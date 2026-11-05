@@ -60,6 +60,16 @@ class Deadline(TimeoutError):
     runs, so no socket timeout fires): the server's own failure."""
 
 
+class Unanswered(Exception):
+    """A churn request the client got no whole answer to, recorded as such
+    (run_churn): it stops its worker, as the server no longer answers it."""
+
+
+class ClientError(RuntimeError):
+    """A client's own failure, not the server's, such as an exception in
+    recording a request the server answered: the run measured nothing."""
+
+
 def dig(document, path: str):
     """The value at a dotted path of nested dicts, or None."""
     for key in path.split("."):
@@ -119,7 +129,10 @@ class Stream:
     With a barrier the request is sent once every sender has connected, and
     its clock starts after the connection; without one, before it. A request
     still streaming `timeout` seconds after its send raises Deadline; the
-    socket's own timeout, as long, ends one the server went silent on."""
+    socket's own timeout, as long, ends one the server went silent on. A
+    stream that ends before its `data: [DONE]` without an error event raises
+    ConnectionError, as http.client does for a connection the server closed
+    before its response."""
 
     def __init__(
         self,
@@ -149,11 +162,13 @@ class Stream:
             if response.status != 200:
                 self.error_body = response.read().decode(errors="replace")[:200]
                 return
+            finished = False
             for line in response:
                 if time.time() - self.sent > timeout:
                     raise Deadline(
                         f"a request still streaming {timeout:g} s after its send"
                     )
+                finished = finished or line.startswith(b"data: [DONE]")
                 if not line.startswith(b"data: {"):
                     continue
                 event = json.loads(line[6:])
@@ -166,6 +181,8 @@ class Stream:
                     if piece:
                         self.chunks.append(time.time())
                         self.text.append(piece)
+            if not finished and not self.error_body:
+                raise ConnectionError("the stream ended before its data: [DONE]")
         finally:
             connection.close()
             self.ended = time.time()
@@ -311,46 +328,44 @@ def run_churn(
     timeout: float = REQUEST_SECONDS,
 ) -> None:
     """A churn run. Workers send requests until `minutes` have passed and
-    finish the one they have in flight; the run ends 4 s after the last. A
-    request the server keeps streaming `timeout` seconds after its send ends
-    its worker with a deadline record of its chunk times; the end record
-    lists it, as every request still open, with its open gap or, before its
-    first token, as unanswered, and the run raises Deadline. Each /status
-    sample also logs churn_status_event's values as an event."""
+    finish the one they have in flight; the run ends 4 s after the last.
+    Each request ends in one record: done, http_error (the server answered
+    it with an error) or unanswered (chat), which also stops its worker.
+    Any other exception is the client's own: it ends its worker with a
+    traceback and, once the others finish, the run with ClientError. Each
+    /status sample also logs churn_status_event's values as an event."""
     model = served_model(port)
     recorder = Recorder(directory, label)
     end = recorder.start + minutes * 60
-    # The content chunk times of each request in flight, by tag, and the
-    # requests past their time.
-    open_streams: dict[str, list[float]] = {}
-    expired: list[str] = []
 
     def chat(messages, tag):
+        """Sends one request and records how it ended: done, returning the
+        answer; http_error, the server's error, returning None; or
+        unanswered, when the client got no whole answer: its deadline
+        passed (Deadline), or its connection failed or closed before the
+        stream's end. That record keeps its chunk times, as a done record
+        does for its gaps, and why, and chat raises Unanswered: the server
+        no longer answers it. Only the stream's own failures are
+        unanswered."""
+        body = churn_body(model, messages)
         chunks: list[float] = []
-        with recorder.lock:
-            open_streams[tag] = chunks
         sent = time.time()
         try:
-            stream = Stream(port, churn_body(model, messages), timeout, chunks=chunks)
-        except Deadline as error:
-            # Its chunk times, as a done record's, for its gaps' causes.
+            stream = Stream(port, body, timeout, chunks=chunks)
+        except Exception as error:
             recorder.emit(
-                "deadline",
+                "unanswered",
                 tag=tag,
                 start=round(sent - recorder.start, 1),
                 chunks_ms=[round((t - sent) * 1000) for t in chunks],
-                error=str(error),
+                error=f"{type(error).__name__}: {error}",
             )
-            with recorder.lock:
-                expired.append(tag)
-            raise
+            raise Unanswered(tag) from error
         if not stream.ok:
             # Code 200 for an error event in a stream the server had begun.
             recorder.emit(
                 "http_error", tag=tag, code=stream.status, body=stream.error_body
             )
-            with recorder.lock:
-                open_streams.pop(tag, None)
             return None
         out = stream.usage.get("completion_tokens") or 0
         first = stream.first or stream.ended
@@ -368,8 +383,6 @@ def run_churn(
             gap=gap_summary(stream.chunks, recorder.start),
             chunks_ms=[round((t - stream.sent) * 1000) for t in stream.chunks],
         )
-        with recorder.lock:
-            open_streams.pop(tag, None)
         return "".join(stream.text)
 
     def worker(index):
@@ -377,16 +390,28 @@ def run_churn(
         round_number, previous = 0, None
         while time.time() < end:
             round_number += 1
-            try:
-                if previous and round_number % 4 == 0:
-                    chat(previous, f"w{index}-resend{round_number}")
-                    continue
+            resend = previous is not None and round_number % 4 == 0
+            if resend:
+                messages, tag = previous, f"w{index}-resend{round_number}"
+            else:
                 messages = churn_messages(index, round_number, base, step)
-                answer = chat(messages, f"w{index}-r{round_number}")
-            except Deadline:
+                tag = f"w{index}-r{round_number}"
+            try:
+                answer = chat(messages, tag)
+            except Unanswered:
                 return
-            if answer is not None:
+            if answer is not None and not resend:
                 previous = churn_resend(messages, answer)
+
+    # The exceptions of the clients' own that ended their workers.
+    failures: list[Exception] = []
+
+    def client(index):
+        try:
+            worker(index)
+        except Exception as error:
+            failures.append(error)
+            raise  # threading prints its traceback
 
     def observe(status):
         recorder.emit("status", **churn_status_event(status))
@@ -399,7 +424,7 @@ def run_churn(
     )
     poller.start()
     workers = [
-        threading.Thread(target=worker, args=(w,), daemon=True)
+        threading.Thread(target=client, args=(w,), daemon=True)
         for w in range(CHURN_WORKERS)
     ]
     for thread in workers:
@@ -407,22 +432,15 @@ def run_churn(
     for thread in workers:
         thread.join()
     time.sleep(4)
-    now = time.time()
-    with recorder.lock:
-        open_gaps = {
-            tag: round(now - chunks[-1], 3)
-            for tag, chunks in open_streams.items()
-            if chunks
-        }
-        unanswered = sorted(tag for tag, chunks in open_streams.items() if not chunks)
-    recorder.emit("end", open_gaps=open_gaps, unanswered=unanswered)
+    recorder.emit("end")
     done.set()
     poller.join(timeout=poll_seconds + 35)
     recorder.close()
-    if expired:
-        raise Deadline(
-            f"requests still streaming {timeout:g} s after their send: {', '.join(sorted(expired))}"
-        )
+    if failures:
+        error = failures[0]
+        raise ClientError(
+            f"a churn client failed: {type(error).__name__}: {error}"
+        ) from error
 
 
 # ----------------------------------------------------------------- ttft

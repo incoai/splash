@@ -43,12 +43,14 @@ def status(t, rows=0, tokens=0, **fields):
     return {"t": t, "status": document}
 
 
-def churn_run(directory: Path, label: str, done, samples, end=None, meta=None):
+def churn_run(directory: Path, label: str, done, samples, events=(), meta=None):
     """A complete churn run's files: done records (tag, start, t and
-    optional chunks_ms, ttft, decode_tps), /status samples, an end record
-    (t, open_gaps) and meta."""
-    events = [{"kind": "done", "out": 100, **record} for record in done]
-    events.append({"kind": "end", "t": 960, "open_gaps": {}, **(end or {})})
+    optional chunks_ms, ttft, decode_tps), other `events`, /status samples,
+    an end record at 960 s and meta."""
+    events = [{"kind": "done", "out": 100, **record} for record in done] + [
+        *events,
+        {"kind": "end", "t": 960},
+    ]
     write_jsonl(directory / f"{label}.events.jsonl", events)
     write_jsonl(directory / f"{label}.status.jsonl", samples)
     (directory / f"{label}.out").write_text("DONE\n")
@@ -138,6 +140,8 @@ def content_event(text):
 
 
 KEEPALIVE = object()
+# The server closes the connection there, before the stream's end.
+CLOSE = object()
 
 
 def keepalives_forever():
@@ -165,13 +169,19 @@ def finished(target, seconds=30):
 class StreamingServer:
     """A server on 127.0.0.1 streaming each chat completion, status 200, as
     server.py does: the role chunk, then the events answer(body) returns
-    (KEEPALIVE: server.py's keepalive, 0.05 s after the last write), then
-    [DONE]; /status what status() returns, idle."""
+    (KEEPALIVE: server.py's keepalive, 0.05 s after the last write; CLOSE:
+    the connection closes there), then [DONE]; a request for whose body
+    dropped(body) is true has its connection closed before any response;
+    /status what status() returns, idle."""
 
-    def __init__(self, answer, status=dict):
+    def __init__(self, answer, status=dict, dropped=lambda body: False):
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
+
+            def close(self):
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.close_connection = True
 
             def do_GET(self):
                 models = {"data": [{"id": "m"}]}
@@ -184,6 +194,9 @@ class StreamingServer:
 
             def do_POST(self):
                 body = self.rfile.read(int(self.headers["Content-Length"])).decode()
+                if dropped(body):
+                    self.close()
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
@@ -191,6 +204,9 @@ class StreamingServer:
                 try:
                     self.wfile.write(f"data: {json.dumps(role)}\n\n".encode())
                     for event in answer(body):
+                        if event is CLOSE:
+                            self.close()
+                            return
                         if event is KEEPALIVE:
                             time.sleep(0.05)
                             self.wfile.write(b": splash-keepalive\n\n")
@@ -430,11 +446,13 @@ class ChurnStatusTests(unittest.TestCase):
         )
 
 
-class DeadlineTests(unittest.TestCase):
-    """server.py keeps every stream alive with a keepalive every 2 s and sets
-    no deadline of its own, so a request a scheduler or ledger bug starves
-    ends at its time as the server's failure instead of holding the run, and
-    its machine's GPU lock, forever."""
+class UnansweredTests(unittest.TestCase):
+    """A request the client gets no whole answer to is unanswered, the
+    server's failure (G8): one the server keeps open past its time, as
+    server.py keeps every stream alive with a keepalive every 2 s and sets
+    no deadline of its own, so that a request a scheduler or ledger bug
+    starves does not hold the run, and its machine's GPU lock, forever; and
+    one whose connection closes before the stream's end."""
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -445,6 +463,30 @@ class DeadlineTests(unittest.TestCase):
         path = Path(self.directory) / f"{label}.events.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()]
 
+    def churn(self, label, answer, dropped=lambda body: False, timeout=30):
+        """A churn run of 0.01 min against StreamingServer(answer, dropped),
+        completed as run.py completes one, and its check."""
+        with (
+            StreamingServer(answer, dropped=dropped) as fake,
+            mock.patch.object(clients, "CHURN_STAGGER_SECONDS", 0),
+        ):
+            outcome = finished(
+                lambda: clients.run_churn(
+                    fake.port,
+                    self.directory,
+                    label,
+                    0.01,
+                    [0, 1, 2],
+                    poll_seconds=0.05,
+                    timeout=timeout,
+                )
+            )
+        self.assertEqual(outcome, ("returned", None))
+        directory = Path(self.directory)
+        (directory / f"{label}.out").write_text("DONE\n")
+        (directory / f"{label}.meta.json").write_text(json.dumps({"scenario": "churn"}))
+        return self.events(label), check.check_run(check.Run(directory, label))
+
     def test_keepalives_do_not_hold_a_request_open(self):
         with StreamingServer(lambda body: keepalives_forever()) as fake:
             outcome = finished(lambda: clients.Stream(fake.port, "{}", timeout=0.5), 10)
@@ -453,11 +495,16 @@ class DeadlineTests(unittest.TestCase):
         )
         self.assertIsInstance(outcome[1], clients.Deadline)
 
-    def test_churn_fails_a_request_the_server_keeps_open(self):
+    def test_a_stream_cut_before_its_end_raises(self):
+        with StreamingServer(lambda body: [content_event("1"), CLOSE]) as fake:
+            with self.assertRaisesRegex(ConnectionError, r"before its data: \[DONE\]"):
+                clients.Stream(fake.port, "{}")
+
+    def test_churn_records_requests_the_server_keeps_open(self):
         # w1's first request stays queued and w2's stops
         # after its first token while w0 keeps working, and the server keeps
-        # both streams alive. Each deadline record keeps the chunk times its
-        # request had, for gap_causes.
+        # both streams alive. Each unanswered record keeps the chunk times its
+        # request had, for its gaps.
         usage = {
             "choices": [],
             "usage": {"prompt_tokens": 9000, "completion_tokens": 2},
@@ -472,35 +519,95 @@ class DeadlineTests(unittest.TestCase):
             time.sleep(0.2)
             yield from (content_event("1"), content_event("2"), usage)
 
-        with (
-            StreamingServer(answer) as fake,
-            mock.patch.object(clients, "CHURN_STAGGER_SECONDS", 0),
-        ):
-            outcome = finished(
-                lambda: clients.run_churn(
-                    fake.port,
-                    self.directory,
-                    "c",
-                    0.01,
-                    [0, 1, 2],
-                    poll_seconds=0.05,
-                    timeout=1,
-                )
-            )
-        self.assertEqual(outcome[0], "raised", outcome)
-        self.assertIsInstance(outcome[1], clients.Deadline)
-        self.assertIn("w1-r1, w2-r1", str(outcome[1]))
-        events = self.events("c")
-        expired = {e["tag"]: e for e in events if e["kind"] == "deadline"}
-        self.assertEqual(sorted(expired), ["w1-r1", "w2-r1"])
-        self.assertEqual(expired["w1-r1"]["chunks_ms"], [])
-        self.assertEqual(len(expired["w2-r1"]["chunks_ms"]), 1)
-        self.assertLess(expired["w2-r1"]["chunks_ms"][0], 1000)
-        (end,) = [e for e in events if e["kind"] == "end"]
-        self.assertEqual(end["unanswered"], ["w1-r1"])
-        self.assertEqual(list(end["open_gaps"]), ["w2-r1"])
+        events, result = self.churn("c", answer, timeout=1)
+        unanswered = {e["tag"]: e for e in events if e["kind"] == "unanswered"}
+        self.assertEqual(sorted(unanswered), ["w1-r1", "w2-r1"])
+        self.assertTrue(
+            all(e["error"].startswith("Deadline: ") for e in unanswered.values())
+        )
+        self.assertEqual(unanswered["w1-r1"]["chunks_ms"], [])
+        self.assertEqual(len(unanswered["w2-r1"]["chunks_ms"]), 1)
+        self.assertLess(unanswered["w2-r1"]["chunks_ms"][0], 1000)
         done = {e["tag"].split("-")[0] for e in events if e["kind"] == "done"}
         self.assertEqual(done, {"w0"})
+        (g8,) = [f for f in result["failures"] if f.startswith("G8")]
+        self.assertTrue(g8.startswith("G8: 2 requests unanswered at the client: "))
+        self.assertIn("w1-r1 (Deadline: ", g8)
+        self.assertIn("w2-r1 (Deadline: ", g8)
+
+    def test_churn_records_requests_whose_connection_closed(self):
+        # w1's second request: its connection closes before any response,
+        # or after five tokens, before the stream's end; w0 and w2 work on.
+        tokens = [content_event(f"{i}\n") for i in range(30)]
+        usage = {
+            "choices": [],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 30},
+        }
+
+        def answer(body):
+            return [*tokens[:5], CLOSE] if "Log 1-2:" in body else [*tokens, usage]
+
+        for name, dropped, error in (
+            ("no-response", lambda body: "Log 1-2:" in body, "RemoteDisconnected: "),
+            (
+                "cut",
+                lambda body: False,
+                "ConnectionError: the stream ended before its data: [DONE]",
+            ),
+        ):
+            with self.subTest(name):
+                events, result = self.churn(name, answer, dropped)
+                (unanswered,) = [e for e in events if e["kind"] == "unanswered"]
+                self.assertEqual(unanswered["tag"], "w1-r2")
+                self.assertTrue(unanswered["error"].startswith(error), unanswered)
+                done = {e["tag"] for e in events if e["kind"] == "done"}
+                self.assertEqual(
+                    ("w1-r1" in done, "w1-r2" in done, "w0-r2" in done),
+                    (True, False, True),
+                )
+                self.assertIn(
+                    f"G8: 1 requests unanswered at the client: w1-r2 ({error}",
+                    "\n".join(result["failures"]),
+                )
+
+    def test_a_clients_own_exception_is_not_an_unanswered_request(self):
+        # The client fails building a request's body, or recording one the
+        # server answered whole: each worker ends with a traceback, nothing
+        # is recorded unanswered, and the run ends as the client's failure.
+        usage = {"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 2}}
+
+        def answer(body):
+            return [content_event("1"), content_event("2"), usage]
+
+        for name, patched in (("body", "churn_body"), ("record", "gap_summary")):
+            with (
+                self.subTest(name),
+                StreamingServer(answer) as fake,
+                mock.patch.object(clients, "CHURN_STAGGER_SECONDS", 0),
+                mock.patch.object(clients, patched, side_effect=ValueError("bug")),
+                mock.patch.object(threading, "excepthook") as excepthook,
+            ):
+                outcome = finished(
+                    lambda: clients.run_churn(
+                        fake.port,
+                        self.directory,
+                        name,
+                        0.01,
+                        [0, 1, 2],
+                        poll_seconds=0.05,
+                    )
+                )
+                self.assertEqual(outcome[0], "raised", outcome)
+                self.assertIsInstance(outcome[1], clients.ClientError)
+                self.assertEqual(
+                    str(outcome[1]), "a churn client failed: ValueError: bug"
+                )
+                self.assertEqual(
+                    [call.args[0].exc_type for call in excepthook.call_args_list],
+                    [ValueError] * clients.CHURN_WORKERS,
+                )
+                kinds = {e["kind"] for e in self.events(name)}
+                self.assertFalse(kinds & {"done", "unanswered"}, kinds)
 
     def test_a_sender_that_fails_before_the_barrier_releases_the_others(self):
         # At N=2 one sender of a round cannot connect; the
@@ -590,10 +697,23 @@ class CheckTests(unittest.TestCase):
     def test_g4_fails_a_freeze_and_frequent_stalls(self):
         for name, served in (
             ("freeze", self.served("freeze", gaps=(0.05,) * 500 + (12,))),
+            # A request the client stopped waiting for 11 s after its last
+            # token.
             (
                 "open",
                 self.served(
-                    "open", gaps=(0.05,) * 500, end={"open_gaps": {"w0-r2": 11.0}}
+                    "open",
+                    gaps=(0.05,) * 500,
+                    events=[
+                        {
+                            "kind": "unanswered",
+                            "tag": "w0-r2",
+                            "start": 40.0,
+                            "t": 52.0,
+                            "chunks_ms": [0, 50, 1000],
+                            "error": "Deadline: a request still streaming",
+                        }
+                    ],
                 ),
             ),
             ("p99", self.served("p99", gaps=(0.05,) * 90 + (6,) * 10)),
@@ -900,8 +1020,9 @@ class RunTests(unittest.TestCase):
     def test_the_servers_own_failures_are_recorded_as_such(self):
         # A request the server failed, a server gone by the end of the
         # scenario, or anything else that ends a scenario once the server is
-        # ready, ends the run as the server's failure, which fails G8;
-        # run.py's refusals are recorded by their own kinds.
+        # ready, ends the run as the server's failure, which fails G8, but a
+        # client's own failure, the client's; run.py's refusals are recorded
+        # by their own kinds.
         exited = {}
 
         class FakeServer:
@@ -999,17 +1120,11 @@ class RunTests(unittest.TestCase):
 
         # A request it kept streaming past --request-seconds.
         def expired(*args, **kwargs):
-            raise clients.Deadline(
-                "requests still streaming 2137 s after their send: w1-r1"
-            )
+            raise clients.Deadline("a request still streaming 2137 s after its send")
 
         self.assertEqual(
             recorded("expired", expired),
-            (
-                1,
-                "server",
-                "Deadline: requests still streaming 2137 s after their send: w1-r1",
-            ),
+            (1, "server", "Deadline: a request still streaming 2137 s after its send"),
         )
 
         def owing(*args, **kwargs):
@@ -1018,6 +1133,14 @@ class RunTests(unittest.TestCase):
         self.assertEqual(
             recorded("owing", owing),
             (1, "server", "RuntimeError: server did not go idle"),
+        )
+
+        def client_failed(*args, **kwargs):
+            raise clients.ClientError("a churn client failed: ValueError: bug")
+
+        self.assertEqual(
+            recorded("client", client_failed),
+            (1, "client", "a churn client failed: ValueError: bug"),
         )
 
     def test_gpu_utilization_reads_ioreg(self):

@@ -338,11 +338,12 @@ schema, and the client times what a user sees.
 Every request timestamps each content chunk of its stream; its gaps are the
 intervals between consecutive chunks after the first. Each request may take
 `--request-seconds` from its send (by default twice the longest request
-measured on any Mac): one the server keeps streaming
-past it, though its keepalives hold the connection open, ends the scenario as
-the server's failure; in `churn` its client stops with a record of the
-request's chunk times, and the end record lists every request still open,
-with its open gap or, before its first token, as unanswered.
+measured on any Mac). A request the client gets no whole answer to is
+unanswered, the server's failure: one the server keeps streaming past that
+time, though its keepalives hold the connection open, or one whose connection
+fails or closes before the stream's `data: [DONE]`. It ends `serve1` and
+`warm`, ends `ttft` as one of its warm-ups and fails its round otherwise; in
+`churn` its client records it, with its chunk times and why, and stops.
 
 ```sh
 .venv/bin/python -m dev.benchmarks.serving.run --tree TREE --machine m6 \
@@ -363,8 +364,9 @@ started on that Mac before, host memory and pressure, process snapshots at
 the start, middle and end of the scenario while the server serves, the pids
 the run started, and for a run that did not complete why and whose failure
 that was: the server's, which exited, was not ready in time, failed a
-request or, once ready, did not let the scenario end, or `run.py`'s refusal
-to measure) and on the M5 Pro
+request or, once ready, did not let the scenario end, a client's, which
+raised an exception of its own, or `run.py`'s refusal to measure) and on the
+M5 Pro
 `LABEL.idle.jsonl`, its idle time and sleep assertions every 10 s. It refuses any output directory that resolves,
 through whatever symlinks, into `~/.cache/huggingface` or an `install/models`
 directory.
@@ -395,8 +397,8 @@ these do not excuse, notes them.
 
 | Gate | Rule |
 | --- | --- |
-| G4 | the client gaps between token events (chunks less than half the shortest decode command apart are one event's; a request still open at the end counts its open gap): the largest at most 10 s, the p99 at most 5 s; every gap past 2.5 s is listed |
-| G8 | no engine restart, failed request (an HTTP error but `context_length_exceeded`, an error event in a stream the server had begun, a request of a failed TTFT round, or one `/status` counts in `requests.failed`), Metal failure or loop tick of 5 s or more, and no exit, late start or failed request that ended the run |
+| G4 | the client gaps between token events (chunks less than half the shortest decode command apart are one event's; an unanswered request counts its open gap, up to when the client stopped waiting): the largest at most 10 s, the p99 at most 5 s; every gap past 2.5 s is listed |
+| G8 | no engine restart, failed request (an HTTP error but `context_length_exceeded`, an error event in a stream the server had begun, a request of a failed TTFT round, or one `/status` counts in `requests.failed`), unanswered request, Metal failure or loop tick of 5 s or more, and no exit, late start or failed request that ended the run |
 | G9 | the memory accounts sum to `charged_bytes` in every sample, no claim waits 30 s, nothing is owed at the end |
 | Store | a regrown expert unit taken back within 60 s of its regrow is counted; a second such take back within 60 s of the one before is an oscillation and fails |
 | Churn | the run lasted its load window (`--minutes`) and every client completed a request |

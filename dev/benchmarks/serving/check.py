@@ -129,7 +129,8 @@ class Run:
             for e in read_jsonl(path)
         ]
         self.done = [e for e in self.events if e.get("kind") == "done"]
-        self.expired = [e for e in self.events if e.get("kind") == "deadline"]
+        # Requests the client got no whole answer to (clients.run_churn).
+        self.unanswered = [e for e in self.events if e.get("kind") == "unanswered"]
         # HTTP errors and failed TTFT rounds; a prompt past the context is
         # the client's.
         self.errors = [
@@ -159,20 +160,17 @@ class Run:
 
     def gaps(self) -> list[tuple[float, float]]:
         """Every client gap between token events, as (seconds, seconds into
-        the run at its end): those of each request that ended or that the
-        client ended at its deadline, and each the end record lists as open,
-        ending at that record."""
-        found = [
-            ((later - earlier) / 1000, record["start"] + later / 1000)
-            for record in [*self.done, *self.expired]
-            for chunks in [record.get("chunks_ms") or []]
-            for earlier, later in zip(chunks, chunks[1:])
-            if later - earlier >= TOKEN_EVENT_MS
-        ]
-        if self.end:
+        the run at its end): those of each answered request, and of each
+        unanswered one up to when the client stopped waiting for it."""
+        found = []
+        for record in [*self.done, *self.unanswered]:
+            chunks = record.get("chunks_ms") or []
+            if record["kind"] == "unanswered":
+                chunks = [*chunks, (record["t"] - record["start"]) * 1000]
             found += [
-                (length, self.end["t"])
-                for length in (self.end.get("open_gaps") or {}).values()
+                ((later - earlier) / 1000, record["start"] + later / 1000)
+                for earlier, later in zip(chunks, chunks[1:])
+                if later - earlier >= TOKEN_EVENT_MS
             ]
         return found
 
@@ -250,8 +248,9 @@ def not_quiet(run: Run) -> list[str]:
 
 def g8_failures(run: Run) -> list[str]:
     """G8, the server's own failures: an engine restart, a request it
-    failed, a Metal failure, a loop tick past the GPU wait limit, or an
-    exit, a start not ready in time or a failed request that ended the run."""
+    failed or left unanswered, a Metal failure, a loop tick past the GPU
+    wait limit, or an exit, a start not ready in time or a failed request
+    that ended the run."""
     failures = []
     restarts = [
         r
@@ -269,6 +268,11 @@ def g8_failures(run: Run) -> list[str]:
     if failed or run.errors:
         failures.append(
             f"G8: {failed} failed requests in /status, {len(run.errors)} at the client"
+        )
+    if run.unanswered:
+        failures.append(
+            f"G8: {len(run.unanswered)} requests unanswered at the client: "
+            + "; ".join(f"{e['tag']} ({e['error']})" for e in run.unanswered)
         )
     if any(
         value(s["status"], "metrics.metal_failures", 0)

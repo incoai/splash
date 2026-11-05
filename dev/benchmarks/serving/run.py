@@ -24,7 +24,8 @@ SIGINT; and writes beside the client's records:
   this run started, on the M5 Pro the idle and sleep-assertion samples
   (LABEL.idle.jsonl) that show whether the machine was in use, and for a run
   that did not complete why (error) and whose failure that was (failure:
-  server or request, the server's own, else the refusal's kind);
+  server or request for the server's own, client for a client's own, else
+  the refusal's kind);
 - LABEL.server.log (one per server: LABEL-nN for each concurrency of ttft).
 
 No output goes under ~/.cache/huggingface or an install/models directory,
@@ -71,9 +72,10 @@ PRINT_CONSTANTS = "splash-benchmark-print-build-id-constants:\n\t@printf '%s\\n'
 class RunError(RuntimeError):
     """Why a run cannot complete, and whose doing that is: `kind`, recorded
     in meta.json as `failure`, is one of SERVER_FAILURES when the server
-    failed the run, else this harness refused to measure it (a port that
-    answers, a build or a server that is not the tree's, an installation or
-    an output it cannot make)."""
+    failed the run, `client` when a client failed on its own
+    (clients.ClientError), else this harness refused to measure it (a port
+    that answers, a build or a server that is not the tree's, an
+    installation or an output it cannot make)."""
 
     def __init__(self, message: str, kind: str):
         super().__init__(message)
@@ -687,6 +689,8 @@ def main(argv=None) -> int:
                 raise
             except clients.RequestFailed as error:
                 raise RunError(str(error), "request") from error
+            except clients.ClientError as error:
+                raise RunError(str(error), "client") from error
             except Exception as error:
                 # Past Ready, whatever else ends the scenario is the server's
                 # failure: it exited, or, alive on 127.0.0.1, it did not answer
