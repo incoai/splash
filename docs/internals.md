@@ -1430,8 +1430,9 @@ off from a refusal: the wanted starts after it that compete for what it was
 refused are held, not tried, so the lanes that finish leave it what they free.
 Every start competes for memory; for the SSD cache's quota of active KV only
 one that would take some of it, a Spill start's commitment or the copies on
-the chain it restores that no lane holds yet (a copy counts once however many
-lanes hold its block), and a quota refusal holds back only those
+the chain it restores that no lane holds yet (the quota counts a copy once
+however many lanes hold its block, so restoring a copy a lane holds takes
+none of it), and a quota refusal holds back only those
 (`Engine::competesForQuota`). A Spill start's own check counts those copies
 beside its commitment (`Cache::chainCopies`), and so does its commitment
 (`Cache::commitSpill`); a copy a reclaim writes for a block of its chain
@@ -1447,9 +1448,10 @@ way (`Cache::fitDiskLimit`).
 A refused start the scheduler does not want waits for scheduling: it holds
 back nothing, its claim holds no room and its wait's limit stops; it keeps its
 wait's age and its refusal. Aging bounds how long younger prompts lead a
-refused start ([below](#prefill-and-decode-scheduling)); while those admitted
-ahead of it that compete for what it was refused work, its wait's limit
-restarts ([resource waits](#resource-waits)). A refused resume holds back the
+refused start ([below](#prefill-and-decode-scheduling)); while a lane
+submitted before it, or one admitted ahead of it that competes for what it
+was refused, works, its wait's limit restarts
+([resource waits](#resource-waits)). A refused resume holds back the
 later resumes.
 
 ### What a refused claim takes
@@ -1748,19 +1750,29 @@ after a suspension, new work waits for resident requests only while memory is
 still short, and at most for the 30 s resource wait; suspended requests then
 resume first, each within its own resource wait. A request of a strictly higher
 priority than every suspended request waits for neither. A resource wait's limit
-restarts whenever an earlier lane has work in flight: one submitted before the
-waiting request, or one that competes for what the request was refused (any
-lane for memory, one that holds some of the SSD cache's quota, a Spill lane's
-commitment or copies of the blocks on its own pages, for that quota, as
-admission holds them back, [above](#memory-rules)) and was admitted before its
-latest refusal while it has no lane (at its start or resume, or its
-suspension), or before its first refusal as a lane in service. Such a lane
-holds what the request waits for until it finishes: the shorter starts
-admission leads ahead of a refused start, which aging bounds, keep its wait
-open while they work. Other lanes do not extend the wait. A lane holding
-copies on a waiting resume's own chain keeps that wait open too while it
-works, though its end leaves the resume needing room for those copies all the
-same: that extension lasts at most the lane's run.
+restarts whenever a lane of the command in flight was submitted before the
+waiting request, whatever it holds, or was admitted before the refusal the wait
+records and competes for what the request was refused (`Engine::tick`). The
+refusal recorded is the latest while the request has no lane (a refused start
+or resume, or its suspension), so a waiting start or resume counts the
+competing lanes admitted before its latest refusal; for a lane in service it
+is the first. Any
+lane competes for memory. For the SSD cache's quota a lane competes while it
+holds some of it by its own count (`Cache::holdsActiveKvQuota`): a Spill
+commitment, or a block of its chain with a copy, which every lane holding the
+block counts, even one whose end returns none of the quota because another
+lane holds the block too. A lane that holds none of the quota extends a quota
+wait only if it was submitted before the waiting request. The rule is wide on
+purpose: the lanes it counts may still return what the request needs, and a
+refused Spill start needs memory as well, since a later attempt may place it
+Resident once memory returns. Rules narrowed to the lanes whose end returns quota
+failed requests at the limit that this one completes: a Spill start that fit
+Resident once memory returned, a start whose quota holder a higher priority
+kept from running for a while, and requests that suspended and resumed each
+other in turn.
+The wait fails at its limit once a whole limit passes with no such lane in
+flight; the request's own deadline, its `timeout` or `--request-timeout`,
+applies throughout.
 Readiness does not guarantee that a request-sized allocation fits. A request
 that cannot fit even alone, after every cached prefix was evicted and the expert
 store shrank to its floor, fails with 400 `capacity_exhausted`, naming a smaller

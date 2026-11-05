@@ -55,8 +55,8 @@ Cache::Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> di
   // A spillable layout's pages keep every layer (kv::Layout::slimmable).
   if (window_ && (!window_->windowPages || spill_))
     throw std::invalid_argument("a windowed cache keeps a window of pages, and its requests do not spill");
-  // A copy that lands, leaves or turns out another command's changes what
-  // the requests holding its block on their own pages hold of the quota
+  // A copy that lands, leaves or turns out another command's changes the
+  // copies each request holding its block on that page counts
   // (Request::heldCopies). A block sits at its depth in each holder's chain;
   // a request's page and its block's move together (followMoves).
   if (spill_)

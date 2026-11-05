@@ -686,9 +686,9 @@ void testADeclinedQuotaRefusalKeepsItsScope() {
           "a declined quota refusal held back a Resident start, or let a Spill start be tried");
 }
 
-// A start refused the SSD cache's quota waits only for the starts admitted ahead of it that
-// compete for the quota: a Resident start it does not hold back, admitted beside it, does not keep
-// its wait open, which expires at its limit while that start still works.
+// A Resident start submitted after a start refused the SSD cache's quota, holding none of the
+// quota, does not keep that start's wait open though admitted ahead of it: the wait expires at its
+// limit while the Resident start still works.
 void testAResidentStartDoesNotHoldAQuotaWaitOpen() {
   // As in testAQuotaWaitHoldsBackOnlyStartsCompetingForIt: the first
   // request commits the whole quota and the second waits for it.

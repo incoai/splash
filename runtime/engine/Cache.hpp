@@ -491,9 +491,10 @@ public:
   // to its first block no longer matchable, as refresh() does, and stops at
   // the first such copy.
   [[nodiscard]] bool restoreTakesQuota(std::span<const uint64_t> chain) const;
-  // Whether the request holds some of the quota of active KV: a Spill
-  // request's commitment, or a block on its own page with a copy
-  // (Request::heldCopies).
+  // Whether the request holds some of the quota of active KV by its own
+  // count: a Spill request's commitment, or a block of its chain it holds
+  // with a copy (Request::heldCopies), even one another request holds too,
+  // whose copy the quota counts once.
   [[nodiscard]] bool holdsActiveKvQuota(uint64_t requestId) const;
   // Starts writing Spill requests' published pages that have no copy of
   // what they hold (KvCache::kvCopied), as the tier's share for them allows;
@@ -803,10 +804,12 @@ private:
     // The copies on the chain it restores that its commitment counted
     // (commitSpill).
     uint32_t committedCopies = 0;
-    // In a cache whose requests spill, its blocks on its own pages with a
-    // copy of their K/V (holdsCopy): the copies of active KV it holds
-    // (holdsActiveKvQuota). A block it keeps a page of its own beside, while
-    // a restore fills the block's (KvCache::insert), it does not hold.
+    // In a cache whose requests spill, the blocks of its chain it holds on
+    // their own pages with a copy of their K/V (holdsCopy): the copies of
+    // active KV it holds (holdsActiveKvQuota). Every request holding a block
+    // counts its copy; the quota counts it once (KvCache::heldCopies). A
+    // block it keeps a page of its own beside, while a restore fills the
+    // block's (KvCache::insert), it does not hold.
     uint32_t heldCopies = 0;
     uint64_t spillOrder = 0;
     std::deque<uint64_t> owedCopies;
@@ -1371,8 +1374,8 @@ private:
   [[nodiscard]] bool commit(Request &active, uint32_t pages, uint32_t unheld = 0);
   // A copy no request holds yet (ChainCopies::unheld).
   [[nodiscard]] bool takesQuota(uint64_t block) const;
-  // Whether the request holds the block at this index of its chain on its
-  // own page, with a copy of its K/V (Request::heldCopies).
+  // Whether the request holds the block at this index of its chain on the
+  // block's own page, with a copy of its K/V (Request::heldCopies).
   [[nodiscard]] bool holdsCopy(const Request &active, uint32_t index) const;
   // A slot drawn for the request came back unwritten: it commits the slot
   // again, or, while active KV's limit cannot hold it, counts the

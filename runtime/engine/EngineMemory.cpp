@@ -426,11 +426,11 @@ void Engine::deferResourceRetry(Request &active, double now,
   if (!wait.startedMilliseconds)
     wait.startedMilliseconds = now;
   // Waiting for a lane is not waiting for memory. Without a lane, refused at
-  // its start or resume or suspended, a request waits for the lanes admitted
-  // before its latest refusal that compete for what it was refused (tick):
-  // those admission started ahead of it while it waited, as the scheduler
-  // led them, hold what it waits for. A lane in service waits for those
-  // admitted before its first refusal; the starts admitted beside it do not.
+  // its start or resume or suspended, a request's wait counts the lanes
+  // admitted before its latest refusal, its latest retry's for a start or a
+  // resume, that compete for what it was refused (tick): their ends may
+  // return what it waits for. A lane in service counts those admitted before
+  // its first refusal, not the starts admitted after it.
   if (reason != StateFailure::ConcurrencyLimit && (!active.lane || !wait.admittedBefore))
     wait.admittedBefore = admissions_;
   noteRefusal(active, now, denial);
@@ -484,9 +484,9 @@ double Engine::resourceDeadline(const Request &active) const noexcept {
     return 0.0;
   // The limit restarts whenever a lane submitted before the request, or
   // admitted before the refusal ResourceWait::admittedBefore records and
-  // competing for what it was refused, works, however long that takes. Other
-  // lanes do not extend it: requests that keep arriving would otherwise hold
-  // it until the request's deadline.
+  // competing for what it was refused, works, however long that takes
+  // (tick). It fires once no such lane has worked for a whole limit; the
+  // request's own deadline applies regardless.
   return std::max(wait.deadlineMilliseconds,
                   wait.earlierLaneWorkMilliseconds + config_.resourceWaitTimeoutMilliseconds);
 }

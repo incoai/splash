@@ -152,13 +152,14 @@ public:
   void unholdPage(uint32_t page);
   [[nodiscard]] bool held(uint64_t blockId) const;
   // Held blocks whose K/V has a copy (kvCopied): the copies of active KV
-  // (model::DiskBudget::commit). A copy of another command's K/V beside a
-  // held page is a cached copy.
+  // (model::DiskBudget::commit), each once however many requests hold its
+  // block. A copy of another command's K/V beside a held page is a cached
+  // copy.
   [[nodiscard]] uint32_t heldCopies() const noexcept { return heldCopies_; }
   // Called as a block gains or loses a copy of its own K/V (kvCopied), with
-  // the block's depth and page, so that the requests holding it on their
-  // own pages count theirs (Cache::holdsActiveKvQuota). Erasing a block
-  // calls none: a block that can be erased is on no request's chain.
+  // the block's depth and page, so that each request holding it on that
+  // page counts it (Cache::holdsActiveKvQuota). Erasing a block calls none:
+  // a block that can be erased is on no request's chain.
   using CopyChanged = std::function<void(uint64_t blockId, uint32_t depth, uint32_t page, bool copied)>;
   void onCopyChanged(CopyChanged changed) { copyChanged_ = std::move(changed); }
   void touch(uint64_t blockId) noexcept;

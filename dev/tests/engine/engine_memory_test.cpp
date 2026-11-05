@@ -1301,9 +1301,9 @@ void testAdmissionWaitsOutEarlierLanes() {
   }
 }
 
-// A lane in service refused memory waits only for the lanes admitted before its first refusal: a start admitted beside
-// it after that refusal does not extend its wait, however often the lane is refused again while that start runs. The
-// wait fails at its limit, retryably, while the start's command is still in flight.
+// A lane in service refused memory counts the lanes admitted before its first refusal: a start submitted after it and
+// admitted after that refusal does not extend its wait, however often the lane is refused again while that start runs.
+// The wait fails at its limit, retryably, while the start's command is still in flight.
 void testStartsAdmittedBesideALaneInServiceDoNotExtendItsWait() {
   test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);

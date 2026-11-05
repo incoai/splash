@@ -264,12 +264,18 @@ bool Engine::tick(double now) {
       active.resourceWait.deadlineMilliseconds = 0.0;
       continue;
     }
-    // A lane submitted before the request, or admitted before the refusal
-    // ResourceWait::admittedBefore records (a waiting start's latest, so the
-    // starts admission led ahead of it count) and competing for what it was
-    // refused, holds what it may wait for until it finishes; while it works,
-    // the wait's limit restarts. Other lanes do not extend it: requests that
-    // keep arriving would otherwise hold it until its deadline.
+    // While a lane with work in flight was submitted before the request,
+    // whatever it holds, or was admitted before the refusal
+    // ResourceWait::admittedBefore records (the latest refusal, or the
+    // suspension, of a request without a lane; a lane in service's first)
+    // and competes for what it was refused, the wait's limit restarts. For the quota a lane
+    // competes by its own count (competesForQuota), copies another lane
+    // holds too included. The rule is wide on purpose: such a lane may still
+    // return what the request needs, and a refused Spill start needs memory
+    // too, as a later attempt may place it Resident; narrower rules
+    // failed requests at the limit that this one completes. The wait fails
+    // once no such lane has worked for a whole limit; the request's own
+    // deadline applies throughout (above).
     const ResourceWait &wait = active.resourceWait;
     const uint64_t earliestAhead = wait.diskQuota ? earliestQuotaAdmission : earliestWorkingAdmission;
     if (scheduler_.submissionOrder(id) > earliestWorking ||

@@ -332,9 +332,9 @@ private:
     // The admissions counted at the request's latest refusal while it has no
     // lane (its start's, its resume's, its suspension), or at its first
     // refusal in service: the lanes admitted up to then that compete for
-    // what it was refused, any for memory and those holding some of the SSD
-    // cache's quota for it (competesForQuota), hold what it waits for
-    // (deferResourceRetry).
+    // what it was refused, any for memory and, for the SSD cache's quota,
+    // those holding some of it by their own count (competesForQuota),
+    // restart its limit while they work (tick, deferResourceRetry).
     // A wait for a lane does not record it.
     std::optional<uint64_t> admittedBefore;
     double deadlineMilliseconds = 0.0;
@@ -576,14 +576,16 @@ private:
   [[nodiscard]] bool admitQueued(double nowMilliseconds);
   [[nodiscard]] bool admit(Request &request, double nowMilliseconds);
   // Whether the request competes for the SSD cache's quota of active KV
-  // (Cache::spillRoom): a lane while it holds some of it
-  // (Cache::holdsActiveKvQuota), a start if it would take some once it
-  // starts, as a Spill start's commitment or the copies no request holds
-  // yet on the chain it restores (Cache::restoreTakesQuota). Every request
-  // competes for memory. A refused start holds back the wanted
-  // starts after it that compete for what it was refused (admitQueued), and
-  // those admitted ahead of it that compete for it keep its wait open while
-  // they work (tick).
+  // (Cache::spillRoom): a lane while it holds some of it by its own count,
+  // copies another request holds too included (Cache::holdsActiveKvQuota);
+  // a start if it would take some once it starts, as a Spill start's
+  // commitment or the copies no request holds yet on the chain it restores
+  // (Cache::restoreTakesQuota). A Resident start restoring only held copies
+  // thus does not compete, and the lane it becomes does. Every request
+  // competes for memory. A refused start holds back the wanted starts after
+  // it that compete for what it was refused (admitQueued), and the lanes
+  // admitted before its latest refusal that compete for it keep its wait
+  // open while they work, as every lane submitted before it does (tick).
   [[nodiscard]] bool competesForQuota(const Request &request) const;
   // The tokens the request's KV is projected to hold: those it holds and
   // the output it may still generate, at most kProjectedOutputTokens.
