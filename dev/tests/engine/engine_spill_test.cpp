@@ -186,6 +186,53 @@ void testConversionSpillsAHistoryWithCopies() {
           "the lane whose history had copies did not spill them when it converted");
 }
 
+// A converted lane preempted and resumed stays Spill under its output limit when the quota holds its
+// projection; a quota short of it bounds the resume, and the bound and the end at it count as the
+// converted lane's.
+void testAConvertedLaneResumesUnderTheSpillRules() {
+  for (const bool quotaHolds : {true, false}) {
+    Spilling spill(16, false);
+    // Two Full extents beside the Index runway, and one Index extent more.
+    spill.storage.budgetPages = 9;
+    // Seven pages of prompt and 100 tokens of output: the lane meets the
+    // wall past its eighth page and converts.
+    EngineRequest background = Spilling::prompt(1, 1, 7, 100);
+    background.priority = RequestPriority::Background;
+    spill.engine.submit(std::move(background));
+    spill.runUntil([&] { return spill.engine.snapshot().spill.converted == 1 && spill.events.outputs[1].size() >= 10; },
+                   "the lane did not convert at the wall");
+    // A Normal start is refused memory while the lane is resident, which
+    // suspends it.
+    spill.model.beginGrowthBlocked = [&] {
+      return spill.model.lastBeginId == 2 && spill.model.requests.at(1).resident;
+    };
+    spill.model.resumeDenied = true;
+    spill.engine.submit(Spilling::prompt(2, 2, 1, 1));
+    spill.runUntil([&] { return spill.events.completedCount == 1; }, "the Normal request did not run");
+    require(spill.model.suspensions == 1, "the converted lane was not suspended");
+    // Short: the seven pages its conversion copied and two slots hold 288
+    // tokens, 63 of output.
+    if (!quotaHolds)
+      spill.budget->setActiveLimitBytes(2 * 100);
+    spill.model.resumeDenied = false;
+    spill.runUntil([&] { return spill.model.resumptions == 1; }, "the converted lane did not resume");
+    const KvMode resumed = spill.engine.snapshot().activeRequests.front().kvMode;
+    spill.runUntilIdle();
+    const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+    const uint32_t output = quotaHolds ? 100 : 63;
+    require(resumed == KvMode::Spill && spill.events.completedCount == 2 && spill.events.failures.empty() &&
+                spill.events.usage.at(1).second == output && spill.model.outputLimits.at(1) == output,
+            quotaHolds ? "a converted lane did not resume Spill with its whole output"
+                       : "a converted lane's resume was not bounded to what the quota holds");
+    require(counts.converted == 1 && counts.convertedLengthEnds == counts.lengthEnds &&
+                counts.convertedBounded == counts.bounded && counts.bounded == (quotaHolds ? 0U : 1U) &&
+                counts.lengthEnds == counts.bounded,
+            "the converted lane's bounded resume or its end at the bound was not counted, as a bound and as the "
+            "converted lane's");
+    require(spill.committedSlots() == 0, "the lane kept its commitment");
+  }
+}
+
 // A lane that converts at the wall where a start is not admitted, so that landed moves would keep an
 // empty Full extent as the runway, releases every Full extent its moves empty, compacted, and decodes
 // without a yield.
@@ -744,6 +791,40 @@ void testSpillResumeCommitsAgain() {
             roomLater ? "a bound of a resume that did not start outlived it"
                       : "the resumed request was not bounded to what the quota holds");
   }
+}
+
+// A request bounded at its start and bounded again on resume counts as one bounded request.
+void testABoundAtStartAndResumeCountsOnce() {
+  // 2 pages of prompt and 200 tokens of output project 9 pages: 5 hold the
+  // prompt and 95 tokens.
+  Spilling spill(20);
+  spill.budget->setActiveLimitBytes(5 * 100);
+  // No copies: the request holds its whole history without any.
+  spill.allowSpillWrites(false);
+  EngineRequest background = Spilling::prompt(1, 1, 2, 200);
+  background.priority = RequestPriority::Background;
+  spill.engine.submit(std::move(background));
+  spill.runUntil([&] { return spill.events.outputs[1].size() >= 10; }, "the request did not decode");
+  require(spill.model.outputLimits.at(1) == 95, "the start was not bounded");
+  // Room for a Normal start, which is refused memory while the request is
+  // resident and so suspends it.
+  spill.budget->setActiveLimitBytes(20 * 100);
+  spill.model.beginGrowthBlocked = [&] {
+    return spill.model.lastBeginId == 2 && spill.model.requests.at(1).resident;
+  };
+  spill.model.resumeDenied = true;
+  spill.engine.submit(Spilling::prompt(2, 2, 1, 1));
+  spill.runUntil([&] { return spill.events.completedCount == 1; }, "the Normal request did not run");
+  require(spill.model.suspensions == 1, "the request was not suspended");
+  spill.budget->setActiveLimitBytes(5 * 100);
+  spill.model.resumeDenied = false;
+  spill.runUntilIdle();
+  const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+  require(spill.model.resumptions == 1 && spill.events.usage.at(1).second == 95 &&
+              spill.model.outputLimits.at(1) == 95 && spill.events.boundedIds == std::vector<uint64_t>{1},
+          "the resume was not bounded again");
+  require(counts.bounded == 1 && counts.lengthEnds == 1 && counts.convertedBounded == 0,
+          "a request bounded at its start and on resume was not counted once");
 }
 
 // A Spill request suspended before the tier closed resumes and completes: the closure refuses only
@@ -2199,6 +2280,7 @@ std::span<const test::TestCase> spillTests() {
       {"testSpillCommitmentCoversTheChainWithoutCopies", testSpillCommitmentCoversTheChainWithoutCopies},
       {"testConversionCommitsTheHistoryWithoutCopies", testConversionCommitsTheHistoryWithoutCopies},
       {"testConversionSpillsAHistoryWithCopies", testConversionSpillsAHistoryWithCopies},
+      {"testAConvertedLaneResumesUnderTheSpillRules", testAConvertedLaneResumesUnderTheSpillRules},
       {"testAConvertedLanesMovesReleaseTheExtentsTheyEmpty", testAConvertedLanesMovesReleaseTheExtentsTheyEmpty},
       {"testALongDecodingLaneConvertsItselfAtTheWall", testALongDecodingLaneConvertsItselfAtTheWall},
       {"testALaneConvertsOnlyWithAnIndexRunway", testALaneConvertsOnlyWithAnIndexRunway},
@@ -2220,6 +2302,7 @@ std::span<const test::TestCase> spillTests() {
       {"testSpilledFullExtentsLeaveOnceNoPromptGrows", testSpilledFullExtentsLeaveOnceNoPromptGrows},
       {"testSpillMovesThroughTheHostPause", testSpillMovesThroughTheHostPause},
       {"testSpillResumeCommitsAgain", testSpillResumeCommitsAgain},
+      {"testABoundAtStartAndResumeCountsOnce", testABoundAtStartAndResumeCountsOnce},
       {"testSpillResumeOnAClosedTier", testSpillResumeOnAClosedTier},
       {"testSpillResumeBoundLeavesOutputPastItsAnchor", testSpillResumeBoundLeavesOutputPastItsAnchor},
       {"testSpillResumeInItsPromptHoldsNoAnchor", testSpillResumeInItsPromptHoldsNoAnchor},

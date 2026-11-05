@@ -1116,6 +1116,14 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
     }
   }
   model_.setDraftContextPlan(active.request.id, std::move(draft));
+  // A request whose output a start or a resume bounds counts once. A lane
+  // bounded before it converts started Spill and never converts, so its
+  // first bound tells whether it counts as a converted lane's too.
+  if (!active.boundCounted && active.outputLimit < active.request.maxNewTokens) {
+    active.boundCounted = true;
+    ++counters_.spill.bounded;
+    counters_.spill.convertedBounded += active.converted;
+  }
   if (resuming) {
     active.resumeKvTargetTokens = 0;
     active.replaying = true;
@@ -1135,11 +1143,8 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   } else {
     ++counters_.coldMisses;
   }
-  if (config_.spill.capable) {
+  if (config_.spill.capable)
     ++(active.kvMode == KvMode::Spill ? counters_.spill.spill : counters_.spill.resident);
-    counters_.spill.bounded += active.outputLimit < active.request.maxNewTokens;
-    counters_.spill.convertedBounded += active.converted && active.outputLimit < active.request.maxNewTokens;
-  }
 }
 
 bool Engine::pollRestores() {

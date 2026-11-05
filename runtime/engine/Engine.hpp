@@ -141,19 +141,20 @@ struct ActiveRequestSnapshot final {
 
 // The requests of a target that can spill (EngineConfig::spill): those that
 // started in each KV mode; those that converted to Spill when memory
-// refused their growth; those whose output the SSD cache's quota bounded,
-// and those that ended at that bound or once the cache could hold no more
-// of their KV; and those refused because the quota cannot hold their
-// prompt, the daily write budget is spent or the tier takes no writes. Those
-// waiting for the quota now are ResourceWaitSnapshot::diskQuota.
+// refused their growth; those whose output the SSD cache's quota bounded
+// (once per request, at its start or a resume), and those that ended at
+// that bound or once the cache could hold no more of their KV; and those
+// refused because the quota cannot hold their prompt, the daily write budget
+// is spent or the tier takes no writes. Those waiting for the quota now are
+// ResourceWaitSnapshot::diskQuota.
 struct SpillRequestsSnapshot final {
   uint64_t spill = 0;
   uint64_t resident = 0;
   uint64_t converted = 0;
   uint64_t bounded = 0;
   uint64_t lengthEnds = 0;
-  // Of those, the converted lanes': a resume whose output the quota bounded,
-  // and an end at that bound or at a quota that stopped its writes.
+  // Of those, the converted lanes': one whose output the quota bounded on a
+  // resume, and an end at that bound or at a quota that stopped its writes.
   uint64_t convertedBounded = 0;
   uint64_t convertedLengthEnds = 0;
   uint64_t refusedQuota = 0;
@@ -418,6 +419,9 @@ private:
     // quota bounds its output (admitSpill), which each attempt to start it
     // decides anew.
     uint32_t outputLimit = 0;
+    // SpillRequestsSnapshot counted its output bounded; it stays set when a
+    // later attempt leaves the output unbounded, so the request counts once.
+    bool boundCounted = false;
     // The KV a Resident lane takes when it resumes, before its replay
     // consumes any model work: what it held, or the work it was refused
     // room for (suspendLane). A Spill lane takes its replay's pages a
