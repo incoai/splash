@@ -824,3 +824,38 @@ test-sanitizers-metal:
 		$(METAL_TSAN_BUILD)/engine-tests/kv-block-cache $(METAL_TSAN_BUILD)/engine-tests/kv-history-stream
 	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/kv-block-cache $(METAL_TSAN_BUILD)/splash.metallib
 	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/kv-history-stream $(METAL_TSAN_BUILD)/splash.metallib
+
+# The Ripple draft-kernel geometry prototypes (step 1, dev/benchmarks/ripple):
+# a variant metallib whose draft attention and convolution instantiate the
+# production phases with Ripple's geometry beside the shipped one, and a sweep
+# that checks and times them against the production kernels. Not production
+# sources: the engine does not load the variant library.
+RIPPLE_METAL_BUILD := $(BUILD)/ripple
+TEST_RIPPLE_DRAFT_SWEEP := $(ENGINE_TEST_BUILD)/ripple-draft-sweep
+RIPPLE_VARIANT_LIB := $(RIPPLE_METAL_BUILD)/ripple_draft_variant.metallib
+
+$(TEST_RIPPLE_DRAFT_SWEEP): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(RIPPLE_VARIANT_LIB): BUILD_CONFIG := $(CONFIG_DIGEST)
+
+$(TEST_RIPPLE_DRAFT_SWEEP): dev/benchmarks/ripple/ripple_draft_sweep.mm \
+		dev/benchmarks/DispatchReplay.hpp \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(RIPPLE_VARIANT_LIB): dev/benchmarks/ripple/ripple_draft_variant.metal \
+		runtime/metal/kernels/shared/residency.metal $(KERNEL_HEADERS) | $(RIPPLE_METAL_BUILD)
+	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $< -o $(RIPPLE_METAL_BUILD)/ripple_draft_variant.air
+	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c runtime/metal/kernels/shared/residency.metal -o $(RIPPLE_METAL_BUILD)/residency.air
+	$(RUN_CONFIGURED) $(METALLIB) $(RIPPLE_METAL_BUILD)/ripple_draft_variant.air \
+		$(RIPPLE_METAL_BUILD)/residency.air -o $@
+
+$(RIPPLE_METAL_BUILD) $(ENGINE_TEST_BUILD):
+	mkdir -p $@
+
+.PHONY: ripple-step1
+ripple-step1: $(RIPPLE_VARIANT_LIB) $(TEST_RIPPLE_DRAFT_SWEEP) $(LIB)
+
+.PHONY: print-prod-metalflags
+print-prod-metalflags:
+	@echo $(PROD_METALFLAGS)
