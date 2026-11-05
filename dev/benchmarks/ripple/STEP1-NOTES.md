@@ -109,3 +109,36 @@ scaled), which the block's capture already holds for the draft's taps.
 The decode epilogue's clamped variant reads the clamp from a uniform of the
 family's ffn_clamp_threshold; the prefill clamps the gate scratch between
 the passes as written before.
+
+## Step 2 spec: the block graph, from the llama.cpp port (PR #31692, KLD 0)
+
+Per block (the port's build_arch_graph, verbatim semantics):
+
+    residual = x                                  # saved pre-norm
+    a = attn_norm(x)
+    q, k = Wq(a), Wk(a); per-head norms; RoPE iff sliding (NoPE on full)
+    v_in = sigmoid(λ)·a + (1 - sigmoid(λ))·scaled_emb    # scaled_emb = the
+        # gather's rows, the same tensor every block mixes back in
+    v = Wv(v_in); attn = softmax(q·k/sqrt(d))·v; gated: attn *= sigmoid(Wg(a))
+    attn_out = Wo(attn)
+    attn_post = post_attention_norm(attn_out)     # a BRANCH norm, pre-residual
+    ffn_in = attn_post + residual
+    ffn_normed = ffn_norm(ffn_in)                 # the residual's norm, pre-FFN
+    ffn_out = Wdown(clamp20(silu(Wgate(ffn_normed)) * Wup(ffn_normed)))
+    ffn_post = post_ffw_norm(ffn_out)             # a BRANCH norm, pre-residual
+    x = ffn_post + ffn_in
+
+This is a post-norm architecture: each branch's output is normed before its
+residual add, which the QwenTarget block helpers (inputNorm → mixer →
+residual → postAttentionNorm → FFN → residual) do not express - RippleTarget
+composes its own blocks over the shared step machinery, as FlintTarget does
+for its composition. The loader and planner are unaffected (they read the
+four norms by name); the earlier note's "post-FFN norm stage" meant this
+branch norm.
+
+The residual split of the earlier note stands, with the input named: the
+fused projection's v rows scale by sigmoid(λ) at load (term one through the
+fused projection, whose input is a); term two is (1 - sigmoid(λ)) · Wv ·
+scaled_emb, a per-block projection through the v rows alone (the prepared
+weights' last fused section), adding where the prepare stages v. The scale
+of the embeddings is the gather's (landed), and kq_scale is 1/sqrt(128).
