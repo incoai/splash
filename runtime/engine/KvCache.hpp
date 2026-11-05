@@ -286,9 +286,15 @@ public:
     std::array<uint32_t, 3> written{};
     std::array<uint32_t, 3> reachable{};
     uint32_t candidates = 0;
+    friend bool operator==(const PageReach &, const PageReach &) = default;
   };
   [[nodiscard]] PageReach pageReach(Keeps mask, std::span<const uint64_t> kept, std::span<const uint64_t> unwaited,
                                     uint64_t written) const;
+  // Tests: with `check`, every pageReach also follows its rule block by
+  // block over the whole cache, each block's reasons as they stand and the
+  // written state's chain recounted from what its blocks hold, and throws
+  // std::logic_error where the counts differ.
+  void checkReaches(bool check) noexcept { checkReaches_ = check; }
   // The pages of each form no request holds and no transfer moves on the
   // chains of the reasons `chains` names (kChainKeeps).
   [[nodiscard]] std::array<uint32_t, 3> keptPages(Keeps chains) const;
@@ -544,6 +550,12 @@ private:
   // The blocks with a RAM copy a reclaim may take, by their reasons.
   std::array<uint32_t, size_t{1} << kKeeps> candidateCounts_{};
   mutable uint64_t reachVisits_ = 0;
+  bool checkReaches_ = false;
+  // pageReach from the counts and the chains it walks, and by its rule.
+  [[nodiscard]] PageReach countReach(Keeps mask, std::span<const uint64_t> kept, std::span<const uint64_t> unwaited,
+                                     uint64_t written) const;
+  [[nodiscard]] PageReach reachByRule(Keeps mask, std::span<const uint64_t> kept, std::span<const uint64_t> unwaited,
+                                      uint64_t written) const;
 };
 
 } // namespace splash::engine

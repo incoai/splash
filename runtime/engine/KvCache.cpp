@@ -571,6 +571,77 @@ void KvCache::forget(Block &entry) noexcept {
 
 KvCache::PageReach KvCache::pageReach(Keeps mask, std::span<const uint64_t> kept, std::span<const uint64_t> unwaited,
                                       uint64_t written) const {
+  const PageReach reach = countReach(mask, kept, unwaited, written);
+  if (checkReaches_) {
+    const PageReach rule = reachByRule(mask, kept, unwaited, written);
+    if (reach != rule) {
+      const auto forms = [](const std::array<uint32_t, 3> &pages) {
+        return std::to_string(pages[0]) + "/" + std::to_string(pages[1]) + "/" + std::to_string(pages[2]);
+      };
+      throw std::logic_error("a reach's counts differ from its rule: now " + forms(reach.now) + " vs " +
+                             forms(rule.now) + ", written " + forms(reach.written) + " vs " + forms(rule.written) +
+                             ", reachable " + forms(reach.reachable) + " vs " + forms(rule.reachable) +
+                             ", candidates " + std::to_string(reach.candidates) + " vs " +
+                             std::to_string(rule.candidates));
+    }
+  }
+  return reach;
+}
+
+KvCache::PageReach KvCache::reachByRule(Keeps mask, std::span<const uint64_t> kept, std::span<const uint64_t> unwaited,
+                                        uint64_t written) const {
+  constexpr Keeps busy = keepBit(Keep::Busy);
+  const Keeps stays = static_cast<Keeps>(busy | (mask & kChainKeeps));
+  // Whether the block is one of `chains`' blocks or above one.
+  const auto on = [&](std::span<const uint64_t> chains, uint64_t id) {
+    for (const uint64_t last : chains)
+      for (uint64_t at = last; at; at = block(at).parent)
+        if (at == id)
+          return true;
+    return false;
+  };
+  PageReach reach;
+  for (const auto &[id, entry] : blocks_) {
+    if (entry.page == noPage)
+      continue;
+    const auto form = static_cast<size_t>(entry.form);
+    const bool idle = !pool_.pageActive(entry.page) && entry.transfer == Transfer::None;
+    const bool keptChain = on(kept, id), aboveWrite = on(unwaited, id);
+    const bool now = !(entry.keeps & mask) && !keptChain && !aboveWrite;
+    reach.now[form] += now ? 1 : 0;
+    reach.candidates += now && entry.stateCandidate ? 1 : 0;
+    reach.reachable[form] += !(entry.keeps & (idle ? stays : busy)) && !(keptChain && idle) && !aboveWrite ? 1 : 0;
+  }
+  if (!written)
+    return reach;
+  // Once the written state has left RAM through its write: the reasons at
+  // each block and below it, its own write gone.
+  const Keeps kind = block(written).stateKeeps & (keepBit(Keep::Writer) | keepBit(Keep::UsedWriter));
+  const auto after = [&](const auto &self, uint64_t id) -> Keeps {
+    const Block &entry = block(id);
+    Keeps keeps = id == written ? static_cast<Keeps>(entry.keepsHere & ~kind) : entry.keepsHere;
+    for (const uint64_t child : children(id))
+      keeps |= self(self, child);
+    if (entry.page != noPage && pool_.pageActive(entry.page))
+      keeps &= static_cast<Keeps>(~kChainKeeps);
+    return keeps;
+  };
+  // Up its chain while each block frees, it needing every block as a state
+  // on disk does: one without a copy stays where the walk keeps those.
+  bool uncopied = false;
+  for (uint64_t id = written; id; id = block(id).parent) {
+    const Block &entry = block(id);
+    uncopied = uncopied || !entry.slot;
+    const Keeps keeps = static_cast<Keeps>(after(after, id) | (uncopied ? keepBit(Keep::Uncopied) : 0));
+    if (entry.page == noPage || (keeps & mask) || on(kept, id) || on(unwaited, id))
+      break;
+    ++reach.written[static_cast<size_t>(entry.form)];
+  }
+  return reach;
+}
+
+KvCache::PageReach KvCache::countReach(Keeps mask, std::span<const uint64_t> kept, std::span<const uint64_t> unwaited,
+                                       uint64_t written) const {
   constexpr Keeps busy = keepBit(Keep::Busy);
   const Keeps chains = mask & kChainKeeps;
   // What no reclaim of the walk reaches: a page nothing reaches below which

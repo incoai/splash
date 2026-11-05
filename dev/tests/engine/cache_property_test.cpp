@@ -86,6 +86,10 @@ public:
     tier_.transferLimit = 64;
     tier_.writeLimits = {8, 4, 8};
     storage_.budgetPages = 96;
+    // Every count a peek or a take makes of what a reclaim reaches follows
+    // its rule over the whole cache, as kv-page-cache's
+    // testPageReachFollowsItsRule states it.
+    cache_.checkReaches(true);
     for (uint32_t base = 0; base < bases_.size(); ++base) {
       bases_[base].resize(kMaximumPages * KvCache::pageTokens + 1);
       for (uint32_t row = 0; row < bases_[base].size(); ++row)

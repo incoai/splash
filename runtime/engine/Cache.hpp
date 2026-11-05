@@ -766,6 +766,9 @@ public:
   // Tests, between commands: std::logic_error unless the blocks, pages,
   // references and quota keep every invariant spilling relies on.
   void checkInvariants() const;
+  // Tests: every reach the reclaim counts take also follows its rule over
+  // the whole cache (KvCache::checkReaches).
+  void checkReaches(bool check) noexcept { kv_.checkReaches(check); }
 
 private:
   // Matches the prompt's pages on from blocks.back() (from the root when
