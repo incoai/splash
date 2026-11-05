@@ -2,7 +2,6 @@
 
 #include "engine/Capture.hpp"
 #include "engine/Scheduler.hpp"
-#include "engine/Types.hpp"
 #include "model/Model.hpp"
 
 #include <cstdint>
@@ -32,8 +31,6 @@ public:
   // Null without a command.
   [[nodiscard]] const PassProgress *progress() const noexcept;
   [[nodiscard]] bool holds(uint64_t requestId) const noexcept;
-  // Its lanes' priority; only with a command.
-  [[nodiscard]] RequestPriority priority() const;
   [[nodiscard]] bool anyEnded() const;
   // The buffers of the states it would capture, which giving it up returns
   // to the model's pool.
@@ -41,7 +38,7 @@ public:
 
   // Its first pass, `plan`, was submitted with these items and captures;
   // only without a command.
-  void start(const BatchPlan &plan, RequestPriority priority, std::vector<ModelBatchItem> items,
+  void start(const BatchPlan &plan, std::vector<ModelBatchItem> items,
              std::vector<std::vector<LaneCapture>> captures);
   // Its items and captures for its next pass; only their page tables may
   // have changed, which the caller cuts again.
@@ -61,7 +58,6 @@ public:
 private:
   struct Command final {
     PassProgress progress;
-    RequestPriority priority = RequestPriority::Normal;
     std::vector<ModelBatchItem> items;
     std::vector<std::vector<LaneCapture>> captures;
   };

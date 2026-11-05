@@ -348,7 +348,7 @@ bool Engine::tick(double now) {
     // pass comes after that plan: the command goes on, its other lanes
     // keeping the passes they ran, and the lane ends at its last pass.
     if (passCommand_.anyEnded() && !plan->pass &&
-        requests_.at(plan->items.front().requestId).request.priority < passCommand_.priority()) {
+        scheduler_.yieldsTo(requests_.at(plan->items.front().requestId).request.priority, in)) {
       settleEnded(passCommand_.yield());
       sweepTerminal(now);
       return true;
@@ -390,7 +390,7 @@ bool Engine::tick(double now) {
       // A command in passes keeps its items and their captures for its
       // later passes (prepare), and its progress for planning.
       if (plan->passes > 1 && !plan->pass)
-        passCommand_.start(*plan, requests_.at(plan->items.front().requestId).request.priority, items, captures);
+        passCommand_.start(*plan, items, captures);
       // The command reads the cached pages its lanes' blocks were swapped
       // for, and those a resume restored. Selecting a constrained request's
       // first token reads none, but the cycle after it does; only a first
@@ -871,9 +871,7 @@ bool Engine::admit(Request &active, double now) {
   // A start of a higher priority than the command between its passes may
   // take that command, as its prompt's command does once it runs
   // (ClaimSpec::supersedes).
-  const std::vector<LaneShape> shapes = laneShapes();
-  const bool supersedes =
-      scheduler_.yieldsTo(active.request.priority, {.shapes = shapes, .passes = passCommand_.progress()});
+  const bool supersedes = scheduler_.yieldsTo(active.request.priority, {.passes = passCommand_.progress()});
   ModelRequest modelRequest = active.request.modelView();
   modelRequest.prompt = active.exactTokens;
   CacheLookup lookup =

@@ -19,10 +19,6 @@ bool PassCommand::holds(uint64_t requestId) const noexcept {
          });
 }
 
-RequestPriority PassCommand::priority() const {
-  return command_.value().priority;
-}
-
 bool PassCommand::anyEnded() const {
   return command_ && std::ranges::any_of(command_->items, [&](const ModelBatchItem &item) {
            return ended_(item.requestId);
@@ -42,12 +38,11 @@ uint32_t PassCommand::captureBuffers() const noexcept {
   return buffers;
 }
 
-void PassCommand::start(const BatchPlan &plan, RequestPriority priority, std::vector<ModelBatchItem> items,
+void PassCommand::start(const BatchPlan &plan, std::vector<ModelBatchItem> items,
                         std::vector<std::vector<LaneCapture>> captures) {
   if (command_)
     throw std::logic_error("a command in passes started beside another");
   command_ = Command{.progress = {.plan = plan},
-                     .priority = priority,
                      .items = std::move(items),
                      .captures = std::move(captures)};
 }

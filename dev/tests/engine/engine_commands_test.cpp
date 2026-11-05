@@ -47,7 +47,7 @@ public:
     std::vector<ModelBatchItem> items(2);
     items[0].requestId = 1;
     items[1].requestId = 2;
-    command.start(first, RequestPriority::Normal, std::move(items), {{}, {}});
+    command.start(first, std::move(items), {{}, {}});
   }
   // The plan of its next pass.
   [[nodiscard]] BatchPlan next() const { return command.progress()->plan; }
