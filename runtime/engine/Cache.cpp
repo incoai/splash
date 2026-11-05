@@ -705,42 +705,23 @@ uint64_t Cache::extentsCompleted(kv::PageForm form, uint32_t pages, uint32_t bes
 // over the orders its reclaim steps take from.
 
 Cache::Walk Cache::walkFor(const VictimQuery &query) const {
-  const ClaimSpec claim = query.claim ? *query.claim : ClaimSpec{};
+  using Reuse = TakeRights::CertainReuse;
+  using Reserves = TakeRights::Reserves;
+  const TakeRights &rights = query.rights;
   const Need &need = query.need;
   Walk walk;
-  // What the class may take of certain reuse, which a request would rebuild at
-  // its whole prefill (MemoryLedger's Order::mayTake has the same table): every
-  // queued request's chain and the newest resume point for in-service work and
-  // the host at critical pressure; the resume point but never a queued chain
-  // for a start and optional work, since a running lane
-  // beats a queued one but a new request does not; neither for growth and the
-  // host below critical pressure. What is in use only in-service work that can
-  // wait and reaches it, and the host at critical pressure. A need the host
-  // refused runs as an Immediate claim of ordinary reach. A device or a page
-  // need's reclaims take many victims, so the walk leaves out what the claim
-  // may not take rather than mark it. Every walk keeps the chain a start's
-  // placement reuses (VictimQuery::kept).
-  const bool hostCritical = claim.cls == ClaimClass::Host && query.critical;
-  const bool immediate = claim.timing == NeedTiming::Immediate || need.hostRefused;
-  const bool queuedChains = claim.cls == ClaimClass::InService || hostCritical;
-  const bool resumePoint = queuedChains || claim.cls == ClaimClass::Start || claim.cls == ClaimClass::Optional;
-  const bool inUse =
-      (claim.cls == ClaimClass::InService && !immediate && claim.reach == ReclaimClass::InUse) || hostCritical;
-  walk.scope.upTo = inUse ? ReclaimClass::InUse : ReclaimClass::Ordinary;
-  walk.keepResumePoint = !resumePoint;
-  walk.restored = queuedChains ? nullptr : &wanted_;
+  // The walk leaves out what the claim may not take (takeRights): a device
+  // or a page need's reclaims take many victims, so nothing is marked. Every
+  // walk keeps the chain a start's placement reuses (VictimQuery::kept). The
+  // Index runway kept is where landed copies spill at the memory wall
+  // (moveLandedPages) and a conversion lands.
+  walk.scope.upTo = rights.inUse ? ReclaimClass::InUse : ReclaimClass::Ordinary;
+  walk.keepResumePoint = rights.certainReuse == Reuse::None;
+  walk.restored = rights.certainReuse == Reuse::All ? nullptr : &wanted_;
   walk.reused = query.kept;
-  walk.timing = immediate ? ReclaimTiming::Immediate : ReclaimTiming::CanWait;
-  // A state that needs a write frees its memory as a unit that lands later,
-  // which the reclaims of an Immediate claim pass over.
-  walk.skipStateWrites = walk.timing == ReclaimTiming::Immediate;
-  // Memory for later, growth and a pass keep the empty extent the next
-  // request takes, and every claim keeps the Index runway, where landed
-  // copies spill at the memory wall (moveLandedPages) and a conversion
-  // lands, unless the host is critical.
-  walk.keepRunway = !query.critical && (claim.cls == ClaimClass::Optional || claim.cls == ClaimClass::Growth ||
-                                         claim.cls == ClaimClass::Host);
-  walk.keepIndexRunway = !query.critical;
+  walk.timing = rights.waitsForWrites ? ReclaimTiming::CanWait : ReclaimTiming::Immediate;
+  walk.keepRunway = rights.reserves == Reserves::None;
+  walk.keepIndexRunway = rights.reserves != Reserves::All;
   walk.hostRefused = need.hostRefused;
   // A state that goes ends a unit for a need of its buffers, and of bytes,
   // which its buffers meet once they leave the model's pool.
@@ -881,7 +862,7 @@ void Cache::holdAfter(const Walk &walk, WalkCursor &cursor) const {
   using Phase = WalkCursor::Phase;
   const auto waits = [&](uint64_t block) {
     const bool write = writesState(block);
-    return !(walk.skipStateWrites && write) && states_.reclaimOutcome(block, write).pending;
+    return !(walk.timing == ReclaimTiming::Immediate && write) && states_.reclaimOutcome(block, write).pending;
   };
   if (cursor.phase == Phase::Checkpoints && cursor.last == Unit::Checkpoint && waits(cursor.lastCandidate.id)) {
     cursor = WalkCursor{.phase = walk.scope.statesOnly ? Phase::Ordinary : Phase::DeadLeaves};
@@ -934,7 +915,7 @@ bool Cache::writesState(uint64_t block) const {
 
 StateEviction Cache::reclaimState(const Walk &walk, uint64_t block) {
   const bool write = writesState(block);
-  if (walk.skipStateWrites && write)
+  if (walk.timing == ReclaimTiming::Immediate && write)
     return {};
   return states_.reclaim(block, write);
 }
@@ -995,7 +976,6 @@ std::optional<engine::Victim> Cache::victimOf(const WalkUnit &unit) const {
                         // One that waits for the state write in flight frees
                         // nothing yet, and one that needs a write lands later.
                         .later = outcome.pending || write,
-                        .certainReuse = inUse || certainReuse(block),
                         .cls = inUse ? ReclaimClass::InUse : ReclaimClass::Ordinary};
   return victim;
 }
@@ -1040,7 +1020,6 @@ Cache::Walk Cache::phaseWalk(const Walk &walk, ReclaimPhase phase) const {
   if (phase == ReclaimPhase::Now || phase == ReclaimPhase::Later)
     each.scope.upTo = ReclaimClass::Ordinary;
   each.timing = now ? ReclaimTiming::Immediate : ReclaimTiming::CanWait;
-  each.skipStateWrites = now;
   return each;
 }
 
@@ -1160,7 +1139,6 @@ std::optional<engine::Victim> Cache::reclaimUnit(const Walk &walk, ReclaimPhase 
                         .form = walk.form,
                         .stateBuffers = unit.states,
                         .later = later,
-                        .certainReuse = used,
                         .stepwise = true,
                         .cls = used ? ReclaimClass::InUse : ReclaimClass::Ordinary};
 }
@@ -1424,7 +1402,7 @@ Cache::ReclaimResult Cache::recycleState(const Walk &walk) {
   WalkCursor cursor;
   while (const std::optional<WalkUnit> state = nextStepUnit(states, cursor)) {
     const bool write = writesState(state->candidate.id);
-    if (states.skipStateWrites && write)
+    if (states.timing == ReclaimTiming::Immediate && write)
       continue;
     const StateEviction eviction = states_.reclaim(state->candidate.id, write);
     return {.madeProgress = eviction.evicted, .pending = eviction.pending, .evictedState = eviction.evicted};

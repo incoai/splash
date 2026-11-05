@@ -1398,7 +1398,7 @@ void testCopyDemandCountsOnlyWhatGoesAtOnce() {
   process.publish(point);
   writes.published(point, WriteBehind::kMinimumTokens, 0.0);
   const ClaimSpec growth{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
-  const VictimQuery query{.claim = &growth, .need = {.bytes = 1}};
+  const VictimQuery query = test::query(growth, {.bytes = 1});
   uint64_t atOnce = 0;
   bool later = false;
   for (std::optional<Victim> unit = process.cache.peek(query, nullptr); unit;

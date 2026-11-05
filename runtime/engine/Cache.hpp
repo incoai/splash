@@ -656,12 +656,9 @@ public:
   // trims for Full pages), checkpoints, KV no state restores through,
   // ordinary states and resident leaves by one recency order, then, for a
   // claim that reaches InUse, states in use and the KV they restore through.
-  // The units of certain reuse, the resume point and the wanted chains, stay
-  // in their place, marked, for the classes that may take them (walkFor):
-  // in-service work and the host at critical pressure take both; a start
-  // and optional work the resume point only; growth and the host
-  // short of critical pressure neither. What is in use comes only to
-  // in-service work that reaches it and to the host at critical pressure.
+  // The units of certain reuse, the resume point and the wanted chains, and
+  // what is in use come in their place only to a claim whose rights take
+  // them (walkFor, TakeRights).
   //
   // A device need (the engine's limit refused it, whatever pages it was for)
   // and a page need (pages in place; a page scan while the host refuses
@@ -907,10 +904,10 @@ private:
     friend bool operator==(const Shortfall &, const Shortfall &) = default;
   };
   // What a walk takes, and how: a query's (walkFor) or a reclaim step's.
-  // Its scope; how long it can wait for KV memory (ReclaimTiming); whether
-  // a state that needs a write (writesState) is passed over as a unit that
-  // lands later, which an Immediate claim does not wait for
-  // (skipStateWrites; one it takes waits for the write slot);
+  // Its scope; how long it can wait for KV memory (ReclaimTiming), and so
+  // whether a state that needs a write (writesState) is passed over as a
+  // unit that lands later, which an Immediate claim does not wait for (one
+  // a claim that can wait takes waits for the write slot);
   // what it keeps beside what is in use, the resume point and the restored
   // chains; the shortfall a transfer in flight must cover for a step that
   // finds nothing to report pending (returnsInFlight), any transfer without
@@ -925,7 +922,6 @@ private:
   struct Walk final {
     WalkScope scope;
     ReclaimTiming timing = ReclaimTiming::CanWait;
-    bool skipStateWrites = false;
     bool keepResumePoint = false;
     // The chains it keeps: those queued requests restore (wanted_), or none,
     // and the chain a start's placement reuses (VictimQuery::kept).

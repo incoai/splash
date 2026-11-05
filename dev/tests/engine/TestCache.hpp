@@ -50,11 +50,18 @@ inline std::vector<uint64_t> indexBlocks(engine::Cache &cache, uint64_t requestI
   return blocks;
 }
 
+// The query the ledger makes for a claim of `spec` that lacks `need`, with
+// no lane in service (MemoryLedger::free).
+inline engine::VictimQuery query(const engine::ClaimSpec &spec, const engine::Need &need, bool critical = false,
+                                 const engine::RestoredChains *kept = nullptr) {
+  return {.rights = engine::takeRights(spec, need, critical, std::nullopt), .need = need, .kept = kept};
+}
+
 // What the ledger takes of the cache for a claim of `spec` that lacks
 // `need` (MemoryLedger::free over its first source): the cache's first unit
 // for it, taken; Short when it has none.
 inline engine::FreeResult takeFirst(engine::Cache &cache, const engine::ClaimSpec &spec, const engine::Need &need) {
-  const engine::VictimQuery query{.claim = &spec, .need = need};
+  const engine::VictimQuery query = test::query(spec, need);
   const std::optional<engine::Victim> unit = cache.peek(query, nullptr);
   return unit ? cache.take(query, *unit) : engine::FreeResult{};
 }
@@ -86,11 +93,10 @@ inline constexpr engine::ClaimSpec kInServiceGrowth{.cls = engine::ClaimClass::I
 // in flight holds what it needs. The ledger's order across sources and its
 // stop at a pending unit are not part of it (freeFromCache has them).
 inline engine::FreeResult takeStep(engine::Cache &cache, const engine::ClaimSpec &spec, const engine::Need &need) {
-  const engine::VictimQuery query{.claim = &spec, .need = need};
-  const bool immediate = spec.timing == engine::NeedTiming::Immediate || need.hostRefused;
+  const engine::VictimQuery query = test::query(spec, need);
   engine::FreeResult result;
   for (std::optional<engine::Victim> unit = cache.peek(query, nullptr); unit; unit = cache.peek(query, &*unit)) {
-    if (immediate && unit->later)
+    if (!query.rights.waitsForWrites && unit->later)
       continue;
     const engine::FreeResult taken = cache.take(query, *unit);
     if (taken.gave())

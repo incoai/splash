@@ -152,7 +152,7 @@ public:
   }
 
   // A claim's takes never free more than peek counted for its units, and
-  // never take in-use or certain-reuse units its class may not take.
+  // never take in-use or certain-reuse units its rights do not take.
   void checkTake() {
     const ClaimSpec claim{.cls = std::array{ClaimClass::InService, ClaimClass::Start, ClaimClass::Optional,
                                             ClaimClass::Growth, ClaimClass::Host}[pick(0, 4)],
@@ -161,16 +161,13 @@ public:
     const kv::PageForm form = !chance(50) ? kv::PageForm::Full : windowed_ ? kv::PageForm::Slim : kv::PageForm::Index;
     const uint32_t stateBuffers = chance(30) ? 1u : 0u;
     const bool device = chance(50);
-    const VictimQuery query{.claim = &claim,
-                            .need = device ? Need{.bytes = pick(1, 8) * 400ull, .stateBuffers = stateBuffers}
-                                           : Need{.hostRefused = chance(50), .pages = pick(1, 8), .form = form,
-                                                  .stateBuffers = stateBuffers},
-                            .critical = chance(10)};
-    // A need the host refused runs as an Immediate claim of ordinary reach.
-    const bool immediate = claim.timing == NeedTiming::Immediate || query.need.hostRefused;
-    const bool reachesInUse =
-        (claim.cls == ClaimClass::InService && !immediate && claim.reach == ReclaimClass::InUse) ||
-        (claim.cls == ClaimClass::Host && query.critical);
+    const VictimQuery query =
+        test::query(claim,
+                    device ? Need{.bytes = pick(1, 8) * 400ull, .stateBuffers = stateBuffers}
+                           : Need{.hostRefused = chance(50), .pages = pick(1, 8), .form = form,
+                                  .stateBuffers = stateBuffers},
+                    chance(10));
+    const bool immediate = !query.rights.waitsForWrites;
     std::vector<uint64_t> inUse;
     for (const auto &[_, request] : requests_)
       if (request.state && cache_.stateResident(request.state))
@@ -178,7 +175,7 @@ public:
     // With states in use, a request waits to start on a prefix of a base
     // prompt: the state its chain restores is of certain reuse, which only
     // work in service and the host under critical pressure take.
-    const bool takesCertain = claim.cls == ClaimClass::InService || (claim.cls == ClaimClass::Host && query.critical);
+    const bool takesCertain = query.rights.certainReuse == TakeRights::CertainReuse::All;
     std::vector<uint64_t> wanted;
     if (usedStates_) {
       const std::span<const uint32_t> base = bases_[pick(0, static_cast<uint32_t>(bases_.size()) - 1)];
@@ -229,7 +226,7 @@ public:
     const uint32_t pagesAfter = pagesOf();
     const uint32_t freedPages = pagesAfter - std::min(pagesAfter, pagesBefore);
     for (const uint64_t block : inUse)
-      require(reachesInUse || cache_.stateResident(block),
+      require(query.rights.inUse || cache_.stateResident(block),
               "a claim that does not reach what is in use took a state in use");
     require(takesCertain || !wantedResident || cache_.stateResident(wanted.back()),
             "a claim that does not take what is of certain reuse took the state a waiting request restores");

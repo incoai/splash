@@ -1339,7 +1339,8 @@ waits while what it reached or started lands, and is `Short` otherwise. A
 refusal of KV counts the free pages of its form as its own: the ledger never
 releases their extent for it, which it would only allocate again.
 
-Three rules say who takes what:
+Three rules say who takes what. They are derived in one function
+(`takeRights`), whose `TakeRights` every source of units reads:
 
 - An `Immediate` claim, and any need the host refused, takes only units that
   free memory now: never a unit that needs a write, a pool unit above its
@@ -1370,7 +1371,7 @@ Three rules say who takes what:
 | `Growth` | yes | no | no | no | no | no | no | no |
 | `Host` with a deficit | yes | yes | yes | no | no | no | no | no |
 | `Host` under critical pressure | yes | no | yes | no | yes | yes | yes | yes |
-| A need the host refused | yes | no | no | no | no | as its class | as its class | no |
+| A need the host refused | yes | no | yes | no | no | as its class | as its class | no |
 
 A claim below the priority of a lane in service takes no pool unit: the pools
 serve every lane. A claim for memory nothing needs yet, such as the Index

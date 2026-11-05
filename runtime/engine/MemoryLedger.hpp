@@ -158,7 +158,6 @@ struct Victim final {
   kv::PageForm form = kv::PageForm::Full;
   uint32_t stateBuffers = 0;    // pooled state buffers it frees (in-place needs; bytes, setBufferBytes)
   bool later = false;           // frees on a landing (a demotion, a state write, a conversion's copies)
-  bool certainReuse = false;    // in use, the newest resume point, a chain a queued request restores
   // false: a unit that costs nothing, taken before any count, whose
   // bytes are at least what peek gives (available() counts them)
   bool sized = true;
@@ -169,10 +168,52 @@ struct Victim final {
   ReclaimClass cls = ReclaimClass::Ordinary;
   VictimKind kind = VictimKind::Memory;
 };
+
+// What a claim may take, derived once from its class and need (takeRights)
+// and read by every source and stage of the take. Each default is the
+// narrowest: TakeRights{} takes only the units that free now and cost
+// nothing.
+struct TakeRights final {
+  // The units of certain reuse: none, the newest resume point, or that and
+  // the chains queued requests restore.
+  enum class CertainReuse : uint8_t { None, ResumePoint, All };
+  // The reserves kept for the work to come it may take: none, the empty
+  // extent the next request takes, or also the Index runway and the idle
+  // buffers one lane starts from.
+  enum class Reserves : uint8_t { None, NextExtent, All };
+  bool waitsForWrites = false;    // takes cache that frees only once its write lands
+  bool waitsForLandings = false;  // waits for memory transfers return: the engine's limit refused it
+  bool inUse = false;             // units other requests use
+  CertainReuse certainReuse = CertainReuse::None;
+  Reserves reserves = Reserves::None;
+  bool rebuiltPools = false;      // pool units that cost only their rebuild (PoolState::rebuildOnly)
+  bool storeAboveFloor = false;   // the other pools' units above their floors
+  bool passCommand = false;       // the command between passes its work supersedes
+  uint64_t convertLane = 0;       // the request whose own lane may convert to Spill; 0: none
+
+  friend bool operator==(const TakeRights &, const TakeRights &) = default;
+};
+
+// The one table of what each claim may take. A need the host refused, and
+// an Immediate claim, take only what frees now: no write, store chunk,
+// pass, conversion or unit in use. What costs a lane work later (a store
+// chunk's reads, the pass, the claim's own conversion) goes only to
+// in-service work that can wait; units in use also need its reach. Certain
+// reuse, which a request rebuilds at its whole prefill, goes to in-service
+// work; a start and optional work take the resume point but never a queued
+// chain, since a running lane beats a queued one and a new request does
+// not. The host waits for writes short of critical pressure and never for
+// landings, which its pass's target is net of; at critical pressure it is
+// Immediate but takes the store, certain reuse and units in use. No pool
+// unit for a claim below a lane in service, since the pools serve every
+// lane, and none for a pool's growth. A Floor claim takes nothing
+// (logic_error).
+[[nodiscard]] TakeRights takeRights(const ClaimSpec &spec, const Need &need, bool critical,
+                                    std::optional<RequestPriority> highestLane);
+
 struct VictimQuery final {
-  const ClaimSpec *claim = nullptr;
+  TakeRights rights;
   Need need;
-  bool critical = false;        // macOS critical: InUse and certain-reuse units for Host claims too
   // Chains every walk keeps: the one a start restores, which its placement
   // leaves out of the need it asks about (Engine::placement).
   const RestoredChains *kept = nullptr;
@@ -192,7 +233,10 @@ struct VictimQuery final {
 // lane's request id. Taking a unit leaves the units before it in place and
 // those after it in order: free() peeks again from the unit before it. Units
 // that cost nothing and are sized only when taken come first in a source's
-// order.
+// order. A source gives only the units its query's rights take: units in
+// use, certain reuse, the pass command and the claimant's own conversion it
+// leaves out itself; the ledger passes over those that land later for a
+// claim that does not wait for writes.
 class VictimSource {
 public:
   virtual ~VictimSource() = default;
@@ -393,7 +437,7 @@ private:
   [[nodiscard]] Run bound(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack) const;
   // Takes those units in that order, one at a time, until what they freed
   // now and later covers the lack, or none is left.
-  [[nodiscard]] Run take(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack);
+  [[nodiscard]] Run take(const VictimQuery &query, const Lacking &lack);
   // Takes each source's units that cost nothing and are sized only when
   // taken, until one frees nothing; the bytes they freed.
   uint64_t takeUnsized(const VictimQuery &query);

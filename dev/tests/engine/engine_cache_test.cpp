@@ -4083,8 +4083,8 @@ void testAPageNeedOfAFormTheCacheHoldsNoneOfCountsNothing() {
   require(spill.pool.reclaimEmptyExtents(false, 1, kv::PageForm::Index) && !spill.pool.allocatedExtents(kv::PageForm::Index),
           "the Index runway stayed");
   const ClaimSpec refill{.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate, .takesUnits = false};
-  const VictimQuery query{.claim = &refill,
-                          .need = {.bytes = 40, .hostRefused = true, .pages = 4, .form = kv::PageForm::Index}};
+  const VictimQuery query =
+      test::query(refill, {.bytes = 40, .hostRefused = true, .pages = 4, .form = kv::PageForm::Index});
   uint32_t evictions = 0;
   for (std::optional<engine::Victim> victim = spill.cache.peek(query, nullptr); victim;
        victim = spill.cache.peek(query, &*victim))
@@ -5312,7 +5312,7 @@ void testPeekHasNoSideEffects() {
         for (const Need need : {Need{.bytes = 1}, Need{.pages = 2}, Need{.hostRefused = true, .pages = 2},
                                 Need{.stateBuffers = 1}}) {
           const ClaimSpec claim{.cls = cls, .reach = reach, .timing = timing};
-          const VictimQuery query{.claim = &claim, .need = need};
+          const VictimQuery query = test::query(claim, need);
           for (std::optional<engine::Victim> victim = fixture.cache.peek(query, nullptr); victim;
                victim = fixture.cache.peek(query, &*victim))
             ++units;
@@ -5321,8 +5321,8 @@ void testPeekHasNoSideEffects() {
   require(units && observe() == before, "the walk changed the cache");
 }
 
-// The resume point and wanted chains are marked certain reuse in place; Growth and a host below
-// Critical never take them.
+// The resume point and wanted chains come in their place to in-service work, the resume point alone
+// to a start; Growth and a host below Critical are never offered them.
 void testResumePointAndWantedChainsAreCertainReuse() {
   test::TestKvStorage storage{16, 100, 1};
   KvPool pool{storage, 16};
@@ -5342,34 +5342,28 @@ void testResumePointAndWantedChainsAreCertainReuse() {
   const std::vector<uint32_t> newest = cachePrompt(3, 9000);
   CacheProbe probe = cache.probe(wanted, {});
   cache.setWantedChains({probe.restoredChain()});
-  const ClaimSpec claim{.cls = ClaimClass::InService};
-  const VictimQuery query{.claim = &claim, .need = {.stateBuffers = 1}};
-  std::vector<engine::Victim> units;
-  for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim; victim = cache.peek(query, &*victim))
-    units.push_back(*victim);
-  uint32_t certain = 0;
-  for (const engine::Victim &victim : units)
-    certain += victim.certainReuse;
-  // Prompt 1's state (wanted), prompt 3's (the resume point); prompt 2's
-  // state is not.
-  require(units.size() == 3 && certain == 2 && !units[1].certainReuse && units[0].certainReuse &&
-              units[2].certainReuse,
-          "the resume point and the wanted chain's state were not marked in their place");
+  // The units and pages a claim of the class is offered.
+  const auto offered = [&](ClaimClass cls, const Need &need) {
+    const VictimQuery query = test::query({.cls = cls}, need);
+    std::pair<uint32_t, uint32_t> units;
+    for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim;
+         victim = cache.peek(query, &*victim)) {
+      ++units.first;
+      units.second += victim->pages;
+    }
+    return units;
+  };
+  // Prompt 1's state (wanted), prompt 2's and prompt 3's (the resume point).
+  require(offered(ClaimClass::InService, {.stateBuffers = 1}).first == 3,
+          "in-service work was not offered the resume point and the wanted chain's state");
+  require(offered(ClaimClass::Start, {.stateBuffers = 1}).first == 2,
+          "a start was not offered the resume point alone of certain reuse");
   // Growth and a host pass short of critical pressure leave them: a page
   // need's units free prompt 2's pages alone, its state and then its
   // leaves, and a device need's units every extent but theirs.
-  for (const ClaimClass cls : {ClaimClass::Host, ClaimClass::Growth}) {
-    const ClaimSpec keeps{.cls = cls};
-    const VictimQuery pages{.claim = &keeps, .need = {.pages = 1}};
-    uint32_t offered = 0;
-    bool kept = true;
-    for (std::optional<engine::Victim> victim = cache.peek(pages, nullptr); victim;
-         victim = cache.peek(pages, &*victim)) {
-      offered += victim->pages;
-      kept = kept && !victim->certainReuse;
-    }
-    require(kept && offered == 2, "a claim that may take nothing of certain reuse was offered some, or not the rest");
-  }
+  for (const ClaimClass cls : {ClaimClass::Host, ClaimClass::Growth})
+    require(offered(cls, {.stateBuffers = 1}).first == 1 && offered(cls, {.pages = 1}).second == 2,
+            "a claim that may take nothing of certain reuse was offered some, or not the rest");
   const ClaimSpec growth{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
   require(test::freeFromCache(cache, growth, {.pages = 2}).outcome == FreeOutcome::Met,
           "growth did not take what is not of certain reuse");
@@ -5380,10 +5374,8 @@ void testResumePointAndWantedChainsAreCertainReuse() {
               !cache.probe(other, {}).cachedTokens(),
           "growth's memory reclaims took the wanted chain or the resume point");
   cache.setWantedChains({});
-  uint32_t left = 0;
-  for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim; victim = cache.peek(query, &*victim))
-    left += victim->certainReuse;
-  require(left == 1, "a chain no request waits for any more stayed of certain reuse");
+  require(offered(ClaimClass::Growth, {.stateBuffers = 1}).first == 1,
+          "a chain no request waits for any more stayed of certain reuse");
 }
 
 // Units in use come only to a claim with reach InUse, after everything else.
@@ -5394,7 +5386,7 @@ void testInUseUnitsComeOnlyWithReachInUse() {
   StateUse use = fixture.cache.useState(fixture.blocks[3]);
   const auto units = [&](ReclaimClass reach) {
     const ClaimSpec claim{.reach = reach};
-    const VictimQuery query{.claim = &claim, .need = {.stateBuffers = 1}};
+    const VictimQuery query = test::query(claim, {.stateBuffers = 1});
     std::vector<engine::Victim> result;
     for (std::optional<engine::Victim> victim = fixture.cache.peek(query, nullptr); victim;
          victim = fixture.cache.peek(query, &*victim))
@@ -5404,7 +5396,7 @@ void testInUseUnitsComeOnlyWithReachInUse() {
   const std::vector<engine::Victim> ordinary = units(ReclaimClass::Ordinary);
   const std::vector<engine::Victim> inUse = units(ReclaimClass::InUse);
   require(ordinary.size() == 1 && ordinary[0].cls == ReclaimClass::Ordinary && inUse.size() == 2 &&
-              inUse[1].cls == ReclaimClass::InUse && inUse[1].certainReuse,
+              inUse[1].cls == ReclaimClass::InUse,
           "what is in use came to a claim that does not reach it, or before the rest");
 }
 
@@ -5425,7 +5417,7 @@ void testBurstReclaimTakesWholeExtentsOncePerNeed() {
   static_cast<void>(cache.releaseEmptyExtents(false));
   const uint64_t extent = 4 * 100;
   const ClaimSpec claim{.cls = ClaimClass::InService};
-  const VictimQuery query{.claim = &claim, .need = {.bytes = 3 * extent}};
+  const VictimQuery query = test::query(claim, {.bytes = 3 * extent});
   for (uint32_t take = 0; take < 3; ++take) {
     const std::optional<engine::Victim> unit = cache.peek(query, nullptr);
     const uint64_t allocated = pool.allocatedBytes(), prefix = cache.snapshot().pool.pagesPrefix;
@@ -5458,7 +5450,7 @@ void testGrowthNeedKeepsTheFreePagesItTakes() {
           "the conversation did not leave two free pages in its second extent");
   const Need need = cache.growthNeed(10);
   const ClaimSpec start{.cls = ClaimClass::Start};
-  const VictimQuery query{.claim = &start, .need = need};
+  const VictimQuery query = test::query(start, need);
   uint64_t found = 0;
   for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim; victim = cache.peek(query, &*victim))
     found += victim->bytes;
@@ -5581,7 +5573,7 @@ void testDeviceNeedKeepsKvBesideTheIndexRunway() {
           "fixture geometry changed");
   const uint64_t cached = spill.cache.snapshot().pool.pagesPrefix;
   const ClaimSpec claim{.cls = ClaimClass::InService};
-  const VictimQuery query{.claim = &claim, .need = {.bytes = 400}};
+  const VictimQuery query = test::query(claim, {.bytes = 400});
   const std::optional<engine::Victim> unit = spill.cache.peek(query, nullptr);
   require(unit && unit->stateBuffers == 1 && !unit->bytes && !unit->later,
           "the walk offered KV that empties no extent but the Index runway it keeps");
@@ -5614,7 +5606,7 @@ void testDeviceNeedPassesOverLeavesOfFormsOutOfReach() {
           "fixture geometry changed");
   const uint64_t extent = 4 * spill.storage.bytesPerPage(kv::PageForm::Index);
   const ClaimSpec claim{.cls = ClaimClass::InService};
-  const VictimQuery query{.claim = &claim, .need = {.bytes = extent}};
+  const VictimQuery query = test::query(claim, {.bytes = extent});
   const std::optional<engine::Victim> unit = spill.cache.peek(query, nullptr);
   const uint64_t allocated = spill.pool.allocatedBytes();
   require(unit && unit->bytes == extent && spill.cache.take(query, *unit).outcome == FreeOutcome::Met &&
@@ -5673,7 +5665,7 @@ void testImmediateWalksOfferWhatLandsLaterInItsPlace() {
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TestState>(100), false);
   const auto unitsOf = [&](ClaimClass cls, NeedTiming timing) {
     const ClaimSpec claim{.cls = cls, .timing = timing};
-    const VictimQuery query{.claim = &claim, .need = {.stateBuffers = 1}};
+    const VictimQuery query = test::query(claim, {.stateBuffers = 1});
     std::vector<engine::Victim> units;
     for (std::optional<engine::Victim> victim = fixture.cache.peek(query, nullptr); victim;
          victim = fixture.cache.peek(query, &*victim))
@@ -5693,7 +5685,7 @@ void testImmediateWalksOfferWhatLandsLaterInItsPlace() {
             "a claim that cannot wait was not offered the states that need a write in their place, marked later");
   }
   const ClaimSpec cannotWait{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
-  const VictimQuery immediate{.claim = &cannotWait, .need = {.stateBuffers = 1}};
+  const VictimQuery immediate = test::query(cannotWait, {.stateBuffers = 1});
   require(fixture.cache.take(immediate, unitsOf(ClaimClass::Growth, NeedTiming::Immediate)[2]).outcome ==
                   FreeOutcome::Met &&
               !control->slots && fixture.cache.stateResident(fixture.blocks[0]) &&
@@ -5704,7 +5696,7 @@ void testImmediateWalksOfferWhatLandsLaterInItsPlace() {
               blockOf(waits[1]) == fixture.blocks[1] && waits[1].later,
           "growth that can wait passed over the states that need a write, or took them as going at once");
   const ClaimSpec growth{.cls = ClaimClass::Growth};
-  const VictimQuery query{.claim = &growth, .need = {.stateBuffers = 1}};
+  const VictimQuery query = test::query(growth, {.stateBuffers = 1});
   require(fixture.cache.take(query, waits[0]).outcome == FreeOutcome::Met && control->slots == 1 &&
               !fixture.cache.stateResident(fixture.blocks[0]),
           "growth did not write the state it took");
@@ -5722,7 +5714,7 @@ void testImmediateWalksOfferWhatLandsLaterInItsPlace() {
   static_cast<void>(kv.cache.pollTransfers());
   const auto leavesOf = [&](NeedTiming timing) {
     const ClaimSpec claim{.cls = ClaimClass::InService, .timing = timing};
-    const VictimQuery pages{.claim = &claim, .need = {.pages = 1}};
+    const VictimQuery pages = test::query(claim, {.pages = 1});
     std::vector<engine::Victim> units;
     for (std::optional<engine::Victim> victim = kv.cache.peek(pages, nullptr); victim;
          victim = kv.cache.peek(pages, &*victim))
@@ -5826,7 +5818,8 @@ std::pair<uint32_t, uint32_t> countAndTakePages(engine::Cache &cache, KvPool &po
            cache.returning().landingPages[static_cast<size_t>(query.need.form)];
   };
   const uint32_t before = pages();
-  while (test::takeFirst(cache, *query.claim, query.need).outcome != FreeOutcome::Short) {
+  for (std::optional<engine::Victim> unit = cache.peek(query, nullptr);
+       unit && cache.take(query, *unit).outcome != FreeOutcome::Short; unit = cache.peek(query, nullptr)) {
   }
   cache.checkInvariants();
   return {counted, pages() - before};
@@ -5846,7 +5839,7 @@ void testPageWalkOffersEachDeadLeafOnce() {
   cache.publishCompositeState(first, std::make_shared<TestState>(100), false);
   cache.endRequest(1);
   const ClaimSpec growth{.cls = ClaimClass::Growth};
-  const auto [counted, freed] = countAndTakePages(cache, pool, {.claim = &growth, .need = {.pages = 2}});
+  const auto [counted, freed] = countAndTakePages(cache, pool, test::query(growth, {.pages = 2}));
   require(counted == 1 && freed == 1 && cache.stateResident(first),
           "the walk counted " + std::to_string(counted) + " pages, taking its units freed " + std::to_string(freed));
 }
@@ -5880,7 +5873,7 @@ void testPageNeedReachesParentsAndLeavesUnderStates() {
     engine::Cache cache(pool, nullptr, nullptr);
     static_cast<void>(cacheConversation(cache, 1, 8));
     const auto [counted, freed] =
-        countAndTakePages(cache, pool, {.claim = &claim, .need = {.hostRefused = hostRefused, .pages = 4}});
+        countAndTakePages(cache, pool, test::query(claim, {.hostRefused = hostRefused, .pages = 4}));
     require(counted == 8 && freed == 8,
             std::string(hostRefused ? "a page scan" : "a page need") + " of an idle conversation counted " +
                 std::to_string(counted) + " pages, freed " + std::to_string(freed));
@@ -5891,7 +5884,7 @@ void testPageNeedReachesParentsAndLeavesUnderStates() {
     engine::Cache cache(pool, nullptr, nullptr);
     for (uint64_t id = 1; id <= 3; ++id)
       static_cast<void>(cacheConversation(cache, id, 2, std::make_shared<TestState>(100)));
-    const VictimQuery query{.claim = &claim, .need = {.hostRefused = hostRefused, .pages = 6}};
+    const VictimQuery query = test::query(claim, {.hostRefused = hostRefused, .pages = 6});
     const auto [counted, freed] = countAndTakePages(cache, pool, query);
     require(counted == 6 && freed == 6 && !cache.snapshot().stateCache.entries,
             std::string(hostRefused ? "a page scan" : "a page need") + " under states counted " +
@@ -5916,7 +5909,7 @@ void testDeviceUnitReportsWhatItsDemotionsReturn() {
   static_cast<void>(cache.pollTransfers());
   require(pool.freePageCount() == 1, "the open page's extent is not the one empty extent");
   const ClaimSpec host{.cls = ClaimClass::Host};
-  const VictimQuery query{.claim = &host, .need = {.bytes = 100}};
+  const VictimQuery query = test::query(host, {.bytes = 100});
   const std::optional<engine::Victim> unit = cache.peek(query, nullptr);
   require(unit && unit->later, "the unit that demotes the leaf was not marked later");
   const uint64_t allocated = pool.allocatedBytes();

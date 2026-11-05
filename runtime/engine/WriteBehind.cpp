@@ -46,8 +46,7 @@ bool WriteBehind::demanded(uint64_t demandBytes) const {
   // At most what the cache gives a claim that cannot wait now, which starts
   // no write and waits for none, and what the copies ahead in flight let go
   // once they land.
-  const ClaimSpec atOnce{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
-  const VictimQuery query{.claim = &atOnce, .need = {.bytes = demandBytes}};
+  const VictimQuery query{.need = {.bytes = demandBytes}};
   uint64_t covered = cache_.copyingAheadBytes();
   for (std::optional<Victim> unit = cache_.peek(query, nullptr); unit && covered < demandBytes;
        unit = cache_.peek(query, &*unit))

@@ -806,16 +806,15 @@ Engine::Verdict Engine::judge(const Denial &denial, uint64_t requestId) const {
 std::vector<Victim> Engine::EngineVictims::conversions(const VictimQuery &query) const {
   const Engine &engine = engine_;
   std::vector<Victim> units;
-  const ClaimSpec *claim = query.claim;
-  // A need the host refused never converts: the host exemption grows it.
-  // The first copies land in the Index runway, so with none free nothing
+  // Only the claimant's own lane converts (TakeRights::convertLane). The
+  // first copies land in the Index runway, so with none free nothing
   // converts.
-  if (!claim || !claim->kvGrowth || query.need.hostRefused || !engine.config_.spill.capable ||
-      engine.cache_.spillGate() != SpillGate::Open || !engine.cache_.freePages(kv::PageForm::Index))
+  const uint64_t id = query.rights.convertLane;
+  if (!id || !engine.config_.spill.capable || engine.cache_.spillGate() != SpillGate::Open ||
+      !engine.cache_.freePages(kv::PageForm::Index))
     return units;
-  // Only the claimant's own lane converts, Resident and decoding: its
-  // history is whole and its next growth is what it lacks.
-  const uint64_t id = claim->requestId;
+  // Resident and decoding: its history is whole and its next growth is what
+  // it lacks.
   const auto found = engine.requests_.find(id);
   if (found == engine.requests_.end())
     return units;
@@ -857,8 +856,7 @@ std::optional<Victim> Engine::EngineVictims::peek(const VictimQuery &query, cons
   // none in flight: the buffers its captures hold, counted as bytes for a
   // need of bytes. It costs that work nothing, so it comes before the
   // conversions, which cost their lanes the spilled reads.
-  if (after->kind == VictimKind::Memory && engine.passCommand_ && !engine.pending_ && query.claim &&
-      query.claim->supersedes) {
+  if (after->kind == VictimKind::Memory && engine.passCommand_ && !engine.pending_ && query.rights.passCommand) {
     uint32_t buffers = 0;
     for (const ModelBatchItem &item : engine.passCommand_->items)
       buffers += static_cast<uint32_t>(std::ranges::count_if(
@@ -881,16 +879,18 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
   Engine &engine = engine_;
   if (engine.pending_)
     throw std::logic_error("the engine's victims taken while a command is in flight");
-  // Short of critical pressure, the buffers one lane starts from stay.
+  // The buffers one lane starts from stay unless the claim takes every
+  // reserve.
+  const bool keepLaneStart = query.rights.reserves != TakeRights::Reserves::All;
   const auto releaseIdle = [&] {
     uint64_t bytes = 0;
-    while (const uint64_t buffer = engine.model_.releaseIdleBuffer(!query.critical))
+    while (const uint64_t buffer = engine.model_.releaseIdleBuffer(keepLaneStart))
       bytes += buffer;
     return bytes;
   };
   switch (victim.kind) {
   case VictimKind::Memory:
-    if (const uint64_t bytes = engine.model_.releaseIdleBuffer(!query.critical))
+    if (const uint64_t bytes = engine.model_.releaseIdleBuffer(keepLaneStart))
       return {FreeOutcome::Met, bytes};
     return {};
   case VictimKind::Conversion:

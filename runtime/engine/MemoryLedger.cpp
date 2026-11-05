@@ -42,14 +42,33 @@ const char *outcomeName(FreeOutcome outcome) noexcept {
   return "short";
 }
 
-// A Floor claim takes nothing: the start and a weights restore pass only the
-// host's rule for it (HostRule::admits).
-void requireTakes(const ClaimSpec &spec) {
+} // namespace
+
+TakeRights takeRights(const ClaimSpec &spec, const Need &need, bool critical,
+                      std::optional<RequestPriority> highestLane) {
+  using Reuse = TakeRights::CertainReuse;
+  using Reserves = TakeRights::Reserves;
   if (spec.cls == ClaimClass::Floor)
     throw std::logic_error("a Floor claim takes nothing: the start and a weights restore pass only the host's rule");
+  const bool host = spec.cls == ClaimClass::Host;
+  const bool inService = spec.cls == ClaimClass::InService;
+  const bool hostCritical = host && critical;
+  const bool waits = (host ? !critical : spec.timing == NeedTiming::CanWait) && !need.hostRefused;
+  const bool belowALane = highestLane && *highestLane < spec.priority;
+  return {.waitsForWrites = waits,
+          .waitsForLandings = waits && !host,
+          .inUse = (inService && waits && spec.reach == ReclaimClass::InUse) || hostCritical,
+          .certainReuse = inService || hostCritical ? Reuse::All
+                          : spec.cls == ClaimClass::Start || spec.cls == ClaimClass::Optional ? Reuse::ResumePoint
+                                                                                              : Reuse::None,
+          .reserves = critical                                        ? Reserves::All
+                      : inService || spec.cls == ClaimClass::Start ? Reserves::NextExtent
+                                                                     : Reserves::None,
+          .rebuiltPools = !belowALane && spec.cls != ClaimClass::Growth,
+          .storeAboveFloor = !belowALane && ((inService && waits) || hostCritical),
+          .passCommand = inService && waits && spec.supersedes,
+          .convertLane = inService && waits && spec.kvGrowth ? spec.requestId : 0};
 }
-
-} // namespace
 
 // What a claim lacks, in each measure that can meet it: device bytes beyond
 // the room it has, free pages of a form in kept extents, pooled state
@@ -279,8 +298,8 @@ struct MemoryLedger::Run final {
 // what another request uses, since its state in use costs it a re-prefill
 // of its whole prompt while a store chunk costs only reads until it regrows.
 // Within a stage the source registered first goes first, then the pools;
-// each source's own order is kept. A unit the claim's class may not take is
-// skipped, not stopped at.
+// each source's own order is kept. What the claim may not take (TakeRights)
+// is left out, by its source or here for the pools, not stopped at.
 class MemoryLedger::Order final {
 public:
   struct Head final {
@@ -295,65 +314,21 @@ public:
     uint32_t units = 0;
   };
 
-  Order(const MemoryLedger &ledger, const ClaimSpec &spec, const VictimQuery &query)
-      : ledger_(ledger), spec_(spec), query_(query) {
-    // A need the host refused runs as an Immediate claim that reaches no
-    // further than ordinary units: the host, not the engine's limit, refused
-    // it, so nothing that lands later or that a request uses helps it.
-    immediate = spec.timing == NeedTiming::Immediate || query.need.hostRefused;
-    hostCritical_ = spec.cls == ClaimClass::Host && query.critical;
-    inService_ = spec.cls == ClaimClass::InService;
-    // Pool units above floors (the expert store's chunks) only for an
-    // in-service claim that can wait and the host at critical pressure: a
-    // chunk costs reads while it stays away, so nothing that only starts or
-    // helps work takes it, and a host claim would hand a whole chunk to the
-    // lanes' KV for a far smaller margin. The units of pools that cost only
-    // their rebuild (PoolState::rebuildOnly), such as the hot block cache's
-    // extents when no lane reads above its floor, for in-service work, a
-    // start, optional work and the host; never for a weights restore or a
-    // pool's growth. None for a claim below a lane in service.
-    const bool belowALane = ledger.lanePriority_ && *ledger.lanePriority_ < spec.priority;
-    const bool poolUnits = !belowALane && ((inService_ && !immediate) || hostCritical_);
-    const bool rebuiltUnits =
-        poolUnits || (!belowALane && (inService_ || spec.cls == ClaimClass::Start ||
-                                      spec.cls == ClaimClass::Optional || spec.cls == ClaimClass::Host));
+  Order(const MemoryLedger &ledger, const VictimQuery &query) : ledger_(ledger), query_(query) {
+    const TakeRights &rights = query.rights;
     heads.reserve(ledger.sources_.size() + ledger.accounts_.size());
     for (size_t index = 0; index < ledger.sources_.size(); ++index)
       heads.push_back(Head{.victim = ledger.sources_[index]->peek(query, nullptr), .source = index});
     for (size_t index = 1; index < ledger.accounts_.size(); ++index) {
       const Account &account = ledger.accounts_[index];
-      if (!account.pool || !rebuiltUnits)
+      if (!account.pool)
         continue;
       Head head{.pool = AccountId{static_cast<uint8_t>(index)}, .state = account.pool->state()};
-      if (!poolUnits && !head.state.rebuildOnly)
+      if (!(head.state.rebuildOnly ? rights.rebuiltPools : rights.storeAboveFloor))
         continue;
       head.victim = poolUnit(head);
       heads.push_back(std::move(head));
     }
-  }
-
-  // What each class may take. Immediate claims and host-refused needs take
-  // only what frees now: no store chunk, pass, conversion or unit in use.
-  // Pass and conversion only for an in-service claim that can wait: the
-  // pass when it supersedes the command, the conversion of its own lane for
-  // that lane's KV growth. Units in use for such a claim that reaches them,
-  // and for the host at critical pressure. Certain reuse never for growth
-  // or the host below critical pressure; Start and Optional take the
-  // newest resume point but never a queued chain, which their walk keeps
-  // (Cache::walkFor).
-  [[nodiscard]] bool mayTake(const Victim &victim) const {
-    if (victim.cls == ReclaimClass::InUse &&
-        !((inService_ && !immediate && spec_.reach == ReclaimClass::InUse) || hostCritical_))
-      return false;
-    if (victim.certainReuse &&
-        (spec_.cls == ClaimClass::Growth || (spec_.cls == ClaimClass::Host && !query_.critical)))
-      return false;
-    switch (victim.kind) {
-    case VictimKind::Memory: return true;
-    case VictimKind::Conversion: return inService_ && !immediate && spec_.kvGrowth;
-    case VictimKind::PassCommand: return inService_ && !immediate && spec_.supersedes;
-    }
-    return false;
   }
 
   // The head's stage in the order: kWriteStage is the cache's units that
@@ -399,7 +374,6 @@ public:
     head.victim = ledger_.sources_[head.source]->peek(query_, nullptr);
   }
 
-  bool immediate = false;
   std::vector<Head> heads;
 
 private:
@@ -416,10 +390,7 @@ private:
   }
 
   const MemoryLedger &ledger_;
-  const ClaimSpec &spec_;
   const VictimQuery &query_;
-  bool hostCritical_ = false;
-  bool inService_ = false;
 };
 
 uint64_t MemoryLedger::bufferBytes(const VictimQuery &query, const Lacking &lack, uint32_t before,
@@ -437,12 +408,12 @@ uint64_t MemoryLedger::bufferBytes(const VictimQuery &query, const Lacking &lack
 // before (setBufferBytes). A unit that meets none of the need, or that
 // lands later for an Immediate claim, is skipped.
 MemoryLedger::Run MemoryLedger::bound(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack) const {
-  Order order(*this, spec, query);
+  Order order(*this, query);
   Run run;
   for (;;) {
     Order::Head *best = nullptr;
     for (Order::Head &head : order.heads) {
-      while (head.victim && (!order.mayTake(*head.victim) || !lack.meets(*head.victim)))
+      while (head.victim && !lack.meets(*head.victim))
         order.pass(head);
       if (head.victim && (!best || Order::stage(head) < Order::stage(*best)))
         best = &head;
@@ -455,7 +426,7 @@ MemoryLedger::Run MemoryLedger::bound(const ClaimSpec &spec, const VictimQuery &
       run.uncopied = true;
     // Kept in an Immediate claim's way until here, to note that the run
     // reached it.
-    if (victim.later && order.immediate)
+    if (victim.later && !query.rights.waitsForWrites)
       continue;
     if (!spec.takesUnits)
       break;
@@ -482,17 +453,17 @@ MemoryLedger::Run MemoryLedger::bound(const ClaimSpec &spec, const VictimQuery &
 // finitely many units, so the walk ends. A unit's state buffers count for
 // a need of bytes as in bound(). An Immediate claim passes over what lands
 // later.
-MemoryLedger::Run MemoryLedger::take(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack) {
-  Order order(*this, spec, query);
+MemoryLedger::Run MemoryLedger::take(const VictimQuery &query, const Lacking &lack) {
+  Order order(*this, query);
   Run run{.freed = {.outcome = FreeOutcome::Met}};
   // A pending unit holds back the stages after the cache's writes.
   int ceiling = std::numeric_limits<int>::max();
   while (!lack.none() && !lack.covered(run.bytes, run.pages, run.buffers)) {
     Order::Head *best = nullptr;
     for (Order::Head &head : order.heads) {
-      while (head.victim && (!order.mayTake(*head.victim) || !lack.meets(*head.victim) ||
-                             (order.immediate && head.victim->later))) {
-        if (head.victim->later && head.victim->kind == VictimKind::Memory && order.mayTake(*head.victim))
+      while (head.victim && (!lack.meets(*head.victim) ||
+                             (!query.rights.waitsForWrites && head.victim->later))) {
+        if (head.victim->later && head.victim->kind == VictimKind::Memory)
           run.uncopied = true;
         order.pass(head);
       }
@@ -523,7 +494,7 @@ MemoryLedger::Run MemoryLedger::take(const ClaimSpec &spec, const VictimQuery &q
       taken.stateBuffers = unit.stateBuffers;
     }
     if (!took) {
-      if (taken.outcome == FreeOutcome::Pending && !order.immediate) {
+      if (taken.outcome == FreeOutcome::Pending && query.rights.waitsForWrites) {
         run.pending = true;
         ceiling = std::min(ceiling, std::max(Order::stage(*best), Order::kWriteStage));
       }
@@ -587,8 +558,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
   const uint32_t id = claimId.value;
   ClaimState &claim = claims_.at(id);
   const ClaimSpec &spec = claim.spec;
-  requireTakes(spec);
-  const VictimQuery query{.claim = &spec, .need = need, .critical = critical};
+  const VictimQuery query{.rights = takeRights(spec, need, critical, lanePriority_), .need = need};
 
   FreeResult result{.nowBytes = takeUnsized(query)};
   const bool host = spec.cls == ClaimClass::Host;
@@ -652,7 +622,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
     if (most.uncopied)
       uncopiedReachedSeconds_ = nowSeconds_;
     if (most.covered) {
-      run = take(spec, query, lack);
+      run = take(query, lack);
       if (run->uncopied)
         uncopiedReachedSeconds_ = nowSeconds_;
       FreeResult taken = run->freed;
@@ -734,7 +704,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
 // victims, as free() counts them.
 uint64_t MemoryLedger::available(const ClaimSpec &spec, const Need &need, uint64_t freeBytes, bool critical,
                                  const RestoredChains *kept) const {
-  requireTakes(spec);
+  const VictimQuery query{.rights = takeRights(spec, need, critical, lanePriority_), .need = need, .kept = kept};
   const uint64_t enough = need.bytes;
   const bool host = spec.cls == ClaimClass::Host;
   const uint64_t held = host ? 0 : heldFor(spec, std::nullopt);
@@ -747,7 +717,6 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, const Need &need, uint64
   const uint64_t room = host ? 0 : plus(freeBytes, landing);
   if (less(room, held) >= enough)
     return enough;
-  const VictimQuery query{.claim = &spec, .need = need, .critical = critical, .kept = kept};
   const uint64_t taken = bound(spec, query, {.bytes = less(plus(enough, held), room)}).bytes;
   return std::min(enough, less(plus(room, taken), held));
 }
@@ -793,7 +762,8 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
       uint64_t funded = 0;
       bool grown = true;
       if (lacking) {
-        const VictimQuery query{.claim = &spec, .need = {.bytes = unit}};
+        const VictimQuery query{.rights = takeRights(spec, {.bytes = unit}, false, lanePriority_),
+                                .need = {.bytes = unit}};
         const Run run = bound(spec, query, {.bytes = lacking});
         if (run.uncopied)
           uncopiedReachedSeconds_ = nowSeconds_;

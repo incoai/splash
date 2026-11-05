@@ -48,11 +48,24 @@ public:
   explicit TestSource(std::string name, FakeMemory *memory = nullptr) : name_(std::move(name)), memory_(memory) {}
 
   [[nodiscard]] std::string_view name() const noexcept override { return name_; }
-  [[nodiscard]] std::optional<Victim> peek(const VictimQuery &, const Victim *after) const override {
+  // Only the units the query's rights take (VictimSource): units in use,
+  // the pass command and a conversion of the claimant's own lane (its key)
+  // only for a claim whose rights take them.
+  [[nodiscard]] std::optional<Victim> peek(const VictimQuery &query, const Victim *after) const override {
     ++peeks;
+    const auto takes = [&](const Victim &unit) {
+      switch (unit.kind) {
+      case VictimKind::Memory: return unit.cls != ReclaimClass::InUse || query.rights.inUse;
+      case VictimKind::Conversion: return unit.key == query.rights.convertLane;
+      case VictimKind::PassCommand: return query.rights.passCommand;
+      }
+      return false;
+    };
     auto unit = units.begin();
     if (after)
       unit = std::next(std::ranges::find(units, after->key, &Victim::key));
+    while (unit != units.end() && !takes(*unit))
+      ++unit;
     return unit == units.end() ? std::nullopt : std::optional<Victim>(*unit);
   }
   FreeResult take(const VictimQuery &, const Victim &victim) override {
@@ -709,18 +722,18 @@ public:
 };
 
 // free() takes the units of a source keyed by place, each at its place after the takes before it; a unit the
-// claim's class may not take stays.
+// claim passes over (one that lands later, for a claim that does not wait for writes) stays.
 void testUnitsKeyedByTheirPlaceAreTakenAsChosen() {
   MemoryLedger ledger;
   PlacedSource placed;
   TestSource other("other");
-  Victim inUse = unit(0, kGiB);
-  inUse.cls = ReclaimClass::InUse;
-  placed.units = {{1, unit(0, kGiB)}, {2, inUse}, {3, unit(0, kGiB)}, {4, unit(0, kGiB)}};
+  placed.units = {{1, unit(0, kGiB)}, {2, unit(0, kGiB, true)}, {3, unit(0, kGiB)}, {4, unit(0, kGiB)}};
   other.units = {unit(5, kGiB)};
   ledger.addSource(placed);
   ledger.addSource(other);
-  const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
+  ClaimSpec spec = request(1, RequestPriority::Normal);
+  spec.timing = NeedTiming::Immediate;
+  const ClaimId claim = ledger.open(spec);
   require(ledger.free(claim, {.bytes = 4 * kGiB}, 0, false).outcome == FreeOutcome::Met,
           "the claim was not met");
   require(placed.taken == std::vector<uint64_t>{1, 3, 4} && other.taken == std::vector<uint64_t>{5} &&
@@ -744,6 +757,81 @@ void testStateBuffersCountBeyondThoseThePoolKeeps() {
           "free() did not count the bytes of the state buffers the model's pool releases");
 }
 
+// The take table, row by row (one claim per row of the rules' table): what
+// each claimant may take.
+void testTakeRightsTable() {
+  using Reuse = TakeRights::CertainReuse;
+  using Reserves = TakeRights::Reserves;
+  const auto rights = [](const ClaimSpec &spec, const Need &need = {.bytes = kMiB}, bool critical = false,
+                         std::optional<RequestPriority> highest = std::nullopt) {
+    return takeRights(spec, need, critical, highest);
+  };
+  const ClaimSpec everything{.cls = ClaimClass::InService, .requestId = 7, .reach = ReclaimClass::InUse,
+                             .supersedes = true, .kvGrowth = true};
+  ClaimSpec immediate = everything;
+  immediate.timing = NeedTiming::Immediate;
+  ClaimSpec start = everything;
+  start.cls = ClaimClass::Start;
+  ClaimSpec optional = immediate;
+  optional.cls = ClaimClass::Optional;
+  ClaimSpec below = everything;
+  below.priority = RequestPriority::Background;
+  struct Row final {
+    std::string name;
+    TakeRights actual;
+    TakeRights expected;
+  };
+  const std::vector<Row> rows{
+      {"in service, can wait", rights(everything),
+       {.waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
+        .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = true,
+        .convertLane = 7}},
+      {"in service, can wait, ordinary reach", rights({.cls = ClaimClass::InService}),
+       {.waitsForWrites = true, .waitsForLandings = true, .inUse = false, .certainReuse = Reuse::All,
+        .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = false,
+        .convertLane = 0}},
+      {"in service, Immediate", rights(immediate),
+       {.waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::All,
+        .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
+        .convertLane = 0}},
+      {"start", rights(start),
+       {.waitsForWrites = true, .waitsForLandings = true, .inUse = false, .certainReuse = Reuse::ResumePoint,
+        .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
+        .convertLane = 0}},
+      {"optional", rights(optional),
+       {.waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::ResumePoint,
+        .reserves = Reserves::None, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
+        .convertLane = 0}},
+      {"growth", rights({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate}), TakeRights{}},
+      {"the host with a deficit", rights({.cls = ClaimClass::Host}),
+       {.waitsForWrites = true, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::None,
+        .reserves = Reserves::None, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
+        .convertLane = 0}},
+      {"the host at critical pressure", rights({.cls = ClaimClass::Host}, {.bytes = kMiB}, true),
+       {.waitsForWrites = false, .waitsForLandings = false, .inUse = true, .certainReuse = Reuse::All,
+        .reserves = Reserves::All, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = false,
+        .convertLane = 0}},
+      {"a need the host refused in service", rights(everything, {.bytes = kMiB, .hostRefused = true}),
+       {.waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::All,
+        .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
+        .convertLane = 0}},
+      {"a need the host refused a start", rights(start, {.bytes = kMiB, .hostRefused = true}),
+       {.waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::ResumePoint,
+        .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
+        .convertLane = 0}},
+      {"in service below a lane", rights(below, {.bytes = kMiB}, false, RequestPriority::Foreground),
+       {.waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
+        .reserves = Reserves::NextExtent, .rebuiltPools = false, .storeAboveFloor = false, .passCommand = true,
+        .convertLane = 7}},
+      {"in service at critical pressure", rights(everything, {.bytes = kMiB}, true),
+       {.waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
+        .reserves = Reserves::All, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = true,
+        .convertLane = 7}},
+  };
+  for (const Row &row : rows)
+    require(row.actual == row.expected, row.name + ": the take rights differ from the table");
+}
+
 // A Floor claim is a host rule only: asking the ledger to take or count
 // units for one is a caller's error, not an empty take.
 void testAFloorClaimTakesNothing() {
@@ -760,67 +848,46 @@ void testAFloorClaimTakesNothing() {
   require(cache.taken.empty(), "a Floor claim took a unit");
 }
 
-// What each claim class may take, from units of distinct sizes: the take table of free now, certain reuse,
-// conversion, pass command, pools and units in use.
-void testClassBoundsEligibility() {
+// What the ledger itself takes by the rights, from units of distinct sizes:
+// the pools, and cache that frees once its write lands. What else a claim
+// may take its sources leave out (VictimSource).
+void testThePoolsAndWritesEachClaimTakes() {
   FakeMemory memory({});
   FakeElasticPool pool("experts", memory, 32 * kMiB, 0, 1, 2, 1);
   FakeElasticPool rebuilt("vision_arena", memory, 64 * kMiB, 0, 1, 1, 1);
   rebuilt.rebuildOnly = true;
   MemoryLedger ledger;
-  TestSource cache("cache"), engine("engine");
-  Victim inUse = unit(2, 2 * kMiB);
-  inUse.cls = ReclaimClass::InUse;
-  Victim certain = unit(3, 4 * kMiB);
-  certain.certainReuse = true;
-  cache.units = {unit(1, kMiB), inUse, certain};
-  Victim conversion = unit(4, 8 * kMiB);
-  conversion.kind = VictimKind::Conversion;
-  Victim passes = unit(5, 16 * kMiB);
-  passes.kind = VictimKind::PassCommand;
-  engine.units = {conversion, passes};
+  TestSource cache("cache");
+  cache.units = {unit(1, kMiB), unit(2, 2 * kMiB, true)};
   ledger.addSource(cache);
-  ledger.addSource(engine);
   ledger.addPool(pool);
   ledger.addPool(rebuilt);
-  const auto counted = [&](ClaimSpec spec, bool critical = false) {
-    return ledger.available(spec, {.bytes = kGiB}, 0, critical) / kMiB;
+  const auto counted = [&](ClaimSpec spec, bool critical = false, bool hostRefused = false) {
+    return ledger.available(spec, {.bytes = kGiB, .hostRefused = hostRefused}, 0, critical) / kMiB;
   };
-  // 1 Ordinary, 2 InUse, 4 certain reuse, 8 a conversion, 16 the pass
-  // command, 32 a pool unit, 64 a unit that costs only its rebuild.
-  require(counted({.cls = ClaimClass::InService}) == 1 + 4 + 32 + 64, "in-service work took the wrong units");
-  require(counted({.cls = ClaimClass::InService, .kvGrowth = true}) == 1 + 4 + 8 + 32 + 64,
-          "a lane's KV growth did not take its conversion");
-  require(counted({.cls = ClaimClass::InService, .timing = NeedTiming::Immediate, .kvGrowth = true}) == 1 + 4 + 64,
-          "KV growth that cannot wait took a conversion or the store");
-  require(counted({.cls = ClaimClass::InService, .reach = ReclaimClass::InUse, .supersedes = true,
-                   .kvGrowth = true}) == 127,
-          "in-service work that reaches InUse and supersedes took the wrong units");
-  require(counted({.cls = ClaimClass::Start, .supersedes = true}) == 1 + 4 + 64,
-          "a start took other than Ordinary units and those that cost only their rebuild");
-  // Certain reuse here is the resume point: the walk keeps queued chains
-  // from a start and optional work (Cache::walkFor).
-  require(counted({.cls = ClaimClass::Optional, .reach = ReclaimClass::InUse, .supersedes = true}) == 1 + 4 + 64,
-          "optional work converted, took InUse, the pass command or the store, or not the resume point");
-  require(counted({.cls = ClaimClass::InService,
-                   .reach = ReclaimClass::InUse,
-                   .timing = NeedTiming::Immediate,
-                   .supersedes = true}) == 1 + 4 + 64,
-          "an Immediate in-service claim took the store, a conversion, the pass command or InUse");
+  // 1 cache that frees now, 2 cache that needs a write, 32 a store unit, 64
+  // a unit that costs only its rebuild.
+  require(counted({.cls = ClaimClass::InService}) == 1 + 2 + 32 + 64, "in-service work took the wrong units");
+  require(counted({.cls = ClaimClass::InService, .timing = NeedTiming::Immediate}) == 1 + 64,
+          "an Immediate in-service claim took a write or the store");
+  require(counted({.cls = ClaimClass::InService}, false, true) == 1 + 64,
+          "a need the host refused took a write or the store");
+  require(counted({.cls = ClaimClass::Start}) == 1 + 2 + 64, "a start took the store or no write");
+  require(counted({.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate}) == 1 + 64,
+          "optional work took a write or the store");
   require(counted({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate}) == 1,
-          "growth took more than Ordinary cache");
-  require(counted({.cls = ClaimClass::Host}) == 1 + 64,
-          "the host's deficit took the wrong units: a pool unit or a conversion short of critical pressure, or not "
-          "the units that cost only their rebuild");
-  require(counted({.cls = ClaimClass::Host, .reach = ReclaimClass::InUse, .timing = NeedTiming::Immediate}, true) ==
-              1 + 2 + 4 + 32 + 64,
-          "critical pressure did not give the host what is in use and the store, or converted");
+          "growth took more than cache that frees now");
+  require(counted({.cls = ClaimClass::Host}) == 1 + 2 + 64,
+          "the host's deficit took the store short of critical pressure, or not the units that cost only their "
+          "rebuild");
+  require(counted({.cls = ClaimClass::Host}, true) == 1 + 32 + 64,
+          "critical pressure did not give the host the store, or gave it a write");
   ledger.setLanes(0, RequestPriority::Foreground);
-  require(counted(growth(1, RequestPriority::Background)) == 1 + 4 + 8,
+  require(counted(request(1, RequestPriority::Background)) == 1 + 2,
           "a claim below a lane in service took a pool unit");
-  require(counted(request(1, RequestPriority::Background, ClaimClass::Start)) == 1 + 4,
+  require(counted(request(1, RequestPriority::Background, ClaimClass::Start)) == 1 + 2,
           "a start below a lane in service took a pool unit");
-  require(counted(growth(1, RequestPriority::Foreground)) == 1 + 4 + 8 + 32 + 64,
+  require(counted(request(1, RequestPriority::Foreground)) == 1 + 2 + 32 + 64,
           "a claim at the lanes' priority was refused a pool unit");
 }
 
@@ -1323,7 +1390,6 @@ void testGrowthTakesIdleCacheAfterABurst() {
   fixture.memory.hold("cache", 6 * kGiB);
   TestSource cache("cache", &fixture.memory);
   cache.units = {Victim{.key = 1, .bytes = kGiB, .cls = ReclaimClass::InUse},
-                 Victim{.key = 2, .bytes = kGiB, .certainReuse = true},
                  unit(3, kGiB, true),
                  unit(4, kGiB, true),
                  unit(5, kGiB, true),
@@ -1341,7 +1407,7 @@ void testGrowthTakesIdleCacheAfterABurst() {
     static_cast<void>(fixture.pass(period * kRegrowQuietSeconds + 1.0));
   require(experts.units() == 4, "the store did not return to its cap: units " + std::to_string(experts.units()));
   require(cache.taken == std::vector<uint64_t>{4, 5, 6},
-          "growth took a unit in use, of certain reuse or that frees only once written");
+          "growth took a unit in use or that frees only once written");
   fixture.ledger().removeSource(cache);
 }
 
@@ -1376,9 +1442,7 @@ void testCriticalTakesWhatItFindsWhateverLands() {
   fixture.memory.hold("cache", 400 * kMiB);
   Victim inUse = unit(1, 200 * kMiB);
   inUse.cls = ReclaimClass::InUse;
-  Victim certain = unit(2, 200 * kMiB);
-  certain.certainReuse = true;
-  cache.units = {inUse, certain};
+  cache.units = {inUse, unit(2, 200 * kMiB)};
   fixture.ledger().setReturning([] { return Returning{.landingBytes = kGiB, .transfers = 4}; },
                                 [](std::span<const uint64_t>) { return Returning{}; });
   fixture.ledger().addSource(cache);
@@ -1884,7 +1948,8 @@ void testTheOrderTakesCacheThenRebuiltPoolsThenConversionsThenTheStore() {
   vision.rebuildOnly = true;
   MemoryLedger ledger;
   TestSource engine("engine"), cache("cache");
-  Victim lane = unit(2, kGiB, true);
+  // The lane of request 3, which its own growth converts.
+  Victim lane = unit(3, kGiB, true);
   lane.kind = VictimKind::Conversion;
   engine.units = {lane};
   cache.units = {unit(1, 256 * kMiB)};
@@ -1905,7 +1970,7 @@ void testTheOrderTakesCacheThenRebuiltPoolsThenConversionsThenTheStore() {
   require(vision.units() == 0 && engine.taken.empty() && experts.units() == 6,
           "the pool that costs only its rebuild did not go before conversions and the store");
   lacks(3, kGiB);
-  require(engine.taken == std::vector<uint64_t>{2} && experts.units() == 6,
+  require(engine.taken == std::vector<uint64_t>{3} && experts.units() == 6,
           "the lane's conversion did not go before the store");
   lacks(4, kGiB);
   require(experts.units() == 5, "the store did not give a unit once nothing else was left");
@@ -2094,8 +2159,9 @@ std::span<const test::TestCase> ledgerTests() {
       {"testSourceOrderIsKeptWithinASource", testSourceOrderIsKeptWithinASource},
       {"testUnitsKeyedByTheirPlaceAreTakenAsChosen", testUnitsKeyedByTheirPlaceAreTakenAsChosen},
       {"testStateBuffersCountBeyondThoseThePoolKeeps", testStateBuffersCountBeyondThoseThePoolKeeps},
-      {"testClassBoundsEligibility", testClassBoundsEligibility},
+      {"testThePoolsAndWritesEachClaimTakes", testThePoolsAndWritesEachClaimTakes},
       {"testAFloorClaimTakesNothing", testAFloorClaimTakesNothing},
+      {"testTakeRightsTable", testTakeRightsTable},
       {"testAHostRefusedNeedTakesOnlyWhatFreesNow", testAHostRefusedNeedTakesOnlyWhatFreesNow},
       {"testRoomHeldForHigherRanksMakesAWait", testRoomHeldForHigherRanksMakesAWait},
       {"testUnitsHeldForHigherRanksMakeAWait", testUnitsHeldForHigherRanksMakeAWait},

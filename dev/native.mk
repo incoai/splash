@@ -804,12 +804,14 @@ $(TEST_ELASTIC_KV_TEST) $(TEST_ELASTIC_KV_ASAN) $(TEST_ELASTIC_KV_TSAN): \
 $(TEST_SLOT_RECYCLER) $(TEST_SLOT_RECYCLER_ASAN) $(TEST_SLOT_RECYCLER_TSAN): \
 		runtime/model/SlotRecycler.cpp dev/tests/engine/slot_recycler_test.cpp
 $(TEST_PERSISTENT_CACHE) $(TEST_PERSISTENT_CACHE_ASAN) $(TEST_PERSISTENT_CACHE_TSAN): \
-		$(CACHE_SOURCES) runtime/model/SlotFile.cpp dev/tests/engine/persistent_cache_test.cpp
+		$(CACHE_SOURCES) runtime/engine/MemoryLedger.cpp runtime/model/SlotFile.cpp \
+		dev/tests/engine/persistent_cache_test.cpp
 $(TEST_ENGINE_CACHE_TEST) $(TEST_ENGINE_CACHE_ASAN) $(TEST_ENGINE_CACHE_TSAN): \
 		$(CACHE_SOURCES) runtime/engine/MemoryLedger.cpp runtime/model/SlotFile.cpp \
 		dev/tests/engine/engine_cache_test.cpp
 $(TEST_CACHE_PROPERTY) $(TEST_CACHE_PROPERTY_ASAN) $(TEST_CACHE_PROPERTY_TSAN): \
-		$(CACHE_SOURCES) runtime/model/SlotFile.cpp dev/tests/engine/cache_property_test.cpp
+		$(CACHE_SOURCES) runtime/engine/MemoryLedger.cpp runtime/model/SlotFile.cpp \
+		dev/tests/engine/cache_property_test.cpp
 $(TEST_PROTOCOL_TEST) $(TEST_PROTOCOL_ASAN) $(TEST_PROTOCOL_TSAN): \
 		runtime/engine/Protocol.cpp dev/tests/engine/ProtocolPeer.cpp \
 		dev/tests/engine/protocol_test.cpp
