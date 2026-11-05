@@ -91,10 +91,11 @@ class CachedTest(unittest.TestCase):
         selects it from them and from the Hub's listing of all the
         repository's files alike: a suggested one, or else its own."""
         suggested = {"owner/m-GGUF": ["owner/m-GGUF:UD-Q4_K_M", "owner/m-GGUF:IQ1_S"]}
+        root_split = {"m-Q2_0-00001-of-00002.gguf", "m-Q2_0-00002-of-00002.gguf"}
         hub_files = {
             f"m-{variant}.gguf"
             for variant in ("Q4_K_M", "Q8_0", "UD-Q4_K_M", "UD-Q8_0", "UD-IQ1_S")
-        } | {"mmproj-BF16.gguf", "m.gguf"}
+        } | {"mmproj-BF16.gguf", "m.gguf", *root_split}
         for cached_files, expected in (
             # Variants named as on the Hub, not past the words only the
             # cached files share.
@@ -114,6 +115,16 @@ class CachedTest(unittest.TestCase):
                     "README.md",
                 },
                 ["owner/m-GGUF:BF16", "owner/m-GGUF:Q4_K_M"],
+            ),
+            # A split GGUF's parts in the root are one target, which an
+            # incomplete one is not.
+            (
+                root_split | {"m-Q4_K_M.gguf"},
+                ["owner/m-GGUF:Q2_0", "owner/m-GGUF:Q4_K_M"],
+            ),
+            (
+                {"m-Q2_0-00001-of-00002.gguf", "m-Q4_K_M.gguf"},
+                ["owner/m-GGUF:Q4_K_M"],
             ),
             # No ID selects the GGUF named as the model beside another.
             ({"m.gguf", "m-Q8_0.gguf"}, ["owner/m-GGUF:Q8_0"]),

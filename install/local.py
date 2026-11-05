@@ -183,49 +183,38 @@ def _inspect(target, mmproj, language_only, scratch):
     return repo, inspected
 
 
-def _model_of(name):
-    """The model a GGUF file holds: NAME for a split GGUF's part,
-    NAME-0000K-of-0000N.gguf, else the file's own name."""
-    match = upstream.SPLIT_NAME.search(name)
-    return name[: match.start()] if match else name
-
-
 def _gguf_in(files):
-    """The files of the one GGUF target at the root of a directory of files,
-    in split order, whatever vision projectors (named mmproj) lie beside
-    it."""
-    candidates = [
-        name
-        for name in upstream.root_ggufs(files)
-        if not upstream.projector_named(name)
-    ]
-    if not candidates:
+    """The files of the one GGUF target at the root of a directory of files
+    (upstream.root_targets), in split order, whatever vision projectors
+    (named mmproj) lie beside it."""
+    targets = upstream.root_targets(files)
+    if not targets:
         raise ModelError(
             "it holds no model at its root: no safetensors checkpoint, and no "
             "GGUF file but vision projectors (named mmproj)"
         )
-    if len({_model_of(name) for name in candidates}) > 1:
+    if len(targets) > 1:
         raise ModelError(
-            f"it holds several GGUF targets ({', '.join(candidates)}); pass the "
+            f"it holds several GGUF targets ({', '.join(targets)}); pass the "
             "target's file"
         )
-    if _model_of(candidates[0]) == candidates[0]:
-        return candidates
-    return upstream.split_order(candidates, "its split GGUF")
+    [names] = targets.values()
+    return upstream.target_files(names)
 
 
 def _split_parts(target):
     """The files of the GGUF target, in split order: target alone, or every
-    part of the split GGUF it is one part of, beside it."""
-    model = _model_of(target.name)
-    if model == target.name:
+    part of the split GGUF it is one part of, beside it; a whole file of the
+    same model beside them, such as their merge, is no part."""
+    if not upstream.SPLIT_NAME.search(target.name):
         return [target.name]
+    model = upstream.model_of(target.name)
     parts = [
         path.name
         for path in target.parent.iterdir()
         if path.is_file()
-        and path.name.endswith(".gguf")
-        and _model_of(path.name) == model
+        and upstream.SPLIT_NAME.search(path.name)
+        and upstream.model_of(path.name) == model
     ]
     return upstream.split_order(parts, f"the split GGUF {model} in {target.parent}")
 

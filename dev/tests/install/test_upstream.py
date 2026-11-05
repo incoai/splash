@@ -222,8 +222,8 @@ class UpstreamTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             models.ModelError,
-            "no single GGUF matches :Q4_K_M .*Qwen3.8-27B-UD-Q4_K_M.gguf, "
-            "Qwen3.8-27B-XL-Q4_K_M.gguf",
+            "no single GGUF matches :Q4_K_M .*Qwen3.8-27B-UD-Q4_K_M, "
+            r"Qwen3.8-27B-XL-Q4_K_M\)",
         ):
             upstream.select_gguf(files | {"Qwen3.8-27B-XL-Q4_K_M.gguf"}, "Q4_K_M")
         # A projector is never a target, however its publisher names it.
@@ -266,7 +266,7 @@ class UpstreamTest(unittest.TestCase):
         for variant in (None, "Q4", "missing"):
             with (
                 self.subTest(variant=variant),
-                self.assertRaisesRegex(models.ModelError, "Qwen3.8-27B-Q8_0.gguf"),
+                self.assertRaisesRegex(models.ModelError, "Qwen3.8-27B-Q8_0, "),
             ):
                 upstream.select_gguf(files, variant)
         # The native loader finds a target by its .gguf extension alone.
@@ -276,6 +276,39 @@ class UpstreamTest(unittest.TestCase):
                 self.assertRaisesRegex(models.ModelError, "repository root: none"),
             ):
                 upstream.select_gguf({"Qwen3.8-27B-Q4_K_M.GGUF"}, variant)
+
+    def test_a_root_split_gguf_is_one_target(self):
+        parts = [f"Model-Q1_0-0000{n}-of-00003.gguf" for n in (1, 2, 3)]
+        files = {*parts, "mmproj-BF16.gguf", "README.md"}
+        whole = "Model-Q4_K_M.gguf"
+        # Its parts are one target, named by its model's name or not at all.
+        for repository, variant in (
+            (files, None),
+            (files, "Q1_0"),
+            (files | {whole}, "Q1_0"),
+        ):
+            with self.subTest(files=sorted(repository), variant=variant):
+                self.assertEqual(
+                    upstream.select_gguf(repository, variant), (parts, False)
+                )
+        # Several targets are refused by their names, not their files.
+        with self.assertRaisesRegex(
+            models.ModelError,
+            "select a GGUF with OWNER/REPO:VARIANT "
+            r"\(GGUF targets in the repository root: Model-Q1_0, Model-Q4_K_M\)",
+        ):
+            upstream.select_gguf(files | {whole}, None)
+        # Every part of the selected target must be there; a target selected
+        # beside an incomplete one is whole.
+        incomplete = files - {parts[1]}
+        with self.assertRaisesRegex(
+            models.ModelError,
+            f"the split GGUF Model-Q1_0 is incomplete: {parts[0]}, {parts[2]}",
+        ):
+            upstream.select_gguf(incomplete, None)
+        self.assertEqual(
+            upstream.select_gguf(incomplete | {whole}, "Q4_K_M"), ([whole], False)
+        )
 
     def test_architecture_is_checked_before_weight_downloads(self):
         # Another architecture, and fine-tunes of a supported one the engine

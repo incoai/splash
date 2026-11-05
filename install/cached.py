@@ -43,11 +43,11 @@ def candidates(name, files, suggested_models):
     """The model IDs repository name's cached files may install as, one for
     each GGUF target they hold whole: the first of its suggested IDs that
     selects it (upstream.select_gguf), or else its own if that does: its
-    split parts' folder, or its root file's name past the leading words of
-    the repository's model name (without -GGUF), at least the first, which
-    selects the same MODEL-VARIANT.gguf from the Hub's full listing. Without
-    any, the repository itself: an MLX model, or files the installer
-    refuses."""
+    split parts' folder, or its root target's name (upstream.root_targets)
+    past the leading words of the repository's model name (without -GGUF),
+    at least the first, which selects the same MODEL-VARIANT from the Hub's
+    full listing. Without any, the repository itself: an MLX model, or files
+    the installer refuses."""
     from . import upstream
 
     def selected(model_id):
@@ -71,12 +71,11 @@ def candidates(name, files, suggested_models):
             targets.append((f"{name}:{folder}", upstream.split_gguf(files, folder)))
         except models.ModelError:
             pass  # not a whole split GGUF
-    for file in upstream.root_ggufs(files):
-        if not upstream.projector_named(file):
-            words = Path(file).stem.split("-")
-            shared = os.path.commonprefix([[w.lower() for w in words], model])
-            variant = "-".join(words[max(len(shared), 1) :])
-            targets.append((f"{name}:{variant}" if variant else name, [file]))
+    for stem, parts in upstream.root_targets(files).items():
+        words = stem.split("-")
+        shared = os.path.commonprefix([[w.lower() for w in words], model])
+        variant = "-".join(words[max(len(shared), 1) :])
+        targets.append((f"{name}:{variant}" if variant else name, parts))
     ids = []
     for own, target in targets:
         for model_id in (*suggested_models.get(name, ()), own):

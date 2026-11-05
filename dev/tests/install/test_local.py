@@ -337,9 +337,13 @@ class LocalModelTest(unittest.TestCase):
         with self.assertRaisesRegex(
             models.ModelError,
             f"cannot prepare {directory}: it holds several GGUF targets "
-            ".*model-Q8_0.gguf.*; pass the target's file",
+            r"\(model-Q8_0, model-UD-Q4_K_M\); pass the target's file",
         ):
             self.prepare(directory, draft)
+        # A whole file beside the parts, such as their merge, is no part.
+        self.gguf(directory / "model-UD-Q4_K_M.gguf")
+        prepared = self.prepare(directory / parts[0], draft)
+        self.assertEqual(sorted(p.name for p in (prepared / "target").iterdir()), parts)
 
     def test_files_splash_cannot_serve_are_refused_by_name(self):
         target = self.gguf(self.root / "model" / "model-Q4_K_M.gguf")
