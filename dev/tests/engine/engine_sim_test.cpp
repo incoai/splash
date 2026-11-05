@@ -540,9 +540,10 @@ std::vector<std::optional<uint64_t>> resumeBlocks(Serving &serving,
 
 // The 35B (store floor 0.85 of its cap) after a burst of three 60K prompts that took a store chunk: the
 // chunk comes back no sooner than a quiet period after the burst took it and within a minute of the
-// last request's end, from cache that frees now: no write starts for it, the newest conversation's
-// resume point stays in RAM, and the copies written ahead while idle stay within the chunk.
-void testRegrowthAfterABurstTakesOnlyCopiedOrDeadCache() {
+// last request's end, from cache that frees now (copied or dead cache, and the one state the idle
+// staging buffer writes): no demotion starts for it, the newest conversation's resume point stays in
+// RAM, and the copies written ahead while idle stay within the chunk.
+void testRegrowthAfterABurstTakesOnlyCacheThatFreesNow() {
   const Machine &machine = k35BStudio18G;
   Serving serving(machine);
   std::vector<std::pair<double, uint32_t>> moves;
@@ -569,7 +570,7 @@ void testRegrowthAfterABurstTakesOnlyCopiedOrDeadCache() {
               "a minute after the last request");
   require(serving.fixture.cache.stateResident(*newest) && regrown.kvTier.demotions == idle.kvTier.demotions &&
               copiedBytes <= double(machine.store.unitBytes),
-          at(machine) + "regrowth took the newest resume point, wrote cache to take it, or copied more than " +
+          at(machine) + "regrowth took the newest resume point, demoted cache to take it, or copied more than " +
               "a chunk ahead");
   note(at(machine) + "the burst took a chunk at " + std::to_string(taken / 1000.0) + " s, the last request ended at " +
        std::to_string(ended / 1000.0) + " s, the chunk came back at " + std::to_string(moves.back().first / 1000.0) +
@@ -695,7 +696,7 @@ std::span<const test::TestCase> simTests() {
   static constexpr test::TestCase kTests[] = {
       {"testLongPromptBesideTwoDecoders", testLongPromptBesideTwoDecoders},
       {"testChurnKeepsTheStoreThroughAHostEpisode", testChurnKeepsTheStoreThroughAHostEpisode},
-      {"testRegrowthAfterABurstTakesOnlyCopiedOrDeadCache", testRegrowthAfterABurstTakesOnlyCopiedOrDeadCache},
+      {"testRegrowthAfterABurstTakesOnlyCacheThatFreesNow", testRegrowthAfterABurstTakesOnlyCacheThatFreesNow},
       {"testCriticalTakesTheMarginASecondAndKeepsTheResumePoint",
        testCriticalTakesTheMarginASecondAndKeepsTheResumePoint},
       {"testAResendStartsBesideARefusedLongerPrompt", testAResendStartsBesideARefusedLongerPrompt},

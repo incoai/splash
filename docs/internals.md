@@ -1901,8 +1901,9 @@ writes, and a state a reclaim writes waits for the point's, the one state write
 in flight, as for any other. A temporary tier's copies serve reclaims alone, so
 they wait for the memory's demand (`WriteBehind::run`), while a recent claim reached cache that a copy would
 have let go at once, and a point is copied only while the cache's victims that
-go at once, starting no write and waiting for none, with what the copies ahead
-in flight let go once they land, hold less than that (the cache's walk,
+go at once, waiting for no write to land (the state the idle staging buffer
+writes among them), with what the copies ahead in flight let go once they land,
+hold less than that (the cache's walk,
 `Cache::peek`); a step that stops there, or for a claim that waits, asks for no
 wake-up. The demand is the larger of twice the KV the lanes' next commands add
 and what a pool's last growth lacked, one growth unit (a 1 GiB store chunk) at

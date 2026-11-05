@@ -745,8 +745,9 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, const Need &need, uint64
 // request's claim waits for memory, or its request to retry what the host
 // refused: the claim takes the memory that appears. A unit takes the room it
 // lacks from cache units that free memory now, in the cache's order, as an
-// Immediate Growth claim: never what is in use, of certain reuse or needs a
-// write. Growing into free room alone, the lanes' KV cached after a burst
+// Immediate Growth claim: never what is in use, of certain reuse, or frees
+// only once a write lands; it takes the state the idle staging buffer
+// writes. Growing into free room alone, the lanes' KV cached after a burst
 // that shrank the store would keep it at its floor. A count (bound) first
 // finds what the cache funds at most; the host then judges the unit's net
 // change (GrowthHost::admits), and a refusal takes nothing. Serving's passes

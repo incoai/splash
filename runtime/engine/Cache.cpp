@@ -1483,7 +1483,9 @@ uint32_t Cache::reusablePages(ReclaimClass upTo, kv::PageForm form) const {
 Cache::ReclaimResult Cache::recycleState(const Walk &walk) {
   // The oldest checkpoint, else the oldest ordinary state; running work
   // takes a state in use after every other, once no transfer in flight can
-  // return what is needed first.
+  // return what is needed first. A Written take writes the first state that
+  // needs a write in the one recency order, the one reach staged, unless an
+  // older state that needs none goes first; the ledger then peeks again.
   Walk states = walk;
   states.scope.statesOnly = true;
   states.scope.pagesOnly = false;
