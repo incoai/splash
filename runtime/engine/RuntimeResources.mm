@@ -1203,9 +1203,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // victims as it is built, and the model's pools follow
     // (ServingRuntime::start).
     MemoryLedger &ledger = memoryGovernor->ledger();
-    ledger.addAccount("kv", AccountRole::Kv, [pages = kvPages.get()] { return pages->actualAllocatedBytes(); });
-    ledger.addAccount("states", AccountRole::States,
-                      [states = stateStorage.get()] { return states->actualAllocatedBytes(); });
+    ledger.addAccount("kv", [pages = kvPages.get()] { return pages->actualAllocatedBytes(); });
+    ledger.addAccount("states", [states = stateStorage.get()] { return states->actualAllocatedBytes(); });
     // A target whose KV spills reads it back through one hot block cache and
     // one history stream, which take KV memory from the governor.
     std::unique_ptr<model::KvBlockCache> blockCache;

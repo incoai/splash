@@ -45,9 +45,6 @@ struct AccountId final {
   uint8_t value = 0;
   friend bool operator==(AccountId, AccountId) = default;
 };
-inline constexpr AccountId kFixedAccount{0};
-// For status only: nothing branches on an account's role or name.
-enum class AccountRole : uint8_t { Fixed, Kv, States, Pool };
 
 // Why an allocation is made: decides the host's rule (but for what a lane
 // needs, ClaimSpec::laneNeeds) and what free() may take. Floor (what the
@@ -333,9 +330,9 @@ public:
   MemoryLedger &operator=(const MemoryLedger &) = delete;
 
   // Registration (startup; stable for the process). An account's current
-  // bytes are pulled from its owner. Units tie by stage, then to the source
-  // registered first, then to the pools.
-  AccountId addAccount(std::string name, AccountRole role, std::function<uint64_t()> currentBytes);
+  // bytes are pulled from its owner; its name is for status only. Units tie
+  // by stage, then to the source registered first, then to the pools.
+  AccountId addAccount(std::string name, std::function<uint64_t()> currentBytes);
   AccountId addPool(model::ElasticPool &pool);   // account + victim source; name = PoolState::name
   // The cache, the engine's lane victims: each source once, whoever
   // registers it again (two engines over one cache), until it is removed.

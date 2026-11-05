@@ -256,8 +256,8 @@ void testAccountsSumToCharged() {
     std::mt19937_64 random(seed);
     Fixture fixture(host(32 * kGiB));
     FakeElasticPool experts("experts", fixture.memory, 256 * kMiB, 2, 8, 16, 4);
-    fixture.ledger().addAccount("kv", AccountRole::Kv, [&] { return fixture.memory.held("kv"); });
-    fixture.ledger().addAccount("states", AccountRole::States, [&] { return fixture.memory.held("states"); });
+    fixture.ledger().addAccount("kv", [&] { return fixture.memory.held("kv"); });
+    fixture.ledger().addAccount("states", [&] { return fixture.memory.held("states"); });
     fixture.ledger().addPool(experts);
     for (int step = 0; step < 60; ++step) {
       const char *holders[] = {"kv", "states", "weights"};
@@ -304,7 +304,7 @@ void testSnapshotRendersEveryAccount() {
   fixture.memory.hold("kv", 3 * kGiB);
   FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 4, 3);
   MemoryLedger &ledger = fixture.ledger();
-  ledger.addAccount("kv", AccountRole::Kv, [&] { return fixture.memory.held("kv"); });
+  ledger.addAccount("kv", [&] { return fixture.memory.held("kv"); });
   ledger.addPool(experts);
   ledger.setReturning([] { return Returning{.landingBytes = 3 * kMiB, .owedBytes = 5 * kMiB, .transfers = 2,
                                             .oldestMilliseconds = 40.0}; },

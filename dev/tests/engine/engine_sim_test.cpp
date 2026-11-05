@@ -182,10 +182,8 @@ struct Serving final {
     // The history staging of the floor's 8192 pages, 281,149,440 B.
     model.stagingPageBytes = 281'149'440 / 8192;
     engine::MemoryLedger &ledger = fixture.governor->ledger();
-    static_cast<void>(ledger.addAccount("kv", engine::AccountRole::Kv,
-                                        [this] { return fixture.memory->held("kv"); }));
-    static_cast<void>(ledger.addAccount("states", engine::AccountRole::States,
-                                        [this] { return fixture.memory->held("states"); }));
+    static_cast<void>(ledger.addAccount("kv", [this] { return fixture.memory->held("kv"); }));
+    static_cast<void>(ledger.addAccount("states", [this] { return fixture.memory->held("states"); }));
     static_cast<void>(ledger.addPool(*experts));
     model.commandTimed = [this](const BatchPlan &, const test::CommandTimes &times) {
       lastCommandEnd = fixture.monotonic + times.wallMilliseconds;

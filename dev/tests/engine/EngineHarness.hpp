@@ -69,8 +69,8 @@ public:
     guardReleases(storage, engine);
     // The accounts a start books (RuntimeResources::create).
     if (governor) {
-      governor->ledger().addAccount("kv", engine::AccountRole::Kv, [this] { return storage.allocatedBytes(); });
-      governor->ledger().addAccount("states", engine::AccountRole::States, [this] { return model.heldStateBytes; });
+      governor->ledger().addAccount("kv", [this] { return storage.allocatedBytes(); });
+      governor->ledger().addAccount("states", [this] { return model.heldStateBytes; });
     }
     const std::function<double()> clock = [this] { return now_; };
     events.clock = clock;

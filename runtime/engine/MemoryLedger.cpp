@@ -1,5 +1,6 @@
 #include "engine/MemoryLedger.hpp"
 
+#include "Checked.hpp"
 #include "engine/MemoryGovernor.hpp"
 
 #include <algorithm>
@@ -14,12 +15,6 @@ namespace splash::engine {
 namespace {
 
 constexpr double kMiB = double(1ULL << 20);
-
-uint64_t less(uint64_t a, uint64_t b) noexcept { return a > b ? a - b : 0; }
-
-uint64_t plus(uint64_t a, uint64_t b) noexcept {
-  return a <= std::numeric_limits<uint64_t>::max() - b ? a + b : std::numeric_limits<uint64_t>::max();
-}
 
 const char *className(ClaimClass cls) noexcept {
   switch (cls) {
@@ -95,7 +90,6 @@ struct MemoryLedger::Lacking final {
 
 struct MemoryLedger::Account final {
   std::string name;
-  AccountRole role = AccountRole::Fixed;
   std::function<uint64_t()> current;
   model::ElasticPool *pool = nullptr;
   uint64_t grows = 0;
@@ -103,24 +97,24 @@ struct MemoryLedger::Account final {
 };
 
 MemoryLedger::MemoryLedger() {
-  accounts_.push_back(Account{.name = "fixed", .role = AccountRole::Fixed});
+  accounts_.push_back(Account{.name = "fixed"});
 }
 
 MemoryLedger::~MemoryLedger() = default;
 
-AccountId MemoryLedger::addAccount(std::string name, AccountRole role, std::function<uint64_t()> currentBytes) {
+AccountId MemoryLedger::addAccount(std::string name, std::function<uint64_t()> currentBytes) {
   if (accounts_.size() > std::numeric_limits<uint8_t>::max())
     throw std::logic_error("the memory ledger has no account id left");
-  if (role == AccountRole::Fixed || role == AccountRole::Pool || !currentBytes)
+  if (!currentBytes)
     throw std::invalid_argument("an account the ledger pulls needs its current bytes");
-  accounts_.push_back(Account{.name = std::move(name), .role = role, .current = std::move(currentBytes)});
+  accounts_.push_back(Account{.name = std::move(name), .current = std::move(currentBytes)});
   return {static_cast<uint8_t>(accounts_.size() - 1)};
 }
 
 AccountId MemoryLedger::addPool(model::ElasticPool &pool) {
   if (accounts_.size() > std::numeric_limits<uint8_t>::max())
     throw std::logic_error("the memory ledger has no account id left");
-  accounts_.push_back(Account{.name = std::string(pool.state().name), .role = AccountRole::Pool, .pool = &pool});
+  accounts_.push_back(Account{.name = std::string(pool.state().name), .pool = &pool});
   return {static_cast<uint8_t>(accounts_.size() - 1)};
 }
 
@@ -189,7 +183,7 @@ uint64_t MemoryLedger::heldByClaims(const ClaimRank &rank, std::optional<uint64_
   uint64_t held = 0;
   for (const auto &[id, state] : claims_)
     if (state.waiting && (!self || id != *self) && state.spec.rank > rank)
-      held = plus(held, state.need.bytes);
+      held = saturatingAdd(held, state.need.bytes);
   return held;
 }
 
@@ -199,7 +193,7 @@ uint64_t MemoryLedger::heldFor(const ClaimSpec &spec, std::optional<uint64_t> se
   if (spec.cls == ClaimClass::Host)
     return 0;
   const uint64_t lanes = spec.cls == ClaimClass::Growth ? laneDemandBytes_ : 0;
-  return plus(lanes, heldByClaims(spec.rank, self));
+  return saturatingAdd(lanes, heldByClaims(spec.rank, self));
 }
 
 uint64_t MemoryLedger::heldBytes(ClaimId claim) const { return heldFor(claims_.at(claim.value).spec, claim.value); }
@@ -215,7 +209,7 @@ std::array<uint32_t, 3> MemoryLedger::heldPages(ClaimId claim, uint64_t roomByte
   // kept extent's free pages takes room they wait for as an extent would
   // (the extents their landings complete hold free pages too). A form
   // without pages has none to hold.
-  const uint64_t bytes = less(heldByClaims(self.spec.rank, claim.value), roomBytes);
+  const uint64_t bytes = saturatingSubtract(heldByClaims(self.spec.rank, claim.value), roomBytes);
   for (size_t form = 0; form < held.size(); ++form)
     if (pageBytes_[form]) {
       const uint64_t pages = bytes / pageBytes_[form] + (bytes % pageBytes_[form] != 0);
@@ -239,14 +233,14 @@ uint64_t MemoryLedger::hostRefusedWaitingBytes() const noexcept {
   uint64_t bytes = 0;
   for (const auto &[id, state] : claims_)
     if ((state.waiting || state.hostRefusedWaiting) && state.refusal.hostRefused)
-      bytes = plus(bytes, state.refusal.bytes);
+      bytes = saturatingAdd(bytes, state.refusal.bytes);
   return bytes;
 }
 
 uint64_t MemoryLedger::poolReleases() const noexcept {
   uint64_t units = 0;
   for (const Account &account : accounts_)
-    units = plus(units, account.shrinks);
+    units = saturatingAdd(units, account.shrinks);
   return units;
 }
 
@@ -386,7 +380,7 @@ public:
 
 private:
   [[nodiscard]] std::optional<Victim> poolUnit(const Head &head) const {
-    const uint64_t above = less(head.state.currentBytes, head.state.floorBytes);
+    const uint64_t above = saturatingSubtract(head.state.currentBytes, head.state.floorBytes);
     if (!head.state.releaseUnitBytes || head.counted >= above)
       return std::nullopt;
     // Each unit at its own bytes where the pool lists them (the store's
@@ -440,11 +434,11 @@ MemoryLedger::Run MemoryLedger::bound(const VictimQuery &query, const Lacking &l
     }
     if (!query.rights.units)
       break;
-    unitBytes = plus(unitBytes, victim.bytes);
+    unitBytes = saturatingAdd(unitBytes, victim.bytes);
     if (victim.form == lack.form)
       run.pages += victim.pages;
     run.buffers += victim.stateBuffers;
-    run.bytes = less(plus(unitBytes, pooledBytes(query, lack, run.buffers)), pooledBefore);
+    run.bytes = saturatingSubtract(saturatingAdd(unitBytes, pooledBytes(query, lack, run.buffers)), pooledBefore);
     if (lack.covered(run.bytes, run.pages, run.buffers)) {
       run.covered = true;
       break;
@@ -512,19 +506,19 @@ MemoryLedger::Run MemoryLedger::take(const VictimQuery &query, const Lacking &la
     }
     if (taken.outcome == FreeOutcome::Pending)
       run.freed.outcome = FreeOutcome::Pending;
-    run.freed.nowBytes = plus(run.freed.nowBytes, taken.nowBytes);
-    run.freed.laterBytes = plus(run.freed.laterBytes, taken.laterBytes);
+    run.freed.nowBytes = saturatingAdd(run.freed.nowBytes, taken.nowBytes);
+    run.freed.laterBytes = saturatingAdd(run.freed.laterBytes, taken.laterBytes);
     const uint64_t pooledNow = pooledBytes(query, lack, 0);
-    run.pooled = less(pooledNow, pooledBefore);
-    run.bytes = less(plus(plus(run.freed.nowBytes, run.freed.laterBytes), pooledNow), pooledBefore);
+    run.pooled = saturatingSubtract(pooledNow, pooledBefore);
+    run.bytes = saturatingSubtract(saturatingAdd(saturatingAdd(run.freed.nowBytes, run.freed.laterBytes), pooledNow), pooledBefore);
     run.pages += taken.pages;
     run.buffers += taken.stateBuffers;
     run.costly = run.costly || Order::stage(*best) > Order::Stage::NeedsWrite;
     if (!run.took.empty() && run.took.back().source == best->source && run.took.back().pool == best->pool &&
         run.took.back().unit.key == unit.key)
-      run.took.back().bytes = plus(run.took.back().bytes, plus(taken.nowBytes, taken.laterBytes));
+      run.took.back().bytes = saturatingAdd(run.took.back().bytes, saturatingAdd(taken.nowBytes, taken.laterBytes));
     else
-      run.took.push_back({best->source, best->pool, unit, plus(taken.nowBytes, taken.laterBytes)});
+      run.took.push_back({best->source, best->pool, unit, saturatingAdd(taken.nowBytes, taken.laterBytes)});
     order.again(*best);
   }
   run.covered = lack.covered(run.bytes, run.pages, run.buffers);
@@ -539,7 +533,7 @@ uint64_t MemoryLedger::takeUnsized(const VictimQuery &query) {
     for (std::optional<Victim> unit = source->peek(query, nullptr);
          unit && !unit->sized; unit = source->peek(query, nullptr)) {
       const FreeResult taken = source->take(query, *unit);
-      bytes = plus(bytes, taken.nowBytes);
+      bytes = saturatingAdd(bytes, taken.nowBytes);
       if (!taken.nowBytes && !taken.laterBytes)
         break;
     }
@@ -571,12 +565,13 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
   const VictimQuery query{.rights = takeRights(spec, need, critical, lanePriority_), .need = need};
 
   FreeResult result{.nowBytes = takeUnsized(query)};
-  const uint64_t room = plus(freeBytes, result.nowBytes);
+  const uint64_t room = saturatingAdd(freeBytes, result.nowBytes);
   // Waiting claims ranked above it hold room it waits for, and the lanes'
   // projected growth room a pool's growth leaves them.
   const uint64_t held = heldFor(spec, id);
-  const uint64_t forClaim = less(room, held);
-  const uint64_t lackingBytes = need.hostRefused || !need.bytes ? 0 : less(plus(need.bytes, held), room);
+  const uint64_t forClaim = saturatingSubtract(room, held);
+  const uint64_t lackingBytes =
+      need.hostRefused || !need.bytes ? 0 : saturatingSubtract(saturatingAdd(need.bytes, held), room);
   const uint32_t lackingPages = need.pages;
   const bool canWait = query.rights.waitsForLandings;
 
@@ -595,19 +590,21 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
   const auto waits = [&](bool owedToo) {
     if (!canWait || (!lackingBytes && !lackingPages))
       return false;
-    const uint64_t landing = plus(all.landingBytes, owedToo ? all.owedBytes : own.owedBytes);
+    const uint64_t landing = saturatingAdd(all.landingBytes, owedToo ? all.owedBytes : own.owedBytes);
     const uint64_t landingPages =
         uint64_t{all.landingPages[form]} + (owedToo ? all.owedPages[form] : own.owedPages[form]);
-    if (lackingBytes && (plus(forClaim, landing) >= need.bytes || (!owedToo && plus(room, all.landingBytes) >= need.bytes)))
+    if (lackingBytes && (saturatingAdd(forClaim, landing) >= need.bytes ||
+                         (!owedToo && saturatingAdd(room, all.landingBytes) >= need.bytes)))
       return true;
-    return lackingPages && (less(landingPages, heldPagesAbove) >= lackingPages ||
+    return lackingPages && (saturatingSubtract(landingPages, heldPagesAbove) >= lackingPages ||
                             (!owedToo && all.landingPages[form] >= lackingPages));
   };
   // What lands and its own lanes' owed copies count before victims also in
   // part: the units cover only what they do not. The room held above the
   // claim is in what it lacks already.
-  const uint64_t creditBytes = plus(all.landingBytes, own.owedBytes);
-  const uint64_t creditPages = less(uint64_t{all.landingPages[form]} + own.owedPages[form], heldPagesAbove);
+  const uint64_t creditBytes = saturatingAdd(all.landingBytes, own.owedBytes);
+  const uint64_t creditPages =
+      saturatingSubtract(uint64_t{all.landingPages[form]} + own.owedPages[form], heldPagesAbove);
 
   std::optional<Run> run;
   // A refusal of bytes the room covers once the units that cost nothing
@@ -618,8 +615,8 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
   } else if (waits(false)) {
     result.outcome = FreeOutcome::Pending;
   } else {
-    const Lacking lack{.bytes = less(lackingBytes, creditBytes),
-                       .pages = static_cast<uint32_t>(less(lackingPages, creditPages)),
+    const Lacking lack{.bytes = saturatingSubtract(lackingBytes, creditBytes),
+                       .pages = static_cast<uint32_t>(saturatingSubtract(lackingPages, creditPages)),
                        .form = need.form,
                        .buffers = need.stateBuffers};
     const Run most = bound(query, lack);
@@ -635,7 +632,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
       // met by their bytes.
       const bool metInPlace = need.stateBuffers && run->buffers >= need.stateBuffers;
       if (run->pooled && !metInPlace)
-        taken.nowBytes = plus(taken.nowBytes, takeUnsized(query));
+        taken.nowBytes = saturatingAdd(taken.nowBytes, takeUnsized(query));
       const bool alone = (lackingBytes && run->bytes >= lackingBytes) ||
                          (lackingPages && run->pages >= lackingPages) ||
                          (need.stateBuffers && run->buffers >= need.stateBuffers);
@@ -645,13 +642,13 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
       const FreeOutcome outcome = !run->covered ? (landing ? FreeOutcome::Pending : FreeOutcome::Short)
                                   : alone        ? taken.outcome
                                                  : FreeOutcome::Pending;
-      result = {outcome, plus(result.nowBytes, taken.nowBytes), taken.laterBytes, run->pages, run->buffers};
+      result = {outcome, saturatingAdd(result.nowBytes, taken.nowBytes), taken.laterBytes, run->pages, run->buffers};
     } else {
       // Short only by the room waiting claims ranked above it hold, it waits
       // for them and takes nothing: Short would end a lone lane as if at its
       // capacity (Engine::judge).
       const bool heldAbove = canWait && lackingBytes && held &&
-                             plus(plus(most.bytes, creditBytes), held) >= lackingBytes;
+                             saturatingAdd(saturatingAdd(most.bytes, creditBytes), held) >= lackingBytes;
       result.outcome = waits(true) || heldAbove ? FreeOutcome::Pending : FreeOutcome::Short;
     }
   }
@@ -715,14 +712,14 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, const Need &need, uint64
   if (query.rights.waitsForLandings) {
     landing = returning().landingBytes;
     if (returningFor_ && spec.requestId)
-      landing = plus(landing, returningFor_(std::span<const uint64_t>(&spec.requestId, 1)).owedBytes);
+      landing = saturatingAdd(landing, returningFor_(std::span<const uint64_t>(&spec.requestId, 1)).owedBytes);
   }
-  const uint64_t room = plus(freeBytes, landing);
-  if (less(room, held) >= enough)
+  const uint64_t room = saturatingAdd(freeBytes, landing);
+  if (saturatingSubtract(room, held) >= enough)
     return enough;
-  const Lacking lack{.bytes = less(plus(enough, held), room)};
+  const Lacking lack{.bytes = saturatingSubtract(saturatingAdd(enough, held), room)};
   const uint64_t taken = bound(query, lack).bytes;
-  return std::min(enough, less(plus(room, taken), held));
+  return std::min(enough, saturatingSubtract(saturatingAdd(room, taken), held));
 }
 
 // Growth into the room beyond what waiting claims and the lanes' projected
@@ -762,8 +759,8 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
     // counted: the cache is not walked for it.
     for (uint64_t unit = account.pool->state().growUnitBytes; unit && host.admits(unit, unit);
          unit = account.pool->state().growUnitBytes) {
-      const uint64_t room = less(freeBytes, grownBytes);
-      const uint64_t lacking = less(plus(unit, heldFor(spec, std::nullopt)), room);
+      const uint64_t room = saturatingSubtract(freeBytes, grownBytes);
+      const uint64_t lacking = saturatingSubtract(saturatingAdd(unit, heldFor(spec, std::nullopt)), room);
       uint64_t funded = 0;
       bool grown = true;
       if (lacking) {
@@ -784,14 +781,14 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
         const ClaimId claim = open(spec);
         if (lacking) {
           const FreeResult taken = free(claim, {.bytes = unit}, room, false);
-          freeBytes = plus(freeBytes, taken.nowBytes);
+          freeBytes = saturatingAdd(freeBytes, taken.nowBytes);
           grown = taken.outcome == FreeOutcome::Met;
         }
         grown = grown && host.grow(claim, *account.pool);
         close(claim);
       }
       if (grown) {
-        grownBytes = plus(grownBytes, unit);
+        grownBytes = saturatingAdd(grownBytes, unit);
         ++account.grows;
         grew = true;
         if (log_) {
@@ -833,17 +830,17 @@ void MemoryLedger::fill(MemoryGovernorSnapshot &snapshot, uint64_t chargedBytes)
       row.currentBytes = account.current();
       row.capBytes = row.currentBytes;
     }
-    others = plus(others, row.currentBytes);
+    others = saturatingAdd(others, row.currentBytes);
     accounts.push_back(std::move(row));
   }
-  const uint64_t fixed = less(chargedBytes, others);
+  const uint64_t fixed = saturatingSubtract(chargedBytes, others);
   snapshot.accounts.push_back({.name = accounts_.front().name, .currentBytes = fixed, .capBytes = fixed});
   for (MemoryAccountSnapshot &row : accounts)
     snapshot.accounts.push_back(std::move(row));
 
   const Returning back = returning();
   snapshot.owed = {.transfers = back.transfers,
-                   .bytes = plus(back.landingBytes, back.owedBytes),
+                   .bytes = saturatingAdd(back.landingBytes, back.owedBytes),
                    .oldestMilliseconds = back.oldestMilliseconds};
   snapshot.claims = {};
   std::optional<double> oldest;
@@ -851,7 +848,7 @@ void MemoryLedger::fill(MemoryGovernorSnapshot &snapshot, uint64_t chargedBytes)
     if (!state.waiting)
       continue;
     ++snapshot.claims.waiting;
-    snapshot.claims.bytes = plus(snapshot.claims.bytes, state.need.bytes);
+    snapshot.claims.bytes = saturatingAdd(snapshot.claims.bytes, state.need.bytes);
     oldest = std::min(oldest.value_or(state.waitingSinceSeconds), state.waitingSinceSeconds);
   }
   if (oldest)
