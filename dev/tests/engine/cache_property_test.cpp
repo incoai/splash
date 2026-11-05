@@ -17,6 +17,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace splash;
@@ -118,6 +119,12 @@ public:
   }
 
   uint64_t steps = 0;
+  // Units taken, as peek offered them just before, by whether their takes
+  // freed, in the need's measure, all peek counted (exact) or less (short),
+  // and of those offered as needing no write the same; and the units whose
+  // first take gave nothing and waited for nothing (stalled). Peek counts an
+  // upper bound (VictimSource), so these are reported, not required.
+  uint64_t exactUnits = 0, shortUnits = 0, exactNoWrite = 0, shortNoWrite = 0, stalled = 0;
 
   // Every request ends, every transfer lands, and nothing leaks: the pool's
   // pages and the tier's slots belong to the cache's blocks alone.
@@ -228,12 +235,30 @@ public:
     uint64_t releasedNow = 0;
     uint32_t reportedPages = 0;
     uint32_t reportedBuffers = 0;
+    // What a take that gives something changes: the memory the pool holds,
+    // its free, landing and cached pages, the states in RAM, the writes
+    // started.
+    const auto fingerprint = [&] {
+      const CacheSnapshot snapshot = cache_.snapshot();
+      return std::tuple{pool_.allocatedBytes(),          pool_.freePageCount(kv::PageForm::Full),
+                        pool_.freePageCount(kv::PageForm::Slim), pool_.freePageCount(kv::PageForm::Index),
+                        cache_.demotedPages(),           snapshot.pool.pagesPrefix,
+                        snapshot.stateCache.entries,     snapshot.stateCache.bytes,
+                        snapshot.stateCache.offloads,    tier_.demotions};
+    };
     for (const auto &[after, first] : units) {
       // A unit's takes while the cache offers it again in its place, until
       // one takes nothing: a reclaim phase goes a step at a time, each a
       // reclaim of a finite cache.
-      for (std::optional<engine::Victim> unit = first; unit && unit->key == first.key;
+      uint64_t unitFreed = 0;
+      bool firstTake = true;
+      // As peek offers it now, after the takes of the units before it.
+      const std::optional<engine::Victim> fresh = cache_.peek(query, after ? &*after : nullptr);
+      if (!fresh || fresh->key != first.key)
+        continue;
+      for (std::optional<engine::Victim> unit = fresh; unit && unit->key == first.key;
            unit = cache_.peek(query, after ? &*after : nullptr)) {
+        const auto unchanged = fingerprint();
         const uint64_t before = pool_.allocatedBytes();
         const uint64_t offloads = cache_.snapshot().stateCache.offloads;
         const uint32_t demotions = tier_.demotions;
@@ -253,10 +278,22 @@ public:
         releasedNow += released;
         reportedPages += taken.pages;
         reportedBuffers += taken.stateBuffers;
+        unitFreed += device ? taken.nowBytes + taken.laterBytes : states ? taken.stateBuffers : taken.pages;
+        // Progress: a take that says it gave something changed the cache,
+        // so the ledger's peek again from the head (MemoryLedger::take)
+        // never finds the same unit for ever.
+        require(!taken.gave() || fingerprint() != unchanged, "a take reported giving something and changed nothing");
+        stalled += firstTake && !taken.gave() && taken.outcome != FreeOutcome::Pending;
+        firstTake = false;
         if (!taken.gave())
           break;
         ++steps;
       }
+      const uint64_t unitCounted = device ? fresh->bytes : states ? fresh->stateBuffers : fresh->pages;
+      const bool exact = unitFreed >= unitCounted;
+      ++(exact ? exactUnits : shortUnits);
+      if (!fresh->write)
+        ++(exact ? exactNoWrite : shortNoWrite);
     }
     const uint32_t pagesAfter = pagesOf();
     const uint32_t freedPages = pagesAfter - std::min(pagesAfter, pagesBefore);
@@ -519,7 +556,7 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
 // The same runs with random claims counted and taken (checkTake), again with requests using the states they resume
 // from.
 void testTakeNeverExceedsPeek(uint32_t plainSeeds, uint32_t windowedSeeds) {
-  uint64_t steps = 0;
+  uint64_t steps = 0, exact = 0, shortOf = 0, exactNoWrite = 0, shortNoWrite = 0, stalled = 0;
   const auto check = [&](uint32_t seed, bool windowed, bool usedStates) {
     Run run(seed, windowed, true, usedStates);
     try {
@@ -533,13 +570,21 @@ void testTakeNeverExceedsPeek(uint32_t plainSeeds, uint32_t windowedSeeds) {
                                error.what());
     }
     steps += run.steps;
+    exact += run.exactUnits;
+    shortOf += run.shortUnits;
+    exactNoWrite += run.exactNoWrite;
+    shortNoWrite += run.shortNoWrite;
+    stalled += run.stalled;
   };
   for (const bool usedStates : {false, true})
     for (const bool windowed : {false, true})
       for (uint32_t seed = 1; seed <= (windowed ? windowedSeeds : plainSeeds); ++seed)
         check(seed, windowed, usedStates);
   std::cout << "cache take runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds << " windowed; " << steps
-            << " reclaim steps, none freeing more than peek counted\n";
+            << " reclaim steps, none freeing more than peek counted, each that gave something changing the cache; "
+            << exact << " units freed all peek counted, " << shortOf << " less (" << exactNoWrite << " and "
+            << shortNoWrite << " of those needing no write); " << stalled
+            << " freed nothing and waited for nothing at their first take\n";
 }
 
 } // namespace
