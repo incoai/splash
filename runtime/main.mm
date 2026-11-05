@@ -433,7 +433,7 @@ int serveNative(int argc, char **argv) {
         transport.failure() + ")");
     break;
   }
-  // Not only a clean stop: a protocol or I/O failure leaves the engine
+  // Not only after CleanEof: a protocol or I/O failure leaves the engine
   // healthy, and its newest restore points still reach the disk.
   if (runtime->resources().cache().persistent() && runtime->nativeLoop().engineHealthy())
     closePersistentCache(transport, *runtime);

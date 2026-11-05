@@ -53,9 +53,9 @@ public:
   [[nodiscard]] std::function<void()> controlNotifier();
   void setControlHandler(ControlHandler handler);
   [[nodiscard]] NativeProcessExit run(NativeRuntime &loop);
-  // After run() returned CleanEof: makes the newest restore points durable
-  // (NativeRuntime::flushRestorePoints) as the writes it starts land, which
-  // wake it, without reading input, until none is left or budget has
+  // After run() returned, however it ended: makes the newest restore points
+  // durable (NativeRuntime::flushRestorePoints) as the writes it starts land,
+  // which wake it, without reading input, until none is left or budget has
   // passed. True once none is left.
   [[nodiscard]] bool runFlush(NativeRuntime &loop, std::chrono::milliseconds budget);
   // Async-signal-safe. Asks run() to return CleanEof at its next iteration.
