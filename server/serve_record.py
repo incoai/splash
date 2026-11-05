@@ -7,13 +7,16 @@ message for the rest.
 
 The app learns a start's outcome from the record and the process's exit
 alone: it waits until the record says ready and takes an exit before that for
-the start's failure. So a ready record that cannot be written fails the start
-(NotRecorded), and the server ends before it serves instead of serving while
-the app waits on it. Every other record is best effort, one that cannot be
-written a line in the log: a refusal or a failure stays the one the process
-prints and exits with, and a phase before ready, which only words the wait,
-leaves the record as it was. The standard library and the protocol and
-diagnostics modules alone: the launcher runs before .venv exists."""
+the start's failure. So the starting and ready records that cannot be written
+fail the start (NotRecorded): the launcher ends before any model loads,
+rather than leave a record of an earlier process, a stale ready one of the
+same pid among them, to say how this start goes; the server ends before it
+serves instead of serving while the app waits on it. Every other record is
+best effort, one that cannot be written a line in the log: a refusal or a
+failure stays the one the process prints and exits with, and a later phase
+before ready, which only words the wait, leaves the record as it was. The
+standard library and the protocol and diagnostics modules alone: the launcher
+runs before .venv exists."""
 
 import contextlib
 import json
@@ -47,11 +50,16 @@ class NotRecorded(Exception):
     """A record that cannot be written: its path and the system's error."""
 
 
+def starting(path: Path | None):
+    """Record that this process's start began, which no stale record of its
+    pid can be; NotRecorded where it cannot be, and the start has failed."""
+    _write(path, {"pid": os.getpid(), "phase": "starting"})
+
+
 def entered(path: Path | None, phase: str):
-    """Record, best effort, that this process's start entered `phase`:
-    "starting", which no stale record of its pid can be; "loading", the
-    tokenizer, then the engine's weights; or "warming", the engine runs the
-    model once at full size (WarmingEvent)."""
+    """Record, best effort, that this process's start entered a later
+    `phase`: "loading", the tokenizer, then the engine's weights; or
+    "warming", the engine runs the model once at full size (WarmingEvent)."""
     _write_best_effort(path, {"pid": os.getpid(), "phase": phase})
 
 

@@ -1629,35 +1629,70 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(refused.exception.code, 2)
                 self.assertIn("splash serve: error: ", error.getvalue())
 
-    def test_a_start_refused_whose_record_cannot_be_written_says_its_refusal(self):
-        """A start the launcher refuses while its record cannot be written, a
-        directory in its place, prints its refusal, not the record's
-        failure."""
+    def test_a_start_whose_starting_record_cannot_be_written_fails_before_model_work(
+        self,
+    ):
+        """A start that cannot record it began, a directory in its record's
+        place, fails at once with one error naming the record and the
+        system's error, before any model work, and releases its port's lock:
+        otherwise an earlier process's record, a stale ready one of the same
+        pid among them, would say how this start goes."""
         with tempfile.TemporaryDirectory() as temporary:
             runtime = Path(temporary)
-            (runtime / "serve-8000.json").mkdir()
+            record = runtime / "serve-8000.json"
+            record.mkdir()
+            with (
+                mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                mock.patch.object(launcher, "_prepare_start") as prepare,
+                mock.patch.object(launcher.os, "execve") as execute,
+                mock.patch("sys.stderr", io.StringIO()) as error,
+            ):
+                self.assertEqual(launcher.main(["serve", "--model", MODEL_ID]), 1)
+            prepare.assert_not_called()
+            execute.assert_not_called()
+            self.assertEqual(
+                error.getvalue(),
+                f"error: cannot write the serve record {record}: Is a directory\n",
+            )
+            with (runtime / "serve-8000.lock").open("a+") as released:
+                fcntl.flock(released, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_a_start_refused_whose_record_cannot_be_written_says_its_refusal(self):
+        """A start the launcher refuses once its record cannot be written, a
+        directory in its place after it recorded the start, prints its
+        refusal, not the record's failure."""
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            record = runtime / "serve-8000.json"
+            starting = launcher.serve_record.starting
+
+            def started(path):
+                starting(path)
+                path.unlink()
+                path.mkdir()
+
             with (
                 (runtime / "serve.lock").open("a+") as installation,
                 mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                mock.patch.object(
+                    launcher.serve_record, "starting", side_effect=started
+                ),
                 mock.patch("sys.stderr", io.StringIO()) as error,
             ):
                 fcntl.flock(installation, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 self.assertEqual(launcher.main(["serve", "--model", MODEL_ID]), 1)
-            *records, refusal = error.getvalue().splitlines()
+            written, refusal = error.getvalue().splitlines()
             self.assertEqual(
                 refusal,
                 "error: Splash is being upgraded; wait for the upgrade to finish",
             )
-            # The record of its start, then of its refusal.
-            self.assertEqual(len(records), 2)
-            for line in records:
-                self.assertTrue(
-                    line.endswith(
-                        " Warning · cannot write the serve record "
-                        f"{runtime / 'serve-8000.json'}: Is a directory"
-                    ),
-                    line,
-                )
+            # The record of its refusal.
+            self.assertTrue(
+                written.endswith(
+                    f" Warning · cannot write the serve record {record}: Is a directory"
+                ),
+                written,
+            )
 
     def test_metadata_write_failure_releases_lock_before_model_work(self):
         with (

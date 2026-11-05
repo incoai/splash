@@ -397,8 +397,10 @@ def serve(args):
         json.dump({"pid": os.getpid(), "model": args.model, "port": args.port}, lock)
         lock.flush()
         # The record is the lock holder's: from here on a start that fails
-        # says why in it, as the server, which keeps this pid, does too.
-        serve_record.entered(record, "starting")
+        # says why in it, as the server, which keeps this pid, does too. A
+        # start that cannot record it began fails here, before any model work
+        # (serve_record).
+        serve_record.starting(record)
         try:
             # Servers share the installation; upgrades require exclusive
             # access.
@@ -699,7 +701,12 @@ def main(argv=None):
         raise
     try:
         return serve(args) if args.command == "serve" else coding_client(args)
-    except (LauncherError, clients.ClientError, OSError) as error:
+    except (
+        LauncherError,
+        clients.ClientError,
+        OSError,
+        serve_record.NotRecorded,
+    ) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     except StopSignal as stop:
