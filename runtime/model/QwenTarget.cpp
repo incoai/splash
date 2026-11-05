@@ -7,6 +7,7 @@
 #include "ops/Embedding.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PageStorage.hpp"
+#include "ops/ResidualSteer.hpp"
 #include "ops/RowCopy.hpp"
 
 #include <algorithm>
@@ -457,6 +458,15 @@ void QwenTarget::addCapture(metal::CommandGraph &graph, uint32_t slot, metal::Me
                     {destinationRow, capturedWidth, slot * width}, rows, width);
 }
 
+void QwenTarget::addResidualSteer(metal::CommandGraph &graph, metal::MetalBuffer residual, uint32_t index,
+                                  uint32_t rows) const {
+  const std::optional<ControlVector> &vector = weightsBase_.controlVector;
+  if (!vector || !vector->steers(index)) return;
+  ops::addResidualSteer(graph, std::move(residual), vector->directions,
+                        {index, vector->mode == ControlVectorMode::Project, vector->scale}, geometry_.hiddenSize,
+                        rows);
+}
+
 namespace {
 
 // The rows a mixer's output projection adds to the layer's input rows into.
@@ -507,6 +517,7 @@ public:
           },
           layer.mixer);
       addVerifyFfn(step, layer, residual, output);
+      addResidualSteer(step.graph, output, index, step.rows);
       if (const auto slot = geometry_.captureSlot(index))
         addCapture(step.graph, *slot, output, 0, buffers.capturedTargetHidden, 0, step.rows);
     }
@@ -547,6 +558,7 @@ private:
   void addPrefillExperts(PrefillStep &step, uint32_t index) const {
     const QwenTargetPrefillBuffers &b = step.buffers;
     if (const ops::BlockMoeWeights *ffn = moe(index)) ops::MoE::addRouted(step.graph, step.ffn, *ffn, *step.moe);
+    addResidualSteer(step.graph, b.hidden[(index & 1) ^ 1], index, step.rows);
     forEachPrefillCapture(step, index, [&](uint32_t slot, uint32_t source, uint32_t destination, uint32_t rows) {
       addCapture(step.graph, slot, b.hidden[(index & 1) ^ 1], source, b.captured, destination, rows);
     });
