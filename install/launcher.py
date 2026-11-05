@@ -107,12 +107,17 @@ def _base_url(port):
     return f"http://127.0.0.1:{port}"
 
 
+# The server is on this Mac's loopback: requests to it connect directly, so
+# no proxy, the environment's or the system's, receives the server's key.
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _request_json(path, timeout=2, *, port=serve_options.DEFAULT_PORT):
     request = urllib.request.Request(_base_url(port) + path)
     if key := os.environ.get("SPLASH_API_KEY"):
         request.add_header("Authorization", f"Bearer {key}")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _DIRECT.open(request, timeout=timeout) as response:
             return json.loads(response.read())
     except urllib.error.HTTPError as error:
         if error.code == 401:

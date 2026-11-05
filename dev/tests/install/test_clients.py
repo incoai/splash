@@ -11,6 +11,7 @@ import tempfile
 import threading
 import tomllib
 import unittest
+import urllib.request
 from contextlib import contextmanager
 from itertools import product
 from pathlib import Path
@@ -22,6 +23,9 @@ from install import clients, launcher
 from server import serve_options
 
 MODEL = "mlx-community/Qwen3.6-35B-A3B-4bit"
+# What a launch under an environment's proxy adds to the hosts a client
+# reaches without it.
+LOOPBACK_HOSTS = "127.0.0.1,localhost,::1"
 
 
 def hermes_profile_create(argv, *, env, **options):
@@ -175,6 +179,9 @@ class ClientTests(unittest.TestCase):
 
     def test_default_environment_is_a_copy_of_the_process_environment(self):
         with mock.patch.dict(os.environ, {"SPLASH_API_KEY": "process-key"}):
+            for name in list(os.environ):
+                if name.lower() in clients.PROXY_VARIABLES:
+                    os.environ.pop(name)
             before = dict(os.environ)
             _, env = clients.command(
                 "codex",
@@ -186,6 +193,66 @@ class ClientTests(unittest.TestCase):
             )
             self.assertEqual(dict(os.environ), before)
         self.assertEqual(env, before)
+
+    def test_every_client_reaches_the_server_without_a_proxy(self):
+        """Where the environment names a proxy, loopback, where the server
+        is, joins the hosts each client reaches without it, so no proxy
+        receives the server's key. A client reads NO_PROXY or no_proxy, and
+        the other where its own is unset or empty: each keeps the hosts a client found
+        there, and one exempting loopback already, or "*", stays. An
+        environment naming no proxy, whose clients take the system proxy, is
+        left as it is."""
+        proxy = "http://proxy.example:3128"
+        for proxies, no_proxy, expected in (
+            (
+                {"HTTPS_PROXY": proxy},
+                {},
+                (LOOPBACK_HOSTS, LOOPBACK_HOSTS),
+            ),
+            (
+                {"http_proxy": proxy},
+                {"NO_PROXY": "corp.example"},
+                (f"corp.example,{LOOPBACK_HOSTS}", f"corp.example,{LOOPBACK_HOSTS}"),
+            ),
+            (
+                {"all_proxy": proxy},
+                {"NO_PROXY": "", "no_proxy": "corp.example, localhost"},
+                (
+                    "corp.example,localhost,127.0.0.1,::1",
+                    "corp.example,localhost,127.0.0.1,::1",
+                ),
+            ),
+            (
+                {"ALL_PROXY": proxy},
+                {"no_proxy": f"{LOOPBACK_HOSTS},corp.example"},
+                (None, f"{LOOPBACK_HOSTS},corp.example"),
+            ),
+            ({"HTTP_PROXY": proxy}, {"NO_PROXY": "*"}, ("*", None)),
+            ({"https_proxy": proxy}, {"NO_PROXY": "*", "no_proxy": "*"}, ("*", "*")),
+            ({}, {}, (None, None)),
+            ({"http_proxy": ""}, {"NO_PROXY": "corp.example"}, ("corp.example", None)),
+        ):
+            for name in clients.INSTALL_URLS:
+                with self.subTest(client=name, proxies=proxies, no_proxy=no_proxy):
+                    _, env = self.command(name, env=proxies | no_proxy)
+                    self.assertEqual(
+                        (env.get("NO_PROXY"), env.get("no_proxy")), expected
+                    )
+                    self.assertEqual({key: env[key] for key in proxies}, proxies)
+
+    def test_a_system_proxy_alone_stays_the_clients_proxy(self):
+        """Without a proxy variable, Python's urllib takes the macOS system
+        proxy; a NO_PROXY in the agent's environment would make it drop that
+        proxy, so the launch adds none."""
+        system = {"http": "http://sysproxy.example:3128"}
+        _, env = self.command("codex", env={"PATH": "/bin"})
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                urllib.request, "getproxies_macosx_sysconf", return_value=system
+            ),
+        ):
+            self.assertEqual(urllib.request.getproxies(), system)
 
     def test_claude_launch_selects_the_local_server_for_every_model_alias(self):
         # A shell configured for a cloud provider keeps its unrelated

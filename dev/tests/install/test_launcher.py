@@ -893,6 +893,69 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(command.call_args.args[3:5], (MODEL_ID, 4096))
         execute.assert_called_once()
 
+    def test_server_probe_never_goes_through_a_proxy(self):
+        """The server is on loopback: the launcher reaches it directly, and a
+        proxy the environment names never receives the server's key."""
+        requests = []
+
+        class Recorder(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append(
+                    (
+                        self.server.server_port,
+                        self.path,
+                        self.headers.get("Authorization"),
+                    )
+                )
+                body = b'{"data": []}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        with (
+            ThreadingHTTPServer(("127.0.0.1", 0), Recorder) as server,
+            ThreadingHTTPServer(("127.0.0.1", 0), Recorder) as proxy,
+        ):
+            port = server.server_port
+            workers = [
+                threading.Thread(target=listener.serve_forever)
+                for listener in (server, proxy)
+            ]
+            for worker in workers:
+                worker.start()
+            try:
+                # A new process, as the launcher is: urlopen keeps the
+                # proxies it finds on its first call.
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import sys\nfrom install import launcher\n"
+                        "print(launcher._request_json('/v1/models', "
+                        "port=int(sys.argv[1])))",
+                        str(port),
+                    ],
+                    cwd=Path(launcher.__file__).resolve().parents[1],
+                    env={
+                        "SPLASH_API_KEY": "test-key",
+                        "http_proxy": f"http://127.0.0.1:{proxy.server_port}",
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            finally:
+                for listener in (server, proxy):
+                    listener.shutdown()
+                for worker in workers:
+                    worker.join(timeout=5)
+        self.assertEqual(result.stdout, "{'data': []}\n", result.stderr)
+        self.assertEqual(requests, [(port, "/v1/models", "Bearer test-key")])
+
     def test_source_script_runs_its_checkout_launcher_through_links(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

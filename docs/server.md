@@ -1069,7 +1069,13 @@ count. Text completions have no reasoning split and refuse a budget with 400.
 
 Agents must already be installed; `splash claude|opencode|codex|hermes|pi`
 connects to the running server. Arguments pass through, for example
-`splash codex resume --last` or `splash hermes chat -q "Hello"`.
+`splash codex resume --last` or `splash hermes chat -q "Hello"`. `splash`
+reaches the server on loopback without a proxy. Where the environment names a
+proxy (`http_proxy`, `https_proxy` or `all_proxy`, in either case), it adds
+`127.0.0.1`, `localhost` and `::1` to the agent's `NO_PROXY` and `no_proxy`,
+keeping the hosts already there and leaving `*` as it is, so no proxy receives
+the server's key. A proxy set only in macOS system settings is left to that
+setting's own exceptions.
 
 `splash pi` adds a `splash` provider to Pi's `models.json` (`splash-<port>` for
 a server on another port), preserving other providers, settings and sessions.

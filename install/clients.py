@@ -37,6 +37,10 @@ CLIENT_RESPONSE_TOKENS = 32768
 OPENCODE_AGENTS = ("build", "plan", "general", "explore", "title", "compaction")
 OPENCODE_EFFORTS = ("none", "low", "medium", "high", "xhigh")
 OPENCODE_CONFIG_ERROR = "OPENCODE_CONFIG_CONTENT must be a JSON object"
+# How a client names loopback, where the server is.
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+# The variables that name a proxy, in either case.
+PROXY_VARIABLES = ("http_proxy", "https_proxy", "all_proxy")
 
 
 class ClientError(RuntimeError):
@@ -170,7 +174,39 @@ def command(
             argv = _pi(path, server, environment, client_args)
         case _:
             raise ClientError(f"Unknown coding client: {name}")
+    _reach_loopback_directly(environment)
     return argv, environment
+
+
+def _reach_loopback_directly(environment):
+    """Where the environment names a proxy (http_proxy, https_proxy or
+    all_proxy, in either case), add the loopback hosts it does not exempt
+    yet to NO_PROXY and no_proxy, so no proxy receives the server's key. A
+    client there takes its proxies from the environment alone, so the hosts
+    added change nothing else. A client reads NO_PROXY or no_proxy, and the
+    other where its own is unset or empty: each keeps the hosts a client
+    found there,
+    and one that exempts loopback already, or every host as "*" does, stays
+    as it is.
+
+    An environment that names no proxy is left as it is: a client then
+    takes the macOS system proxy, whose own exceptions decide whether
+    loopback goes through it, and a NO_PROXY added there would make Python's
+    urllib, which takes the system proxy only where the environment names
+    none, drop it."""
+    if not any(
+        value and name.lower() in PROXY_VARIABLES for name, value in environment.items()
+    ):
+        return
+    found = {
+        name: environment.get(name) or environment.get(other, "")
+        for name, other in (("NO_PROXY", "no_proxy"), ("no_proxy", "NO_PROXY"))
+    }
+    for name, value in found.items():
+        hosts = [host.strip() for host in value.split(",") if host.strip()]
+        missing = [host for host in LOOPBACK_HOSTS if host not in hosts]
+        if missing and hosts != ["*"]:
+            environment[name] = ",".join(hosts + missing)
 
 
 def _claude(path, server, environment, arguments):
