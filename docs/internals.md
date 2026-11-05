@@ -1663,15 +1663,21 @@ only the constrained lanes read masks. A mask request the server leaves
 unanswered for 5 s fails that request with the retryable `mask_timeout` (HTTP
 503), so a stalled grammar cannot hold the batch's command.
 
-Prefill takes the ready lanes of the most urgent priority. Within it a lane
-that has waited, while commands served later arrivals of its priority, for
-three times its own remaining rows is overdue and leads, to its prompt's end;
-otherwise the lane of the fewest remaining rows leads, then in submission
-order. The leader takes a chunk, or a group of the model's command rows (four
-chunks), evenly split, where its command runs in passes over the model's
-layers: on a target whose weights stream (`CommandLimits::streamsWeights`), or
-for a lane whose history has Index pages or may gain them, which a group reads
-once. A group runs in passes contended or not, each of no more layers than fit
+Prefill takes the ready lanes of the most urgent priority. Within it a
+request that three prefill commands in a row served later arrivals of its
+priority and not it (`maximumBatchWidth - 1`: the other lanes of a full batch,
+each finishing one short prompt), whether it has a lane or waits for one, is
+overdue and leads, the oldest first, until a command serves it; otherwise the
+lane of the fewest remaining rows leads, then in submission order. A command
+counts once, whatever its passes, and serves every lane it holds, a joiner
+too, which starts its count again; a lane a command is planned without is
+blocked, not passed over. Commands are counted, not rows: three commands of
+cache hits a few hundred rows each make a long uncached prompt overdue as
+three long commands do. The leader takes a chunk, or a group of the model's
+command rows (four chunks), evenly split, where its command runs in passes
+over the model's layers: on a target whose weights stream
+(`CommandLimits::streamsWeights`), or for a lane whose history has Index
+pages or may gain them, which a group reads once. A group runs in passes contended or not, each of no more layers than fit
 in G, the decode gap of 500 ms (`EngineConfig::decodeGapMilliseconds`), at the
 time a layer of the last command's heaviest pass took, scaled up where the
 group has more rows or its heaviest layer more attention pairs, never down: a
@@ -1707,10 +1713,11 @@ its priority or a lower one, whose rows would take the prefill memory its work
 is in, but admission waits for no pass: a request that arrives meanwhile
 starts at the next command's boundary, in ordinary admission and during
 recovery alike.
-Admission starts a prompt only where the next command serves it and leaves it
-waiting for no other prompt: the command ends the prompt, the prompt leads it
-or is overdue, or every lane ahead of it ends its prompt there and none is a
-Spill lane, so two Spill lanes prefill together only as the later one leads.
+Admission starts a prompt only where the next command serves it and the
+prompt is overdue, or the command leaves it waiting for no other prompt: it
+ends the prompt, the prompt leads it, or every lane ahead of it ends its
+prompt there and none is a Spill lane, so two Spill lanes prefill together
+only as the later one leads or one is overdue.
 The lanes of a command between its passes count past its rows, which commit
 before any other prefill.
 A start still restoring its prefix from the SSD cache runs in no command before

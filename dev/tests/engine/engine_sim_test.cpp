@@ -24,6 +24,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <ranges>
 #include <set>
 #include <span>
 #include <string>
@@ -688,6 +689,77 @@ void testAResendStartsBesideARefusedLongerPrompt() {
        std::to_string(*served.ttft(1) / 1000.0) + " s");
 }
 
+// The 35B on the Studio: eight closed-loop workers resend their ~8.6K-token
+// conversations, cached but for their last rows, while a 38,133-token prompt
+// nothing caches waits. Each command that serves the resends runs a few
+// hundred rows, yet the cold prompt waits behind at most
+// K = maximumBatchWidth - 1 prefill commands that serve later arrivals, then
+// takes the next lane that frees and leads.
+void testAColdPromptStartsWithinTheOvertakesAmidCachedResends() {
+  constexpr uint32_t kWorkers = 8, kOutput = 64, kOvertakes = model::ExecutionLimits::maximumBatchWidth - 1;
+  TimedHarness served(test::k35BStudio18G);
+  test::EngineHarness &harness = served.harness;
+  uint64_t nextId = 1;
+  std::array<std::vector<uint32_t>, kWorkers> conversation;
+  std::array<uint64_t, kWorkers> inFlight{};
+  std::array<uint32_t, kWorkers> rounds{};
+  const auto send = [&](uint32_t worker) {
+    const uint64_t id = nextId++;
+    const std::vector<uint32_t> turn = prompt(id, conversation[worker].empty() ? 8600 + 60 * worker : 8);
+    conversation[worker].insert(conversation[worker].end(), turn.begin(), turn.end());
+    served.submit(id, conversation[worker], kOutput);
+    inFlight[worker] = id;
+    ++rounds[worker];
+  };
+  // Runs the workers, each sending its next turn as its last one ends, until
+  // `until`.
+  const auto work = [&](const std::function<bool()> &until, std::string_view what) {
+    const auto ended = [&](uint32_t worker) { return harness.events.usage.contains(inFlight[worker]); };
+    while (!until()) {
+      harness.runUntil(
+          [&] { return until() || std::ranges::any_of(std::views::iota(0u, kWorkers), ended); }, what);
+      for (uint32_t worker = 0; worker < kWorkers; ++worker)
+        if (ended(worker))
+          send(worker);
+    }
+  };
+  for (uint32_t worker = 0; worker < kWorkers; ++worker)
+    send(worker);
+  work([&] { return std::ranges::all_of(rounds, [](uint32_t round) { return round >= 3; }); },
+       "the workers did not finish their first turns");
+  const uint64_t cold = nextId++;
+  const size_t from = harness.commands().size();
+  const double arrived = harness.now();
+  served.submit(cold, prompt(cold, 38'133), kTokensPerCommand);
+  // The prefill commands, first passes, from its arrival to its first one.
+  uint32_t overtakes = 0, cachedResends = 0;
+  size_t seen = from;
+  bool led = false;
+  const auto first = [&] {
+    for (; !led && seen < harness.commands().size(); ++seen) {
+      const test::EngineHarness::Command &command = harness.commands()[seen];
+      if (command.kind != WorkKind::Prefill || command.pass)
+        continue;
+      led = std::ranges::count(command.lanes, cold) != 0;
+      overtakes += !led && std::ranges::any_of(command.lanes, [&](uint64_t id) { return id > cold; });
+    }
+    return led || harness.now() >= arrived + 300'000.0;
+  };
+  work(first, "the workers and the cold prompt did not move");
+  for (size_t index = 0; index < harness.events.startIds.size(); ++index)
+    cachedResends += harness.events.startIds[index] > cold && harness.events.starts[index] >= 8000;
+  require(cachedResends >= kOvertakes, "the workers' resends did not start from their cached conversations");
+  require(led && overtakes <= kOvertakes,
+          "the cold 38,133-token prompt " +
+              (led ? "led after " + std::to_string((harness.now() - arrived) / 1000.0) + " s"
+                   : std::string("had not led in 300 s")) +
+              ", behind " + std::to_string(overtakes) + " prefill commands that served later arrivals, past K = " +
+              std::to_string(kOvertakes));
+  note("the 35B's cold 38,133-token prompt led " + std::to_string((harness.now() - arrived) / 1000.0) +
+       " s after it arrived, behind " + std::to_string(overtakes) + " commands of " + std::to_string(cachedResends) +
+       " cached resends");
+}
+
 } // namespace
 
 std::span<const test::TestCase> simTests() {
@@ -698,6 +770,8 @@ std::span<const test::TestCase> simTests() {
       {"testCriticalTakesTheMarginASecondAndKeepsTheResumePoint",
        testCriticalTakesTheMarginASecondAndKeepsTheResumePoint},
       {"testAResendStartsBesideARefusedLongerPrompt", testAResendStartsBesideARefusedLongerPrompt},
+      {"testAColdPromptStartsWithinTheOvertakesAmidCachedResends",
+       testAColdPromptStartsWithinTheOvertakesAmidCachedResends},
   };
   return kTests;
 }

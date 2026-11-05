@@ -14,11 +14,10 @@ constexpr uint32_t kMinimumPrefillRows = 64;
 // where more (the Neural Engine FFN split's least chunk): smaller cuts lose
 // prefill throughput (17% fewer rows a second on an M6 below 512 rows).
 constexpr uint32_t kFloorRows = 512;
-// A lane waits behind later arrivals of its priority for at most this many
-// times its own remaining rows before it leads to its prompt's end: the other
-// lanes of a full batch, each finishing a prompt no longer than its own
-// remaining one.
-constexpr uint64_t kAgingSlowdown = model::ExecutionLimits::maximumBatchWidth - 1;
+// A request yields to later arrivals of its priority at most this many
+// prefill commands in a row: the other lanes of a full batch, each finishing
+// one short prompt.
+constexpr uint32_t kMaximumOvertakes = model::ExecutionLimits::maximumBatchWidth - 1;
 
 // A command excludes at most the lanes of a full batch: a linear search.
 bool listed(std::span<const uint64_t> ids, uint64_t id) noexcept {
@@ -266,17 +265,16 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(std::span<const PrefillAd
   restoring.reserve(in.restoring.size());
   for (const auto &entry : in.restoring)
     restoring.push_back(unstarted(entry));
-  // Admission starts only lanes their first command serves and leaves
-  // waiting for no other prompt: one whose prompt the command ends, an
-  // overdue one, or one it leads or that leads next, every
-  // lane ordered before it ending its prompt there, and that no restoring
-  // start leads once it lands. A start holds its memory from its first
-  // command to its last, so a prompt that would join with the rows that
-  // spare it a command and then wait out another's prompt stays queued
-  // until it leads. One that leads next starts beside no Spill lane, as two
-  // Spill lanes prefill together only as the later one leads or one is
-  // overdue: beside the last command of a Spill lane, one between its
-  // passes too, it stays queued. A restoring start holds back a
+  // Admission starts only lanes their first command serves, overdue or left
+  // waiting for no other prompt: one whose prompt the command ends, or one it
+  // leads or that leads next, every lane ordered before it ending its prompt
+  // there, and that no restoring start leads once it lands. A start holds
+  // its memory from its first command to its last, so a prompt that would
+  // join with the rows that spare it a command and then wait out another's
+  // prompt stays queued until it leads. One that leads next starts beside
+  // no Spill lane, as two Spill lanes prefill together only as the later one
+  // leads or one is overdue: beside the last command of a Spill lane, one
+  // between its passes too, it stays queued. A restoring start holds back a
   // candidate it leads once it lands: past the candidate's first command,
   // which this tick plans without it, or as the candidate stands while a
   // command is between its passes, as it may land before the first command
@@ -395,11 +393,10 @@ LaneShape Scheduler::shapeOf(uint64_t id, const PlanInputs &in) const {
 }
 
 Scheduler::Lane Scheduler::lane(const Request &request, uint32_t processed, const PlanInputs &in) const {
-  const uint32_t remaining = request.spec.prefillTokens - processed;
   return {.request = &request,
           .processed = processed,
           .shape = shapeOf(request.spec.id, in),
-          .overdue = request.overdue || request.waitedRows >= kAgingSlowdown * remaining};
+          .overdue = request.overtaken >= kMaximumOvertakes};
 }
 
 std::vector<model::PrefillLane> Scheduler::prefillLanes(std::span<const BatchItem> items,
@@ -625,23 +622,25 @@ void Scheduler::commit(const BatchPlan &plan, const PlanInputs &in) {
       counters_.boundCuts += lastPlanned_->boundCuts;
       counters_.indexPageConflicts += lastPlanned_->indexPageConflicts;
     }
-    // The lanes of its priority submitted before a lane it serves, which wait
-    // without rows, count its rows as waited; those now overdue stay so to
-    // their prompt's end.
-    uint64_t youngestServed = 0, rows = 0;
-    for (const BatchItem &item : plan.items) {
+    // A command, its passes one, serves its lanes, joiners too: each starts
+    // its count again. It overtakes the other requests of its priority
+    // submitted before a lane it serves, with a lane or waiting for one: one
+    // overtaken kMaximumOvertakes times in a row is overdue until a command
+    // serves it. Lanes the command is planned without are blocked, not
+    // passed over.
+    uint64_t youngestServed = 0;
+    for (const BatchItem &item : plan.items)
       youngestServed = std::max(youngestServed, get(item.requestId).order);
-      rows += item.tokenCount;
+    for (auto &[id, request] : requests_) {
+      if (request.spec.priority != priority || request.suspended || listed(in.excluded, id) ||
+          (request.phase != Phase::Queued && request.phase != Phase::WaitingResources &&
+           request.phase != Phase::WaitingPrefix && request.phase != Phase::Prefill))
+        continue;
+      if (holds(plan.items, id))
+        request.overtaken = 0;
+      else if (request.order < youngestServed && request.overtaken < kMaximumOvertakes)
+        ++request.overtaken;
     }
-    for (auto &[id, request] : requests_)
-      if (request.spec.priority == priority && request.order < youngestServed && !request.suspended &&
-          (request.phase == Phase::Queued || request.phase == Phase::WaitingResources ||
-           request.phase == Phase::WaitingPrefix || request.phase == Phase::Prefill) &&
-          !listed(in.excluded, id) && !holds(plan.items, id))
-        request.waitedRows += rows;
-    for (const Lane &view : readyLanes(in))
-      if (view.overdue)
-        get(view.request->spec.id).overdue = true;
   } else if (!prefill) {
     const uint64_t dispatchOrder = ++decodeDispatchOrder_;
     for (const BatchItem &item : plan.items)
@@ -764,8 +763,7 @@ void Scheduler::abandoned() {
 }
 
 void Scheduler::promptCompleted(Request &request) noexcept {
-  request.waitedRows = 0;
-  request.overdue = false;
+  request.overtaken = 0;
 }
 
 void Scheduler::dropStaleDecodeDebt() noexcept {

@@ -2162,9 +2162,8 @@ void testARefusedStartHoldsOnlyWhatItLeads() {
           "the held request lost work or started ahead of the refused one");
 }
 
-// Younger, shorter prompts that lead a refused start overtake it by at most the aging bound: once the commands that
-// served them ran maximumBatchWidth - 1 times its remaining rows, one prompt past that at most, it leads them and
-// holds them back until it starts.
+// Younger, shorter prompts that lead a refused start overtake it by at most the aging bound: once
+// maximumBatchWidth - 1 commands in a row served them and not it, it leads them and holds them back until it starts.
 void testAgingBoundsHowFarShorterArrivalsPassARefusedStart() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
@@ -2192,11 +2191,11 @@ void testAgingBoundsHowFarShorterArrivalsPassARefusedStart() {
     static_cast<void>(engine.tick(now++));
   }
   const auto overtaken = static_cast<uint32_t>(std::ranges::count_if(events.startIds, [](uint64_t id) { return id >= 100; }));
-  const uint32_t bound = (model::ExecutionLimits::maximumBatchWidth - 1) * kRefusedRows + kShortRows;
-  require(overtaken != 0 && overtaken * kShortRows <= bound && !executor.requests.contains(latest) &&
+  const uint32_t bound = model::ExecutionLimits::maximumBatchWidth - 1;
+  require(overtaken != 0 && overtaken <= bound && !executor.requests.contains(latest) &&
               engine.resourceWaitSnapshot(now).heldBehindRefusal == 1,
-          "shorter prompts overtook the refused start by " + std::to_string(overtaken * kShortRows) +
-              " rows, not within the aging bound of " + std::to_string(bound));
+          "shorter prompts overtook the refused start " + std::to_string(overtaken) +
+              " times, not within the aging bound of " + std::to_string(bound));
   refused = false;
   now += 100;
   tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");

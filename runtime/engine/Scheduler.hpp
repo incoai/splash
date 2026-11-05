@@ -121,11 +121,12 @@ struct SchedulerSnapshot final {
 
 // One single-owner scheduling policy.
 //
-// Prefill takes the ready lanes of the most urgent priority. Within it a lane
-// that has waited behind later arrivals of its priority for kAgingSlowdown
-// times its own remaining rows is overdue and leads, to its prompt's end;
-// otherwise the lane of the fewest remaining rows leads, ties in submission
-// order. A group command, whose
+// Prefill takes the ready lanes of the most urgent priority. Within it a
+// request that kMaximumOvertakes prefill commands in a row served later
+// arrivals of its priority and not it, with a lane or waiting for one, is
+// overdue and leads, the oldest first, until a command serves it; otherwise
+// the lane of the fewest remaining rows leads, ties in submission order. A
+// group command, whose
 // target streams experts or whose leader has or may gain Index pages, holds
 // up to the model's command rows and runs in layer passes, contended or not:
 // as many as the last command's measured time at these rows and attention
@@ -160,11 +161,11 @@ public:
   void remove(uint64_t requestId);
 
   [[nodiscard]] std::vector<uint64_t> admissionOrder() const;
-  // The candidates their first command would serve and leave waiting for no
-  // other prompt: running them to their prompt's end, leading them now or,
-  // beside no Spill lane, next, or as they are overdue, beside the resident
-  // prefill lanes (those of the command between its passes past its rows),
-  // and led by none of the requests restoring in `in` once they land.
+  // The candidates their first command would serve, overdue or left waiting
+  // for no other prompt: running them to their prompt's end, leading them now
+  // or, beside no Spill lane, next, beside the resident prefill lanes (those
+  // of the command between its passes past its rows), and led by none of the
+  // requests restoring in `in` once they land.
   // Admission starts only those, planning again without the others until it
   // serves all it plans, with the candidates' shapes in `in`.
   [[nodiscard]] std::vector<uint64_t>
@@ -229,12 +230,10 @@ private:
     DecodeStage decodeStage = DecodeStage::Regular;
     uint64_t order = 0;
     uint64_t lastDecodeDispatch = 0;
-    // Until its prompt completes: the rows of the prefill commands of its
-    // priority that served later arrivals while it waited without rows, and
-    // whether they reached kAgingSlowdown times its remaining rows at a
-    // commit, after which it stays overdue.
-    uint64_t waitedRows = 0;
-    bool overdue = false;
+    // The prefill commands of its priority in a row that served later
+    // arrivals and not it, up to kMaximumOvertakes, at which it is overdue;
+    // none once a command serves it or its prompt completes.
+    uint32_t overtaken = 0;
     // The prompt position its committed rows reach in prefillRows, never
     // short of promptProcessed, which rows planned again after their command
     // was abandoned between its passes do not pass; a resume's replay counts

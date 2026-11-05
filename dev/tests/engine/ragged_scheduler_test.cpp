@@ -34,6 +34,9 @@ using test::require;
 
 constexpr uint32_t kChunk = model::ExecutionLimits::prefillTokenBudget;
 constexpr uint32_t kPageTokens = SPLASH_TARGET_KV_BLOCK_TOKENS;
+// The prefill commands in a row that may serve later arrivals of a request's
+// priority and not it before it is overdue (Scheduler.cpp).
+constexpr uint32_t kOvertakes = model::ExecutionLimits::maximumBatchWidth - 1;
 constexpr double kGap = 500.0;
 
 model::CommandLimits limits(uint32_t commandRows = kChunk, uint32_t passes = 1, uint32_t indexPageLanes = 1,
@@ -1243,10 +1246,12 @@ void testFewestRemainingRowsLead() {
   require(sim.plan().items[0].requestId == 3, "the fewest remaining rows did not lead");
 }
 
-// Two near-equal long Spill prompts never interleave: the one that starts (the
-// shorter, or the older if it started alone) prefills to its end, its last
-// command's passes included, before the other is admitted.
-void testNearEqualLongPromptsDoNotInterleave() {
+// Of two near-equal long Spill prompts, the older, started alone, prefills to
+// its end, its last command's passes included, before the younger is
+// admitted: the younger is never overtaken. The shorter starts when both
+// wait, the younger here; the older then waits K of its commands, starts
+// overdue, and from then on no more than K commands in a row pass over it.
+void testNearEqualLongPromptsAgeByCommands() {
   Sim alone(test::kM6FlashNextQ2, limits(8192, 48));
   alone.lane(1, 0, 71'254);
   alone.shapes.push_back({.requestId = 1, .spill = true});
@@ -1272,13 +1277,33 @@ void testNearEqualLongPromptsDoNotInterleave() {
   sim.scheduler.resourcesReady(2, 0);
   sim.shapes.push_back({.requestId = 2, .spill = true});
   const std::array older{PrefillAdmission{1, 0}};
-  while (sim.scheduler.phase(2) == Phase::Prefill) {
-    require(sim.scheduler.prefillAdmissionOrder(older, sim.in()).empty(),
-            "the older prompt was admitted while the younger prefilled");
-    sim.step();
+  uint32_t commands = 0;
+  while (sim.scheduler.prefillAdmissionOrder(older, sim.in()).empty()) {
+    require(commands < kOvertakes, "the older prompt was not admitted after K commands of the younger");
+    const BatchPlan plan = sim.plan();
+    commands += !plan.pass;
+    sim.run(plan);
   }
-  require(sim.scheduler.prefillAdmissionOrder(older, sim.in()) == std::vector<uint64_t>{1},
-          "the older prompt did not start once the younger's prompt ended");
+  require(commands == kOvertakes, "the older prompt was admitted after " + std::to_string(commands) +
+                                      " commands of the younger, not K");
+  sim.scheduler.resourcesReady(1, 0);
+  sim.shapes.push_back({.requestId = 1, .spill = true});
+  while (sim.passes)
+    sim.step();
+  require(sim.plan().items[0].requestId == 1, "the overdue older prompt did not lead the next command");
+  uint32_t passedOver = 0, led = 0;
+  while (sim.scheduler.phase(1) == Phase::Prefill) {
+    const BatchPlan plan = sim.plan();
+    if (plan.kind == WorkKind::Prefill && !plan.pass) {
+      const bool served = std::ranges::count(plan.items, 1u, &BatchItem::requestId) != 0;
+      passedOver = served ? 0 : passedOver + 1;
+      led += plan.items[0].requestId == 1;
+      require(passedOver <= kOvertakes, "more than K commands in a row passed over the older prompt");
+    }
+    sim.run(plan);
+  }
+  require(led > 1 && sim.scheduler.phase(2) != Phase::Prefill,
+          "the two prompts did not share the commands until the younger's prompt ended");
 }
 
 // A queued prompt starts only when the next command serves it and leaves it
@@ -1360,9 +1385,9 @@ void testARestoringStartHoldsBackWhatItWouldLead() {
   require(!starts(pair, 56'644, 1000, 57'664), "the second of the near-equal pair started beside the first's restore");
 }
 
-// A long lane under a stream of short arrivals of its priority waits at
-// most K = 3 times its own remaining rows behind them, then leads to its
-// end: its first token within (1 + K) times its own time plus a unit.
+// A long lane under a stream of short arrivals of its priority waits behind
+// at most K = 3 commands that serve them, then leads one: its prompt ends
+// within (1 + K) times its own time plus a unit.
 void testAgingBoundsALongLaneUnderArrivals() {
   DenseSim sim;
   sim.lane(1, 0, 6 * kChunk);
@@ -1387,6 +1412,36 @@ void testAgingBoundsALongLaneUnderArrivals() {
   require(sim.scheduler.phase(1) != Phase::Prefill && sim.now <= 4.0 * cost + longest,
           "the long lane's prompt ended after " + std::to_string(sim.now) + " ms, past (1 + K) of its " +
               std::to_string(cost) + " ms");
+}
+
+// A prompt waiting for a lane is overtaken as a lane is: after K commands
+// that end later arrivals' short prompts, a few hundred rows each, the 30K
+// prompt, whose rows past its whole chunks do not fit beside them, is overdue
+// and starts, ahead of the next short arrival, and leads the next command;
+// served, it counts again, and the short arrival leads.
+void testAWaitingPromptIsOverdueAfterKOvertakes() {
+  DenseSim sim;
+  sim.scheduler.submit(request(1, 14 * kChunk + 1900));
+  const std::array waiting{PrefillAdmission{1, 0}};
+  for (uint64_t id = 10; id < 10 + kOvertakes; ++id) {
+    sim.lane(id, 0, 300);
+    require(sim.scheduler.prefillAdmissionOrder(waiting, sim.in()).empty(),
+            "the waiting prompt started after " + std::to_string(id - 10) + " commands of later arrivals");
+    sim.step();
+    require(sim.scheduler.phase(id) == Phase::Decode, "a short arrival did not end its prompt in one command");
+    sim.scheduler.cancel(id);
+    sim.scheduler.remove(id);
+  }
+  sim.scheduler.submit(request(20, 300));
+  const std::array both{PrefillAdmission{1, 0}, PrefillAdmission{20, 0}};
+  require(sim.scheduler.prefillAdmissionOrder(both, sim.in()).front() == 1,
+          "the waiting prompt did not start ahead of a short arrival after K overtakes");
+  sim.scheduler.resourcesReady(1, 0);
+  sim.scheduler.resourcesReady(20, 0);
+  const BatchPlan first = sim.plan();
+  require(first.items == std::vector<BatchItem>{{1, kChunk, 0}}, "the overdue prompt did not lead the next command");
+  sim.run(first);
+  require(sim.plan().items[0].requestId == 20, "served, the prompt stayed overdue");
 }
 
 // Equal prompts are served oldest first, the oldest leading to its prompt's
@@ -1712,10 +1767,11 @@ constexpr test::TestCase kTests[] = {
     {"testTwoSpillLanesNeverShareAMultiPassCommand", testTwoSpillLanesNeverShareAMultiPassCommand},
     {"testTheCountersAreThoseOfThePlanCommitted", testTheCountersAreThoseOfThePlanCommitted},
     {"testFewestRemainingRowsLead", testFewestRemainingRowsLead},
-    {"testNearEqualLongPromptsDoNotInterleave", testNearEqualLongPromptsDoNotInterleave},
+    {"testNearEqualLongPromptsAgeByCommands", testNearEqualLongPromptsAgeByCommands},
     {"testALongPromptStartsOnlyToLead", testALongPromptStartsOnlyToLead},
     {"testARestoringStartHoldsBackWhatItWouldLead", testARestoringStartHoldsBackWhatItWouldLead},
     {"testAgingBoundsALongLaneUnderArrivals", testAgingBoundsALongLaneUnderArrivals},
+    {"testAWaitingPromptIsOverdueAfterKOvertakes", testAWaitingPromptIsOverdueAfterKOvertakes},
     {"testEqualPromptsFinishInArrivalOrder", testEqualPromptsFinishInArrivalOrder},
     {"testShortArrivalPrecedesLongColdPrompt", testShortArrivalPrecedesLongColdPrompt},
     {"testHigherTierCommandsDoNotAgeALowerTier", testHigherTierCommandsDoNotAgeALowerTier},
