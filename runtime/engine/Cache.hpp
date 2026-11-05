@@ -759,8 +759,8 @@ public:
   // the blocks of the chain a start reuses and the staged state's
   // (KvCache::reachVisits), the states the walk keeps and those of its order
   // up to the staged one (StateCache::reclaimVisits), and the pages of the
-  // running requests' windows (trimmableCount, passedPages); never the
-  // cache.
+  // running requests' windows (trimmableCount, passedKeptPages, which the
+  // trims read too); never the cache.
   [[nodiscard]] uint64_t reachVisits() const noexcept {
     return kv_.reachVisits() + states_.reclaimVisits() + windowVisits_;
   }
@@ -1438,10 +1438,13 @@ private:
   // last, a cost the running requests bound, not the cache.
   [[nodiscard]] std::vector<uint32_t> trimmablePages(size_t most) const;
   [[nodiscard]] uint32_t trimmableCount() const;
+  // The pages requests keep beside their blocks that are Full and every
+  // window has passed, each once, sorted: those trimWindows moves of them.
+  [[nodiscard]] std::vector<uint32_t> passedKeptPages() const;
   // The Full pages trimWindows(false) moves to the Slim form as many free
-  // Slim pages allow: those every window has passed (trimmableCount) and
-  // the pages requests keep beside their blocks that it has passed, each
-  // once.
+  // Slim pages allow: those every window has passed (trimmableCount, which
+  // checkInvariants checks against trimmablePages) and the kept ones
+  // (passedKeptPages).
   [[nodiscard]] uint32_t passedPages() const;
   // A page need of Full pages in a windowed cache that trims: trims free
   // pages in place for it, the passed pages first (its Trim unit, peek: as
@@ -1489,7 +1492,7 @@ private:
   // The window snapshot's counts.
   uint64_t trimmedPages_ = 0;
   uint64_t refusedStates_ = 0;
-  // The requests' pages trimmableCount and passedPages looked at.
+  // The requests' pages trimmableCount and passedKeptPages looked at.
   mutable uint64_t windowVisits_ = 0;
   double extentCompactMaxMilliseconds_ = 0.0;
   std::function<void()> completionNotifier_;

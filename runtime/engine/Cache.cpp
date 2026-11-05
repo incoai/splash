@@ -2086,7 +2086,7 @@ uint32_t Cache::trimmableCount() const {
   return kv_.trimCandidates() - static_cast<uint32_t>(read.size());
 }
 
-uint32_t Cache::passedPages() const {
+std::vector<uint32_t> Cache::passedKeptPages() const {
   std::vector<uint32_t> kept;
   for (const auto &[_, active] : requests_)
     for (const uint32_t index : active.privatePages) {
@@ -2095,8 +2095,12 @@ uint32_t Cache::passedPages() const {
         kept.push_back(active.pages[index]);
     }
   std::ranges::sort(kept);
-  const auto repeated = std::ranges::unique(kept);
-  return trimmableCount() + static_cast<uint32_t>(repeated.begin() - kept.begin());
+  kept.erase(std::ranges::unique(kept).begin(), kept.end());
+  return kept;
+}
+
+uint32_t Cache::passedPages() const {
+  return trimmableCount() + static_cast<uint32_t>(passedKeptPages().size());
 }
 
 uint32_t Cache::trimWindows(bool allocate) {
@@ -2107,18 +2111,13 @@ uint32_t Cache::trimWindows(bool allocate) {
       trimmablePages(allocate ? std::numeric_limits<size_t>::max() : pool_.freePageCount(kv::PageForm::Slim));
   // So do the pages requests keep beside their blocks, once each: a
   // writer's own, or one a block left for a writer's, which every request
-  // that held it keeps.
-  std::vector<uint32_t> kept;
-  for (auto &[_, active] : requests_) {
+  // that held it keeps (passedKeptPages). One no longer Full leaves the
+  // request's list.
+  for (auto &[_, active] : requests_)
     std::erase_if(active.privatePages,
                   [&](uint32_t index) { return pool_.form(active.pages[index]) != kv::PageForm::Full; });
-    for (const uint32_t index : active.privatePages)
-      if (windowsPassed(active.pages[index], index))
-        kept.push_back(active.pages[index]);
-  }
-  std::ranges::sort(kept);
-  const auto repeated = std::ranges::unique(kept);
-  pages.insert(pages.end(), kept.begin(), repeated.begin());
+  const std::vector<uint32_t> kept = passedKeptPages();
+  pages.insert(pages.end(), kept.begin(), kept.end());
   // Free Slim pages first, the runway's among them; with `allocate` the
   // rest asks for extents of the form, an extent's pages at a time, and a
   // refusal leaves the rest Full: a claim the host exempts for one
@@ -2260,6 +2259,11 @@ void Cache::checkInvariants() const {
   if (spill_)
     check(committed * tier_->slotBytes() == diskBudget_->committedBytes(),
           "the commitments are the requests'");
+  // The trim count, which the window reads bound, counts the pages the
+  // trims take.
+  if (window_)
+    check(trimmableCount() == trimmablePages(std::numeric_limits<size_t>::max()).size(),
+          "the trim count is that of the pages every window has passed");
   for (const Write &write : writes_)
     check(kv_.transfer(write.block) == KvCache::Transfer::Draining, "a page being written is Draining");
   for (const auto &[block, _] : restores_)
