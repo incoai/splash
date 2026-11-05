@@ -1717,6 +1717,8 @@ def _native_command(args, model_root, relaunch_context=None):
         command.extend(("--ane", "off"))
     if args.verify_rows != "auto":
         command.extend(("--verify-rows", args.verify_rows))
+    if args.verify_attention_pages is not None:
+        command.extend(("--verify-attention-pages", str(args.verify_attention_pages)))
     if args.decode_share is not None:
         command.extend(("--decode-share", str(args.decode_share)))
     if args.max_image_pixels != image_input.MAX_PIXELS:

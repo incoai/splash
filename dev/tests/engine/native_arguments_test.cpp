@@ -156,6 +156,7 @@ void testServerCommandLines(const char *path) {
       {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
       // Auto is the engine's default, which the server leaves out.
       {"verify_rows_auto", [](NativeArguments &) {}},
+      {"verify_attention_pages", [](NativeArguments &read) { read.verifyAttentionPages = 2; }},
       // A relaunch keeps the first engine's context; with --max-context,
       // which every start holds, its command is the first one's.
       {"relaunch", [](NativeArguments &read) { read.relaunchContext = 61433; }},
@@ -203,7 +204,7 @@ void testServerCommandLines(const char *path) {
            read.neuralEngine == meant.neuralEngine && read.pleMemory == meant.pleMemory &&
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
            read.kvSpillAlways == meant.kvSpillAlways && read.kvWindowTrim == meant.kvWindowTrim &&
-           read.verifyRows == meant.verifyRows;
+           read.verifyRows == meant.verifyRows && read.verifyAttentionPages == meant.verifyAttentionPages;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -260,6 +261,15 @@ void testWindowTrim() {
           "--kv-window-trim did not reach the arguments as given");
 }
 
+// --verify-attention-pages is off (0) unless the server passes a page count.
+void testVerifyAttentionPages() {
+  const ModelDirectory model;
+  require(parse(model, {"auto", "auto"}).verifyAttentionPages == 0 &&
+              parse(model, {"auto", "auto", "--verify-attention-pages", "2"}).verifyAttentionPages == 2 &&
+              parse(model, {"auto", "auto", "--verify-attention-pages", "16"}).verifyAttentionPages == 16,
+          "--verify-attention-pages did not reach the arguments as given");
+}
+
 // A command line the server never writes is refused with what is wrong.
 void testRefusals() {
   const ModelDirectory model;
@@ -302,6 +312,8 @@ void testRefusals() {
     refuses({"auto", "auto", "--kv-spill", spill}, "--kv-spill requires always");
   for (const char *trim : {"never", "auto", ""})
     refuses({"auto", "auto", "--kv-window-trim", trim}, "--kv-window-trim requires on or off");
+  for (const char *pages : {"0", "17", "off", ""})
+    refuses({"auto", "auto", "--verify-attention-pages", pages}, "--verify-attention-pages requires a page count from 1 to 16");
   refuses({"auto", "auto", "--persistent-cache", "yes"}, "--persistent-cache requires on or off");
   refuses({"auto", "auto", "0", "--persistent-cache", "on"},
           "--persistent-cache requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
@@ -386,6 +398,7 @@ int main(int argc, char **argv) {
     testVerifyRows();
     testStreamedMemoryAndSpill();
     testWindowTrim();
+    testVerifyAttentionPages();
     testRefusals();
     std::cout << "native arguments tests passed\n";
     return EXIT_SUCCESS;

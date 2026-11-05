@@ -58,7 +58,10 @@ static_assert(kVerifySplits <= kVerifyMaximumSplits);
 // than kVerifySplits and never more than the maximum the partial workspace
 // is sized for, nor, with a window of windowTokens keys before each row,
 // than the pages the window reads (a split each). It depends only on the
-// lane's own history, so batching never changes a lane's arithmetic; a
+// lane's own history, so batching never changes a lane's arithmetic; the
+// balanced partition of those splits still follows the block's length, so a
+// row's pages per split follow where its block starts unless the plan fixes
+// them (PagedAttention::verifyPlan's pagesPerSplit); a
 // sparse lane's splits likewise follow its own block list alone
 // (kernels/common/sparse_attention_tile.h).
 [[nodiscard]] constexpr uint32_t
@@ -180,6 +183,10 @@ struct VerifyAttentionPlan final {
   // Whether the reduce adds the layer's learned sinks, which addVerify then
   // takes (PagedVerifyBuffers::sinks): its geometry's (kCompiledAttention).
   const bool sinks;
+  // Each lane's pages per split at absolute page boundaries
+  // (SplashVerifyAttentionParams::pages_per_split), 0 for the balanced
+  // partition.
+  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> lanePagesPerSplit{};
 
 private:
   friend class PagedAttention;
@@ -257,10 +264,14 @@ public:
   [[nodiscard]] static PrefillAttentionPlan
   prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout, AttentionVariant variant = {});
   // historyTokens holds each lane's committed tokens before its verify rows,
-  // one entry per lane.
+  // one entry per lane. pagesPerSplit (1-16; 0, the default, for the
+  // balanced partition) puts that many pages in each split at absolute page
+  // boundaries for dense windowless lanes up to 4096 pagesPerSplit tokens
+  // (splash serve --verify-attention-pages).
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-             std::span<const uint32_t> historyTokens, AttentionVariant variant = {});
+             std::span<const uint32_t> historyTokens, AttentionVariant variant = {},
+             uint32_t pagesPerSplit = 0);
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences

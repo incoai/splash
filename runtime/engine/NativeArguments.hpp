@@ -79,6 +79,9 @@ struct NativeArguments final {
   // --verify-rows auto|all: the rows of the draft's block a decode
   // cycle verifies (RuntimeResourcesConfig::verifyRows).
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --verify-attention-pages 1-16: a verify split's pages at absolute page
+  // boundaries (ops::ExecutionOptions::verifyAttentionPages); 0, the default, balances them.
+  uint32_t verifyAttentionPages = 0;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

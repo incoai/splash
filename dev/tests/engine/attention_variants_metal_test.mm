@@ -517,7 +517,7 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format) {
     std::memset(staging.output.contents(), 0xff, staging.output.sizeBytes());
     std::array<kv::VerifyAttentionParams, 4> params{};
     for (uint32_t lane = 0; lane < 3; ++lane)
-      params[lane] = {histories[lane], uint32_t(data.pages[lane].size()), data.layer, splits, splits, 0, 0};
+      params[lane] = {histories[lane], uint32_t(data.pages[lane].size()), data.layer, splits, splits, 0, 0, 0};
     metal::CommandGraph graph;
     graph.add(plan.splitPipeline,
               {staging.queries, partials, statistics, data.tables[0], data.tables[1], data.tables[2], data.tables[3]},
@@ -798,10 +798,65 @@ void checkGather(metal::MetalBackend &backend) {
 
 } // namespace
 
+// The verify output of absolute positions [h2, h1 + 8) computed in a block starting at h1 and again in one starting at
+// h2, every key, value and query a function of its absolute position (the history's BF16 bits are the staged rows'),
+// with `pagesPerSplit` pages per split (PagedAttention::verifyPlan; 0 for the balanced partition). Returns the outputs
+// that differ bit for bit, of `compared`.
+uint64_t verifyBlockStartDifferences(metal::MetalBackend &backend, uint32_t h1, uint32_t h2, uint32_t pagesPerSplit,
+                                     uint64_t &compared) {
+  std::array<std::vector<uint16_t>, 2> rows;
+  for (int which = 0; which < 2; ++which) {
+    const uint32_t h = which ? h2 : h1;
+    Case data = makeCase(backend, kv::Format::BFloat16, kWhole, 1, kv::kVerifyRows, {h, 0, 0, 0});
+    for (uint32_t token = 0; token < h; ++token)
+      for (uint32_t head = 0; head < kKvHeads; ++head)
+        for (uint32_t d = 0; d < kHeadDimension; ++d) {
+          const uint32_t id = data.page(0, token), place = token % kPageTokens;
+          data.pool.slab<uint16_t>(kLayer, SPLASH_KV_KEYS, id)[splash_kv_key_element(head, place, d, kHeadDimension)] =
+              floatToBf16(chunkKey(0, head, token, d));
+          data.pool.slab<uint16_t>(kLayer, SPLASH_KV_VALUES, id)[data.pool.valueElement(head, place, d)] =
+              floatToBf16(chunkValue(0, head, token, d));
+        }
+    const Staging staging = stage(backend, data, h, kv::kVerifyRows, kv::kVerifyChunkStride);
+    const auto plan =
+        ops::PagedAttention::verifyPlan(1, kQueryHeads, data.layout, std::array<uint32_t, 1>{h}, kWhole, pagesPerSplit);
+    const uint32_t pages = (h + kv::kVerifyRows + kv::kPageTokens - 1) / kv::kPageTokens;
+    require(plan.lanePagesPerSplit[0] == pagesPerSplit &&
+                plan.laneSplits[0] ==
+                    (pagesPerSplit ? (pages + pagesPerSplit - 1) / pagesPerSplit : kv::verifyAttentionSplits(h)),
+            "a verify lane's splits do not hold the pages per split it was given");
+    const metal::MetalBuffer partials = poisoned(backend, plan.workspace.partialsBytes);
+    const metal::MetalBuffer statistics = poisoned(backend, plan.workspace.statisticsBytes);
+    const metal::CommandGraph graph = encode(data, staging, plan, partials, statistics);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    for (uint32_t position = h2; position < h1 + kv::kVerifyRows; ++position)
+      for (uint32_t head = 0; head < kQueryHeads; ++head)
+        for (uint32_t d = 0; d < kHeadDimension; ++d)
+          rows[which].push_back(contents<uint16_t>(staging.output)[staging.queryIndex(0, head, position - h, d)]);
+  }
+  compared = rows[0].size();
+  uint64_t differ = 0;
+  for (size_t i = 0; i < rows[0].size(); ++i) differ += rows[0][i] != rows[1][i];
+  return differ;
+}
+
 int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: attention-variants METALLIB");
     metal::MetalBackend backend(argv[1]);
+    // Pairs of block starts whose visible pages straddle 1024 (32 to 33 pages), 2048 and 3072 tokens, and a pair
+    // within one page count. With pages per split fixed, a row's output does not depend on where its block starts;
+    // the balanced partition's are reported (they differ where the pair straddles a multiple of 32 pages).
+    for (const uint32_t pagesPerSplit : {0U, 1U, 2U, 4U}) {
+      for (const auto &[h1, h2] : std::vector<std::pair<uint32_t, uint32_t>>{
+               {1015, 1018}, {1012, 1017}, {2039, 2043}, {3063, 3066}, {600, 603}}) {
+        uint64_t compared = 0;
+        const uint64_t differ = verifyBlockStartDifferences(backend, h1, h2, pagesPerSplit, compared);
+        std::cout << "verify block starts " << h1 << " vs " << h2 << ", pages per split " << pagesPerSplit << ": "
+                  << differ << " of " << compared << " outputs differ\n";
+        require(!pagesPerSplit || differ == 0, "a verify row's output depends on where its block starts");
+      }
+    }
     checkPlans(backend);
     checkRopeTables(backend);
     for (const bool rotated : {true, false})

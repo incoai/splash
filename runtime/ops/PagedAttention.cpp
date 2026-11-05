@@ -7,12 +7,35 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 namespace splash::ops {
 
 namespace {
+
+// A lane's pages per split (0: the balanced partition) and split count. The
+// balanced partition gives a verify row ceil(pages / split_count) pages per
+// split, pages counted from its 8-row block's visible length, so the same
+// row sums its history in another order (1 page per split below 1024
+// visible tokens, 2 above, ...) depending on where its block starts, which
+// the draft decides. With g pages per split (splash serve
+// --verify-attention-pages), splits hold g pages at absolute page
+// boundaries; the pages and splits a row cannot see are masked and add exact
+// zeros, so a row's sums depend on its position alone. A lane takes g while
+// ceil(pages / g) splits fit the slot workspace (kVerifyMaximumSplits: 4096 g
+// tokens), and never with a window or block lists, whose partitions are their
+// own; past that it keeps the balanced partition.
+std::pair<uint32_t, uint32_t> laneVerifySplits(uint32_t committedTokens, uint32_t windowTokens, bool sparse,
+                                               uint32_t g) {
+  const uint32_t base = kv::verifyAttentionSplits(committedTokens, windowTokens);
+  if (!g || windowTokens || sparse) return {0u, base};
+  const uint64_t pages = (uint64_t{committedTokens} + kv::kVerifyRows + kv::kPageTokens - 1) / kv::kPageTokens;
+  const uint64_t splits = (pages + g - 1) / g;
+  if (splits > kv::kVerifyMaximumSplits) return {0u, base};
+  return {g, static_cast<uint32_t>(splits)};
+}
 
 // The parts a dense tile of a layout's GQA group runs in, each a threadgroup
 // of the split (SPLASH_ATTENTION_TILE_PARTS); a sparse tile is one.
@@ -263,23 +286,26 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
 
 VerifyAttentionPlan PagedAttention::verifyPlan(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens, AttentionVariant variant) {
+    std::span<const uint32_t> historyTokens, AttentionVariant variant, uint32_t pagesPerSplit) {
   const CompiledAttention &kernel = compiledAttention(queryHeads, layout, variant);
+  if (pagesPerSplit > 16)
+    throw std::invalid_argument("verify attention pages per split exceed 16");
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid attention workspace batch width");
   if (historyTokens.size() != lanes)
     throw std::invalid_argument("invalid verify attention history vector");
-  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits{};
+  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits{}, lanePages{};
   uint32_t splits = 0;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (uint64_t{historyTokens[lane]} + kv::kVerifyRows >
         kv::kMaximumPhysicalTokens)
       throw std::invalid_argument(
           "verify attention history exceeds physical context");
-    laneSplits[lane] = kv::verifyAttentionSplits(historyTokens[lane], variant.windowTokens);
+    std::tie(lanePages[lane], laneSplits[lane]) =
+        laneVerifySplits(historyTokens[lane], variant.windowTokens, layout.valuesTokenMajor, pagesPerSplit);
     splits = std::max(splits, laneSplits[lane]);
   }
-  return {lanes, laneSplits, splits,
+  VerifyAttentionPlan plan{lanes, laneSplits, splits,
           verifyWorkspaceBound(lanes, queryHeads, layout),
           kernelName("verify", kernelFormat(layout) + (kernel.valuesTokenMajor ? "_sparse" : "_split"),
                      splitSuffix(kernel, variant)),
@@ -298,6 +324,8 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
           kernelName("verify", kernelFormat(layout) + "_store", storeSuffix(layout)),
           {uint64_t{lanes} * 2 * kv::kVerifyRows * layout.kvHeads, 1, 1},
           {layout.headDimension, 1, 1}, layout, queryHeads};
+  plan.lanePagesPerSplit = lanePages;
+  return plan;
 }
 
 AttentionWorkspace PagedAttention::prefillWorkspace(
@@ -544,7 +572,7 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
     stores[lane].kv = layer;
     attention[lane] = {chunk.committed_tokens, chunk.page_table_entries, layer,
                        plan.laneSplits[lane], plan.splits, blocks.stride,
-                       blocks.list + lane};
+                       blocks.list + lane, plan.lanePagesPerSplit[lane]};
   }
   const auto &tables = buffers.pageTables;
   graph.add(std::string(plan.storePipeline_),
