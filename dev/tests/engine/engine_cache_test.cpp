@@ -5290,6 +5290,41 @@ void testHeldDemotionReturnsNoPage() {
   require(fixture.cache.pollTransfers() && fixture.pool.freePageCount() == 2, "the demotion did not free its page");
 }
 
+// A claim that cannot wait counts no landing page: the dead leaf it evicts under a block being
+// demoted gives it a free page now, though the demotion then frees its page as it lands.
+void testImmediateEvictionCountsNoLandingPage() {
+  test::TestKvTier tier;
+  CacheFixture fixture(&tier);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false);
+  require(reclaimStateBytes(fixture.cache) == 100 && fixture.cache.pollTransfers() &&
+              test::evictStep(fixture.cache).gave() && tier.demotions == 1,
+          "the leaf's demotion did not start");
+  constexpr auto full = static_cast<size_t>(kv::PageForm::Full);
+  constexpr uint32_t extended = 5 * KvCache::pageTokens;
+  std::vector<uint32_t> longer = fixture.prompt;
+  longer.pop_back();
+  for (uint32_t row = 0; row <= KvCache::pageTokens; ++row)
+    longer.push_back(5000 + row);
+  fixture.storage.budgetPages = 5;
+  auto lookup = fixture.lookup(129);
+  fixture.cache.beginRequest(2);
+  require(admitRestore(fixture.cache, 2, lookup).granted() && admitTokens(fixture.cache, 2, extended).granted(),
+          "the request did not extend the chain being demoted");
+  lookup = {};
+  fixture.cache.publishCommittedBlocks(2, longer, extended, {});
+  fixture.cache.endRequest(2);
+  require(!fixture.cache.returning().landingPages[full], "the demotion under the dead leaf returned its page");
+  const ClaimSpec cannotWait{.cls = ClaimClass::InService, .timing = NeedTiming::Immediate};
+  const FreeResult freed = test::freeFromCache(fixture.cache, cannotWait, {.pages = 1});
+  require(freed.outcome == FreeOutcome::Met && freed.pages == 1 && fixture.pool.freePageCount() == 1 &&
+              fixture.cache.returning().landingPages[full] == 1,
+          "a claim that cannot wait was left waiting for the page of a demotion its eviction made a leaf");
+  tier.complete();
+  require(fixture.cache.pollTransfers() && fixture.pool.freePageCount() == 2, "the demotion did not free its page");
+}
+
 // What spilling returns splits into landing (in-flight writes that spill) and owed (copies not
 // started); per request.
 void testReturningSplitsLandingAndOwed() {
@@ -6319,6 +6354,7 @@ int main() {
     testFullShortfallsAtTheWallTakeDeadLeavesFirst();
     testRestoresReturnNothing();
     testHeldDemotionReturnsNoPage();
+    testImmediateEvictionCountsNoLandingPage();
     testReturningSplitsLandingAndOwed();
     testPeekHasNoSideEffects();
     testResumePointAndWantedChainsAreCertainReuse();

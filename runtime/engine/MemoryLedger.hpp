@@ -361,8 +361,9 @@ public:
                     std::function<Returning(std::span<const uint64_t> requestIds)> ofRequests);
   // The bytes the model's pool releases once `states` more state buffers
   // return to it, of the pool a start leaves with `afterStart`
-  // (Model::idleBufferBytes): a unit's buffers give a need of bytes what they
-  // add to it.
+  // (Model::idleBufferBytes): the pool as it stands, the buffers of a state
+  // taken already in it. A unit's buffers give a need of bytes what they
+  // add to what it released before the units taken for the claim.
   void setBufferBytes(std::function<uint64_t(uint32_t states, bool afterStart)> bytes);
   // The bytes of a KV page of each kv::PageForm (Cache::bytesPerPage), in
   // which the bytes waiting claims hold are held as pages (heldPages).
@@ -451,10 +452,10 @@ private:
   // memory that appears. A claim of no request never holds it (requests
   // first).
   [[nodiscard]] bool holdsGrowth() const noexcept;
-  // What `added` state buffers give a need of bytes as they leave the
-  // model's pool, beyond the `before` ones counted already (setBufferBytes).
-  [[nodiscard]] uint64_t bufferBytes(const VictimQuery &query, const Lacking &lack, uint32_t before,
-                                     uint32_t added) const;
+  // What the model's pool releases, for a need of bytes, once `states`
+  // more state buffers return to it (setBufferBytes): a run's buffers give
+  // what they add to what it released before the run.
+  [[nodiscard]] uint64_t pooledBytes(const VictimQuery &query, const Lacking &lack, uint32_t states) const;
   // The most the units the claim's rights take give it, counted in the
   // one order without taking any, up to the lack.
   [[nodiscard]] Run bound(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack) const;

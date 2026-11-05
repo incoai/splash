@@ -287,6 +287,9 @@ struct MemoryLedger::Run final {
   // Now and later, with the bytes its state buffers give once they leave
   // the model's pool.
   uint64_t bytes = 0;
+  // take: what the model's pool releases now beyond what it released
+  // before the run, of the buffers its states returned to it.
+  uint64_t pooled = 0;
   uint32_t pages = 0;
   uint32_t buffers = 0;
   bool covered = false;
@@ -405,24 +408,24 @@ private:
   const VictimQuery &query_;
 };
 
-uint64_t MemoryLedger::bufferBytes(const VictimQuery &query, const Lacking &lack, uint32_t before,
-                                   uint32_t added) const {
-  if (!lack.bytes || !added || !bufferBytes_)
+uint64_t MemoryLedger::pooledBytes(const VictimQuery &query, const Lacking &lack, uint32_t states) const {
+  if (!lack.bytes || !bufferBytes_)
     return 0;
-  const bool afterStart = query.need.afterStart;
-  return less(bufferBytes_(before + added, afterStart), bufferBytes_(before, afterStart));
+  return bufferBytes_(states, query.need.afterStart);
 }
 
 // The most the order gives a claim, counted without taking: the units
 // take() would take, in its order, each at what its source says it frees
 // at most (VictimSource::peek), counted up to the query's enough, and none
-// past the unit that covers the lack. A unit's state buffers count for a
-// need of bytes as what the model's pool releases of them beyond the units
-// counted before (setBufferBytes). A unit that meets none of the need, or
-// that lands later for an Immediate claim, is skipped.
+// past the unit that covers the lack. The state buffers of the units
+// counted give a need of bytes what the model's pool would release with
+// them beyond what it releases now (pooledBytes). A unit that meets none
+// of the need, or that lands later for an Immediate claim, is skipped.
 MemoryLedger::Run MemoryLedger::bound(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack) const {
   Order order(*this, query);
   Run run;
+  const uint64_t pooledBefore = pooledBytes(query, lack, 0);
+  uint64_t unitBytes = 0;
   for (;;) {
     Order::Head *best = nullptr;
     for (Order::Head &head : order.heads) {
@@ -444,10 +447,11 @@ MemoryLedger::Run MemoryLedger::bound(const ClaimSpec &spec, const VictimQuery &
     }
     if (!spec.takesUnits)
       break;
-    run.bytes = plus(run.bytes, plus(victim.bytes, bufferBytes(query, lack, run.buffers, victim.stateBuffers)));
+    unitBytes = plus(unitBytes, victim.bytes);
     if (victim.form == lack.form)
       run.pages += victim.pages;
     run.buffers += victim.stateBuffers;
+    run.bytes = less(plus(unitBytes, pooledBytes(query, lack, run.buffers)), pooledBefore);
     if (lack.covered(run.bytes, run.pages, run.buffers)) {
       run.covered = true;
       break;
@@ -465,12 +469,16 @@ MemoryLedger::Run MemoryLedger::bound(const ClaimSpec &spec, const VictimQuery &
 // cache's units that need a write once a unit is pending: it waits for the
 // transfer rather than take what costs work later. Every take frees
 // something of a finite cache or pool, or passes one of a source's
-// finitely many units, so the walk ends. A unit's state buffers count for
-// a need of bytes as in bound(). An Immediate claim passes over what lands
-// later.
+// finitely many units, so the walk ends. The state buffers of the units
+// taken give a need of bytes as in bound(), read from the model's pool once
+// their takes returned them to it, so that each counts once: what the pool
+// releases now beyond what it released before the run, an idle buffer a
+// take released being in what that take freed. An Immediate claim passes
+// over what lands later.
 MemoryLedger::Run MemoryLedger::take(const VictimQuery &query, const Lacking &lack) {
   Order order(*this, query);
   Run run{.freed = {.outcome = FreeOutcome::Met}};
+  const uint64_t pooledBefore = pooledBytes(query, lack, 0);
   // A pending unit holds back the stages after the cache's writes.
   Order::Stage ceiling = Order::Stage::InUse;
   while (!lack.none() && !lack.covered(run.bytes, run.pages, run.buffers)) {
@@ -509,12 +517,13 @@ MemoryLedger::Run MemoryLedger::take(const VictimQuery &query, const Lacking &la
       order.pass(*best);
       continue;
     }
-    const uint64_t buffers = bufferBytes(query, lack, run.buffers, taken.stateBuffers);
     if (taken.outcome == FreeOutcome::Pending)
       run.freed.outcome = FreeOutcome::Pending;
     run.freed.nowBytes = plus(run.freed.nowBytes, taken.nowBytes);
     run.freed.laterBytes = plus(run.freed.laterBytes, taken.laterBytes);
-    run.bytes = plus(run.bytes, plus(plus(taken.nowBytes, taken.laterBytes), buffers));
+    const uint64_t pooledNow = pooledBytes(query, lack, 0);
+    run.pooled = less(pooledNow, pooledBefore);
+    run.bytes = less(plus(plus(run.freed.nowBytes, run.freed.laterBytes), pooledNow), pooledBefore);
     run.pages += taken.pages;
     run.buffers += taken.stateBuffers;
     run.costly = run.costly || Order::stage(*best) > Order::Stage::NeedsWrite;
@@ -637,7 +646,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
       // the need in place, so a need of bytes beside an unheldStateBuffer is
       // met by their bytes.
       const bool metInPlace = need.stateBuffers && run->buffers >= need.stateBuffers;
-      if (bufferBytes(query, lack, 0, run->buffers) && !metInPlace)
+      if (run->pooled && !metInPlace)
         taken.nowBytes = plus(taken.nowBytes, takeUnsized(query));
       const bool alone = (lackingBytes && run->bytes >= lackingBytes) ||
                          (lackingPages && run->pages >= lackingPages) ||

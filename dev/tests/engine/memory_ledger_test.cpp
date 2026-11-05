@@ -771,22 +771,6 @@ void testUnitsKeyedByTheirPlaceAreTakenAsChosen() {
           "free() did not take the units of a source keyed by place at their places");
 }
 
-// A need of bytes counts the state buffers its units free as what the model's pool releases of them: the first
-// state's buffer the pool keeps gives nothing, the second's gives its bytes, so the two states and one unit meet a
-// need of two units.
-void testStateBuffersCountBeyondThoseThePoolKeeps() {
-  MemoryLedger ledger;
-  PlacedSource placed;
-  const Victim state{.stateBuffers = 1};
-  placed.units = {{1, state}, {2, state}, {3, unit(0, kGiB)}, {4, unit(0, kGiB)}};
-  ledger.addSource(placed);
-  ledger.setBufferBytes([](uint32_t buffers, bool) { return buffers > 1 ? uint64_t{buffers - 1} * kGiB : 0; });
-  const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
-  const FreeResult freed = ledger.free(claim, {.bytes = 2 * kGiB}, 0, false);
-  require(freed.outcome == FreeOutcome::Met && placed.taken == std::vector<uint64_t>{1, 2, 3},
-          "free() did not count the bytes of the state buffers the model's pool releases");
-}
-
 // The take table, row by row (one claim per row of the rules' table): what
 // each claimant may take.
 void testTakeRightsTable() {
@@ -1103,8 +1087,9 @@ void testLandingCountsBeforeVictimsInPart() {
   }
 }
 
-// A model's pool of state buffers: those idle go one at a time, at no cost,
-// as a unit sized only when taken (Model::releaseIdleBuffer).
+// A model's pool of state buffers: those idle beyond the `kept` ones a lane
+// starts from go one at a time, at no cost, as a unit sized only when taken
+// (Model::releaseIdleBuffer).
 class BufferPool final : public VictimSource {
 public:
   explicit BufferPool(uint64_t bufferBytes) : bufferBytes_(bufferBytes) {}
@@ -1113,12 +1098,17 @@ public:
     return after ? std::nullopt : std::optional<Victim>(Victim{.sized = false});
   }
   FreeResult take(const VictimQuery &, const Victim &) override {
-    if (!idle)
+    if (idle <= kept)
       return {};
     --idle;
     return {FreeOutcome::Met, bufferBytes_};
   }
+  // What it releases once `more` buffers return to it (Model::idleBufferBytes).
+  [[nodiscard]] uint64_t releases(uint32_t more) const noexcept {
+    return uint64_t{idle + more - std::min(idle + more, kept)} * bufferBytes_;
+  }
   uint32_t idle = 0;
+  uint32_t kept = 0;
 
 private:
   uint64_t bufferBytes_;
@@ -1139,10 +1129,10 @@ public:
   FreeResult take(const VictimQuery &, const Victim &victim) override {
     const auto unit = std::ranges::find(units, victim.key, &Victim::key);
     taken.push_back(unit->key);
-    const uint32_t buffers = unit->stateBuffers;
-    pool_.idle += buffers;
+    const Victim gone = *unit;
+    pool_.idle += gone.stateBuffers;
     units.erase(unit);
-    return {.outcome = FreeOutcome::Met, .stateBuffers = buffers};
+    return {.outcome = FreeOutcome::Met, .nowBytes = gone.bytes, .stateBuffers = gone.stateBuffers};
   }
   std::vector<Victim> units;
   std::vector<uint64_t> taken;
@@ -1150,6 +1140,28 @@ public:
 private:
   BufferPool &pool_;
 };
+
+// A need of bytes counts the state buffers its units free as what the model's pool releases of them, once: a
+// state taken returns its buffers to the pool at once, and the pool keeps a lane's. Of a pool below them the first
+// state's buffer gives nothing and the second's its bytes, so the two states and one unit meet a need of two units,
+// and the pool releases what was counted.
+void testStateBuffersCountBeyondThoseThePoolKeeps() {
+  MemoryLedger ledger;
+  BufferPool pool(kGiB);
+  pool.kept = 1;
+  CachedStates cache(pool);
+  cache.units = {{.key = 1, .stateBuffers = 1}, {.key = 2, .stateBuffers = 1}, unit(3, kGiB), unit(4, kGiB)};
+  ledger.addSource(cache);
+  ledger.addSource(pool);
+  ledger.setBufferBytes([&pool](uint32_t states, bool) { return pool.releases(states); });
+  const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
+  const FreeResult freed = ledger.free(claim, {.bytes = 2 * kGiB}, 0, false);
+  require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 2 * kGiB &&
+              cache.taken == std::vector<uint64_t>{1, 2, 3} && pool.idle == 1,
+          "free() did not count the bytes of the state buffers the model's pool releases, once: " +
+              std::to_string(cache.taken.size()) + " units taken, " + std::to_string(freed.nowBytes / kMiB) +
+              " MiB freed");
+}
 
 // The buffers a state frees meet a need of bytes, counted at what the pool releases of them; a need of buffers in
 // place keeps them pooled.
@@ -1163,7 +1175,10 @@ void testStateBuffersMeetANeedOfBytes() {
   ledger.addSource(pool);
   // The first state's buffers release 64 MiB, each after it 32 MiB more:
   // two cover no 100 MiB, three do.
-  ledger.setBufferBytes([](uint32_t states, bool) { return states ? uint64_t{states + 1} * 32 * kMiB : 0; });
+  ledger.setBufferBytes([&pool](uint32_t states, bool) {
+    const uint32_t pooled = pool.idle + states;
+    return pooled ? uint64_t{pooled + 1} * 32 * kMiB : 0;
+  });
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
   const FreeResult freed = ledger.free(claim, {.bytes = 100 * kMiB}, 0, false);
   require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 192 * kMiB &&
@@ -2166,7 +2181,7 @@ void testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes() {
   cache.units.push_back({.key = 1, .stateBuffers = 1});
   ledger.addSource(cache);
   ledger.addSource(pool);
-  ledger.setBufferBytes([](uint32_t states, bool) { return uint64_t{states} * 64 * kMiB; });
+  ledger.setBufferBytes([&pool](uint32_t states, bool) { return pool.releases(states); });
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal, ClaimClass::Start));
   const FreeResult freed = ledger.free(claim, {.bytes = 48 * kMiB, .unheldStateBuffer = true}, 0, false);
   require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 64 * kMiB &&
@@ -2231,7 +2246,6 @@ std::span<const test::TestCase> ledgerTests() {
       {"testGrowthLeavesTheHostWhatAStartItRefusedWaitsFor", testGrowthLeavesTheHostWhatAStartItRefusedWaitsFor},
       {"testSourceOrderIsKeptWithinASource", testSourceOrderIsKeptWithinASource},
       {"testUnitsKeyedByTheirPlaceAreTakenAsChosen", testUnitsKeyedByTheirPlaceAreTakenAsChosen},
-      {"testStateBuffersCountBeyondThoseThePoolKeeps", testStateBuffersCountBeyondThoseThePoolKeeps},
       {"testThePoolsAndWritesEachClaimTakes", testThePoolsAndWritesEachClaimTakes},
       {"testAFloorClaimTakesNothing", testAFloorClaimTakesNothing},
       {"testTakeRightsTable", testTakeRightsTable},
@@ -2241,6 +2255,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testLandingThenVictimsThenOwed", testLandingThenVictimsThenOwed},
       {"testImmediateSkipsLandings", testImmediateSkipsLandings},
       {"testLandingCountsBeforeVictimsInPart", testLandingCountsBeforeVictimsInPart},
+      {"testStateBuffersCountBeyondThoseThePoolKeeps", testStateBuffersCountBeyondThoseThePoolKeeps},
       {"testStateBuffersMeetANeedOfBytes", testStateBuffersMeetANeedOfBytes},
       {"testIdleBuffersThatCoverARefusalTakeNothingInPlace", testIdleBuffersThatCoverARefusalTakeNothingInPlace},
       {"testHostRefusedNeedIsMetInPlaceFirst", testHostRefusedNeedIsMetInPlaceFirst},

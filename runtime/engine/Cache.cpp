@@ -1238,12 +1238,13 @@ FreeResult Cache::take(const VictimQuery &query, const engine::Victim &victim) {
     // extents and pages its demotions free as they land.
     const Walk each = phaseWalk(walk, static_cast<ReclaimPhase>(block));
     const auto form = static_cast<size_t>(walk.form);
-    // The free pages of the need's form, and for a walk that can wait the
-    // landing ones.
-    const auto pages = [&] {
-      return pool_.freePageCount(walk.form) + (each.timing == ReclaimTiming::CanWait ? demotedPages()[form] : 0);
+    // The landing pages of the need's form, for a walk that can wait, and
+    // the free ones with them.
+    const auto landingPages = [&] {
+      return each.timing == ReclaimTiming::CanWait ? demotedPages()[form] : 0u;
     };
-    const uint32_t landing = demotedPages()[form];
+    const auto pages = [&] { return pool_.freePageCount(walk.form) + landingPages(); };
+    const uint32_t landing = landingPages();
     const uint32_t pagesBefore = pages();
     const uint64_t fillBefore = walk.device ? landingFill(walk) : 0;
     const ReclaimResult reclaimed =
@@ -1259,7 +1260,7 @@ FreeResult Cache::take(const VictimQuery &query, const engine::Victim &victim) {
     const uint64_t filled = reclaimed.reclaimedBytes + (walk.device ? landingFill(walk) : 0);
     const uint64_t gave = filled - std::min(filled, fillBefore);
     const uint64_t now = std::min(reclaimed.reclaimedBytes, gave);
-    return {.outcome = gave > now || demotedPages()[form] > landing ? FreeOutcome::Pending : FreeOutcome::Met,
+    return {.outcome = gave > now || landingPages() > landing ? FreeOutcome::Pending : FreeOutcome::Met,
             .nowBytes = now,
             .laterBytes = gave - now,
             .pages = pagesAfter - std::min(pagesAfter, pagesBefore),
