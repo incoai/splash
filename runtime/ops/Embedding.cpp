@@ -12,7 +12,7 @@
 namespace splash::ops {
 
 StoredRows::StoredRows(metal::MetalBuffer rows, uint32_t formatId) : rows(std::move(rows)), formatId(formatId) {
-  if (formatId >= GGUF_FMT_COUNT) throw std::invalid_argument("unsupported native embedding format");
+  if (formatId >= GGUF_FMT_COUNT) throw std::invalid_argument("unsupported embedding format");
 }
 const QuantFormat &StoredRows::format() const noexcept { return kQuantFormats[formatId]; }
 
@@ -24,7 +24,7 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
   // Every gather reads `rows` token ids and writes `rows` bf16 rows of the table's width.
   requireBytes(tokens, uint64_t{rows} * sizeof(uint32_t), "embedding token");
   requireBytes(output, uint64_t{rows} * table.inputSize * sizeof(uint16_t), "embedding output");
-  const StoredRows &stored = table.blocks();
+  const StoredRows &stored = table.rows();
   const QuantFormat &format = stored.format();
   // Every token's row as stored, which the gather reads (kernels/shared/embedding.metal).
   const uint64_t rowBytes = quant_stored_row_bytes(stored.formatId, table.inputSize);

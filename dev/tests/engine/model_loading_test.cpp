@@ -432,7 +432,7 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
                 {.type = type, .outputSize = rows, .inputSize = width, .plane0Bytes = uint64_t{rows} * width * 2}));
             const auto table = splash::model::readBlockEmbedding(file, rows, width, "embedding");
             file.finish();
-            require(table.blocks().formatId == format,
+            require(table.rows().formatId == format,
                     "GGUF 16-bit embedding did not read as its format's rows at " + std::to_string(width) + " values");
         }
     WeightFile file = loaded(embedding);
@@ -710,7 +710,7 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
                 segmentFormats(weights.layers[1].upProjection) == std::vector<uint32_t>{format("up_proj")} &&
                 segmentFormats(weights.layers[1].downProjection) == std::vector<uint32_t>{format("down_proj")} &&
                 segmentFormats(weights.logitsProjection) == std::vector<uint32_t>{format("lm_head")} &&
-                weights.tokenEmbedding.blocks().formatId == format("embed_tokens"),
+                weights.tokenEmbedding.rows().formatId == format("embed_tokens"),
             "a block FFN, head or token table did not keep its module's format");
     require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned,
             "streamableWeights is not what an MLX block target loads");
@@ -747,7 +747,7 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
             "missing source tensor: language_model.lm_head.weight",
             "a checkpoint without language_model.lm_head was accepted");
     unquantized("language_model.model.embed_tokens");
-    require(std::get<Qwen3_8Weights>(loadModel(backend, root, descriptor).target).tokenEmbedding.blocks().formatId ==
+    require(std::get<Qwen3_8Weights>(loadModel(backend, root, descriptor).target).tokenEmbedding.rows().formatId ==
                 GGUF_FMT_BF16,
             "a bf16 token table did not load as its bf16 rows");
 }
@@ -791,7 +791,7 @@ void testSyntheticFloatModel(MetalBackend &backend, const std::filesystem::path 
                 segmentFormats(weights.layers[1].upProjection) == nvfp4 &&
                 segmentFormats(weights.layers[1].downProjection) == nvfp4 &&
                 segmentFormats(weights.logitsProjection) == fp8 &&
-                weights.tokenEmbedding.blocks().formatId == GGUF_FMT_BF16,
+                weights.tokenEmbedding.rows().formatId == GGUF_FMT_BF16,
             "a " + name + " target did not keep its modules' formats and its bf16 token table");
     // Every stored norm weight is zero: 1 + w is 1, the gated norm's w 0.
     const auto first = [](const splash::ops::NormWeights &norm) {

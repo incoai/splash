@@ -500,7 +500,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
             std::string_view(weights.logitsProjection.blocks().segments.front().name()) == "q6k" &&
             weights.logitsProjection.destination == ops::FloatOutput::Float32,
         "GGUF target: logits a Q6_K block projection of vocabulary x hidden into fp32");
-  check(weights.tokenEmbedding.blocks().formatId == GGUF_FMT_IQ4XS &&
+  check(weights.tokenEmbedding.rows().formatId == GGUF_FMT_IQ4XS &&
             weights.tokenEmbedding.outputSize == layout.vocabularySize && weights.tokenEmbedding.inputSize == hidden,
         "GGUF target: token table IQ4_XS blocks of vocabulary x hidden");
   const std::array<uint32_t, 2> captured{1, layout.layers - 1};

@@ -233,7 +233,7 @@ public:
   EmbeddingWeights(uint32_t output, uint32_t input, StoredRows rows)
       : outputSize(output), inputSize(input), rows_(std::move(rows)) {}
 
-  [[nodiscard]] const StoredRows &blocks() const noexcept { return rows_; }
+  [[nodiscard]] const StoredRows &rows() const noexcept { return rows_; }
 
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;

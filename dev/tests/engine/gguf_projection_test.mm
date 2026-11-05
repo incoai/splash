@@ -1053,7 +1053,7 @@ void gatherExtents(MetalBackend &backend) {
     const uint64_t rowBytes = uint64_t{kHidden} / format.block_elements * format.block_bytes;
     EmbeddingWeights table(kVocabulary, kHidden, StoredRows(test::sharedBuffer(backend, kVocabulary * rowBytes), f));
     if (f == PQ20) table.rotation.signs = test::sharedBuffer(backend, kHidden);
-    requireTableExtent(table.blocks().rows, kVocabulary * rowBytes, format.block_bytes, "token table",
+    requireTableExtent(table.rows().rows, kVocabulary * rowBytes, format.block_bytes, "token table",
                        [&](const MetalBuffer &rows) {
                          EmbeddingWeights changed(kVocabulary, kHidden, StoredRows(rows, f));
                          changed.rotation = table.rotation;

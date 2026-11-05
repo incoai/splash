@@ -2,7 +2,7 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/gguf_embedding_formats.h"
 
-// The gather of rows of native blocks (ops/Embedding.cpp) of a format of common/gguf_embedding_formats.h, each
+// The gather of rows as stored (ops::StoredRows) of a format of common/gguf_embedding_formats.h, each
 // element its decode as T: bf16, the token gathers', or fp32, the F32 values load-time widening writes
 // (model/GgufPreparation.cpp). Inlined, with the format's decode, so every gather stays one function (the compiler
 // otherwise keeps Q6_K's as a call).
