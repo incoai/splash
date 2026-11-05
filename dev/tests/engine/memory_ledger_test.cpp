@@ -1391,6 +1391,21 @@ void testAClaimThatTakesNoUnitsTakesNone() {
   }
 }
 
+// A claim that takes no units counts none: it peeks a source only for the units that cost nothing, and asks no
+// copies ahead of cache it would not take copied either.
+void testAClaimThatTakesNoUnitsCountsNone() {
+  MemoryLedger ledger;
+  TestSource cache("cache");
+  cache.units = {unit(1, kGiB, true), unit(2, kGiB)};
+  ledger.addSource(cache);
+  const ClaimId claim = ledger.open({.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate});
+  const FreeOutcome outcome = ledger.free(claim, {.bytes = kGiB}, 0, false).outcome;
+  ledger.close(claim);
+  require(outcome == FreeOutcome::Short && cache.taken.empty(), "a claim that takes no units took one");
+  require(cache.peeks == 1, "a claim that takes no units peeked " + std::to_string(cache.peeks) + " units");
+  require(!ledger.copyDemand(), "a claim that takes no units asked copies ahead");
+}
+
 // available() counts the room, the cache and pool units above the floor up to the need, and takes nothing.
 void testAvailableTakesNothing() {
   FakeMemory memory({});
@@ -2299,6 +2314,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testZeroCostUnsizedUnitsGoFirst", testZeroCostUnsizedUnitsGoFirst},
       {"testTheHostClaimCountsTheIdleBuffersInItsTarget", testTheHostClaimCountsTheIdleBuffersInItsTarget},
       {"testAClaimThatTakesNoUnitsTakesNone", testAClaimThatTakesNoUnitsTakesNone},
+      {"testAClaimThatTakesNoUnitsCountsNone", testAClaimThatTakesNoUnitsCountsNone},
       {"testAvailableTakesNothing", testAvailableTakesNothing},
       {"testCountsStopAtTheLack", testCountsStopAtTheLack},
       {"testAvailableCountsWhatLandsForAClaimThatCanWait", testAvailableCountsWhatLandsForAClaimThatCanWait},

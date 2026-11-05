@@ -407,10 +407,13 @@ uint64_t MemoryLedger::pooledBytes(const VictimQuery &query, const Lacking &lack
 // lack. The state buffers of the units counted give a need of bytes what
 // the model's pool would release with them beyond what it releases now
 // (pooledBytes). A unit that meets none of the need, or that lands later
-// for an Immediate claim, is skipped.
+// for an Immediate claim, is skipped. A claim that takes no units
+// (TakeRights::units) counts none and reaches none: no source is walked.
 MemoryLedger::Run MemoryLedger::bound(const VictimQuery &query, const Lacking &lack) const {
-  Order order(*this, query);
   Run run;
+  if (!query.rights.units)
+    return run;
+  Order order(*this, query);
   const uint64_t pooledBefore = pooledBytes(query, lack, 0);
   uint64_t unitBytes = 0;
   for (;;) {
@@ -432,8 +435,6 @@ MemoryLedger::Run MemoryLedger::bound(const VictimQuery &query, const Lacking &l
       order.pass(*best);
       continue;
     }
-    if (!query.rights.units)
-      break;
     unitBytes = saturatingAdd(unitBytes, victim.bytes);
     if (victim.form == lack.form)
       run.pages += victim.pages;
