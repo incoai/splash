@@ -853,6 +853,7 @@ std::vector<Victim> Engine::EngineVictims::conversions(const VictimQuery &query)
                          .bytes = freed - reads,
                          .pages = static_cast<uint32_t>(pages),
                          .form = kv::PageForm::Full,
+                         .write = true,
                          .later = true,
                          .kind = VictimKind::Conversion});
   return units;

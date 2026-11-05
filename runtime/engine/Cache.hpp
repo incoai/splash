@@ -274,12 +274,15 @@ enum class SpillGate : uint8_t { Open, TierClosed, WriteBudget };
 // leaves.
 enum class SpilledExtents : uint8_t { KeepRunway, Released };
 
-// Whether the caller can wait for KV memory a step leaves to come back.
+// Whether the caller can wait for memory a step leaves to come back.
 // CanWait (growth and pressure passes): a KV leaf a state needs is written
-// first, and its page returns when the copy lands. Immediate (a state's
-// buffers, taken between commands): only leaves whose page frees now go,
-// through their disk copy or erased; a leaf that needs a demotion is passed
-// over. A state that needs a write waits for it.
+// first, and its page returns when the copy lands; a state that needs a
+// write waits for the staging buffer while the one write in flight holds
+// it. Immediate (a state's buffers, taken between commands): only what
+// frees now goes. A leaf goes through its disk copy or erased; one that
+// needs a demotion is passed over. A state that needs a write goes only
+// through the idle staging buffer, whose copy frees its RAM at once; while
+// a write holds the buffer it is passed over.
 enum class ReclaimTiming : uint8_t { CanWait, Immediate };
 
 // The class of a state a command captures, which bounds what is taken for
@@ -662,20 +665,25 @@ public:
   //
   // A device need (the engine's limit refused it, whatever pages it was for)
   // and a page need (pages in place; a page scan while the host refuses
-  // growth) take the walk's reclaims, one at a time, in four phases, each a
-  // unit: what frees now (copied, dead, a state with a disk copy), then what
-  // frees only as the writes the reclaims start land, of the ordinary class,
-  // then the same of what is in use (ReclaimPhase). So a claim that can wait
-  // takes every unit that frees now before it waits for a write, within the
-  // one recency order, and an Immediate claim takes none that needs one. A
-  // page need takes the other forms' empty extents and a windowed cache's
-  // trims first. A state need's units are its states, one each.
+  // growth) take the walk's reclaims, one at a time, in six phases, each a
+  // unit: what frees with no write (copied, dead, a state with a disk copy
+  // or none the tier takes), then the state the idle staging buffer writes,
+  // whose RAM frees at once, then what frees only as the writes the
+  // reclaims start land, of the ordinary class, then the same of what is in
+  // use (ReclaimPhase). So every claim takes every unit that frees with no
+  // write before one that needs a write, within the one recency order, and
+  // an Immediate claim takes none whose write it would wait for. A page need
+  // takes the other forms' empty extents and a windowed cache's trims
+  // first. A state need's units are its states, one each.
   //
   // peek() changes nothing: a phase's unit counts at most what its reclaims
   // free (reach), from the pool's extent and page counts, what frees now up
   // to the query's enough, and none is given once that is nothing. take()
-  // makes one reclaim of the unit's phase and reports what it freed: the
-  // bytes of the extents released now, and those it adds to the extents the
+  // makes one reclaim of the unit's phase, of the state alone in a phase of
+  // the staging buffer's write (the copied part of its chain, which its unit
+  // counts too, then frees with no write, in the first phase, which the
+  // ledger peeks again after a take), and reports what it freed: the bytes
+  // of the extents released now, and those it adds to the extents the
   // landing pages complete beside the free ones (laterBytes, landingFill),
   // less any of them a release took; the pages of the need's form free now,
   // or for a claim that can wait landing; and the state buffers it gave up.
@@ -904,10 +912,10 @@ private:
     friend bool operator==(const Shortfall &, const Shortfall &) = default;
   };
   // What a walk takes, and how: a query's (walkFor) or a reclaim step's.
-  // Its scope; how long it can wait for KV memory (ReclaimTiming), and so
-  // whether a state that needs a write (writesState) is passed over as a
-  // unit that lands later, which an Immediate claim does not wait for (one
-  // a claim that can wait takes waits for the write slot);
+  // Its scope; how long it can wait for memory (ReclaimTiming); whether it
+  // starts writes at all, which the reclaims of what frees with no write
+  // (ReclaimPhase::Now) do not (writes); what it passes over then
+  // (passesOver);
   // what it keeps beside what is in use, the resume point and the restored
   // chains; the shortfall a transfer in flight must cover for a step that
   // finds nothing to report pending (returnsInFlight), any transfer without
@@ -922,6 +930,7 @@ private:
   struct Walk final {
     WalkScope scope;
     ReclaimTiming timing = ReclaimTiming::CanWait;
+    bool writes = true;
     bool keepResumePoint = false;
     // The chains it keeps: those queued requests restore (wanted_), or none,
     // and the chain a start's placement reuses (VictimQuery::kept).
@@ -988,30 +997,40 @@ private:
   // The state is of certain reuse beside what is in use: the resume point,
   // a wanted chain's state.
   [[nodiscard]] bool certainReuse(uint64_t block) const;
-  // A reclaim of the state at this block writes it: it has no disk copy the
-  // tier would take, and a restore from it is expected, as it is in use, of
-  // certain reuse or the newest point of its conversation (newestPoint, the
-  // points write-behind copies). Any other state frees now, dropped
-  // unwritten: no expected restore pays for its write.
-  [[nodiscard]] bool writesState(uint64_t block) const;
+  // The walk passes over the state at this block, which needs a write
+  // (StateCache::reclaimWrites) it does not start: it starts none, or it
+  // cannot wait and the write in flight holds the staging buffer.
+  [[nodiscard]] bool passesOver(const Walk &walk, uint64_t block) const;
   // What peek() reports of a state unit the walk reaches, none when taking
-  // it frees nothing.
+  // it frees nothing. Each state counts as its reclaim would go now: one
+  // whose write starts frees now, and once a take has started it the next
+  // state that needs a write waits for it, which peek then reports.
   [[nodiscard]] std::optional<engine::Victim> victimOf(const WalkUnit &unit) const;
-  // The phases of a device or a page need's reclaims (Unit::Reclaim).
-  enum class ReclaimPhase : uint8_t { Now, Later, UsedNow, UsedLater };
+  // The phases of a device or a page need's reclaims (Unit::Reclaim): of
+  // the ordinary class, then of what is in use, each what frees with no
+  // write, then the state whose write the idle staging buffer takes, which
+  // frees at once, then what frees only as the writes the reclaims start
+  // land.
+  enum class ReclaimPhase : uint8_t { Now, Written, Later, UsedNow, UsedWritten, UsedLater };
   // At most what a walk's reclaims of a class free, from counts: of each
   // form, the whole extents of the pages within the class's reach, but the
   // idle pages of the chains it keeps, the free pages a KV need takes and
   // the runway it keeps, as compaction gathers what stays; now, the free
   // pages and those nothing keeps or lets go only later
-  // (KvCache::pagesFreeingNow: a state or a block that leaves only once
-  // written, a block a transfer moves, and their chains); later the rest,
-  // but the extents the landing pages complete beside the free ones
-  // (landingExtents), which the ledger counts as landing. A page walk that
-  // trims also frees the Full pages it moves into Slim ones. States: the
-  // RAM copies the walk takes, later those that leave only once written.
-  // With `enough`, the pages that free now are counted from the oldest
-  // leaves until `enough` says the amount counted so far suffices.
+  // (KvCache::pagesFreeingNow: a state that needs a write, which stays in
+  // RAM until its write starts and needs its chain on the SSD after, or
+  // that waits for the write in flight; a block a writable tier writes
+  // before its page frees, as a state that stays needs it; a block a
+  // transfer moves; and their chains); written, those the state the idle
+  // staging buffer writes lets go once it has left RAM, the copied part of
+  // its chain; later the rest, but the extents the landing pages complete
+  // beside the free ones (landingExtents), which the ledger counts as
+  // landing. A page walk that trims also frees the Full pages it moves into
+  // Slim ones. States: the RAM copies the walk takes, now those that need no
+  // write; written the first that needs one, while no write holds the
+  // staging buffer, which frees at once; later the others, which wait for
+  // that buffer. With `enough`, only what frees now is counted, from the
+  // oldest leaves until `enough` says the amount counted so far suffices.
   struct ReclaimReach final {
     struct Amount final {
       uint64_t bytes = 0;
@@ -1019,11 +1038,14 @@ private:
       uint32_t states = 0;
     };
     Amount now;
+    Amount written;
     Amount later;
+    [[nodiscard]] const Amount &of(ReclaimPhase phase) const noexcept;
   };
   [[nodiscard]] ReclaimReach reach(const Walk &walk, ReclaimClass upTo,
                                    const std::function<bool(const ReclaimReach &)> &enough) const;
-  // The walk of a phase: of its class, Immediate for what frees now.
+  // The walk of a phase: of its class; Immediate but for what frees as
+  // writes land; no write for what frees with none.
   [[nodiscard]] Walk phaseWalk(const Walk &walk, ReclaimPhase phase) const;
   // peek()'s unit of a phase: reach's amount of it, none when nothing; what
   // frees now counted up to `enough` (VictimQuery::enough).

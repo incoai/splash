@@ -861,8 +861,7 @@ Cache::WalkCursor Cache::cursorAfter(Unit unit, uint64_t block) const {
 void Cache::holdAfter(const Walk &walk, WalkCursor &cursor) const {
   using Phase = WalkCursor::Phase;
   const auto waits = [&](uint64_t block) {
-    const bool write = writesState(block);
-    return !(walk.timing == ReclaimTiming::Immediate && write) && states_.reclaimOutcome(block, write).pending;
+    return !passesOver(walk, block) && states_.reclaimOutcome(block).pending;
   };
   if (cursor.phase == Phase::Checkpoints && cursor.last == Unit::Checkpoint && waits(cursor.lastCandidate.id)) {
     cursor = WalkCursor{.phase = walk.scope.statesOnly ? Phase::Ordinary : Phase::DeadLeaves};
@@ -908,16 +907,15 @@ bool Cache::certainReuse(uint64_t block) const {
   return block == states_.resumePoint() || std::ranges::find(wanted_.states(), block) != wanted_.states().end();
 }
 
-bool Cache::writesState(uint64_t block) const {
+bool Cache::passesOver(const Walk &walk, uint64_t block) const {
   return states_.reclaimWrites(block) &&
-         (states_.inUse(block) || certainReuse(block) || newestPoint(block));
+         (!walk.writes || (walk.timing == ReclaimTiming::Immediate && states_.writing()));
 }
 
 StateEviction Cache::reclaimState(const Walk &walk, uint64_t block) {
-  const bool write = writesState(block);
-  if (walk.timing == ReclaimTiming::Immediate && write)
+  if (passesOver(walk, block))
     return {};
-  return states_.reclaim(block, write);
+  return states_.reclaim(block);
 }
 
 Cache::UnitTaken Cache::takeUnit(const Walk &walk, const WalkUnit &unit, ReclaimTiming timing) {
@@ -966,16 +964,17 @@ uint64_t blockOfKey(uint64_t key) noexcept { return key & ((uint64_t{1} << kUnit
 
 std::optional<engine::Victim> Cache::victimOf(const WalkUnit &unit) const {
   const uint64_t block = unit.candidate.id;
-  const bool write = writesState(block);
-  const StateEviction outcome = states_.reclaimOutcome(block, write);
+  const StateEviction outcome = states_.reclaimOutcome(block);
   if (!outcome.evicted && !outcome.pending)
     return std::nullopt;
   const bool inUse = unit.unit == Unit::UsedState;
   engine::Victim victim{.key = unitKey(static_cast<uint8_t>(unit.unit), block),
                         .stateBuffers = outcome.evicted ? 1u : 0u,
-                        // One that waits for the state write in flight frees
-                        // nothing yet, and one that needs a write lands later.
-                        .later = outcome.pending || write,
+                        // One whose write the idle staging buffer takes
+                        // frees now; one that waits for the write in flight
+                        // frees nothing yet.
+                        .write = outcome.pending || states_.reclaimWrites(block),
+                        .later = outcome.pending,
                         .cls = inUse ? ReclaimClass::InUse : ReclaimClass::Ordinary};
   return victim;
 }
@@ -1014,12 +1013,28 @@ uint64_t Cache::landingFill(const Walk &walk) const noexcept {
   return bytes;
 }
 
+const Cache::ReclaimReach::Amount &Cache::ReclaimReach::of(ReclaimPhase phase) const noexcept {
+  switch (phase) {
+  case ReclaimPhase::Now:
+  case ReclaimPhase::UsedNow:
+    return now;
+  case ReclaimPhase::Written:
+  case ReclaimPhase::UsedWritten:
+    return written;
+  case ReclaimPhase::Later:
+  case ReclaimPhase::UsedLater:
+    return later;
+  }
+  return later;
+}
+
 Cache::Walk Cache::phaseWalk(const Walk &walk, ReclaimPhase phase) const {
+  using enum ReclaimPhase;
   Walk each = walk;
-  const bool now = phase == ReclaimPhase::Now || phase == ReclaimPhase::UsedNow;
-  if (phase == ReclaimPhase::Now || phase == ReclaimPhase::Later)
+  if (phase < UsedNow)
     each.scope.upTo = ReclaimClass::Ordinary;
-  each.timing = now ? ReclaimTiming::Immediate : ReclaimTiming::CanWait;
+  each.timing = phase == Later || phase == UsedLater ? ReclaimTiming::CanWait : ReclaimTiming::Immediate;
+  each.writes = phase != Now && phase != UsedNow;
   return each;
 }
 
@@ -1036,29 +1051,40 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo,
       kept.insert(kept.end(), chains->states().begin(), chains->states().end());
   if (const uint64_t point = states_.resumePoint(); walk.keepResumePoint && point && states_.stateResident(point))
     kept.push_back(point);
-  // What frees only later holds its chain above it too, which frees later:
-  // a state that leaves only once written, or once the write in flight has
-  // landed; a block a writable tier writes before its page frees, as a
-  // state that stays needs it; a block a transfer moves
-  // (KvCache::pagesFreeingNow). The states the walk takes count by the same
-  // split, and those it drops without a copy need no block.
+  // What needs a write holds its chain above it, which frees later: a
+  // state that does, which stays in RAM until its write starts and needs
+  // its chain on the SSD after, or that waits for the write in flight; a
+  // block a writable tier writes before its page frees, as a state that
+  // stays needs it; a block a transfer moves (KvCache::pagesFreeingNow).
+  // The states the walk takes free now when they need no write, those it
+  // drops without a copy needing no block. The first that needs one while
+  // no write holds the staging buffer frees at once (written), and once it
+  // has left RAM its chain holds only the blocks without a copy: the copied
+  // ones free with it. The others wait for that buffer.
   std::vector<uint64_t> holding = kept;
   std::vector<uint64_t> dropped;
   ReclaimReach states;
   Walk stateWalk = walk;
   stateWalk.scope = {.upTo = upTo, .statesOnly = true};
   WalkCursor cursor;
+  bool staging = states_.writing();
+  std::optional<size_t> staged;
   for (std::optional<WalkUnit> unit; (unit = nextStepUnit(stateWalk, cursor));) {
     const uint64_t block = unit->candidate.id;
-    const bool write = writesState(block);
-    if (write || states_.reclaimOutcome(block, write).pending) {
-      holding.push_back(block);
-      ++states.later.states;
-    } else {
+    const bool write = states_.reclaimWrites(block);
+    if (!write && !states_.reclaimOutcome(block).pending) {
       ++states.now.states;
       if (!states_.onDisk(block))
         dropped.push_back(block);
+      continue;
     }
+    if (write && !std::exchange(staging, true)) {
+      ++states.written.states;
+      staged = holding.size();
+    } else {
+      ++states.later.states;
+    }
+    holding.push_back(block);
   }
   const std::array<uint32_t, 3> keptPages = kv_.idlePagesOnChains(kept);
   // The extents landing pages complete beside the free ones count already
@@ -1077,16 +1103,19 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo,
             pool_.form(active.pages[index]) == kv::PageForm::Full && windowsPassed(active.pages[index], index);
   }
   // Of each form, the pages within the class's reach, all but the kept
-  // chains', free now (the free ones and `freeNow`) or later (the rest).
-  const auto reached = [&](const std::array<uint32_t, 3> &freeNow) {
+  // chains', that free now (the free ones and `freeNow`), once the staged
+  // state's write has started (the free ones and `freeWritten`, which holds
+  // `freeNow`) or later (the rest).
+  const auto reached = [&](const std::array<uint32_t, 3> &freeNow, const std::array<uint32_t, 3> &freeWritten) {
     ReclaimReach result = states;
-    std::array<uint32_t, 3> now{}, all{};
+    std::array<uint32_t, 3> now{}, written{}, all{};
     for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {
       const auto index = static_cast<size_t>(form);
       const uint32_t allocated = pool_.allocatedExtents(form) * extent;
       const uint32_t reusable = pool_.reusablePages(form);
       all[index] = std::min(allocated, reusable - std::min(reusable, keptPages[index]));
       now[index] = std::min(all[index], pool_.freePageCount(form) + freeNow[index]);
+      written[index] = std::min(all[index], pool_.freePageCount(form) + std::max(freeNow[index], freeWritten[index]));
       // Compaction gathers the pages that stay into the fewest extents, and
       // the rest empty, but for the free pages a KV need takes and the
       // runway the walk keeps.
@@ -1095,36 +1124,47 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo,
         const uint32_t whole = (pages - std::min(pages, walk.keptPages[index])) / extent;
         return whole - std::min(whole, walk.keeps(form) ? 1u : 0u);
       };
-      const uint32_t later = extents(all[index]) - extents(now[index]);
+      const uint32_t later = extents(all[index]) - extents(written[index]);
       const uint32_t landed = landingExtents(walk, form, landing[index]);
       result.now.bytes += extents(now[index]) * extentBytes;
+      result.written.bytes += (extents(written[index]) - extents(now[index])) * extentBytes;
       result.later.bytes += (later - std::min(later, landed)) * extentBytes;
     }
     const auto need = static_cast<size_t>(walk.form);
-    uint32_t pagesNow = now[need], pagesAll = all[need];
+    uint32_t pagesNow = now[need], pagesWritten = written[need], pagesAll = all[need];
     if (trims(walk)) {
       const auto slim = static_cast<size_t>(kv::PageForm::Slim);
       const uint32_t allocated = pool_.allocatedExtents(kv::PageForm::Full) * extent;
       pagesNow = std::min(allocated, pagesNow + std::min(trimmable, now[slim]));
+      pagesWritten = std::min(allocated, pagesWritten + std::min(trimmable, written[slim]));
       pagesAll = std::min(allocated, pagesAll + std::min(trimmable, all[slim]));
     }
     const uint32_t free = pool_.freePageCount(walk.form);
     result.now.pages = pagesNow - std::min(pagesNow, free);
-    result.later.pages = pagesAll - std::min(pagesAll, std::max(pagesNow, free) + landing[need]);
+    result.written.pages = pagesWritten - std::min(pagesWritten, std::max(pagesNow, free));
+    result.later.pages = pagesAll - std::min(pagesAll, std::max(pagesWritten, free) + landing[need]);
     return result;
   };
-  std::function<bool(const std::array<uint32_t, 3> &)> counted;
-  if (enough)
-    counted = [&](const std::array<uint32_t, 3> &freeNow) { return enough(reached(freeNow)); };
-  return reached(kv_.pagesFreeingNow(holding, dropped, kvTierWritable(), counted));
+  const bool unwritten = kvTierWritable();
+  if (enough) {
+    // What frees now alone, the staged state's chain held as it is.
+    const auto counted = [&](const std::array<uint32_t, 3> &freeNow) { return enough(reached(freeNow, freeNow)); };
+    const std::array<uint32_t, 3> freeNow = kv_.pagesFreeingNow(holding, dropped, unwritten, counted);
+    return reached(freeNow, freeNow);
+  }
+  const std::array<uint32_t, 3> freeNow = kv_.pagesFreeingNow(holding, dropped, unwritten, {});
+  if (!staged)
+    return reached(freeNow, freeNow);
+  holding.erase(holding.begin() + static_cast<std::ptrdiff_t>(*staged));
+  return reached(freeNow, kv_.pagesFreeingNow(holding, dropped, unwritten, {}));
 }
 
 std::optional<engine::Victim> Cache::reclaimUnit(const Walk &walk, ReclaimPhase phase,
                                                  const VictimQuery::Enough &enough) const {
-  const bool used = phase == ReclaimPhase::UsedNow || phase == ReclaimPhase::UsedLater;
-  const bool later = phase == ReclaimPhase::Later || phase == ReclaimPhase::UsedLater;
+  const bool used = phase >= ReclaimPhase::UsedNow;
   if (used && walk.scope.upTo != ReclaimClass::InUse)
     return std::nullopt;
+  const Walk each = phaseWalk(walk, phase);
   // A page need counts pages alone; states only where they are units.
   const auto measured = [&](ReclaimReach::Amount amount) {
     if (!walk.device)
@@ -1149,13 +1189,12 @@ std::optional<engine::Victim> Cache::reclaimUnit(const Walk &walk, ReclaimPhase 
   } else {
     // The later phases come only once what frees now falls short, so their
     // counts are whole.
-    const auto amount = [&](ReclaimClass upTo) {
-      const ReclaimReach reached = reach(walk, upTo, {});
-      return later ? reached.later : reached.now;
-    };
-    unit = amount(used ? ReclaimClass::InUse : ReclaimClass::Ordinary);
+    unit = reach(walk, used ? ReclaimClass::InUse : ReclaimClass::Ordinary, {}).of(phase);
     if (used) {
-      const ReclaimReach::Amount ordinary = amount(ReclaimClass::Ordinary);
+      const ReclaimReach::Amount ordinary = reach(walk, ReclaimClass::Ordinary, {}).of(phase);
+      // The staging buffer writes an ordinary state before one in use.
+      if (phase == ReclaimPhase::UsedWritten && ordinary.states)
+        return std::nullopt;
       unit = {.bytes = unit.bytes - std::min(unit.bytes, ordinary.bytes),
               .pages = unit.pages - std::min(unit.pages, ordinary.pages),
               .states = unit.states - std::min(unit.states, ordinary.states)};
@@ -1169,7 +1208,8 @@ std::optional<engine::Victim> Cache::reclaimUnit(const Walk &walk, ReclaimPhase 
                         .pages = unit.pages,
                         .form = walk.form,
                         .stateBuffers = unit.states,
-                        .later = later,
+                        .write = each.writes,
+                        .later = each.timing == ReclaimTiming::CanWait,
                         .cls = used ? ReclaimClass::InUse : ReclaimClass::Ordinary};
 }
 
@@ -1232,11 +1272,14 @@ FreeResult Cache::take(const VictimQuery &query, const engine::Victim &victim) {
       return {.outcome = FreeOutcome::Met, .pages = victim.pages};
     return {};
   case Unit::Reclaim: {
-    // One reclaim of the unit's phase: a device need's memory reclaim
-    // (takeReclaim), a page need's eviction, and in a windowed cache the
-    // trims of what a state that left unpinned. What it freed now, and the
-    // extents and pages its demotions free as they land.
-    const Walk each = phaseWalk(walk, static_cast<ReclaimPhase>(block));
+    // One reclaim of the unit's phase: the state the staging buffer writes
+    // (recycleState), else a device need's memory reclaim (takeReclaim), a
+    // page need's eviction, and in a windowed cache the trims of what a
+    // state that left unpinned. What it freed now, and the extents and pages
+    // its demotions free as they land.
+    const auto phase = static_cast<ReclaimPhase>(block);
+    const bool written = phase == ReclaimPhase::Written || phase == ReclaimPhase::UsedWritten;
+    const Walk each = phaseWalk(walk, phase);
     const auto form = static_cast<size_t>(walk.form);
     // The landing pages of the need's form, for a walk that can wait, and
     // the free ones with them.
@@ -1248,8 +1291,10 @@ FreeResult Cache::take(const VictimQuery &query, const engine::Victim &victim) {
     const uint32_t pagesBefore = pages();
     const uint64_t fillBefore = walk.device ? landingFill(walk) : 0;
     const ReclaimResult reclaimed =
-        walk.device ? takeReclaim(each, demotionPages(), fillBefore, query.need.pages != 0) : evictOne(each);
-    if (!walk.device && reclaimed.evictedState && trims(walk))
+        written       ? recycleState(each)
+        : walk.device ? takeReclaim(each, demotionPages(), fillBefore, query.need.pages != 0)
+                      : evictOne(each);
+    if (!walk.device && !written && reclaimed.evictedState && trims(walk))
       static_cast<void>(trimWindows(false));
     if (!reclaimed.madeProgress && !reclaimed.evictedKv)
       return {reclaimed.pending ? FreeOutcome::Pending : FreeOutcome::Short};
@@ -1444,10 +1489,9 @@ Cache::ReclaimResult Cache::recycleState(const Walk &walk) {
   states.scope.pagesOnly = false;
   WalkCursor cursor;
   while (const std::optional<WalkUnit> state = nextStepUnit(states, cursor)) {
-    const bool write = writesState(state->candidate.id);
-    if (states.timing == ReclaimTiming::Immediate && write)
+    if (passesOver(states, state->candidate.id))
       continue;
-    const StateEviction eviction = states_.reclaim(state->candidate.id, write);
+    const StateEviction eviction = states_.reclaim(state->candidate.id);
     return {.madeProgress = eviction.evicted, .pending = eviction.pending, .evictedState = eviction.evicted};
   }
   return {.pending = returns(states)};

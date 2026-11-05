@@ -6048,7 +6048,8 @@ void testAHostRefusedReplayPointCutsNoCommand() {
   GovernedHost host;
   engine::Engine engine(host.connect({}), cache, executor, events);
   guardReleases(storage, engine);
-  // A finished conversation's state in RAM, whose copy never lands here.
+  // A finished conversation's state in RAM, copied ahead to the SSD: a copy
+  // that never lands here, which reads the RAM copy.
   std::vector<uint32_t> prompt(129);
   std::iota(prompt.begin(), prompt.end(), 1000);
   cache.beginRequest(1);
@@ -6057,6 +6058,7 @@ void testAHostRefusedReplayPointCutsNoCommand() {
   cache.publishCompositeState(
       leaf, std::make_shared<OffloadState>(std::make_shared<OffloadControl>(), executor.evictedStateBytes), false);
   cache.endRequest(1);
+  require(cache.persist(leaf) == PersistStatus::Started && cache.stateResident(leaf), "the state's copy did not start");
   // No idle state buffer: a state's buffers take one admission, which the
   // host refuses under its warning.
   executor.reservationRoom = [&] {

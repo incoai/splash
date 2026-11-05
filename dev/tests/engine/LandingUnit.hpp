@@ -21,7 +21,7 @@ public:
                                                    const engine::Victim *after) const override {
     if (after || landed)
       return std::nullopt;
-    return engine::Victim{.key = 1, .bytes = bytes_, .later = true};
+    return engine::Victim{.key = 1, .bytes = bytes_, .write = true, .later = true};
   }
   engine::FreeResult take(const engine::VictimQuery &, const engine::Victim &) override {
     return {engine::FreeOutcome::Pending, 0, bytes_};

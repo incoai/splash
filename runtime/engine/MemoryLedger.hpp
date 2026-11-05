@@ -159,7 +159,15 @@ struct Victim final {
   uint32_t pages = 0;           // free KV pages of `form` it leaves in kept extents (in-place needs)
   kv::PageForm form = kv::PageForm::Full;
   uint32_t stateBuffers = 0;    // pooled state buffers it frees (in-place needs; bytes, setBufferBytes)
-  bool later = false;           // frees on a landing (a demotion, a state write, a conversion's copies)
+  // It frees through a write: one its take starts (a state's, which the
+  // idle staging buffer frees at once; a demotion; a conversion's copies)
+  // or one in flight it waits for. The order's stage of cache that needs a
+  // write.
+  bool write = false;
+  // It frees only once that write lands (a demotion, the state write in
+  // flight, a conversion's copies): a claim that does not wait for writes
+  // passes over it.
+  bool later = false;
   // false: a unit that costs nothing, taken before any count, whose
   // bytes are at least what peek gives (available() counts them)
   bool sized = true;
@@ -193,19 +201,20 @@ struct TakeRights final {
 };
 
 // The one table of what each claim may take. A need the host refused, and
-// an Immediate claim, take only what frees now: no write, store chunk,
-// pass, conversion or unit in use. What costs a lane work later (a store
-// chunk's reads, the pass, the claim's own conversion) goes only to
-// in-service work that can wait; units in use also need its reach. Certain
-// reuse, which a request rebuilds at its whole prefill, goes to in-service
-// work; a start and optional work take the resume point but never a queued
-// chain, since a running lane beats a queued one and a new request does
-// not. The host waits for writes short of critical pressure and never for
-// landings, which its pass's target is net of; at critical pressure it is
-// Immediate but takes the store, certain reuse and units in use. No pool
-// unit for a claim below a lane in service, since the pools serve every
-// lane, and none for a pool's growth. A Floor claim takes nothing
-// (logic_error).
+// an Immediate claim, take only what frees now: no write whose memory frees
+// only when it lands (a state the idle staging buffer writes frees at once,
+// and they take it), store chunk, pass, conversion or unit in use. What
+// costs a lane work later (a store chunk's reads, the pass, the claim's own
+// conversion) goes only to in-service work that can wait; units in use also
+// need its reach. Certain reuse, which a request rebuilds at its whole
+// prefill, goes to in-service work; a start and optional work take the
+// resume point but never a queued chain, since a running lane beats a
+// queued one and a new request does not. The host waits for writes short of
+// critical pressure and never for landings, which its pass's target is net
+// of; at critical pressure it is Immediate but takes the store, certain
+// reuse and units in use. No pool unit for a claim below a lane in service,
+// since the pools serve every lane, and none for a pool's growth. A Floor
+// claim takes nothing (logic_error).
 [[nodiscard]] TakeRights takeRights(const ClaimSpec &spec, const Need &need, bool critical,
                                     std::optional<RequestPriority> highestLane);
 

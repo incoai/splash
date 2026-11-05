@@ -114,12 +114,17 @@ private:
 };
 
 // A captured state whose copy a persistent tier writes while it stays in
-// RAM (persist); the copy is a DiskState.
+// RAM (persist), and a reclaim writes as it leaves RAM through a staging
+// copy (offload), as the model's states are written; the copy is a
+// DiskState.
 class KeptState final : public CompositeState {
 public:
   explicit KeptState(std::shared_ptr<OffloadControl> control) : control_(std::move(control)) {}
   uint64_t bytes() const noexcept override { return 64; }
   bool canOffload(bool) const noexcept override { return true; }
+  std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
+    return std::make_unique<OffloadTicket>(control_);
+  }
   std::unique_ptr<StateOffload> persist(std::function<void()>) const override {
     return std::make_unique<OffloadTicket>(control_);
   }

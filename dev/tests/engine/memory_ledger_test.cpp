@@ -170,8 +170,9 @@ private:
   std::vector<uint64_t> units_;
 };
 
+// A cached unit; `later`: one that frees only once its write lands.
 Victim unit(uint64_t key, uint64_t bytes, bool later = false) {
-  return {.key = key, .bytes = bytes, .later = later};
+  return {.key = key, .bytes = bytes, .write = later, .later = later};
 }
 
 // A host of 64 GiB whose headroom, its spare memory above the governor's
@@ -1012,6 +1013,34 @@ void testImmediateSkipsLandings() {
           "an Immediate claim waited for landings");
 }
 
+// A cached unit that needs a write but frees now, as a state the idle staging buffer writes does,
+// goes to a claim that cannot wait in the stage of the cache that needs a write: after the pools
+// that cost only their rebuild. One that frees only once its write lands it passes over.
+void testImmediateTakesAWriteThatFreesNowAfterRebuiltPools() {
+  FakeMemory memory({});
+  FakeElasticPool vision("vision", memory, 256 * kMiB, 0, 1, 1, 1);
+  vision.rebuildOnly = true;
+  MemoryLedger ledger;
+  TestSource cache("cache");
+  Victim staged = unit(3, 256 * kMiB);
+  staged.write = true;
+  cache.units = {unit(1, 256 * kMiB), unit(2, 256 * kMiB, true), staged};
+  ledger.addSource(cache);
+  ledger.addPool(vision);
+  const auto lacks = [&](uint64_t bytes) {
+    const ClaimId claim = ledger.open({.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate});
+    const FreeOutcome outcome = ledger.free(claim, {.bytes = bytes}, 0, false).outcome;
+    ledger.close(claim);
+    return outcome;
+  };
+  require(lacks(512 * kMiB) == FreeOutcome::Met && cache.taken == std::vector<uint64_t>{1} && vision.units() == 0,
+          "the pool that costs only its rebuild did not go before the unit that needs a write");
+  require(lacks(256 * kMiB) == FreeOutcome::Met && cache.taken == std::vector<uint64_t>{1, 3},
+          "a claim that cannot wait did not take the unit whose write frees it now");
+  require(lacks(256 * kMiB) == FreeOutcome::Short && cache.taken.size() == 2,
+          "a claim that cannot wait took the unit that frees only once its write lands");
+}
+
 // What lands and what the claim's own lanes owe count before victims in part too: a waiting claim takes victims
 // only for the rest and waits for the landing.
 void testLandingCountsBeforeVictimsInPart() {
@@ -1471,7 +1500,7 @@ void testGrowthTakesIdleCacheAfterABurst() {
               fixture.ledger().growthLackBytes() != 0,
           "growth that found only cache awaiting its copy took it or asked for no copies ahead");
   for (Victim &each : cache.units)
-    each.later = each.key == 3;
+    each.write = each.later = each.key == 3;
   for (int period = 2; period <= 5; ++period)
     static_cast<void>(fixture.pass(period * kRegrowQuietSeconds + 1.0));
   require(experts.units() == 4, "the store did not return to its cap: units " + std::to_string(experts.units()));
@@ -2198,7 +2227,7 @@ void testABufferNoStateHoldsReachesNoCachedState() {
   MemoryLedger ledger;
   BufferPool pool(64 * kMiB);
   CachedStates cache(pool);
-  cache.units.push_back({.key = 1, .stateBuffers = 1, .later = true});
+  cache.units.push_back({.key = 1, .stateBuffers = 1, .write = true, .later = true});
   ledger.addSource(cache);
   ledger.addSource(pool);
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal, ClaimClass::Start));
@@ -2254,6 +2283,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testUnitsHeldForHigherRanksMakeAWait", testUnitsHeldForHigherRanksMakeAWait},
       {"testLandingThenVictimsThenOwed", testLandingThenVictimsThenOwed},
       {"testImmediateSkipsLandings", testImmediateSkipsLandings},
+      {"testImmediateTakesAWriteThatFreesNowAfterRebuiltPools", testImmediateTakesAWriteThatFreesNowAfterRebuiltPools},
       {"testLandingCountsBeforeVictimsInPart", testLandingCountsBeforeVictimsInPart},
       {"testStateBuffersCountBeyondThoseThePoolKeeps", testStateBuffersCountBeyondThoseThePoolKeeps},
       {"testStateBuffersMeetANeedOfBytes", testStateBuffersMeetANeedOfBytes},

@@ -153,7 +153,11 @@ public:
   }
 
   // A claim's takes never free more than peek counted for its units, and
-  // never take in-use or certain-reuse units its rights do not take.
+  // never take in-use or certain-reuse units its rights do not take. A unit
+  // peek offers as needing no write starts none when taken; one that needs
+  // a write but frees now (the state the idle staging buffer writes) starts
+  // at most that state's write and is one state; a state that frees only
+  // once a write lands gives nothing when taken.
   void checkTake() {
     const ClaimSpec claim{.cls = std::array{ClaimClass::InService, ClaimClass::Start, ClaimClass::Optional,
                                             ClaimClass::Growth, ClaimClass::Host}[pick(0, 4)],
@@ -161,12 +165,16 @@ public:
                           .timing = chance(50) ? NeedTiming::Immediate : NeedTiming::CanWait};
     const kv::PageForm form = !chance(50) ? kv::PageForm::Full : windowed_ ? kv::PageForm::Slim : kv::PageForm::Index;
     const uint32_t stateBuffers = chance(30) ? 1u : 0u;
-    const bool device = chance(50);
+    // A device need, a page need, or a need of state buffers alone.
+    const uint32_t kind = pick(0, 2);
+    const bool device = kind == 0;
+    const bool states = kind == 2;
     const VictimQuery query =
         test::query(claim,
-                    device ? Need{.bytes = pick(1, 8) * 400ull, .stateBuffers = stateBuffers}
-                           : Need{.hostRefused = chance(50), .pages = pick(1, 8), .form = form,
-                                  .stateBuffers = stateBuffers},
+                    device   ? Need{.bytes = pick(1, 8) * 400ull, .stateBuffers = stateBuffers}
+                    : states ? Need{.hostRefused = chance(50), .stateBuffers = pick(1, 2)}
+                             : Need{.hostRefused = chance(50), .pages = pick(1, 8), .form = form,
+                                    .stateBuffers = stateBuffers},
                     chance(10));
     const bool immediate = !query.rights.waitsForWrites;
     std::vector<uint64_t> inUse;
@@ -190,13 +198,18 @@ public:
     std::vector<std::pair<std::optional<engine::Victim>, engine::Victim>> units;
     uint64_t counted = 0;
     uint32_t countedPages = 0;
+    uint32_t countedBuffers = 0;
     std::optional<engine::Victim> previous;
     for (std::optional<engine::Victim> unit = cache_.peek(query, nullptr); unit;
          previous = unit, unit = cache_.peek(query, &*previous)) {
+      require(!unit->later || unit->write, "a unit that frees once a write lands was not marked as needing one");
+      require(!unit->write || unit->later || unit->stateBuffers <= 1,
+              "a unit that frees now through a write counted more than the one state the staging buffer takes");
       if (unit->later && immediate)
         continue;
       counted += unit->bytes;
       countedPages += unit->form == form ? unit->pages : 0;
+      countedBuffers += unit->stateBuffers;
       units.emplace_back(previous, *unit);
     }
     // The free pages of the form, and for a claim that can wait the landing ones.
@@ -211,6 +224,7 @@ public:
     uint64_t freed = 0;
     uint64_t releasedNow = 0;
     uint32_t reportedPages = 0;
+    uint32_t reportedBuffers = 0;
     for (const auto &[after, first] : units) {
       // A unit's takes while the cache offers it again in its place, until
       // one takes nothing: a reclaim phase goes a step at a time, each a
@@ -218,13 +232,24 @@ public:
       for (std::optional<engine::Victim> unit = first; unit && unit->key == first.key;
            unit = cache_.peek(query, after ? &*after : nullptr)) {
         const uint64_t before = pool_.allocatedBytes();
+        const uint64_t offloads = cache_.snapshot().stateCache.offloads;
+        const uint32_t demotions = tier_.demotions;
         const FreeResult taken = cache_.take(query, *unit);
         const uint64_t released = before - std::min(before, pool_.allocatedBytes());
         require(taken.nowBytes <= released, "a take released " + std::to_string(released) + " bytes, reported " +
                                                 std::to_string(taken.nowBytes));
+        const uint64_t written = cache_.snapshot().stateCache.offloads - offloads;
+        require(unit->write || (!written && tier_.demotions == demotions),
+                "a take of a unit offered as needing no write started one");
+        require(!unit->write || unit->later || (written <= 1 && tier_.demotions == demotions),
+                "a take of a unit offered as freeing now through the staging buffer started more than its state's "
+                "write");
+        require(!states || !unit->later || !taken.gave(),
+                "a take of a state offered as freeing once a write lands gave something now");
         freed += taken.nowBytes + taken.laterBytes;
         releasedNow += released;
         reportedPages += taken.pages;
+        reportedBuffers += taken.stateBuffers;
         if (!taken.gave())
           break;
         ++steps;
@@ -239,13 +264,16 @@ public:
             "a claim that does not take what is of certain reuse took the state a waiting request restores");
     if (!wanted.empty())
       cache_.setWantedChains({});
-    // A device need counts bytes, a page need pages of its form.
-    require(device ? freed <= counted && releasedNow <= counted + landing
-                   : freedPages <= countedPages && reportedPages <= countedPages,
+    // A device need counts bytes, a page need pages of its form, a state
+    // need buffers.
+    require(device   ? freed <= counted && releasedNow <= counted + landing
+            : states ? reportedBuffers <= countedBuffers
+                     : freedPages <= countedPages && reportedPages <= countedPages,
             "the claim's takes freed more than peek counted: counted " + std::to_string(counted) + " bytes and " +
                 std::to_string(countedPages) + " pages, freed " + std::to_string(freed) + " bytes (" +
                 std::to_string(releasedNow) + " now) and " +
-                std::to_string(freedPages) + " pages (" + std::to_string(reportedPages) + " reported)");
+                std::to_string(freedPages) + " pages (" + std::to_string(reportedPages) + " reported), " +
+                std::to_string(reportedBuffers) + " of " + std::to_string(countedBuffers) + " state buffers");
   }
 
   // Counted up to a random enough (VictimQuery::enough), the walk gives the

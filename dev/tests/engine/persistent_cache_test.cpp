@@ -251,10 +251,7 @@ void testWindowedCopiesNameTheirForm() {
   constexpr CacheWindowPolicy window{2};
   Process earlier(true, nullptr, std::nullopt, window);
   const std::vector<uint64_t> blocks = earlier.cachePrompt(1, prompt);
-  // The earlier point is copied while it is its conversation's newest; a
-  // reclaim writes only the newest.
   earlier.publish(blocks[1]);
-  require(earlier.persist(blocks[1]) == PersistStatus::Durable, "the earlier restore point was not copied");
   earlier.publish(blocks[3]);
   earlier.writeEverything();
   std::vector<std::vector<std::byte>> copies = earlier.kvLabels();
@@ -395,7 +392,6 @@ void testRestorePointsComeBack() {
   Process earlier(true);
   const std::vector<uint64_t> blocks = earlier.cachePrompt(1, prompt);
   earlier.publish(blocks[1]);
-  require(earlier.persist(blocks[1]) == PersistStatus::Durable, "the earlier restore point was not copied");
   earlier.publish(blocks[3]);
   earlier.writeEverything();
   Process next(true);
@@ -444,7 +440,6 @@ void testBrokenChainsStayBehind() {
   Process earlier(true);
   const std::vector<uint64_t> blocks = earlier.cachePrompt(1, prompt);
   earlier.publish(blocks[1]);
-  require(earlier.persist(blocks[1]) == PersistStatus::Durable, "the earlier restore point was not copied");
   earlier.publish(blocks[3]);
   earlier.writeEverything();
   std::vector<std::vector<std::byte>> kv;
@@ -737,16 +732,11 @@ void testCleanStopRecordsRecency() {
 // after a crash.
 void testReusedCheckpointsComeBackOrdinary() {
   Process process(true);
-  const std::vector<uint64_t> first = process.cachePrompt(1, promptOf(1000, 2));
-  const uint64_t reused = first[1];
+  const uint64_t reused = process.cachePrompt(1, promptOf(1000, 2))[1];
   process.publish(reused, true);
-  const std::vector<uint64_t> second = process.cachePrompt(2, promptOf(2000, 2));
-  const uint64_t resumed = second[1];
+  const uint64_t resumed = process.cachePrompt(2, promptOf(2000, 2))[1];
   process.publish(resumed, true);
-  // Queued requests restore both checkpoints, which a reclaim then writes.
-  process.cache.setWantedChains({first, second});
   process.writeEverything();
-  process.cache.setWantedChains({});
   const auto checkpoints = [&] {
     std::set<uint64_t> labelled;
     for (const auto &bytes : process.stateLabels())
@@ -1392,7 +1382,7 @@ void testCopyDemandCountsOnlyWhatGoesAtOnce() {
   constexpr double kDelay = WriteBehind::kDelayMilliseconds;
   Process process(false);
   WriteBehind writes(process.cache);
-  process.publish(process.cachePrompt(1, promptOf(9000, 2))[0]);
+  process.publish(process.cachePrompt(1, promptOf(9000, 2))[0], true);
   static_cast<void>(process.cachePrompt(2, promptOf(5000, 2)));
   const uint64_t point = process.cachePrompt(3, promptOf(1000, 1))[0];
   process.publish(point);
@@ -1408,7 +1398,7 @@ void testCopyDemandCountsOnlyWhatGoesAtOnce() {
     else
       atOnce += unit->bytes;
   }
-  require(atOnce && later, "the walk did not offer what writing the older point frees beside the KV that goes at once");
+  require(atOnce && later, "the walk did not offer what writing the checkpoint frees beside the KV that goes at once");
   require(!writes.run(kDelay, atOnce, false) && !process.tier.demotions && writes.snapshot().waiting == 1,
           "a point was copied ahead though what goes at once held the demand");
   require(!writes.run(kDelay, atOnce + 1, false) && process.tier.demotions == 1,

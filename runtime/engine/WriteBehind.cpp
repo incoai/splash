@@ -43,9 +43,9 @@ bool WriteBehind::settle(PersistStatus status) {
 bool WriteBehind::copying() const noexcept { return cache_.persistent() || demandBytes_ != 0; }
 
 bool WriteBehind::demanded(uint64_t demandBytes) const {
-  // At most what the cache gives a claim that cannot wait now, which starts
-  // no write and waits for none, and what the copies ahead in flight let go
-  // once they land, each unit counted up to what is left of the demand.
+  // At most what the cache gives a claim that cannot wait now, which waits
+  // for no write to land, and what the copies ahead in flight let go once
+  // they land, each unit counted up to what is left of the demand.
   uint64_t covered = cache_.copyingAheadBytes();
   if (covered >= demandBytes)
     return false;

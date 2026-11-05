@@ -232,15 +232,15 @@ public:
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   inUseCandidate(const std::optional<CacheEvictionCandidate> &after = {}) const noexcept;
   // Frees the RAM copy of a candidate above (an unpinned RAM copy; anything
-  // else throws std::logic_error): for nothing when a disk copy exists; with
-  // `write`, which the cache sets for a state a restore is expected from
-  // (Cache::writesState), by writing one when the tier takes it (makeRoom
-  // frees quota on its behalf); otherwise by dropping the state. While the
-  // one write in flight holds the staging buffer, a state to write stays,
-  // pending; one the quota refuses goes. Its buffers return to the model's
-  // pool, which releaseIdleBuffer gives back to the host. A RAM copy a write
-  // in flight reads (persist) stays until it lands: pending.
-  [[nodiscard]] StateEviction reclaim(uint64_t kvBlock, bool write);
+  // else throws std::logic_error): for nothing when a disk copy exists, by
+  // writing one when the tier takes it (makeRoom frees quota on its behalf),
+  // otherwise by dropping the state. The write copies the state into the
+  // staging buffer, so the RAM copy is free at once; while the one write in
+  // flight holds that buffer, a state to write stays, pending. A write the
+  // quota refuses drops the state. Its buffers return to the model's pool,
+  // which releaseIdleBuffer gives back to the host. A RAM copy a write in
+  // flight reads (persist) stays until it lands: pending.
+  [[nodiscard]] StateEviction reclaim(uint64_t kvBlock);
   // The state at this block may be given to reclaim(): an unpinned, valid
   // RAM copy.
   [[nodiscard]] bool reclaimable(uint64_t kvBlock) const noexcept;
@@ -252,10 +252,10 @@ public:
   // A reclaim of the state at this block writes it: it has no disk copy and
   // the tier takes its write.
   [[nodiscard]] bool reclaimWrites(uint64_t kvBlock) const noexcept;
-  // What reclaim(kvBlock, write) of a reclaimable state does, doing
-  // nothing: evicted or pending. A write the quota refuses drops the state,
-  // which counts as evicted.
-  [[nodiscard]] StateEviction reclaimOutcome(uint64_t kvBlock, bool write) const noexcept;
+  // What reclaim(kvBlock) of a reclaimable state does, doing nothing:
+  // evicted or pending. A write the quota refuses drops the state, which
+  // counts as evicted.
+  [[nodiscard]] StateEviction reclaimOutcome(uint64_t kvBlock) const noexcept;
   // Removes an unpinned state from both tiers.
   void evict(uint64_t kvBlock) noexcept;
   // Disk replacement: the oldest unpinned disk copy that is redundant (a RAM

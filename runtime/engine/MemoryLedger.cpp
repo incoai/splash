@@ -307,15 +307,18 @@ struct MemoryLedger::Run final {
 
 // The one order units are counted and taken in: memory nothing needs that
 // frees now (the cache's units that need no write, by its walk); the units
-// of pools that cost only their rebuild; the cache's units that free once a
-// write lands; the claimant's own conversion to Spill and the command
-// between its passes; the other pools' units (the expert store's chunks, top
-// first) down to their floors, which cost reads while they stay away; last
-// what another request uses, since its state in use costs it a re-prefill
-// of its whole prompt while a store chunk costs only reads until it regrows.
-// Within a stage the source registered first goes first, then the pools;
-// each source's own order is kept. What the claim may not take (TakeRights)
-// is left out, by its source or here for the pools, not stopped at.
+// of pools that cost only their rebuild; the cache's units that need a
+// write (Victim::write), a state the idle staging buffer writes, which
+// frees at once, and what frees once a write lands; the claimant's own
+// conversion to Spill and the command between its passes; the other pools'
+// units (the expert store's chunks, top first) down to their floors, which
+// cost reads while they stay away; last what another request uses, since
+// its state in use costs it a re-prefill of its whole prompt while a store
+// chunk costs only reads until it regrows. Within a stage the source
+// registered first goes first, then the pools; each source's own order is
+// kept. What the claim may not take (TakeRights) is left out, by its source
+// or here for the pools, not stopped at; a claim that does not wait for
+// writes passes over what frees only once one lands (Victim::later).
 class MemoryLedger::Order final {
 public:
   struct Head final {
@@ -358,7 +361,7 @@ public:
       return Stage::PassOrConversion;
     if (head.victim->cls == ReclaimClass::InUse)
       return Stage::InUse;
-    return head.victim->later ? Stage::NeedsWrite : Stage::FreeNow;
+    return head.victim->write ? Stage::NeedsWrite : Stage::FreeNow;
   }
 
   // Moves past the head's unit, which stays in its source's order (or which

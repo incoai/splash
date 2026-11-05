@@ -354,7 +354,7 @@ std::optional<CacheEvictionCandidate> StateCache::inUseDiskCandidate() const noe
   return inUseOnDisk_.oldest();
 }
 
-StateEviction StateCache::reclaim(uint64_t kvBlock, bool write) {
+StateEviction StateCache::reclaim(uint64_t kvBlock) {
   auto found = entries_.find(kvBlock);
   if (found == entries_.end() || found->second.pins || !found->second.ram)
     throw std::logic_error("state eviction candidate became pinned");
@@ -363,7 +363,7 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, bool write) {
   if (persisting(kvBlock))
     return {false, true};
   // One write at a time, of a class the tier takes now.
-  const bool writable = write && reclaimWrites(kvBlock);
+  const bool writable = reclaimWrites(kvBlock);
   if (writable && pending_)
     return {false, true};
   if (writable) {
@@ -403,9 +403,9 @@ bool StateCache::reclaimWrites(uint64_t kvBlock) const noexcept {
          found->second.ram->canOffload(inUse(kvBlock));
 }
 
-StateEviction StateCache::reclaimOutcome(uint64_t kvBlock, bool write) const noexcept {
+StateEviction StateCache::reclaimOutcome(uint64_t kvBlock) const noexcept {
   // As reclaim() decides it.
-  if (persisting(kvBlock) || (write && reclaimWrites(kvBlock) && pending_))
+  if (persisting(kvBlock) || (reclaimWrites(kvBlock) && pending_))
     return {false, true};
   return {true};
 }

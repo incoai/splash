@@ -1293,7 +1293,9 @@ take is skipped, not a stop:
 3. Caches the model rebuilds on use: the vision encoder's scratch, images'
    encoded rows, idle history staging, and the hot block cache while no lane
    reads above its floor.
-4. Cached units that need a write, for a claim that can wait.
+4. Cached units that need a write: the state the idle staging buffer writes,
+   whose RAM frees at once, for any claim; what frees only once its write
+   lands, for a claim that can wait.
 5. The command between its passes, then the claimant's own conversion to
    Spill.
 6. Pool units above their floors: the expert store's chunks, top chunk first,
@@ -1310,7 +1312,7 @@ step 4.
 **Who takes what**, derived in one function (`takeRights`) whose `TakeRights`
 every source of units reads (`MemoryLedger::Order`, `Cache::walkFor`):
 
-| Claimant | Cache that frees now | Cache that needs a write | Rebuilt caches | Pass command, own conversion | Pools above their floors | Resume point | Queued chains | In use |
+| Claimant | Cache that frees now | Cache that frees once its write lands | Rebuilt caches | Pass command, own conversion | Pools above their floors | Resume point | Queued chains | In use |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `InService`, can wait | yes | yes | yes | yes | yes | yes | yes | where it reaches them |
 | `InService`, immediate | yes | no | yes | no | no | yes | yes | no |
@@ -1415,15 +1417,20 @@ unit in use its request's prompt again. Inside the cache's one order
 units that free now past an uncopied one before it waits for that unit's
 write, which stays at the head for copies ahead of need to make.
 
-A state needs a write only when a restore from it is expected: one in use,
-the resume point, a queued request's, or a point copies ahead of need would
-copy, the newest of its conversation (`Cache::writesState`). Any other state,
-such as one its conversation went on from or a checkpoint no request waits
-for, is dropped like a unit no tier can copy, with no SSD cache or one whose
-files stopped taking writes. KV whose write finds no slot, with the quota
-full, nothing in it the take may give up and no transfer in flight, goes the
-same way once the take reaches it, a leaf with the copies below it that need
-it (`Cache::reclaimKvLeaf`).
+Reclaim writes every state it evicts to the SSD cache, checkpoints and points
+a conversation went on from too, and the SSD cache keeps them by its own LRU.
+A state's write copies it into the one staging buffer, so while no other write
+holds that buffer its RAM frees at once, and with it the blocks of its chain
+that already have a copy; a claim that cannot wait takes it too. What frees
+only once its write lands, a state whose write waits for the staging buffer or
+a KV leaf's demotion, goes only to a claim that can wait, which then waits for
+the write it starts; an `Immediate` claim passes over it.
+A unit no tier can copy, with no SSD cache or one whose files stopped taking
+writes, is dropped, and so is a state whose write the write budget or a full
+quota refuses. KV whose write finds no slot, with the quota full, nothing in
+it the take may give up and no transfer in flight, goes the same way once the
+take reaches it, a leaf with the copies below it that need it
+(`Cache::reclaimKvLeaf`).
 
 The ledger first counts the most the order gives, taking nothing
 (`MemoryLedger::bound`): each unit at what its source says it frees at most.
@@ -1565,10 +1572,10 @@ The last stays cached once the replay point is published: a later request that
 shares the prompt up to it, such as another conversation with the same long
 system prompt, resumes there instead of from the start. It stays only if the
 replay state fits beside it; refused memory, the replay state takes its buffers
-rather than another lane's checkpoint. Reclaim takes checkpoints first and
-drops them unwritten, but for one a queued request restores, which it writes
-to the SSD; one published straight to the SSD, when no RAM slot took it, stays
-there. These writes draw on the SSD cache's
+rather than another lane's checkpoint. With the SSD cache it costs a write as
+well: reclaim takes checkpoints first and writes the states it evicts to the
+SSD, this one too (153 MiB for 27B), and one published straight to the SSD,
+when no RAM slot took it, stays there. These writes draw on the SSD cache's
 write budget when one is set, which drops them while it is spent, a suspended
 request's own too, and a full quota makes room for one by dropping the oldest
 copy, perhaps an older conversation's restore point.
@@ -1901,10 +1908,12 @@ wake-up. The demand is the larger of twice the KV the lanes' next commands add
 and what a pool's last growth lacked, one growth unit (a 1 GiB store chunk) at
 most; a waiting claim adds nothing, as write-behind stops while one waits. A claim
 reached such cache when, within `kCopyDemandSeconds` (60 s), a `free()`
-reached a KV leaf a state needs, or a state, without a copy while the tier
-takes writes (`MemoryLedger::copyDemand`), whether it wrote it, waited for the
-write in flight or passed over it; what leaves through a copy it has counts for
-nothing, so the copies stop once claims find what they take copied. Without
+reached cache that frees only once its write lands, a KV leaf a state needs
+without a copy while the tier takes writes or a state whose write waits for
+the one in flight (`MemoryLedger::copyDemand`), whether it wrote it, waited
+for it or passed over it; what leaves through a copy it has counts for
+nothing, nor does a state the idle staging buffer writes, which frees at
+once, so the copies stop once claims find what they take copied. Without
 that nothing is written ahead. A point that waits for demand keeps its turn
 while it stays its conversation's newest: a publication meanwhile drops the
 queued points their conversations went on from or that are gone
