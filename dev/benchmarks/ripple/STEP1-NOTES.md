@@ -206,3 +206,22 @@ found the float path's epilogue coverage too narrow for an isolated block
 test (the gated epilogues are quantized-path only); the harness runs the
 real quantized path through the full loading machinery, which the goldens
 and the planning tests already exercise.
+
+## The pipeline's end-to-end validation
+
+The tiny model (2 layers at the family's attention geometry, hidden 256,
+with a 1-layer shipped-variant draft) loads through the full pipeline:
+the descriptor constructs, the planner plans the GGUF's images, the
+preparation writes them, the loader reads them into the target's and the
+draft's weights, and the target constructs (ripple-load). The fixture's
+builder writes the GGUF and the checkpoint at test dimensions with the real
+tensor names and formats.
+
+The block composition's compute is validated piece by piece (the mix and
+the placed projection, the attention kernels, the norms, the clamped
+epilogue) and code-reviewed against the pinned graph. The full numerical
+gate is the parity harness: the tiny model's prefill run through the
+engine's Runtime and through a CPU reference of the block graph, the logits
+compared. The Runtime's setup (the states, the KV pages, the scheduler) is
+the oracle test's infrastructure, whose Ripple case needs the tiny model's
+fixture and the family's oracle tokens.
