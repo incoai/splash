@@ -673,39 +673,57 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(check.gap_causes(run), {"claim wait": clients.CHURN_WORKERS})
 
     def test_runs_that_measured_nothing_are_invalid(self):
-        hog = {"ps": [{"rows": [[999, 96.0, 1.0, "mediaanalysisd", False]]}]}
-        busy = {"gpu_idle_check": {"ok": False, "max_percent": 40, "waited_s": 600}}
-        cases = {
-            "hot": {"samples": [status(0), status(60, thermal_state="serious")]},
-            "hog": {"meta": hog},
-            "build": {"meta": {"build_id": "b2"}},
-            "busy": {"meta": busy},
-        }
-        for name, files in cases.items():
-            with self.subTest(name):
-                run = self.served(name, **files)
-                self.assertTrue(check.check_run(run, build="b1")["invalid"])
-        # On the M5 Pro: a touch within a sampling period, or a sleep
-        # assertion of a process the run did not start other than powerd.
-        powerd = "pid 351(powerd): PreventUserIdleSystemSleep named: display on"
-        ours = "pid 7(python3): PreventUserIdleSystemSleep named: benchmark"
-        idle = {
-            "touched": [{"hid_idle_s": 3.0, "holders": [powerd]}],
-            "held": [{"hid_idle_s": 900.0, "holders": ["pid 8(Music): Prevent"]}],
-            "unused": [{"hid_idle_s": 900.0, "holders": [powerd, ours]}],
-        }
-        for name, samples in idle.items():
-            with self.subTest(name):
-                write_jsonl(self.directory / f"{name}.idle.jsonl", samples)
-                run = self.served(name, meta={"pids": [7]})
-                self.assertEqual(
-                    bool(check.check_run(run)["invalid"]), name != "unused"
-                )
+        other = self.served("build", meta={"build_id": "b2"})
+        self.assertTrue(check.check_run(other, build="b1")["invalid"])
         self.served("cut")
         (self.directory / "cut.out").write_text("")
         self.assertTrue(check.check_run(check.Run(self.directory, "cut"))["invalid"])
         self.assertTrue(
             check.check_run(self.served("resident"), streamed=True)["invalid"]
+        )
+
+    def test_only_a_comparison_needs_a_quiet_machine(self):
+        # A run's own check notes what made its machine loud, and passes;
+        # compare fails it. The pressure run of 11-04 on the M5 Pro: its
+        # display kept WindowServer at 36.6 % of a core.
+        windowserver = [[410, 36.6, 0.2, "WindowServer", False]]
+        busy = {"gpu_idle_check": {"ok": False, "max_percent": 40, "waited_s": 600}}
+        # On the M5 Pro: a touch within a sampling period, or a sleep
+        # assertion of a process the run did not start other than powerd.
+        powerd = "pid 351(powerd): PreventUserIdleSystemSleep named: display on"
+        ours = "pid 7(python3): PreventUserIdleSystemSleep named: benchmark"
+        cases = {
+            "hot": ({"samples": [status(0), status(60, thermal_state="serious")]}, []),
+            "display": ({"meta": {"ps": [{"rows": windowserver}]}}, []),
+            "busy": ({"meta": busy}, []),
+            "touched": ({}, [{"hid_idle_s": 3.0, "holders": [powerd]}]),
+            "held": ({}, [{"hid_idle_s": 900.0, "holders": ["pid 8(Music): Prevent"]}]),
+            "quiet": ({}, [{"hid_idle_s": 900.0, "holders": [powerd, ours]}]),
+        }
+        for name, (files, idle) in cases.items():
+            with self.subTest(name):
+                write_jsonl(self.directory / f"{name}.idle.jsonl", idle)
+                meta = {"pids": [7], **files.pop("meta", {})}
+                run = self.served(name, meta=meta, **files)
+                result = check.check_run(run, minutes=15, build="b1")
+                self.assertEqual(result["invalid"] + result["failures"], [])
+                noted = [n for n in result["notes"] if n.startswith("not quiet: ")]
+                self.assertEqual(bool(noted), name != "quiet", result["notes"])
+                self.assertEqual(bool(check.not_quiet(run)), name != "quiet")
+        display = self.served(
+            "display-a", meta={"build_id": "a", "ps": [{"rows": windowserver}]}
+        )
+        rounds = [
+            self.served(f"q{i}", meta={"build_id": build})
+            for i, build in enumerate("abb")
+        ]
+        problems, _ = check.compare([*rounds, display])
+        self.assertEqual(
+            problems,
+            [
+                "display-a: a process this run did not start in the top five "
+                "by CPU: WindowServer at 36.6 %"
+            ],
         )
 
     def test_the_cli_exits_1_on_a_failed_run(self):

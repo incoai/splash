@@ -22,7 +22,7 @@ SIGINT; and writes beside the client's records:
   start compiles Metal), host memory and pressure at start, ps snapshots at
   the start, middle and end of the scenario while the server serves, the pids
   this run started, on the M5 Pro the idle and sleep-assertion samples
-  (LABEL.idle.jsonl) that void a run while the machine was in use, and for a run
+  (LABEL.idle.jsonl) that show whether the machine was in use, and for a run
   that did not complete why (error) and whose failure that was (failure:
   server or request, the server's own, else the refusal's kind);
 - LABEL.server.log (one per server: LABEL-nN for each concurrency of ttft).

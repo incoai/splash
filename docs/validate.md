@@ -375,21 +375,23 @@ directory.
   run on its own and exits 1 on any failure; `test-pressure-real` runs it on
   its churn run.
 - `compare A1 B1 B2 A2`, each run as `RESULTS/LABEL`, compares two builds on
-  four runs in ABBA order on one idle Mac: each run must pass its own check,
-  the two A runs and the two B runs must each be one build, and every
-  per-request metric the four share (churn's TTFT, completion latency and
+  four runs in ABBA order on one Mac: each run must pass its own check on a
+  quiet machine, the two A runs and the two B runs must each be one build,
+  and every per-request metric the four share (churn's TTFT, completion latency and
   decode milliseconds per token, ttft's TTFT per concurrency, serve1's TTFT
   and decode per size, warm's prompt time per depth) must pass the release check's speed rule
   (`dev/benchmarks/abba.py`).
 
 A run measured nothing and is to be repeated when it did not end with `DONE`
-for a reason other than the server's, saw a `serious` or `critical` thermal
-sample, found the GPU still busy after its wait for idle (`--gpu-idle-percent`),
-on the M5 Pro was touched within a 10 s sampling period or saw a sleep
-assertion held by a process it did not start other than `powerd`, had a
-process it did not start among the top five by CPU at 24 % or more, served a
-build other than `--build`, or, with `--streamed`, did not start with its
-routed experts streamed.
+for a reason other than the server's, served a build other than `--build`,
+or, with `--streamed`, did not start with its routed experts streamed. Only a
+timed comparison needs a quiet machine: `compare` also fails a run that saw a
+`serious` or `critical` thermal sample, found the GPU still busy after its wait
+for idle (`--gpu-idle-percent`), on the M5 Pro was touched within a 10 s
+sampling period or saw a sleep assertion held by a process it did not start
+other than `powerd`, or had a process it did not start among the top five by
+CPU at 24 % or more. `run`, whose gates judge freezes and correctness, which
+these do not excuse, notes them.
 
 | Gate | Rule |
 | --- | --- |

@@ -8,8 +8,9 @@ compared on four runs in ABBA order.
 `run` prints a FAIL line per failure, an INVALID line per reason the run
 measured nothing (repeat it) and a NOTE line per readout, and exits 1 on any
 FAIL or INVALID. `compare` takes each run as RUN_DIR/LABEL, baseline build A
-first and last, checks each on its own, then compares their per-request
-metrics by abba.compare_samples, and exits 1 unless every metric passes.
+first and last, checks each on its own and that its machine was quiet
+(not_quiet), then compares their per-request metrics by
+abba.compare_samples, and exits 1 unless every metric passes.
 """
 
 from __future__ import annotations
@@ -46,10 +47,13 @@ CLAIM_WAIT_MS = 30_000
 # counts as taken back, and a second take back within it of the first is an
 # oscillation: a store that changes this fast pays reads for nothing.
 STORE_HORIZON_S = 60
-THERMAL_INVALID = ("serious", "critical")
+THERMAL_HOT = ("serious", "critical")
 # A process the run did not start, among the top five by CPU at this share or
-# more, competes with the server: twice the busiest steady system process
-# measured (WindowServer, 11.9 %).
+# more, competes with the server and voids a timed comparison (not_quiet):
+# twice the busiest steady system process on the Studio (WindowServer,
+# 11.9 %). A Mac whose display is in use exceeds it (the M5 Pro's
+# WindowServer at 36.6 % and more): compare fails its runs, and their own
+# check notes it.
 FOREIGN_CPU_PERCENT = 24
 
 
@@ -185,20 +189,33 @@ def app_assertion(holder: str, ours: set[int]) -> bool:
 
 def invalid(run: Run, build: str | None, streamed: bool) -> list[str]:
     """Why a run measured nothing and is to be repeated: it did not end with
-    DONE for a reason that is not the server's (G8 judges those), it ran
-    hot, the GPU was busy at its start, the machine was in use or another
-    process held a sleep assertion, a foreign process competed for the CPU,
-    it served another build, or the experts did not stream from the start
-    when they were to."""
+    DONE for a reason that is not the server's (G8 judges those), it served
+    another build, or the experts did not stream from the start when they
+    were to."""
     reasons = []
     if not run.complete and run.meta.get("failure") not in SERVER_FAILURES:
         reasons.append(
             "the run did not end with DONE"
             + (f": {run.meta['error']}" if run.meta.get("error") else "")
         )
-    thermal = {s["status"].get("thermal_state") for s in run.samples} & set(
-        THERMAL_INVALID
-    )
+    if build and run.build != build:
+        reasons.append(f"build {run.build}, not {build}")
+    if streamed and not value(
+        run.samples[0]["status"] if run.samples else {}, "streamed_experts.cap_bytes"
+    ):
+        reasons.append("the routed experts did not stream from the start")
+    return reasons
+
+
+def not_quiet(run: Run) -> list[str]:
+    """Why the machine was not quiet during a run: it ran hot, the GPU was
+    busy at its start, the machine was in use or another process held a
+    sleep assertion, or a foreign process competed for the CPU. Only a timed
+    comparison needs a quiet machine: `compare` fails a run on these, as
+    they void the times it compares. A run's own check judges freezes and
+    correctness (G4, G8, G9), which they do not excuse, and notes them."""
+    reasons = []
+    thermal = {s["status"].get("thermal_state") for s in run.samples} & set(THERMAL_HOT)
     if thermal:
         reasons.append(f"thermal state {sorted(thermal)}")
     busy = run.meta.get("gpu_idle_check")
@@ -228,12 +245,6 @@ def invalid(run: Run, build: str | None, streamed: bool) -> list[str]:
                 f"{foreign[0][3]} at {foreign[0][1]:g} %"
             )
             break
-    if build and run.build != build:
-        reasons.append(f"build {run.build}, not {build}")
-    if streamed and not value(
-        run.samples[0]["status"] if run.samples else {}, "streamed_experts.cap_bytes"
-    ):
-        reasons.append("the routed experts did not stream from the start")
     return reasons
 
 
@@ -401,13 +412,14 @@ def check_run(
     streamed: bool = False,
     build: str | None = None,
 ) -> dict:
-    """One run on its own: `invalid` reasons, `failures` and `notes`. Every
-    run is judged on G8; a churn run also on its load window, every client
-    served, G4, G9 and the store line."""
+    """One run on its own: `invalid` reasons, `failures` and `notes`, among
+    them why its machine was not quiet. Every run is judged on G8; a churn
+    run also on its load window, every client served, G4, G9 and the store
+    line."""
     result = {
         "invalid": invalid(run, build, streamed),
         "failures": g8_failures(run),
-        "notes": [],
+        "notes": [f"not quiet: {reason}" for reason in not_quiet(run)],
     }
     if run.meta.get("scenario", "churn") != "churn":
         return result
@@ -467,15 +479,15 @@ def metrics(run: Run) -> dict[str, list[float]]:
 
 def compare(runs: list[Run]) -> tuple[list[str], list[str]]:
     """Two builds on four runs in ABBA order: each run must pass its own
-    check, the two A runs and the two B runs must each be one build, the
-    builds two, and every metric the four share must pass abba.compare.
-    Returns the problems and one line per metric."""
+    check on a quiet machine, the two A runs and the two B runs must each
+    be one build, the builds two, and every metric the four share must pass
+    abba.compare. Returns the problems and one line per metric."""
     problems, lines = [], []
     for run in runs:
         checked = check_run(run)
         problems += [
             f"{run.label}: {reason}"
-            for reason in checked["invalid"] + checked["failures"]
+            for reason in checked["invalid"] + checked["failures"] + not_quiet(run)
         ]
     a1, b1, b2, a2 = (run.build for run in runs)
     if a1 != a2 or b1 != b2:
