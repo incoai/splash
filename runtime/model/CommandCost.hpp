@@ -72,8 +72,6 @@ struct CommandWork final {
 struct CommandSample final {
   CommandWork work;                       // realized: bytes as the store's and the readers' counters moved
   double wallMilliseconds = 0.0;
-  double spilledKvReadMilliseconds = 0.0; // decode: host-step work of the hot block cache's blocking reads during
-                                          // the command (KvBlockCacheStats::work delta); prefill 0
   double imageEncodeMilliseconds = 0.0;   // the encode command ahead of a prefill (Runtime::prefillAsync)
   bool representative = true;             // false when the completion added work (the Neural Engine FFN's rerun)
 };

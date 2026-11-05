@@ -1110,6 +1110,39 @@ void testADecodeGapOnExpertReadsIsAnSsdWait() {
               std::to_string(counted.gaps[at(GapCause::Other)]) + " under no cause");
 }
 
+// A decode gap ended by a command that read spilled K/V from the SSD, hot blocks its lane missed, counts as an SSD
+// wait; one ended by a command whose lane found every hot block in memory counts as none, however long the
+// command took.
+void testADecodeGapIsAnSsdWaitOnlyWhenItsHotBlocksMissed() {
+  for (const bool missed : {false, true}) {
+    test::EngineHarness harness({.pages = 1024, .timing = &test::kM6FlashNextQ2});
+    harness.model.decodeFinishes = false;
+    const double bound = harness.engine.snapshot().scheduler.decodeGapTargetMilliseconds;
+    harness.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
+      test::CommandTimes times;
+      if (plan.kind == WorkKind::Decode) {
+        times.wallMilliseconds = 2.0 * bound;
+        times.sample.work.spilledKvReadBytes = missed ? 1ULL << 20 : 0;
+      }
+      return times;
+    };
+    EngineRequest decoder = harness.request(1, std::vector<uint32_t>(40, 1));
+    decoder.maxNewTokens = 4000;
+    decoder.deadlineMilliseconds = 1e9;
+    harness.engine.submit(std::move(decoder));
+    harness.runUntil([&] { return harness.events.tokenTimes[1].size() > 8; }, "the decoder did not decode");
+    const DecodeGapCausesSnapshot counted = harness.engine.snapshot().decodeGapCauses;
+    const auto at = [](GapCause cause) { return static_cast<size_t>(cause); };
+    const uint64_t gaps = std::accumulate(counted.gaps.begin(), counted.gaps.end(), uint64_t{0});
+    require(harness.longestDecodeGap() > bound && gaps > 0 &&
+                counted.gaps[at(missed ? GapCause::SsdRead : GapCause::Other)] == gaps,
+            std::string("decode gaps past the bound whose commands read ") + (missed ? "missed" : "no") +
+                " hot blocks counted " + std::to_string(counted.gaps[at(GapCause::SsdRead)]) +
+                " times as an SSD wait and " + std::to_string(counted.gaps[at(GapCause::Other)]) +
+                " under no cause, of " + std::to_string(gaps));
+  }
+}
+
 // Copies ahead for a pool's regrowth stay within about the unit the try lacked (one 16-page batch past it at most),
 // and stop once the store is at its cap.
 void testCopiesAheadForRegrowthStayWithinAUnit() {
@@ -1187,6 +1220,7 @@ std::span<const test::TestCase> rulesTests() {
       {"testAnImageStartKeepsItsArenaAndGivesBackIdleRows", testAnImageStartKeepsItsArenaAndGivesBackIdleRows},
       {"testADecodeGapNamesItsCause", testADecodeGapNamesItsCause},
       {"testADecodeGapOnExpertReadsIsAnSsdWait", testADecodeGapOnExpertReadsIsAnSsdWait},
+      {"testADecodeGapIsAnSsdWaitOnlyWhenItsHotBlocksMissed", testADecodeGapIsAnSsdWaitOnlyWhenItsHotBlocksMissed},
       {"testACancelBetweenPassesEndsBesideAHigherPrioritysDecode",
        testACancelBetweenPassesEndsBesideAHigherPrioritysDecode},
       {"testACancelBetweenPassesBesideItsOwnPrioritysDecodeKeepsThePasses",

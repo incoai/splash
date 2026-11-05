@@ -488,9 +488,10 @@ void Engine::firstTokens(Request &active) {
 
 void Engine::decodeGap(Request &active, const model::CommandSample &sample, double now) {
   Request::GapSince &since = active.gapSince;
-  // The command waited on the SSD, every lane of it alike: for the experts
-  // the store missed, or the hot blocks a lane with Index pages read.
-  if (sample.work.weightReadBytes || sample.spilledKvReadMilliseconds > 0.0)
+  // The command read from the SSD, for every lane of it alike: the experts
+  // the store missed, or spilled K/V (the hot blocks a decode missed). A
+  // command whose lanes found every hot block in memory read nothing.
+  if (sample.work.weightReadBytes || sample.work.spilledKvReadBytes)
     since.ssdRead = true;
   const uint64_t releases = governor().ledger().poolReleases();
   if (active.lastTokenMilliseconds && now - *active.lastTokenMilliseconds > config_.decodeGapMilliseconds) {

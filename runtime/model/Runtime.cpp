@@ -59,18 +59,12 @@ using metal::MetalBuffer;
 // the work it encodes, with the weights it read on demand as the store's
 // reads moved from before its submission to its completion
 // (ExpertStore::readBytes), as commands never overlap, and the spilled K/V
-// its reads brought (SpilledKvReads::readBytes); a decode's, also the
-// host-step work of the hot block cache's reads in the same span
-// (KvBlockCacheStats::work), which the backend counts before the command
-// completes (metal::EventStep). It holds the command's reads, which its
-// completion ends, until it realizes the work.
+// its reads brought (SpilledKvReads::readBytes). It holds the command's
+// reads, which its completion ends, until it realizes the work.
 class WorkCount final {
 public:
-  WorkCount(CommandWork work, const ExpertStore *store, std::shared_ptr<const SpilledKvReads> reads = {},
-            const KvBlockCache *blockCache = nullptr)
-      : work_(work), store_(store), reads_(std::move(reads)), blockCache_(blockCache),
-        weightReadBytes_(store ? store->readBytes() : 0),
-        hotBlockMilliseconds_(blockCache ? blockCache->stats().work.totalMilliseconds : 0.0) {}
+  WorkCount(CommandWork work, const ExpertStore *store, std::shared_ptr<const SpilledKvReads> reads = {})
+      : work_(work), store_(store), reads_(std::move(reads)), weightReadBytes_(store ? store->readBytes() : 0) {}
 
   // Once the command completed; lets go of its reads.
   [[nodiscard]] CommandWork realize() {
@@ -79,17 +73,12 @@ public:
     if (reads_) work.spilledKvReadBytes = std::exchange(reads_, {})->readBytes();
     return work;
   }
-  [[nodiscard]] double spilledKvReadMilliseconds() const {
-    return blockCache_ ? blockCache_->stats().work.totalMilliseconds - hotBlockMilliseconds_ : 0.0;
-  }
 
 private:
   CommandWork work_;
   const ExpertStore *store_ = nullptr;
   std::shared_ptr<const SpilledKvReads> reads_;
-  const KvBlockCache *blockCache_ = nullptr;
   uint64_t weightReadBytes_ = 0;
-  double hotBlockMilliseconds_ = 0.0;
 };
 
 class DeferredMetalTicket final : public ModelBatchTicket {
@@ -136,7 +125,6 @@ public:
     std::vector<ModelStepResult> results = completion(timing);
     wallMilliseconds_ = timing.wallSeconds * 1000.0;
     work_ = count_.realize();
-    spilledKvReadMilliseconds_ = count_.spilledKvReadMilliseconds();
     // Work the completion added takes wall time, but is no sample of the
     // command's rows.
     if (timing.wallSeconds != commandSeconds)
@@ -147,7 +135,6 @@ public:
   CommandSample sample() const noexcept override {
     return {.work = work_,
             .wallMilliseconds = wallMilliseconds_,
-            .spilledKvReadMilliseconds = spilledKvReadMilliseconds_,
             .imageEncodeMilliseconds = imageEncodeMilliseconds_,
             .representative = representativePrefillTiming_};
   }
@@ -173,7 +160,6 @@ private:
   CommandTicket ticket_;
   CommandTiming encodes_;
   double wallMilliseconds_ = 0.0;
-  double spilledKvReadMilliseconds_ = 0.0;
   double imageEncodeMilliseconds_ = 0.0;
   bool representativePrefillTiming_ = true;
 };
@@ -2663,14 +2649,11 @@ struct Runtime::Impl {
       items_.clear();
       reads_.reset();
       work_ = count_.realize();
-      spilledKvReadMilliseconds_ = count_.spilledKvReadMilliseconds();
       return results;
     }
 
     CommandSample sample() const noexcept override {
-      return {.work = work_,
-              .wallMilliseconds = timing_.wallSeconds * 1000.0,
-              .spilledKvReadMilliseconds = spilledKvReadMilliseconds_};
+      return {.work = work_, .wallMilliseconds = timing_.wallSeconds * 1000.0};
     }
 
   private:
@@ -2703,7 +2686,6 @@ struct Runtime::Impl {
     std::shared_ptr<SpilledKvReads> reads_;
     WorkCount count_;
     CommandWork work_;
-    double spilledKvReadMilliseconds_ = 0.0;
     Stage stage_ = Stage::Draft;
     CommandTicket command_;
     CommandTiming timing_;
@@ -3265,9 +3247,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                {logicalPositions.data(), width},
                                {maximumRetained.data(), width}, constrained);
   std::shared_ptr<SpilledKvReads> reads = impl_->decodeReads(items);
-  // The weights it reads on demand, the spilled K/V its reads bring and the
-  // hot blocks they resolve.
-  WorkCount count({}, impl_->model.expertStore(), reads, impl_->blockCache);
+  // The weights it reads on demand and the spilled K/V its reads bring.
+  WorkCount count({}, impl_->model.expertStore(), reads);
   if (constrained) {
     return std::make_unique<Impl::ConstrainedDecodeTicket>(*impl_, std::move(lanes), items, std::move(reads),
                                                            commandGraph, std::move(count), std::move(completion));
