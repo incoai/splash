@@ -31,7 +31,7 @@ permissions:
 
 jobs:
   engine-check:
-    name: Production, CPU runtime, native builds, and sanitizers
+    name: Production, CPU runtime, native builds and the app
     runs-on: blacksmith-6vcpu-macos-27
     timeout-minutes: 30
     steps:
@@ -45,10 +45,21 @@ jobs:
         run: make check-source check-native-cpu PYTHON_CANDIDATES="$(brew --prefix python@3.13)/bin/python3.13"
       - name: Build every native test and tool
         run: make check-native-build
-      - name: Run native sanitizers
-        run: make test-sanitizers
       - name: Test the desktop app
         run: make check-app
+
+  sanitizers:
+    name: Native sanitizers
+    runs-on: blacksmith-6vcpu-macos-27
+    # From a fresh checkout, make test-sanitizers took 56 minutes on an M5
+    # Pro at nice 15 with a load of 4 to 7 (11-05): 12 to build, 32 in
+    # engine-sim under ThreadSanitizer, 9 in it under AddressSanitizer. Not
+    # measured on this runner: twice that, for a slower one.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build and run the sanitizer tests
+        run: make test-sanitizers
 
   python-compatibility:
     name: Python compatibility ${{ matrix.python-version }}
