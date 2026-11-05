@@ -26,17 +26,54 @@
 
 // The dynamic convolutions of a draft layer (draft_conv), each run in two
 // stages, before its attention or MLP and after it with the residual: a
-// stage weighs a channel's row and the row before it, its two taps, each by
-// a base weight plus the dynamic weight of the channel's group of 16
+// stage weighs a channel's row and the rows before it, its taps, each by a
+// base weight plus the dynamic weight of the channel's group of 16
 // channels. The draft projects every row's dynamic weights, for each stage,
 // tap and group of a `hidden`-wide layer.
 #define SPLASH_DRAFT_CONVOLUTION_STAGES 2u
 #define SPLASH_DRAFT_CONVOLUTION_TAPS 2u
 #define SPLASH_DRAFT_CONVOLUTION_GROUP 16u
+inline constexpr uint32_t draft_dynamic_width(uint32_t hidden, uint32_t taps);
 inline constexpr uint32_t draft_dynamic_width(uint32_t hidden) {
-  return SPLASH_DRAFT_CONVOLUTION_STAGES * SPLASH_DRAFT_CONVOLUTION_TAPS *
+  return draft_dynamic_width(hidden, SPLASH_DRAFT_CONVOLUTION_TAPS);
+}
+inline constexpr uint32_t draft_dynamic_width(uint32_t hidden, uint32_t taps) {
+  return SPLASH_DRAFT_CONVOLUTION_STAGES * taps *
          (hidden / SPLASH_DRAFT_CONVOLUTION_GROUP);
 }
+
+#ifndef __METAL_VERSION__
+// The draft geometries the kernels are compiled for (decode/draft.metal and
+// prefill/draft_context.metal), which a draft's configuration must match in
+// full: a draft of another geometry is refused, as one the kernels cannot
+// serve. A variant's kernels carry its suffix after the shipped kernels'
+// names, and a KV head's query heads are shared among whole head groups of
+// the rows one threadgroup attends, as the target's attention kernels share
+// a KV head's query heads.
+struct SplashDraftVariant {
+  uint32_t query_heads;
+  uint32_t kv_heads;
+  uint32_t head_dimension;
+  uint32_t window;
+  uint32_t convolution_taps;
+  uint32_t splits;
+  uint32_t head_groups;
+  const char *suffix;
+};
+inline constexpr SplashDraftVariant SPLASH_DRAFT_VARIANTS[] = {
+    // The shipped drafts: 32 query heads over 8 KV heads of 128 dimensions,
+    // a 2048-slot ring, two-tap convolutions, four split threadgroups, one
+    // head group per KV head.
+    {SPLASH_DRAFT_QUERY_HEADS, SPLASH_DRAFT_KV_HEADS, SPLASH_DRAFT_HEAD_DIMENSION,
+     SPLASH_DRAFT_SLIDING_WINDOW, SPLASH_DRAFT_CONVOLUTION_TAPS,
+     SPLASH_DRAFT_ATTENTION_SPLITS, 1, ""},
+    // Ripple's draft: 80 query heads over the 8 KV heads, a 4096-slot ring,
+    // four-tap convolutions, head groups of five query heads (two 40-row
+    // threadgroups per KV head, the device's 32 KB threadgroup memory
+    // measured to refuse one 80-row group), eight split threadgroups.
+    {80, 8, 128, 4096, 4, 8, 2, "_kv8_h5_d128_w4096_s8"},
+};
+#endif
 
 // The batched draft kernels' grids cover exactly the dispatch's lanes:
 // per-lane arrays hold those lanes, and entries past them are zero and unread.

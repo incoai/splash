@@ -26,7 +26,7 @@ prefill_draft_context_kv(device const bfloat *context_kv [[buffer(0)]],
 }
 
 kernel void
-prefill_draft_context_kv_w4096(device const bfloat *context_kv [[buffer(0)]],
+prefill_draft_context_kv_kv8_h5_d128_w4096_s8(device const bfloat *context_kv [[buffer(0)]],
                                device const bfloat *k_norm [[buffer(1)]],
                                device const float *rope_cos [[buffer(2)]],
                                device const float *rope_sin [[buffer(3)]],
@@ -134,7 +134,7 @@ prefill_draft_context_store(device const bfloat *context [[buffer(0)]],
 }
 
 kernel void
-prefill_draft_context_store_w4096(
+prefill_draft_context_store_kv8_h5_d128_w4096_s8(
     device const bfloat *context [[buffer(0)]],
     device uchar *window [[buffer(1)]],
     constant DraftContextWindowParams &params [[buffer(2)]],
@@ -160,7 +160,7 @@ prefill_draft_context_load(device const uchar *window [[buffer(0)]],
 }
 
 kernel void
-prefill_draft_context_load_w4096(
+prefill_draft_context_load_kv8_h5_d128_w4096_s8(
     device const uchar *window [[buffer(0)]],
     device bfloat *context [[buffer(1)]],
     constant DraftContextWindowParams &params [[buffer(2)]],

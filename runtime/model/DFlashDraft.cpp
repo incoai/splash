@@ -172,7 +172,8 @@ void DFlashDraft::addContextPrefill(
                          const metal::MetalBuffer &window) {
     ops::DraftAttention::addWindowStore(graph,
                                         backend_.view(buffers.hidden, compactRow * rowBytes, count * rowBytes),
-                                        window, count, startPosition, layout.hiddenSize);
+                                        window, count, startPosition, layout.hiddenSize,
+                                        ops::draftVariant(layout.attentionShape()));
   };
   for (const DFlashPrefillSpan &span : spans)
     store(span.compactRow, span.rows, span.startPosition, span.window);
@@ -193,7 +194,8 @@ void DFlashDraft::addContextRebuild(metal::CommandGraph &graph,
   if (!rows || rows > ExecutionLimits::draftContextTokens || ring.size() != layout.layers)
     throw std::invalid_argument("invalid draft context rebuild");
   ops::DraftAttention::addWindowLoad(graph, window, buffers.hidden, rows, startPosition,
-                                     layout.hiddenSize);
+                                     layout.hiddenSize,
+                                     ops::draftVariant(layout.attentionShape()));
   const DFlashPrefillSpan span{0, rows, startPosition, ring, window};
   addContextKv(graph, buffers, rows, {&span, 1});
 }

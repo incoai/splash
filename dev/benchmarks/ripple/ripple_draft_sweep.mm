@@ -613,22 +613,21 @@ int main(int argc, char **argv) {
     std::cerr << "device " << variant.capabilities().deviceName << "\n";
     std::cout << "{\"device\":\"" << variant.capabilities().deviceName
               << "\",\"cases\":[";
+    // The production metallib's compiled draft kernels: the shipped
+    // geometry's and Ripple's (splits 4 and 8 both compiled; the engine's
+    // variant table serves 8).
     const AttentionCase cases[]{
-        AttentionCase{"baseline-variant", "ripple_split_q32_h4_s4_w2048",
-                      "ripple_reduce_q32_h4_s4", 32, 4, 4, 2048, "", ""},
         AttentionCase{"baseline-production", "", "", 32, 4, 4, 2048,
                       "draft_attention_bf16_split",
                       "draft_attention_bf16_reduce"},
-        AttentionCase{"ripple-h5-s4-w2048", "ripple_split_q80_h5_s4_w2048",
-                      "ripple_reduce_q80_h5_s4", 80, 5, 4, 2048, "", ""},
-        AttentionCase{"ripple-h5-s8-w2048", "ripple_split_q80_h5_s8_w2048",
-                      "ripple_reduce_q80_h5_s8", 80, 5, 8, 2048, "", ""},
-        AttentionCase{"ripple-h5-s4-w4096", "ripple_split_q80_h5_s4_w4096",
-                      "ripple_reduce_q80_h5_s4_w4096", 80, 5, 4, 4096, "", ""},
-        AttentionCase{"ripple-h5-s8-w4096", "ripple_split_q80_h5_s8_w4096",
-                      "ripple_reduce_q80_h5_s8_w4096", 80, 5, 8, 4096, "", ""},
-        AttentionCase{"ripple-h10-s4-w2048", "ripple_split_q80_h10_s4_w2048",
-                      "ripple_reduce_q80_h10_s4", 80, 10, 4, 2048, "", ""},
+        AttentionCase{"ripple-h5-s8-w4096",
+                      "draft_attention_bf16_split_kv8_h5_d128_w4096_s8",
+                      "draft_attention_bf16_reduce_kv8_h5_d128_w4096_s8",
+                      80, 5, 8, 4096, "", ""},
+        AttentionCase{"ripple-h5-s4-w4096",
+                      "draft_attention_bf16_split_kv8_h5_d128_w4096_s4",
+                      "draft_attention_bf16_reduce_kv8_h5_d128_s4",
+                      80, 5, 4, 4096, "", ""},
     };
     bool first = true;
     for (const AttentionCase &c : cases) {
@@ -648,8 +647,8 @@ int main(int argc, char **argv) {
       }
     }
     const ConvCase convCases[]{
-        ConvCase{"conv-t2", "ripple_conv_t2", 2, 5120},
-        ConvCase{"conv-t4", "ripple_conv_t4", 4, 5120},
+        ConvCase{"conv-t2", "draft_conv", 2, 5120},
+        ConvCase{"conv-t4", "draft_conv_kv8_h5_d128_w4096_s8", 4, 5120},
     };
     for (const ConvCase &c : convCases) {
       std::cout << (first ? "" : ",");
