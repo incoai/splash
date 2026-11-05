@@ -142,3 +142,31 @@ fused projection, whose input is a); term two is (1 - sigmoid(λ)) · Wv ·
 scaled_emb, a per-block projection through the v rows alone (the prepared
 weights' last fused section), adding where the prepare stages v. The scale
 of the embeddings is the gather's (landed), and kq_scale is 1/sqrt(128).
+
+## Step 2 spec: the value residual's final form (supersedes the row-scale split)
+
+The mixed v input is materialized and the v projection reads it, which keeps
+the attention kernels' packed row order untouched and adds no weight bytes:
+
+    packed row = [ q | gate | k | v ]     (22528 columns, as today)
+    fused projection: q + gate + k  ->  packed[0 .. 21504)   (input: a)
+    v mix kernel:     v_in = sigmoid(λ)·a + (1 - sigmoid(λ))·scaled_emb
+    v projection:     attn_v (1024 rows) -> packed[21504 .. 22528)
+                      (input: v_in; out_offset = 21504, which
+                       GgufDecodeParams.out_offset carries and the staged
+                       kernels already apply)
+
+Per block, three dispatches (fused, mix, v) instead of one; the weight bytes
+are the same (the fused projection drops the v rows it used to carry, the v
+projection picks them up). The attention's q/k/v prepare reads the packed v
+columns at the tail as it does for every family, unchanged. The λ is the
+block's F32 section; the mix kernel computes its sigmoid (a scalar per
+block). scaled_emb is the gather's output rows, which the block's capture
+already holds for the draft's taps.
+
+Consequences for the loader and planner: the fused read is q+gate+k
+(21504 rows) and attn_v plans as its own projection section, so the mixer's
+reading is Ripple's own (readQwenAttention serves the Qwen fused three; the
+generic reader's mixer hook takes a family's reader, as its FFN hook does).
+The layout's packedFullWidth stays 22528 - the packed row the kernels see -
+and the fused read's width is the loader's business.
