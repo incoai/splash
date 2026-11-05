@@ -212,8 +212,8 @@ struct TakeRights final {
 // since the pools serve every lane, and none for a pool's growth. A Floor
 // claim takes nothing (logic_error). The engine's own optional work, an
 // Optional claim of no request (the Index runway's refill with no Spill lane
-// in service, trims with no lane in service), takes no unit: only what costs
-// nothing and what lands, for memory it can go without.
+// in service, trims with no lane in service), takes no unit: its rights are
+// the narrowest, TakeRights{}, for memory it can go without.
 [[nodiscard]] TakeRights takeRights(const ClaimSpec &spec, const Need &need, bool critical,
                                     std::optional<RequestPriority> highestLane);
 

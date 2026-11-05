@@ -1333,8 +1333,9 @@ a resume point that goes keeps its SSD copy: its next turn starts with a
 restore read rather than a prefill.
 
 The engine's own optional work (the Index runway's refill with no Spill lane
-in service, trims with no lane in service) takes no unit at all
-(`TakeRights::units`): only the idle state buffers and what lands. The pass
+in service, trims with no lane in service) takes no unit at all: its rights
+are the narrowest, `TakeRights{}`, which take only the idle state buffers
+and what lands, and its count walks no source. The pass
 command goes only to work that supersedes it, a conversion only to its own
 lane's KV growth. A claim below the priority of a lane in service
 takes no pool's units, rebuilt or above a floor. A `Floor` claim, the start's

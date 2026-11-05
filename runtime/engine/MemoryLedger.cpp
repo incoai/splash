@@ -45,12 +45,16 @@ TakeRights takeRights(const ClaimSpec &spec, const Need &need, bool critical,
   using Reserves = TakeRights::Reserves;
   if (spec.cls == ClaimClass::Floor)
     throw std::logic_error("a Floor claim takes nothing: the start and a weights restore pass only the host's rule");
+  // The engine's own optional work takes no unit, so every right is the
+  // narrowest.
+  if (spec.cls == ClaimClass::Optional && !spec.requestId)
+    return {};
   const bool host = spec.cls == ClaimClass::Host;
   const bool inService = spec.cls == ClaimClass::InService;
   const bool hostCritical = host && critical;
   const bool waits = (host ? !critical : spec.timing == NeedTiming::CanWait) && !need.hostRefused;
   const bool belowALane = highestLane && *highestLane < spec.priority;
-  return {.units = spec.cls != ClaimClass::Optional || spec.requestId != 0,
+  return {.units = true,
           .waitsForWrites = waits,
           .waitsForLandings = waits && !host,
           .inUse = (inService && waits && spec.reach == ReclaimClass::InUse) || hostCritical,
