@@ -77,9 +77,12 @@
   #empty { position: fixed; top: calc(50% - 58px); left: calc(var(--sidebar) + (100vw - var(--sidebar)) / 2); transform: translateX(-50%); font-size: 25px; font-weight: 600; letter-spacing: -.025em; transition: left var(--sidebar-duration) ease }
   .message { margin: 28px 0; overflow-wrap: anywhere }
   .user { width: fit-content; max-width: 80%; margin-left: auto; padding: 10px 16px; border-radius: 20px; background: var(--bubble); white-space: pre-wrap }
-  .user-images { display: flex; flex-wrap: wrap; gap: 8px }
-  .user-text + .user-images { margin-top: 9px }
+  .user-images, .user-files { display: flex; flex-wrap: wrap; gap: 8px }
+  .user-text + .user-images, .user-text + .user-files, .user-files + .user-images { margin-top: 9px }
   .user-images img { display: block; width: min(240px, 100%); max-height: 240px; border-radius: 12px; object-fit: cover }
+  .user-file { display: flex; align-items: center; gap: 8px; max-width: 260px; padding: 7px 12px; border-radius: 12px; background: var(--bg); font-size: 13px }
+  .user-file .badge { flex: none; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .04em }
+  .user-file .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
   .assistant { padding: 0 4px }
   .content blockquote { margin: 0 0 1em; padding-left: 14px; border-left: 2px solid var(--border); color: var(--muted) }
   .content hr { margin: 1.5em 0; border: 0; border-top: 1px solid var(--border) }
@@ -119,8 +122,11 @@
   #attachments { display: flex; gap: 8px; overflow-x: auto; padding: 2px 0 8px }
   #attachments:empty { display: none }
   .attachment { position: relative; width: 58px; height: 58px; flex: none }
-  .attachment img, .attachment-status { width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 12px; object-fit: cover }
+  .attachment img, .attachment-status, .attachment-file { width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 12px; object-fit: cover }
   .attachment-status { display: grid; place-items: center; padding: 4px; background: var(--bubble); text-align: center; font-size: 11px; line-height: 1.2 }
+  .attachment-file { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; overflow: hidden; padding: 4px; background: var(--bubble); text-align: center; font-size: 10px; line-height: 1.15 }
+  .attachment-file b { font-size: 11px; letter-spacing: .04em }
+  .attachment-file span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
   .remove-image { position: absolute; top: -5px; right: -5px; display: grid; width: 20px; height: 20px; place-items: center; border-radius: 50%; color: #fff; background: #333; font-size: 15px; line-height: 1 }
   textarea { display: block; width: 100%; max-height: 180px; padding: 6px 0; resize: none; border: 0; outline: 0; background: transparent }
   textarea::placeholder { color: var(--muted) }
@@ -199,12 +205,12 @@
 <main><div id="chat"></div></main>
 <form id="form">
   <button id="scroll-bottom" type="button" hidden aria-label="Jump to latest message">&#8595; Jump to latest</button>
-  <button id="attach" type="button" aria-label="Add images" title="Add images">
+  <button id="attach" type="button" aria-label="Add images or PDFs" title="Add images or PDFs">
     <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
   </button>
-  <input id="image-input" type="file" accept="image/*" multiple hidden>
+  <input id="file-input" type="file" accept="image/*,application/pdf,.pdf" multiple hidden>
   <div class="composer">
-    <div id="attachments" aria-label="Attached images"></div>
+    <div id="attachments" aria-label="Attached files"></div>
     <textarea id="input" rows="1" placeholder="Message Splash" autofocus></textarea>
   </div>
   <div class="toolbar">
@@ -228,7 +234,7 @@
   const form = $('#form');
   const input = $('#input');
   const attachmentsBox = $('#attachments');
-  const imageInput = $('#image-input');
+  const fileInput = $('#file-input');
   const attach = $('#attach');
   const thinking = $('#thinking');
   const effort = $('#effort');
@@ -286,8 +292,12 @@
   let attachments = [];
   let controller;
   let followResponse = false;
-  // Until /v1/models says otherwise; a text-only model takes no images.
+  // Until /v1/models says otherwise; a text-only model takes no files.
   let imagesAccepted = true;
+  let pdfsAccepted = true;
+  // What the server takes of one file; it says no to more only after the upload.
+  // A PDF shares its limit with its rendered pages, so it must stay under it.
+  const maxFileBytes = {image: 32 * 1024 * 1024, pdf: 64 * 1024 * 1024 - 1};
 
   selectEffort();
 
@@ -311,8 +321,25 @@
       const modalities = model?.input_modalities;
       if (!Array.isArray(modalities)) return;
       imagesAccepted = modalities.includes('image');
-      attach.hidden = !imagesAccepted;
-      if (!imagesAccepted) clearAttachments();
+      pdfsAccepted = modalities.includes('pdf');
+      const acceptsFiles = imagesAccepted || pdfsAccepted;
+      attach.hidden = !acceptsFiles;
+      fileInput.accept = [imagesAccepted && 'image/*', pdfsAccepted && 'application/pdf,.pdf'].filter(Boolean).join(',');
+      const label = acceptsFiles
+        ? `Add ${imagesAccepted && pdfsAccepted ? 'images or PDFs' : imagesAccepted ? 'images' : 'PDFs'}`
+        : '';
+      attach.title = label;
+      attach.setAttribute('aria-label', label);
+      if (!acceptsFiles) {
+        clearAttachments();
+      } else {
+        const kept = attachments.filter(attachment =>
+          attachment.kind === 'pdf' ? pdfsAccepted : imagesAccepted);
+        if (kept.length !== attachments.length) {
+          attachments = kept;
+          renderAttachments();
+        }
+      }
       showEfforts(model.reasoning);
     } catch { /* The server still rejects input the model cannot take. */ }
   }
@@ -368,8 +395,18 @@
     if (!Array.isArray(content)) return null;
     const clean = content.flatMap(part => {
       if (part?.type === 'text' && typeof part.text === 'string') return [{type: 'text', text: part.text}];
-      const url = part?.type === 'image_url' ? part.image_url?.url : null;
-      return typeof url === 'string' && url.startsWith('data:image/') ? [{type: 'image_url', image_url: {url}}] : [];
+      if (part?.type === 'image_url') {
+        const url = part.image_url?.url;
+        return typeof url === 'string' && url.startsWith('data:image/') ? [{type: 'image_url', image_url: {url}}] : [];
+      }
+      if (part?.type === 'file') {
+        const data = part.file?.file_data;
+        if (typeof data !== 'string' || !data.startsWith('data:application/pdf;base64,')) return [];
+        const file = {file_data: data};
+        if (typeof part.file.filename === 'string') file.filename = part.file.filename;
+        return [{type: 'file', file}];
+      }
+      return [];
     });
     return clean.length ? clean : null;
   }
@@ -401,15 +438,16 @@
     } catch { return []; }
   }
 
-  function hasImages(conversation) {
+  function hasMedia(conversation) {
     return conversation.messages.some(message => Array.isArray(message.content) &&
-      message.content.some(part => part.type === 'image_url'));
+      message.content.some(part => part.type === 'image_url' || part.type === 'file'));
   }
 
-  function withoutImages(conversation) {
+  function withoutMedia(conversation) {
     const messages = conversation.messages.map(message => Array.isArray(message.content) ? {
       ...message,
-      content: message.content.map(part => part.type === 'image_url' ? {type: 'text', text: '[Image not saved]'} : part)
+      content: message.content.map(part => part.type === 'image_url' ? {type: 'text', text: '[Image not saved]'}
+        : part.type === 'file' ? {type: 'text', text: '[PDF not saved]'} : part)
     } : message);
     return {...conversation, messages};
   }
@@ -417,14 +455,14 @@
   function save() {
     conversations.sort((a, b) => b.updated - a.updated);
     conversations = conversations.slice(0, 20);
-    // Browser storage holds a few MB per site, which one photo can fill. Rather
-    // than fail every later save, store the newest chats that fit, each with its
-    // images if they still fit and without them otherwise, so a photo too large
-    // to store does not cost older chats theirs. The open page keeps its images.
+    // Browser storage holds a few MB per site, which one photo or PDF can fill.
+    // Rather than fail every later save, store the newest chats that fit, each
+    // with its files if they still fit and without them otherwise, so a file too
+    // large to store does not cost older chats theirs. The open page keeps them.
     if (!storageSet(storeKey, JSON.stringify(conversations))) {
       const stored = [];
       for (const conversation of conversations) {
-        const candidates = hasImages(conversation) ? [conversation, withoutImages(conversation)] : [conversation];
+        const candidates = hasMedia(conversation) ? [conversation, withoutMedia(conversation)] : [conversation];
         const fitting = candidates.find(candidate => storageSet(storeKey, JSON.stringify([...stored, candidate])));
         if (!fitting) break;
         stored.push(fitting);
@@ -446,10 +484,13 @@
   }
 
   function userParts(content) {
-    if (typeof content === 'string') return {text: content, images: []};
+    if (typeof content === 'string') return {text: content, images: [], documents: []};
     return {
       text: content.filter(part => part.type === 'text').map(part => part.text).join('\n'),
-      images: content.filter(part => part.type === 'image_url').map(part => part.image_url.url)
+      images: content.filter(part => part.type === 'image_url').map(part => part.image_url.url),
+      documents: content.filter(part => part.type === 'file').map(part => ({
+        name: part.file?.filename || 'Attached PDF'
+      }))
     };
   }
 
@@ -571,12 +612,30 @@
     const box = message.role === 'assistant' ? assistantBox(message, live) : document.createElement('div');
     if (message.role !== 'assistant') {
       box.className = `message ${message.role}`;
-      const {text, images} = userParts(message.content);
+      const {text, images, documents} = userParts(message.content);
       if (text) {
         const content = document.createElement('div');
         content.className = 'user-text';
         content.textContent = text;
         box.append(content);
+      }
+      if (documents.length) {
+        const files = document.createElement('div');
+        files.className = 'user-files';
+        documents.forEach(({name}) => {
+          const file = document.createElement('div');
+          file.className = 'user-file';
+          file.title = name;
+          const badge = document.createElement('span');
+          badge.className = 'badge';
+          badge.textContent = 'PDF';
+          const label = document.createElement('span');
+          label.className = 'name';
+          label.textContent = name;
+          file.append(badge, label);
+          files.append(file);
+        });
+        box.append(files);
       }
       if (images.length) {
         const gallery = document.createElement('div');
@@ -706,15 +765,25 @@
     attachments.forEach(attachment => {
       const item = document.createElement('div');
       item.className = 'attachment';
-      const name = attachment.name || 'Attached image';
+      const name = attachment.name || (attachment.kind === 'pdf' ? 'Attached PDF' : 'Attached image');
       item.title = name;
-      const preview = document.createElement(attachment.url ? 'img' : 'span');
-      if (attachment.url) {
+      let preview;
+      if (attachment.url && attachment.kind === 'pdf') {
+        preview = document.createElement('span');
+        preview.className = 'attachment-file';
+        const badge = document.createElement('b');
+        badge.textContent = 'PDF';
+        const label = document.createElement('span');
+        label.textContent = name;
+        preview.append(badge, label);
+      } else if (attachment.url) {
+        preview = document.createElement('img');
         preview.src = attachment.url;
         preview.alt = name;
       } else {
+        preview = document.createElement('span');
         preview.className = `attachment-status${attachment.error ? ' error' : ''}`;
-        preview.textContent = attachment.error ? 'Read failed' : 'Loading…';
+        preview.textContent = attachment.error || 'Loading…';
         preview.setAttribute('role', 'status');
       }
       const remove = document.createElement('button');
@@ -734,11 +803,11 @@
 
   function clearAttachments() {
     attachments = [];
-    imageInput.value = '';
+    fileInput.value = '';
     renderAttachments();
   }
 
-  function readImage(file) {
+  function readFile(file) {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result);
@@ -747,19 +816,35 @@
     });
   }
 
-  async function addImages(files) {
-    const images = Array.from(files).filter(file => file.type.startsWith('image/'));
-    if (!images.length) return;
+  function fileKind(file) {
+    if (file.type?.startsWith('image/')) return 'image';
+    if (file.type === 'application/pdf' || /\.pdf$/i.test(file.name || '')) return 'pdf';
+    return null;
+  }
+
+  async function addFiles(files) {
+    const accepted = Array.from(files).flatMap(file => {
+      const kind = fileKind(file);
+      if (!kind || (kind === 'image' && !imagesAccepted) || (kind === 'pdf' && !pdfsAccepted)) return [];
+      return [{file, kind}];
+    });
+    if (!accepted.length) return;
     // Readers update stable entries, even if rollback moves them to a new draft.
-    const selected = images.map(file => ({name: file.name, url: null, error: false}));
+    const selected = accepted.map(({file, kind}) => ({
+      name: file.name || (kind === 'pdf' ? 'Attached PDF' : 'Attached image'),
+      kind, url: null, error: file.size > maxFileBytes[kind] ? 'Too large' : ''
+    }));
     attachments.push(...selected);
     renderAttachments();
-    await Promise.all(images.map(async (file, index) => {
+    await Promise.all(accepted.map(async ({file, kind}, index) => {
       const attachment = selected[index];
+      if (attachment.error) return;
       try {
-        attachment.url = await readImage(file);
+        const url = await readFile(file);
+        // A file known as a PDF by its name alone reads as another type, which the server refuses.
+        attachment.url = kind === 'pdf' ? `data:application/pdf;base64,${url.slice(url.indexOf(',') + 1)}` : url;
       } catch {
-        attachment.error = true;
+        attachment.error = 'Read failed';
       }
       if (attachments.includes(attachment)) renderAttachments();
     }));
@@ -829,7 +914,9 @@
     const pendingAttachments = attachments;
     const content = pendingAttachments.length ? [
       ...(text ? [{type: 'text', text}] : []),
-      ...pendingAttachments.map(attachment => ({type: 'image_url', image_url: {url: attachment.url}}))
+      ...pendingAttachments.map(attachment => attachment.kind === 'pdf'
+        ? {type: 'file', file: {filename: attachment.name, file_data: attachment.url}}
+        : {type: 'image_url', image_url: {url: attachment.url}})
     ] : text;
     input.value = '';
     attachments = [];
@@ -870,7 +957,7 @@
       if (!doneEvent) throw new Error('Connection closed early');
       box.querySelector('.waiting').hidden = true;
       messages.push(assistant);
-      persist(text || pendingAttachments[0]?.name || 'Image');
+      persist(text || pendingAttachments[0]?.name || 'Attachment');
     } catch (error) {
       messages.pop();
       userBox.remove();
@@ -900,21 +987,20 @@
     chosenEffort = effort.value;
     storageSet(effortKey, effort.value);
   });
-  attach.addEventListener('click', () => imageInput.click());
-  imageInput.addEventListener('change', () => {
-    if (imagesAccepted) addImages(imageInput.files).catch(console.error);
-    imageInput.value = '';
+  attach.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => {
+    if (imagesAccepted || pdfsAccepted) addFiles(fileInput.files).catch(console.error);
+    fileInput.value = '';
   });
   input.addEventListener('paste', event => {
-    // Without image input the browser pastes as usual.
-    if (!imagesAccepted) return;
-    const images = Array.from(event.clipboardData?.items || [])
-      .filter(item => item.type.startsWith('image/'))
+    // Without file input the browser pastes as usual.
+    if (!imagesAccepted && !pdfsAccepted) return;
+    const files = Array.from(event.clipboardData?.items || [])
       .map(item => item.getAsFile())
       .filter(Boolean);
-    if (!images.length) return;
+    if (!files.length) return;
     if (!event.clipboardData.getData('text/plain')) event.preventDefault();
-    addImages(images).catch(console.error);
+    addFiles(files).catch(console.error);
   });
   input.addEventListener('input', () => { resize(); updateComposer(); });
   input.addEventListener('keydown', event => {

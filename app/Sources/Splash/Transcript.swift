@@ -120,6 +120,8 @@ struct TranscriptMessage: Encodable, Equatable {
     let reasoning: String
     /// The user's images, sent as the addresses the page loads them from (`ChatImages`).
     let images: [Data]
+    /// The names of the user's PDFs.
+    let documents: [String]
     let error: String?
     /// The line over a reply, if it has one.
     let line: ReplyLine?
@@ -134,6 +136,7 @@ struct TranscriptMessage: Encodable, Equatable {
         text = message.text
         reasoning = message.reasoning
         images = message.images
+        documents = message.documents.map(\.name)
         error = message.error
         line = message.role == .assistant ? ReplyLine(message, live: live, asleep: asleep) : nil
         self.live = live != nil
@@ -143,7 +146,7 @@ struct TranscriptMessage: Encodable, Equatable {
     }
 
     private enum CodingKeys: CodingKey {
-        case id, role, text, reasoning, images, error, line, live, details
+        case id, role, text, reasoning, images, documents, error, line, live, details
     }
 
     func encode(to encoder: any Encoder) throws {
@@ -153,6 +156,7 @@ struct TranscriptMessage: Encodable, Equatable {
         try container.encode(text, forKey: .text)
         try container.encode(reasoning, forKey: .reasoning)
         try container.encode(images.indices.map { ChatImages.url(message: id, index: $0) }, forKey: .images)
+        try container.encode(documents, forKey: .documents)
         try container.encode(error, forKey: .error)
         try container.encode(line, forKey: .line)
         try container.encode(live, forKey: .live)

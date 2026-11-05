@@ -13,7 +13,8 @@ struct TranscriptTests {
 
     @Test func sendsMessagesAsThePageReadsThem() throws {
         let conversation = Conversation(messages: [
-            ChatMessage(role: .user, text: "What is this?", images: [Showcase.picture]),
+            ChatMessage(role: .user, text: "What is this?", images: [Showcase.picture],
+                        documents: [ChatDocument(name: "notes.pdf", data: Data([1, 2]))]),
             ChatMessage(role: .assistant, text: "A cat.", reasoning: "Whiskers.", model: "a/Big-GGUF:Q4", tokensPerSecond: 38.4,
                         thinkingTime: 3.2, reasoningTokens: 1_200, stopped: true),
             ChatMessage(role: .user, text: "Sure?"),
@@ -29,9 +30,10 @@ struct TranscriptTests {
         let messages = try #require(json["messages"] as? [[String: Any]])
         #expect(messages.map { $0["role"] as? String } == ["user", "assistant", "user", "assistant"])
         // Every key there, null for none.
-        #expect(messages.allSatisfy { Set($0.keys) == ["id", "role", "text", "reasoning", "images", "error", "line", "live", "details"] })
+        #expect(messages.allSatisfy { Set($0.keys) == ["id", "role", "text", "reasoning", "images", "documents", "error", "line", "live", "details"] })
         // Images as the addresses the page loads them from, which the app serves.
         #expect(messages[0]["images"] as? [String] == ["chat-image://\(conversation.messages[0].id.uuidString)/0"])
+        #expect(messages[0]["documents"] as? [String] == ["notes.pdf"])
         #expect(messages[0]["line"] is NSNull && messages[0]["error"] is NSNull && messages[0]["details"] as? String == "")
         #expect(messages[1]["line"] as? [String: AnyHashable] == ["verb": "Thinking", "facts": "1.2K tokens · 3.2s", "since": NSNull()])
         #expect(messages[1]["details"] as? String == "Name of a/Big-GGUF:Q4 · 38 tok/s · Stopped")

@@ -13,12 +13,12 @@ const transcript = (() => {
   const firstScreen = 6000;
   // How the page lays out a message's text, for the room one not drawn yet keeps (page.estimator):
   // the user's words in their bubble, 22 px a row, which leaves the column's first 80 px clear and
-  // pads them 16 px at either side, under their images (page.css, transcript.css); a reply's
+  // pads them 16 px at either side, under their PDFs and images (page.css, transcript.css); a reply's
   // Markdown across the column, 24 px a paragraph's row, its blocks 14 px apart less the 5 px their
   // rows leave over and under them (markdown.css), over its actions and under its line and why it
   // stopped short (transcript.css).
   const estimate = page.estimator(messages);
-  const userText = images => ({inset: 112, row: 22, gap: null, around: 17 + (images ? 128 : 0)});
+  const userText = (images, files) => ({inset: 112, row: 22, gap: null, around: 17 + (images ? 128 : 0) + (files ? 44 : 0)});
   const replyText = (line, error) => ({inset: 0, row: 24, gap: 9, around: 26 + (line ? 31 : 0) + (error ? 25 : 0)});
 
   // The messages drawn, by id: their element, the message as last given, and of a reply, its
@@ -46,7 +46,7 @@ const transcript = (() => {
       const element = document.createElement('article');
       element.className = message.role === 'user' ? 'user' : 'reply';
       element.dataset.id = message.id;
-      element.innerHTML = message.role === 'user' ? '<div class="images"></div><p class="bubble"></p>' : replyMarkup;
+      element.innerHTML = message.role === 'user' ? '<div class="files"></div><div class="images"></div><p class="bubble"></p>' : replyMarkup;
       follow.keep(element);
       view = {element, message: null, shown: null};
       if (message.role !== 'user') {
@@ -67,13 +67,32 @@ const transcript = (() => {
   function same(a, b) {
     return a !== null && a.text === b.text && a.reasoning === b.reasoning && a.error === b.error && a.live === b.live &&
       a.details === b.details && a.line?.verb === b.line?.verb && a.line?.facts === b.line?.facts &&
-      a.line?.since === b.line?.since && sameImages(a, b);
+      a.line?.since === b.line?.since && sameImages(a, b) && sameDocuments(a, b);
   }
 
   const sameImages = (a, b) => a.images.length === b.images.length && a.images.every((image, index) => image === b.images[index]);
+  const sameDocuments = (a, b) => a.documents.length === b.documents.length &&
+    a.documents.every((document, index) => document === b.documents[index]);
 
-  // The user's images over their text, at the column's end.
+  // The user's PDFs and images over their text, at the column's end.
   function drawUser(element, message, previous) {
+    const files = element.querySelector('.files');
+    if (!previous || !sameDocuments(previous, message)) {
+      files.replaceChildren(...message.documents.map(name => {
+        const file = document.createElement('div');
+        file.className = 'file';
+        const badge = document.createElement('span');
+        badge.className = 'badge';
+        badge.textContent = 'PDF';
+        const label = document.createElement('span');
+        label.className = 'name';
+        label.textContent = name;
+        label.title = name;
+        file.append(badge, label);
+        return file;
+      }));
+    }
+    files.hidden = message.documents.length === 0;
     const images = element.querySelector('.images');
     if (!previous || !sameImages(previous, message)) {
       images.replaceChildren(...message.images.map(url => Object.assign(document.createElement('img'), {src: url, alt: ''})));
@@ -82,7 +101,7 @@ const transcript = (() => {
     const bubble = element.querySelector('.bubble');
     bubble.textContent = message.text;
     bubble.hidden = message.text === '';
-    estimate(element, message.text, userText(message.images.length > 0));
+    estimate(element, message.text, userText(message.images.length > 0, message.documents.length > 0));
   }
 
   // A reply: its line, its Markdown, why it stopped short, and its actions, which keep their place

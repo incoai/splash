@@ -1033,6 +1033,130 @@ struct ChatTests {
         #expect((text["messages"] as! [[String: Any]])[0]["content"] as? String == "[An image this model can’t see]\n\nWhat is this?")
     }
 
+    @Test func asksWithPDFsAsFilePartsOrANote() throws {
+        let pdf = Data([0x25, 0x50, 0x44, 0x46, 1])
+        let document = ChatDocument(name: "report.pdf", data: pdf)
+        let messages = [ChatMessage(role: .user, text: "Summarize", documents: [document])]
+        let body = try JSONSerialization.jsonObject(
+            with: ChatClient.body(messages, effort: "", images: true, pdfs: true)) as! [String: Any]
+        let parts = (body["messages"] as! [[String: Any]])[0]["content"] as! [[String: Any]]
+        let file = parts[0]["file"] as! [String: String]
+        #expect(parts[0]["type"] as? String == "file")
+        #expect(file["filename"] == "report.pdf")
+        #expect(file["file_data"] == "data:application/pdf;base64,\(pdf.base64EncodedString())")
+        #expect(parts[1]["text"] as? String == "Summarize")
+        // A model that cannot read PDFs gets a note in their place.
+        let text = try JSONSerialization.jsonObject(
+            with: ChatClient.body(messages, effort: "", images: true, pdfs: false)) as! [String: Any]
+        #expect((text["messages"] as! [[String: Any]])[0]["content"] as? String == "[A PDF this model can’t read]\n\nSummarize")
+    }
+
+    @Test func aModelThatTakesOneKindGetsItAndANoteForTheOther() throws {
+        let messages = [ChatMessage(role: .user, text: "Compare", images: [Showcase.picture],
+                                    documents: [ChatDocument(name: "report.pdf", data: Data([1]))])]
+        let body = try JSONSerialization.jsonObject(
+            with: ChatClient.body(messages, effort: "", images: true, pdfs: false)) as! [String: Any]
+        let parts = (body["messages"] as! [[String: Any]])[0]["content"] as! [[String: Any]]
+        #expect(parts.map { $0["type"] as? String } == ["image_url", "text", "text"])
+        #expect(parts[1]["text"] as? String == "Compare")
+        #expect(parts[2]["text"] as? String == "[A PDF this model can’t read]")
+    }
+
+    @Test func promptsLeaveOutARefusedMessage() throws {
+        let messages = [ChatMessage(role: .user, text: "Read this", rejected: true),
+                        ChatMessage(role: .assistant, text: ""),
+                        ChatMessage(role: .user, text: "Hello")]
+        let body = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "", images: true)) as! [String: Any]
+        #expect((body["messages"] as! [[String: Any]]).map { $0["content"] as? String } == ["Hello"])
+    }
+
+    /// A PDF the server refuses fails its own prompt, not those after it; asked again, it goes again.
+    @MainActor @Test func aRefusedAttachmentLeavesTheChatUsable() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        RefusingProtocol.register
+        let store = ChatStore(folder: folder)
+        let server = ChatTarget(url: URL(string: "http://refused.test")!, model: "a/b", acceptsImages: true,
+                                acceptsPDFs: true, effort: "")
+        store.send("Read this", images: [], documents: [ChatDocument(name: "locked.pdf", data: Data([1]))], to: server)
+        while store.streaming != nil { try await Task.sleep(for: .milliseconds(20)) }
+        let refused = try #require(store.current?.messages)
+        #expect(refused[0].rejected == true)
+        #expect(refused[1].error == "PDF documents requiring an opening password are not supported. The model won’t see this message.")
+        #expect(ChatStore(folder: folder).conversations[0].messages[0].rejected == true)
+        store.retry(with: server)
+        #expect(store.current?.messages[0].rejected == nil)
+        while store.streaming != nil { try await Task.sleep(for: .milliseconds(20)) }
+        #expect(store.current?.messages[0].rejected == true)
+    }
+
+    /// Only the message that carries an attachment is left out: what fails after it stays.
+    @MainActor @Test func aRefusedFollowUpIsLeftOutOnlyWithItsOwnAttachment() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        RefusingProtocol.register
+        let store = ChatStore(folder: folder)
+        let server = ChatTarget(url: URL(string: "http://refused.test")!, model: "a/b", acceptsImages: true,
+                                acceptsPDFs: true, effort: "")
+        store.send("Read this", images: [], documents: [ChatDocument(name: "report.pdf", data: Data([1]))], to: server)
+        while store.streaming != nil { try await Task.sleep(for: .milliseconds(20)) }
+        store.send("And now?", images: [], to: server)
+        while store.streaming != nil { try await Task.sleep(for: .milliseconds(20)) }
+        #expect(store.current?.messages[2].rejected == nil)
+        #expect(store.current?.messages[3].error == "PDF documents requiring an opening password are not supported")
+        store.send("And this?", images: [Showcase.picture], to: server)
+        while store.streaming != nil { try await Task.sleep(for: .milliseconds(20)) }
+        #expect(store.current?.messages[4].rejected == true)
+    }
+
+    /// A message too long for the context leaves too, and the note says what happened to it.
+    @MainActor @Test func anAttachmentTheContextCannotHoldIsLeftOut() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        RefusingProtocol.register
+        let store = ChatStore(folder: folder)
+        let server = ChatTarget(url: URL(string: "http://context.test")!, model: "a/b", acceptsImages: true,
+                                acceptsPDFs: true, effort: "")
+        store.send("", images: [], documents: [ChatDocument(name: "long.pdf", data: Data([1]))], to: server)
+        while store.streaming != nil { try await Task.sleep(for: .milliseconds(20)) }
+        let messages = try #require(store.current?.messages)
+        #expect(messages[0].rejected == true)
+        #expect(messages[1].error == "This message doesn’t fit in the model’s context. The model won’t see it.")
+    }
+
+    /// A conversation file edited by hand may hold an answer alone.
+    @MainActor @Test func askingAgainWithNothingBeforeTheAnswerDoesNotCrash() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        RefusingProtocol.register
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let conversation = Conversation(title: "Hi", messages: [ChatMessage(role: .assistant, text: "Hello")])
+        try JSONEncoder().encode(conversation).write(to: folder.appending(path: "\(conversation.id.uuidString).json"))
+        let store = ChatStore(folder: folder)
+        store.selection = conversation.id
+        store.retry(with: ChatTarget(url: URL(string: "http://refused.test")!, model: "a/b", acceptsImages: true, effort: ""))
+        while store.streaming != nil { try await Task.sleep(for: .milliseconds(20)) }
+        #expect(store.current?.messages.count == 1)
+    }
+
+    /// A text chat's failure is not an attachment's: its message stays in later prompts.
+    @MainActor @Test func aRefusedChatWithoutAttachmentsKeepsItsMessage() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        RefusingProtocol.register
+        let store = ChatStore(folder: folder)
+        store.send("Hello", images: [], to: ChatTarget(url: URL(string: "http://refused.test")!, model: "a/b",
+                                                       acceptsImages: true, effort: ""))
+        while store.streaming != nil { try await Task.sleep(for: .milliseconds(20)) }
+        #expect(store.current?.messages[0].rejected == nil)
+    }
+
+    @Test func readsMessagesSavedBeforeDocumentsExisted() throws {
+        let old = Data(#"{"role":"user","text":"Hi"}"#.utf8)
+        let message = try JSONDecoder().decode(ChatMessage.self, from: old)
+        #expect(message.text == "Hi" && message.images.isEmpty && message.documents.isEmpty)
+    }
+
     @MainActor @Test func keepsConversationsInTheirFolder() async throws {
         let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -1113,4 +1237,26 @@ struct ChatTests {
         try JSONEncoder().encode(conversation).write(to: folder.appending(path: "\(conversation.id.uuidString).json"))
         #expect(ChatStore(folder: folder).conversations[0].messages[1].error == "The reply was interrupted.")
     }
+}
+
+/// A server that refuses every prompt, as it does a PDF it cannot read.
+private final class RefusingProtocol: URLProtocol, @unchecked Sendable {
+    /// Registered once and for good: tests run at once, and it answers only for its own host.
+    static let register: Void = { URLProtocol.registerClass(RefusingProtocol.self) }()
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        ["refused.test", "context.test"].contains(request.url?.host)
+    }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        guard let url = request.url,
+              let response = HTTPURLResponse(url: url, statusCode: 400, httpVersion: "HTTP/1.1", headerFields: nil) else { return }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        let body = url.host == "context.test"
+            ? #"{"error":{"message":"prompt exceeds the context window","code":"context_length_exceeded"}}"#
+            : #"{"error":{"message":"PDF documents requiring an opening password are not supported"}}"#
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
 }
