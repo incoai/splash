@@ -149,12 +149,13 @@ class Job:
     image_owner: object | None = None
     public_id: str = ""
     created_at: int = field(default_factory=lambda: int(time.time()))
-    response_store: bool = False
     # (count, short hash) of the normalized tool list, so the console shows
     # when a client's tool block changes between turns and breaks its prefix.
     tools_signature: tuple | None = None
-    response_previous_id: str | None = None
-    response_history_items: list | None = None
+    # Input an API keeps past preparation for its answer, such as the
+    # conversation a stored Responses answer is stored with, charged to the
+    # request body budget until the job is released (retain_for).
+    retained_input: list | None = None
     # Option token ids for score-only jobs; empty means ordinary generation.
     score_tokens: tuple = ()
     # Trailing prompt tokens of the chat template's generation prompt; zero

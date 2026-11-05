@@ -78,7 +78,7 @@ class ResponseLifecycleTests(unittest.TestCase):
         harness.app.response_store.put(
             {"id": "resp_previous"}, [{"role": "user", "content": "old history"}]
         )
-        job = responses_dialect.prepare(
+        job, conversation = responses_dialect.prepare(
             harness.app,
             {
                 "input": "continue",
@@ -89,8 +89,9 @@ class ResponseLifecycleTests(unittest.TestCase):
             reserve_input=fixtures.reserve_unbounded,
         )
         self.assertIn("old history", str(harness.tokenizer.templates))
-        self.assertIsNone(job.response_history_items)
-        self.assertFalse(job.response_store)
+        self.assertIsNone(job.retained_input)
+        self.assertIsNone(conversation.items)
+        self.assertFalse(conversation.store)
 
     def test_stored_history_is_independent_of_the_request_body(self):
         harness = self.harness()
@@ -101,14 +102,16 @@ class ResponseLifecycleTests(unittest.TestCase):
             "content": [{"type": "output_text", "text": "answer"}],
         }
         body = {"input": [dict(question)]}
-        job = responses_dialect.prepare(
+        _, conversation = responses_dialect.prepare(
             harness.app,
             body,
             deadline=fixtures.FOREVER,
             reserve_input=fixtures.reserve_unbounded,
         )
         output = [copy.deepcopy(answer)]
-        responses_dialect.persist(harness.app, job, {"id": "resp_stored"}, output)
+        responses_dialect.persist(
+            harness.app, conversation, {"id": "resp_stored"}, output
+        )
         # The record was encoded when it was stored.
         body["input"][0]["content"] = "changed"
         output[0]["content"][0]["text"] = "changed"

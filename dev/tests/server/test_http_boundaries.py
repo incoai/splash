@@ -386,7 +386,11 @@ class HttpBoundaryTests(HarnessTestCase):
         first_job.created_at = 123
         with mock.patch.object(api.time, "time", return_value=999):
             response = responses_dialect.response_object(
-                "test-model", first_job, "in_progress", []
+                "test-model",
+                first_job,
+                responses_dialect.Conversation(None, True, []),
+                "in_progress",
+                [],
             )
         self.assertEqual(response["created_at"], 123)
 

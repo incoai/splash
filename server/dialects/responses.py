@@ -21,7 +21,7 @@ RESPONSE_PATH = re.compile(r"/v1/responses/(resp_[A-Za-z0-9_]+)")
 
 def post(exchange, body, deadline):
     streamed, flags = request_fields.generation(body)
-    job = prepare(
+    job, conversation = prepare(
         exchange.app,
         body,
         deadline=deadline,
@@ -29,7 +29,7 @@ def post(exchange, body, deadline):
         reserve_input=exchange.reserve_input,
     )
     respond = stream if streamed else complete
-    return job, partial(respond, exchange)
+    return job, partial(respond, exchange, conversation=conversation)
 
 
 def get(exchange, response_id):
@@ -50,10 +50,22 @@ def delete(exchange, response_id):
     )
 
 
+@dataclass(slots=True)
+class Conversation:
+    """What a Responses request's answer needs of its conversation beside
+    the job: the response it continues, whether the answer is stored (until
+    the store refuses it), and the items stored with the answer's output,
+    None when it is not stored."""
+
+    previous_id: str | None
+    store: bool
+    items: list | None
+
+
 def prepare(app, body, *, deadline, reserve_input, flags=wire.RequestFlag(0)):
-    """The generation of a Responses request, after the input of the stored
-    response it continues. `reserve_input(size)` reserves request body
-    budget for that input; flags are the request's own
+    """The generation job of a Responses request, after the input of the
+    stored response it continues, and its Conversation. `reserve_input(size)`
+    reserves request body budget for that input; flags are the request's own
     (request_fields.generation)."""
     store = body.get("store")
     if store is not None and not isinstance(store, bool):
@@ -89,22 +101,22 @@ def prepare(app, body, *, deadline, reserve_input, flags=wire.RequestFlag(0)):
             output_field="max_output_tokens",
             tool_namespaces=namespaces,
         )
-        job.response_store = store
-        job.response_previous_id = previous_id
-        if store:
-            job.response_history_items = items
-        return job
+        conversation = Conversation(previous_id, store, items if store else None)
+        # The items stay charged to the request body budget until the job is
+        # released.
+        job.retained_input = conversation.items
+        return job, conversation
 
 
-def persist(app, job, response, output):
-    if not job.response_store:
+def persist(app, conversation, response, output):
+    if not conversation.store:
         return
     # The store encodes the history at once, so later changes to the
     # request's items or the output cannot reach it.
-    history = [*job.response_history_items, *output]
+    history = [*conversation.items, *output]
     if not app.response_store.put(response, history):
         response["store"] = False
-        job.response_store = False
+        conversation.store = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -531,7 +543,7 @@ def to_chat_body(body, items):
     return chat, namespaces
 
 
-def complete(exchange, job):
+def complete(exchange, job, *, conversation):
     app = exchange.app
     sequencer = BlockSequencer()
     collected = exchange.collect(
@@ -547,16 +559,24 @@ def complete(exchange, job):
     response = response_object(
         app.response_model,
         job,
+        conversation,
         "incomplete" if incomplete else "completed",
         output,
         result=result,
     )
-    persist(app, job, response, output)
+    persist(app, conversation, response, output)
     exchange.send_json(200, response)
 
 
-def stream(exchange, job):
+def stream(exchange, job, *, conversation):
     app = exchange.app
+
+    def snapshot(status, items, **fields):
+        """The response as it stands (response_object)."""
+        return response_object(
+            app.response_model, job, conversation, status, items, **fields
+        )
+
     output, sequence = [], 0
 
     def send(event, **payload):
@@ -570,14 +590,8 @@ def stream(exchange, job):
         if exchange.response_started:
             return
         exchange.start_event_stream()
-        send(
-            "response.created",
-            response=response_object(app.response_model, job, "in_progress", []),
-        )
-        send(
-            "response.in_progress",
-            response=response_object(app.response_model, job, "in_progress", []),
-        )
+        send("response.created", response=snapshot("in_progress", []))
+        send("response.in_progress", response=snapshot("in_progress", []))
 
     def open_item(index, block):
         item = output_item(job, block, index)
@@ -685,10 +699,7 @@ def stream(exchange, job):
     def keepalive():
         begin()
         if not sequencer.blocks:
-            send(
-                "response.in_progress",
-                response=response_object(app.response_model, job, "in_progress", []),
-            )
+            send("response.in_progress", response=snapshot("in_progress", []))
         else:
             # The data event that adds nothing, response.in_progress, carries
             # a snapshot of the response, which would replace the output
@@ -705,7 +716,7 @@ def stream(exchange, job):
             on_idle=keepalive,
             on_progress=lambda progress: send(
                 "response.in_progress",
-                response=response_object(app.response_model, job, "in_progress", []),
+                response=snapshot("in_progress", []),
                 prompt_progress=progress,
             ),
         )
@@ -713,28 +724,22 @@ def stream(exchange, job):
         incomplete = result.reason == "length"
         sequencer.finish(collected.cut, collected.reasoning_open)
         status = "incomplete" if incomplete else "completed"
-        response = response_object(
-            app.response_model, job, status, output, result=result
-        )
-        persist(app, job, response, output)
+        response = snapshot(status, output, result=result)
+        persist(app, conversation, response, output)
         send(f"response.{status}", response=response)
 
     def send_error(error):
         send(
             "response.failed",
-            response=response_object(
-                app.response_model,
-                job,
-                "failed",
-                output,
-                error=exchange.errors.payload(error)["error"],
+            response=snapshot(
+                "failed", output, error=exchange.errors.payload(error)["error"]
             ),
         )
 
     exchange.guarded_stream(job, run, send_error)
 
 
-def response_object(model, job, status, output, result=None, error=None):
+def response_object(model, job, conversation, status, output, result=None, error=None):
     usage = None
     if result is not None:
         cache = result.cache
@@ -770,8 +775,8 @@ def response_object(model, job, status, output, result=None, error=None):
         "parallel_tool_calls": (
             job.tool_policy.parallel if job.tool_policy is not None else True
         ),
-        "store": job.response_store,
-        "previous_response_id": job.response_previous_id,
+        "store": conversation.store,
+        "previous_response_id": conversation.previous_id,
         "text": {"format": text_format},
         "usage": usage,
         # Once complete, Chat's timings (timings_dict).

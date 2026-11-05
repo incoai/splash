@@ -187,7 +187,11 @@ class StreamKeepaliveTests(HarnessTestCase):
             mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]),
             mock.patch.object(responses_dialect, "persist") as persist,
         ):
-            responses_dialect.stream(handler, job)
+            responses_dialect.stream(
+                handler,
+                job,
+                conversation=responses_dialect.Conversation(None, False, None),
+            )
 
         raw = handler.wfile.getvalue()
         stream = io.BytesIO(raw)

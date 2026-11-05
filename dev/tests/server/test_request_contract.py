@@ -764,7 +764,7 @@ class RequestContractTests(HarnessTestCase):
         for value in ("urgent", 0, None, []):
             with self.assertRaisesRegex(api.APIError, "priority"):
                 harness.app.prepare(chat_body(priority=value), deadline=FOREVER)
-        job = responses_dialect.prepare(
+        job, _ = responses_dialect.prepare(
             harness.app,
             responses_body(priority="foreground"),
             deadline=FOREVER,

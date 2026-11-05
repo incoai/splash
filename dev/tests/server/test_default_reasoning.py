@@ -132,7 +132,7 @@ class DefaultReasoningTests(unittest.TestCase):
             harness = self.harness(tokenizer=tokenizer)
             job = harness.app.prepare(fixtures.chat_body(), deadline=fixtures.FOREVER)
             self.assertEqual(job.thinking, default)
-            job = responses_dialect.prepare(
+            job, _ = responses_dialect.prepare(
                 harness.app,
                 fixtures.responses_body(),
                 deadline=fixtures.FOREVER,

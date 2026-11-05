@@ -506,11 +506,12 @@ class RequestBodyReservation:
         self.size += size
 
     def retain_for(self, job):
-        # Generation retains schemas and, for Responses, conversation history.
-        # Text/image prompts have otherwise become tokens and prepared pixels.
+        # Generation retains schemas and the input its API keeps for its
+        # answer (Job.retained_input). Text/image prompts have otherwise
+        # become tokens and prepared pixels.
         policy = job.tool_policy
         retained = (
-            job.response_history_items,
+            job.retained_input,
             job.response_format,
             policy.schemas if policy else None,
             policy.namespaces if policy else None,
