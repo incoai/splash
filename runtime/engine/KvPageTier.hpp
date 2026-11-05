@@ -89,7 +89,6 @@ public:
   // file (model::SlotFile::adopt).
   [[nodiscard]] std::shared_ptr<KvDiskSlot> adopt(const model::SlotRecord &record);
   [[nodiscard]] bool canDemote(WriteClass write) const noexcept override;
-  [[nodiscard]] std::optional<uint32_t> demotionRoom(WriteClass write) const noexcept override;
   [[nodiscard]] bool canRestore() const noexcept override { return restores_ < kRestores; }
   [[nodiscard]] std::shared_ptr<KvDiskSlot> acquireSlot(model::DiskBudget::Draw draw) override;
   [[nodiscard]] std::unique_ptr<KvTransfer>
@@ -229,14 +228,6 @@ template <class Pages> uint32_t BasicKvPageTier<Pages>::share(WriteClass write) 
 template <class Pages> bool BasicKvPageTier<Pages>::canDemote(WriteClass write) const noexcept {
   return writes_.size() < writeLimit_ && classWrites_[static_cast<size_t>(write)] < share(write) &&
          writable();
-}
-
-template <class Pages>
-std::optional<uint32_t> BasicKvPageTier<Pages>::demotionRoom(WriteClass write) const noexcept {
-  const uint32_t inFlight = static_cast<uint32_t>(writes_.size()), ofClass = classWrites_[static_cast<size_t>(write)];
-  if (!writable() || inFlight >= writeLimit_ || ofClass >= share(write))
-    return 0u;
-  return std::min(writeLimit_ - inFlight, share(write) - ofClass);
 }
 
 template <class Pages>

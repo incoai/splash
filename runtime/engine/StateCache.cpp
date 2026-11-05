@@ -326,43 +326,32 @@ void StateCache::relabel() const {
 }
 
 std::optional<CacheEvictionCandidate>
-StateCache::oldestOf(const RecencyOrder &order, bool keepResumePoint, std::span<const uint64_t> kept,
-                     std::optional<CacheEvictionCandidate> after) const noexcept {
-  // The resume point is its order's newest: none follows it.
-  const uint64_t resume = keepResumePoint ? resumePoint() : 0;
-  for (auto state = after ? order.next(*after) : order.oldest(); state && state->id != resume;
-       state = order.next(*state))
-    if (std::ranges::find(kept, state->id) == kept.end())
-      return state;
-  return std::nullopt;
-}
-
-std::optional<CacheEvictionCandidate>
-StateCache::checkpointCandidate(bool keepResumePoint, std::span<const uint64_t> kept,
-                                std::optional<CacheEvictionCandidate> after) const noexcept {
-  return oldestOf(checkpoints_, keepResumePoint, kept, after);
-}
-
-std::optional<CacheEvictionCandidate>
-StateCache::ordinaryCandidate(bool keepResumePoint, std::span<const uint64_t> kept,
-                              std::optional<CacheEvictionCandidate> after) const noexcept {
-  return oldestOf(ordinary_, keepResumePoint, kept, after);
-}
-
-std::optional<CacheEvictionCandidate>
-StateCache::inUseCandidate(std::optional<CacheEvictionCandidate> after) const noexcept {
-  return oldestOf(inUse_, false, {}, after);
-}
-
-std::optional<CacheEvictionCandidate>
-StateCache::diskCandidate(bool duplicate, const std::optional<CacheEvictionCandidate> &after) const noexcept {
-  const RecencyOrder &order = duplicate ? duplicates_ : diskOnly_;
+StateCache::oldestOf(const RecencyOrder &order, const std::optional<CacheEvictionCandidate> &after) noexcept {
   return after ? order.next(*after) : order.oldest();
 }
 
 std::optional<CacheEvictionCandidate>
-StateCache::inUseDiskCandidate(const std::optional<CacheEvictionCandidate> &after) const noexcept {
-  return after ? inUseOnDisk_.next(*after) : inUseOnDisk_.oldest();
+StateCache::checkpointCandidate(const std::optional<CacheEvictionCandidate> &after) const noexcept {
+  return oldestOf(checkpoints_, after);
+}
+
+std::optional<CacheEvictionCandidate>
+StateCache::ordinaryCandidate(const std::optional<CacheEvictionCandidate> &after) const noexcept {
+  return oldestOf(ordinary_, after);
+}
+
+std::optional<CacheEvictionCandidate>
+StateCache::inUseCandidate(const std::optional<CacheEvictionCandidate> &after) const noexcept {
+  return oldestOf(inUse_, after);
+}
+
+std::optional<CacheEvictionCandidate>
+StateCache::diskCandidate(bool duplicate, const std::optional<CacheEvictionCandidate> &after) const noexcept {
+  return oldestOf(duplicate ? duplicates_ : diskOnly_, after);
+}
+
+std::optional<CacheEvictionCandidate> StateCache::inUseDiskCandidate() const noexcept {
+  return inUseOnDisk_.oldest();
 }
 
 StateEviction StateCache::reclaim(uint64_t kvBlock, bool write) {

@@ -796,10 +796,10 @@ std::optional<Cache::WalkUnit> Cache::nextUnit(const WalkScope &scope, WalkCurso
         continue;
       }
       if (!cursor.started) {
-        cursor.state = states_.checkpointCandidate(false);
+        cursor.state = states_.checkpointCandidate();
         cursor.started = true;
       } else if (last == Unit::Checkpoint) {
-        cursor.state = states_.checkpointCandidate(false, {}, cursor.lastCandidate);
+        cursor.state = states_.checkpointCandidate(cursor.lastCandidate);
       }
       if (cursor.state)
         return give(Unit::Checkpoint, *cursor.state);
@@ -827,7 +827,7 @@ std::optional<Cache::WalkUnit> Cache::nextUnit(const WalkScope &scope, WalkCurso
       const Unit leaf = inUse ? Unit::UsedLeaf : Unit::Leaf;
       const Unit leafState = inUse ? Unit::UsedLeafState : Unit::LeafState;
       const auto stateAfter = [&](std::optional<CacheEvictionCandidate> after) {
-        return inUse ? states_.inUseCandidate(after) : states_.ordinaryCandidate(false, {}, after);
+        return inUse ? states_.inUseCandidate(after) : states_.ordinaryCandidate(after);
       };
       if (!cursor.started) {
         // A page scan takes a state only where it sits on the leaf that goes
@@ -894,9 +894,9 @@ void Cache::holdAfter(const Walk &walk, WalkCursor &cursor) const {
   const bool inUse = cursor.phase == Phase::InUse;
   const CacheEvictionCandidate at = cursor.lastCandidate;
   const bool atState = cursor.last == Unit::State || cursor.last == Unit::UsedState;
-  for (std::optional<CacheEvictionCandidate> state = inUse ? states_.inUseCandidate() : states_.ordinaryCandidate(false);
+  for (std::optional<CacheEvictionCandidate> state = inUse ? states_.inUseCandidate() : states_.ordinaryCandidate();
        state && (state->lastUsed < at.lastUsed || (state->lastUsed == at.lastUsed && (!atState || state->id <= at.id)));
-       state = inUse ? states_.inUseCandidate(state) : states_.ordinaryCandidate(false, {}, state)) {
+       state = inUse ? states_.inUseCandidate(state) : states_.ordinaryCandidate(state)) {
     if (!kept({inUse ? Unit::UsedState : Unit::State, *state}, walk) &&
         waits(state->id)) {
       cursor.statesHeld = true;
@@ -1003,7 +1003,7 @@ std::optional<engine::Victim> Cache::victimOf(const WalkUnit &unit) const {
 
 uint32_t Cache::trimRoom() const {
   uint32_t empty = 0;
-  for (const KvPool::ExtentCounts &extent : pool_.extentCounts({}))
+  for (const KvPool::ExtentCounts &extent : pool_.extentCounts())
     empty += extent.allocated && !extent.usedPages && extent.form == kv::PageForm::Slim;
   return pool_.freePageCount(kv::PageForm::Slim) - (empty > 1 ? (empty - 1) * pool_.extentPages() : 0);
 }
@@ -1175,7 +1175,7 @@ std::optional<engine::Victim> Cache::peek(const VictimQuery &query, const engine
     if (walk.pages && !after && (spill_ || window_)) {
       // The empty extents of the other forms beyond the runway each keeps.
       std::array<uint32_t, 3> empty{};
-      for (const KvPool::ExtentCounts &extent : pool_.extentCounts({}))
+      for (const KvPool::ExtentCounts &extent : pool_.extentCounts())
         empty[static_cast<size_t>(extent.form)] += extent.allocated && !extent.usedPages;
       uint64_t bytes = 0;
       for (const kv::PageForm other : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index})

@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <optional>
 #include <vector>
 
 namespace splash::model {
@@ -62,10 +61,6 @@ public:
   // writable tier. The write budget holds no KV write back
   // (model::DiskBudget).
   [[nodiscard]] virtual bool canDemote(WriteClass write) const noexcept = 0;
-  // How many writes of the class canDemote() admits now, one after another,
-  // for a reclaim weighed before it is made (Cache::peek); none when the
-  // tier does not say.
-  [[nodiscard]] virtual std::optional<uint32_t> demotionRoom(WriteClass) const noexcept { return std::nullopt; }
   // Engine-thread admission probe, before building a restore's arguments.
   [[nodiscard]] virtual bool canRestore() const noexcept = 0;
   // Null when the tier is at its limit for the draw (model::DiskBudget::

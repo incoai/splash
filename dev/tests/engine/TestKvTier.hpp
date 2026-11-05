@@ -90,19 +90,6 @@ public:
     const auto kind = static_cast<size_t>(write);
     return writableFile && inFlight() < transferLimit && writesInFlight_[kind] < writeLimits[kind];
   }
-  // The demotions it admits now, as KvPageTier says (KvTier::demotionRoom):
-  // what its transfer limit, its share of the class's writes and, without a
-  // budget, its slots leave.
-  std::optional<uint32_t> demotionRoom(engine::WriteClass write) const noexcept override {
-    const auto kind = static_cast<size_t>(write);
-    if (!writableFile)
-      return 0u;
-    uint32_t room = std::min(transferLimit - std::min(transferLimit, inFlight()),
-                             writeLimits[kind] - std::min(writeLimits[kind], writesInFlight_[kind]));
-    if (!budget)
-      room = std::min(room, capacity - std::min(capacity, slots));
-    return room;
-  }
   bool canRestore() const noexcept override { return inFlight() < transferLimit; }
   std::shared_ptr<engine::KvDiskSlot> acquireSlot(model::DiskBudget::Draw draw) override {
     draws.push_back(draw);
