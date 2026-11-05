@@ -512,9 +512,9 @@ struct ChildRecordTests {
         #expect(defaults.object(forKey: Preference.installerPID) == nil)
     }
 
-    /// A leftover server stops by itself once its app has ended, as Ctrl+C stops it, and a second
-    /// Ctrl+C would stop its engine at once: the next launch sends what it ignores by then, and
-    /// waits for it.
+    /// A leftover server stops by itself once its app has ended, as SIGTERM stops it, and a
+    /// Ctrl+C would then stop its engine at once: the next launch sends SIGTERM, which it ignores
+    /// by then, and waits for it.
     @Test func aLeftoverServerAlreadyStoppingIsLeftToFinish() async throws {
         let log = try await Self.leftover("trap 'echo interrupted' INT; trap '' TERM; echo ready; sleep 1") {
             Server(runtime: Showcase.runtime, log: URL(filePath: "/dev/null"), defaults: $0).record

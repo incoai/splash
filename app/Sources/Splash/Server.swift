@@ -187,7 +187,7 @@ final class Server {
         stepSince = .now
         phase = .starting
         do {
-            // It stops as Ctrl+C stops it once this app has ended, a crash too, giving its memory
+            // It stops as SIGTERM stops it once this app has ended, a crash too, giving its memory
             // back then rather than at the app's next launch.
             child = try record.start(
                 runtime.command(settings.serveArguments(model: model)),

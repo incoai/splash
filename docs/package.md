@@ -87,7 +87,7 @@ ones of one model (`--revision`, `--draft-model`, `--mmproj`) and the ones it
 sets itself, from one table (`LaunchOption.all`) the tests hold to `splash
 serve --help`; the API key reaches the server as `SPLASH_API_KEY`, from the
 Keychain, and nothing starts while the Keychain does not give it. The server
-stops as Ctrl+C stops it once the app has ended, by a crash too, since the app
+stops as SIGTERM stops it once the app has ended, by a crash too, since the app
 passes its process ID as `SPLASH_APP_PID`; the app's next launch stops one still
 running, as it does a download, by the process ID and start time it keeps. An
 app before 1.6 kept the ID alone, and the server's port: the next launch stops
