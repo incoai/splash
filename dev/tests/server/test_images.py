@@ -412,8 +412,10 @@ class ImageRequestTest(HarnessTestCase):
             [span.offset for span in spans], [positions[0], positions[1] + 3]
         )
         self.assertEqual(pixels, b"\x01\x02")
-        with self.assertRaisesRegex(api.APIError, "image count"):
-            app._expand_image_pads(tokens, prepared[:1], positions)
+        app._check_image_placeholders(tokens, prepared, positions)
+        for wrong in (prepared[:1], [*prepared, prepared[0]]):
+            with self.assertRaisesRegex(api.APIError, "image count"):
+                app._check_image_placeholders(tokens, wrong, positions)
 
     def test_image_render_marker_is_stable_across_requests(self):
         app = self.harness(FakeRuntime(), tokenizer=ImagePadTokenizer()).app

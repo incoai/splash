@@ -33,6 +33,7 @@ from server import server as api
 from server.chat_format import FLINT, GLM_ARGS, QWEN, QWEN_XML, ToolCallSyntax
 from server.chat_templates import NATIVE, ChatTemplates
 from server.dialects import scoring
+from server.errors import APIError
 from server.tokenization import PromptTokenizer
 
 TEMPLATE = (
@@ -682,6 +683,28 @@ class FlintPromptTests(unittest.TestCase):
             ),
             prompt,
         )
+
+    def test_tokens_are_counted_without_an_image_placeholder(self):
+        """Flint's template has no image placeholder and its engine serves no
+        images: a count is the prompt's tokens, as generation prepares them,
+        and an image is refused as every endpoint refuses it."""
+        frontend = self.frontend()
+        body = fixtures.chat_body()
+        job = frontend.prepare(body, deadline=fixtures.FOREVER)
+        self.assertEqual(
+            frontend.count_tokens(body, deadline=fixtures.FOREVER),
+            len(job.prompt_tokens),
+        )
+        image = {"type": "image_url", "image_url": {"url": fixtures.png_data_url()}}
+        body = fixtures.chat_body(messages=[{"role": "user", "content": [image]}])
+        refusals = set()
+        for request in (frontend.prepare, frontend.count_tokens):
+            with self.subTest(request=request.__name__):
+                with self.assertRaises(APIError) as raised:
+                    request(body, deadline=fixtures.FOREVER)
+                self.assertEqual(raised.exception.status, 400)
+                refusals.add(str(raised.exception))
+        self.assertEqual(len(refusals), 1, refusals)
 
     def test_reasoning_options_leave_the_prompt_to_the_model(self):
         frontend = self.frontend()

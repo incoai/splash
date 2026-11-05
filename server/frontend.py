@@ -411,18 +411,23 @@ class Frontend:
         ]
         return list(encoded["input_ids"]), positions, rendered
 
-    def _image_token_count(self, prompt_tokens, prepared, positions):
+    def _check_image_placeholders(self, prompt_tokens, prepared, positions):
+        """The rendered template holds one placeholder token per image."""
         pad_id = self.tokenizer.convert_tokens_to_ids(self.chat_format.image_pad)
         if len(positions) != len(prepared) or any(
             prompt_tokens[position] != pad_id for position in positions
         ):
             raise APIError(400, "image count does not match the rendered template")
+
+    @staticmethod
+    def _image_token_count(prompt_tokens, prepared):
+        """The prompt's length once each image's placeholder is widened."""
         return len(prompt_tokens) + sum(image.tokens - 1 for image in prepared)
 
     def _expand_image_pads(self, prompt_tokens, prepared, positions):
         """Widens the template's single placeholder per image to the image's
         merged token count and returns the spans the engine injects into."""
-        token_count = self._image_token_count(prompt_tokens, prepared, positions)
+        token_count = self._image_token_count(prompt_tokens, prepared)
         # Validate lengths before expanding tokens or copying repeated pixels.
         # HTTP body and image-cache limits do not bound decoded request size.
         self._check_image_request_size(
@@ -533,9 +538,7 @@ class Frontend:
                 body, None, deadline=deadline, without_slot=without_slot
             )
             rendered = self._render_prompt(prompt, deadline, check_context=False)
-            return self._image_token_count(
-                rendered.tokens, rendered.images, rendered.image_positions
-            )
+            return self._image_token_count(rendered.tokens, rendered.images)
 
     def tokenize(self, body, *, deadline):
         content = body.get("content")
@@ -733,6 +736,7 @@ class Frontend:
                 tokens, positions, rendered = self._render_image_tokens(
                     prompt.messages, template
                 )
+                self._check_image_placeholders(tokens, images, positions)
             else:
                 rendered = self._apply_chat_template(prompt.messages, template)
                 with self.latencies.measure("tokenization"):
