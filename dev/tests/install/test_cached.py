@@ -116,6 +116,17 @@ class CachedTest(unittest.TestCase):
                 },
                 ["owner/m-GGUF:BF16", "owner/m-GGUF:Q4_K_M"],
             ),
+            # A split GGUF's folder takes the ID that names it exactly, before
+            # a root file whose name only ends in -VARIANT.
+            (
+                {
+                    "m-UD-IQ1_S.gguf",
+                    "m-Q8_0.gguf",
+                    "IQ1_S/m-IQ1_S-00001-of-00002.gguf",
+                    "IQ1_S/m-IQ1_S-00002-of-00002.gguf",
+                },
+                ["owner/m-GGUF:IQ1_S", "owner/m-GGUF:Q8_0", "owner/m-GGUF:UD-IQ1_S"],
+            ),
             # Folders whose names differ in case alone are one target, as
             # :VARIANT names a folder whatever its case.
             (

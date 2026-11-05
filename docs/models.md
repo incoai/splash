@@ -139,14 +139,19 @@ an FP8 weight's F32 or BF16 `.weight_scale` is the tensor's `g` or, `[rows,
 
 ## GGUF targets
 
-`--model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` selects the repository's
-root-level GGUF target for that variant, a `.gguf` file (a lower-case
-extension, as the native loader requires) or the parts of a split GGUF named
-by their model (`MODEL-00001-of-0000N.gguf ...`, `upstream.root_targets`): the
-target named with the model name its GGUFs share, then `-UD-Q4_K_M`, or else
-the only one whose name ends in `-UD-Q4_K_M` (`upstream.select_gguf`). A whole
-file beside split parts of its name, such as their merge, is a target of its
-own, which the name selects before the parts. Before any weight download, the
+`--model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` selects the repository's GGUF
+target for that variant (`upstream.select_gguf`). A target is a root-level
+`.gguf` file (a lower-case extension, as the native loader requires), the
+parts of a split GGUF at the root named by their model
+(`MODEL-00001-of-0000N.gguf ...`, `upstream.root_targets`), or the parts of a
+split GGUF in a folder, as repositories publish files too large for one
+(`VARIANT/MODEL-VARIANT-00001-of-0000N.gguf`, `upstream.folder_targets`). The
+variant names, in this order: the root target named with the model name the
+root targets share, then `-UD-Q4_K_M`; the folder named `UD-Q4_K_M`, in any
+case; the only root target whose name ends in `-UD-Q4_K_M`, which the
+installer reports when the repository holds several targets. A whole file
+beside split parts of its name, such as their merge, is a target of its own,
+which the name selects before the parts. Before any weight download, the
 engine's check plans the target from its header, which must list every tensor
 the loader reads, of its shape and of a type it accepts for that tensor; one
 error names each missing or unsupported tensor once, with the layers that
@@ -190,10 +195,8 @@ token, one of them its EOS; the engine's check holds each to the family's,
 and the header's layer patterns to them. The token table must be of a format:
 RecursiveSI's int4 GGUF, whose table is F32, is refused before its download.
 
-A variant no root file names may be a folder of a split GGUF's parts, as
-repositories publish files too large for one
-(`VARIANT/MODEL-VARIANT-00001-of-0000N.gguf`, `upstream.split_gguf`): every
-part from 1 to N must be present. The parts install side by side in
+Every part of a split GGUF, from 1 to N, must be present, at the root or in
+its folder (`upstream.split_order`). The parts install side by side in
 `target/`, and the native loader reads them as one GGUF (`findTargetGgufs`,
 `OpenGguf`): the first part's metadata, whose `split.count` and
 `split.tensors.count` must describe the parts, and every part's tensors. The

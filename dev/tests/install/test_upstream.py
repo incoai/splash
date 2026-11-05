@@ -247,6 +247,20 @@ class UpstreamTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(models.ModelError, "incomplete"):
             upstream.select_gguf(files, "BF16")
+        # The folder :VARIANT names exactly wins over a root name that only
+        # ends in -VARIANT, beside one root name or several; a choice by that
+        # ending among several targets, folders included, is reported.
+        folder = [f"Q4_K_M/Qwen3.8-27B-Q4_K_M-0000{n}-of-00002.gguf" for n in (1, 2)]
+        for repository in (files | {*folder}, {"Qwen3.8-27B-UD-Q4_K_M.gguf", *folder}):
+            with self.subTest(files=sorted(repository)):
+                self.assertEqual(
+                    upstream.select_gguf(repository, "Q4_K_M"), (folder, False)
+                )
+        bf16 = [f"BF16/Qwen3.8-27B-BF16-0000{n}-of-00002.gguf" for n in (1, 2)]
+        self.assertEqual(
+            upstream.select_gguf({"Qwen3.8-27B-UD-Q4_K_M.gguf", *bf16}, "Q4_K_M"),
+            (["Qwen3.8-27B-UD-Q4_K_M.gguf"], True),
+        )
         # Two files of one part number are not one GGUF's parts.
         parts = {
             "BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf",
