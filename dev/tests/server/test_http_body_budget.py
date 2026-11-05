@@ -356,7 +356,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
             self.assertGreater(harness.server.request_bodies.stats()["active"], 16000)
             response.close()
             connection.close()
-            self.assertTrue(plan.cancelled.wait(1))
+            self.assertTrue(plan.ended.wait(1))
             for thread in harness.backend.runtime.threads:
                 thread.join(1)
             # This fixture archives callbacks; the real transport drops them

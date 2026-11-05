@@ -223,7 +223,7 @@ class HttpTransportTests(HarnessTestCase):
         response.close()
         connection.close()
         self._wait_for_http_active(harness.server.requests, 0)
-        self.assertTrue(blocking.cancelled.is_set())
+        self.assertTrue(blocking.ended.is_set())
         self.assertEqual(
             harness.request("POST", "/v1/chat/completions", chat_body())[0], 200
         )

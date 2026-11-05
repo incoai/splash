@@ -35,11 +35,12 @@ class Thresholds:
     # input between steps, and a step may last the loop-stall budget.
     status_answer: float
     # How long a frame write may wait for the write lock, or stall once
-    # started, for the same reason (requests and cancels alike).
+    # started, for the same reason (requests, cancels and stops alike).
     write_progress: float
-    # A cancel the engine leaves unacknowledged this long fails it: the
-    # command in flight may run the command watchdog out first.
-    cancel_acknowledgement: float
+    # A request's end, a cancel or a stop, that the engine leaves
+    # unacknowledged this long fails it: the command in flight may run the
+    # command watchdog out first.
+    end_acknowledgement: float
     # From SIGTERM to SIGKILL of an engine, and how long its exit is then
     # waited for.
     stop_grace: float
@@ -56,7 +57,7 @@ class Thresholds:
         return cls(
             status_answer=loop,
             write_progress=loop,
-            cancel_acknowledgement=budgets.command_timeout_ms / 1000 + loop,
+            end_acknowledgement=budgets.command_timeout_ms / 1000 + loop,
             stop_grace=budgets.stop_ms / 1000,
             short_lived=budgets.probation_ms / 1000,
             backoff_cap=budgets.probation_ms / 1000,

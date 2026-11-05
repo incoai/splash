@@ -1130,7 +1130,7 @@ class MultiplexedRuntime:
             with call._lock:
                 if not call.done:
                     timer = threading.Timer(
-                        self._thresholds.cancel_acknowledgement,
+                        self._thresholds.end_acknowledgement,
                         self._end_unacknowledged,
                         (call,),
                     )

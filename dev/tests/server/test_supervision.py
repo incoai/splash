@@ -26,7 +26,7 @@ class ThresholdTests(unittest.TestCase):
             (
                 thresholds.status_answer,
                 thresholds.write_progress,
-                thresholds.cancel_acknowledgement,
+                thresholds.end_acknowledgement,
                 thresholds.stop_grace,
                 thresholds.short_lived,
                 thresholds.backoff_cap,

@@ -347,8 +347,9 @@ class Plan:
         self.release = threading.Event()
         if not block:
             self.release.set()
-        # Set by the call's cancel or stop; `stopped` says which.
-        self.cancelled = threading.Event()
+        # Set when the call ends early, by its cancel or stop; `stopped` says
+        # which.
+        self.ended = threading.Event()
         self.stopped = False
         self.start_release = threading.Event()
         self.terminal = threading.Event()
@@ -436,7 +437,7 @@ class FakeCall:
             self.runtime.cancel_count += 1
         if self.plan is not None:
             self.plan.stopped = stopped
-            self.plan.cancelled.set()
+            self.plan.ended.set()
             self.plan.start_release.set()
             self.plan.release.set()
             self.plan.terminal_release.set()
@@ -527,22 +528,22 @@ class FakeRuntime:
             call.complete(error=api_errors.ConstraintError(plan.error))
             return
         completion = 0
-        if not plan.cancelled.is_set():
+        if not plan.ended.is_set():
             offset = 0
             for batch in plan.batches:
-                if plan.cancelled.is_set():
+                if plan.ended.is_set():
                     break
                 tokens = tuple(batch)
                 call.emit(wire.TokensEvent(call.request_id, offset, tokens))
                 offset += len(tokens)
                 completion += len(tokens)
-                plan.cancelled.wait(plan.delay)
+                plan.ended.wait(plan.delay)
         # As the engine does, a stop before any output cancels the request.
         reason = (
             wire.FinishReason.STOP
             if plan.stopped and completion
             else wire.FinishReason.CANCELLED
-            if plan.cancelled.is_set()
+            if plan.ended.is_set()
             else {
                 "stop": wire.FinishReason.STOP,
                 "length": wire.FinishReason.LENGTH,

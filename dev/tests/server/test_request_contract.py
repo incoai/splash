@@ -751,7 +751,7 @@ class RequestContractTests(HarnessTestCase):
         engine = runtime.MultiplexedRuntime(process_factory=factory, eager_start=True)
         self.addCleanup(engine.close)
         engine._thresholds = dataclasses.replace(
-            engine._thresholds, cancel_acknowledgement=0.02
+            engine._thresholds, end_acknowledgement=0.02
         )
         call = engine.submit(request(10))
         call.cancel()

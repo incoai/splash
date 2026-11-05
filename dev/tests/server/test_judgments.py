@@ -452,7 +452,7 @@ class JudgmentTests(HarnessTestCase):
         )
         self.assertEqual(status, 504, payload)
         self.assertEqual(len(runtime.requests), 2)
-        self.assertTrue(blocked.cancelled.is_set())
+        self.assertTrue(blocked.ended.is_set())
         self.assertEqual(runtime.cancel_count, 1)
 
     def test_systemone_sends_the_cache_salt(self):

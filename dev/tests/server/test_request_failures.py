@@ -457,7 +457,7 @@ class RequestFailureTests(HarnessTestCase):
             events[-1]["response"]["error"]["code"], "internal_server_error"
         )
         cancel.assert_called_once()
-        self.assertTrue(plan.cancelled.is_set())
+        self.assertTrue(plan.ended.is_set())
         self.assertRegex(
             stderr.getvalue(),
             r"^\d{2}:\d{2}:\d{2} Error · internal_server_error · RuntimeError · "
