@@ -206,24 +206,32 @@ def _gguf_in(files):
 def _split_parts(target):
     """The files of the GGUF target, in split order: every part of the split
     GGUF it is one part of, the root target of the files beside it that
-    holds it (upstream.root_targets); else target alone. A whole file of the
-    same model beside split parts, such as their merge, is a target of its
-    own. A part no root target holds, named in another case or Unicode form
-    than its directory entry, as a case- or normalization-insensitive file
-    system finds it, is refused as an incomplete split GGUF; a vision
-    projector's part (named mmproj) is no target's and passes on alone."""
+    holds it (upstream.root_targets), as its directory names them; else
+    target alone. target is its directory entry (_entry), whatever spelling
+    of the entry's name it is given in. A whole file of the same model
+    beside split parts, such as their merge, is a target of its own; a
+    vision projector's part (named mmproj) is no target's and passes on
+    alone."""
     beside = [path.name for path in target.parent.iterdir() if path.is_file()]
+    entry = _entry(target, beside)
     for found in upstream.root_targets(beside):
-        if found.split and target.name in found.files:
+        if found.split and entry in found.files:
             return upstream.split_order(
                 found.files, f"the split GGUF {found.name} in {target.parent}"
             )
-    model, split = upstream.target_of(target.name)
-    if split and not upstream.projector_named(target.name):
-        return upstream.split_order(
-            [target.name], f"the split GGUF {model} in {target.parent}"
-        )
     return [target.name]
+
+
+def _entry(target, names):
+    """The name of target among names, its directory's files: its own, or,
+    as a case- or normalization-insensitive file system (APFS) finds a file
+    by another spelling of its name, the name of the same file."""
+    if target.name in names:
+        return target.name
+    return next(
+        (name for name in names if (target.parent / name).samefile(target)),
+        target.name,
+    )
 
 
 def _projector(mmproj, repo):

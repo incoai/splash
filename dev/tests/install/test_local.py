@@ -3,6 +3,7 @@ import fcntl
 import io
 import json
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -333,17 +334,7 @@ class LocalModelTest(unittest.TestCase):
         ):
             self.prepare(directory / parts[0], draft)
         self.split_gguf(directory, "model-UD-Q4_K_M", 3)
-        # A part named in another case than its directory entry, as a
-        # case-insensitive file system finds it, is no root target's part and
-        # refused as incomplete; a projector's part is no target's and passes
-        # on alone.
-        other_case = directory / parts[0].lower()
-        with self.assertRaisesRegex(
-            models.ModelError,
-            f"the split GGUF model-ud-q4_k_m in {directory} is incomplete: "
-            f"{other_case.name}$",
-        ):
-            local._split_parts(other_case)
+        # A projector's part is no target's and passes on alone.
         self.projector(directory / "mmproj-F32-00001-of-00002.gguf")
         self.projector(directory / "mmproj-F32-00002-of-00002.gguf")
         with self.subTest(target="mmproj-F32-00001-of-00002.gguf"):
@@ -370,6 +361,35 @@ class LocalModelTest(unittest.TestCase):
         self.assertEqual(
             [p.name for p in (prepared / "target").iterdir()], ["model-UD-Q4_K_M.gguf"]
         )
+
+    def test_a_part_is_its_directory_entry_however_it_is_spelled(self):
+        """A part named in another case or Unicode form than its directory
+        entry, as a case- and normalization-insensitive file system (APFS)
+        finds it, is that entry: its split GGUF's parts are found as the
+        directory names them, and only a missing part is refused."""
+        directory = self.root / "parts"
+        directory.mkdir()
+        model = unicodedata.normalize("NFC", "Modèle-Q4_K_M")
+        parts = [f"{model}-0000{n}-of-00003.gguf" for n in (1, 2, 3)]
+        for part in parts:
+            (directory / part).touch()
+        spellings = (parts[1].lower(), unicodedata.normalize("NFD", parts[1]))
+        if not all((directory / spelling).is_file() for spelling in spellings):
+            self.skipTest("the file system tells these spellings apart")
+        for spelling in spellings:
+            with self.subTest(target=spelling):
+                self.assertEqual(local._split_parts(directory / spelling), parts)
+        (directory / parts[2]).unlink()
+        for spelling in spellings:
+            with (
+                self.subTest(target=spelling),
+                self.assertRaisesRegex(
+                    models.ModelError,
+                    f"the split GGUF {model} in {directory} is incomplete: "
+                    f"{parts[0]}, {parts[1]}$",
+                ),
+            ):
+                local._split_parts(directory / spelling)
 
     def test_files_splash_cannot_serve_are_refused_by_name(self):
         target = self.gguf(self.root / "model" / "model-Q4_K_M.gguf")
