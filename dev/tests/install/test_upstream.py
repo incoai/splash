@@ -291,13 +291,20 @@ class UpstreamTest(unittest.TestCase):
                 self.assertEqual(
                     upstream.select_gguf(repository, variant), (parts, False)
                 )
-        # Several targets are refused by their names, not their files.
+        # Several targets are refused by their names, not their files; a
+        # split GGUF's name says so.
         with self.assertRaisesRegex(
             models.ModelError,
             "select a GGUF with OWNER/REPO:VARIANT "
-            r"\(GGUF targets in the repository root: Model-Q1_0, Model-Q4_K_M\)",
+            r"\(GGUF targets in the repository root: Model-Q1_0 \(split, 3 parts\), "
+            r"Model-Q4_K_M\)",
         ):
             upstream.select_gguf(files | {whole}, None)
+        one = "Model-Q2_0-00001-of-00001.gguf"
+        with self.assertRaisesRegex(
+            models.ModelError, r"Model-Q2_0 \(split, 1 part\), Model-Q4_K_M\)"
+        ):
+            upstream.select_gguf({one, whole}, None)
         # Every part of the selected target must be there; a target selected
         # beside an incomplete one is whole.
         incomplete = files - {parts[1]}
@@ -310,17 +317,19 @@ class UpstreamTest(unittest.TestCase):
             upstream.select_gguf(incomplete | {whole}, "Q4_K_M"), ([whole], False)
         )
         # A whole file of the model beside its parts, such as their merge, is
-        # a target of its own, which its name selects before the parts.
+        # a target of its own, which its name selects before the parts. Both
+        # are of one name, so beside no other name it is no choice by its
+        # ending to report.
         merge = "Model-Q1_0.gguf"
-        for repository, expected in (
-            (files | {merge}, ([merge], True)),
-            (files | {merge, whole}, ([merge], False)),
-        ):
+        for repository in (files | {merge}, files | {merge, whole}):
             with self.subTest(files=sorted(repository)):
-                self.assertEqual(upstream.select_gguf(repository, "Q1_0"), expected)
+                self.assertEqual(
+                    upstream.select_gguf(repository, "Q1_0"), ([merge], False)
+                )
         with self.assertRaisesRegex(
             models.ModelError,
-            r"\(GGUF targets in the repository root: Model-Q1_0, Model-Q1_0\)",
+            r"\(GGUF targets in the repository root: Model-Q1_0, "
+            r"Model-Q1_0 \(split, 3 parts\)\)",
         ):
             upstream.select_gguf(files | {merge}, None)
 

@@ -116,6 +116,12 @@ class CachedTest(unittest.TestCase):
                 },
                 ["owner/m-GGUF:BF16", "owner/m-GGUF:Q4_K_M"],
             ),
+            # Folders whose names differ in case alone are one target, as
+            # :VARIANT names a folder whatever its case.
+            (
+                {"BF16/m-BF16-00001-of-00002.gguf", "bf16/m-BF16-00002-of-00002.gguf"},
+                ["owner/m-GGUF:BF16"],
+            ),
             # A split GGUF's parts in the root are one target, which an
             # incomplete one is not.
             (

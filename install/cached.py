@@ -43,43 +43,33 @@ def candidates(name, files, suggested_models):
     """The model IDs repository name's cached files may install as, one for
     each GGUF target they hold whole: the first of its suggested IDs that
     selects it (upstream.select_gguf), or else its own if that does: its
-    split parts' folder, or its root target's name (upstream.root_targets)
-    past the leading words of the repository's model name (without -GGUF),
-    at least the first, which selects the same MODEL-VARIANT from the Hub's
-    full listing. Without any, the repository itself: an MLX model, or files
-    the installer refuses."""
+    split parts' folder (upstream.folder_targets), or its root target's name
+    (upstream.root_targets) past the leading words of the repository's model
+    name (without -GGUF), at least the first, which selects the same
+    MODEL-VARIANT from the Hub's full listing. Without any, the repository
+    itself: an MLX model, or files the installer refuses."""
     from . import upstream
 
-    def selected(model_id):
+    def selects(model_id, target):
+        """Whether model_id selects target's files from files, all of them
+        (a split GGUF's parts are selected in split order)."""
         try:
-            return upstream.select_gguf(files, models.split_model_id(model_id)[1])[0]
+            chosen = upstream.select_gguf(files, models.split_model_id(model_id)[1])
         except models.ModelError:
-            return None
+            return False
+        return sorted(chosen[0]) == list(target.files)
 
     model = name.split("/")[1].lower().removesuffix("-gguf").split("-")
-    targets = []
-    for folder in sorted(
-        {
-            n.split("/")[0]
-            for n in files
-            if n.count("/") == 1
-            and n.endswith(".gguf")
-            and not upstream.projector_named(n)
-        }
-    ):
-        try:
-            targets.append((f"{name}:{folder}", upstream.split_gguf(files, folder)))
-        except models.ModelError:
-            pass  # not a whole split GGUF
-    for stem, parts in upstream.root_targets(files):
-        words = stem.split("-")
+    targets = [(f"{name}:{t.name}", t) for t in upstream.folder_targets(files)]
+    for target in upstream.root_targets(files):
+        words = target.name.split("-")
         shared = os.path.commonprefix([[w.lower() for w in words], model])
         variant = "-".join(words[max(len(shared), 1) :])
-        targets.append((f"{name}:{variant}" if variant else name, parts))
+        targets.append((f"{name}:{variant}" if variant else name, target))
     ids = []
     for own, target in targets:
         for model_id in (*suggested_models.get(name, ()), own):
-            if selected(model_id) == target:
+            if selects(model_id, target):
                 ids.append(model_id)
                 break
     return ids or [name]

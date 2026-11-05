@@ -333,11 +333,30 @@ class LocalModelTest(unittest.TestCase):
         ):
             self.prepare(directory / parts[0], draft)
         self.split_gguf(directory, "model-UD-Q4_K_M", 3)
+        # A part named in another case than its directory entry, as a
+        # case-insensitive file system finds it, is no root target's part and
+        # refused as incomplete; a projector's part is no target's and passes
+        # on alone.
+        other_case = directory / parts[0].lower()
+        with self.assertRaisesRegex(
+            models.ModelError,
+            f"the split GGUF model-ud-q4_k_m in {directory} is incomplete: "
+            f"{other_case.name}$",
+        ):
+            local._split_parts(other_case)
+        self.projector(directory / "mmproj-F32-00001-of-00002.gguf")
+        self.projector(directory / "mmproj-F32-00002-of-00002.gguf")
+        with self.subTest(target="mmproj-F32-00001-of-00002.gguf"):
+            self.assertEqual(
+                local._split_parts(directory / "mmproj-F32-00001-of-00002.gguf"),
+                ["mmproj-F32-00001-of-00002.gguf"],
+            )
         self.gguf(directory / "model-Q8_0.gguf")
         with self.assertRaisesRegex(
             models.ModelError,
             f"cannot prepare {directory}: it holds several GGUF targets "
-            r"\(model-Q8_0, model-UD-Q4_K_M\); pass the target's file",
+            r"\(model-Q8_0, model-UD-Q4_K_M \(split, 3 parts\)\); pass the "
+            "target's file",
         ):
             self.prepare(directory, draft)
         # A whole file beside the parts, such as their merge, is no part but
@@ -349,7 +368,8 @@ class LocalModelTest(unittest.TestCase):
         with self.assertRaisesRegex(
             models.ModelError,
             f"cannot prepare {directory}: it holds several GGUF targets "
-            r"\(model-UD-Q4_K_M, model-UD-Q4_K_M\); pass the target's file",
+            r"\(model-UD-Q4_K_M, model-UD-Q4_K_M \(split, 3 parts\)\); pass the "
+            "target's file",
         ):
             self.prepare(directory, draft)
 

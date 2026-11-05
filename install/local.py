@@ -194,28 +194,35 @@ def _gguf_in(files):
             "GGUF file but vision projectors (named mmproj)"
         )
     if len(targets) > 1:
-        listed = ", ".join(model for model, _ in targets)
+        listed = ", ".join(map(str, targets))
         raise ModelError(
             f"it holds several GGUF targets ({listed}); pass the target's file"
         )
-    [(_, names)] = targets
-    return upstream.target_files(names)
+    [target] = targets
+    return upstream.target_files(target)
 
 
 def _split_parts(target):
-    """The files of the GGUF target, in split order: target alone, or every
-    part of the split GGUF it is one part of, beside it (upstream.target_of);
-    a whole file of the same model beside them, such as their merge, is a
-    target of its own."""
+    """The files of the GGUF target, in split order: every part of the split
+    GGUF it is one part of, the root target of the files beside it that
+    holds it (upstream.root_targets); else target alone. A whole file of the
+    same model beside split parts, such as their merge, is a target of its
+    own. A part no root target holds, named in another case or Unicode form
+    than its directory entry, as a case- or normalization-insensitive file
+    system finds it, is refused as an incomplete split GGUF; a vision
+    projector's part (named mmproj) is no target's and passes on alone."""
+    beside = [path.name for path in target.parent.iterdir() if path.is_file()]
+    for found in upstream.root_targets(beside):
+        if found.split and target.name in found.files:
+            return upstream.split_order(
+                found.files, f"the split GGUF {found.name} in {target.parent}"
+            )
     model, split = upstream.target_of(target.name)
-    if not split:
-        return [target.name]
-    parts = [
-        path.name
-        for path in target.parent.iterdir()
-        if path.is_file() and upstream.target_of(path.name) == (model, True)
-    ]
-    return upstream.split_order(parts, f"the split GGUF {model} in {target.parent}")
+    if split and not upstream.projector_named(target.name):
+        return upstream.split_order(
+            [target.name], f"the split GGUF {model} in {target.parent}"
+        )
+    return [target.name]
 
 
 def _projector(mmproj, repo):
