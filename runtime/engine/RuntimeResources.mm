@@ -362,6 +362,19 @@ std::string_view streamedOnlyIn(const StreamedMemoryPlan &plan, const StreamedMe
   return {};
 }
 
+// Whether a model loaded with `loaded` holds the stores `next` gives: each
+// part's, and the routed experts' store's floor. A store no size sets keeps
+// a share of its slots as its floor (model::ExpertStoreOptions::floorShare),
+// which matters only above its smallest size (`expertMinimumBytes`): at that
+// size every slot is its floor at any share.
+bool holdsStores(const model::ModelLoadOptions &loaded, const model::ModelLoadOptions &next,
+                 const model::StreamableWeights &streamable) {
+  const bool floorByShare = !loaded.expertFloorBytes && loaded.expertMemoryBytes > streamable.expertMinimumBytes;
+  return loaded.expertMemoryBytes == next.expertMemoryBytes && loaded.expertFloorBytes == next.expertFloorBytes &&
+         loaded.streamedTableBytes == next.streamedTableBytes &&
+         (!floorByShare || loaded.expertFloorShare == next.expertFloorShare);
+}
+
 // What streams of the loaded model, and how an automatic part's store was
 // sized; for the routed experts' store, its cap and the floor it starts at
 // and gives memory back down to, the model plan's `floorShare` of its slots:
@@ -984,13 +997,31 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // The plan with the staging the tier keeps.
   const auto planMemory = [&](uint64_t aneFfnBytes) { return planWith(stateStagingBytes, aneFfnBytes); };
 
+  // The model's side of the split (startAneFfn).
+  AneFfnModel splitModel;
+  // Readies the model as it loaded: the expert store's bytes above the floor
+  // it starts at are held back, as the engine's plan charges the store at its
+  // cap and the weights' allocations count its floor alone; the PLE row cache
+  // takes all of its host memory now, before the checks of the host that the
+  // start and the expert store's growth make, which see it whole from here
+  // on rather than as rows fill it; and the split's side is that model's.
+  const auto ready = [&] {
+    if (const model::ExpertStore *store = loaded.expertStore()) {
+      const model::ExpertStoreStats stats = store->stats();
+      hostHeldBackBytes = stats.capBytes - stats.liveBytes;
+    }
+    if (model::SparseRowStore *table = loaded.streamedTable())
+      table->commit();
+    splitModel = aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled);
+  };
+
   // The plan with the loaded model's arenas sizes the stores, and the start
-  // loads again where it gives a part another store: it loads once where the
-  // plan without the arenas already loads each part so, as for a model with
-  // no part to stream or routed experts whose store --expert-memory sizes,
-  // and twice otherwise, as where automatic routed experts stream. Floors
-  // that the arenas take beyond the budget stop the start with the engine
-  // plan's breakdown (requirePlan, below). Nothing
+  // loads again where it gives other stores than those loaded (holdsStores):
+  // it loads once where the plan without the arenas already loads each part
+  // so, as for a model with no part to stream or routed experts whose store
+  // --expert-memory sizes, and twice otherwise, as where automatic routed
+  // experts stream. Floors that the arenas take beyond the budget stop the
+  // start with the engine plan's breakdown (requirePlan, below). Nothing
   // here samples the host: the store starts at its floor, and the ledger
   // grows it by the host's rule before Ready (MemoryGovernor::growToTargets).
   const StreamedMemoryResult planned = storesPlan(true);
@@ -998,29 +1029,13 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     throw planRefusal(planned, config.maximumMemoryBytes, hardBudgetBytes, streamable, config.model);
   if (planned.plan) {
     const model::ModelLoadOptions next = storesOf(*planned.plan, false);
-    if (next.expertMemoryBytes != loadOptions.expertMemoryBytes ||
-        next.expertFloorBytes != loadOptions.expertFloorBytes ||
-        next.streamedTableBytes != loadOptions.streamedTableBytes) {
+    if (!holdsStores(loadOptions, next, streamable)) {
       loadOptions = next;
       load(true);
     }
   }
-  // The engine's plan charges the expert store at its cap: the weights'
-  // allocations count its floor alone, which it starts at.
-  if (const model::ExpertStore *store = loaded.expertStore()) {
-    const model::ExpertStoreStats stats = store->stats();
-    hostHeldBackBytes = stats.capBytes - stats.liveBytes;
-  }
-  // The PLE row cache takes all of its host memory now, before the checks
-  // of the host that the start and the expert store's growth make, which
-  // see it whole from here on rather than as rows fill it.
-  if (model::SparseRowStore *table = loaded.streamedTable())
-    table->commit();
-  reportStreamedStores(loaded, streamable, config.expertMemory, config.pleMemory, loadOptions.expertFloorShare);
+  ready();
   reportVerifyRows(loaded, config.verifyRows);
-  // The model's side of the split (startAneFfn).
-  const AneFfnModel splitModel =
-      aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled);
 
   // The automatic tier keeps its staging only where the plan holds the model
   // and the requested context beside it, the parts as they load, or where
@@ -1115,6 +1130,22 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         activeLimitBytes = std::min(activeLimitBytes, disk.budget->activeLimitBytes());
       memoryPlan = requirePlan();
     }
+    // Whether the run spills is settled now, after the stores were sized: an
+    // automatic expert store laid out beside a spill the plan no longer
+    // makes (the tier turned off or its KV file did not open) loads again
+    // with the floor the plan's spill gives (expertFloorShare) where that
+    // floor is another (holdsStores). The plan holds the store at its cap
+    // whatever its floor, and is made again with it. The stores are final
+    // now, and the start reports them.
+    model::ModelLoadOptions served = loadOptions;
+    served.expertFloorShare = expertFloorShare(memoryPlan.breakdown().kvSpill.enabled);
+    if (!holdsStores(loadOptions, served, streamable)) {
+      loadOptions = served;
+      load(true);
+      ready();
+      memoryPlan = requirePlan();
+    }
+    reportStreamedStores(loaded, streamable, config.expertMemory, config.pleMemory, loadOptions.expertFloorShare);
 
     // The governor holds the complete Metal footprint to the hard budget. The
     // plan budgets pipelines and driver allocations inside the pipeline and

@@ -270,7 +270,12 @@ its weights once where the plan without the arenas already loads each part
 as the plan with them does, as for a model with no part to stream, and
 otherwise loads them again with the stores that plan gives (`Weights loaded
 again`): automatic routed experts the first plan streams load at their
-smallest store until then; a store `--expert-memory` sizes loads once.
+smallest store until then; a store `--expert-memory` sizes loads once. An
+automatic store sized for a run that spills keeps all of it as its floor.
+Where the run then cannot spill (the SSD cache turns off or its KV file does
+not open), the weights load once more for a store above its smallest size,
+whose floor is then 85% of its slots; a store at its smallest size is all its
+floor either way, and the weights do not load again.
 
 A block-sparse target serves the window where its floors hold a request of
 that length and the SSD cache has room for its KV, and otherwise the longest

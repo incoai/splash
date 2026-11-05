@@ -1366,11 +1366,16 @@ capacity takes; `--max-context` replaces it where set, a spill-capable
 target's up to 64K. A larger budget therefore never serves a shorter context
 ([memory and context](server.md#memory-and-context)).
 
-**Store floor and regrowth** (`planParts` in
-`runtime/engine/StreamedMemoryPlan.cpp`, `MemoryLedger::grow`). The expert
+**Store floor and regrowth** (`expertFloorShare` in
+`runtime/engine/StreamedMemoryPlan.hpp`, `MemoryLedger::grow`). The expert
 store's floor is the whole store where the run can spill (a block-sparse
 target with an SSD cache that takes writes), else 0.85 of its slots;
-`--expert-memory` sets it exactly. No claim takes the store below its floor.
+`--expert-memory` sets it exactly. The stores are sized before the start
+knows whether the run spills; a store above its smallest size laid out for a
+spill the final plan does not make loads again at 0.85, while one at its
+smallest size is all its floor at either share (`holdsStores` in
+`runtime/engine/RuntimeResources.mm`). No claim takes the store below its
+floor.
 After the host's pass a pool grows one unit, an elastic store chunk of about
 1 GiB, once 30 s have passed since its last try and since a request's claim
 went unmet or took a pool unit above a floor, the pass command, a conversion

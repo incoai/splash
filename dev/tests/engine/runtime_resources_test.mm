@@ -94,6 +94,13 @@ struct StreamedStart final {
   size_t loads = 0;
 };
 
+// How many times `part` is in `text`.
+size_t occurrences(std::string_view text, std::string_view part) {
+  size_t count = 0;
+  for (size_t at = text.find(part); at != std::string_view::npos; at = text.find(part, at + 1)) ++count;
+  return count;
+}
+
 // A start of `config` asked for `requestedContextTokens` (--max-context),
 // zero for the automatic context.
 StreamedStart startStreamed(const RuntimeResourcesConfig &config, uint32_t requestedContextTokens = 0) {
@@ -111,9 +118,7 @@ StreamedStart startStreamed(const RuntimeResourcesConfig &config, uint32_t reque
     started.tier = resources->cache().snapshot().kvTier.capacityBytes != 0;
     started.memory = resources->backend().refreshMemoryStats();
   });
-  for (size_t at = started.log.find("Weights loaded"); at != std::string::npos;
-       at = started.log.find("Weights loaded", at + 1))
-    ++started.loads;
+  started.loads = occurrences(started.log, "Weights loaded");
   return started;
 }
 
@@ -1193,6 +1198,76 @@ void testRelaunchKeepsTheSpilledContext(const char *metallibPath) {
           "a relaunch for --max-context served less than its first engine's context for want of SSD room");
 }
 
+// An automatic expert store keeps every slot as its floor only where the run
+// spills, except at its smallest size, where every slot is its floor at any
+// share. A byte short of the least budget that loads every expert,
+// Flash-Next's experts stream through a store the plan sizes beside a spill,
+// all of it its floor. Where the SSD cache's files then cannot be made, the
+// run serves without spilling: the weights load once more, and the store
+// keeps kExpertFloorShare of its slots, as in a run that cannot spill. A
+// budget lower by the experts' bytes above their smallest store gives that
+// store, beside a spill too: without the SSD cache's files it is all its
+// floor still, and the weights load as often as where the run spills. Each
+// start reports the store once, as the run serves it.
+void testAStoreKeepsTheFloorOfTheRunsSpill(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-store-floor");
+  RuntimeResourcesConfig config = flashNextConfig(metallibPath, root.path());
+  config.cacheDisk = {.automatic = true};
+  config.diskVolume = reading(localVolume(500 * kGiB));
+  // Halving from the least memory a start needs, where the experts stream
+  // through their smallest store, to 2 GiB above it, where they load whole.
+  uint64_t streams = startStreamed(config).minimumRequired, whole = streams + 2 * kGiB;
+  while (streams + 1 < whole) {
+    config.maximumMemoryBytes = streams + (whole - streams) / 2;
+    (startStreamed(config).experts ? streams : whole) = config.maximumMemoryBytes;
+  }
+  config.maximumMemoryBytes = streams;
+  const StreamedStart spilling = startStreamed(config);
+  require(spilling.tier && spilling.experts && spilling.experts->floorBytes == spilling.experts->capBytes &&
+              spilling.loads == 2,
+          "a store sized beside a spill did not keep all of it as its floor");
+  // A start of `at` with the temporary directory a regular file while the
+  // runtime starts, where no file of the SSD cache can be made.
+  const auto startClosed = [&](const RuntimeResourcesConfig &at) {
+    const char *const saved = std::getenv("TMPDIR");
+    const std::string temporary = saved ? saved : "";
+    const auto restore = [&] { saved ? ::setenv("TMPDIR", temporary.c_str(), 1) : ::unsetenv("TMPDIR"); };
+    StreamedStart closed;
+    closed.log = test::capturedStderr([&] {
+      ::setenv("TMPDIR", (root.path() / "target" / "model.gguf").c_str(), 1);
+      try {
+        const auto resources = RuntimeResources::create(at, 0);
+        closed.experts = resources->streamedExpertStats();
+        closed.tier = resources->cache().snapshot().kvTier.capacityBytes != 0;
+      } catch (...) {
+        restore();
+        throw;
+      }
+      restore();
+    });
+    closed.loads = occurrences(closed.log, "Weights loaded");
+    return closed;
+  };
+  const StreamedStart closed = startClosed(config);
+  require(!closed.tier && closed.experts && closed.experts->capBytes == spilling.experts->capBytes &&
+              closed.experts->floorBytes < closed.experts->capBytes && closed.loads == 3 &&
+              occurrences(closed.log, "Routed experts stream") == 1 &&
+              closed.log.find(std::to_string(static_cast<int>(model::kExpertFloorShare * 100)) +
+                              "% of its slots") != std::string::npos,
+          "a store sized beside a spill the run could not make kept all of it as its floor");
+  const model::StreamableWeights weights =
+      model::streamableWeights(config.modelRoot, config.model, {.streamExperts = true});
+  config.maximumMemoryBytes = streams - (weights.expertBytes - weights.expertMinimumBytes);
+  const StreamedStart least = startStreamed(config), smallest = startClosed(config);
+  require(least.tier && least.experts && least.experts->capBytes == weights.expertMinimumBytes,
+          "a budget lower by the experts' bytes above their smallest store gave another store");
+  require(!smallest.tier && smallest.experts && smallest.experts->capBytes == weights.expertMinimumBytes &&
+              smallest.experts->floorBytes == smallest.experts->capBytes && smallest.loads == least.loads &&
+              occurrences(smallest.log, "Routed experts stream") == 1 &&
+              smallest.log.find("100% of its slots") != std::string::npos,
+          "a store at its smallest size, sized beside a spill the run could not make, loaded again");
+}
+
 // A relaunch is planned as its first engine was. That of a server started
 // with --max-context asks for it again, beside the context the first engine
 // served (server/server.py `_native_command`), and on the budget that engine
@@ -1732,6 +1807,7 @@ int main(int argc, char **argv) {
       testAutomaticTierYieldsToTheContext(argv[1]);
       testAutomaticContextIgnoresTheVolume(argv[1]);
       testRelaunchKeepsTheSpilledContext(argv[1]);
+      testAStoreKeepsTheFloorOfTheRunsSpill(argv[1]);
       testAnExplicitRelaunchServesItsFirstContext(argv[1]);
       testTableShareHoldsAPromptsIds(argv[1]);
       testTheTableIgnoresTheHostsSpareMemory(argv[1]);

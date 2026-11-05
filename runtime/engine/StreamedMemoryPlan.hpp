@@ -78,6 +78,14 @@ struct StreamedMemoryPlan final {
   KvSpillPlan spill{};
 };
 
+// The share of its slots an automatic routed experts' store keeps as its
+// floor: all of them where the run's KV can spill, which gives memory back
+// instead while every chunk the store gives up costs expert reads from the
+// SSD until it regrows; otherwise model::kExpertFloorShare (0.85).
+[[nodiscard]] constexpr double expertFloorShare(bool spills) noexcept {
+  return spills ? 1.0 : model::kExpertFloorShare;
+}
+
 struct StreamedMemoryResult final {
   std::optional<StreamedMemoryPlan> plan;
   // Why nothing was planned, and when the floors exceed the budget, their

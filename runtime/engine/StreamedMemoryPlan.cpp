@@ -246,12 +246,10 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
     }
   }
   // The store's floor: every slot of a store a size sets, which is all of
-  // it, and of an automatic store when the run can spill: spilling KV gives
-  // memory back, and a chunk the store gives up costs expert reads from the
-  // SSD until it regrows. Otherwise it keeps kExpertFloorShare (0.85) of its
-  // slots (model::ExpertStoreOptions).
+  // it, and of an automatic store the share this plan's spill gives
+  // (expertFloorShare; model::ExpertStoreOptions).
   plan.expertFloorBytes = experts.sized ? experts.charged : 0;
-  plan.expertFloorShare = experts.sized || spill.enabled ? 1.0 : model::kExpertFloorShare;
+  plan.expertFloorShare = experts.sized ? 1.0 : expertFloorShare(spill.enabled);
   plan.tableBytes = table.streams ? table.charged : 0;
   if (table.automatic) {
     const int64_t kept = rest - allowance(expertsStream);
