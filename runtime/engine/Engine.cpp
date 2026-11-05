@@ -325,6 +325,7 @@ bool Engine::tick(double now) {
     }
   } const tickEnd{*this};
   for (;;) {
+    settleEndedBetweenPasses();
     // Planning reads the lanes' shapes as they are now, before every plan.
     const std::vector<LaneShape> shapes = laneShapes();
     const PlanInputs in{.excluded = excluded, .shapes = shapes, .passes = passProgress()};
@@ -410,9 +411,6 @@ bool Engine::tick(double now) {
     case Prepared::Replan:
       refused.insert(refused.end(), excluded.begin() + static_cast<std::ptrdiff_t>(planned), excluded.end());
       ++counters_.replans;
-      // The lanes that ended in a command between its passes that a claim
-      // took end before the plan is made again.
-      settleEndedBetweenPasses();
       continue;
     }
   }

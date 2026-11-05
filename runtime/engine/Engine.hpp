@@ -832,7 +832,7 @@ private:
   // then reads through, cover what the claim lacks. It frees its memory as
   // its copies land. The command between its passes gives back the
   // buffers of the states it would capture, which the model's pool releases
-  // at once; its lanes that ended end after the plan is made again
+  // at once; its lanes that ended end before the next plan is made
   // (settleEndedBetweenPasses).
   class EngineVictims final : public VictimSource {
   public:
@@ -856,7 +856,10 @@ private:
   // lanes that ended stay to be settled.
   void takePassCommand();
   // Settles every lane that ended (Request::pendingEnd) that no command in
-  // flight, restore or command between its passes holds any more.
+  // flight, restore or command between its passes holds any more. It runs
+  // before every plan, so a take that may not settle (a claim's, inside the
+  // ledger) leaves them here and no lane's end depends on who took the
+  // command.
   void settleEndedBetweenPasses();
   // The time to their first tokens of the requests that have not sent them:
   // holds(now) counts the time since the last tick
@@ -1112,7 +1115,7 @@ private:
   // (Scheduler::abandonsPasses): before one that holds a lane of it takes
   // shape, and as any other runs, or sooner, where a claim for that work
   // takes it (EngineVictims, takePassCommand), whose lanes that ended end
-  // once the plan is made again. So it does to the suspension of any of its
+  // before the next plan is made. So it does to the suspension of any of its
   // lanes, in place of that suspension where a lane of it ended
   // (yieldsEndedLanes), and once every lane of it has ended.
   void abandonPasses();

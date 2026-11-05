@@ -253,6 +253,46 @@ void testSupersedingClaimTakesThePassCommand() {
   }
 }
 
+// A claim that takes the command between its passes outside any plan's preparation, as any claim of in-service
+// work may, takes no lane with it: the lane of it that was cancelled ends once, at the next tick, and gives back
+// its claim and its KV.
+void testALaneOfACommandTakenOutsidePreparationEndsAtTheNextTick() {
+  PassesUnderALimit passes(uint64_t{1} << 30);
+  passes.submit(1, 129, RequestPriority::Background);
+  passes.submit(2, 129, RequestPriority::Background);
+  passes.runUntil([&] { return !passes.prefills.empty() && !passes.engine.commandInFlight(); },
+                  "the Background prompts did not run a pass");
+  require(passes.prefills.back().second == 0 && passes.model.heldStateBytes == 128,
+          "the Background prompts' command is not between its passes");
+  passes.engine.cancel(2);
+  require(!passes.events.usage.contains(2), "the lane cancelled between passes ended before its command did");
+  const uint64_t abandoned = passes.engine.snapshot().scheduler.abandonedPassCommands;
+  const size_t lanePages = passes.cache.pageTable(2).pages.size();
+  const uint32_t freePages = passes.pool.freePageCount(kv::PageForm::Full);
+  MemoryLedger &ledger = passes.host.governor.ledger();
+  const ClaimId claim = ledger.open({.cls = ClaimClass::InService, .supersedes = true});
+  const FreeResult freed = passes.host.governor.free(claim, {.stateBuffers = 2});
+  ledger.close(claim);
+  require(freed.outcome == FreeOutcome::Met &&
+              passes.engine.snapshot().scheduler.abandonedPassCommands == abandoned + 1,
+          "the claim did not take the command between its passes");
+  require(!passes.events.usage.contains(2), "the claim's take ended the lane inside the ledger's free");
+  static_cast<void>(passes.engine.tick(passes.now++));
+  const auto holdsClaim = [&](uint64_t id) {
+    return std::ranges::any_of(ledger.claims(), [&](const auto &entry) { return entry.second.spec.requestId == id; });
+  };
+  require(passes.events.usage.contains(2) && passes.engine.snapshot().cancelled == 1 && !holdsClaim(2) &&
+              lanePages != 0 && passes.pool.freePageCount(kv::PageForm::Full) >= freePages + lanePages,
+          "the lane cancelled in the command a claim took did not end at the next tick with its claim and KV");
+  passes.runUntil([&] { return idle(passes.engine); }, "the requests did not end");
+  const EngineSnapshot counts = passes.engine.snapshot();
+  require(counts.cancelled == 1 && passes.events.completedCount == 2 && passes.events.failedCount == 0 &&
+              counts.scheduler.abandonedPassCommands == abandoned + 1,
+          "the cancelled lane did not end exactly once beside the other prompt's completion: cancelled " +
+              std::to_string(counts.cancelled) + ", completed " + std::to_string(passes.events.completedCount) +
+              ", abandoned " + std::to_string(counts.scheduler.abandonedPassCommands - abandoned));
+}
+
 // A lane cancelled between its command's passes ends at once though a higher-priority decode holds the command off;
 // the command gives way whole to the decode.
 void testACancelBetweenPassesEndsBesideAHigherPrioritysDecode() {
@@ -1132,6 +1172,8 @@ std::span<const test::TestCase> rulesTests() {
        testALowerPriorityClaimTakesNothingAHigherPriorityLaneNeeds},
       {"testASpillLanesIndexPagesAreClaimedAtItsPriority", testASpillLanesIndexPagesAreClaimedAtItsPriority},
       {"testSupersedingClaimTakesThePassCommand", testSupersedingClaimTakesThePassCommand},
+      {"testALaneOfACommandTakenOutsidePreparationEndsAtTheNextTick",
+       testALaneOfACommandTakenOutsidePreparationEndsAtTheNextTick},
       {"testLandingPaysItsOwnerFirst", testLandingPaysItsOwnerFirst},
       {"testQuotaWaitIsNotAMemoryClaim", testQuotaWaitIsNotAMemoryClaim},
       {"testALaneBelowAWaitingClaimTakesWhatItLacksBeyondTheHeldPages",
