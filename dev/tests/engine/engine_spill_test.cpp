@@ -1972,7 +1972,6 @@ void testAnAdmissionPlacesTheNextCandidateAgain() {
 // beside 1,000 idle bytes.
 void testPlacementCountsIdleStateBuffers() {
   Spilling spill(Spilling::Governed{}, 1024, false);
-  spill.host.bookStates(spill.model);
   spill.host.memory.hold("states", 1'000);
   spill.model.heldStateBytes += 1'000;
   spill.model.reclaimableIdleStateBytes = 1'000;
@@ -2008,7 +2007,6 @@ void testPlacementCountsWholeExtentsAndTheLanesStates() {
   for (const Case &each : {Case{3'839, laneStates, true}, Case{3'903, 0, true}, Case{3'583, laneStates, false}}) {
     Spilling spill{16'384, false, 0, 200'000, Spilling::Extent{256}, 0, {}, {.limitBytes = 4ULL << 30}, true,
                    FlashNextLanes::kPages};
-    spill.host.bookStates(spill.model);
     spill.model.laneFootprintBytes = each.states;
     spill.host.memory.hold("limit", (4ULL << 30) - spill.held() - 31 * extent / 2);
     spill.engine.submit(Spilling::prompt(1, 1, each.pages, 1));
@@ -2036,7 +2034,6 @@ void testPlacementCountsTheLanesBuffersAStartTakesFromThePool() {
   constexpr uint64_t lane = 128, state = 64, shortRoom = 1'100;
   for (const uint64_t room : {shortRoom, shortRoom + lane + state}) {
     Spilling spill(Spilling::Governed{}, 1024, false, Spilling::Extent{4}, 0, test::commandShape(KvCache::pageTokens));
-    spill.host.bookStates(spill.model);
     spill.model.laneFootprintBytes = lane;
     spill.model.decodeFinishes = true;
     for (uint32_t each = 2; each < 5; ++each) {
@@ -2071,7 +2068,6 @@ void testPlacementCountsANextTurnsStartAtWhatItAllocates() {
     for (const bool fits : {false, true}) {
       Spilling spill(Spilling::Governed{}, 1024, false, Spilling::Extent{4}, 0,
                      test::commandShape(KvCache::pageTokens));
-      spill.host.bookStates(spill.model);
       spill.model.laneFootprintBytes = lane;
       spill.model.decodeFinishes = true;
       spill.engine.submit(Spilling::prompt(2, 2, 3, 1));
@@ -2099,10 +2095,12 @@ void testPlacementCountsANextTurnsStartAtWhatItAllocates() {
 // in whole extents past the free pages, as their claims take both from the
 // same extents: beside a lane that projects 6 pages more, a prompt that
 // fills whole extents spills in room half an extent short of the extents
-// both take, and runs Resident in room for them. Counted in pages beside
-// the prompt's extents, the lane's growth fit the first room.
+// both take, and runs Resident in room for them, each beside the state its
+// start captures. Counted in pages beside the prompt's extents, the lane's
+// growth fit the first room.
 void testPlacementCountsTheLanesGrowthInTheSameExtents() {
-  for (const uint64_t room : {4'600U, 4'800U}) {
+  constexpr uint64_t state = 64, shortRoom = 4'600 + state;
+  for (const uint64_t room : {shortRoom, 4'800 + state}) {
     Spilling spill(Spilling::Governed{}, 1024, false);
     spill.model.time(test::passingTarget());
     EngineRequest lane = Spilling::prompt(3, 3, 7, 200);
@@ -2124,9 +2122,9 @@ void testPlacementCountsTheLanesGrowthInTheSameExtents() {
     spill.model.decodeFinishes = true;
     spill.runUntilIdle();
     require(spill.events.failedCount == 0, "a request failed");
-    require(room == 4'600 ? placed.spill == 1 : placed.resident == 2,
+    require(room == shortRoom ? placed.spill == 1 : placed.resident == 2,
             "beside a lane's growth, a prompt in room for " + std::to_string(room) + " B " +
-                (room == 4'600 ? "started Resident" : "spilled"));
+                (room == shortRoom ? "started Resident" : "spilled"));
   }
 }
 

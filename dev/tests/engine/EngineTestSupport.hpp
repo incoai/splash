@@ -190,8 +190,9 @@ struct SpillPages final {
 // window of a page each. With `always` every request spills; otherwise
 // placement decides, a request that cannot spill starting Resident within
 // `residentTokens` (by default those of `residentKvBytes`). Decode runs to
-// each request's output limit. A governed fixture's KV extents allocate
-// through its GovernedHost, whose limit limit() sets.
+// each request's output limit. A governed fixture's KV extents and the
+// model's state buffers allocate through its GovernedHost, whose limit
+// limit() sets.
 struct Spilling {
   // The pages of an extent, of a type of its own for a call to name.
   struct Extent final {
@@ -222,6 +223,7 @@ struct Spilling {
       std::optional<ClaimScope> start;
       if (governed) {
         host.through(storage);
+        host.bookStates(model);
         start.emplace(host.governor, engine::ClaimClass::Floor);
       }
       require(static_cast<bool>(pool.fillRunway(kv::PageForm::Index)), "the Index runway was not allocated");
