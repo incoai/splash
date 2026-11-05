@@ -185,25 +185,29 @@ default), each in a connection slot. A connection waits for its request without
 a thread until the request's head, its request line and headers, has arrived, or
 its client has closed; one of the server's worker threads, one per slot and all
 started with the server, then reads and serves the request, and the connection
-keeps its slot until it has been answered. The server takes every connection the
-kernel holds at each wakeup and starts no thread while connections arrive: macOS
-queues at most 128 connections the server has yet to take and resets those
-beyond, so the accept loop must keep up with a burst. The head is due 30 seconds
-after the server accepted the connection, which is closed without a response if
-the head has not arrived by then; a head that passes 64 KiB goes to its thread
-unfinished, to be read with 30 seconds allowed between reads. When every slot is
-taken, a connection still waiting for its head, or receiving an upload refused
-unread, gives way to the new one, the longest waiting first, so stalled clients
-cannot lock others out; when every slot holds a request whose head has arrived,
-the new connection is refused. A connection refused, or giving way, before its
-request is read gets a fixed 503 with code `frontend_overloaded` in OpenAI's
-shape whatever its path ([errors](#errors)). The server then reads and drops
-what its client still sends until the client closes or 2 seconds pass, so that
-the client reads the 503 rather than a reset, even one that sends its request
-only after the refusal. At most 1024 such connections linger at once; one more
-takes the place of the one refused longest ago. The server raises its soft limit
-of open files to 10240 at start (macOS starts a process at 256), so the
-connections it holds cannot exhaust it.
+keeps its slot until it has been answered. A connection carries one request:
+every response says `Connection: close`, and the server closes the connection
+after it, so a client sends each request on a new connection, and one sent after
+another on the same connection, pipelined, is not answered. The server takes
+every connection the kernel holds at each wakeup and starts no thread while
+connections arrive: macOS queues at most 128 connections the server has yet to
+take and resets those beyond, so the accept loop must keep up with a burst. The
+head is due 30 seconds after the server accepted the connection, which is closed
+without a response if the head has not arrived by then; a head that passes 64
+KiB goes to its thread unfinished, to be read with 30 seconds allowed between
+reads. When every slot is taken, a connection still waiting for its head, or
+receiving an upload refused unread, gives way to the new one, the longest
+waiting first, so stalled clients cannot lock others out; when every slot holds
+a request whose head has arrived, the new connection is refused. A connection
+refused, or giving way, before its request is read gets a fixed 503 with code
+`frontend_overloaded` in OpenAI's shape whatever its path ([errors](#errors)).
+After any response, the server reads and drops what the client still sends until
+the client closes or 2 seconds pass, so that the client reads the response
+rather than a reset, even one that sends its request only after a refusal, or
+another request after its first. At most 1024 such connections linger at once;
+one more takes the place of the one answered longest ago. The server raises its
+soft limit of open files to 10240 at start (macOS starts a process at 256), so
+the connections it holds cannot exhaust it.
 
 ## Sampling
 

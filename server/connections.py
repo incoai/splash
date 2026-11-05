@@ -1,6 +1,6 @@
 """HTTP ingress bounds: the connections the server serves at once and the
 threads that serve them, the requests and request body bytes it admits, and
-the closing of connections it refuses."""
+the closing of the connections it answers."""
 
 import queue
 import re
@@ -163,7 +163,7 @@ class Workers:
 class WaitingConnections:
     """Connections that wait on their clients without a thread, all on one
     thread: ones given a slot, until the heads of their requests arrive, and
-    ones answered without their requests read, until their clients close.
+    answered ones, until their clients close.
 
     One given a slot is looked at, left unread for its thread, as it is
     handed over and on each arrival kqueue reports. Once _ready, it keeps its
@@ -172,8 +172,9 @@ class WaitingConnections:
     gives its slot away comes back here answered.
 
     Closing a connection with request bytes unread resets it, which can
-    destroy the answer before the client reads it. An answered one is
-    half-closed instead, what its client still sends is dropped, and it is
+    destroy the answer before the client reads it: a request refused unread,
+    or one sent after the answered one. An answered one is half-closed
+    instead, what its client still sends is dropped, and it is
     closed once the client has closed or `linger` seconds after its answer.
     At most `capacity` linger at once, a new one replacing the longest
     lingering, whose client has had the longest to read its answer; at most
@@ -219,9 +220,12 @@ class WaitingConnections:
             self._wake()
 
     def close(self, connection):
-        """Close `connection`, answered without its request read, as the
-        class does; one held for its request stops waiting for it."""
+        """Close `connection`, answered, as the class does; one held for its
+        request stops waiting for it."""
         try:
+            # What is read of it then must not wait: with a timeout, a socket
+            # waits for input before each read, MSG_DONTWAIT or not.
+            connection.settimeout(None)
             connection.shutdown(socket.SHUT_WR)
         except OSError:
             pass
@@ -368,10 +372,13 @@ class ConnectionSlots:
     many addresses, cannot keep others out; when every slot has a request
     whose head has arrived (looked at yet or not), the new connection is
     refused. One that gives way awaiting its request gets the 503 of a
-    refused connection, as its request may be on its way, and lingers as
-    one, among at most `refused_capacity`, for up to `linger` seconds; one
-    draining a refused upload, already answered, is shut down for its thread
-    to see the end of its input.
+    refused connection, as its request may be on its way, and is closed as
+    one; one draining a refused upload, already answered, is shut down for
+    its thread to see the end of its input.
+
+    Each connection is closed once answered, refused or served, lingering
+    among at most `answered_capacity` for up to `linger` seconds
+    (WaitingConnections).
     """
 
     # What a connection with a slot is doing.
@@ -379,7 +386,7 @@ class ConnectionSlots:
     SERVING = "serving"
     DRAINING = "draining"
 
-    def __init__(self, capacity, serve, refused_capacity, linger):
+    def __init__(self, capacity, serve, answered_capacity, linger):
         self.capacity = capacity
         # Each connection with a slot, mapped to what it is doing; those that
         # wait on their client in the order they began to.
@@ -389,7 +396,7 @@ class ConnectionSlots:
         self.idle.set()
         self.workers = Workers(capacity, serve)
         self.waiting = WaitingConnections(
-            self, self.workers.put, refused_capacity, linger
+            self, self.workers.put, answered_capacity, linger
         )
 
     def admit(self, connection, address, deadline):
@@ -467,6 +474,12 @@ class ConnectionSlots:
             self.holders.pop(connection, None)
             if not self.holders:
                 self.idle.set()
+
+    def close(self, connection):
+        """Give back the slot of `connection`, served, and close it as an
+        answered one."""
+        self.release(connection)
+        self.waiting.close(connection)
 
     def stop(self):
         """Close every connection held without a thread, and end each worker

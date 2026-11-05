@@ -80,10 +80,10 @@ HTTP_UPLOAD_BYTES_PER_SECOND = 512 * 1024
 # Native events wake a waiting request at once; this only bounds how late a
 # client disconnect is noticed.
 CLIENT_DISCONNECT_POLL = 0.1
-# How long a connection refused unread may take its client to close.
-REFUSED_LINGER_SECONDS = 2.0
+# How long an answered connection may take its client to close.
+ANSWERED_LINGER_SECONDS = 2.0
 # The soft descriptor limit the server raises its own to: macOS starts a
-# process with 256, fewer than its connection slots, the refused connections
+# process with 256, fewer than its connection slots, the answered connections
 # lingering after a burst and the engine's pipes and files can need. 10240 is
 # macOS's OPEN_MAX.
 DESCRIPTOR_LIMIT = 10240
@@ -985,13 +985,13 @@ class FrontendServer(HTTPServer):
     # Keep control/catalog capacity separate from generation capacity.
     # Neither gate allocates workers in advance.
     control_connection_capacity = 64
-    # Connections answered without their requests read that wait at once,
-    # on one thread, for their clients to close. A burst refuses all that
-    # arrive while every slot is held, and a client that sends its request
-    # after its connection closed is reset before it reads the 503, so
-    # enough linger for a burst well beyond the kernel's queue, within the
+    # Answered connections, refused or served, that wait at once, on one
+    # thread, for their clients to close. A burst refuses all that arrive
+    # while every slot is held, and a client that sends its request after
+    # its connection closed is reset before it reads the 503, so enough
+    # linger for a burst well beyond the kernel's queue, within the
     # descriptors the server raises its limit to.
-    refused_connection_capacity = 1024
+    answered_connection_capacity = 1024
 
     def __init__(
         self,
@@ -1032,8 +1032,8 @@ class FrontendServer(HTTPServer):
         self.connections = ConnectionSlots(
             request_capacity + self.control_connection_capacity,
             self._serve_connection,
-            self.refused_connection_capacity,
-            REFUSED_LINGER_SECONDS,
+            self.answered_connection_capacity,
+            ANSWERED_LINGER_SECONDS,
         )
         super().__init__(address, FrontendHandler, bind_and_activate)
         self.app = app
@@ -1104,8 +1104,7 @@ class FrontendServer(HTTPServer):
             self.shutdown_request(request)
 
     def shutdown_request(self, request):
-        self.connections.release(request)
-        super().shutdown_request(request)
+        self.connections.close(request)
 
     def server_close(self):
         super().server_close()
