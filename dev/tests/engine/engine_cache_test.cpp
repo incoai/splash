@@ -196,6 +196,12 @@ struct CacheFixture {
                                 std::make_shared<TestState>(bytes), false);
   }
 
+  // A queued request restores the state at this block, which a reclaim
+  // then writes although a state below supersedes it.
+  void want(uint32_t block) {
+    cache.setWantedChains({std::span<const uint64_t>(blocks).first(block + 1)});
+  }
+
   engine::CacheLookup lookup(uint32_t tokens) {
     return cache.lookup(std::span<const uint32_t>(prompt).first(tokens), {});
   }
@@ -1084,11 +1090,11 @@ void testDiskQuotaKeepsTheOnlyCopyAQueuedRequestRestores() {
   control->capacity = 1;
   publishReusable(fixture, fixture.blocks[0], std::make_shared<TieredState>(control));
   publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
+  const CacheProbe queued = fixture.cache.probe(std::span<const uint32_t>(fixture.prompt).first(33), {});
+  fixture.cache.setWantedChains({queued.restoredChain()});
   require(test::releaseStep(fixture.cache).gave() &&
               fixture.cache.pollTransfers() && control->slots == 1,
           "first write failed");
-  const CacheProbe queued = fixture.cache.probe(std::span<const uint32_t>(fixture.prompt).first(33), {});
-  fixture.cache.setWantedChains({queued.restoredChain()});
   static_cast<void>(test::releaseStep(fixture.cache));
   static_cast<void>(fixture.cache.pollTransfers());
   require(fixture.lookup(33).resumeBoundary() == 32,
@@ -1312,6 +1318,7 @@ void testInvalidationDuringOffload() {
 void testDemotionFreesTheBufferAtOnce() {
   CacheFixture fixture;
   auto control = std::make_shared<TransferControl>();
+  fixture.want(0);
   publishReusable(fixture, fixture.blocks[0], std::make_shared<TieredState>(control));
   publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
   require(test::stateStep(fixture.cache).gave(),
@@ -1416,6 +1423,7 @@ void testRepublicationKeepsTheDiskCopy() {
   CacheFixture fixture;
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
+  fixture.want(0);
   publishReusable(fixture, fixture.blocks[0], std::make_shared<TieredState>(control));
   publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
   require(test::releaseStep(fixture.cache).gave() &&
@@ -1840,6 +1848,7 @@ void testTierOnlyAddsToTierOff() {
 void testDemotionCostsNoSecondState() {
   CacheFixture fixture;
   auto control = std::make_shared<TransferControl>();
+  fixture.want(0);
   publishReusable(fixture, fixture.blocks[0], std::make_shared<TieredState>(control)); // A, A
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false); // B
   require(test::stateStep(fixture.cache).gave(),
@@ -2279,6 +2288,7 @@ void testParentOfDiskChildrenSurvivesRefusal() {
 void testSecondStateWaitsForTheWrite() {
   CacheFixture fixture;
   auto control = std::make_shared<TransferControl>();
+  fixture.want(0);
   publishReusable(fixture, fixture.blocks[0], std::make_shared<TieredState>(control));
   publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
   require(reclaimStateBytes(fixture.cache) == 100,
@@ -2301,8 +2311,8 @@ void testSecondStateWaitsForTheWrite() {
           "second write did not land beside the first");
 }
 
-// A checkpoint whose write waits for the slot holds nothing else back: KV and ordinary states
-// behind it go meanwhile.
+// A checkpoint a queued request restores, whose write waits for the slot, holds nothing else
+// back: KV and ordinary states behind it go meanwhile.
 void testWaitingCheckpointHoldsBackNothingElse() {
   CacheFixture fixture;
   auto control = std::make_shared<TransferControl>();
@@ -2311,6 +2321,7 @@ void testWaitingCheckpointHoldsBackNothingElse() {
   fixture.publish(2);
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control),
                                       true);
+  fixture.want(1);
   // The idle tail is the oldest and needs no transfer; the ordinary state
   // cannot be written and goes next, then the leaf it stood on.
   require(test::evictStep(fixture.cache).gave() &&
@@ -3007,25 +3018,31 @@ void testCompactionFollowsOnlyTheMovedBlocks() {
   const StateWriter write = [&](std::function<void()>) { return writeState(control); };
   require(cache.publishStateToDisk(fixture.lastBlocks[0], write, false) && cache.pollTransfers(),
           "the first prompt's state was not written");
-  // Extent 0 keeps the first prompt's first block and the second prompt's
-  // first block; extent 2 keeps the third prompt's last block alone.
-  demoteLeaves(cache, tier, 2);
-  require(test::releaseStep(cache).nowBytes == 400 &&
-              test::releaseStep(cache).gave() &&
-              storage.copies.size() == 1 && storage.copies[0].from == 8 &&
-              storage.copies[0].to == 1,
-          "the third prompt's leaf did not move into extent 0");
-  // The first prompt's first block goes to disk and the second prompt's
-  // state and two upper blocks go, so extents 0 and 1 hold two pages each.
-  demoteLeaves(cache, tier, 1);
-  for (uint32_t victim = 0; victim < 3; ++victim)
-    require(test::evictStep(cache).gave(),
-            "the second prompt was not evicted");
-  require(test::releaseStep(cache).gave() &&
-              storage.copies.size() == 3 && storage.copies[1].from == 1 &&
-              storage.copies[1].to == 4 && storage.copies[2].from == 3 &&
-              storage.copies[2].to == 5 && cache.snapshot().pool.extentCompactions == 2,
-          "extent 0 was not emptied into extent 1");
+  {
+    // Unfinished requests use the other prompts' states, which go only after
+    // the first prompt's leaves.
+    const StateUse second = cache.useState(fixture.lastBlocks[1]);
+    const StateUse third = cache.useState(fixture.lastBlocks[2]);
+    // Extent 0 keeps the first prompt's first block and the second prompt's
+    // first block; extent 2 keeps the third prompt's last block alone.
+    demoteLeaves(cache, tier, 2);
+    require(test::releaseStep(cache).nowBytes == 400 &&
+                test::releaseStep(cache).gave() &&
+                storage.copies.size() == 1 && storage.copies[0].from == 8 &&
+                storage.copies[0].to == 1,
+            "the third prompt's leaf did not move into extent 0");
+    // The first prompt's first block goes to disk and the second prompt's
+    // state and two upper blocks go, so extents 0 and 1 hold two pages each.
+    demoteLeaves(cache, tier, 1);
+    for (uint32_t victim = 0; victim < 3; ++victim)
+      require(test::evictStep(cache).gave(),
+              "the second prompt was not evicted");
+    require(test::releaseStep(cache).gave() &&
+                storage.copies.size() == 3 && storage.copies[1].from == 1 &&
+                storage.copies[1].to == 4 && storage.copies[2].from == 3 &&
+                storage.copies[2].to == 5 && cache.snapshot().pool.extentCompactions == 2,
+            "extent 0 was not emptied into extent 1");
+  }
 
   auto lookup = cache.lookup(fixture.prompts[2], {});
   cache.beginRequest(4);
@@ -5048,6 +5065,10 @@ void testFullShortfallsKeepTheTailsOfStatesTheSsdKeeps() {
   windowed.publish(1, 8);
   cache.endRequest(1);
   require(cache.trimWindows() == 4 && windowed.slimPages() == 4, "the unpinned pages were not trimmed");
+  // A queued request restores the checkpoint, which a reclaim then writes.
+  const CacheProbe queued = cache.probe(std::span<const uint32_t>(cached).first(4 * KvCache::pageTokens + 1), {});
+  require(queued.restoredChain().size() == 4, "the checkpoint was not found");
+  cache.setWantedChains({queued.restoredChain()});
 
   // A claim for a state's buffers writes the checkpoint first.
   require(test::freeFromCache(cache, test::kInServiceGrowth, {.stateBuffers = 1}).outcome == FreeOutcome::Met &&
@@ -5396,7 +5417,7 @@ void testGrowthNeedKeepsTheFreePagesItTakes() {
 }
 
 // A device need's walk reaches the leaves past the states it gives up: every extent goes, the
-// checkpoint written.
+// newest point written.
 void testDeviceNeedReachesTheLeavesPastTheStates() {
   test::TestKvStorage storage{48, 100, 4};
   KvPool pool{storage, 4};
@@ -5415,8 +5436,8 @@ void testDeviceNeedReachesTheLeavesPastTheStates() {
     return blocks;
   };
   const std::array<uint64_t, 2> oldest = cachePrompt(1, 8);
-  cache.publishCompositeState(oldest[0], std::make_shared<TieredState>(control), true);
-  cache.publishCompositeState(oldest[1], std::make_shared<TestState>(100), false);
+  cache.publishCompositeState(oldest[0], std::make_shared<TieredState>(control), false);
+  cache.publishCompositeState(oldest[1], std::make_shared<TestState>(100), true);
   for (uint64_t id = 2; id <= 5; ++id)
     static_cast<void>(cachePrompt(id, 4));
   static_cast<void>(cache.releaseEmptyExtents(false));
@@ -5424,7 +5445,7 @@ void testDeviceNeedReachesTheLeavesPastTheStates() {
   require(test::freeFromCache(cache, claim, {.bytes = pool.allocatedBytes()}).outcome == FreeOutcome::Met,
           "the cache did not give its extents");
   require(!pool.allocatedBytes() && cache.snapshot().stateCache.offloads == 1,
-          "the units left extents, or the checkpoint unwritten");
+          "the units left extents, or the newest point unwritten");
   cache.checkInvariants();
 }
 
@@ -5588,16 +5609,17 @@ void testHeldPagesAreNoRoomToWaitFor() {
 // Units freed only after a write are offered in place marked later: Immediate claims pass over
 // them, can-wait claims take them.
 void testImmediateWalksOfferWhatLandsLaterInItsPlace() {
-  CacheFixture fixture;
+  // Each state is the newest point of a conversation of its own.
+  Prefixes fixture;
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   control->capacity = 4;
   fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control), false);
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), false);
-  // The resume point, and a state the tier takes no write of, which goes at
-  // once.
-  fixture.publish(2);
-  fixture.publish(3);
+  // A state the tier takes no write of, which goes at once, and the resume
+  // point.
+  fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TestState>(100), false);
+  fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TestState>(100), false);
   const auto unitsOf = [&](ClaimClass cls, NeedTiming timing) {
     const ClaimSpec claim{.cls = cls, .timing = timing};
     const VictimQuery query{.claim = &claim, .need = {.stateBuffers = 1}};
@@ -5664,6 +5686,30 @@ void testImmediateWalksOfferWhatLandsLaterInItsPlace() {
           "a claim that can wait did not demote the leaf");
 }
 
+// A state its conversation went on from, which write-behind leaves unwritten, frees now: a claim
+// that cannot wait takes it, and one that can drops it rather than write it. The newest point
+// still needs its write.
+void testSupersededStatesFreeNow() {
+  for (const NeedTiming timing : {NeedTiming::Immediate, NeedTiming::CanWait}) {
+    CacheFixture fixture;
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), false);
+    fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false);
+    require(!fixture.cache.newestPoint(fixture.blocks[1]) && fixture.cache.newestPoint(fixture.blocks[3]),
+            "the setup's points are not as the test needs");
+    require(test::freeFromCache(fixture.cache, {.cls = ClaimClass::Growth, .timing = timing}, {.stateBuffers = 1})
+                        .outcome == FreeOutcome::Met &&
+                !fixture.cache.stateResident(fixture.blocks[1]) && !control->slots,
+            "the superseded state was not taken at once, or was written");
+    const ClaimSpec cannotWait{.cls = ClaimClass::InService, .timing = NeedTiming::Immediate};
+    require(test::freeFromCache(fixture.cache, cannotWait, {.stateBuffers = 1}).outcome == FreeOutcome::Short &&
+                fixture.cache.stateResident(fixture.blocks[3]) && !control->slots,
+            "a claim that cannot wait took the newest point, which needs a write");
+    fixture.cache.checkInvariants();
+  }
+}
+
 // An Immediate device need passes over cache only a write frees and takes the leaves after it,
 // writing nothing.
 void testImmediateDeviceWalkPassesOverWhatAWriteFrees() {
@@ -5684,18 +5730,18 @@ void testImmediateDeviceWalkPassesOverWhatAWriteFrees() {
     return blocks;
   };
   const std::array<uint64_t, 2> oldest = cachePrompt(1, 8);
-  cache.publishCompositeState(oldest[0], std::make_shared<TieredState>(control), true);
-  cache.publishCompositeState(oldest[1], std::make_shared<TestState>(100), false);
+  cache.publishCompositeState(oldest[0], std::make_shared<TieredState>(control), false);
+  cache.publishCompositeState(oldest[1], std::make_shared<TestState>(100), true);
   for (uint64_t id = 2; id <= 5; ++id)
     static_cast<void>(cachePrompt(id, 4));
   static_cast<void>(cache.releaseEmptyExtents(false));
   const ClaimSpec claim{.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate};
   const uint64_t allocated = pool.allocatedBytes();
   require(test::freeFromCache(cache, claim, {.bytes = 2 * 4 * 100}).outcome == FreeOutcome::Met,
-          "an Immediate claim did not take the leaves after the checkpoint");
+          "an Immediate claim did not take the leaves after the newest point");
   const uint64_t released = allocated - pool.allocatedBytes();
   require(released && !control->slots && !cache.snapshot().stateCache.offloads && cache.stateResident(oldest[0]),
-          "the units that go at once wrote the checkpoint");
+          "the units that go at once wrote the newest point");
   cache.checkInvariants();
 }
 
@@ -6192,6 +6238,7 @@ int main() {
     testHeldPagesAreNoRoomToWaitFor();
     testImmediateWalksOfferWhatLandsLaterInItsPlace();
     testImmediateDeviceWalkPassesOverWhatAWriteFrees();
+    testSupersededStatesFreeNow();
     testPageWalkOffersEachDeadLeafOnce();
     testEngineRefusedPageNeedIsADeviceNeed();
     testPageNeedReachesParentsAndLeavesUnderStates();

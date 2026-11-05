@@ -881,7 +881,8 @@ Cache::WalkCursor Cache::cursorAfter(Unit unit, uint64_t block) const {
 void Cache::holdAfter(const Walk &walk, WalkCursor &cursor) const {
   using Phase = WalkCursor::Phase;
   const auto waits = [&](uint64_t block) {
-    return !skipsState(walk, block) && states_.reclaimOutcome(block, StateCache::Unwritten::Wait).pending;
+    const bool write = writesState(block);
+    return !(walk.skipStateWrites && write) && states_.reclaimOutcome(block, write).pending;
   };
   if (cursor.phase == Phase::Checkpoints && cursor.last == Unit::Checkpoint && waits(cursor.lastCandidate.id)) {
     cursor = WalkCursor{.phase = walk.scope.statesOnly ? Phase::Ordinary : Phase::DeadLeaves};
@@ -927,14 +928,16 @@ bool Cache::certainReuse(uint64_t block) const {
   return block == states_.resumePoint() || std::ranges::find(wanted_.states(), block) != wanted_.states().end();
 }
 
-bool Cache::skipsState(const Walk &walk, uint64_t block) const {
-  return walk.skipStateWrites && states_.reclaimWrites(block);
+bool Cache::writesState(uint64_t block) const {
+  return states_.reclaimWrites(block) &&
+         (states_.inUse(block) || certainReuse(block) || newestPoint(block));
 }
 
 StateEviction Cache::reclaimState(const Walk &walk, uint64_t block) {
-  if (skipsState(walk, block))
+  const bool write = writesState(block);
+  if (walk.skipStateWrites && write)
     return {};
-  return states_.reclaim(block, StateCache::Unwritten::Wait);
+  return states_.reclaim(block, write);
 }
 
 Cache::UnitTaken Cache::takeUnit(const Walk &walk, const WalkUnit &unit, ReclaimTiming timing) {
@@ -983,7 +986,8 @@ uint64_t blockOfKey(uint64_t key) noexcept { return key & ((uint64_t{1} << kUnit
 
 std::optional<engine::Victim> Cache::victimOf(const WalkUnit &unit) const {
   const uint64_t block = unit.candidate.id;
-  const StateEviction outcome = states_.reclaimOutcome(block, StateCache::Unwritten::Wait);
+  const bool write = writesState(block);
+  const StateEviction outcome = states_.reclaimOutcome(block, write);
   if (!outcome.evicted && !outcome.pending)
     return std::nullopt;
   const bool inUse = unit.unit == Unit::UsedState;
@@ -991,7 +995,7 @@ std::optional<engine::Victim> Cache::victimOf(const WalkUnit &unit) const {
                         .stateBuffers = outcome.evicted ? 1u : 0u,
                         // One that waits for the state write in flight frees
                         // nothing yet, and one that needs a write lands later.
-                        .later = outcome.pending || states_.reclaimWrites(block),
+                        .later = outcome.pending || write,
                         .certainReuse = inUse || certainReuse(block),
                         .cls = inUse ? ReclaimClass::InUse : ReclaimClass::Ordinary};
   return victim;
@@ -1055,24 +1059,29 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
     kept.push_back(point);
   // What frees only later holds its chain above it too, which frees later:
   // a state that leaves only once written, or once the write in flight has
-  // landed; a block a writable tier writes before its page frees; a block a
-  // transfer moves (KvCache::laterBlocks). The states the walk takes count
-  // by the same split.
+  // landed; a block a writable tier writes before its page frees, as a
+  // state that stays needs it; a block a transfer moves
+  // (KvCache::laterBlocks). The states the walk takes count by the same
+  // split, and those it drops without a copy need no block.
   std::vector<uint64_t> later = kept;
+  std::vector<uint64_t> dropped;
   ReclaimReach result;
   Walk states = walk;
   states.scope = {.upTo = upTo, .statesOnly = true};
   WalkCursor cursor;
   for (std::optional<WalkUnit> unit; (unit = nextStepUnit(states, cursor));) {
-    if (states_.reclaimOutcome(unit->candidate.id, StateCache::Unwritten::Wait).pending ||
-        states_.reclaimWrites(unit->candidate.id)) {
-      later.push_back(unit->candidate.id);
+    const uint64_t block = unit->candidate.id;
+    const bool write = writesState(block);
+    if (write || states_.reclaimOutcome(block, write).pending) {
+      later.push_back(block);
       ++result.later.states;
     } else {
       ++result.now.states;
+      if (!states_.onDisk(block))
+        dropped.push_back(block);
     }
   }
-  const std::vector<uint64_t> held = kv_.laterBlocks(kvTierWritable());
+  const std::vector<uint64_t> held = kv_.laterBlocks(kvTierWritable(), dropped);
   later.insert(later.end(), held.begin(), held.end());
   const std::array<uint32_t, 3> keptPages = kv_.idlePagesOnChains(kept);
   const std::array<uint32_t, 3> laterPages = kv_.idlePagesOnChains(later);
@@ -1415,9 +1424,10 @@ Cache::ReclaimResult Cache::recycleState(const Walk &walk) {
   states.scope.pagesOnly = false;
   WalkCursor cursor;
   while (const std::optional<WalkUnit> state = nextStepUnit(states, cursor)) {
-    if (skipsState(states, state->candidate.id))
+    const bool write = writesState(state->candidate.id);
+    if (states.skipStateWrites && write)
       continue;
-    const StateEviction eviction = states_.reclaim(state->candidate.id, StateCache::Unwritten::Wait);
+    const StateEviction eviction = states_.reclaim(state->candidate.id, write);
     return {.madeProgress = eviction.evicted, .pending = eviction.pending, .evictedState = eviction.evicted};
   }
   return {.pending = returns(states)};

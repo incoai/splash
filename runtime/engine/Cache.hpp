@@ -908,9 +908,9 @@ private:
   };
   // What a walk takes, and how: a query's (walkFor) or a reclaim step's.
   // Its scope; how long it can wait for KV memory (ReclaimTiming); whether
-  // a state that needs a write is passed over as a unit that lands later,
-  // which an Immediate claim does not wait for (skipStateWrites; one it
-  // takes waits for the write slot, StateCache::Unwritten::Wait);
+  // a state that needs a write (writesState) is passed over as a unit that
+  // lands later, which an Immediate claim does not wait for
+  // (skipStateWrites; one it takes waits for the write slot);
   // what it keeps beside what is in use, the resume point and the restored
   // chains; the shortfall a transfer in flight must cover for a step that
   // finds nothing to report pending (returnsInFlight), any transfer without
@@ -992,6 +992,12 @@ private:
   // The state is of certain reuse beside what is in use: the resume point,
   // a wanted chain's state.
   [[nodiscard]] bool certainReuse(uint64_t block) const;
+  // A reclaim of the state at this block writes it: it has no disk copy the
+  // tier would take, and a restore from it is expected, as it is in use, of
+  // certain reuse or the newest point of its conversation (newestPoint, the
+  // points write-behind copies). Any other state frees now, dropped
+  // unwritten: no expected restore pays for its write.
+  [[nodiscard]] bool writesState(uint64_t block) const;
   // What peek() reports of a state unit the walk reaches, none when taking
   // it frees nothing.
   [[nodiscard]] std::optional<engine::Victim> victimOf(const WalkUnit &unit) const;
@@ -1028,9 +1034,6 @@ private:
   // the walk's class and not of a chain it keeps, until they are `enough`
   // or the tier or the quota has no room for one.
   void demoteChainsAbove(const Walk &walk, size_t firstWrite, const std::function<bool()> &enough);
-  // The walk's reclaims pass over a state that needs a write
-  // (skipStateWrites).
-  [[nodiscard]] bool skipsState(const Walk &walk, uint64_t block) const;
   // Frees the RAM copy of a state the walk reached, as the walk says; one it
   // passes over stays.
   [[nodiscard]] StateEviction reclaimState(const Walk &walk, uint64_t block);

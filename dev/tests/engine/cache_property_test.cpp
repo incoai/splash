@@ -202,6 +202,9 @@ public:
       return pool_.freePageCount(form) + (immediate ? 0 : cache_.demotedPages()[static_cast<size_t>(form)]);
     };
     const uint32_t pagesBefore = pagesOf();
+    // A claim that can wait counts the extents landing pages complete beside
+    // the units, and a take may release one of them before they land.
+    const uint64_t landing = immediate ? 0 : cache_.returning().landingBytes;
     // What the takes report, as the ledger sums it, and what left memory now.
     uint64_t freed = 0;
     uint64_t releasedNow = 0;
@@ -233,7 +236,7 @@ public:
     if (!wanted.empty())
       cache_.setWantedChains({});
     // A device need counts bytes, a page need pages of its form.
-    require(device ? freed <= counted && releasedNow <= counted
+    require(device ? freed <= counted && releasedNow <= counted + landing
                    : freedPages <= countedPages && reportedPages <= countedPages,
             "the claim's takes freed more than peek counted: counted " + std::to_string(counted) + " bytes and " +
                 std::to_string(countedPages) + " pages, freed " + std::to_string(freed) + " bytes (" +

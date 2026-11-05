@@ -216,8 +216,9 @@ public:
   [[nodiscard]] std::array<uint32_t, 3> idlePagesOnChains(std::span<const uint64_t> blocks) const;
   // The resident blocks whose page frees only later: one a transfer moves,
   // and with `unwritten` one without a copy that a state at it or below it
-  // needs, which a writable tier writes before its page frees.
-  [[nodiscard]] std::vector<uint64_t> laterBlocks(bool unwritten) const;
+  // needs, which a writable tier writes before its page frees; the states
+  // at `dropped`, which leave with no copy, need none.
+  [[nodiscard]] std::vector<uint64_t> laterBlocks(bool unwritten, std::span<const uint64_t> dropped) const;
   // The resident pages of each form a transfer moves that no request holds.
   [[nodiscard]] std::array<uint32_t, 3> movingPages() const;
   // Resident, without resident children, users or holders: its page can go

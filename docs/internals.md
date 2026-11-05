@@ -1286,8 +1286,13 @@ the claim's class may not take is skipped, not a stop:
 2. The prefix cache, in its one order
    ([below](#replay-points-and-checkpoints)). A unit that needs a write
    first goes only to a claim that can wait, which then waits for the write
-   it starts; an `Immediate` claim passes over it. A unit no tier can copy,
-   with no SSD cache or one whose files stopped taking writes, is dropped.
+   it starts; an `Immediate` claim passes over it. A state needs a write
+   only when a restore from it is expected: one in use, the resume point, a
+   queued request's, or a point copies ahead of need would copy, the newest
+   of its conversation (`Cache::writesState`). Any other state, such as one
+   its conversation went on from or a checkpoint no request waits for, is
+   dropped like a unit no tier can copy, with no SSD cache or one whose
+   files stopped taking writes.
 3. The caches the model rebuilds on use: the vision encoder's scratch,
    images' encoded rows, idle history staging, and the hot block cache while
    no lane reads above its floor.
@@ -1559,10 +1564,10 @@ The last stays cached once the replay point is published: a later request that
 shares the prompt up to it, such as another conversation with the same long
 system prompt, resumes there instead of from the start. It stays only if the
 replay state fits beside it; refused memory, the replay state takes its buffers
-rather than another lane's checkpoint. With the SSD cache it costs a write as
-well: reclaim takes checkpoints first and writes the states it evicts to the
-SSD, this one too (153 MiB for 27B), and one published straight to the SSD,
-when no RAM slot took it, stays there. These writes draw on the SSD cache's
+rather than another lane's checkpoint. Reclaim takes checkpoints first and
+drops them unwritten, but for one a queued request restores, which it writes
+to the SSD; one published straight to the SSD, when no RAM slot took it, stays
+there. These writes draw on the SSD cache's
 write budget when one is set, which drops them while it is spent, a suspended
 request's own too, and a full quota makes room for one by dropping the oldest
 copy, perhaps an older conversation's restore point.

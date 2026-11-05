@@ -455,12 +455,22 @@ std::array<uint32_t, 3> KvCache::idlePagesOnChains(std::span<const uint64_t> blo
   return pages;
 }
 
-std::vector<uint64_t> KvCache::laterBlocks(bool unwritten) const {
+std::vector<uint64_t> KvCache::laterBlocks(bool unwritten, std::span<const uint64_t> dropped) const {
+  // The dropped states at each block or below it.
+  std::unordered_map<uint64_t, uint32_t> leaving;
+  if (unwritten)
+    for (const uint64_t state : dropped)
+      for (uint64_t id = state; id; id = block(id).parent)
+        ++leaving[id];
   std::vector<uint64_t> blocks;
-  for (const auto &[id, entry] : blocks_)
-    if (entry.page != noPage &&
-        (entry.transfer != Transfer::None || (unwritten && !entry.slot && (entry.statesHere || entry.statesBelow))))
+  for (const auto &[id, entry] : blocks_) {
+    if (entry.page == noPage)
+      continue;
+    const auto gone = leaving.find(id);
+    const uint32_t staying = entry.statesHere + entry.statesBelow - (gone == leaving.end() ? 0 : gone->second);
+    if (entry.transfer != Transfer::None || (unwritten && !entry.slot && staying))
       blocks.push_back(id);
+  }
   return blocks;
 }
 

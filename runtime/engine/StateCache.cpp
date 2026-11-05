@@ -365,7 +365,7 @@ StateCache::inUseDiskCandidate(const std::optional<CacheEvictionCandidate> &afte
   return after ? inUseOnDisk_.next(*after) : inUseOnDisk_.oldest();
 }
 
-StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
+StateEviction StateCache::reclaim(uint64_t kvBlock, bool write) {
   auto found = entries_.find(kvBlock);
   if (found == entries_.end() || found->second.pins || !found->second.ram)
     throw std::logic_error("state eviction candidate became pinned");
@@ -374,8 +374,8 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
   if (persisting(kvBlock))
     return {false, true};
   // One write at a time, of a class the tier takes now.
-  const bool writable = !entry.disk && entry.ram->canOffload(inUse(kvBlock));
-  if (writable && pending_ && unwritten != Unwritten::Drop)
+  const bool writable = write && reclaimWrites(kvBlock);
+  if (writable && pending_)
     return {false, true};
   if (writable) {
     if (auto transfer = startWrite(kvBlock, [state = entry.ram](std::function<void()> done) {
@@ -386,7 +386,7 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
     }
   }
   if (!entry.disk)
-    return unwritten == Unwritten::Keep ? StateEviction{} : erase(kvBlock, false);
+    return erase(kvBlock, false);
   // A write reads its own copy, so the RAM copy is free at once.
   discardRam(entry);
   reindex(kvBlock, entry);
@@ -414,12 +414,9 @@ bool StateCache::reclaimWrites(uint64_t kvBlock) const noexcept {
          found->second.ram->canOffload(inUse(kvBlock));
 }
 
-StateEviction StateCache::reclaimOutcome(uint64_t kvBlock, Unwritten unwritten) const noexcept {
+StateEviction StateCache::reclaimOutcome(uint64_t kvBlock, bool write) const noexcept {
   // As reclaim() decides it.
-  if (persisting(kvBlock))
-    return {false, true};
-  const bool writable = reclaimWrites(kvBlock);
-  if (writable && pending_ && unwritten != Unwritten::Drop)
+  if (persisting(kvBlock) || (write && reclaimWrites(kvBlock) && pending_))
     return {false, true};
   return {true};
 }
