@@ -443,6 +443,17 @@ int main(int argc, char **argv) {
         std::vector<CycleTiming> fused;
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
           fused.push_back(decodeCycle(backend, executor, active));
+        // The cycles in the order they ran, and their mean: a greedy prompt
+        // runs the same cycle sequence every time, so two builds compare
+        // cycle by cycle; the median alone may pick a different cycle.
+        double fusedSum = 0.0;
+        std::printf("\n%s: fused gpu ms in order:", title);
+        for (const CycleTiming &timing : fused) {
+          std::printf(" %.2f", timing.gpuSeconds * 1e3);
+          fusedSum += timing.gpuSeconds;
+        }
+        std::printf("\n%s: mean fused gpu %.3f ms\n", title,
+                    fusedSum * 1e3 / double(fused.size()));
         std::sort(fused.begin(), fused.end(),
                   [](const CycleTiming &left, const CycleTiming &right) {
                     return left.gpuSeconds < right.gpuSeconds;
