@@ -231,6 +231,7 @@ inline uint32_t typeOf(const TensorTypes &types, const std::string &name) {
 // ggufArchitecture: flint for one without GDN layers, qwen4exp for
 // hyper-connected streams, else qwen35moe or qwen35 by its FFN.
 inline std::string architecture(const model::QwenTargetDimensions &g) {
+  if (g.embeddingScale != 0) return "ricursive";
   if (g.layers && !g.gdnLayerCount()) return "flint";
   return g.hyperConnected() ? "qwen4exp" : g.ffnKind == model::QwenFfnKind::SparseMoe ? "qwen35moe" : "qwen35";
 }
@@ -262,6 +263,7 @@ inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, c
   const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
   const uint64_t streams = g.streamWidth();
   const bool flint = architecture(g) == "flint";
+  const bool ripple = architecture(g) == "ricursive";
   // A hyper-connection mix in place of the norm `norm`.
   const auto mix = [&](const std::string &stem, bool inject, const std::string &norm) {
     if (!g.hyperConnected()) {
@@ -277,8 +279,12 @@ inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, c
     const std::string p = "blk." + std::to_string(layer) + ".";
     mix(p + "hc_attn", true, p + "attn_norm.weight");
     if (g.isFullAttentionLayer(layer)) {
-      // The queries and, with attentionGate, their gate.
-      add(p + "attn_q.weight", {hidden, (g.attentionGate ? 2ull : 1ull) * g.attentionWidth});
+      // The queries and, with attentionGate, their gate: fused, as the Qwen
+      // GGUFs hold them, or beside them, as Ripple's do.
+      add(p + "attn_q.weight",
+          {hidden, (g.attentionGate && !ripple ? 2ull : 1ull) * g.attentionWidth});
+      if (ripple) add(p + "attn_gate.weight", {hidden, g.attentionWidth});
+      if (ripple) add(p + "attn_vres_lambda.weight", {1});
       add(p + "attn_k.weight", {hidden, kvRows});
       add(p + "attn_v.weight", {hidden, kvRows});
       add(p + "attn_q_norm.weight", {g.attentionHeadDimension});
@@ -303,6 +309,7 @@ inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, c
       add(p + "ssm_out.weight", {valueRows, hidden});
     }
     mix(p + "hc_ffn", true, p + (flint ? "ffn_norm.weight" : "post_attention_norm.weight"));
+    if (ripple) add(p + "ffn_norm.weight", {hidden});
     if (g.isMoeLayer(layer)) {
       const uint64_t experts = g.experts, width = g.expertIntermediateSize;
       const uint64_t shared = uint64_t{g.sharedExpertSlices} * width;
@@ -319,6 +326,7 @@ inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, c
       add(p + "ffn_up.weight", {hidden, g.intermediateSize});
       add(p + "ffn_down.weight", {g.intermediateSize, hidden});
     }
+    if (ripple) add(p + "post_ffw_norm.weight", {hidden});
     if (g.hasPle() && layer == g.pleLayer) {
       add(p + "ple_key.weight", {g.pleWidth(), streams});
       add(p + "ple_value.weight", {g.pleWidth(), hidden});
@@ -554,6 +562,14 @@ inline std::vector<test_gguf::Key> metadata(const model::QwenTargetDimensions &g
     key("expert_shared_feed_forward_length", g.sharedExpertSlices * g.expertIntermediateSize);
   } else {
     key("feed_forward_length", g.intermediateSize);
+  }
+  if (arch == "ricursive") {
+    key("attention.sliding_window", g.slidingWindow);
+    keys.push_back(test_gguf::float32Key(arch + ".embedding_scale", g.embeddingScale));
+    keys.push_back(test_gguf::float32Key(arch + ".swiglu_clamp", g.swigluClamp));
+    std::vector<bool> sliding;
+    for (uint32_t layer = 0; layer < g.layers; ++layer) sliding.push_back(g.slidingLayers.test(layer));
+    keys.push_back(test_gguf::boolArrayKey(arch + ".attention.sliding_window_pattern", sliding));
   }
   if (arch == "flint") {
     key("attention.sliding_window", g.slidingWindow);

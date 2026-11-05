@@ -121,6 +121,24 @@ public:
     image_.repack(std::move(repack));
   }
 
+  // Two tensors' rows in order - the queries, then each query head's output
+  // gate - as one projection's, which the packed q holds as the Qwen3.5's
+  // fused rows do (Ripple's GGUF keeps the gate beside the queries).
+  void quantizedPair(const std::string &queries, const std::string &gates, uint64_t rows, uint64_t columns) {
+    const GgufTensor *q = find(queries, quantizedType);
+    const GgufTensor *gate = find(gates, quantizedType);
+    if (!q || !gate) return;
+    if (q->rows() != rows || q->columns() != columns || gate->rows() != rows || gate->columns() != columns)
+      throw GgufError("unexpected shape for " + queries + " or " + gates);
+    const uint32_t format = imageFormat(q->type);
+    if (imageFormat(gate->type) != format)
+      throw GgufError(queries + " and " + gates + " are not of one quantization format");
+    Repack repack = image_.planes(format, 2 * rows, columns, queries);
+    for (const GgufTensor *tensor : {q, gate})
+      repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns), {}));
+    image_.repack(std::move(repack));
+  }
+
   // Rows [N, K] as quantized() repacks them, but of a BF16 or F16 tensor
   // as the Q8_0 rows the reference quantize_row_q8_0_ref writes from its
   // values, which the writer quantizes (TensorRows::ggufFloatRowBytes).
@@ -656,13 +674,29 @@ struct RippleGguf final {
       throw GgufError("GGUF metadata does not match the target: attention.sliding_window_pattern");
   }
 
-  static void layer(Builder &, const QwenTargetDimensions &, uint32_t) {
-    throw GgufError("the ricursive GGUF planner is not in this build");
+  // A block's sections around its mixer and FFN, the packed q holding each
+  // query head's output gate after its queries, the block's value-residual
+  // lambda beside the mixer, and a norm after each FFN.
+  static void layer(Builder &b, const QwenTargetDimensions &g, uint32_t index) {
+    const std::string p = prefix(index);
+    const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
+    b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
+    b.quantizedPair(p + "attn_q.weight", p + "attn_gate.weight", g.attentionWidth, g.hiddenSize);
+    b.quantized(p + "attn_k.weight", kvRows, g.hiddenSize);
+    b.quantized(p + "attn_v.weight", kvRows, g.hiddenSize);
+    b.floatNorm(p + "attn_q_norm.weight", g.attentionHeadDimension);
+    b.floatNorm(p + "attn_k_norm.weight", g.attentionHeadDimension);
+    b.quantized(p + "attn_output.weight", g.hiddenSize, g.attentionWidth);
+    b.floatRows(p + "attn_vres_lambda.weight", 1, 1, false);
+    b.floatNorm(p + "post_attention_norm.weight", g.hiddenSize);
+    b.quantized(p + "ffn_gate.weight", g.intermediateSize, g.hiddenSize);
+    b.quantized(p + "ffn_up.weight", g.intermediateSize, g.hiddenSize);
+    b.floatNorm(p + "ffn_norm.weight", g.hiddenSize);
+    b.quantized(p + "ffn_down.weight", g.hiddenSize, g.intermediateSize);
+    b.floatNorm(p + "post_ffw_norm.weight", g.hiddenSize);
   }
 
-  static void head(Builder &, const QwenTargetDimensions &) {
-    throw GgufError("the ricursive GGUF planner is not in this build");
-  }
+  static void head(Builder &b, const QwenTargetDimensions &g) { b.floatNorm("output_norm.weight", g.hiddenSize); }
 
   static void tables(const GgufFile &, const QwenTargetDimensions &, PlanOptions, std::vector<std::string> &,
                      std::vector<Image> &) {}

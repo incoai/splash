@@ -1,0 +1,7862 @@
+{
+ "output.weight": [
+  "Q6_K",
+  [
+   5120,
+   100352
+  ]
+ ],
+ "output_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "token_embd.weight": [
+  "IQ4_XS",
+  [
+   5120,
+   100352
+  ]
+ ],
+ "blk.0.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.0.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.0.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.0.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.0.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.0.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.0.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.0.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.0.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.0.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.0.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.0.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.0.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.0.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.0.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.1.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.1.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.1.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.1.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.1.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.1.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.1.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.1.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.1.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.1.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.1.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.1.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.1.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.1.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.1.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.2.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.2.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.2.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.2.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.2.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.2.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.2.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.2.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.2.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.2.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.2.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.2.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.2.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.2.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.2.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.3.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.3.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.3.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.3.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.3.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.3.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.3.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.3.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.3.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.3.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.3.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.3.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.3.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.3.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.3.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.4.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.4.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.4.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.4.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.4.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.4.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.4.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.4.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.4.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.4.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.4.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.4.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.4.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.4.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.4.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.5.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.5.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.5.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.5.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.5.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.5.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.5.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.5.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.5.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.5.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.5.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.5.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.5.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.5.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.5.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.6.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.6.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.6.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.6.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.6.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.6.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.6.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.6.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.6.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.6.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.6.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.6.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.6.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.6.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.6.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.7.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.7.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.7.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.7.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.7.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.7.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.7.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.7.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.7.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.7.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.7.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.7.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.7.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.7.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.7.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.8.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.8.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.8.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.8.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.8.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.8.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.8.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.8.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.8.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.8.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.8.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.8.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.8.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.8.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.8.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.9.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.9.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.9.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.9.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.9.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.9.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.9.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.9.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.9.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.9.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.9.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.9.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.9.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.9.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.9.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.10.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.10.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.10.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.10.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.10.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.10.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.10.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.10.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.10.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.10.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.10.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.10.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.10.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.10.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.10.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.11.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.11.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.11.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.11.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.11.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.11.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.11.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.11.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.11.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.11.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.11.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.11.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.11.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.11.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.11.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.12.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.12.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.12.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.12.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.12.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.12.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.12.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.12.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.12.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.12.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.12.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.12.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.12.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.12.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.12.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.13.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.13.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.13.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.13.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.13.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.13.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.13.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.13.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.13.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.13.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.13.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.13.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.13.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.13.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.13.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.14.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.14.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.14.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.14.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.14.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.14.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.14.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.14.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.14.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.14.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.14.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.14.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.14.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.14.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.14.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.15.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.15.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.15.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.15.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.15.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.15.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.15.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.15.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.15.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.15.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.15.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.15.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.15.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.15.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.15.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.16.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.16.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.16.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.16.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.16.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.16.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.16.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.16.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.16.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.16.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.16.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.16.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.16.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.16.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.16.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.17.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.17.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.17.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.17.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.17.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.17.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.17.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.17.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.17.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.17.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.17.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.17.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.17.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.17.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.17.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.18.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.18.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.18.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.18.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.18.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.18.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.18.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.18.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.18.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.18.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.18.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.18.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.18.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.18.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.18.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.19.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.19.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.19.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.19.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.19.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.19.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.19.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.19.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.19.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.19.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.19.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.19.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.19.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.19.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.19.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.20.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.20.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.20.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.20.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.20.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.20.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.20.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.20.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.20.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.20.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.20.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.20.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.20.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.20.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.20.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.21.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.21.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.21.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.21.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.21.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.21.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.21.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.21.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.21.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.21.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.21.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.21.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.21.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.21.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.21.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.22.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.22.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.22.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.22.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.22.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.22.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.22.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.22.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.22.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.22.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.22.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.22.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.22.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.22.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.22.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.23.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.23.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.23.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.23.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.23.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.23.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.23.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.23.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.23.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.23.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.23.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.23.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.23.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.23.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.23.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.24.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.24.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.24.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.24.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.24.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.24.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.24.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.24.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.24.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.24.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.24.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.24.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.24.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.24.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.24.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.25.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.25.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.25.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.25.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.25.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.25.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.25.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.25.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.25.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.25.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.25.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.25.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.25.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.25.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.25.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.26.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.26.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.26.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.26.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.26.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.26.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.26.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.26.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.26.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.26.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.26.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.26.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.26.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.26.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.26.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.27.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.27.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.27.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.27.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.27.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.27.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.27.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.27.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.27.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.27.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.27.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.27.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.27.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.27.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.27.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.28.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.28.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.28.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.28.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.28.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.28.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.28.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.28.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.28.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.28.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.28.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.28.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.28.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.28.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.28.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.29.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.29.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.29.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.29.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.29.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.29.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.29.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.29.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.29.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.29.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.29.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.29.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.29.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.29.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.29.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.30.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.30.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.30.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.30.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.30.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.30.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.30.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.30.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.30.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.30.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.30.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.30.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.30.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.30.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.30.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.31.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.31.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.31.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.31.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.31.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.31.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.31.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.31.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.31.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.31.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.31.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.31.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.31.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.31.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.31.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.32.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.32.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.32.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.32.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.32.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.32.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.32.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.32.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.32.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.32.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.32.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.32.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.32.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.32.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.32.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.33.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.33.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.33.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.33.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.33.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.33.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.33.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.33.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.33.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.33.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.33.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.33.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.33.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.33.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.33.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.34.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.34.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.34.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.34.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.34.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.34.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.34.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.34.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.34.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.34.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.34.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.34.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.34.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.34.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.34.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.35.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.35.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.35.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.35.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.35.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.35.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.35.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.35.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.35.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.35.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.35.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.35.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.35.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.35.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.35.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.36.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.36.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.36.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.36.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.36.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.36.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.36.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.36.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.36.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.36.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.36.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.36.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.36.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.36.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.36.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.37.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.37.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.37.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.37.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.37.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.37.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.37.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.37.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.37.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.37.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.37.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.37.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.37.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.37.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.37.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.38.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.38.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.38.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.38.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.38.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.38.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.38.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.38.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.38.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.38.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.38.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.38.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.38.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.38.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.38.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.39.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.39.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.39.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.39.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.39.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.39.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.39.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.39.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.39.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.39.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.39.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.39.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.39.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.39.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.39.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.40.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.40.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.40.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.40.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.40.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.40.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.40.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.40.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.40.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.40.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.40.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.40.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.40.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.40.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.40.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.41.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.41.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.41.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.41.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.41.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.41.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.41.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.41.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.41.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.41.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.41.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.41.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.41.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.41.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.41.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.42.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.42.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.42.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.42.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.42.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.42.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.42.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.42.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.42.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.42.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.42.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.42.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.42.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.42.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.42.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.43.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.43.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.43.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.43.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.43.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.43.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.43.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.43.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.43.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.43.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.43.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.43.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.43.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.43.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.43.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.44.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.44.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.44.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.44.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.44.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.44.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.44.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.44.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.44.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.44.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.44.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.44.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.44.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.44.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.44.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.45.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.45.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.45.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.45.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.45.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.45.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.45.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.45.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.45.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.45.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.45.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.45.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.45.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.45.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.45.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.46.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.46.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.46.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.46.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.46.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.46.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.46.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.46.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.46.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.46.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.46.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.46.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.46.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.46.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.46.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.47.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.47.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.47.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.47.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.47.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.47.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.47.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.47.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.47.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.47.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.47.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.47.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.47.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.47.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.47.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.48.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.48.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.48.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.48.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.48.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.48.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.48.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.48.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.48.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.48.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.48.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.48.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.48.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.48.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.48.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.49.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.49.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.49.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.49.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.49.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.49.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.49.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.49.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.49.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.49.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.49.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.49.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.49.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.49.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.49.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.50.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.50.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.50.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.50.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.50.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.50.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.50.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.50.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.50.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.50.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.50.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.50.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.50.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.50.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.50.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.51.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.51.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.51.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.51.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.51.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.51.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.51.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.51.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.51.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.51.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.51.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.51.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.51.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.51.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.51.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.52.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.52.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.52.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.52.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.52.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.52.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.52.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.52.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.52.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.52.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.52.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.52.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.52.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.52.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.52.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.53.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.53.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.53.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.53.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.53.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.53.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.53.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.53.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.53.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.53.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.53.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.53.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.53.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.53.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.53.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.54.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.54.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.54.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.54.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.54.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.54.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.54.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.54.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.54.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.54.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.54.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.54.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.54.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.54.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.54.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.55.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.55.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.55.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.55.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.55.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.55.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.55.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.55.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.55.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.55.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.55.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.55.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.55.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.55.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.55.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.56.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.56.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.56.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.56.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.56.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.56.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.56.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.56.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.56.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.56.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.56.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.56.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.56.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.56.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.56.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.57.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.57.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.57.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.57.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.57.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.57.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.57.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.57.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.57.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.57.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.57.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.57.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.57.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.57.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.57.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.58.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.58.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.58.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.58.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.58.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.58.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.58.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.58.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.58.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.58.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.58.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.58.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.58.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.58.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.58.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.59.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.59.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.59.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.59.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.59.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.59.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.59.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.59.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.59.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.59.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.59.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.59.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.59.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.59.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.59.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.60.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.60.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.60.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.60.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.60.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.60.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.60.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.60.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.60.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.60.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.60.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.60.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.60.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.60.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.60.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.61.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.61.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.61.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.61.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.61.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.61.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.61.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.61.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.61.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.61.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.61.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.61.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.61.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.61.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.61.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.62.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.62.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.62.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.62.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.62.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.62.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.62.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.62.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.62.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.62.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.62.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.62.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.62.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.62.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.62.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.63.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.63.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.63.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.63.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.63.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.63.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.63.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.63.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.63.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.63.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.63.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.63.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.63.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.63.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.63.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.64.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.64.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.64.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.64.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.64.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.64.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.64.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.64.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.64.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.64.ffn_down.weight": [
+  "Q4_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.64.ffn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.64.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.64.ffn_up.weight": [
+  "Q4_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.64.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.64.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.65.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.65.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.65.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.65.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.65.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.65.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.65.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.65.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.65.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.65.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.65.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.65.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.65.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.65.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.65.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.66.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.66.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.66.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.66.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.66.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.66.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.66.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.66.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.66.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.66.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.66.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.66.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.66.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.66.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.66.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.67.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.67.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.67.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.67.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.67.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.67.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.67.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.67.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.67.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.67.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.67.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.67.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.67.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.67.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.67.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.68.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.68.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.68.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.68.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.68.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.68.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.68.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.68.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.68.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.68.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.68.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.68.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.68.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.68.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.68.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.69.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.69.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.69.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.69.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.69.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.69.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.69.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.69.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.69.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.69.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.69.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.69.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.69.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.69.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.69.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.70.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.70.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.70.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.70.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.70.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.70.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.70.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.70.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.70.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.70.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.70.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.70.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.70.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.70.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.70.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.71.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.71.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.71.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.71.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.71.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.71.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.71.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.71.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.71.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.71.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.71.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.71.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.71.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.71.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.71.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.72.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.72.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.72.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.72.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.72.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.72.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.72.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.72.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.72.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.72.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.72.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.72.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.72.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.72.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.72.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.73.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.73.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.73.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.73.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.73.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.73.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.73.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.73.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.73.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.73.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.73.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.73.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.73.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.73.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.73.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.74.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.74.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.74.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.74.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.74.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.74.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.74.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.74.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.74.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.74.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.74.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.74.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.74.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.74.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.74.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.75.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.75.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.75.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.75.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.75.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.75.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.75.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.75.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.75.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.75.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.75.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.75.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.75.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.75.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.75.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.76.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.76.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.76.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.76.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.76.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.76.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.76.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.76.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.76.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.76.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.76.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.76.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.76.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.76.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.76.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.77.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.77.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.77.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.77.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.77.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.77.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.77.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.77.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.77.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.77.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.77.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.77.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.77.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.77.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.77.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.78.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.78.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.78.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.78.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.78.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.78.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.78.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.78.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.78.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.78.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.78.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.78.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.78.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.78.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.78.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.79.attn_gate.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.79.attn_k.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.79.attn_k_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.79.attn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.79.attn_output.weight": [
+  "Q6_K",
+  [
+   10240,
+   5120
+  ]
+ ],
+ "blk.79.attn_q.weight": [
+  "Q4_K",
+  [
+   5120,
+   10240
+  ]
+ ],
+ "blk.79.attn_q_norm.weight": [
+  "F32",
+  [
+   128
+  ]
+ ],
+ "blk.79.attn_v.weight": [
+  "Q8_0",
+  [
+   5120,
+   1024
+  ]
+ ],
+ "blk.79.attn_vres_lambda.weight": [
+  "F32",
+  [
+   1
+  ]
+ ],
+ "blk.79.ffn_down.weight": [
+  "Q5_K",
+  [
+   40960,
+   5120
+  ]
+ ],
+ "blk.79.ffn_gate.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.79.ffn_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.79.ffn_up.weight": [
+  "Q5_K",
+  [
+   5120,
+   40960
+  ]
+ ],
+ "blk.79.post_attention_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ],
+ "blk.79.post_ffw_norm.weight": [
+  "F32",
+  [
+   5120
+  ]
+ ]
+}
