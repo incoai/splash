@@ -753,10 +753,15 @@ public:
   // idle KV that states in use restore through.
   [[nodiscard]] uint32_t reusablePages(ReclaimClass upTo, kv::PageForm form = kv::PageForm::Full) const;
   [[nodiscard]] CacheSnapshot snapshot() const;
-  // The blocks the reclaim counts walked beside the counts the KV cache
-  // keeps (KvCache::reachVisits): the chain a start reuses and the staged
-  // state's, never the cache.
-  [[nodiscard]] uint64_t reachVisits() const noexcept { return kv_.reachVisits(); }
+  // What the reclaim counts looked at beside the counts the caches keep:
+  // the blocks of the chain a start reuses and the staged state's
+  // (KvCache::reachVisits), the states the walk keeps and those of its order
+  // up to the staged one (StateCache::reclaimVisits), and the pages of the
+  // running requests' windows (trimmableCount, passedPages); never the
+  // cache.
+  [[nodiscard]] uint64_t reachVisits() const noexcept {
+    return kv_.reachVisits() + states_.reclaimVisits() + windowVisits_;
+  }
   [[nodiscard]] KvSpillSnapshot spillSnapshot() const;
   // Tests, between commands: std::logic_error unless the blocks, pages,
   // references and quota keep every invariant spilling relies on.
@@ -1476,6 +1481,8 @@ private:
   // The window snapshot's counts.
   uint64_t trimmedPages_ = 0;
   uint64_t refusedStates_ = 0;
+  // The requests' pages trimmableCount and passedPages looked at.
+  mutable uint64_t windowVisits_ = 0;
   double extentCompactMaxMilliseconds_ = 0.0;
   std::function<void()> completionNotifier_;
 };

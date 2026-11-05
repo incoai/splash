@@ -265,7 +265,7 @@ public:
   // one, which wait for that buffer (later). Whether the tier takes the
   // writes of states not in use (writes) and, with inUse, in use
   // (usedWrites). From the counts the orders keep: it costs `kept`, not the
-  // states.
+  // states (reclaimVisits).
   struct Reclaims final {
     uint32_t now = 0;
     uint64_t staged = 0;
@@ -274,6 +274,9 @@ public:
     bool usedWrites = false;
   };
   [[nodiscard]] Reclaims reclaims(bool inUse, std::span<const uint64_t> kept) const;
+  // The states reclaims() looked at: those `kept` names and those of the
+  // walk's order up to the staged one, never every state.
+  [[nodiscard]] uint64_t reclaimVisits() const noexcept { return reclaimVisits_; }
   // What the state at the block asks of its KV, and whether it is a RAM copy
   // a reclaim may take (KvCache::setStateKeeps), as the cache's counts
   // should name it: none without a state.
@@ -430,6 +433,7 @@ private:
   uint64_t diskBytes_ = 0;
   uint32_t pinnedEntries_ = 0;
   uint64_t publications_ = 0;
+  mutable uint64_t reclaimVisits_ = 0;
   uint64_t evictions_ = 0;
   uint64_t checkpointEntries_ = 0;
   uint64_t checkpointBytes_ = 0;

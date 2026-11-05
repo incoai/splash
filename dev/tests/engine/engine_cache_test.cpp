@@ -6173,14 +6173,22 @@ uint64_t cacheConversation(engine::Cache &cache, uint64_t id, uint32_t pages,
 
 // Counting what a reclaim frees costs as much in a cache of many conversations as in one of few: every phase of a
 // page need and a device need, of what is in use too, beside states that need a write, a state in use and a waiting
-// request's chain, visits the same blocks (Cache::reachVisits), and gives the same units.
+// request's chain, looks at the same blocks, states and request pages (Cache::reachVisits) and gives the same units.
+// So does it in a windowed cache that trims, beside a running request's window (the Trim unit and trimmableCount),
+// and in a spilling one (the Extent unit), where a page need counts the other forms' empty extents first.
 void testReclaimCountsDoNotGrowWithTheCache() {
-  const auto count = [](uint32_t conversations) {
-    test::TestKvStorage storage{conversations * 4 + 8, 100, 4};
-    storage.budgetPages = conversations * 4 + 8;
+  enum class Kind { Plain, Windowed, Spilling };
+  const auto count = [](uint32_t conversations, Kind kind) {
+    const uint32_t pages = conversations * 4 + 16;
+    test::TestKvStorage storage{pages, 100, 4, kind == Kind::Spilling ? 30u : 0u, kind == Kind::Windowed ? 30u : 0u};
+    storage.budgetPages = pages;
     KvPool pool{storage, 4};
     test::TestKvTier tier;
-    engine::Cache cache(pool, &tier, nullptr);
+    auto budget = std::make_shared<model::DiskBudget>(uint64_t{pages} * 100);
+    tier.budget = budget;
+    engine::Cache cache(pool, &tier, budget,
+                        kind == Kind::Spilling ? std::optional(CacheSpillPolicy{1, 1}) : std::nullopt,
+                        kind == Kind::Windowed ? std::optional(CacheWindowPolicy{1}) : std::nullopt);
     auto control = std::make_shared<TransferControl>();
     control->ready = true;
     control->capacity = conversations;
@@ -6192,22 +6200,32 @@ void testReclaimCountsDoNotGrowWithTheCache() {
     std::iota(prompt.begin(), prompt.end(), 1000 * conversations);
     const CacheProbe waiting = cache.probe(prompt, {});
     cache.setWantedChains({waiting.restoredChain()});
+    // A running request whose window the counts of a windowed cache read.
+    const uint64_t running = conversations + 1;
+    cache.beginRequest(running);
+    require(admitTokens(cache, running, 3 * KvCache::pageTokens).granted(), "the running request's pages were denied");
     const uint64_t before = cache.reachVisits();
     std::vector<engine::Victim> units;
     for (const VictimQuery &query : {test::query(test::kInServiceGrowth, {.pages = 1}),
                                      test::query(test::kInServiceGrowth, {.bytes = 1, .stateBuffers = 1})})
       for (std::optional<engine::Victim> unit = cache.peek(query, nullptr); unit; unit = cache.peek(query, &*unit))
         units.push_back(*unit);
+    const uint64_t visits = cache.reachVisits() - before;
+    cache.endRequest(running);
     cache.checkInvariants();
-    return std::pair{cache.reachVisits() - before, units};
+    return std::pair{visits, units};
   };
-  const auto [fewVisits, few] = count(8);
-  const auto [manyVisits, many] = count(32);
-  require(fewVisits == manyVisits && few.size() == many.size() && few.size() >= 4,
-          "counting a cache of 32 conversations visited " + std::to_string(manyVisits) + " blocks, one of 8 " +
-              std::to_string(fewVisits));
-  for (size_t index = 0; index < few.size(); ++index)
-    require(few[index].key == many[index].key, "the larger cache gave other units");
+  for (const Kind kind : {Kind::Plain, Kind::Windowed, Kind::Spilling}) {
+    const std::string name = kind == Kind::Plain ? "plain" : kind == Kind::Windowed ? "windowed" : "spilling";
+    const auto [fewVisits, few] = count(8, kind);
+    const auto [manyVisits, many] = count(32, kind);
+    require(fewVisits == manyVisits && few.size() == many.size() && few.size() >= 4,
+            "counting a " + name + " cache of 32 conversations looked at " + std::to_string(manyVisits) +
+                " blocks, states and request pages, one of 8 " + std::to_string(fewVisits) + " (" +
+                std::to_string(many.size()) + " and " + std::to_string(few.size()) + " units)");
+    for (size_t index = 0; index < few.size(); ++index)
+      require(few[index].key == many[index].key, "the larger " + name + " cache gave other units");
+  }
 }
 
 // The pages a need's units count at most (peek), and those its takes free,

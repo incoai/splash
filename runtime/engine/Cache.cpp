@@ -2089,19 +2089,23 @@ uint32_t Cache::trimmableCount() const {
   // blocks before its last published one or past it, which its window reads.
   std::unordered_set<uint64_t> read;
   for (const auto &[_, holder] : requests_)
-    for (uint32_t index = windowStart(holder); index < holder.pages.size(); ++index)
+    for (uint32_t index = windowStart(holder); index < holder.pages.size(); ++index) {
+      ++windowVisits_;
       if (const uint64_t block = kv_.blockOn(holder.pages[index]);
           block && kv_.chainLength(block) == index + 1 && kv_.trimmable(block))
         read.insert(block);
+    }
   return kv_.trimCandidates() - static_cast<uint32_t>(read.size());
 }
 
 uint32_t Cache::passedPages() const {
   std::vector<uint32_t> kept;
   for (const auto &[_, active] : requests_)
-    for (const uint32_t index : active.privatePages)
+    for (const uint32_t index : active.privatePages) {
+      ++windowVisits_;
       if (pool_.form(active.pages[index]) == kv::PageForm::Full && windowsPassed(active.pages[index], index))
         kept.push_back(active.pages[index]);
+    }
   std::ranges::sort(kept);
   const auto repeated = std::ranges::unique(kept);
   return trimmableCount() + static_cast<uint32_t>(repeated.begin() - kept.begin());

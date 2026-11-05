@@ -412,6 +412,7 @@ StateCache::Reclaims StateCache::reclaims(bool inUse, std::span<const uint64_t> 
   auto writers = static_cast<uint32_t>((result.writes ? checkpointWrites_.size() + ordinaryWrites_.size() : 0) +
                                        (result.usedWrites ? inUseWrites_.size() : 0));
   for (const uint64_t kvBlock : keeps) {
+    ++reclaimVisits_;
     const auto found = entries_.find(kvBlock);
     if (found == entries_.end() || !candidate(kvBlock, found->second) || this->inUse(kvBlock))
       continue;
@@ -423,9 +424,11 @@ StateCache::Reclaims StateCache::reclaims(bool inUse, std::span<const uint64_t> 
     for (const RecencyOrder *order : {&checkpointWrites_, &ordinaryWrites_, &inUseWrites_}) {
       if (order == &inUseWrites_ ? !result.usedWrites : !result.writes)
         continue;
-      for (auto state = order->oldest(); state && !result.staged; state = order->next(*state))
+      for (auto state = order->oldest(); state && !result.staged; state = order->next(*state)) {
+        ++reclaimVisits_;
         if (order == &inUseWrites_ || !std::ranges::binary_search(keeps, state->id))
           result.staged = state->id;
+      }
       if (result.staged)
         break;
     }
