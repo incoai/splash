@@ -715,6 +715,17 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--moe-shared-first",
+        "requests",
+        dict(
+            action="store_true",
+            default=False,
+            help="in a MoE target's decode steps, launch the shared expert's "
+            "tiles before the routed experts': the same outputs, shorter "
+            "steps on the Macs measured (default: routed experts first)",
+        ),
+    ),
+    ServeOption(
         "--allow-idle-sleep",
         "requests",
         dict(

@@ -23,8 +23,8 @@ void include(Workspace &bound, const Workspace &required,
 
 } // namespace
 
-ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
-    : linear_(device), family_(gpuFamilyClass(device.appleGpuFamily)),
+ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, ExecutionOptions options)
+    : linear_(device), family_(gpuFamilyClass(device.appleGpuFamily)), options_(options),
       gpuCores_(plannedGpuCores(device)) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
@@ -50,6 +50,7 @@ MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phas
   config.expertTile =
       phase == MoePhase::Prefill ? moeGgufPrefillTile(shape, rows, config.ggufTile) : MoeExpertTile::M8;
   config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts, shape.routerFormat);
+  config.sharedSlicesFirst = phase == MoePhase::Decode && options_.moeSharedFirst;
   return config;
 }
 

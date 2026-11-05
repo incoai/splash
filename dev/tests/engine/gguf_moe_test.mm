@@ -1210,6 +1210,18 @@ int moe(MetalBackend &backend) {
                                     std::to_string(lanes);
           const MoeRun run =
               runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label);
+          // The shared slices' tiles first (--moe-shared-first) are the same
+          // tiles launched in another order: every row and every route's tile
+          // kind is bitwise the routed-first run's.
+          MoeConfig sharedFirstConfig = plan.configuration();
+          sharedFirstConfig.sharedSlicesFirst = true;
+          const MoeRun sharedFirst =
+              runPlan(backend, m, b, MoE::decodePlan(shape, lanes, sharedFirstConfig), tile == MoeGgufTile::Staged,
+                      products, stats, label + " shared first");
+          if (sharedFirst.output != run.output || sharedFirst.column != run.column) {
+            printf("  %s: the shared slices first differ from the routed experts first FAIL\n", label.c_str());
+            ++failures;
+          }
           // A row's result depends on its own routes and the tile kinds they
           // run only, not on the rows it is batched with (the tile rows of one
           // expert are independent).
@@ -1542,12 +1554,12 @@ int verifiedRows(MetalBackend &backend) {
     };
     // A run's output rows and, per route, its tile kind: column or not on the
     // staged passes, UINT32_MAX where the run left it out.
-    const auto run = [&](const MetalBuffer &verifyRows) {
-      allocate(backend, b, plan);
+    const auto run = [&](const MetalBuffer &verifyRows, const MoePlan &step) {
+      allocate(backend, b, step);
       std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
       b.moe.verifyRows = verifyRows;
       CommandGraph graph;
-      MoE::add(graph, b.moe, m.weights, plan);
+      MoE::add(graph, b.moe, m.weights, step);
       static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
       const auto *output = static_cast<const uint16_t *>(b.moe.output.contents());
       const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
@@ -1559,9 +1571,15 @@ int verifiedRows(MetalBackend &backend) {
                                                      : 0;
       return std::pair{std::vector<uint16_t>(output, output + uint64_t{rows} * kHidden), kinds};
     };
-    const auto [allOutput, allKinds] = run({});
-    const auto [fullOutput, fullKinds] = run(verifyAll);
-    const auto [output, kinds] = run(verify);
+    // The shared slices' tiles first (--moe-shared-first) launch the same
+    // tiles in another order: bitwise the routed-first step.
+    MoeConfig sharedFirstConfig = plan.configuration();
+    sharedFirstConfig.sharedSlicesFirst = true;
+    const MoePlan sharedFirstPlan = MoE::decodePlan(shape, 4, sharedFirstConfig);
+    const auto [sharedFirstOutput, sharedFirstKinds] = run(verify, sharedFirstPlan);
+    const auto [allOutput, allKinds] = run({}, plan);
+    const auto [fullOutput, fullKinds] = run(verifyAll, plan);
+    const auto [output, kinds] = run(verify, plan);
     int tileFailures = 0;
     const auto fail = [&](const std::string &what) {
       printf("  %s FAIL\n", what.c_str());
@@ -1569,6 +1587,8 @@ int verifiedRows(MetalBackend &backend) {
     };
     const bool fullBitwise = fullOutput == allOutput && fullKinds == allKinds;
     if (!fullBitwise) fail("every row verified is not bitwise the all-rows run");
+    const bool sharedFirstBitwise = sharedFirstOutput == output && sharedFirstKinds == kinds;
+    if (!sharedFirstBitwise) fail("the verified step with the shared slices first is not bitwise the routed-first one");
 
     const MoeScratch &scratch = b.moe.scratch;
     const auto *selected = static_cast<const uint32_t *>(scratch.selectedExperts.contents());
@@ -1610,9 +1630,11 @@ int verifiedRows(MetalBackend &backend) {
         fail("verified row " + std::to_string(row) + " differs from the all-rows run");
     }
     if (!compared && tile == MoeGgufTile::Register) fail("no verified row ran its all-rows tile kinds");
-    printf("%-20s %s every row verified: %s; verify rows 8/5/2/1: %u rows bitwise, %u across tile kinds: %s\n",
+    printf("%-20s %s every row verified: %s; verify rows 8/5/2/1: %u rows bitwise, %u across tile kinds; shared "
+           "slices first: %s: %s\n",
            formatNames(m).c_str(), tile == MoeGgufTile::Register ? "register" : "staged  ",
-           fullBitwise ? "bitwise" : "differs", compared, acrossKinds, tileFailures ? "FAIL" : "ok");
+           fullBitwise ? "bitwise" : "differs", compared, acrossKinds, sharedFirstBitwise ? "bitwise" : "differs",
+           tileFailures ? "FAIL" : "ok");
     failures += tileFailures;
   }
   return failures;

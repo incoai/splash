@@ -384,6 +384,11 @@ struct MoeConfig final {
   // The router's float tile; the execution plans derive it from the device,
   // the plan's rows and the router's format (Linear::ggufFloatTile).
   FloatTile ggufRouterTile = FloatTile::Simdgroup;
+  // A decode plan's grouping puts the shared slices' tiles before the routed
+  // ones (MoeGroupParams::shared_first; splash serve --moe-shared-first). The
+  // tiles and their rows are the same, so are the outputs; prefill plans
+  // ignore it.
+  bool sharedSlicesFirst = false;
   bool operator==(const MoeConfig &) const = default;
 };
 

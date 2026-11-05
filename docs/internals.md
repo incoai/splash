@@ -535,7 +535,10 @@ windows (`gguf::TensorRows::windows`), so slice s's rows of each projection foll
 (`moe_group_routes_s2`, `moe_expert_gguf_m8_a_s2`); the softmax router's one gated slice is the
 unsuffixed instances. The expert passes launch the live tiles alone: the grouping kernel writes
 each pass's grid with the tile count, and the pass reads it as an indirect dispatch
-(`ComputeDispatch::indirectThreadgroups`). They find a routed expert through the block's slot
+(`ComputeDispatch::indirectThreadgroups`). The grouping writes the shared slices' tiles after the
+routed ones; with `splash serve --moe-shared-first` a decode grouping writes them first, the same
+tiles in another order, so the outputs are the same and the slices' tiles, which hold every row of
+the step, start first instead of ending the pass alone. They find a routed expert through the block's slot
 table and the chunks that hold its slots (`ops::ExpertChunks`): slot s below floor_slots is at
 place s of the floor chunk, chunk 0, and slot s from floor_slots on at place
 e - (c - 1) * chunk_slots of elastic chunk c = 1 + e / chunk_slots, where e = s - floor_slots (a

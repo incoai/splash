@@ -79,6 +79,9 @@ struct NativeArguments final {
   // --verify-rows auto|all: the rows of the draft's block a decode
   // cycle verifies (RuntimeResourcesConfig::verifyRows).
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --moe-shared-first on|off: whether decode groupings put a MoE block's shared
+  // slices' tiles before the routed ones (ops::ExecutionOptions::moeSharedFirst).
+  bool moeSharedFirst = false;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

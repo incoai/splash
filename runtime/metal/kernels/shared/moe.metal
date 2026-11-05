@@ -177,9 +177,10 @@ inline bool moe_unverified_route(device const uint *verify_rows,
 // that expert's last route that its last tile's matmul reads
 // (moe_matmul_rows) carry the route ~0u. One threadgroup covers all routes
 // and thread e owns expert e's count, offsets and tile descriptors. The
-// shared slices' tiles follow the routed tiles, slice after slice, and each
-// slice's hold every row in order. It writes the tile count with the expert
-// passes' grids (MoeTileCount). Slots threads, one per expert slot. A
+// shared slices' tiles follow the routed tiles (lead them with shared_first:
+// the same tiles in another order), slice after slice, and each slice's hold
+// every row in order. It writes the tile count with the expert passes' grids
+// (MoeTileCount). Slots threads, one per expert slot. A
 // Verified grouping routes each lane's verify rows alone (MoeGroupParams).
 template <uint Slots, uint Shared, bool Verified>
 inline void moe_group_routes_phase(
@@ -208,7 +209,10 @@ inline void moe_group_routes_phase(
   if (simd_lane == 31)
     simd_totals[simd_group] = prefix + expert_tiles;
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  uint tile_offset = prefix;
+  const uint shared_tiles =
+      (params.rows + params.tile_rows - 1) / params.tile_rows;
+  // With shared_first the routed tiles start after the shared slices'.
+  uint tile_offset = prefix + (params.shared_first ? Shared * shared_tiles : 0u);
   for (uint group = 0; group < simd_group; ++group)
     tile_offset += simd_totals[group];
   tile_offsets[thread_index] = tile_offset;
@@ -242,16 +246,17 @@ inline void moe_group_routes_phase(
     route_rows[route] = row;
   }
 
-  const uint shared_tiles =
-      (params.rows + params.tile_rows - 1) / params.tile_rows;
-  const uint shared_base = routed_tiles * params.tile_rows;
+  // routed_tiles is the end of the routed tiles, past the shared slices'
+  // with shared_first.
+  const uint shared_first_tile = params.shared_first ? 0u : routed_tiles;
+  const uint shared_base = shared_first_tile * params.tile_rows;
   const uint shared_rows =
       (shared_tiles - 1) * params.tile_rows +
       moe_matmul_rows(params.rows - (shared_tiles - 1) * params.tile_rows,
                       params.tile_rows);
   for (uint tile = thread_index; tile < shared_tiles; tile += Slots) {
     for (uint slice = 0; slice < Shared; ++slice)
-      tiles[routed_tiles + slice * shared_tiles + tile] = MoeTileDescriptor{
+      tiles[shared_first_tile + slice * shared_tiles + tile] = MoeTileDescriptor{
           params.experts + slice,
           min(params.tile_rows, params.rows - tile * params.tile_rows)};
   }
@@ -270,7 +275,7 @@ inline void moe_group_routes_phase(
     }
   }
   if (thread_index == 0) {
-    const uint live = routed_tiles + Shared * shared_tiles;
+    const uint live = params.shared_first ? routed_tiles : routed_tiles + Shared * shared_tiles;
     *tile_count = MoeTileCount{live, {params.gate_up_columns, live, 1},
                                {params.down_columns, live, 1}};
   }

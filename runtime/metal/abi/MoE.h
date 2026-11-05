@@ -73,10 +73,15 @@ struct MoeGroupParams {
   uint32_t gate_up_columns;
   uint32_t down_columns;
   uint32_t lane_rows;
+  // 1: the shared slices' tiles come first and the routed tiles follow them;
+  // 0: the routed tiles first (MoeConfig::sharedSlicesFirst). The expert
+  // passes launch tiles in grid order, so a shared slice, whose tiles walk
+  // every row of the step, then starts first instead of ending the pass.
+  uint32_t shared_first;
 };
 
-static_assert(sizeof(MoeGroupParams) == 28,
-              "MoE grouping parameters are 28 bytes on both sides");
+static_assert(sizeof(MoeGroupParams) == 32,
+              "MoE grouping parameters are 32 bytes on both sides");
 
 // What the grouping writes besides the tiles: their count, which every pass
 // over them reads first, and the grids (column tiles, tiles, 1) of the
