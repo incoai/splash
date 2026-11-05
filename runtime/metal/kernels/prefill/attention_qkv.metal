@@ -61,6 +61,10 @@ PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g16_f32, 32, 2, 256, 32, true, f
 // rotated (64 pairs) or unrotated.
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv4_g8_d128, 32, 4, 128, 64, false, bfloat)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv4_g8_d128_f32, 32, 4, 128, 64, false, float)
+// Ripple's: 80 query heads over 8 KV heads of 128, gated, whose GGUF norms
+// are float.
+PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv8_g10_d128_f32, 80, 8, 128, 64, true, float)
+PREFILL_ATTENTION_QKV_NOPE(prefill_attention_qkv_kv8_g10_d128_nope_f32, 80, 8, 128, true, float)
 PREFILL_ATTENTION_QKV_NOPE(prefill_attention_qkv_kv4_g8_d128_nope, 32, 4, 128, false, bfloat)
 PREFILL_ATTENTION_QKV_NOPE(prefill_attention_qkv_kv4_g8_d128_nope_f32, 32, 4, 128, false, float)
 #undef PREFILL_ATTENTION_QKV_NOPE
@@ -91,6 +95,8 @@ PREFILL_ATTENTION_GATE(prefill_attention_gate, 24, 4, 256)
 PREFILL_ATTENTION_GATE(prefill_attention_gate_kv2_g8, 16, 2, 256)
 PREFILL_ATTENTION_GATE(prefill_attention_gate_kv2_g12, 24, 2, 256)
 PREFILL_ATTENTION_GATE(prefill_attention_gate_kv2_g16, 32, 2, 256)
+// Ripple's.
+PREFILL_ATTENTION_GATE(prefill_attention_gate_kv8_g10_d128, 80, 8, 128)
 #undef PREFILL_ATTENTION_GATE
 
 // A layer without an output gate gathers its attention rows into the

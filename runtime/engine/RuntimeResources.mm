@@ -1421,19 +1421,19 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
   };
   model.time = [&backend, layers, cancelled, onArena] {
     ops::ane_ffn::Timings timings;
-    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      timings = ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).time();
+    onArena([&](const model::QwenTargetPrefillBuffers &buffers) {
+      timings = ops::ane_ffn::Measurement(backend, *layers, buffers.ffn(), buffers.hidden, cancelled).time();
     });
     return timings;
   };
   model.prepare = [&backend, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
     AneFfnPrepared prepared;
-    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+    onArena([&](const model::QwenTargetPrefillBuffers &buffers) {
       prepared.split = std::make_unique<ops::AneFfn>(backend, *layers, aneUnits, cancelled);
-      prepared.error = prepared.split->verify(*layers, ffn, hidden);
+      prepared.error = prepared.split->verify(*layers, buffers.ffn(), buffers.hidden);
       if (timeChunks)
         prepared.chunks =
-            ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).chunks(*prepared.split);
+            ops::ane_ffn::Measurement(backend, *layers, buffers.ffn(), buffers.hidden, cancelled).chunks(*prepared.split);
     });
     return prepared;
   };

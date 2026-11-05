@@ -8,7 +8,7 @@
   "num_key_value_heads": 8,
   "head_dim": 128,
   "intermediate_size": 512,
-  "sliding_window": 33,
+  "sliding_window": 1024,
   "embed_scale": 16.0,
   "ffn_clamp_threshold": 6.0,
   "rope_theta": 10000.0,

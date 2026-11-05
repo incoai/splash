@@ -174,7 +174,7 @@ loadModel(metal::MetalBackend &backend,
 // buffers of a full chunk and the hidden rows layers alternate between.
 void withPrefillArena(
     metal::MetalBackend &backend, const LoadedModel &model, const ops::ExecutionPlans &operators, kv::Format format,
-    const std::function<void(const ops::PrefillFfnBuffers &, const std::array<metal::MetalBuffer, 2> &)> &use);
+    const std::function<void(const QwenTargetPrefillBuffers &)> &use);
 // What of a model streams from the SSD, which its arenas rest on: a target
 // whose routed experts stream runs its prefill commands as groups
 // (RuntimeGeometry::prefillChunks), the step of one whose table streams

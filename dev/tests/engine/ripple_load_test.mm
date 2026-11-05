@@ -34,7 +34,7 @@ RippleLayout tinyLayout() {
   layout.attentionHeadDimension = 128;
   layout.rotaryPairs = 64;
   layout.rotaryTheta = 10000.0F;
-  layout.slidingWindow = 33;
+  layout.slidingWindow = 1024;
   layout.slidingLayers = {1, 0};   // layer 0 slides
   layout.unrotatedLayers = {2, 0}; // layer 1 is full (NoPE)
   layout.fullAttentionPeriod = 1;

@@ -3547,12 +3547,11 @@ std::vector<ops::SwiGluProjections> aneFfnLayers(const LoadedModel &model) {
 
 void withPrefillArena(
     MetalBackend &backend, const LoadedModel &model, const ops::ExecutionPlans &operators, kv::Format format,
-    const std::function<void(const ops::PrefillFfnBuffers &, const std::array<MetalBuffer, 2> &)> &use) {
+    const std::function<void(const QwenTargetPrefillBuffers &)> &use) {
   // A prefill arena holds no state cell, so either state format sizes it.
   const PrefillArena arena(backend, RuntimeGeometry::from(model, format, ops::GdnStateFormat::Float32),
                            operators);
-  const QwenTargetPrefillBuffers buffers = prefillBuffers(arena, 0);
-  use(buffers.ffn(), buffers.hidden);
+  use(prefillBuffers(arena, 0));
 }
 
 ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
