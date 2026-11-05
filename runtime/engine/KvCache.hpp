@@ -254,6 +254,9 @@ public:
   // its chain needed) or with no copy; and whether it is a RAM copy a
   // reclaim may take (StateCache::candidate). Without a state, none.
   void setStateKeeps(uint64_t blockId, Keeps keeps, bool needed, bool candidate) noexcept;
+  // The reasons at the block or below it: its page frees now for a walk
+  // none of whose reasons they hold.
+  [[nodiscard]] Keeps keeps(uint64_t blockId) const;
   // Cache names, as they change, the chains requests waiting to start
   // restore, each by its last block: one more or one less ends at the block.
   void countWanted(uint64_t blockId, bool added) noexcept;

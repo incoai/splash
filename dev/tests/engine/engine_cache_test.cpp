@@ -6465,6 +6465,41 @@ void testAReleaseOfWhatALandingCompletesCountsOnce() {
   cache.checkInvariants();
 }
 
+// A claim that can wait counts the landing a take of its first unit lets free. A leaf's demotion
+// lands beside three free pages; a state then published in RAM on the leaf keeps its page as it
+// lands, so the landing completes nothing. Taking that state, with no write, lets it complete the
+// extent, which the take credits: the unit offered for the state counts that extent.
+void testATakeCountsTheLandingItLetsFree() {
+  test::TestKvStorage storage{16, 100, 4};
+  KvPool pool{storage, 1};
+  test::TestKvTier tier;
+  auto budget = std::make_shared<model::DiskBudget>(10000);
+  tier.budget = budget;
+  engine::Cache cache(pool, &tier, budget);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const uint64_t leaf = cacheConversation(cache, 1, 1, std::make_shared<TieredState>(control));
+  require(test::stateStep(cache).gave() && cache.pollTransfers(), "the state was not written to the SSD");
+  static_cast<void>(cache.releaseEmptyExtents(false));
+  require(test::freeFromCache(cache, test::kInServiceGrowth, {.bytes = 100}).laterBytes == 400,
+          "the leaf's demotion did not complete an extent");
+  cache.publishCompositeState(leaf, std::make_shared<TestState>(100), false);
+  require(pool.freePageCount() == 3 && tier.demotions == 1 && cache.returning().landingBytes == 0,
+          "fixture geometry changed");
+  const VictimQuery query = test::query(test::kInServiceGrowth, {.bytes = 400, .stateBuffers = 1});
+  const std::optional<engine::Victim> unit = cache.peek(query, nullptr);
+  require(unit && !unit->write && !unit->later && unit->stateBuffers == 1, "the state was not offered first");
+  const FreeResult taken = cache.take(query, *unit);
+  require(!cache.stateResident(leaf) && taken.laterBytes == 400 && cache.returning().landingBytes == 400,
+          "taking the state did not let the landing complete the extent");
+  require(unit->bytes >= taken.nowBytes + taken.laterBytes,
+          "the unit counted " + std::to_string(unit->bytes) + " bytes; its take freed " +
+              std::to_string(taken.nowBytes + taken.laterBytes));
+  tier.complete();
+  static_cast<void>(cache.pollTransfers());
+  cache.checkInvariants();
+}
+
 // Growth counts no page a copy in flight holds: the copy frees nothing until it lands, so the dead
 // leaf beside it, which alone cannot fund the unit, stays.
 void testGrowthCountsNoPageInTransfer() {
@@ -6741,6 +6776,7 @@ int main() {
     testOwnDemotionsHoldBackTheStore();
     testDemotionsStopWhereTheyCompleteAnExtent();
     testAReleaseOfWhatALandingCompletesCountsOnce();
+    testATakeCountsTheLandingItLetsFree();
     testGrowthCountsNoPageInTransfer();
     testGrowthCountsNoStateThatWaitsForAWrite();
     testStagedStateFreesItsCopiedChain();

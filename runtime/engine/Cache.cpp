@@ -1124,9 +1124,42 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
   // frees now.
   if (walk.scope.pagesOnly)
     counted.now.states = std::min(counted.now.states, pages.candidates);
-  // The extents landing pages complete beside the free ones count already
-  // (returning, landingExtents): what frees later is the rest.
+  // The pages landing as their demotions complete (demotedPages). A walk
+  // that can wait counts what they free with the rest (Cache::take credits
+  // it, landingFill): a demotion frees its page as it lands once nothing in
+  // RAM holds the block (freesOnLanding), so a phase that takes the state
+  // on such a block and what frees now below it lets it land too, each
+  // demotion judged on those started before it, as freeingDemotions judges
+  // them. Those of the first phase, then once the staged state's write has
+  // started.
   const std::array<uint32_t, 3> landing = demotedPages();
+  const auto landingOnce = [&](bool stagedGone) {
+    std::array<uint32_t, 3> pages = landing;
+    if (walk.timing != ReclaimTiming::CanWait)
+      return pages;
+    std::unordered_set<uint64_t> freeing = freeingDemotions();
+    const Walk first = phaseWalk(walk, inUse ? ReclaimPhase::UsedNow : ReclaimPhase::Now);
+    const auto stateGoes = [&](uint64_t block) {
+      return !states_.stateResident(block) || (stagedGone && block == states.staged) ||
+             (states_.reclaimable(block) && (inUse || !states_.inUse(block)) &&
+              std::ranges::find(kept, block) == kept.end() &&
+              stateReclaim(first, block).when == StateReclaim::When::Now);
+    };
+    for (const Write &write : writes_) {
+      const uint64_t block = write.block;
+      if (write.write != WriteClass::Reclaim || freeing.contains(block) || !kv_.leafOnceChildrenLeave(block) ||
+          pool_.pageActive(kv_.page(block)) || !stateGoes(block) ||
+          !std::ranges::all_of(kv_.children(block), [&](uint64_t child) {
+            return kv_.page(child) == KvCache::noPage || freeing.contains(child) || !(kv_.keeps(child) & mask);
+          }))
+        continue;
+      freeing.insert(block);
+      ++pages[static_cast<size_t>(pool_.form(kv_.page(block)))];
+    }
+    return pages;
+  };
+  const std::array<uint32_t, 3> landingNow = landingOnce(false);
+  const std::array<uint32_t, 3> landingWritten = states.staged ? landingOnce(true) : landingNow;
   // A page walk that trims also frees the Full pages it moves into Slim
   // ones, as many as the Slim pages free or freed allow: it trims after a
   // state goes (Cache::take), but for the staged state's write, the pages
@@ -1163,11 +1196,27 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
       const uint32_t movable = pool_.allocatedExtents(form) - std::min(pool_.allocatedExtents(form), pinned[index]);
       return std::min(extents(pages), movable - std::min(movable, walk.keeps(form) ? 1u : 0u));
     };
-    const uint32_t later = extents(all[index]) - std::min(extents(all[index]), atOnce(written[index]));
+    // The extents the landing pages complete beside the free ones count
+    // already (returning, landingExtents). Through a phase, with those: the
+    // extents its takes release, or for a walk that can wait, if more, the
+    // extents its takes credit, released or completed by landing pages
+    // beside the pages then free (Cache::take): those the free, freed and
+    // landing pages fill together, but no more than its releases and one
+    // per extent's worth of landing pages begun (a take's free pages may
+    // complete one beside landing pages that the next releases).
     const uint32_t landed = landingExtents(walk, form, landing[index]);
-    counted.now.bytes += atOnce(now[index]) * extentBytes;
-    counted.written.bytes += (atOnce(written[index]) - atOnce(now[index])) * extentBytes;
-    counted.later.bytes += (later - std::min(later, landed)) * extentBytes;
+    const auto through = [&](uint32_t pages, uint32_t lands) -> uint32_t {
+      const uint32_t released = atOnce(pages) + landed;
+      if (walk.timing != ReclaimTiming::CanWait)
+        return released;
+      return std::max(released, std::min(completedExtents(0, pages + lands, extent, walk.keeps(form)),
+                                         atOnce(pages) + (lands + extent - 1) / extent));
+    };
+    const uint32_t throughNow = through(now[index], landingNow[index]);
+    const uint32_t throughWritten = std::max(throughNow, through(written[index], landingWritten[index]));
+    counted.now.bytes += (throughNow - std::min(throughNow, landed)) * extentBytes;
+    counted.written.bytes += (throughWritten - throughNow) * extentBytes;
+    counted.later.bytes += (extents(all[index]) - std::min(extents(all[index]), throughWritten)) * extentBytes;
   }
   const auto need = static_cast<size_t>(walk.form);
   uint32_t pagesNow = now[need], pagesWritten = written[need], pagesAll = all[need];

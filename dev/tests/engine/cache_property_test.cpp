@@ -124,8 +124,6 @@ public:
   // and of those offered as needing no write the same. Peek counts an upper
   // bound (VictimSource), so these are reported, not required.
   uint64_t exactUnits = 0, shortUnits = 0, exactNoWrite = 0, shortNoWrite = 0;
-  // Takes that freed more than the units from the head through theirs.
-  uint64_t overTakes = 0;
 
   // Every request ends, every transfer lands, and nothing leaks: the pool's
   // pages and the tier's slots belong to the cache's blocks alone.
@@ -278,12 +276,12 @@ public:
               "write");
       require(!states || !unit->later || !result.gave(),
               "a take of a state offered as freeing once a write lands gave something now");
-      // Peek should never count less than its take frees: a take frees no
-      // more than the units from the head through it count, the units before
-      // it being what the take may free first (free pages, the extents they
-      // fill). Reported: a first phase's take of a claim that can wait still
-      // credits the landing its state evictions let free.
-      overTakes += gaveOf(result) > through;
+      // Peek never counts less than its take frees: a take frees no more
+      // than the units from the head through it count, the units before it
+      // being what the take may free first (free pages, the extents they
+      // fill).
+      require(gaveOf(result) <= through, "a take freed " + std::to_string(gaveOf(result)) +
+                                             " where the units through it counted " + std::to_string(through));
       record.freed += gaveOf(result);
       // Progress: a take that says it gave something changed the cache, so
       // the ledger's peek again from the head never finds the same unit for
@@ -555,7 +553,7 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
 // The same runs with random claims counted and taken (checkTake), again with requests using the states they resume
 // from.
 void testTakeNeverExceedsPeek(uint32_t plainSeeds, uint32_t windowedSeeds) {
-  uint64_t steps = 0, exact = 0, shortOf = 0, exactNoWrite = 0, shortNoWrite = 0, over = 0;
+  uint64_t steps = 0, exact = 0, shortOf = 0, exactNoWrite = 0, shortNoWrite = 0;
   const auto check = [&](uint32_t seed, bool windowed, bool usedStates) {
     Run run(seed, windowed, true, usedStates);
     try {
@@ -573,17 +571,16 @@ void testTakeNeverExceedsPeek(uint32_t plainSeeds, uint32_t windowedSeeds) {
     shortOf += run.shortUnits;
     exactNoWrite += run.exactNoWrite;
     shortNoWrite += run.shortNoWrite;
-    over += run.overTakes;
   };
   for (const bool usedStates : {false, true})
     for (const bool windowed : {false, true})
       for (uint32_t seed = 1; seed <= (windowed ? windowedSeeds : plainSeeds); ++seed)
         check(seed, windowed, usedStates);
   std::cout << "cache take runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds << " windowed; " << steps
-            << " reclaim steps taken as the ledger takes, each that gave something changing the cache, every offered "
-            << "unit's first take giving something or waiting; " << exact << " units freed all peek counted, "
-            << shortOf << " less (" << exactNoWrite << " and " << shortNoWrite << " of those needing no write); "
-            << over << " takes freed more than the units through theirs counted\n";
+            << " reclaim steps taken as the ledger takes, each that gave something changing the cache and freeing no "
+            << "more than the units through its own counted, every offered unit's first take giving something or "
+            << "waiting; " << exact << " units freed all peek counted, " << shortOf << " less (" << exactNoWrite
+            << " and " << shortNoWrite << " of those needing no write)\n";
 }
 
 } // namespace

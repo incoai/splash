@@ -435,6 +435,8 @@ std::optional<CacheEvictionCandidate> KvCache::trimCandidate(uint64_t after) con
   return trimmable_.next({after, block(after).lastUsed});
 }
 
+KvCache::Keeps KvCache::keeps(uint64_t blockId) const { return block(blockId).keeps; }
+
 bool KvCache::trimmable(uint64_t blockId) const { return orders(block(blockId)).trimmable; }
 
 void KvCache::setStateKeeps(uint64_t blockId, Keeps keeps, bool needed, bool candidate) noexcept {

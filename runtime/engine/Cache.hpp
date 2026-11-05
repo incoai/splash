@@ -1076,13 +1076,17 @@ private:
   // staging buffer writes lets go once it has left RAM, the copied part of
   // its chain; later the rest, but the extents the landing pages complete
   // beside the free ones (landingExtents), which the ledger counts as
-  // landing. A page walk that trims also frees the Full pages it moves into
-  // Slim ones. States: the RAM copies the walk takes, now those that need no
-  // write; written the first that needs one, while no write holds the
-  // staging buffer, which frees at once; later the others, which wait for
-  // that buffer (StateCache::reclaims). The counts cost the chains the walk
-  // keeps that the KV cache does not count by itself (the one a start
-  // reuses) and the staged state's chain, not the cache.
+  // landing. For a walk that can wait, now and written count too the
+  // extents landing pages complete beside the pages then free, with the
+  // landings that taking a state in RAM lets free, as its takes credit them
+  // (Cache::take). A page walk that trims also frees the Full pages it
+  // moves into Slim ones. States: the RAM copies the walk takes, now those
+  // that need no write; written the first that needs one, while no write
+  // holds the staging buffer, which frees at once; later the others, which
+  // wait for that buffer (StateCache::reclaims). The counts cost the chains
+  // the walk keeps that the KV cache does not count by itself (the one a
+  // start reuses), the staged state's chain and the writes in flight, not
+  // the cache.
   struct ReclaimReach final {
     struct Amount final {
       uint64_t bytes = 0;
