@@ -708,7 +708,7 @@ void testAttentionOnlyTarget(metal::MetalBackend &backend) {
     storage.releaseLane(1, 2);
     require(storage.idleCells() == 0 && storage.idleRings() == 2 && storage.idleWindows() == 3 &&
                 storage.statesToActivate() == 0 &&
-                storage.idleBytes(1) == kDraftState.ringBytes() + 3 * kDraftState.windowBytes(),
+                storage.idleBytes(1, false) == kDraftState.ringBytes() + 3 * kDraftState.windowBytes(),
             "released attention-only lanes pooled a cell, lost a buffer or counted a cell's bytes");
     require(releaseAllIdle(storage, false) > 0 && storage.actualAllocatedBytes() == 0 &&
                 storage.idleRings() == 0 && storage.idleWindows() == 0,
@@ -718,45 +718,48 @@ void testAttentionOnlyTarget(metal::MetalBackend &backend) {
           "an attention-only storage's buffers outlived it");
 }
 
-// A start and the state it captures, beside the idle bytes counted for the
-// states its claims evict, allocate no more than startBytes: the evicted
-// states refill the lane's buffers the start took from the pool before any
-// of theirs frees memory, and the draft rings no state returns. Exact once
-// three states go, from an empty pool and from pools holding one and two
-// lanes' buffers.
+// A lane's start and the state it captures allocate startBytes, and the
+// states its claims then evict leave idleBytes after the start to release:
+// they refill the lane's buffers the start took from the pool first. From
+// an empty pool and from pools holding none to two lanes' buffers and none
+// to two states' cells and windows, with none to three states evicted.
 void testStartBytes(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
   const test::ClaimScope start(governor, ClaimClass::Floor);
   for (uint32_t pooledLanes = 0; pooledLanes < 3; ++pooledLanes) {
-    for (uint32_t evicted = 0; evicted < 4; ++evicted) {
-      model::QwenStateStorage storage(backend, governor.allocationAdmission(), kStateLayout, nullptr);
-      metal::AllocationFailure refusal;
-      std::vector<std::shared_ptr<model::QwenStateReservation>> cached;
-      for (uint32_t each = 0; each < evicted; ++each)
-        cached.push_back(storage.reserve(refusal));
-      for (uint32_t lane = 0; lane < pooledLanes; ++lane)
-        require(static_cast<bool>(storage.tryActivateLane(lane, lane + 1)), "a pool lane did not start");
-      for (uint32_t lane = 0; lane < pooledLanes; ++lane)
-        storage.releaseLane(lane, lane + 1);
-      const std::string name = std::to_string(evicted) + " evicted states beside " +
-                               std::to_string(pooledLanes) + " pooled lanes";
-      require(std::ranges::all_of(cached, [](const auto &state) { return state != nullptr; }) &&
-                  storage.idleRings() == pooledLanes,
-              "the fixture of " + name + " did not hold its states and pool");
-      const uint64_t charged = storage.startBytes(1);
-      const uint64_t credited = storage.idleBytes(evicted);
-      const uint64_t before = storage.actualAllocatedBytes();
-      require(static_cast<bool>(storage.tryActivateLane(0, 9)), "the start of " + name + " failed");
-      const auto capture = storage.reserve(refusal);
-      require(capture != nullptr, "the capture of " + name + " failed");
-      cached.clear();
-      static_cast<void>(releaseAllIdle(storage, true));
-      const uint64_t after = storage.actualAllocatedBytes();
-      require(after + credited <= before + charged, "the start of " + name + " allocated more than charged");
-      require(evicted < 3 || after + credited == before + charged,
-              "the start of " + name + " was charged more than it allocated");
-      storage.releaseLane(0, 9);
+    for (uint32_t pooledStates = 0; pooledStates < 3; ++pooledStates) {
+      for (uint32_t evicted = 0; evicted < 4; ++evicted) {
+        model::QwenStateStorage storage(backend, governor.allocationAdmission(), kStateLayout, nullptr);
+        metal::AllocationFailure refusal;
+        std::vector<std::shared_ptr<model::QwenStateReservation>> cached, pooled;
+        for (uint32_t each = 0; each < evicted; ++each)
+          cached.push_back(storage.reserve(refusal));
+        for (uint32_t lane = 0; lane < pooledLanes; ++lane)
+          require(static_cast<bool>(storage.tryActivateLane(lane, lane + 1)), "a pool lane did not start");
+        for (uint32_t each = 0; each < pooledStates; ++each)
+          pooled.push_back(storage.reserve(refusal));
+        for (uint32_t lane = 0; lane < pooledLanes; ++lane)
+          storage.releaseLane(lane, lane + 1);
+        const bool reserved = std::ranges::all_of(cached, [](const auto &state) { return state != nullptr; }) &&
+                              std::ranges::all_of(pooled, [](const auto &state) { return state != nullptr; });
+        pooled.clear();
+        const std::string name = std::to_string(evicted) + " evicted states beside " + std::to_string(pooledLanes) +
+                                 " pooled lanes and " + std::to_string(pooledStates) + " pooled states";
+        require(reserved && storage.idleRings() == pooledLanes && storage.idleWindows() == pooledLanes + pooledStates,
+                "the fixture of " + name + " did not hold its states and pool");
+        const uint64_t charged = storage.startBytes();
+        const uint64_t credited = storage.idleBytes(evicted, true);
+        const uint64_t before = storage.actualAllocatedBytes();
+        require(static_cast<bool>(storage.tryActivateLane(0, 9)), "the start of " + name + " failed");
+        const auto capture = storage.reserve(refusal);
+        require(capture != nullptr && storage.actualAllocatedBytes() == before + charged,
+                "the start of " + name + " did not allocate what it was charged");
+        cached.clear();
+        require(releaseAllIdle(storage, true) == credited,
+                "the states evicted after the start of " + name + " did not release what was counted");
+        storage.releaseLane(0, 9);
+      }
     }
   }
 }
@@ -1127,19 +1130,19 @@ void run(const std::string &metallib) {
     // What releasing down to one lane's worth frees once the cached state is
     // dropped, counted before at the layout's sizes: a lane's buffers and the
     // state's cell and window.
-    const uint64_t idle = storage.idleBytes(1);
+    const uint64_t idle = storage.idleBytes(1, false);
     require(idle == kStateLayout.laneBytes() + kStateLayout.cachedBytes(),
             "the idle bytes a dropped state would leave are not the layout's");
     retained.reset();
     require(storage.idleCells() == 5 && storage.idleRings() == 2 &&
-                storage.idleWindows() == 3 && storage.idleBytes(0) == idle,
+                storage.idleWindows() == 3 && storage.idleBytes(0, false) == idle,
             "dropped cached state did not return its cell and window to the pool");
     // Releasing down to one lane's worth keeps two cells, the rings and a
     // window warm, and frees no less than was counted.
     const uint64_t released = releaseAllIdle(storage, true);
     require(released == observedLaneActual + observedPrefixActual && released >= idle &&
                 storage.idleCells() == 2 && storage.idleRings() == 1 &&
-                storage.idleWindows() == 1 && storage.idleBytes(0) == 0,
+                storage.idleWindows() == 1 && storage.idleBytes(0, false) == 0,
             "partial idle release did not keep the requested buffers");
     require(releaseAllIdle(storage, false) == observedLaneActual,
             "idle lane buffers were not reclaimed");

@@ -858,21 +858,19 @@ public:
   // once the cache has let go of `evictedStates` more cached states, whose
   // buffers return to the pool: the pooled buffers beyond those one lane
   // starts from, at the sizes their layout declares, which no allocation
-  // falls short of. Zero where the model does not describe its pool, which
-  // counts on no more than it releases.
-  [[nodiscard]] virtual uint64_t idleBufferBytes(uint32_t evictedStates) const noexcept {
+  // falls short of. With `afterStart`, of the pool a lane's start and the
+  // state it captures leave (startStateBytes): the evicted states refill the
+  // buffers they took from it before any of theirs frees memory. Zero where
+  // the model does not describe its pool, which counts on no more than it
+  // releases.
+  [[nodiscard]] virtual uint64_t idleBufferBytes(uint32_t evictedStates, bool afterStart) const noexcept {
     static_cast<void>(evictedStates);
+    static_cast<void>(afterStart);
     return 0;
   }
-  // The state bytes a lane's start and `states` cached states it captures
-  // beside it cost, against idleBufferBytes, which counts the pooled buffers
-  // beyond those one lane starts from as room: the buffers it allocates and
-  // those it takes from the pool that evicted states refill before any of
-  // theirs frees memory. Zero by default.
-  [[nodiscard]] virtual uint64_t startStateBytes(uint32_t states) const noexcept {
-    static_cast<void>(states);
-    return 0;
-  }
+  // The state bytes a lane's start and the state it captures allocate: the
+  // buffers the idle pool lacks for them. Zero by default.
+  [[nodiscard]] virtual uint64_t startStateBytes() const noexcept { return 0; }
   // What one prefill command may hold (commandViolation): by default a
   // chunk's rows in one pass over one layer, one lane past a chunk and no
   // lane whose history holds Index pages, as a model without readers of

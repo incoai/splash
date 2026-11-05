@@ -818,7 +818,7 @@ private:
   [[nodiscard]] ClaimSpec stateClaim(const Request &request, StateClass kind, bool supersedes) const;
   // The victims that are the engine's decisions, in this order: the model's idle state buffers, which cost nothing and are
   // taken as they go (Model::releaseIdleBuffer, keeping one lane's short of
-  // critical pressure), of at least Model::idleBufferBytes(0); the command
+  // critical pressure), of at least Model::idleBufferBytes of no evicted states; the command
   // between its passes, for a claim whose work supersedes it, at no cost; the
   // claimant's own lane's conversion to Spill, offered only for its KV growth
   // (ClaimSpec::kvGrowth) while it decodes Resident, not ended and not

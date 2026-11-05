@@ -3335,13 +3335,11 @@ uint32_t Runtime::statesToActivate() const noexcept {
   return impl_->states.statesToActivate();
 }
 
-uint64_t Runtime::idleBufferBytes(uint32_t evictedStates) const noexcept {
-  return impl_->states.idleBytes(evictedStates);
+uint64_t Runtime::idleBufferBytes(uint32_t evictedStates, bool afterStart) const noexcept {
+  return impl_->states.idleBytes(evictedStates, afterStart);
 }
 
-uint64_t Runtime::startStateBytes(uint32_t states) const noexcept {
-  return impl_->states.startBytes(states);
-}
+uint64_t Runtime::startStateBytes() const noexcept { return impl_->states.startBytes(); }
 
 // Also for a request the runtime has not begun or holds no lane for, as the
 // engine places a fresh start before it begins it: the staging is the

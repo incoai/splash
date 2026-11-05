@@ -6127,7 +6127,7 @@ void testGrowthCountsNoStateThatNeedsAWrite() {
   static_cast<void>(cache.releaseEmptyExtents(false));
   engine::MemoryLedger ledger;
   ledger.addSource(cache);
-  ledger.setBufferBytes([](uint32_t states) { return uint64_t{states} * 100; });
+  ledger.setBufferBytes([](uint32_t states, bool) { return uint64_t{states} * 100; });
   const engine::ClaimId claim = ledger.open({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate});
   const FreeResult freed = ledger.free(claim, {.bytes = 200}, 0, false);
   ledger.close(claim);

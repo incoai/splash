@@ -106,7 +106,10 @@ struct ClaimId final {
 // met in place (TokenAdmission::additionalPages, Model::statesToActivate),
 // and for a KV need keptPages: the free pages of each other form its attempt
 // takes, which units taken for it keep as they keep `form`'s
-// (TokenAdmission::keptPages, Cache::walkFor).
+// (TokenAdmission::keptPages, Cache::walkFor). afterStart: a need that
+// counts a lane's start and the state it captures, which take their buffers
+// from the model's pool before any unit's return to it
+// (Model::startStateBytes).
 struct Need final {
   uint64_t bytes = 0;
   bool hostRefused = false;
@@ -114,6 +117,7 @@ struct Need final {
   kv::PageForm form = kv::PageForm::Full;
   uint32_t stateBuffers = 0;
   std::array<uint32_t, 3> keptPages{};
+  bool afterStart = false;
   friend bool operator==(const Need &, const Need &) = default;
 };
 
@@ -282,10 +286,11 @@ public:
   // complete beside every landing (Cache::returningFor).
   void setReturning(std::function<Returning()> all,
                     std::function<Returning(std::span<const uint64_t> requestIds)> ofRequests);
-  // The bytes the model's pool releases of `states` more state buffers
-  // (Model::idleBufferBytes beyond its value at none): what the buffers a
-  // unit frees give a need of bytes once they leave the pool.
-  void setBufferBytes(std::function<uint64_t(uint32_t states)> bytes);
+  // The bytes the model's pool releases once `states` more state buffers
+  // return to it, of the pool a start leaves with `afterStart`
+  // (Model::idleBufferBytes): a unit's buffers give a need of bytes what they
+  // add to it.
+  void setBufferBytes(std::function<uint64_t(uint32_t states, bool afterStart)> bytes);
   // The bytes of a KV page of each kv::PageForm (Cache::bytesPerPage), in
   // which the bytes waiting claims hold are held as pages (heldPages).
   void setPageBytes(const std::array<uint64_t, 3> &bytes) noexcept;
@@ -375,7 +380,8 @@ private:
   [[nodiscard]] bool holdsGrowth() const noexcept;
   // What `added` state buffers give a need of bytes as they leave the
   // model's pool, beyond the `before` ones counted already (setBufferBytes).
-  [[nodiscard]] uint64_t bufferBytes(const Lacking &lack, uint32_t before, uint32_t added) const;
+  [[nodiscard]] uint64_t bufferBytes(const VictimQuery &query, const Lacking &lack, uint32_t before,
+                                     uint32_t added) const;
   // The most the units the claim's class may take give it, counted in the
   // one order without taking any, up to the lack.
   [[nodiscard]] Run bound(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack) const;
@@ -395,7 +401,7 @@ private:
   uint32_t nextClaim_ = 1;
   std::function<Returning()> returning_;
   std::function<Returning(std::span<const uint64_t>)> returningFor_;
-  std::function<uint64_t(uint32_t)> bufferBytes_;
+  std::function<uint64_t(uint32_t, bool)> bufferBytes_;
   std::array<uint64_t, 3> pageBytes_{};
   uint64_t laneDemandBytes_ = 0;
   std::optional<RequestPriority> lanePriority_;

@@ -110,7 +110,7 @@ void MemoryLedger::setReturning(std::function<Returning()> all,
   returningFor_ = std::move(ofRequests);
 }
 
-void MemoryLedger::setBufferBytes(std::function<uint64_t(uint32_t)> bytes) { bufferBytes_ = std::move(bytes); }
+void MemoryLedger::setBufferBytes(std::function<uint64_t(uint32_t, bool)> bytes) { bufferBytes_ = std::move(bytes); }
 
 void MemoryLedger::setPageBytes(const std::array<uint64_t, 3> &bytes) noexcept { pageBytes_ = bytes; }
 
@@ -415,10 +415,12 @@ private:
   bool inService_ = false;
 };
 
-uint64_t MemoryLedger::bufferBytes(const Lacking &lack, uint32_t before, uint32_t added) const {
+uint64_t MemoryLedger::bufferBytes(const VictimQuery &query, const Lacking &lack, uint32_t before,
+                                   uint32_t added) const {
   if (!lack.bytes || !added || !bufferBytes_)
     return 0;
-  return less(bufferBytes_(before + added), bufferBytes_(before));
+  const bool afterStart = query.need.afterStart;
+  return less(bufferBytes_(before + added, afterStart), bufferBytes_(before, afterStart));
 }
 
 // The most the order gives a claim, counted without taking: the units
@@ -450,7 +452,7 @@ MemoryLedger::Run MemoryLedger::bound(const ClaimSpec &spec, const VictimQuery &
       continue;
     if (!spec.takesUnits)
       break;
-    run.bytes = plus(run.bytes, plus(victim.bytes, bufferBytes(lack, run.buffers, victim.stateBuffers)));
+    run.bytes = plus(run.bytes, plus(victim.bytes, bufferBytes(query, lack, run.buffers, victim.stateBuffers)));
     if (victim.form == lack.form)
       run.pages += victim.pages;
     run.buffers += victim.stateBuffers;
@@ -521,7 +523,7 @@ MemoryLedger::Run MemoryLedger::take(const ClaimSpec &spec, const VictimQuery &q
       order.pass(*best);
       continue;
     }
-    const uint64_t buffers = bufferBytes(lack, run.buffers, taken.stateBuffers);
+    const uint64_t buffers = bufferBytes(query, lack, run.buffers, taken.stateBuffers);
     if (taken.outcome == FreeOutcome::Pending)
       run.freed.outcome = FreeOutcome::Pending;
     run.freed.nowBytes = plus(run.freed.nowBytes, taken.nowBytes);
@@ -650,7 +652,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
       // the need in place: a need of bytes beside buffers no state can give
       // (Model::statesToActivate with no ring idle) is met by their bytes.
       const bool metInPlace = need.stateBuffers && run->buffers >= need.stateBuffers;
-      if (bufferBytes(lack, 0, run->buffers) && !metInPlace)
+      if (bufferBytes(query, lack, 0, run->buffers) && !metInPlace)
         taken.nowBytes = plus(taken.nowBytes, takeUnsized(query));
       const bool alone = (lackingBytes && run->bytes >= lackingBytes) ||
                          (lackingPages && run->pages >= lackingPages) ||

@@ -737,7 +737,7 @@ void testStateBuffersCountBeyondThoseThePoolKeeps() {
   const Victim state{.stateBuffers = 1};
   placed.units = {{1, state}, {2, state}, {3, unit(0, kGiB)}, {4, unit(0, kGiB)}};
   ledger.addSource(placed);
-  ledger.setBufferBytes([](uint32_t buffers) { return buffers > 1 ? uint64_t{buffers - 1} * kGiB : 0; });
+  ledger.setBufferBytes([](uint32_t buffers, bool) { return buffers > 1 ? uint64_t{buffers - 1} * kGiB : 0; });
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
   const FreeResult freed = ledger.free(claim, {.bytes = 2 * kGiB}, 0, false);
   require(freed.outcome == FreeOutcome::Met && placed.taken == std::vector<uint64_t>{1, 2, 3},
@@ -1050,7 +1050,7 @@ void testStateBuffersMeetANeedOfBytes() {
   ledger.addSource(pool);
   // The first state's buffers release 64 MiB, each after it 32 MiB more:
   // two cover no 100 MiB, three do.
-  ledger.setBufferBytes([](uint32_t states) { return states ? uint64_t{states + 1} * 32 * kMiB : 0; });
+  ledger.setBufferBytes([](uint32_t states, bool) { return states ? uint64_t{states + 1} * 32 * kMiB : 0; });
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
   const FreeResult freed = ledger.free(claim, {.bytes = 100 * kMiB}, 0, false);
   require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 192 * kMiB &&
@@ -2013,7 +2013,7 @@ void testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes() {
   cache.units.push_back({.key = 1, .stateBuffers = 1});
   ledger.addSource(cache);
   ledger.addSource(pool);
-  ledger.setBufferBytes([](uint32_t states) { return uint64_t{states} * 64 * kMiB; });
+  ledger.setBufferBytes([](uint32_t states, bool) { return uint64_t{states} * 64 * kMiB; });
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal, ClaimClass::Start));
   const FreeResult freed = ledger.free(
       claim, {.bytes = 48 * kMiB, .stateBuffers = std::numeric_limits<uint32_t>::max()}, 0, false);

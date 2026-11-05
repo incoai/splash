@@ -16,8 +16,8 @@ public:
   ~Runtime() override;
   void checkHealth() override;
   [[nodiscard]] uint32_t statesToActivate() const noexcept override;
-  [[nodiscard]] uint64_t idleBufferBytes(uint32_t evictedStates) const noexcept override;
-  [[nodiscard]] uint64_t startStateBytes(uint32_t states) const noexcept override;
+  [[nodiscard]] uint64_t idleBufferBytes(uint32_t evictedStates, bool afterStart) const noexcept override;
+  [[nodiscard]] uint64_t startStateBytes() const noexcept override;
   [[nodiscard]] CommandLimits commandLimits() const noexcept override;
   [[nodiscard]] CommandWork prefillWork(std::span<const PrefillLane> lanes, uint32_t first,
                                         uint32_t passesLeft) const override;

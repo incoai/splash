@@ -284,18 +284,13 @@ public:
   // `evictedStates` more cached states have returned their cell and context
   // window to the pool (QwenBufferPool::give), at the layout's sizes, which
   // each allocation covers: a lane keeps two cells, the draft rings and a
-  // window, and cells of no bytes count none.
-  [[nodiscard]] uint64_t idleBytes(uint32_t evictedStates) const noexcept;
-  // What a lane's activation and `states` cached states beside it cost,
-  // against idleBytes, which counts the pool's buffers beyond one lane's as
-  // room: cells and windows whole, since the next evicted states refill what
-  // the start takes from the pool before any of theirs frees memory; draft
-  // rings, which no state returns, nothing when the pool keeps exactly one
-  // lane's ring, else one ring. Exact once the start's claims evict the
-  // states that refill the pool's lane; a start that evicts none from a pool
-  // holding one lane's buffers is charged two cells and a window it does not
-  // allocate.
-  [[nodiscard]] uint64_t startBytes(uint32_t states) const noexcept;
+  // window, and cells of no bytes count none. With `afterStart`, of the pool
+  // a lane's activation and a state reserved beside it leave once they took
+  // their buffers from it first (startBytes).
+  [[nodiscard]] uint64_t idleBytes(uint32_t evictedStates, bool afterStart) const noexcept;
+  // What a lane's activation and a state reserved beside it allocate: their
+  // buffers (kStartBuffers) that the idle pool lacks.
+  [[nodiscard]] uint64_t startBytes() const noexcept;
 
   // Hot-path metadata operations; none performs a buffer copy. A step makes
   // next() current. swapParity: a prefill step's, which read the lane's
@@ -374,21 +369,34 @@ private:
     QwenLaneMetadata metadata;
     Buffers cells;
   };
+  // Counts of the pool's buffers: a lane takes two GDN cells, the draft
+  // rings and a context window, a cached state a cell and a window, and a
+  // lane's start the lane's and those of the state it captures.
+  struct BufferCounts final {
+    uint32_t cells = 0, rings = 0, windows = 0;
+  };
+  static constexpr BufferCounts kLaneBuffers{CompositeStateLayout::kLaneGdnCells, 1, 1};
+  static constexpr BufferCounts kStateBuffers{1, 0, 1};
+  static constexpr BufferCounts kStartBuffers{kLaneBuffers.cells + kStateBuffers.cells,
+                                              kLaneBuffers.rings + kStateBuffers.rings,
+                                              kLaneBuffers.windows + kStateBuffers.windows};
 
   [[nodiscard]] Lane &lane(uint32_t index);
   [[nodiscard]] const Lane &lane(uint32_t index) const;
   static void requireAssigned(const Lane &lane);
   // Assigned, with no decoded rows pending: its current cell holds its state.
   static void requireCommitted(const Lane &lane);
-  // `cells` GDN cells, the draft rings when `rings` and a context window:
-  // the pool's buffers, and one admission for everything the pool lacks and
-  // for the caller's extra. A refusal allocates nothing and takes nothing
-  // from the pool.
+  // A lane's or a cached state's buffers (`counts`): the pool's, and one
+  // admission for everything the pool lacks and for the caller's extra. A
+  // refusal allocates nothing and takes nothing from the pool.
   [[nodiscard]] metal::AllocationResult
-  acquire(uint32_t cells, bool rings, std::string_view label, Buffers &buffers,
-          uint64_t extraBytes = 0, const std::function<void()> &allocateExtra = {});
-  // The bytes of those buffers the pool lacks.
-  [[nodiscard]] uint64_t missingBytes(uint32_t cells, bool rings) const noexcept;
+  acquire(BufferCounts counts, std::string_view label, Buffers &buffers, uint64_t extraBytes = 0,
+          const std::function<void()> &allocateExtra = {});
+  [[nodiscard]] BufferCounts idle() const noexcept;
+  // The buffers of `count` beyond those of `taken`, each kind apart.
+  [[nodiscard]] static BufferCounts beyond(BufferCounts count, BufferCounts taken) noexcept;
+  // Their bytes at the layout's sizes.
+  [[nodiscard]] uint64_t bytes(BufferCounts buffers) const noexcept;
   void restore(uint32_t lane, const QwenCompositeState &state,
                bool restoreDraftState);
   void restoreLengths(uint32_t lane, QwenLogicalLengths lengths, bool restoreDraft);

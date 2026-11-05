@@ -2025,13 +2025,13 @@ void testPlacementCountsWholeExtentsAndTheLanesStates() {
   }
 }
 
-// Placement counts the state buffers a start takes from the pool whole:
-// the states a claim evicts refill them before any of theirs frees memory.
-// Beside three cached conversations' states and a lane's buffers in the
-// pool, a 20-page prompt prefilled a page a command spills in a room short
-// of what its start takes, and runs Resident in that room plus the lane's
-// buffers and a state. Charged only what the pool lacked, it started
-// Resident in the first room and failed at its KV.
+// Placement counts the states a start's claims evict against the pool the
+// start leaves: they refill the lane's buffers it took before any of theirs
+// frees memory. Beside three cached conversations' states and a lane's
+// buffers in the pool, a 20-page prompt prefilled a page a command spills in
+// a room short of what its start takes, and runs Resident in that room plus
+// the lane's buffers and a state. Counted against the pool before the start,
+// it started Resident in the first room and failed at its KV.
 void testPlacementCountsTheLanesBuffersAStartTakesFromThePool() {
   constexpr uint64_t lane = 128, state = 64, shortRoom = 1'100;
   for (const uint64_t room : {shortRoom, shortRoom + lane + state}) {
@@ -2055,6 +2055,44 @@ void testPlacementCountsTheLanesBuffersAStartTakesFromThePool() {
     require(spill.events.failedCount == 0 && spill.events.completedCount == 4, name + " failed");
     require(placed.spill == (room == shortRoom ? 1U : 0U), name + (room == shortRoom ? " started Resident" : " spilled"));
   }
+}
+
+// A conversation's next turn starts from the pool its last turn left, a
+// lane's buffers, and its claims evict no state: placement charges it the
+// state it captures alone, and counts as room only the idle buffers beyond
+// those its start takes. A 20-page next turn prefilled a page a command,
+// beside no idle buffers and beside a second lane's, runs Resident in room
+// for its pages and that state, and spills in room for its pages alone.
+// Charged the lane's buffers whole, it spilled in both rooms; counting the
+// idle buffers its start takes as room, it started Resident in the second.
+void testPlacementCountsANextTurnsStartAtWhatItAllocates() {
+  constexpr uint64_t lane = 128, state = 64;
+  for (const uint64_t idle : {uint64_t{0}, lane})
+    for (const bool fits : {false, true}) {
+      Spilling spill(Spilling::Governed{}, 1024, false, Spilling::Extent{4}, 0,
+                     test::commandShape(KvCache::pageTokens));
+      spill.host.bookStates(spill.model);
+      spill.model.laneFootprintBytes = lane;
+      spill.model.decodeFinishes = true;
+      spill.engine.submit(Spilling::prompt(2, 2, 3, 1));
+      spill.runUntilIdle();
+      require(spill.model.pooledLaneBytes == lane && spill.host.memory.held("states") == lane + state,
+              "the first turn did not leave a lane's buffers and its state");
+      spill.host.memory.hold("states", idle);
+      spill.model.heldStateBytes += idle;
+      spill.model.reclaimableIdleStateBytes = idle;
+      spill.limit(spill.held() + 20 * spill.pool.bytesPerPage() + (fits ? state : 0));
+      spill.engine.submit(Spilling::prompt(1, 2, 20, 1));
+      spill.runUntil([&] { return std::ranges::find(spill.events.startIds, 1) != spill.events.startIds.end(); },
+                     "the next turn did not start");
+      const SpillRequestsSnapshot placed = spill.engine.snapshot().spill;
+      spill.runUntilIdle();
+      const std::string name =
+          std::string(fits ? "the next turn in room for its state" : "the next turn without room for its state") +
+          (idle ? " beside idle buffers" : "");
+      require(spill.events.failedCount == 0 && spill.events.completedCount == 2, name + " failed");
+      require(placed.spill == (fits ? 0U : 1U), name + (fits ? " spilled" : " started Resident"));
+    }
 }
 
 // Placement counts the Resident lanes' projected growth with the prompt's,
@@ -2157,6 +2195,7 @@ std::span<const test::TestCase> spillTests() {
       {"testPlacementCountsWholeExtentsAndTheLanesStates", testPlacementCountsWholeExtentsAndTheLanesStates},
       {"testPlacementCountsTheLanesGrowthInTheSameExtents", testPlacementCountsTheLanesGrowthInTheSameExtents},
       {"testPlacementCountsTheLanesBuffersAStartTakesFromThePool", testPlacementCountsTheLanesBuffersAStartTakesFromThePool},
+      {"testPlacementCountsANextTurnsStartAtWhatItAllocates", testPlacementCountsANextTurnsStartAtWhatItAllocates},
       {"testAClosedTierRefusesAStartPastTheResidentContext", testAClosedTierRefusesAStartPastTheResidentContext},
       {"testAdmissionSpillsWhatMemoryCannotHold", testAdmissionSpillsWhatMemoryCannotHold},
       {"testSpillCommitmentCoversTheChainWithoutCopies", testSpillCommitmentCoversTheChainWithoutCopies},

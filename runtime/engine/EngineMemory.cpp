@@ -85,10 +85,9 @@ KvMode Engine::placement(const Request &active) const {
   // leaves in place. Less the restored chain's pages in memory, which its
   // start takes in place; the claim keeps that chain for the start to reuse.
   // Counted as the claims take it: its and the Resident lanes' KV from the
-  // free pages the walk keeps, then in whole extents, plus the states its
-  // prefill holds (its lane's and the one it captures); by pages alone, a
-  // 125,500-token prompt placed Resident failed short of an extent and two
-  // states.
+  // free pages the walk keeps, then in whole extents, plus what its lane and
+  // the state it captures allocate, with what the claim frees counted
+  // against the pool they leave.
   RestoredChains own;
   uint32_t held = 0;
   if (active.admissionProbe && !active.skipCache) {
@@ -97,7 +96,8 @@ KvMode Engine::placement(const Request &active) const {
   }
   const LaneDemand lanes = laneDemand();
   Need need = cache_.growthNeed(pages - std::min(pages, held) + lanes.residentPages);
-  need.bytes += model_.startStateBytes(1) + lanes.bytes;
+  need.bytes += model_.startStateBytes() + lanes.bytes;
+  need.afterStart = true;
   return governor().available(claimFor(active, ClaimClass::Start), need, &own) >= need.bytes ? KvMode::Resident
                                                                                               : KvMode::Spill;
 }
@@ -852,7 +852,7 @@ std::optional<Victim> Engine::EngineVictims::peek(const VictimQuery &query, cons
   // pool releases short of critical pressure.
   const Engine &engine = engine_;
   if (!after)
-    return Victim{.bytes = engine.model_.idleBufferBytes(0), .sized = false};
+    return Victim{.bytes = engine.model_.idleBufferBytes(0, query.need.afterStart), .sized = false};
   // Then, for work that supersedes it, the command between its passes with
   // none in flight: the buffers its captures hold, counted as bytes for a
   // need of bytes. It costs that work nothing, so it comes before the

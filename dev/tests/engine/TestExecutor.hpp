@@ -648,27 +648,28 @@ public:
   uint32_t statesToActivate() const noexcept override {
     return statesLacked ? statesLacked() : 0;
   }
-  // As the production pool counts its cells and windows: the lane's
-  // footprint and each state's buffers whole, since evicted states refill
-  // the footprint before they free. The fake's footprint has no draft rings,
-  // which no state refills.
-  uint64_t startStateBytes(uint32_t states) const noexcept override {
+  // What a lane's start (takeLaneState) and the state it captures
+  // (takeStateBuffers) allocate. Nothing without `memory`.
+  uint64_t startStateBytes() const noexcept override {
     if (!memory)
       return 0;
-    return laneFootprintBytes + uint64_t{states} * State().bytes();
+    return laneTake().allocated + (stateReused() ? 0 : State().bytes());
   }
   // The production model's pool releases the buffers beyond a lane's
   // (QwenStateStorage::idleBytes); the fake's are those of the states the
   // cache let go of and of `evictedStates` more (none under KeptState), less
-  // what refills a lane's footprint. Nothing without `memory`.
-  uint64_t idleBufferBytes(uint32_t evictedStates) const noexcept override {
+  // what refills a lane's footprint, of the pool a start leaves with
+  // `afterStart`. Nothing without `memory`.
+  uint64_t idleBufferBytes(uint32_t evictedStates, bool afterStart) const noexcept override {
     if (!memory)
       return 0;
+    const LaneTake lane = afterStart ? laneTake() : LaneTake{};
+    const uint64_t pooled = pooledLaneBytes - lane.pooled;
     const uint64_t each = keptTier ? 0 : State().bytes();
-    const uint64_t returned = *evictedStateBytes + uint64_t{evictedStates} * each;
-    const uint64_t refill =
-        std::min(returned, laneFootprintBytes - std::min(laneFootprintBytes, pooledLaneBytes));
-    return reclaimableIdleStateBytes + returned - refill;
+    const uint64_t returned = *evictedStateBytes - (afterStart && stateReused() ? State().bytes() : 0) +
+                              uint64_t{evictedStates} * each;
+    const uint64_t refill = std::min(returned, laneFootprintBytes - std::min(laneFootprintBytes, pooled));
+    return reclaimableIdleStateBytes - lane.idle + returned - refill;
   }
   // A decoding lane's floor of the hot block cache, held until the lane is
   // suspended or ends, or a prefill's staging of the pages it reads; refused
@@ -981,9 +982,10 @@ private:
     return result;
   }
   // One state's buffers: those the cache let go of first, else booked.
+  bool stateReused() const noexcept { return *evictedStateBytes >= State().bytes(); }
   metal::AllocationResult takeStateBuffers() {
     const uint64_t bytes = State().bytes();
-    if (*evictedStateBytes >= bytes) {
+    if (stateReused()) {
       *evictedStateBytes -= bytes;
       return {};
     }
@@ -1012,16 +1014,24 @@ private:
     reclaimableIdleStateBytes += bytes - refill;
   }
   // A lane's state buffers, from the idle pooled ones first, then those a
-  // lane starts from: the cause of a refusal, or None.
+  // lane starts from, and what it allocates.
+  struct LaneTake final {
+    uint64_t idle = 0, pooled = 0, allocated = 0;
+  };
+  LaneTake laneTake() const noexcept {
+    const uint64_t idle = std::min(reclaimableIdleStateBytes, laneFootprintBytes);
+    const uint64_t pooled = std::min(pooledLaneBytes, laneFootprintBytes - idle);
+    return {idle, pooled, laneFootprintBytes - idle - pooled};
+  }
+  // Takes them: the cause of a refusal, or None.
   metal::AllocationFailure takeLaneState() {
     if (!memory || !laneFootprintBytes)
       return metal::AllocationFailure::None;
-    const uint64_t idle = std::min(reclaimableIdleStateBytes, laneFootprintBytes);
-    const uint64_t pooled = std::min(pooledLaneBytes, laneFootprintBytes - idle);
-    if (const metal::AllocationResult result = allocateStates(laneFootprintBytes - idle - pooled); !result)
+    const LaneTake take = laneTake();
+    if (const metal::AllocationResult result = allocateStates(take.allocated); !result)
       return result.failure;
-    reclaimableIdleStateBytes -= idle;
-    pooledLaneBytes -= pooled;
+    reclaimableIdleStateBytes -= take.idle;
+    pooledLaneBytes -= take.pooled;
     return metal::AllocationFailure::None;
   }
   metal::AllocationResult allocateReads(uint64_t id, uint64_t bytes) {
