@@ -14,11 +14,9 @@ from ..tool_schema import TAG_NAME_RULE, is_tag_name
 
 def post_messages(exchange, body, deadline):
     app = exchange.app
-    streamed = request_fields.streaming(body)
-    progress = request_fields.progress_flag(body, streamed)
+    streamed, flags = request_fields.generation(body)
     chat, omitted = to_chat_body(body, thinking_resolver=app.thinking_codec.decode)
-    job = app.prepare(chat, deadline=deadline, output_field="max_tokens")
-    job.flags |= progress
+    job = app.prepare(chat, deadline=deadline, flags=flags, output_field="max_tokens")
     respond = stream if streamed else complete
     return job, partial(respond, exchange, omitted=omitted)
 
@@ -109,7 +107,6 @@ def to_chat_body(body, *, thinking_resolver):
         top_p=body.get("top_p"),
         top_k=body.get("top_k"),
         seed=body.get("seed"),
-        timeout=body.get("timeout"),
         priority=body.get("priority"),
         cache_salt=body.get("cache_salt"),
     )

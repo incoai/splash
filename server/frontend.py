@@ -454,20 +454,23 @@ class Frontend:
             )
         return started_at + min(timeout, self.request_timeout)
 
-    def prepare(self, body, *, deadline, output_field=None):
-        """A Chat request, or a Messages request converted to Chat.
-        Output limit errors name output_field, that API's own field."""
+    def prepare(self, body, *, deadline, flags=wire.RequestFlag(0), output_field=None):
+        """A Chat request, or a Messages request converted to Chat, with the
+        request's own flags (request_fields.generation). Output limit errors
+        name output_field, that API's own field."""
         with self.preparation(deadline) as without_slot:
             return self.chat_job(
                 body,
                 deadline=deadline,
                 without_slot=without_slot,
+                flags=flags,
                 output_field=output_field,
             )
 
-    def prepare_completion(self, body, *, deadline):
-        """A text completion: the prompt generates as given, with no chat
-        template, reasoning split, tools or images."""
+    def prepare_completion(self, body, *, deadline, flags=wire.RequestFlag(0)):
+        """A text completion, with the request's own flags
+        (request_fields.generation): the prompt generates as given, with no
+        chat template, reasoning split, tools or images."""
         with self.preparation(deadline):
             if not self.accepts_model(body.get("model")):
                 raise APIError(
@@ -498,7 +501,9 @@ class Frontend:
                 prompt_tokens,
                 "max_tokens",
             )
-            return self._generation_job(options, prompt_tokens, max_new, deadline)
+            return self._generation_job(
+                options, prompt_tokens, max_new, deadline, flags
+            )
 
     def _completion_prompt(self, prompt):
         """A string encodes as a raw prompt, with the tokenizer's own special
@@ -763,12 +768,20 @@ class Frontend:
         )
 
     def chat_job(
-        self, body, *, deadline, without_slot, output_field=None, tool_namespaces=None
+        self,
+        body,
+        *,
+        deadline,
+        without_slot,
+        flags=wire.RequestFlag(0),
+        output_field=None,
+        tool_namespaces=None,
     ):
         """The generation job of a Chat body, prepared while the caller holds
-        a preparation slot (preparation(), which yields `without_slot`).
-        tool_namespaces names each tool the model sees under another name, as
-        the request names it."""
+        a preparation slot (preparation(), which yields `without_slot`), with
+        the request's own flags (request_fields.generation). tool_namespaces
+        names each tool the model sees under another name, as the request
+        names it."""
         # Fields checked without the prompt fail before it is prepared, which
         # can render documents and build validators.
         options = self._generation_options(body)
@@ -862,6 +875,7 @@ class Frontend:
             prompt_tokens,
             max_new,
             deadline,
+            flags,
             thinking=thinking,
             reasoning=ReasoningRequest(
                 prompt.sent_effort, prompt.reasoning_effort, prompt.enable_thinking
@@ -987,8 +1001,14 @@ class Frontend:
             raise APIError(400, f"{field} must be a positive integer")
         return min(max_new, remaining)
 
-    def _generation_job(self, options, prompt_tokens, max_new, deadline, **fields):
-        """The job for a prepared prompt, with the endpoint's own fields."""
+    def _generation_job(
+        self, options, prompt_tokens, max_new, deadline, flags, **fields
+    ):
+        """The job for a prepared prompt, with the endpoint's own fields: its
+        flags are the request's own (request_fields.generation) and those its
+        generation options set."""
+        if options.ignore_eos:
+            flags |= wire.RequestFlag.IGNORE_END_OF_SEQUENCE
         return Job(
             request_id=next(self.ids),
             prompt_tokens=prompt_tokens,
@@ -999,11 +1019,7 @@ class Frontend:
             priority=options.priority,
             cache_salt=options.cache_salt,
             stop_sequences=options.stop_sequences,
-            flags=(
-                wire.RequestFlag.IGNORE_END_OF_SEQUENCE
-                if options.ignore_eos
-                else wire.RequestFlag(0)
-            ),
+            flags=flags,
             public_id=secrets.token_hex(16),
             **fields,
         )

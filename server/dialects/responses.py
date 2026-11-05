@@ -20,12 +20,14 @@ RESPONSE_PATH = re.compile(r"/v1/responses/(resp_[A-Za-z0-9_]+)")
 
 
 def post(exchange, body, deadline):
-    streamed = request_fields.streaming(body)
-    progress = request_fields.progress_flag(body, streamed)
+    streamed, flags = request_fields.generation(body)
     job = prepare(
-        exchange.app, body, deadline=deadline, reserve_input=exchange.reserve_input
+        exchange.app,
+        body,
+        deadline=deadline,
+        flags=flags,
+        reserve_input=exchange.reserve_input,
     )
-    job.flags |= progress
     respond = stream if streamed else complete
     return job, partial(respond, exchange)
 
@@ -48,10 +50,11 @@ def delete(exchange, response_id):
     )
 
 
-def prepare(app, body, *, deadline, reserve_input):
+def prepare(app, body, *, deadline, reserve_input, flags=wire.RequestFlag(0)):
     """The generation of a Responses request, after the input of the stored
     response it continues. `reserve_input(size)` reserves request body
-    budget for that input."""
+    budget for that input; flags are the request's own
+    (request_fields.generation)."""
     store = body.get("store")
     if store is not None and not isinstance(store, bool):
         raise APIError(400, "store must be a boolean")
@@ -82,6 +85,7 @@ def prepare(app, body, *, deadline, reserve_input):
             chat,
             deadline=deadline,
             without_slot=without_slot,
+            flags=flags,
             output_field="max_output_tokens",
             tool_namespaces=namespaces,
         )
@@ -513,7 +517,6 @@ def to_chat_body(body, items):
         *wire.SAMPLING_FIELDS,
         "logit_bias",
         "seed",
-        "timeout",
         "priority",
         "cache_salt",
         "stop",

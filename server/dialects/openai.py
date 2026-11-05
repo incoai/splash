@@ -25,11 +25,9 @@ def post_chat_count_tokens(exchange, body, deadline):
 def _post(exchange, body, deadline, prepare, *, chat):
     """Prepare a Chat or text completion, and the answer that writes its
     output: whole, or as a stream."""
-    streamed = request_fields.streaming(body)
-    progress = request_fields.progress_flag(body, streamed)
+    streamed, flags = request_fields.generation(body)
     stream_options = _stream_options(body)
-    job = prepare(body, deadline=deadline)
-    job.flags |= progress
+    job = prepare(body, deadline=deadline, flags=flags)
     if streamed:
         return job, partial(stream, exchange, stream_options=stream_options, chat=chat)
     return job, partial(complete, exchange, chat=chat)
