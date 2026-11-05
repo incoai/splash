@@ -144,8 +144,6 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
   spill.groupPages = in.groupPages;
   spill.slotBytes = in.kvSlotBytes;
   spill.laneSlots = shape.laneSlots();
-  spill.laneReadBytes =
-      (spill.laneSlots >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS) * layout.kvBytesPerModelPage();
   spill.hotFloorBytes = spill.hotTargetBytes = spillFloors.hotFloorBytes;
   spill.hotLimitBytes = extentsBytes(
       shape.requiredSlots(model::ExecutionLimits::maximumBatchWidth) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS,

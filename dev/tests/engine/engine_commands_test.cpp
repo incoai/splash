@@ -681,7 +681,7 @@ void testAResidentLaneHoldingSpilledBlocksRunsPrefillGroups() {
   // Resident KV holds 120 pages, and the engine's limit no more: a request
   // whose projection does not fit in the room left starts Spill
   // (Engine::placement).
-  Spilling spill(256, false, 120 * 100, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget),
+  Spilling spill(256, false, 120 * 100, 0, {4}, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget),
                  {.limitBytes = 120 * 100});
   spill.model.time(test::heavyHistoryTarget());
   // Eight pages and 4,096 tokens of output project 136 pages: it spills,
@@ -740,7 +740,7 @@ void testASpilledReadsRefusalFollowsTheRuleForLanesThatEnded() {
   {
     // The engine's limit holds 200 pages of Resident KV: the first request
     // projects 209 and starts Spill (Engine::placement).
-    Spilling spill(1024, false, 200 * 100, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6, true),
+    Spilling spill(1024, false, 200 * 100, 0, {4}, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6, true),
                    {.limitBytes = 200 * 100});
     std::vector<Lanes> prefills;
     setUp(spill, prefills);
@@ -761,7 +761,7 @@ void testASpilledReadsRefusalFollowsTheRuleForLanesThatEnded() {
     require(spill.events.completedCount == 3 && spill.events.failedCount == 0, "the requests did not end");
   }
   {
-    Spilling spill(1024, true, 100'000, 0, Spilling::Extent{64}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6, true));
+    Spilling spill(1024, true, 100'000, 0, Spilling::Extent{64}, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6, true));
     std::vector<Lanes> prefills;
     setUp(spill, prefills);
     const std::vector<uint32_t> earlier(40 * KvCache::pageTokens + 1, 7);
@@ -796,7 +796,7 @@ void testASpilledReadsRefusalFollowsTheRuleForLanesThatEnded() {
 // the prompt's own command gives up anyway, costs its claim nothing, and the
 // buffers of the states it would capture are what the prompt's KV fits in.
 void testASupersedingPromptTakesACommandsMemoryBeforeSpilling() {
-  Spilling spill(64, false, 100'000, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6, true));
+  Spilling spill(64, false, 100'000, 0, {4}, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6, true));
   spill.host.bookStates(spill.model);
   std::vector<std::pair<uint64_t, uint32_t>> prefills;
   spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
@@ -844,7 +844,7 @@ void testASupersedingPromptTakesACommandsMemoryBeforeSpilling() {
 // command, is no part of a start's projection: a turn that would fit beside
 // the lanes that go on starts Resident, not Spill for life.
 void testAnEndedLaneLeavesAStartResident() {
-  Spilling spill(64, false, 3000, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6, true));
+  Spilling spill(64, false, 3000, 0, {4}, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6, true));
   std::vector<std::pair<uint64_t, uint32_t>> prefills;
   spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
     if (plan.kind == WorkKind::Prefill)

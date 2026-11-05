@@ -60,6 +60,8 @@ struct Machine final {
   uint32_t extentPages = 256;
   // A lane's state buffers: lane_state_bytes over the four lanes it plans.
   uint64_t laneStateBytes = 0;
+  // A decoding Spill lane's floor of the hot block cache.
+  uint64_t laneHotFloorBytes = 0;
   Store store;
   engine::SpillGeometry spill;
   // A prefill command's rows, in up to a pass a layer.
@@ -82,6 +84,7 @@ const Machine kStudio18G{
     .pageBytes = 423'936,
     .indexPageBytes = 24'576,
     .laneStateBytes = 276'496'384 / 4,
+    .laneHotFloorBytes = 408'944'640,
     .store = {.unitBytes = 954 * kSlotBytes, .floor = 6, .cap = 7, .whole = 26},
     .spill = {.fullPageBytes = 423'936,
               .indexPageBytes = 24'576,
@@ -89,8 +92,7 @@ const Machine kStudio18G{
               .residentTokens = 147'449,
               .densePages = 64,
               .windowPages = 64,
-              .groupPages = 256,
-              .laneReadBytes = 408'944'640},
+              .groupPages = 256},
     .commandRows = 8192,
 };
 
@@ -175,7 +177,7 @@ struct Serving final {
     model.decodeFinishes = false;
     model.firstTokens = true;
     model.laneFootprintBytes = machine.laneStateBytes;
-    model.spilledReadFloorBytes = machine.spill.laneReadBytes;
+    model.spilledReadFloorBytes = machine.laneHotFloorBytes;
     // The history staging of the floor's 8192 pages, 281,149,440 B.
     model.stagingPageBytes = 281'149'440 / 8192;
     engine::MemoryLedger &ledger = fixture.governor->ledger();

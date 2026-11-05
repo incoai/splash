@@ -127,8 +127,6 @@ struct KvSpillPlan final {
   uint32_t groupPages = 0;
   uint64_t slotBytes = 0;
   uint64_t laneSlots = 0;
-  // The hot block cache one more lane decoding over Index pages adds.
-  uint64_t laneReadBytes = 0;
   uint64_t hotFloorBytes = 0;
   uint64_t hotTargetBytes = 0;
   // The most the hot cache holds: its target, or the floor of every lane
@@ -144,7 +142,7 @@ struct KvSpillPlan final {
   // What the plan sets aside for one Spill request's readers: the larger of
   // the hot cache's target and the history staging. Not the most they hold:
   // once their floors pass its target, each further lane decoding over Index
-  // pages adds laneReadBytes up to hotLimitBytes, and a prompt's staging may
+  // pages adds a lane's floor up to hotLimitBytes, and a prompt's staging may
   // sit beside other lanes' floors; KV's memory pays for both as they grow.
   [[nodiscard]] uint64_t readerBytes() const noexcept { return std::max(hotTargetBytes, stagingBytes); }
   // The longest context spilling serves: what memory holds beside the
@@ -328,9 +326,6 @@ struct SpillGeometry final {
   uint32_t densePages = 0;
   uint32_t windowPages = 0;
   uint32_t groupPages = 0;
-  // What the readers of a Spill request's spilled KV add once it decodes:
-  // one lane's more of the hot block cache (KvSpillPlan::laneReadBytes).
-  uint64_t laneReadBytes = 0;
 
   // A Resident request's KV at `tokens` tokens: its pages, Full.
   [[nodiscard]] uint64_t residentBytes(uint64_t tokens) const noexcept { return pages(tokens) * fullPageBytes; }

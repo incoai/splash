@@ -72,7 +72,7 @@ void testAClosedTierRefusesAStartPastTheResidentContext() {
 // the lanes' growth, even past the resident context, Spill where it does not; dense history never spills.
 void testAdmissionSpillsWhatMemoryCannotHold() {
   // Memory holds 200 pages, the resident context 100.
-  Spilling spill(1024, false, 100 * 100, 0, {4}, 0, {}, {.limitBytes = 200 * 100});
+  Spilling spill(1024, false, 100 * 100, 0, {4}, {}, {.limitBytes = 200 * 100});
   // Eight pages of prompt and 32K tokens of output: the output is clipped at
   // 4,096 tokens, so it projects 137 pages, which memory holds.
   spill.engine.submit(Spilling::prompt(1, 1, 8, 32'768));
@@ -160,7 +160,7 @@ void testConversionCommitsTheHistoryWithoutCopies() {
 // whole output rather than ending at the wall.
 void testConversionSpillsAHistoryWithCopies() {
   // The room beside the lanes holds 20 pages, as does the resident context.
-  Spilling spill(400, false, 2'000, 0, {4}, 0, {}, {.limitBytes = 2'000});
+  Spilling spill(400, false, 2'000, 0, {4}, {}, {.limitBytes = 2'000});
   // Ten pages and 4,096 tokens of output do not fit: the first turn spills,
   // its pages written through, and is cancelled while it decodes.
   spill.engine.submit(Spilling::prompt(1, 1, 10, 4'096));
@@ -267,7 +267,7 @@ void testAConvertedLanesMovesReleaseTheExtentsTheyEmpty() {
 // block floor, and a dense history and tail window of a page each.
 struct FlashNextLanes {
   static constexpr Spilling::Pages kPages{.count = 8192, .fullBytes = 423'936, .indexBytes = 24'576};
-  Spilling spill{16'384, false, 0, 200'000, Spilling::Extent{256}, 0, {}, {}, false, kPages};
+  Spilling spill{16'384, false, 0, 200'000, Spilling::Extent{256}, {}, {}, false, kPages};
   FlashNextLanes() { spill.model.spilledReadFloorBytes = 390ULL << 20; }
   // No Full extent more: the bytes held, in whole Full pages.
   void wall() { spill.storage.budgetPages = static_cast<uint32_t>(spill.storage.allocatedBytes() / kPages.fullBytes); }
@@ -315,7 +315,7 @@ void testALaneConvertsOnlyWithAnIndexRunway() {
 
 // A growth only the host refuses never converts: the host exemption grows the lane Resident.
 void testAGrowthTheHostRefusesDoesNotConvert() {
-  Spilling spill{16'384, false, 0, 200'000, Spilling::Extent{256}, 0, {}, {}, true, FlashNextLanes::kPages};
+  Spilling spill{16'384, false, 0, 200'000, Spilling::Extent{256}, {}, {}, true, FlashNextLanes::kPages};
   spill.model.spilledReadFloorBytes = 390ULL << 20;
   spill.engine.submit(Spilling::prompt(1, 1, 2'046, 200));
   spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the lane did not decode");
@@ -467,7 +467,7 @@ void testALanesGrowthConvertsNoOtherLane() {
 // A lane whose spill would free about 101 MiB past the hot block floor, short of the 103.5 MiB extent
 // its growth lacks, does not convert; a store unit meets the extent and it decodes Resident.
 void testALaneFreeingLessThanItsNeedDoesNotConvert() {
-  Spilling spill{16'384, false, 0, 200'000, Spilling::Extent{256}, 0, {}, {}, true, FlashNextLanes::kPages};
+  Spilling spill{16'384, false, 0, 200'000, Spilling::Extent{256}, {}, {}, true, FlashNextLanes::kPages};
   spill.model.spilledReadFloorBytes = 390ULL << 20;
   test::FakeElasticPool experts("experts", spill.host.memory, 128ULL << 20, 0, 1, 1, 1);
   static_cast<void>(spill.host.governor.ledger().addPool(experts));
@@ -600,7 +600,7 @@ void testShortQuotaBoundsWaitsOrRefusesASpillStart() {
 void testAStartThatCannotSpillStartsResidentWithinTheResidentContext() {
   for (const bool closed : {true, false}) {
     // The room beside the lanes holds 20 pages, so placement spills; the resident context is 50.
-    Spilling spill(8, false, 0, 50 * KvCache::pageTokens, {4}, 0, {}, {.limitBytes = 20 * 100});
+    Spilling spill(8, false, 0, 50 * KvCache::pageTokens, {4}, {}, {.limitBytes = 20 * 100});
     spill.tier.writableFile = !closed;
     // 40 pages of prompt and 64 tokens of output project 43 pages; the 8
     // slots of the quota cannot hold them.
@@ -645,8 +645,7 @@ void testWriteBudgetRefusalSaysWhenToRetry() {
 // A Spill prompt whose history holds Index pages runs as prefill groups; a Resident one as chunks.
 void testPrefillGroupsFollowIndexPages() {
   for (const bool spills : {false, true}) {
-    Spilling spill(256, spills, 100'000, 0, {4}, 0,
-                   test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget));
+    Spilling spill(256, spills, 100'000, 0, {4}, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget));
     spill.model.time(test::heavyHistoryTarget());
     // 128 pages and a token: three chunks, or fewer commands with groups.
     spill.engine.submit(Spilling::prompt(1, 1, 128, 1));
@@ -663,7 +662,7 @@ void testPrefillGroupsFollowIndexPages() {
 // nothing, and the blocks its first chunk computes take the Spill request's Index pages
 // (KvCache::insert).
 void testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups() {
-  Spilling spill(1024, true, 100'000, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget));
+  Spilling spill(1024, true, 100'000, 0, {4}, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget));
   spill.model.time(test::heavyHistoryTarget());
   // Eight pages, four more of its own and a token: its pages but its dense
   // and window pages spill.
@@ -895,7 +894,7 @@ void testSpillResumeBoundLeavesOutputPastItsAnchor() {
 // A Spill request suspended in its prompt holds no anchor: a quota of its prompt's pages bounds it
 // to the one token its prompt's last step selects.
 void testSpillResumeInItsPromptHoldsNoAnchor() {
-  Spilling spill(20, true, 100'000, 0, {4}, 0, test::commandShape(KvCache::pageTokens));
+  Spilling spill(20, true, 100'000, 0, {4}, test::commandShape(KvCache::pageTokens));
   // No copies: the request holds its whole history without any.
   spill.allowSpillWrites(false);
   // 95 tokens of prompt end a token short of the third page, and each
@@ -1160,7 +1159,7 @@ void testAWaitingFloorKeepsTheMemoryOnItsWayBack() {
     // Extents of 16 pages. Every state goes straight to the SSD. The quota
     // holds the Spill lane's commitment but not the prompt's, which stays
     // Resident.
-    Spilling spill(Spilling::Governed{}, 128, true, Spilling::Extent{16}, 0,
+    Spilling spill(Spilling::Governed{}, 128, true, Spilling::Extent{16},
                    test::commandShape(model::ExecutionLimits::prefillTokenBudget, passes, passes > 1));
     spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
     spill.model.stateTier = std::make_shared<OffloadControl>();
@@ -1361,7 +1360,7 @@ void testAWaitingStartHoldsNoLane() {
 // A lane held for a waiting floor ends its command at the state boundary its pages reach, taking
 // no page past its capacity.
 void testAHeldLaneEndsItsCommandAtItsCapacity() {
-  Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{16}, 0, test::commandShape(498));
+  Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{16}, test::commandShape(498));
   spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
   spill.model.stateTier = std::make_shared<OffloadControl>();
   spill.model.stateTier->ready = true;
@@ -1434,7 +1433,7 @@ void testAHeldLaneEndsItsCommandAtItsCapacity() {
 // command's lane is cancelled between them.
 void testAJoinerHeldBackLeavesACommandItsPasses() {
   for (const bool cancelled : {false, true}) {
-    Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{16}, 0,
+    Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{16},
                    test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 4, true));
     spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
     spill.model.stateTier = std::make_shared<OffloadControl>();
@@ -1891,8 +1890,7 @@ void testFailedRestoreReturnsTheCommitment() {
 // yields or ends, and the lane's next page comes from the prompt's cached pages: it runs to its end.
 void testALaneTakesCachedPagesInPlace() {
   for (const uint64_t room : {0, 50, 100}) {
-    Spilling spill(Spilling::Governed{}, 1024, false, Spilling::Extent{4}, 0,
-                   test::commandShape(KvCache::pageTokens));
+    Spilling spill(Spilling::Governed{}, 1024, false, Spilling::Extent{4}, test::commandShape(KvCache::pageTokens));
     spill.limit(spill.held() + 1'100);
     EngineRequest lane = Spilling::prompt(2, 2, 12, 200);
     lane.deadlineMilliseconds = 1e9;
@@ -1979,7 +1977,7 @@ void testARestoreOfTwoFormsKeepsTheFreePagesItTakes() {
 // A Spill prompt preempted past its first checkpoint resumes from its durable prefix, never from 0,
 // though its copies land a tick late.
 void testPreemptedSpillPrefillResumesFromItsDurablePrefix() {
-  Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{4}, 0, test::commandShape(KvCache::pageTokens));
+  Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{4}, test::commandShape(KvCache::pageTokens));
   spill.model.memory = &spill.host.memory;
   spill.model.admission = spill.host.governor.allocationAdmission();
   // Each lane's state takes buffers of its own from the governor.
@@ -2136,7 +2134,7 @@ void testPlacementCountsWholeExtentsAndTheLanesStates() {
   };
   // 15 whole extents beside the states; 15.25 extents of pages without them; 14 and the states.
   for (const Case &each : {Case{3'839, laneStates, true}, Case{3'903, 0, true}, Case{3'583, laneStates, false}}) {
-    Spilling spill{16'384, false, 0, 200'000, Spilling::Extent{256}, 0, {}, {.limitBytes = 4ULL << 30}, true,
+    Spilling spill{16'384, false, 0, 200'000, Spilling::Extent{256}, {}, {.limitBytes = 4ULL << 30}, true,
                    FlashNextLanes::kPages};
     spill.model.laneFootprintBytes = each.states;
     spill.host.memory.hold("limit", (4ULL << 30) - spill.held() - 31 * extent / 2);
@@ -2164,7 +2162,7 @@ void testPlacementCountsWholeExtentsAndTheLanesStates() {
 void testPlacementCountsTheLanesBuffersAStartTakesFromThePool() {
   constexpr uint64_t lane = 128, state = 64, shortRoom = 1'100;
   for (const uint64_t room : {shortRoom, shortRoom + lane + state}) {
-    Spilling spill(Spilling::Governed{}, 1024, false, Spilling::Extent{4}, 0, test::commandShape(KvCache::pageTokens));
+    Spilling spill(Spilling::Governed{}, 1024, false, Spilling::Extent{4}, test::commandShape(KvCache::pageTokens));
     spill.model.laneFootprintBytes = lane;
     spill.model.decodeFinishes = true;
     for (uint32_t each = 2; each < 5; ++each) {
@@ -2197,8 +2195,7 @@ void testPlacementCountsANextTurnsStartAtWhatItAllocates() {
   constexpr uint64_t lane = 128, state = 64;
   for (const uint64_t idle : {uint64_t{0}, lane})
     for (const bool fits : {false, true}) {
-      Spilling spill(Spilling::Governed{}, 1024, false, Spilling::Extent{4}, 0,
-                     test::commandShape(KvCache::pageTokens));
+      Spilling spill(Spilling::Governed{}, 1024, false, Spilling::Extent{4}, test::commandShape(KvCache::pageTokens));
       spill.model.laneFootprintBytes = lane;
       spill.model.decodeFinishes = true;
       spill.engine.submit(Spilling::prompt(2, 2, 3, 1));
@@ -2263,7 +2260,7 @@ void testPlacementCountsTheLanesGrowthInTheSameExtents() {
 // no room: a cached follow-up starts Resident, uncached or past the room it spills.
 void testPlacementCountsTheChainItRestoresInMemory() {
   for (const bool cached : {true, false}) {
-    Spilling spill(1024, false, 60 * 100, 0, {4}, 0, {}, {.limitBytes = Spilling::kGovernedLimitBytes}, true);
+    Spilling spill(1024, false, 60 * 100, 0, {4}, {}, {.limitBytes = Spilling::kGovernedLimitBytes}, true);
     if (cached) {
       spill.engine.submit(Spilling::prompt(1, 1, 32, 1));
       spill.runUntilIdle();
@@ -2283,7 +2280,7 @@ void testPlacementCountsTheChainItRestoresInMemory() {
     spill.runUntilIdle();
   }
   {
-    Spilling spill(1024, false, 60 * 100, 0, {4}, 0, {}, {.limitBytes = Spilling::kGovernedLimitBytes}, true);
+    Spilling spill(1024, false, 60 * 100, 0, {4}, {}, {.limitBytes = Spilling::kGovernedLimitBytes}, true);
     auto states = std::make_shared<OffloadControl>();
     states->ready = true;
     spill.model.offloadTier = states;

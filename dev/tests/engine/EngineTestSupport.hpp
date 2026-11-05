@@ -203,9 +203,8 @@ struct Spilling {
   // `shape` sets what one of the model's prefill commands may hold
   // (Executor::groupRows, passes), which the engine takes as it is built.
   explicit Spilling(uint32_t slots, bool always = true, uint64_t residentKvBytes = 100'000,
-                    uint32_t residentTokens = 0, Extent extent = {4}, uint64_t laneReadBytes = 0,
-                    const std::function<void(Executor &)> &shape = {}, const GovernorLimits &limits = {},
-                    bool governed = false, Pages pages = {})
+                    uint32_t residentTokens = 0, Extent extent = {4}, const std::function<void(Executor &)> &shape = {},
+                    const GovernorLimits &limits = {}, bool governed = false, Pages pages = {})
       : storage(pages.count, pages.fullBytes, extent.pages, pages.indexBytes),
         budget(std::make_shared<model::DiskBudget>(uint64_t{slots} * 100, [this] { return now; })),
         cache(pool, &tier, budget, engine::CacheSpillPolicy{1, 1}),
@@ -214,7 +213,7 @@ struct Spilling {
                 config(always,
                        residentTokens ? residentTokens
                                       : static_cast<uint32_t>(residentKvBytes / 100 * engine::KvCache::pageTokens),
-                       host, laneReadBytes, pages)),
+                       host, pages)),
                cache, model, events) {
     tier.budget = budget;
     tier.transferLimit = 1024;
@@ -233,13 +232,12 @@ struct Spilling {
   }
 
   // A governed fixture, its governor's limit kGovernedLimitBytes.
-  explicit Spilling(Governed, uint32_t slots, bool always = true, Extent extent = {4}, uint64_t laneReadBytes = 0,
+  explicit Spilling(Governed, uint32_t slots, bool always = true, Extent extent = {4},
                     const std::function<void(Executor &)> &shape = {})
-      : Spilling(slots, always, 100'000, 0, extent, laneReadBytes, shape, {.limitBytes = kGovernedLimitBytes}, true) {}
+      : Spilling(slots, always, 100'000, 0, extent, shape, {.limitBytes = kGovernedLimitBytes}, true) {}
   static constexpr uint64_t kGovernedLimitBytes = 1ULL << 20;
 
-  static engine::EngineConfig config(bool always, uint32_t residentTokens,
-                                     GovernedHost &host, uint64_t laneReadBytes, Pages pages = {}) {
+  static engine::EngineConfig config(bool always, uint32_t residentTokens, GovernedHost &host, Pages pages = {}) {
     engine::EngineConfig result = host.connect({});
     result.spill = {.capable = true,
                     .always = always,
@@ -250,8 +248,7 @@ struct Spilling {
                                  .residentTokens = residentTokens,
                                  .densePages = 1,
                                  .windowPages = 1,
-                                 .groupPages = 4,
-                                 .laneReadBytes = laneReadBytes}};
+                                 .groupPages = 4}};
     return result;
   }
   // A request whose prompt is `pages` whole pages of `token` and one token

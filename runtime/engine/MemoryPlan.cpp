@@ -332,8 +332,7 @@ SpillGeometry EngineMemoryPlan::spillGeometry() const noexcept {
           .residentTokens = breakdown_.contextBounds.resident,
           .densePages = spill.densePages,
           .windowPages = spill.windowPages,
-          .groupPages = spill.groupPages,
-          .laneReadBytes = spill.laneReadBytes};
+          .groupPages = spill.groupPages};
 }
 
 std::string EngineMemoryPlan::toStatusJson() const {
