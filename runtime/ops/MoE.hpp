@@ -375,6 +375,29 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
 }
 
 // The device's policy for a MoE plan, which the execution plans derive.
+// Int8 activations of decode plans' staged expert passes, off by default; with splash serve --moe-int8
+// ExecutionPlans::moeConfig gives decode plans moeInt8Decode().
+struct MoeInt8 final {
+  // 1: the gather also writes each grouped row as int8 with an fp32 scale (the A8 pre-pass);
+  // 2, the bf16 passes run on activations rounded as the int8 passes round them (bf16(s q); the int8 tests'
+  // reference).
+  uint8_t activations = 0;
+  // The GGUF_FMT_* bit mask of the expert formats on the W-A8 tile (needs activations 1).
+  uint32_t formats = 0;
+  // Power-of-two scales (the int8 tests, which set every field themselves).
+  bool pow2 = false;
+  bool operator==(const MoeInt8 &) const = default;
+};
+// The int8 activations --moe-int8 gives decode plans: the A8 pre-pass and every format the W-A8 tile takes, and
+// those formats.
+MoeInt8 moeInt8Decode() noexcept;
+uint32_t moeInt8Formats() noexcept;
+// Where a decode plan's int8 rows live in its groupedSums (metal/abi/MoE.h MoeInt8Params), for `groupedRows`.
+struct MoeInt8Layout final {
+  uint64_t x8 = 0, xScales = 0, d8 = 0, dScales = 0, bytes = 0;
+};
+MoeInt8Layout moeInt8Layout(MoeShape shape, uint64_t groupedRows) noexcept;
+
 struct MoeConfig final {
   // M8 for decode plans; a prefill plan takes moeGgufPrefillTile's.
   MoeExpertTile expertTile = MoeExpertTile::M8;
@@ -384,6 +407,8 @@ struct MoeConfig final {
   // The router's float tile; the execution plans derive it from the device,
   // the plan's rows and the router's format (Linear::ggufFloatTile).
   FloatTile ggufRouterTile = FloatTile::Simdgroup;
+  // Int8 activations (MoeInt8), off by default; decode plans only.
+  MoeInt8 int8 = {};
   bool operator==(const MoeConfig &) const = default;
 };
 
@@ -398,6 +423,11 @@ public:
     return static_cast<uint32_t>(config_.expertTile);
   }
   [[nodiscard]] uint32_t maximumTiles() const noexcept { return maximumTiles_; }
+  // Whether the passes take int8 activations (MoeInt8): a decode plan of staged 8-row tiles with a switch on.
+  [[nodiscard]] bool int8() const noexcept {
+    return phase_ == MoePhase::Decode && config_.ggufTile == MoeGgufTile::Staged &&
+           config_.expertTile == MoeExpertTile::M8 && (config_.int8.activations || config_.int8.formats);
+  }
   [[nodiscard]] const MoeWorkspace &workspace() const noexcept {
     return workspace_;
   }

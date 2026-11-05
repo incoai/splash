@@ -160,6 +160,60 @@ struct MoeGgufGateUpParams {
 static_assert(sizeof(MoeGgufGateUpParams) == 36,
               "MoE GGUF gate/up parameters are 36 bytes on both sides");
 
+// Int8 activations of the staged decode expert passes (ops::MoeInt8; splash serve --moe-int8, off by default).
+// The int8 rows live in the scratch's groupedSums (unused by staged plans) at these byte offsets: the gate/up input's
+// int8 rows (grouped row order, K = hidden) and one fp32 scale per grouped row, which the gather writes
+// (moe_gather_rows_a8); the down input's int8 rows (K = intermediate) and one fp32 scale per grouped row and 32
+// columns, which the up epilogue writes (MOE_A8_DOWN). `formats` is the GGUF_FMT_* bit mask the W-A8 tile takes.
+#define MOE_A8_POW2 1u      // power-of-two scales: s * q exact in bf16 (the int8 tests)
+#define MOE_A8_DOWN 4u      // the up epilogue writes the down input's int8 rows
+struct MoeInt8Params {
+  uint32_t formats;
+  uint32_t mode;
+  uint32_t x8;
+  uint32_t x_scales;
+  uint32_t d8;
+  uint32_t d_scales;
+};
+
+static_assert(sizeof(MoeInt8Params) == 24, "MoE int8 parameters are 24 bytes on both sides");
+
+struct MoeGgufI8GateUpParams {
+  struct MoeGgufGateUpParams g;
+  struct MoeInt8Params a;
+};
+
+static_assert(sizeof(MoeGgufI8GateUpParams) == 60, "MoE int8 gate/up parameters are 60 bytes on both sides");
+
+struct MoeGgufI8ExpertParams {
+  struct MoeGgufExpertParams e;
+  struct MoeInt8Params a;
+};
+
+static_assert(sizeof(MoeGgufI8ExpertParams) == 56, "MoE int8 expert parameters are 56 bytes on both sides");
+
+// The gather's int8 rows (moe_gather_rows_a8) and the bf16 passes' fake quantization (moe_a8_fake: rows of `width`
+// in blocks of `block`, the int8 rounding written back as bf16(s q); the reference of the int8 tests).
+struct MoeGatherA8Params {
+  uint32_t tile_rows;
+  uint32_t input_size;
+  uint32_t routes_per_row;
+  uint32_t mode;
+  uint32_t x8;
+  uint32_t x_scales;
+};
+
+static_assert(sizeof(MoeGatherA8Params) == 24, "MoE int8 gather parameters are 24 bytes on both sides");
+
+struct MoeA8FakeParams {
+  uint32_t tile_rows;
+  uint32_t width;
+  uint32_t block;
+  uint32_t mode;
+};
+
+static_assert(sizeof(MoeA8FakeParams) == 16, "MoE fake quantization parameters are 16 bytes on both sides");
+
 // One projection (gate, up or down) of the experts a load writes into their
 // slots (moe_expert_load, model/ExpertStore.cpp): rows x columns in `format`,
 // job j's native rows of row_bytes each staged from wherever the job's source

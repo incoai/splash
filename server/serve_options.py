@@ -715,6 +715,16 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--moe-int8",
+        "requests",
+        dict(
+            action="store_true",
+            default=False,
+            help="decode a MoE target's GGUF experts in int8 activations on the "
+            "staged tile (experimental; outputs differ slightly; default: bf16)",
+        ),
+    ),
+    ServeOption(
         "--allow-idle-sleep",
         "requests",
         dict(
