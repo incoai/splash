@@ -223,8 +223,9 @@ public:
   // What leaves a resident page in place when a reclaim takes all it may
   // (Cache::reach): its block, or a block below it, has a reason the
   // reclaim's walk names, and a page stays while one below it does. Busy:
-  // the block is used or moves, a request holds its page, or it is a
-  // poisoned leaf, which no reclaim reaches. Uncopied: it has no copy and a
+  // the block is used, a request holds its page, a restore fills it, or it
+  // is a poisoned leaf, which no reclaim reaches. Moving: a write drains its
+  // page, which a reclaim reaches once the write lands. Uncopied: it has no copy and a
   // state that needs its KV sits at it or below (setStateKeeps), which a
   // writable tier writes before the page goes. Writer, UsedWriter: the
   // state at it is a RAM copy a reclaim may take that has no disk copy,
@@ -235,8 +236,8 @@ public:
   // resume point (moveResumePoint). A request that holds a page holds every
   // page above it, so the chains of Used, Wanted and ResumePoint count no
   // page from one a request holds up.
-  enum class Keep : uint8_t { Busy, Uncopied, Writer, UsedWriter, Used, Wanted, ResumePoint };
-  static constexpr size_t kKeeps = 7;
+  enum class Keep : uint8_t { Busy, Moving, Uncopied, Writer, UsedWriter, Used, Wanted, ResumePoint };
+  static constexpr size_t kKeeps = 8;
   // A set of Keep reasons.
   using Keeps = uint8_t;
   [[nodiscard]] static constexpr Keeps keepBit(Keep keep) noexcept {
@@ -250,8 +251,9 @@ public:
   // the KV it restores through: Writer or UsedWriter, Used, or none; and
   // whether it needs the KV as it is: every state but a RAM copy a reclaim
   // may take without a disk copy, which leaves through a write (that makes
-  // its chain needed) or with no copy. Without a state, none.
-  void setStateKeeps(uint64_t blockId, Keeps keeps, bool needed) noexcept;
+  // its chain needed) or with no copy; and whether it is a RAM copy a
+  // reclaim may take (StateCache::candidate). Without a state, none.
+  void setStateKeeps(uint64_t blockId, Keeps keeps, bool needed, bool candidate) noexcept;
   // Cache names, as they change, the chains requests waiting to start
   // restore, each by its last block: one more or one less ends at the block.
   void countWanted(uint64_t blockId, bool added) noexcept;
@@ -262,19 +264,25 @@ public:
   // reasons at their block or below it (now); those that free too once the
   // state at `written` (a Writer or UsedWriter; 0 for none) has left RAM
   // through its write and needs its chain as a state on disk does
-  // (written); and the pages no request holds and no transfer moves on the
-  // chains the walk keeps: those of the chain reasons `mask` names
-  // (kChainKeeps) and of the states `kept`, each block and the blocks above
-  // it, up to a page a request holds (kept). The chains of `kept` free
-  // neither now nor once written. The cache keeps the counts by reason as
-  // blocks, states and transfers change, so a reach costs the chains of
-  // `kept` and of `written` alone, not the cache.
+  // (written). The chains of the states `kept`, each block and the blocks
+  // above it, free neither now nor once written. Every page a reclaim of
+  // the walk reaches at all, now or once the writes land (reachable): no
+  // Busy at it or below it, nor for an idle page (no write drains it) a
+  // chain reason `mask` names or a chain of `kept`, since a page a write
+  // drains frees as it lands, kept or not; and none above a write in
+  // `unwaited`, which no reclaim waits for.
+  // The RAM copies a reclaim may take at the blocks that free now
+  // (candidates). The cache keeps the counts by reason as blocks, states
+  // and transfers change, so a reach costs the chains of `kept`, `unwaited`
+  // and `written` alone, not the cache.
   struct PageReach final {
     std::array<uint32_t, 3> now{};
     std::array<uint32_t, 3> written{};
-    std::array<uint32_t, 3> kept{};
+    std::array<uint32_t, 3> reachable{};
+    uint32_t candidates = 0;
   };
-  [[nodiscard]] PageReach pageReach(Keeps mask, std::span<const uint64_t> kept, uint64_t written) const;
+  [[nodiscard]] PageReach pageReach(Keeps mask, std::span<const uint64_t> kept, std::span<const uint64_t> unwaited,
+                                    uint64_t written) const;
   // The pages of each form no request holds and no transfer moves on the
   // chains of the reasons `chains` names (kChainKeeps).
   [[nodiscard]] std::array<uint32_t, 3> keptPages(Keeps chains) const;
@@ -359,6 +367,7 @@ public:
   struct Marks final {
     Keeps stateKeeps = 0;
     bool stateNeeded = false;
+    bool stateCandidate = false;
     uint32_t wanted = 0;
     bool resumePoint = false;
     friend bool operator==(const Marks &, const Marks &) = default;
@@ -435,6 +444,7 @@ private:
     // moves it): `counted` names where, noCount for none.
     Keeps stateKeeps = 0;
     bool stateNeeded = false;
+    bool stateCandidate = false;
     uint32_t wanted = 0;
     bool resumePoint = false;
     Keeps keepsHere = 0;
@@ -443,6 +453,9 @@ private:
     uint32_t neededChildren = 0;
     std::array<uint32_t, kKeeps> keepChildren{};
     uint16_t counted = noCount;
+    // With a RAM copy a reclaim may take, the reasons it counts under in
+    // candidateCounts_; noCount for none.
+    uint16_t candidateCounted = noCount;
   };
   // keepCounts_'s index of a resident block's form, reasons and idleness.
   [[nodiscard]] static constexpr uint16_t keepCount(kv::PageForm form, Keeps keeps, bool idle) noexcept {
@@ -522,6 +535,8 @@ private:
   uint32_t pinnedBlocks_ = 0;
   // The resident blocks by form, reasons (Keep) and idleness (keepCount).
   std::array<uint32_t, size_t{3} << (kKeeps + 1)> keepCounts_{};
+  // The blocks with a RAM copy a reclaim may take, by their reasons.
+  std::array<uint32_t, size_t{1} << kKeeps> candidateCounts_{};
   mutable uint64_t reachVisits_ = 0;
 };
 

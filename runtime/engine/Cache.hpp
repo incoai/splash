@@ -965,6 +965,9 @@ private:
     bool keepRunway = false;
     bool keepIndexRunway = false;
     bool device = false;
+    // A device need that lacks pages too: its reclaims take KV for those
+    // pages in place as well as for whole extents (Cache::formsInReach).
+    bool inPlace = false;
     bool statesAreUnits = false;
     uint32_t pages = 0;
     kv::PageForm form = kv::PageForm::Full;
@@ -1393,16 +1396,16 @@ private:
   // their count, which costs the requests' windows rather than the cache.
   [[nodiscard]] std::vector<uint32_t> trimmablePages(size_t most) const;
   [[nodiscard]] uint32_t trimmableCount() const;
-  // The free Slim pages trims take without an allocation, but those of the
-  // empty Slim extents past the runway, which a page need's walk releases
-  // first (its Extent unit).
-  [[nodiscard]] uint32_t trimRoom() const;
+  // The Full pages trimWindows(false) moves to the Slim form as many free
+  // Slim pages allow: those every window has passed (trimmableCount) and
+  // the pages requests keep beside their blocks that it has passed, each
+  // once.
+  [[nodiscard]] uint32_t passedPages() const;
   // A page need of Full pages in a windowed cache that trims: trims free
   // pages in place for it, the passed pages first (its Trim unit, peek: as
-  // many as trimRoom takes, since no take allocates, a ledger take running
-  // outside any allocation's scope, and the Extent unit before it may
-  // release Slim pages), then the tail a state that leaves the cache
-  // unpins (reach).
+  // many as the free Slim pages take, since no take allocates, a ledger take
+  // running outside any allocation's scope), then, after a state that goes,
+  // the passed pages and the tail it unpins (reach).
   [[nodiscard]] bool trims(const Walk &walk) const noexcept;
 
   KvPool &pool_;

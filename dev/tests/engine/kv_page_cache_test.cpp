@@ -406,11 +406,14 @@ struct FakeSlot final : engine::KvDiskSlot {};
 
 // On random trees, as blocks, states, holders, transfers, waiting chains and the resume point change, the counts the
 // cache keeps give what its rule names (pageReach): for a walk's reasons `mask`, a resident block frees now unless
-// one of the reasons sits at it or below it (it or a resident block below is used, has a page a request holds or
-// moves, or lacks a copy below a state that needs its KV; a state, a waiting chain's end or the resume point below
-// it has a reason `mask` names), or it is on the chain of a `kept` state; the written state's chain frees once that
-// state has left RAM and needs its KV; and the kept chains' pages no request holds and no transfer moves, up to a
-// page a request holds. Every step checks the counts against a recount (checkInvariants).
+// one of the reasons sits at it or below it (it or a resident block below is used, has a page a request holds, a
+// restore fills or a write drains, or lacks a copy below a state that needs its KV; a state, a waiting chain's end
+// or the resume point below it has a reason `mask` names), or it is on the chain of a `kept` state or above a write
+// no reclaim waits for (`unwaited`); the written state's chain frees once that state has left RAM and needs its KV;
+// a block is reachable at all unless it or one below is used, held or filled, it is above a write no reclaim waits
+// for, or, idle, it has a chain reason `mask` names at it or below or is on a kept chain; and the RAM copies a
+// reclaim may take count at the blocks that free now. Every step checks the counts against a recount
+// (checkInvariants).
 void testPageReachFollowsItsRule() {
   using Keep = KvCache::Keep;
   constexpr uint32_t count = 48;
@@ -424,11 +427,12 @@ void testPageReachFollowsItsRule() {
     bool live = false;
     bool used = false;    // retainActive
     bool held = false;    // a request holds its page
-    bool moving = false;  // in transfer
+    bool moving = false;  // in transfer: a write drains it (copied) or a restore fills it
     bool copied = false;  // has a disk copy
     bool state = false;   // a state sits at it
     KvCache::Keeps keeps = 0;
     bool needed = false;
+    bool candidate = false;  // a RAM copy a reclaim may take
     uint32_t wanted = 0;
   };
   std::vector<Reference> blocks(1);
@@ -449,7 +453,7 @@ void testPageReachFollowsItsRule() {
     return false;
   };
   const auto bit = [](Keep keep) { return KvCache::keepBit(keep); };
-  uint32_t checks = 0, freeing = 0, written = 0, kept = 0;
+  uint32_t checks = 0, freeing = 0, written = 0, reachable = 0;
   for (uint32_t step = 0; step < 6000; ++step) {
     const uint64_t id = blocks.size() > 1 ? 1 + pick(blocks.size() - 2) : 0;
     Reference *entry = id && blocks[id].live ? &blocks[id] : nullptr;
@@ -525,7 +529,8 @@ void testPageReachFollowsItsRule() {
                                                               (use ? bit(Keep::Used) : 0))
                                      : static_cast<KvCache::Keeps>(use ? bit(Keep::Used) : 0);
         entry->needed = entry->state && !writer;
-        cache.setStateKeeps(id, entry->keeps, entry->needed);
+        entry->candidate = entry->state && resident(id) && (writer || pick(1));
+        cache.setStateKeeps(id, entry->keeps, entry->needed, entry->candidate);
       }
       break;
     case 8:
@@ -546,26 +551,31 @@ void testPageReachFollowsItsRule() {
     cache.checkInvariants();
     // A walk: its reasons, some states it keeps, and the state it writes.
     KvCache::Keeps mask = bit(Keep::Busy);
-    for (const Keep keep : {Keep::Uncopied, Keep::Writer, Keep::UsedWriter, Keep::Used, Keep::Wanted,
+    for (const Keep keep : {Keep::Moving, Keep::Uncopied, Keep::Writer, Keep::UsedWriter, Keep::Used, Keep::Wanted,
                             Keep::ResumePoint})
       if (pick(1))
         mask |= bit(keep);
     std::vector<uint64_t> keptStates;
     std::vector<uint64_t> writers;
+    std::vector<uint64_t> unwaited;
     for (uint64_t block = 1; block < blocks.size(); ++block) {
       if (!blocks[block].live)
         continue;
       if (!pick(15))
         keptStates.push_back(block);
+      if (resident(block) && blocks[block].moving && blocks[block].copied && pick(1))
+        unwaited.push_back(block);
       if (blocks[block].keeps & mask & (bit(Keep::Writer) | bit(Keep::UsedWriter)))
         writers.push_back(block);
     }
     const uint64_t stateWritten = !writers.empty() && pick(1) ? writers[pick(writers.size() - 1)] : 0;
     // The rule, block by block, with the written state as it is or once it
     // has left RAM.
+    const auto filled = [&](const Reference &at) { return at.moving && !at.copied; };
+    const auto drained = [&](const Reference &at) { return at.moving && at.copied; };
     const auto staysHere = [&](uint64_t block, bool afterWrite) {
       const Reference &at = blocks[block];
-      if (at.used || at.held || at.moving)
+      if (at.used || at.held || filled(at) || (drained(at) && (mask & bit(Keep::Moving))))
         return true;
       bool needed = false;
       for (uint64_t below = 1; below < blocks.size(); ++below) {
@@ -584,53 +594,75 @@ void testPageReachFollowsItsRule() {
       }
       return (mask & bit(Keep::Uncopied)) && !at.copied && needed;
     };
-    const auto frees = [&](uint64_t block, bool afterWrite) {
-      if (!resident(block))
-        return false;
+    const auto cut = [&](uint64_t block) {
       for (const uint64_t state : keptStates)
         if (atOrBelow(state, block))
-          return false;
+          return true;
+      for (const uint64_t write : unwaited)
+        if (atOrBelow(write, block))
+          return true;
+      return false;
+    };
+    const auto frees = [&](uint64_t block, bool afterWrite) {
+      if (!resident(block) || cut(block))
+        return false;
       for (uint64_t below = 1; below < blocks.size(); ++below)
         if (resident(below) && atOrBelow(below, block) && staysHere(below, afterWrite))
           return false;
       return true;
     };
-    uint32_t expectedNow = 0, expectedWritten = 0;
+    // Reachable: nothing at or below it used, held or filled; and for an
+    // idle page, which no write drains, not on a kept chain and no chain
+    // reason `mask` names there. Above a write no reclaim waits for, none.
+    const KvCache::Keeps chains = mask & KvCache::kChainKeeps;
+    const auto reaches = [&](uint64_t block) {
+      if (!resident(block))
+        return false;
+      for (const uint64_t write : unwaited)
+        if (atOrBelow(write, block))
+          return false;
+      const bool idle = !blocks[block].held && !blocks[block].moving;
+      if (idle)
+        for (const uint64_t state : keptStates)
+          if (atOrBelow(state, block))
+            return false;
+      for (uint64_t below = 1; below < blocks.size(); ++below) {
+        const Reference &at = blocks[below];
+        if (!at.live || !atOrBelow(below, block))
+          continue;
+        if (resident(below) && (at.used || at.held || filled(at)))
+          return false;
+        const KvCache::Keeps keeps = static_cast<KvCache::Keeps>(
+            at.keeps | (at.wanted ? bit(Keep::Wanted) : 0) | (below == resumePoint ? bit(Keep::ResumePoint) : 0));
+        if (idle && (keeps & chains))
+          return false;
+      }
+      return true;
+    };
+    uint32_t expectedNow = 0, expectedWritten = 0, expectedReachable = 0, expectedCandidates = 0;
     for (uint64_t block = 1; block < blocks.size(); ++block) {
       const bool now = frees(block, false);
       expectedNow += now;
       expectedWritten += !now && stateWritten && frees(block, true);
+      expectedReachable += reaches(block);
+      expectedCandidates += now && blocks[block].candidate;
     }
-    // The kept chains, from each source up to a page a request holds.
-    std::vector<uint64_t> sources = keptStates;
-    for (uint64_t block = 1; block < blocks.size(); ++block) {
-      const Reference &at = blocks[block];
-      if (at.live && (((at.keeps & bit(Keep::Used)) && (mask & bit(Keep::Used))) ||
-                      (at.wanted && (mask & bit(Keep::Wanted))) ||
-                      (block == resumePoint && (mask & bit(Keep::ResumePoint)))))
-        sources.push_back(block);
-    }
-    std::vector<bool> onChain(blocks.size());
-    for (const uint64_t source : sources)
-      for (uint64_t block = source; block && !(resident(block) && blocks[block].held); block = blocks[block].parent)
-        onChain[block] = true;
-    uint32_t expectedKept = 0;
-    for (uint64_t block = 1; block < blocks.size(); ++block)
-      expectedKept += onChain[block] && resident(block) && !blocks[block].moving;
-    const KvCache::PageReach reach = cache.pageReach(mask, keptStates, stateWritten);
+    const KvCache::PageReach reach = cache.pageReach(mask, keptStates, unwaited, stateWritten);
     require(reach.now == std::array<uint32_t, 3>{expectedNow, 0, 0} &&
                 reach.written == std::array<uint32_t, 3>{expectedWritten, 0, 0} &&
-                reach.kept == std::array<uint32_t, 3>{expectedKept, 0, 0},
+                reach.reachable == std::array<uint32_t, 3>{expectedReachable, 0, 0} &&
+                reach.candidates == expectedCandidates,
             "pageReach counted " + std::to_string(reach.now[0]) + " now, " + std::to_string(reach.written[0]) +
-                " written and " + std::to_string(reach.kept[0]) + " kept pages, the rule " +
-                std::to_string(expectedNow) + ", " + std::to_string(expectedWritten) + " and " +
-                std::to_string(expectedKept) + " at step " + std::to_string(step));
+                " written and " + std::to_string(reach.reachable[0]) + " reachable pages and " +
+                std::to_string(reach.candidates) + " RAM copies, the rule " + std::to_string(expectedNow) + ", " +
+                std::to_string(expectedWritten) + ", " + std::to_string(expectedReachable) + " and " +
+                std::to_string(expectedCandidates) + " at step " + std::to_string(step));
     ++checks;
     freeing += expectedNow;
     written += expectedWritten;
-    kept += expectedKept;
+    reachable += expectedReachable;
   }
-  require(freeing > checks && written && kept > checks, "the random trees rarely had a page each count names");
+  require(freeing > checks && written && reachable > freeing, "the random trees rarely had a page each count names");
   for (uint64_t block = 1; block < blocks.size(); ++block) {
     Reference &entry = blocks[block];
     if (!entry.live)

@@ -121,10 +121,9 @@ public:
   uint64_t steps = 0;
   // Units taken, as peek offered them just before, by whether their takes
   // freed, in the need's measure, all peek counted (exact) or less (short),
-  // and of those offered as needing no write the same; and the units whose
-  // first take gave nothing and waited for nothing (stalled). Peek counts an
-  // upper bound (VictimSource), so these are reported, not required.
-  uint64_t exactUnits = 0, shortUnits = 0, exactNoWrite = 0, shortNoWrite = 0, stalled = 0;
+  // and of those offered as needing no write the same. Peek counts an upper
+  // bound (VictimSource), so these are reported, not required.
+  uint64_t exactUnits = 0, shortUnits = 0, exactNoWrite = 0, shortNoWrite = 0;
 
   // Every request ends, every transfer lands, and nothing leaks: the pool's
   // pages and the tier's slots belong to the cache's blocks alone.
@@ -254,7 +253,9 @@ public:
       bool firstTake = true;
       // As peek offers it now, after the takes of the units before it.
       const std::optional<engine::Victim> fresh = cache_.peek(query, after ? &*after : nullptr);
-      if (!fresh || fresh->key != first.key)
+      // A claim that does not wait for writes passes over what lands later,
+      // as the ledger does.
+      if (!fresh || fresh->key != first.key || (fresh->later && immediate))
         continue;
       for (std::optional<engine::Victim> unit = fresh; unit && unit->key == first.key;
            unit = cache_.peek(query, after ? &*after : nullptr)) {
@@ -283,7 +284,11 @@ public:
         // so the ledger's peek again from the head (MemoryLedger::take)
         // never finds the same unit for ever.
         require(!taken.gave() || fingerprint() != unchanged, "a take reported giving something and changed nothing");
-        stalled += firstTake && !taken.gave() && taken.outcome != FreeOutcome::Pending;
+        // Progress: a unit peek offers is one its first take gives something
+        // of, or that waits for a transfer in flight; never a count of what
+        // the walk cannot reach.
+        require(!firstTake || taken.gave() || taken.outcome == FreeOutcome::Pending,
+                "a unit peek offered gave nothing and waited for nothing at its first take");
         firstTake = false;
         if (!taken.gave())
           break;
@@ -556,7 +561,7 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
 // The same runs with random claims counted and taken (checkTake), again with requests using the states they resume
 // from.
 void testTakeNeverExceedsPeek(uint32_t plainSeeds, uint32_t windowedSeeds) {
-  uint64_t steps = 0, exact = 0, shortOf = 0, exactNoWrite = 0, shortNoWrite = 0, stalled = 0;
+  uint64_t steps = 0, exact = 0, shortOf = 0, exactNoWrite = 0, shortNoWrite = 0;
   const auto check = [&](uint32_t seed, bool windowed, bool usedStates) {
     Run run(seed, windowed, true, usedStates);
     try {
@@ -574,17 +579,16 @@ void testTakeNeverExceedsPeek(uint32_t plainSeeds, uint32_t windowedSeeds) {
     shortOf += run.shortUnits;
     exactNoWrite += run.exactNoWrite;
     shortNoWrite += run.shortNoWrite;
-    stalled += run.stalled;
   };
   for (const bool usedStates : {false, true})
     for (const bool windowed : {false, true})
       for (uint32_t seed = 1; seed <= (windowed ? windowedSeeds : plainSeeds); ++seed)
         check(seed, windowed, usedStates);
   std::cout << "cache take runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds << " windowed; " << steps
-            << " reclaim steps, none freeing more than peek counted, each that gave something changing the cache; "
-            << exact << " units freed all peek counted, " << shortOf << " less (" << exactNoWrite << " and "
-            << shortNoWrite << " of those needing no write); " << stalled
-            << " freed nothing and waited for nothing at their first take\n";
+            << " reclaim steps, none freeing more than peek counted, each that gave something changing the cache, "
+            << "every offered unit's first take giving something or waiting; " << exact
+            << " units freed all peek counted, " << shortOf << " less (" << exactNoWrite << " and " << shortNoWrite
+            << " of those needing no write)\n";
 }
 
 } // namespace

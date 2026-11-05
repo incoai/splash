@@ -435,16 +435,16 @@ StateCache::Reclaims StateCache::reclaims(bool inUse, std::span<const uint64_t> 
   return result;
 }
 
-std::pair<KvCache::Keeps, bool> StateCache::keeps(uint64_t kvBlock) const noexcept {
+std::tuple<KvCache::Keeps, bool, bool> StateCache::keeps(uint64_t kvBlock) const noexcept {
   const auto found = entries_.find(kvBlock);
-  return found == entries_.end() ? std::pair<KvCache::Keeps, bool>{} : keeps(kvBlock, found->second);
+  return found == entries_.end() ? std::tuple<KvCache::Keeps, bool, bool>{} : keeps(kvBlock, found->second);
 }
 
 bool StateCache::candidate(uint64_t kvBlock, const Entry &target) const noexcept {
   return !target.pins && !target.invalid && target.ram && !persisting(kvBlock);
 }
 
-std::pair<KvCache::Keeps, bool> StateCache::keeps(uint64_t kvBlock, const Entry &target) const noexcept {
+std::tuple<KvCache::Keeps, bool, bool> StateCache::keeps(uint64_t kvBlock, const Entry &target) const noexcept {
   using Keep = KvCache::Keep;
   const bool used = inUse(kvBlock) && !target.invalid;
   // A RAM copy a reclaim may take without a disk copy leaves through a write
@@ -454,7 +454,7 @@ std::pair<KvCache::Keeps, bool> StateCache::keeps(uint64_t kvBlock, const Entry 
   KvCache::Keeps keeps = used ? KvCache::keepBit(Keep::Used) : 0;
   if (leaves && target.ram->writable())
     keeps |= KvCache::keepBit(used ? Keep::UsedWriter : Keep::Writer);
-  return {keeps, !leaves};
+  return {keeps, !leaves, candidate(kvBlock, target)};
 }
 
 void StateCache::markResumePoint() noexcept {
@@ -606,7 +606,7 @@ StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {
   RecencyOrder::unlink(target.diskNode);
   RecencyOrder::unlink(target.writeNode);
   entries_.erase(found);
-  kv_.setStateKeeps(kvBlock, 0, false);
+  kv_.setStateKeeps(kvBlock, 0, false, false);
   markResumePoint();
   kv_.countState(kvBlock, false, inUse(kvBlock));
   if (disk)
@@ -757,8 +757,8 @@ void StateCache::reindex(uint64_t kvBlock, Entry &target) noexcept {
   if (target.disk && !writing(kvBlock) && !target.pins && !target.invalid)
     (target.ram ? duplicates_ : used ? inUseOnDisk_ : diskOnly_)
         .link(target.diskNode, target.lastUsed, kvBlock);
-  const auto [keeps, needed] = this->keeps(kvBlock, target);
-  kv_.setStateKeeps(kvBlock, keeps, needed);
+  const auto [keeps, needed, reclaimable] = this->keeps(kvBlock, target);
+  kv_.setStateKeeps(kvBlock, keeps, needed, reclaimable);
   markResumePoint();
 }
 

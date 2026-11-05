@@ -734,6 +734,7 @@ Cache::Walk Cache::walkFor(const VictimQuery &query) const {
     // Memory the engine's limit refused, whatever pages it was for: an
     // extent released covers it.
     walk.device = true;
+    walk.inPlace = need.pages != 0;
     walk.refused = Shortfall{pool_.extentPages(), kv::PageForm::Full};
     // A KV need takes the free pages of its form first, and those of the
     // other forms its attempt takes: releasing their extent would give it
@@ -951,7 +952,14 @@ Cache::UnitTaken Cache::takeUnit(const Walk &walk, const WalkUnit &unit, Reclaim
 }
 
 bool Cache::returns(const Walk &walk) const noexcept {
-  return walk.refused ? returnsInFlight(*walk.refused) : transfersInFlight();
+  if (walk.refused ? returnsInFlight(*walk.refused) : transfersInFlight())
+    return true;
+  // An extent's worth of free pages that compaction cannot gather while a
+  // write in flight reads a page among them returns, for memory, as it
+  // lands.
+  return walk.device && std::ranges::any_of(writes_, [&](const Write &write) {
+           return pool_.freePageCount(pool_.form(kv_.page(write.block))) >= pool_.extentPages();
+         });
 }
 
 namespace {
@@ -981,11 +989,6 @@ std::optional<engine::Victim> Cache::victimOf(const WalkUnit &unit) const {
                         .later = outcome.pending,
                         .cls = inUse ? ReclaimClass::InUse : ReclaimClass::Ordinary};
   return victim;
-}
-
-uint32_t Cache::trimRoom() const {
-  const uint32_t empty = pool_.emptyExtents(kv::PageForm::Slim);
-  return pool_.freePageCount(kv::PageForm::Slim) - (empty > 1 ? (empty - 1) * pool_.extentPages() : 0);
 }
 
 bool Cache::trims(const Walk &walk) const noexcept {
@@ -1063,7 +1066,7 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
   // point's while the walk keeps it), but for the chain a start reuses,
   // which it walks (KvCache::pageReach). Once the staged state's write has
   // started, its chain holds only its blocks without a copy.
-  KvCache::Keeps mask = KvCache::keepBit(Keep::Busy);
+  KvCache::Keeps mask = KvCache::keepBit(Keep::Busy) | KvCache::keepBit(Keep::Moving);
   if (kvTierWritable())
     mask |= KvCache::keepBit(Keep::Uncopied);
   if (states.writes)
@@ -1079,32 +1082,62 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
   if (walk.restored && walk.restored != &wanted_)
     throw std::logic_error("a walk restores chains the cache does not count");
   const std::span<const uint64_t> reused = walk.reused ? walk.reused->states() : std::span<const uint64_t>{};
-  const KvCache::PageReach pages = kv_.pageReach(mask, reused, states.staged);
+  // A write in flight frees what it holds once it lands only where a take
+  // waits for it (returns): a demotion, a copy ahead of a leaf, a write
+  // through whose page spills as it lands. Above any other, no reclaim
+  // reaches a page until it has landed. The extents that hold a page a
+  // transfer reads or fills, which compaction does not move, empty only
+  // then too.
+  std::vector<uint64_t> unwaited;
+  std::array<uint32_t, 3> pinned{};
+  {
+    std::unordered_set<uint32_t> extentsPinned;
+    const auto pin = [&](uint64_t block) {
+      if (const uint32_t page = kv_.page(block);
+          page != KvCache::noPage && extentsPinned.insert(page / pool_.extentPages()).second)
+        ++pinned[static_cast<size_t>(pool_.form(page))];
+    };
+    for (const Write &write : writes_) {
+      pin(write.block);
+      if (write.write != WriteClass::Reclaim &&
+          !(write.write == WriteClass::Persist && kv_.residentLeaf(write.block)) &&
+          !(spill_ && spillsOnLanding(write)))
+        unwaited.push_back(write.block);
+    }
+    for (const auto &[block, _] : restores_)
+      pin(block);
+  }
+  const KvCache::PageReach pages = kv_.pageReach(mask, reused, unwaited, states.staged);
+
+  // A page scan takes a state only where it sits on the leaf that goes next
+  // (Cache::nextUnit): of those that free now, the RAM copies at a block that
+  // frees now.
+  if (walk.scope.pagesOnly)
+    counted.now.states = std::min(counted.now.states, pages.candidates);
   // The extents landing pages complete beside the free ones count already
   // (returning, landingExtents): what frees later is the rest.
   const std::array<uint32_t, 3> landing = demotedPages();
   // A page walk that trims also frees the Full pages it moves into Slim
-  // ones: those the windows passed and those a state's tail holds, which
-  // any state that goes lets go, as many as the Slim pages free or freed
-  // allow.
-  uint32_t trimmable = 0;
-  if (trims(walk)) {
-    trimmable = trimmableCount() + kv_.pinnedBlocks();
-    for (const auto &[_, active] : requests_)
-      for (const uint32_t index : active.privatePages)
-        trimmable +=
-            pool_.form(active.pages[index]) == kv::PageForm::Full && windowsPassed(active.pages[index], index);
-  }
-  // Of each form, the pages within the class's reach, all but the kept
-  // chains', that free now (the free ones and those nothing holds), once
-  // the staged state's write has started (the written ones too) or later
-  // (the rest).
+  // ones, as many as the Slim pages free or freed allow: it trims after a
+  // state goes (Cache::take), but for the staged state's write, the pages
+  // the windows passed and the tails of the states gone, each at most
+  // windowPages blocks.
+  const uint32_t passed = trims(walk) ? passedPages() : 0;
+  const auto trimmable = [&](uint32_t gone) -> uint32_t {
+    if (!gone || !trims(walk))
+      return 0;
+    return passed +
+           static_cast<uint32_t>(std::min<uint64_t>(kv_.pinnedBlocks(), uint64_t{gone} * window_->windowPages));
+  };
+  // Of each form, the pages a reclaim of the class reaches (the free ones
+  // and those reachable), that free now (the free ones and those nothing
+  // holds), once the staged state's write has started (the written ones
+  // too) or later (the rest).
   std::array<uint32_t, 3> now{}, written{}, all{};
   for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {
     const auto index = static_cast<size_t>(form);
     const uint32_t allocated = pool_.allocatedExtents(form) * extent;
-    const uint32_t reusable = pool_.reusablePages(form);
-    all[index] = std::min(allocated, reusable - std::min(reusable, pages.kept[index]));
+    all[index] = std::min(allocated, pool_.freePageCount(form) + pages.reachable[index]);
     now[index] = std::min(all[index], pool_.freePageCount(form) + pages.now[index]);
     written[index] = std::min(all[index], pool_.freePageCount(form) + pages.now[index] + pages.written[index]);
     // Compaction gathers the pages that stay into the fewest extents, and
@@ -1115,10 +1148,15 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
       const uint32_t whole = (pages - std::min(pages, walk.keptPages[index])) / extent;
       return whole - std::min(whole, walk.keeps(form) ? 1u : 0u);
     };
-    const uint32_t later = extents(all[index]) - extents(written[index]);
+    // Until its transfer lands, an extent that holds a pinned page stays.
+    const auto atOnce = [&](uint32_t pages) {
+      const uint32_t movable = pool_.allocatedExtents(form) - std::min(pool_.allocatedExtents(form), pinned[index]);
+      return std::min(extents(pages), movable - std::min(movable, walk.keeps(form) ? 1u : 0u));
+    };
+    const uint32_t later = extents(all[index]) - std::min(extents(all[index]), atOnce(written[index]));
     const uint32_t landed = landingExtents(walk, form, landing[index]);
-    counted.now.bytes += extents(now[index]) * extentBytes;
-    counted.written.bytes += (extents(written[index]) - extents(now[index])) * extentBytes;
+    counted.now.bytes += atOnce(now[index]) * extentBytes;
+    counted.written.bytes += (atOnce(written[index]) - atOnce(now[index])) * extentBytes;
     counted.later.bytes += (later - std::min(later, landed)) * extentBytes;
   }
   const auto need = static_cast<size_t>(walk.form);
@@ -1126,9 +1164,11 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
   if (trims(walk)) {
     const auto slim = static_cast<size_t>(kv::PageForm::Slim);
     const uint32_t allocated = pool_.allocatedExtents(kv::PageForm::Full) * extent;
-    pagesNow = std::min(allocated, pagesNow + std::min(trimmable, now[slim]));
-    pagesWritten = std::min(allocated, pagesWritten + std::min(trimmable, written[slim]));
-    pagesAll = std::min(allocated, pagesAll + std::min(trimmable, all[slim]));
+    const uint32_t goneNow = counted.now.states,
+                   goneAll = goneNow + counted.written.states + counted.later.states;
+    pagesNow = std::min(allocated, pagesNow + std::min(trimmable(goneNow), now[slim]));
+    pagesWritten = std::min(allocated, pagesWritten + std::min(trimmable(goneNow), written[slim]));
+    pagesAll = std::min(allocated, pagesAll + std::min(trimmable(goneAll), all[slim]));
   }
   const uint32_t free = pool_.freePageCount(walk.form);
   counted.now.pages = pagesNow - std::min(pagesNow, free);
@@ -1152,9 +1192,12 @@ std::optional<engine::Victim> Cache::reclaimUnit(const Walk &walk, ReclaimPhase 
             .pages = unit.pages - std::min(unit.pages, ordinary.pages),
             .states = unit.states - std::min(unit.states, ordinary.states)};
   }
-  // A page need counts pages alone; states only where they are units.
+  // A page need counts pages alone; a device need pages only in place,
+  // where its take frees them; states only where they are units.
   if (!walk.device)
     unit.bytes = 0;
+  if (walk.device && !walk.inPlace)
+    unit.pages = 0;
   if (!walk.statesAreUnits)
     unit.states = 0;
   if (!unit.bytes && !unit.pages && !unit.states)
@@ -1185,7 +1228,7 @@ std::optional<engine::Victim> Cache::peek(const VictimQuery &query, const engine
         return engine::Victim{.key = unitKey(static_cast<uint8_t>(Unit::Extent), 0), .bytes = bytes};
     }
     if (walk.pages && (!after || afterUnit == Unit::Extent))
-      if (const uint32_t pages = trims(walk) ? std::min(trimmableCount(), trimRoom()) : 0)
+      if (const uint32_t pages = trims(walk) ? std::min(passedPages(), pool_.freePageCount(kv::PageForm::Slim)) : 0)
         return engine::Victim{.key = unitKey(static_cast<uint8_t>(Unit::Trim), 0), .pages = pages};
     // Then the reclaims, phase by phase.
     auto phase = static_cast<uint8_t>(ReclaimPhase::Now);
@@ -1245,7 +1288,7 @@ FreeResult Cache::take(const VictimQuery &query, const engine::Victim &victim) {
     const uint64_t fillBefore = walk.device ? landingFill(walk) : 0;
     const ReclaimResult reclaimed =
         written       ? recycleState(each)
-        : walk.device ? takeReclaim(each, demotionPages(), fillBefore, query.need.pages != 0)
+        : walk.device ? takeReclaim(each, demotionPages(), fillBefore, walk.inPlace)
                       : evictOne(each);
     if (!walk.device && !written && reclaimed.evictedState && trims(walk))
       static_cast<void>(trimWindows(false));
@@ -1992,6 +2035,17 @@ uint32_t Cache::trimmableCount() const {
   return kv_.trimCandidates() - static_cast<uint32_t>(read.size());
 }
 
+uint32_t Cache::passedPages() const {
+  std::vector<uint32_t> kept;
+  for (const auto &[_, active] : requests_)
+    for (const uint32_t index : active.privatePages)
+      if (pool_.form(active.pages[index]) == kv::PageForm::Full && windowsPassed(active.pages[index], index))
+        kept.push_back(active.pages[index]);
+  std::ranges::sort(kept);
+  const auto repeated = std::ranges::unique(kept);
+  return trimmableCount() + static_cast<uint32_t>(repeated.begin() - kept.begin());
+}
+
 uint32_t Cache::trimWindows(bool allocate) {
   if (!window_ || !window_->trim)
     return 0;
@@ -2077,10 +2131,11 @@ void Cache::checkInvariants() const {
   const uint64_t point = states_.resumePoint();
   kv_.checkInvariants([this](uint64_t block) { return states_.onDisk(block); },
                       [&](uint64_t block) {
-                        const auto [keeps, needed] = states_.keeps(block);
+                        const auto [keeps, needed, candidate] = states_.keeps(block);
                         const auto chains = wanted.find(block);
                         return KvCache::Marks{.stateKeeps = keeps,
                                               .stateNeeded = needed,
+                                              .stateCandidate = candidate,
                                               .wanted = chains == wanted.end() ? 0 : chains->second,
                                               .resumePoint = block == point};
                       });
