@@ -331,21 +331,25 @@ class UpstreamTest(unittest.TestCase):
             upstream.select_gguf(incomplete | {whole}, "Q4_K_M"), ([whole], False)
         )
         # A whole file of the model beside its parts, such as their merge, is
-        # a target of its own, which its name selects before the parts. Both
-        # are of one name, so beside no other name it is no choice by its
-        # ending to report.
+        # a target of its own, which its name selects before the parts, by
+        # :VARIANT or as the only name without one. Both are of one name, so
+        # beside no other name it is no choice by its ending to report.
         merge = "Model-Q1_0.gguf"
-        for repository in (files | {merge}, files | {merge, whole}):
-            with self.subTest(files=sorted(repository)):
+        for repository, variant in (
+            (files | {merge}, "Q1_0"),
+            (files | {merge}, None),
+            (files | {merge, whole}, "Q1_0"),
+        ):
+            with self.subTest(files=sorted(repository), variant=variant):
                 self.assertEqual(
-                    upstream.select_gguf(repository, "Q1_0"), ([merge], False)
+                    upstream.select_gguf(repository, variant), ([merge], False)
                 )
         with self.assertRaisesRegex(
             models.ModelError,
             r"\(GGUF targets in the repository root: Model-Q1_0, "
-            r"Model-Q1_0 \(split, 3 parts\)\)",
+            r"Model-Q1_0 \(split, 3 parts\), Model-Q4_K_M\)",
         ):
-            upstream.select_gguf(files | {merge}, None)
+            upstream.select_gguf(files | {merge, whole}, None)
 
     def test_architecture_is_checked_before_weight_downloads(self):
         # Another architecture, and fine-tunes of a supported one the engine

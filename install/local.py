@@ -52,8 +52,9 @@ def prepare_local_model(
 
     target: a GGUF file, any part of a split GGUF naming all of them, which
     lie beside it; or a directory whose root holds an MLX model (config.json,
-    tokenizer files and a safetensors checkpoint) or else a single GGUF
-    target, whole or split, beside any vision projector named mmproj.
+    tokenizer files and a safetensors checkpoint) or else GGUF targets of
+    one name, the name's whole file before its split parts, beside any
+    vision projector named mmproj.
     draft: the directory of a DFlash2 draft (config.json and safetensors
     weights) trained for the target's family. Without one, the draft
     released for the family is taken from the Hugging Face cache
@@ -184,21 +185,21 @@ def _inspect(target, mmproj, language_only, scratch):
 
 
 def _gguf_in(files):
-    """The files of the one GGUF target at the root of a directory of files
-    (upstream.root_targets), in split order, whatever vision projectors
-    (named mmproj) lie beside it."""
+    """The files of the GGUF target at the root of a directory of files that
+    the root targets' one name selects (upstream.named_target), in split
+    order, whatever vision projectors (named mmproj) lie beside it."""
     targets = upstream.root_targets(files)
     if not targets:
         raise ModelError(
             "it holds no model at its root: no safetensors checkpoint, and no "
             "GGUF file but vision projectors (named mmproj)"
         )
-    if len(targets) > 1:
+    target = upstream.named_target(targets, {found.name for found in targets})
+    if target is None:
         listed = ", ".join(map(str, targets))
         raise ModelError(
             f"it holds several GGUF targets ({listed}); pass the target's file"
         )
-    [target] = targets
     return upstream.target_files(target)
 
 

@@ -182,17 +182,16 @@ def select_gguf(files, variant):
     not X-UD-Q4_K_M); the folder named VARIANT (split_gguf); the only root
     target whose name ends in -VARIANT. A repository of one root name and no
     folder names no variant apart from its model, so its one match needs no
-    report. A whole file and a split GGUF of one name hold one model, as a
-    merge and its parts do, and the name takes the whole file (_named).
-    Without :VARIANT, the only target. Anything else is an error listing the
-    root targets."""
+    report. Without :VARIANT, the root targets' only name. A name selects
+    its target by named_target. Anything else is an error listing the root
+    targets."""
     targets = root_targets(files)
+    names = sorted({target.name for target in targets})
     if variant is None:
-        if len(targets) == 1:
-            return target_files(targets[0]), False
+        if target := named_target(targets, names):
+            return target_files(target), False
         choice = "select a GGUF with OWNER/REPO:VARIANT"
     else:
-        names = sorted({target.name for target in targets})
         words = [name.split("-") for name in names]
         shared = len(os.path.commonprefix(words))
         exact = [
@@ -200,13 +199,13 @@ def select_gguf(files, variant):
             for name, own in zip(names, words, strict=True)
             if "-".join(own[shared:]).lower() == variant.lower()
         ]
-        if target := _named(targets, exact):
+        if target := named_target(targets, exact):
             return target_files(target), False
         if split := split_gguf(files, variant):
             return split, False
         suffix = "-" + variant.lower()
         ending = [name for name in names if name.lower().endswith(suffix)]
-        if target := _named(targets, ending):
+        if target := named_target(targets, ending):
             several = len(names) + len(folder_targets(files)) > 1
             return target_files(target), several
         choice = "no single GGUF matches :" + variant
@@ -214,13 +213,17 @@ def select_gguf(files, variant):
     raise models.ModelError(f"{choice} (GGUF targets in the repository root: {listed})")
 
 
-def _named(targets, names):
-    """The root target :VARIANT names when it matches names, the distinct
-    names of root targets: the whole file of the one name, before the split
-    GGUF of that name, as both hold one model; None for no name or several."""
+def named_target(targets, names):
+    """The root target (root_targets) that names, distinct names of root
+    targets, select when they are one name: the name's whole file before the
+    split GGUF of that name, as both hold one model, a merge and its parts;
+    None for no name or several. :VARIANT selects by the names it matches,
+    and a repository or a local directory without one by all of its root
+    targets' names."""
     if len(names) != 1:
         return None
-    return min((t for t in targets if t.name == names[0]), key=lambda t: t.split)
+    [name] = names
+    return min((t for t in targets if t.name == name), key=lambda t: t.split)
 
 
 def split_gguf(files, variant):

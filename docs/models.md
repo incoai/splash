@@ -151,7 +151,9 @@ root targets share, then `-UD-Q4_K_M`; the folder named `UD-Q4_K_M`, in any
 case; the only root target whose name ends in `-UD-Q4_K_M`, which the
 installer reports when the repository holds several targets. A whole file
 beside split parts of its name, such as their merge, is a target of its own,
-which the name selects before the parts. Before any weight download, the
+which the name selects before the parts, by the variant or, as a repository's
+or a local directory's only name, without one (`upstream.named_target`).
+Before any weight download, the
 engine's check plans the target from its header, which must list every tensor
 the loader reads, of its shape and of a type it accepts for that tensor; one
 error names each missing or unsupported tensor once, with the layers that
@@ -539,7 +541,7 @@ message for every family, so a developer message renders as `<|system|>`.
 `splash serve --model-dir PATH` prepares the target at `PATH` with
 `install.local.prepare_local_model` and starts the server on the directory it
 returns. `PATH` names a GGUF file, any part of a split GGUF, a directory
-holding one GGUF target, or an MLX model directory. It names the target
+holding GGUF targets of one name, or an MLX model directory. It names the target
 directly, rather than a library to search by repository ID:
 
 ```sh
@@ -595,7 +597,8 @@ model's source options (`--revision`, `--draft-model`, `--language-only`,
 
 - `target`: a GGUF file, any part of a split GGUF naming all its parts,
   which lie beside it; or a directory whose root holds an MLX model or else
-  a single GGUF target, whole or split, beside any projectors named `mmproj`.
+  GGUF targets of one name ([GGUF targets](#gguf-targets)), beside any
+  projectors named `mmproj`.
 - `draft`: the directory of a DFlash2 draft ([Drafts](#drafts)). Without
   one, the family's released draft is taken from the Hugging Face cache, at
   the commit last recorded there for its default branch, as `hf download
