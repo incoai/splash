@@ -1613,20 +1613,51 @@ class LauncherTests(unittest.TestCase):
                     )
 
     def test_a_refusal_whose_record_cannot_be_written_stays_a_refusal(self):
-        with (
-            tempfile.TemporaryDirectory() as temporary,
-            mock.patch("sys.stderr", io.StringIO()),
-        ):
-            # A runtime directory under a file cannot be created.
+        with tempfile.TemporaryDirectory() as temporary:
+            # A runtime directory under a file cannot be created; a record
+            # with a directory in its place cannot be replaced.
             (Path(temporary) / "file").touch()
+            (Path(temporary) / "run/serve-9123.json").mkdir(parents=True)
+            for runtime in (Path(temporary) / "file/run", Path(temporary) / "run"):
+                with (
+                    self.subTest(runtime=runtime.name),
+                    mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                    mock.patch("sys.stderr", io.StringIO()) as error,
+                    self.assertRaises(SystemExit) as refused,
+                ):
+                    launcher.main(["serve", "--port", "9123"])
+                self.assertEqual(refused.exception.code, 2)
+                self.assertIn("splash serve: error: ", error.getvalue())
+
+    def test_a_start_refused_whose_record_cannot_be_written_says_its_refusal(self):
+        """A start the launcher refuses while its record cannot be written, a
+        directory in its place, prints its refusal, not the record's
+        failure."""
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            (runtime / "serve-8000.json").mkdir()
             with (
-                mock.patch.object(
-                    launcher, "RUNTIME_DIR", Path(temporary) / "file" / "run"
-                ),
-                self.assertRaises(SystemExit) as refused,
+                (runtime / "serve.lock").open("a+") as installation,
+                mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                mock.patch("sys.stderr", io.StringIO()) as error,
             ):
-                launcher.main(["serve", "--port", "9123"])
-            self.assertEqual(refused.exception.code, 2)
+                fcntl.flock(installation, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertEqual(launcher.main(["serve", "--model", MODEL_ID]), 1)
+            *records, refusal = error.getvalue().splitlines()
+            self.assertEqual(
+                refusal,
+                "error: Splash is being upgraded; wait for the upgrade to finish",
+            )
+            # The record of its start, then of its refusal.
+            self.assertEqual(len(records), 2)
+            for line in records:
+                self.assertTrue(
+                    line.endswith(
+                        " Warning · cannot write the serve record "
+                        f"{runtime / 'serve-8000.json'}: Is a directory"
+                    ),
+                    line,
+                )
 
     def test_metadata_write_failure_releases_lock_before_model_work(self):
         with (

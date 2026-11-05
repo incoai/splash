@@ -482,6 +482,85 @@ class ServerMainTests(unittest.TestCase):
             api.main()
         self.assertEqual(phases, [(True, {"pid": 4242, "phase": "ready"})])
 
+    def test_a_failed_start_whose_record_cannot_be_written_ends_as_it_would(self):
+        """With the record's directory gone, a start the server refuses still
+        exits with status 1 and an error it does not expect still raises
+        itself: the record cannot replace the failure."""
+        record = Path(self.enterContext(tempfile.TemporaryDirectory())) / "gone/s.json"
+        for fault, ends in (
+            (
+                mock.patch.object(
+                    api.AutoTokenizer,
+                    "from_pretrained",
+                    side_effect=KeyError("added_tokens"),
+                ),
+                SystemExit,
+            ),
+            (
+                mock.patch.object(
+                    api, "check_capabilities", side_effect=AttributeError("vision")
+                ),
+                AttributeError,
+            ),
+        ):
+            with self.subTest(ends=ends.__name__):
+                with contextlib.ExitStack() as stack:
+                    for patch in self.main_starting(
+                        main_args(serve_record=record), mock.Mock()
+                    ):
+                        stack.enter_context(patch)
+                    stack.enter_context(fault)
+                    stack.enter_context(mock.patch.object(api, "print_status"))
+                    log = stack.enter_context(mock.patch("sys.stderr", io.StringIO()))
+                    with self.assertRaises(ends) as ended:
+                        api.main()
+                if ends is SystemExit:
+                    self.assertEqual(ended.exception.code, 1)
+                self.assertIn(
+                    f"Warning · cannot write the serve record {record}: "
+                    "No such file or directory",
+                    log.getvalue(),
+                )
+
+    def test_a_server_whose_ready_record_cannot_be_written_ends_before_serving(self):
+        """The app takes a server for ready from its record alone: one that
+        cannot say ready in it, its directory gone once it listens, has not
+        started and exits with status 1 before it serves, its one error
+        naming the record and the system's error, so that the app sees it
+        stop instead of waiting on it."""
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (directory / "run").mkdir()
+        record = directory / "run/s.json"
+        runtime = mock.Mock()
+        runtime.capabilities = engine_ready(131072)
+        with contextlib.ExitStack() as stack:
+            for patch in self.main_starting(main_args(serve_record=record), runtime):
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(api, "check_capabilities"))
+            output = stack.enter_context(mock.patch("sys.stdout", io.StringIO()))
+            log = stack.enter_context(mock.patch("sys.stderr", io.StringIO()))
+            server = api.FrontendServer.return_value
+            server.server_activate.side_effect = lambda: (directory / "run").rename(
+                directory / "moved"
+            )
+            with self.assertRaises(SystemExit) as ended:
+                api.main()
+        self.assertEqual(ended.exception.code, 1)
+        server.serve_forever.assert_not_called()
+        (line,) = log.getvalue().splitlines()
+        self.assertTrue(
+            line.endswith(
+                f" Error · cannot write the serve record {record}: "
+                "No such file or directory"
+            ),
+            line,
+        )
+        self.assertNotIn("Ready · ", output.getvalue())
+        self.assertEqual(
+            json.loads((directory / "moved/s.json").read_text()),
+            {"pid": 4242, "phase": "loading"},
+        )
+
     def test_main_wires_allowed_origins_and_warns_without_a_key(self):
         warning = mock.call(
             "Warning · --allowed-origin '*' without --api-key lets every web "

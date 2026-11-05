@@ -1332,12 +1332,14 @@ def main():
         )
         server.app = app
         server.server_activate()
+        # The app takes the server for ready from its record alone: one that
+        # cannot say so has not started (serve_record).
+        serve_record.ready(args.serve_record)
         address = f"http://{args.host}:{server.server_port}"
         tokens = served.max_context_tokens
         context = f"{tokens // 1024}K" if tokens % 1024 == 0 else f"{tokens:,}"
         mode = "" if served.vision else " · text only"
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
-        serve_record.entered(args.serve_record, "ready")
         server.serve_forever()
     except engine_runtime.EngineStartFailed as error:
         _start_failed(args, error, serve_record.engine_failure(error.event, str(error)))
@@ -1354,6 +1356,11 @@ def main():
         _start_failed(
             args, error, serve_record.failure(serve_record.INTERNAL, str(error))
         )
+    except serve_record.NotRecorded as error:
+        # The record that cannot say ready cannot say why either: the app
+        # takes the exit for the failure, which the log words.
+        print_status(f"Error · {error}", error=True)
+        raise SystemExit(1) from None
     except Exception as error:
         # An error no clause above names is a bug: the record still names the
         # failure, so that the app reports it instead of a crash, and the

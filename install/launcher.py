@@ -2,6 +2,7 @@
 """Serve in the foreground, or connect an installed agent to the local server."""
 
 import argparse
+import contextlib
 import errno
 import fcntl
 import http.client
@@ -349,19 +350,17 @@ def _serve_record(port):
 
 def _record_refusal(port, failure):
     """Record a start refused before it held the port's lock, under that lock.
-    While another process holds the lock, the record is that process's and
-    stays. The refusal printed is the answer; a record that cannot be written
-    leaves the app only the exit status."""
-    try:
-        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-        with _serve_lock(port).open("a+") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return
-            serve_record.failed(_serve_record(port), failure)
-    except OSError:
-        pass
+    A lock this process cannot take leaves the record as it is: one another
+    process holds, whose record it is, or one that cannot be created. The
+    refusal printed is the answer."""
+    with contextlib.ExitStack() as held:
+        try:
+            RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+            lock = held.enter_context(_serve_lock(port).open("a+"))
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return
+        serve_record.failed(_serve_record(port), failure)
 
 
 def serve(args):
