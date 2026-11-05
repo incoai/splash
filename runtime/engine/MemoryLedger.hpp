@@ -323,12 +323,15 @@ struct ClaimState final {
   // sets it on a unit it admitted on its net change, so that allocation
   // passes the host (MemoryGovernor::growthHost).
   bool hostExempt = false;
-  // What its latest free() decided.
-  std::optional<FreeOutcome> outcome;
-  // The decisions its lines logged since its last grant, by need: a retry
-  // back to one of them logs nothing.
+  // The decisions its lines logged since its last grant, by what the need
+  // lacks rather than how much: a retry back to one of them logs nothing.
   struct Logged final {
-    Need need;
+    struct Lack final {
+      bool bytes = false, hostRefused = false, pages = false, stateBuffers = false;
+      kv::PageForm form = kv::PageForm::Full;
+      friend bool operator==(const Lack &, const Lack &) = default;
+    };
+    Lack lack;
     uint8_t decisions = 0;
   };
   std::vector<Logged> logged;

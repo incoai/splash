@@ -182,7 +182,6 @@ void MemoryLedger::setHostExempt(ClaimId claim, bool exempt) { claims_.at(claim.
 
 void MemoryLedger::granted(ClaimId claim) {
   ClaimState &state = claims_.at(claim.value);
-  state.outcome.reset();
   state.logged.clear();
 }
 
@@ -699,25 +698,30 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
     claim.hostExempt = true;
     result.outcome = FreeOutcome::Met;
   }
-  // One line per decision: whatever takes units, and a change of a
-  // request's outcome or a need met past the host, but not a retry back to
-  // a decision logged for the same need since the claim's last grant: a
-  // claim that flips between short and pending as copies land logged 669
-  // lines in one second.
-  bool changed = spec.requestId && (claim.outcome != result.outcome || exempted);
-  if (changed) {
+  // One line per decision of a request's claim, with what its units took:
+  // an outcome, or a need met past the host, once for each kind of need
+  // since the claim's last grant. A retry back to a decision logged since
+  // then logs nothing, whatever it took and however much the need still
+  // lacks: a claim that flips between short and pending as copies land
+  // logged 669 lines in one second, and one whose pages came a page at a
+  // time a pair of lines a page (5,216 of a run's 5,812). A claim of no
+  // request logs each take.
+  bool logs = run.has_value();
+  if (spec.requestId) {
     const auto bit = static_cast<uint8_t>(1U << (exempted ? 3U : static_cast<unsigned>(result.outcome)));
-    auto found = std::ranges::find(claim.logged, need, &ClaimState::Logged::need);
+    const ClaimState::Logged::Lack lack{.bytes = need.bytes != 0,
+                                        .hostRefused = need.hostRefused,
+                                        .pages = need.pages != 0,
+                                        .stateBuffers = need.lacksStateBuffers(),
+                                        .form = need.form};
+    auto found = std::ranges::find(claim.logged, lack, &ClaimState::Logged::lack);
     if (found == claim.logged.end())
-      claim.logged.push_back({need, bit});
-    else if (found->decisions & bit)
-      changed = false;
-    else
-      found->decisions |= bit;
+      found = claim.logged.insert(claim.logged.end(), {lack});
+    logs = !(found->decisions & bit);
+    found->decisions |= bit;
   }
-  if (run || changed)
+  if (logs)
     log(spec, need, run ? &*run : nullptr, result, exempted);
-  claim.outcome = result.outcome;
   return result;
 }
 

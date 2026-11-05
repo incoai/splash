@@ -2075,9 +2075,10 @@ void testEachDecisionLogsOneLine() {
 }
 
 // A claim that flips between waiting for what lands and short of it as
-// copies land logs each outcome once for each need until an allocation of
-// it is granted: six retries of one need log two lines, another need's
-// short its own, and past the grant the first need logs again.
+// copies land logs each outcome once for each kind of need until an
+// allocation of it is granted, however much the need still lacks: six
+// retries of a need that shrinks as they go log two lines, a need of pages
+// its own short, and past the grant the first need logs again.
 void testARetryBackToALoggedOutcomeLogsNothing() {
   MemoryLedger ledger;
   std::vector<std::string> lines;
@@ -2086,11 +2087,11 @@ void testARetryBackToALoggedOutcomeLogsNothing() {
   ledger.setReturning([&] { return Returning{.landingBytes = landing}; },
                       [](std::span<const uint64_t>) { return Returning{}; });
   const ClaimId claim = ledger.open(request(4, RequestPriority::Normal));
-  for (int retry = 0; retry < 6; ++retry) {
+  for (uint32_t retry = 0; retry < 6; ++retry) {
     landing = retry % 2 ? kGiB : 0;
-    static_cast<void>(ledger.free(claim, {.bytes = kGiB}, 0, false));
+    static_cast<void>(ledger.free(claim, {.bytes = kGiB - retry * kMiB, .pages = 6 - retry}, 0, false));
   }
-  static_cast<void>(ledger.free(claim, {.bytes = 2 * kGiB}, 0, false));
+  static_cast<void>(ledger.free(claim, {.pages = 3}, 0, false));
   ledger.granted(claim);
   landing = 0;
   static_cast<void>(ledger.free(claim, {.bytes = kGiB}, 0, false));
