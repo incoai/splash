@@ -2183,7 +2183,8 @@ tokens and mask rows, from which the server sizes its token masks and against
 which it checks its tokenizer. Its transport is open before it reads its
 command line, so a start that fails before Ready, as when `--max-context`
 exceeds what the model or its budget holds, writes its report to stderr,
-sends a StartFailed event in its place and exits. StartFailed classes the
+sends a StartFailed event in its place and exits. A start whose server has
+gone, which closes its input, stops as on a stop signal. StartFailed classes the
 failure for the server's restart policy and the app's words: host memory, a
 driver allocation, the memory budget or the context the plan holds (with what
 the start needed against what it had, and whether this Mac, `--max-memory` or

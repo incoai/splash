@@ -26,6 +26,7 @@
 #include <functional>
 #include <future>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -217,20 +218,29 @@ engine::NativeProcessExit finish(std::future<engine::NativeProcessExit> &loop) {
   return loop.get();
 }
 
-engine::NativeProcessExit run(std::span<const uint8_t> input) {
-  Harness harness;
-  if (!input.empty()) {
-    ssize_t count = write(harness.pipes.input[1], input.data(), input.size());
-    require(count == static_cast<ssize_t>(input.size()),
-            "failed to seed transport input");
-  }
-  harness.pipes.closeInputWriter();
-  return harness.transport.run(harness.loop);
-}
-
 void wakeWithStatusRequest(Harness &harness, uint64_t id) {
   writeAll(harness.pipes.input[1],
            protocol::peer::serialize(protocol::StatusRequestFrame{id}));
+}
+
+// Runs the loop on a thread of its own and returns once it takes the input:
+// it has answered a status request.
+std::future<engine::NativeProcessExit> startTaking(Harness &harness) {
+  constexpr uint64_t kTaking = 1'000;
+  auto loop = start(harness);
+  wakeWithStatusRequest(harness, kTaking);
+  if (!awaitStatus(harness.pipes.output[0], kTaking, std::chrono::seconds(5)))
+    abandon("the loop did not take its input");
+  return loop;
+}
+
+// Hands `input` to a loop that takes the input, then ends the input.
+engine::NativeProcessExit run(std::span<const uint8_t> input) {
+  Harness harness;
+  auto loop = startTaking(harness);
+  writeAll(harness.pipes.input[1], input);
+  harness.pipes.closeInputWriter();
+  return finish(loop);
 }
 
 // A shutdown request ends run() with a clean exit while the input is still
@@ -459,11 +469,12 @@ void testQueueBoundStopsTheWriter() {
           "writing did not resume, or a frame was lost, once the loop caught up");
 }
 
-// Shutdown ends run() promptly and joins the reader, whether it waits on an
-// idle pipe or for room in a full queue.
-void testShutdownJoinsTheReader() {
+// A shutdown ends run() promptly, and the transport's end stops and joins
+// the reader, whether it waits on an idle pipe or for room in a full queue.
+void testShutdownAndTheTransportsEndStopTheReader() {
   for (bool full : {false, true}) {
-    Harness harness(64 * 1024);
+    auto owned = std::make_unique<Harness>(64 * 1024);
+    Harness &harness = *owned;
     BusyPass busy;
     if (full)
       busy.install(harness.transport);
@@ -490,9 +501,26 @@ void testShutdownJoinsTheReader() {
     const auto exit = finish(loop);
     require(exit == engine::NativeProcessExit::CleanEof &&
                 std::chrono::steady_clock::now() - requested < std::chrono::seconds(2),
-            full ? "shutdown did not stop a reader waiting for room"
-                 : "shutdown did not stop a reader waiting on an idle pipe");
+            "a shutdown did not end run() promptly");
+    auto ended = std::async(std::launch::async, [&owned] { owned.reset(); });
+    if (ended.wait_for(std::chrono::seconds(2)) != std::future_status::ready)
+      abandon(full ? "the transport's end did not stop a reader waiting for room"
+                   : "the transport's end did not stop a reader waiting on an idle pipe");
   }
+}
+
+// Until run() takes the input, its end is a shutdown request: a start whose
+// server has gone stops (main.mm). run() then ends at once, as a shutdown.
+void testTheInputsEndBeforeRunIsAShutdown() {
+  Harness harness;
+  harness.pipes.closeInputWriter();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!harness.transport.shutdownRequested() && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  require(harness.transport.shutdownRequested(),
+          "the input's end before run() did not request a shutdown");
+  require(harness.transport.run(harness.loop) == engine::NativeProcessExit::CleanEof,
+          "the input's end before run() did not end run() as a shutdown");
 }
 
 // The input's end and a read error reach the loop after the bytes read
@@ -502,9 +530,10 @@ void testInputEndsAfterItsBytes() {
       protocol::peer::serialize(protocol::StatusRequestFrame{11});
   {
     Harness harness;
+    auto loop = startTaking(harness);
     writeAll(harness.pipes.input[1], status);
     harness.pipes.closeInputWriter();
-    require(harness.transport.run(harness.loop) == engine::NativeProcessExit::CleanEof &&
+    require(finish(loop) == engine::NativeProcessExit::CleanEof &&
                 awaitStatus(harness.pipes.output[0], 11, std::chrono::seconds(1)),
             "the end of the input overtook the bytes before it");
   }
@@ -696,7 +725,8 @@ int main() {
     testLoopWakesForAnEngineDeadline();
     testReaderReadsWhileTheLoopIsBusy();
     testQueueBoundStopsTheWriter();
-    testShutdownJoinsTheReader();
+    testShutdownAndTheTransportsEndStopTheReader();
+    testTheInputsEndBeforeRunIsAShutdown();
     testInputEndsAfterItsBytes();
     testShutdownInterruptsABlockedOutputWrite();
     testNoOutputWriteStartsAfterAShutdown();

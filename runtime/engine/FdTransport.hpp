@@ -22,14 +22,16 @@ enum class NativeProcessExit : int {
   IoFailure = EX_IOERR,
 };
 
-// POSIX pipe transport for the native runtime child process. While run() is
-// active a reader thread reads the input fd, which is nonblocking meanwhile,
-// so the process keeps reading what the server writes while the loop runs a
-// command or a control pass. Each iteration passes everything read so far to
-// the loop before advancing the backend. Constraint-mask responses can
-// therefore arrive while the scheduler-owned target-forward command is in
-// flight; cancellation remains safe because provisional writes commit only
-// after that command drains.
+// POSIX pipe transport for the native runtime child process. From its
+// construction a reader thread reads the input fd, which is nonblocking
+// meanwhile, so the process keeps reading what the server writes while the
+// loop runs a command or a control pass. Each iteration of run() passes
+// everything read so far to the loop before advancing the backend.
+// Constraint-mask responses can therefore arrive while the scheduler-owned
+// target-forward command is in flight; cancellation remains safe because
+// provisional writes commit only after that command drains. Until run()
+// takes the input, its end (EOF) is a shutdown request: the server has gone,
+// so a start stops (main.mm).
 class FdTransport final {
 public:
   // The reader stops reading once inputQueueBytes of input wait for the
@@ -41,6 +43,8 @@ public:
 
   explicit FdTransport(int inputFd, int outputFd,
                        size_t inputQueueBytes = kInputQueueBytes);
+  // Stops and joins the reader, then gives the input fd its flags back.
+  ~FdTransport();
   FdTransport(const FdTransport &) = delete;
   FdTransport &operator=(const FdTransport &) = delete;
 
@@ -55,7 +59,7 @@ public:
   [[nodiscard]] NativeProcessExit run(NativeRuntime &loop);
   // After run() returned, however it ended: makes the newest restore points
   // durable (NativeRuntime::flushRestorePoints) as the writes it starts land,
-  // which wake it, without reading input, until none is left or budget has
+  // which wake it, without taking input, until none is left or budget has
   // passed. True once none is left.
   [[nodiscard]] bool runFlush(NativeRuntime &loop, std::chrono::milliseconds budget);
   // Async-signal-safe. Asks run() to return CleanEof at its next iteration.
@@ -63,6 +67,7 @@ public:
   // An output write the signal interrupts fails instead of resuming, and
   // run() still returns CleanEof.
   void requestShutdown() noexcept;
+  // True once a shutdown was requested, or the input ended before run().
   [[nodiscard]] bool shutdownRequested() const noexcept;
   // The longest one iteration of run() has taken: the input it hands the
   // loop, a control pass and a tick. Read on the loop thread (status). The
@@ -85,8 +90,10 @@ private:
 
   int inputFd_ = -1;
   int outputFd_ = -1;
-  size_t inputQueueBytes_ = 0;
+  // The input fd's flags before the transport made it nonblocking.
+  int inputFlags_ = 0;
   std::shared_ptr<LoopWake> wake_;
+  std::unique_ptr<InputReader> reader_;
   ControlHandler controlHandler_;
   double maxTickMilliseconds_ = 0.0;
   std::string failure_;

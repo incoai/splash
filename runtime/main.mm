@@ -339,7 +339,8 @@ int refuseStart(engine::FdTransport &transport, std::string_view executable) {
 
 // serve-native. Its transport is the server's pipes, open before the command
 // line is read, so that every start that fails before Ready tells the server
-// why (refuseStart).
+// why (refuseStart), and a start whose server has gone stops: the input's end
+// before run() requests a shutdown (FdTransport).
 int serveNative(int argc, char **argv) {
   if (const std::filesystem::path caches = splashCaches(); !caches.empty())
     reportLegacyWeightCache(caches / "weights");
