@@ -379,41 +379,6 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   const std::string expected{std::istreambuf_iterator<char>(golden), {}};
   require(golden && json + '\n' == expected,
           std::string(goldenPath) + " is not the status document, which is now:\n" + json);
-  require(json.find("\"kv_disk_hit_tokens\":96") != std::string::npos &&
-              json.find("\"kv_restores\":3") != std::string::npos,
-          "disk token accounting must include transfers completed before admission retries");
-  require(json.find("\"read_bytes\":12345") != std::string::npos &&
-              json.find("\"written_bytes\":67890") != std::string::npos &&
-              json.find("\"file_bytes\":24680,") != std::string::npos,
-          "disk byte accounting was not exposed");
-  require(json.find("\"disk\":{\"capacity_bytes\":34359738368,\"limit_bytes\":8589934592,"
-                    "\"used_bytes\":4096,\"file_bytes\":24680,"
-                    "\"volume_available_bytes\":46170898432,\"writes_gated\":\"budget\","
-                    "\"write_budget_bytes\":0,") != std::string::npos,
-          "the disk tier's limit, volume and write budget were not exposed");
-  require(json.find("\"persistent\":true,\"kv_copies\":64,\"kv_copy_failures\":0,"
-                    "\"taken_back\":{\"states\":2,\"kv_blocks\":96,\"bytes\":4096,"
-                    "\"left_behind\":1},\"write_behind\":{\"waiting\":1,\"durable\":5,"
-                    "\"unneeded\":3,\"refused\":0}}") != std::string::npos,
-          "status lost the persistent tier");
-  // The room the host held back of the streamed stores follows the staging
-  // among the fixed parts.
-  require(json.find("\"state_staging_bytes\":0,\"host_held_back_bytes\":0,\"fixed_runtime_bytes\"") !=
-              std::string::npos,
-          "the memory plan status omitted the disk tier's state staging or the room the host held back");
-  const std::string kvIdentity =
-      "{\"target_model_sha256\":\"" + std::string(64, 'b') +
-      "\",\"format\":\"int8\",\"quantization\":\"symmetric_int8\","
-      "\"scale_type\":\"float32\",\"key_layout\":\"token_major\","
-      "\"value_layout\":\"dimension_major\"}";
-  require(json.find("\"kv\":" + kvIdentity) != std::string::npos,
-          "INT8 status lost its KV identity");
-  require(json.find("\"cache\":{\"loaded_model_layout_sha256\":\"" + std::string(64, 'a') +
-                    "\",\"build_id\":\"build\",\"dtype\":\"q8s8_f32_scale_per_token_"
-                    "head_k_token_major_v_dimension_major\",\"block_tokens\":32,\"rope_scaling\":null}") !=
-                  std::string::npos &&
-              json.find("runtime_cache_namespace") == std::string::npos,
-          "status lost the cache identity or reported a cache namespace");
   StatusInputs bf16 = status;
   bf16.identity.kvLayout = kv::Layout{16, 4, 256, kv::Format::BFloat16};
   const std::string bf16Status = bf16.json();
@@ -439,27 +404,6 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                   std::string::npos &&
               tokenMajorStatus.find("\"value_layout\":\"token_major\"") != std::string::npos,
           "token-major values were reported dimension-major");
-  require(json.find("\"schema_version\":8") != std::string::npos &&
-              json.find("\"ready\":true") != std::string::npos,
-          "status readiness/schema is wrong");
-  require(json.find("\"ready\":true,\"maximum_context_tokens\":102400,") !=
-              std::string::npos,
-          "status advertised model capacity instead of the active engine limit");
-  require(json.find("\"images\":{\"encodes\":3,\"embedding_reuses\":4,"
-                    "\"embedding_evictions\":9,\"arena_bytes\":5,\"cached_bytes\":6,"
-                    "\"state_held_bytes\":7,\"rows_bytes\":8}") !=
-              std::string::npos,
-          "image telemetry is missing from status");
-  require(json.find("\"decode_wall_ms\":10,\"decode_cycle_ms\":12.5,") !=
-              std::string::npos,
-          "status lost the decode command wall or the engine's decode cycle");
-  require(json.find("\"model_timing\":{\"scope\":\"model_lifetime\","
-                    "\"prefill\":{\"last_gpu_ms\":5250,\"last_wall_ms\":116921.479,"
-                    "\"total_gpu_ms\":500500,\"total_wall_ms\":700250},"
-                    "\"decode\":{\"last_gpu_ms\":72.5,\"last_wall_ms\":83,"
-                    "\"total_gpu_ms\":1125,\"total_wall_ms\":1500}}") !=
-              std::string::npos,
-          "status lost model GPU/wall timing, scope, or milliseconds units");
 
   StatusInputs unmeasuredInputs = status;
   unmeasuredInputs.sample.telemetry = {};
@@ -471,79 +415,8 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                           "\"total_gpu_ms\":0,\"total_wall_ms\":0}}") !=
               std::string::npos,
           "status invented model timings from request metrics");
-  require(json.find("\"verify_rows\":\"auto\"") != std::string::npos &&
-              unmeasured.find("\"verify_rows\":\"all\"") != std::string::npos,
+  require(unmeasured.find("\"verify_rows\":\"all\"") != std::string::npos,
           "status lost the rows decode cycles verify");
-  require(json.find("\"kv\":{\"block_tokens\":32,"
-                    "\"pages_allocated\":128,\"pages_active\":24,"
-                    "\"extents_active\":2,\"active_bytes\":262144,"
-                    "\"pages_cache\":32,\"pages_free\":72,") !=
-              std::string::npos,
-          "status lost the KV pool's page counts or the extents of requests' pages");
-  require(json.find("\"extent_allocations\":5,\"extent_releases\":3,"
-                    "\"extent_allocate_max_ms\":2.5,\"extent_release_max_ms\":0.75,"
-                    "\"extent_compactions\":2,\"pages_moved\":9,"
-                    "\"extent_compact_max_ms\":1.25,\"window\":{") !=
-              std::string::npos,
-          "status lost the KV extent growth and release diagnostics");
-  require(json.find("\"system_pressure\":\"normal\"") != std::string::npos &&
-              json.find("\"host_measurement_valid\":true") != std::string::npos &&
-              json.find("\"host_headroom_bytes\":" + std::to_string(6 * kGiB)) !=
-                  std::string::npos,
-          "status omitted the host-side growth constraints");
-  require(json.find("\"serving_footprint_bytes\"") == std::string::npos,
-          "status reported a governor field nothing reads");
-  require(json.find("\"allocated_bytes\":350224384") != std::string::npos &&
-              json.find("\"idle_gdn_cells\":1,\"idle_draft_rings\":2,\"idle_context_windows\":3,") !=
-                  std::string::npos &&
-              json.find("\"active_lanes\":") != std::string::npos &&
-              json.find("\"cell_ceiling\"") == std::string::npos &&
-              json.find("\"scope\":\"startup_warmup\"") != std::string::npos,
-          "live state memory or audit scope is missing from status");
-  require(json.find("\"checkpoint_entries\":1,\"checkpoint_bytes\":64,"
-                    "\"checkpoint_evictions\":4,\"checkpoint_retirements\":3") !=
-              std::string::npos,
-          "temporary state occupancy and retirement are missing from status");
-  require(json.find("\"pinned\":0,\"in_use\":2,\"in_use_evictions\":5,") !=
-              std::string::npos,
-          "states unfinished requests use are missing from status");
-  require(json.find("\"cache\":{\"probe_hashed_blocks\":7,\"hits\":1,\"cold_misses\":2,") !=
-              std::string::npos &&
-              json.find("\"disk_hits\":1,") != std::string::npos &&
-              json.find("\"misses\"") == std::string::npos &&
-              json.find("\"lookups\"") == std::string::npos &&
-              json.find("\"state_hit_tokens\"") == std::string::npos &&
-              json.find("\"deduplicated_publications\"") == std::string::npos,
-          "status reported a lookup counter twice");
-  require(json.find("\"block_tokens\":32") != std::string::npos &&
-              json.find("\"decode_batches_by_width\":{\"b1\":1,\"b2\":1,\"b3\":"
-                        "1,\"b4\":1},") != std::string::npos,
-          "Page32 or real B3 status is missing");
-  require(
-      json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
-          json.find("\"resource_replay_tokens\":1234") != std::string::npos &&
-          json.find("\"resource_suspensions\":5,\"priority_suspensions\":2,") !=
-              std::string::npos &&
-          json.find("\"waiting_prefix\":3") != std::string::npos &&
-          json.find("\"deduplicated_state_publications\":2,"
-                    "\"recycled_state_publications\":1,"
-                    "\"disk_state_publications\":4,"
-                    "\"state_captures\":6,\"capture_cuts\":1,") !=
-              std::string::npos &&
-          json.find("\"lazy_junctions\":1") != std::string::npos &&
-          json.find("\"checkpoint_publications\":3,"
-                    "\"checkpoint_publication_failures\":1") !=
-              std::string::npos &&
-          json.find("\"draft_context\":{\"target_prefill_rows\":10000,\"prompt_"
-                    "end_rows\":2048,\"materialization_rows\":31,\"avoided_rows\":"
-                    "7921,\"restore_skipped\":1,\"resets\":2}") !=
-              std::string::npos &&
-          json.find("\"constraint_masks\":{\"overlap_batches\":5,\"overlap_"
-                    "requests\":8,\"last_target_forward_gpu_ms\":72.5,"
-                    "\"total_target_forward_gpu_ms\":250,\"last_residual_"
-                    "wait_ms\":1.5,\"total_residual_wait_ms\":12}") !=
-              std::string::npos,
-      "status lacks the engine's memory, cache or constraint counters");
 }
 
 // Whole documents for the branches the representative one leaves out. A
