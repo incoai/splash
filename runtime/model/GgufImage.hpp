@@ -114,12 +114,11 @@ struct Fill {
 // float(-exp(double)) rounds once, as the F32 values of a quantized tensor's
 // rows as stored (decodedColumns), which the GPU decodes as the format's
 // gather does (kernels/common/gguf_embedding_formats.h) and the kernels read
-// unquantized (a safetensors MoE router and shared-expert gate, GDN alpha and
-// beta of two types or of F16, and a GGUF's Q8_0 hyper-connection injection
-// weights and shared-expert scalar gate), or as the F32 1 + w of a BF16
-// RMSNorm weight w, which a checkpoint stores 1 below the weight the norm
-// multiplies by (exact but where |w| < 2^-16 or |w| >= 2^24, which it may
-// round once).
+// unquantized (a safetensors shared-expert gate, GDN alpha and beta of two
+// types or of F16, and a GGUF's Q8_0 hyper-connection injection weights and
+// shared-expert scalar gate), or as the F32 1 + w of a BF16 RMSNorm weight w,
+// which a checkpoint stores 1 below the weight the norm multiplies by (exact
+// but where |w| < 2^-16 or |w| >= 2^24, which it may round once).
 enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32, Decay, DequantizeToFloat32, CenteredNorm };
 // Rows written back to back, each value converted as `conversion` says.
 struct Copy {
