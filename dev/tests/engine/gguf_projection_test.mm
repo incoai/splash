@@ -24,7 +24,7 @@
 //   every K split each tile takes there, and prefilled; and Q8_0 decoded at K 192, three of the register tile's
 //   64-input coefficient units, which two partitions split into one and two.
 // Every run leaves the padding columns past its segments, the guard bands past its buffers and its counters as they
-// were. The token gather (ops::Embedding) of every format's native rows is checked here too.
+// were. The token gather (ops::Embedding) of every format's rows as stored is checked here too.
 #include "GgufFormatReference.hpp"
 #include "LinearNumerics.hpp"
 #include "TestBuffers.hpp"
@@ -923,7 +923,7 @@ void tokenGather(MetalBackend &backend) {
   for (int fi = 0; fi < FMT_COUNT; ++fi) {
     const Fmt f = Fmt(fi);
     const std::vector<uint8_t> native = makeNative(f, kVocabulary, kHidden, rng);
-    const EmbeddingWeights table(kVocabulary, kHidden, NativeRows(upload(backend, native), f));
+    const EmbeddingWeights table(kVocabulary, kHidden, StoredRows(upload(backend, native), f));
     const Guarded ids(backend, tokens.size() * sizeof(uint32_t), 0), output(backend, tokens.size() * kHidden * 2, 0xFF);
     std::memcpy(ids.view.contents(), tokens.data(), ids.bytes);
     CommandGraph graph;
@@ -944,7 +944,7 @@ void tokenGather(MetalBackend &backend) {
     std::vector<uint8_t> rows(size_t{kVocabulary} * hidden * 2);
     for (auto &b : rows) b = uint8_t(rng());
     for (size_t i = 1; i < rows.size(); i += 2) rows[i] &= 0xBF;   // finite: the top exponent bit clear
-    const EmbeddingWeights table(kVocabulary, hidden, NativeRows(upload(backend, rows), format));
+    const EmbeddingWeights table(kVocabulary, hidden, StoredRows(upload(backend, rows), format));
     const std::string name = std::string(fmtName(format)) + " at " + std::to_string(hidden) + " values";
     const Guarded ids(backend, tokens.size() * sizeof(uint32_t), 0), output(backend, tokens.size() * hidden * 2, 0xFF);
     std::memcpy(ids.view.contents(), tokens.data(), ids.bytes);
@@ -998,7 +998,7 @@ void stagedGather(MetalBackend &backend) {
                                 {model::SparseRowStore::cacheBytesFor(kRows / 2, bytesPerRow) +
                                      model::SparseRowStore::workingBytes(bytesPerRow, 1024, 0),
                                  std::make_shared<model::SsdReaders>(2), 1024});
-    const EmbeddingWeights table(kRows, hidden, NativeRows(upload(backend, native), f));
+    const EmbeddingWeights table(kRows, hidden, StoredRows(upload(backend, native), f));
     for (int step = 0; step < 2; ++step) {
       std::vector<uint32_t> ids(kCount);
       for (uint32_t &id : ids) id = uint32_t(rng() % (step ? kRows : 64)); // the second step repeats rows
@@ -1013,7 +1013,7 @@ void stagedGather(MetalBackend &backend) {
                   {static_cast<uint32_t *>(slots.view.contents()), kCount}, model::SparseRowUse::Prefill);
       CommandGraph graph;
       Embedding::add(graph, indices.view, table, resident.view, kCount);
-      Embedding::add(graph, slots.view, EmbeddingWeights(kCount, hidden, NativeRows(staging.view, f)), staged.view,
+      Embedding::add(graph, slots.view, EmbeddingWeights(kCount, hidden, StoredRows(staging.view, f)), staged.view,
                      kCount);
       static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
       if (!staged.intact() || !resident.intact()) fail(name + " staged gather writes past its output");
@@ -1051,11 +1051,11 @@ void gatherExtents(MetalBackend &backend) {
   for (const Fmt f : {Q80, PQ20, Fmt(GGUF_FMT_AF4G64), NVFP4, BF16, F16}) {
     const QuantFormat &format = kQuantFormats[f];
     const uint64_t rowBytes = uint64_t{kHidden} / format.block_elements * format.block_bytes;
-    EmbeddingWeights table(kVocabulary, kHidden, NativeRows(test::sharedBuffer(backend, kVocabulary * rowBytes), f));
+    EmbeddingWeights table(kVocabulary, kHidden, StoredRows(test::sharedBuffer(backend, kVocabulary * rowBytes), f));
     if (f == PQ20) table.rotation.signs = test::sharedBuffer(backend, kHidden);
     requireTableExtent(table.blocks().rows, kVocabulary * rowBytes, format.block_bytes, "token table",
                        [&](const MetalBuffer &rows) {
-                         EmbeddingWeights changed(kVocabulary, kHidden, NativeRows(rows, f));
+                         EmbeddingWeights changed(kVocabulary, kHidden, StoredRows(rows, f));
                          changed.rotation = table.rotation;
                          return changed;
                        });
@@ -1069,7 +1069,7 @@ void gatherExtents(MetalBackend &backend) {
   }
   for (const Fmt f : {BF16, F16})
     requireTableExtent(test::sharedBuffer(backend, kVocabulary * 320), kVocabulary * 320, 2, "token table",
-                       [&](const MetalBuffer &rows) { return EmbeddingWeights(kVocabulary, 160, NativeRows(rows, f)); });
+                       [&](const MetalBuffer &rows) { return EmbeddingWeights(kVocabulary, 160, StoredRows(rows, f)); });
   for (const EmbeddingWeights &table : tables) {
     test::requireExtent(backend, tokens, kRows * 4, 4, "embedding token", [&](CommandGraph &graph, const MetalBuffer &view) {
       Embedding::add(graph, view, table, output, kRows);

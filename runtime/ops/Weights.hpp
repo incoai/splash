@@ -210,13 +210,14 @@ private:
 };
 
 // A token table's rows as stored, gathered, never multiplied (Embedding.cpp):
-// native blocks of a GGUF format (metal/abi/QuantFormat.h), BF16 and F16
-// values among them, which a GGUF or a safetensors checkpoint may keep
-// unquantized. A default value holds no rows, which a reader replaces.
-struct NativeRows final {
-  NativeRows() = default;
+// whole native blocks of a GGUF format (metal/abi/QuantFormat.h), or BF16 or
+// F16 values at any width (quant_stored_row_bytes), which a GGUF or a
+// safetensors checkpoint may keep unquantized. A default value holds no rows,
+// which a reader replaces.
+struct StoredRows final {
+  StoredRows() = default;
   // Rows of a GGUF_FMT_*; throws for any other formatId.
-  NativeRows(metal::MetalBuffer rows, uint32_t formatId);
+  StoredRows(metal::MetalBuffer rows, uint32_t formatId);
   metal::MetalBuffer rows;
   uint32_t formatId = 0;
   // Its format's native block and kernel name suffix.
@@ -229,18 +230,18 @@ struct NativeRows final {
 class EmbeddingWeights final {
 public:
   EmbeddingWeights() = default;
-  EmbeddingWeights(uint32_t output, uint32_t input, NativeRows rows)
+  EmbeddingWeights(uint32_t output, uint32_t input, StoredRows rows)
       : outputSize(output), inputSize(input), rows_(std::move(rows)) {}
 
-  [[nodiscard]] const NativeRows &blocks() const noexcept { return rows_; }
+  [[nodiscard]] const StoredRows &blocks() const noexcept { return rows_; }
 
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
-  // Native rows stored rotated, gathered as D (H r) (InputRotation).
+  // Rows stored rotated, gathered as D (H r) (InputRotation).
   InputRotation rotation;
 
 private:
-  NativeRows rows_;
+  StoredRows rows_;
 };
 
 } // namespace splash::ops

@@ -284,8 +284,8 @@ public:
       uint64_t destination = image_.section(2 * heads * rowBytes);
       for (const GgufTensor *t : {beta, alpha}) {
         if (quantizedType(t->type) && !bfloat16) {
-          const uint64_t native = ggufRowBytes(kQuantFormats[imageFormat(t->type)], hidden);
-          image_.copyAt(destination, tensorRows(*t, heads, native, grouped(0, 1)), Conversion::DequantizeToFloat32);
+          image_.copyAt(destination, tensorRows(*t, heads, storedRowBytes(*t), grouped(0, 1)),
+                        Conversion::DequantizeToFloat32);
         } else {
           image_.copyAt(destination, tensorRows(*t, heads, t->bytes / heads, grouped(0, 1)), Conversion::None);
         }
@@ -379,7 +379,7 @@ public:
   // (a family's table, which no projection reads), as stored but for GGUF's
   // NVFP4 (tableRows). An F16 table's values reach the model rounded to
   // bf16, as the gather writes them.
-  void nativeTable(const std::string &name, uint64_t columns) {
+  void storedTable(const std::string &name, uint64_t columns) {
     const GgufTensor *tensor = find(name, quantizedType);
     if (!tensor) return;
     if (tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
@@ -611,14 +611,14 @@ struct Qwen4ExpGguf final {
 
   static void head(Builder &b, const QwenTargetDimensions &g) { hyperImage(b, g, "output_hc", false); }
 
-  // The PLE table's native rows in an image of their own (ple.bin), whose
+  // The PLE table's rows as stored in an image of their own (ple.bin), whose
   // rows stream from the file instead with streamTable once every tensor
   // the plan reads was found (planImages names those it misses first).
   static void tables(const GgufFile &file, const QwenTargetDimensions &g, PlanOptions options, Problems &problems,
                      std::vector<Image> &images) {
     const std::string table = "per_layer_token_embd.weight";
     Builder b(file, g, problems, "ple.bin", g.pleLayer, kTableImageType);
-    b.nativeTable(table, g.pleHeadDimension);
+    b.storedTable(table, g.pleHeadDimension);
     Image image = b.finish();
     if (options.streamTable && problems.empty()) image.streamedRows = tableRows(file, table, g.pleHeadDimension);
     images.push_back(std::move(image));
@@ -758,13 +758,25 @@ uint64_t convertedBytes(const TensorRows &source, Conversion conversion, uint64_
   case Conversion::WidenToFloat32: case Conversion::CenteredNorm: return sourceBytes * 2;
   case Conversion::Decay: return source.type == ggml::kBF16 ? sourceBytes * 2 : sourceBytes;
   case Conversion::DequantizeToFloat32: {
-    const uint32_t format = gguf_format_of(source.type);
-    if (format == GGUF_FMT_COUNT) throw GgufError("not a quantized tensor: " + source.name);
-    return sourceBytes / kQuantFormats[format].block_bytes * kQuantFormats[format].block_elements * 4;
+    const uint64_t columns = decodedColumns(source);
+    if (sourceBytes % source.rowBytes) throw GgufError("decoded bytes are not whole rows: " + source.name);
+    return sourceBytes / source.rowBytes * columns * sizeof(float);
   }
   case Conversion::None: break;
   }
   return sourceBytes;
+}
+
+uint64_t decodedColumns(const TensorRows &rows) {
+  const uint32_t format = gguf_format_of(rows.type);
+  if (format == GGUF_FMT_COUNT) throw GgufError("not a quantized tensor: " + rows.name);
+  // Rows as stored take a native block's bytes as stored for each of its
+  // elements, at any width they hold.
+  const uint64_t block = kQuantFormats[format].block_elements;
+  const uint64_t columns = rows.rowBytes * block / quant_stored_row_bytes(format, block);
+  if (!columns || quant_stored_row_bytes(format, columns) != rows.rowBytes)
+    throw GgufError("decoded rows are not rows as stored: " + rows.name);
+  return columns;
 }
 
 ImageBuilder::ImageBuilder(std::string name, uint32_t layer, uint32_t type, bool streamExperts)

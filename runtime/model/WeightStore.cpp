@@ -184,7 +184,7 @@ ops::EmbeddingWeights readBlockEmbedding(WeightFile &file, uint32_t outputSize, 
     const uint64_t rowBytes = quant_stored_row_bytes(format, d.inputSize);
     if (!rowBytes)
         throw WeightStoreError("GGUF embedding rows are not whole blocks of a GGUF format: " + std::string(label));
-    return {outputSize, inputSize, ops::NativeRows(readRows(file, d, rowBytes, label), format)};
+    return {outputSize, inputSize, ops::StoredRows(readRows(file, d, rowBytes, label), format)};
 }
 
 std::string weightManifestFingerprint(

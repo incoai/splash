@@ -112,13 +112,14 @@ struct Fill {
 // or F16 to the F32 value it equals (rows the kernels read as F32), as the F32
 // decay -exp(A_log) of a safetensors GDN's A_log, BF16 or F32, which
 // float(-exp(double)) rounds once, as the F32 values of a quantized tensor's
-// native rows, which the GPU decodes as the format's gather does
-// (kernels/common/gguf_embedding_formats.h) and the kernels read unquantized
-// (a safetensors MoE router and shared-expert gate, GDN alpha and beta of two
-// types or of F16, and a GGUF's Q8_0 hyper-connection injection weights and
-// shared-expert scalar gate), or as the F32 1 + w of a BF16 RMSNorm weight w,
-// which a checkpoint stores 1 below the weight the norm multiplies by (exact
-// but where |w| < 2^-16 or |w| >= 2^24, which it may round once).
+// rows as stored (decodedColumns), which the GPU decodes as the format's
+// gather does (kernels/common/gguf_embedding_formats.h) and the kernels read
+// unquantized (a safetensors MoE router and shared-expert gate, GDN alpha and
+// beta of two types or of F16, and a GGUF's Q8_0 hyper-connection injection
+// weights and shared-expert scalar gate), or as the F32 1 + w of a BF16
+// RMSNorm weight w, which a checkpoint stores 1 below the weight the norm
+// multiplies by (exact but where |w| < 2^-16 or |w| >= 2^24, which it may
+// round once).
 enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32, Decay, DequantizeToFloat32, CenteredNorm };
 // Rows written back to back, each value converted as `conversion` says.
 struct Copy {
@@ -193,8 +194,14 @@ struct PlanOptions {
 
 // The destination bytes of `sourceBytes` bytes of rows copied with
 // `conversion`: halved when narrowed, doubled when widened (and for the decay
-// of BF16 values and a centered norm), four per element when decoded to F32.
+// of BF16 values and a centered norm), four per element of whole rows when
+// decoded to F32 (decodedColumns).
 [[nodiscard]] uint64_t convertedBytes(const TensorRows &source, Conversion conversion, uint64_t sourceBytes);
+// The values of each row of a copy decoded to F32: the columns whose rows as
+// stored (quant_stored_row_bytes) take rows.rowBytes, whole native blocks but
+// for BF16's and F16's, which hold any width; throws for rows of no such
+// width.
+[[nodiscard]] uint64_t decodedColumns(const TensorRows &rows);
 
 // Lays out one image: its header block, then 16 KiB-aligned sections, each a
 // descriptor, copied rows or a quantized tensor's planes. The planners of a
@@ -252,7 +259,7 @@ private:
                                             const QwenTargetDimensions &geometry, PlanOptions options = {});
 
 // Where the GGUF holds the rows of the tensor `name`, a table of `columns`
-// values a row whose image copies its native rows as stored (a family's
+// values a row whose image copies its rows as stored (a family's
 // table), for reading them from the file. Throws GgufError for a tensor of a
 // type its image does not copy as stored, of another width or of a rotated
 // GGUF.

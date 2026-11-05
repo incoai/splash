@@ -45,10 +45,10 @@ void readRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count, 
 // with the file's bytes alone: the file and the offset of the first row from
 // its start. None when they are built (a quantized safetensors tensor's,
 // NVFP4 rows, a quantized float tensor) or permuted, or span two sources.
-struct StoredRows final {
+struct FileRows final {
   const WeightSource *file = nullptr;
   uint64_t offset = 0;
 };
-[[nodiscard]] std::optional<StoredRows> storedRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count);
+[[nodiscard]] std::optional<FileRows> storedRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count);
 
 } // namespace splash::model
