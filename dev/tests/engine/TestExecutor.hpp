@@ -101,6 +101,7 @@ public:
       *pool_ += bytes();
   }
   uint64_t bytes() const noexcept override { return 64; }
+  bool writable() const noexcept override { return true; }
   bool canOffload(bool) const noexcept override { return true; }
   std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
     return std::make_unique<OffloadTicket>(control_);
@@ -121,6 +122,7 @@ class KeptState final : public CompositeState {
 public:
   explicit KeptState(std::shared_ptr<OffloadControl> control) : control_(std::move(control)) {}
   uint64_t bytes() const noexcept override { return 64; }
+  bool writable() const noexcept override { return true; }
   bool canOffload(bool) const noexcept override { return true; }
   std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
     return std::make_unique<OffloadTicket>(control_);

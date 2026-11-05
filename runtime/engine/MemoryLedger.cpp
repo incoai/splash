@@ -88,16 +88,7 @@ struct MemoryLedger::Lacking final {
   }
   // Whether these amounts, of pages of its form, meet it, in any measure.
   [[nodiscard]] bool covered(uint64_t freedBytes, uint32_t freedPages, uint32_t freedBuffers) const noexcept {
-    return enough().reached(freedBytes, freedPages, form, freedBuffers);
-  }
-  [[nodiscard]] VictimQuery::Enough enough() const noexcept {
-    return {.bytes = bytes, .pages = pages, .form = form, .stateBuffers = buffers};
-  }
-  // A query that counts its units up to it (VictimQuery::enough).
-  [[nodiscard]] VictimQuery counting(const VictimQuery &query) const noexcept {
-    VictimQuery counted = query;
-    counted.enough = enough();
-    return counted;
+    return (bytes && freedBytes >= bytes) || (pages && freedPages >= pages) || (buffers && freedBuffers >= buffers);
   }
 };
 
@@ -419,11 +410,11 @@ uint64_t MemoryLedger::pooledBytes(const VictimQuery &query, const Lacking &lack
 
 // The most the order gives a claim, counted without taking: the units
 // take() would take, in its order, each at what its source says it frees
-// at most (VictimSource::peek), counted up to the query's enough, and none
-// past the unit that covers the lack. The state buffers of the units
-// counted give a need of bytes what the model's pool would release with
-// them beyond what it releases now (pooledBytes). A unit that meets none
-// of the need, or that lands later for an Immediate claim, is skipped.
+// at most (VictimSource::peek), and none past the unit that covers the
+// lack. The state buffers of the units counted give a need of bytes what
+// the model's pool would release with them beyond what it releases now
+// (pooledBytes). A unit that meets none of the need, or that lands later
+// for an Immediate claim, is skipped.
 MemoryLedger::Run MemoryLedger::bound(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack) const {
   Order order(*this, query);
   Run run;
@@ -578,11 +569,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
   const uint32_t id = claimId.value;
   ClaimState &claim = claims_.at(id);
   const ClaimSpec &spec = claim.spec;
-  // Its units counted up to the need, and then up to what it lacks
-  // (Lacking::counting).
-  const VictimQuery query{.rights = takeRights(spec, need, critical, lanePriority_),
-                          .need = need,
-                          .enough = VictimQuery::Enough::of(need)};
+  const VictimQuery query{.rights = takeRights(spec, need, critical, lanePriority_), .need = need};
 
   FreeResult result{.nowBytes = takeUnsized(query)};
   const uint64_t room = plus(freeBytes, result.nowBytes);
@@ -636,12 +623,11 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
                        .pages = static_cast<uint32_t>(less(lackingPages, creditPages)),
                        .form = need.form,
                        .buffers = need.stateBuffers};
-    const VictimQuery counted = lack.counting(query);
-    const Run most = bound(spec, counted, lack);
+    const Run most = bound(spec, query, lack);
     if (most.uncopied)
       uncopiedReachedSeconds_ = nowSeconds_;
     if (most.covered) {
-      run = take(counted, lack);
+      run = take(query, lack);
       if (run->uncopied)
         uncopiedReachedSeconds_ = nowSeconds_;
       FreeResult taken = run->freed;
@@ -736,7 +722,7 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, const Need &need, uint64
   if (less(room, held) >= enough)
     return enough;
   const Lacking lack{.bytes = less(plus(enough, held), room)};
-  const uint64_t taken = bound(spec, lack.counting(query), lack).bytes;
+  const uint64_t taken = bound(spec, query, lack).bytes;
   return std::min(enough, less(plus(room, taken), held));
 }
 
@@ -782,11 +768,8 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
       uint64_t funded = 0;
       bool grown = true;
       if (lacking) {
-        // Counted up to the unit too: the host judges what the cache funds
-        // of the whole unit.
         const VictimQuery query{.rights = takeRights(spec, {.bytes = unit}, false, lanePriority_),
-                                .need = {.bytes = unit},
-                                .enough = {.bytes = std::max(lacking, unit)}};
+                                .need = {.bytes = unit}};
         const Run run = bound(spec, query, {.bytes = lacking});
         if (run.uncopied)
           uncopiedReachedSeconds_ = nowSeconds_;

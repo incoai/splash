@@ -404,11 +404,15 @@ void testSubtreeThroughChurn() {
 
 struct FakeSlot final : engine::KvDiskSlot {};
 
-// On random trees, pagesFreeingNow counts exactly the resident blocks that no reclaim leaves in place: none of the
-// block and the resident blocks below it is used, has a page a request holds, moves, holds a `holding` state (at it
-// or at a disk-only block it restores through), or, with `unwritten`, lacks a copy while a state not `dropped` sits
-// at it or below. Counted up to enough, it stops there.
-void testPagesFreeingNowFollowsItsRule() {
+// On random trees, as blocks, states, holders, transfers, waiting chains and the resume point change, the counts the
+// cache keeps give what its rule names (pageReach): for a walk's reasons `mask`, a resident block frees now unless
+// one of the reasons sits at it or below it (it or a resident block below is used, has a page a request holds or
+// moves, or lacks a copy below a state that needs its KV; a state, a waiting chain's end or the resume point below
+// it has a reason `mask` names), or it is on the chain of a `kept` state; the written state's chain frees once that
+// state has left RAM and needs its KV; and the kept chains' pages no request holds and no transfer moves, up to a
+// page a request holds. Every step checks the counts against a recount (checkInvariants).
+void testPageReachFollowsItsRule() {
+  using Keep = KvCache::Keep;
   constexpr uint32_t count = 48;
   test::TestKvStorage storage(count, 100, 1);
   KvPool pool(storage, count);
@@ -423,8 +427,12 @@ void testPagesFreeingNowFollowsItsRule() {
     bool moving = false;  // in transfer
     bool copied = false;  // has a disk copy
     bool state = false;   // a state sits at it
+    KvCache::Keeps keeps = 0;
+    bool needed = false;
+    uint32_t wanted = 0;
   };
   std::vector<Reference> blocks(1);
+  uint64_t resumePoint = 0;
   std::mt19937 random(733);
   const auto pick = [&](uint64_t last) { return random() % (last + 1); };
   const auto resident = [&](uint64_t id) { return blocks[id].live && blocks[id].page != KvCache::noPage; };
@@ -440,14 +448,15 @@ void testPagesFreeingNowFollowsItsRule() {
         return true;
     return false;
   };
-  uint32_t checks = 0, counted = 0;
-  for (uint32_t step = 0; step < 4000; ++step) {
+  const auto bit = [](Keep keep) { return KvCache::keepBit(keep); };
+  uint32_t checks = 0, freeing = 0, written = 0, kept = 0;
+  for (uint32_t step = 0; step < 6000; ++step) {
     const uint64_t id = blocks.size() > 1 ? 1 + pick(blocks.size() - 2) : 0;
     Reference *entry = id && blocks[id].live ? &blocks[id] : nullptr;
     // A use, a held page or a transfer ends whenever drawn and starts a
     // third of the time, so that most blocks have none.
     const bool flip = !pick(2);
-    switch (pick(7)) {
+    switch (pick(9)) {
     case 0:
     case 1: {
       // Each resident block owns a page.
@@ -463,7 +472,8 @@ void testPagesFreeingNowFollowsItsRule() {
       break;
     }
     case 2:
-      if (entry && !entry->used && !entry->held && !entry->moving && !entry->state && !hasChild(id, false)) {
+      if (entry && !entry->used && !entry->held && !entry->moving && !entry->state && !entry->wanted &&
+          id != resumePoint && !hasChild(id, false)) {
         cache.erase(id);
         entry->live = false;
       }
@@ -481,15 +491,20 @@ void testPagesFreeingNowFollowsItsRule() {
       }
       break;
     case 5:
+      // A write reads a page with its copy; a restore fills one without.
       if (entry && resident(id) && (entry->moving || flip)) {
-        cache.setTransfer(id, entry->moving ? KvCache::Transfer::None : KvCache::Transfer::Draining);
+        cache.setTransfer(id, entry->moving  ? KvCache::Transfer::None
+                              : entry->copied ? KvCache::Transfer::Draining
+                                              : KvCache::Transfer::Filling);
         entry->moving = !entry->moving;
       }
       break;
     case 6:
       if (!entry || !resident(id) || entry->moving)
         break;
-      if (entry->copied && !entry->used && !entry->held && !hasChild(id, true) && pick(1)) {
+      // A RAM copy and the resume point sit on a page.
+      if (entry->copied && !entry->used && !entry->held && !hasChild(id, true) &&
+          !(entry->keeps & (bit(Keep::Writer) | bit(Keep::UsedWriter))) && id != resumePoint && pick(1)) {
         cache.dropPage(id);
         entry->page = KvCache::noPage;
       } else {
@@ -498,64 +513,124 @@ void testPagesFreeingNowFollowsItsRule() {
       }
       break;
     case 7:
-      if (entry) {
-        cache.countState(id, !entry->state, false);
-        entry->state = !entry->state;
+      // A state comes or goes, or changes what it asks of its KV: a RAM
+      // copy that leaves only through a write (sitting on a page), in use or
+      // not, or one that needs its KV, in use or not.
+      if (entry && (!entry->state || pick(1))) {
+        entry->state = !entry->state || pick(1);
+        const bool use = pick(1);
+        const bool writer = entry->state && resident(id) && pick(1);
+        entry->keeps = !entry->state ? 0
+                       : writer      ? static_cast<KvCache::Keeps>(bit(use ? Keep::UsedWriter : Keep::Writer) |
+                                                              (use ? bit(Keep::Used) : 0))
+                                     : static_cast<KvCache::Keeps>(use ? bit(Keep::Used) : 0);
+        entry->needed = entry->state && !writer;
+        cache.setStateKeeps(id, entry->keeps, entry->needed);
+      }
+      break;
+    case 8:
+      if (entry && (entry->wanted || flip)) {
+        const bool added = !entry->wanted || pick(1);
+        cache.countWanted(id, added);
+        added ? ++entry->wanted : --entry->wanted;
+      }
+      break;
+    case 9:
+      if (entry || flip) {
+        const uint64_t to = entry && entry->state && resident(id) ? id : 0;
+        cache.moveResumePoint(resumePoint, to);
+        resumePoint = to;
       }
       break;
     }
-    // The walk's states: some kept or leaving only once written, some
-    // leaving with no copy, and some chains kept without a state.
-    std::vector<uint64_t> holding, dropped;
+    cache.checkInvariants();
+    // A walk: its reasons, some states it keeps, and the state it writes.
+    KvCache::Keeps mask = bit(Keep::Busy);
+    for (const Keep keep : {Keep::Uncopied, Keep::Writer, Keep::UsedWriter, Keep::Used, Keep::Wanted,
+                            Keep::ResumePoint})
+      if (pick(1))
+        mask |= bit(keep);
+    std::vector<uint64_t> keptStates;
+    std::vector<uint64_t> writers;
     for (uint64_t block = 1; block < blocks.size(); ++block) {
       if (!blocks[block].live)
         continue;
-      const uint64_t draw = pick(9);
-      if (blocks[block].state && draw < 3)
-        holding.push_back(block);
-      else if (blocks[block].state && draw < 6)
-        dropped.push_back(block);
-      else if (!draw)
-        holding.push_back(block);
+      if (!pick(15))
+        keptStates.push_back(block);
+      if (blocks[block].keeps & mask & (bit(Keep::Writer) | bit(Keep::UsedWriter)))
+        writers.push_back(block);
     }
-    const bool unwritten = pick(1);
-    const auto restoresThrough = [&](uint64_t block) {
-      while (block && !resident(block))
-        block = blocks[block].parent;
-      return block;
-    };
-    const auto leftInPlace = [&](uint64_t block) {
+    const uint64_t stateWritten = !writers.empty() && pick(1) ? writers[pick(writers.size() - 1)] : 0;
+    // The rule, block by block, with the written state as it is or once it
+    // has left RAM.
+    const auto staysHere = [&](uint64_t block, bool afterWrite) {
       const Reference &at = blocks[block];
-      if (at.used || at.held || at.moving ||
-          std::ranges::any_of(holding, [&](uint64_t state) { return restoresThrough(state) == block; }))
+      if (at.used || at.held || at.moving)
         return true;
-      if (!unwritten || at.copied)
-        return false;
-      for (uint64_t below = 1; below < blocks.size(); ++below)
-        if (blocks[below].live && blocks[below].state && atOrBelow(below, block) &&
-            std::ranges::find(dropped, below) == dropped.end())
+      bool needed = false;
+      for (uint64_t below = 1; below < blocks.size(); ++below) {
+        const Reference &state = blocks[below];
+        if (!state.live || !atOrBelow(below, block))
+          continue;
+        // Once written, a state no longer waits for its write; one in use
+        // stays in use.
+        const bool gone = afterWrite && below == stateWritten;
+        const KvCache::Keeps keeps = static_cast<KvCache::Keeps>(
+            (gone ? state.keeps & ~(bit(Keep::Writer) | bit(Keep::UsedWriter)) : state.keeps) |
+            (state.wanted ? bit(Keep::Wanted) : 0) | (below == resumePoint ? bit(Keep::ResumePoint) : 0));
+        if (keeps & mask)
           return true;
-      return false;
+        needed = needed || (state.state && (state.needed || gone));
+      }
+      return (mask & bit(Keep::Uncopied)) && !at.copied && needed;
     };
-    uint32_t expected = 0;
+    const auto frees = [&](uint64_t block, bool afterWrite) {
+      if (!resident(block))
+        return false;
+      for (const uint64_t state : keptStates)
+        if (atOrBelow(state, block))
+          return false;
+      for (uint64_t below = 1; below < blocks.size(); ++below)
+        if (resident(below) && atOrBelow(below, block) && staysHere(below, afterWrite))
+          return false;
+      return true;
+    };
+    uint32_t expectedNow = 0, expectedWritten = 0;
     for (uint64_t block = 1; block < blocks.size(); ++block) {
-      bool frees = resident(block);
-      for (uint64_t below = 1; frees && below < blocks.size(); ++below)
-        frees = !(resident(below) && atOrBelow(below, block) && leftInPlace(below));
-      expected += frees;
+      const bool now = frees(block, false);
+      expectedNow += now;
+      expectedWritten += !now && stateWritten && frees(block, true);
     }
-    const std::array<uint32_t, 3> whole = cache.pagesFreeingNow(holding, dropped, unwritten, {});
-    require(whole == std::array<uint32_t, 3>{expected, 0, 0},
-            "pagesFreeingNow counted " + std::to_string(whole[0]) + " pages, the rule " + std::to_string(expected) +
-                " at step " + std::to_string(step));
-    const auto enough = static_cast<uint32_t>(1 + pick(expected));
-    const std::array<uint32_t, 3> upTo = cache.pagesFreeingNow(
-        holding, dropped, unwritten, [&](const std::array<uint32_t, 3> &pages) { return pages[0] >= enough; });
-    require(upTo[0] == std::min(enough, expected), "pagesFreeingNow counted past enough, or stopped short of it");
+    // The kept chains, from each source up to a page a request holds.
+    std::vector<uint64_t> sources = keptStates;
+    for (uint64_t block = 1; block < blocks.size(); ++block) {
+      const Reference &at = blocks[block];
+      if (at.live && (((at.keeps & bit(Keep::Used)) && (mask & bit(Keep::Used))) ||
+                      (at.wanted && (mask & bit(Keep::Wanted))) ||
+                      (block == resumePoint && (mask & bit(Keep::ResumePoint)))))
+        sources.push_back(block);
+    }
+    std::vector<bool> onChain(blocks.size());
+    for (const uint64_t source : sources)
+      for (uint64_t block = source; block && !(resident(block) && blocks[block].held); block = blocks[block].parent)
+        onChain[block] = true;
+    uint32_t expectedKept = 0;
+    for (uint64_t block = 1; block < blocks.size(); ++block)
+      expectedKept += onChain[block] && resident(block) && !blocks[block].moving;
+    const KvCache::PageReach reach = cache.pageReach(mask, keptStates, stateWritten);
+    require(reach.now == std::array<uint32_t, 3>{expectedNow, 0, 0} &&
+                reach.written == std::array<uint32_t, 3>{expectedWritten, 0, 0} &&
+                reach.kept == std::array<uint32_t, 3>{expectedKept, 0, 0},
+            "pageReach counted " + std::to_string(reach.now[0]) + " now, " + std::to_string(reach.written[0]) +
+                " written and " + std::to_string(reach.kept[0]) + " kept pages, the rule " +
+                std::to_string(expectedNow) + ", " + std::to_string(expectedWritten) + " and " +
+                std::to_string(expectedKept) + " at step " + std::to_string(step));
     ++checks;
-    counted += expected;
+    freeing += expectedNow;
+    written += expectedWritten;
+    kept += expectedKept;
   }
-  require(counted > checks, "the random trees rarely had a page that frees now");
+  require(freeing > checks && written && kept > checks, "the random trees rarely had a page each count names");
   for (uint64_t block = 1; block < blocks.size(); ++block) {
     Reference &entry = blocks[block];
     if (!entry.live)
@@ -566,10 +641,8 @@ void testPagesFreeingNowFollowsItsRule() {
       pool.releasePage(entry.page, false);
     if (entry.moving)
       cache.setTransfer(block, KvCache::Transfer::None);
-    if (entry.state)
-      cache.countState(block, false, false);
   }
-  std::cout << "pagesFreeingNow follows its rule: " << checks << " counts\n";
+  std::cout << "pageReach follows its rule: " << checks << " counts\n";
 }
 
 // A resident block gains a disk copy, gives up its page, and takes a page
@@ -1040,7 +1113,7 @@ int main() {
     testCandidateOrderThroughChurn();
     testSubtreeThroughChurn();
     testDiskTierTransitions();
-    testPagesFreeingNowFollowsItsRule();
+    testPageReachFollowsItsRule();
     testDiskOnlyAdoptionAndPoison();
     testMatchableExcludesPoisonedBlocks();
     testRequestsHoldTheirBlocks();

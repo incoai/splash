@@ -191,8 +191,6 @@ public:
   [[nodiscard]] bool inUse(uint64_t kvBlock) const noexcept {
     return uses_.contains(kvBlock);
   }
-  // The blocks of the states in use that either tier holds.
-  [[nodiscard]] std::vector<uint64_t> usedStates() const;
 
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
   // An ordinary state, in either tier.
@@ -252,6 +250,32 @@ public:
   // A reclaim of the state at this block writes it: it has no disk copy and
   // the tier takes its write.
   [[nodiscard]] bool reclaimWrites(uint64_t kvBlock) const noexcept;
+  // Whether the tier takes the write of a writable RAM copy not in use, or
+  // in use, now: CompositeState::canOffload, which answers alike for every
+  // writable copy of the class, asked of the oldest a reclaim may take;
+  // false without one.
+  [[nodiscard]] bool takesWrite(bool inUse) const noexcept;
+  // What a reclaim's walk over the RAM copies takes (Cache::reach): of the
+  // checkpoints and the ordinary states but those `kept` names (the walk
+  // keeps none in use), and with inUse the states in use, those that leave
+  // with no write (now); the first that leaves through a write, in the
+  // walk's order, while no write holds the staging buffer, which frees at
+  // once (staged, its block; 0 for none); and the others that leave through
+  // one, which wait for that buffer (later). Whether the tier takes the
+  // writes of states not in use (writes) and, with inUse, in use
+  // (usedWrites). From the counts the orders keep: it costs `kept`, not the
+  // states.
+  struct Reclaims final {
+    uint32_t now = 0;
+    uint64_t staged = 0;
+    uint32_t later = 0;
+    bool writes = false;
+    bool usedWrites = false;
+  };
+  [[nodiscard]] Reclaims reclaims(bool inUse, std::span<const uint64_t> kept) const;
+  // What the state at the block asks of its KV (KvCache::setStateKeeps), as
+  // the cache's counts should name it: none without a state.
+  [[nodiscard]] std::pair<KvCache::Keeps, bool> keeps(uint64_t kvBlock) const noexcept;
   // What reclaim(kvBlock) of a reclaimable state does, doing nothing:
   // evicted or pending. A write the quota refuses drops the state, which
   // counts as evicted.
@@ -304,6 +328,9 @@ private:
     uint64_t publication = 0;
     RecencyOrder::Node ramNode;
     RecencyOrder::Node diskNode;
+    // A writable RAM copy a reclaim may take without a disk copy waits in
+    // the order of its class's writes too.
+    RecencyOrder::Node writeNode;
   };
   struct PendingOffload {
     uint64_t kvBlock;
@@ -349,8 +376,14 @@ private:
   void unuse(uint64_t kvBlock) noexcept;
   [[nodiscard]] std::optional<CompositeStateLease>
   acquireBlock(uint64_t kvBlock);
-  // Places the entry in the orders its copies call for.
+  // Places the entry in the orders its copies call for, and names what it
+  // asks of its KV (keeps) and the resume point to the KV cache.
   void reindex(uint64_t kvBlock, Entry &entry) noexcept;
+  // A RAM copy a reclaim may take: in the order of its class.
+  [[nodiscard]] bool candidate(uint64_t kvBlock, const Entry &entry) const noexcept;
+  [[nodiscard]] std::pair<KvCache::Keeps, bool> keeps(uint64_t kvBlock, const Entry &entry) const noexcept;
+  // Names the resume point to the KV cache once it moved.
+  void markResumePoint() noexcept;
   void discardRam(Entry &entry) noexcept;
   void discardDisk(uint64_t kvBlock, Entry &entry) noexcept;
   // An ordinary publication or reuse: the block has held a reusable state,
@@ -374,6 +407,14 @@ private:
   RecencyOrder ordinary_;
   RecencyOrder checkpoints_;
   RecencyOrder inUse_;
+  // Of each, the writable RAM copies without a disk copy
+  // (CompositeState::writable), which leave through a write while the tier
+  // takes one.
+  RecencyOrder ordinaryWrites_;
+  RecencyOrder checkpointWrites_;
+  RecencyOrder inUseWrites_;
+  // The resume point the KV cache was last told of.
+  uint64_t resumeMarked_ = 0;
   RecencyOrder duplicates_;
   RecencyOrder diskOnly_;
   RecencyOrder inUseOnDisk_;

@@ -176,9 +176,8 @@ public:
   [[nodiscard]] uint64_t residentBytes() const noexcept override {
     return disk_ ? 0 : bytes();
   }
-  [[nodiscard]] bool canOffload(bool inUse) const noexcept override {
-    return !disk_ && file_ && file_->takesWrite(inUse);
-  }
+  [[nodiscard]] bool writable() const noexcept override { return !disk_ && file_; }
+  [[nodiscard]] bool canOffload(bool inUse) const noexcept override { return writable() && file_->takesWrite(inUse); }
   [[nodiscard]] std::unique_ptr<StateOffload>
   offload(std::function<void()> completion) const override;
   [[nodiscard]] std::unique_ptr<StateOffload>

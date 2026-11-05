@@ -72,6 +72,7 @@ public:
   }
   uint64_t bytes() const noexcept override { return 100; }
   uint64_t residentBytes() const noexcept override { return disk_ ? 0 : bytes(); }
+  bool writable() const noexcept override { return !disk_; }
   bool canOffload(bool inUse) const noexcept override {
     return !disk_ && (!control_->writeBudget || control_->writeBudget->admits(inUse));
   }
@@ -3065,18 +3066,6 @@ struct ExtentFixture {
             "eviction did not take exactly the first prompt");
   }
 };
-
-// What frees now is counted from the oldest leaf until it reaches the
-// query's enough, not over the whole cache.
-void testWhatFreesNowIsCountedUpToEnough() {
-  CacheFixture fixture;
-  VictimQuery query = test::query(test::kInServiceGrowth, {.pages = 1});
-  const std::optional<engine::Victim> whole = fixture.cache.peek(query, nullptr);
-  query.enough = {.pages = 1};
-  const std::optional<engine::Victim> counted = fixture.cache.peek(query, nullptr);
-  require(whole && counted && whole->pages == 4 && counted->pages == 1 && !counted->later,
-          "the walk counted what frees now past enough");
-}
 
 // A reclaim that releases extents releases an empty extent, then compacts scattered free pages,
 // before it evicts anything.
@@ -6112,6 +6101,45 @@ uint64_t cacheConversation(engine::Cache &cache, uint64_t id, uint32_t pages,
   return last;
 }
 
+// Counting what a reclaim frees costs as much in a cache of many conversations as in one of few: every phase of a
+// page need and a device need, of what is in use too, beside states that need a write, a state in use and a waiting
+// request's chain, visits the same blocks (Cache::reachVisits), and gives the same units.
+void testReclaimCountsDoNotGrowWithTheCache() {
+  const auto count = [](uint32_t conversations) {
+    test::TestKvStorage storage{conversations * 4 + 8, 100, 4};
+    storage.budgetPages = conversations * 4 + 8;
+    KvPool pool{storage, 4};
+    test::TestKvTier tier;
+    engine::Cache cache(pool, &tier, nullptr);
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    control->capacity = conversations;
+    std::vector<uint64_t> last;
+    for (uint64_t id = 1; id <= conversations; ++id)
+      last.push_back(cacheConversation(cache, id, 4, std::make_shared<TieredState>(control)));
+    const StateUse use = cache.useState(last[1]);
+    std::vector<uint32_t> prompt(4 * KvCache::pageTokens + 1);
+    std::iota(prompt.begin(), prompt.end(), 1000 * conversations);
+    const CacheProbe waiting = cache.probe(prompt, {});
+    cache.setWantedChains({waiting.restoredChain()});
+    const uint64_t before = cache.reachVisits();
+    std::vector<engine::Victim> units;
+    for (const VictimQuery &query : {test::query(test::kInServiceGrowth, {.pages = 1}),
+                                     test::query(test::kInServiceGrowth, {.bytes = 1, .stateBuffers = 1})})
+      for (std::optional<engine::Victim> unit = cache.peek(query, nullptr); unit; unit = cache.peek(query, &*unit))
+        units.push_back(*unit);
+    cache.checkInvariants();
+    return std::pair{cache.reachVisits() - before, units};
+  };
+  const auto [fewVisits, few] = count(8);
+  const auto [manyVisits, many] = count(32);
+  require(fewVisits == manyVisits && few.size() == many.size() && few.size() >= 4,
+          "counting a cache of 32 conversations visited " + std::to_string(manyVisits) + " blocks, one of 8 " +
+              std::to_string(fewVisits));
+  for (size_t index = 0; index < few.size(); ++index)
+    require(few[index].key == many[index].key, "the larger cache gave other units");
+}
+
 // The pages a need's units count at most (peek), and those its takes free,
 // of the need's form, now or as the demotions they start land, taken one at
 // a time until one takes nothing.
@@ -6587,7 +6615,7 @@ int main() {
     testDuplicateProbePromotesStateWithoutLookupAccounting();
     testUnifiedRecencyAndReleasedByteAccounting();
     testFinishedRequestLeavesTailKvBeforeItsState();
-    testWhatFreesNowIsCountedUpToEnough();
+    testReclaimCountsDoNotGrowWithTheCache();
     testCompactionReturnsFreePagesBeforeEvicting();
     testCompactionFollowsOnlyTheMovedBlocks();
     testCompactionLeavesTheRunway();

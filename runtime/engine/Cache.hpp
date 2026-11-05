@@ -697,16 +697,17 @@ public:
   // first. A state need's units are its states, one each.
   //
   // peek() changes nothing: a phase's unit counts at most what its reclaims
-  // free (reach), from the pool's extent and page counts, what frees now up
-  // to the query's enough, and none is given once that is nothing. take()
-  // makes one reclaim of the unit's phase, of the state alone in a phase of
-  // the staging buffer's write (the copied part of its chain, which its unit
-  // counts too, then frees with no write, in the first phase, which the
-  // ledger peeks again after a take), and reports what it freed: the bytes
-  // of the extents released now, and those it adds to the extents the
-  // landing pages complete beside the free ones (laterBytes, landingFill),
-  // less any of them a release took; the pages of the need's form free now,
-  // or for a claim that can wait landing; and the state buffers it gave up.
+  // free (reach), from the counts the pool and the KV cache keep, at a cost
+  // that does not grow with the cache, and none is given once that is
+  // nothing. take() makes one reclaim of the unit's phase, of the state
+  // alone in a phase of the staging buffer's write (the copied part of its
+  // chain, which its unit counts too, then frees with no write, in the first
+  // phase, which the ledger peeks again after a take), and reports what it
+  // freed: the bytes of the extents released now, and those it adds to the
+  // extents the landing pages complete beside the free ones (laterBytes,
+  // landingFill), less any of them a release took; the pages of the need's
+  // form free now, or for a claim that can wait landing; and the state
+  // buffers it gave up.
   // A device need's reclaim that demotes a leaf starts the demotions of its
   // chain above it, child before parent, while the tier and the quota have
   // room (a waiting claim's chain lands in about ceil(pages/64) ticks rather
@@ -760,6 +761,10 @@ public:
   // idle KV that states in use restore through.
   [[nodiscard]] uint32_t reusablePages(ReclaimClass upTo, kv::PageForm form = kv::PageForm::Full) const;
   [[nodiscard]] CacheSnapshot snapshot() const;
+  // The blocks the reclaim counts walked beside the counts the KV cache
+  // keeps (KvCache::reachVisits): the chain a start reuses and the staged
+  // state's, never the cache.
+  [[nodiscard]] uint64_t reachVisits() const noexcept { return kv_.reachVisits(); }
   [[nodiscard]] KvSpillSnapshot spillSnapshot() const;
   // Tests, between commands: std::logic_error unless the blocks, pages,
   // references and quota keep every invariant spilling relies on.
@@ -1044,12 +1049,12 @@ private:
   // form, the whole extents of the pages within the class's reach, but the
   // idle pages of the chains it keeps, the free pages a KV need takes and
   // the runway it keeps, as compaction gathers what stays; now, the free
-  // pages and those nothing keeps or lets go only later
-  // (KvCache::pagesFreeingNow: a state that needs a write, which stays in
-  // RAM until its write starts and needs its chain on the SSD after, or
-  // that waits for the write in flight; a block a writable tier writes
-  // before its page frees, as a state that stays needs it; a block a
-  // transfer moves; and their chains); written, those the state the idle
+  // pages and those nothing keeps or lets go only later (KvCache::Keep: a
+  // state that needs a write, which stays in RAM until its write starts and
+  // needs its chain on the SSD after, or that waits for the write in
+  // flight; a block a writable tier writes before its page frees, as a
+  // state that stays needs it; a block in use or in transfer, a page a
+  // request holds; and their chains); written, those the state the idle
   // staging buffer writes lets go once it has left RAM, the copied part of
   // its chain; later the rest, but the extents the landing pages complete
   // beside the free ones (landingExtents), which the ledger counts as
@@ -1057,8 +1062,9 @@ private:
   // Slim ones. States: the RAM copies the walk takes, now those that need no
   // write; written the first that needs one, while no write holds the
   // staging buffer, which frees at once; later the others, which wait for
-  // that buffer. With `enough`, only what frees now is counted, from the
-  // oldest leaves until `enough` says the amount counted so far suffices.
+  // that buffer (StateCache::reclaims). The counts cost the chains the walk
+  // keeps that the KV cache does not count by itself (the one a start
+  // reuses) and the staged state's chain, not the cache.
   struct ReclaimReach final {
     struct Amount final {
       uint64_t bytes = 0;
@@ -1070,15 +1076,12 @@ private:
     Amount later;
     [[nodiscard]] const Amount &of(ReclaimPhase phase) const noexcept;
   };
-  [[nodiscard]] ReclaimReach reach(const Walk &walk, ReclaimClass upTo,
-                                   const std::function<bool(const ReclaimReach &)> &enough) const;
+  [[nodiscard]] ReclaimReach reach(const Walk &walk, ReclaimClass upTo) const;
   // The walk of a phase: of its class; Immediate but for what frees as
   // writes land; no write for what frees with none.
   [[nodiscard]] Walk phaseWalk(const Walk &walk, ReclaimPhase phase) const;
-  // peek()'s unit of a phase: reach's amount of it, none when nothing; what
-  // frees now counted up to `enough` (VictimQuery::enough).
-  [[nodiscard]] std::optional<engine::Victim> reclaimUnit(const Walk &walk, ReclaimPhase phase,
-                                                          const VictimQuery::Enough &enough) const;
+  // peek()'s unit of a phase: reach's amount of it, none when nothing.
+  [[nodiscard]] std::optional<engine::Victim> reclaimUnit(const Walk &walk, ReclaimPhase phase) const;
   // Starts the demotions of the blocks above each demotion from writes_
   // [firstWrite] on whose page frees as it lands, child before parent,
   // those that then free their pages as they land too (freesOnLanding), of
@@ -1399,22 +1402,21 @@ private:
   // published the window's pages past it.
   [[nodiscard]] bool windowsPassed(uint32_t page, uint32_t index) const;
   // The pages of the cached blocks every window has passed, whose windowed
-  // layers trimming takes, oldest first (trimWindows).
-  [[nodiscard]] std::vector<uint32_t> trimmablePages() const;
+  // layers trimming takes, oldest first, the `most` oldest (trimWindows); and
+  // their count, which costs the requests' windows rather than the cache.
+  [[nodiscard]] std::vector<uint32_t> trimmablePages(size_t most) const;
+  [[nodiscard]] uint32_t trimmableCount() const;
   // The free Slim pages trims take without an allocation, but those of the
   // empty Slim extents past the runway, which a page need's walk releases
   // first (its Extent unit).
   [[nodiscard]] uint32_t trimRoom() const;
   // A page need of Full pages in a windowed cache that trims: trims free
-  // pages in place for it, the passed pages first (trimmedBy), then the tail
-  // a state that leaves the cache unpins (reach).
+  // pages in place for it, the passed pages first (its Trim unit, peek: as
+  // many as trimRoom takes, since no take allocates, a ledger take running
+  // outside any allocation's scope, and the Extent unit before it may
+  // release Slim pages), then the tail a state that leaves the cache
+  // unpins (reach).
   [[nodiscard]] bool trims(const Walk &walk) const noexcept;
-  // The pages a page need's walk may trim first (its Trim unit, peek), as
-  // many as free Slim pages take, since no take allocates (a ledger take
-  // runs outside any allocation's scope): Full pages each frees, which leave
-  // the blocks on them Slim. The unit counts only those trimRoom takes: the
-  // Extent unit before it may release Slim pages.
-  [[nodiscard]] std::vector<uint32_t> trimmedBy(const Walk &walk) const;
 
   KvPool &pool_;
   KvTier *tier_;

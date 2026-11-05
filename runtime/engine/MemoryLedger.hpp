@@ -224,30 +224,6 @@ struct VictimQuery final {
   // Chains every walk keeps: the one a start restores, which its placement
   // leaves out of the need it asks about (Engine::placement).
   const RestoredChains *kept = nullptr;
-  // Where a source may stop counting a unit it sizes from what it holds
-  // (the cache's reclaims): once the unit reaches one of these measures (KV
-  // pages of `form`), it gives at least that much there; below all of them,
-  // the whole unit. A measure of 0 stops nothing. The ledger counts up to
-  // what a claim lacks, so a count costs what the claim takes rather than
-  // what the cache holds.
-  struct Enough final {
-    uint64_t bytes = 0;
-    uint32_t pages = 0;
-    kv::PageForm form = kv::PageForm::Full;
-    uint32_t stateBuffers = 0;
-    [[nodiscard]] static Enough of(const Need &need) noexcept {
-      return {.bytes = need.bytes, .pages = need.pages, .form = need.form, .stateBuffers = need.stateBuffers};
-    }
-    [[nodiscard]] bool any() const noexcept { return bytes || pages || stateBuffers; }
-    // Whether an amount, of KV pages of `pagesForm`, reaches it in one of
-    // its measures.
-    [[nodiscard]] bool reached(uint64_t amountBytes, uint32_t amountPages, kv::PageForm pagesForm,
-                               uint32_t amountBuffers) const noexcept {
-      return (bytes && amountBytes >= bytes) || (pages && pagesForm == form && amountPages >= pages) ||
-             (stateBuffers && amountBuffers >= stateBuffers);
-    }
-  };
-  Enough enough;
 };
 
 // A source of the units free() takes, on the engine thread between commands.

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <span>
@@ -162,6 +163,11 @@ public:
   // A request holds the page, as one of its own or as a page of a cached
   // chain it uses.
   [[nodiscard]] bool pageActive(uint32_t page) const;
+  // The one observer of pageActive: told of a page as a request's first
+  // reference to it arrives or its last leaves, or as its references move
+  // with its content (movePages, compactExtent), so that whoever keeps
+  // counts of what the pages hold follows them (KvCache). Null for none.
+  void observeActivity(std::function<void(uint32_t page)> observer) noexcept { activity_ = std::move(observer); }
   // Between commands: gives each page, of another form, a page of form `to`
   // that takes what both hold (ExtentStorage::copyPages) and its references,
   // as compactExtent() moves them, and frees it; all of them or none. The
@@ -182,6 +188,10 @@ public:
   // The form's allocated extents, empty ones and the runway among them.
   [[nodiscard]] uint32_t allocatedExtents(kv::PageForm form) const noexcept {
     return formRecord(form).allocatedExtents;
+  }
+  // The form's allocated extents that hold no page, the runway among them.
+  [[nodiscard]] uint32_t emptyExtents(kv::PageForm form) const noexcept {
+    return formRecord(form).reclaimableExtents.count;
   }
 
   // Releases completely unreferenced extents, of the form or of any, at
@@ -334,6 +344,7 @@ private:
   std::vector<ExtentRecord> extents_;
   // By kv::PageForm.
   std::array<FormRecord, 3> forms_;
+  std::function<void(uint32_t page)> activity_;
 };
 
 } // namespace splash::engine

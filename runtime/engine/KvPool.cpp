@@ -507,6 +507,8 @@ void KvPool::markActive(uint32_t page) noexcept {
     ++form.activeExtents;
     form.fillingExtent = noIndex;
   }
+  if (activity_)
+    activity_(page);
 }
 
 void KvPool::markInactive(uint32_t page) noexcept {
@@ -519,6 +521,8 @@ void KvPool::markInactive(uint32_t page) noexcept {
     --form.activeExtents;
     form.fillingExtent = noIndex;
   }
+  if (activity_)
+    activity_(page);
 }
 
 // An extent changes state only while none of its pages is held: its pages

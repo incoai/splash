@@ -53,7 +53,7 @@ public:
   // only for a claim whose rights take them.
   [[nodiscard]] std::optional<Victim> peek(const VictimQuery &query, const Victim *after) const override {
     ++peeks;
-    peeked.push_back({after ? after->key : 0, query.enough.bytes});
+    peeked.push_back(after ? after->key : 0);
     const auto takes = [&](const Victim &unit) {
       switch (unit.kind) {
       case VictimKind::Memory: return unit.cls != ReclaimClass::InUse || query.rights.inUse;
@@ -69,10 +69,7 @@ public:
       ++unit;
     if (unit == units.end())
       return std::nullopt;
-    Victim counted = *unit;
-    if (countsUpToEnough && query.enough.bytes)
-      counted.bytes = std::min(counted.bytes, query.enough.bytes);
-    return counted;
+    return *unit;
   }
   // A unit goes whole: its pages of the need's form and its state buffers.
   FreeResult take(const VictimQuery &query, const Victim &victim) override {
@@ -114,17 +111,9 @@ public:
   std::vector<Victim> landing;
   uint64_t unsizedBytes = 0;
   bool landsIntoExtents = false;
-  // Its units' bytes are counted up to the query's enough, as the cache
-  // counts what its reclaims free.
-  bool countsUpToEnough = false;
   mutable uint32_t peeks = 0;
-  // Each peek: the key it asked after (0 for the head) and the bytes it
-  // counted up to (VictimQuery::enough).
-  struct Peek final {
-    uint64_t after = 0;
-    uint64_t enoughBytes = 0;
-  };
-  mutable std::vector<Peek> peeked;
+  // Each peek's key it asked after, 0 for the head.
+  mutable std::vector<uint64_t> peeked;
 
 private:
   std::string name_;
@@ -1398,25 +1387,21 @@ void testAvailableTakesNothing() {
   require(cache.taken.empty() && pool.units() == 3 && pool.shrinks == 0, "available() took something");
 }
 
-// free() and available() count each unit up to what the claim needs or lacks, and peek no unit past the one that
-// covers the lack: a count costs what the claim takes, not the cache behind it.
+// free() and available() peek no unit past the one that covers the lack: a count costs what the claim takes, not
+// the cache behind it.
 void testCountsStopAtTheLack() {
   MemoryLedger ledger;
   TestSource cache("cache");
   cache.units = {unit(1, 2 * kGiB), unit(2, kGiB)};
   ledger.addSource(cache);
-  const auto countedUpTo = [&](uint64_t need) {
-    return std::ranges::all_of(cache.peeked, [&](const TestSource::Peek &peek) {
-      return peek.after != 1 && peek.enoughBytes && peek.enoughBytes <= need;
-    });
-  };
+  const auto stopped = [&] { return std::ranges::find(cache.peeked, uint64_t{1}) == cache.peeked.end(); };
   const ClaimSpec spec = request(1, RequestPriority::Normal);
-  require(ledger.available(spec, {.bytes = kGiB}, 256 * kMiB, false) == kGiB && countedUpTo(kGiB),
+  require(ledger.available(spec, {.bytes = kGiB}, 256 * kMiB, false) == kGiB && stopped(),
           "available() counted past what the claim lacks");
   cache.peeked.clear();
   const ClaimId claim = ledger.open(spec);
   require(ledger.free(claim, {.bytes = kGiB}, 256 * kMiB, false).outcome == FreeOutcome::Met &&
-              cache.taken == std::vector<uint64_t>{1} && countedUpTo(kGiB),
+              cache.taken == std::vector<uint64_t>{1} && stopped(),
           "free() counted past what the claim lacks");
   ledger.close(claim);
 }
@@ -2182,8 +2167,8 @@ void testWarningRegrowsOnlyWhatTheCacheFunds() {
   }
 }
 
-// Under macOS's warning a unit the cache funds whole regrows though the room lacks less than the unit: the cache
-// counts what it frees up to the whole unit, which the host judges, not only up to what the room lacks.
+// Under macOS's warning a unit the cache funds whole regrows though the room lacks less than the unit: the host
+// judges what the cache frees of the whole unit, not only of what the room lacks.
 void testWarningRegrowsAUnitTheCacheFundsBeyondTheLack() {
   Fixture fixture(host(8 * kGiB + 7 * kGiB, MemoryPressure::Warning), 7 * kGiB + 512 * kMiB);
   FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 3, 4, 2);
@@ -2191,7 +2176,6 @@ void testWarningRegrowsAUnitTheCacheFundsBeyondTheLack() {
   fixture.memory.hold("cache", 2 * kGiB);
   TestSource cache("cache", &fixture.memory);
   cache.units = {unit(1, 2 * kGiB)};
-  cache.countsUpToEnough = true;
   fixture.ledger().addPool(experts);
   fixture.ledger().addSource(cache);
   static_cast<void>(fixture.pass(kRegrowQuietSeconds + 1.0));

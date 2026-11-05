@@ -220,10 +220,15 @@ public:
   // model's pool, and idle-state reclaim frees them.
   [[nodiscard]] virtual uint64_t bytes() const noexcept = 0;
   [[nodiscard]] virtual uint64_t residentBytes() const noexcept { return bytes(); }
+  // Whether the disk tier can take this state's write at all: a RAM copy of
+  // a model with a state tier.
+  [[nodiscard]] virtual bool writable() const noexcept { return false; }
   // Whether the disk tier takes this state's write now, for a state in use
-  // or not: a RAM copy, the tier's state file takes writes, its limit holds
-  // a state's slot, and the write budget admits one of the class
-  // (model::SlotFile::takesWrite).
+  // or not: a writable copy, the tier's state file takes writes, its limit
+  // holds a state's slot, and the write budget admits one of the class
+  // (model::SlotFile::takesWrite). Of a writable copy it depends on the tier
+  // and the class alone, the same for every such copy, so the cache asks one
+  // for all (StateCache::takesWrite).
   [[nodiscard]] virtual bool canOffload(bool) const noexcept { return false; }
   // Starts writing this state to the disk tier and returns the ticket that
   // carries its disk copy; the source is free as soon as the call returns.

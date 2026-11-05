@@ -60,6 +60,7 @@ public:
   }
   uint64_t bytes() const noexcept override { return 100; }
   uint64_t residentBytes() const noexcept override { return disk_ ? 0 : bytes(); }
+  bool writable() const noexcept override { return !disk_; }
   bool canOffload(bool inUse) const noexcept override {
     return !disk_ && shelf_->writable &&
            (!shelf_->writeBudget || shelf_->writeBudget->admits(inUse));
