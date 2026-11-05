@@ -16,6 +16,11 @@ class ValueMix final {
 public:
   static void add(metal::CommandGraph &graph, metal::MetalBuffer normed, metal::MetalBuffer scaledEmbeddings,
                   metal::MetalBuffer lambda, metal::MetalBuffer valueInput, uint32_t rows, uint32_t width);
+  // A post-norm block's add (model/Ripple.hpp): the branch's normed output
+  // rows plus the residual they add to, which this file's kernels host
+  // beside the mix.
+  static void sum(metal::CommandGraph &graph, metal::MetalBuffer a, metal::MetalBuffer b,
+                  metal::MetalBuffer output, uint32_t rows, uint32_t width);
 };
 
 } // namespace splash::ops

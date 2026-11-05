@@ -110,10 +110,66 @@ struct RippleLayerWeights final {
   // embeddings), as the kernels read it.
   metal::MetalBuffer valueResidualLambda;
   RippleDenseFfnWeights ffn;
+  // The residual's norm before the FFN, and the FFN output's norm before its
+  // residual add.
+  ops::NormWeights ffnNorm;
   ops::NormWeights postFfnNorm;
 };
 
 using RippleWeights = QwenTargetWeights<RippleLayout, RippleLayerWeights>;
+
+class RippleTarget final : public QwenTarget {
+public:
+  RippleTarget(const RippleWeights &weights, const QwenTargetGeometry &geometry,
+               metal::MetalBackend &backend, const ops::ExecutionPlans &operators);
+  ~RippleTarget() override;
+
+  [[nodiscard]] QwenTargetScratchBytes allocatedScratchBytes() const noexcept override;
+  [[nodiscard]] std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph,
+                                                           std::span<const QwenTargetPrefillChunk> chunks,
+                                                           const kv::PageStorage &kv, SpilledKvReads &spilled,
+                                                           QwenPrefillLayers layers, ops::AneFfn *aneFfn) override;
+  void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
+                 SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
+                 uint32_t lanes) const override;
+  void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
+                    metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const override;
+  void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens, metal::MetalBuffer hidden,
+                    uint32_t rows) const override;
+
+private:
+  // The shared prefill's layer loop runs the family's (QwenTarget::addPrefillLayers).
+  friend class QwenTarget;
+
+  void addPrefillBegin(PrefillStep &) const {}
+  [[nodiscard]] bool attends(uint32_t) const { return true; }
+  void addPrefillLayer(PrefillStep &step, uint32_t index) const;
+  [[nodiscard]] const ops::BlockMoeWeights *moe(uint32_t index) const noexcept;
+  void addPrefillExperts(PrefillStep &step, uint32_t index) const;
+  [[nodiscard]] metal::MetalBuffer addPrefillEnd(PrefillStep &step) const;
+  // The mixers of the family's split value: the fused projection's rows and
+  // the placed value projection's, whose input the block's mix computes.
+  void addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer,
+                       const metal::MetalBuffer &lambda) const;
+  void addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mixer, const metal::MetalBuffer &lambda,
+                      ops::PreparedInput normalized, BlockOutput output) const;
+  // The block's dense SwiGLU, whose activations clamp, and the norms and adds
+  // of its post-norm arrangement.
+  void addPrefillFfn(PrefillStep &step, const RippleLayerWeights &layer, metal::MetalBuffer ffnIn,
+                     metal::MetalBuffer output) const;
+  void addVerifyFfn(VerifyStep &step, const RippleLayerWeights &layer, metal::MetalBuffer ffnIn,
+                    metal::MetalBuffer output) const;
+  // The mixer's split dispatches of a verify's normalized rows.
+  void addVerifyProjectionPair(VerifyStep &step, const QwenAttentionWeights &mixer,
+                               const metal::MetalBuffer &lambda, ops::PreparedInput normalized) const;
+
+  const RippleWeights &weights_;
+  // The block's clamp, one F32 the clamped FFN epilogues read, and the scaled
+  // token embedding rows, which every block's mix reads back and the gather
+  // writes once.
+  metal::MetalBuffer clamp_;
+  metal::MetalBuffer embedRows_;
+};
 
 [[nodiscard]] RippleWeights loadRippleWeights(metal::MetalBackend &backend, RippleLayout layout,
                                               const QwenTargetFiles &files);

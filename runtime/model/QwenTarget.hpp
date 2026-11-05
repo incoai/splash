@@ -511,8 +511,8 @@ public:
   virtual void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                               metal::MetalBuffer proposals,
                               metal::MetalBuffer verifyInput, uint32_t lanes) const;
-  void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
-                    metal::MetalBuffer hidden, uint32_t rows) const;
+  virtual void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
+                            metal::MetalBuffer hidden, uint32_t rows) const;
   // The commit after acceptance of a verify of `lanes` lanes: in the
   // verify's command after it (addVerify), or for constrained decoding in
   // the next command, before any other decode step reuses the verify's

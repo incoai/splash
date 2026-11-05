@@ -28,4 +28,16 @@ void ValueMix::add(metal::CommandGraph &graph, metal::MetalBuffer normed,
             {kThreads, 1, 1});
 }
 
+void ValueMix::sum(metal::CommandGraph &graph, metal::MetalBuffer a, metal::MetalBuffer b,
+                   metal::MetalBuffer output, uint32_t rows, uint32_t width) {
+  if (!rows || !width)
+    throw std::invalid_argument("invalid row add");
+  const uint64_t elements = uint64_t{rows} * width;
+  requireBytes(a, elements * 2, "row add a");
+  requireBytes(b, elements * 2, "row add b");
+  requireBytes(output, elements * 2, "row add output");
+  graph.add("ripple_add", {std::move(a), std::move(b), std::move(output)}, elements,
+            {(elements + kThreads - 1) / kThreads, 1, 1}, {kThreads, 1, 1});
+}
+
 } // namespace splash::ops

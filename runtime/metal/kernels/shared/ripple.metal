@@ -10,6 +10,18 @@
 // a and emb are `elements` bf16 values (the block's normed input rows and the
 // scaled token embedding rows, which every block mixes back in); lambda is
 // the block's one F32 value.
+// The post-norm block's adds (model/Ripple.hpp): a branch's normed output
+// rows plus the residual they add to, one fp32 add per element rounded once
+// to bf16, as the linear epilogues' residual adds are.
+kernel void ripple_add(device const bfloat *a [[buffer(0)]],
+                       device const bfloat *b [[buffer(1)]],
+                       device bfloat *output [[buffer(2)]],
+                       constant uint &elements [[buffer(3)]],
+                       uint index [[thread_position_in_grid]]) {
+  if (index >= elements) return;
+  output[index] = bfloat(float(a[index]) + float(b[index]));
+}
+
 kernel void ripple_value_mix(device const bfloat *a [[buffer(0)]],
                              device const bfloat *emb [[buffer(1)]],
                              device const float *lambda [[buffer(2)]],
