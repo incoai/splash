@@ -166,7 +166,7 @@ constexpr NSUInteger kHostStepSeenOffset = 128;
 // The library of host_step_wait, beside the backend's own: built apart, as
 // its compiler may refuse it (Makefile), and loaded only for awake steps.
 constexpr std::string_view kHostStepLibrary = "host-step.metallib";
-// How long after a spin check that decided nothing (every spin started after
+// How long after a spin check that decided nothing (no spin was spinning at
 // its release, the GPU busy with other work) awake steps check it again.
 constexpr auto kHostStepSpinRecheck = std::chrono::seconds(10);
 
@@ -1304,7 +1304,7 @@ struct MetalBackend::Impl {
     }
 
     // How a check of the spin ended (checkHostStepSpin): a spin ended at its
-    // release, or ran past it, or every spin started after its release.
+    // release, or ran past it, or no spin was spinning at its release.
     enum class SpinCheck : uint8_t { Seen, Unseen, Late };
 
     // Runs spins on a queue of their own, each released while it spins, as
@@ -1315,8 +1315,6 @@ struct MetalBackend::Impl {
         if (!checkQueue) fail("unable to create Metal command queue");
         const auto *seen = reinterpret_cast<const uint32_t *>(
             static_cast<const uint8_t *>(spin.releases.contents) + kHostStepSeenOffset);
-        // A spin that starts after its release sees it at its first load
-        // and shows nothing, so a late one runs again, released later.
         for (const auto delay : {std::chrono::milliseconds(2), std::chrono::milliseconds(20),
                                  std::chrono::milliseconds(100)}) {
             id<MTLCommandBuffer> buffer = [checkQueue commandBuffer];
@@ -1329,7 +1327,10 @@ struct MetalBackend::Impl {
             [buffer waitUntilCompleted];
             if (buffer.status != MTLCommandBufferStatusCompleted)
                 fail("a GPU spin failed: " + errorDescription(buffer.error));
-            if (buffer.GPUStartTime >= released) continue;
+            // A spin that was not spinning at its release (started after it,
+            // or ended before it, as when the GPU, busy with other work,
+            // started it late) shows nothing, so it runs again, released later.
+            if (buffer.GPUStartTime >= released || buffer.GPUEndTime <= released) continue;
             // A spin that saw its release at its first load proves nothing:
             // a release that came before that load shows to any load.
             if (seen[0] == value && seen[1] == 0) continue;
@@ -1346,15 +1347,15 @@ struct MetalBackend::Impl {
     // with an awake step is encoded, the backend builds the spin
     // (HostStepSpin), and one spin runs on a queue of its own and is released
     // 2 ms after its commit, while it spins: it must end at that release, not
-    // at its bound. A spin that started only after its release shows
-    // nothing, and runs again, released 20 and then 100 ms after its commit.
+    // at its bound. A spin that started after its release, or ended before
+    // it, shows nothing and runs again, released 20, then 100 ms after commit.
     // Once a spin ended at its release, awake steps spin. If one ran past its
     // release, or the spin cannot be built or run, awake steps run as plain
     // ones (encodeHostStep), which only gives up the spin's head start, and a
-    // warning says so. If every spin started late, the GPU busy with other
-    // work, the check decides nothing: awake steps run as plain ones for
-    // kHostStepSpinRecheck, and the first command with one after that checks
-    // again.
+    // warning says so. If no spin was spinning at its release, the GPU busy
+    // with other work, the check decides nothing: awake steps run as plain
+    // ones for kHostStepSpinRecheck, and the first command with one after
+    // that checks again.
     void checkHostStepSpin() {
         @autoreleasepool {
             try {

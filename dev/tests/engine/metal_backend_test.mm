@@ -1952,18 +1952,23 @@ void firstCommandSpinsThroughItsAwakeHostStep(const std::string &metallibPath) {
 
 id noCommandQueue(id, SEL) { return nil; }
 CFTimeInterval startedLate(id, SEL) { return std::numeric_limits<CFTimeInterval>::max(); }
+CFTimeInterval startedEarly(id, SEL) { return 0.0; }
+CFTimeInterval endedLate(id, SEL) { return std::numeric_limits<CFTimeInterval>::max(); }
+
+// The warning of awake host steps that run as plain ones.
+constexpr std::string_view kNoSpinWarning = "Metal host steps run without keeping the GPU awake";
 
 // Awake host steps run as plain ones, with one warning, when the backend
 // cannot build or check their spin or a spin ran past its release: without
 // host-step.metallib beside the backend's library, with one Metal cannot
-// load, with one whose host_step_wait never sees its release (the test
-// library's, metal_backend_test.metal), and when Metal creates no queue for
-// the check. A check whose every spin started after its release, as when the
-// GPU is busy with other work, decides nothing and warns of nothing: a later
-// check spins.
+// load, with one whose host_step_wait runs past its release without seeing
+// it (the test library's, metal_backend_test.metal, whose spin ends at once,
+// with its times reported across its release), and when Metal creates no
+// queue for the check.
+// A check whose every spin started after its release, as when the GPU is busy
+// with other work, decides nothing and warns of nothing: a later check spins.
 void hostStepSpinFallsBack(const std::string &metallibPath) {
     namespace fs = std::filesystem;
-    constexpr std::string_view kWarning = "Metal host steps run without keeping the GPU awake";
     const auto runAwakeSteps = [](MetalBackend &backend) {
         MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
         auto *value = static_cast<volatile uint32_t *>(buffer.contents());
@@ -1979,9 +1984,9 @@ void hostStepSpinFallsBack(const std::string &metallibPath) {
     };
     const auto fallsBack = [&](MetalBackend &backend, std::string_view cause) {
         const std::string warnings = capturedStderr([&] { runAwakeSteps(backend); });
-        const size_t warning = warnings.find(kWarning);
+        const size_t warning = warnings.find(kNoSpinWarning);
         require(warning != std::string::npos && warnings.find(cause) != std::string::npos &&
-                    warnings.find(kWarning, warning + 1) == std::string::npos,
+                    warnings.find(kNoSpinWarning, warning + 1) == std::string::npos,
                 "awake host steps without their spin did not warn once of \"" + std::string(cause) + "\": " +
                     warnings);
         require(backend.healthy() && BackendInstrumentation::awakeHostStepsSpin(backend) == false,
@@ -2001,11 +2006,14 @@ void hostStepSpinFallsBack(const std::string &metallibPath) {
         fallsBack(backend, "unable to load metallib");
     }
     fs::copy_file(library, spinLibrary, fs::copy_options::overwrite_existing);
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     {
         MetalBackend backend(library.string());
+        id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
+        MethodReplacement early(command, @selector(GPUStartTime), reinterpret_cast<IMP>(startedEarly));
+        MethodReplacement late(command, @selector(GPUEndTime), reinterpret_cast<IMP>(endedLate));
         fallsBack(backend, "did not see the CPU's release");
     }
-    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     {
         MetalBackend backend(metallibPath);
         MethodReplacement noQueue(device, @selector(newCommandQueue), reinterpret_cast<IMP>(noCommandQueue));
@@ -2013,19 +2021,44 @@ void hostStepSpinFallsBack(const std::string &metallibPath) {
     }
     MetalBackend backend(metallibPath);
     std::string warnings;
+    std::optional<bool> decision;
     {
         id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
         MethodReplacement late(command, @selector(GPUStartTime), reinterpret_cast<IMP>(startedLate));
-        warnings = capturedStderr([&] {
-            require(!BackendInstrumentation::awakeHostStepsSpin(backend).has_value(),
-                    "a check whose spins all started late decided");
-        });
+        warnings = capturedStderr([&] { decision = BackendInstrumentation::awakeHostStepsSpin(backend); });
     }
+    require(!decision.has_value(), "a check whose spins all started late decided: " + warnings);
     runAwakeSteps(backend);
-    require(warnings.find(kWarning) == std::string::npos &&
+    require(warnings.find(kNoSpinWarning) == std::string::npos &&
                 spinCheck(backend, "a check after one that decided nothing").value_or(true),
             "a check whose spins all started late warned, or kept a later check from spinning: " + warnings);
     std::cout << "PASS awake host steps run as plain ones without a spin that sees its release\n";
+}
+
+// A check whose every spin ended before its release, as when the GPU, busy
+// with other work, starts a spin so late that it makes all its loads before
+// the CPU releases it, decides nothing and warns of nothing, like one whose
+// spins all started after their release: a later check spins. The test
+// library's host_step_wait ends at once, before any release.
+void hostStepSpinEndedEarlyDecidesNothing(const std::string &metallibPath) {
+    namespace fs = std::filesystem;
+    TemporaryDirectory directory("splash-host-step");
+    const fs::path library = directory.path() / "test.metallib";
+    const fs::path spinLibrary = directory.path() / "host-step.metallib";
+    fs::copy_file(metallibPath, library);
+    fs::copy_file(metallibPath, spinLibrary);
+    MetalBackend backend(library.string());
+    std::optional<bool> decision;
+    const std::string warnings =
+        capturedStderr([&] { decision = BackendInstrumentation::awakeHostStepsSpin(backend); });
+    require(!decision.has_value(), "a check whose spins all ended before their release decided: " + warnings);
+    fs::copy_file(fs::path(metallibPath).replace_filename("host-step.metallib"), spinLibrary,
+                  fs::copy_options::overwrite_existing);
+    require(warnings.find(kNoSpinWarning) == std::string::npos &&
+                spinCheck(backend, "a check after one that decided nothing").value_or(true),
+            "a check whose spins all ended before their release warned, or kept a later check from spinning: " +
+                warnings);
+    std::cout << "PASS a spin check whose spins all ended before their release decides nothing\n";
 }
 
 // The buffers of a command before its last are committed as their encoding
@@ -2740,6 +2773,7 @@ std::span<const splash::test::TestCase> behaviourTests() {
         {"firstCommandWithAnAwakeHostStep", [] { (void)firstCommandWithAnAwakeHostStep(metallib); }},
         {"hostSteps", [] { (void)hostSteps(metallib); }},
         {"hostStepSpinFallsBack", [] { hostStepSpinFallsBack(metallib); }},
+        {"hostStepSpinEndedEarlyDecidesNothing", [] { hostStepSpinEndedEarlyDecidesNothing(metallib); }},
         {"earlyBuffersRunWhileTheRestEncodes", [] { earlyBuffersRunWhileTheRestEncodes(metallib); }},
         {"encodingFailureAfterACommit", [] { encodingFailureAfterACommit(metallib); }},
         {"throwingHostStepFailsItsCommand", [] { throwingHostStepFailsItsCommand(metallib); }},
