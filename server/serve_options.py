@@ -715,6 +715,20 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--verify-attention-pages",
+        "requests",
+        dict(
+            type=int,
+            choices=range(1, 17),
+            default=None,
+            metavar="PAGES",
+            help="verify attention sums each draft row's history in splits of this "
+            "many pages (1-16) at fixed positions, so a row's output does not "
+            "depend on where its draft block starts (default: splits balanced "
+            "over the block's length)",
+        ),
+    ),
+    ServeOption(
         "--allow-idle-sleep",
         "requests",
         dict(

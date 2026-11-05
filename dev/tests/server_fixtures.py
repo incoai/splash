@@ -798,6 +798,7 @@ def main_args(**overrides):
             "decode_share": None,
             "disable_ane": False,
             "verify_rows": "auto",
+            "verify_attention_pages": None,
             "max_image_pixels": images.MAX_PIXELS,
             "request_timeout": None,
             "queue_size": 1,

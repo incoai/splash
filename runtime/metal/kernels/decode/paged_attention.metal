@@ -60,7 +60,7 @@
         params[group.z].kv, kv_head, tile.first_position, tile.active_rows,    \
         tile.splits, group.y, partials, statistics, tile.first_slot + group.y, \
         scores, probabilities, row_max, row_sum, previous_scale, &rescale,     \
-        thread_index);                                                         \
+        thread_index, tile.fixed_per_split);                                   \
   }
 
 PAGED_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, 256, 0, int8_t)

@@ -154,10 +154,15 @@ struct SplashVerifyAttentionParams {
   // The lane's block list, which its sparse split and reduce read.
   uint32_t block_stride;
   uint32_t block_list;
+  // 0: the balanced partition (ceil(pages / split_count) pages per split).
+  // G > 0 (splash serve --verify-attention-pages; dense windowless lanes
+  // only): G pages per split at absolute page boundaries, so a row's
+  // partition never depends on where its 8-row block starts.
+  uint32_t pages_per_split;
 };
 
-static_assert(sizeof(SplashVerifyAttentionParams) == 32,
-              "Verify attention parameters are 32 bytes on both sides");
+static_assert(sizeof(SplashVerifyAttentionParams) == 36,
+              "Verify attention parameters are 36 bytes on both sides");
 
 // A prefill whose history has pages that hold only their index reads one
 // layer's history staged (kernels/shared/kv_stage.metal, ops::PagedAttention::

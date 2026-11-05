@@ -179,6 +179,26 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
                 (lanes < 4 || plan.laneSplits[3] == kv::kVerifyMaximumSplits),
             "verify partition changed");
   }
+  // Fixed pages per split (--verify-attention-pages): a dense lane runs one
+  // split per that many pages while they fit the slot workspace, and the
+  // balanced partition past it; a sparse lane always keeps its own.
+  for (const uint32_t pagesPerSplit : {1U, 2U, 4U, 16U}) {
+    const std::array<uint32_t, 4> histories{0, 31, 16384, 131072};
+    const auto plan = ops::PagedAttention::verifyPlan(4, queryHeads, layout, histories, {}, pagesPerSplit);
+    uint32_t maximum = 0;
+    for (uint32_t lane = 0; lane < 4; ++lane) {
+      const uint32_t pages = (histories[lane] + kv::kVerifyRows + kv::kPageTokens - 1) / kv::kPageTokens;
+      const uint32_t fixed = (pages + pagesPerSplit - 1) / pagesPerSplit;
+      const bool takes = !layout.valuesTokenMajor && fixed <= kv::kVerifyMaximumSplits;
+      require(plan.lanePagesPerSplit[lane] == (takes ? pagesPerSplit : 0) &&
+                  plan.laneSplits[lane] == (takes ? fixed : kv::verifyAttentionSplits(histories[lane])),
+              "verify lane split count does not follow its pages per split");
+      maximum = std::max(maximum, plan.laneSplits[lane]);
+    }
+    require(plan.splits == maximum, "verify plan splits are not its widest lane's");
+  }
+  rejects([&] { (void)ops::PagedAttention::verifyPlan(1, queryHeads, layout, zeroHistory, {}, 17); },
+          "verify attention pages per split exceed 16", "17 pages per verify split were accepted");
   for (const uint32_t rows : {0U, 2049U})
     rejects([&] { (void)ops::PagedAttention::prefillPlan(rows, queryHeads, layout); },
             "invalid attention workspace rows", "a prefill plan of no rows or past the budget was accepted");

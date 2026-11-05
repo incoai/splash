@@ -23,8 +23,8 @@ void include(Workspace &bound, const Workspace &required,
 
 } // namespace
 
-ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
-    : linear_(device), family_(gpuFamilyClass(device.appleGpuFamily)),
+ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, ExecutionOptions options)
+    : linear_(device), family_(gpuFamilyClass(device.appleGpuFamily)), options_(options),
       gpuCores_(plannedGpuCores(device)) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
@@ -35,7 +35,8 @@ PrefillAttentionPlan ExecutionPlans::prefillAttention(
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
     std::span<const uint32_t> historyTokens, AttentionVariant variant) const {
-  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, variant);
+  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, variant,
+                                    options_.verifyAttentionPages);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,

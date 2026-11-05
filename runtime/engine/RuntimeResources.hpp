@@ -164,6 +164,8 @@ struct RuntimeResourcesConfig {
   // (model::budgetsVerifyRows); a benchmark round verifies every row so that
   // rounds repeat one another.
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // The plan choices of splash serve flags (ops::ExecutionOptions).
+  ops::ExecutionOptions executionOptions;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.

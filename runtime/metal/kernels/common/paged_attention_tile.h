@@ -61,7 +61,12 @@ inline bool splash_verify_attention_contract_valid(
          params.split_count > 0 &&
          params.split_count <= SplashVerifyMaximumSplits &&
          params.slot_splits >= params.split_count &&
-         params.slot_splits <= SplashVerifyMaximumSplits;
+         params.slot_splits <= SplashVerifyMaximumSplits &&
+         (params.pages_per_split == 0 ||
+          (params.committed_tokens + SPLASH_TARGET_VERIFY_ROWS +
+           SplashKvPageTokens * params.pages_per_split - 1) /
+                  (SplashKvPageTokens * params.pages_per_split) <=
+              params.split_count);
 }
 
 // The query tile a threadgroup owns, of one KV head: the offset of its fused
@@ -78,6 +83,9 @@ struct SplashAttentionTile {
   uint active_rows;
   uint splits;
   bool active;
+  // Pages per split at absolute page boundaries (SplashVerifyAttentionParams::
+  // pages_per_split), or 0 for the balanced partition; prefill tiles take 0.
+  uint fixed_per_split;
 };
 
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim>
@@ -88,7 +96,7 @@ inline SplashAttentionTile splash_verify_attention_tile(
   const ulong head = ulong(batch) * KVHeads + kv_head;
   return {head * SPLASH_VERIFY_CHUNK_STRIDE * QueryHeadsPerKVHead * HeadDim,
           head * lane.slot_splits, lane.committed_tokens, SPLASH_TARGET_VERIFY_ROWS,
-          lane.split_count, true};
+          lane.split_count, true, lane.pages_per_split};
 }
 
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim>
@@ -102,7 +110,7 @@ inline SplashAttentionTile splash_prefill_attention_tile(
               HeadDim,
           (ulong(tile) * KVHeads + kv_head) * params.split_count,
           params.committed_tokens + start, min(SplashPrefillTileRows, params.rows - start),
-          params.split_count, true};
+          params.split_count, true, 0};
 }
 
 // Part `part` of a tile run as Parts parts of RowsPerTile / Parts rows each
@@ -122,7 +130,7 @@ inline SplashAttentionTile splash_attention_tile_part(SplashAttentionTile tile, 
     return {};
   return {tile.offset + ulong(first) * QueryHeadsPerKVHead * HeadDim,
           tile.first_slot * Parts + ulong(part) * slot_stride, tile.first_position + first,
-          min(Rows, tile.active_rows - first), tile.splits, true};
+          min(Rows, tile.active_rows - first), tile.splits, true, tile.fixed_per_split};
 }
 
 // Split and reduce derive the same balanced partition of each query tile's
@@ -285,7 +293,7 @@ inline void splash_paged_attention_tile(
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
-    uint thread_index) {
+    uint thread_index, uint fixed_per_split = 0) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr ushort N = SplashKvPageTokens;
@@ -295,7 +303,8 @@ inline void splash_paged_attention_tile(
   uint first_page = 0;
   if constexpr (Window != 0)
     first_page = splash_attention_first_page<Window>(committed_tokens);
-  uint per_split = splash_attention_pages_per_split(pages - first_page, splits);
+  uint per_split = Window == 0 && fixed_per_split ? fixed_per_split
+                                                  : splash_attention_pages_per_split(pages - first_page, splits);
   uint page_begin = first_page + split * per_split;
   if (page_begin >= pages)
     return;
@@ -488,7 +497,8 @@ inline void splash_attention_reduce_row(
   uint pages = splash_attention_pages(tile.first_position + tile.active_rows);
   if constexpr (Window != 0)
     pages -= splash_attention_first_page<Window>(tile.first_position);
-  const uint per_split = splash_attention_pages_per_split(pages, tile.splits);
+  const uint per_split = Window == 0 && tile.fixed_per_split ? tile.fixed_per_split
+                                                             : splash_attention_pages_per_split(pages, tile.splits);
   const uint written = (pages + per_split - 1) / per_split;
   splash_attention_combine_splits<QueryHeadsPerKVHead, PartRows, HeadDim>(
       partials, statistics, output + tile.offset, tile.active_rows, written,

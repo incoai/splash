@@ -9,11 +9,20 @@
 
 namespace splash::ops {
 
+// Plan choices that splash serve flags turn on; every one is off by default.
+struct ExecutionOptions final {
+  // --verify-attention-pages: pages per verify-attention split at absolute page
+  // boundaries (PagedAttention::verifyPlan); 0 keeps the balanced partition.
+  uint32_t verifyAttentionPages = 0;
+  bool operator==(const ExecutionOptions &) const = default;
+};
+
 // The device's plans of every operator a model runs. One runtime owns this
 // object and production models borrow it; it never changes after creation.
 class ExecutionPlans final {
 public:
-  explicit ExecutionPlans(const DeviceCapabilities &device);
+  explicit ExecutionPlans(const DeviceCapabilities &device, ExecutionOptions options = {});
+  [[nodiscard]] ExecutionOptions options() const noexcept { return options_; }
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
 
   [[nodiscard]] PrefillAttentionPlan prefillAttention(
@@ -48,6 +57,7 @@ private:
 
   Linear linear_;
   GpuFamilyClass family_;
+  ExecutionOptions options_;
   uint32_t gpuCores_;
 };
 

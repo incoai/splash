@@ -677,7 +677,15 @@ or a window of the keys before it (`…_w512`: a row at position p attends p −
 windowed split and reduce start at the page of their tile's first row's window start
 (`splash_attention_first_page`), each row masking the keys before its own, and a windowed verify
 lane's or prefill tile's splits stop at the 18 pages such a window reads
-(`kv::windowAttentionPages`). A geometry with learned sinks (`reduce…_sinks`) binds the layer's,
+(`kv::windowAttentionPages`). A verify lane's split count follows its own history
+(`kv::verifyAttentionSplits`), but its splits share the block's pages out evenly, so a row's
+pages per split, and the order its sums run in, follow where its 8-row block starts: a row just
+below 1024 tokens sums one page per split in a block that starts below 1016 and two in one that
+starts later. With `splash serve --verify-attention-pages G` a dense windowless lane's splits hold
+G pages at absolute page boundaries (`pages_per_split`), the pages a row cannot see adding exact
+zeros, so a row's output follows its position alone; the lane keeps the balanced partition past
+4096 G tokens, where ceil(pages / G) splits outgrow the slot workspace.
+A geometry with learned sinks (`reduce…_sinks`) binds the layer's,
 an F32 per query head, to the reduce, which adds each to its row's softmax after the splits, in
 their order, as a key with no value; one without an output gate (`gather`) gives the
 out-projection its attention rows as they are. The RoPE tables are of the target geometry's pairs

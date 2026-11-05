@@ -178,6 +178,11 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "auto" && value != "all")
         throw UsageError("--verify-rows requires auto or all");
       result.verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
+    } else if (option == "--verify-attention-pages") {
+      uint64_t pages = 0;
+      if (!parsePositive(value, pages) || pages > 16)
+        throw UsageError("--verify-attention-pages requires a page count from 1 to 16");
+      result.verifyAttentionPages = static_cast<uint32_t>(pages);
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
     } else {

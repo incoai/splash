@@ -82,6 +82,7 @@ OPTIONS = {
         "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
     ),
     "--disable-ane": ([(["--disable-ane"], True)], []),
+    "--verify-attention-pages": values("--verify-attention-pages", {"1": 1, "2": 2, "16": 16}, ("0", "17", "off")),
     "--verify-rows": values(
         "--verify-rows",
         {"auto": "auto", "all": "all"},
