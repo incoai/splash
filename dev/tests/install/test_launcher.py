@@ -1500,7 +1500,7 @@ class LauncherTests(unittest.TestCase):
             return mock.patch.object(launcher.paths, "PYTHON", program)
 
         unsupported = "Splash needs Apple GPU family 9 or newer (M3 or later)"
-        for case, setup, arguments, failure, output in (
+        for case, setup, arguments, failure, said, output in (
             (
                 "upgrade",
                 lambda runtime: [upgrading(runtime)],
@@ -1509,6 +1509,7 @@ class LauncherTests(unittest.TestCase):
                     "kind": "upgrade",
                     "message": "Splash is being upgraded; wait for the upgrade to finish",
                 },
+                "error: Splash is being upgraded; wait for the upgrade to finish\n",
                 "",
             ),
             (
@@ -1525,6 +1526,7 @@ class LauncherTests(unittest.TestCase):
                     "kind": "port",
                     "message": "cannot bind 127.0.0.1:8000: [Errno 48] Address already in use",
                 },
+                "error: cannot bind 127.0.0.1:8000: [Errno 48] Address already in use\n",
                 "",
             ),
             (
@@ -1543,6 +1545,7 @@ class LauncherTests(unittest.TestCase):
                 ],
                 [],
                 {"kind": "device", "message": unsupported},
+                f"error: {unsupported}\n",
                 "",
             ),
             (
@@ -1553,6 +1556,8 @@ class LauncherTests(unittest.TestCase):
                 ],
                 [],
                 {"kind": "install", "message": "a/b is not installed"},
+                # Said by the installer (test_an_installer_failure_is_said_once).
+                "",
                 "Selected a/b.\n",
             ),
             (
@@ -1563,6 +1568,8 @@ class LauncherTests(unittest.TestCase):
                 ],
                 ["--model-dir", "/m.gguf"],
                 {"kind": "model", "message": "it is not a GGUF file"},
+                # The line names the files, which the record leaves to the app.
+                "error: cannot prepare /m.gguf: it is not a GGUF file\n",
                 "",
             ),
             (
@@ -1570,6 +1577,7 @@ class LauncherTests(unittest.TestCase):
                 lambda _: [mock.patch.object(launcher, "_ensure_runtime"), helper("")],
                 ["--model-dir", "/m.gguf"],
                 {"kind": "internal", "message": "local model preparation failed"},
+                "error: local model preparation failed\n",
                 "",
             ),
             (
@@ -1581,6 +1589,7 @@ class LauncherTests(unittest.TestCase):
                 ],
                 [],
                 {"kind": "internal", "message": "[Errno 2] No such file or directory"},
+                "error: [Errno 2] No such file or directory\n",
                 "",
             ),
         ):
@@ -1612,9 +1621,6 @@ class LauncherTests(unittest.TestCase):
                     json.loads((runtime / "serve-8000.json").read_text()),
                     {"pid": os.getpid(), "phase": "failed", "failure": failure},
                 )
-                # The installer says its own failure on stderr
-                # (test_an_installer_failure_is_said_once).
-                said = "" if case == "install" else f"error: {failure['message']}\n"
                 self.assertEqual(error.getvalue(), said)
                 self.assertEqual(relayed.getvalue(), output)
 

@@ -175,9 +175,20 @@ class LocalServeTests(unittest.TestCase):
             setup.assert_not_called()
 
     def test_failed_local_preparation_does_not_start_the_server(self):
-        result, execute = self.serve(self.root / "missing.gguf")
+        """The line said names the files refused, absolute and resolved, and
+        the record holds the reason alone, as the app names the files."""
+        target = self.root / "missing.gguf"
+        with mock.patch("sys.stderr", io.StringIO()) as error:
+            result, execute = self.serve(self.root / "absent" / ".." / target.name)
         self.assertEqual(result, 1)
         execute.assert_not_called()
+        self.assertEqual(
+            error.getvalue(), f"error: cannot prepare {target}: it does not exist\n"
+        )
+        record = json.loads((self.root / "run/serve-8000.json").read_text())
+        self.assertEqual(
+            record["failure"], {"kind": "model", "message": "it does not exist"}
+        )
 
 
 class LocalPreparationCommandTests(unittest.TestCase):

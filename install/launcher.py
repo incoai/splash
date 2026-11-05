@@ -43,12 +43,17 @@ STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 class LauncherError(RuntimeError):
     """A refusal of the launcher's, of a serve_record kind. said: whether the
     program that failed printed it already, so the launcher records it
-    without printing it again."""
+    without printing it again. subject: what the launcher could not do, as
+    "cannot prepare PATH", which the printed line puts before the message
+    and the record leaves to the app."""
 
-    def __init__(self, message, kind=serve_record.INTERNAL, *, said=False):
+    def __init__(
+        self, message, kind=serve_record.INTERNAL, *, said=False, subject=None
+    ):
         super().__init__(message)
         self.kind = kind
         self.said = said
+        self.subject = subject
 
 
 class ArgumentRefusal(SystemExit):
@@ -241,7 +246,7 @@ def _prepare_local_model(args):
             message, kind = refusal["message"], refusal["kind"]
         except (ValueError, TypeError, KeyError):
             raise LauncherError("local model preparation failed") from None
-        raise LauncherError(message, kind)
+        raise LauncherError(message, kind, subject=f"cannot prepare {args.model_dir}")
     prepared = Path(output)
     if not prepared.is_absolute():
         raise LauncherError("local model preparation returned no absolute directory")
@@ -531,9 +536,12 @@ def _version():
 
 
 def _local_path(value):
-    # Preserve a GGUF's filename symlink in a Hub snapshot: resolving the
-    # file itself would replace its .gguf name with a cache blob's digest.
-    return str(Path(value).expanduser().absolute())
+    # Absolute, its parent resolved, as the local helper takes it and as a
+    # refusal names it. The file's own name stays: resolving a GGUF's link
+    # in a Hub snapshot would replace its .gguf name with a cache blob's
+    # digest.
+    path = Path(os.path.abspath(Path(value).expanduser()))
+    return str(path.parent.resolve() / path.name)
 
 
 def parse_args(argv=None):
@@ -717,7 +725,8 @@ def main(argv=None):
         return serve(args) if args.command == "serve" else coding_client(args)
     except LauncherError as error:
         if not error.said:
-            print(f"error: {error}", file=sys.stderr)
+            subject = f"{error.subject}: " if error.subject else ""
+            print(f"error: {subject}{error}", file=sys.stderr)
         return 1
     except (clients.ClientError, OSError, serve_record.NotRecorded) as error:
         print(f"error: {error}", file=sys.stderr)
