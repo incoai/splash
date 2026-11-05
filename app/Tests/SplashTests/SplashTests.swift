@@ -580,7 +580,8 @@ struct OutputTests {
         #expect(try words("not_found") == "Hugging Face has no public model named a/b. Check the name, then try again.")
         #expect(try words("offline") == "Splash couldn’t reach Hugging Face. Check the internet connection, then try again.")
         #expect(try words("auth")
-            == "Hugging Face refused access to a/b. Sign in with an account that can read it (hf auth login), then try again.")
+            == "Hugging Face refused access to a/b. Sign in with an account that can read it (hf auth login) and, "
+                + "if the model asks, accept its terms at huggingface.co/a/b, then try again.")
         let unclassed = try #require(Installer.Failure(
             line: #"{"event": "error", "kind": null, "message": "cannot install a/b: no supported model"}"#))
         #expect(Installer.problem(unclassed, model: "a/b") == "cannot install a/b: no supported model")

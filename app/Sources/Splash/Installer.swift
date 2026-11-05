@@ -61,7 +61,8 @@ final class Installer {
         case "offline":
             return "Splash couldn’t reach Hugging Face. Check the internet connection, then try again."
         case "auth":
-            return "Hugging Face refused access to \(name). Sign in with an account that can read it (hf auth login), then try again."
+            return "Hugging Face refused access to \(name). Sign in with an account that can read it (hf auth login) and, "
+                + "if the model asks, accept its terms at huggingface.co/\(name), then try again."
         default:
             return failure.message
         }
