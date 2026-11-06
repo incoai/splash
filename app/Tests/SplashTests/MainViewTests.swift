@@ -61,14 +61,14 @@ struct MainViewTests {
         defer { server.remove() }
         let state = server.state
         let model = "example/Model"
-        let name = state.displayName(of: model)
+        let name = state.catalog.name(of: model)
         #expect(state.serverTitle == "Server")
         state.server.start(model, settings: ServeSettings(values: ["--port": String(server.port)]))
         #expect(state.server.step == .starting)
         #expect(state.serverTitle == name)
         try await waitFor(state.server.step == .loading)
         #expect(state.serverTitle == name)
-        #expect(state.status == "\(name) · Loading weights…")
+        #expect(state.status == "\(state.displayName(of: model)) · Loading weights…")
         server.signal("loaded")
         try await waitFor(state.server.step == .warming)
         #expect(state.serverTitle == name)
@@ -82,7 +82,7 @@ struct MainViewTests {
         try await waitFor(state.server.phase == .failed("x"))
         #expect(state.server.running)
         #expect(state.serverStatus.look == .failed)
-        #expect(state.status == "\(name) · Not responding")
+        #expect(state.status == "\(state.displayName(of: model)) · Not responding")
         #expect(state.serverTitle == "Server")
         state.server.stop()
         #expect(state.serverTitle == name)

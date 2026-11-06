@@ -232,14 +232,16 @@ struct SidebarButton: View {
 
 extension AppState {
     /// The Server button's title: the model's name while one starts, runs or stops, the word
-    /// Server while none does, Downloading while a download comes. It holds no figure that changes
+    /// Server while none does, Downloading while a download comes. It names the model without the
+    /// variant that tells installed variants apart, which the button's help and the Server give,
+    /// so the toolbar stays short. It holds no figure that changes
     /// while it shows, as a step, a speed or a percentage would: the toolbar lays its items out
     /// again at each change of its width, and moves the buttons beside it. The indicator shows a
     /// start and a download's progress; the button's help says the step and the percentage, the
     /// Server and the menu bar's panel the speed.
     var serverTitle: String {
         if installer.running { return "Downloading…" }
-        guard let name = server.model.map(displayName(of:)) else { return "Server" }
+        guard let name = server.model.map(catalog.name(of:)) else { return "Server" }
         switch server.phase {
         case .starting, .ready, .stopping: return name
         case .stopped, .failed: return "Server"
