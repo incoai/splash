@@ -177,6 +177,15 @@ final class AppState {
         set { withMutation(keyPath: \.selection) { defaults.set(newValue, forKey: Preference.model) } }
     }
 
+    /// The model the menus offer to start while none runs: the one picked, or the only one.
+    var modelToStart: String? {
+        server.running ? nil : selection
+    }
+
+    var canStart: Bool {
+        ready && keyProblem == nil
+    }
+
     /// Whether the model that runs would start otherwise with the options set now.
     var optionsChanged: Bool {
         guard server.phase == .ready, let model = server.model else { return false }
