@@ -253,6 +253,60 @@ struct AppStateTests {
         state.options.apiKey = nil
         #expect(try keychain.read() == nil)
     }
+
+    /// A model whose files are gone, as when its Hugging Face cache folder was deleted, is not on
+    /// this Mac: it leaves the list, and the pick of it falls to the first model listed, as for a
+    /// model taken off the list. Its files back, as installed again, it is listed and picked again.
+    @Test func listsOnlyInstallationsWhoseFilesAreOnThisMac() throws {
+        let manager = FileManager.default
+        let folder = manager.temporaryDirectory.appending(path: "splash-installed-\(UUID().uuidString)")
+        defer { try? manager.removeItem(at: folder) }
+        let runtime = Runtime(root: folder.appending(path: "Runtime"))
+        let snapshot = folder.appending(path: "hub/models--owner--repo/snapshots/abc")
+        let metadata = runtime.models.appending(path: ".metadata/key/config.json")
+        // An installation as the installer builds it: an assembly linking the files its record
+        // names, which a selection link names, its files a snapshot's and derived metadata.
+        func install(_ variant: String, _ files: [String: URL]) throws {
+            let assembly = runtime.models.appending(path: ".resolved/\(variant)")
+            var record: [String: [String: Any]] = [:]
+            for (name, file) in files {
+                try manager.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data(count: 1000).write(to: file)
+                let link = assembly.appending(path: name)
+                try manager.createDirectory(at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try manager.createSymbolicLink(at: link, withDestinationURL: file)
+                record[name] = ["path": file.path, "bytes": 1000]
+            }
+            try JSONSerialization.data(withJSONObject: ["model": "owner/repo:\(variant)", "files": record])
+                .write(to: assembly.appending(path: "model.json"))
+            try manager.createDirectory(at: runtime.models.appending(path: "owner"), withIntermediateDirectories: true)
+            try manager.createSymbolicLink(at: runtime.models.appending(path: "owner/repo:\(variant)"), withDestinationURL: assembly)
+        }
+        let q2 = snapshot.appending(path: "Q2_0/m-00001-of-00001.gguf")
+        try install("IQ3_S", ["target/m-00001-of-00002.gguf": snapshot.appending(path: "IQ3_S/m-00001-of-00002.gguf"),
+                              "target/m-00002-of-00002.gguf": snapshot.appending(path: "IQ3_S/m-00002-of-00002.gguf"),
+                              "config.json": metadata])
+        try install("Q2_0", ["target/m-00001-of-00001.gguf": q2, "config.json": metadata])
+        #expect(runtime.installedModels() == [InstalledModel(id: "owner/repo:IQ3_S", bytes: 3000),
+                                              InstalledModel(id: "owner/repo:Q2_0", bytes: 2000)])
+        let state = AppState.forTests(in: folder, runtime: runtime)
+        state.selection = "owner/repo:Q2_0"
+        #expect(state.selection == "owner/repo:Q2_0")
+
+        try manager.removeItem(at: q2.deletingLastPathComponent())
+        #expect(runtime.installedModels() == [InstalledModel(id: "owner/repo:IQ3_S", bytes: 3000)])
+        state.refresh()
+        #expect(state.installed.map(\.id) == ["owner/repo:IQ3_S"])
+        #expect(state.selection == "owner/repo:IQ3_S")
+        // Nothing of the installation is deleted.
+        #expect(manager.fileExists(atPath: runtime.models.appending(path: "owner/repo:Q2_0/model.json").path))
+
+        try manager.createDirectory(at: q2.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(count: 1000).write(to: q2)
+        state.refresh()
+        #expect(state.installed.map(\.id) == ["owner/repo:IQ3_S", "owner/repo:Q2_0"])
+        #expect(state.selection == "owner/repo:Q2_0")
+    }
 }
 
 struct ServerTests {

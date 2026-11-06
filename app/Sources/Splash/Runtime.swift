@@ -87,7 +87,10 @@ struct Runtime: Sendable {
         return environment
     }
 
-    /// The models installed here: each selection link's assembly record names its model.
+    /// The models installed here: each selection link's assembly record names its model, which is
+    /// on this Mac while every file the record names is, its links followed (as `verify` in
+    /// `install/assembly.py` requires, without its size and time checks): a model whose files were
+    /// deleted, as from the Hugging Face cache, is not, and installing it again replaces it.
     func installedModels() -> [InstalledModel] {
         struct Record: Decodable {
             struct File: Decodable { let path: String; let bytes: Int64 }
@@ -100,7 +103,8 @@ struct Runtime: Sendable {
             .flatMap { (try? manager.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil)) ?? [] }
             .compactMap { link in
                 guard let data = try? Data(contentsOf: link.appending(path: "model.json")),
-                      let record = try? JSONDecoder().decode(Record.self, from: data)
+                      let record = try? JSONDecoder().decode(Record.self, from: data),
+                      record.files.values.allSatisfy({ manager.fileExists(atPath: $0.path) })
                 else { return nil }
                 // An assembly can link one file under two names (a checkpoint's vision tower).
                 let files = Dictionary(record.files.values.map { ($0.path, $0.bytes) }) { first, _ in first }
