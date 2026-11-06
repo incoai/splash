@@ -305,11 +305,12 @@ final class AppState {
         return chatContext.shown(history: history, target: target, started: server.since)
     }
 
-    /// Whether the draft can go: a model answers, no reply streams, and the model's context can
-    /// hold the prompt, as far as it has been counted. A count not done, or failed, holds nothing
-    /// back: the server checks the prompt too, and says so if it is too long.
+    /// Whether the draft can go: its images are all attached, a model answers, no reply streams,
+    /// and the model's context can hold the prompt, as far as it has been counted. A count not
+    /// done, or failed, holds nothing back: the server checks the prompt too, and says so if it is
+    /// too long.
     var canSendDraft: Bool {
-        guard !draft.isEmpty, server.answers, chats.streaming == nil,
+        guard !draft.isEmpty, draft.attaching == 0, server.answers, chats.streaming == nil,
               draft.images.isEmpty || server.acceptsImages else { return false }
         return overflow == nil
     }

@@ -7,6 +7,10 @@ import UniformTypeIdentifiers
 final class Draft {
     var text = ""
     private(set) var images: [Data] = []
+    /// How many attached images are still being encoded, which join `images` once they are.
+    private(set) var attaching = 0
+    /// The attachment that joins `images` last, which the next one waits for.
+    private var lastAttachment: Task<Void, Never>?
     /// Asks the text field for the keyboard; counts the requests.
     private(set) var focusRequests = 0
 
@@ -16,8 +20,19 @@ final class Draft {
 
     /// Attaches `images` in a form the server takes: at most 2048 pixels on the long side (its
     /// limit is about four million pixels), PNG when they have transparency and JPEG otherwise.
+    /// They are encoded away from the main thread, which a photo would hold for a tenth of a second
+    /// or more, and join the draft in the order they were attached.
     func attach(_ images: [NSImage]) {
-        self.images += images.compactMap(Self.encoded)
+        let sources = images.compactMap { $0.cgImage(forProposedRect: nil, context: nil, hints: nil) }
+        guard !sources.isEmpty else { return }
+        attaching += sources.count
+        let encoding = Task.detached(priority: .userInitiated) { sources.compactMap(Self.encoded) }
+        let previous = lastAttachment
+        lastAttachment = Task {
+            await previous?.value
+            self.images += await encoding.value
+            attaching -= sources.count
+        }
     }
 
     func remove(at index: Int) { images.remove(at: index) }
@@ -28,8 +43,7 @@ final class Draft {
         return (text.trimmingCharacters(in: .whitespacesAndNewlines), images)
     }
 
-    private static func encoded(_ image: NSImage) -> Data? {
-        guard let source = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+    nonisolated private static func encoded(_ source: CGImage) -> Data? {
         let scale = min(1, 2048 / Double(max(source.width, source.height)))
         let width = Int(Double(source.width) * scale), height = Int(Double(source.height) * scale)
         guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,

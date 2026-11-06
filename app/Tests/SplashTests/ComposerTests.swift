@@ -69,6 +69,21 @@ struct ComposerTests {
         }
     }
 
+    /// A photo attaches without holding the main thread while it is scaled and encoded; images
+    /// join the draft in the order they were attached, a photo before a small image attached after
+    /// it, which is encoded sooner.
+    @Test func imagesAttachAwayFromTheMainThreadInTheirOrder() async throws {
+        let draft = Draft()
+        let photo = try #require(NSImage(data: Self.photo(width: 4032, height: 3024)))
+        let picture = try #require(NSImage(data: Showcase.picture))
+        draft.attach([photo])
+        draft.attach([picture])
+        #expect(draft.images.isEmpty)
+        try await waitFor(draft.images.count == 2)
+        let widths = draft.images.map { NSBitmapImageRep(data: $0)?.pixelsWide }
+        #expect(widths == [2048, 240])
+    }
+
     /// The ring of the composer's context and the Server button's download: its fraction filled in
     /// its tint from the top clockwise, the rest a faint track, as wide as asked.
     @Test func aRingFillsItsFractionClockwiseFromTheTop() throws {
@@ -116,6 +131,25 @@ struct ComposerTests {
             view.subviews.flatMap { ($0 as? NSTextView).map { [$0] } ?? textViews(in: $0) }
         }
         return window.contentView.flatMap { textViews(in: $0).first { !$0.isFieldEditor } }
+    }
+
+    /// A photo as a camera takes one, `width` by `height` pixels, as JPEG.
+    private static func photo(width: Int, height: Int) -> Data {
+        let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height, bitsPerSample: 8,
+                                      samplesPerPixel: 3, hasAlpha: false, isPlanar: false, colorSpaceName: .deviceRGB,
+                                      bytesPerRow: 0, bitsPerPixel: 0)!
+        let pixels = bitmap.bitmapData!
+        var noise: UInt32 = 1
+        for y in 0..<height {
+            for x in 0..<width {
+                noise = noise &* 1_664_525 &+ 1_013_904_223
+                let grain = Int(noise >> 28), at = y * bitmap.bytesPerRow + x * 3
+                pixels[at] = UInt8((x * 255 / width + grain) & 255)
+                pixels[at + 1] = UInt8((y * 255 / height + grain) & 255)
+                pixels[at + 2] = UInt8(((x + y) * 255 / (width + height) + grain) & 255)
+            }
+        }
+        return bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.9])!
     }
 
     /// What SwiftUI owes the window, done now: its views updated for every change made so far.

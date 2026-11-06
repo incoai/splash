@@ -21,6 +21,7 @@ struct ChatContextFlowTests {
                 we should implement next.
                 """
             state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+            try await waitFor(!state.draft.images.isEmpty)
             let text = state.draft.text, images = state.draft.images
             let usage = try await count(state)
             #expect(usage.level == .full && state.contextUsage == usage)
@@ -91,6 +92,30 @@ struct ChatContextFlowTests {
             try await waitFor(state.chats.streaming == nil)
             #expect(state.chats.current?.messages.last?.text == "Answer")
             #expect(try fixture.sent().count == 2)
+        }
+    }
+
+    /// Return pressed right after an image is pasted, while it is still being encoded, doesn't
+    /// send the text without it and leave the image in the next draft: Send waits for the image,
+    /// and the message goes with it.
+    @Test func sendWaitsForAnImageStillBeingAttached() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            state.chats.newChat()
+            state.draft.text = "What is in this picture?"
+            state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+            state.sendDraft()
+            // Return again once the image shows, if the first one waited for it.
+            if !state.draft.isEmpty {
+                #expect(!state.canSendDraft)
+                try await waitFor(!state.draft.images.isEmpty)
+                state.sendDraft()
+            }
+            try await waitFor(state.chats.streaming == nil && !((try? fixture.sent()) ?? []).isEmpty)
+            let sent = try fixture.sent()
+            let parts = try #require(sent.last?.last?["content"] as? [[String: Any]])
+            #expect(parts.map { $0["type"] as? String } == ["image_url", "text"])
+            #expect(state.draft.isEmpty)
         }
     }
 
