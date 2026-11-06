@@ -888,6 +888,13 @@ $(SANITIZER_CONFIG_TARGETS): | $(ENGINE_SANITIZER_BUILD)
 ASAN_TEST_ENV := ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
 	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
 TSAN_TEST_ENV := TSAN_OPTIONS=halt_on_error=1
+# engine-sim under the sanitizers runs every scenario but those too long for
+# them: testRegrowthAfterABurstTakesOnlyCacheThatFreesNow runs past 5 minutes
+# under ThreadSanitizer, where the others take at most 1.5. test-engine-cpu
+# runs every scenario.
+ENGINE_SIM_SANITIZER_SKIPPED := sim/testRegrowthAfterABurstTakesOnlyCacheThatFreesNow
+# The names of sim binary $(1)'s scenarios but the skipped ones, for --filter.
+engine_sim_sanitizer_scenarios = "$$($(1) --list | grep -v -x -F $(foreach name,$(ENGINE_SIM_SANITIZER_SKIPPED),-e $(name)) | paste -s -d , -)"
 test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(ASAN_TEST_ENV) $(TEST_SLOT_FILE_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_SLOT_FILE_TSAN)
@@ -920,8 +927,8 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_FD_TRANSPORT_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_NATIVE_LOOP_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_NATIVE_LOOP_TSAN)
-	$(ASAN_TEST_ENV) $(TEST_ENGINE_SIM_ASAN)
-	$(TSAN_TEST_ENV) $(TEST_ENGINE_SIM_TSAN)
+	$(ASAN_TEST_ENV) $(TEST_ENGINE_SIM_ASAN) --filter $(call engine_sim_sanitizer_scenarios,$(TEST_ENGINE_SIM_ASAN))
+	$(TSAN_TEST_ENV) $(TEST_ENGINE_SIM_TSAN) --filter $(call engine_sim_sanitizer_scenarios,$(TEST_ENGINE_SIM_TSAN))
 	$(ASAN_TEST_ENV) $(TEST_ANE_FFN_CALIBRATION_ASAN)
 	$(TSAN_TEST_ENV) $(TEST_ANE_FFN_CALIBRATION_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_SPARSE_ROW_STORE_ASAN)
