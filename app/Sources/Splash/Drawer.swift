@@ -331,10 +331,10 @@ private struct TerminalPane: View {
     }
 }
 
-/// A log file, read only, as it grows, in whole lines (`LogLines`): those that start in its last
-/// `limit` bytes at first, then each line as it is written, the oldest going past `limit`; kept in
-/// view while the end is; ⌘F finds in it. A file written again from its start, as the server's log
-/// is at each start, is read again from there.
+/// A log file, read only, as it grows: the lines that start in its last `limit` bytes at first,
+/// then what is written to it, the line being written as far as it is, the oldest lines going an
+/// eighth of `limit` at a time past it; ⌘F finds in it. It keeps its place as it changes (`LogScrollView`). A file written
+/// again from its start, as the server's log is at each start, is read again from there.
 struct LogText: NSViewRepresentable {
     let url: URL
 
@@ -342,25 +342,15 @@ struct LogText: NSViewRepresentable {
     /// are never more than the bytes they decode from.
     static let limit = 512 * 1024
 
-    func makeNSView(context: Context) -> NSScrollView {
-        let scroll = NSTextView.scrollableTextView()
-        scroll.drawsBackground = false
-        let text = scroll.documentView as! NSTextView
-        text.isEditable = false
-        text.isSelectable = true
-        text.drawsBackground = false
-        text.usesFindBar = true
-        text.isIncrementalSearchingEnabled = true
-        text.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        text.textColor = .labelColor
-        text.textContainerInset = NSSize(width: 10, height: 8)
-        context.coordinator.follow(url, in: text)
+    func makeNSView(context: Context) -> LogScrollView {
+        let scroll = LogScrollView()
+        context.coordinator.follow(url, in: scroll)
         return scroll
     }
 
-    func updateNSView(_ scroll: NSScrollView, context: Context) {}
+    func updateNSView(_ scroll: LogScrollView, context: Context) {}
 
-    static func dismantleNSView(_ scroll: NSScrollView, coordinator: Coordinator) {
+    static func dismantleNSView(_ scroll: LogScrollView, coordinator: Coordinator) {
         coordinator.stop()
     }
 
@@ -372,12 +362,14 @@ struct LogText: NSViewRepresentable {
         private var handle: FileHandle?
         private var offset: UInt64 = 0
         private var lines = LogLines()
-        private weak var text: NSTextView?
+        /// The line being written, as the view shows it at its end.
+        private var unfinished = Data()
+        private weak var scroll: LogScrollView?
         private var url: URL?
 
-        func follow(_ url: URL, in text: NSTextView) {
+        func follow(_ url: URL, in scroll: LogScrollView) {
             self.url = url
-            self.text = text
+            self.scroll = scroll
             reopen()
         }
 
@@ -390,7 +382,7 @@ struct LogText: NSViewRepresentable {
         /// made, empty, with its folder, and followed from its start.
         private func reopen() {
             stop()
-            text?.string = ""
+            clear()
             guard let url else { return }
             try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             let descriptor = open(url.path, O_RDONLY | O_CREAT | O_CLOEXEC, 0o644)
@@ -403,7 +395,7 @@ struct LogText: NSViewRepresentable {
             let tail = UInt64(LogText.limit)
             offset = size > tail ? size - tail - 1 : 0
             lines = LogLines(inside: size > tail)
-            read(scrolling: true)
+            read()
             let source = DispatchSource.makeFileSystemObjectSource(
                 fileDescriptor: handle.fileDescriptor, eventMask: [.extend, .write, .delete, .rename], queue: .main)
             source.setEventHandler { [weak self] in
@@ -417,38 +409,131 @@ struct LogText: NSViewRepresentable {
             source.resume()
         }
 
-        /// Reads what the file has gained, keeping the end in view where it was, or `scrolling` to it.
-        private func read(scrolling: Bool = false) {
-            guard let handle, let text, let storage = text.textStorage else { return }
+        private func clear() {
+            lines = LogLines()
+            unfinished = Data()
+            scroll?.text.string = ""
+        }
+
+        /// Shows what the file has gained: the lines it ends in place of the line shown as being
+        /// written, then the line now being written.
+        private func read() {
+            guard let handle, let scroll, let storage = scroll.text.textStorage else { return }
             let size = (try? handle.seekToEnd()) ?? 0
             if size < offset {
                 // Written again from its start.
                 offset = 0
-                lines = LogLines()
-                storage.setAttributedString(NSAttributedString())
+                clear()
             }
             try? handle.seek(toOffset: offset)
             guard let data = try? handle.readToEnd(), !data.isEmpty else { return }
             offset += UInt64(data.count)
-            let added = lines.take(data)
-            guard !added.isEmpty else { return }
-            let atEnd = (text.enclosingScrollView?.verticalScroller?.floatValue ?? 1) > 0.98
-                || text.visibleRect.maxY >= text.bounds.maxY - 4
-            storage.append(NSAttributedString(string: String(decoding: added, as: UTF8.self), attributes: [
-                .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
-                .foregroundColor: NSColor.labelColor,
-            ]))
-            // Past the limit, the lines that start in its last `limit` units stay. It holds whole
-            // lines, so a newline ends it.
-            let excess = storage.length - LogText.limit
-            if excess > 0 {
+            let ended = lines.take(data)
+            let shown = unfinished
+            unfinished = lines.unfinished
+            guard !ended.isEmpty || unfinished != shown else { return }
+            let length = String(decoding: shown, as: UTF8.self).utf16.count
+            let added = String(decoding: ended + unfinished, as: UTF8.self)
+            let unfinishedLength = String(decoding: unfinished, as: UTF8.self).utf16.count
+            scroll.keepingPlace {
+                storage.replaceCharacters(in: NSRange(location: storage.length - length, length: length), with: NSAttributedString(
+                    string: added, attributes: [.font: LogScrollView.font, .foregroundColor: NSColor.labelColor]))
+                // Past the limit, the lines that start in its last seven eighths stay: each removal
+                // lays the whole text out again, so the oldest lines go many at a time. All the
+                // whole lines go where the line being written is longer.
+                guard storage.length > LogText.limit else { return 0 }
+                let excess = storage.length - LogText.limit / 8 * 7
                 let newline = storage.mutableString.range(
                     of: "\n", options: [], range: NSRange(location: excess - 1, length: storage.length - excess + 1))
-                storage.deleteCharacters(in: NSRange(location: 0, length: NSMaxRange(newline)))
+                let removed = newline.location == NSNotFound ? storage.length - unfinishedLength : NSMaxRange(newline)
+                storage.deleteCharacters(in: NSRange(location: 0, length: removed))
+                return removed
             }
-            if atEnd { text.scrollToEndOfDocument(nil) }
-            // At first the view has no size yet: to its end once it has been laid out.
-            if scrolling { DispatchQueue.main.async { [weak text] in text?.scrollToEndOfDocument(nil) } }
         }
+    }
+}
+
+/// A log's text, which keeps its place as the text and its own size change: on the end while
+/// the end is in view, else on the line at the top of the view, as far above it as it was. Its
+/// layout is exact, so that each place is where the text is.
+final class LogScrollView: NSScrollView {
+    static let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+
+    /// Laid out by a layout manager, which places every line where it is, rather than by
+    /// estimates of where the lines not yet shown are, which move the view as they come true.
+    let text = NSTextView(usingTextLayoutManager: false)
+
+    init() {
+        super.init(frame: .zero)
+        hasVerticalScroller = true
+        drawsBackground = false
+        text.minSize = .zero
+        text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: .greatestFiniteMagnitude)
+        text.isVerticallyResizable = true
+        text.autoresizingMask = .width
+        text.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        text.textContainer?.widthTracksTextView = true
+        text.isEditable = false
+        text.isSelectable = true
+        text.drawsBackground = false
+        text.usesFindBar = true
+        text.isIncrementalSearchingEnabled = true
+        text.font = Self.font
+        text.textColor = .labelColor
+        text.textContainerInset = NSSize(width: 10, height: 8)
+        documentView = text
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// A new size, as when the view is first shown, the drawer is resized or the find bar shows,
+    /// keeps the view's place too.
+    override func tile() {
+        keepingPlace {
+            super.tile()
+            return 0
+        }
+    }
+
+    /// Makes `change`, which gives how many characters it removed from the start of the text,
+    /// keeping the view's place.
+    func keepingPlace(_ change: () -> Int) {
+        guard let layout = text.layoutManager, let container = text.textContainer else { _ = change(); return }
+        let place = place(in: layout, container)
+        let removed = change()
+        layout.ensureLayout(for: container)
+        text.sizeToFit()
+        let y: CGFloat
+        switch place {
+        case .end:
+            y = text.bounds.maxY - contentView.bounds.height
+        case let .line(character, offset):
+            let character = character - removed
+            // The line at the top went with the oldest lines: the text's start is there now.
+            guard character >= 0, layout.numberOfGlyphs > 0 else { y = 0; break }
+            let line = layout.lineFragmentRect(
+                forGlyphAt: min(layout.glyphIndexForCharacter(at: character), layout.numberOfGlyphs - 1), effectiveRange: nil)
+            y = line.minY + text.textContainerOrigin.y + offset
+        }
+        let bounds = contentView.constrainBoundsRect(NSRect(origin: NSPoint(x: contentView.bounds.minX, y: y), size: contentView.bounds.size))
+        contentView.scroll(to: bounds.origin)
+        reflectScrolledClipView(contentView)
+    }
+
+    private enum Place {
+        case end
+        /// The line starting at `character`, `offset` points above the top of the view.
+        case line(Int, CGFloat)
+    }
+
+    /// Where the view is: on the end while the end is in view, as before it was ever shown.
+    private func place(in layout: NSLayoutManager, _ container: NSTextContainer) -> Place {
+        let visible = text.visibleRect
+        guard !visible.isEmpty, visible.maxY < text.bounds.maxY - 1, layout.numberOfGlyphs > 0 else { return .end }
+        var range = NSRange()
+        let glyph = layout.glyphIndex(for: NSPoint(x: 0, y: visible.minY - text.textContainerOrigin.y), in: container)
+        let line = layout.lineFragmentRect(forGlyphAt: glyph, effectiveRange: &range)
+        return .line(layout.characterIndexForGlyph(at: range.location), visible.minY - text.textContainerOrigin.y - line.minY)
     }
 }

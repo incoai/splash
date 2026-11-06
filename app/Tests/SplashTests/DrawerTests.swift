@@ -251,16 +251,18 @@ struct DrawerTests {
         #expect(text.string == "first\nsecond\nStarted · a/b\n")
     }
 
-    /// A log read in parts gives whole lines, a character split between two reads whole, and the
-    /// bytes after the last newline last; read from inside it, its lines from its first newline.
+    /// A log read in parts gives whole lines, a character split between two reads whole, the line
+    /// being written without a character still being written, and the bytes after the last newline
+    /// last; read from inside it, its lines from its first newline.
     @Test func aLogReadInPartsGivesWholeLines() {
         let dot = Array("·".utf8)
         var lines = LogLines()
         #expect(lines.take(Data("a\nb".utf8) + dot.prefix(1)) == Data("a\n".utf8))
+        #expect(lines.unfinished == Data("b".utf8))
         #expect(lines.take(Data(dot.dropFirst()) + Data("c\nd".utf8)) == Data("b·c\n".utf8))
         #expect(lines.rest() == Data("d".utf8) && lines.rest().isEmpty)
         var inside = LogLines(inside: true)
-        #expect(inside.take(Data("ne beg".utf8)).isEmpty)
+        #expect(inside.take(Data("ne beg".utf8)).isEmpty && inside.unfinished.isEmpty)
         #expect(inside.take(Data("un before\nnext\nla".utf8)) == Data("next\n".utf8))
         #expect(inside.rest() == Data("la".utf8))
     }
@@ -282,17 +284,74 @@ struct DrawerTests {
         #expect(lines == ["first", "Started · a/b", "last"])
     }
 
-    /// As a log grows, its oldest lines go: it keeps the lines that start in its last 512 K
-    /// characters.
-    @Test func aLogKeepsTheLinesOfItsLast512KCharactersAsItGrows() async throws {
+    /// As a log grows, its oldest lines go: past 512 K characters, it keeps the lines that start
+    /// in its last seven eighths of that.
+    @Test func aLogKeepsAtMostTheLinesOfItsLast512KCharactersAsItGrows() async throws {
         let (folder, file) = try Self.log((1...50_000).map(Self.line).joined())
         let window = Self.window(LogText(url: file))
         defer { Self.close(window); try? FileManager.default.removeItem(at: folder) }
         let text = try await Self.shownText(in: window)
         try Self.append((50_001...60_000).map(Self.line).joined(), to: file)
         try await waitFor(text.string.hasSuffix(Self.line(60_000)))
-        // The last 512 Ki of 720,000 start inside line 16,310.
-        #expect(text.string == (16_311...60_000).map(Self.line).joined())
+        // Shown from line 6,311, 644,280 characters: the last 448 Ki start inside line 21,771.
+        #expect(text.string == (21_772...60_000).map(Self.line).joined())
+    }
+
+    /// A log shows its end, and keeps it in view as each line is written, the line being written
+    /// too, in place as it grows.
+    @Test func aLogAtItsEndShowsEachLineThereAsItIsWritten() async throws {
+        let (folder, file) = try Self.log((1...2_000).map(Self.wrappingLine).joined())
+        let window = Self.window(LogText(url: file))
+        defer { Self.close(window); try? FileManager.default.removeItem(at: folder) }
+        let text = try await Self.shownText(in: window)
+        Self.update(window)
+        #expect(Self.endInView(text))
+        for (number, written) in [(2_001, "line 2001\n"), (2_002, "line 2002 being"), (2_002, " written\n")] {
+            try Self.append(written, to: file)
+            try await waitFor(text.string.hasSuffix(written), "line \(number)")
+            Self.update(window)
+            #expect(Self.endInView(text), "line \(number)")
+        }
+        #expect(text.string.hasSuffix("line 2001\nline 2002 being written\n"))
+    }
+
+    /// A log scrolled up stays where it is as lines are written, the line being written too.
+    @Test func aLogScrolledUpStaysWhereItIsAsLinesAreWritten() async throws {
+        let (folder, file) = try Self.log((1...2_000).map(Self.wrappingLine).joined())
+        let window = Self.window(LogText(url: file))
+        defer { Self.close(window); try? FileManager.default.removeItem(at: folder) }
+        let text = try await Self.shownText(in: window)
+        let clip = try #require(text.enclosingScrollView?.contentView)
+        Self.update(window)
+        // Some 20 lines above the end.
+        clip.scroll(to: NSPoint(x: 0, y: text.bounds.maxY - clip.bounds.height - 300))
+        Self.update(window)
+        let shown = Self.shownLines(text), origin = clip.bounds.origin
+        for written in ["line 2001\n", "line 2002 being", " written\n"] {
+            try Self.append(written, to: file)
+            try await waitFor(text.string.hasSuffix(written))
+            Self.update(window)
+            #expect(Self.shownLines(text) == shown && clip.bounds.origin == origin, "\(written)")
+        }
+    }
+
+    /// A log scrolled up stays on the lines it shows as its oldest lines go.
+    @Test func aLogScrolledUpStaysOnItsLinesAsTheOldestGo() async throws {
+        let (folder, file) = try Self.log((1...50_000).map(Self.line).joined())
+        let window = Self.window(LogText(url: file))
+        defer { Self.close(window); try? FileManager.default.removeItem(at: folder) }
+        let text = try await Self.shownText(in: window)
+        let clip = try #require(text.enclosingScrollView?.contentView)
+        Self.update(window)
+        clip.scroll(to: NSPoint(x: 0, y: text.bounds.midY))
+        Self.update(window)
+        let shown = Self.shownLines(text)
+        try Self.append((50_001...51_000).map(Self.line).joined(), to: file)
+        try await waitFor(text.string.hasSuffix(Self.line(51_000)))
+        Self.update(window)
+        // Shown from line 6,311, 536,280 characters: the last 448 Ki start inside line 12,771.
+        #expect(text.string.hasPrefix(Self.line(12_772)))
+        #expect(Self.shownLines(text) == shown)
     }
 
     /// A log written again from its start, emptied in place or replaced as each start replaces
@@ -373,6 +432,25 @@ struct DrawerTests {
     private static func shownText(in window: NSWindow) async throws -> NSTextView {
         try await waitFor(textView(in: window).map { !$0.string.isEmpty } ?? false)
         return try #require(textView(in: window))
+    }
+
+    /// Whether the end of `text` is in view.
+    private static func endInView(_ text: NSTextView) -> Bool {
+        text.visibleRect.maxY >= text.bounds.maxY - 1
+    }
+
+    /// The lines at the top and the bottom of the view.
+    private static func shownLines(_ text: NSTextView) -> [String] {
+        let visible = text.visibleRect, string = text.string as NSString
+        return [visible.minY + 1, visible.maxY - 1].map { y in
+            let index = text.characterIndexForInsertion(at: NSPoint(x: 20, y: y))
+            return string.substring(with: string.lineRange(for: NSRange(location: min(index, string.length - 1), length: 0)))
+        }
+    }
+
+    /// Line `number` of a test's log, every seventh long enough to wrap.
+    private static func wrappingLine(_ number: Int) -> String {
+        "line \(number)" + (number % 7 == 0 ? String(repeating: " wrapping", count: 40) : "") + "\n"
     }
 
     /// A log holding `text`, in a folder of its own.

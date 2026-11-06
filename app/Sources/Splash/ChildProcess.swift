@@ -149,6 +149,19 @@ struct LogLines {
         defer { pending.removeAll() }
         return pending
     }
+
+    /// The line being written, as far as its characters are whole: the bytes after the last
+    /// newline but those of a character still being written. None while the reads are inside the
+    /// line they started in.
+    var unfinished: Data {
+        guard !midLine else { return Data() }
+        // A character still being written: the lead byte of a UTF-8 sequence missing some of the
+        // continuation bytes after it.
+        let bytes = [UInt8](pending)
+        guard let lead = bytes.indices.reversed().prefix(4).first(where: { bytes[$0] & 0xC0 != 0x80 }) else { return pending }
+        let length = bytes[lead] >= 0xF0 ? 4 : bytes[lead] >= 0xE0 ? 3 : bytes[lead] >= 0xC0 ? 2 : 1
+        return bytes.count - lead < length ? Data(bytes[..<lead]) : pending
+    }
 }
 
 /// Follows a log file as it grows, one call per complete line, on the main queue.
