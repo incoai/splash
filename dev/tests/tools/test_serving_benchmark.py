@@ -1069,7 +1069,7 @@ class RunTests(unittest.TestCase):
 
             def stop(self):
                 events.append("stop")
-                return {"signals": ["SIGINT"], "exit": 0}
+                return {"signals": ["SIGINT"], "exit": 0, "left_running": []}
 
         def snapshot(ours):
             events.append(frozenset(ours))
@@ -1142,7 +1142,7 @@ class RunTests(unittest.TestCase):
                 return {4242}
 
             def stop(self):
-                return {"signals": [], "exit": -9}
+                return {"signals": [], "exit": -9, "left_running": []}
 
         def recorded(label, serve1):
             with tempfile.TemporaryDirectory() as directory:
@@ -1248,16 +1248,21 @@ class RunTests(unittest.TestCase):
             (1, "client", "a churn client failed: ValueError: bug"),
         )
 
-    def test_a_server_must_stop_on_sigint_with_exit_0(self):
+    def test_a_server_must_stop_on_sigint_with_exit_0_and_its_engine_gone(self):
         # The run records each server's stop, and G8 fails one that needed
-        # more than SIGINT or did not exit 0: here, a server that ignores
-        # SIGINT, stopped by SIGTERM.
+        # more than SIGINT, did not exit 0 or left its engine running: here, a
+        # server that ignores SIGINT, stopped by SIGTERM, and one that exits 0
+        # on SIGINT without stopping its engine. Each stands in for its engine
+        # with a child.
+        engine = "engine = subprocess.Popen(['sleep', '600']); "
         children = {
-            "clean": "signal.signal(signal.SIGINT, lambda *_: sys.exit(0))",
-            "deaf": "signal.signal(signal.SIGINT, signal.SIG_IGN)",
+            "clean": engine + "signal.signal(signal.SIGINT, lambda *_: "
+            "(engine.terminate(), engine.wait(), sys.exit(0)))",
+            "deaf": engine + "signal.signal(signal.SIGINT, signal.SIG_IGN)",
+            "stray": engine + "signal.signal(signal.SIGINT, lambda *_: sys.exit(0))",
             "gone": "sys.exit(3)",
         }
-        stops = {}
+        stops, engines = {}, {}
         with tempfile.TemporaryDirectory() as directory:
             for name, setup in children.items():
                 server = run.Server.__new__(run.Server)
@@ -1266,13 +1271,16 @@ class RunTests(unittest.TestCase):
                     [
                         sys.executable,
                         "-c",
-                        f"import signal, sys, time; {setup}; print(1, flush=True); "
-                        "time.sleep(600)",
+                        f"import signal, subprocess, sys, time; {setup}; "
+                        "print(engine.pid, flush=True); time.sleep(600)",
                     ],
                     stdout=subprocess.PIPE,
                 )
-                # Its handler is installed, or it exited.
-                if not server.process.stdout.readline():
+                # Its engine runs and its handler is installed, or it exited.
+                started = server.process.stdout.readline()
+                if started:
+                    engines[name] = int(started)
+                else:
                     server.process.wait()
                 server.process.stdout.close()
                 with mock.patch.object(run, "STOP_GRACE_SECONDS", 1):
@@ -1280,11 +1288,25 @@ class RunTests(unittest.TestCase):
         self.assertEqual(
             stops,
             {
-                "clean": {"signals": ["SIGINT"], "exit": 0},
-                "deaf": {"signals": ["SIGINT", "SIGTERM"], "exit": -15},
-                "gone": {"signals": [], "exit": 3},
+                "clean": {"signals": ["SIGINT"], "exit": 0, "left_running": []},
+                "deaf": {
+                    "signals": ["SIGINT", "SIGTERM"],
+                    "exit": -15,
+                    "left_running": [engines["deaf"]],
+                },
+                "stray": {
+                    "signals": ["SIGINT"],
+                    "exit": 0,
+                    "left_running": [engines["stray"]],
+                },
+                "gone": {"signals": [], "exit": 3, "left_running": []},
             },
         )
+        # The engines left running were killed.
+        deadline = time.monotonic() + 10
+        while any(map(run.running, engines.values())) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertFalse([pid for pid in engines.values() if run.running(pid)])
 
         def stopped_by(stop):
             class FakeServer:
@@ -1302,7 +1324,12 @@ class RunTests(unittest.TestCase):
 
             return FakeServer
 
-        for name, failed in (("clean", False), ("deaf", True), ("gone", True)):
+        for name, failed in (
+            ("clean", False),
+            ("deaf", True),
+            ("stray", True),
+            ("gone", True),
+        ):
             with self.subTest(name), tempfile.TemporaryDirectory() as directory:
                 tree = Path(directory)
                 (tree / "build").mkdir()

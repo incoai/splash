@@ -13,7 +13,8 @@ It installs the model with the tree's own installer, offline, or takes
 between trees, so a build never runs under another tree's server) on a port
 nothing answers on; checks that /status names the server it started (pid) and
 the tree's own sources (build id); runs the scenario; stops the server with
-SIGINT, or SIGTERM and SIGKILL when it outlasts that; and writes beside the
+SIGINT, or SIGTERM and SIGKILL when it outlasts that, and kills the processes
+it started, its engine, that outlast it; and writes beside the
 client's records:
 
 - LABEL.out: what ran, the checks, and DONE as its last line once all of it
@@ -22,12 +23,12 @@ client's records:
   seconds and whether the binary had started on this machine before (a first
   start compiles Metal), host memory and pressure at start, ps snapshots at
   the start, middle and end of the scenario while the server serves, the pids
-  this run started, each server's stop (the signals it took and its exit
-  code), on the M5 Pro the idle and sleep-assertion samples
-  (LABEL.idle.jsonl) that show whether the machine was in use, and for a run
-  that did not complete why (error) and whose failure that was (failure:
-  server or request for the server's own, client for a client's own, else
-  the refusal's kind);
+  this run started, each server's stop (the signals it took, its exit code
+  and the processes it started that it left running), on the M5 Pro the
+  idle and sleep-assertion samples (LABEL.idle.jsonl) that show whether the
+  machine was in use, and for a run that did not complete why (error) and
+  whose failure that was (failure: server or request for the server's own,
+  client for a client's own, else the refusal's kind);
 - LABEL.server.log (one per server: LABEL-nN for each concurrency of ttft).
 
 No output goes under ~/.cache/huggingface or an install/models directory,
@@ -37,6 +38,7 @@ whatever symlinks lead there.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -57,7 +59,8 @@ MACHINES = ("studio", "m5", "m6", "mini", "other")
 SCENARIOS = ("churn", "ttft", "serve1", "warm")
 READY_TIMEOUT_SECONDS = 900
 # A server that ignores SIGINT this long gets SIGTERM, then SIGKILL (a server
-# under memory pressure once ignored SIGINT): G8 fails it.
+# under memory pressure once ignored SIGINT), and a process it started, its
+# engine, still running then gets SIGKILL: G8 fails either.
 STOP_GRACE_SECONDS = 60
 # The M5 Pro is also used interactively: its idle time and sleep assertions are
 # sampled this often during a run.
@@ -354,17 +357,23 @@ class Server:
                 time.sleep(1)
         raise RunError(f"the server was not ready within {timeout} s", "server")
 
-    def engine_pids(self) -> set[int]:
+    def children(self) -> set[int]:
+        """The processes the server started: its engine, and any document
+        worker."""
         listed = command_output(["pgrep", "-P", str(self.process.pid)])
-        return {
-            self.process.pid,
-            *(int(pid) for pid in listed.split() if pid.isdigit()),
-        }
+        return {int(pid) for pid in listed.split() if pid.isdigit()}
+
+    def engine_pids(self) -> set[int]:
+        return {self.process.pid, *self.children()}
 
     def stop(self) -> dict:
         """Sends SIGINT, then SIGTERM and SIGKILL to a server that outlasts
-        each, until it exits. Returns the signals sent, none to a server that
-        had exited, and its exit code, None if it outlasted SIGKILL."""
+        each, until it exits, and SIGKILL to the processes it started that
+        still run once SIGINT's grace is over. Returns the signals sent, none
+        to a server that had exited, its exit code, None if it outlasted
+        SIGKILL, and the pids of those it started that it left running."""
+        children = self.children()
+        window = time.monotonic() + STOP_GRACE_SECONDS
         signals = []
         for sent, grace in (
             (signal.SIGINT, STOP_GRACE_SECONDS),
@@ -379,8 +388,33 @@ class Server:
                 self.process.wait(grace)
             except subprocess.TimeoutExpired:
                 pass
+        # Its processes have until SIGINT's grace is over, the same window,
+        # to exit and, once orphaned, be reaped.
+        while True:
+            children = {pid for pid in children if running(pid)}
+            if not children or time.monotonic() >= window:
+                break
+            time.sleep(0.1)
+        for pid in children:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
         self.log.close()
-        return {"signals": signals, "exit": self.process.poll()}
+        return {
+            "signals": signals,
+            "exit": self.process.poll(),
+            "left_running": sorted(children),
+        }
+
+
+def running(pid: int) -> bool:
+    """Whether process pid exists (a zombie not yet reaped among them)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
 
 
 def install(args, out: Path) -> str:
@@ -714,7 +748,8 @@ def main(argv=None) -> int:
                 record["stop"] = stop = server.stop()
                 note(
                     f"{part} stop: signals {', '.join(stop['signals']) or 'none'}, "
-                    f"exit {stop['exit']}"
+                    f"exit {stop['exit']}, left running "
+                    f"{', '.join(map(str, stop['left_running'])) or 'none'}"
                 )
         meta["first_start_spawn_to_ready_s"] = (
             parts[0]["spawn_to_ready_s"] if parts else None

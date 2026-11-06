@@ -41,8 +41,10 @@ GAP_REPORT_S = 2.5
 GAP_TARGET_S = 0.5
 # G8: supervision's GPU wait limit; a loop tick that long is a hang.
 MAX_TICK_MS = 5000
-# G8: a server stops on SIGINT, as on Ctrl+C, and exits 0 (run.Server.stop).
-CLEAN_STOP = {"signals": ["SIGINT"], "exit": 0}
+# G8: a server stops on SIGINT, as on Ctrl+C, exits 0 and leaves none of the
+# processes it started, its engine, running past SIGINT's grace
+# (run.Server.stop).
+CLEAN_STOP = {"signals": ["SIGINT"], "exit": 0, "left_running": []}
 # G9: the engine's resource wait timeout; a claim waiting that long starves.
 CLAIM_WAIT_MS = 30_000
 # A regrown store unit taken back within this many seconds of its regrow
@@ -305,8 +307,9 @@ def g8_failures(run: Run) -> list[str]:
         if stop != CLEAN_STOP:
             failures.append(
                 f"G8: the server of {part['label']} did not stop on SIGINT with "
-                f"exit 0: signals {', '.join(stop.get('signals') or []) or 'none'}, "
-                f"exit {stop.get('exit')}"
+                "exit 0 and its engine gone: signals "
+                f"{', '.join(stop.get('signals') or []) or 'none'}, "
+                f"exit {stop.get('exit')}, left running {stop.get('left_running')}"
             )
     return failures
 
