@@ -73,6 +73,45 @@ Projection blockProjection(uint32_t n, uint32_t k, uint32_t segments, uint32_t f
   return blockProjection(n, k, std::vector<uint32_t>(segments, format));
 }
 
+// Allocation without the live weights must reserve the tile dispatch uses,
+// including the 27B's fused GDN input with trailing output padding.
+void fourAndHalfBitStorage() {
+  const Linear device = gpu(10, 20);
+  for (const bool lastFloat : {false, true}) {
+    BlockWeights weights;
+    uint32_t offset = 0;
+    for (const uint32_t n : {10240U, 6144U, 128U}) {
+      QuantizedSegment part = lastFloat && n == 128
+          ? QuantizedSegment::floats(n, 5120, {})
+          : QuantizedSegment::planes(GGUF_FMT_AF4G64, n, 5120, {}, {}, {});
+      part.columnOffset = offset;
+      offset += n;
+      weights.segments.push_back(part);
+    }
+    const Projection p(16640, 5120, std::move(weights));
+    const LinearPlan plan = device.decodePlan(p, 1);
+    require(p.shape().weightBits16 == 72 && plan.configuration().sixteenRows && plan.storageRows() == 16 &&
+                device.decodeStorageRows(8, p.shape()) == plan.storageRows(),
+            "4.5-bit fused input allocation and dispatch agree");
+  }
+  // The stored-bit boundary is exact; absent format information does not
+  // opt an allocation into the measured policy.
+  for (const uint32_t bits16 : {0U, 71U, 72U, 73U})
+    require(device.decodeStorageRows(8, {.outputSize = 17408, .inputSize = 5120, .weightBits16 = bits16}) ==
+                (bits16 == 71 || bits16 == 72 ? 16U : 8U),
+            "4.5-bit storage boundary");
+  // The pair can run unsplit although each tensor's own plan splits. An
+  // override after selectProjection would choose M16 over an M8 allocation.
+  for (const uint32_t format : {GGUF_FMT_Q4K, GGUF_FMT_AF4G64}) {
+    const Projection p = blockProjection(14336, 5120, 1, format);
+    const LinearPlan pair = device.decodePlan(p, 1, LinearEpilogue::GateUp, &p);
+    require(pair.configuration().oneGateUpPass && pair.configuration().splits == 1 &&
+                !pair.configuration().sixteenRows && pair.storageRows() == 8 &&
+                device.decodeStorageRows(8, p.shape()) == 8,
+            "an unsplit 4.5-bit gate/up pair must fit its tensors' allocations");
+  }
+}
+
 // fp32 destinations (the logits): the plan of a projection with an fp32
 // destination keeps the configuration, input table and scratch of its bf16
 // plan on every family and core count, and only plain decode workloads take
@@ -578,7 +617,8 @@ void ggufPlans() {
     for (const uint32_t family : {9U, 10U, 11U})
       for (uint32_t cores = 0; cores <= 128; ++cores) {
         const Linear device = gpu(family, cores);
-        for (const auto [n, k] : {std::pair{17408U, 5120U}, {5120U, 17408U}, {16384U, 5120U}, {248320U, 5120U},
+        for (const auto [n, k] : {std::pair{17408U, 5120U}, {14336U, 5120U}, {16640U, 5120U},
+                                  {5120U, 17408U}, {16384U, 5120U}, {248320U, 5120U},
                                   {1024U, 5120U}})
           for (const Formats &formats : kFormats) {
             const Projection plain = blockProjection(n, k, formats), mixed = withFloat(n, k, formats),
@@ -594,15 +634,21 @@ void ggufPlans() {
               const LinearPlan one = device.plan({{n, k}, 8, LinearPhase::Decode, epilogue}, *p, gate),
                                two = device.plan({{n, k}, 16, LinearPhase::Decode, epilogue}, *p, gate);
               LinearConfig config = one.configuration();
-              const bool sixteen = gate ? alone(*p) && alone(*gate)
+              const uint32_t bits16 = p->shape().weightBits16;
+              const bool sixteen = gate ? config.splits == 1 && alone(*p) && alone(*gate)
                                         : family >= 10 && config.tile == LinearTile::GgufStaged &&
-                                              config.splits == 1 && underFourAndHalfBits(p->shape());
+                                              config.splits == 1 && (underFourAndHalfBits(p->shape()) ||
+                                                                    (cores == 20 && bits16 == 72));
               uint32_t storage = device.decodeStorageRows(8, p->shape());
               if (gate) storage = std::max(storage, device.decodeStorageRows(8, gate->shape()));
               require(config.sixteenRows == sixteen && one.storageRows() == (sixteen ? 16U : 8U) &&
                           (gate ? one.storageRows() <= storage : one.storageRows() == storage),
                       "one lane on the 16-row tile: family " + std::to_string(family) + ", " +
-                          std::to_string(cores) + " cores, " + std::to_string(n) + " x " + std::to_string(k));
+                          std::to_string(cores) + " cores, " + std::to_string(n) + " x " + std::to_string(k) +
+                          ", bits16 " + std::to_string(bits16) + ", gate " + std::to_string(gate != nullptr) +
+                          ", splits " + std::to_string(config.splits) + ", actual/expected M16 " +
+                          std::to_string(config.sixteenRows) + "/" + std::to_string(sixteen) +
+                          ", plan/allocation rows " + std::to_string(one.storageRows()) + "/" + std::to_string(storage));
               config.sixteenRows = false;
               require(!sixteen || config == two.configuration(), "one lane on the 16-row tile took another plan");
             }
@@ -746,8 +792,8 @@ void scratchBoundsRotated() {
 // - every batch width runs the register tile's plan (Apple9; Apple10 where
 //   the grid of column tiles and lanes, a one-pass pair's of both tensors,
 //   holds fewer than 1.5 per core) or the staged tile's, over its tile's
-//   rows, one unsplit lane of IQ4_XS on Apple10 its 16-row tile at the
-//   two-lane plan;
+//   rows, one unsplit lane of IQ4_XS on Apple10 (also Q4_K on 20 cores)
+//   its 16-row tile at the two-lane plan;
 //   the register tile and Apple9's staged tile take one split at every width,
 //   so a request's sums there do not depend on the requests batched with it;
 // - a split count is a power of two up to the maximum whose partitions keep
@@ -757,8 +803,9 @@ void scratchBoundsRotated() {
 //   never, and only a spreading staged gate/up pair may run in one pass;
 // - it depends on the grid per core only: doubling the width and the core
 //   count keeps it (and a pair's passes, where both core counts spread or
-//   neither does); on the tiers (the register tile, Apple9's staged tile) more
-//   cores never lower it and a wider grid never raises it, and on Apple10's
+//   neither does), except the 20-core 4.5-bit height; on the tiers (the
+//   register tile, Apple9's staged tile) more cores never lower it and a
+//   wider grid never raises it, and on Apple10's
 //   staged tile, whose split law weighs each split's partials of the tile's
 //   rows, more rows never raise it;
 // - the arena bound (of the shape without formats) covers every segment
@@ -792,10 +839,12 @@ void ggufCoreLaws() {
                   return family == 9 || 2 * uint64_t{width / 64} * lanes < uint64_t{3} * planned;
                 };
                 // One lane may run the 16-row tile unsplit: Apple10, fewer than
-                // 4.5 bits per weight, staged, a pair where its tensors' own
-                // plans run it.
+                // 4.5 bits per weight (also exactly 4.5 on 20 cores), staged,
+                // a pair where both its tensors' own plans run it.
                 const LinearWorkload own{{n, k}, 8, LinearPhase::Decode, LinearEpilogue::None};
-                const bool sixteen = family >= 10 && underFourAndHalfBits(p.shape()) && !registers(1, columns) &&
+                const bool sixteen = family >= 10 &&
+                                     (underFourAndHalfBits(p.shape()) || (planned == 20 && p.shape().weightBits16 == 72)) &&
+                                     !registers(1, columns) &&
                                      (!gateUp || linear.plan(own, gate).configuration().sixteenRows);
                 // Every batch width takes its tile and binds its tile's rows; the
                 // tiers' tiles take one configuration at every width, and on
@@ -835,9 +884,12 @@ void ggufCoreLaws() {
                     // the core count (kApple10SpreadFromCores), and with it whether
                     // a pair may run in one pass.
                     const LinearConfig doubled = plan(twice, 2 * n, rows).configuration();
+                    const bool measuredHeight = family >= 10 && p.shape().weightBits16 == 72 &&
+                                                (planned == 20 || simulatedDevice(family, 2 * cores).plannedGpuCores() == 20);
                     require((gateUp && spreads != twiceSpreads) ||
                                 (doubled.tile == at.tile && doubled.splits == at.splits &&
-                                 doubled.oneGateUpPass == at.oneGateUpPass && doubled.sixteenRows == at.sixteenRows),
+                                 doubled.oneGateUpPass == at.oneGateUpPass &&
+                                 (measuredHeight || doubled.sixteenRows == at.sixteenRows)),
                             "GGUF decode plan depends on more than the grid per core");
                     if (at.tile == LinearTile::GgufStaged && family >= 10) continue;
                     const LinearConfig withMore = plan(more, n, rows).configuration(),
@@ -1359,6 +1411,7 @@ int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: linear-plan <production.metallib|--cpu>");
     ggufPlans();
+    fourAndHalfBitStorage();
     scratchBoundsRotated();
     ggufCoreLaws();
     floatOutputPlans();

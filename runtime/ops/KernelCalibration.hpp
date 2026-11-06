@@ -228,6 +228,17 @@ inline constexpr ProjectionCalibration kApple10Projection{
     .stagedPrefillRows = kApple10StagedPrefillRows,
 };
 
+// The archived 20-core M5 Pro experiment also favored M16 at exactly 4.5
+// stored bits per weight. Keep the same allocation/dispatch and gate/up
+// guards; fresh paired performance qualification remains pending. Other
+// core counts keep the strict 4.5-bit boundary above.
+inline constexpr uint32_t kApple10TwentyCoreGpuCores = 20;
+inline constexpr ProjectionCalibration kApple10TwentyCoreProjection = [] {
+  ProjectionCalibration row = kApple10Projection;
+  row.sixteenRowBelowBits16 = 73;
+  return row;
+}();
+
 // ---- Float projections ----------------------------------------------------
 
 // The neural accelerator tile needs one (Apple9's matrix operations share the
@@ -275,7 +286,8 @@ inline constexpr AttentionCalibration kApple9SmallAttention{64};
 inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device) noexcept {
   const uint32_t cores = device.plannedGpuCores();
   if (device.gpuClass() == GpuClass::Apple10)
-    return {cores, kApple10Projection, kApple10FloatTile, kApple10Moe, kAttention};
+    return {cores, cores == kApple10TwentyCoreGpuCores ? kApple10TwentyCoreProjection : kApple10Projection,
+            kApple10FloatTile, kApple10Moe, kAttention};
   const bool small = cores <= kApple9SmallGpuCores;
   return {cores, small ? kApple9SmallProjection : kApple9Projection, kApple9FloatTile,
           small ? kApple9SmallMoe : kApple9Moe, small ? kApple9SmallAttention : kAttention};
