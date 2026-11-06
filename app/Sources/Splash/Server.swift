@@ -72,6 +72,22 @@ final class Server {
     /// Whether the model answers a request now: ready, and not recovering.
     var answers: Bool { phase == .ready && !recovering }
 
+    /// What the server is at, as the window shows it: its phase and the model a stop makes way
+    /// for, the model, what a ready one does, and what that model takes and how it thinks. A
+    /// change of it changes the window as one (`MainView`); a start's step changes words alone.
+    struct Stage: Equatable {
+        var phase: Phase
+        var next: String?
+        var model: String?
+        var serving: Serving
+        var acceptsImages: Bool
+        var reasoning: Reasoning?
+    }
+
+    var stage: Stage {
+        Stage(phase: phase, next: next, model: model, serving: serving, acceptsImages: acceptsImages, reasoning: reasoning)
+    }
+
     /// Once ready: each request the server finished, as its log line gives it, the latest last.
     private(set) var requestLog: [RequestEntry] = []
 

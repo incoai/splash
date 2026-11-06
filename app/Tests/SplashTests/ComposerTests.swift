@@ -69,6 +69,71 @@ struct ComposerTests {
         }
     }
 
+    /// A model becoming ready changes the composer's controls in one animation: Attach Images and
+    /// Thinking fade in as the mark and the model's name move along beside them, none of them in
+    /// its place at once while the others move; with Reduce Motion all of them are in their places
+    /// at once, the mark taking its color within `quick`.
+    @Test func theComposersControlsChangeWithTheServerAsOne() async throws {
+        let fake = try FakeRuntime("splash-composer-stage", launcher: "stepped_server")
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer {
+            state.quit()
+            try? FileManager.default.removeItem(at: fake.root)
+        }
+        func signal(_ name: String) { FileManager.default.createFile(atPath: fake.root.appending(path: name).path, contents: nil) }
+        await state.launch()
+        state.section = .chat
+        _ = NSApplication.shared
+        let window = NSWindow(contentViewController: NSHostingController(rootView: MainView().environment(state)))
+        window.setContentSize(CGSize(width: 1000, height: 700))
+        window.setFrameOrigin(NSPoint(x: -30000, y: -30000))
+        window.orderFrontRegardless()
+        defer { window.orderOut(nil) }
+        let text = try #require(try await focusedComposer(in: window).enclosingScrollView)
+        state.server.start("example/Model", settings: ServeSettings(values: ["--port": String(fake.port)]))
+        signal("loaded")
+        try await waitFor(state.server.step == .warming)
+        try await Task.sleep(for: .seconds(1))
+        Self.update(window)
+        // The row of controls under the text, from the first control's glyph to Send.
+        let field = text.convert(text.bounds, to: nil)
+        let row = CGRect(x: field.minX - 8, y: field.minY - 40, width: field.width + 10, height: 32)
+        let before = try Self.picture(row, in: window)
+
+        signal("warm")
+        // The row as the window first draws it once the server is ready.
+        await withCheckedContinuation { ready in
+            withObservationTracking { _ = state.server.phase } onChange: { ready.resume() }
+        }
+        #expect(state.server.phase == .ready)
+        Self.update(window)
+        let start = try Self.picture(row, in: window)
+        try await Task.sleep(for: .seconds(1))
+        Self.update(window)
+        let settled = try Self.picture(row, in: window)
+
+        // The controls as they settle, each a run of columns drawn on the composer: Attach Images,
+        // the mark, the model's name, Thinking and Send.
+        let controls = Self.runs(in: settled)
+        print("The row's controls before \(Self.runs(in: before)), at the start \(Self.runs(in: start)), settled \(controls)")
+        try #require(controls.count >= 4, "the row's controls: \(controls)")
+        if Motion.reduced {
+            #expect(Self.runs(in: start) == controls, "every control in its place at once")
+        }
+        let named = ["Attach Images", "the mark", "the model's name", "Thinking"]
+        for (control, columns) in zip(named, controls) {
+            let change = Self.difference(before, settled, in: columns)
+            let left = Self.difference(start, settled, in: columns)
+            print("\(control) at \(columns): changes \(change), at the start \(left) from its end")
+            #expect(change > 0.02, "\(control) changes")
+            if !Motion.reduced {
+                #expect(left > change * 0.3, "\(control) changes in the animation, not at once")
+            } else if control != "the mark" {
+                #expect(left < change * 0.05, "\(control) is there at once")
+            }
+        }
+    }
+
     /// A photo attaches without holding the main thread while it is scaled and encoded; images
     /// join the draft in the order they were attached, a photo before a small image attached after
     /// it, which is encoded sooner.
@@ -188,6 +253,52 @@ struct ComposerTests {
             }
         }
         return bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.9])!
+    }
+
+    /// The window's content in `rect`, in the window's points, as it draws now.
+    private static func picture(_ rect: CGRect, in window: NSWindow) throws -> NSBitmapImageRep {
+        let content = try #require(window.contentView)
+        let area = content.convert(rect, from: nil)
+        let bitmap = try #require(content.bitmapImageRepForCachingDisplay(in: area))
+        content.cacheDisplay(in: area, to: bitmap)
+        return bitmap
+    }
+
+    /// The brightness of a picture's pixels, from 0 to 1, by row from the top, then by column.
+    private static func brightness(_ picture: NSBitmapImageRep) -> [[Double]] {
+        (0..<picture.pixelsHigh).map { y in
+            (0..<picture.pixelsWide).map { x in
+                guard let color = picture.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { return 0 }
+                return (color.redComponent + color.greenComponent + color.blueComponent) / 3
+            }
+        }
+    }
+
+    /// How much two pictures of one area differ in `columns`: the mean difference of their
+    /// pixels' brightness there, from 0 to 1.
+    private static func difference(_ one: NSBitmapImageRep, _ other: NSBitmapImageRep, in columns: Range<Int>) -> Double {
+        let one = brightness(one), other = brightness(other)
+        let total = zip(one, other).reduce(0.0) { sum, rows in
+            sum + columns.reduce(0.0) { $0 + abs(rows.0[$1] - rows.1[$1]) }
+        }
+        return total / Double(one.count * columns.count)
+    }
+
+    /// The runs of columns where `picture` draws something over its background, the color in its
+    /// middle, from left to right; runs less than 4 points apart are one.
+    private static func runs(in picture: NSBitmapImageRep) -> [Range<Int>] {
+        let rows = brightness(picture)
+        let background = rows[rows.count / 2][picture.pixelsWide / 2]
+        let gap = Int(4 * Double(picture.pixelsWide) / picture.size.width)
+        var runs: [Range<Int>] = []
+        for x in 0..<picture.pixelsWide where rows.contains(where: { abs($0[x] - background) > 0.1 }) {
+            if let last = runs.last, x - last.upperBound <= gap {
+                runs[runs.count - 1] = last.lowerBound..<(x + 1)
+            } else {
+                runs.append(x..<(x + 1))
+            }
+        }
+        return runs
     }
 
     /// What SwiftUI owes the window, done now: its views updated for every change made so far.

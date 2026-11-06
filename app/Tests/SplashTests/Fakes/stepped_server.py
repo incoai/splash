@@ -1,5 +1,6 @@
 # A launcher that starts as `splash serve` does, one step at a time as the test signals it with
-# a file in the runtime's folder, then answers as a ready server (MainViewTests).
+# a file in the runtime's folder, then answers as a ready server of a model that sees images and
+# thinks at three efforts (MainViewTests, ComposerTests).
 import json
 import os
 import sys
@@ -37,7 +38,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = {}
         if self.path == "/v1/models":
-            body = {"data": [{}]}
+            body = {"data": [{
+                "input_modalities": ["text", "image"],
+                "reasoning": {"thinks": True, "efforts": ["low", "medium", "high"], "default": "medium"},
+            }]}
         if self.path == "/status":
             running = [{}] if (root / "answering").exists() else []
             body = {

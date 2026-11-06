@@ -8,7 +8,14 @@ struct MainView: View {
     var body: some View {
         // The window works out its least size from its content: the frame's minimum alone, without
         // laying either screen out for it on every change.
-        Offered { WithDrawer { content } }
+        Offered {
+            WithDrawer {
+                // A change of what the server is at changes both screens as one: what comes and
+                // goes with it fades, what is beside it moves along, in the Server's rows and bar
+                // and the composer's controls alike. The toolbar and the drawer stay as they are.
+                content.animation(Motion.settle, value: state.server.stage)
+            }
+        }
             .frame(minWidth: 800, minHeight: 560)
             .navigationTitle("Splash")
             .toolbar(removing: .title)

@@ -73,10 +73,10 @@ struct ServerView: View {
             }
         }
         .formStyle(.grouped)
-        // The screen changes its shape as one: rows and sections fade in and out as the server,
-        // downloads and options change, the rows after them moving along.
-        .animation(Motion.settle, value: Layout(phase: state.server.phase, next: state.server.next, serving: state.server.serving,
-                                                installed: state.installed.map(\.id), downloading: state.installer.running,
+        // The screen changes its shape as one: rows and sections fade in and out as the models,
+        // downloads and options change, the rows after them moving along; as the server's stage
+        // changes too, which the window animates (`MainView`).
+        .animation(Motion.settle, value: Layout(installed: state.installed.map(\.id), downloading: state.installer.running,
                                                 failure: state.installer.failure?.message, keyProblem: state.keyProblem,
                                                 finding: state.findingCachedModels, options: state.options,
                                                 family: state.family(of: state.selection)))
@@ -95,13 +95,10 @@ struct ServerView: View {
         .sheet(isPresented: $customModel) { CustomModelSheet() }
     }
 
-    /// What the screen holds: what the server does, the models, a download or a problem, and the
-    /// launch options, those the family of the model picked uses; the model picked is not in it, so
-    /// that picking one of the same family is immediate.
+    /// What the screen holds besides the server's stage: the models, a download or a problem, and
+    /// the launch options, those the family of the model picked uses; the model picked is not in
+    /// it, so that picking one of the same family is immediate.
     private struct Layout: Equatable {
-        var phase: Server.Phase
-        var next: String?
-        var serving: Server.Serving
         var installed: [String]
         var downloading: Bool
         var failure: String?
@@ -168,21 +165,9 @@ struct ServerView: View {
 private struct ControlBar: View {
     @Environment(AppState.self) private var state
 
-    /// What the bar shows, which changes it with one cross-fade.
-    private struct Stage: Equatable {
-        var phase: Server.Phase
-        var next: String?
-        var model: String?
-        var serving: Server.Serving
-        var selection: String?
-        var changed: Bool
-    }
-
     var body: some View {
         let server = state.server
         let model = server.running ? server.model : state.selection
-        let stage = Stage(phase: server.phase, next: server.next, model: server.model, serving: server.serving,
-                          selection: state.selection, changed: state.optionsChanged)
         HStack(spacing: 12) {
             StatusMark(look: look, since: server.since)
             VStack(alignment: .leading, spacing: 2) {
@@ -203,7 +188,10 @@ private struct ControlBar: View {
         .frame(maxWidth: column - 40)
         .padding(.vertical, 12)
         .frame(maxWidth: .infinity)
-        .animation(Motion.settle, value: stage)
+        // The model picked and changed options change it with one cross-fade, as the server's
+        // stage does (`MainView`).
+        .animation(Motion.settle, value: state.selection)
+        .animation(Motion.settle, value: state.optionsChanged)
     }
 
     /// Whether the model picked is the one that failed, so that Start tries it again.
