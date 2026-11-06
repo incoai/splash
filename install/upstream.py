@@ -164,16 +164,18 @@ def folder_targets(files):
     ]
 
 
-def target_files(target):
+def target_files(target, *, shared_last=False):
     """The files of a root target (root_targets) as the native loader reads
-    them: its one file, or its split GGUF's parts, all present, in split
-    order."""
+    them: its one file, or its split GGUF's parts, all present (with
+    shared_last, all but the last, split_order), in split order."""
     if not target.split:
         return list(target.files)
-    return split_order(target.files, f"the split GGUF {target.name}")
+    return split_order(
+        target.files, f"the split GGUF {target.name}", shared_last=shared_last
+    )
 
 
-def select_gguf(files, variant):
+def select_gguf(files, variant, *, shared_last=False):
     """The target GGUF among a repository's targets, as the list of its files
     in split order (target_files; split_gguf), and whether it was taken by
     its -VARIANT ending from several targets, which the caller reports.
@@ -184,12 +186,14 @@ def select_gguf(files, variant):
     folder names no variant apart from its model, so its one match needs no
     report. Without :VARIANT, the root targets' only name. A name selects
     its target by named_target. Anything else is an error listing every
-    target :VARIANT can select, root targets then folders."""
+    target :VARIANT can select, root targets then folders. With shared_last,
+    a split GGUF at the root may lack its last part, which a caller that reads
+    headers finds (shared_last_part)."""
     targets = root_targets(files)
     names = sorted({target.name for target in targets})
     if variant is None:
         if target := named_target(targets, names):
-            return target_files(target), False
+            return target_files(target, shared_last=shared_last), False
         choice = "select a GGUF with OWNER/REPO:VARIANT"
     else:
         words = [name.split("-") for name in names]
@@ -200,14 +204,14 @@ def select_gguf(files, variant):
             if "-".join(own[shared:]).lower() == variant.lower()
         ]
         if target := named_target(targets, exact):
-            return target_files(target), False
+            return target_files(target, shared_last=shared_last), False
         if split := split_gguf(files, variant):
             return split, False
         suffix = "-" + variant.lower()
         ending = [name for name in names if name.lower().endswith(suffix)]
         if target := named_target(targets, ending):
             several = len(names) + len(selectable_folders(files)) > 1
-            return target_files(target), several
+            return target_files(target, shared_last=shared_last), several
         choice = "no single GGUF matches :" + variant
     listed = ", ".join(map(str, targets + selectable_folders(files))) or "none"
     raise models.ModelError(f"{choice} (GGUF targets: {listed})")
@@ -250,11 +254,12 @@ def split_gguf(files, variant):
     return None
 
 
-def split_order(names, split):
+def split_order(names, split, *, shared_last=False):
     """names, the files of one split GGUF, in split order: the parts of one
-    name, each NAME-0000K-of-0000N.gguf, every part from 1 to N present once.
-    The engine holds a target's files to the same rule (findTargetGgufs).
-    split names the split GGUF in a refusal."""
+    name, each NAME-0000K-of-0000N.gguf, every part from 1 to N present once,
+    or, with shared_last, every part but the last (last_part_name). The
+    engine holds a target's files to the same rule (findTargetGgufs). split
+    names the split GGUF in a refusal."""
     matches = {name: SPLIT_NAME.search(name) for name in names}
     for name, match in matches.items():
         if not match:
@@ -276,9 +281,50 @@ def split_order(names, split):
             )
         parts[number] = (int(match.group(2)), name)
     counts = {count for count, _ in parts.values()}
-    if len(counts) != 1 or sorted(parts) != list(range(1, counts.pop() + 1)):
+    count = counts.pop() if len(counts) == 1 else None
+    if count is None or sorted(parts) not in (
+        list(range(1, count + 1)),
+        *([list(range(1, count))] if shared_last and count > 1 else []),
+    ):
         raise models.ModelError(f"{split} is incomplete: " + ", ".join(sorted(names)))
     return [parts[number][1] for number in sorted(parts)]
+
+
+def last_part_name(first):
+    """The name under which the last part of the split GGUF whose first
+    part's name is `first` lies beside its other parts in target/, where the
+    native loader finds each by its -0000K-of-0000N name."""
+    match = SPLIT_NAME.search(first)
+    count = match.group(2)
+    return f"{first[: match.start()]}-{count}-of-{count}.gguf"
+
+
+def shared_last_part(repo, names, first):
+    """The root file of repo that is the last part of the split GGUF whose
+    other parts are names (first, the first one's header), as DeepSeek-V4.1's
+    variants share their Engram tables (gguf.last_part): the one root GGUF,
+    neither another split's part nor a projector, whose header says so. Each
+    candidate's header costs a few range requests."""
+    found = []
+    for name in root_ggufs(repo.files):
+        if projector_named(name) or SPLIT_NAME.search(name):
+            continue
+        with repo.open(name) as stream:
+            header = gguf.Metadata(stream, tensors=True)
+        if gguf.last_part(first, header):
+            found.append((name, header))
+    if len(found) != 1:
+        count = first.values.get("split.count")
+        raise models.ModelError(
+            f"{names[0]} is part 1 of {count}; "
+            + (
+                f"no root GGUF of {repo.name} is part {count}"
+                if not found
+                else "several root GGUFs are its last part: "
+                + ", ".join(name for name, _ in found)
+            )
+        )
+    return found[0]
 
 
 def select_vision(repo):
@@ -370,7 +416,7 @@ def inspect_target(repo, variant, language_only, scratch):
 
 
 def _gguf_target(repo, variant, language_only, scratch):
-    names, by_ending = select_gguf(repo.files, variant)
+    names, by_ending = select_gguf(repo.files, variant, shared_last=True)
     name = names[0] if len(names) == 1 else f"{len(names)} split files {names[0]} ..."
     if by_ending:
         print(
@@ -403,6 +449,14 @@ def gguf_target(repo, names, scratch, *, projector=None):
         with repo.open(part) as stream:
             headers.append(gguf.Metadata(stream, tensors=True))
         (target / Path(part).name).write_bytes(headers[-1].raw)
+    # A last part the variants share goes beside the others under the name
+    # they imply.
+    if headers[0].values.get("split.count") == len(names) + 1:
+        shared, header = shared_last_part(repo, names, headers[0])
+        headers.append(header)
+        last = last_part_name(Path(names[0]).name)
+        files["target/" + last] = shared
+        (target / last).write_bytes(header.raw)
     # The first part's metadata describes the model.
     config = scratch / "config.json"
     config.write_bytes(models.json_bytes(gguf.model_config(headers[0])))
@@ -735,7 +789,11 @@ def publish(models_root, link, record, files):
     servers wait for, and its record is taken again under the lock."""
     models_root.mkdir(parents=True, exist_ok=True)
     # One record per linked file, however many assembly paths link it.
-    records = _file_records(assembly.recorded(link), set(files.values()))
+    records = _file_records(
+        assembly.recorded(link),
+        set(files.values()),
+        assembly.recorded_files(models_root),
+    )
     # Everything written under the models root is written under the lock.
     with models.installation_lock(models_root):
         # The record of the assembly the link names, which this one replaces.
@@ -773,11 +831,12 @@ def publish(models_root, link, record, files):
     return published
 
 
-def _file_records(previous, paths):
+def _file_records(previous, paths, known=None):
     """The record of each of paths (assembly.file_record), keeping the
     digest previous, an assembly's record or None, holds of one unchanged
-    since."""
-    recorded = {}
+    since, or else the one another assembly records (`known`, by path:
+    assembly.recorded_files)."""
+    recorded = dict(known or {})
     for entry in previous["files"].values() if previous else ():
         recorded[entry["path"]] = entry
     return {
@@ -808,13 +867,35 @@ def _changes(installed, family, draft):
     return changes
 
 
+class NoDraft:
+    """The draft source of an installation without a draft (--draft-model
+    none, or a family no draft is released for), which decodes one token a
+    cycle: no files, and recorded as the draft repository models.NO_DRAFT."""
+
+    name = models.NO_DRAFT
+    revision = None
+    unreachable_reason = None
+    files = frozenset()
+
+    @staticmethod
+    def identity():
+        return {"repo": models.NO_DRAFT, "revision": None}
+
+
+NO_DRAFT = NoDraft()
+
+
 def _resolve_draft(family, selection, installed, target):
     """The draft's repository, --draft-model or else the family's DFlash2
     release, at its default branch's commit: one Hub request, made only when
     the Hub answered for the target. Otherwise, or when it cannot be
     resolved, the installed draft stands in; without one, a commit the Hub
-    cache holds, else it fails with the target's reason and class."""
+    cache holds, else it fails with the target's reason and class.
+    --draft-model none, and a family no draft is released for without
+    --draft-model, install none (NO_DRAFT)."""
     name = selection.draft_model or family.draft_repo
+    if name is None or name == models.NO_DRAFT:
+        return NO_DRAFT
     recorded = installed and installed["sources"]["draft"]
     asked = _answered(target)
     if recorded and not asked:
@@ -845,7 +926,10 @@ def _draft(target, installed, draft):
     """The draft repository and its downloaded files, by assembly path: draft,
     as this start resolved it, when it is not the installed draft, or else
     the installed one, which is kept too when draft cannot be fetched
-    (downloaded and checked for the target)."""
+    (downloaded and checked for the target). An installation without a draft
+    has no files of one."""
+    if draft is NO_DRAFT:
+        return draft, {}
     family = target.family
     recorded = installed and installed["sources"]["draft"]
     if draft.identity() != recorded:
@@ -874,6 +958,30 @@ def _at(repo):
     return f"{repo.name}@{repo.revision[:12]}" if repo.revision else repo.name
 
 
+def dspark_files(repo, target):
+    """The DSpark draft in repo for target's family, downloaded, by assembly
+    path: the one dspark*.gguf file at the root of the repository, or the
+    --draft-model GGUF itself. The engine checks it against the target when
+    the model loads (runtime/model/DSpark.hpp readDSparkLayout)."""
+    found = sorted(
+        name
+        for name in repo.files
+        if "/" not in name
+        and name.lower().startswith("dspark")
+        and name.lower().endswith(".gguf")
+    )
+    if repo.revision is None and len(repo.files) == 1:
+        found = sorted(repo.files)
+    if len(found) != 1:
+        held = f": {', '.join(found)}" if found else ""
+        raise models.ModelError(
+            f"{repo.name} does not hold one DSpark GGUF for {target.family.name}"
+            f" (dspark*.gguf at its root{held})"
+        )
+    downloaded = repo.download(set(found))
+    return {"draft/" + name: path for name, path in downloaded.items()}
+
+
 def draft_files(repo, target):
     """The DFlash2 draft in repo for target's family, downloaded, by assembly
     path: config.json, the safetensors weights and the mask embedding when
@@ -881,6 +989,8 @@ def draft_files(repo, target):
     download only once the engine accepts its configuration with the
     target's (check_model)."""
     family = target.family
+    if family.dspark:
+        return dspark_files(repo, target)
     try:
         if "config.json" not in repo.files:
             raise models.ModelError("no config.json")

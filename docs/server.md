@@ -100,7 +100,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--model-dir` | None | Prepare a local GGUF file or GGUF/MLX model directory without the Hub. See [local model files](models.md#local-model-files). |
 | `--mmproj` | None | A local GGUF target's vision projector; requires `--model-dir`. |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
-| `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place. See [drafts](models.md#drafts). |
+| `--draft-model` | The family's released DFlash2 draft, none for a family without one | A compatible repository or local directory in its place, DeepSeek-V4.1-Flash's DSpark GGUF (a repository holding one `dspark*.gguf`, or a local file), or `none` to decode one token a cycle without a draft. See [drafts](models.md#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](models.md#vision). |
 | `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
@@ -113,7 +113,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--max-context` | Auto | Set the context limit, e.g. `100K` or `1M` (K = 1024 tokens, M = 1,000,000), up to the model's limit; past the 256K native window a model with YaRN turns it on. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
-| `--ple-memory` | Auto | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`; `off` loads the whole table. Auto loads it where memory holds it, else streams it through its share of the budget. See [PLE table streaming](#ple-table-streaming). |
+| `--ple-memory` | Auto | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`; `off` loads the whole table. Auto loads it where memory holds it, else streams it through its share of the budget. DeepSeek-V4.1-Flash's Engram tables always stream this way, and `off` is refused. See [PLE table streaming](#ple-table-streaming). |
 | `--expert-memory` | Auto | MoE targets: the memory routed experts keep, e.g. `16G`; they stream through a store of exactly this size, which neither grows nor gives memory back, and read the other experts from the SSD when a step routes them; a size that holds every expert, or `off`, loads them all. Auto loads them all where memory holds them, else gives them what the context leaves, given back down to their floor while requests need it. See [streamed experts](#streamed-experts). |
 | `--sparse-kv-memory` | Auto | Qwen3.8-Flash-Next: memory for the KV blocks read back from the SSD for requests whose KV is there, e.g. `1200M`; never below its floor, which auto keeps. See [KV on the SSD](#kv-on-the-ssd). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](internals.md#weight-loading). |
@@ -422,9 +422,10 @@ whole slots and chunks, which startup says where they differ: its cap and
 its floor both, so it neither grows nor gives memory back, and the context
 and KV take the rest of the budget. A SIZE below every expert
 streams them even where memory holds them all. A store holds at least a
-layer's experts of each format mix and every expert of a layer whose mix no
-other layer shares; the engine refuses a SIZE below that, and `--expert-memory
-off` loads every expert, as a SIZE that holds them all does.
+layer's experts, in slots of the widest expert's size, which every layer's
+experts share whatever formats a layer mixes; the engine refuses a SIZE below
+that, and `--expert-memory off` loads every expert, as a SIZE that holds them
+all does.
 
 - Each MoE layer of a command loads the experts its rows route that are not
   resident: after the layer's routing, a host step of the command claims
@@ -433,34 +434,52 @@ off` loads every expert, as a SIZE that holds them all does.
   experts go first), and reads them from their
   files into a staging of a decode cycle's experts on the engine's SSD
   readers, and a repack kernel writes them into their slots before the expert
-  passes run. A decode step's load is one such round; a prefill command's
+  passes run; its threads take the consecutive rows of a tile of the planes,
+  each a native block of its row, so a simdgroup writes each group's places
+  in one piece (a DeepSeek-V4.1-Flash decode cycle's repacks of its IQ1_S
+  experts on a 48 GB M4 Pro: 15 instead of 19.5 ms). A decode step's load is one such round; a prefill command's
   loads take as many rounds as its rows may route experts, each staging half
   of the staging while the other half is read ahead. The kernels read every
   routed expert through the layer's slot table and the chunks that hold its
   slots, so resident experts, one chunk of every expert, and streamed
   experts run the same kernels.
+- A decode step's load on staged tiles splits around its expert passes
+  (`ExpertStore::addSplitLoadStart`, `ops::MoeSplitTiles`): its first host
+  step routes it and starts the reads of the experts that are not resident,
+  which the readers read while the GPU runs the passes of the experts that
+  were (and of the shared expert); its second host step waits for the reads,
+  which the repack and the passes of the loaded experts follow. Each pass
+  runs every live tile, the other pass's of no rows, which it skips, so the
+  outputs are those of one pass bitwise. Serving DeepSeek-V4.1-Flash with its
+  DSpark drafter on a 48 GB M4 Pro, whose cycles read about 2 experts a layer,
+  the host steps' waits fell from about 70 to 52 ms of a 170 ms cycle and
+  greedy prose decoded 8% faster (12.6 instead of 11.7 tokens per second);
+  without a draft, at a 90% hit rate, it decoded as fast as before.
 - An expert's rows a GGUF stores as they are are read straight into the
   staging (`F_NOCACHE`, widened to whole 16 KiB pages, which the kernel reads
   without the buffer cache: an M5 Pro reads 460 KiB pieces from four threads
   at 9.3 GB/s instead of 8.1, with less than half the CPU).
 - While the GPU repacks a round or runs a layer, the next round's experts or
   the next block's likely experts are read ahead: those the next block's
-  router picks from this block's input in a decode step; after a long prefill
+  router picks from this block's input in a decode step (by its selection
+  bias too, where it has one, as DeepSeek-V4.1's has); after a long prefill
   chunk's last repack, one more host step reads nearly all of the next
   block's into the whole staging. A load takes the read-ahead over without
   waiting for its reads of experts it does not route, and a read ahead of an
   expert no load routes may fail without failing anything. A decode step
   loads and predicts only the experts its lanes' verify rows route
   ([Drafts](models.md#drafts)); the selector writes those rows before the step's load.
-- Experts of one format share their slots, held in chunks, each a buffer of
-  its own of at most the device's largest buffer (`maxBufferLength`). One
-  chunk holds each format's floor: under auto every slot when KV can spill
-  to the SSD cache, else 85% of them, or every slot of the store
-  `--expert-memory SIZE` sizes;
-  the rest lie in chunks of about 1 GiB
-  (more where they would take more than 47, since the expert kernels' address
-  table holds at most 48 chunks), the last of fewer slots; a floor larger than
-  the device's largest buffer takes the elastic chunks it needs too. The kernels
+- Every layer's experts share the slots of one size, the widest expert's: a
+  slot keeps all of an expert's planes together, so experts of any formats
+  take any slot, and the kernels read a slot's expert at its place in its
+  chunk times that size (`ops::ExpertChunks::slotBytes`). The slots lie in
+  chunks, each a buffer of its own of at most the device's largest buffer
+  (`maxBufferLength`). One chunk holds the floor: under auto every slot when
+  KV can spill to the SSD cache, else 85% of them, or every slot of the store
+  `--expert-memory SIZE` sizes; the rest lie in chunks of about 1 GiB (more
+  where they would take more than 47, since the expert kernels' address table
+  holds at most 48 chunks), the last of fewer slots; a floor larger than the
+  device's largest buffer takes the elastic chunks it needs too. The kernels
   reach the chunks through their GPU addresses, which the backend writes for
   each expert dispatch as it encodes the command, and makes them resident for
   that dispatch's encoder rather than for every command on the queue
@@ -468,13 +487,12 @@ off` loads every expert, as a SIZE that holds them all does.
   because each one a decode encoder makes resident costs GPU time: 36 chunks
   of about 512 MiB cost a streamed decode cycle 2.3% of its GPU time on the
   M5 Max, about 0.065% a chunk. A store whose floor is all of it has no
-  elastic chunk. With a floor of 0.85, a format that starts at its cap has
+  elastic chunk. With a floor of 0.85, a store that starts at its cap has
   about one elastic chunk per 6.7 GiB of its slots (0.15 of them, in chunks of
   about 1 GiB), one where they are less, so a 17.2 GiB store, a floor and 3
-  elastic chunks, costs about 0.25%; one that starts below its
-  cap has as many of the cap's chunks as the slots above its lower floor take,
-  at most 7 in a store under 6.7 GiB. A size of one block (layers in formats
-  of their own) is one chunk of every expert.
+  elastic chunks, costs about 0.25%; one that starts below its cap has as many
+  of the cap's chunks as the slots above its lower floor take, at most 7 in a
+  store under 6.7 GiB. A store of one MoE layer is one chunk of every expert.
 - A decode step's loads keep the GPU awake through their host steps
   ([Host steps](internals.md#host-steps)), so the work after a load starts at once and at
   full clocks rather than after the GPU's wake-up.
@@ -950,8 +968,10 @@ environment. Unset, the model's template default is unchanged. An effort, the
 default or a request's own, reaches the template as `enable_thinking`, false
 for `none`, and as `reasoning_effort`, not as a token budget, so a template that
 switches reasoning by either follows it. A template that rejects an effort
-renders an alias: `xhigh` for `high` and `max`, `low` for `minimal`; one that
-rejects `none` renders by `enable_thinking` alone while thinking is off. A
+renders an alias: `xhigh` for `high` and `max`, `low` for `minimal`, `high`
+for `medium` and `max` for `xhigh`, as DeepSeek-V4.1's knows `low`, `high`
+and `max` alone; one that rejects `none` renders by `enable_thinking` alone
+while thinking is off. A
 template that cannot give the thinking a request asks for, one that always or
 never thinks, renders as it can, and the request reasons as its prompt does. A
 template that refuses a request's messages returns 400 with its reason.

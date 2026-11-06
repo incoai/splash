@@ -58,22 +58,27 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   put(PrefillTensor::FullPacked,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.target.packedFullWidth));
+  // The paged attention's scratch, which a target whose attention runs on
+  // its own scratch has none of.
+  const bool paged = geometry.target.pagedAttention();
+  const uint64_t attentionRows = paged ? kRaggedAttentionRows : 0;
   put(PrefillTensor::FullQueries,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
-                         kRaggedAttentionRows *
+                         attentionRows *
                          geometry.target.attentionHeadDimension));
   put(PrefillTensor::FullAttention,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
-                         kRaggedAttentionRows *
+                         attentionRows *
                          geometry.target.attentionHeadDimension));
   const ops::AttentionWorkspace attentionWorkspace =
-      operators.prefillAttentionWorkspace(
-          kPrefillRows, geometry.target.attentionQueryHeads,
-          geometry.target.kvLayout);
+      paged ? operators.prefillAttentionWorkspace(
+                  kPrefillRows, geometry.target.attentionQueryHeads,
+                  geometry.target.kvLayout)
+            : ops::AttentionWorkspace{};
   put(PrefillTensor::AttentionPartials, attentionWorkspace.partialsBytes);
   put(PrefillTensor::AttentionStatistics, attentionWorkspace.statisticsBytes);
   put(PrefillTensor::AttentionHidden,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+      bytesFor<uint16_t>(uint64_t{paged ? kPrefillRows : 0} *
                          geometry.target.attentionWidth));
   // The rows a mixer adds its output to, which the FFN adds to.
   if (geometry.target.mixersAddToHidden()) {
@@ -108,18 +113,21 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
                       geometry.draftRotaryPairs()));
   put(PrefillTensor::ChunkKeys,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
-                         kRaggedAttentionRows *
+                         attentionRows *
                          geometry.target.attentionHeadDimension));
   put(PrefillTensor::ChunkValues,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
-                         kRaggedAttentionRows *
+                         attentionRows *
                          geometry.target.attentionHeadDimension));
   // The split partials and counters and the rotated rows of the largest
-  // prefill plan, the draft's context projections' too.
+  // prefill plan, the draft's context projections' too where it has one.
   const auto &draft = geometry.draft;
   std::vector<ops::ProjectionShape> prefillProjections = geometry.target.prefillProjections;
-  prefillProjections.push_back({draft.hiddenSize, draft.targetHiddenSize()});
-  prefillProjections.push_back({draft.contextKvSize(), draft.hiddenSize});
+  // DSpark's projections run on scratch of its own (DSparkDraft).
+  if (draft.dflash()) {
+    prefillProjections.push_back({draft.hiddenSize, draft.targetHiddenSize()});
+    prefillProjections.push_back({draft.contextKvSize(), draft.hiddenSize});
+  }
   for (const auto &projection : prefillProjections) {
     const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection);
     put(PrefillTensor::LinearPartials, linear.partials);
@@ -169,6 +177,7 @@ uint64_t gdnTapeSlotBytes(const RuntimeGeometry &geometry) noexcept {
          ops::gdnTapeLayerBytes(geometry.target.gdnShape());
 }
 static uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept {
+  if (!geometry.target.pagedAttention()) return 0;
   return bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
                             kv::kVerifyChunkStride *
                             geometry.target.attentionHeadDimension);
@@ -178,8 +187,10 @@ std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators) {
   std::array<uint64_t, decodeTensorCount> result{};
-  const auto draftWorkspace =
-      operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape());
+  // A model without a DFlash2 draft has no draft attention, nor its scratch.
+  const ops::DraftAttentionWorkspace draftWorkspace =
+      geometry.draft.dflash() ? operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape())
+                              : ops::DraftAttentionWorkspace{};
   const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
   const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
@@ -204,21 +215,26 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(r * geometry.target.intermediateSize));
   put(DecodeTensor::FullPacked,
       bytesFor<uint16_t>(r * geometry.target.packedFullWidth));
+  // As in prefill, no paged attention's scratch where the target's
+  // attention runs on its own.
+  const bool paged = geometry.target.pagedAttention();
+  const uint64_t attentionRows = paged ? kv::kVerifyChunkStride : 0;
   put(DecodeTensor::FullQueries,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
-                         kv::kVerifyChunkStride *
+                         attentionRows *
                          geometry.target.attentionHeadDimension));
   const ops::AttentionWorkspace attentionWorkspace =
-      operators.verifyAttentionWorkspacePerLane(
-          geometry.target.attentionQueryHeads, geometry.target.kvLayout);
+      paged ? operators.verifyAttentionWorkspacePerLane(
+                  geometry.target.attentionQueryHeads, geometry.target.kvLayout)
+            : ops::AttentionWorkspace{};
   put(DecodeTensor::AttentionPartials, attentionWorkspace.partialsBytes);
   put(DecodeTensor::AttentionStatistics, attentionWorkspace.statisticsBytes);
   put(DecodeTensor::FullAttention,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
-                         kv::kVerifyChunkStride *
+                         attentionRows *
                          geometry.target.attentionHeadDimension));
   put(DecodeTensor::AttentionHidden,
-      bytesFor<uint16_t>(r * geometry.target.attentionWidth));
+      bytesFor<uint16_t>((paged ? r : 0) * geometry.target.attentionWidth));
   put(DecodeTensor::AttentionOutput,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Positions, bytesFor<uint32_t>(r * 3));
@@ -337,6 +353,9 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   ops::LinearScratchSize result;
   // Includes the vocabulary head shared with the draft.
   for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p));
+  // DSpark's projections run on scratch of its own (DSparkDraft).
+  if (!d.dflash())
+    return result;
   for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
        {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
        {d.hiddenSize, d.attentionSize},

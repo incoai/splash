@@ -1,0 +1,6974 @@
+{
+  "blk.0.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.0.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.0.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.0.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.0.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.0.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.0.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.0.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.0.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.0.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.0.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.0.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.0.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.0.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.0.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.0.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.0.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.0.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.0.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.0.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.0.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.0.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.0.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.0.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.0.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.1.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.1.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.1.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.1.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.1.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.1.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.1.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.1.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.1.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.1.engram_gate.weight": [
+    "F32",
+    [
+      5120,
+      4
+    ]
+  ],
+  "blk.1.engram_kv.weight": [
+    "Q5_K",
+    [
+      6144,
+      25600
+    ]
+  ],
+  "blk.1.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.1.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.1.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.1.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.1.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.1.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.1.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.1.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.1.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.1.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.1.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.1.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.1.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.1.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.1.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.1.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.10.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.10.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.10.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.10.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.10.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.10.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.10.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.10.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.10.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.10.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.10.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.10.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.10.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.10.ffn_gate_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.10.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.10.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.10.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.10.ffn_up_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.10.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.10.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.10.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.10.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.10.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.10.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.10.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.11.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.11.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.11.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.11.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.11.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.11.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.11.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.11.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.11.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.11.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.11.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.11.ffn_down_exps.weight": [
+    "IQ2_XXS",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.11.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.11.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.11.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.11.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.11.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.11.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.11.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.11.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.11.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.11.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.11.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.11.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.11.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.12.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.12.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.12.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.12.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.12.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.12.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.12.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.12.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.12.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.12.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.12.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.12.ffn_down_exps.weight": [
+    "IQ1_M",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.12.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.12.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.12.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.12.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.12.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.12.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.12.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.12.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.12.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.12.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.12.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.12.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.12.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.13.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.13.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.13.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.13.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.13.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.13.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.13.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.13.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.13.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.13.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.13.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.13.ffn_down_exps.weight": [
+    "IQ1_M",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.13.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.13.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.13.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.13.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.13.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.13.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.13.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.13.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.13.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.13.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.13.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.13.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.13.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.14.attn_compressor_gate.weight": [
+    "BF16",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.14.attn_compressor_kv.weight": [
+    "BF16",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.14.attn_compressor_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.14.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.14.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.14.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.14.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.14.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.14.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.14.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.14.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.14.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.14.engram_gate.weight": [
+    "F32",
+    [
+      5120,
+      4
+    ]
+  ],
+  "blk.14.engram_kv.weight": [
+    "Q5_K",
+    [
+      6144,
+      25600
+    ]
+  ],
+  "blk.14.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.14.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.14.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.14.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.14.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.14.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.14.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.14.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.14.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.14.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.14.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.14.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.14.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.14.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.14.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.14.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.14.indexer.attn_k.weight": [
+    "BF16",
+    [
+      512,
+      128
+    ]
+  ],
+  "blk.14.indexer.attn_q_b.weight": [
+    "BF16",
+    [
+      1280,
+      4096
+    ]
+  ],
+  "blk.14.indexer.k_norm.weight": [
+    "F32",
+    [
+      128
+    ]
+  ],
+  "blk.14.indexer.proj.weight": [
+    "BF16",
+    [
+      5120,
+      32
+    ]
+  ],
+  "blk.15.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.15.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.15.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.15.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.15.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.15.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.15.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.15.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.15.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.15.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.15.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.15.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.15.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.15.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.15.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.15.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.15.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.15.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.15.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.15.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.15.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.15.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.15.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.15.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.15.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.16.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.16.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.16.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.16.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.16.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.16.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.16.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.16.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.16.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.16.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.16.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.16.ffn_down_exps.weight": [
+    "IQ1_M",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.16.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.16.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.16.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.16.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.16.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.16.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.16.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.16.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.16.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.16.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.16.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.16.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.16.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.17.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.17.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.17.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.17.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.17.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.17.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.17.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.17.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.17.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.17.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.17.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.17.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.17.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.17.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.17.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.17.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.17.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.17.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.17.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.17.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.17.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.17.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.17.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.17.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.17.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.18.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.18.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.18.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.18.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.18.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.18.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.18.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.18.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.18.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.18.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.18.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.18.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.18.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.18.ffn_gate_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.18.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.18.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.18.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.18.ffn_up_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.18.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.18.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.18.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.18.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.18.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.18.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.18.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.19.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.19.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.19.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.19.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.19.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.19.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.19.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.19.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.19.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.19.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.19.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.19.ffn_down_exps.weight": [
+    "IQ1_M",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.19.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.19.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.19.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.19.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.19.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.19.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.19.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.19.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.19.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.19.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.19.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.19.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.19.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.2.attn_compressor_gate.weight": [
+    "BF16",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.2.attn_compressor_kv.weight": [
+    "BF16",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.2.attn_compressor_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.2.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.2.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.2.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.2.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.2.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.2.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.2.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.2.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.2.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.2.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.2.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.2.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.2.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.2.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.2.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.2.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.2.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.2.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.2.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.2.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.2.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.2.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.2.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.2.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.2.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.2.indexer.attn_k.weight": [
+    "BF16",
+    [
+      512,
+      128
+    ]
+  ],
+  "blk.2.indexer.attn_q_b.weight": [
+    "BF16",
+    [
+      1280,
+      4096
+    ]
+  ],
+  "blk.2.indexer.k_norm.weight": [
+    "F32",
+    [
+      128
+    ]
+  ],
+  "blk.2.indexer.proj.weight": [
+    "BF16",
+    [
+      5120,
+      32
+    ]
+  ],
+  "blk.20.attn_compressor_kv.weight": [
+    "BF16",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.20.attn_compressor_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.20.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.20.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.20.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.20.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.20.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.20.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.20.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.20.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.20.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.20.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.20.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.20.ffn_down_exps.weight": [
+    "IQ1_M",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.20.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.20.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.20.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.20.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.20.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.20.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.20.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.20.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.20.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.20.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.20.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.20.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.20.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.20.indexer.attn_k.weight": [
+    "BF16",
+    [
+      512,
+      128
+    ]
+  ],
+  "blk.20.indexer.attn_q_b.weight": [
+    "BF16",
+    [
+      1280,
+      4096
+    ]
+  ],
+  "blk.20.indexer.k_norm.weight": [
+    "F32",
+    [
+      128
+    ]
+  ],
+  "blk.20.indexer.proj.weight": [
+    "BF16",
+    [
+      5120,
+      32
+    ]
+  ],
+  "blk.21.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.21.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.21.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.21.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.21.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.21.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.21.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.21.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.21.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.21.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.21.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.21.ffn_down_exps.weight": [
+    "IQ1_M",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.21.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.21.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.21.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.21.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.21.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.21.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.21.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.21.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.21.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.21.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.21.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.21.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.21.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.22.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.22.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.22.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.22.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.22.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.22.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.22.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.22.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.22.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.22.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.22.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.22.ffn_down_exps.weight": [
+    "IQ1_M",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.22.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.22.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.22.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.22.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.22.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.22.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.22.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.22.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.22.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.22.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.22.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.22.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.22.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.23.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.23.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.23.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.23.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.23.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.23.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.23.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.23.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.23.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.23.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.23.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.23.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.23.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.23.ffn_gate_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.23.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.23.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.23.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.23.ffn_up_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.23.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.23.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.23.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.23.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.23.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.23.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.23.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.24.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.24.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.24.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.24.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.24.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.24.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.24.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.24.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.24.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.24.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.24.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.24.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.24.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.24.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.24.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.24.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.24.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.24.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.24.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.24.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.24.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.24.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.24.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.24.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.24.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.24.indexer.attn_q_b.weight": [
+    "BF16",
+    [
+      1280,
+      4096
+    ]
+  ],
+  "blk.24.indexer.proj.weight": [
+    "BF16",
+    [
+      5120,
+      32
+    ]
+  ],
+  "blk.25.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.25.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.25.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.25.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.25.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.25.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.25.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.25.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.25.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.25.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.25.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.25.ffn_down_exps.weight": [
+    "IQ1_M",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.25.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.25.ffn_gate_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.25.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.25.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.25.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.25.ffn_up_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.25.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.25.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.25.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.25.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.25.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.25.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.25.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.26.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.26.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.26.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.26.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.26.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.26.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.26.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.26.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.26.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.26.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.26.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.26.ffn_down_exps.weight": [
+    "IQ2_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.26.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.26.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.26.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.26.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.26.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.26.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.26.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.26.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.26.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.26.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.26.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.26.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.26.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.27.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.27.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.27.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.27.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.27.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.27.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.27.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.27.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.27.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.27.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.27.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.27.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.27.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.27.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.27.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.27.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.27.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.27.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.27.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.27.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.27.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.27.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.27.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.27.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.27.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.28.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.28.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.28.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.28.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.28.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.28.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.28.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.28.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.28.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.28.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.28.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.28.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.28.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.28.ffn_gate_exps.weight": [
+    "IQ1_M",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.28.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.28.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.28.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.28.ffn_up_exps.weight": [
+    "IQ1_M",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.28.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.28.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.28.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.28.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.28.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.28.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.28.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.28.indexer.attn_q_b.weight": [
+    "BF16",
+    [
+      1280,
+      4096
+    ]
+  ],
+  "blk.28.indexer.proj.weight": [
+    "BF16",
+    [
+      5120,
+      32
+    ]
+  ],
+  "blk.29.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.29.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.29.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.29.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.29.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.29.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.29.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.29.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.29.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.29.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.29.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.29.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.29.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.29.ffn_gate_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.29.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.29.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.29.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.29.ffn_up_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.29.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.29.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.29.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.29.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.29.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.29.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.29.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.3.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.3.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.3.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.3.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.3.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.3.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.3.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.3.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.3.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.3.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.3.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.3.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.3.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.3.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.3.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.3.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.3.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.3.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.3.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.3.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.3.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.3.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.3.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.3.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.3.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.30.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.30.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.30.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.30.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.30.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.30.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.30.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.30.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.30.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.30.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.30.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.30.ffn_down_exps.weight": [
+    "IQ1_M",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.30.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.30.ffn_gate_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.30.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.30.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.30.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.30.ffn_up_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.30.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.30.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.30.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.30.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.30.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.30.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.30.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.31.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.31.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.31.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.31.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.31.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.31.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.31.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.31.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.31.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.31.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.31.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.31.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.31.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.31.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.31.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.31.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.31.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.31.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.31.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.31.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.31.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.31.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.31.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.31.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.31.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.32.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.32.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.32.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.32.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.32.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.32.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.32.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.32.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.32.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.32.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.32.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.32.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.32.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.32.ffn_gate_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.32.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.32.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.32.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.32.ffn_up_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.32.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.32.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.32.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.32.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.32.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.32.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.32.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.32.indexer.attn_q_b.weight": [
+    "BF16",
+    [
+      1280,
+      4096
+    ]
+  ],
+  "blk.32.indexer.proj.weight": [
+    "BF16",
+    [
+      5120,
+      32
+    ]
+  ],
+  "blk.33.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.33.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.33.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.33.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.33.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.33.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.33.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.33.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.33.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.33.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.33.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.33.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.33.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.33.ffn_gate_exps.weight": [
+    "IQ1_M",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.33.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.33.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.33.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.33.ffn_up_exps.weight": [
+    "IQ1_M",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.33.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.33.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.33.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.33.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.33.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.33.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.33.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.34.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.34.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.34.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.34.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.34.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.34.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.34.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.34.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.34.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.34.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.34.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.34.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.34.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.34.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.34.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.34.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.34.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.34.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.34.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.34.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.34.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.34.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.34.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.34.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.34.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.35.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.35.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.35.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.35.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.35.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.35.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.35.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.35.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.35.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.35.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.35.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.35.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.35.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.35.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.35.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.35.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.35.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.35.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.35.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.35.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.35.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.35.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.35.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.35.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.35.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.36.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.36.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.36.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.36.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.36.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.36.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.36.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.36.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.36.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.36.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.36.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.36.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.36.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.36.ffn_gate_exps.weight": [
+    "IQ1_M",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.36.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.36.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.36.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.36.ffn_up_exps.weight": [
+    "IQ1_M",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.36.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.36.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.36.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.36.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.36.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.36.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.36.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.36.indexer.attn_q_b.weight": [
+    "BF16",
+    [
+      1280,
+      4096
+    ]
+  ],
+  "blk.36.indexer.proj.weight": [
+    "BF16",
+    [
+      5120,
+      32
+    ]
+  ],
+  "blk.37.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.37.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.37.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.37.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.37.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.37.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.37.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.37.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.37.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.37.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.37.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.37.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.37.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.37.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.37.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.37.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.37.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.37.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.37.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.37.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.37.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.37.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.37.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.37.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.37.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.38.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.38.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.38.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.38.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.38.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.38.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.38.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.38.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.38.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.38.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.38.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.38.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.38.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.38.ffn_gate_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.38.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.38.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.38.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.38.ffn_up_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.38.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.38.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.38.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.38.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.38.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.38.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.38.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.39.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.39.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.39.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.39.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.39.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.39.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.39.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.39.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.39.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.39.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.39.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.39.ffn_down_exps.weight": [
+    "IQ2_XXS",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.39.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.39.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.39.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.39.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.39.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.39.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.39.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.39.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.39.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.39.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.39.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.39.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.39.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.4.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.4.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.4.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.4.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.4.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.4.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.4.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.4.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.4.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.4.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.4.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.4.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.4.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.4.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.4.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.4.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.4.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.4.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.4.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.4.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.4.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.4.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.4.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.4.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.4.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.5.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.5.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.5.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.5.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.5.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.5.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.5.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.5.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.5.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.5.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.5.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.5.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.5.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.5.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.5.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.5.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.5.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.5.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.5.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.5.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.5.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.5.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.5.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.5.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.5.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.6.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.6.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.6.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.6.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.6.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.6.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.6.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.6.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.6.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.6.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.6.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.6.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.6.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.6.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.6.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.6.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.6.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.6.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.6.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.6.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.6.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.6.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.6.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.6.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.6.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.7.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.7.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.7.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.7.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.7.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.7.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.7.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.7.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.7.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.7.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.7.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.7.ffn_down_exps.weight": [
+    "IQ2_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.7.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.7.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.7.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.7.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.7.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.7.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.7.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.7.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.7.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.7.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.7.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.7.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.7.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.8.attn_compressor_gate.weight": [
+    "BF16",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.8.attn_compressor_kv.weight": [
+    "BF16",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.8.attn_compressor_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.8.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.8.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.8.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.8.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.8.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.8.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.8.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.8.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.8.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.8.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.8.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.8.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.8.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.8.ffn_gate_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.8.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.8.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.8.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.8.ffn_up_exps.weight": [
+    "IQ1_S",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.8.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.8.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.8.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.8.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.8.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.8.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.8.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.8.indexer.attn_k.weight": [
+    "BF16",
+    [
+      512,
+      128
+    ]
+  ],
+  "blk.8.indexer.attn_q_b.weight": [
+    "BF16",
+    [
+      1280,
+      4096
+    ]
+  ],
+  "blk.8.indexer.k_norm.weight": [
+    "F32",
+    [
+      128
+    ]
+  ],
+  "blk.8.indexer.proj.weight": [
+    "BF16",
+    [
+      5120,
+      32
+    ]
+  ],
+  "blk.9.attn_kv.weight": [
+    "Q8_0",
+    [
+      5120,
+      512
+    ]
+  ],
+  "blk.9.attn_kv_a_norm.weight": [
+    "F32",
+    [
+      512
+    ]
+  ],
+  "blk.9.attn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.9.attn_output_a.weight": [
+    "Q5_K",
+    [
+      4096,
+      8192
+    ]
+  ],
+  "blk.9.attn_output_b.weight": [
+    "Q5_K",
+    [
+      8192,
+      5120
+    ]
+  ],
+  "blk.9.attn_q_a.weight": [
+    "Q8_0",
+    [
+      5120,
+      1280
+    ]
+  ],
+  "blk.9.attn_q_a_norm.weight": [
+    "F32",
+    [
+      1280
+    ]
+  ],
+  "blk.9.attn_q_b.weight": [
+    "Q5_K",
+    [
+      1280,
+      32768
+    ]
+  ],
+  "blk.9.attn_sinks.weight": [
+    "F32",
+    [
+      64
+    ]
+  ],
+  "blk.9.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.9.exp_probs_b_vl.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.9.ffn_down_exps.weight": [
+    "IQ1_S",
+    [
+      2304,
+      5120,
+      384
+    ]
+  ],
+  "blk.9.ffn_down_shexp.weight": [
+    "Q5_K",
+    [
+      2304,
+      5120
+    ]
+  ],
+  "blk.9.ffn_gate_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.9.ffn_gate_inp.weight": [
+    "BF16",
+    [
+      5120,
+      384
+    ]
+  ],
+  "blk.9.ffn_gate_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.9.ffn_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "blk.9.ffn_up_exps.weight": [
+    "IQ2_XXS",
+    [
+      5120,
+      2304,
+      384
+    ]
+  ],
+  "blk.9.ffn_up_shexp.weight": [
+    "Q5_K",
+    [
+      5120,
+      2304
+    ]
+  ],
+  "blk.9.hc_attn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.9.hc_attn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.9.hc_attn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "blk.9.hc_ffn_base.weight": [
+    "F32",
+    [
+      24
+    ]
+  ],
+  "blk.9.hc_ffn_fn.weight": [
+    "F32",
+    [
+      20480,
+      24
+    ]
+  ],
+  "blk.9.hc_ffn_scale.weight": [
+    "F32",
+    [
+      3
+    ]
+  ],
+  "output.weight": [
+    "Q5_K",
+    [
+      5120,
+      129280
+    ]
+  ],
+  "output_norm.weight": [
+    "F32",
+    [
+      5120
+    ]
+  ],
+  "per_layer_token_embd.weight": [
+    "IQ4_NL",
+    [
+      256,
+      768022850
+    ]
+  ],
+  "token_embd.weight": [
+    "Q5_K",
+    [
+      5120,
+      129280
+    ]
+  ]
+}

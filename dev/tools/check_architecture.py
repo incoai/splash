@@ -106,6 +106,10 @@ ENGINE_MODEL_BOUNDARY = frozenset(
 # types they define (concrete_model_types).
 CONCRETE_MODEL_HEADERS = (
     "model/DFlashDraft.hpp",
+    "model/DSpark.hpp",
+    "model/DSparkDraft.hpp",
+    "model/DeepSeek41.hpp",
+    "model/DeepSeek41Target.hpp",
     "model/Flint.hpp",
     "model/ModelFactory.hpp",
     "model/Qwen3_6Moe.hpp",
@@ -472,14 +476,17 @@ def identifier_parts(identifier: str) -> list[str]:
 
 def family_names(path: Path) -> list[tuple[str, str]]:
     """The name and the draft's repository of each family the installer
-    serves (FAMILIES in install/families.py)."""
+    serves (FAMILIES in install/families.py), an empty name for a family no
+    draft is released for."""
     families = next(
         node.value
         for node in ast.parse(path.read_text()).body
         if isinstance(node, ast.Assign)
         and any(getattr(target, "id", None) == "FAMILIES" for target in node.targets)
     )
-    return [(family.args[0].value, family.args[1].value) for family in families.elts]
+    return [
+        (family.args[0].value, family.args[1].value or "") for family in families.elts
+    ]
 
 
 def family_words(

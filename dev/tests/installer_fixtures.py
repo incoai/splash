@@ -27,8 +27,12 @@ DENSE = families.named("Qwen3.8-27B")
 MOE = families.named("Qwen3.6-35B-A3B")
 FLASH_NEXT = families.named("Qwen3.8-Flash-Next")
 FLINT = families.named("Flint")
+DEEPSEEK = families.named("DeepSeek-V4.1-Flash")
 # The families whose targets the engine loads from a GGUF only.
-GGUF_ONLY = (FLASH_NEXT, FLINT)
+GGUF_ONLY = (FLASH_NEXT, FLINT, DEEPSEEK)
+# The families without a released DFlash2 draft, which decode a token a
+# cycle: the engine refuses a draft for them.
+DRAFTLESS = (DEEPSEEK,)
 MODEL = "mlx-community/Qwen3.8-27B-4bit"
 # An MLX config.json (of a GGUF_ONLY family, the one the installer derives
 # from its GGUF), a DFlash2 draft config and, of Qwen3.6-35B-A3B and the
@@ -146,7 +150,8 @@ def write_target(path, values, tensors):
 def fixture(*, native=False, family=MOE):
     """A GGUF's metadata of family's (Qwen3.6-35B-A3B's by default): its
     architecture's and a tokenizer's, native=True of Qwen's vocabulary
-    size."""
+    size. DeepSeek-V4.1-Flash's holds a token map, of which its fixture leaves
+    out the 129280 entries, onto the Engram hash's compressed ids."""
     tokens = sorted(pre_tokenizers.ByteLevel.alphabet())
     tokens += ["ab", "<|endoftext|>", "<|im_end|>", "<think>", "<|im_start|>"]
     types = [NORMAL] * 257 + [CONTROL, CONTROL, USER_DEFINED, CONTROL]
@@ -154,17 +159,26 @@ def fixture(*, native=False, family=MOE):
         padding = 248320 - len(tokens)
         tokens += [f"[unused{i}]" for i in range(padding)]
         types += [UNUSED] * padding
-    return family_config(family, "gguf-metadata.json") | {
-        "tokenizer.ggml.model": "gpt2",
-        "tokenizer.ggml.pre": "qwen35",
-        "tokenizer.ggml.tokens": tokens,
-        "tokenizer.ggml.token_type": types,
-        "tokenizer.ggml.merges": ["a b"],
-        "tokenizer.ggml.eos_token_id": 258,
-        "tokenizer.ggml.bos_token_id": 257,
-        "tokenizer.ggml.padding_token_id": 257,
-        "tokenizer.chat_template": "{% for message in messages %}{{ message.content }}<|im_end|>{% endfor %}",
-    }
+    token_map = (
+        {"deepseek41.engram.token_map": [token % 99092 for token in range(129280)]}
+        if family is DEEPSEEK
+        else {}
+    )
+    return (
+        family_config(family, "gguf-metadata.json")
+        | token_map
+        | {
+            "tokenizer.ggml.model": "gpt2",
+            "tokenizer.ggml.pre": "qwen35",
+            "tokenizer.ggml.tokens": tokens,
+            "tokenizer.ggml.token_type": types,
+            "tokenizer.ggml.merges": ["a b"],
+            "tokenizer.ggml.eos_token_id": 258,
+            "tokenizer.ggml.bos_token_id": 257,
+            "tokenizer.ggml.padding_token_id": 257,
+            "tokenizer.chat_template": "{% for message in messages %}{{ message.content }}<|im_end|>{% endfor %}",
+        }
+    )
 
 
 def vision_fixture():
@@ -317,11 +331,14 @@ class FakeHub:
 
 def fake_hub(test, cache, *, target=DENSE, commit="a" * 40):
     """A FakeHub publishing MODEL at commit on main and the DFlash2 draft
-    released for each family at DRAFT_COMMIT on main."""
+    released for each family that has one at DRAFT_COMMIT on main."""
     fake = FakeHub(test, cache)
     fake.publish(MODEL, commit, lambda p: mlx_target(p, target))
     for family in families.FAMILIES:
-        fake.publish(family.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, family))
+        if family.draft_repo:
+            fake.publish(
+                family.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, family)
+            )
     return fake
 
 

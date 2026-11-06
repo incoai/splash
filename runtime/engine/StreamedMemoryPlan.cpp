@@ -37,13 +37,16 @@ uint64_t extentsBytes(uint64_t pages, uint64_t extentPages, uint64_t pageBytes) 
 // given a size (`sized`) streams through a store of exactly that size, which
 // the floors charge and which is all its floor, so it neither grows nor gives
 // memory back. Any other part loads whole. An Auto part whose smallest store
-// takes all it would loads whole.
+// takes all it would loads whole, unless it only streams (`streamsOnly`),
+// which streams through a store of all it would take where a setting would
+// load it whole, and is refused off.
 struct Part final {
   uint64_t charged = 0;
   uint64_t all = 0;
   bool automatic = false;
   bool streams = false;
   bool sized = false;
+  bool streamsOnly = false;
 };
 
 // The part as `option` sets it: a size is its store, exactly.
@@ -52,20 +55,26 @@ std::optional<Part> resolve(const StreamedPart &part, std::string_view option, s
   const uint64_t bytes = part.setting.bytes;
   switch (part.setting.mode) {
   case StreamedSetting::Mode::Auto:
-    if (part.minimumBytes < part.allBytes) return Part{part.minimumBytes, part.allBytes, true, false};
+    if (part.minimumBytes < part.allBytes || part.streamsOnly)
+      return Part{part.minimumBytes, part.allBytes, true, false, false, part.streamsOnly};
     [[fallthrough]];
   case StreamedSetting::Mode::Off:
+    if (part.streamsOnly) {
+      error = std::string(option) + " off cannot load a part that only streams";
+      return std::nullopt;
+    }
     return Part{part.allBytes, part.allBytes, false, false};
   case StreamedSetting::Mode::Size:
-    if (bytes >= part.allBytes) return Part{part.allBytes, part.allBytes, false, false};
+    if (bytes >= part.allBytes)
+      return Part{part.allBytes, part.allBytes, false, part.streamsOnly, false, part.streamsOnly};
     if (bytes < part.minimumBytes) {
       error = std::string(option) + " of " + std::to_string(bytes / kMiB) + " MiB is less than its smallest store, " +
               std::to_string((part.minimumBytes + kMiB - 1) / kMiB) + " MiB";
       return std::nullopt;
     }
-    return Part{bytes, bytes, false, true, true};
+    return Part{bytes, bytes, false, true, true, part.streamsOnly};
   case StreamedSetting::Mode::Loaded:
-    return Part{bytes, bytes, false, true};
+    return Part{bytes, bytes, false, true, false, part.streamsOnly};
   }
   return Part{};
 }
@@ -253,7 +262,7 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   plan.tableBytes = table.streams ? table.charged : 0;
   if (table.automatic) {
     const int64_t kept = rest - allowance(expertsStream);
-    if (kept < static_cast<int64_t>(table.all - table.charged))
+    if (table.streamsOnly || kept < static_cast<int64_t>(table.all - table.charged))
       plan.tableBytes = table.charged + static_cast<uint64_t>(std::clamp<int64_t>(kept, 0, tableShare));
   }
   // A second buffer of staged history lets the next layer's reads overlap

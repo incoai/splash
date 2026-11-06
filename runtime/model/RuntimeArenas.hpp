@@ -85,11 +85,14 @@ struct RuntimeGeometry final {
     if (parts.kv) result.spilledKv = model.descriptor.capabilities.sparseKv;
     result.streamedExperts = parts.experts;
     if (parts.experts || parts.kv) result.prefillChunks = kPrefillGroupChunks;
+    // A draft reads the target's rows and shares its vocabulary; a model
+    // without one captures none.
+    const bool draftFits = !result.draft.present() ||
+                           (result.target.hiddenSize == result.draft.hiddenSize &&
+                            result.target.vocabularySize == result.draft.vocabularySize);
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         (parts.kv && !result.target.kvLayout.spillable()) ||
-        result.target.contextTokens() != model.descriptor.capabilities.maximumContextTokens ||
-        result.target.hiddenSize != result.draft.hiddenSize ||
-        result.target.vocabularySize != result.draft.vocabularySize ||
+        result.target.contextTokens() != model.descriptor.capabilities.maximumContextTokens || !draftFits ||
         result.target.capturedHiddenSize() != result.draft.targetHiddenSize()) {
       throw std::invalid_argument("invalid model runtime geometry");
     }
@@ -102,8 +105,11 @@ struct RuntimeGeometry final {
     return result;
   }
 
+  // The pairs of the RoPE tables of a DFlash2 draft's rows; DSpark rotates
+  // its latents itself (ops::LatentRotation), and a model without a draft
+  // has none.
   [[nodiscard]] uint32_t draftRotaryPairs() const noexcept {
-    return draft.attentionHeadDimension / 2;
+    return draft.dflash() ? draft.attentionHeadDimension / 2 : 0;
   }
   [[nodiscard]] uint32_t maskWords() const noexcept {
     return maskWordsPerToken(target.vocabularySize);
@@ -143,8 +149,11 @@ struct RuntimeGeometry final {
 // How far the rows of attention layer `attention` of `target` reach back: a
 // sliding layer's window, the row's own key included (the window's other
 // keys are kv::Layout::windowTokens); a block-sparse target's indexer
-// selection; else every key.
+// selection; DeepSeek-V4.1's window and its indexer's top groups, at any
+// depth; else every key.
 [[nodiscard]] inline AttentionReach attentionReach(const QwenTargetGeometry &target, uint32_t attention) noexcept {
+  if (target.deepseek.present())
+    return {.windowTokens = target.slidingWindow + target.deepseek.indexerTopGroups};
   if (const uint32_t window = target.attentionVariant(attention).windowTokens)
     return {.windowTokens = window + 1};
   if (target.kvLayout.reads == kv::Reads::SelectedBlocks)
@@ -317,7 +326,8 @@ public:
         get(PrefillTensor::TargetInverseFrequencies).contents());
     auto *draft = static_cast<float *>(
         get(PrefillTensor::DraftInverseFrequencies).contents());
-    if (!target || !draft)
+    // A model without a draft has no draft frequencies.
+    if (!target || (!draft && geometry.draftRotaryPairs()))
       throw std::logic_error("RoPE frequencies are not CPU-visible");
     rotaryInverseFrequencies(geometry.target.rotaryTheta, geometry.target.rotaryPairs,
                              geometry.target.ropeScaling,
@@ -582,10 +592,12 @@ public:
   static uint64_t gateScratchBytes(const RuntimeGeometry &geometry,
                                   const ops::ExecutionPlans &operators) {
     // One private gate buffer is reused serially by the target dense FFN (when
-    // present) and the always-dense DFlash draft. Sparse target FFNs use their
-    // own route-major arena tensors, but must not remove the draft's scratch.
-    const uint64_t draft = operators.gateUpWorkspace(
-        {geometry.draft.intermediateSize, geometry.draft.hiddenSize});
+    // present) and the always-dense DFlash draft (when the model has one).
+    // Sparse target FFNs use their own route-major arena tensors, but must not
+    // remove the draft's scratch. DSpark's experts run on its own.
+    const uint64_t draft = geometry.draft.dflash()
+                               ? operators.gateUpWorkspace({geometry.draft.intermediateSize, geometry.draft.hiddenSize})
+                               : 0;
     uint64_t target = 0;
     for (const auto &p : geometry.target.gateUpProjections)
       target = std::max(target, operators.gateUpWorkspace(p));
@@ -621,6 +633,9 @@ private:
                                                    uint32_t layer, uint32_t lanes) const {
     const uint32_t index = static_cast<uint32_t>(base);
     const uint64_t stride = sizes_[index] / layers;
+    // As batchSlice's, scratch the target does not read is an empty buffer.
+    if (!stride)
+      return {};
     return backend_.view(base_, offsets_[index] + uint64_t{layer} * kLaneCount * stride,
                          uint64_t{lanes} * stride);
   }

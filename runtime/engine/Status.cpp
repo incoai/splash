@@ -785,8 +785,9 @@ std::string runtimeStatusJson(const StatusStart &start, const StatusSample &samp
     });
     // The rows decode cycles verify (--verify-rows): auto where the verify
     // budget chooses them, all where they are every row up to each lane's
-    // retention limit.
-    w.field("verify_rows", executorTelemetry.verifyBudget ? "auto" : "all");
+    // retention limit, anchor where a model without a draft verifies its
+    // anchor alone.
+    w.field("verify_rows", executorTelemetry.verifyBudget ? "auto" : executorTelemetry.drafts ? "all" : "anchor");
     w.key("model_timing");
     writeModelTiming(w, executorTelemetry);
     w.object("constraint_masks", [&] {

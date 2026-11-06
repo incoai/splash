@@ -11,7 +11,7 @@ from llguidance.numpy import (
     fill_next_token_bitmask_par_with_draft_tokens,
 )
 
-from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
+from .chat_format import THINK_END, THINK_START
 from .errors import APIError, ConstraintError
 from .lru import LRUCache
 
@@ -111,13 +111,13 @@ def validate_tokenizer(tokenizer, chat_format):
     """Before the engine starts, refuse a tokenizer that does not encode the
     tags chat_format reads the model's output by as that format has them:
     the close of thinking, the model's own opening of it where the model
-    opens it, and a call's opening must each be the format's token, and
-    each stop text one token (check_capabilities checks which stop tokens,
-    once the engine names them)."""
+    opens it, and the marker a call's opening holds must each be the format's
+    token, and each stop text one token (check_capabilities checks which stop
+    tokens, once the engine names them)."""
     vocabulary = tokenizer.get_vocab()
     expected = {
         THINK_END: chat_format.think_end_id,
-        TOOL_CALL_OPEN: chat_format.call_open_id,
+        chat_format.call_syntax.marker: chat_format.call_open_id,
     }
     if chat_format.think_start_id is not None:
         expected[THINK_START] = chat_format.think_start_id

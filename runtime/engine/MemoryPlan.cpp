@@ -226,8 +226,9 @@ std::optional<std::string> ModelMemoryProfile::validationError() const {
   if (!targetKvLayout.valid()) return "invalid_target_kv_layout";
   if (spill.enabled && !targetKvLayout.spillable()) return "spill_plan_needs_a_spillable_layout";
   if (!ops::validFormat(stateFormat)) return "invalid_state_format";
+  // Draft weights, as vision weights, are absent from a model without them;
+  // loading requires them for a model with a draft (requireLoadedModel).
   if (!footprint.targetWeightsBytes) return "target_weight_bytes_required";
-  if (!footprint.draftWeightsBytes) return "draft_weight_bytes_required";
   if (!footprint.runtime.laneStatePlannedAllocatedBytes) {
     return "lane_state_bytes_required";
   }
