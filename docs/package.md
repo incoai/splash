@@ -164,9 +164,12 @@ from the app in the disk image: the build number Sparkle compares
 (`CFBundleVersion`), the version it shows and `LSMinimumSystemVersion`. It
 signs the disk image with the release key from the login keychain, or the
 file `SPARKLE_KEY_FILE` names, and checks the signature with
-`SPARKLE_PUBLIC_KEY`. The apps check whichever release is the latest, and
-cannot while it carries no appcast. A release candidate, `x.y.z-rc.N`, is a
-prerelease, never the latest.
+`SPARKLE_PUBLIC_KEY`, and that the build number is above that of the release
+before, the latest annotated `x.y.z` tag below the version, whose apps Sparkle
+would otherwise never update. The build number is the commit count, so
+`package_app.py` builds nothing from a shallow clone. The apps check whichever
+release is the latest, and cannot while it carries no appcast. A release
+candidate, `x.y.z-rc.N`, is a prerelease, never the latest.
 
 ### Releases
 
