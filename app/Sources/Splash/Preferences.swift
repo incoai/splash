@@ -227,16 +227,16 @@ extension LaunchOption {
             help: "How a hybrid model such as Qwen3.6 keeps its state. 16-bit takes half the memory, so twice as many fit.",
             section: .memory, kind: .choice(standard: "32-bit", choices: [("bf16", "16-bit")], custom: nil)),
         LaunchOption(
-            flag: "--expert-memory", title: "Expert memory",
-            help: "Memory for a MoE model’s experts, kept at exactly this size; the rest are read from the SSD as tokens need them. Auto gives them what the context leaves and gives it back while requests need it. Off keeps every expert in memory.",
-            section: .memory, kind: .choice(standard: "Auto", choices: [("off", "Off")], custom: size(example: "16G"))),
+            flag: "--expert-memory", title: "Expert cache",
+            help: "MoE expert weights kept in memory; the others are read from the SSD as needed. Auto gives them what the context leaves. All keeps every expert in memory.",
+            section: .memory, kind: .choice(standard: "Auto", choices: [("off", "All")], custom: size(example: "16G"))),
         LaunchOption(
-            flag: "--ple-memory", title: "PLE table memory",
-            help: "Memory for the n-gram table of Qwen3.8-Flash-Next; the rest streams from the SSD. Off loads the whole table, tens of GB.",
-            section: .memory, kind: .choice(standard: "Auto", choices: [("off", "Off")], custom: size(example: "2G"))),
+            flag: "--ple-memory", title: "PLE table",
+            help: "Memory for Qwen3.8-Flash-Next’s per-layer n-gram embedding table; the rest is read from the SSD. All loads the whole table, tens of GB.",
+            section: .memory, kind: .choice(standard: "Auto", choices: [("off", "All")], custom: size(example: "2G"))),
         LaunchOption(
-            flag: "--sparse-kv-memory", title: "Sparse KV memory",
-            help: "Memory for the KV blocks Qwen3.8-Flash-Next reads back from the SSD; never below its floor.",
+            flag: "--sparse-kv-memory", title: "Sparse KV cache",
+            help: "Memory for the sparse-attention KV blocks Qwen3.8-Flash-Next reads back from the SSD; never below its floor.",
             section: .memory, kind: .choice(standard: "Auto", choices: [], custom: size(example: "1200M"))),
     ]
 
@@ -323,14 +323,14 @@ extension LaunchOption {
             section: .api,
             kind: .text(Value(prompt: "Model’s Default", message: "", parse: { $0.isEmpty ? nil : $0 }), list: false)),
         LaunchOption(
-            flag: "--served-model-name", title: "Other model names",
+            flag: "--served-model-name", title: "Served model names",
             help: "More names requests may give the model, such as gpt-4o for an app that asks for it.",
             section: .api,
             kind: .text(Value(prompt: "None", message: "", parse: { items($0).isEmpty ? nil : items($0).joined(separator: ", ") }),
                         list: true)),
         LaunchOption(
-            flag: "--announce-served-name", title: "Answer as the first other name",
-            help: "Replies and the model list give the first other name rather than the model’s.",
+            flag: "--announce-served-name", title: "Report served name",
+            help: "Replies and the model list give the first served model name rather than the model’s own.",
             section: .api, kind: .toggle(on: true), applies: { $0["--served-model-name"] != nil }),
     ]
 
@@ -342,8 +342,8 @@ extension LaunchOption {
             kind: .choice(standard: "None", choices: [("5m", "5 Minutes"), ("30m", "30 Minutes"), ("1h", "1 Hour")],
                           custom: duration(message: "Seconds, or with s, m or h, such as 10m."))),
         LaunchOption(
-            flag: "--queue-size", title: "Requests at once",
-            help: "Requests the model takes at once, running or waiting; more are turned away.",
+            flag: "--queue-size", title: "Queue limit",
+            help: "Requests taken at once, running or waiting; more are turned away.",
             section: .requests,
             kind: .choice(standard: "32", choices: [], custom: Value(prompt: "64", message: "A whole number.", parse: whole))),
         LaunchOption(
@@ -357,8 +357,8 @@ extension LaunchOption {
             kind: .choice(standard: "4,194,304", choices: [], custom: Value(prompt: "1048576", message: "Pixels, 65,536 to 4,194,304.",
                                                                            parse: whole))),
         LaunchOption(
-            flag: "--decode-share", title: "Answering while reading",
-            help: "How long answers go on, for each second spent reading a new prompt meanwhile: more keeps answers flowing, less starts the new one sooner; 0 takes turns step by step.",
+            flag: "--decode-share", title: "Decode share",
+            help: "Seconds of answering for each second spent reading a new prompt: more keeps answers flowing, less starts the new one sooner; 0 takes turns step by step.",
             section: .requests,
             kind: .choice(standard: "0.5", choices: [], custom: Value(prompt: "1", message: "A number, 0 or more.",
                                                                      parse: { Double($0).flatMap { $0 >= 0 ? String($0) : nil } }))),

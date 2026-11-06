@@ -50,11 +50,67 @@ struct LaunchOptions: View {
     }
 }
 
+extension EnvironmentValues {
+    /// Whether the pointer is over the launch option's row the view is in (OptionRow).
+    @Entry var optionRowHovered = false
+}
+
+/// An option's name, with an info button that shows what it does: the one place its explanation
+/// shows. The button appears while the pointer is over the option's row, its explanation is open
+/// or it has the keyboard's focus, so the card stays as plain as a list of names; VoiceOver and the
+/// keyboard reach it always.
+private struct OptionLabel: View {
+    let title: String
+    let help: String
+    @Environment(\.optionRowHovered) private var hovered
+    @State private var shown = false
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        let visible = hovered || shown || focused
+        HStack(spacing: 4) {
+            Text(title)
+            Button { shown.toggle() } label: {
+                Image(systemName: "info.circle").foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .focused($focused)
+            .opacity(visible ? 1 : 0)
+            .animation(Motion.quick, value: visible)
+            // A dimmed option still says what it does.
+            .environment(\.isEnabled, true)
+            .accessibilityLabel("About \(title)")
+            .popover(isPresented: $shown, arrowEdge: .bottom) {
+                Text(help)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(width: 280, alignment: .leading)
+                    .padding(12)
+            }
+        }
+    }
+}
+
+/// A row of a value control labeled with its option's name and info button (OptionLabel).
+private struct OptionLabeled<Content: View>: View {
+    let title: String
+    let help: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        LabeledContent {
+            content
+        } label: {
+            OptionLabel(title: title, help: help)
+        }
+    }
+}
+
 /// One launch option, with the control its kind takes; dimmed where the others leave it no effect,
 /// and with what to beware of under it.
 private struct OptionRow: View {
     @Environment(AppState.self) private var state
     let option: LaunchOption
+    @State private var hovered = false
 
     var body: some View {
         @Bindable var state = state
@@ -63,22 +119,26 @@ private struct OptionRow: View {
             Group {
                 switch option.kind {
                 case .toggle(let on):
-                    Toggle(option.title, isOn: Binding(get: { (value.wrappedValue == "true") == on },
-                                                        set: { value.wrappedValue = $0 == on ? "true" : nil }))
+                    Toggle(isOn: Binding(get: { (value.wrappedValue == "true") == on },
+                                         set: { value.wrappedValue = $0 == on ? "true" : nil })) {
+                        OptionLabel(title: option.title, help: option.help)
+                    }
                 case .choice(let standard, let choices, let custom):
-                    ChoicePicker(title: option.title, standard: standard, choices: choices, custom: custom, value: value)
+                    ChoicePicker(title: option.title, help: option.help, standard: standard, choices: choices, custom: custom, value: value)
                 case .text(let custom, _):
-                    TextRow(title: option.title, custom: custom, value: value)
+                    TextRow(title: option.title, help: option.help, custom: custom, value: value)
                 case .folder:
-                    FolderRow(title: option.title, value: value)
+                    FolderRow(title: option.title, help: option.help, value: value)
                 case .secret:
-                    TextRow(title: option.title, custom: LaunchOption.Value(prompt: "None", message: "", parse: { $0.isEmpty ? nil : $0 }),
+                    TextRow(title: option.title, help: option.help, custom: LaunchOption.Value(prompt: "None", message: "", parse: { $0.isEmpty ? nil : $0 }),
                             secure: true, value: $state.options.apiKey)
                         .disabled(state.keyProblem != nil)
                 }
             }
-            .help(option.help)
             .disabled(!option.applies(state.options))
+            .environment(\.optionRowHovered, hovered)
+            .contentShape(.rect)
+            .onHover { hovered = $0 }
             if let warning = option.warning(state.options) {
                 Label(warning, systemImage: "exclamationmark.triangle.fill")
                     .font(.callout)
@@ -92,6 +152,7 @@ private struct OptionRow: View {
 /// A menu of the server's default, the choices, the value set, and Custom… to type another.
 private struct ChoicePicker: View {
     let title: String
+    let help: String
     let standard: String
     let choices: [(value: String, title: String)]
     let custom: LaunchOption.Value?
@@ -110,7 +171,7 @@ private struct ChoicePicker: View {
             + choices.map { PopupItem(id: $0.value, title: $0.title) }
             + [typed].compactMap { $0 }
             + (custom == nil ? [] : [PopupItem(id: Self.other, title: "Custom…", separated: true)])
-        LabeledContent(title) {
+        OptionLabeled(title: title, help: help) {
             // Its row names it.
             PopupMenu(items: items, chosen: value ?? Self.none) { choice in
                 if choice == Self.other { typing = true } else { value = choice == Self.none ? nil : choice }
@@ -137,6 +198,7 @@ private struct ChoicePicker: View {
 /// gives way to the value taken when the field is left.
 private struct TextRow: View {
     let title: String
+    let help: String
     let custom: LaunchOption.Value
     var secure = false
     @Binding var value: String?
@@ -144,7 +206,7 @@ private struct TextRow: View {
     @FocusState private var focused: Bool
 
     var body: some View {
-        LabeledContent(title) {
+        OptionLabeled(title: title, help: help) {
             Group {
                 if secure {
                     SecureField(title, text: $text, prompt: Text(custom.prompt))
@@ -182,10 +244,11 @@ private struct TextRow: View {
 /// A folder picked, or the server's default.
 private struct FolderRow: View {
     let title: String
+    let help: String
     @Binding var value: String?
 
     var body: some View {
-        LabeledContent(title) {
+        OptionLabeled(title: title, help: help) {
             HStack {
                 Spacer(minLength: 0)
                 Text(value.map { URL(filePath: $0).lastPathComponent } ?? "Default")
