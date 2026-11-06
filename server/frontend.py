@@ -35,6 +35,7 @@ from .errors import (
 from .latency import LatencyMetrics
 from .metrics import is_finite_number
 from .output import MAX_STOP_CHARACTERS
+from .serve_options import REASONING_MODES
 from .tokenization import PromptTokenizer, tokenizable
 from .tool_schema import (
     ToolPolicy,
@@ -184,6 +185,7 @@ class Frontend:
         default_reasoning_effort=None,
         default_thinking_token_budget=None,
         sampling_defaults=None,
+        reasoning=None,
     ):
         # What the engine serves, from its Ready (backend.runtime.capabilities):
         # the context follows the latest engine (max_context); its lanes and
@@ -236,6 +238,14 @@ class Frontend:
         for name, value in self.sampling_defaults.items():
             if not accepts_sampling(name, value):
                 raise ValueError(f"invalid sampling default {name}={value!r}")
+        if reasoning is not None and reasoning not in REASONING_MODES:
+            raise ValueError("invalid reasoning")
+        # --reasoning off: the server, not the request, decides that no
+        # request reasons. A request's own thinking config outranks every
+        # server default, so a client that sends one on each request reasons
+        # on each request: a median 893 output tokens per tool-loop turn
+        # against 106 with reasoning off, measured on one Mac at 32 tok/s.
+        self.reasoning_off = reasoning == "off"
         self.request_timeout = request_timeout
         self.constraint_factory = constraint_factory
         self.max_image_pixels = max_image_pixels
@@ -284,7 +294,8 @@ class Frontend:
             return {"thinks": None, "efforts": [], "default": None}
         template = self.chat_templates.select(None)
         reasoning = dict(template.reasoning)
-        if (effort := self.default_reasoning_effort) is not None:
+        effort = "none" if self.reasoning_off else self.default_reasoning_effort
+        if effort is not None:
             reasoning["thinks"] = effort != "none"
             reasoning["default"] = template.effort_names.get(effort)
         return reasoning
@@ -680,6 +691,9 @@ class Frontend:
             raise APIError(
                 400, "chat_template_kwargs enable_thinking must be a boolean"
             )
+        if self.reasoning_off:
+            # After the checks, so a malformed request still fails as before.
+            reasoning_effort, enable_thinking = "none", False
         messages = normalize_messages(body.get("messages"), vision=self.vision)
         tools, tool_policy = normalize_tools(
             body.get("tools"),

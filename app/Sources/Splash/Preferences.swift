@@ -390,6 +390,11 @@ extension LaunchOption {
 
     private static let api: [LaunchOption] = [
         LaunchOption(
+            flag: "--reasoning", title: "Thinking for every request",
+            help: "Off: no request thinks, whatever its thinking or effort asks. By default each request decides.",
+            section: .api,
+            kind: .choice(standard: "Each Request Decides", choices: [("off", "Off")], custom: nil)),
+        LaunchOption(
             flag: "--default-reasoning-effort", title: "Thinking",
             help: "How much the model thinks for apps whose requests don’t say. The Chat asks for its own.",
             section: .api,
