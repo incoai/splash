@@ -84,6 +84,44 @@ struct ComposerTests {
         #expect(widths == [2048, 240])
     }
 
+    /// A new line grows the field in the layout that follows it, before the window shows it: its
+    /// text doesn't scroll up a line for a frame and back. Text cleared elsewhere, as Send does,
+    /// takes it back to one line, a narrower field wraps and grows, and it grows to 220 points at
+    /// most, past which the text scrolls.
+    @Test func theFieldIsAsTallAsItsTextWhenItShows() async throws {
+        let (state, window, folder) = try chat()
+        defer { window.orderOut(nil); try? FileManager.default.removeItem(at: folder) }
+        let composer = try await focusedComposer(in: window)
+        let scroll = try #require(composer.enclosingScrollView)
+        let nowhere = NSRange(location: NSNotFound, length: 0)
+        Self.update(window)
+        let line = scroll.frame.height
+        composer.insertText("one", replacementRange: nowhere)
+        // Shift-Return.
+        composer.insertNewlineIgnoringFieldEditor(nil)
+        composer.insertText("two", replacementRange: nowhere)
+        Self.update(window)
+        #expect(scroll.frame.height > line + 10)
+        #expect(scroll.contentView.bounds.minY == 0)
+
+        state.draft.text = ""
+        Self.update(window)
+        #expect(scroll.frame.height == line)
+
+        composer.insertText(String(repeating: "word ", count: 30), replacementRange: nowhere)
+        Self.update(window)
+        let wide = scroll.frame.height
+        window.setContentSize(CGSize(width: 600, height: 600))
+        Self.update(window)
+        #expect(scroll.frame.height > wide)
+
+        composer.insertText(String(repeating: "\nline", count: 20), replacementRange: nowhere)
+        Self.update(window)
+        #expect(scroll.frame.height == 220)
+        // The caret's line in view, at the text's end.
+        #expect(composer.frame.maxY - scroll.contentView.bounds.maxY < 5)
+    }
+
     /// The ring of the composer's context and the Server button's download: its fraction filled in
     /// its tint from the top clockwise, the rest a faint track, as wide as asked.
     @Test func aRingFillsItsFractionClockwiseFromTheTop() throws {

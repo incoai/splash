@@ -68,7 +68,6 @@ struct Composer: View {
     @Environment(\.colorScheme) private var colorScheme
     @Bindable var draft: Draft
     @State private var picking = false
-    @State private var height: CGFloat = 22
 
     var body: some View {
         let images = state.server.acceptsImages
@@ -76,10 +75,9 @@ struct Composer: View {
             if !draft.images.isEmpty {
                 Attachments(draft: draft)
             }
-            ComposerField(text: $draft.text, height: $height, focusRequests: draft.focusRequests,
+            ComposerField(text: $draft.text, focusRequests: draft.focusRequests,
                           placeholder: "Message Splash", submit: state.sendDraft, cancel: stop, acceptsImages: images,
                           attach: draft.attach)
-                .frame(height: min(max(height, 22), 220))
             HStack(spacing: 6) {
                 // Only for a model that sees images.
                 if images {
@@ -324,10 +322,10 @@ private struct Attachments: View {
 
 /// The message's text view: Return sends and Shift-Return starts a new line, and Escape stops the
 /// reply, after the input method has finished what it composes; pasted and dropped images attach
-/// when the model sees images.
+/// when the model sees images. It is as tall as its text, from one line to 220 points, past which
+/// the text scrolls.
 private struct ComposerField: NSViewRepresentable {
     @Binding var text: String
-    @Binding var height: CGFloat
     let focusRequests: Int
     let placeholder: String
     let submit: () -> Void
@@ -336,6 +334,17 @@ private struct ComposerField: NSViewRepresentable {
     let attach: ([NSImage]) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    /// The text's height as the view lays it out, at its width; a change of its height asks again
+    /// (`MessageTextView.setFrameSize`).
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView scroll: NSScrollView, context: Context) -> CGSize? {
+        guard let view = scroll.documentView as? NSTextView, let container = view.textContainer,
+              let layout = view.layoutManager else { return nil }
+        layout.ensureLayout(for: container)
+        let height = layout.usedRect(for: container).height + view.textContainerInset.height * 2
+        let width = proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? scroll.frame.width
+        return CGSize(width: width, height: min(max(height, 22), 220))
+    }
 
     func makeNSView(context: Context) -> NSScrollView {
         // TextKit 1: the height is measured with its layout manager.
@@ -381,7 +390,6 @@ private struct ComposerField: NSViewRepresentable {
             // A change made here is no edit to undo.
             view.string = text
             context.coordinator.undo.removeAllActions()
-            context.coordinator.measure(view)
         }
         if context.coordinator.focusRequests != focusRequests {
             context.coordinator.focusRequests = focusRequests
@@ -408,7 +416,6 @@ private struct ComposerField: NSViewRepresentable {
             guard let view = notification.object as? NSTextView else { return }
             published = view.string
             field.text = view.string
-            measure(view)
         }
 
         func textView(_ view: NSTextView, doCommandBy selector: Selector) -> Bool {
@@ -425,14 +432,6 @@ private struct ComposerField: NSViewRepresentable {
             default:
                 return false
             }
-        }
-
-        func measure(_ view: NSTextView) {
-            guard let container = view.textContainer, let layout = view.layoutManager else { return }
-            layout.ensureLayout(for: container)
-            let height = layout.usedRect(for: container).height + view.textContainerInset.height * 2
-            // Not while SwiftUI updates the view, which measures too.
-            DispatchQueue.main.async { [self] in if field.height != height { field.height = height } }
         }
     }
 }
@@ -452,6 +451,15 @@ private final class MessageTextView: NSTextView {
     override func didChangeText() {
         super.didChangeText()
         needsDisplay = true
+    }
+
+    // The view is as tall as its text laid out: an edit, what the input method composes, or a new
+    // width that wraps it differently. The field takes the new height in the layout that follows,
+    // before the window shows it, rather than scrolling its text a line meanwhile.
+    override func setFrameSize(_ size: NSSize) {
+        let height = frame.height
+        super.setFrameSize(size)
+        if frame.height != height { enclosingScrollView?.invalidateIntrinsicContentSize() }
     }
 
     // A plain-text view turns Paste off for a clipboard of image data alone.
