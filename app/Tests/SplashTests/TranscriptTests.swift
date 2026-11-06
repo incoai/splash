@@ -322,6 +322,38 @@ struct TranscriptTests {
         #expect(try await text() == thought)
     }
 
+    @Test func aThoughtFoldsFromItsLatestLinesAsTheAnswerStarts() async throws {
+        let (transcript, webView, window) = try await shownPage()
+        defer { window.orderOut(nil) }
+        let thought = (1...40).map { "Line \($0) of the model’s thinking." }.joined(separator: "\n")
+        var reply = ChatMessage(role: .assistant, text: "", reasoning: thought)
+        let page = TranscriptPage(Conversation(messages: [ChatMessage(role: .user, text: "Think."), reply]),
+                                  askAgain: .init(enabled: false, help: ""), name: { $0 })
+        let live = ChatStore.Live(asked: .now, thinking: .now)
+        transcript.show(page, reply: TranscriptMessage(reply, live: live, asleep: false, name: { $0 }))
+        func height() async throws -> Double {
+            try await webView.callAsyncJavaScript("return document.querySelector('.reply .thought').getBoundingClientRect().height",
+                                                  contentWorld: .page) as? Double ?? -1
+        }
+        // Open on its latest lines: 96 px of them under 8.
+        let open = try await settled(height) { $0 == 104 }
+        #expect(open == 104)
+        // The answer starts: the thought folds, from no taller than it was, a frame at a time.
+        reply.text = "Yes."
+        let json = String(decoding: try WebPage.encoder.encode(TranscriptMessage(reply, live: live, asleep: false, name: { $0 })),
+                          as: UTF8.self)
+        let heights = try await webView.callAsyncJavaScript("""
+            transcript.update(JSON.parse(json))
+            const thought = document.querySelector('.reply .thought'), heights = []
+            do {
+              await new Promise(drawn => requestAnimationFrame(drawn))
+              heights.push(thought.getBoundingClientRect().height)
+            } while (heights.at(-1) > 0 && heights.length < 120)
+            return heights
+            """, arguments: ["json": json], contentWorld: .page) as? [Double] ?? []
+        #expect(heights.last == 0 && heights.allSatisfy { $0 <= open }, "\(heights.map { Int($0.rounded()) })")
+    }
+
     @Test func aConversationOpensAtItsLatestScreenAndDrawsTheRestAfter() async throws {
         let (transcript, webView, window) = try await shownPage()
         defer { window.orderOut(nil) }

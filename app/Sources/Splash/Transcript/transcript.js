@@ -112,7 +112,8 @@ const transcript = (() => {
 
   // The line over a reply: its verb while it waits, which shows half a second into the wait;
   // what the thinking took after. It opens to the thinking, of which it shows the latest lines
-  // while the model thinks.
+  // while the model thinks, unless the reader opened it: said while it is open alone, so that a
+  // thought that folds, as when the answer starts, folds from what it showed.
   function drawLine(view) {
     const {element, message} = view;
     const line = element.querySelector('.line');
@@ -123,8 +124,8 @@ const transcript = (() => {
     const open = reasoned && (expanded.get(message.id) ?? thinking);
     line.classList.toggle('waiting', message.live && !reasoned);
     line.classList.toggle('reasoned', reasoned);
-    line.classList.toggle('thinking', thinking);
     line.classList.toggle('open', open);
+    if (open) line.classList.toggle('latest', thinking && !expanded.has(message.id));
     const toggle = line.querySelector('.toggle');
     if (reasoned) toggle.setAttribute('aria-expanded', open);
     else toggle.removeAttribute('aria-expanded');
@@ -134,14 +135,13 @@ const transcript = (() => {
     drawThought(view);
   }
 
-  // The thinking a line opens to, drawn while it shows: its latest lines while the model thinks,
-  // unless the reader opened it, all of it then. A thought folded keeps what it showed as it folds.
+  // The thinking a line opens to, drawn while it shows: its latest lines or all of it, as the line
+  // says. A thought folded keeps what it showed as it folds.
   function drawThought(view) {
     const line = view.element.querySelector('.line');
     if (view.shown === null || !line.classList.contains('open')) return;
     const reasoning = view.shown.reasoning;
-    const latest = line.classList.contains('thinking') && !expanded.has(view.message.id);
-    page.write(line.querySelector('.text > div'), latest ? page.latest(reasoning) : reasoning);
+    page.write(line.querySelector('.text > div'), line.classList.contains('latest') ? page.latest(reasoning) : reasoning);
   }
 
   function facts(line, words) {

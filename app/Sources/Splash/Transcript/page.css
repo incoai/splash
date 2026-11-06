@@ -237,8 +237,8 @@ button {
   white-space: pre-wrap;
 }
 
-/* While the model thinks, its latest lines, faded at the top. */
-.line.thinking .text {
+/* While the model thinks, its latest lines, faded at the top, as they fold too. */
+.line.latest .text {
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
@@ -246,7 +246,7 @@ button {
   overflow: hidden;
 }
 
-.line.thinking.tall .text { mask-image: linear-gradient(transparent, black 28px); }
+.line.latest.tall .text { mask-image: linear-gradient(transparent, black 28px); }
 
 /* Why something stopped short: the warning sign and a sentence. */
 .error {
