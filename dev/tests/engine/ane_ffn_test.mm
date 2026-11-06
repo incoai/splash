@@ -63,6 +63,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -482,8 +483,9 @@ Forward forward(MetalBackend &backend, const Linear &linear, const Model &model,
   const auto &[ffn, hidden] = chunk;
   std::memset(hidden[0].contents(), 0, hidden[0].sizeBytes());
   CommandGraph graph;
-  const bool splits = split && split->splits(rows);
+  // As the runtime does: begin() first, which may restart a split a late evaluation stopped.
   if (split) static_cast<void>(split->begin());
+  const bool splits = split && split->splits(rows);
   for (uint32_t layer = 0; layer < kLayers; ++layer) {
     const MetalBuffer &residual = hidden[layer & 1], &output = hidden[(layer & 1) ^ 1];
     if (splits)
@@ -780,6 +782,24 @@ void stops(MetalBackend &backend, const Linear &linear, const Model &model, cons
     fail(label + ": the GPU's forward after the split stopped differs from the GPU's alone");
 }
 
+// An evaluation that runs late stops the split, with its command's results unusable, until the Neural Engine has
+// reported it; the next command then starts over on the ANE and computes, bit for bit, what a split that never
+// stalled computes.
+void resumes(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
+  constexpr uint32_t kRows = AneFfn::kMaximumRows;
+  constexpr auto kDelay = std::chrono::milliseconds(3000);
+  const auto healthy = std::make_unique<AneFfn>(backend, model.layers, kAneUnits, nullptr);
+  const Forward expected = forward(backend, linear, model, healthy.get(), chunk, kRows);
+  ane::ProgramInstrumentation::arm({.delayedEvaluation = 2, .delay = kDelay});
+  const auto split = std::make_unique<AneFfn>(backend, model.layers, kAneUnits, nullptr);
+  if (forward(backend, linear, model, split.get(), chunk, kRows).usable || !split->retired())
+    fail("a late evaluation: the split did not stop");
+  std::this_thread::sleep_for(kDelay + std::chrono::milliseconds(500));
+  const Forward resumed = forward(backend, linear, model, split.get(), chunk, kRows);
+  if (!resumed.usable || split->retired()) fail("a late evaluation: the split did not resume: " + split->reason());
+  if (resumed.bits != expected.bits) fail("a late evaluation: the resumed split computes other values");
+}
+
 // A Neural Engine slower than the GPU alone: every evaluation starts a lag after its event reaches its wait, twice the
 // longer of the GPU alone's layer of its rows and the Neural Engine's own evaluation of them as timed here, so that on
 // a fast GPU as on a slow one the lag is most of the time the evaluations take and alone makes them take twice what
@@ -840,6 +860,185 @@ void loses(MetalBackend &backend, const Linear &linear, const Model &model, cons
 
 // The split of the MLX and the GGUF model over normalized rows of normal values, and the numerics of rows the ANE's
 // fp16 barely holds.
+// ---------------------------------------------------------------- projections
+// Two layers of AF4G64 projections of `inputs` inputs, of a model's magnitude, as blockModel's, each stacking a
+// tensor of each of `tensors` rows, as a loader fuses a mixer's input projections.
+std::vector<Projection> projectionLayers(MetalBackend &backend, std::initializer_list<uint32_t> tensors,
+                                         uint32_t inputs) {
+  using namespace gguf_reference;
+  const auto format = Fmt(GGUF_FMT_AF4G64);
+  std::vector<Projection> layers;
+  for (uint32_t layer = 0; layer < 2; ++layer) {
+    BlockWeights weights;
+    uint32_t outputs = 0;
+    for (const uint32_t rows : tensors) {
+      std::uniform_real_distribution<float> range = scaleRange(format);
+      const std::vector<uint8_t> native = makeAffineNative(format, rows, inputs, rng, [&] { return range(rng); });
+      const Packed packed = repack(format, native, rows, inputs, nullptr);
+      QuantizedSegment &segment = weights.segments.emplace_back(QuantizedSegment::planes(
+          format, rows, inputs, upload(backend, packed.w0),
+          kQuantFormats[format].plane1_bytes ? upload(backend, packed.w1) : MetalBuffer{}, upload(backend, packed.meta)));
+      segment.columnOffset = outputs;
+      outputs += rows;
+    }
+    layers.emplace_back(outputs, inputs, std::move(weights));
+  }
+  return layers;
+}
+std::vector<const Projection *> pointers(const std::vector<Projection> &layers) {
+  std::vector<const Projection *> result;
+  for (const Projection &layer : layers) result.push_back(&layer);
+  return result;
+}
+// The relative RMS of `got`'s difference from `expected`.
+double relativeError(const std::vector<float> &got, const std::vector<float> &expected) {
+  double difference = 0.0, total = 0.0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    if (!std::isfinite(got[i])) return INFINITY;
+    difference += (double(got[i]) - expected[i]) * (double(got[i]) - expected[i]);
+    total += double(expected[i]) * expected[i];
+  }
+  return std::sqrt(difference / total);
+}
+
+// The mixers' projections split beside the FFN's split: a linear-attention-like input projection whose ANE columns
+// run ahead of the mixer and deferred, an attention-like one whose ANE columns are strided heads and a range across
+// two of its tensors, both stacking tensors as a loader fuses them, and an output projection that adds its residual. Layouts of one layer or that leave columns to neither part are refused. Each
+// split kind is within the bound of the GPU alone on every function's rows and both weight sets, within its planned
+// memory, at its share. A command of two layers as a prefill encodes them, the input projection, its deferred join,
+// the output projection and the FFN, each split, computes within the bound what the GPU alone computes; a kind whose
+// breaker trips goes back to the GPU alone after ane_ffn::Breaker::kWindow commands, while the FFN goes on split.
+void projections(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
+  using ane_ffn::Columns;
+  using ane_ffn::ProjectionKind;
+  using ane_ffn::ProjectionLayout;
+  static constexpr uint32_t kBlock = 256, kConvolution = 4096, kGate = 1920, kBeta = 128;
+  static constexpr uint32_t kPacked = kConvolution + kGate + kBeta, kHeads = 8, kHead = 256, kKv = 1024;
+  static_assert(kHeads * 2 * kHead + kKv == kHidden, "the attention-like projection reads and writes hidden rows");
+  constexpr uint32_t kRows = AneFfn::kMaximumRows;
+  const std::vector<Projection> input = projectionLayers(backend, {kConvolution, kGate, kBeta}, kHidden),
+                                attention = projectionLayers(backend, {kHeads * 2 * kHead, kKv / 2, kKv / 2}, kHidden),
+                                output = projectionLayers(backend, {kHidden}, kPacked);
+  const ProjectionLayout gdn{ProjectionKind::GdnInput, pointers(input), kConvolution / kBlock, kBlock,
+                             [](uint32_t aneUnits) {
+                               const uint32_t gpu = kConvolution - aneUnits * kBlock;
+                               return Columns{{gpu, kConvolution - gpu}, {kConvolution + kGate, kBeta}};
+                             },
+                             [](uint32_t) { return Columns{{kConvolution, kGate}}; }};
+  const ProjectionLayout heads{ProjectionKind::AttentionInput, pointers(attention), kHeads, 2 * kHead,
+                               [](uint32_t aneUnits) {
+                                 Columns columns{{kHeads * 2 * kHead, kKv}};
+                                 for (uint32_t head = kHeads - aneUnits; head < kHeads; ++head)
+                                   columns.push_back({head * 2 * kHead, kHead});
+                                 return columns;
+                               },
+                               [](uint32_t aneUnits) {
+                                 Columns columns;
+                                 for (uint32_t head = kHeads - aneUnits; head < kHeads; ++head)
+                                   columns.push_back({head * 2 * kHead + kHead, kHead});
+                                 return columns;
+                               }};
+  const ProjectionLayout residual{ProjectionKind::GdnOutput, pointers(output), kHidden / kBlock, kBlock,
+                                  [](uint32_t aneUnits) {
+                                    const uint32_t gpu = kHidden - aneUnits * kBlock;
+                                    return Columns{{gpu, kHidden - gpu}};
+                                  },
+                                  {}};
+  for (const ProjectionLayout *layout : {&gdn, &heads, &residual})
+    if (const char *reason = AneFfn::unsupportedProjections(*layout))
+      fail(std::string("the split does not take the ") + ane_ffn::projectionName(layout->kind) +
+           " projections: " + reason);
+  ProjectionLayout uncovered = gdn, single = gdn;
+  uncovered.deferred = {};
+  single.layers.resize(1);
+  if (!AneFfn::unsupportedProjections(uncovered) || !AneFfn::unsupportedProjections(single))
+    fail("the split takes projections of one layer, or that leave columns to neither part");
+
+  const MetalBuffer packed = test::sharedBuffer(backend, uint64_t{kRows} * kPacked * 2),
+                    mixed = test::sharedBuffer(backend, uint64_t{kRows} * kHidden * 2);
+  AneFfn split(backend, model.layers, kAneUnits, nullptr);
+  const uint64_t before = split.allocatedBytes();
+  uint64_t planned = 0;
+  struct Taken {
+    const ProjectionLayout *layout;
+    uint32_t aneUnits;
+    MetalBuffer input, output, residual;
+  };
+  for (const Taken &taken : {Taken{&gdn, 10, chunk.ffn.normalized, packed, {}},
+                             Taken{&heads, 5, chunk.ffn.normalized, packed, {}},
+                             Taken{&residual, 13, packed, chunk.hidden[1], chunk.hidden[0]}}) {
+    const ProjectionKind kind = taken.layout->kind;
+    split.addProjections(*taken.layout, taken.aneUnits);
+    planned += AneFfn::plannedProjectionBytes(*taken.layout, taken.aneUnits);
+    const double error = split.verifyProjections(kind, taken.input, taken.output, {}, taken.residual);
+    if (!(error <= kMaximumError))
+      fail(std::string(ane_ffn::projectionName(kind)) + " projections: " + std::to_string(100.0 * error) +
+           "% from the GPU alone on the Neural Engine's part");
+    if (split.projectionShare(kind) != static_cast<double>(taken.aneUnits) / taken.layout->units ||
+        !split.projects(kind, kRows) || split.projects(kind, AneFfn::kMinimumRows - 1))
+      fail(std::string(ane_ffn::projectionName(kind)) + " projections: not split at their share and rows");
+  }
+  if (split.allocatedBytes() - before > planned) fail("the projections allocated more than their planned memory");
+  section("projections: an input projection's ahead and deferred columns, strided heads' and a range across stacked "
+          "tensors, and an output's with its residual, each within the bound of the GPU alone and its planned memory; layouts of one layer or that "
+          "leave columns to neither part refused");
+
+  // hidden[0] -> (input projection, output projection over it) -> mixed -> (FFN) -> hidden[1] -> ... -> hidden[0].
+  const auto layers = [&](bool splitting) {
+    std::memset(chunk.hidden[0].contents(), 0, chunk.hidden[0].sizeBytes());
+    CommandGraph graph;
+    if (splitting && !split.begin()) fail("the split stopped: " + split.reason());
+    for (uint32_t layer = 0; layer < 2; ++layer) {
+      const MetalBuffer &in = chunk.hidden[layer & 1], &out = chunk.hidden[(layer & 1) ^ 1];
+      if (splitting && split.projects(ProjectionKind::GdnInput, kRows)) {
+        split.addProjection(ProjectionKind::GdnInput, graph, layer, chunk.ffn.normalized, packed, kRows, {});
+        split.addDeferredJoin(ProjectionKind::GdnInput, graph, packed, kRows);
+      } else {
+        linear.addPrefill(graph, chunk.ffn.normalized, input[layer], packed, kRows, {});
+      }
+      if (splitting && split.projects(ProjectionKind::GdnOutput, kRows))
+        split.addProjection(ProjectionKind::GdnOutput, graph, layer, packed, mixed, kRows, {}, in);
+      else
+        linear.addPrefillResidual(graph, packed, output[layer], in, mixed, kRows, {});
+      if (splitting)
+        split.add(graph, layer, chunk.ffn, mixed, out, kRows);
+      else
+        linear.addPrefillSwiGlu(graph, model.layers[layer], chunk.ffn, mixed, out, kRows);
+    }
+    if (splitting) {
+      static_cast<void>(split.commit(graph, {}).wait());
+      if (!split.finish()) fail("a command of split projections and FFN failed: " + split.reason());
+    } else {
+      run(backend, graph);
+    }
+    std::vector<float> values(uint64_t{kRows} * kHidden);
+    const auto *bits = static_cast<const uint16_t *>(chunk.hidden[0].contents());
+    for (size_t i = 0; i < values.size(); ++i) values[i] = bf16ToFloat(bits[i]);
+    return values;
+  };
+  fillRows(chunk, kRows, [](uint64_t) { return 1.0f; });
+  const std::vector<float> gpu = layers(false);
+  if (const double error = relativeError(layers(true), gpu); !(error <= kMaximumError))
+    fail("two layers of split projections and FFN: " + std::to_string(100.0 * error) + "% from the GPU alone");
+  section("projections: two layers of an input projection and its deferred columns, an output projection and the FFN, "
+          "each split in one command, within the bound of the GPU alone");
+
+  // A breaker given a GPU alone far faster than any Neural Engine.
+  split.setProjectionBreaker(ProjectionKind::GdnOutput,
+                             ane_ffn::Breaker({{{AneFfn::kMinimumRows, 1e-6}, {AneFfn::kMaximumRows, 4e-6}}}));
+  for (uint32_t command = 1; command <= ane_ffn::Breaker::kWindow; ++command) {
+    if (!split.projects(ProjectionKind::GdnOutput, kRows))
+      fail("the output projections' breaker tripped after " + std::to_string(command - 1) + " commands");
+    static_cast<void>(layers(true));
+  }
+  if (split.projects(ProjectionKind::GdnOutput, kRows) || !split.projects(ProjectionKind::GdnInput, kRows) ||
+      !split.splits(kRows))
+    fail("a tripped breaker did not take its kind alone back to the GPU");
+  if (const double error = relativeError(layers(true), gpu); !(error <= kMaximumError))
+    fail("after the output projections' breaker tripped: " + std::to_string(100.0 * error) + "% from the GPU alone");
+  section("projections: a kind whose breaker trips goes back to the GPU alone after 8 commands, the rest split");
+}
+
 void split(MetalBackend &backend) {
   const Linear linear(backend.capabilities());
   const Model mlx = mlxModel(backend), gguf = ggufModel(backend);
@@ -852,6 +1051,7 @@ void split(MetalBackend &backend) {
   quietRows(backend, linear, mlx, buffers);
   massiveChannel(backend, linear, buffers);
   idle(backend, linear, mlx, buffers);
+  projections(backend, linear, mlx, buffers);
   fillRows(buffers, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
   stops(backend, linear, mlx, buffers, {.poisonedEvaluation = 2}, "an infinity in layer 1's output",
         AneFfn::kMaximumRows, "not finite");
@@ -876,8 +1076,9 @@ void faults(MetalBackend &backend) {
       {"a throwing enqueue", [](uint64_t at) { return Faults{.throwingEnqueue = at}; }, "could not start"},
       {"a failed evaluation", [](uint64_t at) { return Faults{.failingEvaluation = at}; }, "an evaluation failed"},
       {"a stalled evaluation", [](uint64_t at) { return Faults{.stalledEvaluation = at}; }, "did not complete"},
+      // Late enough not to report before stops() runs the GPU alone after it; resumes() lets one report.
       {"a late evaluation",
-       [](uint64_t at) { return Faults{.delayedEvaluation = at, .delay = std::chrono::milliseconds(3000)}; },
+       [](uint64_t at) { return Faults{.delayedEvaluation = at, .delay = std::chrono::milliseconds(10000)}; },
        "did not complete"},
       {"an infinite output", [](uint64_t at) { return Faults{.poisonedEvaluation = at}; }, "not finite"},
   };
@@ -888,6 +1089,8 @@ void faults(MetalBackend &backend) {
               std::string(kind.name) + " at layer " + std::to_string(layer), count, kind.reason);
     section(std::string("faults: ") + kind.name + " at each layer of chunks of 512, 700 and 2048 rows");
   }
+  resumes(backend, linear, model, buffers);
+  section("faults: a late evaluation stops the split until it reports, and the next command resumes it");
 
   // A program that does not load again after the idle release.
   ane::ProgramInstrumentation::arm({.failingLoad = true});

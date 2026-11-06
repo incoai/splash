@@ -797,8 +797,8 @@ ANE's weights from the block planes one layer ahead into double-buffered
 IOSurfaces and adds the ANE's partial down projection to its own. Shared
 events order each evaluation between the GPU's packing and that join inside
 the one prefill command (`metal::EventStep`); each signal ends a Metal command
-buffer, so the queue holds 512. MoE targets, the mixers and decode stay on the
-GPU.
+buffer, so the queue holds 512. MoE targets and decode stay on the GPU; a
+dense target's mixers split their projections too (below).
 
 Startup decides the split on the loaded model before it allocates the KV cache
 (`runtime/engine/AneFfnStartup.cpp`), once it has built the memory governor,
@@ -916,7 +916,11 @@ GPU's join, in fp32. While serving, any failure of the ANE's work stops the
 split for the life of the process (`runtime/ane/Handoff.mm`): an evaluation
 that fails, cannot start or has not completed 2 s after the GPU raised its
 event (Metal fails a command buffer whose wait stays unmet for 5 s), or a value
-the join reads that is not finite. The CPU then raises the event to the GPU's
+the join reads that is not finite. An evaluation that only ran late is the
+exception: once the ANE has reported every evaluation it started, so none can
+still write the split's surfaces, the next command's `begin()` starts the
+handoff over on a new event and logs `Neural Engine split resumed after a late
+evaluation (N of 3)`, at most three times. The CPU then raises the event to the GPU's
 last wait, the chunk runs again on the GPU alone, which computes what it would
 have, as does every chunk after it, and the engine logs `Warning · Neural
 Engine FFN split stopped (...)`. A split that loses to the GPU alone stops the
@@ -966,6 +970,38 @@ the model runtime oracle with the GPU alone, with the GPU alone over a BF16
 state (`--state-format bf16`), and with the split as a start makes it, which
 must not be unavailable, and whose automatic context must be what the plan
 holds with the split it runs.
+
+The mixers' input and output projections split the same way, by output
+channel, over the FFN's handoff (`AneFfn::addProjection`): the GPU computes a
+projection's leading columns over views of its planes, the ANE the rest from
+int8 rows the GPU stages a layer ahead during the FFN's wait for the ANE, and
+a join (`ane_proj_join`, `ane_proj_join_residual` for an output projection)
+writes the ANE's columns where the model's packed rows hold them. An input
+projection's output-gate columns, which only the gate after the GDN scan or
+the attention reads, the ANE computes during them, and the GPU joins them
+before the gate (`addDeferredJoin`). The model describes its projections
+(`model::aneProjectionLayouts`: Qwen3.8's linear-attention and attention inputs
+and both outputs). A loader stacks an input projection from several tensors
+(q, k and v; z; beta and alpha), so the split stages each tensor's rows from
+its own planes; columns past the tensors are padding, which neither part
+writes, and the split refuses a layout whose columns its join cannot map.
+Calibration times each kind as it times the FFN, at two shares, its GPU part
+alone and the GPU alone, fits the same `T(s)` and takes each kind's units, or
+the GPU alone where no split gains 5%. The record (`ane-ffn-calibration-2`)
+keeps each kind's units and GPU alone, under a key that names the kinds
+offered. Each kind has a breaker of its own, which returns that kind to the
+GPU alone and leaves the rest split. Until a calibration is remembered the
+memory plan sets aside the most each kind may take, then the calibration's.
+On an M4 Pro with Qwen3.8-27B MLX 4-bit the first start calibrates in about
+45 s and takes 0.74 of the FFN and 0.72-0.80 of each projection kind.
+`ane-ffn` checks every kind's split against the GPU alone, stacked inputs
+among them.
+
+A prefill's output is read only at a prompt's last row, whose logits pick the
+first token. So a dense target's last layer, when it is a full attention that
+the draft does not capture, stores every row's K/V but computes the rest of the
+layer for the chunk's last 256 rows only, on the GPU
+(`QwenTarget::prefillTailRows`).
 
 ## Host steps
 

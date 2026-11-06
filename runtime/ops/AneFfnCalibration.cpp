@@ -22,7 +22,7 @@ constexpr double kMinimumGain = 0.05;
 constexpr double kChunkNoise = 0.02;
 // The first word of a Calibration's text, which a change to its fields
 // renumbers.
-constexpr std::string_view kCalibrationTag = "ane-ffn-calibration-1";
+constexpr std::string_view kCalibrationTag = "ane-ffn-calibration-2";
 
 // The GPU alone's milliseconds of a chunk's FFN layer by its rows: the line
 // through its timings, which the GPU follows within 1% between them.
@@ -32,7 +32,28 @@ Line gpuAlone(const std::array<ChunkTimings::Gpu, 2> &gpu) {
   return {low.milliseconds - slope * low.rows, slope};
 }
 
+// Whether `gpu` holds ascending rows of usable milliseconds.
+bool usableLine(const std::array<ChunkTimings::Gpu, 2> &gpu) {
+  const auto usableMilliseconds = [](double value) { return value > 0.0 && std::isfinite(value); };
+  const auto &[low, high] = gpu;
+  return low.rows < high.rows && usableMilliseconds(low.milliseconds) && usableMilliseconds(high.milliseconds);
+}
+
 } // namespace
+
+const char *projectionName(ProjectionKind kind) noexcept {
+  switch (kind) {
+  case ProjectionKind::GdnInput:
+    return "linear-attention input";
+  case ProjectionKind::AttentionInput:
+    return "attention input";
+  case ProjectionKind::GdnOutput:
+    return "linear-attention output";
+  case ProjectionKind::AttentionOutput:
+    return "attention output";
+  }
+  return "unknown";
+}
 
 double usable(double milliseconds) {
   if (!(milliseconds > 0.0 && std::isfinite(milliseconds)))
@@ -128,27 +149,47 @@ std::optional<uint32_t> minimumRows(const ChunkTimings &timings) {
 
 std::string Calibration::text() const {
   std::ostringstream text;
+  const auto line = [&](const std::array<ChunkTimings::Gpu, 2> &points) {
+    for (const ChunkTimings::Gpu &point : points) text << ' ' << point.rows << ' ' << point.milliseconds;
+  };
   text << std::setprecision(9) << kCalibrationTag << ' ' << aneUnits << ' ' << minimumRows;
-  for (const ChunkTimings::Gpu &point : gpu) text << ' ' << point.rows << ' ' << point.milliseconds;
+  line(gpu);
+  for (const ProjectionCalibration &projection : projections) {
+    text << ' ' << projection.aneUnits;
+    line(projection.gpu);
+  }
   return text.str();
 }
 
 // A record of units holds least rows and the GPU alone at ascending rows of
-// usable milliseconds; one of none holds neither.
+// usable milliseconds, and so does each projection kind of units; one of none
+// holds none of them.
 std::optional<Calibration> Calibration::parse(std::string_view text) {
   std::istringstream in{std::string(text)};
   std::string tag;
   Calibration calibration;
+  const auto line = [&](std::array<ChunkTimings::Gpu, 2> &points) {
+    for (ChunkTimings::Gpu &point : points) in >> point.rows >> point.milliseconds;
+  };
   in >> tag >> calibration.aneUnits >> calibration.minimumRows;
-  for (ChunkTimings::Gpu &point : calibration.gpu) in >> point.rows >> point.milliseconds;
+  line(calibration.gpu);
+  for (ProjectionCalibration &projection : calibration.projections) {
+    in >> projection.aneUnits;
+    line(projection.gpu);
+  }
   std::string rest;
   if (!in || tag != kCalibrationTag || (in >> rest)) return std::nullopt;
-  const auto &[low, high] = calibration.gpu;
-  const auto usableMilliseconds = [](double value) { return value > 0.0 && std::isfinite(value); };
-  if (!calibration.aneUnits) return calibration.minimumRows ? std::nullopt : std::optional(Calibration{});
-  if (!calibration.minimumRows || !(low.rows < high.rows) || !usableMilliseconds(low.milliseconds) ||
-      !usableMilliseconds(high.milliseconds))
-    return std::nullopt;
+  const bool projects = std::ranges::any_of(
+      calibration.projections, [](const ProjectionCalibration &projection) { return projection.aneUnits != 0; });
+  if (!calibration.aneUnits)
+    return calibration.minimumRows || projects ? std::nullopt : std::optional(Calibration{});
+  if (!calibration.minimumRows || !usableLine(calibration.gpu)) return std::nullopt;
+  for (ProjectionCalibration &projection : calibration.projections) {
+    if (!projection.aneUnits)
+      projection.gpu = {};
+    else if (!usableLine(projection.gpu))
+      return std::nullopt;
+  }
   return calibration;
 }
 

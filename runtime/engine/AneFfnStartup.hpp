@@ -69,6 +69,19 @@ struct AneFfnModel final {
   std::function<void(uint32_t maxAneUnits)> forget;
   // Whether the Metal backend still serves.
   std::function<bool()> healthy;
+  // The mixers' projections the split may also take, kind by kind
+  // (ops::AneFfn::addProjections), none without projectionBytes: the units of
+  // each kind, none of a kind the model does not lay out; the projections'
+  // Metal memory with the ANE taking `aneUnits` of each kind, none of a kind
+  // of none; calibration's timings of a kind with `split` taking it
+  // (ops::ane_ffn::Measurement::projection); and `split` taking a kind with
+  // the ANE taking `aneUnits`, verified, which returns what
+  // AneFfn::verifyProjections did.
+  ops::ane_ffn::ProjectionUnits projectionUnits{};
+  std::function<uint64_t(const ops::ane_ffn::ProjectionUnits &aneUnits)> projectionBytes;
+  std::function<ops::ane_ffn::ProjectionTimings(ops::AneFfn &split, ops::ane_ffn::ProjectionKind kind)>
+      timeProjections;
+  std::function<double(ops::AneFfn &split, ops::ane_ffn::ProjectionKind kind, uint32_t aneUnits)> addProjections;
 };
 
 // The context a start asks the split to leave: --max-context's, or with
@@ -120,7 +133,13 @@ struct AneFfnStart final {
 // remembered, a split or none. The split then judges itself against the GPU
 // alone as calibrated (ops::ane_ffn::Breaker), which forgets the calibration
 // when it trips, so that the next start calibrates again; a given split
-// takes the given least chunk, no breaker, and nothing remembered. Logs the
+// takes the given least chunk, no breaker, and nothing remembered. The split
+// also takes each of the model's projection kinds its calibration found
+// gaining (ops::ane_ffn::choose of the kind's timings), within memory the plan
+// sets aside for the most of each until this Mac's calibration is
+// remembered: the projections give way where the plan cannot hold them
+// beside the FFN's split, a given split takes none, and a kind that fails to
+// set up leaves the FFN's split to serve without it. Logs the
 // outcome, a split a relaunch's context refuses in a plain line: the server,
 // not the user, asked for that context. A failure leaves the GPU alone,
 // unless `cancelled` returns true, the wait for the ANE was interrupted or

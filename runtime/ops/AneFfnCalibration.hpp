@@ -82,14 +82,44 @@ struct ChunkTimings final {
 // a chunk of the most rows does.
 [[nodiscard]] std::optional<uint32_t> minimumRows(const ChunkTimings &timings);
 
+// The mixers' projections a split also takes (AneFfn::addProjections), each
+// kind calibrated on its own: a layer joins the ANE's part of a projection
+// before anything reads it, so each balances the GPU and the ANE as the FFN
+// does, by the same model.
+enum class ProjectionKind : uint8_t { GdnInput, AttentionInput, GdnOutput, AttentionOutput };
+inline constexpr size_t kProjectionKinds = 4;
+// The kind's name, as "linear-attention input".
+[[nodiscard]] const char *projectionName(ProjectionKind kind) noexcept;
+// A count of units of each kind, by kind.
+using ProjectionUnits = std::array<uint32_t, kProjectionKinds>;
+
+// What calibration times of a projection kind (Measurement::projection): as
+// Timings, per layer of the projection of a full chunk; and the GPU alone's
+// projection at the least and the most rows of the split's functions, which
+// the kind's breaker judges it against.
+struct ProjectionTimings final {
+  Timings timings;
+  std::array<ChunkTimings::Gpu, 2> gpu{};
+};
+
+// A projection kind as calibrated: the ANE's units, none when no split of it
+// gained enough or the model has none; and the GPU alone's projection at the
+// least and the most rows of the split's functions.
+struct ProjectionCalibration final {
+  uint32_t aneUnits = 0;
+  std::array<ChunkTimings::Gpu, 2> gpu{};
+};
+
 // What one calibration of the split on this Mac decided, which later starts
 // take again (engine::startAneFfn): the ANE's units and the least rows of a
-// chunk the split takes, none of either when no split gained enough; and the
+// chunk the split takes, none of either when no split gained enough; the
 // GPU alone's layer at the least and the most rows of the split's functions,
-// which the breaker judges the split against.
+// which the breaker judges the split against; and each projection kind's,
+// none of which a split of none takes.
 struct Calibration final {
   uint32_t aneUnits = 0, minimumRows = 0;
   std::array<ChunkTimings::Gpu, 2> gpu{};
+  std::array<ProjectionCalibration, kProjectionKinds> projections{};
 
   // As one line of text, and back: none for text that is not such a line.
   [[nodiscard]] std::string text() const;

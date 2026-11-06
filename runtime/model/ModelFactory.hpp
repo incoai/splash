@@ -19,6 +19,9 @@
 
 namespace splash::ops {
 class AneFfn;
+namespace ane_ffn {
+struct ProjectionLayout;
+} // namespace ane_ffn
 } // namespace splash::ops
 
 namespace splash::model {
@@ -169,6 +172,11 @@ loadModel(metal::MetalBackend &backend,
 // The FFN layers of a dense target, which the prefill FFN's Neural Engine
 // split (ops::AneFfn) may take; none for another target.
 [[nodiscard]] std::vector<ops::SwiGluProjections> aneFfnLayers(const LoadedModel &model);
+// The mixers' projections of a dense target that the split may also take
+// (ops::AneFfn::addProjections), kind by kind as its packed rows lay them
+// out; none for another target, and none of a kind whose rows the split
+// cannot lay out so.
+[[nodiscard]] std::vector<ops::ane_ffn::ProjectionLayout> aneProjectionLayouts(const LoadedModel &model);
 // Runs `use` on a prefill arena allocated for the call: on the dense FFN's
 // buffers of a full chunk and the hidden rows layers alternate between.
 void withPrefillArena(

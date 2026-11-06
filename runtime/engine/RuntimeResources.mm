@@ -15,14 +15,19 @@
 
 #import <Foundation/Foundation.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <sstream>
+#include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace splash::engine {
 namespace {
@@ -1435,9 +1440,53 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
     });
     return prepared;
   };
-  const std::string key = calibrationKey(*layers) + " device " + backend.capabilities().deviceName + " macos " +
-                          [[NSProcessInfo processInfo] operatingSystemVersionString].UTF8String + " build " +
-                          std::string(buildId) + " most ";
+  // The mixers' projections the split may also take, kind by kind.
+  auto projections = std::make_shared<const std::vector<ops::ane_ffn::ProjectionLayout>>(
+      model::aneProjectionLayouts(loaded));
+  for (const ops::ane_ffn::ProjectionLayout &layout : *projections)
+    model.projectionUnits[static_cast<size_t>(layout.kind)] = layout.units;
+  if (!projections->empty()) {
+    const auto layoutOf = [projections](ops::ane_ffn::ProjectionKind kind) -> const ops::ane_ffn::ProjectionLayout & {
+      const auto found = std::ranges::find(*projections, kind, &ops::ane_ffn::ProjectionLayout::kind);
+      if (found == projections->end())
+        throw std::logic_error(std::string("the model lays out no ") + ops::ane_ffn::projectionName(kind) +
+                               " projections");
+      return *found;
+    };
+    model.projectionBytes = [projections](const ops::ane_ffn::ProjectionUnits &aneUnits) {
+      uint64_t bytes = 0;
+      for (const ops::ane_ffn::ProjectionLayout &layout : *projections)
+        if (const uint32_t units = aneUnits[static_cast<size_t>(layout.kind)])
+          bytes += ops::AneFfn::plannedProjectionBytes(layout, units);
+      return bytes;
+    };
+    model.timeProjections = [&backend, layers, cancelled, onArena, layoutOf](ops::AneFfn &split,
+                                                                            ops::ane_ffn::ProjectionKind kind) {
+      ops::ane_ffn::ProjectionTimings timings;
+      onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+        timings = ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).projection(split, layoutOf(kind));
+      });
+      return timings;
+    };
+    model.addProjections = [onArena, layoutOf](ops::AneFfn &split, ops::ane_ffn::ProjectionKind kind,
+                                               uint32_t aneUnits) {
+      split.addProjections(layoutOf(kind), aneUnits);
+      double error = 0.0;
+      onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+        const ops::ane_ffn::ProjectionBuffers buffers = ops::ane_ffn::projectionBuffers(kind, ffn, hidden);
+        error = split.verifyProjections(kind, buffers.input, buffers.output, buffers.scratch, buffers.residual);
+      });
+      return error;
+    };
+  }
+  // The projection kinds offered are part of it: a record that ran a kind on
+  // the GPU because it was not offered then holds nothing for it now.
+  std::string offered;
+  for (const ops::ane_ffn::ProjectionLayout &layout : *projections)
+    offered += std::string(" ") + ops::ane_ffn::projectionName(layout.kind) + ":" + std::to_string(layout.units);
+  const std::string key = calibrationKey(*layers) + offered + " device " + backend.capabilities().deviceName +
+                          " macos " + [[NSProcessInfo processInfo] operatingSystemVersionString].UTF8String +
+                          " build " + std::string(buildId) + " most ";
   model.recall = [key](uint32_t maxAneUnits) -> std::optional<ops::ane_ffn::Calibration> {
     const std::optional<std::string> line = ane::recall(key + std::to_string(maxAneUnits));
     return line ? ops::ane_ffn::Calibration::parse(*line) : std::nullopt;

@@ -10,6 +10,18 @@
 
 namespace splash::ops::ane_ffn {
 
+// A projection kind's rows in a prefill arena's FFN buffers, which hold any
+// of them: an input projection reads the normalized hidden rows into the
+// intermediate rows, wide enough for any mixer's packed row; an output
+// projection reads the intermediate rows, as wide as any mixer's, into one
+// hidden buffer after the other, its residual.
+struct ProjectionBuffers final {
+  metal::MetalBuffer input, output, residual;
+  LinearScratch scratch;
+};
+[[nodiscard]] ProjectionBuffers projectionBuffers(ProjectionKind kind, const PrefillFfnBuffers &ffn,
+                                                  const std::array<metal::MetalBuffer, 2> &hidden);
+
 // Times the prefill FFN's Neural Engine split of `layers` (AneFfn) on this
 // device, with chunks in `ffn` and the residual and output of alternate
 // layers in `hidden`, all of which it overwrites, through the split's path:
@@ -32,6 +44,12 @@ public:
   // and `split` over a chunk of the rows of each of its functions, on the
   // first layers.
   [[nodiscard]] ChunkTimings chunks(AneFfn &split);
+  // `layout`'s projections timed as time() times the FFN, on five of its
+  // layers spread over the model, with `split` taking them for each share
+  // (AneFfn::addProjections, a function of a full chunk's rows) and then
+  // leaving them again; and the GPU alone's projection at the least and the
+  // most rows of `split`'s functions.
+  [[nodiscard]] ProjectionTimings projection(AneFfn &split, const ProjectionLayout &layout);
 
 private:
   // The per-layer milliseconds of `count` `rows`-row FFN layers of `layers`
@@ -41,6 +59,13 @@ private:
   [[nodiscard]] double layer(std::span<const SwiGluProjections> layers, uint32_t count, uint32_t rows,
                              AneFfn *split = nullptr, double standIn = 0.0);
   [[nodiscard]] double gpuPart(std::span<const SwiGluProjections> layers, AneFfn &split);
+  // layer() and gpuPart() of `layout`'s projections: the GPU alone's without
+  // `split`, or `split`'s, each split layer after the GPU alone's projection
+  // of the same layer, which stands in for the mixer, less `standIn`.
+  [[nodiscard]] double projectionLayer(const ProjectionLayout &layout, const ProjectionBuffers &buffers,
+                                       uint32_t rows, AneFfn *split = nullptr, double standIn = 0.0);
+  [[nodiscard]] double projectionGpuPart(const ProjectionLayout &layout, const ProjectionBuffers &buffers,
+                                         AneFfn &split);
 
   metal::MetalBackend &backend_;
   std::span<const SwiGluProjections> layers_;

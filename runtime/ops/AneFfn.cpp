@@ -12,12 +12,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <iomanip>
 #include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace splash::ops {
 namespace {
@@ -63,6 +65,11 @@ constexpr auto kProgramLimit = std::chrono::seconds(120);
 // Mac still finishes, and one that stopped answering stops the split instead
 // of holding the engine longer.
 constexpr auto kReloadLimit = std::chrono::seconds(10);
+// How many times a split stopped by an evaluation that ran late starts over
+// once the Neural Engine has reported it: a stall a busy Mac recovers from
+// costs one chunk's rerun on the GPU, and one that keeps coming back stops
+// the split for good after the last.
+constexpr uint32_t kHandoffRestarts = 3;
 
 // The GPU's channels of `intermediate` with the ANE taking `aneUnits`.
 uint32_t gpuChannels(uint32_t intermediate, uint32_t aneUnits) {
@@ -196,11 +203,15 @@ std::vector<float> bf16Values(const metal::MetalBuffer &buffer, uint64_t count) 
 
 } // namespace
 
-AneFfn::Planes::Planes(const Projection &projection) {
-  const QuantizedSegment &segment = projection.blocks().segments.front();
+AneFfn::Planes::Planes(const Projection &projection)
+    : Planes(projection.blocks().segments.front(), projection.inputSize) {}
+
+AneFfn::Planes::Planes(const QuantizedSegment &segment, uint32_t inputs) {
   requireSegmentPlanes(segment, "ANE FFN projection");
-  groups = projection.inputSize / 32;
+  groups = inputs / 32;
   format = segment.formatId;
+  first = segment.columnOffset;
+  rows = segment.outputSize;
   buffers = {segment.plane0, segment.plane1Slot(), segment.meta};
 }
 
@@ -395,8 +406,8 @@ AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> 
 
 AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
                std::function<bool()> interrupted, std::span<const uint32_t> functionRows)
-    : backend_(backend), linear_(backend.capabilities()), shape_(shapeOf(layers, aneUnits)),
-      handoff_(backend, kHandoffBound) {
+    : backend_(backend), linear_(backend.capabilities()), interrupted_(std::move(interrupted)),
+      shape_(shapeOf(layers, aneUnits)), handoff_(backend, kHandoffBound) {
   // What Metal allocates, which the memory audit compares with the plan.
   memory_ = allocate(
       shape_,
@@ -423,7 +434,7 @@ AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> 
   const std::vector<Input> inputs = programInputs(shape_, memory_);
   program_ = std::make_unique<ane::Program>(program(shape_, inputs, memory_.partial, functionRows),
                                             rotationBlob(shape_.ane, signs),
-                                            ane::Program::Limits{kProgramLimit, std::move(interrupted)});
+                                            ane::Program::Limits{kProgramLimit, interrupted_});
   for (const uint32_t rows : functionRows) {
     Evaluation &evaluation = evaluations_.emplace_back();
     evaluation.rows = rows;
@@ -504,6 +515,8 @@ void AneFfn::addWeights(metal::CommandGraph &graph, uint32_t layer, uint32_t set
   }
 }
 
+bool AneFfn::restartable() const { return handoff_.overran() && restarts_ < kHandoffRestarts; }
+
 bool AneFfn::begin() {
   // A command committed but never finished failed on the GPU, and the
   // evaluations it queued with it.
@@ -513,6 +526,16 @@ bool AneFfn::begin() {
   }
   jobs_.clear();
   nextLayer_ = 0;
+  for (const std::unique_ptr<ProjectionSplit> &split : projections_)
+    if (split) {
+      split->next = 0;
+      split->staged = ProjectionSplit::kNotStaged;
+      split->deferredDone = 0;
+    }
+  if (handoff_.retired() && !released_ && restartable() && handoff_.restart(backend_)) {
+    warned_ = false;
+    logLine("Neural Engine split resumed after a late evaluation (", ++restarts_, " of ", kHandoffRestarts, ")");
+  }
   return !handoff_.retired();
 }
 
@@ -550,21 +573,22 @@ void AneFfn::encode(metal::CommandGraph &graph, uint32_t layer, const PrefillFfn
   if (ane) graph.signal(handoff_.event(), ready);
   linear_.addPrefillSwiGlu(graph, {&current.gate, &current.up, &current.down}, ffn, residual, output, rows);
   if (layer + 1 < layers_.size()) addWeights(graph, layer + 1, set ^ 1);
+  if (ane) addNextProjectionWeights(graph);
   const uint64_t done = ane ? handoff_.next() : 0;
   if (ane) graph.wait(handoff_.event(), done);
   graph.add("ane_ffn_join", {output, memory_.partial.buffer, memory_.tokenScale.buffer, memory_.status},
             AneFfnJoinParams{shape_.hidden, memory_.partial.strideBytes / uint32_t{sizeof(_Float16)}, rows},
             {tiles, shape_.hidden / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
   if (ane) jobs_.push_back({index, set, ready, done});
+  encodingRows_ = evaluations_[index].rows;
   ++nextLayer_;
 }
 
 metal::CommandTicket AneFfn::commit(const metal::CommandGraph &graph, metal::CommandCompletion completion) {
-  const std::vector<Job> jobs = std::exchange(jobs_, {});
-  for (const Job &job : jobs) queue(job);
-  unfinished_ = !jobs.empty();
-  committedEvaluations_ = static_cast<uint32_t>(jobs.size());
-  committedRows_ = jobs.empty() ? 0 : evaluations_[jobs.front().evaluation].rows;
+  committed_ = std::exchange(jobs_, {});
+  for (const Job &job : committed_) queue(job);
+  unfinished_ = !committed_.empty();
+  committedRows_ = encodingRows_;
   const auto cancel = [&](const std::string &reason) {
     if (!std::exchange(unfinished_, false)) return;
     handoff_.cancel(reason);
@@ -582,27 +606,53 @@ metal::CommandTicket AneFfn::commit(const metal::CommandGraph &graph, metal::Com
 }
 
 bool AneFfn::finish() {
-  const std::optional<AwakeClock::duration> ran = completed();
+  const std::optional<std::vector<AwakeClock::duration>> ran = completed();
+  const std::vector<Job> jobs = std::exchange(committed_, {});
   if (!ran) {
     warnStopped();
     return false;
   }
-  if (!committedEvaluations_) return true;
-  const double milliseconds = std::chrono::duration<double, std::milli>(*ran).count();
+  if (jobs.empty()) return true;
+  if (ran->size() != jobs.size()) throw std::logic_error("ANE FFN split's handoff finished other jobs than it took");
+  // The Neural Engine's milliseconds and evaluations of the command by owner:
+  // a projection's deferred columns count in its layer's evaluation.
+  std::array<double, kFfn + 1> milliseconds{};
+  std::array<uint32_t, kFfn + 1> evaluations{};
+  for (size_t index = 0; index < jobs.size(); ++index) {
+    milliseconds[jobs[index].owner] += std::chrono::duration<double, std::milli>((*ran)[index]).count();
+    if (!jobs[index].deferred) ++evaluations[jobs[index].owner];
+  }
   ++served_.commands;
-  served_.evaluations += committedEvaluations_;
-  served_.milliseconds += milliseconds;
-  if (std::string losing = breaker_.add(committedRows_, committedEvaluations_, milliseconds); !losing.empty()) {
+  served_.evaluations += jobs.size();
+  for (const double owner : milliseconds) served_.milliseconds += owner;
+  // Any breaker that trips forgets the calibration, so the next start
+  // calibrates again.
+  const auto lose = [&] {
+    if (lost_) std::exchange(lost_, {})();
+  };
+  for (size_t owner = 0; owner < projections_.size(); ++owner) {
+    ProjectionSplit *split = projections_[owner].get();
+    if (!split || split->lost || !evaluations[owner]) continue;
+    if (std::string losing = split->breaker.add(committedRows_, evaluations[owner], milliseconds[owner]);
+        !losing.empty()) {
+      split->lost = true;
+      logWarning("Neural Engine split of the ", ane_ffn::projectionName(split->kind), " projections stopped (",
+                 losing, "); the GPU runs them alone until the engine restarts.");
+      lose();
+    }
+  }
+  if (!evaluations[kFfn]) return true;
+  if (std::string losing = breaker_.add(committedRows_, evaluations[kFfn], milliseconds[kFfn]); !losing.empty()) {
     handoff_.retire(std::move(losing));
     warnStopped();
-    if (lost_) std::exchange(lost_, {})();
+    lose();
   }
   return true;
 }
 
-std::optional<AwakeClock::duration> AneFfn::completed() {
+std::optional<std::vector<AwakeClock::duration>> AneFfn::completed() {
   unfinished_ = false;
-  std::optional<AwakeClock::duration> ran = handoff_.finish();
+  std::optional<std::vector<AwakeClock::duration>> ran = handoff_.finishEach();
   if (std::exchange(*static_cast<uint32_t *>(memory_.status.contents()), 0u) && ran) {
     handoff_.retire("the Neural Engine's output or its scales were not finite");
     ran.reset();
@@ -616,6 +666,8 @@ bool AneFfn::release() {
   if (released_ || (handoff_.retired() && !handoff_.idle())) return false;
   try {
     program_->unload({kReloadLimit, {}});
+    for (const std::unique_ptr<ProjectionSplit> &split : projections_)
+      if (split) split->program->unload({kReloadLimit, {}});
   } catch (const std::exception &error) {
     handoff_.retire(std::string("its program did not unload: ") + error.what());
     warnStopped();
@@ -627,13 +679,15 @@ bool AneFfn::release() {
 }
 
 void AneFfn::restore() noexcept {
-  // A stopped split keeps its program unloaded.
-  if (!released_ || handoff_.retired()) return;
+  // A stopped split keeps its program unloaded, unless it may still restart.
+  if (!released_ || (handoff_.retired() && !restartable())) return;
   released_ = false;
   const auto start = AwakeClock::now();
   std::string failure = "an unknown exception";
   try {
     program_->load({kReloadLimit, {}});
+    for (const std::unique_ptr<ProjectionSplit> &split : projections_)
+      if (split) split->program->load({kReloadLimit, {}});
     logLine("Neural Engine FFN program reloaded in ", std::fixed, std::setprecision(2),
             millisecondsSince(start) / 1000.0, " s");
     return;
@@ -648,15 +702,28 @@ void AneFfn::restore() noexcept {
 void AneFfn::warnStopped() {
   if (std::exchange(warned_, true)) return;
   logWarning("Neural Engine FFN split stopped (", handoff_.reason(),
-             "); the GPU runs the prefill FFN alone until the engine restarts.");
+             restartable() ? "); the GPU runs the prefill FFN alone until the Neural Engine reports the evaluation, "
+                             "then the split resumes."
+                           : "); the GPU runs the prefill FFN alone until the engine restarts.");
 }
 
 void AneFfn::queue(const Job &job) {
-  const ane::Program::Binding &binding = evaluations_.at(job.evaluation).bindings.at(job.set);
+  const ProjectionSplit *split = job.owner == kFfn ? nullptr : projections_.at(job.owner).get();
+  ane::Program &program = split ? *split->program : *program_;
+  const std::vector<Evaluation> &evaluations = !split        ? evaluations_
+                                               : job.deferred ? split->deferred.evaluations
+                                                              : split->ahead.evaluations;
+  const ane::Program::Binding &binding = evaluations.at(job.evaluation).bindings.at(job.set);
   handoff_.queue(job.ready, job.done,
                  [&](const metal::SharedEvent &event, uint64_t wait, uint64_t signal, ane::Handoff::Report report) {
-                   program_->enqueue(binding, event, wait, signal, std::move(report));
+                   program.enqueue(binding, event, wait, signal, std::move(report));
                  });
+}
+
+std::vector<uint32_t> AneFfn::functionRowsOf() const {
+  std::vector<uint32_t> rows;
+  for (const Evaluation &evaluation : evaluations_) rows.push_back(evaluation.rows);
+  return rows;
 }
 
 void AneFfn::fillNormalized(const metal::MetalBuffer &normalized) {
@@ -726,6 +793,600 @@ double AneFfn::verify(std::span<const SwiGluProjections> layers, const PrefillFf
     if (!(error <= kMaximumAneError))
       fail("differs from the GPU alone's by " + std::to_string(100.0 * error) + "% of the Neural Engine's part");
     worst = std::max(worst, error);
+  }
+  return worst;
+}
+
+
+// The mixers' projections. A layer joins the ANE's ahead columns before its
+// mixer reads them and the deferred ones before its gate, so neither waits
+// on more than its own projection: each kind balances the GPU and the ANE
+// on its own (ane_ffn::ProjectionKind), over the FFN's handoff and staging.
+
+namespace {
+
+using ane_ffn::Columns;
+using ane_ffn::ProjectionKind;
+
+// The kinds that read a mixer's rows and add the residual in their join;
+// the others read the hidden rows the FFN's input surfaces hold.
+bool outputKind(ProjectionKind kind) {
+  return kind == ProjectionKind::GdnOutput || kind == ProjectionKind::AttentionOutput;
+}
+
+// The output columns a projection's tensors hold; the ones past them are
+// padding, which nothing reads.
+uint32_t tensorColumns(const Projection &projection) {
+  const QuantizedSegment &last = projection.blocks().segments.back();
+  return last.columnOffset + last.outputSize;
+}
+
+// Whether the ANE can stage `projection`'s rows: each tensor it stacks a
+// quantized one in planes, of whole plane tiles, which the GPU reads
+// unrotated over all its inputs.
+bool stagesTensors(const Projection &projection) {
+  if (projection.rotation || projection.planeInputs()) return false;
+  for (const QuantizedSegment &segment : projection.blocks().segments)
+    if (segment.isFloat() || segment.outputSize % QUANT_TILE_ROWS) return false;
+  return true;
+}
+
+// The first tensor of a stacked projection, whose leading rows the GPU's
+// part of a split views.
+Projection firstTensor(const Projection &projection) {
+  if (projection.blocks().segments.size() == 1) return projection;
+  QuantizedSegment first = projection.blocks().segments.front();
+  const uint32_t rows = first.outputSize;
+  return Projection(rows, projection.inputSize, BlockWeights{{std::move(first)}});
+}
+
+// Calls `use(planes, begin, length, offset)` for each piece of the columns
+// [begin, begin + length) one tensor holds, `begin` the tensor's own row and
+// `offset` the piece's from the range's start.
+template <class Tensors, class Use>
+void eachTensorPiece(const Tensors &tensors, uint32_t begin, uint32_t length, Use &&use) {
+  for (const auto &tensor : tensors) {
+    const uint32_t from = std::max(begin, tensor.first), to = std::min(begin + length, tensor.first + tensor.rows);
+    if (from < to) use(tensor, from - tensor.first, to - from, from - begin);
+  }
+}
+
+uint32_t countOf(const Columns &columns) {
+  uint32_t count = 0;
+  for (const auto &[begin, length] : columns) count += length;
+  return count;
+}
+
+// Whether ane_proj_join maps `columns`: a first range, then one more or equal
+// blocks at a fixed stride, each of whole join tiles and whole rows of the
+// weight kernels' threadgroups, past the GPU's `gpu` columns and inside the
+// projection's `width`.
+bool joinable(const Columns &columns, uint32_t gpu, uint32_t width) {
+  for (const auto &[begin, length] : columns)
+    if (!length || length % ANE_FFN_TILE || length % ANE_FFN_WEIGHT_ROWS || begin < gpu || begin + length > width)
+      return false;
+  if (columns.size() <= 2) return true;
+  const uint32_t length = columns[1].second, stride = columns[2].first - columns[1].first;
+  for (size_t index = 1; index < columns.size(); ++index)
+    if (columns[index].second != length || columns[index].first != columns[1].first + (index - 1) * stride)
+      return false;
+  return stride >= length;
+}
+
+} // namespace
+
+const char *AneFfn::unsupportedProjections(const ane_ffn::ProjectionLayout &layout) {
+  // Two layers stage both weight sets, which verifyProjections() checks.
+  if (layout.layers.size() < 2) return "ANE projection split needs two or more layers";
+  const Projection &front = *layout.layers.front();
+  // Columns past the tensors' are padding, which neither part writes.
+  const uint32_t width = tensorColumns(front), inputs = front.inputSize;
+  for (const Projection *projection : layout.layers) {
+    if (!stagesTensors(*projection)) return "ANE projection split needs unrotated quantized projections";
+    if (projection->outputSize != front.outputSize || projection->inputSize != inputs ||
+        projection->blocks().segments.size() != front.blocks().segments.size() || tensorColumns(*projection) != width)
+      return "ANE projection split layers differ in shape";
+  }
+  if (inputs % kRotateGroup || inputs / kRotateGroup > ANE_FFN_ROTATE_BLOCKS)
+    return "ANE projection split needs inputs ane_ffn_rotate takes";
+  if (layout.units < 2 || !layout.unitColumns || layout.unitColumns % QUANT_TILE_ROWS ||
+      layout.unitColumns % ANE_FFN_TILE || uint64_t{layout.units} * layout.unitColumns > width)
+    return "ANE projection split needs two or more units of whole plane tiles";
+  if (!layout.ahead) return "ANE projection split has no columns ahead of the mixer";
+  if (uint64_t{layout.units - 1} * layout.unitColumns > front.blocks().segments.front().outputSize)
+    return "ANE projection split needs the GPU's columns in the projection's first tensor";
+  for (uint32_t aneUnits = 1; aneUnits < layout.units; ++aneUnits) {
+    const uint32_t gpu = (layout.units - aneUnits) * layout.unitColumns;
+    const Columns ahead = layout.ahead(aneUnits), deferred = layout.deferred ? layout.deferred(aneUnits) : Columns{};
+    if (ahead.empty() || !joinable(ahead, gpu, width) || (!deferred.empty() && !joinable(deferred, gpu, width)))
+      return "ANE projection split's columns are not ones its join maps";
+    if (!deferred.empty() && outputKind(layout.kind)) return "an output projection defers no columns";
+    // Every column once, the GPU's or the ANE's: a column of neither would
+    // hold what the output held before.
+    std::vector<bool> covered(width);
+    std::fill_n(covered.begin(), gpu, true);
+    for (const Columns *columns : {&ahead, &deferred})
+      for (const auto &[begin, length] : *columns)
+        for (uint32_t column = begin; column < begin + length; ++column) {
+          if (covered[column]) return "ANE projection split's columns overlap";
+          covered[column] = true;
+        }
+    if (!std::ranges::all_of(covered, std::identity{})) return "ANE projection split leaves columns to neither part";
+  }
+  return nullptr;
+}
+
+template <class MakeBuffer, class MakeSurface>
+std::unique_ptr<AneFfn::ProjectionSplit> AneFfn::allocateProjection(const ane_ffn::ProjectionLayout &layout,
+                                                                    uint32_t aneUnits, MakeBuffer &&buffer,
+                                                                    MakeSurface &&surface) {
+  if (const char *reason = unsupportedProjections(layout)) throw std::invalid_argument(reason);
+  if (!aneUnits || aneUnits >= layout.units)
+    throw std::invalid_argument("ANE projection split leaves the GPU or the ANE no units");
+  auto split = std::make_unique<ProjectionSplit>();
+  split->kind = layout.kind;
+  split->units = layout.units;
+  split->aneUnits = aneUnits;
+  split->width = layout.layers.front()->outputSize;
+  split->inputs = layout.layers.front()->inputSize;
+  split->gpu = (layout.units - aneUnits) * layout.unitColumns;
+  split->segments = segments(split->inputs);
+  split->layers = layout.layers;
+  const uint64_t layers = layout.layers.size();
+  split->gpuPart = buffer(uint64_t{kMaximumRows} * split->gpu * sizeof(uint16_t), "ane projection gpu part");
+  if (outputKind(layout.kind)) {
+    split->rotated =
+        buffer(uint64_t{kMaximumRows} * split->inputs * sizeof(_Float16), "ane projection rotated input");
+    for (const uint32_t width : split->segments) split->x.push_back(surface(width, kMaximumRows, Element::Int8));
+  }
+  const auto columns = [&](ProjectionColumns &part, Columns given, const char *label) {
+    part.columns = std::move(given);
+    part.count = countOf(part.columns);
+    if (!part.count) return;
+    part.rowScales = buffer(layers * part.count * sizeof(_Float16), label);
+    for (std::vector<ane::Surface> &set : part.weights)
+      for (const uint32_t width : split->segments) set.push_back(surface(part.count, width, Element::Int8));
+    for (ane::Surface &scale : part.scales) scale = surface(part.count, 1, Element::Float16);
+    part.partial = surface(part.count, kMaximumRows, Element::Float16);
+  };
+  columns(split->ahead, layout.ahead(aneUnits), "ane projection row scales");
+  columns(split->deferred, layout.deferred ? layout.deferred(aneUnits) : Columns{},
+          "ane projection deferred row scales");
+  return split;
+}
+
+uint64_t AneFfn::plannedProjectionBytes(const ane_ffn::ProjectionLayout &layout, uint32_t aneUnits) {
+  uint64_t bytes = 0;
+  static_cast<void>(allocateProjection(
+      layout, aneUnits,
+      [&](uint64_t size, const char *) {
+        bytes += alignUp(size);
+        return metal::MetalBuffer{};
+      },
+      [&](uint32_t rows, uint32_t width, Element element) {
+        bytes += ane::Surface::bytes(rows, width, element);
+        return ane::Surface{};
+      }));
+  return bytes;
+}
+
+std::string AneFfn::projectionFunction(bool deferred, uint32_t rows) {
+  return (deferred ? "deferred" : "ahead") + std::to_string(rows);
+}
+
+// x<k>: the chunk's rotated int8 inputs of segment k, the FFN's for an input
+// projection; w<k>: the ANE's rotated int8 rows of the projection over
+// segment k; s: their per-row scales. A function's output holds the ANE's
+// columns before each token's input scale, which the join applies.
+std::string AneFfn::projectionProgram(const ProjectionSplit &split, const std::vector<ane::Surface> &x,
+                                      std::span<const uint32_t> rows) {
+  const std::string unit = fp16(1.0 / ANE_FFN_INT8_UNIT);
+  std::string text = "program(1.3)\n{\n";
+  for (const bool deferred : {false, true}) {
+    const ProjectionColumns &part = deferred ? split.deferred : split.ahead;
+    if (!part.count) continue;
+    for (const uint32_t count : rows) {
+      std::string parameters, body, total;
+      const auto line = [&](const std::string &statement) { body += "        " + statement + ";\n"; };
+      for (uint32_t k = 0; k < split.segments.size(); ++k) {
+        const std::string i = std::to_string(k);
+        const uint32_t width = split.segments[k];
+        parameters += (k ? ", " : "") + x[k].bufferType(width, count) + " x" + i + ", " +
+                      part.weights[0][k].bufferType(part.count, width) + " w" + i;
+        line(tensor("int8", width, count) + " x" + i + "_t = tensor_buffer_to_tensor<ios17>(input = x" + i + ")");
+        line(tensor("int8", part.count, width) + " w" + i + "_t = tensor_buffer_to_tensor<ios17>(input = w" + i +
+             ")");
+        line(tensor("fp16", width, count) + " x" + i + "_d = dequantize(input = x" + i + "_t, scale = " + unit + ")");
+        line(tensor("fp16", part.count, width) + " w" + i + "_d = dequantize(input = w" + i + "_t, scale = " + unit +
+             ")");
+        line(tensor("fp16", part.count, count) + " m" + i +
+             " = matmul(transpose_x = bool(false), transpose_y = bool(false), x = w" + i + "_d, y = x" + i + "_d)");
+        if (k) {
+          line(tensor("fp16", part.count, count) + " sum" + i + " = add(x = " + total + ", y = m" + i + ")");
+          total = "sum" + i;
+        } else {
+          total = "m0";
+        }
+      }
+      parameters += ", " + part.scales[0].bufferType(part.count, 1) + " s";
+      line(tensor("fp16", part.count, 1) + " s_t = tensor_buffer_to_tensor<ios17>(input = s)");
+      line(tensor("fp16", part.count, count) + " ys = mul(x = " + total + ", y = s_t)");
+      line(part.partial.bufferType(part.count, count) +
+           " y = tensor_to_tensor_buffer<ios17>(input = ys, interleave_factors = tensor<uint8, [4]>([1, 1, 1, 1]), "
+           "strides = tensor<int64, [4]>(" + part.partial.strides(part.count) + "))");
+      text += "    func " + projectionFunction(deferred, count) + "<ios18>(" + parameters + ") {\n" + body +
+              "    } -> (y);\n";
+    }
+  }
+  return text + "}\n";
+}
+
+void AneFfn::addProjections(const ane_ffn::ProjectionLayout &layout, uint32_t aneUnits) {
+  addProjections(layout, aneUnits, functionRowsOf());
+}
+
+void AneFfn::addProjections(const ane_ffn::ProjectionLayout &layout, uint32_t aneUnits,
+                            std::span<const uint32_t> functionRows) {
+  std::unique_ptr<ProjectionSplit> &slot = projections_.at(static_cast<size_t>(layout.kind));
+  const std::string name = ane_ffn::projectionName(layout.kind);
+  if (slot) throw std::logic_error("ANE split already takes the " + name + " projections");
+  if (!outputKind(layout.kind) && !layout.layers.empty() && layout.layers.front()->inputSize != shape_.hidden)
+    throw std::invalid_argument("ANE split's input projections read other rows than its FFN's");
+  uint64_t allocated = 0;
+  std::unique_ptr<ProjectionSplit> split = allocateProjection(
+      layout, aneUnits,
+      [&](uint64_t bytes, const char *label) {
+        metal::MetalBuffer buffer = backend_.allocateBuffer(bytes, metal::BufferStorage::Shared, label);
+        allocated += buffer.allocatedBytes();
+        return buffer;
+      },
+      [&](uint32_t rows, uint32_t width, Element element) {
+        ane::Surface surface = ane::Surface::create(backend_, rows, width, element);
+        allocated += surface.buffer.allocatedBytes();
+        return surface;
+      });
+  split->allocatedBytes = allocated;
+  for (const Projection *source : layout.layers) {
+    std::vector<Planes> &tensors = split->planes.emplace_back();
+    for (const QuantizedSegment &segment : source->blocks().segments) tensors.emplace_back(segment, source->inputSize);
+    split->gpuRows.push_back(firstTensor(*source).leadingRows(backend_, split->gpu));
+  }
+  const std::vector<ane::Surface> &x = inputsOf(*split);
+  split->program = std::make_unique<ane::Program>(projectionProgram(*split, x, functionRows),
+                                                  std::span<const uint8_t>{},
+                                                  ane::Program::Limits{kProgramLimit, interrupted_});
+  for (const bool deferred : {false, true}) {
+    ProjectionColumns &part = deferred ? split->deferred : split->ahead;
+    if (!part.count) continue;
+    for (const uint32_t rows : functionRows) {
+      Evaluation &evaluation = part.evaluations.emplace_back();
+      evaluation.rows = rows;
+      const uint32_t procedure = split->program->procedure(projectionFunction(deferred, rows));
+      for (uint32_t set = 0; set < 2; ++set) {
+        std::vector<ane::Surface> surfaces;
+        for (const std::string &input : split->program->inputs(procedure)) {
+          const uint32_t k = input.size() > 1 ? static_cast<uint32_t>(std::stoul(input.substr(1))) : 0;
+          if (input[0] == 'x')
+            surfaces.push_back(x.at(k));
+          else if (input[0] == 'w')
+            surfaces.push_back(part.weights[set].at(k));
+          else if (input == "s")
+            surfaces.push_back(part.scales[set]);
+          else
+            throw std::logic_error("ANE projection program has an unknown input " + input);
+        }
+        evaluation.bindings.push_back(split->program->bind(procedure, surfaces, part.partial));
+      }
+    }
+  }
+
+  // Each ANE row's int8 scale over its rotated inputs, once.
+  metal::CommandGraph graph;
+  for (uint32_t layer = 0; layer < split->planes.size(); ++layer) {
+    for (const ProjectionColumns *part : {&split->ahead, &split->deferred}) {
+      uint32_t offset = 0;
+      for (const auto &[begin, length] : part->columns) {
+        eachTensorPiece(split->planes[layer], begin, length,
+                        [&](const Planes &planes, uint32_t row, uint32_t rows, uint32_t piece) {
+                          graph.add(kernel("ane_ffn_row_scale_gguf", Rotation::Inputs),
+                                    {planes.buffers[0], planes.buffers[1], planes.buffers[2],
+                                     backend_.view(part->rowScales,
+                                                   (uint64_t{layer} * part->count + offset + piece) * sizeof(_Float16),
+                                                   uint64_t{rows} * sizeof(_Float16)),
+                                     memory_.signs},
+                                    AneFfnWeightParams{planes.groups, row, 0, split->inputs, 0, 0, planes.format},
+                                    {rows / ANE_FFN_WEIGHT_ROWS, 1, 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
+                        });
+        offset += length;
+      }
+    }
+  }
+  static_cast<void>(backend_.submitCommandAsync(graph.dispatches()).wait());
+  allocatedBytes_ += split->allocatedBytes;
+  slot = std::move(split);
+}
+
+void AneFfn::removeProjections(ane_ffn::ProjectionKind kind) {
+  std::unique_ptr<ProjectionSplit> &slot = projections_.at(static_cast<size_t>(kind));
+  if (!slot) return;
+  if (unfinished_ || !jobs_.empty() || !handoff_.idle())
+    throw std::logic_error("ANE projection split removed while its evaluations may run");
+  allocatedBytes_ -= slot->allocatedBytes;
+  slot.reset();
+}
+
+bool AneFfn::projects(ane_ffn::ProjectionKind kind, uint32_t rows) const {
+  const ProjectionSplit *split = projection(kind);
+  return split && !split->lost && splits(rows);
+}
+
+double AneFfn::projectionShare(ane_ffn::ProjectionKind kind) const noexcept {
+  const ProjectionSplit *split = projection(kind);
+  return split ? static_cast<double>(split->aneUnits) / split->units : 0.0;
+}
+
+void AneFfn::setProjectionBreaker(ane_ffn::ProjectionKind kind, ane_ffn::Breaker breaker) {
+  ProjectionSplit *split = projection(kind);
+  if (!split)
+    throw std::logic_error(std::string("ANE split judges ") + ane_ffn::projectionName(kind) +
+                           " projections it does not take");
+  split->breaker = std::move(breaker);
+}
+
+// Each range's rows follow the range before's in the surfaces.
+void AneFfn::addProjectionWeights(const ProjectionSplit &split, metal::CommandGraph &graph, uint32_t layer,
+                                  uint32_t set) const {
+  const std::vector<Planes> &tensors = split.planes.at(layer);
+  for (const ProjectionColumns *part : {&split.ahead, &split.deferred}) {
+    if (!part->count) continue;
+    const ane::Surface &scale = part->scales[set];
+    const uint32_t scaleStride = scale.strideBytes / uint32_t{sizeof(_Float16)};
+    uint32_t input = 0;
+    for (uint32_t k = 0; k < split.segments.size(); ++k) {
+      const ane::Surface &output = part->weights[set][k];
+      const uint32_t width = split.segments[k];
+      requireBytes(output.buffer, rowBytes(part->count, output.strideBytes, width, 1),
+                   "ANE projection weight surface");
+      uint32_t offset = 0;
+      for (const auto &[begin, length] : part->columns) {
+        eachTensorPiece(tensors, begin, length, [&](const Planes &planes, uint32_t row, uint32_t rows, uint32_t piece) {
+          const uint32_t at = offset + piece;
+          graph.add(kernel("ane_ffn_weights_gguf", Rotation::Inputs),
+                    {planes.buffers[0], planes.buffers[1], planes.buffers[2],
+                     backend_.view(part->rowScales, (uint64_t{layer} * part->count + at) * sizeof(_Float16),
+                                   uint64_t{rows} * sizeof(_Float16)),
+                     backend_.view(output.buffer, uint64_t{at} * output.strideBytes, uint64_t{rows} * output.strideBytes),
+                     backend_.view(scale.buffer, uint64_t{at} * scale.strideBytes, uint64_t{rows} * scale.strideBytes),
+                     memory_.signs},
+                    AneFfnWeightParams{planes.groups, row, input, width, output.strideBytes, scaleStride, planes.format},
+                    {rows / ANE_FFN_WEIGHT_ROWS, width / blockOf(Rotation::Inputs), 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
+        });
+        offset += length;
+      }
+      input += width;
+    }
+  }
+}
+
+// The set a kind's next layer reads was last read by the layer before its
+// last, whose evaluations the last's joins followed.
+void AneFfn::addNextProjectionWeights(metal::CommandGraph &graph) {
+  for (const std::unique_ptr<ProjectionSplit> &split : projections_) {
+    if (!split || split->lost || split->next >= split->planes.size() || split->staged == split->next) continue;
+    addProjectionWeights(*split, graph, split->next, split->next & 1);
+    split->staged = split->next;
+  }
+}
+
+AneProjJoinParams AneFfn::joinParams(const ProjectionSplit &split, const ProjectionColumns &columns,
+                                     uint32_t rows) const {
+  const Columns &ranges = columns.columns;
+  AneProjJoinParams params{split.width,
+                           &columns == &split.ahead ? split.gpu : 0,
+                           columns.partial.strideBytes / uint32_t{sizeof(_Float16)},
+                           rows,
+                           ranges.front().first,
+                           ranges.front().second,
+                           0,
+                           0,
+                           0,
+                           0};
+  if (ranges.size() >= 2) params.begin2 = ranges[1].first;
+  if (ranges.size() > 2) {
+    params.block_length = ranges[1].second;
+    params.block_stride = ranges[2].first - ranges[1].first;
+  }
+  return params;
+}
+
+void AneFfn::addProjection(ane_ffn::ProjectionKind kind, metal::CommandGraph &graph, uint32_t layer,
+                           metal::MetalBuffer input, metal::MetalBuffer output, uint32_t rows, LinearScratch scratch,
+                           metal::MetalBuffer residual) {
+  encodeProjection(kind, graph, layer, std::move(input), std::move(output), rows, scratch, std::move(residual),
+                   Parts::Both);
+}
+
+void AneFfn::addDeferredJoin(ane_ffn::ProjectionKind kind, metal::CommandGraph &graph, metal::MetalBuffer output,
+                             uint32_t rows) {
+  encodeDeferredJoin(kind, graph, std::move(output), rows, Parts::Both);
+}
+
+// The GPU's leading columns and the ANE's ahead columns of the layer, joined;
+// the ANE's deferred columns start as its ahead ones end, and the GPU waits
+// for them in encodeDeferredJoin(), which must come before the GPU next
+// raises the event: a higher value would meet that wait.
+void AneFfn::encodeProjection(ane_ffn::ProjectionKind kind, metal::CommandGraph &graph, uint32_t layer,
+                              metal::MetalBuffer input, metal::MetalBuffer output, uint32_t rows,
+                              LinearScratch scratch, metal::MetalBuffer residual, Parts parts) {
+  ProjectionSplit *split = projection(kind);
+  const std::string name = ane_ffn::projectionName(kind);
+  if (!split || split->lost) throw std::logic_error("ANE split adds " + name + " projections it does not take");
+  if (rows < kMinimumRows || rows > kMaximumRows)
+    throw std::invalid_argument("ANE projection split does not take a chunk of these rows");
+  if (layer != split->next || layer >= split->planes.size())
+    throw std::logic_error("ANE split adds " + name + " projection " + std::to_string(layer) + ", not its next " +
+                           std::to_string(split->next) + " (begin() starts each command at 0)");
+  if (outputKind(kind) != static_cast<bool>(residual))
+    throw std::invalid_argument("an output projection split takes its residual, an input projection none");
+  if (split->deferredDone)
+    throw std::logic_error("ANE split adds a " + name +
+                           " projection before joining the last one's deferred columns");
+  const uint64_t outputBytes = uint64_t{rows} * split->width * sizeof(uint16_t);
+  requireBytes(input, uint64_t{rows} * split->inputs * sizeof(uint16_t), "ANE projection input");
+  requireBytes(output, outputBytes, "ANE projection output");
+  if (residual) requireBytes(residual, outputBytes, "ANE projection residual");
+  const auto found = std::ranges::find_if(split->ahead.evaluations,
+                                          [&](const Evaluation &evaluation) { return evaluation.rows >= rows; });
+  if (found == split->ahead.evaluations.end())
+    throw std::invalid_argument("ANE projection split has no function of the chunk's rows");
+  const auto evaluation = static_cast<uint32_t>(found - split->ahead.evaluations.begin());
+  const uint32_t set = layer & 1, tiles = (rows + ANE_FFN_TILE - 1) / ANE_FFN_TILE;
+  const bool ane = parts == Parts::Both;
+  const auto owner = static_cast<uint8_t>(kind);
+  // A command's first layer of the kind stages its own rows; each later one
+  // finds them staged during the FFN before it (addNextProjectionWeights).
+  if (split->staged != layer) {
+    addProjectionWeights(*split, graph, layer, set);
+    split->staged = layer;
+  }
+  const metal::MetalBuffer rotated = split->rotated ? split->rotated : memory_.rotated;
+  const std::vector<ane::Surface> &x = inputsOf(*split);
+  graph.add("ane_ffn_rotate", {input, memory_.signs, rotated, memory_.tokenScale.buffer},
+            AneFfnRotateParams{split->inputs}, {rows, 1, 1}, {ANE_FFN_ROTATE_THREADS, 1, 1});
+  uint32_t channel = 0;
+  for (uint32_t k = 0; k < split->segments.size(); ++k) {
+    graph.add("ane_ffn_pack", {rotated, x[k].buffer}, AneFfnPackParams{split->inputs, channel, x[k].strideBytes},
+              {tiles, split->segments[k] / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
+    channel += split->segments[k];
+  }
+  const uint64_t ready = ane ? handoff_.next() : 0;
+  if (ane) graph.signal(handoff_.event(), ready);
+  linear_.addPrefill(graph, input, split->gpuRows[layer], split->gpuPart, rows, scratch);
+  const uint64_t done = ane ? handoff_.next() : 0;
+  if (ane) graph.wait(handoff_.event(), done);
+  const AneProjJoinParams params = joinParams(*split, split->ahead, rows);
+  const uint64_t columnTiles = (split->gpu + split->ahead.count) / ANE_FFN_TILE;
+  if (residual)
+    graph.add("ane_proj_join_residual",
+              {output, split->gpuPart, split->ahead.partial.buffer, memory_.tokenScale.buffer, memory_.status,
+               residual},
+              params, {tiles, columnTiles, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
+  else
+    graph.add("ane_proj_join",
+              {output, split->gpuPart, split->ahead.partial.buffer, memory_.tokenScale.buffer, memory_.status},
+              params, {tiles, columnTiles, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
+  if (ane) {
+    jobs_.push_back({evaluation, set, ready, done, owner});
+    if (split->deferred.count) {
+      split->deferredDone = handoff_.next();
+      jobs_.push_back({evaluation, set, done, split->deferredDone, owner, true});
+    }
+  }
+  encodingRows_ = split->ahead.evaluations[evaluation].rows;
+  ++split->next;
+}
+
+void AneFfn::encodeDeferredJoin(ane_ffn::ProjectionKind kind, metal::CommandGraph &graph, metal::MetalBuffer output,
+                                uint32_t rows, Parts parts) {
+  ProjectionSplit *split = projection(kind);
+  const std::string name = ane_ffn::projectionName(kind);
+  if (!split || !split->deferred.count || !split->next)
+    throw std::logic_error("ANE split joins deferred columns of no " + name + " projection");
+  if (parts == Parts::Both && !split->deferredDone)
+    throw std::logic_error("ANE split joins the deferred columns of a " + name + " projection twice");
+  requireBytes(output, uint64_t{rows} * split->width * sizeof(uint16_t), "ANE projection output");
+  if (parts == Parts::Both) graph.wait(handoff_.event(), std::exchange(split->deferredDone, 0));
+  graph.add("ane_proj_join",
+            {output, split->gpuPart, split->deferred.partial.buffer, memory_.tokenScale.buffer, memory_.status},
+            joinParams(*split, split->deferred, rows),
+            {(rows + ANE_FFN_TILE - 1) / ANE_FFN_TILE, split->deferred.count / ANE_FFN_TILE, 1},
+            {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
+}
+
+// What the ANE adds is the GPU alone's output in the ANE's columns, which the
+// split's difference from the GPU alone is held against, as verify() holds
+// the FFN's, over each function's rows of the first layer and then of the
+// second, which reads the other weight set.
+double AneFfn::verifyProjections(ane_ffn::ProjectionKind kind, metal::MetalBuffer input, metal::MetalBuffer output,
+                                 LinearScratch scratch, metal::MetalBuffer residual) {
+  try {
+    return checkProjections(kind, std::move(input), std::move(output), scratch, std::move(residual));
+  } catch (...) {
+    // The split goes on without the kind; one whose evaluations may still
+    // run keeps it, never to split it.
+    try {
+      removeProjections(kind);
+    } catch (const std::logic_error &) {
+      if (ProjectionSplit *split = projection(kind)) split->lost = true;
+    }
+    throw;
+  }
+}
+
+double AneFfn::checkProjections(ane_ffn::ProjectionKind kind, metal::MetalBuffer input, metal::MetalBuffer output,
+                                LinearScratch scratch, metal::MetalBuffer residual) {
+  ProjectionSplit *split = projection(kind);
+  const std::string name = ane_ffn::projectionName(kind);
+  if (!split) throw std::logic_error("ANE split verifies " + name + " projections it does not take");
+  if (handoff_.retired()) throw std::runtime_error("ANE FFN split stopped (" + handoff_.reason() + ")");
+  fillNormalized(input);
+  if (residual) std::memset(residual.contents(), 0, residual.sizeBytes());
+  // The ANE's columns; padding past the tensors' columns neither part writes.
+  const uint32_t columns = tensorColumns(*split->layers.front());
+  std::vector<bool> ane(split->width);
+  for (const ProjectionColumns *part : {&split->ahead, &split->deferred})
+    for (const auto &[begin, length] : part->columns) std::fill_n(ane.begin() + begin, length, true);
+  // Layers 0 to `last` of the kind, of `rows` rows, the GPU alone's or split.
+  const auto forward = [&](bool splitting, uint32_t last, uint32_t rows) {
+    metal::CommandGraph graph;
+    if (splitting) {
+      for (const ProjectionColumns *part : {&split->ahead, &split->deferred})
+        if (part->count)
+          std::fill_n(static_cast<uint16_t *>(part->partial.buffer.contents()),
+                      part->partial.buffer.sizeBytes() / sizeof(uint16_t), kHalfNaN);
+      static_cast<void>(begin());
+    }
+    for (uint32_t layer = 0; layer <= last; ++layer) {
+      if (splitting) {
+        addProjection(kind, graph, layer, input, output, rows, scratch, residual);
+        if (split->deferred.count) addDeferredJoin(kind, graph, output, rows);
+      } else if (residual) {
+        linear_.addPrefillResidual(graph, input, *split->layers[layer], residual, output, rows, scratch);
+      } else {
+        linear_.addPrefill(graph, input, *split->layers[layer], output, rows, scratch);
+      }
+    }
+    if (splitting) {
+      static_cast<void>(commit(graph, {}).wait());
+      if (!completed())
+        throw std::runtime_error("ANE split of the " + name + " projections of " + std::to_string(rows) +
+                                 " rows failed (" + reason() + ")");
+    } else {
+      static_cast<void>(backend_.submitCommandAsync(graph.command()).wait());
+    }
+    return bf16Values(output, uint64_t{rows} * split->width);
+  };
+  double worst = 0.0;
+  for (uint32_t last = 0; last < 2; ++last) {
+    const std::vector<float> gpu = forward(false, last, kMaximumRows);
+    for (const Evaluation &evaluation : split->ahead.evaluations) {
+      const uint32_t rows = evaluation.rows;
+      const std::vector<float> got = forward(true, last, rows);
+      const auto fail = [&](const std::string &why) {
+        throw std::runtime_error("ANE split's " + name + " projections of " + std::to_string(rows) + " rows " + why);
+      };
+      double difference = 0.0, contribution = 0.0;
+      for (size_t i = 0; i < got.size(); ++i) {
+        if (i % split->width >= columns) continue;
+        if (!std::isfinite(got[i])) fail("are not finite");
+        difference += (double(got[i]) - gpu[i]) * (double(got[i]) - gpu[i]);
+        if (ane[i % split->width]) contribution += double(gpu[i]) * gpu[i];
+      }
+      const double error = std::sqrt(difference / contribution);
+      if (!(error <= kMaximumAneError))
+        fail("differ from the GPU alone's by " + std::to_string(100.0 * error) + "% of the Neural Engine's part");
+      worst = std::max(worst, error);
+    }
   }
   return worst;
 }

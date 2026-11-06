@@ -3,6 +3,7 @@
 #include "ane/Handoff.hpp"
 #include "ane/Program.hpp"
 #include "metal/CommandGraph.hpp"
+#include "metal/abi/AneFfn.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/AneFfnCalibration.hpp"
 #include "ops/Linear.hpp"
@@ -14,12 +15,31 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace splash::ops {
 
 namespace ane_ffn {
 class Measurement;
+
+// Output columns of a projection, {begin, length} each.
+using Columns = std::vector<std::pair<uint32_t, uint32_t>>;
+// A kind of the mixers' projections as the model lays it out: its layers'
+// projections, all of one shape; the units the split moves its columns in,
+// of `unitColumns` each, the GPU taking the leading columns of all but the
+// ANE's units; and the ANE's columns with the ANE taking `aneUnits`: those
+// ahead of the mixer, which a layer joins before the mixer reads them, and
+// those it defers, which the mixer reads only at its gate and the ANE computes
+// while the GPU runs the scan or the attention, none for an output
+// projection. Ahead and deferred each list a first range and then at most one
+// more, or equal blocks at a fixed stride (ane_proj_join).
+struct ProjectionLayout final {
+  ProjectionKind kind = ProjectionKind::GdnInput;
+  std::vector<const Projection *> layers;
+  uint32_t units = 0, unitColumns = 0;
+  std::function<Columns(uint32_t aneUnits)> ahead, deferred;
+};
 } // namespace ane_ffn
 
 // The dense FFN of a prefill chunk split by intermediate channel between the
@@ -33,8 +53,10 @@ class Measurement;
 // (ane::Handoff). Any failure of the ANE's work stops the split for the life
 // of the process: finish() then reports the command's results unusable, and
 // the caller runs the chunk again on the GPU alone, which every later chunk
-// runs too. A split that loses to the GPU alone stops the same way, after a
-// command whose results are usable (setBreaker).
+// runs too. An evaluation that only ran late stops it until the ANE has
+// reported it, a few times at most, and the next command starts over. A split
+// that loses to the GPU alone stops for good, after a command whose results
+// are usable (setBreaker).
 class AneFfn final {
 public:
   // A chunk runs on the smallest of the program's functions that holds it,
@@ -142,6 +164,60 @@ public:
   // split, and the GPU runs every later chunk alone.
   void restore() noexcept;
 
+  // The mixers' projections, split by output channel over this split's
+  // handoff (AneFfn.cpp): the GPU computes a projection's leading
+  // columns with its prefill kernels over views of the leading rows of the
+  // projection's planes, the ANE the rest as a W8A8 program of its own over
+  // the chunk's rows, with int8 rows the GPU stages a layer ahead, and a join
+  // writes the ANE's columns where the layout puts them. A projection's ANE
+  // work fails, stops and resumes with the FFN's: it is the same split. Each
+  // kind judges itself against the GPU alone (setProjectionBreaker), and one
+  // that loses goes back to the GPU alone without stopping the rest.
+  //
+  // Why the split does not take `layout`, or null when it does.
+  [[nodiscard]] static const char *unsupportedProjections(const ane_ffn::ProjectionLayout &layout);
+  // The Metal memory addProjections() allocates for `layout` with the ANE
+  // taking `aneUnits`.
+  [[nodiscard]] static uint64_t plannedProjectionBytes(const ane_ffn::ProjectionLayout &layout, uint32_t aneUnits);
+  // Splits `layout`'s projections with the ANE taking `aneUnits` of its
+  // units, from one to all but one, over chunks this split takes: allocates
+  // their memory, compiles and loads their program, a function of each of
+  // this split's functions' rows, and computes each row's int8 scale. Throws
+  // if the split cannot take them or already takes the kind; the split goes
+  // on without them.
+  void addProjections(const ane_ffn::ProjectionLayout &layout, uint32_t aneUnits);
+  // Whether a chunk of `rows` rows splits projections of `kind`: the split
+  // takes the chunk (splits()) and the kind, whose breaker has not tripped.
+  [[nodiscard]] bool projects(ane_ffn::ProjectionKind kind, uint32_t rows) const;
+  // The ANE's share of `kind`'s units, 0 for a kind the split does not take.
+  [[nodiscard]] double projectionShare(ane_ffn::ProjectionKind kind) const noexcept;
+  // Stops splitting `kind` once it loses to the GPU alone, as setBreaker()
+  // the FFN: `breaker` judges each command finish() finds split, and the
+  // owner's `lost` runs once when any breaker trips.
+  void setProjectionBreaker(ane_ffn::ProjectionKind kind, ane_ffn::Breaker breaker);
+  // Layer `layer`'s projection of `kind`, of the layers of that kind, from 0
+  // in order after begin(), for a chunk that projects(): output = input x the
+  // projection's rows, ahead of the mixer, plus `residual` for an output
+  // projection, which takes one. An input projection leaves its deferred
+  // columns to addDeferredJoin().
+  void addProjection(ane_ffn::ProjectionKind kind, metal::CommandGraph &graph, uint32_t layer,
+                     metal::MetalBuffer input, metal::MetalBuffer output, uint32_t rows, LinearScratch scratch,
+                     metal::MetalBuffer residual = {});
+  // Waits for the deferred columns of the input projection addProjection()
+  // added last of `kind` and joins them into `output`: before the mixer reads
+  // them, and before anything the GPU signals the handoff with next.
+  void addDeferredJoin(ane_ffn::ProjectionKind kind, metal::CommandGraph &graph, metal::MetalBuffer output,
+                       uint32_t rows);
+  // Checks `kind`'s split against the GPU alone as verify() checks the FFN's,
+  // on its first two layers, reading `input` and writing `output`, after
+  // `residual` for an output projection, all of which it overwrites. Returns
+  // the largest error of what the ANE adds. Throws as verify() does, and the
+  // split then goes on without the kind; only a failure of the ANE's work
+  // stops the split.
+  [[nodiscard]] double verifyProjections(ane_ffn::ProjectionKind kind, metal::MetalBuffer input,
+                                         metal::MetalBuffer output, LinearScratch scratch,
+                                         metal::MetalBuffer residual = {});
+
 private:
   // Times the split's layers and their GPU part against the GPU's alone.
   friend class ane_ffn::Measurement;
@@ -173,12 +249,14 @@ private:
   };
   // A projection's weight planes as the ane_ffn kernels bind them: an image
   // tensor's plane0, plane1 and meta, in groups of 32 inputs, of their
-  // `groups` per row, and its `format`.
+  // `groups` per row, and its `format`; `first` and `rows` are the
+  // projection's output columns the tensor holds.
   struct Planes final {
     // Throws unless the planes hold all of the projection's weights.
     explicit Planes(const Projection &projection);
+    Planes(const QuantizedSegment &segment, uint32_t inputs);
     std::array<metal::MetalBuffer, 3> buffers;
-    uint32_t groups = 0, format = 0;
+    uint32_t groups = 0, format = 0, first = 0, rows = 0;
   };
   // A matrix of a layer: its index in Layer::planes, and the part of the
   // layer's per-row int8 scales rowScales() views.
@@ -215,7 +293,104 @@ private:
   struct Job final {
     uint32_t evaluation, set;
     uint64_t ready, done;
+    // The FFN's, kFfn, or a projection kind's (its index), and for a
+    // projection whether it evaluates the deferred columns.
+    uint8_t owner = kFfn;
+    bool deferred = false;
   };
+  static constexpr uint8_t kFfn = ane_ffn::kProjectionKinds;
+  // The ANE's columns of a projection kind, ahead of the mixer or deferred:
+  // the layout's columns and how many they hold; their int8 rows over each
+  // segment of the inputs and their per-row scales, staged in two sets, and
+  // each layer's per-row int8 scales, computed once; the partial output, its
+  // rows channel-major before each token's input scale; and the program's
+  // function of each of the split's rows, by rows, ascending.
+  struct ProjectionColumns final {
+    ane_ffn::Columns columns;
+    uint32_t count = 0;
+    std::array<std::vector<ane::Surface>, 2> weights;
+    std::array<ane::Surface, 2> scales;
+    metal::MetalBuffer rowScales;
+    ane::Surface partial;
+    std::vector<Evaluation> evaluations;
+  };
+  // A projection kind the split takes (addProjections()): its shape, the
+  // GPU's views of each layer's leading rows and the rows its part writes,
+  // the layers' planes the ANE's rows are staged from, the rotated inputs and
+  // their int8 segments of a projection whose inputs are not the hidden rows
+  // the FFN's surfaces hold, the ANE's columns, its program, and its breaker.
+  struct ProjectionSplit final {
+    static constexpr uint32_t kNotStaged = ~0u;
+    ane_ffn::ProjectionKind kind = ane_ffn::ProjectionKind::GdnInput;
+    uint32_t units = 0, aneUnits = 0, width = 0, inputs = 0, gpu = 0;
+    std::vector<uint32_t> segments;
+    std::vector<const Projection *> layers;
+    // Per layer, the planes of each tensor the projection stacks.
+    std::vector<std::vector<Planes>> planes;
+    std::vector<Projection> gpuRows;
+    metal::MetalBuffer gpuPart, rotated;
+    std::vector<ane::Surface> x;
+    ProjectionColumns ahead, deferred;
+    std::unique_ptr<ane::Program> program;
+    ane_ffn::Breaker breaker;
+    // What Metal allocated for it.
+    uint64_t allocatedBytes = 0;
+    // Once its breaker tripped.
+    bool lost = false;
+    // The layer addProjection() takes next, the one whose rows the weight
+    // sets hold the last staged of, and while its deferred evaluation runs,
+    // the event value that raises once done.
+    uint32_t next = 0, staged = kNotStaged;
+    uint64_t deferredDone = 0;
+  };
+  // The kind's split, null for one the split does not take.
+  [[nodiscard]] ProjectionSplit *projection(ane_ffn::ProjectionKind kind) const noexcept {
+    return projections_[static_cast<size_t>(kind)].get();
+  }
+  // The projection's shape and memory with the ANE taking `aneUnits` of
+  // `layout`, which `buffer` and `surface` make: plannedProjectionBytes()
+  // counts them and addProjections() allocates them.
+  template <class MakeBuffer, class MakeSurface>
+  [[nodiscard]] static std::unique_ptr<ProjectionSplit> allocateProjection(const ane_ffn::ProjectionLayout &layout,
+                                                                           uint32_t aneUnits, MakeBuffer &&buffer,
+                                                                           MakeSurface &&surface);
+  // The program of a projection's ahead and deferred columns, a function of
+  // each of `rows` rows of each, and their names.
+  [[nodiscard]] static std::string projectionProgram(const ProjectionSplit &split, const std::vector<ane::Surface> &x,
+                                                     std::span<const uint32_t> rows);
+  [[nodiscard]] static std::string projectionFunction(bool deferred, uint32_t rows);
+  // Layer `layer`'s int8 rows and their scales of `split`'s ANE columns into
+  // weight set `set`.
+  void addProjectionWeights(const ProjectionSplit &split, metal::CommandGraph &graph, uint32_t layer,
+                            uint32_t set) const;
+  // Stages each projection kind's next rows into the set its next layer
+  // reads, once, at a point where the GPU waits for the ANE anyway: the
+  // FFN's join (encode()), whose ANE part outlasts the GPU's on most Macs.
+  void addNextProjectionWeights(metal::CommandGraph &graph);
+  // The join of `columns` of `split` over `rows` rows.
+  [[nodiscard]] AneProjJoinParams joinParams(const ProjectionSplit &split, const ProjectionColumns &columns,
+                                             uint32_t rows) const;
+  // The ANE's input surfaces of `split`: the FFN's for the hidden rows.
+  [[nodiscard]] const std::vector<ane::Surface> &inputsOf(const ProjectionSplit &split) const noexcept {
+    return split.x.empty() ? memory_.inputs : split.x;
+  }
+  // The rows of the split's functions, ascending.
+  [[nodiscard]] std::vector<uint32_t> functionRowsOf() const;
+  // addProjections() with a function of each of `functionRows` rows, and its
+  // undoing, which calibration's timings take (ane_ffn::Measurement).
+  void addProjections(const ane_ffn::ProjectionLayout &layout, uint32_t aneUnits,
+                      std::span<const uint32_t> functionRows);
+  void removeProjections(ane_ffn::ProjectionKind kind);
+  // verifyProjections() but for its undoing of a kind that fails.
+  [[nodiscard]] double checkProjections(ane_ffn::ProjectionKind kind, metal::MetalBuffer input,
+                                        metal::MetalBuffer output, LinearScratch scratch, metal::MetalBuffer residual);
+  // addProjection(), or with Parts::Gpu the GPU's work alone, whose deferred
+  // join encodeDeferredJoin() adds without waiting.
+  void encodeProjection(ane_ffn::ProjectionKind kind, metal::CommandGraph &graph, uint32_t layer,
+                        metal::MetalBuffer input, metal::MetalBuffer output, uint32_t rows, LinearScratch scratch,
+                        metal::MetalBuffer residual, Parts parts);
+  void encodeDeferredJoin(ane_ffn::ProjectionKind kind, metal::CommandGraph &graph, metal::MetalBuffer output,
+                          uint32_t rows, Parts parts);
 
   // The split with a function of each of `functionRows` rows, ascending.
   AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
@@ -243,14 +418,16 @@ private:
   void queue(const Job &job);
   // finish() but for its log line and judgment: if every evaluation of the
   // command committed last succeeded and its joins read finite values, the
-  // Neural Engine's time over them (ane::Handoff::finish); none otherwise,
-  // which stops the split.
-  [[nodiscard]] std::optional<AwakeClock::duration> completed();
+  // Neural Engine's time over each, in the order of the command's jobs
+  // (ane::Handoff::finishEach); none otherwise, which stops the split.
+  [[nodiscard]] std::optional<std::vector<AwakeClock::duration>> completed();
   // Logs, once, that the split stopped.
   void warnStopped();
 
   metal::MetalBackend &backend_;
   const Linear linear_;
+  // Ends the wait for the ANE's service of each program the split compiles.
+  const std::function<bool()> interrupted_;
   Shape shape_;
   uint32_t minimumRows_ = kMinimumRows;
   std::vector<Layer> layers_;
@@ -262,8 +439,13 @@ private:
   // layer it adds next.
   std::vector<Job> jobs_;
   uint32_t nextLayer_ = 0;
-  // The evaluations of the command committed last, and its function's rows.
-  uint32_t committedEvaluations_ = 0, committedRows_ = 0;
+  // The jobs of the command committed last, and its function's rows.
+  std::vector<Job> committed_;
+  uint32_t committedRows_ = 0;
+  // The function rows of the command being encoded.
+  uint32_t encodingRows_ = 0;
+  // The projection kinds the split takes, by kind.
+  std::array<std::unique_ptr<ProjectionSplit>, ane_ffn::kProjectionKinds> projections_;
   ane_ffn::Breaker breaker_;
   std::function<void()> lost_;
   Served served_;
@@ -272,6 +454,9 @@ private:
   // From a release() that unloaded the program until restore().
   bool released_ = false;
   bool warned_ = false;
+  // Restarts after a late evaluation so far (begin()).
+  uint32_t restarts_ = 0;
+  [[nodiscard]] bool restartable() const;
   uint64_t allocatedBytes_ = 0;
   // Destroyed first: it waits for the evaluations the ANE has not reported.
   ane::Handoff handoff_;

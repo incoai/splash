@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace splash::ane {
 
@@ -67,6 +68,8 @@ public:
   // otherwise. Waits at most one bound for their reports: a job that has not
   // reported by then has failed. Forgets the command's jobs either way.
   [[nodiscard]] std::optional<AwakeClock::duration> finish();
+  // finish() job by job: each job's time in the order queue() took them.
+  [[nodiscard]] std::optional<std::vector<AwakeClock::duration>> finishEach();
   // The command will not be committed: retires with `reason`, forgets its
   // jobs, and waits at most one bound for the agent to report those it
   // started.
@@ -78,6 +81,13 @@ public:
   // Whether the agent has reported every job it started, so that none of
   // them still runs.
   [[nodiscard]] bool idle() const;
+  // Whether it retired because a job ran past the bound, rather than failing.
+  [[nodiscard]] bool overran() const;
+  // A handoff retired by an overrun, once idle: starts over on a new event,
+  // as if just constructed, so a stall the agent recovered from (a slow
+  // report under memory pressure) stops it for a moment rather than for good.
+  // False, changing nothing, otherwise.
+  bool restart(metal::MetalBackend &backend);
   // Why the handoff retired, the first failure's; empty until it does.
   [[nodiscard]] std::string reason() const;
 

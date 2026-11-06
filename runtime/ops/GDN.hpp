@@ -5,6 +5,7 @@
 #include "ops/Normalization.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string_view>
 
@@ -137,10 +138,13 @@ public:
   // gate then runs once over every row. The scan is sequential, so with an
   // fp32 state the runs compute what one run does, and a bf16 state is
   // rounded at each capture as a prefill ending there rounds it.
+  // `beforeGate`, when given, encodes work the gate must follow, as the join
+  // of packed columns the Neural Engine computed during the scan.
   static void addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &backend,
                          GdnPrefillBuffers buffers, GdnShape shape, uint32_t tokens,
                          GdnStateFormat state, GdnHeadOrder order,
-                         std::span<const GdnPrefillCapture> captures = {});
+                         std::span<const GdnPrefillCapture> captures = {},
+                         const std::function<void()> &beforeGate = {});
   // Also writes the out-projection's `input` table into
   // buffers.linearScratch when it is not Plain, and throws when the scratch
   // cannot hold it.

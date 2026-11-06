@@ -90,6 +90,8 @@ struct Fake {
   std::string unsupported;
   std::optional<std::string> unavailable;
   uint64_t unitBytes = 256 * kMiB;
+  // The memory of the mixers' projections the split may also take, whatever their units; none of a model of none.
+  uint64_t projectionBytes = 0;
   std::function<Timings()> time = measured;
   std::function<AneFfnPrepared(uint32_t, bool)> prepare = [](uint32_t, bool timed) {
     AneFfnPrepared prepared;
@@ -143,6 +145,10 @@ struct Fake {
     };
     result.forget = [this](uint32_t) { stored.reset(); };
     result.healthy = [this] { return healthy; };
+    if (projectionBytes) {
+      result.projectionUnits = {40, 24, 20, 20};
+      result.projectionBytes = [this](const splash::ops::ane_ffn::ProjectionUnits &) { return projectionBytes; };
+    }
     return result;
   }
 };
@@ -568,6 +574,26 @@ void testRemembered() {
   }
 }
 
+// Until a calibration is remembered, the plan sets memory aside for the most of the mixers' projections beside the
+// split, so that the most units it holds are fewer; projections the plan cannot hold beside the least split give way
+// to the split's, which then takes the units it would alone. The split a model the test plays prepares takes none,
+// and the plan it serves holds none of them.
+void testProjectionMemory() {
+  Fake fake;
+  fake.projectionBytes = kGiB;
+  const uint32_t context = contextWith(fake.bytes(8));
+  Started started = start(fake, {}, {context});
+  require(started.start.outcome.kind == Kind::Split && fake.recalled == 4u && fake.prepared == std::pair(4u, true) &&
+              started.start.plan && started.start.plan->breakdown().aneFfnBytes == fake.bytes(4),
+          "the projections' memory did not leave the split 4 units: " + started.log);
+  fake = {};
+  fake.projectionBytes = 4 * kGiB;
+  started = start(fake, {}, {context});
+  require(started.start.outcome.kind == Kind::Split && fake.recalled == 8u && fake.prepared == std::pair(8u, true) &&
+              started.start.plan && started.start.plan->breakdown().aneFfnBytes == fake.bytes(8),
+          "projections the plan cannot hold did not give way to the split: " + started.log);
+}
+
 // A given share runs the units nearest it, untimed, over the chunks given, and is not remembered; a given split
 // of no units or of rows no function holds is refused.
 void testGivenShare() {
@@ -615,6 +641,7 @@ int main() {
     testNoGain();
     testRemembered();
     testGivenShare();
+    testProjectionMemory();
     std::cout << "ane ffn startup tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

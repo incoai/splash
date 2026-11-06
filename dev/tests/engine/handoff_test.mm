@@ -381,6 +381,40 @@ void eventsNeverDecrease(MetalBackend &backend) {
 
 } // namespace
 
+// A handoff an overrun retired starts over once the agent has reported the late job, and runs the next command's
+// jobs; one a failure retired, or whose job never reports, stays retired.
+void restarts(MetalBackend &backend) {
+  const MetalBuffer markers = zeroed(backend);
+  Layers layers(backend, markers);
+  {
+    ane::Handoff handoff(backend, kBound);
+    Agent agent(Behaviour::Late, 3, markers);
+    static_cast<void>(layers.run(backend, handoff, agent.start()));
+    require(!handoff.finish() && handoff.retired() && handoff.overran(), "a late job did not retire it as an overrun");
+    require(!handoff.restart(backend), "it restarted while the late job still ran");
+    const auto deadline = AwakeClock::now() + 4 * kBound;
+    while (!handoff.idle() && AwakeClock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    require(handoff.restart(backend), "it did not restart once the late job reported");
+    require(!handoff.retired() && !handoff.overran() && handoff.reason().empty(), "the restart kept the old state");
+    std::memset(markers.contents(), 0, markers.sizeBytes());
+    const uint32_t started = agent.started();
+    static_cast<void>(layers.run(backend, handoff, agent.start()));
+    require(handoff.finish().has_value() && agent.started() == started + kLayers,
+            "the restarted handoff did not run the next command's jobs");
+    require(backend.healthy(), "the restart left the backend unhealthy");
+  }
+  for (const Behaviour behaviour : {Behaviour::FailAfterReady, Behaviour::Never}) {
+    ane::Handoff handoff(backend, kBound);
+    std::memset(markers.contents(), 0, markers.sizeBytes());
+    Agent agent(behaviour, 3, markers);
+    static_cast<void>(layers.run(backend, handoff, agent.start()));
+    static_cast<void>(handoff.finish());
+    std::this_thread::sleep_for(4 * kBound);
+    require(handoff.retired() && !handoff.restart(backend), std::string(name(behaviour)) + ": it restarted");
+  }
+  std::cout << "PASS an overrun restarts once the agent reports the job, a failure or a lost job never\n";
+}
+
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     if (argc != 2) {
@@ -399,6 +433,7 @@ int main(int argc, const char *argv[]) {
       }
       times(backend);
       cancels(backend);
+      restarts(backend);
     } catch (const std::exception &error) {
       std::cout << "FAIL " << error.what() << '\n';
       return 1;

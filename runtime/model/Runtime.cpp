@@ -3534,6 +3534,90 @@ std::vector<ops::SwiGluProjections> aneFfnLayers(const LoadedModel &model) {
   return layers;
 }
 
+std::vector<ops::ane_ffn::ProjectionLayout> aneProjectionLayouts(const LoadedModel &model) {
+  using ops::ane_ffn::Columns;
+  using ops::ane_ffn::ProjectionKind;
+  using ops::ane_ffn::ProjectionLayout;
+  const auto *dense = std::get_if<Qwen3_8Weights>(&model.target);
+  if (!dense) return {};
+  const QwenTargetDimensions &g = dense->layout;
+  // The GPU's part of a projection moves in blocks of this many columns,
+  // whole plane tiles and join tiles, but for the attention input's, which
+  // moves in query heads.
+  constexpr uint32_t kBlock = 256;
+  std::array<ProjectionLayout, ops::ane_ffn::kProjectionKinds> layouts;
+  for (size_t kind = 0; kind < layouts.size(); ++kind) layouts[kind].kind = static_cast<ProjectionKind>(kind);
+  const auto layout = [&](ProjectionKind kind) -> ProjectionLayout & { return layouts[static_cast<size_t>(kind)]; };
+  for (const Qwen3_8LayerWeights &layer : dense->layers) {
+    if (const auto *gdn = std::get_if<QwenGdnWeights>(&layer.mixer)) {
+      layout(ProjectionKind::GdnInput).layers.push_back(&gdn->inputProjection);
+      layout(ProjectionKind::GdnOutput).layers.push_back(&gdn->outputProjection);
+    } else if (const auto *attention = std::get_if<QwenAttentionWeights>(&layer.mixer)) {
+      layout(ProjectionKind::AttentionInput).layers.push_back(&attention->inputProjection);
+      layout(ProjectionKind::AttentionOutput).layers.push_back(&attention->outputProjection);
+    }
+  }
+
+  // The linear-attention input packs q, k and v, the output gate, then the
+  // beta and decay inputs (ops::GDN). The GPU takes leading q, k, v columns;
+  // the ANE the rest of them and beta and decay ahead of the scan, and the
+  // gate, which only the gate after the scan reads, during it.
+  const uint32_t convolution = g.convolutionDimension, values = g.gdnValueHeads * g.gdnHeadDimension;
+  if (convolution % kBlock == 0 && !layout(ProjectionKind::GdnInput).layers.empty()) {
+    ProjectionLayout &gdn = layout(ProjectionKind::GdnInput);
+    // Beta and alpha, with the rows a loader pads them to whole plane tiles
+    // with, which the ANE takes too: the packed row's columns past them are
+    // padding (ops::Projection).
+    const ops::QuantizedSegment &last = gdn.layers.front()->blocks().segments.back();
+    const uint32_t gates = last.columnOffset + last.outputSize - convolution - values;
+    gdn.units = convolution / kBlock;
+    gdn.unitColumns = kBlock;
+    gdn.ahead = [=, units = gdn.units](uint32_t aneUnits) {
+      const uint32_t gpu = (units - aneUnits) * kBlock;
+      return Columns{{gpu, convolution - gpu}, {convolution + values, gates}};
+    };
+    gdn.deferred = [=](uint32_t) { return Columns{{convolution, values}}; };
+  }
+  // A gated attention input packs each query head's rows and then its output
+  // gate's, then K and V. The GPU takes the leading heads whole; the ANE K, V
+  // and the other heads' queries ahead of attention, and their gates during
+  // it, which only the gate after attention reads.
+  const uint32_t head = g.attentionHeadDimension, heads = g.attentionQueryHeads, kvHeads = g.attentionKvHeads;
+  if (g.attentionGate) {
+    ProjectionLayout &attention = layout(ProjectionKind::AttentionInput);
+    attention.units = heads;
+    attention.unitColumns = 2 * head;
+    attention.ahead = [=](uint32_t aneUnits) {
+      Columns columns{{heads * 2 * head, 2 * kvHeads * head}};
+      for (uint32_t index = heads - aneUnits; index < heads; ++index) columns.push_back({index * 2 * head, head});
+      return columns;
+    };
+    attention.deferred = [=](uint32_t aneUnits) {
+      Columns columns;
+      for (uint32_t index = heads - aneUnits; index < heads; ++index)
+        columns.push_back({index * 2 * head + head, head});
+      return columns;
+    };
+  }
+  // Both output projections leave the GPU their leading columns, and their
+  // joins add the residual.
+  if (g.hiddenSize % kBlock == 0)
+    for (const ProjectionKind kind : {ProjectionKind::GdnOutput, ProjectionKind::AttentionOutput}) {
+      ProjectionLayout &output = layout(kind);
+      output.units = g.hiddenSize / kBlock;
+      output.unitColumns = kBlock;
+      output.ahead = [hidden = g.hiddenSize, units = output.units](uint32_t aneUnits) {
+        const uint32_t gpu = (units - aneUnits) * kBlock;
+        return Columns{{gpu, hidden - gpu}};
+      };
+    }
+
+  std::vector<ProjectionLayout> taken;
+  for (ProjectionLayout &candidate : layouts)
+    if (candidate.units && !ops::AneFfn::unsupportedProjections(candidate)) taken.push_back(std::move(candidate));
+  return taken;
+}
+
 void withPrefillArena(
     MetalBackend &backend, const LoadedModel &model, const ops::ExecutionPlans &operators, kv::Format format,
     const std::function<void(const ops::PrefillFfnBuffers &, const std::array<MetalBuffer, 2> &)> &use) {

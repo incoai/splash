@@ -187,25 +187,38 @@ void testMinimumRows() {
     rejects([&] { static_cast<void>(minimumRows(timings)); }, "not those of its functions", what + " were taken");
 }
 
-// A calibration as a line of text comes back as it was, and one of no split as none; a line of another tag or
-// version, with more or fewer fields, units without least rows or the GPU alone out of order or unusable is not one.
+// A calibration as a line of text comes back as it was, its projection kinds' too, and one of no split as none; a
+// line of another tag or version, with more or fewer fields, units without least rows, a split of none with
+// projections, or the GPU alone out of order or unusable, the FFN's or a projection kind's, is not one.
 void testCalibrationText() {
-  const Calibration made{8, 655, {{{512, 5.25}, {2048, 19.375}}}};
+  Calibration made{8, 655, {{{512, 5.25}, {2048, 19.375}}}};
+  made.projections[0] = {26, {{{512, 1.5}, {2048, 5.75}}}};
+  made.projections[3] = {14, {{{512, 0.75}, {2048, 2.5}}}};
   const std::optional<Calibration> back = Calibration::parse(made.text());
   require(back && back->aneUnits == 8 && back->minimumRows == 655 && back->gpu[0].rows == 512 &&
-              back->gpu[0].milliseconds == 5.25 && back->gpu[1].rows == 2048 && back->gpu[1].milliseconds == 19.375,
+              back->gpu[0].milliseconds == 5.25 && back->gpu[1].rows == 2048 && back->gpu[1].milliseconds == 19.375 &&
+              back->projections[0].aneUnits == 26 && back->projections[0].gpu[0].milliseconds == 1.5 &&
+              back->projections[0].gpu[1].milliseconds == 5.75 && !back->projections[1].aneUnits &&
+              !back->projections[2].aneUnits && back->projections[3].aneUnits == 14 &&
+              back->projections[3].gpu[0].rows == 512 && back->projections[3].gpu[1].milliseconds == 2.5,
           "a calibration did not come back as it was: " + made.text());
   const std::optional<Calibration> none = Calibration::parse(Calibration{}.text());
   require(none && !none->aneUnits && !none->minimumRows, "a calibration of no split did not come back");
-  for (const std::string_view line : {"", "ane-ffn-calibration-0 8 655 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-1 8 655 512 5.25 2048",
-                                      "ane-ffn-calibration-1 8 655 512 5.25 2048 19.375 1",
-                                      "ane-ffn-calibration-1 8 0 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-1 0 655 0 0 0 0",
-                                      "ane-ffn-calibration-1 8 655 2048 19.375 512 5.25",
-                                      "ane-ffn-calibration-1 8 655 512 0 2048 19.375",
-                                      "ane-ffn-calibration-1 8 655 512 nan 2048 19.375"})
-    require(!Calibration::parse(line), "\"" + std::string(line) + "\" was taken for a calibration");
+  const std::string ffn = "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375", off = " 0 0 0 0 0",
+                    gpu = off + off + off + off;
+  const std::optional<Calibration> alone = Calibration::parse(ffn + gpu);
+  require(alone && alone->aneUnits == 8 && std::ranges::none_of(alone->projections, &ProjectionCalibration::aneUnits),
+          "a calibration whose projections stay on the GPU did not come back");
+  for (const std::string &line : {std::string(), "ane-ffn-calibration-1 8 655 512 5.25 2048 19.375" + gpu, ffn,
+                                  ffn + gpu + " 1", "ane-ffn-calibration-2 8 0 512 5.25 2048 19.375" + gpu,
+                                  "ane-ffn-calibration-2 0 655 0 0 0 0" + gpu,
+                                  "ane-ffn-calibration-2 0 0 0 0 0 0 26 512 1.5 2048 5.75" + off + off + off,
+                                  "ane-ffn-calibration-2 8 655 2048 19.375 512 5.25" + gpu,
+                                  "ane-ffn-calibration-2 8 655 512 0 2048 19.375" + gpu,
+                                  "ane-ffn-calibration-2 8 655 512 nan 2048 19.375" + gpu,
+                                  ffn + " 26 2048 5.75 512 1.5" + off + off + off,
+                                  ffn + " 26 512 nan 2048 5.75" + off + off + off})
+    require(!Calibration::parse(line), "\"" + line + "\" was taken for a calibration");
 }
 
 // The breaker against the GPU alone on the line through 8 ms at 512 rows and 20 at 2048, 4 ms + rows / 128: a window

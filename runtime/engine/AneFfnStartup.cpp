@@ -107,10 +107,24 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     throw std::invalid_argument("ANE FFN split has no function of " + std::to_string(setting.given->minimumRows) +
                                 " rows");
 
+  // The units of each projection kind the plan sets memory aside for: until
+  // this Mac's calibration is remembered the most each may take, all but one
+  // of its units, and then the calibration's; none for a given split.
+  ane_ffn::ProjectionUnits projections{};
+  if (!given && model.projectionBytes)
+    for (size_t kind = 0; kind < projections.size(); ++kind)
+      projections[kind] = model.projectionUnits[kind] > 1 ? model.projectionUnits[kind] - 1 : 0;
+  const auto projectionBytes = [&]() -> uint64_t {
+    const bool any = std::ranges::any_of(projections, [](uint32_t units) { return units != 0; });
+    return any ? model.projectionBytes(projections) : 0;
+  };
+
   // Feasibility. The split's memory comes out of the KV cache, more of it
   // with each unit the ANE takes: the plan must still hold the context asked
   // for, or with none asked some context, which becomes the automatic one.
-  const auto planWith = [&](uint32_t aneUnits) { return planMemory(model.plannedBytes(aneUnits)); };
+  const auto planWith = [&](uint32_t aneUnits) {
+    return planMemory(model.plannedBytes(aneUnits) + projectionBytes());
+  };
   const auto contextWith = [&](uint32_t aneUnits) { return contextOf(planWith(aneUnits)); };
   // The most units from `low`, whose plan holds `context`, to `high` whose
   // plan holds it.
@@ -125,6 +139,10 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     return low;
   };
   const uint32_t least = leastUnits(model, setting);
+  const uint32_t needed = std::max<uint32_t>(requested.tokens, 1);
+  // The projections give way where the plan cannot hold them beside the
+  // FFN's least split.
+  if (contextWith(least) < needed) projections = {};
   if (const uint32_t leaves = contextWith(least); leaves < std::max<uint32_t>(requested.tokens, 1)) {
     if (!requested.tokens) return gpuAlone(Kind::Refused, "it leaves no memory for context", without);
     const std::string asked = requested.relaunch
@@ -167,6 +185,21 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
   // The split that serves, with what the start found of it: its share, its
   // least chunk, the timings that chose them if it calibrated, the error
   // verify() found and how it was set up.
+  // The projection kinds the split takes and their shares, for the log.
+  const auto projected = [&](const ops::AneFfn *split) {
+    if (!split || !model.projectionBytes) return std::string();
+    std::ostringstream text;
+    for (size_t index = 0; index < projections.size(); ++index) {
+      const auto kind = static_cast<ane_ffn::ProjectionKind>(index);
+      if (!model.projectionUnits[index]) continue;
+      text << (text.tellp() ? ", " : "; projections: ") << ane_ffn::projectionName(kind) << ' ';
+      if (const double share = split->projectionShare(kind))
+        text << std::fixed << std::setprecision(2) << share;
+      else
+        text << "on the GPU";
+    }
+    return text.str();
+  };
   const auto serve = [&](AneFfnPrepared prepared, uint32_t aneUnits, uint32_t minimumRows, const std::string &timed,
                          const char *how) {
     EngineMemoryPlanResult plan = planWith(aneUnits);
@@ -174,8 +207,8 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     std::ostringstream reason;
     reason << std::fixed << std::setprecision(2) << "at " << (given ? "the given share " : "share ")
            << static_cast<double>(aneUnits) / model.units << " for chunks of " << minimumRows << " rows or more"
-           << timed << ", " << fixed(100.0 * prepared.error) << "% from the GPU alone on the Neural Engine's part ("
-           << how << " in " << seconds() << ")";
+           << timed << ", " << fixed(100.0 * prepared.error) << "% from the GPU alone on the Neural Engine's part"
+           << projected(prepared.split.get()) << " (" << how << " in " << seconds() << ")";
     return AneFfnStart{std::move(prepared.split), std::move(plan.plan),
                        {Kind::Split, reason.str(), automaticWith(aneUnits), without}};
   };
@@ -193,6 +226,40 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
       prepared.split->setMinimumRows(calibration.minimumRows);
       prepared.split->setBreaker(ane_ffn::Breaker(calibration.gpu),
                                  [forget = model.forget, maxAneUnits] { forget(maxAneUnits); });
+      for (size_t index = 0; index < projections.size(); ++index)
+        if (projections[index])
+          prepared.split->setProjectionBreaker(static_cast<ane_ffn::ProjectionKind>(index),
+                                               ane_ffn::Breaker(calibration.projections[index].gpu));
+    };
+    // `split` takes each projection kind `projections` holds units of, or
+    // with `calibration` times it first and takes it with the units chosen,
+    // which `calibration` records. A kind none of whose splits gains enough,
+    // or that fails, the GPU runs alone, and the plan then holds none of it.
+    const auto addProjections = [&](ops::AneFfn &split, ane_ffn::Calibration *calibration) {
+      for (size_t index = 0; index < projections.size(); ++index) {
+        if (!projections[index]) continue;
+        const auto kind = static_cast<ane_ffn::ProjectionKind>(index);
+        const uint32_t units = std::exchange(projections[index], 0);
+        try {
+          std::optional<uint32_t> chosen = units;
+          ane_ffn::ProjectionTimings timed;
+          if (calibration) {
+            timed = model.timeProjections(split, kind);
+            chosen = ane_ffn::choose(ane_ffn::fit(timed.timings.low, timed.timings.high), timed.timings.gpuAlone,
+                                     model.projectionUnits[index], units);
+          }
+          if (!chosen) continue;
+          static_cast<void>(model.addProjections(split, kind, *chosen));
+          projections[index] = *chosen;
+          if (calibration) calibration->projections[index] = {*chosen, timed.gpu};
+        } catch (const ane::Interrupted &) {
+          throw;
+        } catch (const std::exception &error) {
+          if ((cancelled && cancelled()) || !model.healthy()) throw;
+          logWarning("Neural Engine split of the ", ane_ffn::projectionName(kind), " projections not set up (",
+                     error.what(), "); the GPU runs them alone.");
+        }
+      }
     };
     // No split gains enough: the start remembers so, and the GPU alone serves
     // its own context.
@@ -211,7 +278,15 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
       assumed = calibration->aneUnits;
       if (!calibration->aneUnits)
         return gpuAloneServing(Kind::NoGain, "no Neural Engine split beat it by enough when this Mac calibrated it");
+      for (size_t index = 0; index < projections.size(); ++index)
+        if (projections[index])
+          projections[index] = std::min(projections[index], calibration->projections[index].aneUnits);
+      if (contextWith(calibration->aneUnits) < needed) projections = {};
       AneFfnPrepared prepared = model.prepare(calibration->aneUnits, false);
+      if (prepared.split)
+        addProjections(*prepared.split, nullptr);
+      else
+        projections = {};
       take(prepared, *calibration);
       return serve(std::move(prepared), calibration->aneUnits, calibration->minimumRows, "",
                    "set up as calibrated before");
@@ -232,7 +307,11 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     if (!minimumRows)
       return noGain("no chunk of the Neural Engine split beats it by enough, " + timed + " (calibrated in " +
                     seconds() + ")");
-    const ane_ffn::Calibration made{*chosen, *minimumRows, chunks.gpu};
+    ane_ffn::Calibration made{*chosen, *minimumRows, chunks.gpu};
+    if (prepared.split)
+      addProjections(*prepared.split, &made);
+    else
+      projections = {};
     take(prepared, made);
     AneFfnStart start = serve(std::move(prepared), *chosen, *minimumRows, ": " + timed + " on the GPU alone",
                               "calibrated");
