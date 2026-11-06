@@ -75,9 +75,22 @@ def candidates(name, files, suggested_models):
     return ids or [name]
 
 
+def present(link):
+    """Whether the installation at selection link link is on this Mac, as
+    the app lists it (Runtime.installedModels): its record names files that
+    are all here, links followed."""
+    from . import assembly
+
+    record = assembly.recorded(link)
+    return record is not None and all(
+        Path(entry["path"]).exists() for entry in record["files"].values()
+    )
+
+
 def install_cached(models_root):
-    """Install each model the Hub cache holds whole that is not installed in
-    models_root, without the Hub."""
+    """Install each model the Hub cache holds whole whose installation in
+    models_root is not on this Mac (present), without the Hub: one whose
+    files are gone installs again from the files the cache holds now."""
     from . import hub, upstream
 
     suggested_models = suggested()
@@ -89,7 +102,7 @@ def install_cached(models_root):
         for model in candidates(name, repository.files, suggested_models):
             try:
                 selection = models.Selection.of(models_root, model)
-                if selection.link.exists():
+                if present(selection.link):
                     continue
                 with contextlib.redirect_stdout(io.StringIO()):
                     upstream.prepare(selection)

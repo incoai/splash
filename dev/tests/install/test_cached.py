@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,7 +16,7 @@ from dev.tests.installer_fixtures import (
     mlx_target,
     selection,
 )
-from install import cached, models, upstream
+from install import assembly, cached, models, upstream
 
 
 def vision_target(root):
@@ -85,6 +86,28 @@ class CachedTest(unittest.TestCase):
         self.assertEqual(models.selection_links(app), [link])
         self.assertNotIn(MODEL, [call.args[0].model for call in prepare.call_args_list])
         self.assertEqual((fake.requests, fake.downloads), ([], []))
+
+    def test_an_installation_whose_files_are_gone_installs_again(self):
+        """An installation whose snapshot was deleted from the cache, which
+        the app then no longer lists, is not present, and installs again
+        from the commit the cache holds now."""
+        fake = fake_hub(self, self.cache)
+        fake.publish(MODEL, "d" * 40, vision_target)
+        checkout = selection(self.root / "checkout", language_only=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            upstream.prepare(checkout)
+        self.install_cached()
+        link = models.Selection.of((self.root / "app").resolve(), MODEL).link
+        self.assertTrue(cached.present(link))
+        fake.publish(MODEL, "f" * 40, vision_target)
+        with contextlib.redirect_stdout(io.StringIO()):
+            upstream.prepare(checkout)
+        shutil.rmtree(fake.snapshot(MODEL, "d" * 40))
+        self.assertFalse(cached.present(link))
+        self.install_cached()
+        self.assertEqual(
+            assembly.verify(link)["sources"]["target"]["revision"], "f" * 40
+        )
 
     def test_candidates_follow_the_installer_s_names(self):
         """One ID for each GGUF target the cached files hold whole, which
