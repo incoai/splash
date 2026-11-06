@@ -33,6 +33,11 @@ final class Drawer {
         if terminal == id { terminal = terminals[safe: min(index, terminals.count - 1)]?.id }
     }
 
+    /// How many terminals run a program besides their shell, which a quit ends too.
+    var running: Int {
+        terminals.filter(\.running).count
+    }
+
     /// Ends every shell at once, for a quit that goes on to wait for the model or a download to
     /// stop. Any other end of the app hangs them up (`TerminalSession`).
     func endAll() {
@@ -110,6 +115,14 @@ final class TerminalSession: Identifiable {
             view.nativeBackgroundColor = NSColor.textBackgroundColor.usingColorSpace(.sRGB) ?? .textBackgroundColor
             view.caretColor = NSColor.controlAccentColor
         }
+    }
+
+    /// Whether a program other than the shell has the terminal, as a coding agent has it while it
+    /// runs; a shell waiting for a command is the terminal's own group.
+    var running: Bool {
+        guard !ended, view.process.shellPid != 0 else { return false }
+        let group = tcgetpgrp(view.process.childfd)
+        return group > 0 && group != view.process.shellPid
     }
 
     /// Hangs the shell up, as closing a terminal window does, which ends it and its jobs, and

@@ -104,6 +104,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// asking first.
     private var termination: DispatchSourceSignal?
     private var signalled = false
+    /// The user has answered the question below with Quit.
+    private var confirmed = false
+    private let question = QuitQuestion()
 
     /// SIGTERM caught by a handler that does nothing, for `termination` alone to act on. Not
     /// ignored: a program the app starts keeps a signal ignored, but not one caught, so that what
@@ -152,15 +155,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let state = state
-        guard state.busy else { return .terminateNow }
-        if let model = state.installer.model, !signalled {
-            let alert = NSAlert()
-            alert.messageText = "Quit Splash?"
-            alert.informativeText = "\(state.displayName(of: model)) is still downloading. If you quit, the download starts over next time."
-            alert.addButton(withTitle: "Quit")
-            alert.addButton(withTitle: "Cancel")
-            guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        if asksFirst, let cost = state.quitCost {
+            question.ask(cost) { [weak self] in
+                self?.confirmed = true
+                NSApp.terminate(nil)
+            }
+            return .terminateCancel
         }
+        guard state.busy else { return .terminateNow }
         state.quit()
         Task {
             while state.busy {
@@ -169,6 +171,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
+    }
+
+    /// Whether this quit is one to ask about. A quit from the app's own menus and the Dock's asks;
+    /// a signal, an update and any other sender's quit event, as a script's or the system's as it
+    /// logs out, go ahead at once, and so does a quit event whose sender cannot be told.
+    private var asksFirst: Bool {
+        guard !confirmed, !signalled, !updates.relaunching else { return false }
+        guard let event = NSAppleEventManager.shared().currentAppleEvent else { return true }
+        guard let sender = event.attributeDescriptor(forKeyword: keySenderPIDAttr)?.int32Value else { return false }
+        return NSRunningApplication(processIdentifier: sender)?.bundleIdentifier == "com.apple.dock"
+    }
+}
+
+/// Asks whether to quit, in a window of its own: while a modal alert shows, AppKit refuses the quit
+/// event of a script, and of the system as it logs out. A second quit brings it forward.
+@MainActor
+final class QuitQuestion: NSObject {
+    private var alert: NSAlert?
+    private var confirm: (() -> Void)?
+
+    func ask(_ cost: AppState.QuitCost, confirm: @escaping () -> Void) {
+        NSApp.unhide(nil)
+        NSApp.activate()
+        if let alert {
+            alert.window.makeKeyAndOrderFront(nil)
+            return
+        }
+        self.confirm = confirm
+        let alert = NSAlert()
+        alert.messageText = "Quit Splash?"
+        alert.informativeText = cost.text
+        let quit = alert.addButton(withTitle: cost.button)
+        quit.keyEquivalent = "\r"
+        quit.target = self
+        quit.action = #selector(quit(_:))
+        let cancel = alert.addButton(withTitle: "Cancel")
+        cancel.keyEquivalent = "\u{1b}"
+        cancel.target = self
+        cancel.action = #selector(cancel(_:))
+        alert.layout()
+        alert.window.level = .floating
+        alert.window.center()
+        alert.window.makeKeyAndOrderFront(nil)
+        self.alert = alert
+    }
+
+    @objc private func quit(_ sender: NSButton) {
+        let confirm = confirm
+        close()
+        confirm?()
+    }
+
+    @objc private func cancel(_ sender: NSButton) {
+        close()
+    }
+
+    private func close() {
+        alert?.window.orderOut(nil)
+        alert = nil
+        confirm = nil
     }
 }
 

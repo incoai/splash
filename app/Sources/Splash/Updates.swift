@@ -6,17 +6,20 @@ import Sparkle
 /// taking an update whose disk image the release key (`SUPublicEDKey`) or, to replace a lost key,
 /// the app's Developer ID signed; `dev/tools/package_app.py` writes the keys. Sparkle asks on the
 /// second launch whether to check by itself, once a day, and installs an update by quitting the
-/// app as its Quit command does, which stops what runs first.
+/// app as its Quit command does, which stops what runs first, but without asking.
 /// An app built without the key, as one `swift build` makes, checks nothing and says nothing.
 @MainActor @Observable
 final class Updates {
     /// Whether "Check for Updates…" can check now: Sparkle has started and is not checking already.
     private(set) var canCheck = false
-    @ObservationIgnored private let controller = SPUStandardUpdaterController(
-        startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
+    /// Whether Sparkle is quitting the app to install an update.
+    var relaunching: Bool { events.relaunching }
+    @ObservationIgnored private let events = UpdaterEvents()
+    @ObservationIgnored private let controller: SPUStandardUpdaterController
     @ObservationIgnored private var observation: AnyCancellable?
 
     init() {
+        controller = SPUStandardUpdaterController(startingUpdater: false, updaterDelegate: events, userDriverDelegate: nil)
         // Sparkle changes it on the main thread.
         observation = controller.updater.publisher(for: \.canCheckForUpdates)
             .sink { [weak self] canCheck in MainActor.assumeIsolated { self?.canCheck = canCheck } }
@@ -31,5 +34,13 @@ final class Updates {
     /// Checks now, showing what Sparkle finds.
     func check() {
         controller.checkForUpdates(nil)
+    }
+}
+
+private final class UpdaterEvents: NSObject, SPUUpdaterDelegate {
+    private(set) var relaunching = false
+
+    func updaterWillRelaunchApplication(_ updater: SPUUpdater) {
+        relaunching = true
     }
 }
