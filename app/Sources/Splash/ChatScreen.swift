@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The width of the composer: the transcript's column (`main`'s max-width in page.css), so
@@ -20,10 +21,68 @@ struct ChatScreen: View {
     }
 }
 
+/// The chats picked in the list: the open one at first, then those a click with Command or Shift
+/// picks, and the row a later Shift-click extends from.
+struct ChatListSelection: Equatable {
+    private(set) var ids: Set<UUID> = []
+    private(set) var anchor: UUID?
+
+    /// Takes a click: a plain one picks and opens `id`, a Command-click picks or unpicks it alone,
+    /// and a Shift-click picks everything between the row clicked before and `id`. Returns whether
+    /// the click opens the chat.
+    @discardableResult
+    mutating func click(_ id: UUID, command: Bool, shift: Bool, in order: [UUID]) -> Bool {
+        if shift, let anchor, let start = order.firstIndex(of: anchor), let end = order.firstIndex(of: id) {
+            ids = Set(order[start <= end ? start...end : end...start])
+            return false
+        }
+        if command {
+            if ids.contains(id) { ids.remove(id) } else { ids.insert(id) }
+            anchor = id
+            return false
+        }
+        ids = [id]
+        anchor = id
+        return true
+    }
+
+    /// Follows the conversation the app opens elsewhere, as when a new chat starts or a chat
+    /// another part deletes closes.
+    mutating func follow(_ id: UUID?) {
+        guard let id else {
+            ids = []
+            anchor = nil
+            return
+        }
+        ids = [id]
+        anchor = id
+    }
+
+    /// Drops the chats no longer in the list; a Shift-click then has no row to extend from.
+    mutating func prune(to present: Set<UUID>) {
+        ids.formIntersection(present)
+        if let anchor, !present.contains(anchor) { self.anchor = nil }
+    }
+
+    /// The picked chats among the rows `shown`: a search can hide a picked chat, which a delete
+    /// of the rows in view leaves alone.
+    func picked(in shown: [UUID]) -> Set<UUID> {
+        ids.intersection(shown)
+    }
+
+    mutating func clear() {
+        ids = []
+        anchor = nil
+    }
+}
+
 private struct ChatList: View {
     @Environment(AppState.self) private var state
     @State private var query = ""
+    @State private var selection = ChatListSelection()
     @State private var deleting: Conversation?
+    @State private var deletingSelected: Set<UUID>?
+    @State private var deletingAll = false
     @State private var renaming: Conversation?
     @State private var title = ""
 
@@ -46,14 +105,46 @@ private struct ChatList: View {
             .padding(.top, 10)
             .padding(.bottom, 4)
             list(shown)
+            Divider()
+            HStack {
+                Button("Delete All Chats") { deletingAll = true }
+                    .buttonStyle(.hover)
+                    .foregroundStyle(.tint)
+                    .disabled(chats.conversations.isEmpty)
+                    .help("Delete All Chats")
+                Spacer()
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
         }
         .background(.background.secondary)
+        .onAppear { follow() }
+        .onChange(of: chats.selection) { follow() }
+        .onChange(of: chats.conversations.map(\.id)) { _, ids in selection.prune(to: Set(ids)) }
         .confirmationDialog("Delete this chat?", isPresented: Binding(
             get: { deleting != nil }, set: { if !$0 { deleting = nil } }
         ), presenting: deleting) { conversation in
             Button("Delete", role: .destructive) { chats.delete(conversation.id) }
         } message: { conversation in
             Text("“\(conversation.title)” will be deleted from this Mac.")
+        }
+        .confirmationDialog("Delete selected chats?", isPresented: Binding(
+            get: { deletingSelected != nil }, set: { if !$0 { deletingSelected = nil } }
+        ), presenting: deletingSelected) { ids in
+            Button("Delete", role: .destructive) {
+                chats.delete(ids)
+                follow()
+            }
+        } message: { ids in
+            Text("\(ids.count) chats will be deleted from this Mac. This cannot be undone.")
+        }
+        .confirmationDialog("Delete all chats?", isPresented: $deletingAll) {
+            Button("Delete All Chats", role: .destructive) {
+                chats.deleteAll()
+                selection.clear()
+            }
+        } message: {
+            Text("This cannot be undone.")
         }
         .alert("Rename Chat", isPresented: Binding(
             get: { renaming != nil }, set: { if !$0 { renaming = nil } }
@@ -64,23 +155,39 @@ private struct ChatList: View {
         }
     }
 
-    /// The conversations, the latest first, the open one held highlighted; a conversation that
+    /// Picks the conversation the app opened elsewhere, or none.
+    private func follow() {
+        if let id = state.chats.selection, state.chats.conversations.contains(where: { $0.id == id }) {
+            selection.follow(id)
+        } else {
+            selection.follow(nil)
+        }
+    }
+
+    /// The conversations, the latest first, each picked as the click says; a conversation that
     /// gets a message moves to the top, and one deleted closes its gap.
     private func list(_ shown: [Conversation]) -> some View {
-        let chats = state.chats
+        let picked = selection.picked(in: shown.map(\.id))
         // A stack, not a sidebar list, whose source-list rows AppKit insets further.
         return ScrollView {
             LazyVStack(spacing: 2) {
                 ForEach(shown) { conversation in
-                    ChatRow(conversation: conversation, open: chats.selection == conversation.id) {
-                        chats.selection = conversation.id
+                    ChatRow(conversation: conversation, selected: selection.ids.contains(conversation.id),
+                            open: state.chats.selection == conversation.id) {
+                        click(conversation, in: shown)
                     }
                     .contextMenu {
-                        Button("Rename…") {
-                            title = conversation.title
-                            renaming = conversation
+                        if picked.count > 1, picked.contains(conversation.id) {
+                            Button("Delete Selected Chats…", role: .destructive) {
+                                deletingSelected = picked
+                            }
+                        } else {
+                            Button("Rename…") {
+                                title = conversation.title
+                                renaming = conversation
+                            }
+                            Button("Delete…", role: .destructive) { deleting = conversation }
                         }
-                        Button("Delete…", role: .destructive) { deleting = conversation }
                     }
                 }
             }
@@ -89,12 +196,23 @@ private struct ChatList: View {
         }
         .animation(Motion.settle, value: shown.map(\.id))
     }
+
+    /// Takes a click with the keys Command and Shift, as a sidebar picks its rows.
+    private func click(_ conversation: Conversation, in shown: [Conversation]) {
+        let flags = NSEvent.modifierFlags
+        if selection.click(conversation.id, command: flags.contains(.command), shift: flags.contains(.shift),
+                           in: shown.map(\.id)) {
+            state.chats.selection = conversation.id
+        }
+    }
 }
 
-/// A conversation in the list: its title, highlighted as the app's buttons are, held while open;
-/// the highlight in line with the search field.
+/// A conversation in the list: its title, highlighted as the app's buttons are, held while picked;
+/// the highlight in line with the search field. The open chat, when it is not picked, takes an
+/// outline, so that the list always shows which chat is open.
 private struct ChatRow: View {
     let conversation: Conversation
+    let selected: Bool
     let open: Bool
     let select: () -> Void
 
@@ -105,8 +223,14 @@ private struct ChatRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(.rect)
         }
-        .buttonStyle(HoverStyle(padding: EdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8), held: open))
-        .accessibilityAddTraits(open ? .isSelected : [])
+        .buttonStyle(HoverStyle(padding: EdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8), held: selected))
+        .overlay {
+            if open && !selected {
+                RoundedRectangle(cornerRadius: 7).strokeBorder(.separator).allowsHitTesting(false)
+            }
+        }
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityValue(open ? "Open" : "")
     }
 }
 
