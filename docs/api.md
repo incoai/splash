@@ -282,7 +282,9 @@ priority can also resume from a state another request cached past the blocks it
 had computed, and its replay then reads the KV of the blocks it restores there.
 The Done line of the request log counts the tokens of both, as does
 `metrics.cache.deduplicated_tokens` in Chat Completions and text completions
-responses (in a stream, its usage chunk), and `/status` sums them in
+responses (in a stream, its usage chunk), but for a response a `stop` string
+ended outside a grammar, which reports 0 ([output limits and
+streaming](#output-limits-and-streaming)), and `/status` sums them in
 `cache.deduplicated_kv_tokens`. One case goes uncounted: while a request is
 suspended, blocks it computed can be evicted and computed again by another
 request, and when it resumes it reads those as its own. A request with a
@@ -349,7 +351,7 @@ in a complete response, and in a stream in `message_delta` and in the response
 of `response.completed` or `response.incomplete`. `prompt_n` and `predicted_n` are the full prompt
 and output counts; `cache_n` is the cached prompt count. `prompt_ms` measures
 native start to first emission, and `predicted_ms` measures first emission to
-completion. These elapsed intervals exclude the initial admission queue and
+completion, but in a response a `stop` string ended outside a grammar (below). These elapsed intervals exclude the initial admission queue and
 are not isolated GPU timings. `prompt_per_second` uses only uncached prompt
 tokens; `predicted_per_second` excludes the entire first emission (which can
 contain multiple speculative tokens). Thus rates use tokens processed in the
@@ -358,7 +360,9 @@ responses completed in one emission. A request that drafted adds
 llama-server's `draft_n` and `draft_n_accepted`: the tokens its draft proposed
 that its cycles verified ([Drafts](models.md#drafts)) and those verification accepted,
 but for accepted proposals past the output limit or from one of the model's
-stop tokens on; those a `stop` string then cuts still count. The end tokens a
+stop tokens on; those a `stop` string then cuts still count where a grammar
+constrains the output, and a response a `stop` string ended outside a grammar
+reports none (below). The end tokens a
 [thinking token budget](server.md#thinking-token-budget) puts in place of the draft's
 proposals are neither. They count that request alone, so
 they hold under concurrency. `metrics.speculation` carries them with the
@@ -366,6 +370,21 @@ request's speculative `cycles`, the decode cycles in which its draft proposed
 tokens, and the Done line shows what the draft yields per cycle,
 `1 + accepted / cycles`; a request whose thinking budget ran out also took the
 end's tokens in its cycles.
+
+A response a `stop` string ends is sent at the match, before the engine stops
+the request, unless a grammar constrains its output (constrained tool calls,
+output under `tool_choice: "none"`, structured output), whose response waits
+for the engine to finish. Sent at the match, it carries the server's own
+figures: the prompt and output counts, the cache and the stop sequence as any
+response does, and `request_latency` and `timings` on the server's clock, so
+`prompt_ms` measures the engine's start reaching the server to the first token
+event, `predicted_ms` the first token event to the match, and the wall time
+and `ttft_ms` start at submission; it carries no `draft_n`, `draft_n_accepted`
+or `metrics.speculation`, and `metrics.cache.deduplicated_tokens` is 0. The
+request log and native queue timing ([status, readiness and
+metrics](#status-readiness-and-metrics)) take the engine's figures for it. Its
+`--queue-size` slot stays held until the engine has stopped the request, so the
+next request is admitted as it would be after a response sent at the end.
 
 ## Tool calls
 
@@ -734,7 +753,9 @@ encoding call, including reuse when available. Histogram buckets are cumulative
 and labeled by upper bound. HTTP TTFT (`http_ttft`) starts before upload and
 ends at the first native token event; native TTFT (`metrics.ttft_ms`,
 per-request `request_latency.ttft_ms`) starts when the engine receives the
-request. Output intervals are between native token events, which can contain
+request; in a response a `stop` string ended outside a grammar,
+`request_latency.ttft_ms` starts when the server submits the request instead
+([output limits and streaming](#output-limits-and-streaming)). Output intervals are between native token events, which can contain
 multiple speculative tokens; they are not per-token latency. Native queue
 timing is recorded from successful completions. These histograms live with the
 HTTP process and survive a native engine restart.

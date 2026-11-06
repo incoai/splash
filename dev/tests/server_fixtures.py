@@ -335,6 +335,7 @@ class Plan:
         after_terminal=False,
         matched_tokens=1,
         logits=None,
+        hold_done=False,
     ):
         self.batches = list(batches)
         self.reason = reason
@@ -358,6 +359,11 @@ class Plan:
             self.start_release.set()
         if not after_terminal:
             self.terminal_release.set()
+        # With hold_done, the DoneEvent waits for the test, past any cancel
+        # or stop: a call still draining its last decode cycle.
+        self.done_release = threading.Event()
+        if not hold_done:
+            self.done_release.set()
 
 
 class FakeCall:
@@ -565,6 +571,7 @@ class FakeRuntime:
             tuple(plan.logits) if plan.logits is not None else (),
             bounded=reason == wire.FinishReason.LENGTH and plan.reason == "bounded",
         )
+        plan.done_release.wait(2)
         call.complete(result=done)
 
     def close(self):
@@ -965,7 +972,7 @@ def no_signed_thinking(signature):
     raise AssertionError(f"unexpected thinking signature {signature!r}")
 
 
-def make_job(request_id=101, *, constraint=None, temperature=0.0):
+def make_job(request_id=101, *, constraint=None, temperature=0.0, stop_sequences=()):
     return backend_api.Job(
         request_id=request_id,
         prompt_tokens=[11, 12, 13, 14],
@@ -982,6 +989,7 @@ def make_job(request_id=101, *, constraint=None, temperature=0.0):
         ),
         deadline=time.monotonic() + 10.0,
         priority=wire.RequestPriority.FOREGROUND,
+        stop_sequences=stop_sequences,
         constraint=constraint,
     )
 

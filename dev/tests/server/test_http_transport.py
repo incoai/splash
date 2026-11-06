@@ -228,6 +228,26 @@ class HttpTransportTests(HarnessTestCase):
             harness.request("POST", "/v1/chat/completions", chat_body())[0], 200
         )
 
+    def test_ingress_slot_held_until_a_stopped_call_drains(self):
+        # A stop's early done answers before the native call ends; the slot
+        # stays held until it has, as the native pending limit is the gate's.
+        draining = Plan([[14], [15], [4]], reason="length", hold_done=True)
+        harness = self.harness(FakeRuntime(draining), queue_size=1)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/chat/completions",
+            chat_body(stop="second", reasoning_effort="none"),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["choices"][0]["finish_reason"], "stop")
+        self.assertTrue(draining.ended.wait(1))
+        self.assertEqual(harness.server.requests.stats()["active"], 1)
+        draining.done_release.set()
+        self._wait_for_http_active(harness.server.requests, 0)
+        self.assertEqual(
+            harness.request("POST", "/v1/chat/completions", chat_body())[0], 200
+        )
+
     def test_ingress_releases_slot_after_parse_preparation_and_native_errors(self):
         harness = self.harness(FakeRuntime(), queue_size=1)
         self.assertEqual(harness.raw_post(b"{", 1)[0], 400)

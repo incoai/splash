@@ -33,6 +33,7 @@ from server import errors as api_errors
 from server import protocol as wire
 from server.chat_format import FLINT, QWEN, THINK_END, THINK_START, TOOL_CALL_OPEN
 from server.output import MAX_STOP_CHARACTERS, ReasoningSplitter
+from server.runtime import EngineUnhealthy
 from server.supervision import THRESHOLDS
 
 
@@ -1172,6 +1173,281 @@ class NativeBackendContractTests(unittest.TestCase):
         ):
             with self.subTest(fake=type(fake).__name__):
                 self.assertEqual(interface_drift(fake, real), [])
+
+
+class ScriptedStreamer:
+    """A CallbackStreamer stand-in whose stops follow `script`: a stop
+    sequence on its first batch, a stop matched in end()'s held tail, or an
+    end() that raises."""
+
+    def __init__(
+        self, script, tokenizer, callback, stop_sequences=(), on_stop=None, *_
+    ):
+        self.script = script
+        self.on_stop = on_stop
+        self.token_ids = []
+        self.stop_sequence = None
+
+    def put_tokens(self, token_ids):
+        if self.stop_sequence is not None:
+            return
+        self.token_ids.extend(token_ids)
+        if self.script.get("stop") is None:
+            return
+        self.stop_sequence = self.script["stop"]
+        self.on_stop()
+
+    def end(self):
+        if self.script.get("end_error") is not None:
+            raise self.script["end_error"]
+        stop = self.script.get("stop_at_end")
+        if self.stop_sequence is None and stop is not None:
+            self.stop_sequence = stop
+            if self.on_stop is not None:
+                self.on_stop()
+
+    def count_reasoning_tokens(self, chat_format, thinking, tool_calls=False):
+        return len(self.token_ids) if thinking else 0
+
+
+class NativeBackendEarlyDoneTests(unittest.TestCase):
+    def make_transport(self, runtime=None, script=None):
+        runtime = runtime or DrivenRuntime()
+        records = []
+        transport = backend_api.NativeBackend(runtime, DigitTokenizer(), records.append)
+        self.addCleanup(transport.close)
+        if script is not None:
+            patcher = mock.patch.object(
+                backend_api,
+                "CallbackStreamer",
+                lambda *args: ScriptedStreamer(script, *args),
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return transport, runtime, records
+
+    @staticmethod
+    def terminal(job, timeout=1.0):
+        while True:
+            event = job.events.get(timeout=timeout)
+            if event[0] in ("done", "error"):
+                return event
+
+    @staticmethod
+    def drain_finalizer(transport):
+        """Wait until the finalizer has run every item queued so far."""
+        drained = threading.Event()
+        transport.finalizer_queue.put(drained.set)
+        if not drained.wait(1.0):
+            raise AssertionError("the finalizer did not drain")
+
+    @staticmethod
+    def queued_terminals(job):
+        """The terminals left on `job.events`; call once the finalizer has
+        drained."""
+        terminals = []
+        while True:
+            try:
+                kind, value = job.events.get_nowait()
+            except queue.Empty:
+                return terminals
+            if kind in ("done", "error"):
+                terminals.append((kind, value))
+
+    @staticmethod
+    def final_records(records):
+        return [record for record in records if record["outcome"] != "started"]
+
+    def start_stopped_job(self, transport, runtime, **job_options):
+        job = make_job(stop_sequences=("8",), **job_options)
+        transport.submit(job)
+        call = runtime.calls[0]
+        call.emit(wire.StartEvent(call.request_id, 2, 2))
+        call.emit(wire.TokensEvent(call.request_id, 0, (7, 8, 9)))
+        return job, call
+
+    def test_stop_match_sends_done_before_native_completion(self):
+        transport, runtime, records = self.make_transport()
+        job, call = self.start_stopped_job(transport, runtime)
+        streamer = transport.active[job.request_id].streamer
+
+        kind, result = self.terminal(job)
+        early_done = call.done
+        call.complete(
+            result=success_result(
+                call, tokens=(7, 8, 9), deduplicated=64, speculation=(3, 2, 1)
+            )
+        )
+        self.drain_finalizer(transport)
+
+        self.assertEqual((kind, early_done, runtime.stop_count), ("done", False, 1))
+        self.assertEqual((result.reason, result.stop_sequence), ("stop", "8"))
+        self.assertEqual(result.completion_tokens, len(streamer.token_ids))
+        self.assertEqual(result.cache.deduplicated_tokens, 0)
+        self.assertNotIn("speculation", result.metrics)
+        self.assertGreaterEqual(result.request_wall_ms, result.first_token_to_done_ms)
+        self.assertEqual(self.queued_terminals(job), [])
+        (record,) = self.final_records(records)
+        self.assertEqual(record["outcome"], "stop")
+        self.assertEqual(record["metrics"]["cache"]["deduplicated_tokens"], 64)
+        self.assertEqual(record["metrics"]["speculation"]["drafted_tokens"], 3)
+        self.assertEqual(record["metrics"]["request_latency"]["wall_ms"], 4.0)
+
+    def test_release_after_drain_runs_once_the_stopped_call_ends(self):
+        transport, runtime, _records = self.make_transport()
+        job, call = self.start_stopped_job(transport, runtime)
+        released = []
+
+        self.terminal(job)
+        held = transport.release_after_drain(job, lambda: released.append(job))
+        held_before_completion = list(released)
+        call.complete(result=success_result(call, tokens=(7, 8, 9)))
+        self.drain_finalizer(transport)
+
+        self.assertTrue(held)
+        self.assertEqual(held_before_completion, [])
+        self.assertEqual(released, [job])
+        # Once the call has ended, the caller releases.
+        self.assertFalse(transport.release_after_drain(job, released.clear))
+
+    def test_release_after_drain_leaves_a_request_without_early_done(self):
+        transport, runtime, _records = self.make_transport()
+        job = make_job()
+        transport.submit(job)
+        call = runtime.calls[0]
+        call.emit(wire.StartEvent(call.request_id, 2, 2))
+
+        self.assertFalse(transport.release_after_drain(job, lambda: None))
+
+    def test_close_runs_a_held_release(self):
+        runtime = DrivenRuntime(complete_on_close=False)
+        transport, runtime, _records = self.make_transport(runtime)
+        job, _call = self.start_stopped_job(transport, runtime)
+        released = []
+
+        self.terminal(job)
+        self.assertTrue(
+            transport.release_after_drain(job, lambda: released.append(job))
+        )
+        transport.close()
+
+        self.assertEqual(released, [job])
+
+    def test_constrained_stop_match_waits_for_native_completion(self):
+        constraint = FakeConstraint()
+        transport, runtime, _records = self.make_transport()
+        job, call = self.start_stopped_job(transport, runtime, constraint=constraint)
+
+        with self.assertRaises(queue.Empty):
+            self.terminal(job, timeout=0.05)
+        call.complete(result=success_result(call, tokens=(7, 8, 9)))
+        kind, result = self.terminal(job)
+
+        self.assertEqual((kind, result.reason), ("done", "stop"))
+        self.assertEqual(result.cache.deduplicated_tokens, 0)
+        self.assertEqual(result.request_wall_ms, 4.0)
+        # A stop-sequence end skips the trailing grammar check.
+        self.assertEqual(constraint.finish_calls, 0)
+
+    def test_native_error_after_early_done_changes_only_the_record(self):
+        transport, runtime, records = self.make_transport()
+        job, call = self.start_stopped_job(transport, runtime)
+
+        kind, _result = self.terminal(job)
+        call.complete(error=EngineUnhealthy("native write failed"))
+        self.drain_finalizer(transport)
+
+        self.assertEqual(kind, "done")
+        self.assertEqual(self.queued_terminals(job), [])
+        (record,) = self.final_records(records)
+        self.assertEqual(record["outcome"], "error")
+
+    def test_close_after_early_done_sends_no_second_terminal(self):
+        runtime = DrivenRuntime(complete_on_close=False)
+        transport, runtime, records = self.make_transport(runtime)
+        job, _call = self.start_stopped_job(transport, runtime)
+
+        kind, _result = self.terminal(job)
+        transport.close()
+
+        self.assertEqual(kind, "done")
+        self.assertEqual(self.queued_terminals(job), [])
+        (record,) = self.final_records(records)
+        self.assertEqual(
+            (record["outcome"], record["error_code"]), ("error", "server_shutdown")
+        )
+
+    def test_stop_matched_in_the_finalizers_end_sends_one_done(self):
+        transport, runtime, _records = self.make_transport(script={"stop_at_end": "9"})
+        job = make_job(stop_sequences=("9",))
+        transport.submit(job)
+        call = runtime.calls[0]
+
+        call.emit(wire.TokensEvent(call.request_id, 0, (7, 8)))
+        call.complete(result=success_result(call, tokens=(7, 8)))
+        self.drain_finalizer(transport)
+
+        terminals = self.queued_terminals(job)
+        self.assertEqual([kind for kind, _value in terminals], ["done"])
+        self.assertEqual(terminals[0][1].stop_sequence, "9")
+
+    def test_early_items_end_matching_a_stop_sends_one_done(self):
+        transport, runtime, _records = self.make_transport(script={"stop": "9"})
+        job = make_job(stop_sequences=("9",))
+        job.thinking = True
+        transport.submit(job)
+        call = runtime.calls[0]
+
+        with mock.patch.object(
+            transport.finalizer_queue, "put", wraps=transport.finalizer_queue.put
+        ) as put:
+            call.emit(wire.StartEvent(call.request_id, 0, 0))
+            call.emit(wire.TokensEvent(call.request_id, 0, (7, 8)))
+            state = transport.active[job.request_id]
+            self.assertTrue(state.client_done)
+            # A second match, as the early item's end() or the finalizer's
+            # would make, queues no second early done.
+            state.streamer.on_stop()
+            kind, result = self.terminal(job)
+            call.complete(result=success_result(call, tokens=(7, 8)))
+            self.drain_finalizer(transport)
+        early_items = [
+            args[0]
+            for args, _kwargs in put.call_args_list
+            if getattr(args[0], "func", None) == transport._finish_early
+        ]
+
+        self.assertEqual(len(early_items), 1)
+        self.assertEqual(
+            (kind, result.reason, result.stop_sequence), ("done", "stop", "9")
+        )
+        self.assertEqual(job.reasoning_tokens, 2)
+        self.assertEqual(runtime.stop_count, 1)
+        self.assertEqual(self.queued_terminals(job), [])
+
+    def test_failed_early_item_sends_one_terminal_and_the_next_request_finishes(self):
+        script = {"stop": "8", "end_error": RuntimeError("end failed")}
+        transport, runtime, _records = self.make_transport(script=script)
+        job = make_job(stop_sequences=("8",))
+        transport.submit(job)
+        call = runtime.calls[0]
+
+        with mock.patch.object(backend_api, "print_status"):
+            call.emit(wire.TokensEvent(call.request_id, 0, (7, 8)))
+            kind, error = self.terminal(job)
+            call.complete(result=success_result(call, tokens=(7, 8)))
+            script.clear()
+            next_job = make_job(102)
+            transport.submit(next_job)
+            next_call = runtime.calls[1]
+            next_call.emit(wire.TokensEvent(next_call.request_id, 0, (7,)))
+            next_call.complete(result=success_result(next_call, tokens=(7,)))
+            next_kind, _result = self.terminal(next_job)
+            self.drain_finalizer(transport)
+
+        self.assertEqual((kind, error.code), ("error", "runtime_error"))
+        self.assertEqual(self.queued_terminals(job), [])
+        self.assertEqual(next_kind, "done")
 
 
 class ByteLevelTestTokenizer:
