@@ -1293,6 +1293,46 @@ class NativeBackendEarlyDoneTests(unittest.TestCase):
         self.assertEqual(record["metrics"]["speculation"]["drafted_tokens"], 3)
         self.assertEqual(record["metrics"]["request_latency"]["wall_ms"], 4.0)
 
+    def test_release_after_drain_runs_once_the_stopped_call_ends(self):
+        transport, runtime, _records = self.make_transport()
+        job, call = self.start_stopped_job(transport, runtime)
+        released = []
+
+        self.terminal(job)
+        held = transport.release_after_drain(job, lambda: released.append(job))
+        held_before_completion = list(released)
+        call.complete(result=success_result(call, tokens=(7, 8, 9)))
+        self.drain_finalizer(transport)
+
+        self.assertTrue(held)
+        self.assertEqual(held_before_completion, [])
+        self.assertEqual(released, [job])
+        # Once the call has ended, the caller releases.
+        self.assertFalse(transport.release_after_drain(job, released.clear))
+
+    def test_release_after_drain_leaves_a_request_without_early_done(self):
+        transport, runtime, _records = self.make_transport()
+        job = make_job()
+        transport.submit(job)
+        call = runtime.calls[0]
+        call.emit(wire.StartEvent(call.request_id, 2, 2))
+
+        self.assertFalse(transport.release_after_drain(job, lambda: None))
+
+    def test_close_runs_a_held_release(self):
+        runtime = DrivenRuntime(complete_on_close=False)
+        transport, runtime, _records = self.make_transport(runtime)
+        job, _call = self.start_stopped_job(transport, runtime)
+        released = []
+
+        self.terminal(job)
+        self.assertTrue(
+            transport.release_after_drain(job, lambda: released.append(job))
+        )
+        transport.close()
+
+        self.assertEqual(released, [job])
+
     def test_constrained_stop_match_waits_for_native_completion(self):
         constraint = FakeConstraint()
         transport, runtime, _records = self.make_transport()

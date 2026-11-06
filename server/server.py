@@ -610,8 +610,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
             # The handler outlives the request, through what finish()
             # still reads of an upload refused unread; the job must not, as
             # freeing it returns the input it retains.
-            self._submitted = None
-            admission.release()
+            submitted, self._submitted = self._submitted, None
+            # A stop's early done answers before its native call drains; the
+            # slot stays held until it has, as the native pending limit is
+            # this gate's capacity.
+            if submitted is None or not self.app.backend.release_after_drain(
+                submitted, admission.release
+            ):
+                admission.release()
             self.app.latencies.observe("http_request", time.monotonic() - started_at)
 
     def _serve(self, route, started_at):

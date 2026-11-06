@@ -325,6 +325,9 @@ class _JobState:
     started_at: float | None = None
     first_token_at: float | None = None
     stopped_at: float | None = None
+    # What the client's request still holds after its early done, run once
+    # the native call ends: its HTTP request gate slot.
+    drain_releases: list = field(default_factory=list)
 
     def detach(self):
         self.detached = True
@@ -956,8 +959,8 @@ class NativeBackend:
         except Exception as error:
             with self.lock:
                 deliver = not state.detached and not state.terminal_enqueued
-                if deliver:
-                    self._detach_locked(state)
+                releases = self._detach_locked(state) if deliver else []
+            self._run_drain_releases(releases)
             if deliver:
                 refusal = None
                 if isinstance(
@@ -973,9 +976,38 @@ class NativeBackend:
                 job.events.put(("error", refusal or self._api_error(error)))
 
     def _detach_locked(self, state):
+        """Detach `state` and return its drain releases, which the caller
+        runs once it has left the lock."""
         state.detach()
         if self.active.get(state.job.request_id) is state:
             del self.active[state.job.request_id]
+        releases, state.drain_releases = state.drain_releases, []
+        return releases
+
+    @staticmethod
+    def _run_drain_releases(releases):
+        for release in releases:
+            try:
+                release()
+            except Exception as unexpected:
+                # The finalizer and close() must go on to the next request.
+                print_status(f"Drain release failed · {unexpected}", error=True)
+
+    def release_after_drain(self, job, release):
+        """Hold `release` until `job`'s native call ends and return True,
+        when an early done answered the client while the call still drains;
+        otherwise return False, and the caller releases now.
+
+        The HTTP request gate releases its slot this way: the native pending
+        limit is the gate's capacity, so a slot freed while the call drains
+        would admit a request the native limit then refuses.
+        """
+        with self.lock:
+            state = self.active.get(job.request_id)
+            if state is None or state.job is not job or not state.client_done:
+                return False
+            state.drain_releases.append(release)
+            return True
 
     def _on_event(self, state, event):
         job = state.job
@@ -1096,7 +1128,8 @@ class NativeBackend:
             with self.lock:
                 shutdown_requested = state.shutdown_requested
                 client_done = state.client_done
-                self._detach_locked(state)
+                releases = self._detach_locked(state)
+            self._run_drain_releases(releases)
         if shutdown_requested:
             # Once close() has claimed an active HTTP request, its public
             # terminal is deterministic even if the native cancellation and
@@ -1236,11 +1269,11 @@ class NativeBackend:
             return APIError(400, str(error), "constraint_error")
         if isinstance(error, engine_runtime.PendingLimitExceeded):
             # The native pending limit is --queue-size, the HTTP request
-            # gate's capacity, so only a race with the gate reaches it: a
-            # request whose gate slot is free while its native call still
-            # holds a native slot, as a cancelled request, or a stop that got
-            # its early done while the call drains its last decode cycle. An
-            # overload like the gate's own, retried the same way.
+            # gate's capacity, so only a race with the gate reaches it, as
+            # when a cancelled request still holds its native slot (a stop's
+            # early done keeps its gate slot until the call drains: see
+            # release_after_drain): an overload like the gate's own, retried
+            # the same way.
             return APIError(503, "request queue is full", "frontend_overloaded")
         if isinstance(
             error,
@@ -1304,9 +1337,10 @@ class NativeBackend:
                 for state in list(self.active.values()):
                     if state.terminal_enqueued:
                         continue
-                    self._detach_locked(state)
-                    stranded.append((state, state.client_done))
-            for state, client_done in stranded:
+                    releases = self._detach_locked(state)
+                    stranded.append((state, state.client_done, releases))
+            for state, client_done, releases in stranded:
+                self._run_drain_releases(releases)
                 error = APIError(503, "server is shutting down", "server_shutdown")
                 self._record(state.job, error=error)
                 # An early done, queued or sent, is that client's terminal.

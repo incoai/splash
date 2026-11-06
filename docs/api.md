@@ -382,7 +382,9 @@ event, `predicted_ms` the first token event to the match, and the wall time
 and `ttft_ms` start at submission; it carries no `draft_n`, `draft_n_accepted`
 or `metrics.speculation`, and `metrics.cache.deduplicated_tokens` is 0. The
 request log and native queue timing ([status, readiness and
-metrics](#status-readiness-and-metrics)) take the engine's figures for it.
+metrics](#status-readiness-and-metrics)) take the engine's figures for it. Its
+`--queue-size` slot stays held until the engine has stopped the request, so the
+next request is admitted as it would be after a response sent at the end.
 
 ## Tool calls
 
