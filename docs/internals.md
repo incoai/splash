@@ -105,19 +105,17 @@ so pruning can free what no installation links any more.
 
 `hub.Repository.download` first removes the partial files
 (`<blob>.<random>.incomplete`) killed downloads left in the repository's blobs
-folder, of any blob, each under huggingface_hub's lock on its blob, and refuses
-a download that would leave its volume less free space than the SSD cache keeps
-there, which the engine's `disk-floor PATH` reports by the cache's own rule
-(`diskFloorBytes`). Front ends such as the desktop app run `install/models.py
---model ID prepare --json-progress`, with which each download also reports its
-progress as JSON lines on stdout, `{"event": "download", "repo": REPO, "done":
-BYTES, "total": BYTES}`: done 0 first, at most four a second as the bytes
-received grow (what the network has brought or what the Hub cache holds,
-whichever is more), and done equal to total once it succeeds. A failed
-`prepare`, with or without the flag, ends with `{"event": "error", "kind": KIND,
-"message": TEXT}` on stdout, which the app words by its kind and `splash serve`
-records as its start's failure. It is an interface between Splash's front ends
-and its installer, not a public one.
+folder, of any blob, each under huggingface_hub's lock on its blob. Front ends
+such as the desktop app run `install/models.py --model ID prepare
+--json-progress`, with which each download also reports its progress as JSON
+lines on stdout, `{"event": "download", "repo": REPO, "done": BYTES, "total":
+BYTES}`: done 0 first, at most four a second as the bytes received grow (what
+the network has brought or what the Hub cache holds, whichever is more), and
+done equal to total once it succeeds. A failed `prepare`, with or without the
+flag, ends with `{"event": "error", "kind": KIND, "message": TEXT}` on stdout,
+which the app words by its kind and `splash serve` records as its start's
+failure. It is an interface between Splash's front ends and its installer, not
+a public one.
 
 huggingface_hub downloads on threads it joins, which finish their files
 before an interrupt reaches the program, so the download runs on a thread of

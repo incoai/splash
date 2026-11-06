@@ -28,8 +28,6 @@ FILES = {
     "model-2.safetensors": b"2" * 200,
 }
 WEIGHTS = {"model-1.safetensors", "model-2.safetensors"}
-# The volume's measurement, which each DownloadTest replaces with ample room.
-AVAILABLE_BYTES = hub._available_bytes
 # The bytes huggingface_hub appends to a partial file at a time, here.
 CHUNK = 100
 
@@ -87,7 +85,6 @@ class DownloadTest(unittest.TestCase):
             ("huggingface_hub.constants.HF_HUB_CACHE", str(self.cache)),
             ("huggingface_hub.snapshot_download", self.snapshot_download),
             ("install.hub.PROGRESS_INTERVAL", 0.001),
-            ("install.hub._available_bytes", lambda path: 1 << 50),
         ):
             patch = mock.patch(name, replacement)
             patch.start()
@@ -241,7 +238,7 @@ class DownloadTest(unittest.TestCase):
         shutil.rmtree(self.blobs.parent)
         with (
             mock.patch.object(
-                hub, "_available_bytes", wraps=AVAILABLE_BYTES
+                hub, "_available_bytes", wraps=hub._available_bytes
             ) as measured,
             self.assertRaises(hub.models.ModelError),
         ):
@@ -250,25 +247,18 @@ class DownloadTest(unittest.TestCase):
         self.assertIn(self.cache, [volume, *volume.parents])
         self.assertEqual(self.downloads, [])
         self.assertEqual(self.events(), [])
-
-    def test_a_download_leaves_the_free_space_the_ssd_cache_keeps(self):
-        """10 GiB, or 5% of a volume under 200 GiB, as the engine reports it
-        (disk-floor)."""
-        floor = min(10 << 30, shutil.disk_usage(self.cache).total // 20)
+        self.blobs.mkdir(parents=True)
         with (
-            mock.patch.object(hub, "_available_bytes", lambda path: floor + 499),
+            mock.patch.object(hub, "_available_bytes", lambda path: 499),
             self.assertRaisesRegex(
-                hub.models.ModelError,
-                f"needs 0.00 GB beyond the {floor / 1e9:.2f} GB Splash keeps "
-                "free there",
+                hub.models.ModelError, "needs 0.00 GB and 0.00 GB is available"
             ),
         ):
             self.download()
         self.assertEqual(self.downloads, [])
-        with mock.patch.object(hub, "_available_bytes", lambda path: floor + 500):
+        with mock.patch.object(hub, "_available_bytes", lambda path: 500):
             self.download()
         self.assertEqual(self.downloads, [sorted(WEIGHTS)])
-        self.assertEqual(hub._floor_bytes(self.cache), floor)
 
     def test_a_failed_download_reports_no_completion(self):
         def fail(done):

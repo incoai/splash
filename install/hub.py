@@ -577,27 +577,17 @@ def _publish(path, content):
 
 
 def _require_room(repo_id, blobs, needed):
-    """Refuse a download of needed bytes into the blobs folder that would
-    leave its volume less free space than the SSD cache keeps there
-    (_floor_bytes), before it fills the disk: the Hub cache can be on
+    """Refuse a download of needed bytes into the blobs folder that its volume
+    has no room for, before it fills the disk: the Hub cache can be on
     another volume (HF_HOME, HF_HUB_CACHE) than the home folder."""
     existing = next(p for p in (blobs, *blobs.parents) if p.exists())
     available = _available_bytes(existing)
-    floor = _floor_bytes(existing)
-    if needed + floor > available:
+    if needed > available:
         raise models.ModelError(
             f"not enough disk space for {repo_id}: the download needs "
-            f"{needed / 1e9:.2f} GB beyond the {floor / 1e9:.2f} GB Splash keeps "
-            f"free there, and {available / 1e9:.2f} GB is available in "
-            f"{blobs.parent.parent}"
+            f"{needed / 1e9:.2f} GB and {available / 1e9:.2f} GB is available "
+            f"in {blobs.parent.parent}"
         )
-
-
-def _floor_bytes(path):
-    """The free space the engine's SSD cache keeps on the volume of path, by
-    the engine's own rule (its disk-floor command)."""
-    floor = models.run_engine(["disk-floor", str(path)], "disk floor")
-    return json.loads(floor)["bytes"]
 
 
 def _available_bytes(path):

@@ -247,9 +247,6 @@ class FakeHub:
             ("huggingface_hub.hf_hub_download", self.hf_hub_download),
             ("huggingface_hub.HfFileSystem", lambda: self),
             ("huggingface_hub.try_to_load_from_cache", self.try_to_load_from_cache),
-            # A cache volume with room for every download, whatever the test
-            # machine's has (test_hub measures the room).
-            ("install.hub._available_bytes", lambda path: 1 << 50),
         ):
             patch = mock.patch(name, replacement)
             patch.start()

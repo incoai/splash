@@ -4,7 +4,6 @@
 #include "Supervision.hpp"
 #include "engine/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
-#include "engine/DiskSpace.hpp"
 #include "engine/Json.hpp"
 #include "engine/NativeArguments.hpp"
 #include "model/ModelDescriptor.hpp"
@@ -159,7 +158,6 @@ void printUsage(std::string_view executable) {
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " device-check");
-  writeStderrLine("       " + command + " disk-floor PATH");
   writeStderrLine("       " + command + " families");
 }
 
@@ -476,20 +474,6 @@ int checkModel(int argc, char **argv) {
   return 0;
 }
 
-// The free space the SSD cache keeps on the volume of a path
-// (engine::diskFloorBytes), which the installer leaves after a download too,
-// as JSON.
-int printDiskFloor(int argc, char **argv) {
-  if (argc != 3)
-    throw engine::UsageError("disk-floor takes a path");
-  const std::optional<engine::DiskVolume> volume = engine::volumeOf(argv[2]);
-  if (!volume)
-    throw std::runtime_error(std::string("cannot measure the volume of ") + argv[2]);
-  std::printf("{\"bytes\":%llu}\n",
-              static_cast<unsigned long long>(engine::diskFloorBytes(volume->sizeBytes)));
-  return 0;
-}
-
 // What each family's layout gives the options a start takes
 // (model::familyFacts), as JSON by family, which the installer reports to the
 // app (install/families.py).
@@ -524,8 +508,6 @@ int main(int argc, char **argv) {
         return splash::checkDevice(argc);
       if (command == "model-check")
         return splash::checkModel(argc, argv);
-      if (command == "disk-floor")
-        return splash::printDiskFloor(argc, argv);
       if (command == "families")
         return splash::printFamilies(argc);
       if (command == "serve-native")
