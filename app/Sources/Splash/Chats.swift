@@ -108,11 +108,33 @@ final class ChatStore {
     }
 
     func delete(_ id: UUID) {
-        if streaming == id { stop() }
-        conversations.removeAll { $0.id == id }
-        let file = file(id)
-        files.async { try? FileManager.default.removeItem(at: file) }
-        if selection == id { selection = nil }
+        delete([id])
+    }
+
+    /// Deletes each conversation in `ids`, stopping the one that streams if it is one of them.
+    /// The open conversation closes when it is deleted.
+    func delete(_ ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        if let streaming, ids.contains(streaming) { stop() }
+        conversations.removeAll { ids.contains($0.id) }
+        // On the queue the chats are written on, after what is written there already.
+        let doomed = ids.map(file)
+        files.async { for file in doomed { try? FileManager.default.removeItem(at: file) } }
+        if let selection, ids.contains(selection) { self.selection = nil }
+    }
+
+    /// Deletes every conversation in the folder, open or not, and closes the open one.
+    func deleteAll() {
+        stop()
+        conversations.removeAll()
+        selection = nil
+        let folder = folder
+        files.async {
+            let all = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+            for file in all where file.pathExtension == "json" {
+                try? FileManager.default.removeItem(at: file)
+            }
+        }
     }
 
     func rename(_ id: UUID, to title: String) {

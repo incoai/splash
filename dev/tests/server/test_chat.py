@@ -69,7 +69,7 @@ function createChat(storage = new Map(), writable = true, models = null,
   let scrollBehavior;
   for (const id of ['chat', 'form', 'input', 'attachments', 'image-input',
                    'attach', 'effort', 'api-key', 'send', 'recents', 'new-chat',
-                   'mobile-new', 'menu', 'scrim', 'scroll-bottom', 'sidebar',
+                   'delete-all', 'mobile-new', 'menu', 'scrim', 'scroll-bottom', 'sidebar',
                    'sidebar-close', 'sidebar-open', 'credentials', 'thinking']) elements[id] = new Element();
   // Elements the markup hides start hidden, as in a browser.
   for (const [, id] of html.matchAll(/<\w+ id="([^"]+)"[^>]* hidden[ >]/g)) elements[id].hidden = true;
@@ -852,6 +852,29 @@ submit(chat);
 assert.deepEqual(chat.requests[0].body.messages, [{role:'user', content:'new prompt'}]);
 """)
 
+    def test_deleting_all_chats_confirms_and_clears_history(self):
+        self.run_chat(r"""
+const storage = new Map([['splash-chats', JSON.stringify([
+  {id:'first', title:'First', updated:2, messages:[{role:'user', content:'first prompt'}]},
+  {id:'second', title:'Second', updated:1, messages:[{role:'user', content:'second prompt'}]},
+])]]);
+const chat = createChat(storage);
+const removeAll = chat.elements['delete-all'];
+assert.equal(typeof removeAll.handlers.click, 'function', 'sidebar needs a delete all button');
+assert.equal(removeAll.disabled, false);
+chat.dialog.accept = false;
+removeAll.handlers.click();
+assert.equal(chat.dialog.messages.at(-1), 'Delete all chats? This cannot be undone.');
+assert.equal(chat.elements.recents.children.length, 2);
+assert.deepEqual(JSON.parse(storage.get('splash-chats')).map(chat => chat.id), ['first', 'second']);
+chat.dialog.accept = true;
+removeAll.handlers.click();
+assert.deepEqual(JSON.parse(storage.get('splash-chats')), []);
+assert.equal(chat.elements.recents.children.length, 0);
+assert.equal(chat.elements.chat.children[0].id, 'empty');
+assert.equal(removeAll.disabled, true);
+""")
+
     def test_loading_image_blocks_send_and_enter_until_ready(self):
         self.run_chat(r"""
 (async () => {
@@ -1024,7 +1047,7 @@ class ChatPageTest(HarnessTestCase):
             self.assertIn(b'value="' + effort + b'"', payload)
         for label in (b"Auto", b"Off"):
             self.assertIn(b">" + label + b"</option>", payload)
-        for label in (b"Splash", b"New chat", b"Recents"):
+        for label in (b"Splash", b"New Chat", b"Delete All Chats", b"Recents"):
             self.assertIn(label, payload)
         self.assertIn(
             b'<label id="credentials" hidden>This server needs an API key', payload

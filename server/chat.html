@@ -53,6 +53,10 @@
   #new-chat { display: flex; align-items: center; gap: 10px; width: 100%; margin-top: 9px; padding: 9px 10px; border-radius: 9px; text-align: left }
   #new-chat:hover { background: var(--hover) }
   #new-chat svg { width: 18px; height: 18px }
+  #delete-all { display: flex; align-items: center; gap: 10px; width: 100%; margin-top: 2px; padding: 9px 10px; border-radius: 9px; color: var(--muted); text-align: left }
+  #delete-all:hover { color: var(--text); background: var(--hover) }
+  #delete-all:disabled { opacity: .45 }
+  #delete-all svg { width: 18px; height: 18px }
   .recent-label { margin: 22px 10px 7px; color: var(--muted); font-size: 12px; font-weight: 600 }
   .recent-label:has(+ #recents:empty) { display: none }
   #recents { display: grid; gap: 2px }
@@ -179,7 +183,11 @@
   </div>
   <button id="new-chat" type="button">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-6"/><path d="M18 2v8M14 6h8"/></svg>
-    New chat
+    New Chat
+  </button>
+  <button id="delete-all" type="button" title="Delete All Chats" aria-label="Delete All Chats">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M9 6V4h6v2M5 6l1 14h12l1-14M10 10v6M14 10v6"/></svg>
+    Delete All Chats
   </button>
   <div class="recent-label">Recents</div>
   <nav id="recents" aria-label="Recent chats"></nav>
@@ -194,7 +202,7 @@
 <header id="mobile-header">
   <button id="menu" type="button" aria-label="Open sidebar" aria-controls="sidebar" aria-expanded="false"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
   <div class="brand">Splash</div>
-  <button id="mobile-new" type="button" aria-label="New chat"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-6"/><path d="M18 2v8M14 6h8"/></svg></button>
+  <button id="mobile-new" type="button" aria-label="New Chat"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-6"/><path d="M18 2v8M14 6h8"/></svg></button>
 </header>
 <main><div id="chat"></div></main>
 <form id="form">
@@ -236,6 +244,7 @@
   const credentials = $('#credentials');
   const send = $('#send');
   const recents = $('#recents');
+  const deleteAll = $('#delete-all');
   const scrollBottom = $('#scroll-bottom');
   const mobileLayout = window.matchMedia('(max-width: 720px)');
   const copyIcons = {
@@ -607,6 +616,7 @@
   }
 
   function renderRecents() {
+    deleteAll.disabled = Boolean(controller) || !conversations.length;
     recents.replaceChildren();
     conversations.forEach(conversation => {
       const item = document.createElement('div');
@@ -637,6 +647,14 @@
     if (!conversation || !window.confirm(`Delete chat "${conversation.title}"? This cannot be undone.`)) return;
     conversations = conversations.filter(conversation => conversation.id !== id);
     if (activeId === id) newChat();
+    save();
+  }
+
+  function deleteAllChats() {
+    if (controller || !conversations.length) return;
+    if (!window.confirm('Delete all chats? This cannot be undone.')) return;
+    conversations = [];
+    newChat();
     save();
   }
 
@@ -925,6 +943,7 @@
   apiKey.addEventListener('change', loadModel);
   $('#new-chat').addEventListener('click', newChat);
   $('#mobile-new').addEventListener('click', newChat);
+  deleteAll.addEventListener('click', deleteAllChats);
   $('#sidebar-close').addEventListener('click', () => setSidebarOpen(false));
   $('#sidebar-open').addEventListener('click', () => setSidebarOpen(true));
   $('#menu').addEventListener('click', () => setSidebarOpen(true));
