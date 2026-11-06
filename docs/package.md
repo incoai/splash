@@ -82,9 +82,8 @@ Support/Splash` and the Hugging Face cache. The app offers
 memory with its download size and a few words about the model, and starts
 coding agents with `splash AGENT --port PORT` in Terminal, in a folder the user
 picks, from a script that holds the running server's API key and removes itself
-as it starts. Its launch options are every option `splash serve` takes but the
-ones of one model (`--revision`, `--draft-model`, `--mmproj`) and the ones it
-sets itself, from one table (`LaunchOption.all`) the tests hold to `splash
+as it starts. Its launch options are every option `splash serve` takes but
+`--revision` and the ones it sets itself (`--model-dir`, `--offline`), from one table (`LaunchOption.all`) the tests hold to `splash
 serve --help`. It offers a model only those its family can use, and passes
 no other: at launch it runs `install/families.py`, which reports for each
 family, from the engine's `families` command and the options' own needs
@@ -102,7 +101,9 @@ still runs the download command above; it leaves any other process alone and
 forgets the record. It serves model files on this Mac
 the user adds with `splash serve --model local/NAME
 --model-dir PATH`, NAME being the file's or folder's name made a repository
-name, and at launch it runs `install/cached.py`. While a model runs, the Server
+name or the one set under Launch Options › Advanced › Model Files, where their
+vision projector (`--mmproj`) and DFlash2 draft (`--draft-model`) are picked too
+and kept for those files alone, and at launch it runs `install/cached.py`. While a model runs, the Server
 shows its context limit, from `/v1/models`, and its `/status`: requests,
 answering and prompt speed, time to first token, the tokens generated, read and
 taken from the cache, and the Metal memory it holds, with each request's line

@@ -585,8 +585,8 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("SPLASH_PORT or 8123", " ".join(output.getvalue().split()))
 
     def test_the_apps_launch_options_are_the_serve_options(self):
-        # The desktop app offers every option of splash serve but those of one
-        # model and those it sets itself, from one table (LaunchOption.all,
+        # The desktop app offers every option of splash serve but --revision
+        # and those it sets itself, from one table (LaunchOption.all,
         # docs/package.md): a flag it keeps that serve no longer takes would
         # fail every start, and a new option would never show.
         with (
@@ -596,12 +596,9 @@ class LauncherTests(unittest.TestCase):
             launcher.parse_args(["serve", "--help"])
         flags = set(re.findall(r"(?m)^  (--[a-z-]+)", output.getvalue())) - {
             "--help",
-            "--model",
             "--model-dir",
             "--offline",
             "--revision",
-            "--draft-model",
-            "--mmproj",
         }
         self.assertIn("--max-memory", flags)
         table = Path(launcher.__file__).resolve().parents[1] / (

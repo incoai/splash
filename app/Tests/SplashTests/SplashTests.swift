@@ -72,6 +72,73 @@ struct ServeSettingsTests {
         }
     }
 
+    @Test func servesModelFilesWithTheirNameProjectorAndDraft() {
+        let model = "/models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+        let settings = ServeSettings(values: ["--host": "0.0.0.0"], localValues: [model: [
+            "--model": "local/huihui-v2-q4",
+            "--mmproj": "/models/mmproj-BF16.gguf",
+            "--draft-model": "/models/flash-next-dflash2",
+        ]])
+        #expect(settings.serveArguments(model: model)
+            == ["serve", "--model", "local/huihui-v2-q4", "--model-dir", model,
+                "--port", "8000", "--offline",
+                "--mmproj", "/models/mmproj-BF16.gguf",
+                "--draft-model", "/models/flash-next-dflash2",
+                "--host", "0.0.0.0"])
+        // Without a name, the file's name is the model's.
+        #expect(ServeSettings(localValues: ["/models/m.gguf": ["--mmproj": "/models/mmproj-BF16.gguf"]])
+            .serveArguments(model: "/models/m.gguf")
+            == ["serve", "--model", "local/m", "--model-dir", "/models/m.gguf", "--port", "8000", "--offline",
+                "--mmproj", "/models/mmproj-BF16.gguf"])
+    }
+
+    @Test func keepsTheOptionsOfOneModelToItsFiles() throws {
+        // A name, a projector and a draft are one model's files': other model files start without
+        // them, an upstream model uses its installed selection, and text only loads no projector.
+        let projector = try #require(LaunchOption.all.first { $0.flag == "--mmproj" })
+        var settings = ServeSettings()
+        settings[projector, model: "/models/m.gguf"] = "/models/mmproj.gguf"
+        settings[projector, model: "/models/other.gguf"] = "/models/other-mmproj.gguf"
+        settings[projector, model: nil] = "/models/nothing.gguf"
+        settings[projector, model: "a/b"] = "/models/nothing.gguf"
+        #expect(settings[projector, model: "/models/m.gguf"] == "/models/mmproj.gguf")
+        #expect(settings[projector, model: "/models/other.gguf"] == "/models/other-mmproj.gguf")
+        #expect(settings[projector, model: "/models/third.gguf"] == nil && settings.values.isEmpty)
+        #expect(settings.serveArguments(model: "/models/third.gguf")
+            == ServeSettings().serveArguments(model: "/models/third.gguf"))
+        #expect(settings.serveArguments(model: "a/b") == ServeSettings().serveArguments(model: "a/b"))
+        #expect(Set(settings.localValues.keys) == ["/models/m.gguf", "/models/other.gguf"])
+        // An entry for an upstream model, from defaults edited by hand, starts nothing it refuses.
+        #expect(ServeSettings(localValues: ["a/b": ["--mmproj": "/models/mmproj.gguf"]]).serveArguments(model: "a/b")
+            == ServeSettings().serveArguments(model: "a/b"))
+        var textOnly = settings
+        textOnly["--language-only"] = "true"
+        #expect(!textOnly.serveArguments(model: "/models/m.gguf").contains("--mmproj"))
+        // A change to one model's files shows on them alone, and leaving a value leaves no entry.
+        #expect(settings.differs(from: ServeSettings(), model: "/models/m.gguf", family: .unknown))
+        #expect(!settings.differs(from: ServeSettings(), model: "/models/third.gguf", family: .unknown))
+        settings[projector, model: "/models/m.gguf"] = nil
+        #expect(Array(settings.localValues.keys) == ["/models/other.gguf"])
+        let name = try #require(LaunchOption.all.first { $0.flag == "--model" })
+        #expect(name.accepts("local/huihui-v2-q4") && name.accepts("local/x:Q4.git") && name.accepts("local/x:a--b"))
+        #expect(!name.accepts("huihui-v2-q4") && !name.accepts("local/..") && !name.accepts("local/x.git:Q4"))
+    }
+
+    @Test func restoresTheDefaultsOfTheModelPicked() {
+        let settings = ServeSettings(values: ["--host": "0.0.0.0"], apiKey: "key", localValues: [
+            "/models/m.gguf": ["--model": "local/m"], "/models/other.gguf": ["--model": "local/other"],
+        ])
+        #expect(settings.defaults(for: .unknown, model: "/models/m.gguf")
+            == ServeSettings(localValues: ["/models/other.gguf": ["--model": "local/other"]]))
+        #expect(settings.defaults(for: .unknown, model: "a/b") == ServeSettings(localValues: settings.localValues))
+        #expect(settings.defaults(for: .unknown, model: nil) == ServeSettings(localValues: settings.localValues))
+        // Options a family cannot use stay kept, for a model that can; the model's own files do not.
+        let family = ModelFamily(unusable: ["--host"])
+        #expect(settings.defaults(for: family, model: "/models/m.gguf")
+            == ServeSettings(values: ["--host": "0.0.0.0"],
+                             localValues: ["/models/other.gguf": ["--model": "local/other"]]))
+    }
+
     @Test func passesTheOptionsSetInTheTablesOrder() {
         let settings = ServeSettings(values: [
             "--port": "8100", "--max-context": "131072", "--max-memory": "48G", "--idle-release": "off",
@@ -111,6 +178,7 @@ struct ServeSettingsTests {
         let off = ServeSettings(values: ["--max-cache-disk": "0", "--language-only": "true"])
         let ssd = "Needs the SSD cache (SSD Cache Size not Off)."
         #expect(LaunchOption.all.filter { !$0.applies(off) }.map { [$0.flag, $0.lacks(off)] } == [
+            ["--mmproj", "Needs the model’s vision (Text only off)."],
             ["--sparse-kv-memory", ssd], ["--max-cache-disk-writes", ssd], ["--persistent-cache", ssd],
             ["--cache-dir", "Needs Keep after stopping on. \(ssd)"],
             ["--announce-served-name", "Needs a served model name."],
@@ -256,9 +324,18 @@ struct ServeSettingsTests {
                                               "--allowed-host": "mymac.local", "--allow-idle-sleep": "true"])
         settings.save(defaults)
         #expect(ServeSettings.current(defaults) == settings)
+        var local = settings
+        local.localValues = ["/models/m.gguf": ["--model": "local/m", "--mmproj": "/models/mmproj.gguf",
+                                                "--draft-model": "/models/draft"]]
+        local.save(defaults)
+        #expect(ServeSettings.current(defaults) == local)
         defaults.set(["--port": "70000", "--max-context": "-1", "--max-memory": "lots", "--nope": "1",
-                      "--kv-format": "bf16"], forKey: Preference.launchOptions)
-        #expect(ServeSettings.current(defaults).values == ["--kv-format": "bf16"])
+                      "--mmproj": "/models/mmproj.gguf", "--kv-format": "bf16"], forKey: Preference.launchOptions)
+        defaults.set(["/models/m.gguf": ["--mmproj": "mmproj.gguf", "--port": "9000", "--draft-model": "/models/draft"],
+                      "/models/bad.gguf": ["--model": "bad"]], forKey: Preference.localModelOptions)
+        let read = ServeSettings.current(defaults)
+        #expect(read.values == ["--kv-format": "bf16"])
+        #expect(read.localValues == ["/models/m.gguf": ["--draft-model": "/models/draft"]])
     }
 
     @Test func typedValuesTakeServesForms() throws {
@@ -327,6 +404,21 @@ struct ServeSettingsTests {
 
 @MainActor
 struct AppStateTests {
+    @Test func takesTheOptionsOfModelFilesOffTheListWithThem() throws {
+        let name = try #require(LaunchOption.all.first { $0.flag == "--model" })
+        let removed = "/models/\(UUID().uuidString).gguf", other = "/models/\(UUID().uuidString).gguf"
+        let (state, folder) = AppState.forTests()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        state.addLocal(URL(filePath: removed))
+        state.addLocal(URL(filePath: other))
+        state.options[name, model: removed] = "local/removed"
+        state.options[name, model: other] = "local/other"
+        state.removeLocal(removed)
+        #expect(state.options[name, model: removed] == nil)
+        let kept = ServeSettings.current(state.defaults)
+        #expect(kept.localValues[removed] == nil && kept.localValues[other] == ["--model": "local/other"])
+    }
+
     @Test(.enabled(if: ServeSettingsTests.keychainWritable, "the login Keychain is locked, as over SSH"))
     func keepsTheKeyTheOptionsHave() throws {
         let keychain = Keychain(service: "Splash Tests \(UUID().uuidString)")

@@ -428,9 +428,10 @@ final class AppState {
         refresh(picking: url.path)
     }
 
-    /// Takes model files off the list; the files stay where they are.
+    /// Takes model files off the list, with the options set for them; the files stay where they are.
     func removeLocal(_ path: String) {
         localModels.removeAll { $0 == path }
+        options.localValues[path] = nil
         refresh()
     }
 
