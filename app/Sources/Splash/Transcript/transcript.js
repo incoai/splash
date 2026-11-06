@@ -11,6 +11,15 @@ const transcript = (() => {
   // The characters of the replies a conversation that opens draws at once, its latest: about a
   // window's worth. The Markdown of those before comes after it has shown (markdown.later).
   const firstScreen = 6000;
+  // How the page lays out a message's text, for the room one not drawn yet keeps (page.estimator):
+  // the user's words in their bubble, 22 px a row, which leaves the column's first 80 px clear and
+  // pads them 16 px at either side, under their images (page.css, transcript.css); a reply's
+  // Markdown across the column, 24 px a paragraph's row, its blocks 14 px apart less the 5 px their
+  // rows leave over and under them (markdown.css), over its actions and under its line and why it
+  // stopped short (transcript.css).
+  const estimate = page.estimator(messages);
+  const userText = images => ({inset: 112, row: 22, gap: null, around: 17 + (images ? 128 : 0)});
+  const replyText = (line, error) => ({inset: 0, row: 24, gap: 9, around: 26 + (line ? 31 : 0) + (error ? 25 : 0)});
 
   // The messages drawn, by id: their element, the message as last given, and of a reply, its
   // texts as they show, which let out what streams at an even pace (page.paced).
@@ -73,7 +82,7 @@ const transcript = (() => {
     const bubble = element.querySelector('.bubble');
     bubble.textContent = message.text;
     bubble.hidden = message.text === '';
-    page.estimate(element, message.text);
+    estimate(element, message.text, userText(message.images.length > 0));
   }
 
   // A reply: its line, its Markdown, why it stopped short, and its actions, which keep their place
@@ -88,7 +97,7 @@ const transcript = (() => {
     element.classList.toggle('live', message.live);
     element.querySelector('.details').textContent = message.details;
     element.querySelector('.actions').setAttribute('aria-hidden', message.live);
-    if (!message.live) page.estimate(element, message.text);
+    if (!message.live) estimate(element, message.text, replyText(message.line !== null, message.error !== null));
     view.later = later;
     view.pace.to({text: message.text, reasoning: message.reasoning}, message.live);
   }

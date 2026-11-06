@@ -292,14 +292,39 @@ const page = (() => {
   });
   const measure = text => tall.observe(text);
 
-  // How tall a message of `text` might be, for one never drawn yet: the room a long conversation's
-  // messages off the screen keep (transcript.css, content-visibility), so that the scroller is
-  // about as long as the conversation before the reader has seen all of it. Lines of about 80
-  // characters, 24 px each.
-  function estimate(element, text) {
-    let rows = 0;
-    for (const line of text.split('\n')) rows += Math.max(1, Math.ceil(line.length / 80));
-    element.style.setProperty('--estimate', `${Math.min(rows * 24 + 32, 20000)}px`);
+  // How tall the messages of `content` might be, for those never drawn yet: the room a long
+  // conversation's messages off the screen keep (transcript.css, content-visibility), so that the
+  // scroller is about as long as the conversation before the reader has seen all of it. The
+  // estimate it gives takes a message's element and `text`, which the page lays out in rows of as
+  // many characters, about 7 px each, as the column fits less `inset` px, `row` px each, and in
+  // blocks that empty lines part, `gap` px apart, as Markdown's paragraphs, or, where `gap` is
+  // null, with its empty lines as rows too, as text that keeps them; and `around`, the room the
+  // rest of it takes. The column is `content`'s width, which the window's sets: a new one
+  // estimates them all again, in the frame that lays them out at it, as the sidebar slides.
+  function estimator(content) {
+    let width = null;
+    const column = () => parseFloat(getComputedStyle(content).width);
+
+    function size(element) {
+      const {lines, inset, row, gap, around} = element.estimate;
+      const columns = Math.max(1, Math.floor((width - inset) / 7));
+      let height = around + gap * Math.max(0, lines.length - 1);
+      for (const block of lines) for (const length of block) height += row * Math.max(1, Math.ceil(length / columns));
+      element.style.setProperty('--estimate', `${Math.min(height, 20000)}px`);
+    }
+
+    addEventListener('resize', () => {
+      if (width === null || column() === width) return;
+      width = column();
+      for (const element of content.children) if (element.estimate) size(element);
+    });
+
+    return (element, text, {inset, row, gap, around}) => {
+      width ??= column();
+      const blocks = gap === null ? [text] : text.split(/\n\s*\n/).filter(block => block.trim() !== '');
+      element.estimate = {lines: blocks.map(block => block.split('\n').map(line => line.length)), inset, row, gap, around};
+      size(element);
+    };
   }
 
   // Shows the whole seconds since `since`, from the first, changing once a second on the second
@@ -314,5 +339,5 @@ const page = (() => {
     element.tick = setTimeout(() => element.isConnected && count(element, since, show), 1000 - elapsed % 1000);
   }
 
-  return {post, setup, copy, follower, paced, write, latest, measure, estimate, count};
+  return {post, setup, copy, follower, paced, write, latest, measure, estimator, count};
 })();

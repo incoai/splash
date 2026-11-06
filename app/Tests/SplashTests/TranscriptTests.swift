@@ -227,13 +227,15 @@ struct TranscriptTests {
         show(messages)
         position = try await scrolled()
         #expect(position.top == position.bottom && !position.latest)
-        // Scrolled up, it stays where the reader left it, and offers the way back.
-        _ = try await webView.callAsyncJavaScript("scrollTo(0, 100)", contentWorld: .page)
+        // Scrolled up, it stays where the reader left it, and offers the way back: at the top, so
+        // that no message across the screen's edge, laid out at its own height in place of the room
+        // kept for it, moves the scroller to keep what the reader reads in place.
+        _ = try await webView.callAsyncJavaScript("scrollTo(0, 0)", contentWorld: .page)
         _ = try await scrolled()
         messages[messages.count - 1].text += "\n\n" + paragraph
         show(messages)
         position = try await scrolled()
-        #expect(position.top == 100 && position.bottom > 100 && position.latest)
+        #expect(position.top == 0 && position.bottom > 0 && position.latest)
         // Which glides there over 0.4 s, and the conversation follows again.
         _ = try await webView.callAsyncJavaScript("document.getElementById('latest').click()", contentWorld: .page)
         position = try await settled(scrolled, seconds: 2) { $0.top == $0.bottom }
@@ -590,14 +592,14 @@ struct TranscriptTests {
         }
         var resting = try await settled(position) { $0.gap == 0 }
         #expect(resting.gap == 0 && !resting.latest)
-        // Scrolled up, it stays where the reader left it, and offers the way back.
-        _ = try await webView.callAsyncJavaScript("scrollTo(0, 100)", contentWorld: .page)
+        // Scrolled up, at the top, it stays where the reader left it, and offers the way back.
+        _ = try await webView.callAsyncJavaScript("scrollTo(0, 0)", contentWorld: .page)
         try await Task.sleep(for: .milliseconds(100))
         grow()
         try await Task.sleep(for: .milliseconds(400))
         let top = try await webView.callAsyncJavaScript("return scrollY", contentWorld: .page) as? Double
         resting = try await position()
-        #expect(top == 100 && resting.latest)
+        #expect(top == 0 && resting.latest)
     }
 
     @Test func messagesOffTheScreenAreLaidOutAsTheyComeAndKeepWhatTheReaderReadsInPlace() async throws {
@@ -636,6 +638,75 @@ struct TranscriptTests {
             """) }) { $0.contains("Answer 19.") }
         #expect(copied.hasPrefix("auto ") && copied.contains("Question 0") && copied.contains("Answer 0.") && copied.contains("Answer 19."))
     }
+
+    /// At the column's width, which the window sets: the chat at the smallest window with the
+    /// sidebar open, 520 px across, and again once the window is wider.
+    @Test func messagesNotDrawnYetKeepAboutTheRoomTheyTake() async throws {
+        let (transcript, webView, window) = try await shownPage()
+        defer { window.orderOut(nil) }
+        // Once every reply is drawn, at `width`, each message laid out, against the room kept for it.
+        func measure(at width: Double) async throws -> (count: Int, total: Double, each: Double) {
+            let measured = try await settled({
+                try await webView.callAsyncJavaScript("""
+                    if (innerWidth !== \(width)) return []
+                    await new Promise(drawn => requestAnimationFrame(() => requestAnimationFrame(drawn)))
+                    const articles = [...document.querySelectorAll('#messages > article')]
+                    if (articles.some(article => article.querySelector('.markdown')?.textContent === '')) return []
+                    for (const article of articles) article.style.contentVisibility = 'visible'
+                    const measured = articles.map(article => [parseFloat(article.style.getPropertyValue('--estimate')),
+                                                              article.getBoundingClientRect().height])
+                    for (const article of articles) article.style.contentVisibility = ''
+                    return measured.flat()
+                    """, contentWorld: .page) as? [Double] ?? []
+            }) { !$0.isEmpty }
+            let kept = stride(from: 0, to: measured.count, by: 2).map { measured[$0] }
+            let heights = stride(from: 1, to: measured.count, by: 2).map { measured[$0] }
+            return (heights.count, kept.reduce(0, +) / heights.reduce(0, +) - 1,
+                    zip(kept, heights).map { abs($0 - $1) / $1 }.reduce(0, +) / Double(heights.count))
+        }
+        webView.frame.size.width = 520
+        transcript.show(TranscriptPage(Conversation(messages: Self.longChat), askAgain: .init(enabled: false, help: ""), name: { $0 }),
+                        reply: nil)
+        for width in [520.0, 800] {
+            webView.frame.size.width = width
+            let (count, total, each) = try await measure(at: width)
+            #expect(count == Self.longChat.count && abs(total) < 0.1 && each < 0.2, "at \(width): total \(total), each \(each)")
+        }
+    }
+
+    /// A long chat, as people have them: short questions, and replies of a few paragraphs, some
+    /// with a heading, a list or code, some after thinking.
+    private static let longChat: [ChatMessage] = {
+        var seed: UInt64 = 7
+        func next(_ count: Int) -> Int {
+            seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return Int((seed >> 33) % UInt64(count))
+        }
+        let words = """
+            the model reads each token of the prompt once and keeps what it learned in its cache so that a reply \
+            can go on without reading it again which makes long chats fast on a Mac with enough memory for them
+            """.split(separator: " ")
+        func sentence() -> String {
+            let text = (0..<(6 + next(18))).map { _ in String(words[next(words.count)]) }.joined(separator: " ")
+            return text.prefix(1).uppercased() + text.dropFirst() + "."
+        }
+        func paragraph() -> String { (0..<(1 + next(5))).map { _ in sentence() }.joined(separator: " ") }
+        return (0..<150).flatMap { _ in
+            var blocks = next(5) == 0 ? ["## " + sentence().dropLast()] : []
+            for _ in 0..<(1 + next(5)) {
+                switch next(8) {
+                case 0: blocks.append((0..<(2 + next(4))).map { _ in "- " + sentence() }.joined(separator: "\n"))
+                case 1: blocks.append((1...(2 + next(4))).map { "\($0). " + sentence() }.joined(separator: "\n"))
+                case 2: blocks.append("```swift\n" + (0..<(3 + next(10))).map { "let value\($0) = compute(\($0))" }.joined(separator: "\n") + "\n```")
+                default: blocks.append(paragraph())
+                }
+            }
+            let question = (0..<(1 + next(2))).map { _ in sentence() }.joined(separator: "\n")
+            return [ChatMessage(role: .user, text: question),
+                    ChatMessage(role: .assistant, text: blocks.joined(separator: "\n\n"), reasoning: next(3) == 0 ? paragraph() : "",
+                                model: "a/Big-GGUF:Q4", tokensPerSecond: 40, thinkingTime: 2)]
+        }
+    }()
 
     @Test func theChatShowsAgainWithoutLoadingOrDrawingItsPageAgain() async throws {
         let folder = FileManager.default.temporaryDirectory.appending(path: "splash-transcript-\(UUID().uuidString)")

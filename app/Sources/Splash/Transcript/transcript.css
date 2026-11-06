@@ -37,7 +37,7 @@ main {
 
 /* A message away from the screen is neither laid out nor painted, so that a long conversation's
    resize, as the sidebar slides, or a line that folds, lays out only those near it: one never
-   drawn keeps the room page.estimate guesses for it, and once drawn, its own. Its paint is cut at
+   drawn keeps the room page.estimator guesses for it, and once drawn, its own. Its paint is cut at
    its edges, so that it takes room at its sides for the highlights that reach past the column, the
    toggles' and the actions'. */
 #messages > article {
