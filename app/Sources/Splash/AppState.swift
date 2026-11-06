@@ -54,6 +54,9 @@ final class AppState {
     var showsDrawer = false
     var drawerHeight: CGFloat = 280
     private(set) var installed: [InstalledModel] = []
+    /// What each model family makes of the launch options, by its name, as the runtime reports it
+    /// at launch; none before, or where the report failed: every option then shows and passes.
+    private(set) var families: [String: ModelFamily] = [:]
     private(set) var blocker: Blocker?
     /// Whether the checks of `launch` are done; nothing starts before.
     private(set) var launched = false
@@ -74,10 +77,12 @@ final class AppState {
     private(set) var quitting = false
     /// The installer of the models the Hugging Face cache holds, while it runs (`launch`).
     private var cachedInstaller: ChildProcess?
-    /// The model files the user added, by path, as last measured (`refresh`), and the count of
-    /// measurements started, so that only the latest one counts.
-    @ObservationIgnored private var measured: [String: InstalledModel] = [:]
-    @ObservationIgnored private var measurements = 0
+    /// The listing of the models under way or last done (`refresh`), and the count of listings
+    /// started, so that only the latest one counts.
+    @ObservationIgnored private var listing: Task<Void, Never>?
+    @ObservationIgnored private var listings = 0
+    /// The model to pick once the latest listing has it (`refresh`).
+    @ObservationIgnored private var picking: String?
 
     init(runtime: Runtime, folders: Folders = .user, keychain: Keychain = .app, defaults: UserDefaults = .standard,
          shell: @escaping () -> Shell = { .login }) {
@@ -93,6 +98,9 @@ final class AppState {
         catalog = Catalog(contentsOf: runtime.suggestedModels)
         transcript = Transcript(runtime: runtime)
         installer.installed = { [weak self] in self?.didInstall($0) }
+        // A start prepares model files on this Mac, which then have a family, and the model that
+        // runs stays listed only while it runs.
+        server.phaseChanged = { [weak self] in self?.refresh() }
         // Asked from the page, which then has the keyboard: the composer takes it back.
         transcript.askAgain = { [weak self] in
             self?.retry()
@@ -158,8 +166,8 @@ final class AppState {
         return "Downloading \(name) · \(progress.fraction.formatted(.percent.precision(.fractionLength(0))))"
     }
 
-    /// The model picked on the Server screen: the last one picked if it is still on this Mac, else
-    /// the first one that is.
+    /// The model picked on the Server screen: the last one picked while it is listed, else the
+    /// first one listed.
     var selection: String? {
         get {
             access(keyPath: \.selection)
@@ -172,7 +180,13 @@ final class AppState {
     /// Whether the model that runs would start otherwise with the options set now.
     var optionsChanged: Bool {
         guard server.phase == .ready, let model = server.model else { return false }
-        return server.settings.differs(from: options, model: model)
+        return server.settings.differs(from: options, model: model, family: family(of: model))
+    }
+
+    /// What the family of `model`, a listed one, makes of the launch options; unknown for model
+    /// files on this Mac not prepared yet, or before the runtime has reported its families.
+    func family(of model: String?) -> ModelFamily {
+        installed.first { $0.id == model }?.family.flatMap { families[$0] } ?? .unknown
     }
 
     /// The name to show for model `id`; its variant tells installed variants of a model apart.
@@ -182,8 +196,9 @@ final class AppState {
         return "\(name) (\(Catalog.variant(of: id)))"
     }
 
-    /// Checks this Mac and the app's location, stops what the app left running last time, and
-    /// then, in the background, installs the models the Hugging Face cache holds.
+    /// Checks this Mac and the app's location, waits for the list of the models on it, stops what
+    /// the app left running last time, and then, in the background, installs the models the Hugging
+    /// Face cache holds; meanwhile it reads what each model family makes of the launch options.
     func launch() async {
         defer { launched = true }
         if let reason = await runtime.unsupportedReason() {
@@ -195,6 +210,8 @@ final class AppState {
                               message: "Splash can’t run from the disk image. Drag it to your Applications folder, then open it from there.")
             return
         }
+        await listed()
+        Task { families = await runtime.families() }
         await installer.stopLeftover()
         await server.stopLeftover()
         installCached()
@@ -237,7 +254,7 @@ final class AppState {
         guard ready, keyProblem == nil else { return }
         selection = model
         chats.stop()
-        server.start(model, settings: options)
+        server.start(model, settings: options.usable(by: family(of: model)))
     }
 
     func stop() {
@@ -350,23 +367,51 @@ final class AppState {
         NSPasteboard.put(settings.url.appending(path: "v1").absoluteString)
     }
 
-    /// The models installed here, the suggested ones first in the list's order, then the model files
-    /// on this Mac the user added, with their sizes as last measured; they are measured again off the
-    /// main thread, as a folder picked may be large.
-    func refresh() {
-        let rank = { (id: String) in self.catalog.variants.firstIndex { $0.id == id } ?? Int.max }
+    /// Lists the models installed here, the suggested ones first in the list's order, then the model
+    /// files on this Mac the user added, measured, with the family of their preparation once
+    /// prepared; the model that runs stays listed as it was while it runs, its files gone or taken
+    /// off the list. It reads them off the main thread, as the Hugging Face cache may be on another
+    /// volume and a folder picked large, and the list stays as it was until it is done; only the
+    /// latest listing counts. `picking` is picked once that listing is done, as the pick of a model
+    /// not listed falls to the first one listed (`selection`).
+    @discardableResult
+    func refresh(picking model: String? = nil) -> Task<Void, Never> {
+        let runtime = runtime
         let paths = localModels
-        installed = runtime.installedModels().sorted { (rank($0.id), $0.id) < (rank($1.id), $1.id) }
-            + paths.map { measured[$0] ?? InstalledModel(id: $0) }
-        guard !paths.isEmpty else { return }
-        measurements += 1
-        let measurement = measurements
-        Task {
-            let models = await Task.detached { paths.map(InstalledModel.local) }.value
-            guard measurement == measurements else { return }
-            measured = Dictionary(models.map { ($0.id, $0) }) { first, _ in first }
-            let current = installed.map { $0.local ? measured[$0.id] ?? $0 : $0 }
-            if current != installed { installed = current }
+        if let model { picking = model }
+        listings += 1
+        let count = listings
+        let task = Task {
+            let (models, prepared, local) = await Task.detached {
+                (runtime.installedModels(), runtime.preparedFamilies(), paths.map(InstalledModel.local))
+            }.value
+            guard count == listings else { return }
+            let found = models + local.map { model in
+                var model = model
+                model.family = prepared[model.id]
+                return model
+            }
+            let all = found + installed.filter { model in
+                server.running && server.model == model.id && !found.contains { $0.id == model.id }
+            }
+            let rank = { (id: String) in self.catalog.variants.firstIndex { $0.id == id } ?? Int.max }
+            let listed = all.filter { !$0.local }.sorted { (rank($0.id), $0.id) < (rank($1.id), $1.id) }
+                + all.filter(\.local)
+            if listed != installed { installed = listed }
+            if let picked = picking {
+                picking = nil
+                selection = picked
+            }
+        }
+        listing = task
+        return task
+    }
+
+    /// Waits for the latest listing of the models (`refresh`) to be done.
+    func listed() async {
+        while let task = listing {
+            await task.value
+            if task == listing { return }
         }
     }
 
@@ -379,8 +424,7 @@ final class AppState {
     /// Splash prepare them, and says why if it cannot serve them.
     func addLocal(_ url: URL) {
         if !localModels.contains(url.path) { localModels.append(url.path) }
-        refresh()
-        selection = url.path
+        refresh(picking: url.path)
     }
 
     /// Takes model files off the list; the files stay where they are.
@@ -395,8 +439,7 @@ final class AppState {
 
     /// Picks the model downloaded, for the user to start.
     private func didInstall(_ model: String) {
-        refresh()
-        selection = model
+        refresh(picking: model)
         if NSApp?.isActive == false { NSApp.requestUserAttention(.informationalRequest) }
     }
 

@@ -78,7 +78,8 @@ struct ServerView: View {
         .animation(Motion.settle, value: Layout(phase: state.server.phase, next: state.server.next, serving: state.server.serving,
                                                 installed: state.installed.map(\.id), downloading: state.installer.running,
                                                 failure: state.installer.failure?.message, keyProblem: state.keyProblem,
-                                                finding: state.findingCachedModels, options: state.options))
+                                                finding: state.findingCachedModels, options: state.options,
+                                                family: state.family(of: state.selection)))
         .contentMargins(.horizontal, max(0, (width - column) / 2), for: .scrollContent)
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -95,7 +96,8 @@ struct ServerView: View {
     }
 
     /// What the screen holds: what the server does, the models, a download or a problem, and the
-    /// launch options; the model picked is not in it, so that picking one is immediate.
+    /// launch options, those the family of the model picked uses; the model picked is not in it, so
+    /// that picking one of the same family is immediate.
     private struct Layout: Equatable {
         var phase: Server.Phase
         var next: String?
@@ -106,6 +108,7 @@ struct ServerView: View {
         var keyProblem: String?
         var finding: Bool
         var options: ServeSettings
+        var family: ModelFamily
     }
 
     /// Ways to models the list doesn't offer: one from Hugging Face by its ID, or files on this Mac.

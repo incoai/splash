@@ -24,6 +24,8 @@ def record(phase):
 
 record("loading")
 after("loaded")
+if (root / "refused").exists():
+    sys.exit(1)  # as the engine refuses a model it cannot serve
 record("warming")
 after("warm")
 

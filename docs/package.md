@@ -85,7 +85,13 @@ picks, from a script that holds the running server's API key and removes itself
 as it starts. Its launch options are every option `splash serve` takes but the
 ones of one model (`--revision`, `--draft-model`, `--mmproj`) and the ones it
 sets itself, from one table (`LaunchOption.all`) the tests hold to `splash
-serve --help`; the API key reaches the server as `SPLASH_API_KEY`, from the
+serve --help`. It offers a model only those its family can use, and passes
+no other: at launch it runs `install/families.py`, which reports for each
+family, from the engine's `families` command and the options' own needs
+(`ServeOption.needs`), the options none of its models can use and the context
+they serve; a model's family is its assembly record's, and a model whose
+family is not known yet gets every option. The API key reaches the server as
+`SPLASH_API_KEY`, from the
 Keychain, and nothing starts while the Keychain does not give it. The server
 stops as SIGTERM stops it once the app has ended, by a crash too, since the app
 passes its process ID as `SPLASH_APP_PID`; the app's next launch stops one still

@@ -87,14 +87,16 @@ struct Runtime: Sendable {
         return environment
     }
 
-    /// The models installed here: each selection link's assembly record names its model, which is
-    /// on this Mac while every file the record names is, its links followed (as `verify` in
-    /// `install/assembly.py` requires, without its size and time checks): a model whose files were
-    /// deleted, as from the Hugging Face cache, is not, and installing it again replaces it.
+    /// The models installed here: each selection link's assembly record names its model and its
+    /// family; the model is on this Mac while every file the record names is, its links followed
+    /// (as `present` in `install/cached.py` has it): a model whose files were deleted, as from the
+    /// Hugging Face cache, is not listed, and installs again once the cache holds it again or it is
+    /// downloaded again.
     func installedModels() -> [InstalledModel] {
         struct Record: Decodable {
             struct File: Decodable { let path: String; let bytes: Int64 }
             let model: String
+            let family: String?
             let files: [String: File]
         }
         let manager = FileManager.default
@@ -108,9 +110,39 @@ struct Runtime: Sendable {
                 else { return nil }
                 // An assembly can link one file under two names (a checkpoint's vision tower).
                 let files = Dictionary(record.files.values.map { ($0.path, $0.bytes) }) { first, _ in first }
-                return InstalledModel(id: record.model, bytes: files.values.reduce(0, +))
+                return InstalledModel(id: record.model, bytes: files.values.reduce(0, +), family: record.family)
             }
             .sorted { $0.id < $1.id }
+    }
+
+    /// The family of each model prepared here under a selection link of its options' hash
+    /// (`.selections`), by the model its assembly record names: model files on this Mac, by their
+    /// path (`install/local.py`), and a model installed with other options than the app's.
+    func preparedFamilies() -> [String: String] {
+        struct Record: Decodable {
+            let model: String
+            let family: String
+        }
+        let links = (try? FileManager.default.contentsOfDirectory(at: models.appending(path: ".selections"),
+                                                                   includingPropertiesForKeys: nil)) ?? []
+        let records = links.compactMap { link in
+            (try? Data(contentsOf: link.appending(path: "model.json"))).flatMap { try? JSONDecoder().decode(Record.self, from: $0) }
+        }
+        return Dictionary(records.map { ($0.model, $0.family) }) { first, _ in first }
+    }
+
+    /// What each model family makes of the launch options, by its name, as `install/families.py`
+    /// reports it on its last line; empty where it fails, or runs past 30 s.
+    @MainActor
+    func families() async -> [String: ModelFamily] {
+        let output = FileManager.default.temporaryDirectory.appending(path: "splash-families-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: output) }
+        guard await ChildProcess.run(scriptCommand("install/families.py", []), environment: environment, log: output,
+                                     timeout: .seconds(30)) == 0,
+              let said = try? String(contentsOf: output, encoding: .utf8),
+              let report = said.split(whereSeparator: \.isNewline).last
+        else { return [:] }
+        return (try? JSONDecoder().decode([String: ModelFamily].self, from: Data(report.utf8))) ?? [:]
     }
 
     /// The process holding `port`'s lock, as it records itself there; nil while none holds it. The
@@ -184,10 +216,12 @@ struct InstalledModel: Identifiable, Hashable, Sendable {
     /// Its Hugging Face ID, or the path of model files on this Mac.
     let id: String
     /// What its files take on disk, shared with any other installation of the same files; nil for
-    /// model files on this Mac not measured yet.
+    /// model files on this Mac that are missing.
     var bytes: Int64?
     /// Whether model files on this Mac are no longer where they were added from.
     var missing = false
+    /// Its family, as its assembly record names it; nil for model files on this Mac not prepared yet.
+    var family: String?
 
     /// Whether it is model files on this Mac rather than a model Splash installed.
     var local: Bool { id.hasPrefix("/") }

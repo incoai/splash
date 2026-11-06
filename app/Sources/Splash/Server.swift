@@ -39,7 +39,11 @@ final class Server {
         case recovering = "Recovering…"
     }
 
-    private(set) var phase = Phase.stopped
+    private(set) var phase = Phase.stopped {
+        didSet { phaseChanged() }
+    }
+    /// Called each time `phase` is set.
+    @ObservationIgnored var phaseChanged: () -> Void = {}
     /// While starting: what the start does, and since when.
     private(set) var step = Step.starting
     private(set) var stepSince = Date.now

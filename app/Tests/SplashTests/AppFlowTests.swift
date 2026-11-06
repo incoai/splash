@@ -77,6 +77,7 @@ final class AppFlowTests {
         try FileManager.default.createDirectory(at: fresh.appending(path: "install"), withIntermediateDirectories: true)
         try? FileManager.default.copyItem(at: state.runtime.suggestedModels, to: Runtime(root: fresh).suggestedModels)
         let first = AppState.forTests(in: fresh, runtime: Runtime(root: fresh))
+        await first.listed()
         #expect(first.installed.isEmpty && first.selection == nil)
         await first.launch()
         await Snapshot.save("server-first-run", MainView().environment(first))
@@ -177,6 +178,7 @@ final class AppFlowTests {
         state.addLocal(file)
         // The list outlives the run, so that a failed one leaves the next a Mac without the files.
         defer { state.removeLocal(file.path) }
+        await state.listed()
         #expect(state.selection == file.path && state.isInstalled(file.path))
         state.start(file.path)
         try await ready()
@@ -188,6 +190,7 @@ final class AppFlowTests {
         try await converse("Say hi.")
         try await stop()
         state.removeLocal(file.path)
+        await state.listed()
         #expect(!state.isInstalled(file.path))
     }
 
@@ -245,7 +248,9 @@ final class AppFlowTests {
         state.start(model)
         #expect(!state.server.running)
         // The model stays picked for the next launch, which starts nothing by itself.
-        #expect(relaunch().selection == model)
+        let next = relaunch()
+        await next.listed()
+        #expect(next.selection == model)
     }
 
     @Test func aRelaunchStopsTheServerACrashLeftBehind() async throws {
@@ -287,7 +292,7 @@ final class AppFlowTests {
     // MARK: -
 
     private func install(_ model: String) async throws {
-        state.refresh()
+        await state.refresh().value
         guard !state.isInstalled(model) else { return }
         state.installer.install(model)
         try await waitFor(!state.installer.running, "installed \(model)", seconds: 3600)

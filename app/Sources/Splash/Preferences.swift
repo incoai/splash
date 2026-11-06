@@ -82,9 +82,22 @@ struct ServeSettings: Equatable {
         apiKey.map { ["SPLASH_API_KEY": $0] } ?? [:]
     }
 
-    /// Whether a model started with these options would start otherwise with `other`.
-    func differs(from other: ServeSettings, model: String) -> Bool {
-        serveArguments(model: model) != other.serveArguments(model: model) || apiKey != other.apiKey
+    /// The options a model of `family` starts with: those set but the ones it does not take
+    /// (`ModelFamily.takes`), whose values stay kept for a model that does.
+    func usable(by family: ModelFamily) -> ServeSettings {
+        ServeSettings(values: values.filter { family.takes($0.key, $0.value) }, apiKey: apiKey)
+    }
+
+    /// These options with the ones a model of `family` can use, those the card shows, back at their
+    /// defaults, the API key too; values kept for the others stay, for a model that can use them.
+    func defaults(for family: ModelFamily) -> ServeSettings {
+        ServeSettings(values: values.filter { !family.uses($0.key) })
+    }
+
+    /// Whether a model of `family` started with these options would start otherwise with `other`.
+    func differs(from other: ServeSettings, model: String, family: ModelFamily) -> Bool {
+        usable(by: family).serveArguments(model: model) != other.usable(by: family).serveArguments(model: model)
+            || apiKey != other.apiKey
     }
 
     /// The server's address: it listens on the loopback address, alone or with every other one, and
@@ -129,16 +142,31 @@ struct LaunchOption: Identifiable, Sendable {
         case secret
     }
 
-    /// A value typed in: the words that ask for it, and the value `splash serve` takes for a text,
-    /// nil where it takes none.
+    /// A value typed in: the words that ask for it, for a model of a family, and the value
+    /// `splash serve` takes for a text, nil where it takes none.
     struct Value: Sendable {
         let prompt: String
-        let message: String
+        let message: @Sendable (ModelFamily) -> String
         let parse: @Sendable (String) -> String?
         /// A value as the field shows it.
         var text: @Sendable (String) -> String = { $0 }
         /// A value as the menu names it.
         var title: @Sendable (String) -> String = { $0 }
+
+        init(prompt: String, message: @escaping @Sendable (ModelFamily) -> String, parse: @escaping @Sendable (String) -> String?,
+             text: @escaping @Sendable (String) -> String = { $0 }, title: @escaping @Sendable (String) -> String = { $0 }) {
+            self.prompt = prompt
+            self.message = message
+            self.parse = parse
+            self.text = text
+            self.title = title
+        }
+
+        /// One whose words are the same for every model.
+        init(prompt: String, message: String, parse: @escaping @Sendable (String) -> String?,
+             text: @escaping @Sendable (String) -> String = { $0 }, title: @escaping @Sendable (String) -> String = { $0 }) {
+            self.init(prompt: prompt, message: { _ in message }, parse: parse, text: text, title: title)
+        }
     }
 
     let flag: String
@@ -146,12 +174,35 @@ struct LaunchOption: Identifiable, Sendable {
     let help: String
     let section: Section
     let kind: Kind
-    /// Whether the option has effect with the others set as they are.
-    var applies: @Sendable (ServeSettings) -> Bool = { _ in true }
+    /// What the option needs of the others to have effect; one that hasn't shows dimmed, a switch
+    /// as off, says what it lacks, and doesn't reach the server.
+    var requires: [Requirement] = []
     /// What to beware of with the options set as they are, if anything.
     var warning: @Sendable (ServeSettings) -> String? = { _ in nil }
 
     var id: String { flag }
+
+    /// What an option needs of the others, in a sentence, and whether they have it.
+    struct Requirement: Sendable {
+        let reason: String
+        let met: @Sendable (ServeSettings) -> Bool
+
+        init(_ reason: String, met: @escaping @Sendable (ServeSettings) -> Bool) {
+            self.reason = reason
+            self.met = met
+        }
+    }
+
+    /// What the option lacks to have effect with the others set as they are; nil while it has it.
+    func lacks(_ settings: ServeSettings) -> String? {
+        let reasons = requires.filter { !$0.met(settings) }.map(\.reason)
+        return reasons.isEmpty ? nil : reasons.joined(separator: " ")
+    }
+
+    /// Whether the option has effect with the others set as they are.
+    func applies(_ settings: ServeSettings) -> Bool {
+        lacks(settings) == nil
+    }
 
     /// What `splash serve` takes for `value`: the option, its value, or nothing.
     func arguments(_ value: String?) -> [String] {
@@ -182,6 +233,40 @@ struct LaunchOption: Identifiable, Sendable {
     }
 }
 
+/// What the models of one family make of the launch options, as the runtime reports it for each
+/// family (`install/families.py`): the flags of the options none of them can use, which the Server
+/// screen leaves out and a start doesn't pass, and the context they serve: their own window, and
+/// the most past it, as far as YaRN stretches it; a longer context length set stays kept for a
+/// model that serves it, and a start passes Auto. Every option is used by a family not known.
+struct ModelFamily: Decodable, Equatable, Sendable {
+    var unusable: Set<String> = []
+    var contextTokens: Int?
+    var maxContextTokens: Int?
+
+    static let unknown = ModelFamily()
+
+    enum CodingKeys: String, CodingKey {
+        case unusable, contextTokens = "context_tokens", maxContextTokens = "max_context_tokens"
+    }
+
+    /// Whether its models can use the option `flag`.
+    func uses(_ flag: String) -> Bool {
+        !unusable.contains(flag)
+    }
+
+    /// Whether its models take `value` for the option `flag`: one they can use, and no refusal.
+    func takes(_ flag: String, _ value: String) -> Bool {
+        uses(flag) && refusal(flag, value) == nil
+    }
+
+    /// Why its models don't take `value` for the option `flag`: a context length past the most
+    /// they serve; nil for any other.
+    func refusal(_ flag: String, _ value: String) -> String? {
+        guard flag == "--max-context", let tokens = Int(value), let most = maxContextTokens, tokens > most else { return nil }
+        return "The model picked serves at most \(ContextLength.title(most)); it starts on Auto."
+    }
+}
+
 extension LaunchOption {
     static let all: [LaunchOption] = main + memory + cache + network + api + requests
 
@@ -191,8 +276,7 @@ extension LaunchOption {
             help: "How much of a conversation the model keeps in mind. Auto fits it to this Mac’s memory.",
             section: .main,
             kind: .choice(standard: "Auto", choices: ContextLength.lengths.map { (String($0), ContextLength.title($0)) },
-                          custom: Value(prompt: "100K",
-                                        message: "Tokens, with K for 1024 or M for a million, such as 100K or 1M. Past the model’s own window it stretches it with YaRN, which changes answers at every length.",
+                          custom: Value(prompt: "100K", message: ContextLength.message,
                                         parse: { ContextLength.parse($0).map(String.init) },
                                         text: { Int($0).map(ContextLength.text) ?? $0 },
                                         title: { Int($0).map(ContextLength.title) ?? $0 }))),
@@ -237,7 +321,8 @@ extension LaunchOption {
         LaunchOption(
             flag: "--sparse-kv-memory", title: "Sparse KV cache",
             help: "Memory for the sparse-attention KV blocks Qwen3.8-Flash-Next reads back from the SSD; never below its floor.",
-            section: .memory, kind: .choice(standard: "Auto", choices: [], custom: size(example: "1200M"))),
+            section: .memory, kind: .choice(standard: "Auto", choices: [], custom: size(example: "1200M")),
+            requires: [ssdCache]),
     ]
 
     private static let cache: [LaunchOption] = [
@@ -253,16 +338,16 @@ extension LaunchOption {
             section: .cache,
             kind: .choice(standard: "No Limit", choices: [("100G", "100 GB"), ("200G", "200 GB"), ("500G", "500 GB")],
                           custom: size(example: "300G")),
-            applies: { $0["--max-cache-disk"] != "0" }),
+            requires: [ssdCache]),
         LaunchOption(
             flag: "--persistent-cache", title: "Keep after stopping",
             help: "The next start of the model goes on from the prompts it kept.",
-            section: .cache, kind: .toggle(on: true), applies: { $0["--max-cache-disk"] != "0" }),
+            section: .cache, kind: .toggle(on: true), requires: [ssdCache]),
         LaunchOption(
             flag: "--cache-dir", title: "Folder",
             help: "Where the SSD cache it keeps lives.",
             section: .cache, kind: .folder,
-            applies: { $0["--persistent-cache"] == "true" && $0["--max-cache-disk"] != "0" }),
+            requires: [Requirement("Needs Keep after stopping on.") { $0["--persistent-cache"] == "true" }, ssdCache]),
     ]
 
     private static let network: [LaunchOption] = [
@@ -331,7 +416,8 @@ extension LaunchOption {
         LaunchOption(
             flag: "--announce-served-name", title: "Report served name",
             help: "Replies and the model list give the first served model name rather than the model’s own.",
-            section: .api, kind: .toggle(on: true), applies: { $0["--served-model-name"] != nil }),
+            section: .api, kind: .toggle(on: true),
+            requires: [Requirement("Needs a served model name.") { $0["--served-model-name"] != nil }]),
     ]
 
     private static let requests: [LaunchOption] = [
@@ -355,7 +441,8 @@ extension LaunchOption {
             help: "The most pixels an image is resized to, 65,536 to 4,194,304.",
             section: .requests,
             kind: .choice(standard: "4,194,304", choices: [], custom: Value(prompt: "1048576", message: "Pixels, 65,536 to 4,194,304.",
-                                                                           parse: whole))),
+                                                                           parse: whole)),
+            requires: [Requirement("Needs the model’s vision (Text only off).") { $0["--language-only"] != "true" }]),
         LaunchOption(
             flag: "--decode-share", title: "Decode share",
             help: "Seconds of answering for each second spent reading a new prompt: more keeps answers flowing, less starts the new one sooner; 0 takes turns step by step.",
@@ -375,6 +462,9 @@ extension LaunchOption {
             help: "The Mac doesn’t sleep in the middle of an answer; the display still may.",
             section: .requests, kind: .toggle(on: false)),
     ]
+
+    /// What the options of the SSD cache need: the cache itself.
+    private static let ssdCache = Requirement("Needs the SSD cache (SSD Cache Size not Off).") { $0["--max-cache-disk"] != "0" }
 
     /// A size typed in, as `splash serve` takes one: bytes, or a number with K, M or G.
     private static func size(example: String) -> Value {
@@ -421,13 +511,30 @@ enum ContextLength {
         return String(tokens)
     }
 
+    /// What the sheet that asks for a length says, for a model of `family`: the most it serves,
+    /// and whether YaRN stretches its own window that far.
+    static let message: @Sendable (ModelFamily) -> String = { family in
+        let units = "Tokens, with K for 1024 or M for a million"
+        guard let window = family.contextTokens, let most = family.maxContextTokens else {
+            return "\(units), such as 100K or 1M. Past the model’s own window it stretches it with YaRN, which changes answers at every length."
+        }
+        guard most > window else { return "\(units), such as 100K; at most \(figure(window)), the model’s own window." }
+        return "\(units), such as 100K or 1M; at most \(figure(most)). Past the model’s own window, \(figure(window)), it stretches it with YaRN, which changes answers at every length."
+    }
+
+    /// The most context `splash serve` takes, its MAX_YARN_CONTEXT_TOKENS, which a test holds this
+    /// to (ServeSettingsTests); dev/tests/install/test_families.py holds that to the most any
+    /// family serves.
+    static let ceiling = 1_010_000
+
     /// A length typed as `--max-context` takes it: a token count, with K for 1024 tokens or M for
-    /// a million; nil for anything else.
+    /// a million, up to `ceiling`; nil for anything else.
     static func parse(_ text: String) -> Int? {
         guard let match = text.trimmingCharacters(in: .whitespaces).uppercased().wholeMatch(of: /(\d{1,9})\s*([KM]?)/),
               let count = Int(match.1), count > 0
         else { return nil }
-        return count * (match.2 == "K" ? 1024 : match.2 == "M" ? 1_000_000 : 1)
+        let tokens = count * (match.2 == "K" ? 1024 : match.2 == "M" ? 1_000_000 : 1)
+        return tokens <= ceiling ? tokens : nil
     }
 }
 
