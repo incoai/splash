@@ -125,6 +125,7 @@ def check_package_imports() -> list[str]:
         "install/models.py",
         "install/local.py",
         "install/cached.py",
+        "install/families.py",
     }
     errors = []
     for package in ("server", "install"):

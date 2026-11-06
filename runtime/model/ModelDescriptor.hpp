@@ -16,6 +16,7 @@
 #include <string_view>
 #include <tuple>
 #include <variant>
+#include <vector>
 
 namespace splash::model {
 
@@ -91,6 +92,29 @@ inspectModelRoot(const std::filesystem::path &root);
 // the family's YaRN window, or the native one of a family YaRN does not
 // serve, or for a model that is already scaled.
 [[nodiscard]] ModelDescriptor servedFor(ModelDescriptor model, uint32_t contextTokens);
+
+// What a family's layout gives the options a start takes, which the
+// installer reports to the app (the engine's families command): whether its
+// FFN is a MoE, whose experts can stream from the SSD (ModelSizing) and
+// whose verify rows a budget sizes (budgetsVerifyRows); whether it keeps GDN
+// state; whether it has a PLE n-gram table; whether its attention selects KV
+// blocks, which a cache reads back from the SSD (SparseKvShape); whether every
+// FFN layer is dense, as the ANE split takes them (aneFfnLayers); and its
+// native window and the most context it serves, past that window with YaRN
+// (servedFor).
+struct FamilyFacts final {
+  std::string_view family;
+  bool experts = false;
+  bool recurrentState = false;
+  bool pleTable = false;
+  bool sparseKv = false;
+  bool denseFfn = false;
+  uint32_t contextTokens = 0;
+  uint32_t maximumContextTokens = 0;
+};
+
+// Each family's facts, in kFamilies' order.
+[[nodiscard]] std::vector<FamilyFacts> familyFacts();
 
 // The family of an upstream model's configuration, checked by the rules
 // inspectModelRoot holds its assembly to: config, the target's config.json

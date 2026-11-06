@@ -4,13 +4,31 @@ the chat format the server reads and writes each one's output in.
 A target's family is the one the engine finds its configuration to describe,
 by the rules it holds every start to (upstream.check_model), never its
 repository's name.
+
+Run as a script, it reports what each family makes of the options of
+`splash serve`, which the desktop app reads as it launches to offer a model
+only the options it can use (option_report):
+
+    python install/families.py
 """
 
 from __future__ import annotations
 
+import json
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
+if __name__ == "__main__" and not __package__:
+    # Run as a script, from the installation's install/ folder: import its
+    # siblings as the install package.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "install"
+
+from server import serve_options
 from server.chat_format import FLINT, QWEN, ChatFormat
+
+from . import models
 
 
 @dataclass(frozen=True)
@@ -74,3 +92,51 @@ FAMILIES = (
 def named(name):
     """The family called name, or None."""
     return next((family for family in FAMILIES if family.name == name), None)
+
+
+# The fact a model's family must have for an option of the launcher's own,
+# beside the shared ones (serve_options.SERVE_OPTIONS), to act on it, as
+# ServeOption.needs names one: --language-only leaves out a vision tower.
+LAUNCHER_NEEDS = {"--language-only": "vision"}
+
+
+def option_report(engine_facts):
+    """What each family, by name, makes of the options of `splash serve`,
+    from its facts: engine_facts, each family's facts of its layout by name,
+    as the engine's families command gives them, and its own vision tower
+    and reasoning switch. Each family's report holds the flags of the
+    options that need a fact it lacks (ServeOption.needs, LAUNCHER_NEEDS),
+    which act on none of its models, and the context its models serve:
+    their native window, and the most past it, with YaRN."""
+    needs = {
+        option.flag: option.needs
+        for option in serve_options.SERVE_OPTIONS
+        if option.needs is not None
+    } | LAUNCHER_NEEDS
+    report = {}
+    for family in FAMILIES:
+        engine = engine_facts[family.name]
+        facts = engine | {
+            "vision": family.vision,
+            "reasoning_switch": family.chat_format.reasoning_switch,
+        }
+        report[family.name] = {
+            "unusable": [flag for flag, fact in needs.items() if not facts[fact]],
+            "context_tokens": engine["context_tokens"],
+            "max_context_tokens": engine["max_context_tokens"],
+        }
+    return report
+
+
+def main():
+    try:
+        engine_facts = json.loads(models.run_engine(["families"], "family report"))
+    except models.ModelError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(option_report(engine_facts)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

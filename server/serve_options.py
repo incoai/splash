@@ -20,8 +20,10 @@ from .chat_format import REASONING_EFFORTS
 from .http_security import validate_api_key
 from .protocol import MAX_THINKING_END_TOKENS
 
-# The most context --max-context takes, which YaRN stretches the targets'
-# native window to and Qwen validates (QwenTargetDimensions::yarnContextTokens).
+# The most context --max-context takes: the most any family serves
+# (QwenTargetDimensions::maximumContextTokens(), as the engine's families
+# command reports it), YaRN's window of the Qwen targets. The engine refuses
+# more than the model's own.
 MAX_YARN_CONTEXT_TOKENS = 1010000
 # The suffixes of a --max-context: K, 1024 tokens, and M, a million.
 _CONTEXT_UNITS = {"K": 1024, "M": 1000000}
@@ -393,6 +395,12 @@ class ServeOption:
     # A parsed value as the server's command line spells it.
     text: Callable[[object], str] = str
     engine: EngineArgument | None = None
+    # What a model's family must have for the option to act on it, one of
+    # the facts install/families.py reports: a fact of its layout, as the
+    # engine gives it (experts, recurrent_state, ple_table, sparse_kv,
+    # dense_ffn), or of its release (vision, reasoning_switch). None: every
+    # model.
+    needs: str | None = None
 
     @property
     def dest(self):
@@ -477,10 +485,11 @@ SERVE_OPTIONS = (
             default=None,
             metavar="TOKENS",
             help="context token limit, e.g. 100K or 1M (K = 1024 tokens, M = "
-            "1000000 tokens), up to 1010000; past the model's 256K native window "
-            "it turns on YaRN, which is static and changes answers at every "
-            "length, so pass more than 256K only when a request needs it "
-            "(default: auto, the native window when memory holds it)",
+            "1000000 tokens), up to the model's limit, at most 1010000; past its "
+            "native window a model with YaRN turns it on, which is static and "
+            "changes answers at every length, so pass more than the native "
+            "window only when a request needs it (default: auto, the native "
+            "window when memory holds it)",
         ),
         engine=EngineArgument(0, text=_auto_text, required=True),
     ),
@@ -497,6 +506,7 @@ SERVE_OPTIONS = (
             "memory cannot hold it)",
         ),
         engine=EngineArgument("--ple-memory"),
+        needs="ple_table",
     ),
     ServeOption(
         "--expert-memory",
@@ -515,6 +525,7 @@ SERVE_OPTIONS = (
             "see streamed experts)",
         ),
         engine=EngineArgument("--expert-memory"),
+        needs="experts",
     ),
     ServeOption(
         "--sparse-kv-memory",
@@ -528,6 +539,7 @@ SERVE_OPTIONS = (
             "1200M; never below its floor (default: auto, its floor)",
         ),
         engine=EngineArgument("--sparse-kv-memory"),
+        needs="sparse_kv",
     ),
     ServeOption(
         "--kv-format",
@@ -549,6 +561,7 @@ SERVE_OPTIONS = (
             "state, so memory and the SSD cache hold about twice as many",
         ),
         engine=EngineArgument("--state-format"),
+        needs="recurrent_state",
     ),
     ServeOption(
         "--idle-release",
@@ -649,6 +662,7 @@ SERVE_OPTIONS = (
             "SPLASH_DEFAULT_REASONING_EFFORT, else the model template's)",
         ),
         environment="SPLASH_DEFAULT_REASONING_EFFORT",
+        needs="reasoning_switch",
     ),
     ServeOption(
         "--thinking-token-budget",
@@ -661,6 +675,7 @@ SERVE_OPTIONS = (
             "SPLASH_THINKING_TOKEN_BUDGET, else no cap)",
         ),
         environment="SPLASH_THINKING_TOKEN_BUDGET",
+        needs="reasoning_switch",
     ),
     ServeOption(
         "--thinking-end-text",
@@ -674,6 +689,7 @@ SERVE_OPTIONS = (
             "after a reasoning)",
         ),
         environment="SPLASH_THINKING_END_TEXT",
+        needs="reasoning_switch",
     ),
     ServeOption(
         "--max-request-size",
@@ -700,6 +716,7 @@ SERVE_OPTIONS = (
         engine=EngineArgument(
             "--max-image-patches", text=lambda pixels: str(images.max_patches(pixels))
         ),
+        needs="vision",
     ),
     ServeOption(
         "--request-timeout",
@@ -745,6 +762,7 @@ SERVE_OPTIONS = (
             "prompts also use the Neural Engine when that is faster)",
         ),
         engine=EngineArgument("--ane", text=_spelled("off")),
+        needs="dense_ffn",
     ),
     ServeOption(
         "--verify-rows",
@@ -759,6 +777,7 @@ SERVE_OPTIONS = (
             "lets those outputs differ from run to run)",
         ),
         engine=EngineArgument("--verify-rows"),
+        needs="experts",
     ),
     ServeOption(
         "--allow-idle-sleep",

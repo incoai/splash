@@ -147,6 +147,11 @@ struct QwenTargetDimensions {
       return nativeContextTokens;
     return static_cast<uint32_t>(std::lround(nativeContextTokens * scaling.factor));
   }
+  // The most context the target serves: YaRN's window, or the native one
+  // for a family YaRN does not stretch (yarnContextTokens 0).
+  [[nodiscard]] constexpr uint32_t maximumContextTokens() const noexcept {
+    return nativeContextTokens > yarnContextTokens ? nativeContextTokens : yarnContextTokens;
+  }
   // Whether the residual is hyperConnections streams, which a mix joins
   // before each mixer, each FFN and the logits in place of a norm.
   [[nodiscard]] constexpr bool hyperConnected() const noexcept { return hyperConnections != 0; }

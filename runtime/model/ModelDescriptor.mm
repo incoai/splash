@@ -893,13 +893,28 @@ ModelDescriptor servedFor(ModelDescriptor model, uint32_t contextTokens) {
         if (contextTokens > layout.yarnContextTokens)
           throw std::invalid_argument(
               std::string(layout.family) + " serves at most " +
-              std::to_string(std::max(layout.nativeContextTokens, layout.yarnContextTokens)) + " tokens of context");
+              std::to_string(layout.maximumContextTokens()) + " tokens of context");
         model.ropeScaling = {.factor = static_cast<double>(contextTokens) / layout.nativeContextTokens,
                              .originalContextTokens = layout.nativeContextTokens};
         model.capabilities.maximumContextTokens = layout.servedContextTokens(model.ropeScaling);
       },
       model.target);
   return model;
+}
+
+std::vector<FamilyFacts> familyFacts() {
+  std::vector<FamilyFacts> facts;
+  forEachFamily([&](const auto &layout) {
+    facts.push_back({.family = layout.family,
+                     .experts = layout.ffnKind == QwenFfnKind::SparseMoe,
+                     .recurrentState = layout.gdnStateLayout().layers > 0,
+                     .pleTable = layout.pleNgram > 0,
+                     .sparseKv = sparseKvShape(layout).has_value(),
+                     .denseFfn = layout.ffnKind == QwenFfnKind::Dense,
+                     .contextTokens = layout.nativeContextTokens,
+                     .maximumContextTokens = layout.maximumContextTokens()});
+  });
+  return facts;
 }
 
 ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {

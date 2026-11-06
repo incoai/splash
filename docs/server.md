@@ -110,7 +110,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--api-key` | `SPLASH_API_KEY` or none | Require this key, as a bearer token or `x-api-key`, on every route but the chat page, `/health` and `/ready`. |
 | `--no-webui` | Off | Disable the chat page. |
 | `--max-memory` | Auto | Lower the ceiling on Metal allocations, e.g. `28G`; not combined process RSS. See [memory and context](#memory-and-context). |
-| `--max-context` | Auto | Set the context limit, e.g. `100K` or `1M` (K = 1024 tokens, M = 1,000,000), up to 1,010,000 tokens; past the 256K native window it turns on YaRN. See [memory and context](#memory-and-context). |
+| `--max-context` | Auto | Set the context limit, e.g. `100K` or `1M` (K = 1024 tokens, M = 1,000,000), up to the model's limit; past the 256K native window a model with YaRN turns it on. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
 | `--ple-memory` | Auto | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`; `off` loads the whole table. Auto loads it where memory holds it, else streams it through its share of the budget. See [PLE table streaming](#ple-table-streaming). |
@@ -218,9 +218,9 @@ model takes, and otherwise as much as the budget holds beside them.
 `--max-context` sets it, such as `--max-context 100K` (K is 1024 tokens, M a
 million), up to what the budget holds without the split: beyond what the split
 leaves, the split takes fewer channels or the GPU runs alone, with a warning.
-Past the native window it turns on YaRN, up to 1,010,000 tokens (below). A
-larger value than the budget holds stops startup with the most the model and
-memory allow.
+Past the native window a model with YaRN turns it on, up to the model's limit
+(below). A larger value than the budget holds stops startup with the most the
+model and memory allow.
 
 One plan sizes everything within the budget (`engine::planStreamedMemory`).
 Its floors come first: the weights that load, the arenas, the runtime
@@ -292,11 +292,13 @@ opens however little room the volume has, and each request's commitment
 checks the room as it starts. The plans that size the streamed stores take
 the room the volume leaves when the start begins, before the weights load.
 
-A `--max-context` past the native window, up to the 1,010,000 tokens Qwen
-validates these models to, turns on YaRN RoPE scaling, as Qwen describes for
-them: the factor is the context over the native window, so that the stretched
-window is the context asked for, such as 2 for `--max-context 512K` and about
-3.81 for `1M`. Without `--max-context`, or at 256K or less, YaRN stays off, so
+On the Qwen families, a `--max-context` past the native window, up to the
+1,010,000 tokens Qwen validates these models to, turns on YaRN RoPE scaling,
+as Qwen describes for them: the factor is the context over the native window,
+so that the stretched window is the context asked for, such as 2 for
+`--max-context 512K` and about 3.81 for `1M`. Flint's full layers have no RoPE
+to stretch, so its native window is its most, and a longer `--max-context`
+stops its startup. Without `--max-context`, or at 256K or less, YaRN stays off, so
 answers and the persistent cache are the native window's. The budget must
 hold the context: about a million tokens of the 27B's int8 KV on a 64 GB Mac,
 more of the 35B's, whose KV per token is a third of the 27B's; where it does

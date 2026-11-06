@@ -5,6 +5,7 @@
 #include "engine/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
 #include "engine/DiskSpace.hpp"
+#include "engine/Json.hpp"
 #include "engine/NativeArguments.hpp"
 #include "model/ModelDescriptor.hpp"
 
@@ -159,6 +160,7 @@ void printUsage(std::string_view executable) {
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " device-check");
   writeStderrLine("       " + command + " disk-floor PATH");
+  writeStderrLine("       " + command + " families");
 }
 
 // Reports the exception in flight on stderr, as every command ends on one,
@@ -488,6 +490,29 @@ int printDiskFloor(int argc, char **argv) {
   return 0;
 }
 
+// What each family's layout gives the options a start takes
+// (model::familyFacts), as JSON by family, which the installer reports to the
+// app (install/families.py).
+int printFamilies(int argc) {
+  if (argc != 2)
+    throw engine::UsageError("families takes no arguments");
+  json::Writer w;
+  w.object([&] {
+    for (const model::FamilyFacts &facts : model::familyFacts())
+      w.object(json::Key(facts.family), [&] {
+        w.field("experts", facts.experts)
+            .field("recurrent_state", facts.recurrentState)
+            .field("ple_table", facts.pleTable)
+            .field("sparse_kv", facts.sparseKv)
+            .field("dense_ffn", facts.denseFfn)
+            .field("context_tokens", facts.contextTokens)
+            .field("max_context_tokens", facts.maximumContextTokens);
+      });
+  });
+  std::printf("%s\n", w.str().c_str());
+  return 0;
+}
+
 } // namespace
 } // namespace splash
 
@@ -501,6 +526,8 @@ int main(int argc, char **argv) {
         return splash::checkModel(argc, argv);
       if (command == "disk-floor")
         return splash::printDiskFloor(argc, argv);
+      if (command == "families")
+        return splash::printFamilies(argc);
       if (command == "serve-native")
         return splash::serveNative(argc, argv);
       throw splash::engine::UsageError(command.empty() ? std::string("expected a command")
