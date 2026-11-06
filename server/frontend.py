@@ -1279,6 +1279,11 @@ class Frontend:
             )
             job.response_store = store
             job.response_previous_id = previous_id
+            instructions = (body.get("instructions") or "").lower()
+            job.is_compaction = (
+                "compact" in instructions
+                or "compaction" in instructions
+            )
             if store:
                 job.response_history_items = items
             return job

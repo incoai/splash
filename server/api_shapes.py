@@ -381,12 +381,36 @@ def normalize_responses_input(instructions, items):
                 }
             )
         else:
-            raise APIError(
-                400,
-                "only message, reasoning, function_call, function_call_output, "
-                "custom_tool_call and custom_tool_call_output input items are "
-                "supported",
-            )
+            # Tolerant fallback for agentic harness input items
+            # (e.g. commandExecution, mcpToolCall, contextCompaction, item_reference)
+            call_id = item.get("call_id") or item.get("id")
+            output = item.get("output")
+            content = item.get("content")
+            if call_id and output is not None:
+                output = output.get("content") if isinstance(output, dict) else output
+                flush()
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": str(call_id),
+                        "content": _responses_content(output),
+                    }
+                )
+            elif content is not None:
+                flush()
+                extracted = (
+                    _responses_text(content)
+                    if not isinstance(content, str)
+                    else content
+                )
+                if extracted:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": extracted,
+                        }
+                    )
+            # Metadata-only, checkpoint, or non-semantic items are safely skipped
     flush()
     return messages
 
@@ -1250,6 +1274,7 @@ _RESPONSES_ITEM_PREFIXES = {
     "text": "msg",
     "tool": "fc",
     "custom": "ctc",
+    "compaction": "cmp",
 }
 
 
@@ -1332,6 +1357,18 @@ def responses_item(job, block, index):
 
 
 def responses_output(job, blocks):
+    if getattr(job, "is_compaction", False):
+        full_text = "".join(b.text for b in blocks if getattr(b, "text", None))
+        return [
+            {
+                "id": responses_item_id(job, "compaction", 0),
+                "type": "compaction",
+                "status": "completed",
+                "summary": [{"type": "summary_text", "text": full_text}],
+                "content": [{"type": "output_text", "text": full_text, "annotations": []}],
+                "encrypted_content": None,
+            }
+        ]
     return [responses_item(job, block, index) for index, block in enumerate(blocks)]
 
 
