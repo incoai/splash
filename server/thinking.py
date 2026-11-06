@@ -1,4 +1,6 @@
-"""Client-carried hidden reasoning, authenticated by the user's serving key."""
+"""Hidden reasoning a client carries between turns as an encrypted signature,
+under a key file every server of this user shares (load_thinking_key), so that
+a signature stays readable after a restart or by another of its servers."""
 
 import os
 import stat

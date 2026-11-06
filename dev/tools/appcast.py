@@ -48,11 +48,14 @@ def generate(image, notes, version, key_file):
         return (folder / "appcast.xml").read_bytes()
 
 
-def check(appcast, image, version, macos_min):
+def check(appcast, image, version, macos_min, build, previous):
     """Check that appcast offers image alone, as release version's download for
-    macOS macos_min or later, signed with the key whose public half every app
-    shipped holds. generate_appcast only warns when the key it signs with is
-    not the one the app in image holds, and then signs nothing."""
+    macOS macos_min or later, with build, the CFBundleVersion of the app in
+    image, as the version Sparkle compares, signed with the key whose public
+    half every app shipped holds. generate_appcast only warns when the key it
+    signs with is not the one the app in image holds, and then signs nothing.
+    previous is the release before, its tag and build, or None: Sparkle offers
+    the apps that have it only a larger build."""
     items = ElementTree.fromstring(appcast).findall("channel/item")
     if len(items) != 1:
         raise RuntimeError(f"the appcast offers {len(items)} updates, not 1")
@@ -61,17 +64,24 @@ def check(appcast, image, version, macos_min):
     expected = {
         "url": f"{package_app.RELEASES}/download/{version}/{image.name}",
         "length": str(image.stat().st_size),
+        "version": build,
         "shortVersionString": package_app.short_version(version),
         "minimumSystemVersion": macos_min,
     }
     found = {
         "url": enclosure.get("url"),
         "length": enclosure.get("length"),
+        "version": item.findtext(f"{SPARKLE}version"),
         "shortVersionString": item.findtext(f"{SPARKLE}shortVersionString"),
         "minimumSystemVersion": item.findtext(f"{SPARKLE}minimumSystemVersion"),
     }
     if found != expected:
         raise RuntimeError(f"the appcast offers {found}, not {expected}")
+    if previous and int(build) <= int(previous[1]):
+        raise RuntimeError(
+            f"the appcast offers build {build}, not above build {previous[1]} of "
+            f"release {previous[0]}, whose apps Sparkle would not update"
+        )
     key = base64.b64decode(package_app.SPARKLE_PUBLIC_KEY)
     signature = base64.b64decode(enclosure.get(f"{SPARKLE}edSignature", ""))
     try:

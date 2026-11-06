@@ -78,7 +78,13 @@ Qwen4PleHash readPleHash(const GgufFile &file, const Qwen4ExpLayout &layout) {
   const std::span<const double> multipliers = array("layer_multipliers", layout.pleNgram);
   for (size_t position = 0; position < multipliers.size(); ++position) {
     const auto multiplier = static_cast<uint64_t>(whole(multipliers[position], kMultiplierLimit));
-    if (position < layout.pleNgram) hash.multipliers[position] = multiplier;
+    if (position >= layout.pleNgram) continue;
+    // A token times its multiplier stays below 2^63, so the unsigned hash
+    // equals the reference's signed one (qwen4PleRows); the released
+    // multipliers are below 2.4e13 of the 3.7e13 this allows.
+    if (multiplier > uint64_t{INT64_MAX} / layout.vocabularySize)
+      throw GgufError("a GGUF PLE multiplier is too large for the vocabulary");
+    hash.multipliers[position] = multiplier;
   }
   const uint32_t heads = layout.pleHeads();
   const std::span<const double> offsets = array("head_offsets", heads), sizes = array("head_vocab_sizes", heads);

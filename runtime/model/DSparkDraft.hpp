@@ -135,6 +135,7 @@ private:
   const ops::ExecutionPlans &operators_;
   ops::ManifoldHyperShape mhc_{};
   ops::MoeShape moeShape_{};
+  ops::MoeFormats moeFormats_{};
   std::unique_ptr<Scratch> scratch_;
   uint64_t allocated_ = 0;
 };

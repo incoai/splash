@@ -26,7 +26,6 @@ enum class RuntimeBootstrapStage {
     DecodeWarmup,
     CompositeStateRestore,
     MemoryAudit,
-    AnnounceReady,
     Ready,
 };
 
@@ -43,6 +42,14 @@ struct RuntimeBootstrapReport {
     WarmupReport warmup;
     MemoryAuditResult memoryAudit;
     std::string budgetDescription;
+    // What a start refused for want of memory or context needed against what
+    // it had: RuntimeResourcesError::shortfall, or the --max-context check.
+    std::optional<protocol::StartShortfall> shortfall;
+    // A command of the start failed: a warmup's, or one of resource assembly
+    // (RuntimeResourcesError::commandFailed); and whether for want of GPU
+    // memory (metal::MetalBackendError::outOfMemory).
+    bool commandFailed = false;
+    bool commandOutOfMemory = false;
 
     [[nodiscard]] std::string describe() const;
 };
@@ -59,6 +66,11 @@ public:
 private:
     RuntimeBootstrapReport report_;
 };
+
+// The failure a start reports in place of Ready (main.mm), classed for the
+// server's restart policy and the app's words.
+[[nodiscard]] protocol::StartFailedEvent startFailedEvent(
+    const RuntimeBootstrapReport &report);
 
 // Startup retries a temporary host or driver allocation failure for a
 // bounded time. The window opens at the first such failure, not at process
@@ -86,10 +98,10 @@ private:
         reached_;
 };
 
-// Temporary host/driver allocation failures can recover during startup.
-// Preserve the desktop reserve and bound retries; configuration and compute
-// failures remain immediate and fail-closed.
-inline constexpr auto kStartupMemoryRecoveryTimeout = std::chrono::seconds(30);
+// Temporary host/driver allocation failures can recover during startup,
+// within supervision::kStartRetryWindow, checked this often. Configuration
+// and compute failures, a command's want of GPU memory among them, remain
+// immediate and fail-closed.
 inline constexpr auto kStartupMemoryRecoveryPoll = std::chrono::seconds(1);
 
 // The wire limits of a model served with maxContext tokens: prompts and
@@ -99,36 +111,47 @@ inline constexpr auto kStartupMemoryRecoveryPoll = std::chrono::seconds(1);
 protocolLimitsFor(const model::ModelCapabilities &capabilities,
                   uint32_t maxContext) noexcept;
 
+// What a model served under `engine` and `limits` (protocolLimitsFor)
+// announces in Ready.
+[[nodiscard]] protocol::ReadyEvent readyEventFor(
+    const model::ModelDescriptor &model, const EngineConfig &engine,
+    const protocol::ProtocolLimits &limits);
+
 struct RuntimeBootstrapConfig {
     RuntimeResourcesConfig resources;
-    // A zero engine maxContext is a relaunch's context
-    // (RuntimeResourcesConfig::relaunchContext), or else what the memory
-    // plan holds, as serve's default; another one larger than the plan
-    // holds fails the bootstrap.
+    // A relaunch serves its context (RuntimeResourcesConfig::relaunchContext)
+    // as far as the memory plan holds it. Otherwise a zero engine maxContext
+    // is what the plan holds, as serve's default, and another one larger
+    // than the plan holds fails the bootstrap.
     NativeLoopConfig nativeLoop;
 };
 
 using ActualMemoryReporter = std::function<ActualMemoryReport()>;
 
-// Complete owner returned only after the native loop has sent its
-// ReadyEvent. No partially warmed instance escapes start().
-class RuntimeBootstrap final {
+// The serving runtime: start() returns it built, warmed up and audited, and
+// it serves once announceReady() has sent Ready. Everything that can refuse
+// a start (StartFailed) runs in start(), so that nothing after Ready can.
+class ServingRuntime final {
 public:
-    [[nodiscard]] static std::unique_ptr<RuntimeBootstrap> start(
+    // loopMaxTick: the loop's longest tick, which its transport measures,
+    // for the status document. Throws std::invalid_argument without it.
+    [[nodiscard]] static std::unique_ptr<ServingRuntime> start(
         RuntimeBootstrapConfig config,
         NativeRuntime::ByteSink output,
-        NativeRuntime::StatusProvider statusProvider);
+        std::function<double()> loopMaxTick);
 
-    // Completes warmup and validation before announcing readiness.
-    [[nodiscard]] static RuntimeBootstrapReport requireWarmupAndAnnounce(
+    // Completes warmup and validation, at stage Ready. Warmup runs on
+    // kvPool's runway (model::ExecutionLimits::warmupKvPages) and holds its
+    // pages while it runs (KvPool::RunwayHold).
+    [[nodiscard]] static RuntimeBootstrapReport requireWarmup(
         const EngineMemoryPlan &memoryPlan,
         model::RuntimeModel &modelRuntime,
-        ActualMemoryReporter memoryReporter,
-        NativeRuntime &nativeLoop);
+        KvPool &kvPool,
+        ActualMemoryReporter memoryReporter);
 
-    RuntimeBootstrap(const RuntimeBootstrap &) = delete;
-    RuntimeBootstrap &operator=(const RuntimeBootstrap &) = delete;
-    ~RuntimeBootstrap();
+    ServingRuntime(const ServingRuntime &) = delete;
+    ServingRuntime &operator=(const ServingRuntime &) = delete;
+    ~ServingRuntime();
 
     [[nodiscard]] RuntimeResources &resources() noexcept {
         return *resources_;
@@ -137,6 +160,11 @@ public:
     [[nodiscard]] NativeRuntime &nativeLoop() noexcept {
         return *nativeLoop_;
     }
+
+    // Ends the start: sends Ready and begins serving. It throws when Ready
+    // cannot be sent or serving cannot begin, which ends the process: the
+    // server takes a StartFailed after Ready for a protocol failure.
+    void announceReady();
 
     // The control pass the transport runs at a command-free point: it
     // samples the thermal state, keeps the disk tier within what its volume
@@ -147,16 +175,16 @@ public:
         resources_->cache().keepDiskLimit();
         return memoryControl_.run(pressure);
     }
-    // The status document, with the metrics and the loop timing the
-    // transport keeps.
-    [[nodiscard]] std::string statusJson(const RuntimeMetricsSnapshot &metrics,
-                                         const NativeLoopTiming &loop);
-
 private:
-    RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
-                     std::unique_ptr<model::RuntimeModel> modelRuntime,
-                     std::unique_ptr<NativeRuntime> nativeLoop,
-                     RuntimeBootstrapReport report);
+    // Connects the loop's status requests to statusJson().
+    ServingRuntime(std::unique_ptr<RuntimeResources> resources,
+                   std::unique_ptr<model::RuntimeModel> modelRuntime,
+                   std::unique_ptr<NativeRuntime> nativeLoop,
+                   protocol::ReadyEvent ready, RuntimeBootstrapReport report,
+                   std::function<double()> loopMaxTick);
+
+    // The status document the loop answers a status request with.
+    [[nodiscard]] std::string statusJson();
 
     // Records the thermal state macOS reports for the status document, and
     // logs a change: nothing else tells why serving slowed down. The control
@@ -169,8 +197,10 @@ private:
     std::unique_ptr<model::RuntimeModel> model_;
     std::unique_ptr<NativeRuntime> nativeLoop_;
     MemoryControl memoryControl_;
+    protocol::ReadyEvent ready_;
     RuntimeBootstrapReport report_;
     ThermalStateReporter thermalState_;
+    std::function<double()> loopMaxTick_;
 };
 
 }  // namespace splash::engine

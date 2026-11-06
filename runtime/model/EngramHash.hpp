@@ -7,7 +7,7 @@
 // each times its layer's multiplier for its place, are XORed in from the
 // token back; each n-gram's running XOR takes each of `heads` heads' prime
 // modulo (as Python's, never negative) plus the head's offset. The products
-// and the XOR wrap as numpy's int64 does. The host computes them: it reads the
+// and the XOR wrap as int64 two's complement does. The host computes them: it reads the
 // rows from the table's file.
 
 #include <cstdint>

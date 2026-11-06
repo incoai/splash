@@ -1,6 +1,10 @@
 #include "engine/Engine.hpp"
+#include "AwakeClock.hpp"
+#include "Supervision.hpp"
+#include "engine/EngineAllocate.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -14,51 +18,26 @@ namespace {
 // fails the engine within a second of its timeout, as a ticket's own wait
 // finds it (MetalBackend.mm kTicketWaitSlice).
 constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
-// A mask request the server leaves unanswered this long fails its request;
-// the batch's command slot is not held longer.
-constexpr int kMaskWaitLimitMilliseconds = 5000;
+// A mask request the server leaves unanswered for supervision::kMaskWait
+// fails its request; the batch's command slot is not held longer.
+constexpr double kMaskWaitMilliseconds = double(supervision::kMaskWait.count());
 // A junction costs a cached state, its capture and up to a draft window of
 // draft-context rows; a later request must save at least that much prefill.
 constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftContextTokens;
-
-// What the request's KV blocks are cached under beside its tokens.
-PromptIdentity promptIdentity(const EngineRequest &request) noexcept {
-  return {request.images, request.cacheSalt};
-}
-
-// A refusal for memory, which reclaim or the host's recovery may end.
-bool memoryDenied(const StateAdmission &admission) noexcept {
-  return admission.failure == StateFailure::MemoryPressure;
-}
-
-bool memoryDenied(const TokenAdmission &admission) noexcept {
-  return admission.failure == TokenAdmissionFailure::Denied;
-}
-
-bool memoryDenied(const model::ModelMemoryAdmission &admission) noexcept {
-  return !admission.granted();
-}
-
-// Memory a transfer in flight holds, which returns by itself.
-bool transferPending(const StateAdmission &) noexcept { return false; }
-
-bool transferPending(const TokenAdmission &admission) noexcept {
-  return admission.failure == TokenAdmissionFailure::Pending;
-}
-
-bool transferPending(const model::ModelMemoryAdmission &) noexcept { return false; }
-
-// What a KV target lacked when it could not be allocated.
-std::string pageShortfall(const TokenAdmission &admission) {
-  return "additional_pages=" + std::to_string(admission.additionalPages) +
-         ", free_pages=" + std::to_string(admission.availablePages);
-}
 
 constexpr std::string_view kKvUnreadableMessage =
     "KV of an earlier part of the conversation could not be read from the SSD cache";
 constexpr std::string_view kDiskQuotaTimeoutMessage =
     "the SSD cache's room for active KV did not become available within the resource wait "
     "limit: other long requests hold it";
+
+// `item` reads the page table its lane's cut gave it (Cache::cutPageTable).
+void setPageTable(ModelBatchItem &item, PageTableView pageTable) {
+  item.pageTable = pageTable.pages;
+  item.pageTableRevision = pageTable.revision;
+  item.pageTableFirstChanged = pageTable.firstChanged;
+  item.pageSources = std::move(pageTable.sources);
+}
 
 } // namespace
 
@@ -71,19 +50,42 @@ std::string resourceTimeoutMessage(metal::AllocationFailure failure) {
 
 Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
                EngineEventSink &events)
-    : config_(config), cache_(cache), writeBehind_(cache), model_(model),
-      events_(events), scheduler_(config_.decodeShare, config_.maximumPrefillAttentionPairs) {
+    : config_(config), cache_(cache), writeBehind_(cache), model_(model), events_(events),
+      scheduler_({.decodeShare = config_.decodeShare,
+                  .decodeGapMilliseconds = config_.decodeGapMilliseconds,
+                  .limits = model.commandLimits()},
+                 model) {
   if (!config_.maxContext || !config_.vocabularySize) {
     throw std::invalid_argument("context and vocabulary sizes must be positive");
   }
-  if (!config_.growthPaused || !config_.serving)
-    throw std::invalid_argument("the engine needs the governor's growth pause and serving mark");
+  if (!config_.governor)
+    throw std::invalid_argument("the engine needs its memory governor");
   if (!std::isfinite(config_.decodeShare) || config_.decodeShare < 0.0)
     throw std::invalid_argument("decode share must be nonnegative and finite");
   if (config_.spill.capable &&
       (!config_.spill.geometry.fullPageBytes || !config_.spill.geometry.slotBytes))
     throw std::invalid_argument("a target that can spill needs its page and slot sizes");
+  if (config_.weights)
+    weights_.emplace(*config_.weights);
+  // What the engine holds is the ledger's to take, cache before the
+  // engine's own victims (the tie order of the sources), the cache tells it
+  // what transfers return and what its pages hold, and the model what the
+  // state buffers its units free release once they leave the pool: the
+  // cache's and the model's, which outlive the engine, as another engine
+  // over them (backend_benchmark's) finds them.
+  MemoryLedger &ledger = config_.governor->ledger();
+  ledger.addSource(cache_);
+  ledger.addSource(victims_);
+  ledger.setReturning([&cache = cache_] { return cache.returning(); },
+                      [&cache = cache_](std::span<const uint64_t> requestIds) { return cache.returningFor(requestIds); });
+  ledger.setBufferBytes([&model = model_](uint32_t states, bool afterStart, bool keepLane) {
+    return model.idleBufferBytes(states, afterStart, keepLane);
+  });
+  ledger.setPageBytes({cache_.bytesPerPage(kv::PageForm::Full), cache_.bytesPerPage(kv::PageForm::Index),
+                       cache_.bytesPerPage(kv::PageForm::Slim)});
 }
+
+Engine::~Engine() { config_.governor->ledger().removeSource(victims_); }
 
 void Engine::submit(EngineRequest value) {
   const auto outOfVocabulary = [&](uint32_t token) {
@@ -136,19 +138,20 @@ void Engine::submit(EngineRequest value) {
   requestState.request = std::move(value);
   const Request &stored =
       requests_.emplace(id, std::move(requestState)).first->second;
-  scheduler_.submit(
-      {.id = id,
-       .priority = stored.request.priority,
-       .prefillTokens = stored.promptTokens,
-       .deadlineMilliseconds = stored.request.deadlineMilliseconds,
-       .prefillGroupRows = model_.prefillGroupRows(false),
-       .prefillPasses = model_.prefillPasses()});
+  scheduler_.submit({.id = id, .priority = stored.request.priority, .prefillTokens = stored.promptTokens});
   ++counters_.submitted;
 }
 
 void Engine::cancel(uint64_t id) {
   if (const auto found = requests_.find(id); found != requests_.end())
     settle(found->second, {LaneOutcome::Cancelled, {}});
+}
+
+void Engine::stop(uint64_t id) {
+  // A request that has generated nothing has nothing to stop on: it is cancelled.
+  if (const auto found = requests_.find(id); found != requests_.end())
+    settle(found->second,
+           {generatedTokens(found->second) ? LaneOutcome::Stopped : LaneOutcome::Cancelled, {}});
 }
 
 void Engine::failRequest(uint64_t id, LaneOutcome outcome, std::string message) {
@@ -185,31 +188,63 @@ bool Engine::flushRestorePoints() {
 }
 
 bool Engine::tick(double now) {
+  // The time since the last tick goes to what held each request then;
+  // however the tick ends, what holds each from now on is as it leaves the
+  // engine.
+  holds(now);
+  struct Holders final {
+    Engine &engine;
+    ~Holders() {
+      for (auto &[_, active] : engine.requests_)
+        if (!active.finalized && !active.firstTokenSent)
+          active.heldBy = engine.holderOf(active);
+    }
+  } const holders{*this};
   model_.checkHealth();
   nextHealthCheckMilliseconds_ = now + kHealthCheckIntervalMilliseconds;
-  bool progressed = scheduler_.expireDeadlines(now);
+  // A request's deadline ends it in whatever phase it is: at once, or once
+  // its command in flight or the read of the state it restores has drained
+  // (settle), before a read that landed can admit it (pollRestores).
+  bool progressed = false;
+  for (auto &[_, active] : requests_) {
+    if (!active.finalized && !active.pendingEnd && active.request.deadlineMilliseconds <= now) {
+      settle(active, deadlineEnd());
+      progressed = true;
+    }
+  }
   if (now >= drainEndMilliseconds_)
     drainEndMilliseconds_ = 0.0;
   if (cache_.pollTransfers()) {
-    // Demoted pages and written states are back; waiting lanes retry now.
-    // The tier's share for Spill requests' writes has room again.
+    // Demoted pages and written states are back; waiting lanes retry now,
+    // and candidates are placed again. The tier's share for Spill
+    // requests' writes has room again.
     signalResourceProgress();
+    ++ledgerChanges_;
     progressed = true;
     if (config_.spill.capable)
       static_cast<void>(cache_.writeThrough());
   }
-  progressed = pollRestores(now) || progressed;
-  progressed = writeBehind_.run(now) || progressed;
-  // The earliest submitted and the earliest admitted of the lanes with work
-  // in flight.
+  progressed = pollRestores() || progressed;
+  // The claims that wait for memory on its way back hold room for it; copies
+  // ahead wait for them (WriteBehind::run).
+  syncClaims(now);
+  progressed = writeBehind_.run(now, copyDemandBytes(), governor().claimWaiting()) || progressed;
+  // The earliest submitted of the lanes with work in flight, and the
+  // earliest admitted of them and, while a request waits for the SSD cache's
+  // quota, of those that compete for it (competesForQuota).
+  const bool quotaWaits = std::ranges::any_of(
+      requests_, [](const auto &entry) { return entry.second.resourceWait.diskQuota; });
   uint64_t earliestWorking = std::numeric_limits<uint64_t>::max();
   uint64_t earliestWorkingAdmission = std::numeric_limits<uint64_t>::max();
+  uint64_t earliestQuotaAdmission = std::numeric_limits<uint64_t>::max();
   if (pending_) {
     for (const BatchItem &item : pending_->plan.items) {
+      const Request &lane = request(item.requestId);
       earliestWorking =
           std::min(earliestWorking, scheduler_.submissionOrder(item.requestId));
-      earliestWorkingAdmission =
-          std::min(earliestWorkingAdmission, request(item.requestId).admission);
+      earliestWorkingAdmission = std::min(earliestWorkingAdmission, lane.admission);
+      if (quotaWaits && competesForQuota(lane))
+        earliestQuotaAdmission = std::min(earliestQuotaAdmission, lane.admission);
     }
   }
   const bool draining = drainingForRecovery();
@@ -217,10 +252,10 @@ bool Engine::tick(double now) {
     // A mask request left unanswered past the limit ends its request: a lane
     // in flight commits without the mask, any other fails now.
     if (!active.pendingEnd && active.maskRequestedMilliseconds &&
-        now >= *active.maskRequestedMilliseconds + kMaskWaitLimitMilliseconds) {
+        now >= *active.maskRequestedMilliseconds + kMaskWaitMilliseconds) {
       settle(active, {LaneOutcome::MaskTimeout,
                       "the server did not answer a token-mask request within " +
-                          std::to_string(kMaskWaitLimitMilliseconds) + " ms"});
+                          std::to_string(supervision::kMaskWait.count()) + " ms"});
       progressed = true;
     }
     // Admission is deliberately paused while resident peers finish. Start a
@@ -229,17 +264,27 @@ bool Engine::tick(double now) {
       active.resourceWait.deadlineMilliseconds = 0.0;
       continue;
     }
-    // A lane submitted before the request, or admitted before it was refused
-    // memory or suspended, holds memory it may wait for until it finishes;
-    // while it works, the wait's limit restarts. Other lanes do not extend
-    // it: requests that keep arriving would otherwise hold it until its
-    // deadline.
-    const std::optional<uint64_t> &admittedBefore = active.resourceWait.admittedBefore;
+    // While a lane with work in flight was submitted before the request,
+    // whatever it holds, or was admitted before the refusal
+    // ResourceWait::admittedBefore records (the latest refusal, or the
+    // suspension, of a request without a lane; a lane in service's first)
+    // and competes for what it was refused, the wait's limit restarts. For the quota a lane
+    // competes by its own count (competesForQuota), copies another lane
+    // holds too included. The rule is wide on purpose: such a lane may still
+    // return what the request needs, and a refused Spill start needs memory
+    // too, as a later attempt may place it Resident; narrower rules
+    // failed requests at the limit that this one completes. The wait fails
+    // once no such lane has worked for a whole limit; the request's own
+    // deadline applies throughout (above).
+    const ResourceWait &wait = active.resourceWait;
+    const uint64_t earliestAhead = wait.diskQuota ? earliestQuotaAdmission : earliestWorkingAdmission;
     if (scheduler_.submissionOrder(id) > earliestWorking ||
-        (admittedBefore && earliestWorkingAdmission <= *admittedBefore))
+        (wait.admittedBefore && earliestAhead <= *wait.admittedBefore))
       active.resourceWait.earlierLaneWorkMilliseconds = now;
+    // A request waiting for the weights fails at its limit only once the
+    // restore's attempt there is refused too (advanceWeights).
     const double deadline = resourceDeadline(active);
-    if (!active.finalized && deadline > 0.0 && now >= deadline) {
+    if (!active.finalized && weightsHeld() && deadline > 0.0 && now >= deadline) {
       settle(active, {LaneOutcome::ResourceTimeout,
                       active.resourceWait.diskQuota
                           ? std::string(kDiskQuotaTimeoutMessage)
@@ -247,30 +292,19 @@ bool Engine::tick(double now) {
       progressed = true;
     }
   }
-  // Finalize expired requests now, even while a command is in flight, so a
-  // late mask or cancel for them is a no-op rather than a scheduler error.
+  // The requests the checks above ended leave the engine and the scheduler
+  // now, even while a command is in flight.
   if (progressed)
-    sweepTerminal();
+    sweepTerminal(now);
   if (pending_) {
-    auto advance = [&] {
-      pending_->ticket->advance();
-      for (ModelMaskRequest &asked : pending_->ticket->takeMaskRequests()) {
-        events_.maskRequested(asked.requestId, asked.simulationTokens);
-        request(asked.requestId).maskRequestedMilliseconds = now;
-        progressed = true;
-      }
-    };
-    advance();
-    for (const BatchItem &item : pending_->plan.items) {
-      Request &active = request(item.requestId);
-      if (!active.pendingEnd && active.request.deadlineMilliseconds <= now) {
-        settle(active, deadlineEnd());
-        progressed = true;
-      }
-    }
     // A mask response, cancellation, or deadline can make the commit tail
     // runnable without another Metal completion wake.
-    advance();
+    pending_->ticket->advance();
+    for (ModelMaskRequest &asked : pending_->ticket->takeMaskRequests()) {
+      events_.maskRequested(asked.requestId, asked.simulationTokens);
+      request(asked.requestId).maskRequestedMilliseconds = now;
+      progressed = true;
+    }
     if (!pending_->ticket->ready())
       return progressed;
     Pending command = std::move(*pending_);
@@ -278,39 +312,107 @@ bool Engine::tick(double now) {
     std::vector<ModelStepResult> results = command.ticket->wait();
     apply(command, results, now - command.startedMilliseconds, now);
     busySinceMilliseconds_ = now;
-    sweepTerminal();
+    sweepTerminal(now);
     return true;
   }
 
-  progressed = admitQueued(now) || progressed;
-  sweepTerminal();
-  if (config_.spill.capable) {
-    for (const auto &[id, active] : requests_)
-      if (active.lane && scheduler_.phase(id) == Phase::Prefill)
-        scheduler_.setStreamsHistory(id, streamsHistory(active));
+  // No request runs until the weights are back: a tick takes back a part,
+  // so that frames are answered between them.
+  if (!weightsHeld()) {
+    progressed = advanceWeights(now) || progressed;
+    if (!weightsHeld()) {
+      sweepTerminal(now);
+      return progressed;
+    }
   }
+  // Pages whose copies landed leave memory before admission judges it.
+  spillLanded(false);
+  // The tick's host time runs from here, its first planning call, to the
+  // submission of the command it plans (tickHostMilliseconds).
+  const AwakeClock::time_point planning = AwakeClock::now();
+  progressed = admitQueued(now) || progressed;
+  sweepTerminal(now);
   // Lanes that wait for memory on its way back cannot run before it lands;
   // the command runs the other lanes meanwhile. A plan whose lanes all wait
-  // adds them, so each attempt plans without at least one more lane.
-  std::vector<uint64_t> excluded;
-  for (const auto &[id, active] : requests_) {
+  // adds them, and each plan prepare sends back adds those it refused or held
+  // back, so each attempt plans without at least one more lane, or with a
+  // lane's rows cut at a state boundary, or after a lane's one conversion.
+  std::vector<uint64_t> excluded, refused;
+  for (const auto &[id, active] : requests_)
     if (active.lane && active.resourceWait.pending && !resourceRetryReady(active, now))
       excluded.push_back(id);
-  }
-  while (auto plan = scheduler_.next(excluded)) {
+  // However the tick ends, the states plans sent back kept for their lanes
+  // go back, and the lanes' row caps clear: the next tick's admission plans
+  // each lane's command uncut, as its planning does.
+  struct TickEnd final {
+    Engine &engine;
+    ~TickEnd() {
+      for (auto &[_, active] : engine.requests_) {
+        active.keptCaptures.reset();
+        active.rowCap.reset();
+      }
+    }
+  } const tickEnd{*this};
+  for (;;) {
+    settleEndedBetweenPasses();
+    // Planning reads the lanes' shapes as they are now, before every plan.
+    const std::vector<LaneShape> shapes = laneShapes();
+    const PlanInputs in{.excluded = excluded, .shapes = shapes, .passes = passCommand_.progress()};
+    const std::optional<BatchPlan> plan = scheduler_.next(in);
+    if (!plan)
+      break;
+    // A command between its passes beside a lane of it that ended (a cancel,
+    // a deadline) gives way, whole, to a plan of a higher priority than its
+    // own, as at every point a lane yields (yieldsEndedLanes), and the tick
+    // ends there: the lane's end and its memory wait for no pass a higher
+    // priority's work may hold off. Beside a plan of its priority, such as
+    // the decode that follows each of its passes, or a lower one, its next
+    // pass comes after that plan: the command goes on, its other lanes
+    // keeping the passes they ran, and the lane ends at its last pass.
+    if (passCommand_.anyEnded() && !plan->pass &&
+        scheduler_.yieldsTo(requests_.at(plan->items.front().requestId).request.priority, in)) {
+      settleEnded(passCommand_.yield());
+      sweepTerminal(now);
+      return true;
+    }
+    // A command between its passes yields, whole, to a prefill plan of a
+    // higher priority (Scheduler::abandonsPasses), which holds none of its
+    // lanes. It is abandoned once that plan runs, so that the command goes
+    // on while that one waits for memory.
+    const bool supersedes = scheduler_.abandonsPasses(*plan, in);
+    passOver(*plan, excluded);
     std::vector<ModelBatchItem> items;
-    std::vector<std::vector<Capture>> captures;
-    switch (prepare(*plan, items, captures, now)) {
+    std::vector<std::vector<LaneCapture>> captures;
+    const size_t planned = excluded.size();
+    const Prepared prepared = prepare(*plan, items, captures, excluded, supersedes, now);
+    switch (prepared) {
     case Prepared::Runnable: {
+      // Unless prepare gave the command up already: a claim for it took the
+      // command (EngineVictims), or a lane yielded beside one of it that
+      // ended (yieldsEndedLanes).
+      if (supersedes)
+        settleEnded(passCommand_.yield());
+      tickHosts_.add(static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(AwakeClock::now() - planning).count()));
       std::unique_ptr<ModelBatchTicket> ticket =
           model_.submit(*plan, items, completionNotifier_);
       if (!ticket) {
         throw std::logic_error("model returned an empty command ticket");
       }
-      // A prefill lane whose page list names Index pages reads its history
-      // from the SSD cache: alone in its command (streamsHistory).
-      const bool streamed = plan->kind == WorkKind::Prefill && items.front().pageSources;
-      scheduler_.commit(*plan, excluded);
+      // The lanes prepare refused or held back were planned without while
+      // ready: a command in passes leaves them out, as it does a lane it had
+      // no room for, and they wait for its end.
+      // Those that wait for memory on its way back join it once that lands.
+      std::vector<uint64_t> waiting;
+      for (const uint64_t id : excluded)
+        if (std::ranges::find(refused, id) == refused.end())
+          waiting.push_back(id);
+      const std::vector<LaneShape> committed = laneShapes();
+      scheduler_.commit(*plan, {.excluded = waiting, .shapes = committed, .passes = passCommand_.progress()});
+      // A command in passes keeps its items and their captures for its
+      // later passes (prepare), and its progress for planning.
+      if (plan->passes > 1 && !plan->pass)
+        passCommand_.start(*plan, std::move(items), captures);
       // The command reads the cached pages its lanes' blocks were swapped
       // for, and those a resume restored. Selecting a constrained request's
       // first token reads none, but the cycle after it does; only a first
@@ -320,16 +422,19 @@ bool Engine::tick(double now) {
         lane.deduplicatedKvTokens += lane.unreadDeduplicatedKvTokens;
         counters_.deduplicatedKvTokens += std::exchange(lane.unreadDeduplicatedKvTokens, 0);
       }
-      pending_ = Pending{std::move(*plan), std::move(captures), std::move(ticket),
-                         busySinceMilliseconds_.value_or(now), streamed};
+      pending_ = Pending{*plan, std::move(captures), std::move(ticket), busySinceMilliseconds_.value_or(now)};
       return true;
     }
     case Prepared::Yielded:
-      sweepTerminal();
+      sweepTerminal(now);
       return true;
     case Prepared::Waiting:
       for (const BatchItem &item : plan->items)
         excluded.push_back(item.requestId);
+      continue;
+    case Prepared::Replan:
+      refused.insert(refused.end(), excluded.begin() + static_cast<std::ptrdiff_t>(planned), excluded.end());
+      ++counters_.replans;
       continue;
     }
   }
@@ -344,7 +449,7 @@ bool Engine::drainingForRecovery() const {
                      [](const auto &entry) {
                        return entry.second.lane.has_value();
                      }) &&
-         (allocationFailed_ || config_.growthPaused());
+         (allocationFailed_ || !governor().admits(ClaimClass::Growth));
 }
 
 std::optional<RequestPriority> Engine::suspendedTier() const {
@@ -366,11 +471,67 @@ bool Engine::admissionTries(const Request &active, std::optional<RequestPriority
          (scheduler_.suspended(active.request.id) && !draining);
 }
 
-bool Engine::holdsBack(std::optional<uint64_t> refused) const {
-  if (!refused)
-    return false;
-  const auto found = requests_.find(*refused);
-  return found != requests_.end() && !found->second.finalized && found->second.refusedResources;
+bool Engine::belowRunnable(const Request &active) const {
+  const std::optional<RequestPriority> runnable = scheduler_.highestRunnablePriority();
+  return runnable && active.request.priority > *runnable;
+}
+
+void Engine::holds(double now) noexcept {
+  for (auto &[_, active] : requests_) {
+    if (active.finalized || active.firstTokenSent)
+      continue;
+    if (active.heldSince && active.heldBy != TtftPart::Rest)
+      active.held[static_cast<size_t>(active.heldBy)] += now - *active.heldSince;
+    active.heldSince = now;
+  }
+}
+
+TtftPart Engine::holderOf(const Request &active) const {
+  const bool own = pending_ && std::ranges::any_of(pending_->plan.items, [&](const BatchItem &item) {
+                     return item.requestId == active.request.id;
+                   });
+  if (own && pending_->plan.kind == WorkKind::Prefill)
+    return TtftPart::OwnPrefill;
+  if (active.claim.id) {
+    const ClaimState &claim = governor().ledger().claim(active.claim.id);
+    if (claim.waiting || claim.hostRefusedWaiting)
+      return TtftPart::ClaimWait;
+  }
+  if (pending_)
+    return pending_->plan.kind == WorkKind::Decode ? TtftPart::Decode : TtftPart::OtherPrefill;
+  return TtftPart::Rest;
+}
+
+void Engine::firstTokens(Request &active) {
+  if (std::exchange(active.firstTokenSent, true))
+    return;
+  events_.firstTokenParts(active.request.id, active.held);
+}
+
+void Engine::decodeGap(Request &active, const model::CommandSample &sample, double now) {
+  Request::GapSince &since = active.gapSince;
+  // The command read from the SSD, for every lane of it alike: the experts
+  // the store missed, or spilled K/V (the hot blocks a decode missed). A
+  // command whose lanes found every hot block in memory read nothing.
+  if (sample.work.weightReadBytes || sample.work.spilledKvReadBytes)
+    since.ssdRead = true;
+  const uint64_t releases = governor().ledger().poolReleases();
+  if (active.lastTokenMilliseconds && now - *active.lastTokenMilliseconds > config_.decodeGapMilliseconds) {
+    const GapCause cause = since.prefillMilliseconds > 0.0   ? GapCause::PrefillUnit
+                           : since.claimWaited               ? GapCause::ClaimWait
+                           : since.ssdRead                   ? GapCause::SsdRead
+                           : releases != since.poolReleases  ? GapCause::PoolRelease
+                           : counters_.replans != since.replans ? GapCause::Replan
+                                                                : GapCause::Other;
+    DecodeGapCausesSnapshot &causes = counters_.decodeGapCauses;
+    ++causes.gaps[static_cast<size_t>(cause)];
+    causes.milliseconds[static_cast<size_t>(cause)] += now - *active.lastTokenMilliseconds;
+    if (cause == GapCause::PrefillUnit) {
+      causes.prefillMilliseconds += since.prefillMilliseconds;
+    }
+  }
+  active.lastTokenMilliseconds = now;
+  since = {.poolReleases = releases, .replans = counters_.replans};
 }
 
 std::optional<double> Engine::nextWakeupMilliseconds() const {
@@ -392,7 +553,7 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
       result = active.request.deadlineMilliseconds;
     if (active.maskRequestedMilliseconds) {
       const double limit =
-          *active.maskRequestedMilliseconds + kMaskWaitLimitMilliseconds;
+          *active.maskRequestedMilliseconds + kMaskWaitMilliseconds;
       if (!result || limit < *result)
         result = limit;
     }
@@ -408,8 +569,8 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
     if (!result || wakeup < *result)
       result = wakeup;
   }
-  if (const std::optional<double> persist = writeBehind_.nextWakeup();
-      persist && (!result || *persist < *result))
+  // Copies ahead wait while a claim waits, which a step of the engine shows.
+  if (const std::optional<double> persist = writeBehind_.nextWakeup(); persist && (!result || *persist < *result))
     result = persist;
   return result;
 }
@@ -420,6 +581,7 @@ EngineSnapshot Engine::snapshot() const {
   result.scheduler = scheduler_.snapshot();
   result.resources = cache_.snapshot();
   result.writeBehind = writeBehind_.snapshot();
+  result.tickHostMilliseconds = tickHosts_.snapshot();
   for (const auto &[id, active] : requests_) {
     if (active.finalized)
       continue;
@@ -439,40 +601,6 @@ EngineSnapshot Engine::snapshot() const {
   return result;
 }
 
-ResourceWaitSnapshot Engine::resourceWaitSnapshot(double now) const {
-  ResourceWaitSnapshot result;
-  result.draining = drainingForRecovery();
-  for (const auto &[id, active] : requests_) {
-    if (active.finalized)
-      continue;
-    // Admitted, it waits for disk reads, not for memory.
-    if (active.restore) {
-      ++result.restoring;
-      continue;
-    }
-    const bool waiting = scheduler_.phase(id) == Phase::WaitingResources;
-    // What the latest admission pass held back, in whatever phase it left
-    // them, while the request they wait behind is still refused, and a
-    // request refused resources while a pass keeps it out of its wait.
-    if (holdsBack(active.heldBehind) || (active.refusedResources && !waiting))
-      ++result.heldBehindRefusal;
-    if (!waiting)
-      continue;
-    if (active.resourceWait.reason == StateFailure::ConcurrencyLimit)
-      ++result.concurrency;
-    else if (active.resourceWait.diskQuota)
-      ++result.diskQuota;
-    else
-      ++result.memory;
-    if (scheduler_.suspended(id))
-      ++result.suspended;
-    if (active.resourceWait.startedMilliseconds)
-      result.oldestWaitMilliseconds = std::max(
-          result.oldestWaitMilliseconds, now - *active.resourceWait.startedMilliseconds);
-  }
-  return result;
-}
-
 bool Engine::admitQueued(double now) {
   const std::optional<RequestPriority> tier = suspendedTier();
   // Once pressure has preempted work, let resident lanes finish while memory
@@ -488,163 +616,179 @@ bool Engine::admitQueued(double now) {
     drainEndMilliseconds_ = 0.0;
   const bool draining = drainingForRecovery();
   const std::vector<uint64_t> order = scheduler_.admissionOrder();
-  // A request this pass does not start, or that waits behind one refused
-  // memory, waits for scheduling; the latter is marked with the refused
-  // request until the next pass.
+  // A request held behind a refusal is marked with the refused request until
+  // the next pass (Request::heldBehind).
   for (auto &[_, active] : requests_)
     active.heldBehind.reset();
   const auto queue = [&](uint64_t id) {
     deferWait(request(id));
     scheduler_.deferAdmission(id);
   };
-  const auto hold = [&](uint64_t id, uint64_t refused) {
-    queue(id);
-    request(id).heldBehind = refused;
-  };
-  // A request below the highest priority that prefills or decodes cannot
-  // run before that priority is done. It waits for scheduling, unprobed, and
-  // takes no lane, neither a free one nor a lower resident's: the lanes of
-  // that priority free theirs as they finish.
-  const std::optional<RequestPriority> runnable = scheduler_.highestRunnablePriority();
-  const auto belowRunnable = [&](const Request &active) {
-    return runnable && active.request.priority > *runnable;
-  };
   // The tokens a request's start would reuse, from its probe brought up to
-  // date: none for a request that ignores the cache, which is ranked by its
-  // whole prompt.
-  const auto cachedTokens = [&](Request &active) -> uint32_t {
+  // date, or as its last probe found for a start this pass does not try:
+  // none for a request that ignores the cache, which is ranked by its whole
+  // prompt.
+  const auto cachedTokens = [&](Request &active, bool refresh) -> uint32_t {
     if (active.skipCache)
       return 0;
-    if (active.admissionProbe)
-      cache_.refresh(*active.admissionProbe, active.exactTokens, promptIdentity(active.request));
-    else
+    if (!active.admissionProbe)
       active.admissionProbe = cache_.probe(active.exactTokens, promptIdentity(active.request));
+    else if (refresh)
+      cache_.refresh(*active.admissionProbe, active.exactTokens, promptIdentity(active.request));
     return active.admissionProbe->cachedTokens();
   };
   // A request starts only in a free lane. While every lane is resident,
-  // record each wait as a failed admission would. The first request that
-  // waits for a lane and not for a producer's prefix takes one from the
-  // lowest-priority resident below it, if there is one: the order is by
-  // priority, so no later request has one to take. The next pass admits
-  // it, above the lane it suspended. Only the requests up to that one are
-  // probed, to tell a prefix wait: a request waiting for a prefix would
-  // leave the freed lane to the suspended one, which would resume into it
-  // and replay for nothing.
+  // record each wait of a request the scheduler would start as a failed
+  // admission would. The first wanted start that waits for a lane takes one
+  // from the lowest-priority resident below it, if there is one: the order
+  // is by priority, so no later request has one to take. The next pass
+  // admits it, above the lane it suspended. A request waiting for a prefix
+  // takes none: it would leave the freed lane to the suspended one, which
+  // would resume into it and replay for nothing.
   const bool lanesFull =
       std::count_if(requests_.begin(), requests_.end(), [](const auto &entry) {
         return entry.second.lane.has_value();
       }) >= model::ExecutionLimits::maximumBatchWidth;
   bool laneSought = false;
   const auto waitForLane = [&](uint64_t id, Request &active) {
-    if (!laneSought && !pendingSharedPrefill(active, cachedTokens(active))) {
-      laneSought = true;
-      if (preemptBelow(active.request.priority, now))
-        return true;
-    }
     scheduler_.waitForResources(id);
     deferResourceRetry(active, now, {}, StateFailure::ConcurrencyLimit);
-    return false;
   };
-  if (tier) {
-    // Recovery admits one request at a time, in admission order: those
-    // above every suspended request, then the suspended ones, which resume
-    // below a running priority too. As in ordinary admission, the first one
-    // refused memory holds back the ones after it. Those are not tried, so
-    // they keep no retry time, and their wait limit starts again at their
-    // next attempt.
-    std::optional<uint64_t> refused;
-    for (uint64_t id : order) {
-      Request &active = request(id);
-      if (active.restore || !admissionTries(active, tier, draining))
-        continue;
-      if (refused) {
-        active.resourceWait.retryMilliseconds = 0.0;
-        active.resourceWait.deadlineMilliseconds = 0.0;
-        active.heldBehind = refused;
-        continue;
-      }
-      if (resourceRetryReady(active, now)) {
-        const bool suspended = scheduler_.suspended(id);
-        if (!suspended && belowRunnable(active))
-          queue(id);
-        else if (lanesFull && !suspended ? waitForLane(id, active) : admit(active, now))
-          return true;
-      }
-      if (active.refusedResources)
-        refused = id;
-    }
-    return false;
-  }
-
-  // A request whose start was refused memory, or the SSD cache's quota,
-  // closes admission behind it until it starts: admission is open for
-  // order[0, open). What reclaim, finishing lanes and returned commitments
-  // free would otherwise keep going to later arrivals that need less of it
-  // at once, and it would wait for as long as they keep coming. Waiting for
-  // a free lane closes nothing: nothing starts without one.
-  size_t open = order.size();
+  // The unstarted requests admission tries: during recovery those of a
+  // strictly higher priority than every suspended one (admissionTries). A
+  // request below the highest priority that prefills or decodes cannot run
+  // before that priority is done (belowRunnable): it waits for scheduling,
+  // unprobed, and takes no lane, neither a free one nor a lower resident's.
+  // A start backing off from a refusal stays a candidate, ranked by its last
+  // probe; one backing off from a lane wait, or restoring its prefix, is left
+  // as it is.
   std::vector<PrefillAdmission> candidates;
-  // Each candidate's place in order.
-  std::unordered_map<uint64_t, size_t> positions;
-  for (size_t index = 0; index < order.size(); ++index) {
-    const uint64_t id = order[index];
+  for (const uint64_t id : order) {
     Request &active = request(id);
-    if (index >= open) {
-      if (!active.restore)
-        hold(id, order[open - 1]);
+    if (active.restore || scheduler_.suspended(id) || !admissionTries(active, tier, draining))
       continue;
-    }
-    if (active.refusedResources)
-      open = index + 1;
-    if (active.restore || !resourceRetryReady(active, now))
+    const bool ready = resourceRetryReady(active, now);
+    if (!ready && !active.refusedResources)
       continue;
     if (belowRunnable(active)) {
       queue(id);
       continue;
     }
-    if (lanesFull) {
-      if (waitForLane(id, active))
-        return true;
+    if (!ready) {
+      candidates.push_back({id, cachedTokens(active, false)});
       continue;
     }
-    const uint32_t cached = cachedTokens(active);
+    const uint32_t cached = cachedTokens(active, true);
     if (pendingSharedPrefill(active, cached)) {
-      deferWait(active);
-      scheduler_.waitForPrefix(id);
+      if (lanesFull) {
+        waitForLane(id, active);
+      } else {
+        deferWait(active);
+        scheduler_.waitForPrefix(id);
+      }
       continue;
     }
-    positions.emplace(id, index);
     candidates.push_back({id, cached});
   }
-  bool progressed = false;
-  while (!candidates.empty()) {
-    const auto selected = scheduler_.prefillAdmissionOrder(candidates);
-    if (selected.empty())
-      break;
-    for (uint64_t id : selected) {
-      if (positions.at(id) >= open)
-        continue;
-      progressed = admit(request(id), now) || progressed;
-      std::erase_if(candidates, [id](const auto &value) {
-        return value.requestId == id;
-      });
-      // Refused resources in this pass, it closes admission behind it at once.
-      if (request(id).refusedResources)
-        open = std::min(open, positions.at(id) + 1);
-    }
-    std::erase_if(candidates, [&](const auto &value) {
-      if (positions.at(value.requestId) < open)
-        return false;
-      hold(value.requestId, order[open - 1]);
-      return true;
-    });
-    // A request that could not start holds back only what arrived after it.
-    if (progressed)
-      break;
+  // The starts the scheduler wants in this pass
+  // (Scheduler::prefillAdmissionOrder), in its lead order, each candidate
+  // placed once in each state of the memory it reads. The others wait for
+  // scheduling, and hold back nothing.
+  std::vector<uint64_t> wanted;
+  if (!candidates.empty()) {
+    placeCandidates(candidates);
+    const std::vector<LaneShape> shapes = laneShapes(candidates);
+    std::vector<PrefillAdmission> restoring;
+    for (const auto &[id, active] : requests_)
+      if (active.restore && !scheduler_.suspended(id))
+        restoring.push_back({id, active.restore->lookup.resumeBoundary()});
+    wanted = scheduler_.prefillAdmissionOrder(
+        candidates, {.shapes = shapes, .passes = passCommand_.progress(), .restoring = restoring});
   }
-  for (const auto &candidate : candidates)
-    queue(candidate.requestId);
-  return progressed;
+  bool startWaits = false;
+  for (const PrefillAdmission &candidate : candidates)
+    if (std::ranges::find(wanted, candidate.requestId) == wanted.end()) {
+      queue(candidate.requestId);
+      startWaits = true;
+    }
+  // The wanted starts are tried in lead order, each once its backoff is over,
+  // up to the first that stands refused or is refused: the wanted starts
+  // after it that compete for what it was refused are held, not tried, in
+  // this pass, so what reclaim, finishing lanes and returned commitments
+  // free goes to it before the starts it leads. Every start competes for
+  // memory; for the SSD cache's quota only those that will hold some of it
+  // (competesForQuota). A start waiting for a prefix holds back nothing.
+  std::optional<uint64_t> refused;
+  std::optional<uint64_t> refusedQuota;
+  bool progressed = false;
+  for (const uint64_t id : wanted) {
+    Request &active = request(id);
+    // Placed in the memory's current state, which a start before it in this
+    // pass may have changed.
+    const PrefillAdmission start{.requestId = id};
+    placeCandidates({&start, 1});
+    std::optional<uint64_t> behind = refused;
+    if (!behind && refusedQuota && competesForQuota(active))
+      behind = refusedQuota;
+    if (behind) {
+      queue(id);
+      active.heldBehind = behind;
+      continue;
+    }
+    // A start that stood refused holds the rest even when its retry
+    // succeeds: its restore or first work takes what freed it in the
+    // commands that follow.
+    const bool stoodRefused = active.refusedResources;
+    bool quota = active.resourceWait.diskQuota;
+    if (resourceRetryReady(active, now)) {
+      if (lanesFull) {
+        if (!laneSought) {
+          laneSought = true;
+          if (preemptBelow(active.request.priority, now))
+            return true;
+        }
+        waitForLane(id, active);
+      } else if (admit(active, now)) {
+        // Recovery admits one request at a time.
+        if (tier)
+          return true;
+        progressed = true;
+      } else if (scheduler_.phase(id) == Phase::WaitingPrefix) {
+        continue;
+      } else if (active.refusedResources) {
+        quota = active.resourceWait.diskQuota;
+      }
+    }
+    if (stoodRefused || active.refusedResources)
+      (quota ? refusedQuota : refused) = id;
+  }
+  if (!tier)
+    return progressed;
+  // Recovery then resumes the suspended requests one at a time, in admission
+  // order, below a running priority too, into the lane a higher priority
+  // took from them, whatever lane leads. A refused resume holds back the
+  // ones after it, as a refused start above them does. A start above them
+  // that waits for scheduling holds them back too: resumed into the lane it
+  // takes once it leads, they would replay for nothing below it and yield
+  // that lane again. A held resume is not tried: it keeps no retry time,
+  // and its wait limit starts again at its next attempt.
+  std::optional<uint64_t> holding = refused ? refused : refusedQuota;
+  for (const uint64_t id : order) {
+    Request &active = request(id);
+    if (!scheduler_.suspended(id) || active.restore || !admissionTries(active, tier, draining))
+      continue;
+    if (holding || startWaits) {
+      active.resourceWait.retryMilliseconds = 0.0;
+      active.resourceWait.deadlineMilliseconds = 0.0;
+      active.heldBehind = holding;
+      continue;
+    }
+    if (resourceRetryReady(active, now) && admit(active, now))
+      return true;
+    if (active.refusedResources)
+      holding = id;
+  }
+  return false;
 }
 
 uint32_t Engine::replayStateBoundary(const Request &active) noexcept {
@@ -748,6 +892,10 @@ uint32_t Engine::awaitedBoundary(const Request &producer, uint32_t end) const {
 
 bool Engine::admit(Request &active, double now) {
   const bool resuming = scheduler_.suspended(active.request.id);
+  // A start of a higher priority than the command between its passes may
+  // take that command, as its prompt's command does once it runs
+  // (ClaimSpec::supersedes).
+  const bool supersedes = scheduler_.yieldsTo(active.request.priority, {.passes = passCommand_.progress()});
   ModelRequest modelRequest = active.request.modelView();
   modelRequest.prompt = active.exactTokens;
   CacheLookup lookup =
@@ -770,8 +918,13 @@ bool Engine::admit(Request &active, double now) {
   // not start set does not outlive it. A Spill request commits the SSD
   // cache's quota for the pages it publishes once it holds its lane.
   active.outputLimit = active.request.maxNewTokens;
-  if (!resuming)
-    active.kvMode = kvModeFor(active);
+  if (!resuming) {
+    if (!active.placement || active.placementState != ledgerChanges_) {
+      active.placement = placement(active);
+      active.placementState = ledgerChanges_;
+    }
+    active.kvMode = *active.placement;
+  }
   bool commits = false;
   if (active.kvMode == KvMode::Spill) {
     switch (admitSpill(active, resuming, chainEnd(lookup), now)) {
@@ -788,29 +941,29 @@ bool Engine::admit(Request &active, double now) {
   }
   modelRequest.maxNewTokens = active.outputLimit;
   // A request is in service when no other lane is resident
-  // (anotherResident): it starts through the host's pause once reuse gives
-  // nothing, and reclaims up to what is in use. Beside a resident lane it
-  // takes nothing in use and waits for that lane.
-  const bool inService = !anotherResident(active.request.id);
-  const ReclaimClass upTo = inService ? ReclaimClass::InUse : ReclaimClass::Ordinary;
+  // (anotherResident): the host exempts it once nothing in place meets it,
+  // and it takes up to what is in use. Beside a resident lane it is a start,
+  // which takes only the cache nothing in use holds, the model's caches it
+  // rebuilds on use among them, and waits for that lane.
+  ClaimSpec spec = claimFor(active, anotherResident(active.request.id) ? ClaimClass::Start : ClaimClass::InService);
+  spec.supersedes = supersedes;
+  const auto begin = [&] {
+    modelRequest.restoredTokens = lookup.resumeBoundary();
+    return resuming ? model_.resume(modelRequest) : model_.begin(modelRequest);
+  };
+  auto state = allocate(begin, spec, Refusal::Waits);
   // The request's own lease goes only when nothing else can free memory
   // (judge() says Fail: no other lane is resident, nothing is pending, the
   // host is not refusing). It then starts without the pin rather than wait
   // for ever, and looks up again once it holds its lane, so a state the
-  // reclaim wrote to disk is restored, not recomputed.
+  // ledger wrote to disk is restored, not recomputed.
   bool droppedLease = false;
-  const auto state = allocate(
-      [&] {
-        modelRequest.restoredTokens = lookup.resumeBoundary();
-        return resuming ? model_.resume(modelRequest) : model_.begin(modelRequest);
-      },
-      inService, upTo, [&](const Denial &denial) {
-        if (!lookup.state || judge(denial, active.request.id) != Verdict::Fail)
-          return false;
-        lookup = {};
-        droppedLease = true;
-        return true;
-      });
+  if (!state.admission.granted() && lookup.state && memoryDenied(state.admission) &&
+      judge(state.denial, active.request.id) == Verdict::Fail) {
+    lookup = {};
+    droppedLease = true;
+    state = allocate(begin, spec, Refusal::Waits);
+  }
   if (!state.admission.granted()) {
     // Without a free lane the request waits for one; only memory it could
     // not get may fail it.
@@ -834,12 +987,16 @@ bool Engine::admit(Request &active, double now) {
   cache_.beginRequest(requestId, active.kvMode);
   active.lane = *state.admission.lane;
   active.admission = ++admissions_;
+  // Its projected growth is the lanes' now (laneDemandBytes).
+  ++ledgerChanges_;
   if (droppedLease)
     lookup = cache_.lookup(modelRequest.prompt, promptIdentity(active.request));
   // The commitment covers the chain it restores too, once the lookup is
-  // final. Writes a reclaim started may have taken the quota admitSpill
+  // final, beside the copies on it the quota counts once the start holds
+  // them. Writes a reclaim started may have taken the quota admitSpill
   // found, or the chain found again may have fewer copies: the start waits.
-  if (commits && !cache_.commitSpill(requestId, spillPages(active, chainEnd(lookup)))) {
+  const Cache::ChainCopies copies = commits ? cache_.chainCopies(chainEnd(lookup)) : Cache::ChainCopies{};
+  if (commits && !cache_.commitSpill(requestId, spillPages(active, copies.copied), copies)) {
     vacateLane(active, resuming);
     waitForDiskQuota(active, now);
     return false;
@@ -848,13 +1005,11 @@ bool Engine::admit(Request &active, double now) {
   // The matched chain first, then the first work's pages for a lane that
   // will not go through ordinary prefill admission before it runs: one
   // that resumes, or one that waits for a restore. As for its lane, beside
-  // a resident request its pages wait for the host. Refused them, a
-  // Resident lane may convert to Spill.
-  const auto convert = spillFallback(active, &lookup);
+  // a resident request its pages wait for the host.
   Allocation<TokenAdmission> kv;
   if (lookup.state)
-    kv = allocate([&] { return cache_.restoreRequest(requestId, lookup); }, inService, upTo,
-                  convert);
+    kv = allocate([&] { return cache_.restoreRequest(requestId, lookup, heldPages(active)); }, spec,
+                  Refusal::Waits);
   const bool restoring =
       lookup.state && (!lookup.state->state()->residentBytes() ||
                        cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending);
@@ -862,16 +1017,15 @@ bool Engine::admit(Request &active, double now) {
     // Its new pages past the chain it restored come cleared: a resume's
     // replay writes them in chunks that may end inside any of them. A
     // Resident lane that resumes takes the KV target it was suspended with
-    // at once. A Spill lane, a Resident one that converts here included,
-    // takes the first work's page, as a start that waits for its restore
-    // does: its replay takes Full pages a command at a time (prepare), which
-    // spill as their copies land, as its output's did.
+    // at once. A Spill lane takes the first work's page, as a start that
+    // waits for its restore does: its replay takes Full pages a command at a
+    // time (prepare), which spill as their copies land, as its output's did.
     const auto workEnd = [&] {
       return resuming && active.kvMode == KvMode::Resident ? active.resumeKvTargetTokens
                                                            : uint64_t{resumeBoundary} + 1;
     };
-    kv = allocate([&] { return cache_.ensureTokens(requestId, workEnd(), resumeBoundary); },
-                  inService, upTo, convert);
+    kv = allocate([&] { return cache_.ensureTokens(requestId, workEnd(), resumeBoundary, heldPages(active)); },
+                  spec, Refusal::Waits);
   }
   if (!kv.admission.granted()) {
     // The host continuation survives this failed admission. No recurrent
@@ -896,7 +1050,9 @@ bool Engine::admit(Request &active, double now) {
       static_cast<void>(preemptBelow(active.request.priority, now));
     return false;
   }
+  // Admitted, it waits for nothing.
   active.resourceWait = {};
+  governor().ledger().setWaiting(active.claim.id, false);
   DraftContextPlan draft = configureDraftStatePlan(
       active, resumeBoundary, lookup.junctionBoundary);
   std::unique_ptr<StateRestore> transfer;
@@ -914,188 +1070,9 @@ bool Engine::admit(Request &active, double now) {
   return true;
 }
 
-uint64_t Engine::projectedTokens(const Request &active) noexcept {
-  const uint64_t generated = active.exactTokens.size() - active.promptTokens;
-  const uint64_t remaining = active.outputLimit - std::min<uint64_t>(generated, active.outputLimit);
-  return active.exactTokens.size() + std::min<uint64_t>(remaining, kProjectedOutputTokens);
-}
-
-KvMode Engine::kvModeFor(const Request &active) const {
-  const EngineSpillConfig &spill = config_.spill;
-  if (!spill.capable)
-    return KvMode::Resident;
-  if (spill.always)
-    return KvMode::Spill;
-  const uint64_t tokens = projectedTokens(active);
-  if (tokens <= spill.denseTokens)
-    return KvMode::Resident;
-  uint64_t bytes = spill.geometry.residentBytes(tokens);
-  for (const auto &[id, peer] : requests_) {
-    if (!peer.lane || id == active.request.id)
-      continue;
-    const uint64_t projection = projectedTokens(peer);
-    bytes += peer.kvMode == KvMode::Spill ? spill.geometry.spillFloorBytes(projection)
-                                          : spill.geometry.residentBytes(projection);
-  }
-  return bytes <= spill.geometry.residentKvBytes ? KvMode::Resident : KvMode::Spill;
-}
-
-bool Engine::fitsResidentAlone(const Request &active) const {
-  return projectedTokens(active) <= config_.spill.geometry.residentTokens;
-}
-
-uint64_t Engine::chainEnd(const CacheLookup &lookup) noexcept {
-  return lookup.state ? lookup.state->kvBlock() : 0;
-}
-
-uint64_t Engine::chainEnd(const Request &active) const {
-  const uint64_t id = active.request.id;
-  const uint32_t held = scheduler_.phase(id) == Phase::Prefill ? scheduler_.promptProcessed(id)
-                                                                : active.publishedTokens;
-  return held < KvCache::pageTokens
-             ? 0
-             : cache_.blockAt(id, held / KvCache::pageTokens * KvCache::pageTokens);
-}
-
-uint32_t Engine::spillPages(const Request &active, uint64_t chainEnd) const {
-  const uint64_t pages = projectedTokens(active) / KvCache::pageTokens;
-  return static_cast<uint32_t>(pages - std::min<uint64_t>(pages, cache_.copiedBlocks(chainEnd)));
-}
-
-Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64_t chainEnd,
-                                          double now) {
-  const SpillGeometry &geometry = config_.spill.geometry;
-  // What it would do without the SSD cache: start Resident if its
-  // projection fits in memory alone, and wait for the other lanes there.
-  const auto residentInstead = [&] {
-    if (!fitsResidentAlone(active))
-      return false;
-    active.kvMode = KvMode::Resident;
-    return true;
-  };
-  // A resume goes on spilling whatever the tier and the write budget: its
-  // writes are in use, and pages a closed tier does not take stay Full.
-  if (!resuming) {
-    if (const SpillGate gate = cache_.spillGate(); gate != SpillGate::Open) {
-      if (residentInstead())
-        return SpillAdmission::Resident;
-      const std::string reason = "requests past " + std::to_string(geometry.residentTokens) +
-                                 " tokens keep their KV on the SSD cache, ";
-      if (gate == SpillGate::WriteBudget) {
-        ++counters_.spill.refusedWriteBudget;
-        // It refills over hours: a retry may succeed once it covers again
-        // what Spill requests committed, or sooner as they end.
-        const double admitted = cache_.spillWritesAdmittedAt().value_or(now);
-        settle(active, {LaneOutcome::KvWriteBudget,
-                        reason + "whose daily write budget (--max-cache-disk-writes) is spent",
-                        static_cast<uint32_t>(std::lround(std::max(0.0, admitted - now) / 1000.0))});
-      } else {
-        ++counters_.spill.refusedClosed;
-        settle(active, {LaneOutcome::CapacityExhausted, reason + "which takes no writes"});
-      }
-      return SpillAdmission::Settled;
-    }
-  }
-  const uint64_t room = cache_.spillRoom() / geometry.slotBytes;
-  if (room >= spillPages(active, chainEnd))
-    return SpillAdmission::Commit;
-  // Short of its projection, a start that fits in memory alone starts
-  // Resident, as without the SSD cache, unless every request spills.
-  if (!resuming && !config_.spill.always && residentInstead())
-    return SpillAdmission::Resident;
-  // Otherwise the quota bounds its output to the pages it holds, if they
-  // hold a token past the tokens the request holds; those of the chain it
-  // restores that have copies need none. A resume counts among them the
-  // anchor its model holds once it selected the request's first token
-  // (Request::suspendedWithAnchor), which the model decodes only with
-  // output left past it: it emits a last budgeted anchor as it selects it.
-  const uint64_t held = active.exactTokens.size() + (active.suspendedWithAnchor ? 1 : 0);
-  const uint64_t copied = cache_.copiedBlocks(chainEnd);
-  const uint64_t needed = held / KvCache::pageTokens + 1 - copied;
-  if (room >= needed) {
-    active.outputLimit = static_cast<uint32_t>(std::min<uint64_t>(
-        active.outputLimit, (copied + room) * KvCache::pageTokens - active.promptTokens));
-    return SpillAdmission::Commit;
-  }
-  // What it lacks is other requests' active KV, the copies of the blocks
-  // they hold and their commitments: it waits for them to end. The quota
-  // cannot hold it even alone: a start is refused, and a resume that has no
-  // room left for output ends.
-  const uint64_t activeLimitBytes = cache_.spillLimit();
-  if (activeLimitBytes / geometry.slotBytes >= needed) {
-    waitForDiskQuota(active, now);
-    return SpillAdmission::Waiting;
-  }
-  if (resuming) {
-    endAtLength(active);
-  } else {
-    ++counters_.spill.refusedQuota;
-    settle(active, {LaneOutcome::KvDiskQuota,
-                    "this request's KV needs needed_bytes=" +
-                        std::to_string(needed * geometry.slotBytes) +
-                        " of the SSD cache, which may hold active_limit_bytes=" +
-                        std::to_string(activeLimitBytes) +
-                        " of active KV now (--max-cache-disk and the volume's free space)"});
-  }
-  return SpillAdmission::Settled;
-}
-
-void Engine::waitForDiskQuota(Request &active, double now) {
-  active.refusedResources = true;
-  scheduler_.waitForResources(active.request.id);
-  deferResourceRetry(active, now, {.diskQuota = true});
-}
-
-std::function<bool(const Engine::Denial &)> Engine::spillFallback(Request &active,
-                                                                  const CacheLookup *restoring) {
-  if (!config_.spill.capable)
-    return {};
-  // A start that converts starts as a Spill request, which completeAdmission
-  // counts, and one refused all the same decides its mode afresh at its next
-  // attempt; a lane that ran Resident before converts once.
-  const bool started = !restoring || scheduler_.suspended(active.request.id);
-  // Memory on its way back comes without it.
-  return [this, &active, restoring, started](const Denial &denial) {
-    if (denial.pending || active.kvMode != KvMode::Resident ||
-        !cache_.convertToSpill(active.request.id,
-                               spillPages(active, restoring ? chainEnd(*restoring)
-                                                            : chainEnd(active))))
-      return false;
-    active.kvMode = KvMode::Spill;
-    scheduler_.setPrefillGroupRows(active.request.id, model_.prefillGroupRows(true));
-    counters_.spill.converted += started;
-    return true;
-  };
-}
-
-bool Engine::streamsHistory(const Request &active) const {
-  const SpillGeometry &geometry = config_.spill.geometry;
-  return cache_.holdsIndexPages(active.request.id) ||
-         (active.kvMode == KvMode::Spill &&
-          scheduler_.promptProcessed(active.request.id) >
-              uint64_t{geometry.densePages + geometry.windowPages} * KvCache::pageTokens);
-}
-
-bool Engine::spillingPrompt() const {
-  return std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
-    const auto &[id, active] = entry;
-    return active.lane && active.kvMode == KvMode::Spill && scheduler_.phase(id) == Phase::Prefill;
-  });
-}
-
-void Engine::endAtLength(Request &active) {
-  ++counters_.spill.lengthEnds;
-  finish(active, EngineFinishReason::Length, {});
-}
-
 void Engine::completeAdmission(Request &active, CacheLookup &lookup,
                                 DraftContextPlan draft) {
   const bool resuming = scheduler_.suspended(active.request.id);
-  // A lane whose history spills runs prefill groups, which read it once for
-  // their chunks; a Resident one only where every lane runs them, so a
-  // request that arrives beside it waits for a chunk.
-  scheduler_.setPrefillGroupRows(active.request.id,
-                                 model_.prefillGroupRows(active.kvMode == KvMode::Spill));
   active.skipCache = false;
   active.admissionProbe.reset();
   const uint32_t resumeBoundary = lookup.resumeBoundary();
@@ -1114,9 +1091,9 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
     active.unprovenState = lookup.state->kvBlock();
     active.latestCheckpoint = cache_.checkpointState(lookup.state->kvBlock());
     // A restored replay point of the prompt already has the ordinary state
-    // we need, in whichever tier holds it: a promotion that found no cache
-    // slot leaves it on disk. Other restored progress points, the end of a
-    // resumed lane's generated history among them, retain their rolling
+    // the lane needs, in whichever tier holds it: a promotion that found no
+    // cache slot leaves it on disk. Other restored progress points, the end of
+    // a resumed lane's generated history among them, retain their rolling
     // lifetime.
     if (resumeBoundary == promptReplayBoundary(active)) {
       if (active.latestCheckpoint) {
@@ -1128,6 +1105,14 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
     }
   }
   model_.setDraftContextPlan(active.request.id, std::move(draft));
+  // A request whose output a start or a resume bounds counts once. A lane
+  // bounded before it converts started Spill and never converts, so its
+  // first bound tells whether it counts as a converted lane's too.
+  if (!active.boundCounted && active.outputLimit < active.request.maxNewTokens) {
+    active.boundCounted = true;
+    ++counters_.spill.bounded;
+    counters_.spill.convertedBounded += active.converted;
+  }
   if (resuming) {
     active.resumeKvTargetTokens = 0;
     active.replaying = true;
@@ -1147,27 +1132,24 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   } else {
     ++counters_.coldMisses;
   }
-  if (config_.spill.capable) {
+  if (config_.spill.capable)
     ++(active.kvMode == KvMode::Spill ? counters_.spill.spill : counters_.spill.resident);
-    counters_.spill.bounded += active.outputLimit < active.request.maxNewTokens;
-  }
 }
 
-bool Engine::pollRestores(double now) {
+bool Engine::pollRestores() {
   bool progressed = false;
   for (auto &[id, active] : requests_) {
     if (!active.restore) continue;
-    // Scheduler::expireDeadlines has already failed this lane's phase; a
-    // restore landing now would otherwise admit the lane on it
-    // (completeAdmission) before sweepTerminal ends it.
-    if (!active.pendingEnd && active.request.deadlineMilliseconds <= now)
-      settle(active, deadlineEnd());
     StateRestore *ticket = active.restore->ticket.get();
     // The state's read must drain before its lane is reused; KV restores
     // belong to their blocks and outlive a request that gives up.
     if (ticket && !ticket->ready()) continue;
     const KvRestoreStatus kv = cache_.kvRestoreStatus(id);
     if (!active.pendingEnd && kv == KvRestoreStatus::Pending) continue;
+    // A state read that landed beside a command in flight waits for the
+    // command to end, where the claim of its RAM copy may take units:
+    // its lane joins no command before that.
+    if (ticket && pending_ && !active.pendingEnd) continue;
     auto restore = std::move(*active.restore);
     active.restore.reset();
     progressed = true;
@@ -1179,7 +1161,8 @@ bool Engine::pollRestores(double now) {
     }
     const bool stateRestored = !restore.ticket || restore.ticket->finish();
     if (stateRestored && kv == KvRestoreStatus::None) {
-      if (restore.ticket) cache_.promoteState(restore.lookup, *restore.ticket);
+      if (restore.ticket)
+        cache_.promoteState(restore.lookup, [&] { return promotedCopy(active, *restore.ticket); });
       completeAdmission(active, restore.lookup, std::move(restore.draft));
       continue;
     }
@@ -1198,59 +1181,19 @@ bool Engine::pollRestores(double now) {
   return progressed;
 }
 
-bool Engine::resourceRetryReady(const Request &active,
-                                double now) const noexcept {
-  return active.resourceWait.retryMilliseconds <= 0.0 ||
-         active.resourceWait.epoch != resourceEpoch_ ||
-         now >= active.resourceWait.retryMilliseconds;
-}
-
-void Engine::deferResourceRetry(Request &active, double now,
-                                const Denial &denial, StateFailure reason) noexcept {
-  auto &wait = active.resourceWait;
-  if (!wait.startedMilliseconds)
-    wait.startedMilliseconds = now;
-  // Waiting for a lane is not waiting for memory: the lanes that count are
-  // those admitted before the first refusal of memory.
-  if (!wait.admittedBefore && reason != StateFailure::ConcurrencyLimit)
-    wait.admittedBefore = admissions_;
-  const bool progressed = wait.pending && wait.epoch != resourceEpoch_;
-  wait.reason = reason;
-  wait.allocationFailure = denial.allocationFailure;
-  wait.pending = denial.pending;
-  wait.diskQuota = denial.diskQuota;
-  if (reason == StateFailure::ConcurrencyLimit)
-    wait.deadlineMilliseconds = 0.0;
-  else if (progressed || wait.deadlineMilliseconds <= 0.0)
-    wait.deadlineMilliseconds = now + config_.resourceWaitTimeoutMilliseconds;
-  wait.epoch = resourceEpoch_;
-  wait.retryMilliseconds = now + kResourceRetryBackoffMilliseconds;
-}
-
-void Engine::deferWait(Request &active) noexcept {
-  ResourceWait kept;
-  if (active.refusedResources) {
-    kept.startedMilliseconds = active.resourceWait.startedMilliseconds;
-    kept.admittedBefore = active.resourceWait.admittedBefore;
-  }
-  active.resourceWait = kept;
-}
-
-double Engine::resourceDeadline(const Request &active) const noexcept {
-  const ResourceWait &wait = active.resourceWait;
-  if ((wait.pending && wait.epoch != resourceEpoch_) || wait.deadlineMilliseconds <= 0.0)
-    return 0.0;
-  // The limit restarts whenever a lane submitted before the request, or
-  // admitted before it was refused memory or suspended, works, however long
-  // that takes. Other lanes do not extend it: requests that keep arriving
-  // would otherwise hold it until the request's deadline.
-  return std::max(wait.deadlineMilliseconds,
-                  wait.earlierLaneWorkMilliseconds + config_.resourceWaitTimeoutMilliseconds);
-}
-
-void Engine::signalResourceProgress() noexcept {
-  if (resourceEpoch_ != std::numeric_limits<uint64_t>::max())
-    ++resourceEpoch_;
+std::shared_ptr<const CompositeState> Engine::promotedCopy(Request &active, StateRestore &restore) {
+  // Optional, with no command in flight (pollRestores): without the copy
+  // the restore reads the state from disk.
+  ClaimSpec spec = claimFor(active, ClaimClass::Optional);
+  spec.timing = NeedTiming::Immediate;
+  std::shared_ptr<const CompositeState> state;
+  static_cast<void>(allocate(
+      [&] {
+        state = restore.snapshot();
+        return StateBuffers{.ok = state != nullptr};
+      },
+      spec, Refusal::Settled));
+  return state;
 }
 
 DraftContextPlan Engine::configureDraftStatePlan(Request &active,
@@ -1259,7 +1202,6 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   if (!active.stateBoundaries.empty() || active.stateBoundaryCursor != 0) {
     throw std::logic_error("request already has a composite-state plan");
   }
-
   const uint32_t latestReplayBoundary = replayStateBoundary(active);
   // Plan draft windows before prefill; arbitrary chunk ends do not carry a
   // complete draft state, the point the lane resumes from does. Progress
@@ -1378,7 +1320,7 @@ void Engine::publishCommittedBlocks(Request &active, uint32_t committedTokens) {
 }
 
 void Engine::publishReachedStateBoundaries(
-    Request &active, uint32_t promptProcessed, std::span<const Capture> captures,
+    Request &active, uint32_t promptProcessed, std::span<const LaneCapture> captures,
     std::span<const std::shared_ptr<const CompositeState>> states, double now) {
   bool materialized = false;
   // The lane's draft state is complete at its progress when the command
@@ -1459,21 +1401,26 @@ void Engine::publishReachedStateBoundaries(
       // The command has completed, so the state it ended at for its lane's
       // checkpoint is taken from the lane now. The replay point keeps that
       // checkpoint only beside buffers of its own; refused them, it takes
-      // the checkpoint's unless a peer still holds it. Then room comes from
-      // cache the state's class may take.
+      // the checkpoint's unless a peer still holds it. Then what the ledger
+      // frees for the state's claim (stateClaim).
       if (fromLane) {
-        state = model_.snapshot(active.request.id);
-        if (!state && replay && resident && !checkpointShared(active) &&
-            retireCheckpoint(active))
-          state = model_.snapshot(active.request.id);
-        if (!state)
-          recycled = makeStateRoom(checkpoint ? StateClass::Checkpoint
-                                   : replay   ? StateClass::InUse
-                                              : StateClass::Ordinary,
-                                   [&] {
-                                     state = model_.snapshot(active.request.id);
-                                     return state != nullptr;
-                                   });
+        bool first = true;
+        recycled = allocate(
+                       [&] {
+                         state = model_.snapshot(active.request.id);
+                         if (!state && std::exchange(first, false) && replay && resident &&
+                             !checkpointShared(active) && retireCheckpoint(active))
+                           state = model_.snapshot(active.request.id);
+                         return StateBuffers{.ok = state != nullptr};
+                       },
+                       stateClaim(active,
+                                  checkpoint ? StateClass::Checkpoint
+                                  : replay   ? StateClass::InUse
+                                             : StateClass::Ordinary,
+                                  false),
+                       Refusal::Settled)
+                       .freed &&
+                   state;
       }
       if (state) {
         cache_.publishCompositeState(block, std::move(state), checkpoint);
@@ -1527,162 +1474,126 @@ void Engine::publishReachedStateBoundaries(
   }
 }
 
-Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &items,
-                                 std::vector<std::vector<Capture>> &captures, double now) {
+Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchItem> &items,
+                                 std::vector<std::vector<LaneCapture>> &captures, std::vector<uint64_t> &excluded,
+                                 bool supersedes, double now) {
   const bool prefill = plan.kind == WorkKind::Prefill;
   const bool spill = config_.spill.capable;
-  // Whether a lane, of the given KV mode if one is named, is in service.
-  const auto inService = [&](std::optional<KvMode> mode) {
-    return std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
-      return entry.second.lane && (!mode || entry.second.kvMode == *mode);
-    });
+  const PlanContext context{.prefill = prefill, .supersedes = supersedes, .now = now};
+  // What the plan was made from that preparing it may change: each lane's
+  // KV mode and whether its history held Index pages, and the command
+  // between its passes.
+  std::vector<std::pair<KvMode, bool>> shapes;
+  for (const BatchItem &item : plan.items)
+    shapes.emplace_back(request(item.requestId).kvMode, cache_.holdsIndexPages(item.requestId));
+  const bool commandBetweenPasses = !plan.pass && passCommand_.active();
+  const auto reshaped = [&] {
+    for (size_t index = 0; index < plan.items.size(); ++index) {
+      const uint64_t id = plan.items[index].requestId;
+      if (request(id).kvMode != shapes[index].first || (cache_.holdsIndexPages(id) && !shapes[index].second))
+        return true;
+    }
+    return false;
   };
-  // Pages whose copies have landed leave memory before any lane grows; the
-  // Index runway they draw on refills if memory allows. The Full extents
-  // they empty leave memory too, but one, the runway, while a spilling
-  // prompt still grows into it or the host holds growth back, when it could
-  // not be allocated again. The Index pages, the runway's included, are
-  // memory the resident Spill lanes need, as their Full pages are, and a
-  // fraction of what the moves free: the host's pause holds them back only
-  // while no such lane is in service.
-  if (spill) {
-    const SpilledExtents extents =
-        spillingPrompt() || config_.growthPaused() ? SpilledExtents::KeepRunway : SpilledExtents::Released;
-    static_cast<void>(allocate([&] { return cache_.spillWritten(extents); }, inService(KvMode::Spill),
-                               ReclaimClass::Ordinary, {}, true));
-  }
+  // Pages whose copies have landed leave memory before any lane grows.
+  spillLanded(false);
   // So do a windowed layout's windowed layers' K/V of the pages every
   // window has passed, the processed rows' (Cache::trimWindows): into the
   // Slim runway and what memory allows, the rest Full for a later pass. A
   // Slim page takes a fraction of the Full page it frees for the lanes to
-  // grow into, so the Slim extents are memory the lanes in service need: the
-  // host's pause holds them back only while none is, and a long prompt's
-  // pages trim as it prefills rather than filling the budget Full.
+  // grow into, so the Slim extents are memory the lanes in service need: an
+  // InService claim of the engine's while one is, else an Optional one, and
+  // a long prompt's pages trim as it prefills rather than filling the
+  // budget Full. Refused, they ask the ledger as the lanes' pages do, and
+  // in service pass the host once nothing in place meets them; with no lane
+  // in service they take only what costs nothing. A
+  // refusal the ledger does not meet leaves pages Full for a later pass.
   {
-    const Serving mark(config_.serving, inService(std::nullopt));
+    const bool inService = laneInService();
+    ClaimHandle claim;
+    claim.governor = &governor();
+    claim.id = governor().ledger().open(
+        {.cls = inService ? ClaimClass::InService : ClaimClass::Optional,
+         .timing = NeedTiming::Immediate});
+    const MemoryGovernor::Scope scope(governor(), claim.id);
     static_cast<void>(cache_.trimWindows());
+    for (Need need = governor().need(claim.id); need.bytes; need = governor().need(claim.id)) {
+      if (governor().free(claim.id, need).outcome != FreeOutcome::Met)
+        break;
+      governor().ledger().refused(claim.id, {});
+      if (!cache_.trimWindows())
+        break;
+    }
   }
-  // A command's later passes run its item again: the lane holds what it
-  // needs, and only its page table may have changed, as moves between
-  // commands rewrite it.
+  // A command's later passes run its items again: their lanes hold what
+  // they need, and only their page tables may have changed, as moves
+  // between commands rewrite them.
   if (plan.pass) {
-    Request &active = request(plan.items.front().requestId);
-    if (!active.passCommand)
-      throw std::logic_error("a prefill command's pass has no command");
-    ModelBatchItem item = active.passCommand->item;
-    const PageTableView pageTable = cache_.cutPageTable(active.request.id);
-    item.pageTable = pageTable.pages;
-    item.pageTableRevision = pageTable.revision;
-    item.pageTableFirstChanged = pageTable.firstChanged;
-    item.pageSources = pageTable.sources;
-    items.push_back(std::move(item));
-    captures.assign(1, active.passCommand->captures);
-    active.resourceWait = {};
+    passCommand_.nextPass(items, captures);
+    for (ModelBatchItem &item : items)
+      setPageTable(item, cache_.cutPageTable(item.requestId));
     return Prepared::Runnable;
   }
   std::vector<BatchItem> admitted;
   admitted.reserve(plan.items.size());
-  struct Denied final {
-    uint64_t requestId = 0;
-    uint64_t workEnd;
-    Denial denial;
-    // What it was refused: its KV target, or else the model's memory for
-    // its reads of KV only the SSD cache holds, which this names.
-    std::optional<TokenAdmission> kv;
-    std::string_view memory;
-  };
   std::vector<Denied> denied;
   denied.reserve(plan.items.size());
-  // A decoding lane reads KV only the SSD cache holds, through the hot block
-  // cache.
-  bool spilledReads = false;
-  Request *const yielding = laneToYield();
-  // A scheduled lane is resident: it grows as a request in service. The
-  // lane that yields first if growth fails takes nothing in use, since its
-  // own suspension, not another conversation's replay point, pays for it.
-  // While other lanes fit, it waits for them instead, resident and denied
-  // each step, as a start a resident lane holds back waits.
-  const auto growthClass = [&](const Request &active) {
-    return &active == yielding && anotherResident(active.request.id) ? ReclaimClass::Ordinary
-                                                                     : ReclaimClass::InUse;
-  };
-  // A prefill command's KV reaches its first state boundary first; what
-  // lies past it follows once that state has its buffers
-  // (reserveCaptures).
-  const auto workEndOf = [&](const Request &active, const BatchItem &scheduled) {
-    uint64_t workEnd = active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
-    if (prefill) {
-      workEnd = scheduled.promptOffset + scheduled.tokenCount;
-      if (active.stateBoundaryCursor < active.stateBoundaries.size())
-        workEnd = std::min<uint64_t>(
-            workEnd, active.stateBoundaries[active.stateBoundaryCursor].tokens);
-    }
-    return workEnd;
-  };
+  // A claim that took the command between its passes (EngineVictims) leaves
+  // a plan made beside it: planning starts again at once, the memory the
+  // lanes were granted kept.
+  const auto commandTaken = [&] { return commandBetweenPasses && !passCommand_.active(); };
   for (const BatchItem &scheduled : plan.items) {
     Request &active = request(scheduled.requestId);
     if (!active.lane)
       throw std::logic_error("scheduled request is not resident");
-    const uint64_t id = active.request.id;
-    const uint64_t workEnd = workEndOf(active, scheduled);
-    const auto kv = allocate([&] { return cache_.ensureTokens(id, workEnd); }, true,
-                             growthClass(active), spillFallback(active));
-    if (kv.admission.granted())
-      admitted.push_back(scheduled);
+    const std::optional<Denied> kv = growLane(active, workEndOf(active, scheduled, prefill), context);
+    if (commandTaken())
+      return Prepared::Replan;
+    if (kv)
+      denied.push_back(*kv);
     else
-      denied.push_back(Denied{id, workEnd, kv.denial, kv.admission, {}});
+      admitted.push_back(scheduled);
   }
   // The model's memory for reads of the KV only the SSD cache holds: a
   // decoding lane's floor of the hot block cache, or the staging of a
-  // prefill's history up to the command's end. It is reserved once every
-  // lane has its KV, since a lane that converts to Spill moves the landed
-  // pages of lanes admitted before it to the index form too
-  // (Cache::convertToSpill), and only for the lanes the command keeps, in
-  // the plan's order. A prefill lane that streams its history
-  // (streamsHistory) runs alone and whole, as the scheduler runs one
-  // (planPrefill, passesFor): kept first, it is the command, in one pass;
-  // after a lane kept, it leaves for a command of its own. Admission may
-  // have made it stream, converting it at once where its restored chain's
-  // copies had landed, which the plan, made before, did not know. A lane
-  // refused its memory leaves the command, and the lanes after it take that
-  // shape without it.
+  // prefill's history up to the command's end, for a lane whose history
+  // holds Index pages, or may gain them before a later pass of the command
+  // (gainsIndexPages), as a pass streams what it holds then. It is reserved
+  // once every lane has its KV, since a lane whose own growth converts it to
+  // Spill moves the landed pages of lanes admitted before it to the index
+  // form too (Cache::convertToSpill).
   if (spill) {
     std::vector<BatchItem> kept;
     kept.reserve(admitted.size());
     for (const BatchItem &scheduled : admitted) {
       Request &active = request(scheduled.requestId);
       const uint64_t id = active.request.id;
-      const bool streams = prefill && streamsHistory(active);
-      if (streams && !kept.empty())
-        continue;
-      if (cache_.holdsIndexPages(id)) {
-        const auto pages = static_cast<uint32_t>(
-            (uint64_t{scheduled.promptOffset} + scheduled.tokenCount + KvCache::pageTokens - 1) /
-            KvCache::pageTokens);
-        const auto memory = allocate(
-            [&] {
-              return prefill ? model_.reserveHistoryStaging(id, pages)
-                             : model_.reserveSpilledReads(id);
-            },
-            true, growthClass(active));
-        if (!memory.admission.granted()) {
-          denied.push_back(Denied{id, workEndOf(active, scheduled), memory.denial, std::nullopt,
-                                  prefill ? "prefill history staging" : "hot KV cache"});
+      if (cache_.holdsIndexPages(id) ||
+          (prefill && plan.passes > 1 && gainsIndexPages(active.kvMode, scheduled.promptOffset))) {
+        const std::optional<Denied> memory = reserveReads(active, scheduled, context);
+        if (commandTaken())
+          return Prepared::Replan;
+        if (memory) {
+          denied.push_back(*memory);
           continue;
         }
-        spilledReads = spilledReads || !prefill;
       }
       kept.push_back(scheduled);
-      if (streams) {
-        plan.passes = 1;
-        break;
-      }
     }
     admitted = std::move(kept);
   }
-  // A lane that runs is waiting for nothing.
-  for (const BatchItem &scheduled : admitted)
-    request(scheduled.requestId).resourceWait = {};
+  // A lane that runs is waiting for nothing, its claim either, once every
+  // lane's memory for the command is decided; one refused waits for what
+  // refused it, beside the lanes that run or alone: memory on its way back,
+  // which its claim holds against the claims ranked below it (syncClaims),
+  // or memory nothing returns, for which it holds nothing.
+  for (const BatchItem &scheduled : admitted) {
+    Request &runs = request(scheduled.requestId);
+    runs.resourceWait = {};
+    governor().ledger().setWaiting(runs.claim.id, false);
+  }
+  for (const Denied &entry : denied)
+    noteRefusal(request(entry.requestId), now, entry.denial);
   // A lane refused the model's memory for its reads of spilled KV, which no
   // transfer in flight returns, takes it from the lane that yields first, as
   // when no lane fits, if that lane holds its memory outside this command
@@ -1690,294 +1601,156 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
   // refusal: run without the lane while they fit, they would leave it
   // refused for as long as they run. A lane refused its KV waits while they
   // fit, since they grow too and are refused in turn.
-  if (yielding && std::ranges::none_of(plan.items, [&](const BatchItem &item) {
+  if (Request *const yielding = laneToYield();
+      yielding && std::ranges::none_of(plan.items, [&](const BatchItem &item) {
         return item.requestId == yielding->request.id;
       })) {
     const auto refused = std::ranges::find_if(denied, [&](const Denied &entry) {
       return !entry.kv && !entry.denial.pending &&
              yieldsBefore(*yielding, request(entry.requestId));
     });
-    if (refused != denied.end()) {
-      suspendForGrowth(*yielding, kvCapacity(yielding->request.id),
+    if (refused != denied.end())
+      return yieldLane(*yielding, kvCapacity(yielding->request.id),
                        refused->denial.allocationFailure, now);
-      return Prepared::Yielded;
-    }
   }
-  // The hot block cache they read through grows toward its planned size,
-  // by an extent at most, into memory nothing needs now.
-  if (spilledReads)
-    static_cast<void>(allocate([&] { return model_.growSpilledReads(); }, false,
-                               ReclaimClass::Ordinary, {}, true));
-  if (!admitted.empty()) {
-    plan.items = std::move(admitted);
-    std::vector<std::vector<StateCapture>> states(plan.items.size());
-    captures.assign(plan.items.size(), {});
-    for (size_t index = 0; prefill && index < plan.items.size(); ++index) {
-      BatchItem &item = plan.items[index];
-      Request &active = request(item.requestId);
-      const uint32_t rows =
-          reserveCaptures(active, item, growthClass(active), states[index], captures[index]);
-      if (rows != item.tokenCount) {
-        item.tokenCount = rows;
-        ++counters_.captureCuts;
-      }
-    }
-    // The items come last: making room for a state's buffers may move KV
-    // pages out of an extent, which rewrites the page lists of the lanes
-    // on them.
-    items.reserve(plan.items.size());
-    for (size_t index = 0; index < plan.items.size(); ++index) {
-      const BatchItem &scheduled = plan.items[index];
-      Request &active = request(scheduled.requestId);
-      ModelBatchItem item;
-      item.requestId = active.request.id;
-      item.logicalPosition = prefill ? scheduled.promptOffset : active.exactTokens.size();
-      item.tokenCount = scheduled.tokenCount;
-      const PageTableView pageTable = cache_.cutPageTable(active.request.id);
-      item.pageTable = pageTable.pages;
-      item.pageTableRevision = pageTable.revision;
-      item.pageTableFirstChanged = pageTable.firstChanged;
-      item.pageSources = pageTable.sources;
-      if (prefill) {
-        item.inputTokens =
-            std::span<const uint32_t>(active.exactTokens)
-                .subspan(scheduled.promptOffset, scheduled.tokenCount);
-        item.stateCaptures = std::move(states[index]);
-      }
-      items.push_back(std::move(item));
-    }
-    if (plan.passes > 1)
-      request(plan.items.front().requestId).passCommand = Request::PassCommand{items.front(), captures.front()};
-    return Prepared::Runnable;
-  }
-
-  // Partial admissions execute at their actual width. If no lane fits, the
-  // lane to yield is chosen among all runnable residents: an unstarted peer
-  // can release its lane before completed prefill is discarded.
-  if (denied.empty())
-    throw std::logic_error("empty resource admission result");
-  // No lane runs: the copies Spill requests owe and have not started, as a
-  // chain a lane restored has before its first command or those the memory
-  // governor's pass left when it collected the ones that landed, start now.
-  // A lane alone waits while they are written (judge).
-  if (spill)
-    static_cast<void>(cache_.writeThrough());
-  // Memory on its way back arrives without anyone yielding. The lanes still
-  // take a retry deadline: the transfer's completion wakes the engine, and
-  // the deadline is what makes the wait end if that wake is ever missed.
-  const auto wait = [&] {
+  if (admitted.empty())
+    return refuse(denied, context);
+  // A lane refused leaves the plan: the others are planned again without
+  // it, keeping what they were granted. So does a lane that converted to
+  // Spill, or took Index pages, while the command took shape.
+  if (!denied.empty()) {
     for (const Denied &entry : denied)
-      deferResourceRetry(request(entry.requestId), now, entry.denial);
-    return Prepared::Waiting;
-  };
-  if (std::any_of(denied.begin(), denied.end(),
-                  [](const Denied &entry) { return entry.denial.pending; }))
-    return wait();
-  const Denied &victim = *std::min_element(
-      denied.begin(), denied.end(),
-      [&](const Denied &left, const Denied &right) {
-        return yieldsBefore(request(left.requestId), request(right.requestId));
-      });
-  if (!yielding)
-    throw std::logic_error("no resident lane can yield");
-  Request &active = *yielding;
-  const auto own = std::find_if(denied.begin(), denied.end(), [&](const Denied &entry) {
-    return entry.requestId == active.request.id;
-  });
-  // A peer that has not failed a growth attempt resumes to its current KV
-  // capacity, not to the blocked lane's requirement.
-  const uint64_t resumeTarget =
-      own != denied.end() ? own->workEnd : kvCapacity(active.request.id);
-  switch (judge(victim.denial, active.request.id)) {
-  case Verdict::Wait:
-    // Alone, it waits for the copies owed, retrying as they land, within the
-    // resource wait its first refusal started: copies that never land, or
-    // keep failing, end it there.
-    return wait();
-  case Verdict::Yield:
-    suspendForGrowth(active, resumeTarget, victim.denial.allocationFailure, now);
-    return Prepared::Yielded;
-  case Verdict::Fail:
-    break;
+      excluded.push_back(entry.requestId);
+    return Prepared::Replan;
   }
-  // Alone with nothing left to reclaim or write. A Spill lane that decodes
-  // ends at its length once the SSD cache can hold no more of its KV.
-  Request &lone = request(victim.requestId);
-  if (!victim.kv)
-    settle(lone, capacityExhausted(victim.memory, victim.denial.allocationFailure));
-  else if (lone.kvMode == KvMode::Spill && !prefill)
-    endAtLength(lone);
-  else
-    settle(lone, capacityExhausted("KV target", victim.denial.allocationFailure,
-                                   pageShortfall(*victim.kv) +
-                                       (spill ? "; the SSD cache took no more of its KV" : "")));
+  if (reshaped())
+    return Prepared::Replan;
+  // A lane whose command reaches the state a waiting request starts from, or
+  // a state boundary whose capture is refused, ends there: it is planned
+  // again with its rows up to it, which the others may fill. The first is
+  // known before any state's buffers are taken.
+  bool cut = false;
+  for (size_t index = 0; prefill && index < plan.items.size(); ++index) {
+    const BatchItem &item = plan.items[index];
+    Request &active = request(item.requestId);
+    const uint32_t end = awaitedBoundary(active, item.promptOffset + item.tokenCount);
+    if (end != item.promptOffset + item.tokenCount) {
+      active.rowCap = end - item.promptOffset;
+      ++counters_.captureCuts;
+      cut = true;
+    }
+  }
+  if (cut)
+    return Prepared::Replan;
+  std::vector<std::vector<StateCapture>> states(plan.items.size());
+  captures.assign(plan.items.size(), {});
+  std::vector<uint32_t> ends(plan.items.size());
+  for (size_t index = 0; prefill && index < plan.items.size(); ++index) {
+    const BatchItem &item = plan.items[index];
+    Request &active = request(item.requestId);
+    ends[index] = item.promptOffset + item.tokenCount;
+    // What a plan sent back took for the same rows, it takes again.
+    if (std::optional<Request::KeptCaptures> kept = std::exchange(active.keptCaptures, std::nullopt);
+        kept && kept->start == item.promptOffset && kept->end == ends[index]) {
+      states[index] = std::move(kept->states);
+      captures[index] = std::move(kept->captures);
+      continue;
+    }
+    const uint32_t rows = reserveCaptures(active, item, states[index], captures[index], supersedes);
+    if (rows != item.tokenCount) {
+      active.rowCap = rows;
+      ends[index] = item.promptOffset + rows;
+      ++counters_.captureCuts;
+      cut = true;
+    }
+  }
+  // Sent back, each lane keeps what it took for its rows, which a plan made
+  // again that runs it so takes without asking for it again. A claim of a
+  // capture that took the command between its passes sends it back too.
+  if (cut || reshaped() || commandTaken()) {
+    for (size_t index = 0; prefill && index < plan.items.size(); ++index)
+      request(plan.items[index].requestId).keptCaptures = Request::KeptCaptures{
+          plan.items[index].promptOffset, ends[index], std::move(states[index]), std::move(captures[index])};
+    return Prepared::Replan;
+  }
+  // The items come last: making room for a state's buffers may move KV
+  // pages out of an extent, which rewrites the page lists of the lanes
+  // on them.
+  items.reserve(plan.items.size());
+  for (size_t index = 0; index < plan.items.size(); ++index) {
+    const BatchItem &scheduled = plan.items[index];
+    Request &active = request(scheduled.requestId);
+    ModelBatchItem item;
+    item.requestId = active.request.id;
+    item.logicalPosition = prefill ? scheduled.promptOffset : active.exactTokens.size();
+    item.tokenCount = scheduled.tokenCount;
+    setPageTable(item, cache_.cutPageTable(active.request.id));
+    if (prefill) {
+      item.inputTokens =
+          std::span<const uint32_t>(active.exactTokens)
+              .subspan(scheduled.promptOffset, scheduled.tokenCount);
+      item.stateCaptures = std::move(states[index]);
+    }
+    items.push_back(std::move(item));
+  }
+  return Prepared::Runnable;
+}
+
+bool Engine::gainsIndexPages(std::optional<KvMode> mode, uint64_t processed) const {
+  const SpillGeometry &geometry = config_.spill.geometry;
+  return mode == KvMode::Spill &&
+         processed > uint64_t{geometry.densePages + geometry.windowPages} * KvCache::pageTokens;
+}
+
+std::vector<LaneShape> Engine::laneShapes(std::span<const PrefillAdmission> candidates) const {
+  std::vector<LaneShape> shapes;
+  for (const auto &[id, active] : requests_)
+    if (active.lane && scheduler_.phase(id) == Phase::Prefill)
+      shapes.push_back({.requestId = id,
+                        .indexPages = cache_.indexPages(id),
+                        .gainsIndexPages = gainsIndexPages(active.kvMode, scheduler_.promptProcessed(id)),
+                        .rowCap = active.rowCap.value_or(std::numeric_limits<uint32_t>::max()),
+                        .spill = active.kvMode == KvMode::Spill,
+                        .ended = active.pendingEnd.has_value()});
+  for (const PrefillAdmission &candidate : candidates) {
+    const KvMode mode = *requests_.at(candidate.requestId).placement;
+    shapes.push_back({.requestId = candidate.requestId,
+                      .gainsIndexPages = gainsIndexPages(mode, candidate.cachedTokens),
+                      .spill = mode == KvMode::Spill});
+  }
+  return shapes;
+}
+
+uint64_t Engine::workEndOf(const Request &active, const BatchItem &scheduled,
+                           bool prefill) noexcept {
+  uint64_t workEnd = active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
+  if (prefill) {
+    workEnd = scheduled.promptOffset + scheduled.tokenCount;
+    if (active.stateBoundaryCursor < active.stateBoundaries.size())
+      workEnd = std::min<uint64_t>(
+          workEnd, active.stateBoundaries[active.stateBoundaryCursor].tokens);
+  }
+  return workEnd;
+}
+
+Engine::Prepared Engine::yieldLane(Request &lane, uint64_t workEnd,
+                                   metal::AllocationFailure failure, double now) {
+  if (!yieldsEndedLanes(lane))
+    suspendForGrowth(lane, workEnd, failure, now);
   return Prepared::Yielded;
 }
 
-uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item, ReclaimClass upTo,
-                                 std::vector<StateCapture> &states,
-                                 std::vector<Capture> &captures) {
-  const uint32_t start = item.promptOffset;
-  // A request waiting for a prefix starts once the command that reaches its
-  // state has ended.
-  const uint32_t end = awaitedBoundary(active, start + item.tokenCount);
-  const std::vector<Request::StateBoundary> &boundaries = active.stateBoundaries;
-  const auto stateClass = [&](size_t index) {
-    return boundaries[index].disposable                               ? StateClass::Checkpoint
-           : boundaries[index].tokens == promptReplayBoundary(active) ? StateClass::InUse
-                                                                      : StateClass::Ordinary;
-  };
-  // Takes the buffers of the state at boundaries[index]; false when refused.
-  // Only the first state the command captures follows the lane's
-  // checkpoint, and each later one the state before it.
-  const auto reserve = [&](size_t index) {
-    const uint32_t tokens = boundaries[index].tokens;
-    const StateClass kind = stateClass(index);
-    if (kind == StateClass::InUse && !states.empty() && boundaries[index - 1].disposable) {
-      // The prompt's replay point keeps the checkpoint the command captures
-      // before it beside buffers of its own, and takes that checkpoint's
-      // when refused the pool and the admission, as it takes its lane's
-      // after a command.
-      metal::AllocationFailure refusal;
-      if (std::shared_ptr<StateReservation> buffers =
-              model_.reserveState(active.request.id, tokens, refusal)) {
-        states.push_back({tokens, std::move(buffers)});
-        captures.push_back({tokens});
-      } else {
-        states.back().tokens = tokens;
-        captures.back().tokens = tokens;
-      }
-      return true;
-    }
-    Reservation reservation = reserveCapture(active, kind, tokens, states.empty());
-    if (!reservation.buffers) {
-      if (reservation.fromLane)
-        captures.push_back({tokens, false, true});
-      return false;
-    }
-    states.push_back({tokens, std::move(reservation.buffers)});
-    captures.push_back({tokens, reservation.recycled});
-    return true;
-  };
-  for (size_t index = active.stateBoundaryCursor;
-       index < boundaries.size() && boundaries[index].tokens <= end; ++index) {
-    const uint32_t tokens = boundaries[index].tokens;
-    // Published, every state but the prompt's replay point retires the
-    // checkpoint before it (apply): a checkpoint the command passes on its
-    // way to such a state is not captured, and that state takes buffers of
-    // its own class.
-    const bool passed = boundaries[index].disposable && index + 1 < boundaries.size() &&
-                        boundaries[index + 1].tokens <= end &&
-                        stateClass(index + 1) != StateClass::InUse;
-    if (!passed && !reserve(index))
-      return tokens - start;
-    if (tokens == end)
-      break;
-    // The KV up to the next boundary, as prepare() takes the first, but its
-    // refusal only ends the command here, which then captures a checkpoint
-    // it would have passed: the lane runs, and its next command asks again.
-    const uint32_t next = index + 1 < boundaries.size() && boundaries[index + 1].tokens < end
-                              ? boundaries[index + 1].tokens
-                              : end;
-    const auto kv = allocate(
-        [&] { return cache_.ensureTokens(active.request.id, next); }, true, upTo, {}, true);
-    if (!kv.admission.granted()) {
-      if (passed)
-        static_cast<void>(reserve(index));
-      return tokens - start;
-    }
-  }
-  return end - start;
-}
-
-Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uint32_t tokens,
-                                           bool followsCheckpoint) {
-  const uint64_t id = active.request.id;
-  metal::AllocationFailure refusal = metal::AllocationFailure::None;
-  Reservation result{model_.reserveState(id, tokens, refusal)};
-  if (result.buffers)
-    return result;
-  // The lane's checkpoint is its recovery point until a state that retires
-  // it is published, after a command that completed: one cancelled, expired
-  // or failed leaves it to a retry. So no state takes its buffers before the
-  // command, nor room a reclaim could make of it, since checkpoints go
-  // first. Refused the pool and the admission while the lane holds one, the
-  // state ends its command, and apply takes it from the lane after the
-  // command: a junction or a checkpoint in the buffers of the checkpoint it
-  // retires (publishReachedStateBoundaries). A checkpoint whose predecessor
-  // a reader pins takes no room either: apply publishes it, from the lane,
-  // only once the pin has gone, which keeps the predecessor the lane's
-  // recovery point until then.
-  const bool predecessorPinned =
-      kind == StateClass::Checkpoint && followsCheckpoint && checkpointPinned(active);
-  result.fromLane = predecessorPinned || checkpointReclaimable(active);
-  if (result.fromLane)
-    return result;
-  // Room comes from what this state's class may take: cached KV unless it
-  // is an optional checkpoint, and the expert store's chunks above its
-  // floor, then states in use, only for the prompt's replay point, which is
-  // in use itself. A pin keeps the lane's checkpoint, if any, out of it.
-  result.recycled = makeStateRoom(kind, [&] {
-    result.buffers = model_.reserveState(id, tokens, refusal);
-    return result.buffers != nullptr;
-  });
-  // The prompt's replay point is work of the request in service, the point
-  // its follow-up resumes from: once nothing its class may take is left,
-  // the host refuses it no more than that request's KV (allocate()). A
-  // junction or a checkpoint stays optional.
-  if (!result.buffers && kind == StateClass::InUse &&
-      refusal == metal::AllocationFailure::HostPressure) {
-    const Serving mark(config_.serving, true);
-    result.buffers = model_.reserveState(id, tokens, refusal);
-  }
-  return result;
-}
-
-template <class Take> bool Engine::makeStateRoom(StateClass kind, Take &&take) {
-  // No command is in flight, so KV that empties an extent releases it now.
-  // A recycled state hands over its buffers; an extent may hold less than a
-  // state, so room is made until the buffers fit, nothing more of the class
-  // goes, or the extents given cover one state: a refusal after that is not
-  // the budget's.
-  const bool growth = !config_.growthPaused();
-  const uint64_t needed = model_.snapshotBytes();
-  uint64_t released = 0;
-  // Steps of `reclaim` until `take` gets the buffers, nothing more of its
-  // kind goes, or what they gave covers one state.
-  enum class Room : uint8_t { Taken, Refused, Exhausted };
-  const auto makeRoom = [&](const auto &reclaim) {
-    StateRoom room;
-    do {
-      room = reclaim();
-      released += room.extentBytes;
-      if (room && take())
-        return Room::Taken;
-    } while (room.extentBytes && released < needed);
-    return room ? Room::Refused : Room::Exhausted;
-  };
-  const Room made = makeRoom([&] { return cache_.reclaimOneState(kind, growth); });
-  if (made != Room::Exhausted || kind != StateClass::InUse)
-    return made == Room::Taken;
-  // The prompt's replay point then takes chunks of the expert store above
-  // its floor, until they cover its buffers, before another request's state
-  // in use, while the host lets the engine grow: the paced reclaim shrinks
-  // the store for the host.
-  while (growth && released < needed) {
-    const uint64_t chunk = releaseExpertChunk();
-    if (!chunk)
-      break;
-    released += chunk;
-    signalResourceProgress();
-    if (take())
-      return true;
-  }
-  return makeRoom([&] { return cache_.reclaimInUseState(); }) == Room::Taken;
-}
-
 uint64_t Engine::completedTokens(const Request &active) const {
-  return scheduler_.phase(active.request.id) == Phase::Prefill
-             ? scheduler_.promptProcessed(active.request.id)
-             : active.exactTokens.size();
+  const uint64_t id = active.request.id;
+  switch (scheduler_.phase(id)) {
+  case Phase::Prefill:
+    return scheduler_.promptProcessed(id);
+  case Phase::Decode:
+  case Phase::WaitingMask:
+    return active.exactTokens.size();
+  default:
+    return active.admissionProbe ? active.admissionProbe->cachedTokens() : 0;
+  }
 }
 
 uint32_t Engine::generatedTokens(const Request &active) noexcept {
@@ -1985,462 +1758,17 @@ uint32_t Engine::generatedTokens(const Request &active) noexcept {
          (active.sentFirstToken ? 1 : 0);
 }
 
-bool Engine::yieldsBefore(const Request &a, const Request &b) const {
-  if (a.request.priority != b.request.priority)
-    return a.request.priority > b.request.priority;
-  const Phase aPhase = scheduler_.phase(a.request.id);
-  const Phase bPhase = scheduler_.phase(b.request.id);
-  // At equal priority, prefer uninterrupted streaming over less replay work.
-  if (aPhase != bPhase)
-    return aPhase == Phase::Prefill;
-  return completedTokens(a) < completedTokens(b);
-}
-
-Engine::Request *Engine::laneToYield() {
-  Request *yielding = nullptr;
-  for (auto &[id, candidate] : requests_) {
-    if (!candidate.lane)
-      continue;
-    // Requests enter the scheduler before they can acquire a lane.
-    const Phase phase = scheduler_.phase(id);
-    if (phase != Phase::Prefill && phase != Phase::Decode)
-      continue;
-    if (!yielding || yieldsBefore(candidate, *yielding) ||
-        (!yieldsBefore(*yielding, candidate) &&
-         scheduler_.submissionOrder(id) > scheduler_.submissionOrder(yielding->request.id)))
-      yielding = &candidate;
-  }
-  return yielding;
-}
-
-uint64_t Engine::kvCapacity(uint64_t requestId) const {
-  return uint64_t{cache_.pageTable(requestId).pages.size()} * KvCache::pageTokens;
-}
-
-bool Engine::preemptBelow(RequestPriority priority, double now) {
-  // The lane that yields first has the lowest priority of all residents.
-  Request *const victim = laneToYield();
-  if (!victim || victim->request.priority <= priority)
-    return false;
-  suspendLane(*victim, kvCapacity(victim->request.id), metal::AllocationFailure::None,
-              StateFailure::ConcurrencyLimit, now);
-  // What the lane held is free: an earlier failure may fit now.
-  allocationFailed_ = false;
-  ++counters_.prioritySuspensions;
-  signalResourceProgress();
-  return true;
-}
-
-bool Engine::anotherResident(uint64_t requestId) const {
-  return std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
-    return entry.first != requestId && entry.second.lane;
-  });
-}
-
-Engine::Verdict Engine::judge(const Denial &denial, uint64_t requestId) const {
-  if (denial.pending)
-    return Verdict::Wait;
-  // Pages held by resident lanes come back when they finish, and memory the
-  // host refuses when its pressure lifts; only a lane that cannot fit on its
-  // own has hit the capacity.
-  if (anotherResident(requestId) ||
-      denial.allocationFailure == metal::AllocationFailure::HostPressure)
-    return Verdict::Yield;
-  // Alone, it waits for the copies Spill requests owe, the slowest memory
-  // to come back: they free its Full pages as the SSD cache writes them.
-  if (cache_.owedCopiesReturn(denial.pages, denial.form))
-    return Verdict::Wait;
-  return Verdict::Fail;
-}
-
-template <class Attempt>
-auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
-                      const std::function<bool(const Denial &)> &fallback, bool optional)
-    -> Allocation<std::invoke_result_t<Attempt &>> {
-  using Admission = std::invoke_result_t<Attempt &>;
-  // Set once a request in service has nothing held left to reuse: from then
-  // on only the engine's limit and critical pressure refuse it.
-  bool serving = false;
-  const auto tryOnce = [&] {
-    const Serving mark(config_.serving, serving);
-    return attempt();
-  };
-  Allocation<Admission> result{tryOnce(), {}};
-  Admission &admission = result.admission;
-  Denial &denial = result.denial;
-  while (memoryDenied(admission)) {
-    const bool paused =
-        admission.allocationFailure == metal::AllocationFailure::HostPressure;
-    CacheReclaimResult reclaimed;
-    if constexpr (std::is_same_v<Admission, StateAdmission>)
-      reclaimed = paused ? reuseCachedStateWhilePaused(upTo) : reclaimForState(upTo, optional);
-    else if constexpr (std::is_same_v<Admission, TokenAdmission>)
-      reclaimed = paused ? reuseCachedPagesWhilePaused(admission, upTo)
-                         : reclaimForKv(admission, upTo, optional);
-    else
-      // The model's memory for reads of spilled KV (a hot block cache floor,
-      // a history's staging) takes what a state takes; while the host
-      // refuses growth, idle buffers alone, and memory for later (that
-      // cache's optional growth) nothing.
-      reclaimed = paused ? CacheReclaimResult{!optional &&
-                                              reclaimIdleState(true, model::IdleMemory::Buffers)}
-                         : reclaimForState(upTo, optional);
-    if (reclaimed.madeProgress) {
-      admission = tryOnce();
-      continue;
-    }
-    denial.allocationFailure = admission.allocationFailure;
-    denial.pending = reclaimed.pending;
-    if (paused && inService && !serving && !reclaimed.pending) {
-      serving = true;
-      admission = tryOnce();
-      continue;
-    }
-    if (fallback && fallback(denial)) {
-      admission = tryOnce();
-      continue;
-    }
-    break;
-  }
-  if (!admission.granted()) {
-    denial.allocationFailure = admission.allocationFailure;
-    denial.pending = denial.pending || transferPending(admission);
-    if constexpr (std::is_same_v<Admission, TokenAdmission>) {
-      denial.pages = admission.additionalPages;
-      denial.form = admission.form;
-    }
-    // Memory on its way back ends the shortage without the residents.
-    if (memoryDenied(admission) && !denial.pending && !optional)
-      allocationFailed_ = true;
-  }
-  return result;
-}
-
-// The reclaim step for a lane's state the engine's limit refused. The pooled
-// buffers a lane starts from stay for its activation to take: idle model
-// memory beyond them goes first (a pooled buffer, else the idle vision
-// arena, else one rebuildable cache entry), then the cache gives up what
-// gives memory back: an extent, or a state (Cache::reclaimForMemory), which
-// makes progress, and the allocation is asked for again, only once memory
-// has come back. The KV it evicts before then frees pages other KV may
-// take, so it wakes the requests waiting for memory as progress does. What
-// nothing in use holds goes first, then a chunk of the expert store above
-// its floor (releaseExpertChunk), then, up to InUse, what is in use; memory
-// on its way back holds back the last two.
-// Memory for later (the hot block cache's growth toward its planned size,
-// any optional allocation) takes no rebuildable cache entry, among which
-// that very cache's slots past its floor are, nor the empty extent kept for
-// the next request, nor the expert store, nor anything in use.
-// A host refusal comes to neither step but to the reuse path (allocate()):
-// the pressure controller owns that shrink, and evicting for an allocator
-// that refuses all the same would drain the cache, and the caches the model
-// can rebuild, before macOS can acknowledge any reclaimed bytes.
-CacheReclaimResult Engine::reclaimForState(ReclaimClass upTo, bool forLater) {
-  if (reclaimIdleState(true, forLater ? model::IdleMemory::Buffers
-                                      : model::IdleMemory::BuffersThenCaches))
-    return {true, 0};
-  CacheReclaimResult reclaimed = cache_.reclaimForMemory(ReclaimClass::Ordinary, forLater);
-  if (!reclaimed.madeProgress && !reclaimed.pending && !forLater) {
-    if (const uint64_t chunk = releaseExpertChunk()) {
-      signalResourceProgress();
-      return {.madeProgress = true, .reclaimedBytes = chunk, .evictedKv = reclaimed.evictedKv};
-    }
-    if (upTo == ReclaimClass::InUse) {
-      const bool evictedKv = reclaimed.evictedKv;
-      reclaimed = cache_.reclaimForMemory(ReclaimClass::InUse, forLater);
-      reclaimed.evictedKv = reclaimed.evictedKv || evictedKv;
-    }
-  }
-  if (reclaimed.madeProgress || reclaimed.evictedKv)
-    signalResourceProgress();
-  return reclaimed;
-}
-
-// The reclaim step for KV pages the engine's limit refused. Allocated extents
-// stay for the pages to reuse; idle state memory beyond the lane's pooled
-// buffers goes first, then the cache gives up what covers the shortfall, of
-// the pages' form, in one step: what nothing in use holds, then a chunk of
-// the expert store above its floor (releaseExpertChunk), then, up to InUse,
-// what is in use; memory on its way back holds back the last two, and so
-// does an optional allocation (a capture's KV past its first boundary, whose
-// refusal only ends the command early). The lane's buffers go last. Their
-// draft ring is the one buffer no cached state holds: while it stays, a
-// request that waits can start beside this one from cached states' cells and
-// windows.
-CacheReclaimResult Engine::reclaimForKv(const TokenAdmission &admission, ReclaimClass upTo,
-                                        bool optional) {
-  if (reclaimIdleState(true, model::IdleMemory::BuffersThenCaches))
-    return {true, 0};
-  const auto reclaimPages = [&](ReclaimClass reach) {
-    return cache_.reclaimForPages(admission.additionalPages, CacheReclaimMode::KeepExtents, reach,
-                                  admission.form);
-  };
-  CacheReclaimResult reclaimed = reclaimPages(ReclaimClass::Ordinary);
-  if (!reclaimed.madeProgress && !reclaimed.pending && !optional) {
-    if (const uint64_t chunk = releaseExpertChunk()) {
-      signalResourceProgress();
-      return {.madeProgress = true, .reclaimedBytes = chunk};
-    }
-    if (upTo == ReclaimClass::InUse)
-      reclaimed = reclaimPages(ReclaimClass::InUse);
-  }
-  if (reclaimed.madeProgress)
-    signalResourceProgress();
-  if (!reclaimed.madeProgress && !reclaimed.pending &&
-      reclaimIdleState(false, model::IdleMemory::Buffers))
-    return {true, 0};
-  return reclaimed;
-}
-
-uint64_t Engine::releaseExpertChunk() {
-  const uint64_t bytes = model_.releaseExpertChunk();
-  if (bytes)
-    ++expertReleases_;
-  return bytes;
-}
-
-uint64_t Engine::releaseExpertsToFloor() {
-  const uint64_t bytes = model_.releaseExpertsToFloor();
-  if (bytes)
-    ++expertReleases_;
-  return bytes;
-}
-
-bool Engine::growExperts(uint64_t headroomBytes) {
-  if (pending_)
-    throw std::logic_error("expert growth requested while a command is in flight");
-  const uint64_t bytes = model_.expertGrowthBytes();
-  // It takes only room the engine's limit has free, and asks for none it
-  // lacks, which would count as a denied reservation for nothing. An engine
-  // without requests makes that room by the exchange alone
-  // (reclaimForExperts), which buys the chunk or takes nothing.
-  return bytes && headroomBytes >= bytes && model_.growExperts().granted();
-}
-
-uint64_t Engine::reclaimForExperts(uint64_t bytes) {
-  if (pending_)
-    throw std::logic_error("cache reclaim for the expert store requested while a command is in flight");
-  // Cache that cannot buy the chunk would go for nothing: as a lane takes a
-  // cached state only when those in RAM cover what it lacks
-  // (reuseCachedStateWhilePaused), nothing goes unless what leaves at once
-  // covers the bytes, and then the bytes leave in this call.
-  if (!idle() || exchangeableBytes() < bytes)
-    return 0;
-  uint64_t returned = 0;
-  while (returned < bytes) {
-    const CacheReclaimResult step = reclaimStepForExperts();
-    if (!step.madeProgress)
-      break;
-    returned += step.reclaimedBytes;
-  }
-  return returned;
-}
-
-uint64_t Engine::exchangeableBytes() const {
-  const CacheExchange cache = cache_.exchangeable();
-  return model_.idleBufferBytes(cache.states) + cache.extentBytes;
-}
-
-CacheReclaimResult Engine::reclaimStepForExperts() {
-  if (const uint64_t buffer = model_.reclaimIdleState(true, model::IdleMemory::Buffers)) {
-    signalResourceProgress();
-    return {.madeProgress = true, .reclaimedBytes = buffer};
-  }
-  return cache_.reclaimForExchange();
-}
-
-bool Engine::reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept {
-  if (!model_.reclaimIdleState(keepLane, scope))
-    return false;
-  signalResourceProgress();
-  return true;
-}
-
-// While growth is paused a lane short of state buffers takes a cached
-// state's, as a request short of pages takes idle cached pages below:
-// evicting the state returns its cell and context window to the pool the
-// lane draws from, and nothing is allocated. A state goes only when those in
-// RAM cover what the pool lacks, which they never do for the draft rings no
-// cached state holds; otherwise the cache survives, and the request grows if
-// it is in service and waits if it is not. Idle buffers beyond the lane's go
-// back to the host first, but no cache the model can rebuild: freeing one
-// would not let the lane start, and the paced pass takes those caches toward
-// what the host lacks.
-CacheReclaimResult Engine::reuseCachedStateWhilePaused(ReclaimClass upTo) {
-  if (reclaimIdleState(true, model::IdleMemory::Buffers))
-    return {true, 0};
-  const uint32_t lacked = model_.statesToActivate();
-  if (!lacked || cache_.evictableStates(upTo) < lacked)
-    return {};
-  const CacheReclaimResult reused = cache_.reclaimStateForLane(upTo);
-  if (reused.madeProgress)
-    signalResourceProgress();
-  return reused;
-}
-
-// Host pressure pauses growth, and the pressure controller owns the shrink.
-// Extents that stay allocated are outside that accounting: a request short
-// of pages takes idle cached pages before it grows or waits. Cache is only
-// evicted when the pages of the shortfall's form the request's class may
-// take can actually cover it: never those a request holds, nor, for a start
-// a resident lane holds back, the idle KV that states in use restore through
-// (Cache::reusablePages). Otherwise it survives for later hits, and the
-// request grows if it is in service and waits if it is not. Only KV goes: a
-// state's buffers give no page while the host refuses growth, unless the
-// state sits on the leaf that goes next (CacheReclaimMode::ReusePages). A
-// reclaim that must wait for the transfer in flight makes the request wait
-// with it, as it does without the pause. Idle buffers go first, but neither
-// the pooled buffers the next lane starts from nor the caches the model can
-// rebuild: they would not let this request grow, and the paced pass keeps
-// the buffers for the next lane and takes the caches toward what the host
-// lacks.
-CacheReclaimResult Engine::reuseCachedPagesWhilePaused(const TokenAdmission &admission,
-                                                       ReclaimClass upTo) {
-  if (reclaimIdleState(true, model::IdleMemory::Buffers))
-    return {true, 0};
-  if (cache_.reusablePages(upTo, admission.form) < admission.additionalPages)
-    return {};
-  const CacheReclaimResult reused = cache_.reclaimForPages(
-      admission.additionalPages, CacheReclaimMode::ReusePages, upTo, admission.form);
-  if (reused.madeProgress)
-    signalResourceProgress();
-  return reused;
-}
-
-void Engine::suspendLane(Request &active, uint64_t workEnd, metal::AllocationFailure failure,
-                         StateFailure reason, double now) {
-  if (!active.lane || scheduler_.suspended(active.request.id)) {
-    throw std::logic_error("request cannot be suspended");
-  }
-  // A decoding lane holds an anchor unless its first mask has yet to select
-  // one; a lane in prefill holds what it held when its replay began.
-  if (scheduler_.phase(active.request.id) == Phase::Decode)
-    active.suspendedWithAnchor =
-        scheduler_.decodeStage(active.request.id) == DecodeStage::Regular;
-  vacateLane(active, true);
-  active.resumeKvTargetTokens = workEnd;
-  active.replayTokens = static_cast<uint32_t>(active.exactTokens.size());
-  scheduler_.suspendForResources(active.request.id);
-  deferResourceRetry(active, now, {.allocationFailure = failure}, reason);
-}
-
-void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
-                              metal::AllocationFailure failure, double now) {
-  suspendLane(active, workEnd, failure, StateFailure::MemoryPressure, now);
-  // Without its lane it waits for the memory of every lane resident now,
-  // also those admitted while it waited to grow.
-  active.resourceWait.admittedBefore = admissions_;
-  // Resident lanes drain before admission resumes. Growth the host refused
-  // resumes when its pressure lifts; any other limit only once memory is
-  // freed, so it counts as a failure the drain waits out.
-  drainEndMilliseconds_ = now + config_.resourceWaitTimeoutMilliseconds;
-  allocationFailed_ = failure != metal::AllocationFailure::HostPressure;
-  ++counters_.resourceSuspensions;
-}
-
-MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
-  if (pending_)
-    throw std::logic_error("memory reclaim requested while a command is in flight");
-  if (cache_.pollTransfers())
-    signalResourceProgress();
-
-  const bool keep = !directive.critical;
-  uint64_t released = 0;
-  // A reclaim step may free memory that stays in the engine, pages of an
-  // extent that stays or buffers that refill the lane's footprint, and a
-  // waiting request may fit in it all the same.
-  bool reclaimed = false;
-  // Pages whose copies are being written count toward the target. A
-  // critical directive has none: it takes everything it may.
-  const auto targetUnmet = [&] {
-    return directive.critical || released + cache_.pendingBytes() < directive.targetBytes;
-  };
-  // Evicted states park their buffers in the model's pool, which a pass
-  // returns to the host at once, or uses to refill the buffers it keeps.
-  const auto releaseIdle = [&] {
-    while (const uint64_t idle = model_.reclaimIdleState(keep, model::IdleMemory::Buffers))
-      released += idle;
-  };
-  releaseIdle();
-  // Caches the model can rebuild go only toward a byte target or under
-  // critical pressure: an untargeted pass keeps the embedding rows and the
-  // vision encoder.
-  const auto reclaimModelCaches = [&] {
-    while (targetUnmet()) {
-      const uint64_t cache =
-          model_.reclaimIdleState(keep, model::IdleMemory::BuffersThenCaches);
-      if (!cache)
-        break;
-      released += cache;
-    }
-  };
-  reclaimModelCaches();
-  // The expert store's chunks above its floor go after what nothing in use
-  // holds and before what is in use.
-  if (directive.critical) {
-    const auto evictAll = [&](ReclaimClass upTo) {
-      const CacheReclaimResult evicted = cache_.evictAll(upTo);
-      reclaimed = reclaimed || evicted.madeProgress;
-      released += evicted.reclaimedBytes;
-      releaseIdle();
-    };
-    evictAll(ReclaimClass::Ordinary);
-    released += releaseExpertsToFloor();
-    evictAll(ReclaimClass::InUse);
-  } else {
-    // Even a zero-byte directive releases completely empty KV extents.
-    released += cache_.releaseEmptyExtents(keep);
-    // True when the steps stopped on what waits for a transfer in flight
-    // rather than on nothing left to take.
-    const auto reclaimUpTo = [&](ReclaimClass upTo) {
-      while (targetUnmet()) {
-        const CacheReclaimResult step = cache_.reclaimOne(
-            CacheReclaimMode::ReleaseExtents, upTo, directive.keepResumePoint, keep);
-        if (!step.madeProgress)
-          return step.pending;
-        reclaimed = true;
-        released += step.reclaimedBytes;
-        releaseIdle();
-      }
-      return false;
-    };
-    // Cache nothing in use holds that waits for a transfer, an SSD demotion
-    // or a state write, still ranks below the store and what is in use: the
-    // pass ends Pending, and the pass that continues it once the transfer
-    // landed takes it first.
-    if (!reclaimUpTo(ReclaimClass::Ordinary)) {
-      if (directive.hostShort)
-        while (targetUnmet()) {
-          const uint64_t chunk = releaseExpertChunk();
-          if (!chunk)
-            break;
-          released += chunk;
-        }
-      if (directive.upTo == ReclaimClass::InUse)
-        static_cast<void>(reclaimUpTo(ReclaimClass::InUse));
-    }
-  }
-  // Image rows only an evicted state held are ordinary cache entries now.
-  reclaimModelCaches();
-  if (released || reclaimed)
-    signalResourceProgress();
-  if (!directive.critical && !directive.targetBytes)
-    return {released, ReclaimOutcome::Untargeted};
-  if (!targetUnmet())
-    return {released, ReclaimOutcome::Met};
-  return {released, cache_.transfersInFlight() ? ReclaimOutcome::Pending
-                                               : ReclaimOutcome::Exhausted};
-}
-
 void Engine::apply(const Pending &command, std::span<const ModelStepResult> results,
                    double cycleMilliseconds, double now) {
   const BatchPlan &plan = command.plan;
-  const std::span<const std::vector<Capture>> captures = command.captures;
+  const std::span<const std::vector<LaneCapture>> captures = command.captures;
   const ModelBatchTicket &ticket = *command.ticket;
   if (results.size() != plan.items.size()) {
     throw std::logic_error("model result count changed");
   }
-  // A pass before the command's last commits nothing and proves nothing.
+  const model::CommandSample sample = ticket.sample();
+  // A pass before the command's last commits nothing, proves nothing and
+  // ends no lane.
   const bool beforeLastPass = plan.kind == WorkKind::Prefill && plan.pass + 1 < plan.passes;
   std::vector<StepResult> schedulerResults;
   schedulerResults.reserve(results.size());
@@ -2459,8 +1787,8 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
     Request &active = request(result.requestId);
     // The model rejected this lane's own numerical result. A model that
     // accepts more draft tokens than it drafted, or emits a token outside the
-    // vocabulary, without reporting it fails the lane the same way (the Qwen
-    // runtime reports its non-finite rows itself).
+    // vocabulary, without reporting it fails the lane the same way (a model
+    // reports its non-finite rows itself).
     std::string invalid = result.failure;
     if (invalid.empty() && result.acceptedDraftTokens > result.draftedTokens)
       invalid = "model accepted more tokens than it drafted";
@@ -2480,16 +1808,18 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
     if (!result.unreadableKvBlocks.empty()) {
       unreadable.insert(unreadable.end(), result.unreadableKvBlocks.begin(),
                         result.unreadableKvBlocks.end());
-      if (!active.pendingEnd)
-        active.pendingEnd = LaneEnd{LaneOutcome::KvUnreadable, std::string(kKvUnreadableMessage)};
+      deferEnd(active, {LaneOutcome::KvUnreadable, std::string(kKvUnreadableMessage)});
     } else if (!invalid.empty()) {
       if (active.unprovenState)
         cache_.invalidateState(*active.unprovenState);
-      if (!active.pendingEnd)
-        active.pendingEnd = LaneEnd{LaneOutcome::ModelResultInvalid, std::move(invalid)};
+      deferEnd(active, {LaneOutcome::ModelResultInvalid, std::move(invalid)});
     }
-    if (!beforeLastPass)
-      active.unprovenState.reset();
+    // A lane that ended meanwhile stays in the command to its last pass.
+    if (beforeLastPass) {
+      schedulerResults.push_back({active.request.id, 0, false, result.nextDecodeStage});
+      continue;
+    }
+    active.unprovenState.reset();
     if (active.pendingEnd) {
       // An in-flight Metal command cannot be revoked safely. Its provisional
       // writes remain invisible, but a cancelled, deadline-expired or
@@ -2504,10 +1834,6 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
     if (result.outputTokensWithoutKv > result.outputTokens.size()) {
       throw std::logic_error("model reported more uncommitted tokens than output");
     }
-    if (beforeLastPass) {
-      schedulerResults.push_back({active.request.id, 0, false, result.nextDecodeStage});
-      continue;
-    }
     if (plan.kind == WorkKind::Prefill) {
       const uint32_t promptProcessed =
           item.promptOffset + result.consumedPromptTokens;
@@ -2517,7 +1843,7 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
       if (promptProcessed == active.replayTokens)
         active.replaying = false;
       // The model captured every state but one taken from the lane, last.
-      const std::vector<Capture> &reached = captures[index];
+      const std::vector<LaneCapture> &reached = captures[index];
       const bool fromLane = !reached.empty() && reached.back().fromLane;
       if (result.capturedStates.size() + fromLane != reached.size())
         throw std::logic_error("model returned mismatched captured states");
@@ -2546,15 +1872,20 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
         unsent = unsent.subspan(1);
         active.sentFirstToken.reset();
       }
-      if (!unsent.empty())
+      if (!unsent.empty()) {
+        firstTokens(active);
         events_.tokens(active.request.id, unsent);
+        decodeGap(active, sample, now);
+      }
     }
     if (result.firstToken) {
       if (active.sentFirstToken || !result.outputTokens.empty())
         throw std::logic_error(
             "model reported a first token twice or beside output");
       active.sentFirstToken = result.firstToken;
+      firstTokens(active);
       events_.tokens(active.request.id, {&*result.firstToken, 1});
+      decodeGap(active, sample, now);
     }
     if (plan.kind == WorkKind::Decode) {
       draftedTokens += result.draftedTokens;
@@ -2587,8 +1918,9 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
     // SSD cache's quota bounded ends at that bound.
     const bool complete =
         result.finished || (!scoring && completionTokens >= active.outputLimit);
-    counters_.spill.lengthEnds +=
-        complete && !result.finished && active.outputLimit < active.request.maxNewTokens;
+    const bool boundEnd = complete && !result.finished && active.outputLimit < active.request.maxNewTokens;
+    counters_.spill.lengthEnds += boundEnd;
+    counters_.spill.convertedLengthEnds += boundEnd && active.converted;
     if (scoring && complete &&
         item.promptOffset + result.consumedPromptTokens !=
             active.promptTokens) {
@@ -2598,7 +1930,8 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
       throw std::logic_error("model emitted an uncommitted token and continued");
     }
     schedulerResults.push_back({active.request.id, result.consumedPromptTokens,
-                                complete, result.nextDecodeStage});
+                                complete, result.nextDecodeStage,
+                                static_cast<uint32_t>(result.outputTokens.size())});
     if (waitsForMask(result.nextDecodeStage)) {
       events_.maskRequested(active.request.id, {});
       active.maskRequestedMilliseconds = now;
@@ -2614,19 +1947,22 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
   // Spill requests' new pages are written as they publish them.
   if (config_.spill.capable)
     static_cast<void>(cache_.writeThrough());
-  const double wallMilliseconds = ticket.wallMilliseconds();
-  scheduler_.complete(plan, schedulerResults, wallMilliseconds,
-                      ticket.prefillTimingIsRepresentative(), ticket.hostMilliseconds(),
-                      command.streamed ? std::optional(ticket.streamMilliseconds())
-                                       : std::nullopt,
-                      ticket.imageEncodeMilliseconds());
-  if (plan.passes > 1 && plan.pass + 1 == plan.passes)
-    request(plan.items.front().requestId).passCommand.reset();
+  const double wallMilliseconds = sample.wallMilliseconds;
+  // A prefill unit ran in the gaps of the lanes that have sent tokens.
+  if (plan.kind == WorkKind::Prefill)
+    for (auto &[id, active] : requests_)
+      if (!active.finalized && active.lastTokenMilliseconds &&
+          std::ranges::none_of(plan.items, [&](const BatchItem &item) { return item.requestId == id; })) {
+        active.gapSince.prefillMilliseconds += wallMilliseconds;
+      }
+  scheduler_.complete(plan, schedulerResults, sample);
+  if (plan.kind == WorkKind::Prefill && plan.passes > 1)
+    settleEnded(passCommand_.passCompleted(plan));
   events_.batchCompleted(plan.kind, plan.width(), inputTokens, outputTokens,
                          draftedTokens, acceptedDraftTokens, wallMilliseconds,
                          cycleMilliseconds);
 
-  for (size_t index = 0; index < results.size(); ++index) {
+  for (size_t index = 0; !beforeLastPass && index < results.size(); ++index) {
     const ModelStepResult &result = results[index];
     Request &active = request(result.requestId);
     if (active.pendingEnd) {
@@ -2645,20 +1981,52 @@ bool Engine::inFlight(uint64_t id) const {
                      [id](const BatchItem &item) { return item.requestId == id; });
 }
 
+bool Engine::yieldsEndedLanes(const Request &lane) {
+  if (!passCommand_.holds(lane.request.id) || !passCommand_.anyEnded())
+    return false;
+  settleEnded(passCommand_.yield());
+  return true;
+}
+
+void Engine::settleEndedBetweenPasses() {
+  for (auto &[id, active] : requests_)
+    if (active.pendingEnd && !active.finalized && !active.restore && !inFlight(id) && !passCommand_.holds(id))
+      settle(active, *std::exchange(active.pendingEnd, std::nullopt));
+}
+
+void Engine::settleEnded(std::span<const uint64_t> lanes) {
+  for (const uint64_t id : lanes) {
+    Request &lane = request(id);
+    settle(lane, std::exchange(lane.pendingEnd, std::nullopt).value());
+  }
+}
+
+void Engine::deferEnd(Request &active, LaneEnd end) {
+  if (!active.pendingEnd)
+    active.pendingEnd = std::move(end);
+}
+
 void Engine::settle(Request &active, LaneEnd end) {
   if (active.finalized)
     return;
-  if (active.restore || inFlight(active.request.id)) {
-    if (!active.pendingEnd)
-      active.pendingEnd = std::move(end);
-    if (!active.restore)
-      pending_->ticket->abandonMask(active.request.id);
-    else if (active.restore->ticket)
-      active.restore->ticket->cancel();
+  const uint64_t id = active.request.id;
+  const bool running = inFlight(id);
+  if (active.restore || running || passCommand_.holds(id)) {
+    deferEnd(active, std::move(end));
+    if (active.restore) {
+      if (active.restore->ticket)
+        active.restore->ticket->cancel();
+    } else {
+      if (running)
+        pending_->ticket->abandonMask(id);
+      settleEnded(passCommand_.laneEnded(id, running));
+    }
     return;
   }
   if (end.outcome == LaneOutcome::Cancelled)
     finish(active, EngineFinishReason::Cancelled, {});
+  else if (end.outcome == LaneOutcome::Stopped)
+    finish(active, EngineFinishReason::Stop, {});
   else
     finishFailure(active, std::move(end));
 }
@@ -2674,10 +2042,13 @@ Engine::LaneEnd Engine::capacityExhausted(std::string_view what,
                         metal::allocationFailureName(failure);
   if (!detail.empty())
     message += " (" + std::string(detail) + ")";
-  // A lone lane judge failed: only other limits fit it.
+  // A lone lane judge failed: only other limits fit it. --max-memory only
+  // lowers this Mac's budget (EngineMemoryPolicy::hardBudgetBytes), so a
+  // larger one helps only where one lowered it.
   message += "; the request does not fit in the memory this server may use, even after "
              "every cached prefix was evicted and any store of streamed experts shrank to its "
-             "floor: restart the server with a larger --max-memory or a smaller --max-context";
+             "floor: restart the server with a smaller --max-context, or with a larger "
+             "--max-memory where one lowered it";
   return {LaneOutcome::CapacityExhausted, std::move(message)};
 }
 
@@ -2714,8 +2085,8 @@ void Engine::finishFailure(Request &active, LaneEnd end) {
 
 void Engine::vacateLane(Request &active, bool keepContinuation) {
   const uint64_t id = active.request.id;
-  // A command between its passes is left, with the states it would capture.
-  active.passCommand.reset();
+  if (passCommand_.holds(id))
+    settleEnded(passCommand_.yield());
   discardPendingStateBoundaries(active);
   if (keepContinuation)
     model_.suspend(id);
@@ -2723,10 +2094,14 @@ void Engine::vacateLane(Request &active, bool keepContinuation) {
     model_.end(id);
   cache_.endRequest(id);
   active.lane.reset();
+  // Its KV is the cache's now, and its projected growth no lane's.
+  ++ledgerChanges_;
 }
 
 void Engine::release(Request &active) {
   active.resourceWait = {};
+  // An ended request holds no claim.
+  active.claim.reset();
   active.maskRequestedMilliseconds.reset();
   if (active.lane || scheduler_.suspended(active.request.id)) {
     // A resident lane gives its memory back: what failed for want of it may
@@ -2741,21 +2116,94 @@ void Engine::release(Request &active) {
   active.replayPoint.reset();
 }
 
-void Engine::sweepTerminal() {
+void Engine::sweepTerminal(double now) {
+  bool swept = false;
   for (auto iterator = requests_.begin(); iterator != requests_.end();) {
     const uint64_t id = iterator->first;
     Request &active = iterator->second;
-    // Scheduler::expireDeadlines is the only source of a Failed phase on an
-    // unfinalized request.
-    if (scheduler_.phase(id) == Phase::Failed && !active.finalized)
-      settle(active, deadlineEnd());
     if (!active.finalized) {
       ++iterator;
       continue;
     }
     scheduler_.remove(id);
     iterator = requests_.erase(iterator);
+    swept = true;
   }
+  if (weights_ && swept && requests_.empty())
+    weights_->idleFrom(now);
+}
+
+bool Engine::releaseIdleWeights(double now) {
+  return weights_.value().release(now, idle(), true);
+}
+
+bool Engine::releaseWeights(double now) {
+  return weights_.value().release(now, idle(), false);
+}
+
+void Engine::startIdleClock(double now) { weights_.value().idleFrom(now); }
+
+WeightsSnapshot Engine::weightsSnapshot() const {
+  WeightsSnapshot snapshot = weights_.value().snapshot();
+  // A request that finds them released restores them: from its arrival.
+  snapshot.restoring = snapshot.restoring ||
+                       (snapshot.released && std::ranges::any_of(requests_, [](const auto &entry) {
+                          return !entry.second.finalized;
+                        }));
+  return snapshot;
+}
+
+bool Engine::advanceWeights(double now) {
+  // Every request not finalized waits for the weights: none starts before
+  // they are back.
+  std::vector<Request *> waiting;
+  for (auto &[_, active] : requests_)
+    if (!active.finalized)
+      waiting.push_back(&active);
+  if (waiting.empty() && !weights_->restoring())
+    return false;
+  // Every tick tries: memory the host frees comes back without a signal, and
+  // the loop wakes for the requests' retries and limits.
+  const WeightResidency::Step step = [&] {
+    // Memory the requests waiting need, a Floor claim's: the host's margins
+    // do not hold it back, critical pressure and the engine's limit refuse
+    // it. Without a request it is a Start claim's, which comes back only as
+    // far as the margins admit it.
+    ClaimHandle claim;
+    claim.governor = &governor();
+    claim.id = governor().ledger().open(
+        {.cls = waiting.empty() ? ClaimClass::Start : ClaimClass::Floor, .timing = NeedTiming::Immediate});
+    const MemoryGovernor::Scope scope(governor(), claim.id);
+    return weights_->restore(now);
+  }();
+  if (step.kind != WeightResidency::Step::Kind::Refused) {
+    // A part that came back ends each waiting request's wait for memory: its
+    // limit counts from its next refusal, by the restore or, once the weights
+    // are back, by its start.
+    for (Request *waiter : waiting) {
+      waiter->resourceWait = {};
+      scheduler_.deferAdmission(waiter->request.id);
+    }
+    signalResourceProgress();
+    return true;
+  }
+  // Each waiting request waits for memory on its own clock, and fails once
+  // this attempt at or past its limit was refused.
+  bool failed = false;
+  for (Request *waiter : waiting) {
+    deferResourceRetry(*waiter, now, {.allocationFailure = step.failure});
+    scheduler_.waitForResources(waiter->request.id);
+    const double deadline = resourceDeadline(*waiter);
+    if (deadline > 0.0 && now >= deadline) {
+      settle(*waiter, {LaneOutcome::ResourceTimeout, resourceTimeoutMessage(step.failure)});
+      weights_->waiterFailed();
+      failed = true;
+    }
+  }
+  if (std::ranges::any_of(waiting, [](const Request *waiter) { return !waiter->finalized; }))
+    return failed;
+  weights_->abandon();
+  return true;
 }
 
 Engine::Request &Engine::request(uint64_t id) {

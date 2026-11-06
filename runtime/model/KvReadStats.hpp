@@ -53,9 +53,9 @@ struct KvReadStats final {
 };
 
 // The hot block cache as /status reports it: its memory, target and floor,
-// its slots per layer and the lanes that hold a floor, everything its
-// commands' resolves did, and how long a resolve, a read and its host steps
-// took (metal::HostStepTiming).
+// its slots per layer and the lanes that hold a floor, everything its commands' resolves did,
+// and how long a resolve, a read and its host steps took
+// (metal::HostStepTiming).
 struct KvBlockCacheStats final {
   uint64_t bytes = 0;
   uint64_t targetBytes = 0;
@@ -67,12 +67,11 @@ struct KvBlockCacheStats final {
 };
 
 // What a prefill's history stream did when its command ended
-// (KvHistoryStream::end): the blocks it could not read, and the time the
-// command waited on its reads, which the scheduler sizes a streaming
-// prefill's rows by.
+// (KvHistoryStream::end): the blocks it could not read and the bytes its
+// reads brought.
 struct KvStreamResult final {
   std::vector<KvReadFailure> failures;
-  double streamMilliseconds = 0.0;
+  uint64_t readBytes = 0;
 };
 
 // The history streams as /status reports them: commands that streamed, the

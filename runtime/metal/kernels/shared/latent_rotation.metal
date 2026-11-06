@@ -5,7 +5,7 @@
 using namespace metal;
 
 // Latent rotation (metal/abi/LatentRotation.h, DeepSeek-V4.1's), as
-// dev/tools/deepseek41_reference.py computes it after model.py: rms_norm,
+// dev/tools/deepseek41_reference.py computes it: rms_norm,
 // rotate (the last rope_pairs pairs, interleaved) and fp8_round or fp4_round,
 // in fp32 with the reference's separate roundings: no contraction into fma,
 // and exact divisions where a scale is no power of two. One simdgroup per

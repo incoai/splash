@@ -2,9 +2,8 @@
 // latent_attention.metal, latent_rotation.metal, latent_index.metal, the
 // sqrt-softplus router of kernels/shared/moe.metal) through
 // ops::ManifoldHyperConnection, ops::LatentAttention, ops::LatentRotation,
-// ops::LatentIndex and ops::MoE, against CPU references of
-// DeepSeek's model.py computation as dev/tools/deepseek41_reference.py
-// carries it out (which matches model.py to 1.4e-6):
+// ops::LatentIndex and ops::MoE, against CPU references of the computation
+// as dev/tools/deepseek41_reference.py carries it out:
 // - the manifold-constrained hyper-connections at the model's shape, four
 //   streams of 5120 values: a mix's pre and post weights and its comb matrix
 //   after 20 Sinkhorn iterations (hc_mixes), a sublayer's input summed by
@@ -22,7 +21,7 @@
 //   indexer's keys and queries, the queries and the attention's output: the
 //   RMS norm of epsilon 1e-20, the interleaved rotation of the last 32 pairs
 //   by YaRN's frequencies (and back) to past a million positions, and the FP8
-//   and FP4 grids of model.py's act_quant and fp4_act_quant, and the query
+//   and FP4 grids of its fp8_round and fp4_round, and the query
 //   latent's norm alone, in fp32 with the
 //   reference's separate roundings: a few values may round the other way by
 //   one step of their grid;
@@ -445,8 +444,7 @@ void latentAttentionTest(MetalBackend &backend, const std::vector<uint32_t> &key
 
 // DeepSeek-V4.1-Flash's rotary frequencies of 32 pairs: those of theta 10000
 // on the layers without compression, of theta 160000 with YaRN (factor 16
-// over 65536 positions, beta 32 and 1) on the others, in fp32 as model.py's
-// precompute_freqs_cis.
+// over 65536 positions, beta 32 and 1) on the others, in fp32.
 std::vector<float> ropeFrequencies(bool compressed) {
   constexpr uint32_t dim = 64;
   const float base = compressed ? 160000.0f : 10000.0f;
@@ -847,7 +845,7 @@ void pagedLatentTest(MetalBackend &backend, uint32_t rows) {
   const test::HostKvExtents extents(backend, layout, spread.extentPages, spread.extents);
   const std::vector<uint32_t> ids = test::HostKvExtents::mixedPages(spread, pages, 3);
   MetalBuffer table = scratch(backend, uint64_t{pages} * sizeof(SplashKvPage));
-  extents.writeTable(ids, table.contents());
+  extents.writeTable(ids, table);
   const ops::LatentIndex::PagedKeys paged{table, extents.layer(1)};
   std::mt19937 rng(61);
   const auto bf16Randoms = [&](size_t n, float scale) {

@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
 
 namespace splash::engine {
@@ -93,8 +95,6 @@ DiskSpace::DiskSpace(std::shared_ptr<model::DiskBudget> budget, bool automatic,
       others_(std::make_move_iterator(others.begin()), std::make_move_iterator(others.end())) {
   if (!budget_ || files_.empty())
     throw std::invalid_argument("a disk tier's space needs its budget and a file");
-  for (const CacheDirectory::Idle &cache : others_)
-    othersBytes_ += cache.bytes;
   measure();
 }
 
@@ -109,6 +109,15 @@ void DiskSpace::measure(std::optional<DiskVolume> volume) {
   uint64_t own = 0;
   for (const std::shared_ptr<model::SlotFile> &file : files_)
     own += file->allocatedBytes();
+  // Another cache someone removed meanwhile, its owner or the user, holds
+  // nothing any more: counted, it would keep the limit low by its bytes.
+  std::erase_if(others_, [](const CacheDirectory::Idle &cache) {
+    std::error_code error;
+    return !std::filesystem::exists(cache.path, error) && !error;
+  });
+  othersBytes_ = 0;
+  for (const CacheDirectory::Idle &cache : others_)
+    othersBytes_ += cache.bytes;
   heldBytes_ = own + othersBytes_;
   if (volume_)
     budget_->setVolumeAvailableBytes(volume_->availableBytes);

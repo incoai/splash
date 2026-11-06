@@ -1,0 +1,15 @@
+{
+  "capabilities": {"max_context_tokens": 131072},
+  "transport": {
+    "ready": false,
+    "recovering": false,
+    "stopped": true,
+    "pending": 0,
+    "pending_limit": 4,
+    "restarts": 0,
+    "last_crash_trace": null,
+    "status_stale": true,
+    "status_age_ms": 0.0,
+    "error": "Splash stopped restarting the engine: --kv-format bf16 is refused. Set SPLASH_CRASH_TRACE=1 to record a crash trace. Restart the Splash server after fixing the cause."
+  }
+}

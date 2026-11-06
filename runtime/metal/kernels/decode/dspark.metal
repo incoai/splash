@@ -6,8 +6,8 @@
 
 using namespace metal;
 
-// DSpark's proposals (metal/abi/DSpark.h), as DeepSeek's inference/model.py
-// draws them greedily: its Markov head's chain over each lane's block.
+// DSpark's proposals (metal/abi/DSpark.h), drawn greedily: its Markov head's
+// chain over each lane's block.
 
 constant constexpr uint kThreads = DSPARK_STEP_THREADS;
 constant constexpr uint kSimdgroups = kThreads / 32;

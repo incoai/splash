@@ -70,7 +70,13 @@ ENTRY_STAGING = ".loading-"
 
 
 class ModelError(RuntimeError):
-    pass
+    """A refusal or failure the installers report without a traceback;
+    `kind` classes a Hub or network failure for the app
+    (hub.failure_kind), None for any other."""
+
+    def __init__(self, message, kind=None):
+        super().__init__(message)
+        self.kind = kind
 
 
 class VisionError(ModelError):
@@ -427,6 +433,14 @@ def main(argv=None):
                 f"({'full' if args.full else 'quick'})."
             )
     except (ModelError, OSError) as error:
+        if args.command == "prepare":
+            # The app and the launcher word the failure by it, beside any
+            # progress and messages.
+            kind = error.kind if isinstance(error, ModelError) else None
+            print(
+                json.dumps({"event": "error", "kind": kind, "message": str(error)}),
+                flush=True,
+            )
         print(f"error: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

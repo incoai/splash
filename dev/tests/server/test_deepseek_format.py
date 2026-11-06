@@ -29,7 +29,6 @@ from dev.tests import server_fixtures as fixtures
 from dev.tests.tool_output import project, put, streamed_text, tool_policy
 from server import constraints, tool_schema
 from server import output as model_output
-from server.api_shapes import template_messages
 from server.chat_format import (
     DEEPSEEK,
     DEEPSEEK_DSML,
@@ -39,12 +38,14 @@ from server.chat_format import (
     QWEN,
     QWEN_XML,
 )
+from server.chat_messages import template_messages
 from server.chat_templates import (
     NATIVE,
     ChatTemplates,
     render_chat_template,
     template_options,
 )
+from server.dialects import scoring
 from server.errors import APIError
 from server.frontend import PLACEHOLDER_RENDER_MARKER
 from server.serve_options import REASONING_EFFORTS
@@ -108,12 +109,18 @@ def deepseek_tokenizer():
 def deepseek_format(tokenizer):
     """DeepSeek's chat format over `tokenizer`'s token IDs."""
     ids = tokenizer.convert_tokens_to_ids
+    return replace(DEEPSEEK, think_end_id=ids("</think>"), call_open_id=ids(DSML))
+
+
+def deepseek_ready(tokenizer):
+    """The Ready of an engine whose vocabulary and stop tokens are
+    `tokenizer`'s."""
     return replace(
-        DEEPSEEK,
-        vocabulary=len(tokenizer),
-        stop_tokens=tuple((text, ids(text)) for text, _ in DEEPSEEK.stop_tokens),
-        think_end_id=ids("</think>"),
-        call_open_id=ids(DSML),
+        fixtures.READY,
+        vocabulary_size=len(tokenizer),
+        stop_token_ids=tuple(
+            tokenizer.convert_tokens_to_ids(text) for text in DEEPSEEK.stop_tokens
+        ),
     )
 
 
@@ -288,7 +295,9 @@ class DsmlGrammarTests(unittest.TestCase):
     def setUpClass(cls):
         cls.tokenizer = deepseek_tokenizer()
         cls.chat_format = deepseek_format(cls.tokenizer)
-        cls.factory = constraints.ConstraintFactory(cls.tokenizer, cls.chat_format)
+        cls.factory = constraints.ConstraintFactory(
+            cls.tokenizer, deepseek_ready(cls.tokenizer)
+        )
 
     def policy(self, choice="auto", parallel=True, strict=False):
         tools = [
@@ -557,10 +566,13 @@ class DeepSeekTokenizerContractTests(unittest.TestCase):
         tokenizer = deepseek_tokenizer()
         chat_format = deepseek_format(tokenizer)
         constraints.validate_tokenizer(tokenizer, chat_format)
+        constraints.check_capabilities(
+            tokenizer, chat_format, deepseek_ready(tokenizer)
+        )
         for field, text in (("think_end_id", "</think>"), ("call_open_id", DSML)):
             with self.subTest(field=field):
                 with self.assertRaisesRegex(
-                    fixtures.engine_runtime.EngineUnhealthy,
+                    constraints.TokenizerContractError,
                     f"tokenizer must encode '{text}' as native token",
                 ):
                     constraints.validate_tokenizer(
@@ -574,13 +586,12 @@ class DeepSeekTokenizerContractTests(unittest.TestCase):
         # Those of the GGUF's vocabulary (dev/tests/install/test_gguf_deepseek41.py).
         self.assertEqual(
             (
-                DEEPSEEK.vocabulary,
                 DEEPSEEK.stop_tokens,
                 DEEPSEEK.think_start_id,
                 DEEPSEEK.think_end_id,
                 DEEPSEEK.call_open_id,
             ),
-            (129280, (("<｜end▁of▁sentence｜>", 1),), None, 128822, 128825),
+            (("<｜end▁of▁sentence｜>",), None, 128822, 128825),
         )
         self.assertIs(DEEPSEEK.call_syntax, DEEPSEEK_DSML)
         self.assertTrue(DEEPSEEK.reasoning_switch)
@@ -1072,12 +1083,13 @@ class DeepSeekPromptTests(unittest.TestCase):
         frontend, unmarked = self.frontend(), self.frontend(refused_placeholder=None)
 
         def prompt(app, state):
-            job, _ = app.prepare_judgment(
+            job, digest = scoring.prepare_judgment(
+                app,
                 fixtures.judgment_body(state=state),
                 deadline=fixtures.FOREVER,
                 disconnected=fixtures.stays_connected,
             )
-            return job.prompt_tokens, job.prompt_sha256
+            return job.prompt_tokens, digest
 
         ordinary = {"evidence": "the sky is blue"}
         self.assertEqual(prompt(frontend, ordinary), prompt(unmarked, ordinary))
@@ -1096,7 +1108,9 @@ class DeepSeekPromptTests(unittest.TestCase):
             ]
         )
         backend.post_processor = processors.ByteLevel(trim_offsets=False)
-        cache = PromptTokenizer(tokenizer, DEEPSEEK.message_boundary)
+        cache = PromptTokenizer(
+            tokenizer, DEEPSEEK.message_boundary, fixtures.NATIVE_CONTEXT
+        )
         self.assertTrue(cache.enabled)
         first = "<｜User｜>" + "Paris 12345 " * 400 + "<｜Assistant｜></think>"
         later = first + "Sunny.<｜end▁of▁sentence｜><｜User｜>Rome?<｜Assistant｜>"

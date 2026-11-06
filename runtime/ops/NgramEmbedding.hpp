@@ -41,7 +41,8 @@ struct NgramEmbedding final {
   static void addHistory(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
                          metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, NgramShape shape,
                          uint32_t rows);
-  // The history after a lane's `retained` (a GPU count) rows.
+  // The history after a lane's `retained` (a GPU count) rows of its verify
+  // step's SPLASH_TARGET_VERIFY_ROWS in convolutionInput.
   static void addCommit(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
                         metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, metal::MetalBuffer retained,
                         NgramShape shape);

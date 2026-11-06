@@ -6,10 +6,9 @@
 using namespace metal;
 
 // Manifold-constrained hyper-connections (metal/abi/ManifoldHyperConnection.h,
-// DeepSeek-V4.1's), as DeepSeek's model.py computes them: a mix's weights
-// (hc_split_sinkhorn), the sum of the streams into a sublayer's input
-// (hc_pre) and the streams after the sublayer (hc_post); in
-// dev/tools/deepseek41_reference.py hc_mixes, hc_pre and hc_post. The streams
+// DeepSeek-V4.1's), as dev/tools/deepseek41_reference.py computes them: a mix's
+// weights (hc_mixes), the sum of the streams into a sublayer's input (hc_pre)
+// and the streams after the sublayer (hc_post). The streams
 // are fp32 [rows][MHC_STREAMS][hidden]; a sublayer reads its input and writes
 // its output as bf16 rows.
 

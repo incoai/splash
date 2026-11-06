@@ -1,4 +1,6 @@
-"""HTTP routes, protocol responses and serving-process startup."""
+"""HTTP routing and serving-process startup. One table names each endpoint's
+handler; each API's handlers, request conversion and answers live in its
+module in dialects/."""
 
 import argparse
 import json
@@ -12,9 +14,10 @@ import select
 import signal
 import socket
 import sys
+import threading
 import time
-from dataclasses import dataclass
-from functools import partial
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -25,48 +28,31 @@ from transformers import AutoTokenizer
 from install import assembly
 from install.models import ModelError
 
-from . import images as image_input
-from . import json_codec, judgments, serve_options
-from . import protocol as wire
+from . import dialects, json_codec, serve_options, serve_record
 from . import runtime as engine_runtime
-from .api_shapes import (
-    anthropic_block,
-    anthropic_response,
-    anthropic_stop,
-    anthropic_to_chat_body,
-    anthropic_to_chat_prompt,
-    anthropic_usage,
-    completion_response,
-    finish_reason,
-    is_custom_call,
-    responses_item,
-    responses_item_id,
-    responses_output,
-    responses_response,
-    stream_chunk,
-    text_completion_chunk,
-    text_completion_response,
-)
 from .backend import (
     NativeBackend,
     NativeResult,
     ThinkingEndError,
-    remaining_request_time,
     thinking_end_tokens,
 )
 from .chat_templates import ChatTemplateError, ChatTemplates
 from .connections import ConnectionSlots, HttpAdmission, RequestBodyReservation
-from .constraints import ConstraintFactory, validate_tokenizer
+from .constraints import (
+    ConstraintFactory,
+    TokenizerContractError,
+    check_capabilities,
+    validate_tokenizer,
+)
 from .diagnostics import log_unexpected, print_request, print_status
 from .errors import (
-    ANTHROPIC_ERRORS,
     OPENAI_ERRORS,
     RETRY_STATUSES,
-    SYSTEMONE_ERRORS,
     APIError,
     ErrorDialect,
     RequestValidationError,
     field_error,
+    remaining_request_time,
 )
 from .frontend import Frontend
 from .http_security import (
@@ -76,10 +62,9 @@ from .http_security import (
     validate_headers,
 )
 from .latency import RequestLatency
-from .metrics import prometheus_metrics, timings_dict, usage_dict
+from .metrics import prometheus_metrics
 from .origins import ANY_ORIGIN
 from .output import (
-    BlockSequencer,
     ReasoningSplitter,
     StreamingToolCallProjector,
     validate_response_content,
@@ -95,15 +80,14 @@ HTTP_UPLOAD_BYTES_PER_SECOND = 512 * 1024
 # Native events wake a waiting request at once; this only bounds how late a
 # client disconnect is noticed.
 CLIENT_DISCONNECT_POLL = 0.1
-# How long a connection refused unread may take its client to close.
-REFUSED_LINGER_SECONDS = 2.0
+# How long an answered connection may take its client to close.
+ANSWERED_LINGER_SECONDS = 2.0
 # The soft descriptor limit the server raises its own to: macOS starts a
-# process with 256, fewer than its connection slots, the refused connections
+# process with 256, fewer than its connection slots, the answered connections
 # lingering after a burst and the engine's pipes and files can need. 10240 is
 # macOS's OPEN_MAX.
 DESCRIPTOR_LIMIT = 10240
 SSE_KEEPALIVE_SECONDS = 2.0
-NATIVE_START_TIMEOUT = 600.0
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
 CHAT_ASSETS = {
@@ -111,6 +95,7 @@ CHAT_ASSETS = {
     for name in (
         "markdown-it-15.0.2.min.js",
         "highlight-11.12.0.min.js",
+        "markdown-links.js",
         "github-11.12.0.min.css",
         "github-dark-11.12.0.min.css",
     )
@@ -157,43 +142,22 @@ def _normalize_path(raw_path):
     return normalized
 
 
-def _progress_flag(body):
-    """The request flag of a generation request's return_progress, which only
-    a stream takes."""
-    value = body.get("return_progress", False)
-    if not isinstance(value, bool) or (value and body.get("stream") is not True):
-        raise APIError(
-            400, "return_progress requires stream: true and must be a boolean"
-        )
-    return wire.RequestFlag.RETURN_PROGRESS if value else wire.RequestFlag(0)
-
-
-def _stream_options(body):
-    """A Chat or text completion request's stream and its stream_options."""
-    stream = body.get("stream", False)
-    options = body.get("stream_options", {})
-    if not isinstance(stream, bool) or not isinstance(options, dict):
-        raise APIError(400, "invalid streaming options")
-    # A null include_usage is one left out, as a null field is.
-    include_usage = options.get("include_usage")
-    if include_usage is None:
-        include_usage = False
-    if not isinstance(include_usage, bool):
-        raise APIError(400, "invalid streaming options")
-    return stream, {"include_usage": include_usage}
-
-
 @dataclass(frozen=True, slots=True)
-class PostRoute:
-    """A POST endpoint, as FrontendHandler serves it."""
+class Route:
+    """An endpoint, as FrontendHandler serves it. Its errors and
+    request_id_header hold for its whole path, so every route on one path
+    states the same ones: path_errors and _send read the first."""
 
-    # The handler's method that serves a request, given its body and
-    # deadline: it answers the request, or prepares the generation the
-    # request asks for and returns its job and the method that answers with
-    # the job's output.
-    method: str
-    # How the endpoint's API answers errors.
-    errors: ErrorDialect
+    # What serves a request, called with the FrontendHandler that reads it.
+    # A POST route's also takes the request's body and deadline: it answers
+    # the request, or prepares the generation the request asks for and
+    # returns its job and the function that answers with the job's output.
+    # Another route's takes what its path pattern captures.
+    handler: Callable
+    # How the endpoint's API answers errors, on its path by any method.
+    errors: ErrorDialect = OPENAI_ERRORS
+    # Whether it answers without the API key: the chat page and the probes.
+    public: bool = False
     # Whether it answers from the prompt alone: it needs no engine, so the
     # engine's state refuses none of its requests, which hold slots of the
     # token-count gate instead of the request gate.
@@ -201,45 +165,15 @@ class PostRoute:
     # Whether it takes no fields: a request carries no body or an empty JSON
     # object.
     fieldless: bool = False
-
-
-POST_ROUTES = {
-    "/v1/chat/completions": PostRoute("_post_chat_completions", OPENAI_ERRORS),
-    "/v1/chat/completions/count_tokens": PostRoute(
-        "_post_chat_count_tokens", OPENAI_ERRORS, prompt_only=True
-    ),
-    "/v1/completions": PostRoute("_post_completions", OPENAI_ERRORS),
-    "/v1/responses": PostRoute("_post_responses", OPENAI_ERRORS),
-    "/v1/messages": PostRoute("_post_messages", ANTHROPIC_ERRORS),
-    "/v1/messages/count_tokens": PostRoute(
-        "_post_count_tokens", ANTHROPIC_ERRORS, prompt_only=True
-    ),
-    "/tokenize": PostRoute("_post_tokenize", OPENAI_ERRORS, prompt_only=True),
-    "/apply-template": PostRoute(
-        "_post_apply_template", OPENAI_ERRORS, prompt_only=True
-    ),
-    "/v1/judgments": PostRoute("_post_judgments", OPENAI_ERRORS),
-    "/v1/systemone": PostRoute("_post_systemone", SYSTEMONE_ERRORS),
-    "/v1/memory/release": PostRoute(
-        "_post_memory_release", OPENAI_ERRORS, fieldless=True
-    ),
-}
-
-
-def path_errors(path):
-    """How every error on `path` is answered, whatever its method and
-    whether it arises before a handler runs or in one: as the API of its
-    POST route answers it, on Anthropic's other paths, those under
-    /v1/messages, as that API does, and elsewhere as OpenAI's."""
-    route = POST_ROUTES.get(path)
-    if route is not None:
-        return route.errors
-    return ANTHROPIC_ERRORS if path.startswith("/v1/messages/") else OPENAI_ERRORS
+    # A header that gives every answer on its path, by any method and errors
+    # too, a fresh request id: TypeSafe's SDK reads one on the routes it
+    # calls.
+    request_id_header: str | None = None
 
 
 @dataclass(slots=True)
 class Collected:
-    """A generation as FrontendHandler._collect gathered it."""
+    """A generation as FrontendHandler.collect gathered it."""
 
     reasoning: str
     content: str
@@ -263,8 +197,13 @@ class Collected:
 
     @property
     def called(self):
-        """Whether the output's tool calls count as made: it cut none."""
-        return bool(self.tool_calls) and not self.cut_in_call
+        """Whether the output's tool calls count as made: the token limit did
+        not end the output, and it cut none."""
+        return (
+            bool(self.tool_calls)
+            and not self.cut_in_call
+            and self.result.reason != "length"
+        )
 
 
 class FrontendHandler(BaseHTTPRequestHandler):
@@ -272,7 +211,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
     methods = "GET, HEAD, POST, DELETE, OPTIONS"
 
     def setup(self):
-        self._response_started = False
+        self.response_started = False
         # What the response owes its request's origin, once the request has
         # passed validate_headers.
         self._allow_origin = None
@@ -337,21 +276,15 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self._allow_origin = validate_headers(
                 self.headers, allowed_hosts, self.server.allowed_origins
             )
-            public = self.command == "OPTIONS" or (
-                self.command in ("GET", "HEAD")
-                and (
-                    self.route
-                    in ("/", "/index.html", "/favicon.ico", "/health", "/ready")
-                    or self.route in CHAT_ASSETS
-                )
-            )
+            route, _ = find_route(self.route, self.command)
+            public = self.command == "OPTIONS" or (route is not None and route.public)
             if not public:
                 authenticate(self.headers, self.server.api_key)
         except APIError as error:
             if isinstance(error, OriginRefused):
                 self.server.refused_origins.report(error.origin)
             self.close_connection = True
-            self._safe_error(error, log=False)
+            self.safe_error(error, log=False)
             return False
         return True
 
@@ -365,9 +298,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self.request_version = self.protocol_version
         status = HTTPStatus(code)
         error_code = status.name.lower() if code >= 500 else "invalid_request_error"
-        self._safe_error(
-            APIError(code, message or status.phrase, error_code), log=False
-        )
+        self.safe_error(APIError(code, message or status.phrase, error_code), log=False)
 
     @property
     def app(self):
@@ -407,24 +338,20 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Connection", "close")
-        route = self.route
-        if (
-            route == "/v1/systemone"
-            or route == "/v1/models"
-            or route.startswith("/v1/models/")
-        ):
-            self.send_header("x-typesafe-request-id", f"req_{secrets.token_hex(12)}")
-        self._response_started = True
+        route, _ = find_route(self.route)
+        if route is not None and route.request_id_header is not None:
+            self.send_header(route.request_id_header, f"req_{secrets.token_hex(12)}")
+        self.response_started = True
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(data)
 
-    def _json(self, status, payload, retry_after=1):
+    def send_json(self, status, payload, retry_after=1):
         try:
             data = json_codec.encode(payload)
         except json_codec.JSONEncodingError as error:
             log_unexpected(error)
-            self._safe_error(
+            self.safe_error(
                 APIError(500, "internal server error", "internal_server_error"),
                 log=False,
             )
@@ -435,16 +362,16 @@ class FrontendHandler(BaseHTTPRequestHandler):
         path = "".join(char if char.isprintable() else "?" for char in self.route)
         print_status(f"Error · {code} · {self.command} {path[:256]}", error=True)
 
-    def _safe_error(self, error, *, log=True):
+    def safe_error(self, error, *, log=True):
         """Answer with `error` as its path's API answers it, unless the
         response has begun."""
-        if self._response_started:
+        if self.response_started:
             return
         status, code, payload = self.errors.answer(error)
         if log:
             self._log_api_error(code)
         try:
-            self._json(status, payload, error.retry_after)
+            self.send_json(status, payload, error.retry_after)
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
 
@@ -545,112 +472,98 @@ class FrontendHandler(BaseHTTPRequestHandler):
         return "Splash"
 
     def do_GET(self):
-        path = self.route
-        if path in ("/", "/index.html", "/favicon.ico") or path in CHAT_ASSETS:
-            if not self.server.webui:
-                self._safe_error(APIError(404, "not found", "not_found"))
-            elif path == "/favicon.ico":
-                self._send(200, FAVICON_SVG, "image/svg+xml")
-            elif path in CHAT_ASSETS:
-                mime = "text/css" if path.endswith(".css") else "text/javascript"
-                self._send(200, CHAT_ASSETS[path], f"{mime}; charset=utf-8")
-            else:
-                self._send(200, CHAT_HTML, "text/html; charset=utf-8")
-            return
-        if path == "/health":
-            self._json(200, {"status": "ok"})
-            return
-        if path == "/ready":
-            ready = self.app.backend.is_ready()
-            self._json(
-                200 if ready else 503, {"status": "ready" if ready else "unavailable"}
-            )
-            return
-        if path == "/status":
-            self._json(200, self.server.status())
-            return
-        if path == "/metrics":
-            self._send(
-                200,
-                prometheus_metrics(self.server.status()).encode(),
-                "text/plain; version=0.0.4; charset=utf-8",
-            )
-            return
-        response_match = re.fullmatch(r"/v1/responses/(resp_[A-Za-z0-9_]+)", path)
-        if response_match:
-            stored = self.app.response_store.get(response_match.group(1))
-            if stored is None:
-                self._safe_error(APIError(404, "response not found", "not_found_error"))
-            else:
-                self._json(200, stored.response)
-            return
-        if path == "/v1/models" or path.startswith("/v1/models/"):
-            models = [
-                {
-                    "id": name,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "splash",
-                    "max_model_len": self.app.max_context,
-                    "context_length": self.app.max_context,
-                    "vision": self.app.vision,
-                    "input_modalities": self.app.input_modalities,
-                    "reasoning": self.app.reasoning,
-                    **(
-                        {"root": self.app.response_model}
-                        if name != self.app.response_model
-                        else {}
-                    ),
-                }
-                for name in self.app.model_names
-            ]
-            if path == "/v1/models":
-                # TypeSafe SDK compatibility: models.list() reads "models" entries.
-                typed = [
-                    {
-                        "name": item["id"],
-                        "description": "Splash resident model",
-                        "release_date": "",
-                    }
-                    for item in models
-                ]
-                self._json(200, {"object": "list", "data": models, "models": typed})
-            else:
-                name = path.removeprefix("/v1/models/")
-                model = next((item for item in models if item["id"] == name), None)
-                if model is None:
-                    self._safe_error(
-                        APIError(404, "model not found", "model_not_found")
-                    )
-                else:
-                    self._json(200, model)
-            return
-        self._safe_error(APIError(404, "not found", "not_found"))
+        self._dispatch("GET")
 
     def do_DELETE(self):
+        self._dispatch("DELETE")
+
+    def _dispatch(self, method):
+        """Serve a request of `method`, which carries no body, by its route."""
+        route, captured = find_route(self.route, method)
+        if route is None:
+            self.safe_error(APIError(404, "not found", "not_found"))
+        else:
+            route.handler(self, *captured)
+
+    def _get_page(self):
         path = self.route
-        response_match = re.fullmatch(r"/v1/responses/(resp_[A-Za-z0-9_]+)", path)
-        if response_match is None:
-            self._safe_error(APIError(404, "not found", "not_found"))
-            return
-        response_id = response_match.group(1)
-        if not self.app.response_store.delete(response_id):
-            self._safe_error(APIError(404, "response not found", "not_found_error"))
-            return
-        self._json(
-            200,
-            {"id": response_id, "object": "response", "deleted": True},
+        if not self.server.webui:
+            self.safe_error(APIError(404, "not found", "not_found"))
+        elif path == "/favicon.ico":
+            self._send(200, FAVICON_SVG, "image/svg+xml")
+        elif path in CHAT_ASSETS:
+            mime = "text/css" if path.endswith(".css") else "text/javascript"
+            self._send(200, CHAT_ASSETS[path], f"{mime}; charset=utf-8")
+        else:
+            self._send(200, CHAT_HTML, "text/html; charset=utf-8")
+
+    def _get_health(self):
+        self.send_json(200, {"status": "ok"})
+
+    def _get_ready(self):
+        ready = self.app.backend.is_ready()
+        self.send_json(
+            200 if ready else 503, {"status": "ready" if ready else "unavailable"}
         )
+
+    def _get_status(self):
+        self.send_json(200, self.server.status())
+
+    def _get_metrics(self):
+        self._send(
+            200,
+            prometheus_metrics(self.server.status()).encode(),
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+
+    def _models(self):
+        return [
+            {
+                "id": name,
+                "object": "model",
+                "created": 0,
+                "owned_by": "splash",
+                "max_model_len": self.app.max_context,
+                "context_length": self.app.max_context,
+                "vision": self.app.vision,
+                "input_modalities": self.app.input_modalities,
+                "reasoning": self.app.reasoning,
+                **(
+                    {"root": self.app.response_model}
+                    if name != self.app.response_model
+                    else {}
+                ),
+            }
+            for name in self.app.model_names
+        ]
+
+    def _get_models(self):
+        models = self._models()
+        self.send_json(
+            200,
+            {
+                "object": "list",
+                "data": models,
+                "models": dialects.scoring.typed_models(models),
+            },
+        )
+
+    def _get_model(self, name):
+        model = next((item for item in self._models() if item["id"] == name), None)
+        if model is None:
+            self.safe_error(APIError(404, "model not found", "model_not_found"))
+        else:
+            self.send_json(200, model)
 
     def do_POST(self):
         started_at = time.monotonic()
-        route = POST_ROUTES.get(self.route)
+        route, _ = find_route(self.route, "POST")
         if route is None:
-            self._safe_error(APIError(404, "not found", "not_found"))
+            self.safe_error(APIError(404, "not found", "not_found"))
             return
         refusal = None if route.prompt_only else self.app.backend.refusal()
         if refusal is not None:
-            self._safe_error(refusal, log=False)
+            self.safe_error(refusal, log=False)
             return
         # Hold one ingress slot through body parsing, preparation, and the
         # complete response. Slow uploads/readers cannot accumulate outside
@@ -659,7 +572,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.server.token_counts if route.prompt_only else self.server.requests
         )
         if not admission.acquire():
-            self._safe_error(
+            self.safe_error(
                 APIError(
                     503,
                     "frontend request capacity is exhausted",
@@ -679,17 +592,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
         except TimeoutError:
             self._cancel_submitted()
             error = APIError(408, "HTTP I/O timed out", "request_timeout")
-            self._safe_error(error, log=self._submitted is None)
+            self.safe_error(error, log=self._submitted is None)
         except APIError as error:
             self._cancel_submitted()
             # The native outcome was already logged; a server-side failure
             # after submission must still reach the console.
-            self._safe_error(error, log=self._submitted is None or error.status >= 500)
+            self.safe_error(error, log=self._submitted is None or error.status >= 500)
         except Exception as error:
             self._cancel_submitted()
             log_unexpected(error)
             error = APIError(500, "internal server error", "internal_server_error")
-            self._safe_error(error, log=False)
+            self.safe_error(error, log=False)
         finally:
             if self._body_reservation is not None:
                 self._body_reservation.release()
@@ -703,8 +616,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _serve(self, route, started_at):
         """Read the request and serve it: answer it, or prepare the
-        generation it asks for and return its job and the method that answers
-        with the job's output."""
+        generation it asks for and return its job and the function that
+        answers with the job's output."""
         if route.fieldless and not self._unread_body:
             body = {}
         else:
@@ -715,8 +628,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             body = {key: value for key, value in body.items() if value is not None}
             if route.fieldless and body:
                 raise APIError(400, "this endpoint takes no fields")
-        serve = getattr(self, route.method)
-        return serve(body, self.app.request_deadline(body, started_at))
+        return route.handler(self, body, self.app.request_deadline(body, started_at))
 
     def _generate(self, job, respond, started_at):
         """Submit a prepared generation and answer with its output. The
@@ -724,107 +636,44 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._body_reservation.retain_for(job)
         self._body_reservation = None
         job.latency = RequestLatency(self.app.latencies, started_at)
-        self._submit(job)
+        self.submit(job)
         respond(job)
 
-    def _submit(self, job):
+    def submit(self, job):
         """Submit `job` unless its deadline has passed or its client has
         left; from then on a failure cancels it."""
         remaining_request_time(job.deadline)
-        if self._client_disconnected():
+        if self.client_disconnected():
             raise ConnectionResetError("client disconnected before submission")
         self.app.backend.submit(job)
         self._submitted = job
+
+    def reserve_input(self, size):
+        """Reserve `size` more bytes of the request body budget for input the
+        request's preparation adds, such as the stored history it continues."""
+        self._body_reservation.grow(size)
 
     def _cancel_submitted(self):
         if self._submitted is not None:
             self.app.backend.cancel(self._submitted)
 
-    def _post_chat_completions(self, body, deadline):
-        progress = _progress_flag(body)
-        stream, stream_options = _stream_options(body)
-        job = self.app.prepare(body, deadline=deadline)
-        job.flags |= progress
-        if stream:
-            return job, partial(
-                self._openai_stream, stream_options=stream_options, chat=True
-            )
-        return job, self._complete
-
-    def _post_completions(self, body, deadline):
-        progress = _progress_flag(body)
-        stream, stream_options = _stream_options(body)
-        job = self.app.prepare_completion(body, deadline=deadline)
-        job.flags |= progress
-        if stream:
-            return job, partial(
-                self._openai_stream, stream_options=stream_options, chat=False
-            )
-        return job, self._text_completion
-
-    def _post_responses(self, body, deadline):
-        progress = _progress_flag(body)
-        job = self.app.prepare_responses(
-            body, deadline=deadline, reserve_input=self._body_reservation.grow
-        )
-        job.flags |= progress
-        if body.get("stream"):
-            return job, self._responses_stream
-        return job, self._responses_complete
-
-    def _post_messages(self, body, deadline):
-        progress = _progress_flag(body)
-        chat, thinking_display = anthropic_to_chat_body(
-            body, thinking_resolver=self.app.thinking_codec.decode
-        )
-        job = self.app.prepare(
-            chat,
-            deadline=deadline,
-            output_field="max_tokens",
-            thinking_display=thinking_display,
-        )
-        job.flags |= progress
-        if body.get("stream"):
-            return job, self._anthropic_stream
-        return job, self._anthropic_complete
-
-    def _post_chat_count_tokens(self, body, deadline):
-        tokens = self.app.count_tokens(body, deadline=deadline)
-        self._json(200, {"input_tokens": tokens})
-
-    def _post_count_tokens(self, body, deadline):
-        prompt = anthropic_to_chat_prompt(
-            body, thinking_resolver=self.app.thinking_codec.decode
-        )
-        tokens = self.app.count_tokens(prompt, deadline=deadline)
-        self._json(200, {"input_tokens": tokens})
-
     def _post_tokenize(self, body, deadline):
-        self._json(200, {"tokens": self.app.tokenize(body, deadline=deadline)})
+        self.send_json(200, {"tokens": self.app.tokenize(body, deadline=deadline)})
 
     def _post_apply_template(self, body, deadline):
-        self._json(200, {"prompt": self.app.apply_template(body, deadline=deadline)})
-
-    def _post_judgments(self, body, deadline):
-        job, row = self.app.prepare_judgment(
-            body, deadline=deadline, disconnected=self._client_disconnected
-        )
-        self._submit(job)
-        result = self._await_done(job)
-        self._json(
-            200,
-            judgments.judgment_response(self.app.response_model, row, job, result),
+        self.send_json(
+            200, {"prompt": self.app.apply_template(body, deadline=deadline)}
         )
 
     def _post_memory_release(self, body, deadline):
         weights = self.app.backend.release_weights().get("weights") or {}
         # A restore leaves the weights released until its last image is back.
         if weights.get("released") is True and weights.get("restoring") is False:
-            self._json(200, {"released": True, "weights": weights})
+            self.send_json(200, {"released": True, "weights": weights})
             return
         # An answer about the engine's state, not a failure: the console does
         # not log it.
-        self._safe_error(
+        self.safe_error(
             APIError(
                 409,
                 "the engine is serving requests or restoring its weights; it "
@@ -834,42 +683,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             log=False,
         )
 
-    def _post_systemone(self, body, deadline):
-        answers = {}
-        input_tokens = 0
-        entries = self.app.prepare_systemone(
-            body, deadline=deadline, disconnected=self._client_disconnected
-        )
-        for qid, spec, job in entries:
-            if job is None:
-                answers[qid] = judgments.deterministic_answer(spec)
-                continue
-            # One admitted job per HTTP request preserves the existing
-            # queue bound and lets later questions reuse the state prefix.
-            self._submit(job)
-            result = self._await_done(job)
-            input_tokens += result.prompt_tokens
-            answers[qid] = judgments.systemone_answer(
-                spec, judgments.softmax(list(result.option_logits))
-            )
-        self._json(
-            200,
-            {
-                "model": self.app.response_model,
-                "answers": answers,
-                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
-            },
-        )
-
-    def _await_done(self, job):
-        """The result of a score job, which emits only start and done."""
-        while (event := self._next_event(job))[0] != "done":
-            pass
-        return event[1]
-
-    def _next_event(self, job, on_idle=None):
+    def next_event(self, job, on_idle=None):
         while True:
-            if self._client_disconnected():
+            if self.client_disconnected():
                 self.app.backend.cancel(job)
                 raise ConnectionResetError
             remaining = job.deadline - time.monotonic()
@@ -884,8 +700,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
             # are sent, the caller can still return its HTTP error status.
             if event is not None and event[0] == "error":
                 raise event[1]
-            if time.monotonic() >= job.deadline:
-                continue
             # Native token activity can be buffered by the tool projector.
             # Measure silence on the HTTP stream across calls, not time spent
             # waiting for an empty native-event queue.
@@ -897,7 +711,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if event is not None:
                 return event
 
-    def _client_disconnected(self):
+    def client_disconnected(self):
         # A poll object holds no descriptor: running out of descriptors
         # must not read as a disconnect.
         poller = select.poll()
@@ -932,7 +746,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             validate_response_content(content, job.response_validator)
         return content, tool_calls, events
 
-    def _collect(
+    def collect(
         self,
         job,
         *,
@@ -980,7 +794,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 publish([(field, text)])
 
         while result is None:
-            kind, value = self._next_event(job, on_idle)
+            kind, value = self.next_event(job, on_idle)
             if kind == "start" and on_start is not None:
                 on_start()
             elif kind == "text":
@@ -1011,212 +825,22 @@ class FrontendHandler(BaseHTTPRequestHandler):
             None if projector is None else projector.call_id,
         )
 
-    def _complete(self, job):
-        collected = self._collect(job)
-        message = {"role": "assistant", "content": collected.content or None}
-        if collected.reasoning:
-            message["reasoning_content"] = collected.reasoning
-        if collected.tool_calls:
-            message["tool_calls"] = collected.tool_calls
-        self._json(
-            200,
-            completion_response(
-                self.app.response_model,
-                job,
-                collected.result,
-                message,
-                collected.called,
-            ),
-        )
-
-    def _text_completion(self, job):
-        collected = self._collect(job)
-        self._json(
-            200,
-            text_completion_response(
-                self.app.response_model, job, collected.result, collected.content
-            ),
-        )
-
-    def _anthropic_complete(self, job):
-        sequencer = BlockSequencer()
-        collected = self._collect(
-            job,
-            on_text=sequencer.text,
-            on_tool_delta=sequencer.tool,
-        )
-        result = collected.result
-        blocks = sequencer.finish(collected.cut, collected.reasoning_open)
-        if collected.cut_call is not None:
-            # A complete message leaves out the call the output cut.
-            blocks = [block for block in blocks if block.call_id != collected.cut_call]
-        signature = (
-            self.app.thinking_codec.encode(collected.reasoning)
-            if collected.reasoning and job.thinking_display == "omitted"
-            else ""
-        )
-        self._json(
-            200,
-            anthropic_response(
-                self.app.response_model,
-                job,
-                blocks,
-                result,
-                collected.called,
-                signature,
-            ),
-        )
-
-    def _anthropic_stream(self, job):
-        omitted = job.thinking_display == "omitted"
-
-        def send(event, payload):
-            self._event_sse(event, {"type": event, **payload})
-
-        def start():
-            # Cache accounting is known at native admission. Keep the socket
-            # alive while queued, but do not publish guessed input usage.
-            self._start_event_stream()
-            send(
-                "message_start",
-                {
-                    "message": {
-                        "id": f"msg_{job.public_id}",
-                        "type": "message",
-                        "role": "assistant",
-                        "model": self.app.response_model,
-                        "content": [],
-                        "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": anthropic_usage(len(job.prompt_tokens), 0, job.cache),
-                    }
-                },
-            )
-
-        def keepalive():
-            self._start_event_stream()
-            send("ping", {})
-
-        def open_block(index, block):
-            send(
-                "content_block_start",
-                {"index": index, "content_block": anthropic_block(job, block)},
-            )
-            if block.kind == "reasoning" and omitted:
-                send(
-                    "content_block_delta",
-                    {
-                        "index": index,
-                        "delta": {"type": "thinking_delta", "thinking": ""},
-                    },
-                )
-
-        def block_delta(index, block, text):
-            if block.kind == "reasoning":
-                if omitted:
-                    return
-                delta = {"type": "thinking_delta", "thinking": text}
-            elif block.kind == "text":
-                delta = {"type": "text_delta", "text": text}
-            else:
-                delta = {"type": "input_json_delta", "partial_json": text}
-            send("content_block_delta", {"index": index, "delta": delta})
-
-        def close_block(index, block):
-            if block.kind == "reasoning" and omitted:
-                signature = self.app.thinking_codec.encode(block.text)
-                send(
-                    "content_block_delta",
-                    {
-                        "index": index,
-                        "delta": {"type": "signature_delta", "signature": signature},
-                    },
-                )
-            send("content_block_stop", {"index": index})
-
-        sequencer = BlockSequencer(open_block, block_delta, close_block)
-
-        def run():
-            collected = self._collect(
-                job,
-                on_start=start,
-                on_text=sequencer.text,
-                on_tool_delta=sequencer.tool,
-                on_idle=keepalive,
-                on_progress=lambda progress: send(
-                    "ping", {"prompt_progress": progress}
-                ),
-            )
-            result = collected.result
-            sequencer.finish(collected.cut, collected.reasoning_open)
-            send(
-                "message_delta",
-                {
-                    "delta": {
-                        "stop_reason": anthropic_stop(
-                            result,
-                            collected.called,
-                            job.output_clamped_to_context,
-                        ),
-                        "stop_sequence": result.stop_sequence,
-                    },
-                    "usage": {
-                        "output_tokens": result.completion_tokens,
-                        "output_tokens_details": {
-                            "thinking_tokens": job.reasoning_tokens
-                        },
-                    },
-                    "timings": timings_dict(result),
-                },
-            )
-            send("message_stop", {})
-
-        def send_error(error):
-            self._event_sse("error", self.errors.payload(error))
-
-        self._guarded_stream(job, run, send_error)
-
-    def _responses_complete(self, job):
-        sequencer = BlockSequencer()
-        collected = self._collect(
-            job,
-            on_text=sequencer.text,
-            on_tool_delta=sequencer.tool,
-        )
-        result = collected.result
-        incomplete = result.reason == "length"
-        output = responses_output(
-            job, sequencer.finish(collected.cut, collected.reasoning_open)
-        )
-        response = responses_response(
-            self.app.response_model,
-            job,
-            "incomplete" if incomplete else "completed",
-            output,
-            result=result,
-        )
-        self.app.persist_response(job, response, output)
-        self._json(
-            200,
-            response,
-        )
-
-    def _start_event_stream(self):
-        if self._response_started:
+    def start_event_stream(self):
+        if self.response_started:
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
-        self._response_started = True
+        self.response_started = True
 
     def _write_sse(self, frame):
         self.wfile.write(frame)
         self.wfile.flush()
         self._last_sse_write = time.monotonic()
 
-    def _sse(self, payload):
+    def sse(self, payload):
         data = (
             payload.encode("utf-8")
             if isinstance(payload, str)
@@ -1224,32 +848,31 @@ class FrontendHandler(BaseHTTPRequestHandler):
         )
         self._write_sse(b"data: " + data + b"\n\n")
 
-    def _event_sse(self, event, payload):
+    def event_sse(self, event, payload):
         data = json_codec.encode(payload)
         self._write_sse(f"event: {event}\ndata: ".encode() + data + b"\n\n")
 
-    def _sse_keepalive(self):
+    def sse_keepalive(self):
         # An SSE comment is traffic, so socket read timeouts and proxies do
         # not take a long prefill or resource wait for a dead connection, but
         # event decoders skip it and clients that time out on missing data
         # events ignore it. Streams send it only where no data event fits: the
         # chat and text completion streams until the request starts, the
         # Responses stream once output has begun.
-        self._start_event_stream()
+        self.start_event_stream()
         self._write_sse(b": splash-keepalive\n\n")
 
-    def _sse_error(self, error):
-        self._sse(self.errors.payload(error))
-        self._sse("[DONE]")
-
-    def _guarded_stream(self, job, run, send_error):
+    def guarded_stream(self, job, run, send_error):
+        """Run a dialect's stream. A failure cancels the job; once the
+        response has begun, send_error writes it as the dialect's error
+        event, and before, the handler answers with its HTTP status."""
         try:
             run()
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             self.app.backend.cancel(job)
         except APIError as error:
             self.app.backend.cancel(job)
-            if not self._response_started:
+            if not self.response_started:
                 raise
             if error.status >= 500:
                 self._log_api_error(error.code)
@@ -1259,7 +882,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 pass
         except Exception as error:
             self.app.backend.cancel(job)
-            if not self._response_started:
+            if not self.response_started:
                 raise
             log_unexpected(error)
             try:
@@ -1269,252 +892,87 @@ class FrontendHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 pass
 
-    def _responses_stream(self, job):
-        output, sequence = [], 0
 
-        def send(event, **payload):
-            nonlocal sequence
-            self._event_sse(
-                event, {"type": event, "sequence_number": sequence, **payload}
-            )
-            sequence += 1
+_MODEL_PATH = re.compile(r"/v1/models/(.*)", re.DOTALL)
+_PAGE = Route(FrontendHandler._get_page, public=True)
 
-        def begin():
-            if self._response_started:
-                return
-            self._start_event_stream()
-            send(
-                "response.created",
-                response=responses_response(
-                    self.app.response_model, job, "in_progress", []
-                ),
-            )
-            send(
-                "response.in_progress",
-                response=responses_response(
-                    self.app.response_model, job, "in_progress", []
-                ),
-            )
+# Every endpoint, by its method and its path or path pattern.
+ROUTES = {
+    **{
+        ("GET", path): _PAGE
+        for path in ("/", "/index.html", "/favicon.ico", *CHAT_ASSETS)
+    },
+    ("GET", "/health"): Route(FrontendHandler._get_health, public=True),
+    ("GET", "/ready"): Route(FrontendHandler._get_ready, public=True),
+    ("GET", "/status"): Route(FrontendHandler._get_status),
+    ("GET", "/metrics"): Route(FrontendHandler._get_metrics),
+    ("GET", dialects.responses.RESPONSE_PATH): Route(dialects.responses.get),
+    ("DELETE", dialects.responses.RESPONSE_PATH): Route(dialects.responses.delete),
+    ("GET", "/v1/models"): Route(
+        FrontendHandler._get_models,
+        request_id_header=dialects.scoring.REQUEST_ID_HEADER,
+    ),
+    ("GET", _MODEL_PATH): Route(
+        FrontendHandler._get_model, request_id_header=dialects.scoring.REQUEST_ID_HEADER
+    ),
+    ("POST", "/v1/chat/completions"): Route(dialects.openai.post_chat),
+    ("POST", "/v1/chat/completions/count_tokens"): Route(
+        dialects.openai.post_chat_count_tokens, prompt_only=True
+    ),
+    ("POST", "/v1/completions"): Route(dialects.openai.post_completion),
+    ("POST", "/v1/responses"): Route(dialects.responses.post),
+    ("POST", "/v1/messages"): Route(
+        dialects.anthropic.post_messages, dialects.anthropic.ERRORS
+    ),
+    ("POST", "/v1/messages/count_tokens"): Route(
+        dialects.anthropic.post_count_tokens,
+        dialects.anthropic.ERRORS,
+        prompt_only=True,
+    ),
+    ("POST", "/tokenize"): Route(FrontendHandler._post_tokenize, prompt_only=True),
+    ("POST", "/apply-template"): Route(
+        FrontendHandler._post_apply_template, prompt_only=True
+    ),
+    ("POST", "/v1/judgments"): Route(dialects.scoring.post_judgments),
+    ("POST", "/v1/systemone"): Route(
+        dialects.scoring.post_systemone,
+        dialects.scoring.ERRORS,
+        request_id_header=dialects.scoring.REQUEST_ID_HEADER,
+    ),
+    ("POST", "/v1/memory/release"): Route(
+        FrontendHandler._post_memory_release, fieldless=True
+    ),
+}
 
-        def open_item(index, block):
-            item = responses_item(job, block, index)
-            send("response.output_item.added", output_index=index, item=item)
-            if block.kind == "reasoning":
-                send(
-                    "response.reasoning_summary_part.added",
-                    item_id=item["id"],
-                    output_index=index,
-                    summary_index=0,
-                    part={"type": "summary_text", "text": ""},
-                )
-            elif block.kind == "text":
-                send(
-                    "response.content_part.added",
-                    item_id=item["id"],
-                    output_index=index,
-                    content_index=0,
-                    part={"type": "output_text", "text": "", "annotations": []},
-                )
 
-        def item_delta(index, block, text):
-            if is_custom_call(job, block):
-                # A custom tool's input is the string inside the arguments;
-                # it streams whole when the call closes.
-                return
-            if block.kind == "tool":
-                event, extra = "response.function_call_arguments.delta", {}
-            elif block.kind == "reasoning":
-                event, extra = (
-                    "response.reasoning_summary_text.delta",
-                    {"summary_index": 0},
-                )
-            else:
-                event, extra = (
-                    "response.output_text.delta",
-                    {"content_index": 0, "logprobs": []},
-                )
-            send(
-                event,
-                item_id=responses_item_id(job, block.kind, index),
-                output_index=index,
-                delta=text,
-                **extra,
-            )
+def find_route(path, method=None):
+    """The route serving `method` on `path`, a route of any method when None,
+    and what its path pattern captures; (None, ()) when no route does. HEAD
+    is served by GET's route."""
+    if method == "HEAD":
+        method = "GET"
+    for (route_method, key), route in ROUTES.items():
+        if method not in (None, route_method):
+            continue
+        if isinstance(key, str):
+            if key == path:
+                return route, ()
+        elif match := key.fullmatch(path):
+            return route, match.groups()
+    return None, ()
 
-        def close_item(index, block):
-            item = responses_item(job, block, index)
-            if is_custom_call(job, block):
-                for event, field in (("delta", "delta"), ("done", "input")):
-                    send(
-                        f"response.custom_tool_call_input.{event}",
-                        item_id=item["id"],
-                        output_index=index,
-                        **{field: item["input"]},
-                    )
-            elif block.kind == "tool":
-                send(
-                    "response.function_call_arguments.done",
-                    item_id=item["id"],
-                    output_index=index,
-                    name=item["name"],
-                    arguments=item["arguments"],
-                )
-            elif block.kind == "reasoning":
-                part = {"type": "summary_text", "text": block.text}
-                send(
-                    "response.reasoning_summary_text.done",
-                    item_id=item["id"],
-                    output_index=index,
-                    summary_index=0,
-                    text=block.text,
-                )
-                payload = {
-                    "item_id": item["id"],
-                    "output_index": index,
-                    "summary_index": 0,
-                    "part": part,
-                }
-                if block.status == "incomplete":
-                    payload["status"] = "incomplete"
-                send("response.reasoning_summary_part.done", **payload)
-            else:
-                part = item["content"][0]
-                send(
-                    "response.output_text.done",
-                    item_id=item["id"],
-                    output_index=index,
-                    content_index=0,
-                    text=part["text"],
-                    logprobs=[],
-                )
-                send(
-                    "response.content_part.done",
-                    item_id=item["id"],
-                    output_index=index,
-                    content_index=0,
-                    part=part,
-                )
-            send("response.output_item.done", output_index=index, item=item)
-            output.append(item)
 
-        sequencer = BlockSequencer(open_item, item_delta, close_item)
-
-        def keepalive():
-            begin()
-            if not sequencer.blocks:
-                send(
-                    "response.in_progress",
-                    response=responses_response(
-                        self.app.response_model, job, "in_progress", []
-                    ),
-                )
-            else:
-                # The data event that adds nothing, response.in_progress,
-                # carries a snapshot of the response, which would replace the
-                # output streamed so far. A comment keeps the stream alive
-                # instead, though clients that time out on missing data events
-                # ignore it.
-                self._sse_keepalive()
-
-        def run():
-            collected = self._collect(
-                job,
-                on_start=begin,
-                on_text=sequencer.text,
-                on_tool_delta=sequencer.tool,
-                on_idle=keepalive,
-                on_progress=lambda progress: send(
-                    "response.in_progress",
-                    response=responses_response(
-                        self.app.response_model, job, "in_progress", []
-                    ),
-                    prompt_progress=progress,
-                ),
-            )
-            result = collected.result
-            incomplete = result.reason == "length"
-            sequencer.finish(collected.cut, collected.reasoning_open)
-            status = "incomplete" if incomplete else "completed"
-            response = responses_response(
-                self.app.response_model, job, status, output, result=result
-            )
-            self.app.persist_response(job, response, output)
-            send(
-                f"response.{status}",
-                response=response,
-            )
-
-        def send_error(error):
-            send(
-                "response.failed",
-                response=responses_response(
-                    self.app.response_model,
-                    job,
-                    "failed",
-                    output,
-                    error=self.errors.payload(error)["error"],
-                ),
-            )
-
-        self._guarded_stream(job, run, send_error)
-
-    def _openai_stream(self, job, stream_options, *, chat):
-        """A Chat or text completion stream; text completions have no tools."""
-        chunk = partial(
-            stream_chunk if chat else text_completion_chunk,
-            self.app.response_model,
-            job.public_id,
-            job.created_at,
-        )
-        empty = {} if chat else ""
-        started = False
-
-        def payload(field, text):
-            return {field: text} if chat else text
-
-        def start():
-            nonlocal started
-            started = True
-            self._start_event_stream()
-            if chat:
-                self._sse(chunk({"role": "assistant", "content": ""}))
-
-        def keepalive():
-            # After the start, a chunk that adds nothing: tool arguments of
-            # arrays and objects are buffered until complete, which can take
-            # minutes, and clients that time out on missing data events
-            # ignore SSE comments.
-            if started:
-                self._sse(chunk(empty))
-            else:
-                self._sse_keepalive()
-
-        def run():
-            collected = self._collect(
-                job,
-                on_start=start,
-                on_text=lambda field, text: self._sse(chunk(payload(field, text))),
-                on_tool_delta=lambda delta: self._sse(chunk({"tool_calls": [delta]})),
-                on_idle=keepalive,
-                on_progress=lambda progress: self._sse(
-                    chunk(empty) | {"prompt_progress": progress}
-                ),
-            )
-            result = collected.result
-            self._sse(
-                chunk(
-                    empty,
-                    finish_reason(result, collected.called),
-                    timings=timings_dict(result),
-                )
-            )
-            if stream_options.get("include_usage"):
-                self._sse(
-                    chunk(empty, usage=usage_dict(result, job), metrics=result.metrics)
-                )
-            self._sse("[DONE]")
-
-        self._guarded_stream(job, run, self._sse_error)
+def path_errors(path):
+    """How every error on `path` is answered, whatever its method and
+    whether it arises before a handler runs or in one: as the API of its
+    route answers it, on Anthropic's other paths, those under /v1/messages,
+    as that API does, and elsewhere as OpenAI's."""
+    route, _ = find_route(path)
+    if route is not None:
+        return route.errors
+    if path.startswith("/v1/messages/"):
+        return dialects.anthropic.ERRORS
+    return OPENAI_ERRORS
 
 
 class FrontendServer(HTTPServer):
@@ -1527,13 +985,13 @@ class FrontendServer(HTTPServer):
     # Keep control/catalog capacity separate from generation capacity.
     # Neither gate allocates workers in advance.
     control_connection_capacity = 64
-    # Connections answered without their requests read that wait at once,
-    # on one thread, for their clients to close. A burst refuses all that
-    # arrive while every slot is held, and a client that sends its request
-    # after its connection closed is reset before it reads the 503, so
-    # enough linger for a burst well beyond the kernel's queue, within the
+    # Answered connections, refused or served, that wait at once, on one
+    # thread, for their clients to close. A burst refuses all that arrive
+    # while every slot is held, and a client that sends its request after
+    # its connection closed is reset before it reads the 503, so enough
+    # linger for a burst well beyond the kernel's queue, within the
     # descriptors the server raises its limit to.
-    refused_connection_capacity = 1024
+    answered_connection_capacity = 1024
 
     def __init__(
         self,
@@ -1574,8 +1032,8 @@ class FrontendServer(HTTPServer):
         self.connections = ConnectionSlots(
             request_capacity + self.control_connection_capacity,
             self._serve_connection,
-            self.refused_connection_capacity,
-            REFUSED_LINGER_SECONDS,
+            self.answered_connection_capacity,
+            ANSWERED_LINGER_SECONDS,
         )
         super().__init__(address, FrontendHandler, bind_and_activate)
         self.app = app
@@ -1646,8 +1104,7 @@ class FrontendServer(HTTPServer):
             self.shutdown_request(request)
 
     def shutdown_request(self, request):
-        self.connections.release(request)
-        super().shutdown_request(request)
+        self.connections.close(request)
 
     def server_close(self):
         super().server_close()
@@ -1677,6 +1134,9 @@ def parse_args(argv=None):
     )
     parser.add_argument("--port", type=int, default=serve_options.DEFAULT_PORT)
     parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))
+    # The launcher's, not a serve option: where the app follows a start and
+    # reads why one failed (serve_record).
+    parser.add_argument("--serve-record", type=Path, metavar="PATH")
     serve_options.add_serve_arguments(parser)
     args = parser.parse_args(argv)
     serve_options.check_serve_arguments(parser, args)
@@ -1687,53 +1147,19 @@ def parse_args(argv=None):
 
 def _native_command(args, model_root, relaunch_context=None):
     """The engine's command line serving model_root, a relaunch's with
-    `relaunch_context`, the context the first engine served: without
-    --max-context the relaunch keeps it, where its own would follow a Neural
-    Engine split calibrated anew."""
+    `relaunch_context`, the context the first engine served. A relaunch is
+    planned as the first engine was, for --max-context or the automatic
+    context, and serves what its plan holds of the first engine's context,
+    where its own automatic one would follow a Neural Engine split calibrated
+    anew."""
     command = [
         args.binary,
         "serve-native",
         str(model_root),
-        "auto" if args.max_context is None else str(args.max_context),
-        "auto" if args.max_memory is None else str(args.max_memory),
+        *serve_options.engine_argv(args),
     ]
-    if args.max_cache_disk is not None:
-        command.append(str(args.max_cache_disk))
-    if args.max_cache_disk_writes:
-        command.extend(("--max-cache-disk-writes", str(args.max_cache_disk_writes)))
-    if args.persistent_cache:
-        command.extend(("--persistent-cache", "on"))
-    if args.cache_dir is not None:
-        command.extend(("--cache-dir", str(args.cache_dir)))
-    if args.kv_format != "int8":
-        command.extend(("--kv-format", args.kv_format))
-    if args.state_format != "fp32":
-        command.extend(("--state-format", args.state_format))
-    if args.idle_release is not None:
-        command.extend(
-            ("--idle-release", serve_options.idle_release_text(args.idle_release))
-        )
-    if args.disable_ane:
-        command.extend(("--ane", "off"))
-    if args.verify_rows != "auto":
-        command.extend(("--verify-rows", args.verify_rows))
-    if args.decode_share is not None:
-        command.extend(("--decode-share", str(args.decode_share)))
-    if args.max_image_pixels != image_input.MAX_PIXELS:
-        command.extend(
-            ("--max-image-patches", str(image_input.max_patches(args.max_image_pixels)))
-        )
-    if args.allow_idle_sleep:
-        command.extend(("--idle-sleep", "allow"))
-    if relaunch_context is not None and args.max_context is None:
+    if relaunch_context is not None:
         command.extend(("--relaunch-context", str(relaunch_context)))
-    for flag, value in (
-        ("--ple-memory", args.ple_memory),
-        ("--expert-memory", args.expert_memory),
-        ("--sparse-kv-memory", args.sparse_kv_memory),
-    ):
-        if value is not None:
-            command.extend((flag, str(value)))
     return command
 
 
@@ -1752,6 +1178,42 @@ def _interrupt(_signum, _frame):
     raise KeyboardInterrupt
 
 
+def _stop_with(pid):
+    """Stops the server with SIGTERM once process `pid` has ended: one stop,
+    which a server already stopping ignores.
+
+    The desktop app passes its own process ID as SPLASH_APP_PID, so a model
+    it started gives its memory back when the app crashes, rather than at
+    the app's next launch. A process already gone stops the server at once:
+    kqueue returns its watch at once, as an error event.
+    """
+
+    def watch():
+        queue = select.kqueue()
+        exited = select.kevent(
+            pid,
+            filter=select.KQ_FILTER_PROC,
+            flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+            fflags=select.KQ_NOTE_EXIT,
+        )
+        queue.control([exited], 1, None)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=watch, name="stop-with-app", daemon=True).start()
+
+
+class ListenError(Exception):
+    """The HTTP server cannot listen at its address."""
+
+
+def _start_failed(args, error, failure):
+    """End a start that failed, saying why in the log and, for the app, in
+    the launcher's serve record (serve_record)."""
+    print_status(f"Error · {error}", error=True)
+    serve_record.failed(args.serve_record, failure)
+    raise SystemExit(1) from None
+
+
 def main():
     args = parse_args()
     server = None
@@ -1766,6 +1228,8 @@ def main():
         # The launcher blocks both across its exec: one sent while this module
         # imported arrives here and ends the startup cleanly.
         signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
+        if app := os.environ.get("SPLASH_APP_PID"):
+            _stop_with(int(app))
         _raise_descriptor_limit()
         # Bind before loading the tokenizer or model so duplicates fail early.
         # Activate only after the runtime is ready, keeping a partially started
@@ -1781,7 +1245,10 @@ def main():
             max_request_bytes=args.max_request_size,
             allowed_origins=args.allowed_origin,
         )
-        server.server_bind()
+        try:
+            server.server_bind()
+        except OSError as error:
+            raise ListenError(f"unable to start HTTP server: {error}") from None
         if ANY_ORIGIN in args.allowed_origin and args.api_key is None:
             print_status(
                 "Warning · --allowed-origin '*' without --api-key lets every web "
@@ -1790,6 +1257,7 @@ def main():
             )
         thinking_codec = ThinkingCodec(load_thinking_key())
         print_status(f"Loading · {args.model}")
+        serve_record.entered(args.serve_record, "loading")
         # Nothing reads `held`: it keeps the assembly held until the server
         # exits, so that no installation collects the assembly its tokenizer
         # and engines, a relaunched one too, serve.
@@ -1802,23 +1270,40 @@ def main():
                 f"{args.model} is not prepared as a model of a family this "
                 "release serves: prepare it again"
             )
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_root / "tokenizer", local_files_only=True, trust_remote_code=False
-        )
+        # A tokenizer the loader cannot read fails with whatever its parsers
+        # raise, such as a KeyError for a tokenizer.json without added_tokens:
+        # each is the model's.
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_root / "tokenizer", local_files_only=True, trust_remote_code=False
+            )
+        except Exception as error:
+            raise ModelError(
+                f"cannot load the tokenizer of {args.model}: "
+                f"{type(error).__name__}: {error}"
+            ) from error
         validate_tokenizer(tokenizer, family.chat_format)
         thinking_end = thinking_end_tokens(
             tokenizer, args.thinking_end_text, family.chat_format
         )
         chat_templates = ChatTemplates(tokenizer)
         print_status(f"Chat template · {chat_templates.describe()}")
+        # Unset, a budget ends thinking as the template closes it, so that the
+        # next request renders that close back as the tokens the reply ended
+        # its thinking with; Qwen's templates still trim a space or line break
+        # the cut leaves before it.
+        if thinking_end is None:
+            thinking_end = thinking_end_tokens(
+                tokenizer, chat_templates.select(None).thinking_end, family.chat_format
+            )
         runtime = engine_runtime.MultiplexedRuntime(
             _native_command(args, model_root),
             relaunch_command=lambda first: _native_command(
                 args, model_root, first.max_context_tokens
             ),
-            startup_timeout=NATIVE_START_TIMEOUT,
             pending_limit=args.queue_size,
         )
+        runtime.on_warming = lambda: serve_record.entered(args.serve_record, "warming")
         backend = NativeBackend(
             runtime,
             tokenizer,
@@ -1827,62 +1312,71 @@ def main():
         )
         if not runtime.wait_ready():
             raise engine_runtime.EngineUnhealthy("native runtime did not become ready")
-        readiness = runtime.readiness
-        # The engine serves --max-context as given, and without it a context
-        # the native window holds.
-        if readiness is None or not (
-            readiness.max_context_tokens == args.max_context
-            if args.max_context is not None
-            else 1 <= readiness.max_context_tokens <= serve_options.MAX_CONTEXT_TOKENS
-        ):
-            raise engine_runtime.EngineUnhealthy(
-                "native runtime reported an invalid context window"
-            )
-        effective_context = readiness.max_context_tokens
-        constraint_factory = ConstraintFactory(tokenizer, family.chat_format)
+        # The engine is authoritative for what it serves: it refuses a
+        # --max-context it cannot serve.
+        served = runtime.capabilities
+        check_capabilities(tokenizer, family.chat_format, served)
         app = Frontend(
             tokenizer,
             backend,
             args.model,
-            effective_context,
             # No deadline unless given, as in vLLM and SGLang; a request still
             # ends when its client disconnects.
             math.inf if args.request_timeout is None else args.request_timeout,
-            readiness.max_concurrent_requests,
-            constraint_factory=constraint_factory,
+            constraint_factory=ConstraintFactory(tokenizer, served),
             chat_templates=chat_templates,
             chat_format=family.chat_format,
+            sampling_defaults=asdict(family.sampling),
             max_image_pixels=args.max_image_pixels,
             thinking_codec=thinking_codec,
+            response_store=dialects.responses.ResponseStore(),
             served_model_names=args.served_model_name,
             announce_served_name=args.announce_served_name,
             default_reasoning_effort=args.default_reasoning_effort,
             default_thinking_token_budget=args.thinking_token_budget,
-            vision=readiness.vision,
         )
         server.app = app
         server.server_activate()
+        # The app takes the server for ready from its record alone: one that
+        # cannot say so has not started (serve_record).
+        serve_record.ready(args.serve_record)
         address = f"http://{args.host}:{server.server_port}"
-        context = (
-            f"{effective_context // 1024}K"
-            if effective_context % 1024 == 0
-            else f"{effective_context:,}"
-        )
-        mode = "" if readiness.vision else " · text only"
+        tokens = served.max_context_tokens
+        context = f"{tokens // 1024}K" if tokens % 1024 == 0 else f"{tokens:,}"
+        mode = "" if served.vision else " · text only"
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
         server.serve_forever()
+    except engine_runtime.EngineStartFailed as error:
+        _start_failed(args, error, serve_record.engine_failure(error.event, str(error)))
+    except ListenError as error:
+        _start_failed(args, error, serve_record.failure(serve_record.PORT, str(error)))
     except (
-        engine_runtime.EngineRuntimeError,
         ModelError,
-        ThinkingKeyError,
         ChatTemplateError,
         ThinkingEndError,
+        TokenizerContractError,
     ) as error:
+        _start_failed(args, error, serve_record.failure(serve_record.MODEL, str(error)))
+    except (engine_runtime.EngineRuntimeError, ThinkingKeyError, OSError) as error:
+        _start_failed(
+            args, error, serve_record.failure(serve_record.INTERNAL, str(error))
+        )
+    except serve_record.NotRecorded as error:
+        # The record that cannot say ready cannot say why either: the app
+        # takes the exit for the failure, which the log words.
         print_status(f"Error · {error}", error=True)
         raise SystemExit(1) from None
-    except OSError as error:
-        print_status(f"Error · unable to start HTTP server: {error}", error=True)
-        raise SystemExit(1) from None
+    except Exception as error:
+        # An error no clause above names is a bug: the record still names the
+        # failure, so that the app reports it instead of a crash, and the
+        # traceback reaches the log.
+        serve_record.failed(
+            args.serve_record,
+            serve_record.failure(
+                serve_record.INTERNAL, f"{type(error).__name__}: {error}"
+            ),
+        )
+        raise
     except KeyboardInterrupt:
         pass
     finally:
@@ -1896,6 +1390,12 @@ def main():
             signal.SIG_IGN if runtime is None else lambda *_: runtime.kill(),
         )
         try:
+            # Stop accepting before the engine stops, which can take seconds:
+            # a client that connects meanwhile is refused at once instead of
+            # waiting in the backlog to be reset. server_close still answers
+            # the requests in flight.
+            if server is not None:
+                server.socket.close()
             if backend is not None:
                 print_status("Stopping · releasing engine resources")
                 backend.close()

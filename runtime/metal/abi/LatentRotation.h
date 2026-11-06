@@ -14,7 +14,7 @@
 #endif
 
 // The grids a vector may be rounded to (dev/tools/deepseek41_reference.py
-// fp8_round and fp4_round, model.py's act_quant and fp4_act_quant): none;
+// fp8_round and fp4_round): none;
 // E4M3 by a power-of-two scale per 32 values (the window's latents, the
 // attention's output); E2M1 by an E4M3 scale per 16 values (the compressed
 // latents); E2M1 by a power-of-two scale per 32 values (the indexer's queries

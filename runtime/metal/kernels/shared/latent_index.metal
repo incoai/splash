@@ -6,9 +6,8 @@
 using namespace metal;
 
 // DeepSeek-V4.1's compressor and indexer (metal/abi/LatentIndex.h), as
-// DeepSeek's model.py computes them (Compressor before its norm, Indexer's
-// scores; in dev/tools/deepseek41_reference.py Forward.latents and
-// Forward.select).
+// dev/tools/deepseek41_reference.py Forward.latents and Forward.select compute
+// them: the compressor before its norm, the indexer's scores.
 
 constant constexpr uint kThreads = LATENT_INDEX_THREADS;
 constant constexpr uint kDim = LATENT_INDEX_DIM;

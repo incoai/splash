@@ -14,7 +14,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <map>
 #include <stdexcept>
 
 namespace splash::model {
@@ -29,21 +28,18 @@ static_assert(ExecutionLimits::draftQueryRows == ExecutionLimits::targetVerifyRo
 
 template <class T> T *contents(const metal::MetalBuffer &buffer) { return static_cast<T *>(buffer.contents()); }
 
-// The shape of DSpark's MoE blocks: its layout's, its routed experts' format
-// that of most of their weights, the routers' format the first block's.
+// The shape of DSpark's MoE blocks, its layout's, and the formats its plans
+// follow.
 ops::MoeShape moeShapeOf(const DSparkWeights &weights) {
-  ops::MoeShape shape = weights.layout.layers.moeBlockShape();
-  std::map<uint32_t, uint64_t> formats;
-  for (const DeepSeek41LayerWeights &layer : weights.layers)
-    for (const ops::BlockExpertProjection *p : {&layer.ffn.gate, &layer.ffn.up, &layer.ffn.down})
-      if (!p->routed.isFloat()) formats[p->routed.formatId] += uint64_t{p->routed.outputSize} * p->routed.inputSize;
-  if (formats.empty() || weights.layers.empty()) throw std::invalid_argument("DSpark has no routed experts");
-  shape.expertFormat =
-      std::max_element(formats.begin(), formats.end(), [](auto &a, auto &b) { return a.second < b.second; })->first;
-  shape.registerFormats = false;
-  shape.routerFormat = weights.layers.front().ffn.router.formatId;
-  if (!shape.valid()) throw std::invalid_argument("invalid DSpark MoE shape");
+  const ops::MoeShape shape = weights.layout.layers.moeBlockShape();
+  if (weights.layers.empty() || !shape.valid()) throw std::invalid_argument("invalid DSpark MoE shape");
   return shape;
+}
+
+ops::MoeFormats moeFormatsOf(const DSparkWeights &weights) {
+  std::vector<const ops::BlockMoeWeights *> blocks;
+  for (const DeepSeek41LayerWeights &layer : weights.layers) blocks.push_back(&layer.ffn);
+  return ops::moeFormats(blocks);
 }
 
 // Every projection of its decode steps: its layers', its main projection
@@ -82,7 +78,7 @@ namespace {
 // The scratch of DSpark of `weights`, through `allocate(bytes, label)`.
 template <class Scratch, class Allocate>
 void layoutScratch(const DSparkWeights &weights, const ops::Projection &head, const ops::ExecutionPlans &operators,
-                   const ops::ManifoldHyperShape &mhc, const ops::MoeShape &moeShape, Scratch &s, Allocate allocate) {
+                   const ops::ManifoldHyperShape &mhc, const ops::MoeShape &moeShape, const ops::MoeFormats &moeFormats, Scratch &s, Allocate allocate) {
   const DeepSeek41Layout &layout = weights.layout.layers;
   const DeepSeek41Dimensions &d = layout.deepseek;
   const ops::Linear &linear = operators.linear();
@@ -128,7 +124,7 @@ void layoutScratch(const DSparkWeights &weights, const ops::Projection &head, co
   s.ffnOut = allocate(r * hidden * 2, "dspark/ffn-out");
   s.verifyRows = allocate(uint64_t{kLanes} * 4, "dspark/verify-rows");
   s.frequencies = allocate(uint64_t{layout.rotaryPairs} * 4, "dspark/rope");
-  const ops::MoeWorkspace workspace = operators.moeDecodeWorkspacePerLane(moeShape);
+  const ops::MoeWorkspace workspace = operators.moeDecodeWorkspacePerLane(moeShape, moeFormats);
   for (const ops::MoeScratchField &field : ops::kMoeScratchFields)
     s.moe.*field.buffer = allocate(workspace.*field.bytes * kLanes, field.name);
   s.markov = allocate(uint64_t{kLanes} * weights.layout.markovRank * 2, "dspark/markov");
@@ -159,7 +155,7 @@ uint64_t DSparkDraft::scratchBytes(const DSparkWeights &weights, const ops::Proj
                                    const ops::ExecutionPlans &operators) {
   uint64_t total = 0;
   Scratch s;
-  layoutScratch(weights, head, operators, mhcOf(weights), moeShapeOf(weights), s, [&](uint64_t bytes, const char *) {
+  layoutScratch(weights, head, operators, mhcOf(weights), moeShapeOf(weights), moeFormatsOf(weights), s, [&](uint64_t bytes, const char *) {
     total += std::max<uint64_t>(bytes, 16);
     return metal::MetalBuffer{};
   });
@@ -169,7 +165,7 @@ uint64_t DSparkDraft::scratchBytes(const DSparkWeights &weights, const ops::Proj
 DSparkDraft::DSparkDraft(const DSparkWeights &weights, const ops::Projection &head, metal::MetalBackend &backend,
                          const ops::ExecutionPlans &operators)
     : weights_(weights), head_(head), backend_(backend), operators_(operators), mhc_(mhcOf(weights)),
-      moeShape_(moeShapeOf(weights)), scratch_(std::make_unique<Scratch>()) {
+      moeShape_(moeShapeOf(weights)), moeFormats_(moeFormatsOf(weights)), scratch_(std::make_unique<Scratch>()) {
   const DSparkLayout &dspark = weights.layout;
   const DeepSeek41Layout &layout = dspark.layers;
   if (weights.layers.size() != layout.layers || !dspark.blockSize || dspark.blockSize > kLaneRows - 1 ||
@@ -177,7 +173,7 @@ DSparkDraft::DSparkDraft(const DSparkWeights &weights, const ops::Projection &he
     throw std::invalid_argument("invalid DSpark weights");
   // Every buffer starts zeroed: a lane's rows past its block are never
   // written, and pass through the layers as zeros.
-  layoutScratch(weights, head, operators, mhc_, moeShape_, *scratch_, [&](uint64_t bytes, const char *label) {
+  layoutScratch(weights, head, operators, mhc_, moeShape_, moeFormats_, *scratch_, [&](uint64_t bytes, const char *label) {
     bytes = std::max<uint64_t>(bytes, 16);
     allocated_ += bytes;
     metal::MetalBuffer buffer = backend_.allocateBuffer(bytes, metal::BufferStorage::Shared, label);
@@ -338,7 +334,7 @@ void DSparkDraft::addDecode(metal::CommandGraph &graph, const DSparkDecodeBuffer
       counts[row] = filled + block;
     }
   }
-  const ops::MoePlan plan = operators_.moeDecode(moeShape_, lanes);
+  const ops::MoePlan plan = operators_.moeDecode(moeShape_, moeFormats_, lanes);
   const float scale = 1.0F / std::sqrt(float(kLatent));
   ops::ManifoldHyperConnection::addInit(graph, buffers.input, s.streams, mhc_, rows);
   metal::MetalBuffer previous = s.firstMixes;

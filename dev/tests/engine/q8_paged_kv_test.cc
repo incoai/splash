@@ -94,7 +94,8 @@ void testWindows() {
       if (flint.windowed(later) == flint.windowed(layer))
         require(flint.region(later) > region, "a class of layers is out of layer order");
   }
-  for (const Layout layout : {Layout{16, 4, 256}, Layout{12, 2, 256, Format::Int8, 128, true}})
+  for (const Layout layout :
+       {Layout{16, 4, 256}, Layout{12, 2, 256, Format::Int8, 128, true, 0, 0, Reads::SelectedBlocks}})
     for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer)
       require(layout.region(layer) == layer && !layout.windowed(layer),
               "a layout without a window moved a layer");

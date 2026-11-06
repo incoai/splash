@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from types import SimpleNamespace
 from unittest import mock
 
-from dev.tests.server_fixtures import grammar_tokenizers
+from dev.tests.server_fixtures import READY, grammar_tokenizers
 from server import constraints
 from server import server as api
 from server.chat_format import QWEN
@@ -40,7 +40,7 @@ class ConstraintCacheTests(unittest.TestCase):
                 constraints.ConstraintFactory, "CACHE_SOURCE_BYTES", budget
             )
         )
-        return constraints.ConstraintFactory(object(), QWEN)
+        return constraints.ConstraintFactory(object(), READY)
 
     def test_byte_budget_evicts_lru_and_counts_utf8(self):
         factory = self.factory()
@@ -171,7 +171,7 @@ class ConstraintCacheTests(unittest.TestCase):
             "guidance_tokenizer",
             return_value=guidance,
         ):
-            factory = constraints.ConstraintFactory(object(), QWEN)
+            factory = constraints.ConstraintFactory(object(), READY)
         unsatisfiable = {"type": "array", "minItems": 5, "maxItems": 2}
         # More grammar symbols than the compiler can index make it panic.
         array = {"type": "array", "maxItems": tool_schema.MAX_GRAMMAR_BOUND}
@@ -199,7 +199,7 @@ class ConstraintCacheTests(unittest.TestCase):
             "guidance_tokenizer",
             return_value=guidance,
         ):
-            factory = constraints.ConstraintFactory(object(), QWEN)
+            factory = constraints.ConstraintFactory(object(), READY)
         barrier = threading.Barrier(8)
 
         def generate(index):
@@ -257,7 +257,7 @@ class ConstraintCacheTests(unittest.TestCase):
                 side_effect=lambda matcher, executor, _format: (matcher, executor),
             ),
         ):
-            factory = constraints.ConstraintFactory(object(), QWEN)
+            factory = constraints.ConstraintFactory(object(), READY)
             first = factory.create("one")
             second = factory.create("one")
             factory.create("two")
@@ -307,7 +307,7 @@ class ConstraintCacheTests(unittest.TestCase):
                 side_effect=lambda matcher, _executor, _format: matcher,
             ),
         ):
-            factory = constraints.ConstraintFactory(object(), QWEN)
+            factory = constraints.ConstraintFactory(object(), READY)
             with ThreadPoolExecutor(max_workers=4) as executor:
                 results = list(executor.map(factory.create, ["shared"] * 4))
 
@@ -348,7 +348,7 @@ class ConstraintCacheTests(unittest.TestCase):
                 side_effect=lambda matcher, _executor, _format: matcher,
             ),
         ):
-            factory = constraints.ConstraintFactory(object(), QWEN)
+            factory = constraints.ConstraintFactory(object(), READY)
             for _ in range(2):
                 with self.assertRaisesRegex(api.APIError, "^too wide$") as caught:
                     factory.create("wide", prefixes=lambda: prefixes(([9], "too wide")))

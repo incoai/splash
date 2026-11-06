@@ -1,14 +1,22 @@
 #include "model/VerifyBudget.hpp"
+#include "AwakeClock.hpp"
+#include "StderrLine.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <iomanip>
 #include <stdexcept>
+#include <utility>
 
 namespace splash::model {
 namespace {
 
 constexpr uint32_t kParameters = 1 + VerifyBudget::kPositions;
 constexpr uint32_t kIterations = 16;
+// At most one notice a minute of the cycles observe() counts at under half
+// their time: stalls show on real traffic without flooding stderr.
+constexpr double kNoticeMilliseconds = 60'000.0;
 
 // A cycle's cost at 1, 2, 4 and 8 rows a lane, for one to four lanes (every
 // row costs 1): the mean shape of Qwen3.8-Flash-Next's cycles (resident and
@@ -21,6 +29,33 @@ constexpr std::array<std::array<double, 4>, VerifyBudget::kLanes> kSeed{{
 }};
 
 using Parameters = std::array<double, kParameters>;
+
+// x with h x = g for a positive definite h, by Gaussian elimination with
+// partial pivoting: the Newton step of the acceptance fit.
+Parameters solve(std::array<Parameters, kParameters> h, Parameters g) noexcept {
+  for (size_t column = 0; column < kParameters; ++column) {
+    size_t pivot = column;
+    for (size_t row = column + 1; row < kParameters; ++row)
+      if (std::fabs(h[row][column]) > std::fabs(h[pivot][column]))
+        pivot = row;
+    std::swap(h[column], h[pivot]);
+    std::swap(g[column], g[pivot]);
+    for (size_t row = column + 1; row < kParameters; ++row) {
+      const double factor = h[row][column] / h[column][column];
+      for (size_t k = column; k < kParameters; ++k)
+        h[row][k] -= factor * h[column][k];
+      g[row] -= factor * g[column];
+    }
+  }
+  Parameters x{};
+  for (size_t row = kParameters; row-- > 0;) {
+    double sum = g[row];
+    for (size_t k = row + 1; k < kParameters; ++k)
+      sum -= h[row][k] * x[k];
+    x[row] = sum / h[row][row];
+  }
+  return x;
+}
 
 double logit(double p) {
   p = std::clamp(p, 1.0e-6, 1.0 - 1.0e-6);
@@ -47,32 +82,6 @@ double objective(std::span<const VerifyBudget::Label> labels, const Parameters &
   for (uint32_t i = 0; i < kParameters; ++i)
     value += 0.5 * VerifyBudget::priorPrecision(i) * (theta[i] - prior[i]) * (theta[i] - prior[i]);
   return value;
-}
-
-// x with h x = g, h positive definite: Gaussian elimination.
-Parameters solve(std::array<Parameters, kParameters> h, Parameters g) {
-  for (uint32_t column = 0; column < kParameters; ++column) {
-    uint32_t pivot = column;
-    for (uint32_t row = column + 1; row < kParameters; ++row)
-      if (std::fabs(h[row][column]) > std::fabs(h[pivot][column]))
-        pivot = row;
-    std::swap(h[column], h[pivot]);
-    std::swap(g[column], g[pivot]);
-    for (uint32_t row = column + 1; row < kParameters; ++row) {
-      const double factor = h[row][column] / h[column][column];
-      for (uint32_t k = column; k < kParameters; ++k)
-        h[row][k] -= factor * h[column][k];
-      g[row] -= factor * g[column];
-    }
-  }
-  Parameters x{};
-  for (uint32_t row = kParameters; row-- > 0;) {
-    double sum = g[row];
-    for (uint32_t k = row + 1; k < kParameters; ++k)
-      sum -= h[row][k] * x[k];
-    x[row] = sum / h[row][row];
-  }
-  return x;
 }
 
 } // namespace
@@ -150,12 +159,25 @@ void VerifyBudget::observe(std::span<const Lane> lanes, bool constrained, double
   }
   const uint32_t count = static_cast<uint32_t>(lanes.size());
   ++tableCycles_[constrained ? 1 : 0][count - 1];
+  Cost &cost = tables_[constrained ? 1 : 0][count - 1];
   if (std::isfinite(milliseconds) && milliseconds > 0.0) {
+    // The mean keeps the cap up where a stall tilted the line to next to
+    // nothing, since a cap at the line alone would hold it there.
     if (const auto fit = line(count, constrained)) {
-      const double expected = std::max(fit->first + fit->second * rows, 1.0e-3);
-      milliseconds = std::clamp(milliseconds, 0.5 * expected, 2.0 * expected);
+      const double counted =
+          std::min(milliseconds, 2.0 * std::max(fit->first + fit->second * rows, cost.time / cost.weight));
+      if (counted < 0.5 * milliseconds) {
+        ++cuts_;
+        if (const double now = awakeMilliseconds(); now >= nextNotice_) {
+          logLine("Verify budget: a cycle of ", count, count == 1 ? " lane" : " lanes", " and ", rows,
+                  " rows took ", std::fixed, std::setprecision(1), milliseconds, " ms and counts as ", counted,
+                  " ms (", cuts_, cuts_ == 1 ? " cycle" : " cycles", " cut by over half since the last such line)");
+          cuts_ = 0;
+          nextNotice_ = now + kNoticeMilliseconds;
+        }
+      }
+      milliseconds = counted;
     }
-    Cost &cost = tables_[constrained ? 1 : 0][count - 1];
     cost.weight = kDecay * cost.weight + 1.0;
     cost.rows = kDecay * cost.rows + rows;
     cost.rowsSquared = kDecay * cost.rowsSquared + double(rows) * rows;

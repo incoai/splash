@@ -4,6 +4,7 @@
 #include "NormReference.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
+#include "TestFamilies.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/KvExtent.h"
@@ -11,6 +12,7 @@
 #include "ops/Linear.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/RoPE.hpp"
+#include "ops/KernelCalibration.hpp"
 
 #include <algorithm>
 #include <array>
@@ -33,6 +35,10 @@
 
 namespace {
 
+// The pages per prefill attention split these plans take: the Apple10 row's
+// (KernelCalibration.hpp).
+constexpr uint32_t kPagesPerSplit = splash::ops::kAttention.prefillPagesPerSplit;
+
 using namespace splash;
 using test::HostKvExtents;
 using test::bf16ToFloat;
@@ -42,6 +48,8 @@ using test::require;
 using test::ulpBf16;
 
 constexpr uint32_t kQueryHeads = 32, kKvHeads = 4, kGroup = kQueryHeads / kKvHeads, kHeadDimension = 128;
+// The geometry among the families' (TestFamilies.hpp): Flint's.
+constexpr test::AttentionGeometry kGeometry{kQueryHeads, kKvHeads, kHeadDimension, kv::Reads::EveryPage};
 constexpr uint32_t kWindow = 512, kRotaryPairs = kHeadDimension / 2;
 constexpr uint32_t kPageTokens = kv::kPageTokens;
 // The attention layer under test is the second of a pool's two, so its region
@@ -183,7 +191,7 @@ Case makeCase(metal::MetalBackend &backend, kv::Format format, ops::AttentionVar
         ++data.poisoned;
       }
     data.tables[lane] = zeroed(backend, table.size() * sizeof(SplashKvPage));
-    data.pool.writeTable(table, data.tables[lane].contents());
+    data.pool.writeTable(table, data.tables[lane]);
     for (uint32_t token = 0; token < histories[lane]; ++token)
       for (uint32_t head = 0; head < kKvHeads; ++head) {
         const uint32_t id = data.page(lane, token), place = token % kPageTokens;
@@ -417,7 +425,8 @@ template <class Plan> metal::CommandGraph encode(const Case &data, const Staging
 // A plan's kernels and grids: the variant's split and reduce of the
 // geometry, the reduce a thread per dimension, and the window's split
 // counts.
-template <class Plan> void checkPlan(const Case &data, const Plan &plan, const metal::CommandGraph &graph) {
+template <class Plan>
+void checkPlan(const Case &data, const Staging &staging, const Plan &plan, const metal::CommandGraph &graph) {
   constexpr bool prefill = std::is_same_v<Plan, ops::PrefillAttentionPlan>;
   const std::string phase = prefill ? "prefill" : "verify";
   const std::string window = data.variant.windowTokens ? "_w" + std::to_string(data.variant.windowTokens) : "";
@@ -433,7 +442,14 @@ template <class Plan> void checkPlan(const Case &data, const Plan &plan, const m
           "the store and reduce run a thread per dimension, the reduce with the sinks");
   const uint32_t pages = kv::windowAttentionPages(kWindow);
   if constexpr (prefill) {
-    const uint32_t splits = std::clamp(32U / plan.tiles, 1U, 32U);
+    // A split per 32 pages a tile's rows read (with a window, no more than
+    // its window's), no fewer than 32 shared out over its tiles, no more
+    // than 32 nor 256 over them.
+    const uint64_t seen = (uint64_t{data.histories[0]} + staging.first + plan.rows + 31) / 32;
+    const uint64_t read = data.variant.windowTokens ? std::min<uint64_t>(seen, pages) : seen;
+    const uint32_t shared = std::clamp(32U / plan.tiles, 1U, 32U);
+    const uint32_t splits = static_cast<uint32_t>(
+        std::clamp<uint64_t>(read / 32, shared, std::clamp(256U / plan.tiles, shared, 32U)));
     require(plan.splits == (data.variant.windowTokens ? std::min(splits, pages) : splits),
             "a prefill's splits are not its window's");
   } else {
@@ -449,7 +465,7 @@ template <class Plan> void run(metal::MetalBackend &backend, const Case &data, c
   const metal::MetalBuffer partials = poisoned(backend, plan.workspace.partialsBytes);
   const metal::MetalBuffer statistics = poisoned(backend, plan.workspace.statisticsBytes);
   const metal::CommandGraph graph = encode(data, staging, plan, partials, statistics);
-  checkPlan(data, plan, graph);
+  checkPlan(data, staging, plan, graph);
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 }
 
@@ -475,7 +491,9 @@ void checkPrefill(metal::MetalBackend &backend, kv::Format format, ops::Attentio
     for (uint32_t first = 0; first < rows; first += chunk) {
       const uint32_t chunkRows = std::min(chunk, rows - first);
       const Staging staging = stage(backend, data, first, chunkRows, (chunkRows + kPageTokens - 1) / kPageTokens * kPageTokens);
-      run(backend, data, staging, ops::PagedAttention::prefillPlan(chunkRows, kQueryHeads, data.layout, variant));
+      run(backend, data, staging,
+          ops::PagedAttention::prefillPlan(chunkRows, history + first, kQueryHeads, data.layout, kPagesPerSplit,
+                                           variant));
       checkStore(data, staging, what);
       largest = std::max(largest, checkOutput(data, staging, what + (whole ? "" : " in chunks of " + std::to_string(chunk))));
     }
@@ -529,7 +547,7 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format) {
   }
   const Case tile = makeCase(backend, format, kWindowed, 1, 8, {4103, 0, 0, 0});
   const Staging tileStaging = stage(backend, tile, 0, 8, kPageTokens);
-  const auto tilePlan = ops::PagedAttention::prefillPlan(8, kQueryHeads, tile.layout, kWindowed);
+  const auto tilePlan = ops::PagedAttention::prefillPlan(8, 4103, kQueryHeads, tile.layout, kPagesPerSplit, kWindowed);
   run(backend, tile, tileStaging, tilePlan);
   for (uint32_t splits = 1; splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS; ++splits) {
     const metal::MetalBuffer partials = poisoned(backend, uint64_t{splits} * kKvHeads * 64 * kHeadDimension * 4);
@@ -561,7 +579,8 @@ void checkWindowWithinHistory(metal::MetalBackend &backend, kv::Format format) {
       run(backend, data, staging,
           ops::PagedAttention::verifyPlan(lanes, kQueryHeads, data.layout, std::span(histories).first(lanes), variant));
     else
-      run(backend, data, staging, ops::PagedAttention::prefillPlan(rows, kQueryHeads, data.layout, variant));
+      run(backend, data, staging,
+          ops::PagedAttention::prefillPlan(rows, histories[0], kQueryHeads, data.layout, kPagesPerSplit, variant));
     const auto *begin = contents<uint16_t>(staging.output);
     return std::vector<uint16_t>(begin, begin + staging.output.sizeBytes() / 2);
   };
@@ -583,20 +602,30 @@ void checkPlans(metal::MetalBackend &backend) {
   require(kv::windowAttentionPages(512) == 18 && kv::verifyAttentionSplits(0, 512) == 18 &&
               kv::verifyAttentionSplits(1'000'000, 512) == 18 && kv::verifyAttentionSplits(1'000'000) == 128,
           "a window of 512 keys reads at most 18 pages");
+  // A windowed tile reads its window's pages whatever its history, so a
+  // windowed chunk keeps its splits as the history grows; a whole layer's
+  // chunk takes more.
+  const auto splitsAfter = [&](uint32_t history, ops::AttentionVariant variant) {
+    return ops::PagedAttention::prefillPlan(64, history, kQueryHeads, layout, kPagesPerSplit, variant).splits;
+  };
+  require(splitsAfter(1024, kWindowed) == splitsAfter(65536, kWindowed) &&
+              splitsAfter(1024, kWhole) < splitsAfter(65536, kWhole),
+          "a windowed chunk's splits follow its history, or a whole chunk's do not");
   for (const ops::AttentionVariant variant : {ops::AttentionVariant{.rotated = true, .windowTokens = 256},
                                               ops::AttentionVariant{.rotated = false, .windowTokens = 1024}})
-    rejects([&] { (void)ops::PagedAttention::prefillPlan(8, kQueryHeads, layout, variant); },
+    rejects([&] { (void)ops::PagedAttention::prefillPlan(8, 0, kQueryHeads, layout, kPagesPerSplit, variant); },
             "no attention kernel for the layer's variant", "a window the geometry has no kernels for was accepted");
   for (const ops::AttentionVariant variant : {kWindowed, kWhole})
-    rejects([&] { (void)ops::PagedAttention::prefillPlan(8, 24, qwen, variant); },
+    rejects([&] { (void)ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kPagesPerSplit, variant); },
             "no attention kernel for the layer's variant", "a variant of a geometry without it was accepted");
-  require(!ops::PagedAttention::prefillPlan(8, 24, qwen).sinks &&
-              ops::PagedAttention::prefillPlan(8, 24, qwen).reducePipeline == "prefill_attention_reduce",
+  require(!ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kPagesPerSplit).sinks &&
+              ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kPagesPerSplit).reducePipeline ==
+                  "prefill_attention_reduce",
           "a geometry without sinks takes none");
   const metal::MetalBuffer buffer = zeroed(backend, 1 << 23), sinks = zeroed(backend, kQueryHeads * 4);
   const metal::MetalBuffer fewSinks = zeroed(backend, kQueryHeads * 4 - 4);
   const kv::ChunkedPrefillParams chunk = ops::PagedAttention::prefillParams(0, 8, 32, 1);
-  const auto plan = ops::PagedAttention::prefillPlan(8, kQueryHeads, layout, kWindowed);
+  const auto plan = ops::PagedAttention::prefillPlan(8, 0, kQueryHeads, layout, kPagesPerSplit, kWindowed);
   metal::CommandGraph graph;
   rejects([&] { ops::PagedAttention::addPrefill(graph, {1, 0}, buffer, buffer, buffer, buffer, buffer, chunk, plan); },
           "attention sinks buffer holds", "a plan with sinks encoded without them");
@@ -605,7 +634,7 @@ void checkPlans(metal::MetalBackend &backend) {
   }, "attention sinks buffer holds", "a plan with sinks encoded with too few");
   rejects([&] {
     ops::PagedAttention::addPrefill(graph, {1, 0}, buffer, buffer, buffer, buffer, buffer, chunk,
-                                    ops::PagedAttention::prefillPlan(8, 24, qwen), {}, sinks);
+                                    ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kPagesPerSplit), {}, sinks);
   }, "the attention kernels take no sinks", "a plan without sinks encoded with some");
   require(graph.empty(), "a refused attention encoded a dispatch");
   std::cout << "variant plans PASS\n";
@@ -615,8 +644,9 @@ void checkPlans(metal::MetalBackend &backend) {
 // 32 query heads, then 4 K and 4 V heads, of 128. Rotated, each pair
 // (i, i + 64) of the normalized head rotates by its row's table entry, NeoX's
 // half split of the whole head; unrotated (NoPE) the head is its norm, and no
-// table is bound. Against fp64 with norm weights in bf16 or F32, as
-// paged_attention_plan_test's check of the gated geometries.
+// table is bound. Against fp64 with norm weights of each type the geometry's
+// families store (test::familyNorms), as paged_attention_plan_test's check of
+// the gated geometries.
 void checkProjection(metal::MetalBackend &backend, bool rotated, bool float32, bool verify) {
   const ops::AttentionVariant variant{.rotated = rotated, .windowTokens = 0};
   const kv::Layout layout = layoutOf(kv::Format::Int8);
@@ -805,7 +835,7 @@ int main(int argc, char **argv) {
     checkPlans(backend);
     checkRopeTables(backend);
     for (const bool rotated : {true, false})
-      for (const bool float32 : {false, true})
+      for (const bool float32 : test::familyNorms(kGeometry))
         for (const bool verify : {false, true}) checkProjection(backend, rotated, float32, verify);
     checkGather(backend);
     for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {

@@ -1,10 +1,10 @@
 #pragma once
 
 // DeepSeek-V4.1-Flash (GGUF architecture deepseek41, model type
-// deepseek_v41_text; ISTA-DASLab's GSQ-RCO GGUFs): 40 layers, each a latent
-// attention and a sparse MoE on a manifold hyper-connected residual, as
-// DeepSeek's model.py computes them (dev/tools/deepseek41_reference.py; its
-// dimensions in QwenTargetDimensions::deepseek, DeepSeek41Dimensions).
+// deepseek_v41_text): 40 layers, each a latent attention and a sparse MoE on a
+// manifold hyper-connected residual, as dev/tools/deepseek41_reference.py
+// computes them (its dimensions in QwenTargetDimensions::deepseek,
+// DeepSeek41Dimensions).
 //  - Attention of 64 query heads over one latent per token of 512 values,
 //    its key and its value: queries from a low-rank latent of 1280 values,
 //    the latent from the row's input, both RMS normalized and rotated by

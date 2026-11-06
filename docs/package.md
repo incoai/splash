@@ -3,12 +3,12 @@
 Release archives contain no Hugging Face credentials.
 Users accessing private models supply their own `HF_TOKEN` or Hugging Face login.
 
-Release versions are three-part, `x.y.z`, with no `v` prefix: after `1.2.1`
-comes `1.2.2` for a fix or `1.3.0` for a feature. Use the same version in all
+Release versions are three-part, `x.y.z`, with no `v` prefix: after `1.5.0`
+comes `1.5.1` for a fix or `1.6.0` for a feature. Use the same version in all
 three commands:
 
 ```sh
-VERSION=1.2.2  # the release being built
+VERSION=1.6.0  # the release being built
 make package RELEASE_VERSION=$VERSION
 make package-bottle RELEASE_VERSION=$VERSION
 make package-check RELEASE_VERSION=$VERSION
@@ -72,7 +72,10 @@ the launch options picked in the app that differ from the server's defaults,
 ready once the port's lock names that process and `/health` answers; stopping
 is Ctrl+C's SIGINT to the group. Switching models stops one server and starts
 the next. The app starts nothing by itself: its window opens on the Server,
-where models download, start and switch, beside the Chat. Models, locks and
+where models download, start and switch, beside the Chat. The toolbar's switch
+opens the Chat, whose sidebar of conversations ⌘B hides, and the Server's
+button at its end the Server: it shows the model that runs, a spinner while
+one starts and a ring for a download's progress. Models, locks and
 downloads are the ones a packaged `splash` uses, in `~/Library/Application
 Support/Splash` and the Hugging Face cache. The app offers
 `install/suggested-models.tsv`, per model the variant meant for the Mac's
@@ -82,9 +85,22 @@ picks, from a script that holds the running server's API key and removes itself
 as it starts. Its launch options are every option `splash serve` takes but the
 ones of one model (`--revision`, `--draft-model`, `--mmproj`) and the ones it
 sets itself, from one table (`LaunchOption.all`) the tests hold to `splash
-serve --help`; the API key reaches the server as `SPLASH_API_KEY`, from the
-Keychain, and nothing starts while the Keychain does not give it. It serves
-model files on this Mac the user adds with `splash serve --model local/NAME
+serve --help`. It offers a model only those its family can use, and passes
+no other: at launch it runs `install/families.py`, which reports for each
+family, from the engine's `families` command and the options' own needs
+(`ServeOption.needs`), the options none of its models can use and the context
+they serve; a model's family is its assembly record's, and a model whose
+family is not known yet gets every option. The API key reaches the server as
+`SPLASH_API_KEY`, from the
+Keychain, and nothing starts while the Keychain does not give it. The server
+stops as SIGTERM stops it once the app has ended, by a crash too, since the app
+passes its process ID as `SPLASH_APP_PID`; the app's next launch stops one still
+running, as it does a download, by the process ID and start time it keeps. An
+app before 1.6 kept the ID alone, and the server's port: the next launch stops
+that server if the ID still holds the port's lock, and that download if the ID
+still runs the download command above; it leaves any other process alone and
+forgets the record. It serves model files on this Mac
+the user adds with `splash serve --model local/NAME
 --model-dir PATH`, NAME being the file's or folder's name made a repository
 name, and at launch it runs `install/cached.py`. While a model runs, the Server
 shows its context limit, from `/v1/models`, and its `/status`: requests,
@@ -93,7 +109,10 @@ taken from the cache, and the Metal memory it holds, with each request's line
 of the server's log, folded. Its chat is its own, not the chat page: it streams
 `/v1/chat/completions` and keeps each conversation as a JSON file in
 `~/Library/Application Support/Splash/Chats`, so a conversation outlives a
-switch of models. Its icon is `app/AppIcon.icon`, an Icon Composer document
+switch of models. The window's drawer, ⌘J or the toolbar's terminal button,
+holds terminals, each the user's login shell in the home folder, through
+SwiftTerm, and the server's and the downloads' logs as they are written. Its
+icon is `app/AppIcon.icon`, an Icon Composer document
 `actool` compiles, which needs the full Xcode; its mark, three arcs of water
 springing from a rippled surface, is the menu bar's too (`SplashMark`), and the
 chat page's (`server/favicon.svg`). `swift test --package-path app` runs its
@@ -145,29 +164,34 @@ from the app in the disk image: the build number Sparkle compares
 (`CFBundleVersion`), the version it shows and `LSMinimumSystemVersion`. It
 signs the disk image with the release key from the login keychain, or the
 file `SPARKLE_KEY_FILE` names, and checks the signature with
-`SPARKLE_PUBLIC_KEY`. The apps check whichever release is the latest, and
-cannot while it carries no appcast. A release candidate, `x.y.z-rc.N`, is a
-prerelease, never the latest.
+`SPARKLE_PUBLIC_KEY`, and that the build number is above that of the release
+before, the latest annotated `x.y.z` tag below the version, whose apps Sparkle
+would otherwise never update. The build number is the commit count, so
+`package_app.py` builds nothing from a shallow clone. The apps check whichever
+release is the latest, and cannot while it carries no appcast. A release
+candidate, `x.y.z-rc.N`, is a prerelease, never the latest.
 
 ### Releases
 
 A release is made from its annotated tag, on the Mac that holds the Developer
 ID and the release key, once `make package` and `make package-bottle`
 ([package](#package)) have left the command line's files of its version in
-`dist/`, and published by hand:
+`dist/`, and published by hand. Its notes are `docs/release-notes/<version>.md`,
+committed before the tag; [1.6.0's](release-notes/1.6.0.md) are the first kept
+there, and earlier releases' are only on their GitHub releases:
 
 ```sh
 git tag -a $VERSION -m $VERSION    # on the release commit
 make release-app RELEASE_VERSION=$VERSION \
-    RELEASE_NOTES=$HOME/splash-releases/$VERSION.md \
+    RELEASE_NOTES=docs/release-notes/$VERSION.md \
     SIGN_IDENTITY="Developer ID Application: NAME (TEAMID)" \
     NOTARY_PROFILE=splash-notary
 ```
 
 `make release-app` (`dev/tools/release_app.py`) first lists what keeps the
 release from being whole, and stops on any of it: a change in the checkout,
-untracked files included, which is why the notes live outside it; a HEAD that
-is not the tag's commit, as the app shows the tag's `x.y.z`; an identity no
+untracked files included, which is why the notes are committed first; a HEAD
+that is not the tag's commit, as the app shows the tag's `x.y.z`; an identity no
 keychain holds; no notary credentials; an empty `SPARKLE_PUBLIC_KEY`; a
 `dist/release/<version>` already made; and, unless it is a release candidate,
 `x.y.z-rc.N`, which carries the app alone, a `dist/` without the version's

@@ -204,9 +204,8 @@ inline void decode(device const bfloat *table, device const float *sums, device 
   for (uint u = u0; u < u1; ++u) {
     // This unit's coefficients for the simdgroup's NC columns, each decoded
     // once. Every source load is issued before the first decode waits for one,
-    // which takes 1-8% off the zero-point formats of 16-input scales (16
-    // coefficients per column and unit) at one to four lanes on the 40-core
-    // M3 Max.
+    // which takes up to 8% off the zero-point formats of 16-input scales (16
+    // coefficients per column and unit).
     constexpr uint I = (NC * S::J + 31) / 32;
     CoefSource<F> src[I];
 #pragma unroll
@@ -421,12 +420,11 @@ GGUF_SG_FUSED(4)
 #undef GGUF_SG_SEGMENT
 
 // MoE experts (ops/MoE.cpp): threadgroup (x, y) computes 64 columns of grouped 8-row tile y from its Table16 tile
-// (kernels/shared/moe.metal) with the weights of the tile's expert (moe_gguf_segment), the routed ones in the chunks
-// of the table at the index after the parameters (metal/abi/MoE.h), of a block whose shared expert is Shared slices
-// (each instance's slices suffix, ops::kCompiledMoeRoutings), in the format the tile picks
-// at run time: on the 40-core M3 Max one run-time-format kernel is within +1.6% of the per-format kernels
-// (23040x2048 Q4_K and 92160x512 Q5_K, one to four lanes). No K splits, so no partials or counters.
-// aux is the gate of the up pass. Grid (column tiles, expert tiles), GGUF_REGISTER_THREADS threads.
+// (kernels/shared/moe.metal) with the weights of the tile's expert (moe_gguf_segment), the routed ones in the chunks of
+// the table at the index after the parameters (metal/abi/MoE.h), of a block whose shared expert is Shared slices (each
+// instance's slices suffix, ops::kCompiledMoeRoutings), in the format the tile picks at run time (within 1.6% of
+// per-format kernels). No K splits, so no partials or counters. aux is the gate of the up pass. Grid (column tiles,
+// expert tiles), GGUF_REGISTER_THREADS threads.
 template <GgufEpilogue Ep, uint Shared>
 inline void gguf_sg_expert(device const bfloat *table, device const float *sums, device const MoeTileDescriptor *tiles,
                            device const uint *tile_count, device uchar *sw0, device uchar *sw1, device uchar *smeta,

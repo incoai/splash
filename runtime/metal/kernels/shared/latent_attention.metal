@@ -7,8 +7,7 @@
 using namespace metal;
 
 // Latent attention (metal/abi/LatentAttention.h, DeepSeek-V4.1's), as
-// DeepSeek's model.py computes it (sparse_attn; in
-// dev/tools/deepseek41_reference.py Forward.attention): each head's scores
+// dev/tools/deepseek41_reference.py Forward.attention computes it: each head's scores
 // over the row's keys, scaled; their softmax beside the head's sink logit,
 // which takes its share of the denominator and no value; and the sum of the
 // keys, each its own value, by those weights. Three passes: the scores of

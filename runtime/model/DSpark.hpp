@@ -1,8 +1,8 @@
 #pragma once
 
 // DSpark, DeepSeek-V4.1-Flash's own block drafter: the checkpoint's three
-// mtp.* stages, which unsloth's dspark-*.gguf holds as a GGUF of
-// architecture dflash (DeepSeek's inference/model.py DSparkBlock). Its layers
+// mtp.* stages, which a dspark-*.gguf holds as a GGUF of architecture dflash.
+// Its layers
 // are the family's (model/DeepSeek41.hpp) of window attention alone, whose
 // window holds, for each position the target ran, the latent of the target's
 // hidden row there: the mean of the four streams at the input of each of

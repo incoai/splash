@@ -1,0 +1,259 @@
+/* The transcript page's look: the system's reading font and colors, following the app's
+   appearance, the app's motion, the 680 pt column, the app's buttons and symbols, the user's words,
+   the actions under a reply, and a line that opens to what it holds; how they lay out in the
+   conversation is in transcript.css. Lines are as tall as SwiftUI sets the system font, which is no
+   fixed share of its size: 19 pt at 15, 15 at 12, 24 at 20; text with room between its lines has
+   that room between lines alone, none over the first or under the last. */
+
+:root {
+  color-scheme: light dark;
+  --label: -apple-system-label;
+  --secondary: -apple-system-secondary-label;
+  --tertiary: -apple-system-tertiary-label;
+  --quaternary: -apple-system-quaternary-label;
+  --separator: -apple-system-separator;
+  /* The mark's color (Color.splash in Mark.swift), the app's one accent: the user's messages are
+     tinted with it. */
+  --splash: color(display-p3 0.055 0.604 0.588);
+  --bubble: color-mix(in srgb, var(--splash) 11%, transparent);
+  /* Fills WebKit doesn't name, as shares of the quaternary label color: inline code (the tertiary
+     system fill), a button under the pointer. */
+  --fill: color-mix(in srgb, var(--quaternary) 48%, transparent);
+  --hover: color-mix(in srgb, var(--quaternary) 75%, transparent);
+  /* The system's link color, which WebKit's isn't. */
+  --link: rgb(0 104 218);
+  /* Motion.swift's quick and settle; settle, a change of state, happens at once with Reduce Motion. */
+  --quick: .12s ease-out;
+  --settle: .24s cubic-bezier(.25, .8, .25, 1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --link: rgb(65 156 255);
+    --splash: color(display-p3 0.345 0.902 0.878);
+    --bubble: color-mix(in srgb, var(--splash) 14%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --settle: 0s; }
+}
+
+html, body {
+  margin: 0;
+  background: transparent;
+}
+
+/* Room for a scroller on both sides, where the Mac shows scrollers always (a mouse plugged in), so
+   that the column stays on the composer's axis, which has none, whether or not the page scrolls. */
+html { scrollbar-gutter: stable both-edges; }
+
+body {
+  font: 15px/19px -apple-system, sans-serif;
+  color: var(--label);
+  overflow-wrap: anywhere;
+}
+
+[hidden] { display: none !important; }
+
+/* The column, which the composer under it lines up with (column in ChatScreen.swift). */
+main {
+  max-width: 680px;
+  margin: 0 auto;
+  padding: 28px 32px;
+}
+
+p, h1, h2, h3, h4, h5, h6, pre, figure, blockquote, ul, ol {
+  margin: 0;
+}
+
+/* MARK: Buttons */
+
+button {
+  margin: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: default;
+}
+
+/* The app's own buttons (HoverStyle): plain, a rounded highlight under the pointer, deeper while
+   pressed; faded while disabled. */
+.hover {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 7px;
+  transition: background-color var(--quick);
+}
+
+.hover:hover:not(:disabled) { background-color: var(--hover); }
+.hover:active:not(:disabled) { background-color: var(--quaternary); }
+.hover:disabled { opacity: .4; }
+
+/* The SF Symbols the app sends a page (setup in page.js): masks colored as text is, but the
+   warning sign, in its own colors. */
+.glyph {
+  display: inline-block;
+  flex: none;
+  background: currentColor;
+  mask: no-repeat center / contain;
+}
+
+.glyph.chevron { mask-image: var(--chevron); width: var(--chevron-width); height: var(--chevron-height); }
+.glyph.copy { mask-image: var(--copy); width: var(--copy-width); height: var(--copy-height); }
+.glyph.check { mask-image: var(--check); width: var(--check-width); height: var(--check-height); }
+.glyph.down { mask-image: var(--down); width: var(--down-width); height: var(--down-height); }
+.glyph.warning { mask: none; background: var(--warning) no-repeat center / contain; width: var(--warning-width); height: var(--warning-height); }
+
+/* A copy says so with a check. */
+.glyph.check, .copied .glyph.copy { display: none; }
+.copied .glyph.check { display: inline-block; }
+
+/* The user's words: their images, then their text in a bubble, filled where the model's are not,
+   at the column's end; the images with a hairline, so that a white one keeps its edge. */
+.user {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.user .images {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.user .images img {
+  width: 120px;
+  height: 120px;
+  object-fit: cover;
+  border-radius: 12px;
+  outline: 1px solid var(--separator);
+  outline-offset: -1px;
+}
+
+.bubble {
+  padding: 8.5px 16px;
+  border-radius: 18px;
+  background: var(--bubble);
+  line-height: 22px;
+  white-space: pre-wrap;
+}
+
+/* MARK: Actions */
+
+/* The actions under a reply, copy first, which keep their place, so that it doesn't grow as they
+   show; transcript.css says when they show. */
+.actions {
+  display: flex;
+  align-items: center;
+  margin-left: -6px;
+  font-size: 12px;
+  line-height: 15px;
+  color: var(--secondary);
+  user-select: none;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--quick);
+}
+
+/* What the actions say of their reply after the buttons: the model and its speed, and that it
+   was stopped. */
+.details {
+  padding-left: 6px;
+  font-size: 11px;
+  line-height: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* MARK: Lines that open */
+
+/* A line over what it opens to, as the model's thinking: its verb and facts in a fainter tone
+   after a chevron, which turns as it opens. */
+.line {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+/* A line that waits shows half a second into the wait, so that a quick answer doesn't flash it. */
+.line.waiting { animation: appear var(--quick) .5s both; }
+
+@keyframes appear {
+  from { opacity: 0; }
+}
+
+.toggle {
+  margin-left: -6px;
+  font-size: 12px;
+  line-height: 15px;
+  color: var(--secondary);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+.toggle .chevron {
+  margin: 0 calc((12px - var(--chevron-width)) / 2);
+  transition: rotate var(--settle);
+}
+
+.open > .toggle .chevron { rotate: 90deg; }
+.facts { color: var(--tertiary); }
+
+/* What a line opens to, which unfolds; hidden once folded, so that a copy of the page leaves it
+   out. */
+.thought {
+  display: grid;
+  grid-template-rows: 0fr;
+  align-self: stretch;
+  opacity: 0;
+  visibility: hidden;
+  transition: grid-template-rows var(--settle), opacity var(--settle), visibility 0s var(--settle);
+}
+
+.open > .thought {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  visibility: visible;
+  transition-delay: 0s;
+}
+
+.fold {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* The model's thinking, set apart by a rule at its side as quotes are (markdown.css). */
+.reasoning {
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 16px;
+  color: var(--secondary);
+  white-space: pre-wrap;
+}
+
+/* While the model thinks, its latest lines, faded at the top, as they fold too. */
+.line.latest .text {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  max-height: 96px;
+  overflow: hidden;
+}
+
+.line.latest.tall .text { mask-image: linear-gradient(transparent, black 28px); }
+
+/* Why something stopped short: the warning sign and a sentence. */
+.error {
+  display: flex;
+  align-items: center;
+  gap: 7.5px;
+  font-size: 12px;
+  line-height: 15px;
+  color: var(--secondary);
+}

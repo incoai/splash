@@ -78,6 +78,11 @@ planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
   return result;
 }
 
+// A dispatch holds at most two capture spans (DispatchDraftCapturePlan):
+// every span after the first is at least draftContextTokens long, so a third
+// would need a dispatch of more rows than the window, 2048.
+static_assert(model::ExecutionLimits::prefillTokenBudget <= model::ExecutionLimits::draftContextTokens);
+
 DispatchDraftCapturePlan
 draftCaptureSpansForDispatch(const DraftContextPlan &plan,
                              uint32_t dispatchBegin, uint32_t dispatchEnd) {

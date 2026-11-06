@@ -69,8 +69,8 @@ void checkSplit(const std::filesystem::path &directory) {
   {
     const splash::model::OpenGguf split(paths);
     const splash::model::GgufFile &file = split.file();
-    require(file.files() == 2 && file.tensors().size() == 4 && file.metadata().architecture() == "fixture" &&
-                file.metadata().unsignedValue("split.count") == 2,
+    require(file.tensors().size() == 4 && file.tensors().back().file == 1 &&
+                file.metadata().architecture() == "fixture" && file.metadata().unsignedValue("split.count") == 2,
             "a split GGUF's tensors and its first part's metadata changed");
     // The parts' headers differ in size, so a tensor read at the other
     // part's data offset reads other bytes.
@@ -114,8 +114,8 @@ void checkMetadataPart(const std::filesystem::path &directory) {
   splash::test::writeFile(paths[1], part({}, 1, 2, 2, tensors));
   const splash::model::OpenGguf split(paths);
   const splash::model::GgufFile &file = split.file();
-  require(file.files() == 2 && file.tensors().size() == 2 && file.metadata().architecture() == architecture &&
-              file.source(0).dataOffset() == first.size(),
+  require(file.tensors().size() == 2 && file.tensors().front().file == 1 &&
+              file.metadata().architecture() == architecture && file.source(0).dataOffset() == first.size(),
           "a split GGUF's metadata-only first part was not read as an empty data section");
   for (const gguf::Tensor &expected : tensors) {
     const splash::model::GgufTensor &tensor = file.require(expected.name);

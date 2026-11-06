@@ -205,7 +205,7 @@ DeepSeek41Target::DeepSeek41Target(const DeepSeek41Weights &weights, const QwenT
   if (!weights.streamedTable || weights.engramFirstRows.size() != static_cast<size_t>(std::popcount(d_.engramLayers)))
     throw std::invalid_argument("DeepSeek-V4.1 runs with its Engram tables streaming, which these weights do not");
   mhc_ = {layout.hiddenSize, d_.sinkhornIterations, d_.hcEpsilon, d_.normEpsilon};
-  moeShape_ = geometry_.moeShape();
+  moeShape_ = geometry_.moeBlockShape();
   for (uint32_t layer = 0; layer < layout.layers; ++layer)
     if (DeepSeek41Dimensions::has(d_.compressorLayers, layer)) {
       pairedOf_.push_back(DeepSeek41Dimensions::has(d_.pairedLayers, layer)
@@ -300,7 +300,7 @@ void DeepSeek41Target::addEngram(metal::CommandGraph &graph, const Scratch &s, c
   const uint32_t table = static_cast<uint32_t>(std::popcount(d_.engramLayers & ((uint64_t{1} << index) - 1)));
   const uint32_t hidden = weights_.layout.hiddenSize, perToken = (d_.engramNgram - 1) * d_.engramHeads;
   const ops::EmbeddingWeights stagedRows{staged, d_.engramHeadDimension,
-                                         ops::NativeRows(s.engramStaging, weights_.engramFormat)};
+                                         ops::StoredRows(s.engramStaging, weights_.engramFormat)};
   const uint32_t tile = decode ? rows : kLayerTile;
   for (uint32_t begin = 0; begin < rows; begin += tile) {
     const uint32_t n = std::min(tile, rows - begin);
@@ -564,7 +564,7 @@ std::vector<metal::MetalBuffer> DeepSeek41Target::addPrefill(metal::CommandGraph
     const Scratch &s = prefill_[c];
     if (chunk.sequences.empty() || chunk.sequences.size() > kLanes || !chunk.rows || chunk.rows > s.rows)
       throw std::invalid_argument("invalid DeepSeek-V4.1 prefill chunk");
-    plans.push_back(operators_.moePrefill(moeShape_, chunk.rows));
+    plans.push_back(operators_.moePrefill(moeShape_, geometry_.moeFormats, chunk.rows));
     ffn[c] = {chunk.buffers.normalized, zeros_, s.ffnOut, chunk.buffers.moe, {}};
     for (uint32_t index = 0; index < chunk.sequences.size(); ++index) {
       const QwenTargetPrefillSequence &sequence = chunk.sequences[index];
@@ -764,7 +764,7 @@ void DeepSeek41Target::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuf
     }
     sequences.push_back(lanes);
   }
-  const ops::MoePlan plan = operators_.moeDecode(moeShape_, lanes);
+  const ops::MoePlan plan = operators_.moeDecode(moeShape_, geometry_.moeFormats, lanes);
   ops::ManifoldHyperConnection::addInit(graph, buffers.hidden[0], s.streams, mhc_, rows);
   for (uint32_t index = 0; index < layout.layers; ++index) {
     const DeepSeek41LayerWeights &layer = weights_.layers[index];

@@ -6,7 +6,7 @@
 // is the argmax of the row's logits plus the bias the Markov head projects
 // from the embedding of the token before it, and its confidence the sigmoid
 // of the confidence head's dot with the row's pre-sum of the streams and that
-// embedding (DeepSeek's inference/model.py DSparkBlock).
+// embedding.
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 #else

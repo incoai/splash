@@ -41,7 +41,10 @@ inline Fmt fmtNamed(const std::string &name) {
 }
 inline uint16_t f2h(float f) { __fp16 h = (__fp16)f; uint16_t u; memcpy(&u, &h, 2); return u; }
 inline float h2f(uint16_t u) { __fp16 h; memcpy(&h, &u, 2); return (float)h; }
+// A row of K values as a GGUF stores it: BF16's and F16's two bytes a value,
+// at any K; any other format's native blocks.
 inline uint32_t rowBytes(Fmt f, uint32_t K) {
+  if (f == BF16 || f == F16) return K * 2;
   const QuantFormat &i = kQuantFormats[f];
   return K / i.block_elements * i.block_bytes;
 }

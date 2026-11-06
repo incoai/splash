@@ -1,6 +1,6 @@
 """HTTP ingress bounds: the connections the server serves at once and the
 threads that serve them, the requests and request body bytes it admits, and
-the closing of connections it refuses."""
+the closing of the connections it answers."""
 
 import queue
 import re
@@ -163,25 +163,23 @@ class Workers:
 class WaitingConnections:
     """Connections that wait on their clients without a thread, all on one
     thread: ones given a slot, until the heads of their requests arrive, and
-    ones answered without their requests read, until their clients close.
+    answered ones, until their clients close.
 
-    One given a slot is looked at as it is handed over and again each time
-    its client sends more, which kqueue reports once per arrival; what the
-    client sent is left unread, for the connection's thread to read. Once it
-    is _ready, it keeps its slot (`slots.arrived`) and goes to
-    `dispatch(connection, address)`. One not ready by the deadline it was
-    given at its accept is closed without a response; one that gives its
-    slot away comes back here answered.
+    One given a slot is looked at, left unread for its thread, as it is
+    handed over and on each arrival kqueue reports. Once _ready, it keeps its
+    slot (`slots.arrived`) and goes to `dispatch(connection, address)`; one
+    not ready by its accept deadline is closed without a response; one that
+    gives its slot away comes back here answered.
 
-    Closing a connection with request bytes unread resets it, and the reset
-    can destroy the answer before the client reads it, as it does when the
-    client sends its request only after the close. An answered one is
-    half-closed instead; what its client still sends is read and dropped,
-    and it is closed once the client has closed or `linger` seconds after
-    its answer. At most `capacity` linger at once: one more takes the place
-    of the longest lingering, whose client has had the longest to read its
-    answer. At most `capacity` more wait for the thread to take them; any
-    beyond them are closed at once.
+    Closing a connection with request bytes unread resets it, which can
+    destroy the answer before the client reads it: a request refused unread,
+    or one sent after the answered one. An answered one is half-closed
+    instead, what its client still sends is dropped, and it is
+    closed once the client has closed or `linger` seconds after its answer.
+    At most `capacity` linger at once, a new one replacing the longest
+    lingering, whose client has had the longest to read its answer; at most
+    `capacity` more wait for this thread to take them; any beyond are closed
+    at once.
     """
 
     # The most events the thread takes at once.
@@ -222,9 +220,12 @@ class WaitingConnections:
             self._wake()
 
     def close(self, connection):
-        """Close `connection`, answered without its request read, as the
-        class does; one held for its request stops waiting for it."""
+        """Close `connection`, answered, as the class does; one held for its
+        request stops waiting for it."""
         try:
+            # What is read of it then must not wait: with a timeout, a socket
+            # waits for input before each read, MSG_DONTWAIT or not.
+            connection.settimeout(None)
             connection.shutdown(socket.SHUT_WR)
         except OSError:
             pass
@@ -360,23 +361,24 @@ class ConnectionSlots:
 
     A connection waits for its request without a thread, held by `waiting`,
     until the head of its request has arrived; it then keeps its slot, and
-    one of `workers`, a thread per slot started with the server, reads and
-    serves the request with `serve(connection, address)`. No thread starts
-    while connections arrive: they are taken as fast as they arrive, before
-    the kernel's queue overflows, and one whose client sends nothing, or
-    only part of a head, ties up no thread.
+    one of `workers`, a thread per slot started with the server, serves it
+    with `serve(connection, address)`. No thread starts while connections
+    arrive, so they are taken before the kernel's queue overflows, and a
+    client that sends nothing, or part of a head, ties up no thread.
 
-    One whose request's head has yet to arrive, or that drains an upload
-    refused unread, gives its slot to a new connection when no slot is free,
-    the longest waiting first, so stalled connections, however many and from
-    however many addresses, cannot keep others out. When every slot has a
-    request whose head has arrived, whether or not the waiting thread has
-    looked at it yet, the new connection is refused. One that gives way
-    awaiting its request gets the 503 of a connection refused at the accept,
-    as its request may be on its way, and is closed as a refused one is,
-    lingering, among at most `refused_capacity`, for up to `linger` seconds.
-    One draining a refused upload has its response already: it is shut
-    down, for its thread to see the end of its input.
+    When no slot is free, one still awaiting its head, or draining an upload
+    refused unread, gives its slot to the new connection, the longest
+    waiting first, so stalled connections, however many and from however
+    many addresses, cannot keep others out; when every slot has a request
+    whose head has arrived (looked at yet or not), the new connection is
+    refused. One that gives way awaiting its request gets the 503 of a
+    refused connection, as its request may be on its way, and is closed as
+    one; one draining a refused upload, already answered, is shut down for
+    its thread to see the end of its input.
+
+    Each connection is closed once answered, refused or served, lingering
+    among at most `answered_capacity` for up to `linger` seconds
+    (WaitingConnections).
     """
 
     # What a connection with a slot is doing.
@@ -384,7 +386,7 @@ class ConnectionSlots:
     SERVING = "serving"
     DRAINING = "draining"
 
-    def __init__(self, capacity, serve, refused_capacity, linger):
+    def __init__(self, capacity, serve, answered_capacity, linger):
         self.capacity = capacity
         # Each connection with a slot, mapped to what it is doing; those that
         # wait on their client in the order they began to.
@@ -394,7 +396,7 @@ class ConnectionSlots:
         self.idle.set()
         self.workers = Workers(capacity, serve)
         self.waiting = WaitingConnections(
-            self, self.workers.put, refused_capacity, linger
+            self, self.workers.put, answered_capacity, linger
         )
 
     def admit(self, connection, address, deadline):
@@ -473,6 +475,12 @@ class ConnectionSlots:
             if not self.holders:
                 self.idle.set()
 
+    def close(self, connection):
+        """Give back the slot of `connection`, served, and close it as an
+        answered one."""
+        self.release(connection)
+        self.waiting.close(connection)
+
     def stop(self):
         """Close every connection held without a thread, and end each worker
         once the connections handed to it are served."""
@@ -511,11 +519,12 @@ class RequestBodyReservation:
         self.size += size
 
     def retain_for(self, job):
-        # Generation retains schemas and, for Responses, conversation history.
-        # Text/image prompts have otherwise become tokens and prepared pixels.
+        # Generation retains schemas and the input its API keeps for its
+        # answer (Job.retained_input). Text/image prompts have otherwise
+        # become tokens and prepared pixels.
         policy = job.tool_policy
         retained = (
-            job.response_history_items,
+            job.retained_input,
             job.response_format,
             policy.schemas if policy else None,
             policy.namespaces if policy else None,

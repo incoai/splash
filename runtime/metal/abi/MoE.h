@@ -11,8 +11,9 @@
 // take this many floats, the block's experts first, and the select and
 // grouping kernels run one thread per slot. A MoE block of at most
 // SPLASH_MOE_EXPERT_SLOTS experts routes on their instances of that many
-// slots, one of more on their wide instances (_e512), so a block routes at
-// most SPLASH_MOE_WIDE_EXPERT_SLOTS experts.
+// slots, one of more on the softmax routing's wide instances (_e512)
+// (ops::kCompiledMoeRoutings), so a block routes at most
+// SPLASH_MOE_WIDE_EXPERT_SLOTS experts.
 #define SPLASH_MOE_EXPERT_SLOTS 256u
 #define SPLASH_MOE_WIDE_EXPERT_SLOTS 512u
 

@@ -1,137 +1,14 @@
-/* The Chat's transcript: a 680 pt column of messages, the system's reading font and colors,
-   following the app's appearance. Lines are as tall as SwiftUI sets the system font, which is no
-   fixed share of its size: 19 pt at 15, 15 at 12, 24 at 20; text with room between its lines has
-   that room between lines alone, none over the first or under the last. */
-
-:root {
-  color-scheme: light dark;
-  --label: -apple-system-label;
-  --secondary: -apple-system-secondary-label;
-  --tertiary: -apple-system-tertiary-label;
-  --quaternary: -apple-system-quaternary-label;
-  --separator: -apple-system-separator;
-  /* Fills WebKit doesn't name, as shares of the quaternary label color: the user's messages,
-     inline code (the tertiary system fill), a button under the pointer. */
-  --bubble: color-mix(in srgb, var(--quaternary) 70%, transparent);
-  --fill: color-mix(in srgb, var(--quaternary) 48%, transparent);
-  --hover: color-mix(in srgb, var(--quaternary) 75%, transparent);
-  /* The system's link color, which WebKit's isn't. */
-  --link: rgb(0 104 218);
-  /* Motion.swift's quick and settle; settle, a change of state, happens at once with Reduce Motion. */
-  --quick: .12s ease-out;
-  --settle: .24s cubic-bezier(.25, .8, .25, 1);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root { --link: rgb(65 156 255); }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  :root { --settle: 0s; }
-}
-
-html, body {
-  margin: 0;
-  background: transparent;
-}
-
-body {
-  font: 15px/19px -apple-system, sans-serif;
-  color: var(--label);
-  overflow-wrap: anywhere;
-}
-
-[hidden] { display: none !important; }
+/* The Chat's transcript: its messages in the column of page.css, the user's words as it draws
+   them, the model's replies under their line with their actions, messages off the screen, and the
+   way back to the latest. */
 
 main {
   display: flex;
   flex-direction: column;
   gap: 28px;
-  max-width: 680px;
-  margin: 0 auto;
-  padding: 28px 32px;
 }
-
-p, h1, h2, h3, h4, h5, h6, pre, figure, blockquote, ul, ol {
-  margin: 0;
-}
-
-/* MARK: Buttons */
-
-button {
-  margin: 0;
-  border: 0;
-  background: none;
-  color: inherit;
-  font: inherit;
-  cursor: default;
-}
-
-/* The app's own buttons (HoverStyle): plain, a rounded highlight under the pointer, deeper while
-   pressed; faded while disabled. */
-.hover {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 6px;
-  border-radius: 7px;
-  transition: background-color var(--quick);
-}
-
-.hover:hover:not(:disabled) { background-color: var(--hover); }
-.hover:active:not(:disabled) { background-color: var(--quaternary); }
-.hover:disabled { opacity: .4; }
-
-.glyph {
-  display: inline-block;
-  flex: none;
-  background: currentColor;
-  mask: no-repeat center / contain;
-}
-
-.glyph.chevron { mask-image: var(--chevron); width: var(--chevron-width); height: var(--chevron-height); }
-.glyph.copy { mask-image: var(--copy); width: var(--copy-width); height: var(--copy-height); }
-.glyph.check { mask-image: var(--check); width: var(--check-width); height: var(--check-height); }
-.glyph.again { mask-image: var(--again); width: var(--again-width); height: var(--again-height); }
-.glyph.down { mask-image: var(--down); width: var(--down-width); height: var(--down-height); }
-.glyph.warning { mask: none; background: var(--warning) no-repeat center / contain; width: var(--warning-width); height: var(--warning-height); }
-
-/* A copy says so with a check. */
-.glyph.check, .copied .glyph.copy { display: none; }
-.copied .glyph.check { display: inline-block; }
 
 /* MARK: Messages */
-
-/* The user's: their images, then their text in a bubble, at the column's end. */
-.user {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 8px;
-  padding-left: 80px;
-}
-
-.images {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 8px;
-}
-
-.images img {
-  width: 120px;
-  height: 120px;
-  object-fit: cover;
-  border-radius: 12px;
-}
-
-.bubble {
-  padding: 8.5px 16px;
-  border-radius: 18px;
-  background: var(--bubble);
-  line-height: 22px;
-  white-space: pre-wrap;
-}
 
 /* A reply: its line, its Markdown, why it stopped short, its actions. */
 .reply {
@@ -140,102 +17,14 @@ button {
   gap: 10px;
 }
 
-.line {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-}
-
-.line.waiting { animation: appear var(--quick) .5s both; }
-
-@keyframes appear {
-  from { opacity: 0; }
-}
-
-.toggle {
-  margin-left: -6px;
-  font-size: 12px;
-  line-height: 15px;
-  color: var(--secondary);
-  font-variant-numeric: tabular-nums;
-  user-select: none;
-}
-
-.toggle .chevron {
-  margin: 0 calc((12px - var(--chevron-width)) / 2);
-  transition: rotate var(--settle);
-}
-
-.line.open .chevron { rotate: 90deg; }
+/* A line over a reply that didn't think has nothing to open. */
 .line:not(.reasoned) .toggle { pointer-events: none; }
 .line:not(.reasoned) .chevron { opacity: 0; }
-.facts { color: var(--tertiary); }
 
-/* The thinking, which unfolds; hidden once folded, so that a copy of the conversation leaves it out. */
-.thought {
-  display: grid;
-  grid-template-rows: 0fr;
-  align-self: stretch;
-  opacity: 0;
-  visibility: hidden;
-  transition: grid-template-rows var(--settle), opacity var(--settle), visibility 0s var(--settle);
-}
+.glyph.again { mask-image: var(--again); width: var(--again-width); height: var(--again-height); }
 
-.line.open .thought {
-  grid-template-rows: 1fr;
-  opacity: 1;
-  visibility: visible;
-  transition-delay: 0s;
-}
-
-.fold {
-  min-height: 0;
-  overflow: hidden;
-}
-
-.reasoning {
-  margin-top: 8px;
-  font-size: 13px;
-  line-height: 16px;
-  color: var(--secondary);
-  white-space: pre-wrap;
-}
-
-/* While the model thinks, its latest lines, faded at the top. */
-.line.thinking .text {
-  display: flex;
-  flex-direction: column;
-  justify-content: flex-end;
-  max-height: 96px;
-  overflow: hidden;
-}
-
-.line.thinking.tall .text { mask-image: linear-gradient(transparent, black 28px); }
-
-.error {
-  display: flex;
-  align-items: center;
-  gap: 7.5px;
-  font-size: 12px;
-  line-height: 15px;
-  color: var(--secondary);
-}
-
-/* They keep their place, so that a reply doesn't grow as it ends; they show under the pointer and
-   on the last reply, a little slower to come than to go, and never while it streams. */
-.actions {
-  display: flex;
-  align-items: center;
-  margin-left: -6px;
-  font-size: 12px;
-  line-height: 15px;
-  color: var(--secondary);
-  user-select: none;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity var(--quick);
-}
-
+/* They show under the pointer and on the last reply, a little slower to come than to go, and
+   never while it streams. */
 .reply:is(:hover, .last):not(.live) .actions {
   opacity: 1;
   pointer-events: auto;
@@ -244,174 +33,27 @@ button {
 
 .reply:not(.last) .again { display: none; }
 
-.details {
-  padding-left: 6px;
-  font-size: 11px;
-  line-height: 14px;
-  font-variant-numeric: tabular-nums;
+/* MARK: Messages off the screen */
+
+/* A message away from the screen is neither laid out nor painted, so that a long conversation's
+   resize, as the sidebar slides, or a line that folds, lays out only those near it: one never
+   drawn keeps the room page.estimator guesses for it, and once drawn, its own. Its paint is cut at
+   its edges, so that it takes room at its sides for the highlights that reach past the column, the
+   toggles' and the actions'. */
+#messages > article {
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto var(--estimate, 120px);
+  margin-inline: -8px;
+  padding-inline: 8px;
 }
 
-/* MARK: Markdown */
-
-.markdown, .item, blockquote {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.item { gap: 10px; }
-
-.markdown p {
-  margin-block: -2.5px;
-  line-height: 24px;
-}
-
-h1, h2, h3, h4, h5, h6 {
-  font-size: 15px;
-  font-weight: 600;
-}
-
-h1 { font-size: 20px; line-height: 24px; }
-h2 { font-size: 17px; line-height: 20px; }
-.markdown > * + :is(h1, h2, h3, h4, h5, h6) { margin-top: 6px; }
-
-a {
-  color: var(--link);
-  text-decoration: none;
-}
-
-/* Filled as high as the line's text reaches. */
-code {
-  padding-top: 1.5px;
-  font: 13.5px ui-monospace, monospace;
-  background: var(--fill);
-}
-
-:is(h1, h2, h3, h4, h5, h6) code {
-  font-size: calc(1em - 1.5px);
-  font-weight: inherit;
-}
-
-/* Lists: markers in a column as wide as the widest, so that the items' text lines up. */
-ul, ol {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  column-gap: 8px;
-  row-gap: 8px;
-  padding: 0 0 0 4px;
-  list-style: none;
-}
-
-li {
-  display: grid;
-  grid-column: 1 / -1;
-  grid-template-columns: subgrid;
-  align-items: first baseline;
-}
-
-.marker {
-  text-align: right;
-  color: var(--secondary);
-  font-variant-numeric: tabular-nums;
-  user-select: none;
-}
-
-/* Quotes, like the model's thinking, are set apart by a rule at their side. */
-blockquote, .reasoning {
-  position: relative;
-  padding-left: 14px;
-}
-
-blockquote { color: var(--secondary); }
-
-blockquote::before, .reasoning::before {
-  content: "";
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 2px;
-  border-radius: 1px;
-  background: var(--tertiary);
-}
-
-hr {
-  height: 1px;
-  margin: 4px 0;
-  border: 0;
-  background: var(--separator);
-}
-
-/* Code, outlined, apart from what is said, which the user's messages show filled; the outline is
-   inside its edge, so that it takes no room. */
-figure.code {
-  overflow: hidden;
-  outline: 1px solid var(--separator);
-  outline-offset: -1px;
-  border-radius: 10px;
-}
-
-figcaption {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  height: 32px;
-  padding: 0 8px 0 14px;
-  border-bottom: 1px solid var(--separator);
-  font-size: 11px;
-  color: var(--secondary);
-  user-select: none;
-}
-
-figcaption button { font-size: 12px; line-height: 15px; }
-
-/* SF Mono's lines are as tall as AppKit sets them, 16 pt at 13. */
-pre {
-  padding: 12.5px 14px;
-  overflow-x: auto;
-  font: 13px/19px ui-monospace, monospace;
-}
-
-pre code {
-  font: inherit;
-  background: none;
-}
-
-/* Tables at the width their cells need, a cell wrapping at 320 pt, rows apart by a rule. */
-.table { overflow-x: auto; }
-
-/* Each cell draws its own rule, once, where collapsed borders would draw the translucent
-   separator twice, darker. */
-table { border-spacing: 0; }
-
-th, td {
-  padding: 8px 0;
-  vertical-align: top;
-  text-align: left;
-}
-
-th { padding-top: 0; font-weight: 600; }
-tbody tr:last-child td { padding-bottom: 0; }
-tbody td { border-top: 1px solid var(--separator); }
-:is(th, td) + :is(th, td) { padding-left: 20px; }
-:is(th, td) > div { max-width: 320px; }
-
-/* Code's colors, the system's own, after Xcode's. */
-.hljs-comment, .hljs-quote { color: var(--secondary); }
-.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-doctag { color: -apple-system-purple; }
-.hljs-string, .hljs-regexp, .hljs-template-tag, .hljs-char.escape_ { color: -apple-system-red; }
-.hljs-number, .hljs-symbol, .hljs-bullet { color: -apple-system-blue; }
-.hljs-title, .hljs-section, .hljs-selector-id, .hljs-selector-class { color: -apple-system-blue; }
-.hljs-type, .hljs-built_in, .hljs-class .hljs-title, .hljs-title.class_ { color: -apple-system-brown; }
-.hljs-attr, .hljs-attribute, .hljs-variable, .hljs-template-variable, .hljs-params, .hljs-property { color: -apple-system-orange; }
-.hljs-meta, .hljs-meta .hljs-keyword { color: -apple-system-brown; }
-.hljs-addition { color: -apple-system-green; }
-.hljs-deletion { color: -apple-system-red; }
-.hljs-emphasis { font-style: italic; }
-.hljs-strong { font-weight: 600; }
+/* The user's words keep the column's first 80 px clear, 88 as the article reaches 8 px out. */
+#messages > .user { padding-left: 88px; }
 
 /* MARK: Back to the latest */
 
-/* A circle over the bottom of the conversation, once the reader has scrolled up from it: solid,
-   the window's background a shade deeper, as the material it stands for looked. */
+/* A circle over the bottom of the page, once the reader has scrolled up from it: solid, in place
+   of a material, the window's background a shade deeper. */
 #latest {
   position: fixed;
   left: 50%;
