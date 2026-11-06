@@ -215,9 +215,9 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
     // Reference the first and final head, whose ring the NaN tile follows;
     // all eight execute above.
     for (const uint32_t head : {0U, kKvHeads - 1}) {
+      const uint64_t laneOffset = uint64_t{lane} * kRows * kAttention;
       const uint64_t queryOffset =
-          uint64_t{lane} * kRows * kAttention + uint64_t{head} * kGroupRows *
-                                                    kHeadDim;
+          laneOffset + uint64_t{head} * kGroupRows * kHeadDim;
       referenceRows(
           input.data() + queryOffset,
           static_cast<const uint16_t *>(keys[lane].contents()) +
@@ -230,14 +230,20 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
               (uint64_t{lane} * kKvHeads + head) * kHeadDim * kRows,
           cacheLengths[lane], reference);
       for (uint64_t index = 0; index < reference.size(); ++index) {
-        const float actual = bf16ToFloat(output[queryOffset + index]);
+        const uint64_t row = index / kHeadDim;
+        const uint64_t dim = index % kHeadDim;
+        const uint64_t proposal = row % kRows;
+        const uint64_t queryHead =
+            uint64_t{head} * (kGroupRows / kRows) + row / kRows;
+        const float actual = bf16ToFloat(
+            output[laneOffset + (proposal * shape.queryHeads + queryHead) * kHeadDim + dim]);
         const float expected = reference[index];
         if (!std::isfinite(actual) ||
             std::fabs(actual - expected) >
                 0.02F + 0.02F * std::fabs(expected)) {
           std::cerr << "lane " << lane << " head " << head << " length "
-                    << cacheLengths[lane] << " row " << index / kHeadDim
-                    << " dim " << index % kHeadDim << ": " << actual
+                    << cacheLengths[lane] << " row " << row
+                    << " dim " << dim << ": " << actual
                     << " vs " << expected << '\n';
           throw std::runtime_error("draft attention diverged from reference");
         }
@@ -316,7 +322,6 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
   const auto queries = allocate(workspace.groupedQueriesBytes);
   const auto queryKeys = allocate(workspace.queryKeysBytes);
   const auto queryValues = allocate(workspace.queryValuesBytes);
-  const auto rowMajor = allocate(workspace.groupedQueriesBytes);
   const auto queryNorm = allocate(kHeadDim * 2);
   const auto keyNorm = allocate(kHeadDim * 2);
   std::fill_n(static_cast<uint16_t *>(queryNorm.contents()), kHeadDim,
@@ -372,7 +377,6 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
   DraftAttention::addPrepare(graph,
       {qkv, queries, queryNorm, keyNorm, ropeCos, ropeSin, queryKeys,
        queryValues}, plan);
-  DraftAttention::addReorder(graph, queries, rowMajor, plan);
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   require(std::equal(originalQkv.begin(), originalQkv.end(),
                      static_cast<const uint16_t *>(qkv.contents())),
@@ -419,22 +423,6 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
                     "draft prepare value copy differs");
       }
     }
-  const auto *grouped = static_cast<const uint16_t *>(queries.contents());
-  const auto *reordered = static_cast<const uint16_t *>(rowMajor.contents());
-  for (uint32_t lane = 0; lane < lanes; ++lane) {
-    const uint64_t laneOffset = uint64_t{lane} * kRows * kAttention;
-    for (uint32_t row = 0; row < kRows; ++row) {
-      for (uint32_t head = 0; head < shape.queryHeads; ++head) {
-        for (uint32_t dim = 0; dim < kHeadDim; ++dim)
-          require(reordered[laneOffset + row * kAttention + head * kHeadDim +
-                             dim] ==
-                      grouped[laneOffset + (head * kRows + row) * kHeadDim +
-                              dim],
-                  "draft reorder differed from CPU layout reference");
-      }
-    }
-  }
-
 }
 
 // The context writers against a CPU ring: a row's key is RMS-normalized,
@@ -757,8 +745,8 @@ void contextWindowCapturedInside(MetalBackend &backend, uint32_t width) {
 // weights and the taps' base weights; the prepare's q|k|v rows, its grouped
 // query rows, the current rows' keys and values, the norms and the RoPE rows;
 // the attention's query rows, followed by the split partials, and each lane's
-// rings; the reorder's rows; the context writers' key and value rows, norm,
-// RoPE rows, rings and the commit's retained counts.
+// rings; the context writers' key and value rows, norm, RoPE rows, rings and
+// the commit's retained counts.
 void bufferExtents(MetalBackend &backend, DraftAttentionShape shape) {
   constexpr uint32_t lanes = 3, contextTokens = 37;
   const auto plan = DraftAttention::plan(shape, lanes);
@@ -810,11 +798,6 @@ void bufferExtents(MetalBackend &backend, DraftAttentionShape shape) {
   splash::test::requireExtents(backend, extents, [&](CommandGraph &graph, const Buffers &b) {
     DraftAttention::addDecode(graph, {b[0], rings(b, 3), rings(b, 3 + lanes), b[1], b[2]}, lengths, plan);
   });
-  splash::test::requireExtents(backend,
-                               Extents{{0, queryRows, 2, "draft grouped attention"}, {1, queryRows, 2, "draft attention"}},
-                               [&](CommandGraph &graph, const Buffers &b) {
-                                 DraftAttention::addReorder(graph, b[0], b[1], plan);
-                               });
   splash::test::requireExtents(backend,
                                Extents{{0, contextTokens * contextRow, 2, "draft context K/V"},
                                        {1, norm, 2, "draft key norm"},
