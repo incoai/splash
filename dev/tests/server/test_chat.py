@@ -67,7 +67,7 @@ function createChat(storage = new Map(), writable = true, models = null,
   const clipboard = {writeText: async text => { copied.push(text); }};
   let scrolls = 0;
   let scrollBehavior;
-  for (const id of ['chat', 'form', 'input', 'attachments', 'image-input',
+  for (const id of ['chat', 'form', 'input', 'attachments', 'file-input',
                    'attach', 'effort', 'api-key', 'send', 'recents', 'new-chat',
                    'mobile-new', 'menu', 'scrim', 'scroll-bottom', 'sidebar',
                    'sidebar-close', 'sidebar-open', 'credentials', 'thinking']) elements[id] = new Element();
@@ -78,7 +78,7 @@ function createChat(storage = new Map(), writable = true, models = null,
     .map(([, value, textContent]) => Object.assign(new Element('option'), {value, textContent}));
   class FileReader {
     readAsDataURL(file) {
-      this.result = `data:image/png;base64,${file.name}`;
+      this.result = `data:${file.type || 'application/octet-stream'};base64,${file.name}`;
       reads.push(this);
     }
   }
@@ -157,25 +157,36 @@ function setText(chat, value) {
   chat.elements.input.value = value;
   chat.elements.input.handlers.input();
 }
-function pasteImages(chat, ...names) {
+function pasteFiles(chat, ...files) {
   const start = chat.reads.length;
   chat.elements.input.handlers.paste({
     clipboardData: {
-      items: names.map(name => ({type: 'image/png', getAsFile: () => ({type: 'image/png', name})})),
+      items: files.map(file => ({type: file.type, getAsFile: () => file})),
       getData: () => '',
     },
     preventDefault() {},
   });
   return chat.reads.slice(start);
 }
+const pasteImages = (chat, ...names) => pasteFiles(chat,
+  ...names.map(name => ({type: 'image/png', name})));
+const pastePDFs = (chat, ...names) => pasteFiles(chat,
+  ...names.map(name => ({type: 'application/pdf', name})));
 const pasteImage = (chat, name) => pasteImages(chat, name)[0];
-function selectImages(chat, ...names) {
+function selectFiles(chat, ...files) {
   const start = chat.reads.length;
-  chat.elements['image-input'].files = names.map(name => ({type: 'image/png', name}));
-  chat.elements['image-input'].handlers.change();
+  chat.elements['file-input'].files = files;
+  chat.elements['file-input'].handlers.change();
   return chat.reads.slice(start);
 }
+const selectImages = (chat, ...names) => selectFiles(chat,
+  ...names.map(name => ({type: 'image/png', name})));
+const selectPDFs = (chat, ...names) => selectFiles(chat,
+  ...names.map(name => ({type: 'application/pdf', name})));
 const imagePart = name => ({type: 'image_url', image_url: {url: `data:image/png;base64,${name}`}});
+const pdfPart = name => ({type: 'file', file: {
+  filename: name, file_data: `data:application/pdf;base64,${name}`,
+}});
 const draftImages = chat => chat.elements.attachments.children.flatMap(
   item => item.children.filter(child => child.tagName === 'IMG').map(image => image.src)
 );
@@ -268,17 +279,22 @@ assert.equal(fresh.requests[0].headers.Authorization, undefined);
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """)
 
-    def test_image_attachment_follows_the_served_input_modalities(self):
+    def test_file_attachments_follow_the_served_input_modalities(self):
         self.run_chat(r"""
 (async () => {
-  for (const [modalities, accepted] of [
-    [['text'], false], [['text', 'image', 'pdf'], true],
+  for (const [modalities, images, pdfs] of [
+    [['text'], false, false], [['text', 'image'], true, false],
+    [['text', 'pdf'], false, true], [['text', 'image', 'pdf'], true, true],
   ]) {
     const chat = createChat(new Map(), true, () => served(modalities));
     await flush();
-    assert.equal(Boolean(chat.elements.attach.hidden), !accepted, `${modalities}`);
-    assert.equal(pasteImages(chat, 'pasted').length, Number(accepted));
-    assert.equal(selectImages(chat, 'selected').length, Number(accepted));
+    assert.equal(Boolean(chat.elements.attach.hidden), !images && !pdfs, `${modalities}`);
+    assert.equal(chat.elements['file-input'].accept,
+      [images && 'image/*', pdfs && 'application/pdf,.pdf'].filter(Boolean).join(','), `${modalities}`);
+    assert.equal(pasteImages(chat, 'pasted').length, Number(images), `${modalities}`);
+    assert.equal(selectImages(chat, 'selected').length, Number(images), `${modalities}`);
+    assert.equal(pastePDFs(chat, 'pasted.pdf').length, Number(pdfs), `${modalities}`);
+    assert.equal(selectPDFs(chat, 'selected.pdf').length, Number(pdfs), `${modalities}`);
   }
   // An offline server leaves the modalities unknown and keeps the button.
   const offline = createChat();
@@ -286,19 +302,101 @@ assert.equal(fresh.requests[0].headers.Authorization, undefined);
   assert.ok(!offline.elements.attach.hidden, 'offline hid the button');
   // A server that needs a key rejects the first request, which also keeps the
   // button. Entering the key asks again with it; a text-only answer hides the
-  // button and drops the image attached meanwhile.
+  // button and drops the files attached meanwhile.
   const chat = createChat(new Map(), true, headers => headers.Authorization ? served(['text'])
     : {ok: false, json: async () => ({error: {type: 'authentication_error'}})});
   await flush();
   assert.ok(!chat.elements.attach.hidden, 'unauthorized hid the button');
   selectImages(chat, 'early');
-  assert.equal(chat.elements.attachments.children.length, 1, 'early image not attached');
+  selectPDFs(chat, 'early.pdf');
+  assert.equal(chat.elements.attachments.children.length, 2, 'early files not attached');
   chat.elements['api-key'].value = 'key';
   chat.elements['api-key'].handlers.change();
   await flush();
   assert.equal(chat.modelRequests.at(-1).Authorization, 'Bearer key');
   assert.ok(chat.elements.attach.hidden, 'text-only model kept the button');
-  assert.equal(chat.elements.attachments.children.length, 0, 'early image kept');
+  assert.equal(chat.elements.attachments.children.length, 0, 'early files kept');
+  // A model that takes images alone keeps the image and drops the PDF.
+  const partial = createChat(new Map(), true, headers => headers.Authorization ? served(['text', 'image'])
+    : {ok: false, json: async () => ({error: {type: 'authentication_error'}})});
+  await flush();
+  selectImages(partial, 'kept');
+  selectPDFs(partial, 'dropped.pdf');
+  partial.elements['api-key'].value = 'key';
+  partial.elements['api-key'].handlers.change();
+  await flush();
+  assert.equal(partial.elements.attachments.children.length, 1, 'PDF kept for an image model');
+  assert.equal(partial.elements.attachments.children[0].title, 'kept');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+    def test_a_pdf_known_by_its_name_alone_goes_as_a_pdf(self):
+        self.run_chat(r"""
+(async () => {
+  const chat = createChat();
+  await flush();
+  const [reading] = selectFiles(chat, {type: '', name: 'typeless.pdf'});
+  reading.onload();
+  await flush();
+  submit(chat);
+  assert.deepEqual(chat.requests[0].body.messages,
+                   [{role: 'user', content: [pdfPart('typeless.pdf')]}]);
+  succeed(chat.requests[0]);
+  await flush();
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+    def test_a_file_over_the_servers_limit_is_not_read_and_blocks_send(self):
+        self.run_chat(r"""
+(async () => {
+  const chat = createChat();
+  await flush();
+  const mib = 1024 * 1024;
+  for (const file of [{type: 'application/pdf', name: 'big.pdf', size: 64 * mib},
+                      {type: 'image/png', name: 'big.png', size: 32 * mib + 1}]) {
+    assert.equal(selectFiles(chat, file).length, 0, `read ${file.name}`);
+    const status = chat.elements.attachments.children.at(-1).children[0];
+    assert.equal(status.textContent, 'Too large');
+  }
+  setText(chat, 'with them');
+  assert.equal(chat.elements.send.disabled, true, 'a refused file blocks Send');
+  // Under the limit a file reads as usual; the server has the last word on a PDF.
+  assert.equal(selectFiles(chat, {type: 'application/pdf', name: 'fits.pdf', size: 64 * mib - 1}).length, 1);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+    def test_pdf_is_sent_saved_and_restored_as_a_file_part(self):
+        self.run_chat(r"""
+(async () => {
+  const models = () => ({ok: true, json: async () => ({data: [{input_modalities: ['text', 'image', 'pdf']}]})});
+  const storage = new Map();
+  const chat = createChat(storage, true, models);
+  await flush();
+  const [reading] = selectPDFs(chat, 'report.pdf');
+  assert.equal(chat.elements.send.disabled, true, 'an unfinished PDF blocks Send');
+  reading.onload();
+  await flush();
+  assert.equal(chat.elements.send.disabled, false);
+  submit(chat);
+  assert.deepEqual(chat.requests[0].body.messages, [{role: 'user', content: [pdfPart('report.pdf')]}]);
+  succeed(chat.requests[0]);
+  await flush();
+  const saved = JSON.parse(storage.get('splash-chats'));
+  assert.deepEqual(saved[0].messages[0].content, [pdfPart('report.pdf')]);
+  assert.equal(saved[0].title, 'report.pdf');
+  // A new page restores the PDF and sends it back with the next prompt.
+  const fresh = createChat(storage, true, models);
+  await flush();
+  fresh.elements.recents.children[0].querySelector('.recent-open').handlers.click();
+  setText(fresh, 'summarize');
+  submit(fresh);
+  assert.deepEqual(fresh.requests[0].body.messages, [
+    {role: 'user', content: [pdfPart('report.pdf')]},
+    {role: 'assistant', content: 'answer', reasoning_content: ''},
+    {role: 'user', content: 'summarize'},
+  ]);
+  succeed(fresh.requests[0]);
+  await flush();
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """)
 
@@ -1041,10 +1139,13 @@ class ChatPageTest(HarnessTestCase):
         )
         self.assertIn(b"function cleanMessage", payload)
         self.assertIn(b"if (input.value === '') input.value = text", payload)
-        self.assertIn(b'id="image-input"', payload)
-        self.assertIn(b'accept="image/*"', payload)
+        self.assertIn(b'id="file-input"', payload)
+        self.assertIn(b'accept="image/*,application/pdf,.pdf"', payload)
         self.assertIn(b"reader.readAsDataURL(file)", payload)
         self.assertIn(b"type: 'image_url'", payload)
+        self.assertIn(b"type: 'file'", payload)
+        self.assertIn(b"file_data", payload)
+        self.assertIn(b"function addFiles", payload)
         self.assertIn(b"input.addEventListener('paste'", payload)
         self.assertIn(b"className = 'waiting'", payload)
         self.assertIn(b"Generating response", payload)

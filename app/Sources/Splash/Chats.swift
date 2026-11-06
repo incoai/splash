@@ -1,6 +1,17 @@
 import Foundation
 import Observation
 
+/// A PDF the user attached, with the name of the file it came from.
+struct ChatDocument: Codable, Equatable, Sendable {
+    /// What the server takes of a request's PDFs. A PDF shares `maxBytes` with its rendered pages,
+    /// so a file must stay under it, by how much depending on what its pages render to.
+    static let maxBytes = 64 * 1024 * 1024
+    static let maxPages = 64
+
+    var name: String
+    var data: Data
+}
+
 /// A message of a conversation, as the app keeps it.
 struct ChatMessage: Codable, Identifiable, Equatable, Sendable {
     enum Role: String, Codable { case user, assistant }
@@ -12,6 +23,8 @@ struct ChatMessage: Codable, Identifiable, Equatable, Sendable {
     var reasoning = ""
     /// Images the user attached, as PNG or JPEG data.
     var images: [Data] = []
+    /// PDFs the user attached, as the files were.
+    var documents: [ChatDocument] = []
     /// The model that answered.
     var model: String?
     var tokensPerSecond: Double?
@@ -22,9 +35,36 @@ struct ChatMessage: Codable, Identifiable, Equatable, Sendable {
     var error: String?
     /// Whether the user, or a switch of models, stopped the answer.
     var stopped: Bool?
+    /// Whether the server refused the prompt this user message ended; later prompts leave it out.
+    var rejected: Bool?
 
     /// Whether the answer holds nothing to send back to the model.
     var isEmpty: Bool { text.isEmpty && reasoning.isEmpty }
+}
+
+extension ChatMessage {
+    private enum CodingKeys: String, CodingKey {
+        case id, role, text, reasoning, images, documents, model, tokensPerSecond, thinkingTime,
+             reasoningTokens, error, stopped, rejected
+    }
+
+    /// A message saved before attachments of a kind existed has none of them.
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        role = try container.decode(Role.self, forKey: .role)
+        text = try container.decode(String.self, forKey: .text)
+        reasoning = try container.decodeIfPresent(String.self, forKey: .reasoning) ?? ""
+        images = try container.decodeIfPresent([Data].self, forKey: .images) ?? []
+        documents = try container.decodeIfPresent([ChatDocument].self, forKey: .documents) ?? []
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        tokensPerSecond = try container.decodeIfPresent(Double.self, forKey: .tokensPerSecond)
+        thinkingTime = try container.decodeIfPresent(Double.self, forKey: .thinkingTime)
+        reasoningTokens = try container.decodeIfPresent(Int.self, forKey: .reasoningTokens)
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+        stopped = try container.decodeIfPresent(Bool.self, forKey: .stopped)
+        rejected = try container.decodeIfPresent(Bool.self, forKey: .rejected)
+    }
 }
 
 struct Conversation: Codable, Identifiable, Equatable {
@@ -34,12 +74,13 @@ struct Conversation: Codable, Identifiable, Equatable {
     var messages: [ChatMessage] = []
 }
 
-/// The model a message goes to: the server's address, the model it serves and whether it sees
-/// images, and the reasoning effort to ask for.
+/// The model a message goes to: the server's address, the model it serves and whether it takes
+/// images and PDFs, and the reasoning effort to ask for.
 struct ChatTarget: Equatable, Sendable {
     let url: URL
     let model: String
     let acceptsImages: Bool
+    var acceptsPDFs = false
     let effort: String
     /// The tokens the model's context holds, if the server said.
     var context: Int?
@@ -121,16 +162,17 @@ final class ChatStore {
         write(conversations[index])
     }
 
-    /// Sends `text` and `images` in the open conversation, or a new one, to the model `server`
-    /// serves, and streams its reply into the conversation.
-    func send(_ text: String, images: [Data], to server: ChatTarget) {
+    /// Sends `text`, `images` and `documents` in the open conversation, or a new one, to the model
+    /// `server` serves, and streams its reply into the conversation.
+    func send(_ text: String, images: [Data], documents: [ChatDocument] = [], to server: ChatTarget) {
         guard streaming == nil else { return }
         var conversation = current ?? Conversation()
         if conversation.title.isEmpty {
-            let line = text.split(separator: "\n").first.map(String.init) ?? "Image"
+            let line = text.split(separator: "\n").first.map(String.init)
+                ?? documents.first?.name ?? "Image"
             conversation.title = String(line.prefix(80))
         }
-        conversation.messages.append(ChatMessage(role: .user, text: text, images: images))
+        conversation.messages.append(ChatMessage(role: .user, text: text, images: images, documents: documents))
         stream(conversation, to: server)
     }
 
@@ -138,6 +180,8 @@ final class ChatStore {
     func retry(with server: ChatTarget) {
         guard streaming == nil, var conversation = current, conversation.messages.last?.role == .assistant else { return }
         conversation.messages.removeLast()
+        // Asked again, a refused message goes again.
+        if let last = conversation.messages.indices.last { conversation.messages[last].rejected = nil }
         stream(conversation, to: server)
     }
 
@@ -188,6 +232,12 @@ final class ChatStore {
                 if Task.isCancelled { answer.stopped = true }
             } catch {
                 answer.error = error.localizedDescription
+                // An attachment the server refuses would fail every later prompt that carried it.
+                if let failure = error as? ChatClient.Failure, failure.refused, let message = history.last,
+                   !message.images.isEmpty || !message.documents.isEmpty {
+                    answer.error = failure.leftOutNote
+                    self?.reject(message.id, in: conversation.id)
+                }
             }
             // A reply that ended while the model still thought.
             if let thinking, answer.thinkingTime == nil { answer.thinkingTime = Date.now.timeIntervalSince(thinking) }
@@ -205,6 +255,13 @@ final class ChatStore {
         updated.messages[index] = message
         updated.updated = .now
         put(updated)
+    }
+
+    private func reject(_ message: UUID, in conversation: UUID) {
+        guard let position = conversations.firstIndex(where: { $0.id == conversation }),
+              let index = conversations[position].messages.firstIndex(where: { $0.id == message })
+        else { return }
+        conversations[position].messages[index].rejected = true
     }
 
     /// Keeps `conversation` first, the most recent, and writes it.
@@ -265,6 +322,22 @@ enum ChatClient {
 
     struct Failure: LocalizedError {
         let errorDescription: String?
+        /// The HTTP status, when the server answered with one.
+        var status: Int? = nil
+        /// The server's name for the error, if it gave one.
+        var code: String? = nil
+
+        /// Whether the server turned the request down, so that sending it again fails again.
+        var refused: Bool { status == 400 || status == 413 }
+
+        /// What to say of a message this failure leaves out of later prompts.
+        var leftOutNote: String {
+            if code == "context_length_exceeded" {
+                return "This message doesn’t fit in the model’s context. The model won’t see it."
+            }
+            let reason = errorDescription ?? "The server refused this message."
+            return "\(reason.last?.isPunctuation == true ? reason : reason + ".") The model won’t see this message."
+        }
     }
 
     /// The tokens `messages` take as the model reads them, its template, images and earlier
@@ -286,7 +359,8 @@ enum ChatClient {
 
     /// The request counting `messages`: the prompt `stream` sends, as it sends it.
     static func countRequest(_ messages: [ChatMessage], with server: ChatTarget) throws -> URLRequest {
-        let json = try JSONSerialization.data(withJSONObject: prompt(messages, effort: server.effort, images: server.acceptsImages))
+        let json = try JSONSerialization.data(withJSONObject: prompt(
+            messages, effort: server.effort, images: server.acceptsImages, pdfs: server.acceptsPDFs))
         return request("v1/chat/completions/count_tokens", json, to: server, timeout: 30)
     }
 
@@ -305,13 +379,14 @@ enum ChatClient {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let json = try body(messages, effort: server.effort, images: server.acceptsImages)
+                    let json = try body(messages, effort: server.effort, images: server.acceptsImages, pdfs: server.acceptsPDFs)
                     let (bytes, response) = try await URLSession.shared.bytes(for: request("v1/chat/completions", json, to: server, timeout: 3600))
                     if let status = (response as? HTTPURLResponse)?.statusCode, status != 200 {
                         var data = Data()
                         for try await byte in bytes { data.append(byte) }
                         throw Failure(errorDescription: message(of: data, for: messages, server: server)
-                            ?? HTTPURLResponse.localizedString(forStatusCode: status))
+                            ?? HTTPURLResponse.localizedString(forStatusCode: status),
+                            status: status, code: problem(of: data)?.code)
                     }
                     for try await line in bytes.lines {
                         switch try parse(line) {
@@ -330,28 +405,52 @@ enum ChatClient {
     }
 
     /// The request for `messages`: the prompt, streamed, with its progress and the usage asked for.
-    static func body(_ messages: [ChatMessage], effort: String, images: Bool) throws -> Data {
-        var body = prompt(messages, effort: effort, images: images)
+    static func body(_ messages: [ChatMessage], effort: String, images: Bool, pdfs: Bool = false) throws -> Data {
+        var body = prompt(messages, effort: effort, images: images, pdfs: pdfs)
         body["stream"] = true
         body["stream_options"] = ["include_usage": true]
         body["return_progress"] = true
         return try JSONSerialization.data(withJSONObject: body)
     }
 
-    /// The prompt of `messages`: images as data URLs, or a note in their place for a model that
-    /// cannot see them; earlier answers with what the model thought, empty ones left out; and the
-    /// reasoning effort unless it is the model's default.
-    private static func prompt(_ messages: [ChatMessage], effort: String, images: Bool) -> [String: Any] {
+    /// The prompt of `messages`: images as data URLs and PDFs as file parts, or a note in their
+    /// place for a model that cannot take them; earlier answers with what the model thought, empty
+    /// ones left out, like messages the server refused; and the reasoning effort unless it is the
+    /// model's default.
+    private static func prompt(_ messages: [ChatMessage], effort: String, images: Bool, pdfs: Bool) -> [String: Any] {
         let wire: [[String: Any]] = messages.compactMap { message in
             switch message.role {
-            case .user where !message.images.isEmpty && images:
-                let parts: [[String: Any]] = message.images.map { image in
-                    ["type": "image_url", "image_url": ["url": "data:\(mediaType(image));base64,\(image.base64EncodedString())"]]
+            case .user where message.rejected == true:
+                return nil
+            case .user where !message.images.isEmpty || !message.documents.isEmpty:
+                var parts: [[String: Any]] = []
+                var notes: [String] = []
+                if images {
+                    parts += message.images.map { image in
+                        ["type": "image_url", "image_url": ["url": "data:\(mediaType(image));base64,\(image.base64EncodedString())"]]
+                    }
+                } else if !message.images.isEmpty {
+                    notes.append(message.images.count == 1
+                        ? "[An image this model can’t see]" : "[\(message.images.count) images this model can’t see]")
                 }
-                return ["role": "user", "content": parts + [["type": "text", "text": message.text]]]
-            case .user where !message.images.isEmpty:
-                let note = message.images.count == 1 ? "[An image this model can’t see]" : "[\(message.images.count) images this model can’t see]"
-                return ["role": "user", "content": message.text.isEmpty ? note : "\(note)\n\n\(message.text)"]
+                if pdfs {
+                    parts += message.documents.map { document in
+                        ["type": "file", "file": [
+                            "filename": document.name,
+                            "file_data": "data:application/pdf;base64,\(document.data.base64EncodedString())",
+                        ]]
+                    }
+                } else if !message.documents.isEmpty {
+                    notes.append(message.documents.count == 1
+                        ? "[A PDF this model can’t read]" : "[\(message.documents.count) PDFs this model can’t read]")
+                }
+                let note = notes.joined(separator: "\n\n")
+                if parts.isEmpty {
+                    return ["role": "user", "content": message.text.isEmpty ? note : "\(note)\n\n\(message.text)"]
+                }
+                if !message.text.isEmpty { parts.append(["type": "text", "text": message.text]) }
+                if !note.isEmpty { parts.append(["type": "text", "text": note]) }
+                return ["role": "user", "content": parts]
             case .user:
                 return ["role": "user", "content": message.text]
             case .assistant where message.isEmpty:
@@ -406,13 +505,21 @@ enum ChatClient {
     /// What the error in a response's body to `messages` says: a prompt too long for the model's
     /// context, in the app's words; any other, in the server's.
     static func message(of data: Data, for messages: [ChatMessage], server: ChatTarget) -> String? {
-        struct Body: Decodable { struct Problem: Decodable { let message: String; let code: String? }; let error: Problem }
-        guard let problem = try? JSONDecoder().decode(Body.self, from: data).error else { return nil }
+        guard let problem = problem(of: data) else { return nil }
         guard problem.code == "context_length_exceeded" else { return problem.message }
         let context = server.context.map { "the model’s \(ContextLength.figure($0))-token context" } ?? "the model’s context"
         // A new chat leaves the earlier messages behind; a first message has none to leave.
         return messages.count == 1 ? "This message is longer than \(context)."
             : "This chat is longer than \(context). Start a new chat to continue."
+    }
+
+    private struct ErrorBody: Decodable {
+        struct Problem: Decodable { let message: String; let code: String? }
+        let error: Problem
+    }
+
+    private static func problem(of data: Data) -> ErrorBody.Problem? {
+        try? JSONDecoder().decode(ErrorBody.self, from: data).error
     }
 
     /// The type of an image the app keeps, PNG or JPEG.

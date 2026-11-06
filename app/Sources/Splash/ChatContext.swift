@@ -40,7 +40,7 @@ struct ContextUsage: Equatable, Sendable {
 }
 
 /// Counts the next prompt, the open conversation and the draft as the model reads them, after a
-/// pause in typing. A count belongs to its whole prompt: history, draft, images, model, reasoning
+/// pause in typing. A count belongs to its whole prompt: history, draft, attachments, model, reasoning
 /// effort and context; one finishing after the prompt changed is dropped.
 @MainActor @Observable
 final class ChatContext {
@@ -48,12 +48,14 @@ final class ChatContext {
         let history: [ChatMessage]
         let text: String
         let images: [Data]
+        var documents: [ChatDocument] = []
         let target: ChatTarget
         /// A restarted model may use another tokenizer even under the same name.
         var started: Date? = nil
 
         var messages: [ChatMessage] {
-            history + (text.isEmpty && images.isEmpty ? [] : [ChatMessage(role: .user, text: text, images: images)])
+            history + (text.isEmpty && images.isEmpty && documents.isEmpty
+                ? [] : [ChatMessage(role: .user, text: text, images: images, documents: documents)])
         }
     }
 
@@ -91,6 +93,7 @@ final class ChatContext {
         // empty history. Message ids tell any other conversation apart.
         let sent = history.starts(with: base) && grown.count <= 2 && (!base.isEmpty || grown.first.map {
             $0.role == .user && $0.text == counted.request.text && $0.images == counted.request.images
+                && $0.documents == counted.request.documents
         } ?? true)
         let askedAgain = base.last?.role == .assistant && history.count == base.count
             && history.dropLast().elementsEqual(base.dropLast())
@@ -118,7 +121,7 @@ final class ChatContext {
 extension ChatTarget {
     /// Whether `other` is the same model, served the same way, whatever reasoning effort it asks for.
     func sameModel(as other: ChatTarget) -> Bool {
-        url == other.url && model == other.model && acceptsImages == other.acceptsImages && context == other.context
-            && apiKey == other.apiKey
+        url == other.url && model == other.model && acceptsImages == other.acceptsImages
+            && acceptsPDFs == other.acceptsPDFs && context == other.context && apiKey == other.apiKey
     }
 }

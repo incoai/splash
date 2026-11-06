@@ -29,6 +29,53 @@ struct ComposerTests {
         #expect(state.draft.text == "你好再次")
     }
 
+    /// A PDF the server would refuse stays out of the draft, which says why.
+    @Test func aDraftTakesThePDFsTheServerTakes() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-draft-tests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        func file(_ name: String, _ data: Data) throws -> URL {
+            let url = folder.appending(path: name)
+            try data.write(to: url)
+            return url
+        }
+        let draft = Draft()
+        let good = try file("good.pdf", Self.pdf(pages: 2))
+        draft.attach(files: [good])
+        #expect(draft.documents.map(\.name) == ["good.pdf"] && draft.notice == nil)
+        draft.attach(files: [try file("fake.pdf", Data("not a PDF".utf8))])
+        #expect(draft.notice == "fake.pdf can’t be read.")
+        draft.attach(files: [try file("locked.pdf", Self.pdf(pages: 1, password: "secret"))])
+        #expect(draft.notice == "locked.pdf needs a password.")
+        draft.attach(files: [try file("long.pdf", Self.pdf(pages: ChatDocument.maxPages + 1))])
+        #expect(draft.notice == "long.pdf has more than 64 pages.")
+        let large = try file("large.pdf", Data())
+        let handle = try FileHandle(forWritingTo: large)
+        try handle.truncate(atOffset: UInt64(ChatDocument.maxBytes))
+        try handle.close()
+        draft.attach(files: [large])
+        #expect(draft.notice == "large.pdf must be under 64 MB.")
+        #expect(draft.documents.count == 1)
+        // The next file picked clears the notice, and so does sending.
+        draft.attach(files: [good])
+        #expect(draft.notice == nil && draft.documents.count == 2)
+        draft.attach(files: [try file("fake.pdf", Data("not a PDF".utf8))])
+        #expect(draft.take().documents.count == 2 && draft.notice == nil)
+    }
+
+    private static func pdf(pages: Int, password: String? = nil) -> Data {
+        let data = NSMutableData()
+        var box = CGRect(x: 0, y: 0, width: 72, height: 72)
+        let options = password.map { [kCGPDFContextUserPassword: $0, kCGPDFContextOwnerPassword: $0] }
+        let context = CGContext(consumer: CGDataConsumer(data: data)!, mediaBox: &box, options as CFDictionary?)!
+        for _ in 0..<pages {
+            context.beginPDFPage(nil)
+            context.endPDFPage()
+        }
+        context.closePDF()
+        return data as Data
+    }
+
     /// A new chat, and a chat's first message, keep the composer's text view, and the keyboard in it.
     @Test func aNewChatKeepsTheComposer() async throws {
         let (state, window, folder) = try chat()

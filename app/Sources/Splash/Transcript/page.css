@@ -112,13 +112,44 @@ button {
 .glyph.check, .copied .glyph.copy { display: none; }
 .copied .glyph.check { display: inline-block; }
 
-/* The user's words: their images, then their text in a bubble, filled where the model's are not,
-   at the column's end; the images with a hairline, so that a white one keeps its edge. */
+/* The user's words: their PDFs and images, then their text in a bubble, filled where the model's are
+   not, at the column's end; the images with a hairline, so that a white one keeps its edge. */
 .user {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
   gap: 8px;
+}
+
+.user .files {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.user .file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 260px;
+  padding: 7px 12px;
+  border-radius: 12px;
+  background: var(--bubble);
+}
+
+.file .badge {
+  flex: none;
+  color: var(--secondary);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .04em;
+}
+
+.file .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .user .images {

@@ -63,6 +63,8 @@ final class Server {
     private(set) var context: Int?
     /// Once ready: whether the model takes images.
     private(set) var acceptsImages = false
+    /// Once ready: whether the model takes PDFs.
+    private(set) var acceptsPDFs = false
     /// Once ready: what a reasoning effort does to the model.
     private(set) var reasoning: Reasoning?
     /// Once ready: the work the server reports, as its status gives it.
@@ -196,6 +198,7 @@ final class Server {
         activity = Activity()
         requestLog = []
         acceptsImages = false
+        acceptsPDFs = false
         reasoning = nil
         stopRequested = false
         resetLog(log)
@@ -329,6 +332,7 @@ final class Server {
                     let served = await servedModel()
                     guard !Task.isCancelled, phase == .starting else { break }
                     acceptsImages = served?.input_modalities?.contains("image") ?? false
+                    acceptsPDFs = served?.input_modalities?.contains("pdf") ?? false
                     reasoning = served?.reasoning
                     context = served?.context_length
                     phase = .ready

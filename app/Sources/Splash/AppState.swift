@@ -292,8 +292,9 @@ final class AppState {
         guard let target, let limit = target.context, limit > 0, chats.streaming == nil else { return nil }
         let history = chats.current?.messages ?? []
         let text = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !history.isEmpty || !text.isEmpty || !draft.images.isEmpty else { return nil }
-        return ChatContext.Request(history: history, text: text, images: draft.images, target: target, started: server.since)
+        guard !history.isEmpty || !text.isEmpty || !draft.images.isEmpty || !draft.documents.isEmpty else { return nil }
+        return ChatContext.Request(history: history, text: text, images: draft.images, documents: draft.documents,
+                                   target: target, started: server.since)
     }
 
     /// The count the composer's ring shows: the next prompt's, or the last one of the open
@@ -311,7 +312,8 @@ final class AppState {
     /// too long.
     var canSendDraft: Bool {
         guard !draft.isEmpty, draft.attaching == 0, server.answers, chats.streaming == nil,
-              draft.images.isEmpty || server.acceptsImages else { return false }
+              draft.images.isEmpty || server.acceptsImages,
+              draft.documents.isEmpty || server.acceptsPDFs else { return false }
         return overflow == nil
     }
 
@@ -325,7 +327,7 @@ final class AppState {
     func sendDraft() {
         guard canSendDraft, let target else { return }
         let message = draft.take()
-        chats.send(message.text, images: message.images, to: target)
+        chats.send(message.text, images: message.images, documents: message.documents, to: target)
     }
 
     /// Asks the running model again for the open conversation's last answer.
@@ -335,8 +337,9 @@ final class AppState {
 
     private var target: ChatTarget? {
         guard server.phase == .ready, let model = server.model else { return nil }
-        return ChatTarget(url: server.settings.url, model: model, acceptsImages: server.acceptsImages, effort: effort,
-                          context: server.context, apiKey: server.settings.apiKey)
+        return ChatTarget(url: server.settings.url, model: model, acceptsImages: server.acceptsImages,
+                          acceptsPDFs: server.acceptsPDFs, effort: effort, context: server.context,
+                          apiKey: server.settings.apiKey)
     }
 
     /// The reasoning effort messages to the model that runs ask for, as chosen for it; empty for
