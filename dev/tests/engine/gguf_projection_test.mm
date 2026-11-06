@@ -673,8 +673,9 @@ void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
 // simdgroups skip their matmuls, though not the barriers of the stage they share, and leave the rows from 192 or 160
 // unwritten. Chunks of up to 32 rows run the decode tiles, whose rows equal the 128-row tiles' bitwise without K
 // splits and lie within fp64 with them; chunks of 33-64 rows run the 64-row decode tile, alike, and also at eight
-// partitions, which the split law takes for some shapes, where K takes them. Each of `formats` ([1024, K]) at each
-// epilogue, and a fused projection at its segments' column offsets.
+// partitions, which the split law takes for some shapes, where K takes them. Every chunk's last 1 and 4 rows, on its
+// tile and splits at their own height, equal its rows bitwise. Each of `formats` ([1024, K]) at each epilogue, and a
+// fused projection at its segments' column offsets.
 void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std::vector<Fmt> &formats) {
   constexpr uint32_t kChunks[] = {168, 136}, kSimdgroupRows = 32;
   // The split chunks' partitions: the most up to four that take whole 32-input groups.
@@ -695,13 +696,32 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
     const std::vector<uint16_t> aux = storageRows(auxiliary, columns, storage, storage);
     const std::vector<Dot> dots = products(parts, columns, x, kChunks[0]);
     const std::string label = what + " " + epilogueName(epilogue);
+    // A chunk's last rows on its plan's tile and splits at their own rows'
+    // height, as a prefill's last layer runs the rows something reads
+    // (Linear::prefillPlan of a chunk's rows), write the chunk's bits.
+    const auto lastRows = [&](const LinearPlan &plan, const Outcome &out, const std::string &name) {
+      const uint32_t chunk = plan.workload().rows;
+      for (const uint32_t rows : {1u, 4u}) {
+        const LinearPlan part = Linear::plan(workload(rows), plan.configuration(), FloatOutput::BFloat16);
+        const auto last = [&](const std::vector<float> &values, uint32_t width) {
+          const auto end = values.begin() + uint64_t{chunk} * width;
+          return storageRows(std::vector<float>(end - uint64_t{rows} * width, end), width, rows, part.storageRows());
+        };
+        const std::string own = name + ", its last " + std::to_string(rows);
+        const Outcome alone =
+            run(backend, linear, part, p, nullptr, last(x, K), last(auxiliary, columns), kPoisonNaN, covered, own);
+        if (!sameRows(alone.output, 0, out.output, chunk - rows, rows, columns)) fail(own + ": differ from the chunk's");
+      }
+    };
     std::vector<uint16_t> tileOutput;  // the first chunk's output on the 128-row tiles
     for (const uint32_t chunk : kChunks) {
       const LinearWorkload w = workload(chunk);
       const std::string name = label + " " + std::to_string(chunk) + " rows";
-      const Outcome whole = run(backend, linear, Linear::plan(w, kTiles, FloatOutput::BFloat16), p, nullptr,
-                                storageRows(x, K, chunk, storage), aux, kPoisonNaN, covered, name);
+      const LinearPlan tiles = Linear::plan(w, kTiles, FloatOutput::BFloat16);
+      const Outcome whole =
+          run(backend, linear, tiles, p, nullptr, storageRows(x, K, chunk, storage), aux, kPoisonNaN, covered, name);
       checkValues(whole, dots, {}, aux, w, chunk, covered, true, name);
+      lastRows(tiles, whole, name);
       const uint32_t written = (chunk + kSimdgroupRows - 1) / kSimdgroupRows * kSimdgroupRows;
       if (!std::all_of(whole.output.begin() + uint64_t{written} * columns, whole.output.end(),
                        [](uint16_t v) { return v == kUnwritten; }))
@@ -720,6 +740,7 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
         const Outcome out = run(backend, linear, plan, p, nullptr, storageRows(x, K, rows, plan.storageRows()),
                                 chunkAux, kPoisonNaN, covered, name);
         checkValues(out, dots, {}, chunkAux, chunk, rows, covered, true, name);
+        lastRows(plan, out, name);
         if (splits == 1 && !sameRows(out.output, 0, tileOutput, 0, rows, columns))
           fail(name + ": differs from the 128-row tiles");
         // A fused chunk runs its segments in one dispatch, each segment's columns bitwise its own chunk's at the
@@ -759,7 +780,8 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
   section("prefill: " + std::to_string(formats.size()) + " formats, K " + std::to_string(K) +
           ", plain/residual/up-with-gate and fused segments, 128-row tiles over 168- and 136-row chunks and chunks of "
           "8-64 rows (S 1 and " + std::to_string(splitChunk) + (K / 32 % 8 ? "" : ", and 8 past 32 rows") +
-          ") within fp64, equal to the 128-row tiles; a fused chunk in one dispatch, bitwise its segments' own");
+          ") within fp64, equal to the 128-row tiles; a fused chunk in one dispatch, bitwise its segments' own; a "
+          "chunk's last rows alone bitwise the chunk's");
 }
 
 // ---------------------------------------------------------------- leading inputs

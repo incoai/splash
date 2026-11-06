@@ -246,9 +246,12 @@ public:
   // pair's among them.
   [[nodiscard]] uint32_t decodeStorageRows(uint32_t rows, ProjectionShape shape) const;
   // The plans of this projection's matrix. A decode plan's input() is the
-  // layout its producer writes.
+  // layout its producer writes. A prefill plan of `rows` rows of a chunk of
+  // `chunkRows` (0: `rows`) takes the chunk's tile kind and K splits, at the
+  // staged height of its own rows, which compute each row as the chunk's plan
+  // does.
   [[nodiscard]] LinearPlan prefillPlan(const Projection &projection, uint32_t rows,
-                                       LinearEpilogue epilogue) const;
+                                       LinearEpilogue epilogue, uint32_t chunkRows = 0) const;
   [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
                                       LinearEpilogue epilogue = LinearEpilogue::None,
                                       const Projection *gate = nullptr) const;
@@ -273,21 +276,24 @@ public:
                     const Projection &projection, const LinearPlan &plan,
                     const Projection *gate = nullptr) const;
 
-  // The projections of `rows` rows through their own matrix. `scratch` holds
-  // the partials and counters of split plans (the chunks the staged tile
-  // runs, ProjectionCalibration::stagedPrefillRows); reused serially within
-  // one command stream, as in decode.
+  // The projections of `rows` rows through their own matrix, on the plans of
+  // a chunk of `chunkRows` rows (prefillPlan). `scratch` holds the partials
+  // and counters of split plans (the chunks the staged tile runs,
+  // ProjectionCalibration::stagedPrefillRows); reused serially within one
+  // command stream, as in decode.
   void addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
-                  metal::MetalBuffer output, uint32_t rows, LinearScratch scratch = {}) const;
+                  metal::MetalBuffer output, uint32_t rows, LinearScratch scratch = {},
+                  uint32_t chunkRows = 0) const;
   void addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
                             metal::MetalBuffer gateScratch, metal::MetalBuffer output, uint32_t rows,
-                            LinearScratch scratch) const;
+                            LinearScratch scratch, uint32_t chunkRows = 0) const;
   void addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
                           metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
-                          LinearScratch scratch) const;
+                          LinearScratch scratch, uint32_t chunkRows = 0) const;
   // output = residual + down(silu(gate x) * up x) of `rows` normalized rows.
   void addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &buffers,
-                        metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows) const;
+                        metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
+                        uint32_t chunkRows = 0) const;
 
 private:
   // The partials and counters a dispatch of `splits` K partitions binds: the

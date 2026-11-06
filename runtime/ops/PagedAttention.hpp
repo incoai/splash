@@ -162,6 +162,14 @@ private:
         splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse), sinks(sinks) {}
 };
 
+// The rows of a prefill chunk from `first`, the first row of a tile, to its
+// last, planned as a chunk of their own after the rows before them
+// (PagedAttention::prefillTail).
+struct PrefillAttentionTail final {
+  const uint32_t first;
+  const PrefillAttentionPlan plan;
+};
+
 struct VerifyAttentionPlan final {
   const kv::Layout layout;
   const uint32_t queryHeads;
@@ -267,6 +275,10 @@ public:
   [[nodiscard]] static PrefillAttentionPlan
   prefillPlan(uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
               const AttentionCalibration &calibration, AttentionVariant variant = {});
+  // `chunk`'s rows from the first of the tile that holds `row`: the chunk's
+  // kernels and splits, so each of their tiles computes what it does in the
+  // chunk.
+  [[nodiscard]] static PrefillAttentionTail prefillTail(const PrefillAttentionPlan &chunk, uint32_t row);
   // historyTokens holds each lane's committed tokens before its verify rows,
   // one entry per lane.
   [[nodiscard]] static VerifyAttentionPlan

@@ -309,6 +309,20 @@ PrefillAttentionPlan PagedAttention::prefillPlan(uint32_t rows, uint32_t history
           layout, queryHeads};
 }
 
+PrefillAttentionTail PagedAttention::prefillTail(const PrefillAttentionPlan &chunk, uint32_t row) {
+  if (row >= chunk.rows) throw std::invalid_argument("a prefill tail starts within its chunk");
+  const uint32_t first = row - row % kv::kPrefillAttentionTileRows, rows = chunk.rows - first;
+  const uint32_t tiles = kv::prefillAttentionTiles(rows);
+  const uint32_t fusedRows = kv::kPrefillAttentionTileRows * (chunk.queryHeads / chunk.layout.kvHeads);
+  return {first,
+          {rows, chunk.splits,
+           attentionWorkspace(uint64_t{tiles} * chunk.splits * chunk.layout.kvHeads * fusedRows,
+                              chunk.layout.headDimension),
+           chunk.splitPipeline, chunk.reducePipeline,
+           {chunk.splitGroups.x, tiles, chunk.splits}, {chunk.reduceGroups.x, chunk.reduceGroups.y, tiles},
+           chunk.sparse, chunk.sinks, chunk.layout, chunk.queryHeads}};
+}
+
 VerifyAttentionPlan PagedAttention::verifyPlan(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
     std::span<const uint32_t> historyTokens, const AttentionCalibration &calibration, AttentionVariant variant) {

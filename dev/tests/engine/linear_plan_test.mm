@@ -135,6 +135,31 @@ void smallApple9StagesShortPrefillChunks() {
     }
 }
 
+// A prefill plan of some of a chunk's rows (Linear::prefillPlan) takes the
+// chunk's tile kind and K splits, at the staged height of its own rows, in no
+// more scratch than the chunk's; rows past the chunk's are refused.
+// gguf-projection checks that such a plan writes the chunk's bits.
+void chunkRowPlans() {
+  const Projection p = blockProjection(5120, 17408, 1);
+  for (const uint32_t family : {9U, 10U, 11U})
+    for (const uint32_t cores : {10U, 12U, 16U, 20U, 32U, 40U}) {
+      const Linear linear = gpu(family, cores);
+      for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
+        for (const uint32_t chunk : {1U, 7U, 32U, 33U, 64U, 65U, 300U, 2048U})
+          for (const uint32_t rows : {1U, 4U, chunk}) {
+            if (rows > chunk) continue;
+            const LinearPlan whole = linear.prefillPlan(p, chunk, epilogue),
+                             part = linear.prefillPlan(p, rows, epilogue, chunk);
+            const LinearScratchSize own = part.scratchSize(), bound = whole.scratchSize();
+            if (part.configuration() != whole.configuration() || part.workload().rows != rows ||
+                own.partials > bound.partials || own.counters > bound.counters)
+              broke("a chunk's rows departed from its prefill plan", family, cores, part.workload());
+          }
+      rejects([&] { (void)linear.prefillPlan(p, 9, LinearEpilogue::None, 8); },
+              "a prefill plan takes rows of its chunk", "a plan of more rows than its chunk was accepted");
+    }
+}
+
 // A GGUF decode projection whose split count is pinned on one core count.
 struct SplitAnchor final {
   const char *projection;
@@ -1406,6 +1431,7 @@ int main(int argc, char **argv) {
     ggufCoreLaws();
     floatOutputPlans();
     smallApple9StagesShortPrefillChunks();
+    chunkRowPlans();
     if (std::string_view(argv[1]) == "--cpu") {
       std::cout << "Linear CPU plans: PASS\n";
       return 0;

@@ -788,6 +788,45 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layou
             << " rows=" << rows << " PASS\n";
 }
 
+// A chunk's last tile attended alone (ops::PagedAttention::prefillTail of its
+// last row), as a chunk of its own after the rows before it on the chunk's
+// splits, writes the bits the whole chunk writes for its rows.
+void checkPrefillTail(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout, uint32_t history,
+                      uint32_t rows) {
+  auto data = makeCase(backend, heads, layout, 1, rows, history, false);
+  const std::vector<uint16_t> whole = run<Phase::Prefill>(backend, data, false);
+  const auto chunk = ops::PagedAttention::prefillPlan(rows, history, heads, layout, kApple10Row);
+  const uint32_t first = (rows - 1) / kv::kPrefillAttentionTileRows * kv::kPrefillAttentionTileRows;
+  const auto [start, tail] = ops::PagedAttention::prefillTail(chunk, rows - 1);
+  require(start == first && tail.rows == rows - first && tail.tiles == 1 && tail.splits == chunk.splits &&
+              tail.splitPipeline == chunk.splitPipeline && tail.reducePipeline == chunk.reducePipeline,
+          "a prefill tail departed from its chunk's plan");
+  rejects([&] { (void)ops::PagedAttention::prefillTail(chunk, rows); }, "a prefill tail starts within its chunk",
+          "a tail past its chunk was accepted");
+  kv::ChunkedPrefillParams params = data.stores[0];
+  params.committed_tokens += first;
+  params.chunk_tokens = rows - first;
+  const uint64_t rowValues = uint64_t{heads / layout.kvHeads} * layout.headDimension;
+  const metal::MetalBuffer output = allocate(backend, data.queries.sizeBytes());
+  const auto from = [&](const metal::MetalBuffer &buffer) {
+    return backend.view(buffer, first * rowValues * 2, buffer.sizeBytes() - first * rowValues * 2);
+  };
+  metal::CommandGraph graph;
+  ops::PagedAttention::addPrefill(graph, data.layer, from(data.queries), from(output),
+                                  allocate(backend, tail.workspace.partialsBytes),
+                                  allocate(backend, tail.workspace.statisticsBytes), data.tables[0], params, tail);
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
+  const auto *bits = static_cast<const uint16_t *>(output.contents());
+  for (uint32_t head = 0; head < layout.kvHeads; ++head)
+    for (uint32_t row = first; row < rows; ++row) {
+      const uint64_t begin = (uint64_t{head} * data.stride + row) * rowValues;
+      require(std::equal(bits + begin, bits + begin + rowValues, whole.begin() + static_cast<std::ptrdiff_t>(begin)),
+              "a prefill tail's rows differ from its chunk's");
+    }
+  std::cout << "paged prefill tail: format=" << kv::formatName(layout.format) << " q=" << heads
+            << " history=" << history << " rows=" << rows << " PASS\n";
+}
+
 // A prefill that reads its history staged, as one whose history has pages
 // that hold only their index does (ops::PagedAttention::addStageLayer): the
 // pool table it stages from has every third page of the history
@@ -1633,6 +1672,9 @@ int main(int argc, char **argv) {
                                                   {100, 77}, {8064, 130},
                                                   {6145, 2048}}})
         checkPrefill(backend, heads, layout, history, rows);
+      for (const auto [history, rows] :
+           std::array<std::array<uint32_t, 2>, 5>{{{0, 1}, {255, 17}, {4093, 1057}, {16383, 256}, {6145, 2048}}})
+        checkPrefillTail(backend, heads, layout, history, rows);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         checkVerify(backend, heads, layout, 0, lanes);
         checkVerify(backend, heads, layout, 1023, lanes);
