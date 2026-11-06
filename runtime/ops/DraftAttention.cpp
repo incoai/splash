@@ -200,20 +200,6 @@ void DraftAttention::addDecode(
             {shape.kvHeads, lanes, 1});
 }
 
-void DraftAttention::addReorder(metal::CommandGraph &graph,
-                                metal::MetalBuffer grouped,
-                                metal::MetalBuffer rowMajor,
-                                const DraftAttentionPlan &plan) {
-  const auto shape = plan.shape();
-  const uint32_t groups =
-      phaseGroups(uint64_t{kRows} * shape.queryHeads * shape.headDimension);
-  const uint32_t lanes = plan.lanes();
-  requireBytes(grouped, queryRowsBytes(plan), "draft grouped attention");
-  requireBytes(rowMajor, queryRowsBytes(plan), "draft attention");
-  graph.add("draft_attention_reorder", {std::move(grouped), std::move(rowMajor)},
-            {groups, lanes, 1});
-}
-
 void DraftAttention::addContextPrefill(
     metal::CommandGraph &graph, metal::MetalBuffer contextKv,
     metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
