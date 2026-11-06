@@ -274,6 +274,48 @@ final class AppState {
         installer.install(model)
     }
 
+    /// What a quit the user asks for would stop, and the button that accepts that.
+    struct QuitCost: Equatable {
+        let text: String
+        let button: String
+    }
+
+    /// What quitting now would stop; nil when nothing would be lost and the app quits at once.
+    var quitCost: QuitCost? {
+        Self.quitCost(phase: server.phase, asleep: server.asleep, model: server.model.map(displayName(of:)),
+                      next: server.next.map(displayName(of:)), downloading: installer.model.map(displayName(of:)),
+                      terminals: drawer.running)
+    }
+
+    /// A sleeping model counts: it still answers, as the next request wakes it. A model already
+    /// stopping for good, or one that failed, does not.
+    static func quitCost(phase: Server.Phase, asleep: Bool, model: String?, next: String?,
+                         downloading: String?, terminals: Int = 0) -> QuitCost? {
+        var stops: String?
+        switch phase {
+        case .ready:
+            stops = model.map {
+                asleep ? "\($0) is sleeping. Quitting stops it, and connected clients can’t wake it."
+                    : "\($0) is running. Quitting stops it and interrupts any connected clients."
+            }
+        case .starting:
+            stops = model.map { "\($0) is still starting. Quitting cancels the startup and the in-progress model load." }
+        case .stopping:
+            if let next {
+                stops = next == model ? "\(next) is restarting. Quitting cancels the restart and stops the server."
+                    : "Splash is switching to \(next). Quitting cancels the switch and stops the server."
+            }
+        default:
+            break
+        }
+        let download = downloading.map { "\($0) is still downloading. If you quit, the download starts over next time." }
+        let programs = terminals == 0 ? nil
+            : terminals == 1 ? "A terminal is running a program. Quitting ends it."
+            : "\(terminals) terminals are running programs. Quitting ends them."
+        let text = [stops, download, programs].compactMap(\.self).joined(separator: "\n\n")
+        return text.isEmpty ? nil : QuitCost(text: text, button: stops == nil ? "Quit" : "Stop Model and Quit")
+    }
+
     /// Stops the download, the model and the installer of cached models, which the app waits for
     /// as it quits, and the drawer's terminals, and starts nothing after. The installer of cached
     /// models gets SIGINT, as Ctrl+C sends, and SIGKILL 5 s later.
