@@ -187,6 +187,33 @@ def checkout_problems(version):
     return problems
 
 
+def previous_release(version):
+    """The release before version, the latest x.y.z, release candidates aside,
+    whose annotated tag is below version's x.y.z, and the build number of its
+    app, its tagged commit's (package_app.build_number); None for none."""
+    tags = subprocess.run(
+        ["git", "for-each-ref", "--format=%(objecttype) %(refname:short)", "refs/tags"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+
+    def number(release):
+        return tuple(map(int, release.split(".")))
+
+    below = number(version.split("-")[0])
+    releases = [
+        tag
+        for kind, _, tag in (line.partition(" ") for line in tags)
+        if kind == "tag" and re.fullmatch(r"\d+\.\d+\.\d+", tag) and number(tag) < below
+    ]
+    if not releases:
+        return None
+    tag = max(releases, key=number)
+    return tag, package_app.build_number(tag)
+
+
 def keychain_identity(identity):
     """The identity valid for signing code that the keychains hold for
     identity, its name or its certificate's SHA-1, as security find-identity
@@ -511,7 +538,14 @@ def make(args, folder, identity, team, carried, run):
     shutil.copyfile(args.notes, folder / "notes.md")
     if package_app.SPARKLE_PUBLIC_KEY:
         feed = appcast.generate(image, args.notes, args.version, args.sparkle_key_file)
-        appcast.check(feed, image, args.version, args.macos_min)
+        appcast.check(
+            feed,
+            image,
+            args.version,
+            args.macos_min,
+            package_app.build_number(),
+            previous_release(args.version),
+        )
         (folder / "appcast.xml").write_bytes(feed)
     else:
         print(

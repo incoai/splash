@@ -12,14 +12,26 @@ the desktop app's tests (`swift test --package-path app`). `make
 check-native-cpu` builds production and runs native CPU tests without a GPU;
 `make check-native-metal` requires a supported Metal device and runs the kernel
 tests under shader validation, and the Linear pipeline resource check without
-it. They include loading small synthetic MLX, GGUF and vision sources and the
-GGUF kernels on synthetic tensors. `make check-native-build` builds every
-native test, benchmark and tool and runs none. Hosted CI runs the CPU checks,
-`check-native-build`, the sanitizers and `check-app`. `make
-test-sanitizers-metal` runs the Metal tests of the components whose host steps
-share their state with the engine thread and the SSD readers (the hot block
-cache of spilled KV and the history stream) under ThreadSanitizer, built with
-it in `build/metal-tsan`. `make architecture-check`, one of the source checks,
+it, then `test-sanitizers-metal`. They include loading small synthetic MLX,
+GGUF and vision sources and the GGUF kernels on synthetic tensors. `make
+check-native-build` builds every native test, benchmark and tool and runs
+none. Hosted CI runs the CPU checks, `check-native-build` and `check-app` in
+one job and `test-sanitizers` in another beside it. `make test-sanitizers`
+runs the CPU tests that start threads, the control plane's (`engine`,
+`native-engine-loop`, the cache, protocol and transport tests) among them,
+under AddressSanitizer with UndefinedBehavior and under ThreadSanitizer.
+`make test-sanitizers-metal` runs the Metal tests of the backend
+(`metal-backend`'s `behaviour` tests: its host-step runner shares each
+command's steps with the thread that encodes it) and of the
+components whose host steps share their state with the engine thread and the
+SSD readers (the hot block cache of spilled KV, the history stream and the
+expert store) under ThreadSanitizer, built with it in `build/metal-tsan`;
+only orders that lie inside Metal are suppressed
+(`dev/tests/engine/metal_tsan_suppressions.txt`). `metal-backend`'s
+`latency` tests, which bound the runner's times on the wall clock (the GPU's
+resume after a step within 10 or 50 ms, the runner's pickup within 25 ms,
+its stop within 0.5 s) that ThreadSanitizer's instrumentation lengthens, run
+in `test-engine-metal` alone. `make architecture-check`, one of the source checks,
 also fails when a workflow under `.github/workflows` names a Hugging Face token
 (`HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` or a `secrets.HF_*` secret): CI installs
 public models alone and never receives one.
@@ -39,11 +51,12 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | Target | Runs |
 | --- | --- |
 | `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests` with `WEIGHT_DIGESTS_ARGS` added, such as `WEIGHT_DIGESTS_ARGS="--expert-memory 7G --ple-memory 2G"` to stream the routed experts and the PLE table, [Release check](#release-check)) |
-| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--max-context 1010000"`); for a block-sparse target their spill checks take the default prompts, two staging buffers, and 32K tokens with the default window |
+| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--max-context 1010000"`); for a block-sparse target their spill checks take the default prompts, two staging buffers, and 32K tokens with the default window, sizes that a `--spill-tokens` in `ORACLE_ARGS` replaces in all three (on a 24 GB Mac, `ORACLE_ARGS="--expert-memory 6656M --ple-memory 237M"`; below) |
 | `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats once its prompt is cached, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which on any MoE target takes `HTTP_SMOKE_ARGS="--verify-rows all"`; where `/status` reports `reasoning_switch` `false` (Flint), it gives each request whose answer it checks room for the model's reasoning and leaves out the thinking budget's check; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](server.md#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
 | `test-performance-real` | the native decode, partial-prefix and short-prompt benchmark, or with `BASELINE` its ABBA comparison with that build, in which both builds' `weight-digests` take `WEIGHT_DIGESTS_ARGS` (`dev/benchmarks/backend_regression.py`) |
+| `test-pressure-real` | the installation on this checkout's own server under `PRESSURE_ARGS` (default `--max-memory 18G`), which must make it stream its routed experts, with the [serving benchmark](#serving-benchmark)'s three churn clients for `PRESSURE_MINUTES` (default 5), checked on its own by [`check.py run`](#serving-benchmark) on G4, G8, G9, Store, Churn (its load window and every client served) and First token; results in `build/release/<model>/pressure` |
 | `release-check` | one model on this Mac ([Release check](#release-check)) |
 
 `test-agent-real` and `test-release-real` first run the tests
@@ -94,7 +107,27 @@ it and macOS's warning. A Neural Engine split leaves the plan room for what the
 checks hold at once (every lane's state, six cached states and the oracle's KV
 pages), as a start's split leaves `--max-context`, so the oracle's split may
 take fewer of the Neural Engine's units than a server's does. With only desktop
-applications open, a 24 GB Mac runs it for those variants.
+applications open, a 24 GB Mac runs it for those variants. A refusal of the
+budget fails its check with its cause, the bytes asked for and the governor's
+limit and charge. A block-sparse target's spill check counts what it allocates
+at most before its first prompt, and where the budget leaves less room, stops
+there, naming both, an `--expert-memory` that fits where that store still
+loads, and a `--spill-tokens` that fits for the oracle's command run by hand:
+`ORACLE_ARGS` reaches all three runs of `test-real`, and a `--spill-tokens`
+there replaces the first two runs' default prompts and the third's 32K.
+Beside the weights, Qwen3.8-Flash-Next's default checks hold up to 4.3 GB and
+its 32K check about 5.9 GB. On the 24 GB M6 (11-02) a check's need as the
+oracle names it (up to 1866 MiB by default, 3382 MiB at 32K) and the expert
+store together fit in about 10440 MiB on a text installation and 9580 MiB on
+one that serves vision, so all three runs take
+`ORACLE_ARGS="--expert-memory 6656M --ple-memory 237M"`, or
+`"--expert-memory 5632M --ple-memory 237M"` where the installation serves
+vision, whose default checks alone fit only up to about `7700M` of experts.
+Unlike `splash serve`, which
+streams the PLE table where memory cannot hold it, the oracle loads it whole
+unless `--ple-memory` streams it, and its weights then need 37555 MiB, which
+it refuses at once on the M6 (11-03); `237M` is the row cache `splash serve`
+gives the table there, with which the 32K check passed.
 
 The engine's `--kv-spill always`, which `splash serve` never passes, keeps
 the KV of every request of a block-sparse target on the SSD cache
@@ -111,9 +144,8 @@ source tree and commits.
 A release is checked once per source identity, and then on each Apple GPU
 family (an Apple9 M3 and an Apple10 M5) against a retained baseline build,
 `BASELINE`: a checkout whose `build/` holds `splash`, `splash.metallib`,
-`engine-tests/backend-benchmark` and, for a build that loads the weights into
-memory (1.2.0 and later), `engine-tests/weight-digests`. `release-check` fails
-without it. The baseline must load the model: it is the previous release's
+`engine-tests/backend-benchmark` and `engine-tests/weight-digests`.
+`release-check` fails without it. The baseline must load the model: it is the previous release's
 build when that loads the model. From a clean checkout:
 
 ```sh
@@ -123,6 +155,7 @@ make install release-check MODEL=mlx-community/Qwen3.8-27B-4bit REVISION=<commit
 make install release-check MODEL=unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M LANGUAGE_ONLY=1 REVISION=<commit> BASELINE=...
 make install release-check MODEL=mlx-community/Qwen3.6-35B-A3B-4bit REVISION=<commit> BASELINE=...
 make install release-check MODEL=unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M REVISION=<commit> BASELINE=...
+make install test-pressure-real MODEL=unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M REVISION=<commit> PRESSURE_ARGS="--max-memory 18G"
 make install verify-models MODEL=mlx-community/Qwen3.6-35B-A3B-4bit
 make test-agent-real MODEL=mlx-community/Qwen3.6-35B-A3B-4bit REVISION=<commit> AGENT_SCENARIO=smoke AGENT_CLIENTS=...
 ```
@@ -152,20 +185,21 @@ the other. Per model, `release-check`:
 - compares this build with `BASELINE`, which must have another build
   identity, in ABBA order (`test-performance-real`), every round after the
   first to report a [Neural Engine share](internals.md#neural-engine-prefill) running that
-  share when its build takes one: output tokens and acceptance must be
+  share: output tokens and acceptance must be
   identical (`EXPECT_OUTPUT_CHANGE=1` allows changed outputs with acceptance
   within 0.02; the benchmark verifies every row (`--verify-rows all`), so a
   MoE target's outputs repeat and its times measure the backend, not the
   verify budget of [Drafts](models.md#drafts)), and so must the bytes of the weight images
   both load (`dev/benchmarks/weights.py`); decode and prefill GPU time, with the cold
-  prefills of short prompts (480 to 2016 tokens, one chunk each) when both
-  builds' benchmarks run them, may regress by at most the larger of 2% and
+  prefills of short prompts (480 to 2016 tokens, one chunk each), and their wall
+  times (decode milliseconds per output token, the cold 14K prefill's wall
+  time and the short prefills' TTFT), which hold the host work between
+  commands, may regress by at most the larger of 2% and
   twice the run's own ABBA spread, a spread above 5% fails as inconclusive,
   and this build's
   memory plan must hold, without the Neural Engine split, at least the
   context the baseline's holds without it. `ANE_FFN_SHARE=SHARE` runs
-  every round at that share instead, in each build whose benchmark takes one
-  (0: the GPU alone); a baseline whose benchmark takes none must report none.
+  every round at that share instead (0: the GPU alone).
 
 Where the Mac's memory cannot hold a model's weight images, or its largest
 Metal buffer cannot hold one of them, as for Qwen3.8-Flash-Next,
@@ -175,17 +209,15 @@ whose images are recorded and compared ([streamed experts](server.md#streamed-ex
 `--expert-memory SIZE` and `--ple-memory SIZE` that `ORACLE_ARGS` gives the
 runtime oracle, each SIZE a whole number of bytes or of `K`, `M` or `G`, such
 as `7G`, in `verify-models` and in both builds of the comparison with
-`BASELINE`, whose `weight-digests` must take them. The layers' images then
+`BASELINE`. The layers' images then
 leave out their routed experts, and a PLE table that streams has no image
 (`ple.bin`): the engine reads those bytes from the source files, which
 `verify --full` hashes, and the digests do not cover them. Any size a store
 takes records the same images. Where the images and stores of a load exceed
 the engine's Metal memory budget, `weight-digests` refuses it before loading
-any image and names the options. A tool's expert store is SIZE and stays so,
-its chunks laid out as `splash serve`'s, where `splash serve` takes SIZE as
-the floor of a store that may be larger (`dev/tools/LoadOptions.hpp`), and
-loads the experts whole where memory holds every one: an HTTP smoke that
-streams them there takes a smaller `--max-memory` beside `--expert-memory` in
+any image and names the options. An expert store is SIZE and stays so, all
+of it its floor, in a tool (`dev/tools/LoadOptions.hpp`) as in `splash
+serve`: an HTTP smoke streams the experts with `--expert-memory` alone in
 `HTTP_SMOKE_ARGS`.
 
 Results go to `build/release/<owner>--<repo>[--VARIANT]/`. The weight images
@@ -289,39 +321,101 @@ report. Its cache checks reuse each context's cached prefix, so they need that
 memory free: when other programs leave too little, the engine evicts cached
 prefixes and the checks fail, naming what each lookup found.
 
-For a same-machine HTTP regression check, retain a `splash` binary **and its
-adjacent `splash.metallib`** built from a checkout with the same native wire
-version and status schema as this one (the server refuses any other), with
-`engine-tests/weight-digests` beside them, then run from the candidate
-checkout, after
-`make build/engine-tests/weight-digests`:
+## Serving benchmark
+
+`dev/benchmarks/serving` measures a server under concurrent requests and
+compares builds of different trees, such as a release candidate with the last
+release, on one Mac. Each run starts the tree's own server, so every tree is
+measured through the same OpenAI API whatever its native wire and status
+schema, and the client times what a user sees.
+
+| Scenario | Requests |
+| --- | --- |
+| `churn` | three clients, each sending 1500-token answers to prompts that grow every round (about 16K tokens, then more; `CHURN_BASE`/`CHURN_STEP` words), every fourth round resending its conversation, the first requests in a fixed arrival order (`--order 2,0,1` or `0,1,2`, 0.6 s apart), for `--minutes`; `/status` every 2 s |
+| `ttft` | for each N of `--n`, on a fresh server: N conversations cache an ~8K-token prefix one at a time, then send it with distinct ~300-token suffixes at the same instant, `--rounds` times, each round recording its `/status` counters' changes and the largest `memory_governor.claims` its samples showed; `/status` every 0.5 s |
+| `serve1` | one request at a time on an idle server, cold prompts of about `--sizes` tokens (300, 2K and 14K): time to first token and decode milliseconds per token; the `/status` each request waited idle for, and one after the last |
+| `warm` | per cached depth of `--sizes`, a fresh cold prefix, then 2 discarded and 8 measured ~300-token suffixes after it: the server's prompt time of each (`--trial` picks the texts, the same for every tree); `/status` as `serve1` |
+
+Every request timestamps each content chunk of its stream; its gaps are the
+intervals between consecutive chunks after the first. Each request may take
+`--request-seconds` from its send (by default twice the longest request
+measured on any Mac). A request the client gets no whole answer to is
+unanswered, the server's failure: one the server keeps streaming past that
+time, though its keepalives hold the connection open, or one whose connection
+fails or closes before the stream's `data: [DONE]`. It ends `serve1` and
+`warm`, ends `ttft` as one of its warm-ups and fails its round otherwise; in
+`churn` its client records it, with its chunk times and why, and stops.
 
 ```sh
-.venv/bin/python -m dev.benchmarks.http_regression \
-  --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M \
-  --baseline-binary /path/to/baseline/build/splash \
-  --contexts 2048,10000 --samples 5
+.venv/bin/python -m dev.benchmarks.serving.run --tree TREE --machine m6 \
+  --model ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0 --revision <commit> \
+  --draft-model DRAFT --scenario churn --order 2,0,1 --minutes 15 --label LABEL --out RESULTS
 ```
 
-It takes any installed model and, for an upstream one, holds its assembly for
-the whole run, so every round serves the same model. For a MoE target, pass
-`--verify-rows all`: the check requires the two builds' transcripts to match,
-and by default the verify budget chooses a MoE target's rows from cycle wall
-times, so its greedy output can differ between runs (see [drafts](models.md#drafts)).
-Both rounds pass the option to their engine, so a MoE comparison needs a
-baseline built from a checkout that takes it; an older baseline cannot run one.
-It starts isolated servers in ABBA order, compares matched cold, exact-prefix
-and decode requests by the release check's speed rule and weight bytes (decode
-by `metrics.decode_cycle_ms` per output token, so host work between commands
-counts), and saves
-`build/release/http-regression.json`. With `--burst N` it sends N requests of
-each context at once instead, 16 output tokens each, and reports each build's
-replay points lost to the burst (`replay_state_publication_failures`), its
-decode rate and advertised context. `--follow-up`, which needs `--burst`, then
-sends each conversation's next turn and compares their time to first token and
-how many resumed at their replay point; a burst run passes only with it. It does
-not contact your running server. Use the same power mode and charger, stop other
-GPU workloads, and report chip/GPU cores, memory, Splash version, model
-revision, actual input/output token counts, and cache hits with results. Keep
-cold prefill, cached TTFT and sustained decode separate; a UI token rate alone
-does not measure end-to-end agent performance.
+`run.py` installs the model with the tree's own installer, offline, or takes
+`--model-root`; refuses a port that already answers; checks that `/status`
+names the server it started (`instance.pid`) and the build of the tree's
+sources (`identity.cache.build_id` against the tree's own
+`dev/tools/build_identity.py check` with its Makefile's constants); runs the
+scenario; and stops the server with SIGINT, or, when it outlasts that, SIGTERM
+after 60 s and SIGKILL after 30 s more. Beside the client's
+`LABEL.events.jsonl` and `LABEL.status.jsonl` it writes `LABEL.out`, whose last
+line is `DONE` only once everything completed, `LABEL.meta.json` (binary
+SHA-256, build id, model, spawn-to-ready seconds and whether the binary had
+started on that Mac before, host memory and pressure, process snapshots at
+the start, middle and end of the scenario while the server serves, the pids
+the run started, each server's stop, the signals it took and its exit code,
+and for a run that did not complete why and whose failure
+that was: the server's, which exited, was not ready in time, failed a
+request or, once ready, did not let the scenario end, a client's, which
+raised an exception of its own, or `run.py`'s refusal to measure) and on the
+M5 Pro
+`LABEL.idle.jsonl`, its idle time and sleep assertions every 10 s. It refuses any output directory that resolves,
+through whatever symlinks, into `~/.cache/huggingface` or an `install/models`
+directory.
+
+`check.py` judges runs:
+
+- `run RESULTS LABEL [--minutes N] [--streamed] [--build BUILD_ID]` checks one
+  run on its own and exits 1 on any failure; `test-pressure-real` runs it on
+  its churn run.
+- `compare A1 B1 B2 A2`, each run as `RESULTS/LABEL`, compares two builds on
+  four runs in ABBA order on one Mac: each run must pass its own check on a
+  quiet machine, the two A runs and the two B runs must each be one build,
+  and every per-request metric the four share (churn's TTFT, completion latency and
+  decode milliseconds per token, ttft's TTFT per concurrency, serve1's TTFT
+  and decode per size, warm's prompt time per depth) must pass the release check's speed rule
+  (`dev/benchmarks/abba.py`).
+
+A run measured nothing and is to be repeated when it did not end with `DONE`
+for a reason other than the server's, served a build other than `--build`,
+or, with `--streamed`, did not start with its routed experts streamed. Only a
+timed comparison needs a quiet machine: `compare` also fails a run that saw a
+`serious` or `critical` thermal sample, found the GPU still busy after its wait
+for idle (`--gpu-idle-percent`), on the M5 Pro was touched within a 10 s
+sampling period or saw a sleep assertion held by a process it did not start
+other than `powerd`, or had a process it did not start among the top five by
+CPU at 24 % or more. `run`, whose gates judge freezes and correctness, which
+these do not excuse, notes them.
+
+| Gate | Rule |
+| --- | --- |
+| G4 | the client gaps between token events (chunks less than half the shortest decode command apart are one event's; an unanswered request counts its open gap, up to when the client stopped waiting): the largest at most 10 s, the p99 at most 5 s; every gap past 2.5 s is listed |
+| G8 | no engine restart, failed request (an HTTP error but `context_length_exceeded`, an error event in a stream the server had begun, a request of a failed TTFT round, or one `/status` counts in `requests.failed`), unanswered request, Metal failure or loop tick of 5 s or more, no exit, late start or failed request that ended the run, and every server stopped by SIGINT alone with exit 0, the engine it started gone within SIGINT's grace too |
+| G9 | the memory accounts sum to `charged_bytes` in every sample, no claim waits 30 s, nothing is owed at the end |
+| Store | a regrown expert unit taken back within 60 s of its regrow is counted; a second such take back within 60 s of the one before is an oscillation and fails |
+| Churn | the run lasted its load window (`--minutes`) and every client completed a request |
+| First token | no answered request (G8 judges unanswered ones) waited for its first token more than twice the prefill time, at the run's own rate (the tokens its answered requests prefilled over the time from the first send to the last answer), of the work the scheduler may put ahead of it: the requests in flight at its send, 24,576 rows of later arrivals (three prefill commands of at most 8,192 rows, the most that may pass over it in a row) and its own prompt, each less its cached tokens; a starvation guard, not a speed check |
+
+G8 applies to every scenario, the others to churn runs. The check also counts
+the client gaps past the decode gap target of 500 ms by cause, each taking the
+first of these that the `/status` samples from 2 s before it to 2 s after it
+show: a claim waiting for memory, the experts' size changing, a compaction, a
+replan, a history-stream wait, a committed prefill command; else it is
+unattributed.
+
+Copy a tree to another Mac by content (`rsync --checksum`): `git archive`
+leaves `dev/tests` and `dev/benchmarks` out (`.gitattributes`), and a copy
+that keeps the files' old times leaves make running stale binaries. For a
+gate, delete the test binary before building it and record the commit, an
+empty `git status --porcelain`, the binary's SHA-256 and its test count.
