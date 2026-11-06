@@ -1,6 +1,8 @@
+import AppKit
+import Observation
 import SwiftUI
 
-/// Stopping the model that runs, and the coding agents on it; models start on the Server screen.
+/// Starting the model picked, or stopping the one that runs, and the coding agents on it.
 struct ServerMenuItems: View {
     @Environment(AppState.self) private var state
 
@@ -8,6 +10,9 @@ struct ServerMenuItems: View {
         if let stop = state.stopItem {
             Button("Stop \(state.displayName(of: stop.model))") { state.stop() }
                 .disabled(!stop.enabled)
+        } else if let model = state.modelToStart {
+            Button("Start \(state.displayName(of: model))") { state.start(model) }
+                .disabled(!state.canStart)
         }
         Menu("Coding Agents") { AgentMenuItems() }
     }
@@ -29,12 +34,114 @@ struct AgentMenuItems: View {
     }
 }
 
-/// The menu bar item's panel, in Splash's own style: what runs, with its totals while it serves,
-/// any download, then the window's two parts, stopping the model, its coding agents, and quitting.
-struct MenuBarPanel: View {
+/// The menu bar item and its menu, a menu of AppKit's: a press on the item can drag to a row and
+/// release on it, as in any menu. The rows are made each time the menu opens.
+@MainActor
+final class StatusMenu: NSObject, NSMenuDelegate {
+    private let state: AppState
+    private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+
+    init(state: AppState) {
+        self.state = state
+        super.init()
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        menu.delegate = self
+        item.menu = menu
+        item.button?.setAccessibilityLabel("Splash")
+        followServer()
+    }
+
+    /// Keeps the mark as the server is.
+    private func followServer() {
+        let serving = withObservationTracking {
+            state.server.answers
+        } onChange: { [weak self] in
+            Task { @MainActor in self?.followServer() }
+        }
+        item.button?.image = SplashMark.menuBarImage(serving: serving)
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        let state = state
+        let server = state.server
+        menu.removeAllItems()
+        menu.addItem(header())
+        menu.addItem(.separator())
+        menu.addItem(ActionItem("Open Server") { Self.show(.server, in: state) })
+        menu.addItem(ActionItem("Open Chat") { Self.show(.chat, in: state) })
+        menu.addItem(.separator())
+        if let stop = state.stopItem {
+            let item = ActionItem("Stop \(state.displayName(of: stop.model))") { state.stop() }
+            item.isEnabled = stop.enabled
+            menu.addItem(item)
+        } else if let start = state.modelToStart {
+            let item = ActionItem("Start \(state.displayName(of: start))") { state.start(start) }
+            item.isEnabled = state.canStart
+            menu.addItem(item)
+        }
+        if server.phase == .ready {
+            let agents = NSMenuItem(title: "Coding Agents", action: nil, keyEquivalent: "")
+            agents.submenu = agentsMenu()
+            menu.addItem(agents)
+        }
+        if menu.items.last?.isSeparatorItem == false { menu.addItem(.separator()) }
+        menu.addItem(ActionItem("Quit Splash", key: "q") { NSApp.terminate(nil) })
+    }
+
+    private func header() -> NSMenuItem {
+        let view = NSHostingView(rootView: MenuBarHeader().environment(state))
+        view.frame.size = view.fittingSize
+        let item = NSMenuItem()
+        item.view = view
+        return item
+    }
+
+    private func agentsMenu() -> NSMenu {
+        let state = state
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        menu.addItem(.sectionHeader(title: "Open in Terminal"))
+        for agent in Agent.allCases {
+            menu.addItem(ActionItem("\(agent.title)…") { state.open(agent) })
+        }
+        menu.addItem(.separator())
+        menu.addItem(ActionItem("Copy API Address") { state.copyAPIAddress() })
+        return menu
+    }
+
+    /// Shows the window, which may have closed: the app opened again brings it back, as a second
+    /// launch does.
+    private static func show(_ section: AppState.Section, in state: AppState) {
+        state.section = section
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: NSWorkspace.OpenConfiguration())
+    }
+}
+
+/// A row of the menu that runs `run`.
+private final class ActionItem: NSMenuItem {
+    private let run: @MainActor () -> Void
+
+    init(_ title: String, key: String = "", run: @escaping @MainActor () -> Void) {
+        self.run = run
+        super.init(title: title, action: #selector(choose), keyEquivalent: key)
+        target = self
+    }
+
+    @available(*, unavailable)
+    required init(coder: NSCoder) {
+        fatalError("not used")
+    }
+
+    @MainActor @objc private func choose() {
+        run()
+    }
+}
+
+/// The top of the menu bar's menu, in Splash's own style: what runs, with its totals while it
+/// serves, and any download. It stays current while the menu is open.
+struct MenuBarHeader: View {
     @Environment(AppState.self) private var state
-    @Environment(\.openWindow) private var openWindow
-    @State private var agents = false
 
     var body: some View {
         let server = state.server
@@ -57,31 +164,9 @@ struct MenuBarPanel: View {
             if let download = state.downloadStatus {
                 Text(download).font(.callout).foregroundStyle(.secondary).padding(.horizontal, 10).padding(.bottom, 6)
             }
-            Divider().padding(.horizontal, 8).padding(.vertical, 4)
-            PanelRow(title: "Open Server") { show(.server) }
-            PanelRow(title: "Open Chat") { show(.chat) }
-            Divider().padding(.horizontal, 8).padding(.vertical, 4)
-            if let stop = state.stopItem {
-                PanelRow(title: "Stop \(state.displayName(of: stop.model))") { state.stop() }
-                    .disabled(!stop.enabled)
-            }
-            if server.phase == .ready {
-                PanelRow(title: "Coding Agents", open: agents) { withAnimation(Motion.settle) { agents.toggle() } }
-                if agents {
-                    ForEach(Agent.allCases) { agent in
-                        PanelRow(title: "\(agent.title)…", indent: true) { state.open(agent) }
-                    }
-                    CopyButton(copy: state.copyAPIAddress) { PanelLabel(title: "Copy API Address", indent: true, check: $0) }
-                        .buttonStyle(.hoverFlush)
-                }
-            }
-            if server.running {
-                Divider().padding(.horizontal, 8).padding(.vertical, 4)
-            }
-            PanelRow(title: "Quit Splash", shortcut: "⌘Q") { NSApp.terminate(nil) }
         }
-        .padding(6)
-        .frame(width: 300)
+        .padding(.horizontal, 6)
+        .frame(width: 300, alignment: .leading)
     }
 
     /// How the model does since it started: answering speed, requests and memory; the tokens it
@@ -103,59 +188,5 @@ struct MenuBarPanel: View {
         .padding(.horizontal, 10)
         .padding(.bottom, 8)
         .animation(Motion.settle, value: activity)
-    }
-
-    private func show(_ section: AppState.Section) {
-        state.section = section
-        openWindow(id: "main")
-        NSApp.activate()
-    }
-}
-
-/// A row of the menu bar's panel, highlighted under the pointer as the app's popups are; one that
-/// opens rows under it shows a chevron.
-private struct PanelRow: View {
-    let title: String
-    var shortcut: String?
-    var open: Bool?
-    var indent = false
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            PanelLabel(title: title, shortcut: shortcut, open: open, indent: indent)
-        }
-        .buttonStyle(.hoverFlush)
-        .accessibilityValue(open.map { $0 ? "Expanded" : "Collapsed" } ?? "")
-    }
-}
-
-/// What a row of the menu bar's panel shows: its title, and a shortcut, a chevron or a check.
-private struct PanelLabel: View {
-    let title: String
-    var shortcut: String?
-    var open: Bool?
-    var indent = false
-    var check = false
-
-    var body: some View {
-        HStack {
-            Text(title)
-            Spacer()
-            if let shortcut { Text(shortcut).foregroundStyle(.secondary) }
-            if let open {
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .rotationEffect(.degrees(open ? 90 : 0))
-                    .accessibilityHidden(true)
-            }
-            if check {
-                Image(systemName: "checkmark").font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
-            }
-        }
-        .padding(.leading, indent ? 22 : 10)
-        .padding(.trailing, 10)
-        .padding(.vertical, 5)
     }
 }

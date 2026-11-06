@@ -110,7 +110,7 @@ final class AppFlowTests {
         #expect(state.server.requestLog.contains { $0.outcome == .done && ($0.output ?? 0) > 0 })
         #expect(state.server.activity.generated > 0)
         await Snapshot.save("server-activity", size: CGSize(width: 1120, height: 1100), ServerView(advanced: true).environment(state))
-        await Snapshot.save("menu-bar", size: CGSize(width: 300, height: 400), MenuBarPanel().environment(state))
+        await Snapshot.save("menu-bar", size: CGSize(width: 300, height: 400), MenuBarHeader().environment(state))
         await Snapshot.save("popup-thinking", size: CGSize(width: 300, height: 260), PopupList(
             header: "Thinking",
             items: [PopupItem(id: "xhigh", title: "Extra High", badge: "Default"),

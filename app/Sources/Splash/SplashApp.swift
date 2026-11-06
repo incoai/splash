@@ -64,15 +64,6 @@ struct SplashApp: App {
                 Button("Show Download Log") { NSWorkspace.shared.open(state.installer.log) }
             }
         }
-
-        MenuBarExtra {
-            MenuBarPanel()
-                .environment(state)
-        } label: {
-            Image(nsImage: SplashMark.menuBarImage(serving: state.server.answers))
-                .accessibilityLabel("Splash")
-        }
-        .menuBarExtraStyle(.window)
     }
 }
 
@@ -103,6 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Quits as the Quit command does when the system or `kill` asks the app to end, without
     /// asking first.
     private var termination: DispatchSourceSignal?
+    private var statusMenu: StatusMenu?
     private var signalled = false
 
     /// SIGTERM caught by a handler that does nothing, for `termination` alone to act on. Not
@@ -137,6 +129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.perform(#selector(NSApplication.terminate(_:)), with: nil, afterDelay: 0)
         }
         termination?.resume()
+        statusMenu = StatusMenu(state: state)
         updates.start()
         Task { await state.launch() }
     }
