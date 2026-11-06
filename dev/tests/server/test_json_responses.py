@@ -25,8 +25,11 @@ from dev.tests.server_fixtures import (
     stream_events,
     tool_request,
 )
-from server import frontend, json_codec
+from server import json_codec
 from server import server as api
+from server.dialects import anthropic as anthropic_dialect
+from server.dialects import openai as openai_dialect
+from server.dialects import responses as responses_dialect
 
 TEXT = '中文 café e\u0301 🌍 "quoted" C:\\Users\\file\n\r\t\x00 NEL\x85 LS\u2028 PS\u2029 end'
 
@@ -219,7 +222,7 @@ class JsonResponseTests(unittest.TestCase):
         )
 
     def test_stored_response_roundtrip_and_atomic_failures(self):
-        store = frontend.ResponseStore()
+        store = responses_dialect.ResponseStore()
         for value in (TEXT, "\ud800", "\udfff"):
             response = {"id": "resp_test", "value": value}
             history = [{"role": "assistant", "content": value}]
@@ -254,8 +257,12 @@ class JsonResponseTests(unittest.TestCase):
 
     def test_nonfinite_response_failure_is_request_scoped(self):
         harness = self.harness()
-        functions = ("completion_response", "responses_response", "anthropic_response")
-        for path, function in zip(PATHS, functions, strict=True):
+        functions = (
+            (openai_dialect, "completion_response"),
+            (responses_dialect, "response_object"),
+            (anthropic_dialect, "message_response"),
+        )
+        for path, (dialect, function) in zip(PATHS, functions, strict=True):
             for stream in (False, True):
                 with (
                     self.subTest(path=path, stream=stream),
@@ -278,7 +285,7 @@ class JsonResponseTests(unittest.TestCase):
                         )
                     else:
                         context = mock.patch.object(
-                            api, function, return_value={"value": math.nan}
+                            dialect, function, return_value={"value": math.nan}
                         )
                     with context:
                         status, _, payload = harness.request(

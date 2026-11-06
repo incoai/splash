@@ -14,6 +14,14 @@
 namespace splash::model {
 namespace {
 
+// The prompt whose table rows an automatic row cache holds, every id its
+// stages read: a cache hits only rows read before, and a 128K-token prompt
+// reads about 1.1M distinct rows of its 2M ids. A larger cache hits no more
+// often (Qwen3.8-Flash-Next, 256 MiB to 2 GiB), while each GiB more in the
+// expert store makes a 24 GB Mac decode 11-23% faster: the rest goes to the
+// experts.
+constexpr uint64_t kTableShareTokens = 128 * 1024;
+
 uint64_t loadedBytes(std::span<const gguf::Image> images) {
   uint64_t bytes = 0;
   for (const gguf::Image &image : images)
@@ -47,9 +55,14 @@ StreamableWeights targetWeights(const Layout &layout, const Plan &plan, gguf::Pl
       result.tableBytes = loadedBytes(plan({.streamExperts = streams.streamExperts})) - result.loadedBytes;
       const SparseRowStoreOptions rows = streamedTableRows(layout);
       result.tableRowBytes = image.streamedRows->rowBytes;
-      result.tableMinimumBytes = SparseRowStore::workingBytes(image.streamedRows->rowBytes, rows.prefetchRows,
-                                                            rows.stageRows) +
-                               SparseRowStore::cacheBytesFor(1, image.streamedRows->rowBytes);
+      const uint64_t working =
+          SparseRowStore::workingBytes(image.streamedRows->rowBytes, rows.prefetchRows, rows.stageRows);
+      result.tableMinimumBytes = working + SparseRowStore::cacheBytesFor(1, image.streamedRows->rowBytes);
+      // A stage takes a prefill chunk's ids (SparseRowStoreOptions::stageRows).
+      result.tableShareBytes =
+          working + SparseRowStore::cacheBytesFor(
+                        kTableShareTokens / ExecutionLimits::prefillTokenBudget * rows.stageRows,
+                        image.streamedRows->rowBytes);
     }
   if (streams.streamExperts) {
     result.expertBytes = loadedBytes(plan({.streamTable = result.tableBytes != 0})) - result.loadedBytes +

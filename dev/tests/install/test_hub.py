@@ -1,5 +1,6 @@
 import _thread
 import contextlib
+import errno
 import fcntl
 import hashlib
 import inspect
@@ -7,6 +8,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import signal
 import tempfile
 import threading
@@ -142,12 +144,12 @@ class DownloadTest(unittest.TestCase):
             },
         )
 
-    def download(self, names=WEIGHTS, *, json_progress=True):
+    def download(self, names=WEIGHTS, *, json_progress=True, listed=None):
         with (
             mock.patch.object(hub, "json_progress", json_progress),
             contextlib.redirect_stdout(self.stdout),
         ):
-            return self.repository().download(names)
+            return self.repository(listed).download(names)
 
     def events(self):
         return [
@@ -228,6 +230,35 @@ class DownloadTest(unittest.TestCase):
         self.download({"config.json"})
         self.assertEqual(self.stdout.getvalue(), "")
         self.assertEqual(self.downloads, [["config.json"]])
+
+    def test_a_download_the_cache_volume_has_no_room_for_is_refused(self):
+        """Measured on the Hub cache's own volume, before anything is
+        fetched, so the disk is never filled; a model's first download, whose
+        folder is not there yet, measures the folder it goes in."""
+        shutil.rmtree(self.blobs.parent)
+        with (
+            mock.patch.object(
+                hub, "_available_bytes", wraps=hub._available_bytes
+            ) as measured,
+            self.assertRaises(hub.models.ModelError),
+        ):
+            self.download(listed={"model-1.safetensors": 1 << 60})
+        volume = measured.call_args.args[0]
+        self.assertIn(self.cache, [volume, *volume.parents])
+        self.assertEqual(self.downloads, [])
+        self.assertEqual(self.events(), [])
+        self.blobs.mkdir(parents=True)
+        with (
+            mock.patch.object(hub, "_available_bytes", lambda path: 499),
+            self.assertRaisesRegex(
+                hub.models.ModelError, "needs 0.00 GB and 0.00 GB is available"
+            ),
+        ):
+            self.download()
+        self.assertEqual(self.downloads, [])
+        with mock.patch.object(hub, "_available_bytes", lambda path: 500):
+            self.download()
+        self.assertEqual(self.downloads, [sorted(WEIGHTS)])
 
     def test_a_failed_download_reports_no_completion(self):
         def fail(done):
@@ -332,6 +363,82 @@ class DownloadTest(unittest.TestCase):
             (self.snapshot / name).unlink()
         self.download()
         self.assertEqual([path.exists() for path in live], [False, False])
+
+
+class PinTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.cache = self.root / "hub"
+        self.installation = self.root / "models" / "model"
+
+    def snapshot(self, cache, commit):
+        return cache / hub.folder_name(REPO) / "snapshots" / commit
+
+    def test_retiring_keeps_the_new_pin_however_its_cache_is_spelled(self):
+        """The assembly a new one replaces may name the same Hub cache by
+        another path, here a symbolic link to it."""
+        alias = self.root / "alias"
+        alias.symlink_to(self.cache)
+        old = hub.pin(self.snapshot(self.cache, "b" * 40), REPO, self.installation)
+        new = hub.pin(self.snapshot(self.cache, COMMIT), REPO, self.installation)
+        hub.retire_other_pins(
+            [new], [hub.pinned(self.snapshot(alias, "b" * 40), self.installation)]
+        )
+        self.assertEqual([old.exists(), new.exists()], [False, True])
+
+    def test_retiring_removes_a_pin_name_that_links_nothing(self):
+        """A symbolic link named like a pin is not the new pin, even when the
+        file it named is gone."""
+        new = hub.pin(self.snapshot(self.cache, COMMIT), REPO, self.installation)
+        dangling = new.parent / ("b" * 40)
+        dangling.symlink_to(self.root / "removed")
+        hub.retire_other_pins([new])
+        self.assertEqual([os.path.lexists(dangling), new.exists()], [False, True])
+
+
+class FailureKindTest(unittest.TestCase):
+    def test_hub_failures_carry_their_kind(self):
+        """A Hub or network failure says which, as the app words it. A gated
+        repository exists, though huggingface_hub refuses it as a
+        RepositoryNotFoundError, and a revision or file the Hub lacks is not
+        a missing repository: the message names it."""
+        import httpx
+        from huggingface_hub.errors import (
+            GatedRepoError,
+            HfHubHTTPError,
+            RemoteEntryNotFoundError,
+            RepositoryNotFoundError,
+            RevisionNotFoundError,
+        )
+
+        request = httpx.Request("GET", f"https://huggingface.co/api/models/{REPO}")
+
+        def refused(status, kind=HfHubHTTPError):
+            return kind("refused", response=httpx.Response(status, request=request))
+
+        for error, kind in (
+            (refused(401, RepositoryNotFoundError), "not_found"),
+            (refused(404, RepositoryNotFoundError), "not_found"),
+            (refused(401, GatedRepoError), "auth"),
+            (refused(403, GatedRepoError), "auth"),
+            (refused(404, RevisionNotFoundError), None),
+            (refused(404, RemoteEntryNotFoundError), None),
+            (refused(404), None),
+            (refused(401), "auth"),
+            (refused(403), "auth"),
+            (httpx.ConnectError("no route", request=request), "offline"),
+            (httpx.ReadTimeout("slow", request=request), "offline"),
+            (OSError(errno.EACCES, "Permission denied"), None),
+            (refused(500), None),
+        ):
+            with self.subTest(error=error):
+                with self.assertRaises(hub.models.ModelError) as caught:
+                    with hub.as_model_errors(f"cannot install {REPO}"):
+                        raise error
+                self.assertEqual(caught.exception.kind, kind)
+                self.assertTrue(str(caught.exception).startswith("cannot install"))
 
 
 if __name__ == "__main__":

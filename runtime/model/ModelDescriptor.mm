@@ -1,5 +1,6 @@
 #include "ModelDescriptor.hpp"
 #include "GgufImage.hpp"
+#include "GgufTarget.hpp"
 #include "SafetensorsImage.hpp"
 #include "WeightStore.hpp"
 #include "metal/abi/DraftAttention.h"
@@ -261,7 +262,7 @@ std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybri
 // sizes it holds (sizeDifference). A safetensors target's config.json also
 // holds the rest of what the kernels compute; a GGUF's is what the installer
 // derived from the GGUF's metadata, which the GGUF planner checks
-// (gguf::requireMetadata).
+// (gguf::planImages).
 void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, TargetSource source) {
   const std::string_view name = sourceName(source);
   if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
@@ -394,7 +395,7 @@ uint32_t draftMaskToken(NSDictionary *draft, const QwenTargetDimensions &target)
 // (ops::MoeShape: from the experts each token takes to the wide slots), and
 // whole 8-column tiles of the router's float projection (GgufFloatParams);
 // every start's planner holds the header and each expert tensor to it
-// (gguf::requireMetadata). A config without it, which an earlier release
+// (gguf::planImages). A config without it, which an earlier release
 // derived, states the family's.
 uint32_t ggufRoutedExperts(NSDictionary *text, const QwenHybridLayout &target) {
   if (!text[@"num_experts"]) return target.experts;
@@ -437,12 +438,11 @@ void requireMlxQuantization(NSDictionary *quantization, const QwenTargetDimensio
       return module && !entry[key] ? modeDefault : requireWhole(entry[key], label + " " + key.UTF8String);
     };
     const uint32_t bits = number(@"bits", 4), group = number(@"group_size", affine ? 64 : nvfp4 ? 16 : 32);
-    if (affine ? quant_affine_format_of(bits, group) == GGUF_FMT_COUNT
-               : nvfp4 ? bits != 4 || group != 16 : ![mode isEqual:@"mxfp4"] || bits != 4 || group != 32)
+    if (safetensors::mlxFormat(mode.UTF8String ?: "", bits, group) == GGUF_FMT_COUNT)
       throw std::invalid_argument(label + " is " + mode.UTF8String + " " + std::to_string(bits) +
-                                  "-bit in groups of " + std::to_string(group) +
-                                  "; MLX weights load as affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or "
-                                  "128, or as mxfp4 or nvfp4");
+                                  "-bit in groups of " + std::to_string(group) + "; MLX weights load as " +
+                                  std::string(safetensors::kMlxAffineFormats) + ", or as " +
+                                  std::string(safetensors::kMlxFloatFormats));
   };
   require(quantization, "quantization", false);
   // A module's entry is an object; the object's other values are its own.
@@ -649,9 +649,10 @@ void requireQuantization(NSDictionary *config, const QwenTargetDimensions &geome
     if ([quantization[@"quant_method"] isEqual:@"compressed-tensors"])
       return requireCompressedTensorsQuantization(quantization, geometry);
   }
-  throw std::invalid_argument(
-      "this model requires an MLX checkpoint (affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or 128, mxfp4 or "
-      "nvfp4), an NVFP4 or FP8 checkpoint of Model Optimizer or compressed-tensors, or a supported GGUF");
+  throw std::invalid_argument("this model requires an MLX checkpoint (" + std::string(safetensors::kMlxAffineFormats) +
+                              ", " + std::string(safetensors::kMlxFloatFormats) +
+                              "), an NVFP4 or FP8 checkpoint of Model Optimizer or compressed-tensors, or a supported "
+                              "GGUF");
 }
 
 // A DFlash2 checkpoint's config: the draft's layout. Its attention widths,
@@ -812,48 +813,16 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   return result;
 }
 
-// A GGUF's scalar metadata as the installer copies it from the header it read
-// (install/gguf.py scalar_metadata): "unsigned", "float" and "string" objects
-// of the values of each kind. An unsigned one is a whole number from 0 to
-// 2^64 - 1, which NSJSONSerialization keeps exactly as a signed or, past
-// 2^63 - 1, an unsigned 64-bit integer.
-GgufMetadata readGgufMetadata(const std::filesystem::path &path) {
-  NSDictionary *object = readObject(path, "GGUF metadata");
-  GgufMetadata metadata;
-  NSDictionary *unsigneds = requireObject(object, @"unsigned", "GGUF metadata unsigned");
-  for (id key in unsigneds) {
-    const std::string name = requireText(key, "GGUF metadata key");
-    id value = unsigneds[key];
-    const std::string_view type = [value isKindOfClass:[NSNumber class]] ? [value objCType] : "";
-    if (type != "Q" && (type != "q" || [value longLongValue] < 0))
-      throw std::invalid_argument("GGUF metadata " + name + " must be a whole number from 0 to 2^64 - 1");
-    metadata.unsigneds.emplace(name, [value unsignedLongLongValue]);
-  }
-  NSDictionary *floats = requireObject(object, @"float", "GGUF metadata float");
-  for (id key in floats) {
-    const std::string name = requireText(key, "GGUF metadata key");
-    metadata.floats.emplace(name, requireNumber(floats[key], "GGUF metadata " + name).doubleValue);
-  }
-  NSDictionary *strings = requireObject(object, @"string", "GGUF metadata string");
-  for (id key in strings) {
-    const std::string name = requireText(key, "GGUF metadata key");
-    metadata.strings.emplace(name, requireText(strings[key], "GGUF metadata " + name));
-  }
-  return metadata;
-}
-
 // The attention of a target whose full-attention layers select blocks (a
 // block indexer): a verify row attends its top blocks, and a row whose
 // history holds no more than those attends it all, through its page table.
 // None for a target whose rows attend every token.
-std::optional<SparseKvShape> sparseKvShape(const QwenTargetDimensions &layout) {
-  if (!layout.hasIndexer()) return std::nullopt;
+std::optional<SparseKvShape> sparseKvShape(const QwenHybridLayout &layout) {
+  if (layout.kvLayout().reads != kv::Reads::SelectedBlocks) return std::nullopt;
   return SparseKvShape{.blockTokens = layout.indexerBlockTokens,
                        .selectedBlocks = layout.indexerTopBlocks,
                        .verifyRows = ExecutionLimits::targetVerifyRows,
-                       .denseHistoryTokens = layout.indexerTokens(),
-                       .sinkTokens = 0,
-                       .localTokens = 0};
+                       .denseHistoryTokens = layout.indexerTokens()};
 }
 
 } // namespace
@@ -924,13 +893,28 @@ ModelDescriptor servedFor(ModelDescriptor model, uint32_t contextTokens) {
         if (contextTokens > layout.yarnContextTokens)
           throw std::invalid_argument(
               std::string(layout.family) + " serves at most " +
-              std::to_string(std::max(layout.nativeContextTokens, layout.yarnContextTokens)) + " tokens of context");
+              std::to_string(layout.maximumContextTokens()) + " tokens of context");
         model.ropeScaling = {.factor = static_cast<double>(contextTokens) / layout.nativeContextTokens,
                              .originalContextTokens = layout.nativeContextTokens};
         model.capabilities.maximumContextTokens = layout.servedContextTokens(model.ropeScaling);
       },
       model.target);
   return model;
+}
+
+std::vector<FamilyFacts> familyFacts() {
+  std::vector<FamilyFacts> facts;
+  forEachFamily([&](const auto &layout) {
+    facts.push_back({.family = layout.family,
+                     .experts = layout.ffnKind == QwenFfnKind::SparseMoe,
+                     .recurrentState = layout.gdnStateLayout().layers > 0,
+                     .pleTable = layout.pleNgram > 0,
+                     .sparseKv = sparseKvShape(layout).has_value(),
+                     .denseFfn = layout.ffnKind == QwenFfnKind::Dense,
+                     .contextTokens = layout.nativeContextTokens,
+                     .maximumContextTokens = layout.maximumContextTokens()});
+  });
+  return facts;
 }
 
 ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
@@ -955,7 +939,7 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
 
 std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::string_view visionFormat,
                                             const std::filesystem::path &config,
-                                            const std::optional<std::filesystem::path> &ggufMetadata,
+                                            const std::optional<std::filesystem::path> &ggufHeaders,
                                             const std::optional<std::filesystem::path> &draft) {
   @autoreleasepool {
     NSDictionary *target = readObject(config, "upstream model config");
@@ -963,10 +947,13 @@ std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::
     // Unnamed: the record names an installation, which this precedes.
     const ModelDescriptor descriptor = describeSourceModel({}, targetFormat, visionFormat, target, checkpoint);
     if (descriptor.targetSource == TargetSource::Gguf) {
-      if (!ggufMetadata) throw std::invalid_argument("a GGUF target is checked with its metadata");
-      const GgufMetadata metadata = readGgufMetadata(*ggufMetadata);
-      std::visit([&](const auto &layout) { gguf::requireMetadata(metadata, layout.ggufArchitecture, layout); },
-                 descriptor.target);
+      if (!ggufHeaders) throw std::invalid_argument("a GGUF target is checked with its headers");
+      const OpenGguf headers(findTargetGgufs(*ggufHeaders), GgufContents::Headers);
+      std::visit(
+          [&](const auto &layout) {
+            static_cast<void>(gguf::planImages(headers.file(), layout.ggufArchitecture, layout));
+          },
+          descriptor.target);
     }
     return descriptor.family();
   }

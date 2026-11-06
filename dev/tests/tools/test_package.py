@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -28,13 +29,7 @@ def write_distribution(path, names):
 def write_source(root):
     """A source tree holding the files stage_runtime copies, and none of the
     optional engine files."""
-    for folder, names in (
-        ("install", package.INSTALL_FILES),
-        ("install/completions", package.COMPLETION_FILES),
-        ("server", package.SERVER_FILES),
-        ("server/chat-assets", package.CHAT_ASSET_FILES),
-        ("build", package.ENGINE_FILES),
-    ):
+    for folder, names in (*package.SOURCE_FOLDERS, ("build", package.ENGINE_FILES)):
         (root / folder).mkdir(parents=True, exist_ok=True)
         for name in names:
             (root / folder / name).write_text("fixture")
@@ -47,10 +42,7 @@ class PackageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for folder, names in (
-                ("install", package.INSTALL_FILES),
-                ("install/completions", package.COMPLETION_FILES),
-                ("server", package.SERVER_FILES),
-                ("server/chat-assets", package.CHAT_ASSET_FILES),
+                *package.SOURCE_FOLDERS,
                 ("build", ("splash", "splash.metallib")),
             ):
                 (root / folder).mkdir(parents=True)
@@ -103,6 +95,7 @@ class PackageTests(unittest.TestCase):
             for folder, names in (
                 ("install", package.INSTALL_FILES),
                 ("server", package.SERVER_FILES),
+                ("server/dialects", package.DIALECT_FILES),
                 ("server/chat-assets", package.CHAT_ASSET_FILES),
                 ("build", (*package.ENGINE_FILES, *package.OPTIONAL_ENGINE_FILES)),
             ):
@@ -154,7 +147,11 @@ class PackageTests(unittest.TestCase):
                 )
             self.assertEqual(
                 {p.name for p in (stage / "server").iterdir()},
-                {*package.SERVER_FILES, "chat-assets"},
+                {*package.SERVER_FILES, "dialects", "chat-assets"},
+            )
+            self.assertEqual(
+                {p.name for p in (stage / "server/dialects").iterdir()},
+                set(package.DIALECT_FILES),
             )
             self.assertEqual(
                 {p.name for p in (stage / "engine").iterdir()},
@@ -251,16 +248,29 @@ class PackageTests(unittest.TestCase):
             for command in smoke:
                 self.assertIn("-B", command)
 
-    def test_every_installer_module_and_the_suggested_models_ship(self):
-        # The packaged launcher and installer import these by module name, and
-        # the app and shell completion read the suggested models.
-        shipped = {
-            path.name
-            for pattern in ("*.py", "*.tsv")
-            for path in (package.ROOT / "install").glob(pattern)
-        }
-        self.assertIn("suggested-models.tsv", shipped)
-        self.assertLessEqual(shipped, set(package.INSTALL_FILES))
+    def test_every_installer_and_server_module_and_the_suggested_models_ship(self):
+        # The packaged launcher, installer and server import these by module
+        # name, some only on the path that needs them, and the app and shell
+        # completion read the suggested models.
+        self.assertTrue((package.ROOT / "install/suggested-models.tsv").exists())
+        shipped = dict(package.SOURCE_FOLDERS)
+        for top in ("install", "server"):
+            for pattern in ("*.py", "*.tsv"):
+                for path in (package.ROOT / top).rglob(pattern):
+                    folder = path.parent.relative_to(package.ROOT).as_posix()
+                    with self.subTest(path=f"{folder}/{path.name}"):
+                        self.assertIn(path.name, shipped.get(folder, ()))
+
+    def test_the_installer_names_the_archive_make_package_builds(self):
+        macos_min = re.search(
+            r"^MACOS_MIN_VERSION := (\S+)$",
+            (package.ROOT / "Makefile").read_text(),
+            re.MULTILINE,
+        )[1]
+        self.assertIn(
+            f'name="{package.archive_name("$version", macos_min)}"',
+            (package.ROOT / "dev/tools/install.sh").read_text(),
+        )
 
     def test_packaged_paths_keep_user_data_outside_versioned_prefix(self):
         source = Path(paths.__file__).read_text()
@@ -770,7 +780,16 @@ class InstallerTests(unittest.TestCase):
             contextlib.redirect_stdout(printed),
         ):
             api.return_value.upload_file.side_effect = upload
-            publish_test.main(["--version", "1.0", "--repo", "owner/splash-releases"])
+            publish_test.main(
+                [
+                    "--version",
+                    "1.0",
+                    "--macos-min",
+                    "26.4",
+                    "--repo",
+                    "owner/splash-releases",
+                ]
+            )
         # This curl serves the uploaded files only to requests that carry the
         # token, as the private repo does.
         commands = self.root / "commands"

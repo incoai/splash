@@ -24,7 +24,7 @@
 //   every K split each tile takes there, and prefilled; and Q8_0 decoded at K 192, three of the register tile's
 //   64-input coefficient units, which two partitions split into one and two.
 // Every run leaves the padding columns past its segments, the guard bands past its buffers and its counters as they
-// were. The token gather (ops::Embedding) of every embedding format's native rows is checked here too.
+// were. The token gather (ops::Embedding) of every format's rows as stored is checked here too.
 #include "GgufFormatReference.hpp"
 #include "LinearNumerics.hpp"
 #include "TestBuffers.hpp"
@@ -313,9 +313,10 @@ struct Operands {
   }
 };
 
-// The output rows [0, storage) of a run and, for gate/up, the gate its up pass read.
+// The output rows [0, storage) of a run, for gate/up the gate its up pass read, and the dispatches it ran.
 struct Outcome {
   std::vector<uint16_t> output, gate;
+  size_t dispatches = 0;
 };
 
 // Runs one projection with `plan` over `x` (and `aux`), its split partials first set to `poison`; checks that a spread
@@ -343,8 +344,9 @@ Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan,
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   if (!scratch.intact() || !o.input.intact() || !o.aux.intact() || !o.output.intact() || !o.gate.intact())
     fail(label + ": a counter is not reset or a write past a buffer");
-  Outcome out{o.output.halves(), plan.workload().epilogue == LinearEpilogue::GateUp ? o.gate.halves()
-                                                                                   : std::vector<uint16_t>{}};
+  Outcome out{o.output.halves(),
+              plan.workload().epilogue == LinearEpilogue::GateUp ? o.gate.halves() : std::vector<uint16_t>{},
+              graph.dispatches().size()};
   const uint32_t columns = plan.workload().matrix.outputSize;
   for (const std::vector<uint16_t> *rows : {&out.output, &out.gate})
     for (uint64_t i = 0; i < rows->size(); ++i)
@@ -720,6 +722,27 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
         checkValues(out, dots, {}, chunkAux, chunk, rows, covered, true, name);
         if (splits == 1 && !sameRows(out.output, 0, tileOutput, 0, rows, columns))
           fail(name + ": differs from the 128-row tiles");
+        // A fused chunk runs its segments in one dispatch, each segment's columns bitwise its own chunk's at the
+        // same split.
+        if (parts.size() > 1) {
+          if (out.dispatches != 1)
+            fail(name + ": ran " + std::to_string(out.dispatches) + " dispatches, not one");
+          uint32_t offset = 0;
+          for (const Tensor *t : parts) {
+            const LinearWorkload alone{{t->N, K}, rows, LinearPhase::Prefill, epilogue};
+            const LinearPlan own = Linear::plan(alone, config(LinearTile::GgufStaged, alone, splits),
+                                                FloatOutput::BFloat16);
+            const Outcome segment = run(backend, linear, own, projection({t}, t->N), nullptr,
+                                        storageRows(x, K, rows, own.storageRows()), chunkAux, kPoisonNaN, t->N,
+                                        name + " " + fmtName(t->format) + " alone");
+            for (uint32_t r = 0; r < rows; ++r)
+              if (!std::equal(segment.output.begin() + uint64_t{r} * t->N,
+                              segment.output.begin() + uint64_t{r + 1} * t->N,
+                              out.output.begin() + uint64_t{r} * columns + offset))
+                fail(name + ": " + fmtName(t->format) + "'s columns differ from its own chunk's");
+            offset += t->N;
+          }
+        }
       }
   };
   for (size_t i = 0; i < formats.size(); ++i) {
@@ -736,7 +759,7 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
   section("prefill: " + std::to_string(formats.size()) + " formats, K " + std::to_string(K) +
           ", plain/residual/up-with-gate and fused segments, 128-row tiles over 168- and 136-row chunks and chunks of "
           "8-64 rows (S 1 and " + std::to_string(splitChunk) + (K / 32 % 8 ? "" : ", and 8 past 32 rows") +
-          ") within fp64, equal to the 128-row tiles");
+          ") within fp64, equal to the 128-row tiles; a fused chunk in one dispatch, bitwise its segments' own");
 }
 
 // ---------------------------------------------------------------- leading inputs
@@ -889,20 +912,18 @@ void splitVisibility(MetalBackend &backend, const Linear &linear, LinearTile til
 } // namespace
 
 // ---------------------------------------------------------------- token gather
-// ops::Embedding over the native rows of every embedding format (kernels/shared/embedding.metal): each gathered value
+// ops::Embedding over the native rows of every format (kernels/shared/embedding.metal): each gathered value
 // is the bf16 rounding of GGML's fp32 value, for tokens in any order, repeated, and the vocabulary's first and last;
 // and over BF16 and F16 rows of random bits with the top exponent bit clear (finite and below 2, subnormals
-// included), each value the bf16 rounding of the stored one.
+// included), each value the bf16 rounding of the stored one, also in rows of Flash-Next's 160 PLE values, which
+// are no whole native block.
 void tokenGather(MetalBackend &backend) {
   constexpr uint32_t kVocabulary = 64, kHidden = 1024;
   const std::vector<uint32_t> tokens{kVocabulary - 1, 0, 17, 17, 42, 3, kVocabulary - 1, 29, 8};
-  int formats = 0;
   for (int fi = 0; fi < FMT_COUNT; ++fi) {
-    if (!gguf_embedding_format(fi)) continue;
-    ++formats;
     const Fmt f = Fmt(fi);
     const std::vector<uint8_t> native = makeNative(f, kVocabulary, kHidden, rng);
-    const EmbeddingWeights table(kVocabulary, kHidden, NativeRows(upload(backend, native), f));
+    const EmbeddingWeights table(kVocabulary, kHidden, StoredRows(upload(backend, native), f));
     const Guarded ids(backend, tokens.size() * sizeof(uint32_t), 0), output(backend, tokens.size() * kHidden * 2, 0xFF);
     std::memcpy(ids.view.contents(), tokens.data(), ids.bytes);
     CommandGraph graph;
@@ -918,13 +939,14 @@ void tokenGather(MetalBackend &backend) {
     }
     if (differ) fail(std::string(fmtName(f)) + " gather: " + std::to_string(differ) + " values differ from bf16(GGML)");
   }
-  for (const Fmt format : {BF16, F16}) {
-    std::vector<uint8_t> rows(size_t{kVocabulary} * kHidden * 2);
+  for (const auto &[format, hidden] : {std::pair{BF16, kHidden}, std::pair{BF16, 160u}, std::pair{F16, kHidden},
+                                      std::pair{F16, 160u}}) {
+    std::vector<uint8_t> rows(size_t{kVocabulary} * hidden * 2);
     for (auto &b : rows) b = uint8_t(rng());
     for (size_t i = 1; i < rows.size(); i += 2) rows[i] &= 0xBF;   // finite: the top exponent bit clear
-    const EmbeddingWeights table(kVocabulary, kHidden, NativeRows(upload(backend, rows), format));
-    const std::string name = fmtName(format);
-    const Guarded ids(backend, tokens.size() * sizeof(uint32_t), 0), output(backend, tokens.size() * kHidden * 2, 0xFF);
+    const EmbeddingWeights table(kVocabulary, hidden, StoredRows(upload(backend, rows), format));
+    const std::string name = std::string(fmtName(format)) + " at " + std::to_string(hidden) + " values";
+    const Guarded ids(backend, tokens.size() * sizeof(uint32_t), 0), output(backend, tokens.size() * hidden * 2, 0xFF);
     std::memcpy(ids.view.contents(), tokens.data(), ids.bytes);
     CommandGraph graph;
     Embedding::add(graph, ids.view, table, output.view, uint32_t(tokens.size()));
@@ -933,25 +955,26 @@ void tokenGather(MetalBackend &backend) {
     const std::vector<uint16_t> got = output.halves();
     size_t differ = 0;
     for (size_t r = 0; r < tokens.size(); ++r)
-      for (uint32_t k = 0; k < kHidden; ++k) {
+      for (uint32_t k = 0; k < hidden; ++k) {
         uint16_t stored;
-        std::memcpy(&stored, rows.data() + (size_t(tokens[r]) * kHidden + k) * 2, 2);
-        differ += got[r * kHidden + k] != (format == BF16 ? stored : floatToBf16(h2f(stored)));
+        std::memcpy(&stored, rows.data() + (size_t(tokens[r]) * hidden + k) * 2, 2);
+        differ += got[r * hidden + k] != (format == BF16 ? stored : floatToBf16(h2f(stored)));
       }
     if (differ) fail(name + " gather: " + std::to_string(differ) + " values differ from bf16 of the table's");
   }
-  section("token gather: " + std::to_string(formats) +
-          " embedding formats, each value bf16 of GGML's fp32 value, and bf16 and f16 rows of random bits, each value "
-          "bf16 of the stored one");
+  section("token gather: " + std::to_string(FMT_COUNT) +
+          " formats, each value bf16 of GGML's fp32 value, and bf16 and f16 rows of random bits at 1024 and 160 "
+          "values, each value bf16 of the stored one");
 }
 
 // A streamed table's gather (Qwen4ExpTarget::addPleGather): a SparseRowStore
 // stages each distinct row a step reads once, with each row id's slot, and the
 // same gather over the staging as a table gives, byte for byte, what it gives
-// over the whole table, for every embedding format, ids repeated and in any
+// over the whole table, for every format, ids repeated and in any
 // order, the table's first and last rows, and rows read or cached; and so at
 // Qwen3.8-Flash-Next's PLE rows of 160 values in the formats its GGUFs hold
-// them in, IQ4_NL (90-byte rows) and Q8_0 (170-byte rows).
+// them in, IQ4_NL (90-byte rows), Q8_0 (170-byte rows), BF16 and F16 (320-byte
+// rows).
 void stagedGather(MetalBackend &backend) {
   constexpr uint32_t kRows = 4096, kCount = 640;
   // Rows read from memory, as from the table's file.
@@ -975,7 +998,7 @@ void stagedGather(MetalBackend &backend) {
                                 {model::SparseRowStore::cacheBytesFor(kRows / 2, bytesPerRow) +
                                      model::SparseRowStore::workingBytes(bytesPerRow, 1024, 0),
                                  std::make_shared<model::SsdReaders>(2), 1024});
-    const EmbeddingWeights table(kRows, hidden, NativeRows(upload(backend, native), f));
+    const EmbeddingWeights table(kRows, hidden, StoredRows(upload(backend, native), f));
     for (int step = 0; step < 2; ++step) {
       std::vector<uint32_t> ids(kCount);
       for (uint32_t &id : ids) id = uint32_t(rng() % (step ? kRows : 64)); // the second step repeats rows
@@ -990,32 +1013,29 @@ void stagedGather(MetalBackend &backend) {
                   {static_cast<uint32_t *>(slots.view.contents()), kCount}, model::SparseRowUse::Prefill);
       CommandGraph graph;
       Embedding::add(graph, indices.view, table, resident.view, kCount);
-      Embedding::add(graph, slots.view, EmbeddingWeights(kCount, hidden, NativeRows(staging.view, f)), staged.view,
+      Embedding::add(graph, slots.view, EmbeddingWeights(kCount, hidden, StoredRows(staging.view, f)), staged.view,
                      kCount);
       static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
       if (!staged.intact() || !resident.intact()) fail(name + " staged gather writes past its output");
       if (resident.halves() != staged.halves()) fail(name + " staged gather differs from the table's");
     }
   };
-  int formats = 0;
-  for (int fi = 0; fi < FMT_COUNT; ++fi) {
-    if (!gguf_embedding_format(fi)) continue;
-    ++formats;
-    check(Fmt(fi), 512);
-  }
-  for (const Fmt f : {IQ4NL, Q80}) {
-    if (rowBytes(f, 160) != (f == Q80 ? 170u : 90u)) fail(std::string(fmtName(f)) + " PLE rows have another width");
+  for (int fi = 0; fi < FMT_COUNT; ++fi) check(Fmt(fi), 512);
+  for (const Fmt f : {IQ4NL, Q80, BF16, F16}) {
+    if (rowBytes(f, 160) != (f == IQ4NL ? 90u : f == Q80 ? 170u : 320u))
+      fail(std::string(fmtName(f)) + " PLE rows have another width");
     check(f, 160);
   }
-  section("staged gather: " + std::to_string(formats) +
-          " embedding formats, and IQ4_NL and Q8_0 PLE rows of 160 values, byte-equal to the table's gather of the "
-          "same rows");
+  section("staged gather: " + std::to_string(FMT_COUNT) +
+          " formats, and IQ4_NL, Q8_0, BF16 and F16 PLE rows of 160 values, byte-equal to the table's gather of "
+          "the same rows");
 }
 
 // Each buffer the token gathers reach, at its extent and one element short:
 // the rows' token ids and bf16 output rows, every token's native blocks (of
-// Q8_0, PQ2_0, MLX's af4g64 and nvfp4, BF16 and F16), and the rotation signs
-// of a rotated PQ2_0 table.
+// Q8_0, PQ2_0, MLX's af4g64 and nvfp4, BF16 and F16), BF16 and F16 rows of
+// Flash-Next's 160 PLE values, and the rotation signs of a rotated PQ2_0
+// table.
 void gatherExtents(MetalBackend &backend) {
   constexpr uint32_t kVocabulary = 64, kHidden = 1024, kRows = 9;
   const MetalBuffer tokens = test::sharedBuffer(backend, kRows * 4),
@@ -1031,11 +1051,11 @@ void gatherExtents(MetalBackend &backend) {
   for (const Fmt f : {Q80, PQ20, Fmt(GGUF_FMT_AF4G64), NVFP4, BF16, F16}) {
     const QuantFormat &format = kQuantFormats[f];
     const uint64_t rowBytes = uint64_t{kHidden} / format.block_elements * format.block_bytes;
-    EmbeddingWeights table(kVocabulary, kHidden, NativeRows(test::sharedBuffer(backend, kVocabulary * rowBytes), f));
+    EmbeddingWeights table(kVocabulary, kHidden, StoredRows(test::sharedBuffer(backend, kVocabulary * rowBytes), f));
     if (f == PQ20) table.rotation.signs = test::sharedBuffer(backend, kHidden);
-    requireTableExtent(table.blocks().rows, kVocabulary * rowBytes, format.block_bytes, "token table",
+    requireTableExtent(table.rows().rows, kVocabulary * rowBytes, format.block_bytes, "token table",
                        [&](const MetalBuffer &rows) {
-                         EmbeddingWeights changed(kVocabulary, kHidden, NativeRows(rows, f));
+                         EmbeddingWeights changed(kVocabulary, kHidden, StoredRows(rows, f));
                          changed.rotation = table.rotation;
                          return changed;
                        });
@@ -1047,6 +1067,9 @@ void gatherExtents(MetalBackend &backend) {
       });
     tables.push_back(table);
   }
+  for (const Fmt f : {BF16, F16})
+    requireTableExtent(test::sharedBuffer(backend, kVocabulary * 320), kVocabulary * 320, 2, "token table",
+                       [&](const MetalBuffer &rows) { return EmbeddingWeights(kVocabulary, 160, StoredRows(rows, f)); });
   for (const EmbeddingWeights &table : tables) {
     test::requireExtent(backend, tokens, kRows * 4, 4, "embedding token", [&](CommandGraph &graph, const MetalBuffer &view) {
       Embedding::add(graph, view, table, output, kRows);
@@ -1054,8 +1077,8 @@ void gatherExtents(MetalBackend &backend) {
     test::requireExtent(backend, output, uint64_t{kRows} * kHidden * 2, 2, "embedding output",
                         [&](CommandGraph &graph, const MetalBuffer &view) { Embedding::add(graph, tokens, table, view, kRows); });
   }
-  section("token gather extents: every buffer of native and rotated tables at its extent and refused one "
-          "element short");
+  section("token gather extents: every buffer of native, 160-value BF16 and F16, and rotated tables at its "
+          "extent and refused one element short");
 }
 
 int main(int argc, char **argv) {

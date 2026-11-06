@@ -69,19 +69,19 @@ inline void full_qkv_decode_phase(
         qkv, q_norm, k_norm, nullptr, nullptr, queries, keys, values,         \
         reductions, normalized, group, thread_index, lane, simd_group);       \
   }
+// Each geometry's instances for the norm types its families store: bf16 (an
+// MLX target's) and F32, or F32 alone for Qwen3.8-Flash-Next's (_kv2_g12) and
+// Flint's (_kv4_g8_d128), which load from GGUFs only.
 VERIFY_ATTENTION_QKV(verify_attention_qkv, 24, 4, 256, 32, true, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g8, 16, 2, 256, 32, true, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_f32, 24, 4, 256, 32, true, float)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g8_f32, 16, 2, 256, 32, true, float)
-VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g12, 24, 2, 256, 32, true, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g12_f32, 24, 2, 256, 32, true, float)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g16, 32, 2, 256, 32, true, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g16_f32, 32, 2, 256, 32, true, float)
 // Four KV heads of 128 dimensions without an output gate, their whole heads
 // rotated (64 pairs) or unrotated.
-VERIFY_ATTENTION_QKV(verify_attention_qkv_kv4_g8_d128, 32, 4, 128, 64, false, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv4_g8_d128_f32, 32, 4, 128, 64, false, float)
-VERIFY_ATTENTION_QKV_NOPE(verify_attention_qkv_kv4_g8_d128_nope, 32, 4, 128, false, bfloat)
 VERIFY_ATTENTION_QKV_NOPE(verify_attention_qkv_kv4_g8_d128_nope_f32, 32, 4, 128, false, float)
 #undef VERIFY_ATTENTION_QKV_NOPE
 #undef VERIFY_ATTENTION_QKV

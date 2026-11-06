@@ -93,7 +93,7 @@ class ServerAccessTests(unittest.TestCase):
                 response.close()
                 connection.close()
                 self.assertTrue(
-                    blocked.cancelled.wait(2),
+                    blocked.ended.wait(2),
                     "stream disconnect did not cancel generation",
                 )
                 deadline = time.monotonic() + 2

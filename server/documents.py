@@ -75,6 +75,7 @@ class RenderLimits:
     text_characters: int
     rendered_bytes: int
     request_bytes: int
+    request_pages: int
 
 
 # One bounded PDF worker runs at a time. A request decodes, hashes and looks
@@ -91,11 +92,12 @@ def _render(payload, budget):
     from .document_worker import render
 
     limits = RenderLimits(
-        min(MAX_PAGES, budget.remaining_pages),
+        MAX_PAGES,
         MAX_PAGE_PIXELS,
         MAX_TEXT_CHARACTERS,
         MAX_RENDERED_BYTES,
         budget.remaining_bytes,
+        budget.remaining_pages,
     )
     values = render(payload, asdict(limits), budget.remaining_time())
     pages = tuple(Page(**value) for value in values)
@@ -114,6 +116,7 @@ def render_pages(payload, budget, limits):
                 raise APIError(
                     400, f"PDF documents must contain 1–{limits.pages} pages"
                 )
+            budget.charge_pages(len(document))
             pages = []
             total_characters = total_bytes = 0
             for index in range(len(document)):
@@ -255,8 +258,6 @@ def document_parts(block):
 
 def pdf_content(encoded, *, budget):
     """Render an inline PDF through the shared bounded document pipeline."""
-    if len(encoded) > 4 * ((MAX_PDF_BYTES + 2) // 3):
-        raise APIError(400, "PDF document exceeds the size limit")
     parts = []
     for page in _pages(encoded, budget):
         parts.append({"type": "text", "text": page.text})
@@ -264,8 +265,33 @@ def pdf_content(encoded, *, budget):
     return parts
 
 
-def file_content(file, *, budget):
-    """Render a file part's inline PDF as canonical text/image parts."""
+def render_files(messages, *, deadline, without_slot):
+    """`messages`, canonical (each file part's data already checked), with
+    each file part replaced by its PDF's pages as text and image parts, all
+    under one request budget; the PDF worker is waited for and used under
+    `without_slot`, which gives a request in preparation its slot back
+    meanwhile."""
+    budget = DocumentBudget(deadline=deadline, without_slot=without_slot)
+    rendered = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            part["type"] == "file" for part in content
+        ):
+            parts = []
+            for part in content:
+                if part["type"] == "file":
+                    parts.extend(pdf_content(part["file"]["file_data"], budget=budget))
+                else:
+                    parts.append(part)
+            message = {**message, "content": parts}
+        rendered.append(message)
+    return rendered
+
+
+def checked_file(file):
+    """A file part's inline PDF, checked without decoding it: its base64
+    data."""
     if not isinstance(file, dict):
         raise APIError(400, "file must be an object")
     if file.get("file_id") is not None or file.get("file_url") is not None:
@@ -282,4 +308,6 @@ def file_content(file, *, budget):
         if not data.startswith(PDF_DATA_URL_PREFIX):
             raise APIError(400, "only application/pdf file data is supported")
         data = data[len(PDF_DATA_URL_PREFIX) :]
-    return pdf_content(data, budget=budget)
+    if len(data) > 4 * ((MAX_PDF_BYTES + 2) // 3):
+        raise APIError(400, "PDF document exceeds the size limit")
+    return data

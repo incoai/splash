@@ -1,7 +1,8 @@
 #pragma once
 
-// C/Metal ABI constants shared by host and shader compilation. Startup
-// static assertions check the corresponding model and operator contracts.
+// C/Metal ABI constants shared by host and shader compilation. Compile-time
+// static assertions, beside the model's ExecutionLimits (model/Model.hpp)
+// and the operators sized by these, check the contracts between them.
 #define SPLASH_DRAFT_QUERY_ROWS 8u
 #define SPLASH_DRAFT_PROPOSAL_TOKENS 7u
 #define SPLASH_TARGET_VERIFY_ROWS 8u
@@ -59,9 +60,9 @@
 #define SPLASH_RMS_EPSILON 1e-6
 // Plain norms of at most SPLASH_STAGED_NORM_ROWS rows of at most
 // SPLASH_STAGED_NORM_WIDTH columns run norm_rms_staged, whose 1024-thread
-// groups hold a row in threadgroup memory: the region where it measured
-// faster than norm_rms (shared/normalization.metal), which covers every
-// decode norm of a 2048-wide model and its short prefill chunks.
+// groups hold a row in threadgroup memory: the region where it beats norm_rms
+// (shared/normalization.metal), which covers every decode norm of a 2048-wide
+// model and its short prefill chunks.
 #define SPLASH_STAGED_NORM_WIDTH 2048u
 #define SPLASH_STAGED_NORM_ROWS 64u
 #define SPLASH_STAGED_NORM_THREADS 1024u

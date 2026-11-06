@@ -6,6 +6,10 @@
 #include <string>
 #include <string_view>
 
+namespace splash::json {
+class Writer;
+} // namespace splash::json
+
 namespace splash::engine {
 
 enum class MemoryAuditError {
@@ -32,10 +36,12 @@ struct ActualMemoryReport {
     uint64_t sharedPrefillBytes = 0;
     uint64_t sharedDecodeBytes = 0;
     uint64_t kvAllocatedBytes = 0;
-    // A spill-capable target's readers of spilled KV: the hot block cache
-    // and the staging of a prefill's history; zero for another.
-    uint64_t kvBlockCacheBytes = 0;
-    uint64_t kvHistoryStagingBytes = 0;
+    // A spill-capable target's readers of spilled KV, as the spill plan
+    // budgets them (KvSpillPlan::hotLimitBytes, stagingBytes): the hot cache
+    // decode steps read through and the staging a prefill's history streams
+    // through; zero for another.
+    uint64_t spilledKvHotBytes = 0;
+    uint64_t spilledKvStagingBytes = 0;
     // The buffer state writes to the disk tier stage through; zero without
     // the tier.
     uint64_t stateStagingBytes = 0;
@@ -64,9 +70,11 @@ struct MemoryAuditResult {
     uint32_t devicePeakDeviationBasisPoints = 0;
     uint64_t actualHeadroomBytes = 0;
 
-    [[nodiscard]] std::string toStatusJson() const;
     [[nodiscard]] std::string describe() const;
 };
+
+// The audit as /status reports it (memory_audit).
+void writeJson(json::Writer &w, const MemoryAuditResult &audit);
 
 inline constexpr uint32_t kMaximumDevicePeakDeviationBasisPoints = 500;
 

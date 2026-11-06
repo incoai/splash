@@ -53,9 +53,8 @@ namespace gguf_float {
 constant constexpr uint kFragments = 4;          // 8-row fragments per threadgroup: 32 rows
 constant constexpr uint kRows = 8 * kFragments;
 constant constexpr uint kStep = 64;              // inputs per step: eight runs of 8
-// K parts, one per simdgroup. A decode dispatch has few threadgroups (64 at Flash-Next's router width, 32 at the
-// 35B's); on the M5 Max at 8 to 32 rows, 8 parts are the fastest at those widths, where 16 took up to 29% longer, and
-// 16 parts gained at most 19% at the narrow alpha/beta widths.
+// K parts, one per simdgroup: a router's decode dispatch has few threadgroups (32 to 64), and 8 parts are the
+// fastest there, where 16 take up to 29% longer.
 constant constexpr uint kSplits = 8;
 
 // The eight consecutive values of a row from input k (a multiple of 8): 16 bytes of bf16 or 32 of fp32 as stored,
@@ -198,10 +197,9 @@ GGUF_QUANTIZED_EMBEDDING_FORMATS(GGUF_FLOAT_NATIVE)
 // hi + mid + lo == w exactly (fp32 has 24) and each part's product with a bf16 activation is exact in fp32; a BF16
 // weight is its own one part (the F32 tensor of its values splits into it and two zero parts, whose products add
 // zeros, so the two give the same bits). The results again differ from the fp64 products only by fp32 accumulation.
-// The accelerator adds a matmul's products to a destination with a few ulps of error (a probe: products
-// 1 + 31 x 0.75 ulp(1) added to 1 + 23 ulp(1) came out 3 ulp(2) above the rounded sum), so the hi part accumulates
-// apart from the mid and lo parts: that cuts the error against fp64 2.2x (mean 1.5e-8 -> 6.6e-9 of sum |x w| at the
-// router's K = 2048, 512 rows; this file's fp32 kernel: 5.5e-9) for 3-6% of the kernel's time on a 20-core M5 Pro.
+// The accelerator adds a matmul's products to a destination with a few ulps of error, so the hi part accumulates apart
+// from the mid and lo parts: that cuts the error against fp64 2.2x (to 6.6e-9 of sum |x w| at the router's K = 2048,
+// near this file's fp32 kernel's 5.5e-9) for 3-6% of the kernel's time.
 namespace gguf_float_na {
 
 constant constexpr ushort kRowsPerSimdgroup = 16;   // the accelerator's row unit

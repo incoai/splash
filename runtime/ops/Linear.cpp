@@ -3,6 +3,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
 #include "ops/BufferExtent.hpp"
+#include "ops/KernelSelection.hpp"
 
 #include <algorithm>
 #include <array>
@@ -138,19 +139,25 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   requireConfiguration();
 }
 
-Linear::Linear(const DeviceCapabilities &device) noexcept
-    : family_(gpuFamilyClass(device.appleGpuFamily)),
-      gpuCores_(plannedGpuCores(device)) {}
+Linear::Linear(const DeviceCapabilities &device) noexcept : calibration_(KernelCalibration::of(device)) {}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
-  const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, LinearEpilogue::None};
-  validate(w);
-  return LinearPlan(w, ggufBaseline(w, {}, shape)).storageRows();
+  // The None and Residual plans share a tile; a gate/up pair of one format
+  // counts both tensors' columns in one pass and may stage where they do not.
+  UnitFormats unit = unitFormats(shape);
+  uint32_t storage = 0;
+  for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::GateUp}) {
+    const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, epilogue};
+    validate(w);
+    unit.oneFormat = epilogue == LinearEpilogue::GateUp;
+    storage = std::max(storage, LinearPlan(w, selectProjection(calibration_, w, unit)).storageRows());
+  }
+  return storage;
 }
 
 LinearPlan Linear::plan(LinearWorkload workload) const {
   validate(workload);
-  return LinearPlan(workload, ggufBaseline(workload));
+  return LinearPlan(workload, selectProjection(calibration_, workload, {}));
 }
 LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config, FloatOutput destination) {
   return LinearPlan(workload, config, destination);
@@ -158,7 +165,14 @@ LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config, FloatOutpu
 LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection *gate) const {
   validate(w);
   const std::array<const Projection *, 2> projections{&p, gate};
-  LinearPlan plan(w, ggufBaseline(w, projections), p.destination);
+  // A gate/up pair's 16-row tile follows its tensors' own formats.
+  std::array<UnitFormats, 2> tensors{};
+  const bool pair = w.epilogue == LinearEpilogue::GateUp && gate;
+  if (pair) tensors = {unitFormats(std::span(&projections[0], 1)), unitFormats(std::span(&projections[1], 1))};
+  LinearPlan plan(w,
+                  selectProjection(calibration_, w, unitFormats(projections),
+                                   pair ? std::span<const UnitFormats>(tensors) : std::span<const UnitFormats>{}),
+                  p.destination);
   plan.rotated_ = static_cast<bool>(p.rotation);
   return plan;
 }

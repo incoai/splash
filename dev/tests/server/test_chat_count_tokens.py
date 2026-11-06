@@ -9,6 +9,7 @@ from dev.tests.server_fixtures import (
     ImagePadTokenizer,
     chat_body,
     png_data_url,
+    serve_context,
 )
 from server import frontend
 from server.errors import APIError
@@ -73,7 +74,7 @@ class ChatCountTokensTest(HarnessTestCase):
         self.assertEqual(json.loads(payload), {"input_tokens": 130})
         with self.assertRaisesRegex(APIError, "context window"):
             harness.app.prepare(body, deadline=FOREVER)
-        harness.app.max_context = 256
+        serve_context(harness.app, 256)
         job = harness.app.prepare(body, deadline=FOREVER)
         self.assertEqual(len(job.prompt_tokens), 130)
         self.assertEqual(runtime.requests, [])

@@ -166,6 +166,47 @@ class ReleaseAppTests(unittest.TestCase):
                 ["HEAD is not the commit tag 1.5.0 names"],
             )
 
+    def test_the_release_before_is_the_latest_annotated_x_y_z_below(self):
+        checkout = self.root / "checkout"
+        checkout.mkdir()
+        environment = {
+            **os.environ,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+        }
+
+        def git(*arguments):
+            subprocess.run(
+                ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com"]
+                + list(arguments),
+                cwd=checkout,
+                env=environment,
+                check=True,
+                capture_output=True,
+            )
+
+        git("init", "-q")
+        for tags in (["1.4.0"], ["1.10.0-rc.1"], ["1.9.0"], [], ["1.10.0"]):
+            git("commit", "-q", "--allow-empty", "-m", "Commit")
+            for tag in tags:
+                git("tag", "-a", tag, "-m", tag)
+        # A tag that names no release: lightweight, or not x.y.z.
+        git("tag", "1.9.5")
+        git("tag", "-a", "v1.9.6", "-m", "v1.9.6")
+        with (
+            mock.patch.object(release_app, "ROOT", checkout),
+            mock.patch.object(package_app, "ROOT", checkout),
+        ):
+            for version, previous in (
+                ("1.4.0", None),
+                ("1.9.0", ("1.4.0", "1")),
+                ("1.10.0-rc.1", ("1.9.0", "3")),
+                ("1.10.0", ("1.9.0", "3")),
+                ("1.10.1", ("1.10.0", "5")),
+            ):
+                with self.subTest(version=version):
+                    self.assertEqual(release_app.previous_release(version), previous)
+
     def signer(self, identity, *listed):
         """signer for identity, the keychains holding listed."""
         found = subprocess.CompletedProcess([], 0, identities(*listed), "")
@@ -225,7 +266,7 @@ class ReleaseAppTests(unittest.TestCase):
 
     def test_a_release_carries_the_command_lines_files_of_its_version(self):
         with mock.patch.object(release_app, "ROOT", self.root):
-            files, formula, problem = release_app.command_line("1.5.0")
+            files, formula, problem = release_app.command_line("1.5.0", "26.4")
             self.assertEqual(
                 problem,
                 f"dist/ has no {ARCHIVE}, {ARCHIVE}.sha256, "
@@ -234,13 +275,13 @@ class ReleaseAppTests(unittest.TestCase):
             made = self.command_line()
             (self.root / "dist/splash-1.4.1.arm64_tahoe.bottle.tar.gz").touch()
             self.assertEqual(
-                release_app.command_line("1.5.0"),
+                release_app.command_line("1.5.0", "26.4"),
                 (made, self.root / "dist/splash.rb", None),
             )
             # A formula of other files, as an earlier release's.
             self.command_line(formula=False)
             self.assertRegex(
-                release_app.command_line("1.5.0")[2],
+                release_app.command_line("1.5.0", "26.4")[2],
                 f"^dist/splash.rb is not the formula of {re.escape(ARCHIVE)}",
             )
 
@@ -686,6 +727,17 @@ end
             steps.append(("appcast", image.read_bytes(), key_file))
             return b"<rss/>\n"
 
+        def check(feed, image, version, macos_min, build, previous):
+            steps.append(
+                ("check", feed, image.name, version, macos_min, build, previous)
+            )
+            if checked:
+                raise checked
+
+        def previous_release(version):
+            steps.append(("previous_release", version))
+            return ("1.4.1", "1600")
+
         def keychain_identity(identity):
             if not keychain:
                 raise LookupError(f"no keychain holds the identity {identity}")
@@ -705,7 +757,11 @@ end
             mock.patch.object(release_app, "notarize", side_effect=notarize),
             mock.patch.object(release_app, "verify", side_effect=verify),
             mock.patch.object(appcast, "generate", side_effect=generate),
-            mock.patch.object(appcast, "check", side_effect=checked),
+            mock.patch.object(appcast, "check", side_effect=check),
+            mock.patch.object(package_app, "build_number", return_value="1700"),
+            mock.patch.object(
+                release_app, "previous_release", side_effect=previous_release
+            ),
             redirect_stdout(io.StringIO()) as printed,
         ):
             release_app.main(
@@ -836,6 +892,16 @@ end
                         ("notarize", image, tuple(PROFILE), False),
                         ("verify", b"stapled disk image", "ABCDE12345", False),
                         ("appcast", b"stapled disk image", None),
+                        ("previous_release", version),
+                        (
+                            "check",
+                            b"<rss/>\n",
+                            image,
+                            version,
+                            "26.4",
+                            "1700",
+                            ("1.4.1", "1600"),
+                        ),
                     ],
                 )
                 files = [image, "SHA256SUMS", "Splash.dmg", "appcast.xml", "notes.md"]

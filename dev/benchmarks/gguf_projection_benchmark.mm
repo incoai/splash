@@ -1,7 +1,7 @@
 // GPU time of one GGUF projection through ops::Linear on both decode tiles (the Apple9 register tile and the staged
 // tile, on the device policy's walk, one lane on its 8- and 16-row tiles, a gate/up pair in two passes and, where the
 // walks spread, in one: pair) at one to four lanes and every K split, the measurements behind the tile rule and split
-// law of runtime/ops/LinearGguf.cpp:
+// law of runtime/ops/KernelCalibration.hpp:
 //   gguf-projection-benchmark <metallib> <fmt[+fmt+fmt]> <N[+N+N]> <K> [none|residual|gateup] [rounds]
 //                             [prefill=R[,R...]]
 // The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 64

@@ -11,10 +11,6 @@ The paths an assembly links, and what reads each:
   config.json            the target configuration: the MLX config.json, or
                          the one derived from the GGUF (ModelDescriptor.mm
                          inspectSourceModel)
-  target/config.json, vision/config.json
-                         the MLX config.json again, as each checkpoint
-                         directory's own config, read by engines up to 1.2,
-                         which a release check runs on this installation
   target/<shard>         the MLX safetensors shards except those holding only
                          vision_tower.* (SafetensorsCheckpoint.mm)
   target/<name>.gguf     the GGUF target, or the parts of a split one
@@ -217,13 +213,16 @@ def _well_formed(record):
     )
 
 
-def pins(record):
-    """The Hub snapshot of each source an assembly links files from, with its
-    repository ID: the snapshots its installation pins. Each is found from a
-    linked file's path, not the cache location: HF_HUB_CACHE may name another
-    folder now than when the assembly was built."""
+def _snapshots(record):
+    """(repository ID, commit) of each Hub source an assembly links files
+    from -> the snapshot its files lie in. Each is found from a linked file's
+    path, not the cache location: HF_HUB_CACHE may name another folder now
+    than when the assembly was built."""
     sources = {
-        (hub.folder_name(source["repo"]), source["revision"]): source["repo"]
+        (hub.folder_name(source["repo"]), source["revision"]): (
+            source["repo"],
+            source["revision"],
+        )
         for source in record["sources"].values()
         if source["revision"] is not None
     }
@@ -232,8 +231,29 @@ def pins(record):
         path = hub.snapshot_of(entry["path"])
         key = path and (path.parent.parent.name, path.name)
         if key in sources:
-            snapshots[path] = sources[key]
-    return sorted(snapshots.items())
+            snapshots[sources[key]] = path
+    return snapshots
+
+
+def pins(record):
+    """The Hub snapshot of each source an assembly links files from
+    (_snapshots), with its repository ID: the snapshots its installation
+    pins."""
+    return sorted((path, repo) for (repo, _), path in _snapshots(record).items())
+
+
+def source(record, role):
+    """An assembly's source, "target" or "draft", read without the Hub from
+    what the assembly links: its local directory, or the snapshot its files
+    lie in (_snapshots), however the Hub cache is configured now."""
+    named = record["sources"][role]
+    repo, revision = named["repo"], named["revision"]
+    if revision is None:
+        return hub.Repository.local_directory(repo)
+    path = _snapshots(record).get((repo, revision))
+    if path is None:
+        raise models.ModelError(f"the installation links no file of {repo}@{revision}")
+    return hub.Repository.cached(repo, revision, path)
 
 
 def recorded(link: Path):
@@ -335,15 +355,13 @@ def _check_metadata(entry):
 
 def hold(path: Path):
     """The assembly path names, an assembly or a selection link to one, and
-    what holds it: its model.json opened under a shared lock. While that
-    file is open, in this process or one that inherited it, collect_garbage
-    keeps the assembly. path is read under the installation lock of the
-    models root the assembly was built in (MODELS/.resolved/<record>), which
-    may be another checkout's, where collection runs, so there is no moment
-    the assembly is neither linked nor held; the lock needs write access to
-    that root. A ModelError refuses a path that names no assembly, such as
-    one collection removed, and one the file system keeps from being held,
-    such as in a root this process cannot write."""
+    what holds it: its model.json opened under a shared lock, which keeps
+    the assembly from collect_garbage while open in this process or one that
+    inherited it. path is read under the installation lock of the models
+    root the assembly was built in, where collection runs, so the assembly
+    is never neither linked nor held; the lock needs write access to that
+    root. A ModelError refuses a path that names no assembly or cannot be
+    held."""
     resolved = path.resolve().parent
     if resolved.name != ".resolved":
         raise models.ModelError(f"{path} is not a model directory Splash prepared")
@@ -379,12 +397,14 @@ def is_held(assembly: Path) -> bool:
 def collect_garbage(models_root: Path):
     """Remove what no installation uses: assemblies that no selection links
     and no server holds, metadata entries the remaining assemblies do not
-    link, and staging an interrupted installation left. Call it under the
-    installation lock, where all of these are written."""
+    link, and staging an interrupted installation left. Each is a directory
+    (_directories): anything else there, such as the .DS_Store Finder
+    leaves, is not an installation's. Call it under the installation lock,
+    where all of these are written."""
     resolved, derived = models_root / ".resolved", models_root / ".metadata"
     linked = {link.resolve() for link in models.selection_links(models_root)}
     used = set()
-    for assembly in sorted(resolved.iterdir()) if resolved.is_dir() else ():
+    for assembly in _directories(resolved.glob("*")):
         if assembly not in linked and not is_held(assembly):
             shutil.rmtree(assembly)
             continue
@@ -397,8 +417,14 @@ def collect_garbage(models_root: Path):
             path = Path(entry.get("path", "")) if isinstance(entry, dict) else None
             if path and path.is_relative_to(derived):
                 used.add(path.relative_to(derived).parts[0])
-    for entry in sorted(derived.iterdir()) if derived.is_dir() else ():
+    for entry in _directories(derived.glob("*")):
         if entry.name not in used:
             shutil.rmtree(entry)
-    for stage in models_root.glob(f"*/{models.LINK_STAGING}*"):
+    for stage in _directories(models_root.glob(f"*/{models.LINK_STAGING}*")):
         shutil.rmtree(stage)
+
+
+def _directories(paths):
+    """The directories among paths, in name order: the entries and staging
+    installations write, which are never links."""
+    return sorted(p for p in paths if p.is_dir() and not p.is_symlink())

@@ -62,9 +62,7 @@ public:
   [[nodiscard]] const std::string &contentIdentity() const noexcept { return contentIdentity_; }
   [[nodiscard]] bool released() const noexcept override { return released_; }
   void release() override;
-  // Every image is needed: `optional` admits none of them.
-  [[nodiscard]] bool restore(const metal::AllocationAdmission &admit,
-                             const metal::AllocationAdmission &optional) override;
+  [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override;
 
   struct Contents final {
     std::string_view component;

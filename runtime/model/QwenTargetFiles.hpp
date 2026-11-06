@@ -11,8 +11,9 @@ namespace splash::model {
 class GgufTargetLoader;
 class SafetensorsTargetLoader;
 
-// The files a target is read from: the block images a loader writes from an
-// MLX source, in its MLX formats, or from a GGUF.
+// The files a target is read from: the block images a loader writes from a
+// safetensors checkpoint (MLX, Model Optimizer or compressed-tensors), in
+// the formats it holds, or from a GGUF.
 using QwenTargetFiles =
     std::variant<std::reference_wrapper<GgufTargetLoader>, std::reference_wrapper<SafetensorsTargetLoader>>;
 
