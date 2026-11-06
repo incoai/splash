@@ -231,30 +231,25 @@ struct SidebarButton: View {
 }
 
 extension AppState {
-    /// The Server button's title: the model's name while one starts, its step with it, runs, its
-    /// speed with it while it answers, or stops; the download while one comes.
+    /// The Server button's title: the model's name while one starts, runs or stops, the word
+    /// Server while none does, Downloading while a download comes. It holds no figure that changes
+    /// while it shows, as a step, a speed or a percentage would: the toolbar lays its items out
+    /// again at each change of its width, and moves the buttons beside it. The indicator shows a
+    /// start and a download's progress; the button's help says the step and the percentage, the
+    /// Server and the menu bar's panel the speed.
     var serverTitle: String {
-        if installer.running {
-            guard let progress = installer.progress, progress.total > 0 else { return "Downloading…" }
-            return "Downloading \(progress.fraction.formatted(.percent.precision(.fractionLength(0))))"
-        }
+        if installer.running { return "Downloading…" }
         guard let name = server.model.map(displayName(of:)) else { return "Server" }
         switch server.phase {
-        case .starting: return "\(name) · \(server.step.rawValue)"
-        case .ready:
-            // Its speed while it answers, which the status brings every 2 s.
-            guard server.activity.running > 0, let rate = server.activity.generation else { return name }
-            return "\(name) · \(rate.formatted(.number.precision(.fractionLength(0)))) tok/s"
-        case .stopping: return name
+        case .starting, .ready, .stopping: return name
         case .stopped, .failed: return "Server"
         }
     }
 }
 
-/// The Server, at the toolbar's end: a light and the model that runs, with its speed while it
-/// answers, or the word Server while none does; a spinner and the step while one starts, the
-/// download's ring while one comes. It opens the Server, and shows picked while the Server shows,
-/// as the switch's segments do.
+/// The Server, at the toolbar's end: a light and the model that runs, or the word Server while
+/// none does; a spinner while one starts, the download's ring while one comes. It opens the
+/// Server, and shows picked while the Server shows, as the switch's segments do.
 struct ServerButton: View {
     @Environment(AppState.self) private var state
     @Environment(\.colorScheme) private var colorScheme

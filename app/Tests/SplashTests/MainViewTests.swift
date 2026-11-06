@@ -51,9 +51,11 @@ struct MainViewTests {
         try await waitFor(window.firstResponder === window)
     }
 
-    /// The Server button names the model, with the step of its start, then its speed while it
-    /// answers, and says Server while none runs. An engine stopped under a server that runs on
-    /// marks it failed, and the app's status says it no longer responds.
+    /// The Server button names the model while it starts, runs and answers, and says Server
+    /// while none runs: its title holds no step or speed, so its width, and the place of the
+    /// toolbar's buttons beside it, stay while the server starts and answers. An engine stopped
+    /// under a server that runs on marks it failed, and the app's status says it no longer
+    /// responds.
     @Test func theServerButtonSaysWhatTheServerDoes() async throws {
         let server = try FakeServer()
         defer { server.remove() }
@@ -62,15 +64,20 @@ struct MainViewTests {
         let name = state.displayName(of: model)
         #expect(state.serverTitle == "Server")
         state.server.start(model, settings: ServeSettings(values: ["--port": String(server.port)]))
-        #expect(state.serverTitle == "\(name) · Starting")
-        try await waitFor(state.serverTitle == "\(name) · Loading weights")
+        #expect(state.server.step == .starting)
+        #expect(state.serverTitle == name)
+        try await waitFor(state.server.step == .loading)
+        #expect(state.serverTitle == name)
+        #expect(state.status == "\(name) · Loading weights…")
         server.signal("loaded")
-        try await waitFor(state.serverTitle == "\(name) · Warming up")
+        try await waitFor(state.server.step == .warming)
+        #expect(state.serverTitle == name)
         server.signal("warm")
         try await waitFor(state.server.phase == .ready)
         #expect(state.serverTitle == name)
         server.signal("answering")
-        try await waitFor(state.serverTitle == "\(name) · 42 tok/s")
+        try await waitFor(state.server.activity.running > 0 && state.server.activity.generation != nil)
+        #expect(state.serverTitle == name)
         server.signal("broken")
         try await waitFor(state.server.phase == .failed("x"))
         #expect(state.server.running)

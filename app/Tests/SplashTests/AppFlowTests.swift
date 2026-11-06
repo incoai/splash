@@ -271,7 +271,7 @@ final class AppFlowTests {
         try await waitFor((installer.progress?.done ?? 0) > 0, "progress", seconds: 120)
         #expect(installer.progress?.repo == String(download.split(separator: ":")[0]))
         #expect(state.downloadStatus?.hasPrefix("Downloading ") == true)
-        #expect(state.serverTitle.hasPrefix("Downloading "))
+        #expect(state.serverTitle == "Downloading…")
         await Snapshot.save("server-downloading", MainView().environment(state))
         let clock = ContinuousClock.now
         installer.cancel()

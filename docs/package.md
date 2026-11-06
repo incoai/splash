@@ -74,8 +74,8 @@ is Ctrl+C's SIGINT to the group. Switching models stops one server and starts
 the next. The app starts nothing by itself: its window opens on the Server,
 where models download, start and switch, beside the Chat. The toolbar's switch
 opens the Chat, whose sidebar of conversations ⌘B hides, and the Server's
-button at its end the Server: it shows the model that runs, a start's step,
-the speed of an answer and a download's progress. Models, locks and
+button at its end the Server: it shows the model that runs, a spinner while
+one starts and a ring for a download's progress. Models, locks and
 downloads are the ones a packaged `splash` uses, in `~/Library/Application
 Support/Splash` and the Hugging Face cache. The app offers
 `install/suggested-models.tsv`, per model the variant meant for the Mac's
