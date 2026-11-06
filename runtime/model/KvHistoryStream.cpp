@@ -56,25 +56,34 @@ struct KvHistoryStream::Impl {
     std::shared_ptr<SsdReaders::Batch> batch;
     bool staged = false;
   };
-  // A command's stream, from begin() to end(): the pages the command reads,
-  // before commandPages, of which `pages` hold only their index (in order),
-  // the pool's table and layers, each layer's reads, and how long its host
-  // steps waited.
+  // A command's stream, from begin() to end(): the attention layers it runs,
+  // the pages the command reads, before commandPages, of which `pages` hold
+  // only their index (in order), the pool's table and layers, and each
+  // layer's reads.
   struct Run final {
     uint64_t serial = 0;
     bool active = false;
+    AttentionLayers range;
     uint32_t commandPages = 0;
     std::shared_ptr<const std::vector<Page>> pages;
     metal::MetalBuffer poolTable;
     std::vector<SplashKvLayer> poolLayers;
     std::vector<LayerReads> layers;
-    double waitMilliseconds = 0.0;
   };
 
   Impl(metal::MetalBackend &backend, metal::AllocationAdmission admission, const kv::Layout &layout,
        uint32_t extentPages, std::shared_ptr<SsdReaders> readers, kv::SlotFormat format, uint32_t buffers);
 
   [[nodiscard]] uint32_t stagingPages() const noexcept { return extents * staging.front()->extentPages(); }
+  // The extents each buffer holds for `pages` pages.
+  [[nodiscard]] uint32_t extentsFor(uint32_t pages) const noexcept {
+    const uint32_t extentPages = staging.front()->extentPages();
+    return (pages + extentPages - 1) / extentPages;
+  }
+  // Whether the run's command runs `layer`; the engine thread's.
+  [[nodiscard]] bool runs(uint32_t layer) const noexcept {
+    return run.active && layer >= run.range.first && layer < run.range.end;
+  }
   // Starts `layer`'s reads into its buffer; under the lock.
   void startLocked(uint32_t layer);
   // A host step's `then`: starts `layer`'s reads unless run `serial` ended;
@@ -92,6 +101,8 @@ struct KvHistoryStream::Impl {
   const kv::SlotFormat format;
   const std::shared_ptr<SsdReaders> readers;
   const uint32_t buffers;
+  // The staging's admission, which reserve() asks once for every extent.
+  const metal::AllocationAdmission admission;
   // The bytes of a page's records of one layer (kv::SlotFormat::layerRange).
   const uint64_t layerBytes;
   std::vector<std::unique_ptr<kv::PageStorage>> staging;
@@ -113,7 +124,7 @@ KvHistoryStream::Impl::Impl(metal::MetalBackend &backend, metal::AllocationAdmis
                             const kv::Layout &layout, uint32_t extentPages, std::shared_ptr<SsdReaders> readers,
                             kv::SlotFormat format, uint32_t buffers)
     : format(checked(layout, format, readers.get(), buffers)), readers(std::move(readers)), buffers(buffers),
-      layerBytes(this->format.layerRange(0).bytes) {
+      admission(admission), layerBytes(this->format.layerRange(0).bytes) {
   const uint64_t pages = (kMostPages + extentPages - 1) / extentPages * extentPages;
   for (uint32_t buffer = 0; buffer < buffers; ++buffer) {
     staging.push_back(std::make_unique<kv::PageStorage>(backend, admission, oneLayer(layout),
@@ -176,7 +187,6 @@ void KvHistoryStream::Impl::finish(uint64_t serial, uint32_t layer) {
   const double waited = millisecondsSince(began);
   const std::lock_guard lock(mutex);
   if (!run.active || run.serial != serial) return;
-  run.waitMilliseconds += waited;
   waits.add(static_cast<uint64_t>(waited * 1e6));
 }
 
@@ -197,28 +207,45 @@ KvHistoryStream::~KvHistoryStream() {
   impl_->drainLocked();
 }
 
+bool KvHistoryStream::holds(uint32_t pages) const noexcept { return impl_->extentsFor(pages) <= impl_->extents; }
+
+uint64_t KvHistoryStream::shortfallBytes(uint32_t pages) const noexcept {
+  const Impl &impl = *impl_;
+  const uint32_t wanted = impl.extentsFor(pages);
+  return wanted > impl.extents ? uint64_t{wanted - impl.extents} * impl.buffers * impl.staging.front()->extentBytes()
+                               : 0;
+}
+
 ModelMemoryAdmission KvHistoryStream::reserve(uint32_t pages) {
   Impl &impl = *impl_;
+  if (holds(pages)) return {.ok = true};
   const uint32_t extentPages = impl.staging.front()->extentPages();
-  const uint32_t wanted = (pages + extentPages - 1) / extentPages;
-  if (wanted <= impl.extents) return {.ok = true};
+  const uint32_t wanted = impl.extentsFor(pages);
   if (uint64_t{wanted} * extentPages > impl.staging.front()->pageCount())
     throw std::invalid_argument("history staging past the longest sequence");
   if (impl.run.active) throw std::logic_error("history staging grows while a command streams");
-  for (uint32_t buffer = 0; buffer < impl.buffers; ++buffer)
-    for (uint32_t extent = impl.extents; extent < wanted; ++extent)
-      if (const metal::AllocationResult result = impl.staging[buffer]->allocateExtent(extent); !result) {
-        // Nothing changes: what this call allocated goes back.
-        for (uint32_t back = 0; back <= buffer; ++back)
-          for (uint32_t allocated = impl.extents; allocated < (back == buffer ? extent : wanted); ++allocated)
-            impl.staging[back]->releaseExtent(allocated);
-        return {.ok = false, .allocationFailure = result.failure};
-      }
+  // One admission of every buffer's extents, so that a refusal asks for all
+  // of them; a driver's refusal of one changes nothing: what this call
+  // allocated goes back.
+  uint32_t buffer = 0, extent = impl.extents;
+  const metal::AllocationResult result = impl.admission(shortfallBytes(pages), [&] {
+    try {
+      for (buffer = 0; buffer < impl.buffers; ++buffer)
+        for (extent = impl.extents; extent < wanted; ++extent)
+          static_cast<void>(impl.staging[buffer]->allocateExtent(extent, kv::PageForm::Full, metal::admittedWithin));
+    } catch (const metal::MetalAllocationError &) {
+      for (uint32_t back = 0; back <= buffer; ++back)
+        for (uint32_t allocated = impl.extents; allocated < (back == buffer ? extent : wanted); ++allocated)
+          impl.staging[back]->releaseExtent(allocated);
+      throw;
+    }
+  });
+  if (!result) return {.ok = false, .allocationFailure = result.failure};
   impl.extents = wanted;
   std::vector<uint32_t> staged(impl.stagingPages());
   std::iota(staged.begin(), staged.end(), 0u);
-  for (uint32_t buffer = 0; buffer < impl.buffers; ++buffer)
-    impl.staging[buffer]->writeEntries(staged, 0, impl.tables[buffer]);
+  for (uint32_t each = 0; each < impl.buffers; ++each)
+    impl.staging[each]->writeEntries(staged, 0, impl.tables[each]);
   return {.ok = true};
 }
 
@@ -235,11 +262,13 @@ uint64_t KvHistoryStream::releaseIdle() {
 }
 
 void KvHistoryStream::begin(const KvPageSources &sources, uint32_t commandPages, const metal::MetalBuffer &poolTable,
-                            std::span<const SplashKvLayer> poolLayers) {
+                            std::span<const SplashKvLayer> poolLayers, AttentionLayers layers) {
   Impl &impl = *impl_;
   if (impl.run.active) throw std::logic_error("a history stream begins before the last command's ended");
   if (poolLayers.size() != impl.format.layout().attentionLayers || commandPages > impl.stagingPages())
     throw std::logic_error("a history stream's layers or staging do not hold the command's pages");
+  if (layers.first >= layers.end || layers.end > poolLayers.size())
+    throw std::logic_error("a history stream runs no layer or layers past the pool's");
   auto pages = std::make_shared<std::vector<Impl::Page>>();
   for (uint32_t page = 0; page < std::min(commandPages, sources.size()); ++page) {
     const KvPageSource &source = sources[page];
@@ -250,23 +279,23 @@ void KvHistoryStream::begin(const KvPageSources &sources, uint32_t commandPages,
   const std::lock_guard lock(impl.mutex);
   impl.run = {.serial = impl.run.serial + 1,
               .active = true,
+              .range = layers,
               .commandPages = commandPages,
               .pages = std::move(pages),
               .poolTable = poolTable,
               .poolLayers = {poolLayers.begin(), poolLayers.end()},
-              .layers = std::vector<Impl::LayerReads>(poolLayers.size()),
-              .waitMilliseconds = 0.0};
-  impl.startLocked(0);
+              .layers = std::vector<Impl::LayerReads>(poolLayers.size())};
+  impl.startLocked(layers.first);
 }
 
 PrefillKv KvHistoryStream::addLayer(metal::CommandGraph &graph, uint32_t layer) {
   const Impl &impl = *impl_;
   const Impl::Run &run = impl.run;
-  if (!run.active || layer >= run.layers.size()) throw std::logic_error("a history layer outside its stream");
+  if (!impl.runs(layer)) throw std::logic_error("a history layer outside its stream");
   const uint32_t buffer = layer % impl.buffers;
   // With two buffers the next layer's reads go on while this layer attends.
   std::function<void()> then;
-  if (impl.buffers == 2 && layer + 1 < run.layers.size())
+  if (impl.buffers == 2 && layer + 1 < run.range.end)
     then = [impl = impl_, serial = run.serial, layer] { impl->start(serial, layer + 1); };
   graph.host([impl = impl_, serial = run.serial, layer] { impl->finish(serial, layer); }, {},
              metal::HostStepGpu::Idle, std::move(then));
@@ -276,7 +305,7 @@ PrefillKv KvHistoryStream::addLayer(metal::CommandGraph &graph, uint32_t layer) 
 void KvHistoryStream::addChunk(metal::CommandGraph &graph, uint32_t layer, uint32_t firstPage, uint32_t pages) {
   Impl &impl = *impl_;
   Impl::Run &run = impl.run;
-  if (!run.active || layer >= run.layers.size()) throw std::logic_error("a history chunk outside its stream");
+  if (!impl.runs(layer)) throw std::logic_error("a history chunk outside its stream");
   if (!pages || uint64_t{firstPage} + pages > run.commandPages)
     throw std::logic_error("a history chunk past the command's pages");
   const auto indexed = std::ranges::lower_bound(*run.pages, firstPage, {}, &Impl::Page::page);
@@ -298,9 +327,9 @@ void KvHistoryStream::addChunk(metal::CommandGraph &graph, uint32_t layer, uint3
 void KvHistoryStream::addLayerEnd(metal::CommandGraph &graph, uint32_t layer) {
   const Impl &impl = *impl_;
   const Impl::Run &run = impl.run;
-  if (!run.active || layer >= run.layers.size()) throw std::logic_error("a history layer outside its stream");
+  if (!impl.runs(layer)) throw std::logic_error("a history layer outside its stream");
   // With one buffer the next layer's reads wait for this layer's attention.
-  if (impl.buffers != 1 || layer + 1 == run.layers.size()) return;
+  if (impl.buffers != 1 || layer + 1 == run.range.end) return;
   graph.host([] {}, {}, metal::HostStepGpu::Idle,
              [impl = impl_, serial = run.serial, layer] { impl->start(serial, layer + 1); });
 }
@@ -311,7 +340,7 @@ KvStreamResult KvHistoryStream::end() {
   Impl::Run &run = impl.run;
   if (!run.active) return {};
   impl.drainLocked();
-  KvStreamResult result{.failures = {}, .streamMilliseconds = run.waitMilliseconds};
+  KvStreamResult result;
   std::vector<uint64_t> unreadable;
   for (const Impl::LayerReads &reads : run.layers) {
     if (!reads.batch) continue;
@@ -319,10 +348,11 @@ KvStreamResult KvHistoryStream::end() {
     const size_t taken = batch.taken(), failed = batch.tally().failures;
     ++impl.counts.layers;
     impl.counts.pages += taken - failed;
-    impl.counts.bytes += (taken - failed) * impl.layerBytes;
+    result.readBytes += (taken - failed) * impl.layerBytes;
     for (size_t index = 0; failed && index < taken; ++index)
       if (batch.failed(index)) unreadable.push_back((*run.pages)[index].block);
   }
+  impl.counts.bytes += result.readBytes;
   ++impl.counts.commands;
   // A page that failed in several layers is one block.
   std::ranges::sort(unreadable);

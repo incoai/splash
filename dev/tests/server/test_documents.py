@@ -130,8 +130,8 @@ class DocumentTests(unittest.TestCase):
                 self.subTest(encoded=encoded),
                 self.assertRaisesRegex(APIError, "PDF data is not valid base64"),
             ):
-                documents.file_content(
-                    {"file_data": encoded},
+                documents.pdf_content(
+                    encoded,
                     budget=documents.DocumentBudget(deadline=math.inf),
                 )
 
@@ -214,13 +214,26 @@ class DocumentTests(unittest.TestCase):
                 )
             render.assert_not_called()
 
-    def test_cold_pdf_obeys_remaining_page_budget(self):
-        with self.assertRaisesRegex(APIError, "pages"):
-            render_pdf(
-                pdf_bytes(pages=3),
-                documents.DocumentBudget(deadline=math.inf, remaining_pages=2),
-            )
-        self.assertFalse(documents._cache)
+    def test_page_budget_error_matches_on_cold_and_cached_pdf(self):
+        payload = pdf_bytes(pages=3)
+        for cached in (False, True):
+            for remaining in (0, 2):
+                with self.subTest(cached=cached, remaining=remaining):
+                    self.setUp()
+                    if cached:
+                        render_pdf(payload)
+                    with self.assertRaises(APIError) as raised:
+                        render_pdf(
+                            payload,
+                            documents.DocumentBudget(
+                                deadline=math.inf, remaining_pages=remaining
+                            ),
+                        )
+                    self.assertEqual(
+                        (raised.exception.status, raised.exception.message),
+                        (400, "documents exceed the request page limit"),
+                    )
+                    self.assertEqual(bool(documents._cache), cached)
 
     def test_request_budget_counts_repeated_pdfs_with_and_without_cache(self):
         render_pdf()

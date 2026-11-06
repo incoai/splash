@@ -27,12 +27,10 @@ uint64_t parseMaxMemory(std::string_view value) {
   return result;
 }
 
-// Whether `value` is a context of 1 to the model's own tokens, which
-// `result` then holds.
-bool parseContext(std::string_view value,
-                  const model::ModelCapabilities &capabilities, uint32_t &result) {
-  return parsePositive(value, result) &&
-         result <= capabilities.maximumContextTokens;
+// Whether `value` is a context of 1 to `most` tokens, which `result` then
+// holds.
+bool parseContext(std::string_view value, uint32_t most, uint32_t &result) {
+  return parsePositive(value, result) && result <= most;
 }
 
 // MAX_CONTEXT, zero for auto; the model bounds it (model::servedFor).
@@ -94,21 +92,30 @@ std::filesystem::path requireModelRoot(std::string_view argument) {
   const std::filesystem::path root =
       std::filesystem::canonical(std::filesystem::path(argument), error);
   if (error || !std::filesystem::is_directory(root, error))
-    throw UsageError("MODEL_DIRECTORY must name an existing directory");
+    throw ModelRootError("MODEL_DIRECTORY must name an existing directory");
   for (const char *role : {"target", "draft"}) {
     if (!std::filesystem::is_directory(root / role, error))
-      throw UsageError(
+      throw ModelRootError(
           "MODEL_DIRECTORY must hold the model's target/ and draft/ directories");
   }
   return root;
 }
 
+// The model `root` holds (model::inspectModelRoot), whose refusal is the
+// root's.
+model::ModelDescriptor inspectModel(const std::filesystem::path &root) {
+  try {
+    return model::inspectModelRoot(root);
+  } catch (const std::exception &error) {
+    throw ModelRootError(error.what());
+  }
+}
+
 } // namespace
 
 NativeArguments parseNativeArguments(int argc, const char *const *argv) {
-  if (argc < 5 || std::string_view(argv[1]) != "serve-native") {
-    throw UsageError("expected the serve-native command");
-  }
+  if (argc < 5)
+    throw UsageError("serve-native requires MODEL_DIRECTORY, MAX_CONTEXT and MAX_MEMORY_BYTES");
   NativeArguments result;
   // Read once the model's own context is known.
   std::optional<std::string_view> relaunchContext;
@@ -191,19 +198,20 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
   if (!result.cacheRoot.empty() && !result.persistentCache)
     throw UsageError("--cache-dir requires --persistent-cache on");
   result.modelRoot = requireModelRoot(argv[2]);
-  model::ModelDescriptor inspected = model::inspectModelRoot(result.modelRoot);
+  model::ModelDescriptor inspected = inspectModel(result.modelRoot);
   result.maxContext = parseMaxContext(argv[3]);
   try {
     result.model = model::servedFor(std::move(inspected), result.maxContext);
   } catch (const std::invalid_argument &error) {
     throw UsageError(std::string("MAX_CONTEXT: ") + error.what());
   }
+  // A relaunch's context is one its first engine served: MAX_CONTEXT at
+  // most, which a relaunch passes as that engine's, else one the model holds.
   if (relaunchContext) {
-    if (result.maxContext)
-      throw UsageError("--relaunch-context requires MAX_CONTEXT auto");
-    if (!parseContext(*relaunchContext, result.model.capabilities, result.relaunchContext))
-      throw UsageError("--relaunch-context requires an integer in [1, " +
-                       std::to_string(result.model.capabilities.maximumContextTokens) + "]");
+    const uint32_t most =
+        result.maxContext ? result.maxContext : result.model.capabilities.maximumContextTokens;
+    if (!parseContext(*relaunchContext, most, result.relaunchContext))
+      throw UsageError("--relaunch-context requires an integer in [1, " + std::to_string(most) + "]");
   }
   result.maxMemoryBytes = parseMaxMemory(argv[4]);
   return result;

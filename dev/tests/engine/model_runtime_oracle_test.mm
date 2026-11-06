@@ -12,6 +12,7 @@
 #include "engine/NativeArguments.hpp"
 #include "engine/Types.hpp"
 #include "metal/BackendInstrumentation.hpp"
+#include "model/ExpertStore.hpp"
 #include "model/KvBlockCache.hpp"
 #include "model/KvCopyRead.hpp"
 #include "model/KvHistoryStream.hpp"
@@ -20,6 +21,7 @@
 #include "model/Qwen4Steps.hpp"
 #include "model/RuntimeInstrumentation.hpp"
 #include "model/QwenState.hpp"
+#include "model/SparseRowStore.hpp"
 #include "model/SpilledKvReads.hpp"
 #include "model/SsdReaders.hpp"
 #include "model/VerifyBudget.hpp"
@@ -37,6 +39,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -56,7 +59,6 @@
 using namespace splash;
 using namespace splash::engine;
 using metal::BackendInstrumentation;
-using splash::model::IdleMemory;
 
 namespace {
 
@@ -203,11 +205,28 @@ std::string mebibytes(uint64_t bytes) {
   std::exit(1);
 }
 
+// The last allocation of the oracle that was refused (governedFor): the
+// bytes it asked for, and the governor's limit and what it charged then.
+struct OracleRefusal final {
+  uint64_t requestedBytes = 0, limitBytes = 0, chargedBytes = 0;
+};
+OracleRefusal lastRefusal;
+
+// A refusal of `failure`'s cause, as a check it fails names it, with what
+// the governor said to the last refused allocation.
+std::string refused(metal::AllocationFailure failure) {
+  return std::string(" (") + metal::allocationFailureName(failure) + ": " +
+         std::to_string(lastRefusal.requestedBytes) + " bytes requested, the governor's limit " +
+         std::to_string(lastRefusal.limitBytes) + " bytes, " + std::to_string(lastRefusal.chargedBytes) +
+         " bytes charged)";
+}
+
 // The admission of what the oracle allocates for `need` through `governor`,
-// which the oracle marks serving, so that only its limit and macOS's critical
-// pressure refuse it. It reads macOS's level before each allocation, as the
+// inside the oracle's Floor claim, so that only its limit and macOS's
+// critical pressure refuse it. It reads macOS's level before each allocation, as the
 // engine's control pass reads it between commands, and stops the run at
-// critical pressure or when it cannot read the level.
+// critical pressure or when it cannot read the level; any other refusal it
+// keeps in lastRefusal.
 metal::AllocationAdmission governedFor(MemoryGovernor &governor, std::string need) {
   return [admit = governor.allocationAdmission(), &governor, need = std::move(need)](
              uint64_t bytes, const std::function<void()> &allocate) {
@@ -219,6 +238,10 @@ metal::AllocationAdmission governedFor(MemoryGovernor &governor, std::string nee
     if (result.failure == metal::AllocationFailure::HostPressure)
       stopForHostMemory("the memory governor refused " + mebibytes(bytes) + " for " + need +
                         " under macOS's critical memory pressure; close other programs and retry");
+    if (!result) {
+      const MemoryGovernorSnapshot memory = governor.snapshot();
+      lastRefusal = {bytes, memory.limitBytes, memory.chargedBytes};
+    }
     return result;
   };
 }
@@ -490,6 +513,27 @@ EngineRequest makeRequest(uint64_t id, std::vector<uint32_t> prompt,
   return result;
 }
 
+// The runtime's pool of this name (model::PoolState::name).
+model::ElasticPool &poolNamed(model::Runtime &runtime, std::string_view name) {
+  for (model::ElasticPool *pool : runtime.pools())
+    if (pool->state().name == name)
+      return *pool;
+  throw std::runtime_error("the runtime has no pool " + std::string(name));
+}
+
+// Gives back what the requests left idle, as the engine's reclaim may: the
+// pooled state buffers, then every unit of the pools that cost only their
+// rebuild (model::PoolState::rebuildOnly). Returns the bytes.
+uint64_t releaseIdle(model::Runtime &runtime) {
+  uint64_t bytes = 0;
+  while (const uint64_t buffer = runtime.releaseIdleBuffer(false))
+    bytes += buffer;
+  for (model::ElasticPool *pool : runtime.pools())
+    if (pool->state().rebuildOnly)
+      bytes += pool->release(UINT64_MAX);
+  return bytes;
+}
+
 void beginCold(model::Runtime &runtime, const EngineRequest &request,
                uint32_t lane) {
   runtime.beginColdRequest(request.modelView(), lane);
@@ -566,8 +610,8 @@ ModelStepResult prefillChunk(model::Runtime &executor, uint64_t requestId,
   auto result = ticket->wait();
   if (images) {
     require(BackendInstrumentation::submittedCommands(images->backend) - commands == (images->encodes ? 2u : 1u) &&
-                (ticket->imageEncodeMilliseconds() > 0.0) == images->encodes &&
-                ticket->prefillTimingIsRepresentative(),
+                (ticket->sample().imageEncodeMilliseconds > 0.0) == images->encodes &&
+                ticket->sample().representative,
             "a chunk's image encodes did not run as a command of their own ahead of it");
   }
   require(result.size() == 1 && result[0].consumedPromptTokens == tokenCount,
@@ -900,8 +944,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
                     : executor.begin(image.modelView())).granted(),
             "image could not retry after an execution lane became free");
     executor.end(image.id);
-    while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-    }
+    releaseIdle(executor);
     require(backend.memoryStats().allocatedBytes == originalBytes,
             "full-lane image test leaked resources");
   }
@@ -915,8 +958,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
       executor.suspend(text.id);
       // The suspended lane's buffers go back: what a reclaim finds after a
       // failed start below is then that start's own.
-      while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-      }
+      releaseIdle(executor);
     }
     for (bool sharedVision : {false, true}) {
       EngineRequest keeper = image;
@@ -947,13 +989,12 @@ void requireAtomicImageAdmission(model::Runtime &executor,
         require(threw == throwing, "image admission exception was lost");
         require(backend.memoryStats().allocatedBytes == before,
                 "failed image admission retained or removed shared buffers");
-        require(executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches) == 0,
+        require(releaseIdle(executor) == 0,
                 "failed image admission created false reclamation progress");
       }
       if (sharedVision) {
         executor.end(keeper.id);
-        while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-        }
+        releaseIdle(executor);
       }
     }
     // The same request can still be admitted after every failure mode.
@@ -961,8 +1002,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
                     : executor.begin(image.modelView())).granted(),
             "image request could not retry after allocation failure");
     executor.end(image.id);
-    while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-        }
+    releaseIdle(executor);
     require(backend.memoryStats().allocatedBytes == originalBytes,
             "image admission test leaked resources");
   }
@@ -981,8 +1021,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
                                   model::QwenStateStorage &states,
                                   const model::LoadedModel &model,
                                   AllocationFault &fault) {
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   const uint64_t encodesBefore = executor.telemetry().imageEncodes;
   const uint64_t reusesBefore = executor.telemetry().imageEmbeddingReuses;
@@ -1001,13 +1040,19 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
       request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}));
   prefillChunk(executor, request.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages, ImageEncodes{backend, true});
-  // Nothing else is idle, so the pass releases exactly the encoder arena.
-  uint64_t reclaimed = 0;
-  while (const uint64_t bytes = executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches))
-    reclaimed += bytes;
   const ImageSpan &span = request.images.front();
   const uint64_t encoderBytes = ops::Vision::scratchBytes(
       model.vision.tensors.layout, span.gridHeight * span.gridWidth);
+  // The encoder, its only image encoded, is a unit of a pool that costs only
+  // its rebuild, which a start may take (model::PoolState::rebuildOnly), as
+  // the image cache is.
+  const model::PoolState arena = poolNamed(executor, "vision_arena").state();
+  require(arena.rebuildOnly && arena.releaseUnitBytes == encoderBytes &&
+              poolNamed(executor, "embeddings").state().rebuildOnly,
+          "an idle encoder's " + std::to_string(arena.releaseUnitBytes) +
+              " bytes are not a unit that costs only its rebuild, or the image cache's are not");
+  // Nothing else is idle, so the pass releases exactly the encoder arena.
+  const uint64_t reclaimed = releaseIdle(executor);
   require(reclaimed == encoderBytes,
           "encoder whose only image is encoded survived reclaim");
   prefillChunk(executor, request.id, 64,
@@ -1073,15 +1118,12 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
   // The cache-only request still holds its rows: dropping their cache entry
   // frees nothing, so the reclaimer must not credit those bytes.
   const uint64_t heldBytes = backend.memoryStats().allocatedBytes;
-  uint64_t released = 0;
-  while (const uint64_t bytes = executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches))
-    released += bytes;
+  const uint64_t released = releaseIdle(executor);
   require(released == heldBytes - backend.memoryStats().allocatedBytes,
           "reclaim credited cached rows a live request still holds");
   executor.end(request.id);
 
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   require(backend.memoryStats().allocatedBytes == originalBytes,
           "image requests leaked resources");
   std::cout << "image_rows_after_reclaim=PASS\n";
@@ -1091,8 +1133,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
                                      metal::MetalBackend &backend,
                                      model::QwenStateStorage &states,
                                      AllocationFault &fault) {
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   std::vector<uint32_t> prompt(128);
   for (uint32_t index = 0; index < prompt.size(); ++index)
@@ -1107,8 +1148,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
   const uint64_t singleImageBytes =
       backend.memoryStats().allocatedBytes - originalBytes;
   executor.end(request.id);
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   require(backend.memoryStats().allocatedBytes == originalBytes,
           "single image allocation fixture retained memory");
 
@@ -1143,8 +1183,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
           "repeated image placements encoded more than once");
   const auto expected = sampleCommittedState(backend, states, lane);
   executor.end(request.id);
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
 
   // The first placement is covered by the prefix, but its later duplicates
   // still need their shared image data after the embedding cache is reclaimed.
@@ -1161,8 +1200,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
       expected, sampleCommittedState(backend, states, *restored.lane), true);
   executor.end(request.id);
   checkpoint.reset();
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   require(backend.memoryStats().allocatedBytes == originalBytes,
           "repeated image placements retained resources");
   std::cout << "repeated_image_placements=PASS\n";
@@ -1197,8 +1235,7 @@ void requireFullWindowRestore(model::Runtime &executor,
   executor.end(request.id);
   // With the idle rings reclaimed, the restored lane's rings hold none of the
   // teacher's rows: only the rebuild puts them back.
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
 
   request.id = 105;
   beginCold(executor, request, 0);
@@ -1453,7 +1490,7 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
     executor.end(id);
   // Later checks compare whole draft rings, which the pool would hand out
   // with what these long prompts left in them: they take fresh ones.
-  while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
+  while (executor.releaseIdleBuffer(false)) {
   }
   std::cout << "states_captured_inside_commands=PASS\n";
 }
@@ -1479,7 +1516,7 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
                                          const model::QwenStateStorage &states, std::span<const uint32_t> chat,
                                          bool vision) {
   constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
-  if (executor.prefillGroupRows(true) <= chunk) {
+  if (executor.commandLimits().commandRows <= chunk) {
     std::cout << "prefill_group=SKIP (the target runs no prefill groups)\n";
     return;
   }
@@ -1663,7 +1700,7 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
   }
   executor.end(521);
   executor.end(522);
-  while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
+  while (executor.releaseIdleBuffer(false)) {
   }
   std::cout << "prefill_group_matches_its_chunks=PASS" << (vision ? " images=PASS" : " images=SKIP") << '\n';
 }
@@ -1671,26 +1708,36 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
 // A prefill command run in passes over the target's layers
 // (BatchPlan::passes), each its own command, leaves what it leaves run
 // whole: its score logits, KV, GDN cell, PLE history, lengths, draft rings
-// and window, and the states it captures, at three passes and at one a
-// layer, and with an image its first pass encodes when the target serves
-// vision; a pass before the last returns its request's id alone. A target
-// whose commands run whole (its experts load whole) skips it.
+// and window, and the states it captures, at three passes and at the most
+// (CommandLimits::maximumPasses), and with an image its first pass
+// encodes when the target serves vision; so does each lane of a command of
+// two, each capturing a state inside its rows and one at their end. On a
+// runtime whose commands hold a prefill group's chunks, the command spans
+// three chunks, its image the first chunk's end, and the second lane's rows
+// run past the first chunk; on one of one chunk, they keep to the chunk, the
+// image past the states inside it. A
+// pass before the last returns its requests' ids alone. A runtime whose
+// commands run whole (the Neural Engine's FFN split) skips it.
 void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStorage &pages,
                                     const model::QwenStateStorage &states, std::span<const uint32_t> chat,
                                     bool vision) {
-  const uint32_t passes = executor.prefillPasses();
+  const model::CommandLimits limits = executor.commandLimits();
+  const uint32_t passes = limits.maximumPasses;
   if (passes <= 1) {
-    std::cout << "prefill_passes=SKIP (the target runs its prefill commands whole)\n";
+    std::cout << "prefill_passes=SKIP (the runtime runs its prefill commands whole)\n";
     return;
   }
   constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
-  constexpr uint32_t rows = kGroupFixtureRows;
+  const bool grouped = limits.commandRows > chunk;
+  const uint32_t rows = grouped ? kGroupFixtureRows : chunk;
   const std::vector<uint32_t> pageTable = pageRange(0, rows / kv::kPageTokens);
   require(pages.pageCount() >= pageTable.size(), "the KV pool cannot hold the prefill passes fixture");
   std::vector<uint32_t> prompt(rows + kv::kPageTokens);
   for (uint32_t index = 0; index < prompt.size(); ++index) prompt[index] = chat[index % chat.size()];
   const std::span<const uint32_t> tokens(prompt);
-  constexpr std::array<uint32_t, 3> capturedAt{1024, chunk + 1024, rows};
+  const std::array<uint32_t, 3> capturedAt =
+      grouped ? std::array<uint32_t, 3>{1024, chunk + 1024, rows} : std::array<uint32_t, 3>{512, 1024, rows};
+  const uint32_t imageAt = (grouped ? chunk : 3 * chunk / 4) - 16;
   const uint32_t width = states.layout().draft.contextWidth;
   struct Run final {
     std::vector<float> scores;
@@ -1708,7 +1755,7 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
     // The same pixels in every request, under a digest of its own, so that
     // each request encodes the image itself.
     if (image) {
-      request.images = {{chunk - 16, 64, 16, 16, id, 0}};
+      request.images = {{imageAt, 64, 16, 16, id, 0}};
       request.imagePixels.resize(request.images.front().pixelBytes());
       for (size_t index = 0; index < request.imagePixels.size(); ++index)
         request.imagePixels[index] = static_cast<uint8_t>(index * 13 + 7);
@@ -1725,12 +1772,10 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
         require(reservation != nullptr, "the buffers of a state to capture were refused");
         item.stateCaptures.push_back({boundary, std::move(reservation)});
       }
-      for (uint32_t pass = 0; pass < split; ++pass) {
-        const BatchPlan plan{.kind = WorkKind::Prefill,
-                             .items = {{id, rows}},
-                             .decodeStage = DecodeStage::Regular,
-                             .pass = pass,
-                             .passes = split};
+      BatchPlan plan{
+          .kind = WorkKind::Prefill, .items = {{id, rows}}, .decodeStage = DecodeStage::Regular, .passes = split};
+      for (; plan.pass < split; plan = followingPass(plan, executor.commandLimits().layers)) {
+        const uint32_t pass = plan.pass;
         std::vector<ModelStepResult> results = executor.submit(plan, std::span(&item, 1), {})->wait();
         require(results.size() == 1 && results[0].requestId == id && results[0].failure.empty(),
                 "a prefill command's pass failed");
@@ -1779,10 +1824,157 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
                     " differs from the command run whole");
     }
   }
-  while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
+
+  const uint32_t firstRows = grouped ? chunk / 2 : chunk / 4, secondRows = grouped ? chunk + chunk / 2 : chunk / 2;
+  const std::array<std::vector<uint32_t>, 2> lanePages{pageRange(0, firstRows / kv::kPageTokens),
+                                                       pageRange(firstRows / kv::kPageTokens,
+                                                                 secondRows / kv::kPageTokens)};
+  const std::array<std::array<uint32_t, 2>, 2> laneCaptures{
+      {{firstRows / 2, firstRows}, {secondRows / 3 / kv::kPageTokens * kv::kPageTokens, secondRows}}};
+  struct LaneRun final {
+    std::vector<float> scores;
+    std::vector<std::vector<uint8_t>> kv;
+    model::QwenLogicalLengths lengths;
+    std::vector<uint8_t> cell;
+    std::vector<std::vector<uint16_t>> rings;
+    std::vector<uint8_t> windowRows;
+    std::vector<StateBytes> captured;
+  };
+  // The two lanes' command in `split` passes: what each lane leaves.
+  const auto runLanes = [&](uint64_t first, uint32_t split) {
+    const std::array<uint64_t, 2> ids{first, first + 1};
+    BatchPlan plan{.kind = WorkKind::Prefill, .decodeStage = DecodeStage::Regular, .passes = split};
+    std::vector<ModelBatchItem> items;
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      const uint32_t laneRows = lane ? secondRows : firstRows;
+      EngineRequest request = makeRequest(ids[lane], {prompt.begin(), prompt.begin() + laneRows}, 0);
+      for (uint32_t option = 0; option < model::ExecutionLimits::maximumScoreOptions; ++option)
+        request.scoreTokens.push_back(1000 + 37 * option);
+      beginCold(executor, request, lane);
+      executor.setDraftContextPlan(ids[lane], planDraftContext(0, laneRows, laneCaptures[lane]));
+      plan.items.push_back({ids[lane], laneRows});
+      ModelBatchItem item = withRevision({ids[lane], 0, laneRows, lanePages[lane]});
+      item.inputTokens = tokens.first(laneRows);
+      for (const uint32_t boundary : laneCaptures[lane]) {
+        metal::AllocationFailure refusal;
+        std::shared_ptr<StateReservation> reservation = executor.reserveState(ids[lane], boundary, refusal);
+        require(reservation != nullptr, "the buffers of a state to capture were refused");
+        item.stateCaptures.push_back({boundary, std::move(reservation)});
+      }
+      items.push_back(std::move(item));
+    }
+    std::vector<ModelStepResult> last;
+    for (; plan.pass < split; plan = followingPass(plan, executor.commandLimits().layers)) {
+      const uint32_t pass = plan.pass;
+      std::vector<ModelStepResult> results = executor.submit(plan, items, {})->wait();
+      require(results.size() == 2 && results[0].requestId == ids[0] && results[1].requestId == ids[1] &&
+                  results[0].failure.empty() && results[1].failure.empty(),
+              "a two-lane prefill command's pass failed");
+      if (pass + 1 < split)
+        require(std::ranges::all_of(results,
+                                    [](const ModelStepResult &result) {
+                                      return !result.consumedPromptTokens && result.capturedStates.empty() &&
+                                             result.scoreLogits.empty() && !result.finished;
+                                    }),
+                "a pass before a two-lane command's last committed something");
+      else
+        last = std::move(results);
+    }
+    items.clear();
+    std::array<LaneRun, 2> runs;
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      require(last[lane].consumedPromptTokens == plan.items[lane].tokenCount &&
+                  last[lane].capturedStates.size() == laneCaptures[lane].size(),
+              "a two-lane command's last pass did not commit a lane's rows and states");
+      LaneRun &run = runs[lane];
+      run.scores = last[lane].scoreLogits;
+      for (const uint32_t page : lanePages[lane])
+        for (const auto &tensor : pages.spans(page)) {
+          const auto *data = reinterpret_cast<const uint8_t *>(tensor.data());
+          run.kv.emplace_back(data, data + tensor.size());
+        }
+      run.lengths = states.metadata(lane).lengths;
+      run.cell = bytesOf(states.current(lane).stateBase);
+      run.rings = committedState(executor, states, lane).rings;
+      run.windowRows = windowRows(bytesOf(states.window(lane)), width, run.lengths.targetTokens);
+    }
+    for (const uint64_t id : ids)
+      executor.end(id);
+    for (uint32_t lane = 0; lane < 2; ++lane)
+      for (size_t index = 0; index < laneCaptures[lane].size(); ++index) {
+        const uint32_t boundary = laneCaptures[lane][index];
+        StateBytes state = restoredBytes(executor, states, 560, 0, tokens, boundary, last[lane].capturedStates[index]);
+        state.window = windowRows(state.window, width, boundary);
+        runs[lane].captured.push_back(std::move(state));
+      }
+    return runs;
+  };
+  const std::array<LaneRun, 2> whole = runLanes(551, 1);
+  for (const uint32_t split : {3u, passes}) {
+    const std::array<LaneRun, 2> passed = runLanes(551 + 2 * split, split);
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      const std::string which = "lane " + std::to_string(lane) + " of a two-lane prefill command in " +
+                                std::to_string(split) + " passes";
+      require(!passed[lane].scores.empty() && passed[lane].scores == whole[lane].scores,
+              which + ": its score logits differ from the command run whole");
+      require(passed[lane].kv == whole[lane].kv, which + ": its KV differs from the command run whole");
+      require(passed[lane].lengths == whole[lane].lengths && passed[lane].cell == whole[lane].cell,
+              which + ": its GDN cell, PLE history or lengths differ from the command run whole");
+      require(passed[lane].rings == whole[lane].rings && passed[lane].windowRows == whole[lane].windowRows,
+              which + ": its draft rings or window rows differ from the command run whole");
+      for (size_t index = 0; index < laneCaptures[lane].size(); ++index)
+        require(passed[lane].captured[index].cell == whole[lane].captured[index].cell &&
+                    passed[lane].captured[index].window == whole[lane].captured[index].window,
+                which + ": the state it captured at " + std::to_string(laneCaptures[lane][index]) +
+                    " differs from the command run whole");
+    }
+  }
+  while (executor.releaseIdleBuffer(false)) {
   }
   std::cout << "prefill_passes_match_whole=PASS passes=3," << passes << (vision ? " images=PASS" : " images=SKIP")
-            << '\n';
+            << " lanes=2\n";
+}
+
+// A command's sample counts as weights read on demand the bytes the expert
+// store read for it, and no row a streamed PLE table read (WorkCount), on a
+// target whose experts and table both stream (--expert-memory,
+// --ple-memory): the first decode of `prompt`, whose verify reads inside the
+// command the rows of the answer it starts, n-grams no command before it
+// took, after a warm-up of a chunk that read both. (runtime_resources_test's
+// start that streams a table runs no command.)
+void requireWeightReadsAreTheStoresAlone(model::Runtime &executor, const model::LoadedModel &model,
+                                         const std::vector<uint32_t> &prompt) {
+  const model::ExpertStore *store = model.expertStore();
+  const model::SparseRowStore *table = model.streamedTable();
+  if (!store || !table) {
+    std::cout << "weight_reads=SKIP (the target does not stream both its experts and a PLE table)\n";
+    return;
+  }
+  uint64_t storeBefore = store->readBytes(), tableBefore = table->stats().readBytes;
+  (void)executor.warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
+  const uint64_t warmupStore = store->readBytes() - storeBefore, warmupTable = table->stats().readBytes - tableBefore;
+  require(warmupTable, "the warm-up read no row of the streamed PLE table");
+  require(warmupStore, "the warm-up read no expert");
+  constexpr uint64_t id = 600;
+  const std::vector<uint32_t> pages = pageRange(0, 8);
+  beginCold(executor, makeRequest(id, prompt, 16), 0);
+  requireOpen(prefillChunk(executor, id, 0, prompt, pages), "the weight reads' decode");
+  const BatchPlan plan{.kind = WorkKind::Decode, .items = {{id, 0}}, .decodeStage = DecodeStage::Regular};
+  const ModelBatchItem item = withRevision({id, prompt.size(), 0, pages});
+  storeBefore = store->readBytes();
+  tableBefore = table->stats().readBytes;
+  const std::unique_ptr<ModelBatchTicket> ticket = executor.submit(plan, std::span(&item, 1), {});
+  const std::vector<ModelStepResult> decoded = ticket->wait();
+  require(decoded.size() == 1 && decoded[0].failure.empty(), "the weight reads' decode failed");
+  const uint64_t decodeStore = store->readBytes() - storeBefore, decodeTable = table->stats().readBytes - tableBefore;
+  require(decodeTable, "the decode read no row of the streamed PLE table");
+  require(ticket->sample().work.weightReadBytes == decodeStore,
+          "a decode's weight reads are not the bytes the expert store read for it alone");
+  executor.end(id);
+  while (executor.releaseIdleBuffer(false)) {
+  }
+  std::cout << "weight_reads=PASS warmup_experts=" << warmupStore << " warmup_table=" << warmupTable
+            << " decode_experts=" << decodeStore << " decode_table=" << decodeTable << '\n';
 }
 
 // A command's ticket holds the buffers of the states it captures once the
@@ -1845,7 +2037,7 @@ void requireCapturesOutliveTheirItems(model::Runtime &executor,
             "a ticket dropped unconsumed did not give back its states' buffers");
   }
   executor.end(421);
-  while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
+  while (executor.releaseIdleBuffer(false)) {
   }
   std::cout << "captures_outlive_their_items=PASS\n";
 }
@@ -2317,8 +2509,7 @@ EngineRequest imageRequest(uint64_t id, ImageSpan span) {
 // once and both lanes inject it.
 void requireConcurrentRequestsShareOneEncode(model::Runtime &executor,
                                              metal::MetalBackend &backend) {
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   const EngineRequest first = imageRequest(110, {16, 16, 8, 8, 167, 449});
   EngineRequest second = first;
@@ -2351,8 +2542,7 @@ void requireConcurrentRequestsShareOneEncode(model::Runtime &executor,
           "two requests with the same image encoded it twice");
   executor.end(first.id);
   executor.end(second.id);
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   require(backend.memoryStats().allocatedBytes == originalBytes,
           "shared image rows leaked resources");
   std::cout << "concurrent_image_requests_share_one_encode=PASS\n";
@@ -2436,8 +2626,7 @@ void requireNonFiniteChunkLeavesItsImageToEncode(model::Runtime &executor,
 // the cache takes them, and the replay injects them without an encode.
 void requireSuspendedLaneKeepsItsRows(model::Runtime &executor,
                                       metal::MetalBackend &backend) {
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   const EngineRequest request = imageRequest(112, {16, 32, 8, 16, 173, 457});
   const std::span<const uint32_t> prompt(request.prompt);
@@ -2457,8 +2646,7 @@ void requireSuspendedLaneKeepsItsRows(model::Runtime &executor,
   require(executor.telemetry().imageEncodes == encodes + 1,
           "a resumed lane encoded its image again");
   executor.end(request.id);
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   require(backend.memoryStats().allocatedBytes == originalBytes,
           "a suspended image request leaked resources");
   std::cout << "suspended_lane_keeps_its_rows=PASS\n";
@@ -2469,8 +2657,7 @@ void requireSuspendedLaneKeepsItsRows(model::Runtime &executor,
 // its lane.
 void requireInjectedRowsBecomeReclaimable(model::Runtime &executor,
                                           metal::MetalBackend &backend) {
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   const EngineRequest request = imageRequest(113, {16, 16, 8, 8, 179, 461});
   const StateAdmission admission = executor.begin(request.modelView());
   require(admission.granted(), "reclaimable image request was not admitted");
@@ -2483,9 +2670,7 @@ void requireInjectedRowsBecomeReclaimable(model::Runtime &executor,
               injected.imageRowsBytes == injected.embeddingCacheBytes,
           "injected rows did not pass to the embedding cache");
   const uint64_t before = backend.memoryStats().allocatedBytes;
-  uint64_t released = 0;
-  while (const uint64_t bytes = executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches))
-    released += bytes;
+  const uint64_t released = releaseIdle(executor);
   require(released == injected.embeddingCacheBytes + injected.visionArenaBytes &&
               before - backend.memoryStats().allocatedBytes == released &&
               executor.telemetry().imageRowsBytes == 0,
@@ -2501,8 +2686,7 @@ void requireInjectedRowsBecomeReclaimable(model::Runtime &executor,
 void requireCoveredImagesAreNotStaged(model::Runtime &executor,
                                       metal::MetalBackend &backend,
                                       const model::QwenStateStorage &states) {
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   std::vector<uint32_t> prompt(128);
   for (uint32_t index = 0; index < prompt.size(); ++index)
@@ -2525,8 +2709,7 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
   std::shared_ptr<const CompositeState> pastImage = executor.snapshot(request.id);
   require(beforeImage && pastImage, "covered image states were not snapshotted");
   executor.end(request.id);
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
 
   const uint64_t encodes = executor.telemetry().imageEncodes;
   const uint64_t reuses = executor.telemetry().imageEmbeddingReuses;
@@ -2554,13 +2737,11 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
               "a restore past an image encoded it");
     }
     executor.end(id);
-    while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-    }
+    releaseIdle(executor);
   }
   beforeImage.reset();
   pastImage.reset();
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   require(backend.memoryStats().allocatedBytes == originalBytes,
           "covered image starts leaked resources");
   std::cout << "covered_images_are_not_staged=PASS\n";
@@ -2575,8 +2756,7 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
                                      const model::QwenStateStorage &states,
                                      const model::LoadedModel &model,
                                      AllocationFault &fault) {
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   const uint64_t laneBytes = states.layout().laneBytes();
   const auto imageBytes = [&](const ImageSpan &span) {
@@ -2609,7 +2789,7 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
     const StateAdmission refused = executor.begin(fresh.modelView());
     fault = {};
     require(!refused.granted() && refused.held &&
-                executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches) == 0 &&
+                releaseIdle(executor) == 0 &&
                 executor.telemetry().visionArenaBytes == arenaBytes,
             "reclaim took the encoder a refused start holds");
   }
@@ -2619,14 +2799,14 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
                   beforeRetry + laneBytes + imageBytes(fresh.images.front()),
           "the retry of a refused start built another encoder");
   executor.end(fresh.id);
-  while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
+  while (executor.releaseIdleBuffer(false)) {
   }
-  require(executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches) == arenaBytes,
+  require(releaseIdle(executor) == arenaBytes,
           "the idle encoder was not the only cache left");
   prefillChunk(executor, cached.id, 64,
                std::span<const uint32_t>(prompt).subspan(64), pages, ImageEncodes{backend, false});
   executor.end(cached.id);
-  while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
+  while (executor.releaseIdleBuffer(false)) {
   }
 
   // The same image's start, refused one byte short of its lane: it holds the
@@ -2639,7 +2819,7 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
     const StateAdmission refused = executor.begin(repeat.modelView());
     fault = {};
     require(!refused.granted() && refused.held &&
-                executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches) == 0 &&
+                releaseIdle(executor) == 0 &&
                 executor.telemetry().embeddingCacheBytes != 0,
             "reclaim took the cached rows a refused start holds");
   }
@@ -2649,22 +2829,21 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
               executor.telemetry().imageEncodes == encodes,
           "the retry of a refused start did not find its cached rows");
   executor.end(repeat.id);
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   require(backend.memoryStats().allocatedBytes == originalBytes,
           "refused image starts leaked resources");
   std::cout << "refused_start_keeps_its_rows=PASS\n";
 }
 
-// A reclaim step frees one unit: with two cached images and an idle encoder
-// three steps free the arena, which neither image needs again, then the
-// older entry and the newer, which the telemetry counts as evictions, and a
-// step limited to buffers frees none of them.
-void requireReclaimTakesOneCacheUnit(model::Runtime &executor,
-                                     metal::MetalBackend &backend,
-                                     const model::LoadedModel &model) {
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+// A release of one unit frees one unit: with two cached images and an idle
+// encoder, the vision arena gives back the encoder, which neither image
+// needs again, and the image cache the older entry, then the newer, which
+// the telemetry counts as evictions; a release of the idle buffers frees
+// none of them.
+void requirePoolReleaseTakesOneUnit(model::Runtime &executor,
+                                    metal::MetalBackend &backend,
+                                    const model::LoadedModel &model) {
+  releaseIdle(executor);
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   const auto rowBytes = [&](const ImageSpan &span) {
     return uint64_t{ops::Vision::embeddingRows({span.gridHeight, span.gridWidth})} *
@@ -2684,24 +2863,24 @@ void requireReclaimTakesOneCacheUnit(model::Runtime &executor,
   executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), {}));
   prefillChunk(executor, request.id, 0, prompt, pageRange(120, 4), ImageEncodes{backend, true});
   executor.end(request.id);
-  while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
+  while (executor.releaseIdleBuffer(false)) {
   }
   const model::ModelTelemetry cached = executor.telemetry();
   require(cached.embeddingCacheBytes ==
                   rowBytes(request.images[0]) + rowBytes(request.images[1]) &&
               cached.visionArenaBytes != 0,
-          "a step limited to buffers freed a cache");
-  for (const uint64_t expected :
-       {cached.visionArenaBytes, rowBytes(request.images[0]), rowBytes(request.images[1])}) {
-    require(executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches) == expected,
-            "a reclaim step did not free the next cache unit");
-  }
-  require(executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches) == 0 &&
+          "a release of the idle buffers freed a cache");
+  require(poolNamed(executor, "vision_arena").release(1) == cached.visionArenaBytes,
+          "a release of one unit did not free the idle encoder");
+  for (const uint64_t expected : {rowBytes(request.images[0]), rowBytes(request.images[1])})
+    require(poolNamed(executor, "embeddings").release(1) == expected,
+            "a release of one unit did not free the image cache's oldest entry");
+  require(releaseIdle(executor) == 0 &&
               backend.memoryStats().allocatedBytes == originalBytes,
           "cache units leaked resources");
   require(executor.telemetry().imageEmbeddingEvictions == cached.imageEmbeddingEvictions + 2,
           "the embedding cache did not count the two entries it let go of");
-  std::cout << "reclaim_takes_one_cache_unit=PASS\n";
+  std::cout << "pool_release_takes_one_unit=PASS\n";
 }
 
 // A start's encoder covers the largest image it encodes, not the server's
@@ -2713,8 +2892,7 @@ void requireEncoderFitsItsImages(model::Runtime &executor,
                                  metal::MetalBackend &backend,
                                  const model::LoadedModel &model,
                                  AllocationFault &fault) {
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   const auto scratchBytes = [&](const EngineRequest &request) {
     const ImageSpan &span = request.images.front();
@@ -2744,22 +2922,20 @@ void requireEncoderFitsItsImages(model::Runtime &executor,
 
   // The idle encoder does not cover a larger image, so that image's refused
   // start holds none of it and reclaim frees the arena before the retry.
-  while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
+  while (executor.releaseIdleBuffer(false)) {
   }
   const EngineRequest largest = imageRequest(126, {0, 64, 16, 16, 233, 523});
   fault.remainingBytes = 0;
   const StateAdmission refused = executor.begin(largest.modelView());
   fault = {};
   require(!refused.granted() && refused.held &&
-              executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches) ==
-                  scratchBytes(large),
+              poolNamed(executor, "vision_arena").release(UINT64_MAX) == scratchBytes(large),
           "a refused start held an encoder too small for its image");
   require(executor.begin(largest.modelView()).granted() &&
               executor.telemetry().visionArenaBytes == scratchBytes(largest),
           "the retry did not build an encoder for its image");
   executor.end(largest.id);
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   require(backend.memoryStats().allocatedBytes == originalBytes,
           "encoders sized for their images leaked resources");
   std::cout << "encoder_fits_its_images=PASS\n";
@@ -2772,8 +2948,7 @@ void requireEncoderFitsItsImages(model::Runtime &executor,
 // cache entry.
 void requireReplayPointKeepsItsImageRows(model::Runtime &executor,
                                          metal::MetalBackend &backend) {
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   std::vector<uint32_t> prompt(128);
   for (uint32_t index = 0; index < prompt.size(); ++index)
@@ -2794,8 +2969,7 @@ void requireReplayPointKeepsItsImageRows(model::Runtime &executor,
   std::shared_ptr<const CompositeState> replayPoint = executor.snapshot(request.id);
   require(replayPoint != nullptr, "replay point snapshot failed");
   executor.end(request.id);
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   const model::ModelTelemetry held = executor.telemetry();
   require(held.stateHeldImageBytes && held.imageRowsBytes == held.stateHeldImageBytes &&
               !held.visionArenaBytes,
@@ -2817,8 +2991,7 @@ void requireReplayPointKeepsItsImageRows(model::Runtime &executor,
   replayPoint.reset();
   require(!executor.telemetry().stateHeldImageBytes,
           "the hold outlived the replay point");
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   require(!executor.telemetry().imageRowsBytes &&
               backend.memoryStats().allocatedBytes == originalBytes,
           "the rows outlived the replay point that held them");
@@ -2832,8 +3005,7 @@ void requireReplayPointKeepsItsImageRows(model::Runtime &executor,
 // and injects the last rows without the encoder.
 void requireCapturedStateKeepsItsImageRows(model::Runtime &executor,
                                        metal::MetalBackend &backend) {
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   std::vector<uint32_t> prompt(128);
   for (uint32_t index = 0; index < prompt.size(); ++index)
@@ -2852,8 +3024,7 @@ void requireCapturedStateKeepsItsImageRows(model::Runtime &executor,
       prefillChunk(executor, request.id, 0, prompt, pages, ImageEncodes{backend, true}, boundary)
           .capturedStates.front();
   executor.end(request.id);
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   const model::ModelTelemetry held = executor.telemetry();
   require(held.stateHeldImageBytes && held.imageRowsBytes == held.stateHeldImageBytes &&
               !held.visionArenaBytes,
@@ -2872,8 +3043,7 @@ void requireCapturedStateKeepsItsImageRows(model::Runtime &executor,
   executor.end(request.id);
   captured.reset();
   require(!executor.telemetry().stateHeldImageBytes, "the hold outlived the captured state");
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   require(!executor.telemetry().imageRowsBytes && backend.memoryStats().allocatedBytes == originalBytes,
           "the rows outlived the captured state that held them");
   std::cout << "captured_state_keeps_its_image_rows=PASS\n";
@@ -2894,8 +3064,7 @@ void requireImageRegistryKeepsOnlyHeldRows(model::Runtime &executor) {
     entries = held;
     executor.end(request.id);
   }
-  while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {
-  }
+  releaseIdle(executor);
   std::cout << "image_registry_keeps_only_held_rows=PASS\n";
 }
 
@@ -3275,7 +3444,7 @@ struct SpillOptions final {
 // The pages a request of a block-sparse target keeps whole before those it
 // may spill: its dense history (engine::CacheSpillPolicy::densePages).
 uint32_t densePagesOf(const model::SparseKvShape &shape) {
-  return (shape.denseTokens() + kv::kPageTokens - 1) / kv::kPageTokens;
+  return (shape.denseHistoryTokens + kv::kPageTokens - 1) / kv::kPageTokens;
 }
 
 // FNV-1a of the values' bytes: logits compared bit for bit.
@@ -3348,11 +3517,12 @@ public:
     const uint64_t arenaBytes = plan.sharedPrefillPlannedAllocatedBytes + plan.sharedDecodePlannedAllocatedBytes;
     // Every row verified: the two runs of one schedule that
     // requireSpilledKvMatchesResident compares must verify the same rows.
-    require(static_cast<bool>(admission(arenaBytes, [&] {
-              runtime_.emplace(model::RuntimeContext{backend, model, kv_, states_, operators, nullptr, &cache_,
-                                                     &stream_, model::VerifyRows::All});
-            })),
-            "the spill runtime's arenas exceed the oracle Metal budget");
+    const metal::AllocationResult arenas = admission(arenaBytes, [&] {
+      runtime_.emplace(model::RuntimeContext{backend, model, kv_, states_, operators, nullptr, &cache_, &stream_,
+                                             model::VerifyRows::All});
+    });
+    require(static_cast<bool>(arenas),
+            "the spill runtime's arenas exceed the oracle Metal budget" + refused(arenas.failure));
   }
 
   [[nodiscard]] model::Runtime &runtime() { return *runtime_; }
@@ -3361,25 +3531,59 @@ public:
   [[nodiscard]] const model::KvHistoryStream &historyStream() const { return stream_; }
   [[nodiscard]] uint32_t densePages() const noexcept { return densePages_; }
 
+  // The most four requests of `tokens`-token prompts that decode
+  // `decodeTokens` more, two of them spilling, allocate beside what the
+  // runtime holds now: the lanes' states; the Full extents of the four
+  // lanes' pages past those the pool holds, which it keeps from run to run;
+  // the Index extents of the spilling lanes' pages; a prompt's history
+  // staging; and the hot block cache's floor for the two spilling lanes,
+  // required(2) slots in whole extents, which it keeps beside the next
+  // run's staging.
+  [[nodiscard]] uint64_t peakBytes(uint32_t tokens, uint32_t decodeTokens) const {
+    const uint64_t lanePages = pagesFor(uint64_t{tokens} + decodeTokens);
+    const auto extents = [&](uint64_t pages) { return (pages + extentPages_ - 1) / extentPages_; };
+    const uint64_t extentSlots = uint64_t{extentPages_} << SPLASH_ATTENTION_LOCATION_BLOCK_BITS;
+    return 4 * states_.layout().laneBytes() +
+           (extents(4 * lanePages) - pool_.allocatedExtents(kv::PageForm::Full)) * kv_.extentBytes() +
+           extents(2 * lanePages) * kv_.extentBytes(kv::PageForm::Index) + stream_.shortfallBytes(pagesFor(tokens)) +
+           (shape_.requiredSlots(2) + extentSlots - 1) / extentSlots * cache_.extentBytes();
+  }
+
   void begin(SpillRequest &request) {
     EngineRequest engineRequest = makeRequest(request.id, request.prompt, 4096);
     engineRequest.flags = RequestIgnoreEndOfSequence;
     beginCold(*runtime_, engineRequest, request.stateLane);
   }
 
-  // The request's prompt from what it committed to token `end`, one command.
-  SpillStep prefill(SpillRequest &request, uint32_t end) {
+  // The request's prompt from what it committed to token `end`, one
+  // command, in `passes` passes over the target's layers (BatchPlan::passes),
+  // each its own command; `afterPass`, if any, runs after each pass but the
+  // last.
+  SpillStep prefill(SpillRequest &request, uint32_t end, uint32_t passes = 1,
+                    const std::function<void()> &afterPass = {}) {
     const uint32_t position = request.committed;
     ensure(request, end);
-    if (request.holdsIndexPages())
-      require(runtime_->reserveHistoryStaging(request.id, pagesFor(end)).granted(),
-              "the staging of a spilled history was refused");
+    if (request.holdsIndexPages()) {
+      const model::ModelMemoryAdmission staging =
+          runtime_->reserveSpilledReads(request.id, {.kind = WorkKind::Prefill, .pages = pagesFor(end)});
+      require(staging.granted(),
+              "the staging of a spilled history was refused" + refused(staging.allocationFailure));
+    }
     const std::span<const uint32_t> input = std::span(request.prompt).subspan(position, end - position);
-    const BatchPlan plan{.kind = WorkKind::Prefill,
-                         .items = {{request.id, end - position}},
-                         .decodeStage = DecodeStage::Regular};
     const std::array items{item(request, position, end - position, input)};
-    std::vector<ModelStepResult> results = runtime_->submit(plan, items, {})->wait();
+    std::vector<ModelStepResult> results;
+    BatchPlan plan{.kind = WorkKind::Prefill,
+                   .items = {{request.id, end - position}},
+                   .decodeStage = DecodeStage::Regular,
+                   .passes = passes};
+    for (; plan.pass < passes; plan = followingPass(plan, runtime_->commandLimits().layers)) {
+      const uint32_t pass = plan.pass;
+      results = runtime_->submit(plan, items, {})->wait();
+      if (pass + 1 == passes) break;
+      require(results.size() == 1 && !results[0].consumedPromptTokens && results[0].unreadableKvBlocks.empty(),
+              "a pass before a spill run's last committed rows or failed them");
+      if (afterPass) afterPass();
+    }
     require(results.size() == 1 && results[0].consumedPromptTokens == end - position,
             "a spill run's prefill result mismatch");
     lastResults_ = results;
@@ -3394,18 +3598,38 @@ public:
                 : std::nullopt};
   }
 
-  // A decode cycle of the requests together, in lanes in their order.
-  std::vector<SpillStep> decode(std::span<SpillRequest *const> requests) {
+  // A decode cycle of the requests together, in lanes in their order;
+  // `during`, if any, runs while its command is in flight. The hot block
+  // cache's host steps work during it once a lane holds Index pages and
+  // not otherwise, and its sample carries the bytes its misses read.
+  std::vector<SpillStep> decode(std::span<SpillRequest *const> requests, const std::function<void()> &during = {}) {
     BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
     std::vector<ModelBatchItem> items;
+    bool indexed = false;
     for (SpillRequest *request : requests) {
       ensure(*request, request->committed + model::ExecutionLimits::targetVerifyRows);
-      if (request->holdsIndexPages())
-        require(runtime_->reserveSpilledReads(request->id).granted(), "a lane's floor of the hot block cache was refused");
+      if (request->holdsIndexPages()) {
+        const model::ModelMemoryAdmission floor =
+            runtime_->reserveSpilledReads(request->id, {.kind = WorkKind::Decode});
+        require(floor.granted(),
+                "a lane's floor of the hot block cache was refused" + refused(floor.allocationFailure));
+      }
+      indexed = indexed || request->holdsIndexPages();
       plan.items.push_back({request->id, 0});
       items.push_back(item(*request, request->committed, 0, {}));
     }
-    std::vector<ModelStepResult> results = runtime_->submit(plan, items, {})->wait();
+    const double resolving = cache_.stats().work.totalMilliseconds;
+    const uint64_t reading = cache_.stats().reads.readBytes;
+    const std::unique_ptr<ModelBatchTicket> ticket = runtime_->submit(plan, items, {});
+    if (during) during();
+    std::vector<ModelStepResult> results = ticket->wait();
+    const uint64_t read = cache_.stats().reads.readBytes - reading;
+    require(ticket->sample().work.spilledKvReadBytes == read,
+            "a decode's sample carried " + std::to_string(ticket->sample().work.spilledKvReadBytes) +
+                " bytes of spilled K/V, not the " + std::to_string(read) + " its misses read");
+    const double resolved = cache_.stats().work.totalMilliseconds - resolving;
+    require((resolved > 0.0) == indexed, "a decode's hot-block resolves worked " + std::to_string(resolved) +
+                                             " ms " + (indexed ? "over Index pages" : "over none"));
     require(results.size() == requests.size(), "a spill run's decode lost a lane");
     lastResults_ = results;
     std::vector<SpillStep> steps;
@@ -3435,19 +3659,19 @@ public:
   // one model::SpilledKvReads, each attention layer staged with the
   // command's pages and handed off, the copy of its last spilled page
   // unreadable in the first run alone. The reads stream it again once they
-  // ended, and keep what the first run could not read and the time both
-  // waited.
+  // ended, and keep what the first run could not read.
   void requireReadsRunAgain(SpillRequest &request, uint32_t end) {
     ensure(request, end);
-    require(runtime_->reserveHistoryStaging(request.id, pagesFor(end)).granted(),
-            "the staging of a spilled history was refused");
+    const model::ModelMemoryAdmission staging =
+        runtime_->reserveSpilledReads(request.id, {.kind = WorkKind::Prefill, .pages = pagesFor(end)});
+    require(staging.granted(), "the staging of a spilled history was refused" + refused(staging.allocationFailure));
     size_t unreadable = request.pages.size() - 1;
     while (!request.copies[unreadable]) --unreadable;
     const uint32_t firstPage = request.committed / kv::kPageTokens, endPage = pagesFor(end);
     kv_.writeEntries(request.pages, 0, tables_[0]);
-    model::SpilledKvReads reads(stream_, 0, pageSources(request), endPage, tables_[0], kv_.layers());
+    model::SpilledKvReads reads(stream_, 0, pageSources(request), endPage, tables_[0], kv_.layers(),
+                                {0, layout_.attentionLayers});
     const uint64_t commands = stream_.stats().commands;
-    double waited = 0.0;
     request.copies[unreadable]->failAll = true;
     for (uint32_t run = 0; run < 2; ++run) {
       metal::CommandGraph graph;
@@ -3460,10 +3684,8 @@ public:
       reads.end();
       request.copies[unreadable]->failAll = false;
       require(reads.failures().size() == 1 && reads.failures().front().lane == 0 &&
-                  reads.failures().front().block == request.sources[unreadable].block &&
-                  reads.streamMilliseconds() >= waited,
-              "a prefill's reads streamed again did not keep what they could not read and the time they waited");
-      waited = reads.streamMilliseconds();
+                  reads.failures().front().block == request.sources[unreadable].block,
+              "a prefill's reads streamed again did not keep what they could not read");
     }
     require(stream_.stats().commands == commands + 2, "a prefill's reads did not stream its history again");
   }
@@ -3484,7 +3706,7 @@ public:
     }
     if (moving.empty()) return;
     const engine::KvPageMoveResult moved = pool_.movePages(moving, kv::PageForm::Index);
-    require(moved.granted(), "a spill run's pages did not move to the index form");
+    require(moved.granted(), "a spill run's pages did not move to the index form" + refused(moved.failure));
     for (size_t index = 0; index < places.size(); ++index) {
       for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
         for (const std::span<std::byte> tensor : kv_.layerSpans(moving[index], layer))
@@ -3510,7 +3732,7 @@ public:
       }
     if (moving.empty()) return;
     const engine::KvPageMoveResult moved = pool_.movePages(moving, kv::PageForm::Full);
-    require(moved.granted(), "a spill run's pages did not move back to the full form");
+    require(moved.granted(), "a spill run's pages did not move back to the full form" + refused(moved.failure));
     model::KvReadBuffer buffer;
     for (size_t index = 0; index < places.size(); ++index) {
       const uint32_t page = moved.moves.follow(moving[index]);
@@ -3554,7 +3776,7 @@ private:
     if (needed <= request.pages.size()) return;
     const engine::KvPageAcquisition acquired =
         pool_.acquirePages(needed - static_cast<uint32_t>(request.pages.size()));
-    require(acquired.granted(), "a spill run's pages were refused");
+    require(acquired.granted(), "a spill run's pages were refused" + refused(acquired.failure));
     for (const uint32_t page : acquired.pages) {
       pool_.clearPage(page);
       request.pages.push_back(page);
@@ -3679,11 +3901,16 @@ struct SpillRecord final {
 // prefill command that streams it, which commits nothing and gives the same
 // step on a retry, while the staging stays the prompt's until it ends; a
 // decode lane that resolves blocks of copies that cannot be read fails
-// alone, its state kept, its retry giving the same step; and a verify over
-// Index pages without block lists, of rows that read their page table, is
-// refused.
+// alone, its state kept, its retry giving the same step; a request that
+// ends with its streamed prompt, or is suspended once its next command
+// reserved the staging, gives the staging back, and one that leaves while
+// another lane's command runs gives it back before the next command; a
+// command in passes keeps its staging until its last pass, whatever another
+// prompt reserved between them; and a verify over Index pages without block
+// lists, of rows that read their page table, is refused.
 void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::LoadedModel &model,
-                                      const ops::ExecutionPlans &operators, const metal::AllocationAdmission &admission,
+                                      const std::filesystem::path &modelRoot, const ops::ExecutionPlans &operators,
+                                      const metal::AllocationAdmission &admission, const MemoryGovernor &governor,
                                       kv::Format format, ops::GdnStateFormat stateFormat, const SpillOptions &options) {
   constexpr uint32_t kCycles = 4;
   constexpr uint32_t kDecodeTokens = (1 + 4 * kCycles) * model::ExecutionLimits::targetVerifyRows;
@@ -3696,17 +3923,50 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
   const uint32_t lanePages = (tokens + kDecodeTokens) / kv::kPageTokens + 2;
   SpillRuntime spill(backend, model, operators, admission, format, stateFormat, options, lanePages);
   model::Runtime &runtime = spill.runtime();
-  // Each prompt's commands: the first, then the runtime's groups, at least
-  // one of them past pages that spilled.
-  std::array<std::vector<uint32_t>, 4> ends;
-  for (uint32_t index = 0; index < ends.size(); ++index) {
-    std::vector<uint32_t> &commands = ends[index];
-    commands = {std::min(tokens, firstEnd + (index < 2 ? kIntoPage : 0))};
-    while (commands.back() < tokens)
-      commands.push_back(std::min(tokens, commands.back() + runtime.prefillGroupRows(true)));
-    require(commands.size() > 1 &&
-                commands[commands.size() - 2] / kv::kPageTokens > spill.densePages() + options.windowPages,
-            "--spill-tokens leaves no prefill command whose history spilled");
+  // Each prompt's commands for prompts of `count` tokens: the first, then
+  // the runtime's groups; and whether at least one of each prompt's is past
+  // pages that spilled.
+  const auto commandsOf = [&](uint32_t count) {
+    std::array<std::vector<uint32_t>, 4> result;
+    for (uint32_t index = 0; index < result.size(); ++index) {
+      std::vector<uint32_t> &commands = result[index];
+      commands = {std::min(count, firstEnd + (index < 2 ? kIntoPage : 0))};
+      while (commands.back() < count)
+        commands.push_back(std::min(count, commands.back() + runtime.commandLimits().commandRows));
+    }
+    return result;
+  };
+  const auto streams = [&](const std::array<std::vector<uint32_t>, 4> &lists) {
+    return std::ranges::all_of(lists, [&](const std::vector<uint32_t> &commands) {
+      return commands.size() > 1 &&
+             commands[commands.size() - 2] / kv::kPageTokens > spill.densePages() + options.windowPages;
+    });
+  };
+  const std::array<std::vector<uint32_t>, 4> ends = commandsOf(tokens);
+  require(streams(ends), "--spill-tokens leaves no prefill command whose history spilled");
+  // The check can neither wait for memory nor yield it, so it stops before
+  // its first prompt where its peak exceeds the room the governor's limit
+  // leaves, naming what fits: the routed experts' store smaller by what the
+  // room lacks, in whole MiB, where that store still loads (no smaller than
+  // the smallest store, model::StreamableWeights::expertMinimumBytes), or
+  // the longest prompts of whole prefill chunks whose peak it holds and whose
+  // commands still stream.
+  const uint64_t room = governor.snapshot().headroomBytes;
+  if (const uint64_t need = spill.peakBytes(tokens, kDecodeTokens); need > room) {
+    std::string fits;
+    if (const model::ExpertStore *store = model.expertStore()) {
+      const uint64_t live = store->stats().liveBytes;
+      const uint64_t size = live > need - room ? (live - (need - room)) >> 20 << 20 : 0;
+      if (size >= model::streamableWeights(modelRoot, model.descriptor, {.streamExperts = true}).expertMinimumBytes)
+        fits = "--expert-memory " + std::to_string(size >> 20) + "M";
+    }
+    constexpr uint32_t kChunk = model::ExecutionLimits::prefillTokenBudget;
+    uint32_t fitting = tokens / kChunk * kChunk;
+    while (fitting && spill.peakBytes(fitting, kDecodeTokens) > room) fitting -= kChunk;
+    if (fitting && streams(commandsOf(fitting)))
+      fits += (fits.empty() ? "--spill-tokens " : " or --spill-tokens ") + std::to_string(fitting);
+    fail("the spill check needs " + mebibytes(need) + " beside what the oracle holds, and the memory plan's limit "
+         "leaves " + mebibytes(room) + (fits.empty() ? std::string() : "; it fits with " + fits));
   }
   std::array<std::vector<uint32_t>, 4> prompts;
   for (uint32_t index = 0; index < prompts.size(); ++index) {
@@ -3715,7 +3975,7 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
     prompts[index].resize(tokens);
     for (uint32_t &token : prompts[index]) token = distribution(random);
   }
-  const auto run = [&](uint64_t firstId, std::array<bool, 4> spills) {
+  const auto run = [&](uint64_t firstId, std::array<bool, 4> spills, uint32_t passes) {
     std::array<SpillRequest, 4> requests;
     SpillRecord record;
     const auto took = [&] { record.commandBuffers.push_back(BackendInstrumentation::lastCommandBuffers(backend)); };
@@ -3724,7 +3984,7 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
       spill.begin(requests[index]);
       std::vector<SpillStep> steps;
       for (const uint32_t end : ends[index]) {
-        steps.push_back(spill.prefill(requests[index], end));
+        steps.push_back(spill.prefill(requests[index], end, passes));
         took();
       }
       record.steps.push_back(std::move(steps));
@@ -3750,15 +4010,29 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
     spill.end(requests[0]);
     return record;
   };
-  const SpillRecord resident = run(4001, {false, false, false, false});
+  const SpillRecord resident = run(4001, {false, false, false, false}, 1);
   const model::KvBlockCacheStats residentReads = spill.blockCache().stats();
   require(!residentReads.reads.resolves && !spill.historyStream().stats().commands,
           "a run whose pages all hold their K/V read spilled K/V");
-  const SpillRecord spilled = run(4011, {true, false, true, false});
+  const SpillRecord spilled = run(4011, {true, false, true, false}, 1);
   require(spill.unspilledPages(), "the spilled run's last turn un-spilled nothing");
   for (size_t step = 0; step < resident.steps.size(); ++step)
     require(spilled.steps[step] == resident.steps[step], "a run whose K/V spilled gave other tokens or logits than one "
                                                          "whose K/V stayed, at step " + std::to_string(step));
+  // Prompts whose commands run in passes over the target's layers, each pass
+  // a command that streams the spilled history of its attention layers
+  // (KvHistoryStream), give what they give whole: in three passes and in the
+  // most (CommandLimits::maximumPasses).
+  const uint64_t streamedCommands = spill.historyStream().stats().commands;
+  const uint32_t mostPasses = runtime.commandLimits().maximumPasses;
+  for (const uint32_t passes : {3u, mostPasses}) {
+    const SpillRecord passed = run(passes == 3 ? 4031 : 4041, {true, false, true, false}, passes);
+    for (size_t step = 0; step < resident.steps.size(); ++step)
+      require(passed.steps[step] == resident.steps[step],
+              "a run whose spilled prompts ran in " + std::to_string(passes) +
+                  " passes gave other tokens or logits than one whose K/V stayed, at step " + std::to_string(step));
+  }
+  require(spill.historyStream().stats().commands > streamedCommands, "prompts in passes streamed no history");
   const model::KvBlockCacheStats reads = spill.blockCache().stats();
   const model::KvHistoryStreamStats history = spill.historyStream().stats();
   require(reads.reads.resolves && reads.reads.hits && reads.reads.misses && reads.reads.paged < reads.reads.entries &&
@@ -3778,16 +4052,15 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
             << " unspilled_pages=" << spill.unspilledPages()
             << " command_buffers=" << std::ranges::max(spilled.commandBuffers) << '\n';
 
-  // With every request ended, an idle reclaim gives back, after the pooled
-  // buffers, the hot block cache above its floors, an extent at a time (the
-  // decoding lanes' floors took the staging's place).
-  while (runtime.reclaimIdleState(true, IdleMemory::Buffers)) {
-  }
+  // With every request ended, the hot block cache gives back what is above
+  // its floors, an extent at a time (the decoding lanes' floors took the
+  // staging's place).
   require(!history.stagingBytes && reads.bytes > reads.floorBytes,
           "the staging stayed beside the decoding lanes' floors of the hot block cache");
-  const uint64_t extent = runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches);
+  model::ElasticPool &hotBlocks = poolNamed(runtime, "hot_kv");
+  const uint64_t extent = hotBlocks.release(1);
   uint64_t released = extent;
-  while (const uint64_t bytes = runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches)) {
+  while (const uint64_t bytes = hotBlocks.release(1)) {
     require(bytes == extent, "an idle reclaim gave back more than an extent of the hot block cache");
     released += bytes;
   }
@@ -3816,22 +4089,30 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
                   streamed.committed == ends[0][command - 1],
               "a prefill command whose history could not be read did not fail its lane alone, committing nothing");
       streamed.copies[unreadable]->failAll = false;
+      // A copy a pass before the last cannot read fails the command at its
+      // last pass, which reads it, committing nothing.
+      streamed.copies[unreadable]->failAll = true;
+      static_cast<void>(spill.prefill(streamed, ends[0][command], 2,
+                                      [&] { streamed.copies[unreadable]->failAll = false; }));
+      const ModelStepResult &failedFirst = spill.lastResults().front();
+      require(failedFirst.failure.empty() && failedFirst.outputTokens.empty() &&
+                  failedFirst.unreadableKvBlocks == std::vector<uint64_t>{streamed.sources[unreadable].block} &&
+                  streamed.committed == ends[0][command - 1],
+              "a prefill command in passes whose history a pass before the last could not read did not fail its "
+              "lane, committing nothing");
       // The staging is the prompt's while it goes on: an idle reclaim, as
       // one that funds the staging's growth, leaves it.
       const uint64_t staging = spill.historyStream().stats().stagingBytes;
-      while (runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches)) {
-      }
+      releaseIdle(runtime);
       require(staging && spill.historyStream().stats().stagingBytes == staging,
               "an idle reclaim took the staging of a prompt that streams");
     }
     require(spill.prefill(streamed, ends[0][command]) == resident.steps[0][command],
             "a prefill command retried after its history could not be read gave another step");
   }
-  // Once the prompt ended, its staging is the first idle cache to go.
+  // Once the prompt ended, its staging is idle and goes whole.
   const uint64_t staging = spill.historyStream().stats().stagingBytes;
-  while (runtime.reclaimIdleState(true, IdleMemory::Buffers)) {
-  }
-  require(staging && runtime.reclaimIdleState(true, IdleMemory::BuffersThenCaches) == staging,
+  require(staging && poolNamed(runtime, "kv_staging").release(1) == staging,
           "an idle reclaim kept the staging of a prompt that ended");
   for (const uint32_t end : ends[1]) static_cast<void>(spill.prefill(healthy, end));
   for (const auto &copy : streamed.copies)
@@ -3850,6 +4131,78 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
   spill.end(streamed);
   spill.end(healthy);
   require(backend.healthy(), "reads of spilled K/V that failed made the backend unhealthy");
+
+  // The staging goes with the request it was reserved for when no decode
+  // takes its place: one that ends as its streamed prompt does (scored, or
+  // stopped at its first token), and one suspended once its next command
+  // reserved it.
+  for (const bool suspends : {false, true}) {
+    SpillRequest leaving{.id = 4023u + suspends, .stateLane = 0, .spills = true, .prompt = prompts[0]};
+    spill.begin(leaving);
+    for (size_t command = 0; command < ends[0].size() - suspends; ++command)
+      static_cast<void>(spill.prefill(leaving, ends[0][command]));
+    if (suspends) {
+      const model::ModelMemoryAdmission reserved = runtime.reserveSpilledReads(
+          leaving.id, {.kind = WorkKind::Prefill, .pages = (tokens + kv::kPageTokens - 1) / kv::kPageTokens});
+      require(reserved.granted(), "the staging of a spilled history was refused" + refused(reserved.allocationFailure));
+    }
+    require(leaving.holdsIndexPages() && spill.historyStream().stats().stagingBytes,
+            "a prompt that streams its history held no staging");
+    if (suspends) runtime.suspend(leaving.id);
+    else spill.end(leaving);
+    require(!spill.historyStream().stats().stagingBytes,
+            suspends ? "a suspended prompt kept its staging" : "a request that ended with its prompt kept its staging");
+    if (suspends) spill.end(leaving);
+  }
+  // A request that leaves while another lane's command runs keeps the
+  // staging, as no extent goes while a command is in flight, and the next
+  // command gives it back before it runs.
+  SpillRequest leaving{.id = 4025, .stateLane = 0, .spills = true, .prompt = prompts[0]};
+  SpillRequest beside{.id = 4026, .stateLane = 1, .spills = false,
+                      .prompt = std::vector(prompts[1].begin(), prompts[1].begin() + denseTokens / 2)};
+  spill.begin(leaving);
+  spill.begin(beside);
+  static_cast<void>(spill.prefill(beside, static_cast<uint32_t>(beside.prompt.size())));
+  for (size_t command = 0; command + 1 < ends[0].size(); ++command)
+    static_cast<void>(spill.prefill(leaving, ends[0][command]));
+  const model::ModelMemoryAdmission reserved = runtime.reserveSpilledReads(
+      leaving.id, {.kind = WorkKind::Prefill, .pages = (tokens + kv::kPageTokens - 1) / kv::kPageTokens});
+  require(reserved.granted(), "the staging of a spilled history was refused" + refused(reserved.allocationFailure));
+  const uint64_t leftStaging = spill.historyStream().stats().stagingBytes;
+  static_cast<void>(spill.decode(std::array{&beside}, [&] { spill.end(leaving); }));
+  require(leftStaging && spill.historyStream().stats().stagingBytes == leftStaging,
+          "the staging of a request that left while a command ran went before the command ended");
+  static_cast<void>(spill.decode(std::array{&beside}));
+  require(!spill.historyStream().stats().stagingBytes,
+          "the next command kept the staging of a request that left while a command ran");
+  spill.end(beside);
+
+  // A command in passes streams its history through the staging it reserved
+  // before its first pass, whatever another prompt reserved between its
+  // passes: one that reserved it and then was suspended, or ended, leaves
+  // it, and the command gives what it gives in one pass. The staging goes
+  // once both left.
+  for (const bool suspends : {true, false}) {
+    SpillRequest streaming{.id = 4027u + 2 * suspends, .stateLane = 0, .spills = true, .prompt = prompts[0]};
+    SpillRequest other{.id = 4028u + 2 * suspends, .stateLane = 1, .spills = false, .prompt = prompts[1]};
+    spill.begin(streaming);
+    spill.begin(other);
+    size_t command = 0;
+    while (!streaming.holdsIndexPages()) static_cast<void>(spill.prefill(streaming, ends[0][command++]));
+    const SpillStep step = spill.prefill(streaming, ends[0][command], 2, [&] {
+      require(runtime.reserveSpilledReads(other.id, {.kind = WorkKind::Prefill, .pages = 1}).granted(),
+              "a prompt's staging was refused");
+      if (suspends) runtime.suspend(other.id);
+      else spill.end(other);
+    });
+    require(step == resident.steps[0][command],
+            std::string("a command in passes whose staging another prompt reserved between them and ") +
+                (suspends ? "was suspended" : "ended") + " gave another step than one whose K/V stayed");
+    spill.end(streaming);
+    if (suspends) spill.end(other);
+    require(!spill.historyStream().stats().stagingBytes,
+            "the staging stayed once every request it was reserved for left");
+  }
 
   // Rows that read their page table read only Full pages
   // (SparseKvShape::denseHistoryTokens), so a verify over Index pages
@@ -3949,7 +4302,9 @@ int main(int argc, char **argv) {
     // --ple-memory SIZE and --expert-memory SIZE stream a Qwen3.8-Flash-Next
     // target's PLE table and a MoE target's routed experts
     // (tools/LoadOptions.hpp); a streamed table's TOKENS line equals the
-    // resident table's. --prefill-groups-only: a prefill group
+    // resident table's, and where both stream a warm-up's and a decode's
+    // weight reads are the store's alone (requireWeightReadsAreTheStoresAlone).
+    // --prefill-groups-only: those, a prefill group
     // against its chunks' commands (requirePrefillGroupMatchesItsChunks),
     // and a command in passes against it whole
     // (requirePrefillPassesMatchWhole), then stop. A block-sparse target's K/V that spilled reads what its
@@ -4027,11 +4382,11 @@ int main(int argc, char **argv) {
     // any is loaded; it can refuse a model production starts. As a start
     // retries a refusal of host memory, the oracle waits for that memory,
     // measuring every kStartupMemoryRecoveryPoll for up to
-    // kStartupMemoryRecoveryTimeout: macOS can return the memory of a process
+    // supervision::kStartRetryWindow: macOS can return the memory of a process
     // that has just exited a moment later, so a run that starts as a server
     // stops can find it still held.
     const uint64_t weightBytes = tools::weightBytes(modelRoot, descriptor, loadOptions);
-    const auto memoryDeadline = AwakeClock::now() + kStartupMemoryRecoveryTimeout;
+    const auto memoryDeadline = AwakeClock::now() + supervision::kStartRetryWindow;
     bool reportedMemoryWait = false;
     while (true) {
       const std::optional<HostMemory> host = queryHostMemory();
@@ -4076,22 +4431,24 @@ int main(int argc, char **argv) {
     // which only moves bytes from KV to fixed memory: the same with the split
     // or without. The checks can neither wait for memory nor yield it, so the
     // governor admits all the oracle allocates, its runtime's arenas and the
-    // lanes, KV and cached states of the requests it runs together, as memory
-    // a request in service needs (MemoryGovernor::setServing): only the plan's
-    // limit and macOS's critical pressure refuse it. Production grants that
-    // only to its start, a request it serves alone and the KV of the requests
-    // it serves; a start beside a resident request, and the cache, are held
-    // to the host's margins and macOS's warning (Engine::allocate).
+    // lanes, KV and cached states of the requests it runs together, under one
+    // Floor claim, as a start's: only the plan's limit and macOS's critical
+    // pressure refuse it. Production grants that only to its start; a request
+    // in service passes the host's margins only once nothing in place meets
+    // it, and a start beside a resident request, and the cache, are held to
+    // them and to macOS's warning (MemoryGovernor::free).
     const EngineMemoryPlanResult gpuAlone = planMemory(0);
     require(gpuAlone.plan.has_value(), "the oracle model has no memory plan: " + gpuAlone.status.describe());
     MemoryGovernor governor(backend, gpuAlone.plan->breakdown(), queryHostMemory);
-    governor.setServing(true);
+    const ClaimId oracleClaim = governor.ledger().open({.cls = ClaimClass::Floor});
+    const MemoryGovernor::Scope oracleScope(governor, oracleClaim);
     const metal::AllocationAdmission governed = governedFor(governor, "an allocation");
     // A block-sparse target's spill check runs before the split is set up, on
     // a pool and a runtime of its own that the context the oracle asks the
     // split to leave does not count.
     if (model.descriptor.capabilities.sparseKv && (spillOnly || !(imagesOnly || warmupEosOnly || prefillGroupsOnly)))
-      requireSpilledKvMatchesResident(backend, model, operators, governed, format, stateFormat, spill);
+      requireSpilledKvMatchesResident(backend, model, modelRoot, operators, governed, governor, format, stateFormat,
+                                      spill);
     if (spillOnly) {
       require(model.descriptor.capabilities.sparseKv.has_value(), "--spill-only needs a block-sparse target");
       std::cout << "PASS model-runtime-oracle scope=spill-only model=" << model.name()
@@ -4237,6 +4594,10 @@ int main(int argc, char **argv) {
       return 0;
     }
     model::Runtime &executor = *runtime;
+    // The scheduler plans no unit below the split's least chunk, where the GPU
+    // alone runs the FFN (model::CommandLimits::minimumUnitRows).
+    require(executor.commandLimits().minimumUnitRows == (aneFfn ? aneFfn->minimumRows() : 1u),
+            "the runtime's least unit rows are not the Neural Engine split's least chunk");
     // Warmup runs on the KV runway and never allocates: without it, after
     // actual state activation, warmupPrefill fails and cleans up.
     pages.releaseExtent(0);
@@ -4268,7 +4629,7 @@ int main(int argc, char **argv) {
       requireInjectedRowsBecomeReclaimable(executor, backend);
       requireCoveredImagesAreNotStaged(executor, backend, states);
       requireRefusedStartKeepsItsRows(executor, backend, states, model, allocationFault);
-      requireReclaimTakesOneCacheUnit(executor, backend, model);
+      requirePoolReleaseTakesOneUnit(executor, backend, model);
       requireEncoderFitsItsImages(executor, backend, model, allocationFault);
       requireReplayPointKeepsItsImageRows(executor, backend);
       requireCapturedStateKeepsItsImageRows(executor, backend);
@@ -4282,11 +4643,12 @@ int main(int argc, char **argv) {
                 << " (admission rollback, chunk reclaim, cache-only budget, mixed/repeated images,"
                    " shared, suspended and injected rows, rows a failed chunk encoded,"
                    " covered images, refused starts,"
-                   " one cache unit per reclaim, replay point and captured state rows,"
+                   " one unit per pool release, replay point and captured state rows,"
                    " registry entries of rows nothing holds)\n";
       return 0;
     }
 
+    requireWeightReadsAreTheStoresAlone(executor, model, targetTokens->productionSeed);
     const std::vector<uint32_t> &samplingSeedTokens = targetTokens->samplingSeed;
     if (prefillGroupsOnly) {
       requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens,

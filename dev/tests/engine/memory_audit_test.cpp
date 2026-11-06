@@ -1,4 +1,5 @@
 #include "TestChecks.hpp"
+#include "TestJson.hpp"
 #include "TestModel.hpp"
 #include "engine/MemoryAudit.hpp"
 
@@ -16,7 +17,7 @@ using splash::test::require;
 
 EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
                       uint64_t stateStagingBytes = 0, uint64_t aneFfnBytes = 0,
-                      uint64_t streamedTableBytes = 0) {
+                      uint64_t streamedTableBytes = 0, uint64_t hostHeldBackBytes = 0) {
   DeviceCapabilities device;
   device.deviceName = "test";
   device.appleGpuFamily = 9;
@@ -33,6 +34,7 @@ EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
   model.footprint.stateStagingBytes = stateStagingBytes;
   model.footprint.aneFfnBytes = aneFfnBytes;
   model.footprint.streamedTableBytes = streamedTableBytes;
+  model.footprint.hostHeldBackBytes = hostHeldBackBytes;
   return test::requireMemoryPlan(device, model);
 }
 
@@ -67,7 +69,7 @@ void testUnifiedDynamicAudit() {
   auto valid = auditActualMemory(memoryPlan, actual);
   require(valid.valid && valid.error == MemoryAuditError::None,
           "valid elastic memory report failed audit");
-  require(valid.toStatusJson().find("\"scope\":\"startup_warmup\"") !=
+  require(test::jsonOf(valid).find("\"scope\":\"startup_warmup\"") !=
               std::string::npos,
           "memory audit status does not identify its startup scope");
 
@@ -82,6 +84,31 @@ void testUnifiedDynamicAudit() {
   require(!rejected.valid &&
               rejected.error == MemoryAuditError::CategoryExceedsPlan,
           "dynamic state/KV budget overflow was accepted");
+}
+
+// The expert store starts at its floor, the 1 GiB of chunks above it the
+// plan's all the same: startup's state may take what the store has not
+// grown into, 512 MiB past the dynamic budget, but not once the store has
+// grown into 768 MiB of it.
+void testStateMayTakeWhatTheStoreHasNotGrownInto() {
+  const EngineMemoryPlan memoryPlan = plan(kGiB, 0, 0, 0, kGiB);
+  const auto withState = [&](uint64_t stateBytes, uint64_t weightsGrown) {
+    ActualMemoryReport actual = report(memoryPlan);
+    actual.targetWeightsBytes += weightsGrown;
+    actual.backendAllocatedBytes += weightsGrown + stateBytes - actual.stateAllocatedBytes;
+    actual.stateAllocatedBytes = stateBytes;
+    actual.deviceCurrentAllocatedBytes = actual.backendAllocatedBytes;
+    actual.devicePeakAllocatedBytes = actual.backendAllocatedBytes + 16 * kMiB;
+    actual.backendPeakAllocatedBytes = actual.devicePeakAllocatedBytes;
+    return auditActualMemory(memoryPlan, actual);
+  };
+  const uint64_t past = memoryPlan.breakdown().dynamicBudgetBytes - memoryPlan.breakdown().kvExtentBytes + 512 * kMiB;
+  const MemoryAuditResult ungrown = withState(past, 0);
+  require(ungrown.valid, "startup state within what the expert store has not grown into failed audit: " +
+                             ungrown.message);
+  const MemoryAuditResult grown = withState(past, 768 * kMiB);
+  require(!grown.valid && grown.error == MemoryAuditError::CategoryExceedsPlan,
+          "startup state in what the expert store had grown into was accepted");
 }
 
 void testOptionalVisionAudit() {
@@ -218,8 +245,8 @@ void testSpilledKvReadersHaveTheirBounds() {
   ActualMemoryReport actual = report(memoryPlan);
   const auto withReaders = [&](uint64_t hot, uint64_t staging) {
     ActualMemoryReport result = actual;
-    result.kvBlockCacheBytes = hot;
-    result.kvHistoryStagingBytes = staging;
+    result.spilledKvHotBytes = hot;
+    result.spilledKvStagingBytes = staging;
     for (uint64_t *bytes : {&result.backendAllocatedBytes, &result.deviceCurrentAllocatedBytes,
                             &result.devicePeakAllocatedBytes, &result.backendPeakAllocatedBytes})
       *bytes += hot + staging;
@@ -312,6 +339,7 @@ void testDevicePeakDeviationExcludesReserves() {
 int main() {
   try {
     testUnifiedDynamicAudit();
+    testStateMayTakeWhatTheStoreHasNotGrownInto();
     testOptionalVisionAudit();
     testUnreportedAllocationsCountAgainstReserves();
     testStateStagingHasItsOwnBound();

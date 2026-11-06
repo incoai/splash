@@ -13,18 +13,28 @@
 - `install/`: launcher, client configuration and model installation.
 - `dev/`: maintained tests, benchmarks and build/release tools.
 
-Within `server/`, `server.py` owns HTTP routing and startup,
-`connections.py` the HTTP ingress bounds and `errors.py` each API's error
-shape; `frontend.py` prepares
-requests and history; `backend.py` owns native request lifecycles. `judgments.py`
-owns finite-choice prompts, validation and typed answer math. `output.py` parses
+Within `server/`, `server.py` owns HTTP and startup: one route table that
+names each endpoint's handler and error shape, admission, body reading, and
+the collection of each generation and the guard of its stream. Each API has
+one module in `dialects/` that holds its whole contract: its routes'
+handlers, how its requests convert to Chat, its complete and streamed
+answers, its error shape and its state (`openai.py` for Chat and text
+completions, `anthropic.py` for Messages, `responses.py` for Responses and
+the responses it stores, `scoring.py` for /v1/judgments and /v1/systemone
+and their finite-choice prompts). `request_fields.py` reads the fields every
+API reads alike, `chat_messages.py` normalizes the Chat messages every API's
+request reaches, and `frontend.py` prepares a Chat body or a text completion
+as a job. `connections.py` holds the HTTP ingress bounds and `errors.py` the
+error shape of OpenAI's APIs, which also answers on paths of no API;
+`backend.py` owns native request lifecycles. `output.py` parses
 generated text as it arrives, one parser serving streamed and complete
 responses alike, in the family's chat format (`chat_format.py`), and
 `constraints.py` compiles token constraints. Messages and
 Responses build streamed and complete responses from the same block sequence;
 the one difference is a call cut by the token limit or a stop sequence, which a
 complete Messages response leaves out. `make architecture-check` prevents lower
-layers from importing the HTTP entry module, and keeps one import style in
+layers from importing the HTTP entry module and a dialect from importing
+another, and keeps one import style in
 `server/` and `install/`: a module imports its package's modules relatively.
 The server runs as `python -m server.server`; `install/launcher.py` and
 `install/models.py`, which run as scripts, import their siblings through a
@@ -77,7 +87,7 @@ checkout builds the engine before it installs, as `make install` and the first
 `./splash serve` do, and a packaged install ships it. The assembly's
 `model.json` records the resolved sources and selected formats. The native
 loader reads it, and the server holds it while it runs, as `test-http-real`
-and the HTTP regression benchmark do across the servers they start, so a
+does across the servers it starts, so a
 concurrent installation cannot collect the assembly they serve. It is local
 installation metadata, not a file model publishers supply. It records each
 file's path, size, times and digest: a Hub cache file's is the blob's name,
@@ -101,8 +111,11 @@ such as the desktop app run `install/models.py --model ID prepare
 lines on stdout, `{"event": "download", "repo": REPO, "done": BYTES, "total":
 BYTES}`: done 0 first, at most four a second as the bytes received grow (what
 the network has brought or what the Hub cache holds, whichever is more), and
-done equal to total once it succeeds. It is an interface between Splash's front
-ends and its installer, not a public one.
+done equal to total once it succeeds. A failed `prepare`, with or without the
+flag, ends with `{"event": "error", "kind": KIND, "message": TEXT}` on stdout,
+which the app words by its kind and `splash serve` records as its start's
+failure. It is an interface between Splash's front ends and its installer, not
+a public one.
 
 huggingface_hub downloads on threads it joins, which finish their files
 before an interrupt reaches the program, so the download runs on a thread of
@@ -111,18 +124,20 @@ fraction of a second: it unwinds its temporary files and ends without waiting
 for those threads, and the repository's next download removes the partial
 files they leave. A launcher run without writing bytecode (`-B` or
 `PYTHONDONTWRITEBYTECODE`) sets `PYTHONDONTWRITEBYTECODE=1` in its environment
-before `serve` starts anything, so the installer, the server and the server's
-PDF workers write none either, and a packaged runtime inside a signed app
-never gains `__pycache__`.
+before `serve` starts anything, so the installer and the server write none
+either, nor do the server's PDF workers, which start with `-B` and no
+environment, and a packaged runtime inside a signed app never gains
+`__pycache__`.
 
 `hub.Repository.resolve` alone decides whether a start asks the Hub
 ([Revisions](server.md#revisions)), each request within `hub.HUB_TIMEOUT`:
 
 - The installed commits: the assembly's links, sizes and times are checked and
   it starts. It is re-assembled first when the draft's repository moved or
-  this release changed the GGUF metadata adapter; if the new draft cannot be
-  fetched or is not the family's ([Drafts](models.md#drafts)), the installed one is
-  kept.
+  this release changed the GGUF metadata adapter, from the snapshots it links
+  (`assembly.source`), wherever `HF_HUB_CACHE` points now; if the new draft
+  cannot be fetched or is not the family's ([Drafts](models.md#drafts)), the
+  installed one is kept.
 - A new commit: only changed files are downloaded, and the new assembly
   replaces the installed one atomically once published.
 - No answer, or a new commit that cannot be installed: the installed assembly
@@ -241,42 +256,40 @@ lane's state, the KV runway and any disk tier state staging, exceed the hard
 budget, so a model that can never fit is not loaded.
 
 When the idle release passes without a request, the memory control between
-commands releases the images' memory (`WeightImages::release`): their buffers
-are freed, the weights' views stay the same handles, and a command that binds
-released memory fails (`MetalBackend::releaseMemory`). The next request waits
-while the same writers write the images again (`WeightImages::restore`), an
-image per tick so that the loop keeps answering status and cancellations; this
-takes about as long as the load at startup and logs `Weights restored in N s`.
-The governor admits each image's memory (`MemoryGovernor::allocationAdmission`)
-as memory the waiting requests need: neither the host's margins nor macOS's
-warning refuse it, as for a request in service, and it fits the
-engine's limit, since the cache does not grow while the engine holds no
-request; critical pressure refuses it. The [expert
-store](server.md#streamed-experts) is the exception to that fit: a chunk it gave
-back while memory was short left room the cache may have taken since. So it
-comes back in parts: its floor chunks and staging in one, which fits as the
-images do, since they were live when it was released, then each elastic chunk in
-a part of its own, as growth the store can do without
-(`MemoryGovernor::growthAdmission`): the serving mark does not lift its host
-checks, and it comes back only while macOS reports no memory pressure and the
-host has the chunk and the 2 GiB recovery margin to spare. The first elastic
-chunk refused stays released with those after it, which the control pass takes
-back later as it does any chunk given back, and the restore goes on as if it had
-come back: only the floor holds the restore up. A refused image, or one the
-driver or its writer cannot allocate, stays released, and the images before it
-stay. The
-requests wait for memory, retrying every 0.1 s as a refused request does and
-counted in `admission.waiting_memory`, and the log says `Weights wait for
-memory to be restored`. Once the 30 s resource wait has passed since the first
-refusal after the last image that came back, the restore gives up: the images it
-wrote back are released, the waiting requests fail with `resource_timeout`, and
-`weights.restore_failures` counts the give-up. When no request waits any more,
-it gives up at once and counts nothing. Either way the next request starts over
-from the first image. Any other failure (a read error, a source written in
-place) stops the engine, which the server starts again. With the [Neural Engine
-split](#neural-engine-prefill), the release unloads its program after the
-images, and the restore loads it again in one tick more, after the last image
-(`ReleasableMemory`).
+commands has the engine release the images' memory (`Engine::releaseIdleWeights`,
+`WeightResidency`, `WeightImages::release`): their buffers are freed, the
+weights' views stay the same handles, and a command that binds released memory
+fails (`MetalBackend::releaseMemory`). The next request waits while the same
+writers write the images again (`WeightImages::restore`), the engine taking back
+an image per tick so that the loop keeps answering status and cancellations;
+meanwhile the tick still ends requests at their deadlines, collects the
+transfers that land and writes restore points behind (`Engine::tick`). The
+restore takes about as long as the load at startup and logs `Weights restored in
+N s`. The governor admits each image's memory
+(`MemoryGovernor::allocationAdmission`) as memory the waiting requests need:
+neither the host's margins nor macOS's warning refuse it, as for a request in
+service, and it fits the engine's limit, since the cache does not grow while the
+engine holds no request; critical pressure refuses it. The [expert
+store](server.md#streamed-experts) comes back at its floor: its floor chunks and
+staging in one part, which fits as the images do, since they were live when it
+was released. Its elastic chunks stay released, and the control pass takes them
+back as it does any chunk given back. A refused image, or one the driver or its
+writer cannot allocate, stays released, and the images before it stay. The
+requests wait for memory as a start refused memory does, each on its own clock,
+counted in `admission.waiting_memory`: the image is tried again at every tick,
+at least every 0.1 s, and a request fails with `resource_timeout` once the try
+at or past the 30 s resource wait since its first refusal after the last image
+that came back is refused too; the log says `Weights wait for memory to be
+restored`. Once the weights are back, a request refused memory at its start
+waits afresh from that refusal. Once no request waits, the restore goes on while
+memory admits it without the waiting requests' mark, and a refused image ends
+it: the images it wrote back are released, and `weights.restore_failures` counts
+it if a request waiting for it failed for want of memory. Either way the next
+request starts over from the first image. Any other failure (a read error, a
+source written in place) stops the engine, which the server starts again. With
+the [Neural Engine split](#neural-engine-prefill), the release unloads its
+program after the images, and the restore loads it again in one tick more, after
+the last image (`ReleasableMemory`).
 
 ### Explicit weights release
 
@@ -316,9 +329,9 @@ A family's target is a `QwenTarget` (`QwenTarget.hpp`) composed of the blocks
 every Qwen target shares: a step's checks and plans, the GDN and attention
 mixers, the FFNs of a residual of one row (a dense SwiGLU and a MoE block's
 routing and experts), the draft's captures and the normed head. The Qwen3.5
-architecture's target (`Qwen3_5Target`, `QwenTarget.cpp`), Flash-Next's
-(`Qwen4ExpTarget`) and Flint's (`FlintTarget`) each compose them into their own
-layer loop. What a family changes in a block is a value of its layout
+architecture's target (`Qwen3_5Target`, `QwenTarget.cpp`), which Flint's
+layers run too, and Flash-Next's (`Qwen4ExpTarget`) each compose them into
+their own layer loop. What a family changes in a block is a value of its layout
 (`QwenTargetDimensions`), read by the shared block rather than branched on: an
 attention layer's variant (`QwenTargetGeometry::attentionVariant`: rotated by
 the target's RoPE unless `unrotatedLayers` names it, over a sliding window of
@@ -366,7 +379,82 @@ us at one to four lanes on the register tile, its native rows 5.2, 6.3, 7.4 and
 weights DRAM-cold). The GDN convolution and time-step bias become bf16 under
 the exact rule.
 
-Decode runs one of two kernel families, chosen by GPU family in `runtime/ops/LinearGguf.cpp`. On
+### Kernel selection
+
+Three pieces choose every kernel configuration, and nothing else in the
+engine or the models branches on the GPU:
+
+- `DeviceCapabilities` (`runtime/metal/DeviceCapabilities.hpp`) describes the
+  device: its class (`gpuClass()`: Apple9, family 9, whose matrix operations
+  share the FP32 pipe; Apple10, family 10 and later, a neural accelerator per
+  core) and the cores kernel policy plans for (`plannedGpuCores()`, the
+  reported count or 32 when IORegistry reports none, a fallback rather than a
+  calibrated optimum).
+- `KernelCalibration` (`runtime/ops/KernelCalibration.hpp`) holds every
+  measured constant of selection as data, one row per class and, where a
+  measurement says so, per core range (`KernelCalibration::of`, the one place
+  that picks a row by class). Each entry keeps what measured it and its status,
+  measured or unmeasured with the reason.
+- `KernelSelection` (`runtime/ops/KernelSelection.{hpp,cpp}`) holds one rule
+  per operator family over that row: `selectProjection` for dense GGUF
+  projections, `selectFloatTile` for float projections and `selectMoe` for MoE
+  blocks. `Linear` and `ExecutionPlans` hold the device's calibration and plan
+  through them.
+
+The rules:
+
+1. *Projection, prefill.* A chunk of up to `stagedPrefillRows` rows (64 on
+   Apple10 and on Apple9 GPUs of 10 cores or fewer, 32 on larger Apple9 GPUs)
+   runs the staged tile at its rows' height (8, 16, 32 or 64) with
+   `stagedSplits`; a longer one runs the 128-row prefill tile, unsplit. A staged
+   chunk of a projection of several segments and no epilogue runs them in one
+   dispatch, in prefill as in decode: a tile choice never adds dispatches to a
+   fused projection.
+2. *Projection, decode.* The register tile runs where it takes every quantized
+   segment and the unit's `FormatClass` (`GridLookup`: IQ3_XXS, the IQ2 formats
+   and IQ1; `GridLookupOrQ2K`; `UnderFourBits`; `FourBitsOrMore`) is below its
+   `RegisterBoundary`: 4 x column tiles x lanes < belowQuarters x cores, a
+   one-pass-eligible gate/up pair's column tiles counting both tensors'. It
+   splits by `registerSplits`. Otherwise the staged tile runs, split by
+   `stagedSplits` (the Apple10 wave law also picks one or two passes for a
+   pair of one format from `onePassFromCores`), its walks spread from
+   `spreadFromCores`, and one unsplit lane of fewer than `sixteenRowBelowBits16`
+   sixteenths of a bit per weight on the 16-row tile, a pair's only where both
+   its tensors' own plans take it. A unit stages only where every quantized
+   segment's class does: dense measurements were taken per projection.
+3. *Float projection.* The accelerator tile runs where the device has one,
+   from `minimumRows` rows and a grid of its tiles of at least half the class's
+   half tiles per core for BF16 values, F32 values or a quantized format's rows.
+4. *MoE.* One plan per step serves every block, so a target's routed experts
+   are one unit (`ops::moeFormats`): the class of the format that holds most
+   routed weights, the register tile's take over every routed and shared
+   segment, the router of most blocks' format. The register tile runs where it
+   takes them and the class's `MoeCalibration::registerTile` entry holds, in
+   both phases; otherwise the staged tile, on 8-row tiles while a prefill
+   chunk's routes average at most one row per expert and 32-row tiles beyond.
+   The router follows rule 3.
+5. *Attention.* The kernels follow how a layout reads its pages
+   (`kv::Layout::reads`, below). A dense prefill tile takes one history split
+   per `AttentionCalibration::prefillPagesPerSplit` pages its rows read (32,
+   and 64 on Apple9 GPUs of 10 cores or fewer, where 32 made one measured case
+   slower than the shared splits), between the splits shared out over the
+   chunk's tiles and the longest chunk's tiles' ceiling (`PagedAttention.cpp`);
+   a sparse tile reads its list's blocks and keeps the shared splits.
+
+The register-against-staged boundaries are measured table entries, not a
+cost model: the wave law, which describes the Apple10 staged tiles, does not
+describe the register tile (`KernelCalibration.hpp`). `kernel-selection`
+(`dev/tests/engine/kernel_selection_test.cc`) pins every plan of every
+family's projections, float tiles, MoE blocks and attention on thirteen device
+classes and core counts as a golden of one FNV-1a-64 per device, section and
+group, and `--dump <dir>` writes the plan lines; a change of a rule or an entry
+shows as the groups it changes. Kernels and their instances do not depend on
+any of this.
+
+### GGUF tiles
+
+Decode runs one of two kernel families, chosen by the device's calibration row
+(`KernelSelection.cpp`). On
 Apple9 (M3, M4) the register tile (`LinearTile::GgufRegister`) runs the kernels of
 `runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal`, which feed the codes themselves to
 bf16 matrix operations, each chain of 32 inputs (16 for 16-input scales) closed by its fp32 scale,
@@ -399,7 +487,7 @@ two (Q3_K at one lane), and on the 32-core M5 Max up to 3.9% more at one lane (I
 2048). They read their activations as the
 Table16 table (`kernels/common/gguf_sgmatrix.h`) that the input's producer writes, or
 `decode_linear_gguf_prepare` when none did. The formats whose operands those kernels build from
-grid lookups, IQ3_XXS, the IQ2 formats and IQ1 (`apple9StagesFormat`), and Q2_K from two lanes
+grid lookups, IQ3_XXS, the IQ2 formats and IQ1 (`FormatClass::GridLookup`), and Q2_K from two lanes
 decode faster on the staged tile there, which a projection all of whose segments are in them
 takes wherever the tile holds its lanes' rows unpadded. F16, whose 11-bit significands bf16 does
 not hold, has no register kernels (`quant_register_format`), and they read a tensor in rows of
@@ -413,7 +501,7 @@ threadgroup memory (`kernels/common/gguf_staged.h`) for MPP `matmul2d`, the neur
 path, on bf16 activations. A decode step whose grid is narrow there, fewer than one and a half
 threadgroups per core (half that in formats of fewer than four bits per weight), runs on the
 register tile instead, whose 128 threads per column tile keep more of its cores' loads in flight
-than the staged tile's 64 (`apple10Registers`). Its coefficient groups apply there too: on the
+than the staged tile's 64 (`kApple10DecodeRegister`). Its coefficient groups apply there too: on the
 32-core M5 Max the 35B's MLX 4-bit g64 projections of 2048 columns, which take the register tile
 at one lane, take 1.6-2.2% less time at their splits (GDN out, the draft's down and its context
 commit's fc), and the 320 x 10240 hyper-connection projections, which take it at every lane,
@@ -436,7 +524,7 @@ where its split differs from the two passes', its sums are reassociated. A step 
 lanes runs the 32-row tile over four lanes of storage. On Apple10 one lane runs the 16-row tile
 over two lanes of storage (`LinearConfig::sixteenRows`), its padding lane computed and
 discarded, where its staged plan is unsplit and the projection's quantized segments store fewer
-than four and a half bits per weight together (`ProjectionShape::underFourAndHalfBits()`), an
+than four and a half bits per weight together (`sixteenRowBelowBits16`), an
 unsplit gate/up pair where both its tensors' own plans do: the lane's rows are bitwise the 8-row
 tile's, in less time (the 27B UD-IQ3_XXS decodes one lane 3.3-3.6% faster on a 12-core M6).
 Split, the padding lane's partials double the split's traffic: on the narrow grids where the law
@@ -446,13 +534,16 @@ per core unsplit, in four or eight partitions) the 16-row tile takes 4-36% more 
 stages), against 2-8% less at 4 to 20 threadgroups per core on the M6 and 7% less to 2% more on
 the 27B's 5120-column projections in four on the M5 Max. Q4_K's 4.5 bits take more time on it on
 the M6. Prefill runs the staged kernels on both families: the 128-row prefill tile
-(`LinearTile::GgufPrefill`), and the staged tile for chunks of up to 32 rows. On Apple10 chunks of
-33 to 64 rows run the staged tile's 64-row height too, which reads the weights once where the prefill
-tile costs about as much for 33 rows as for 64; a fused projection's chunk runs its segments there in
-one dispatch, as decode does.
+(`LinearTile::GgufPrefill`), and the staged tile for chunks of up to 32 rows. On Apple10 and on
+Apple9 GPUs of 10 cores or fewer chunks of 33 to 64 rows run the staged tile's 64-row height too,
+which reads the weights once where the prefill tile costs about as much for 33 rows as for 64 (on
+the 10-core M4 12-22% less time than the prefill tile). A fused projection's staged chunk runs its
+segments in one dispatch, as decode does: a dispatch costs about 0.045 ms however narrow, and at 8
+to 32 rows one dispatch takes 16-56% less time than one per segment on the 32-core M5 Max and 3-11%
+less on the 10-core M4 for the 27B attention and 35B GDN inputs.
 
 Apple10's staged tile splits K across threadgroups, and runs a gate/up pair in one pass or two,
-by one wave law (`apple10Staged` in `runtime/ops/LinearGguf.cpp`), for decode steps and short
+by one wave law (`WaveLaw`, `runtime/ops/KernelSelection.cpp`), for decode steps and short
 prefill chunks alike: it takes the split (of at most eight partitions keeping 512 inputs each)
 and passes of least predicted time, ties to fewer partitions, then one pass. Each tile kernel
 has an occupancy (`StagedOccupancy`): a core runs `resident` of its threadgroups at once, so a
@@ -500,7 +591,7 @@ the 27B gate/up pair's three- and four-lane steps lose about 7%. The law keeps t
 residency of 8, which gives those steps back, sends the 32-core M5 Max's 27B pair to one pass at
 three and four lanes, 19-26% slower than its two passes, and a pair efficiency factor (0.92-0.97)
 fits the sweeps worse; no 16-core Mac has measured the case. Fewer than 16 cores run two
-passes whatever the law (`spreadsStagedDecode`): a 12-core M6 took 2-11% more in one. The law's
+passes whatever the law (`onePassFromCores`): a 12-core M6 took 2-11% more in one. The law's
 plans depend on the batch width, since partials grow with the rows, so a request's greedy output
 may change with the requests batched with it (the 27B MLX's decode cycles of three and four
 lanes and the 35B MLX's of two to four, and of one at other prompt lengths, yield other tokens per
@@ -509,18 +600,19 @@ only the draft's gate/up pair changes (one partition to two), cycles took 0.5-1.
 1024-token prompt but 0.9% less to 0.7% more at 640, 896, 1280 and 1536 tokens, tokens per cycle
 moving both ways, so that step follows the text rather than the kernel. The
 register tile and Apple9's staged tile, whose matrix operations share the FP32 pipe or run exact in
-registers without a residency step in their time, split by tiers (`decodeSplits`: threadgroups per
+registers without a residency step in their time, split by tiers (`TierLaw`: threadgroups per
 core, inputs per partition and partitions, measured on a 40-core M3 Max, Apple9's staged tile taking
 the register tile's of eight partitions) that do not depend on the batch width.
 Partitions stop at eight, but the register tile splits a grid that eight leave below three
 threadgroups per core into sixteen while partitions keep 512 inputs (Qwen3.8-Flash-Next's
-hyper-connection down projection, 320 columns over 10240 inputs; measured on Apple10). The MoE
+hyper-connection down projection, 320 columns over 10240 inputs; measured on Apple10, and on Apple9
+by width on the 10-core M4, where eight instead took up to 21% more). The MoE
 experts
 (`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows: the register
 form in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf.metal`, which
 Apple9 takes on GPUs of 10 cores or fewer (the base M3 and M4), and on larger ones for experts
-mostly in the formats it stages (`MoeShape::expertFormat`) and for experts with an F16 weight
-(`MoeShape::registerFormats`). One `MoeShape` serves all of a model's
+mostly in the formats it stages (`MoeFormats::experts`) and for experts with an F16 weight
+(`UnitFormats::registerTakes`). One plan serves all of a model's
 MoE layers, so one F16 routed or shared expert tensor in any layer stages every layer's experts
 there. A block routes as one of the routings the kernels compile (`ops::kCompiledMoeRoutings`):
 its router weights a row's top k experts by the softmax of their scores (`MoeRouter::Softmax`,
@@ -576,7 +668,7 @@ critical path, take -10% to +7% of the F32 values' time, and the M4's simdgroup 
 at 64 to 2048 rows.
 A float projection takes the neural accelerator tile on Apple10 from 16 rows and a grid of its
 64 x 32 tiles of 1.5 per core for BF16 values, 2 for F32 values and 3 for a quantized format's rows,
-by the bf16 parts the tile stages a weight as (one, three, three decoded; `Linear::ggufFloatTile`).
+by the bf16 parts the tile stages a weight as (one, three, three decoded; `selectFloatTile`).
 Where the two tiles take the same time on a 32-core M5 Max and a 12-core M6
 (`gguf-projection-benchmark float-<format>`, rows in steps of 64): F32 at 2.0-2.67 tiles per core
 for 256 columns of 2048 or 3072 inputs, and 1.75-2.0 (M6) or 2.0 and above (M5 Max) for the 64 and
@@ -602,11 +694,11 @@ up in one pass `gguf_decode_<format>_m<rows>_gate_up`, and
 leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lanes>_<e>`, and the
 experts `moe_expert_gguf_m<rows>_<e>` and `moe_expert_gguf_sg_<e>`, with gate and up in one pass
 `moe_expert_gguf_m<rows>_gate_up`; the fused projections run
-`gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode and, on Apple10, in
-prefill chunks of 33 to 64 rows (`gguf_decode_fused_m64`), and in longer prefill chunks one
-`gguf_prefill_<format>_a` per format over that format's segments. The norm, GDN,
-attention-gate and attention-gather variants that also write the register kernels' input
-table carry `table16` in their names. The epilogue kinds of both GGUF families are in
+`gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode and, on Apple10 and on
+Apple9 GPUs of 10 cores or fewer, in prefill chunks of 33 to 64 rows (`gguf_decode_fused_m64`),
+and in longer prefill chunks one `gguf_prefill_<format>_a` per format over that format's segments.
+The norm, GDN, attention-gate and attention-gather variants that also write the register kernels'
+input table carry `table16` in their names. The epilogue kinds of both GGUF families are in
 `kernels/common/gguf_tile.h`, the SiLU and sigmoid every kernel shares in
 `kernels/common/activation.h`, and the MMA helpers every register kernel uses, GGUF or fp32, in
 `kernels/common/sgmatrix.h`.
@@ -664,7 +756,7 @@ pick; widths emulate core counts, since the policy counts threadgroups per core.
 chunk of `R` rows (more than 32), and for `R` up to 64 the staged 64-row tile at every K split; the formats `float-bf16` and `float-f32`, and `float-<format>` for
 a quantized format's native rows (such as `float-af8g64`), time the float projection
 (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
-`Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape,
+`selectFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape,
 or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
 device's plans and the other GGUF tile.
 
@@ -718,12 +810,18 @@ scores and bitmap cover every block of the window the model serves; a prefill
 chunk scores its rows in batches that keep the native window's score scratch,
 256 rows at 256K, 64 at 1,010,000.
 
-A layout that keeps values token-major (`kv::Layout::valuesTokenMajor`)
-attends sparsely, on kernels compiled for 24 query heads over two KV heads
-(Qwen3.8-Flash-Next's): a query row attends only to the blocks of 4 tokens its
-block mask names within its causal history, the mask a bitmap per row over the
-history's blocks (`metal/abi/PagedAttention.h`). The rows of a tile (a verify
-lane's 8, or 8 of a prefill chunk's) attend through one list, the union of
+A layout whose attention reads the blocks its index selects
+(`kv::Layout::reads`, `Reads::SelectedBlocks`, which the family layout sets
+for a target with a QSA indexer) attends sparsely; such a reader requires its
+values token-major (`kv::valuesTokenMajorFor`, `kv::Layout::valid`), the
+storage order whose blocks are contiguous, while the dense page loop reads
+every page of dimension-major ones. Only such a reader's layout holds a block
+index, and only its pages can spill (`kv::Layout::spillable`). It runs
+kernels compiled for 24 query heads over two KV heads (Qwen3.8-Flash-Next's):
+a query row attends only to the blocks of 4 tokens its block mask names
+within its causal history, the mask a bitmap per row over the history's
+blocks (`metal/abi/PagedAttention.h`). The rows of a tile (a verify lane's 8,
+or 8 of a prefill chunk's) attend through one list, the union of
 their blocks in block order, each entry a block and the rows of the tile that
 attend it (`attention_block_lists`, `ops::PagedAttention::addBlockLists`).
 The split kernels (`kernels/shared/sparse_attention.metal`) share a list out
@@ -762,12 +860,10 @@ times the located split against the default one.
 A block-sparse target declares its attention to the engine
 (`model::SparseKvShape`, `ModelCapabilities::sparseKv`): its blocks' tokens,
 the blocks a row selects and its verify rows, and the rows that read whole
-pages instead, those with at most `denseHistoryTokens` of history and its
-first `sinkTokens` and last `localTokens`. The memory plan sizes the hot block
-cache and the floors of [KV on the SSD](server.md#kv-on-the-ssd) from it, and the
-cache keeps whole the pages those rows read. A target that declares
-`localTokens` keeps its KV in memory: the cache keeps whole only the dense
-history on every path, not each holder's last pages. Its family code reaches K/V that
+pages instead, those with at most `denseHistoryTokens` of history. The memory
+plan sizes the hot block cache and the floors of
+[KV on the SSD](server.md#kv-on-the-ssd) from it, and the cache keeps whole
+the pages those rows read. Its family code reaches K/V that
 left memory through the command's `model::SpilledKvReads`: `verify` after a
 layer's block lists, which locates each listed block of a page that holds
 only its index in the hot block cache for the attention; `prefill` for each
@@ -825,12 +921,14 @@ forgets the calibration (below), after a start whose calibration failed and
 left none, or once macOS cleared the directory that keeps it. The server's
 relaunch of the engine after a failure keeps the first engine's context
 whatever it calibrates: the server passes that context
-(`serve-native --relaunch-context`), the relaunch decides the rest as the first
-engine did, the SSD cache's staging among it, and its split takes at most the
-channels whose plan holds the context, calibrated within them and remembered
-for them, or leaves the GPU alone with a line, not the warning a refused
-`--max-context` gets. A relaunch whose plan holds less, as once the Mac's
-memory budget shrank, serves that, and the server stops relaunching
+(`serve-native --relaunch-context`) beside the first engine's `MAX_CONTEXT`,
+and the relaunch is planned as the first engine was. One of the automatic
+context decides the rest as that engine did, the SSD cache's staging among it,
+and its split takes at most the channels whose plan holds the context,
+calibrated within them and remembered for them, or leaves the GPU alone with a
+line, not the warning a refused `--max-context` gets. A relaunch whose plan
+holds less, as once the Mac's memory budget shrank, serves that, with
+`--max-context` too, and the server serves it from then on
 ([engine restarts](server.md#engine-restarts-and-sleep)).
 Until a calibration is remembered, a start that fails assumes the largest split
 the model could take (all its channel units but one, or the most whose plan
@@ -993,7 +1091,7 @@ command is submitted, whatever GPU work runs ahead of it, and each later one
 once the one before it was met (macOS 27, M5 Max and M5 Pro; a wait committed
 behind 4.5 s of work and met 1 s after it fails at 5.0 s). The work between
 two steps, with the step, must therefore end within 5 s, which the
-scheduler's prefill slices keep with room to spare. Work outside them runs as
+scheduler's bounded prefill units keep with room to spare. Work outside them runs as
 a command of its own: a prefill command's image encodes, seconds of GPU work
 on a small GPU, run first, and the prefill command is submitted once they
 have completed ([Vision](models.md#vision)).
@@ -1006,10 +1104,7 @@ so it builds apart from the metallib, into `build/host-step.metallib`, and a
 Metal compiler that refuses it only warns. Before the first command with such
 a step, the backend checks that the spin sees the CPU end it; without the
 library, or if it does not, the steps run without the spin, with a warning.
-A completed command reports each step's round trip (`HostStepTiming`) and the
-time its GPU work waited on its steps (`CommandTiming::hostSeconds`), which the
-scheduler counts as the command's fixed cost
-([Admission and eviction](#admission-and-eviction)).
+A completed command reports each step's round trip (`HostStepTiming`).
 
 ## Residency and KV extents
 
@@ -1017,36 +1112,45 @@ Every buffer the backend allocates belongs to one residency set
 (`MetalBackend::allocateBuffer`, `metal/Residency.hpp`): weights, KV extents,
 state buffers and scratch alike stay wired between requests until the idle
 release (`--idle-release`, 10 minutes by default) passes without a command, and
-the next command wires them again. The command queue holds only a set of the KV
-extents, which kernels reach by address: Metal makes them resident for every
-command buffer, as it does each buffer a dispatch binds. A queue that held every
-buffer would have each command buffer wait for all of them before it starts,
-which with memory nearly full takes 100-170 ms for 1-2% of them; a streamed
-decode command, whose host steps start about a hundred a cycle, would wait at
-nearly every cycle. `--idle-release off` keeps every buffer wired, and the
-weight images allocated unless an [explicit release](#explicit-weights-release)
-gives them back, while the engine runs; KV extents return only through the
-reclaims below, memory pressure among them. Memory returns to macOS when the
-engine releases it, never because macOS compressed or dropped an idle buffer.
-macOS page cache, driver allocations and other applications still affect memory
-pressure and swap.
+the next command wires them again. That set is never attached to the command
+queue or a command buffer: Metal makes an attached set resident before every
+command buffer starts, so each would wait for all of its memory first. Near the
+GPU's working set limit that wait grew with the bytes in the set: with 6, 9, 10
+and 12 GiB of KV extents in a queue set at 88% of the limit, a streamed
+Qwen3.8-Flash-Next decode cycle (about 49 command buffers) took 10%, 37%, 2.7x
+and 5.8x longer (M5 Max with 36 GB, macOS 27), while resident models, one
+command buffer a cycle, paid nothing. A command makes resident only the memory
+it uses, on the encoders that use it. `--idle-release off` keeps every buffer
+wired, and the weight images allocated unless an
+[explicit release](#explicit-weights-release) gives them back, while the engine
+runs; KV extents return only through the reclaims below, memory pressure among
+them. Memory returns to macOS when the engine releases it, never because macOS
+compressed or dropped an idle buffer. macOS page cache, driver allocations and
+other applications still affect memory pressure and swap.
 
 A buffer a dispatch binds is resident for it; one kernels reach by address is
-made resident in one of two ways. KV extents (`BufferReach::Addressed`) join
-the command queue's set, since nearly every command reads KV. A dispatch may
-instead list buffers in an address table (`metal::AddressTable`,
-`CommandGraph::addresses`): the backend writes their GPU addresses as it
-encodes the command, after the dispatch's parameters (`setBytes`, so at most
-512), and makes them resident from that dispatch to the end of its encoder
-(`useResources`, for reading, or reading and writing, declared once per table
-and usage in each encoder), never for the queue.
+made resident in one of two ways. KV extents (`BufferReach::Addressed`) are
+reached through GPU tables of page entries, and each table names the extents
+its entries reach as it is written (`PageStorage::writeEntries`,
+`MetalBackend::setTableReach`): every encoder whose dispatches bind the table
+makes them resident (`useResources`), so an extent only the cache holds costs
+commands nothing. A dispatch may instead list buffers in an address table
+(`metal::AddressTable`, `CommandGraph::addresses`): the backend writes their GPU
+addresses as it encodes the command, after the dispatch's parameters
+(`setBytes`, so at most 512), and makes them resident from that dispatch to the
+end of its encoder (`useResources`, for reading, or reading and writing).
+An encoder declares each buffer once per usage, however many dispatches list it
+or tables reach it (`EncoderResidency` in `MetalBackend.mm`).
 The addresses are those of the buffers' memory when the command is encoded, so
 a buffer released and restored since (which comes back at another address) is
-reached where it is, and a table that reaches released memory is refused like
-a binding of it. The routed experts are reached this way, the expert store's
-chunks as a resident model's routed planes: a decode command reads few of
-them, and in the queue's set the 18 GiB of a streamed 35B's chunks made every
-command buffer wait for all of them, a decode cycle ten times longer.
+reached where it is, and an address table that lists released memory is
+refused like a binding of it. The routed experts are reached this way, the
+expert store's chunks as a resident model's routed planes: a decode command
+reads few of them, and in a residency set attached to the queue the 18 GiB of a
+streamed 35B's chunks made every command buffer wait for all of them, a decode
+cycle ten times longer. Whatever an encoder makes resident brings what its bytes
+reach as a table, listed or reached through another table as well as bound: a
+kernel may follow an address to the entries of the table it names.
 
 KV pages live in extents: ordinary shared Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, in which every tensor region of
@@ -1071,30 +1175,32 @@ or comes back, or when it gives up its windowed layers' K/V
 (`KvPool::movePages`), and the copy takes what both forms hold. The pool
 allocates an extent when it needs one of its pages. When it is built it
 allocates the runway, the extents of the first 64 pages, which startup warmup
-runs on; nothing but the pool allocates or releases an extent. An extent whose
-last page is free stays allocated until a reclaim releases it, at once and only
-between commands: memory pressure, an admission the budget denies, the
-publication of a replay point in use or a junction, or startup cleanup. Kernels
-reach a page through the GPU address in its request's page table, so no command
-binds KV; the command queue's residency set makes extents resident for every
-command buffer. The host reaches the same memory (`PageStorage::spans`), which
-is how the disk tier moves pages. A reclaim returns free pages before it evicts
-anything: an empty extent as it is, and the free pages scattered over the others
-of its form as soon as they cover the extent of that form that holds the fewest
-pages, whose pages the pool copies to them (`KvPool::compactExtent`): a Full
-extent before a Slim one and a Slim one before an Index one, unless the reclaim
-needs the memory of one form, as a shortfall of Index pages needs Full memory.
-The blocks and requests on those pages follow them, a page a disk transfer reads
-or writes stays where it is, and a pass that evicts everything copies only what
-is left afterwards. Every extent a pass empties is released, except that a
-warning pass, like startup cleanup, keeps one empty extent as the runway the next
-request starts from, and a pool that spills keeps an extent's worth of free
-Index pages, which spilling draws on first, so that a page spills at the memory
-wall.
+holds and runs on; nothing but the pool allocates or releases an extent. An
+extent whose last page is free stays allocated until a reclaim releases it, at
+once and only between commands: memory pressure, an admission the budget denies,
+the publication of a replay point in use or a junction, or startup cleanup.
+Kernels reach a page through the GPU address in its request's page table, so no
+command binds KV; each table names the extents of its pages, which the encoders
+that bind it make resident (`PageStorage::writeEntries`). The host reaches the same memory
+(`PageStorage::spans`), which is how the disk tier moves pages. A reclaim
+returns free pages before it evicts anything: an empty extent as it is, and the
+free pages scattered over the others of its form as soon as they cover the
+extent of that form that holds the fewest pages, whose pages the pool copies to
+them (`KvPool::compactExtent`): a Full extent before a Slim one and a Slim one
+before an Index one, unless the reclaim needs the memory of one form, as a
+shortfall of Index pages needs Full memory. The blocks and requests on those
+pages follow them, a page a disk transfer reads or writes stays where it is, and
+a pass that evicts everything copies only what is left afterwards. Every extent
+a pass empties is released, except that the host's pass short of critical
+pressure, a pool's growth, optional work and startup cleanup keep one empty
+extent as the runway the next request starts from, and a pool that spills
+keeps an extent's worth of free Index pages, which spilling draws on first, so
+that a page spills at the memory wall, and a lane's conversion lands in them.
 `/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
 those requests and the cache hold (`pages_active`, `pages_cache`) and those
-nothing holds (`pages_free`), the bytes allocated and the bytes of empty extents
-(`allocated_bytes`, `reclaimable_bytes`), the extents allocated and released
+nothing holds (`pages_free`), the extents of the pages requests hold and their
+bytes (`extents_active`, `active_bytes`), the bytes allocated and the bytes
+of empty extents (`allocated_bytes`, `reclaimable_bytes`), the extents allocated and released
 (`extent_allocations`, `extent_releases`) and those emptied by moving pages
 (`extent_compactions`, `pages_moved`), and the longest allocation, release and
 emptying of one (`extent_allocate_max_ms`, `extent_release_max_ms`,
@@ -1106,124 +1212,358 @@ the loop shows in `loop.max_tick_ms`.
 ## Admission and eviction
 
 `/status.admission` distinguishes memory and concurrency waits, counts the
-requests held back behind one refused memory (`held_behind_refusal`; during
-recovery only the suspended ones and those of a strictly higher priority, and
-the refused request itself while a pass defers it, even one that recovery does
-not try, which still waits for memory) and those waiting for a disk restore
+starts the scheduler wanted that the latest admission pass held back, untried,
+behind one refused memory or the SSD cache's room for its KV
+(`held_behind_refusal`; during recovery also the suspended requests held back
+behind a refused resume or start) and those waiting for a disk restore
 (`restoring`), reports suspended requests, recovery draining and the oldest
-current wait age, which for a request holding admission closed runs from when
-its wait began. Memory transitions also appear in the console. Growth that no
-request in service needs, and so the cache, leaves other applications their
-memory: it keeps a spare reserve of 7% of the Mac's memory (2 to 7 GiB) and a
-1 GiB margin free of the host's spare memory, the free, file-backed and
-purgeable pages and half of what compressing the anonymous pages would free at
-the compressor's present ratio, at most a quarter of them. When the spare memory
-runs short of that, such growth pauses and the cache gives memory back, a paced
-pass at a time, down to one lane's state buffers and one KV extent. A pass that
-no request waits for keeps the state a follow-up resumes from and takes nothing
-in use (below), such as the replay point a request in service has just
-published: what it would free there would only go back to that request's
-growth. So it does, however much spare memory there is, while macOS reports
-warning memory pressure, its signal for caches to give memory back: each pass
-then returns up to 1 GiB until the level is normal again, still taking nothing
-in use unless a request waits, and keeps the state a follow-up resumes from,
-even while a request waits, whose growth the warning refuses as well (`/status`:
-`memory_governor.system_pressure`, and `growth_allowed` is false meanwhile). A
-pass counts only memory that leaves the engine; a cached state it evicts first
-refills the lane's state buffers it keeps. Where routed experts stream, a pass
-the host is really short for, its headroom measured short of the pass's margin
-or macOS reporting critical pressure, also takes the [expert
-store](server.md#streamed-experts)'s chunks above its floor, a chunk at a time
-while its target is unmet, once nothing outside what is in use is left to free
-and before anything in use; the experts a chunk held move to the chunks below it
-or are evicted, and later steps read them from the SSD again. Memory on its way
-back holds the store back: while cache nothing in use holds waits for a
-transfer, a KV demotion or a state write, the pass ends pending, and the pass
-that continues it once the transfer landed takes that cache first. macOS's
-warning alone never takes the store. Once memory allows again the control
-pass takes one chunk back per pass, its slots empty: when macOS reports no
-memory pressure, no request waits for memory, the host lets growth go on, the
-weights are neither released nor being restored, and 30 s have passed since a
-chunk last went. The chunk takes from the host only its headroom beyond the
-2 GiB recovery margin, and from the engine only room `--max-memory` leaves
-free. While the engine holds any request, resident, queued or draining, it
-takes only that. With none the chunk is an exchange for cache nothing in use
-holds, which ranks below the store, for what the chunk lacks of either: the
-engine first returns that cache to the system, one reclaim step at a time,
-each releasing the extent it empties, until the bytes that left the engine
-cover what the chunk lacks, and keeps the resume point of the newest
-conversation. The governor's growth admission then counts those bytes as the
-host's already (`MemoryGovernor::setGrowthCredit`): its own sample of the host
-may not show them yet, and the pass checked the rest against the sample it
-took before the exchange. Cache that cannot pay for the chunk in that pass
-stays. The exchange starts no copy to the SSD cache, whose memory would come
-back only after the pass: a state or page that needs one stays, and so do the
-pages above that page and the newer states of that state's class (checkpoint
-or ordinary). Unless the idle state buffers beyond a lane's and the extents
-that what leaves at once would empty cover what the chunk lacks
-(`Engine::exchangeableBytes`, `Cache::exchangeable`), the exchange takes
-nothing and the chunk waits; it waits too while a transfer is in flight. With
-the SSD cache on, a cached conversation buys a chunk only once its state and
-pages have copies there, as `--persistent-cache` writes them. A start
-needs only what macOS can
-hand out at all beyond a reserve of a tenth of a small Mac's memory and 2 GiB of
-a larger one, counting what compressing the anonymous pages would free at the
-compressor's present ratio, at most half of them, short of critical pressure:
-what it allocates, the KV runway, arenas and warmup included, is memory a
-request in service needs until serving begins (`/status`:
-`memory_governor.host_available_bytes` and `host_reserve_bytes`; the spare
-memory and its reserve are `host_spare_bytes` and `host_spare_reserve_bytes`,
-and `host_headroom_bytes` is the room above them). A request in service keeps
-growing through host pressure and macOS's warning, short of critical pressure,
-within `--max-memory`, first into cached pages no request holds:
-it takes cached KV, and a cached state only where it sits on the KV that goes
-next, since a state's buffers give it no page. An allocation the host refuses
-takes none of the caches the model can rebuild (the vision encoder's scratch,
-images' encoded rows, the readers of spilled KV), which would not get it past
-the host; the paced passes take them. A new request waits while another
-is in service unless it can start from what the engine already holds, and with
-none in service it starts. A request whose start was refused memory, under host
-pressure or at `--max-memory`, holds back the requests that arrived after it
-until it starts, fails or is cancelled, so the lanes that finish leave their
-memory to it; a higher priority is not held back. So does a start that waits
-for the SSD cache's room for its KV, which other long requests hold. It keeps
-holding them back while it waits for a prefix another lane is computing.
+current wait age, which for a refused request runs from when its wait began.
+`held_behind_refusal` is usually 0: the scheduler leaves out the starts a
+refused prompt leads unless their command ends their prompts. Memory
+transitions also appear in the console.
+
+### Memory claims
+
+Every allocation is made for a claim on the memory ledger (`MemoryLedger`),
+and every refusal, whoever is refused, goes through one rule
+(`MemoryLedger::free`): a claim's class, one fixed order and the host's
+headroom decide what it gets. The class says how the host judges a claim and
+what it may take:
+
+| Class | Claims |
+| --- | --- |
+| `Floor` | What serving needs at all: the start's allocations, under one claim from the governor's construction until serving begins, and the weights' restore after an idle release while requests wait |
+| `InService` | A request in service: its KV growth, the hot block cache floor it reads, its history staging, its replay point |
+| `Start` | A request's admission beside lanes in service |
+| `Optional` | Memory the work can go without: the KV a prefill command takes past its first state boundary, which the host judges as the lane's growth, and a junction's or a checkpoint's buffers |
+| `Growth` | A pool growing back toward its cap |
+| `Host` | The control pass's claim for the rest of the Mac |
+
+A claim either can wait for memory a transfer returns (`CanWait`) or needs it
+now (`Immediate`): optional work, a lane's window trims, the collection of
+landed copies, a pool's growth, the weights' restore and the host's claim
+under critical pressure are immediate. Claims are ranked, the higher first: priority,
+then a decoding lane before a prefill one, then more completed work, then the
+earlier arrival (`ClaimRank`, the order in which lanes yield, reversed). A
+claim that waits holds what it lacks against every claim ranked below it:
+their admissions leave that room, and those free pages of its form, free, so
+memory that lands goes to the highest-ranked waiter first, and claims ranked
+above it are not held back. It holds the room from its first refusal that
+waited, for the resource wait's limit, and only while it is retried;
+meanwhile a lane below it leaves a command where it would take what is held,
+ends one at a state boundary past which it would, and runs within what it
+holds. `/status` reports the waiting claims and the bytes transfers will
+return under `memory_governor.claims` and `owed`, and each account of the
+ledger under `memory_governor.accounts`.
+
+The host's rule weighs each claim against the host's headroom: its spare
+memory beyond a reserve of 7% of the Mac's memory (2 to 7 GiB), counting the
+free, file-backed and purgeable pages and half of what compressing the
+anonymous pages would free at the compressor's present ratio, at most a
+quarter of them. Elective work, a start, optional work or a pool's growth
+into free room, keeps a 1 GiB margin of headroom, waits under macOS's
+warning, and waits in the band, which begins when the headroom falls short of
+the margin and ends once it clears the margin by a pool's unit; a pool's
+growth leaves the host, besides the margin, what the lanes in service are
+projected to grow into. A request in service needs the margin and normal
+pressure too, and grows past both, short of critical pressure, once nothing in
+place meets its refusal: the governor exempts that allocation's retries from
+the margin and the pressure test (`MemoryGovernor::free`), since waiting would
+stall work in service; so does the KV a prefill command takes past its first state
+boundary, which the lane's next command would take anyway. A `Floor` claim
+passes short of critical pressure, and critical pressure refuses every claim.
+The engine's start needs only what macOS can hand out at all beyond a reserve
+of a tenth of a small Mac's memory and 2 GiB of a larger one, counting what
+compressing the anonymous pages would free at the compressor's present ratio,
+at most half of them, short of critical pressure: what it allocates, the KV
+runway, arenas and warmup included, is memory a request in service needs
+until serving begins (`/status`: `memory_governor.host_available_bytes` and
+`host_reserve_bytes`; the spare memory and its reserve are
+`host_spare_bytes` and `host_spare_reserve_bytes`, and `host_headroom_bytes`
+is the room above them).
+
+### Memory rules
+
+**Take order** (`MemoryLedger::Order`, `runtime/engine/MemoryLedger.cpp`).
+Every claim walks one order. A unit the claim's rights (`TakeRights`) do not
+take is skipped, not a stop:
+
+1. Idle state buffers beyond those the next lane starts from, and those
+   too under macOS's critical pressure.
+2. Cached units that free memory now (copied, dead or needing no write), in
+   the cache's one order (`Cache::walkFor`).
+3. Caches the model rebuilds on use: the vision encoder's scratch, images'
+   encoded rows, idle history staging, and the hot block cache while no lane
+   reads above its floor.
+4. Cached units that need a write: the state the idle staging buffer writes,
+   whose RAM frees at once, for any claim; what frees only once its write
+   lands, for a claim that can wait.
+5. The command between its passes, then the claimant's own conversion to
+   Spill.
+6. Pool units above their floors: the expert store's chunks, top chunk first,
+   and the hot block cache's extents while a lane reads above its floor.
+7. Units another request uses.
+8. The pooled state buffers the next lane starts from, whose start then
+   allocates them again, for in-service KV that can wait: the memory plan
+   sizes the context for one lane beside its own state, not beside a next
+   lane's buffers, so a lane alone reaches it and a lone restore takes its
+   whole chain. A need of state buffers and the model's other memory keep
+   them.
+9. The engine: it waits for copies in flight that cover the need. Else, when
+   no lane's growth fits, the lane that yields first is suspended; while other
+   lanes fit, a refused lane waits for them, resident. A lane alone that
+   nothing meets fails with `capacity_exhausted` (`Engine::judge`).
+
+Once a unit the claim reached waits for a transfer, it takes nothing past
+step 4.
+
+**Who takes what**, derived in one function (`takeRights`) whose `TakeRights`
+every source of units reads (`MemoryLedger::Order`, `Cache::walkFor`):
+
+| Claimant | Cache that frees now | Cache that frees once its write lands | Rebuilt caches | Pass command, own conversion | Pools above their floors | Resume point | Queued chains | In use | Next lane's buffers |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `InService`, can wait | yes | yes | yes | yes | yes | yes | yes | where it reaches them | last, for KV |
+| `InService`, immediate | yes | no | yes | no | no | yes | yes | no | no |
+| `Start` | yes | yes | yes | no | no | yes | no | no | no |
+| `Optional` of a request | yes | no | yes | no | no | yes | no | no | no |
+| `Optional` of the engine's own, of no request | no | no | no | no | no | no | no | no | no |
+| `Growth` | yes | no | no | no | no | no | no | no | no |
+| `Host` with a deficit | yes | yes | yes | no | no | no | no | no | no |
+| `Host` under critical pressure | yes | no | yes | no | yes | yes | yes | yes | first |
+| A need the host refused | in place | no | yes | no | no | as its class | as its class | no | no |
+
+Under critical pressure every claim that takes units takes the next lane's buffers
+first, with the idle ones.
+
+The resume point is the newest ordinary state in RAM (`StateCache::resumePoint`),
+the one a conversation's next turn most likely resumes from. A claim of no
+certain reuse passes over it; one with it takes it in its recency order, and
+so does the host's pass under critical pressure. Every state a reclaim takes
+from RAM is written to the SSD cache first while the tier takes the write, so
+a resume point that goes keeps its SSD copy: its next turn starts with a
+restore read rather than a prefill.
+
+The engine's own optional work (the Index runway's refill with no Spill lane
+in service, trims with no lane in service) takes no unit at all: its rights
+are the narrowest, `TakeRights{}`, which take only the idle state buffers
+and what lands, and its count walks no source. The pass
+command goes only to work that supersedes it, a conversion only to its own
+lane's KV growth. A claim below the priority of a lane in service
+takes no pool's units, rebuilt or above a floor. A `Floor` claim, the start's
+or a weights restore's, takes nothing: it is a class of the host's rule only
+(`MemoryGovernor::HostRule::admits`).
+
+**Whole or streamed** (`planParts` in
+`runtime/engine/StreamedMemoryPlan.cpp`). Under auto, a streamable part, the
+routed experts and then the PLE table, loads whole only where the budget
+leaves the floors, all of it and the KV allowance, and otherwise streams
+through what they leave; the experts leave the table's share too. The
+allowance is the KV of the first 64K tokens, or of the model's window where
+that is less, with their speculative rows, in the whole extents one request's
+capacity takes; `--max-context` replaces it where set, a spill-capable
+target's up to 64K. A larger budget therefore never serves a shorter context
+([memory and context](server.md#memory-and-context)).
+
+**Store floor and regrowth** (`expertFloorShare` in
+`runtime/engine/StreamedMemoryPlan.hpp`, `MemoryLedger::grow`). The expert
+store's floor is the whole store where the run can spill (a block-sparse
+target with an SSD cache that takes writes), else 0.85 of its slots;
+`--expert-memory` sets it exactly. The stores are sized before the start
+knows whether the run spills; a store above its smallest size laid out for a
+spill the final plan does not make loads again at 0.85, while one at its
+smallest size is all its floor at either share (`holdsStores` in
+`runtime/engine/RuntimeResources.mm`). No claim takes the store below its
+floor.
+After the host's pass a pool grows one unit, an elastic store chunk of about
+1 GiB, once 30 s have passed since its last try and since a request's claim
+went unmet or took a pool unit above a floor, the pass command, a conversion
+or a unit in use (`MemoryLedger::free`). Nothing grows while a request's claim waits. The
+unit goes first into free room beyond the waiting claims' holds and the lanes'
+projected growth, then takes by the `Growth` row. A unit the cache pays for
+whole needs only no critical pressure and no host deficit; one that needs free
+room needs normal pressure, the margin and the host out of its band
+(`MemoryGovernor::growthHost`). Nothing is taken before the host admits it.
+
+**Placement** (`Engine::placement`, `runtime/engine/EngineMemory.cpp`). A
+start's projection is its tokens plus up to 4096 output tokens. It runs
+Resident when that fits its dense history or costs no more than Spill's peak
+(its floors and the larger of its history staging and its hot block floor);
+else Resident when what a `Start` claim may take covers its Resident KV, its
+state buffers and the lanes' projected growth; else Spill. The lanes'
+projected growth (`Engine::laneDemand`) is each lane's KV up to its
+projection and the hot block floors the lanes that read spilled KV still
+lack. One rule prices a hot block floor in both
+(`KvBlockCache::lanesShortfallBytes`): the floors lacked count once for all
+lanes, in whole extents, and extents no lane reads above the floors are a
+rebuilt cache, not a lane's floor.
+
+**Self-conversion** (`Engine::EngineVictims::conversions`). On a target whose
+run can spill, a Resident lane in decode whose own KV growth the engine's
+limit refuses converts itself to Spill when its eligible pages
+(`Cache::convertiblePages`) times a Full page less an Index page, less the
+first lane's hot block floor (`Model::hotFloorBytes`), cover the missing
+bytes: about 46K tokens on Qwen3.8-Flash-Next. It needs the SSD cache's quota
+for its pages and a free page in the Index runway, an extent kept while
+spilling is possible (`Engine::spillLanded`). Its landed pages release the
+Full extents they empty (`Engine::landedExtents`), and it then follows the
+Spill rules ([KV on the SSD](server.md#kv-on-the-ssd)). No other claim
+converts a lane, and a prefill lane does not convert.
+
+**Hot block cache** (`HotBlocksPool`, `runtime/model/ModelPools.hpp`). The
+floor, 4,096 slots a layer for each decoding Spill lane that holds one and
+4,096 more, in whole extents, is taken all or none as a lane starts decoding
+(`KvBlockCache::reserveLane`). The cache grows toward `--sparse-kv-memory`
+only while a lane holds a floor, and is a rebuilt cache while no lane reads
+above the floor (`KvBlockCache::readsAboveFloor`). A lane's floor is no unit
+any claim takes: it goes only with its lane (`KvBlockCache::releaseLane`).
+
+**Host passes** (`MemoryGovernor::controlPass`). A pass that took something
+waits a settle second (1 s) before the next. With a deficit, a headroom below
+the 1 GiB margin plus what host-refused requests wait to retry, less what
+transfers return (`HostRule::deficitBytes`), the host takes up to the smaller
+of the margin and the deficit, by the `Host` with a deficit row. Without a
+deficit it takes nothing, under macOS's warning too; the warning still holds
+back elective admission and growth into free room. Under critical pressure
+one immediate host claim each settle second takes up to the margin plus what
+refused requests wait to retry, in the take order (`MemoryGovernor::hostPass`).
+A pass that finds nothing while the host is short waives the band until it
+ends.
+
+**Admission** (`Engine::admitQueued`, `runtime/engine/Engine.cpp`). Admission
+walks the starts the scheduler wants this round in its lead order
+(`Scheduler::prefillAdmissionOrder`) and stops at one that is refused or backs
+off from a refusal: the wanted starts after it that compete for what it was
+refused are held, not tried, so the lanes that finish leave it what they free.
+Every start competes for memory; for the SSD cache's quota of active KV only
+one that would take some of it, a Spill start's commitment or the copies on
+the chain it restores that no lane holds yet (the quota counts a copy once
+however many lanes hold its block, so restoring a copy a lane holds takes
+none of it), and a quota refusal holds back only those
+(`Engine::competesForQuota`). A Spill start's own check counts those copies
+beside its commitment (`Cache::chainCopies`), and so does its commitment
+(`Cache::commitSpill`); a copy a reclaim writes for a block of its chain
+before the restore holds it returns that block's page of the commitment. A
+Spill resume holds again the copies it let go when suspended, and needs room
+for them the same way: it waits while only the room is short of
+`held / pageTokens + 1` pages less the copies other requests hold, and ends at
+its length where the limit itself cannot hold them. Held copies plus
+commitments stay within the active limit on these paths, the Spill admission,
+commitment and resume; Resident restores and publications add held copies
+without a check, by design, and the newest Spill lane's commitment then gives
+way (`Cache::fitDiskLimit`).
+A refused start the scheduler does not want waits for scheduling: it holds
+back nothing, its claim holds no room and its wait's limit stops; it keeps its
+wait's age and its refusal. Aging bounds how long younger prompts lead a
+refused start ([below](#prefill-and-decode-scheduling)); while a lane
+submitted before it, or one admitted ahead of it that competes for what it
+was refused, works, its wait's limit restarts
+([resource waits](#resource-waits)). A refused resume holds back the
+later resumes.
+
+### What a refused claim takes
+
+A refused claim lacks what it asked beyond the free room, plus the room
+claims ranked above it hold. The ledger first gives back what costs nothing,
+the idle state buffers. A claim that can wait then waits when what is landing
+meets its need: the transfers in flight and the copies its own lanes owe.
+Otherwise the ledger walks the take order ([above](#memory-rules)), which
+takes what costs least first: a cached unit costs a prefill only if a request
+comes back for it, a rebuilt cache its rebuild, a write its SSD bandwidth and
+the wait for it, a store chunk SSD reads for as long as it stays away, and a
+unit in use its request's prompt again. Inside the cache's one order
+([below](#replay-points-and-checkpoints)), a claim that can wait takes the
+units that free now past an uncopied one before it waits for that unit's
+write, which stays at the head for copies ahead of need to make.
+
+Reclaim writes every state it evicts to the SSD cache, checkpoints and points
+a conversation went on from too, and the SSD cache keeps them by its own LRU.
+A state's write copies it into the one staging buffer, so while no other write
+holds that buffer its RAM frees at once, and with it the blocks of its chain
+that already have a copy; a claim that cannot wait takes it too. What frees
+only once its write lands, a state whose write waits for the staging buffer or
+a KV leaf's demotion, goes only to a claim that can wait, which then waits for
+the write it starts; an `Immediate` claim passes over it.
+A unit no tier can copy, with no SSD cache or one whose files stopped taking
+writes, is dropped, and so is a state whose write the write budget or a full
+quota refuses. KV whose write finds no slot, with the quota full, nothing in
+it the take may give up and no transfer in flight, goes the same way once the
+take reaches it, a leaf with the copies below it that need it
+(`Cache::reclaimKvLeaf`).
+
+The ledger first counts the most the order gives, taking nothing
+(`MemoryLedger::bound`): each unit at what its source says it frees at most.
+Unless that covers what the claim lacks, nothing is taken. Otherwise it takes
+the units one at a time, each found again from the head of its source as it
+stands, until what they freed now and as their transfers land covers the
+need (`MemoryLedger::take`). A unit whose take frees nothing is passed over:
+a transfer in flight may hold it, or nothing of it is left. A claim met
+only by units that land later (a write it started, a conversion's copies)
+waits for them (`Pending`) and is retried as they land; one they do not meet
+waits while what it reached or started lands, and is `Short` otherwise. A
+refusal of KV counts the free pages of its form as its own: the ledger never
+releases their extent for it, which it would only allocate again.
+
+A claim for memory nothing needs yet, such as the Index runway's refill with
+no Spill lane in service, takes only what costs nothing. Pages whose copies
+landed leave memory at every point between commands where memory is judged,
+before admission and at each command's start (`Engine::spillLanded`) and in
+the control pass (`Engine::collectLandings`), so the next attempt finds what
+they gave back.
+
+A request in service keeps growing through host pressure and macOS's warning,
+short of critical pressure, within `--max-memory`, first into cached pages no
+request holds: it takes cached KV, and a cached state only where it sits on
+the KV that goes next, since a state's buffers give it no page. A new request
+waits while another is in service unless what the `Start` row may take meets
+it, and with none in service it starts.
 
 A prompt near the context limit can hold back every other start of its priority
 or below until it ends, its prefill alone taking many minutes: in service, its
 KV grows into the host's spare memory, which pauses other growth; a start beside
 it takes only what the engine already holds, such as a lane's state buffers that
-a finished request left in the pool; and the first start refused holds back the
-rest, its wait's limit restarting while the long request works (below).
-`/status` shows it: `admission.held_behind_refusal` counts the requests held
-back, `memory_governor.growth_allowed` and `host_headroom_bytes` show whether
+a finished request left in the pool or an idle cache the model rebuilds on use;
+and the first start refused holds back the starts it leads, its wait's limit
+restarting while the long request works (below).
+`/status` shows it: `admission.held_behind_refusal` counts the wanted starts
+held back untried (above), `memory_governor.growth_allowed` and
+`host_headroom_bytes` show whether
 and how far the host lets the engine grow, and `state.idle_gdn_cells`,
 `idle_draft_rings` and `idle_context_windows` count the pooled lane buffers a
 start can take. A request's `timeout`, or `--request-timeout`, bounds the wait.
 
 After a suspension, suspended requests resume before new work of their priority
 or below, one at a time, higher priority first and then in the order they
-arrived; one refused memory holds back the suspended requests after it, and
-their resource waits do not run out while it does. When every lane is taken,
-or a new request's start is refused memory that no copy being written to disk
-is about to free, the resident of the lowest priority below it is suspended for
-it (`cache.priority_suspensions` in `/status`) and resumes once a lane and its
-memory are free. A new request below the priority of a running lane neither
+arrived; the suspended requests a refused one holds back keep their resource
+waits from running out. An unstarted request of a higher priority than every
+suspended one starts first, by the same rule as outside recovery; while one is
+refused, or waits for scheduling, no suspended request resumes. When every
+lane is taken, or a new request's start is refused memory that no copy being
+written to disk is about to free, the resident of the lowest priority below it
+is suspended for it (`cache.priority_suspensions` in `/status`) and resumes
+once a lane and its memory are free. A new request below the priority of a running lane neither
 starts nor takes a lane until no lane of that priority runs, since it could not
-run before. Critical pressure evicts every unpinned cache entry and stops all
-growth; it takes the expert store down to its floor after what nothing in use
-holds and before what is in use, in one compaction per format. Refused at
-`--max-memory`, a lane's state, or the model's memory for reading KV from the
-SSD cache, takes cached KV only while evicting it can empty an extent, and is
-tried again only once an extent or a state has gone. Any growth `--max-memory`
-refuses, a start's beside a resident request too, takes a chunk of the expert
-store above its floor once nothing outside what is in use is left and before
-anything in use, and is tried again; so does the prompt's replay point before
-it recycles another request's state in use. Growth that only shortens a command
-(the KV a prefill captures past its first state boundary) or leaves memory for
-later takes neither the store nor anything in use, a junction or checkpoint
-capture never takes the store, and neither does a refusal of the host, which
-the paced passes answer.
+run before.
+
+### Expert store and regrowth
+
+A run that can spill gets memory back from its KV instead, while each chunk
+the store gives up costs expert reads from the SSD for the rest of the run:
+hence its floor ([above](#memory-rules)). The store starts at its floor,
+whatever the host holds; before the engine is ready the ledger grows it into
+the room the host leaves by the host's rule for growth
+(`MemoryGovernor::growToTargets`), its cap the limit's, and the chunks above
+what it grew stay in the plan, so the context does not move.
+
+Regrowth waits for a quiet period because a chunk regrown sooner would go back
+to the next claim, and each cycle costs its refill and compaction; on 35B such
+retakes came 1-29 s apart. A try that falls short asks a temporary SSD cache
+to copy ahead what it lacked ([disk tier](#disk-tier)), so that a later try
+finds that cache free to go. A store a burst shrank so comes back a chunk per
+30 s once requests stop going short, even when the burst's KV, cached, fills
+the room. `memory_governor.growth_allowed` is false while the host refuses
+growth into free room.
+
+### Replay points and checkpoints
 
 A request keeps its reusable model state at the last whole 32-token page before
 its generation prompt, the text a chat template appends to open the reply: the
@@ -1232,31 +1572,12 @@ next turn may render it differently, so a follow-up resumes from there.
 Until the request ends, suspended or not, that replay point is in use, and so is
 the KV it restores through. When the last request using it ends, the point
 becomes the newest ordinary state; the older points on its chain keep their age.
-Cache victims come in three classes: checkpoints, then ordinary states and KV
+Cache units come in three classes: checkpoints, then ordinary states and KV
 (first the KV no state restores through, which saves no prefill), then what is
-in use. No work displaces anything of a class above its own. The expert store's
-chunks above its floor rank between the last two: they go once nothing ordinary
-is left, before anything in use, for work that may take what is in use and for
-needed growth whose class stops at ordinary, but never for growth that only
-shortens a command or leaves memory for later, which takes nothing in use
-either. One exception is kept: a paced pass a request waits for under macOS's
-warning alone, the host not short, takes what is in use while the store keeps
-its chunks, since the warning alone never shrinks the store. Memory for running
-requests takes what is in use after everything else, and so does a paced pass
-that a request waits for. Three kinds of work take nothing in use: a paced pass
-that nothing waits for, under macOS's warning too, and the two that follow. A
-start that a resident lane holds back waits for that lane. And when no lane's
-growth fits, the lane that yields first, such as one just started beside a
-decoding lane, pays for the memory with its own suspension; while other lanes
-fit, it waits for them, resident, as any lane refused its KV does, since they
-grow too and are refused in turn. Where KV spills, a refusal they do not share,
-of the model's memory for reading KV from the SSD cache (a decoding lane's share
-of the hot block cache, a prompt's staging), which no transfer in flight
-returns, suspends the lane that yields first if that lane yields before it and
-is resident outside its command. A prefill command captures the state of
-each boundary it reaches, in buffers reserved before it runs. A junction or a
-checkpoint retires its lane's checkpoint once published, and a checkpoint the
-same command would capture before it is not captured at all; the prompt's
+in use, which only the claims [above](#memory-rules) may take.
+A prefill command captures the state of each boundary it reaches, in buffers
+reserved before it runs. A junction or a checkpoint retires its lane's
+checkpoint once published, and a checkpoint the same command would capture before it is not captured at all; the prompt's
 replay point keeps the lane's checkpoint cached. Until a state retires it, that
 checkpoint is the lane's recovery point, which a command that is cancelled,
 expires or fails leaves to a retry, so no state takes its buffers, or room a
@@ -1267,18 +1588,17 @@ junction or a checkpoint in that checkpoint's buffers, which it takes first,
 the replay point in them only when refused again. A checkpoint only on disk
 gives no buffers, and stays until the state is published. A checkpoint whose
 predecessor a reader pins ends its command too, and is published only once the
-pin has gone. Refused, the replay point, which is in use, takes cached KV and
-states in the same order, then the oldest state in use; of the KV it takes only
-leaves whose page frees at once, and only while an extent can be emptied, which
-is released at once; it drops a state whose write must wait for the write in
-flight. Refused then by the host alone, it takes its buffers as memory the
-request in service needs, as that request's KV does: a headroom between the
-1 GiB margin and the margin plus one state would otherwise refuse every replay
-point once no cached state is left to recycle. A junction makes room the same
-way short of what is in use, and an optional checkpoint takes only
-checkpoints; neither drops a state whose write must wait, and the host's margin
-refuses both. A state whose lane holds no such checkpoint makes that room before
-its command, and still refused ends its command at its boundary. With the SSD
+pin has gone. Refused, the replay point, a claim of its request in service that
+can wait and reaches what is in use, takes what its row allows in the fixed
+order (a cache the model rebuilds or a chunk of the store among them), waits
+for memory on its way back, the copy of uncopied cache it starts included,
+and only then takes the oldest state in use. Refused then by the host alone, it takes its
+buffers as memory the request in service needs, as that request's KV does:
+a headroom between the 1 GiB margin and the margin plus one state would
+otherwise refuse every replay point once no cached state is left to recycle.
+A junction's or a checkpoint's buffers are an optional allocation: neither
+waits for a write, and the host's margin refuses both. A state whose lane
+holds no such checkpoint makes that room before its command, and still refused ends its command at its boundary. With the SSD
 cache, a state its command could not capture and memory still refuses is
 written from the lane unless another write is in flight. A disk copy in use may
 displace the oldest copy in use, and ordinary or optional work never displaces anything in use. Nothing
@@ -1299,15 +1619,6 @@ for the new boundary.
 Higher-priority work does not wait for a lower-priority producer. `/status` exposes
 `scheduler.waiting_prefix` separately from resource waits.
 
-Greedy, sampled and constrained requests share decode batches; each lane keeps
-its own sampling policy and RNG, and a greedy lane takes the argmax path in any
-batch. A batch with a constrained lane runs its cycle as three commands around
-the host mask exchange: the draft, the target forward while the server computes
-each constrained lane's masks from its proposals, and the selection, in which
-only the constrained lanes read masks. A mask request the server leaves
-unanswered for 5 s fails that request with the retryable `mask_timeout` (HTTP
-503), so a stalled grammar cannot hold the batch's command.
-
 Long prefill uses disposable rolling checkpoints every 4096 tokens; none is
 planned within one prefill chunk (2048 tokens) of where the request resumes or
 of its replay boundary. Each retires only once the next one or a junction is
@@ -1326,43 +1637,6 @@ when no RAM slot took it, stays there. These writes draw on the SSD cache's
 write budget when one is set, which drops them while it is spent, a suspended
 request's own too, and a full quota makes room for one by dropping the oldest
 copy, perhaps an older conversation's restore point.
-Contended prefill adapts toward a 500 ms slice, keeping
-2048-token chunks for long unopposed work. A command's estimated cost is a fixed
-part, the time its GPU work waited on host steps (a streamed target's expert
-reads), and a part per row; the slice grows to twice the fixed part, so a
-command's rows take at least as long as its reads. Unopposed, a target whose
-experts stream runs its remaining chunks in as few prefill groups of up to four
-as hold them, evenly split, and so does a request whose KV spills to the SSD
-cache, which reads its history once a group; one whose KV stays in memory on a
-target whose experts load whole runs chunks, so a request that arrives beside it
-waits for a chunk. On a target whose experts stream a request keeps its groups
-whatever contends, and a command whose estimate exceeds the slice runs alone in
-passes over the model's layers, as many as keep each within the slice: its
-later passes come before any other prefill or admission, decode commands run
-between them as the decode share owes them, only the last commits its rows,
-and a request that ends between passes leaves the rest unrun. A lane whose history holds KV only the SSD cache has
-reads all of that history in each command, whatever its rows: it runs alone,
-and contended it takes the fewest rows, halving from its group's, whose time
-still covers its own running estimate of that wait, and never fewer than another
-contended command; the wait stays out of the command estimate. Without
-contention, a prompt that can
-finish within one 2048-token chunk ends its chunk at its last row instead of
-sharing it with a longer prompt. While requests of the same or a higher priority
-decode (a lane waiting for its token mask is owed nothing), each slice owes them
-decode time, `--decode-share` times its own, before the next slice runs. These
-policies do not extend client deadlines. Memory recovery waits are bounded:
-after a suspension, new work waits for resident requests only while memory is
-still short, and at most for the 30 s resource wait; suspended requests then
-resume first, each within its own resource wait. A request of a strictly higher
-priority than every suspended request waits for neither. A resource wait's limit
-restarts whenever an earlier lane has work in flight: one submitted before the
-waiting request, or admitted before the request was first refused memory or
-suspended. Such a lane holds memory the request waits for until it finishes.
-Other lanes do not extend the wait. Readiness does not guarantee that a
-request-sized allocation fits. A request that cannot fit even alone, after every
-cached prefix was evicted and the expert store shrank to its floor, fails with
-400 `capacity_exhausted`, naming
-`--max-memory` and `--max-context`; retrying it fails the same way.
 
 A cached state holds the target's GDN cell and the draft's context window, not
 the draft's rings: the context row of each of the 2048 positions the rings
@@ -1383,6 +1657,140 @@ copied from the lane after it. A target without GDN layers keeps no GDN state:
 its cells have no bytes, every lane and state shares one empty cell that holds
 no memory, so a lane holds the draft's rings and window and a cached state the
 window alone, and `state.idle_gdn_cells` stays 0.
+
+### Prefill and decode scheduling
+
+Greedy, sampled and constrained requests share decode batches; each lane keeps
+its own sampling policy and RNG, and a greedy lane takes the argmax path in any
+batch. A batch with a constrained lane runs its cycle as three commands around
+the host mask exchange: the draft, the target forward while the server computes
+each constrained lane's masks from its proposals, and the selection, in which
+only the constrained lanes read masks. A mask request the server leaves
+unanswered for 5 s fails that request with the retryable `mask_timeout` (HTTP
+503), so a stalled grammar cannot hold the batch's command.
+
+Prefill takes the ready lanes of the most urgent priority. Within it a
+request that three prefill commands in a row served later arrivals of its
+priority and not it (`maximumBatchWidth - 1`: the other lanes of a full batch,
+each finishing one short prompt), whether it has a lane or waits for one, is
+overdue and leads, the oldest first, until a command serves it; otherwise the
+lane of the fewest remaining rows leads, then in submission order. A command
+counts once, whatever its passes, and serves every lane it holds, a joiner
+too, which starts its count again; a lane a command is planned without is
+blocked, not passed over. Commands are counted, not rows: three commands of
+cache hits a few hundred rows each make a long uncached prompt overdue as
+three long commands do. The leader takes a chunk, or a group of the model's
+command rows (four chunks), evenly split, where its command runs in passes
+over the model's layers: on a target whose weights stream
+(`CommandLimits::streamsWeights`), or for a lane whose history has Index
+pages or may gain them, which a group reads once. A group runs in passes contended or not, each of no more layers than fit
+in G, the decode gap of 500 ms (`EngineConfig::decodeGapMilliseconds`), at the
+time a layer of the last command's heaviest pass took, scaled up where the
+group has more rows or its heaviest layer more attention pairs, never down: a
+command's fixed part, its experts' reads, does not shrink with its rows.
+Before any command is measured a group runs a pass a layer. Once a pass of a
+group ran its heaviest attention layer, the layers left are split again the
+same way at the time a layer of the group's own heaviest pass so far took
+(`Scheduler::nextPass`), so a group whose first passes were sized for more
+work than it has runs in about its time over G passes; before such a pass,
+the time of its passes holds none of its attention, and the planned passes
+stay. Any other command
+runs whole in one pass: a chunk, or, while a lane of its priority or a higher
+one decodes, the rows the last completed command ran in G at its measured time
+a row, fewer where the lane's layers reach more attention pairs than that
+command's heaviest did (`scheduler.bound_cuts`). A cut never goes below
+max(512, the model's least rows), the floor before any command is measured,
+nor past a chunk; a rest below the floor runs with the unit, up to a chunk. A
+command whose time was not measured, or whose completion added work, sizes
+nothing. The query-key pairs one attention layer computes bound a command's
+rows, never its passes (`CommandLimits::attentionPairs`). A lane whose
+commands run in passes joins only a command that does. Another ready prompt
+of the priority joins the command with the fewest rows that spare it a command
+of its own, all of a short prompt's, where the command's rows (a cut's, a
+group's or a chunk), its lanes past a chunk and its attention pairs allow, and
+a command holds at most `CommandLimits::indexPageLanes` lanes whose history
+may hold Index pages (`scheduler.index_page_conflicts` counts the plans that
+left one out for it). A lane whose history holds Index pages reads that
+history in each command, whatever its rows, and holds the history's staging
+while it does. Every pass runs all its lanes, decode commands of any priority
+run between passes as priority and the decode share order them, and only the
+last commits their rows. Its later passes come before any other prefill of
+its priority or a lower one, whose rows would take the prefill memory its work
+is in, but admission waits for no pass: a request that arrives meanwhile
+starts at the next command's boundary, in ordinary admission and during
+recovery alike.
+Admission starts a prompt only where the next command serves it and the
+prompt is overdue, or the command leaves it waiting for no other prompt: it
+ends the prompt, the prompt leads it, or every lane ahead of it ends its
+prompt there and none is a Spill lane, so two Spill lanes prefill together
+only as the later one leads or one is overdue.
+The lanes of a command between its passes count past its rows, which commit
+before any other prefill.
+A start still restoring its prefix from the SSD cache runs in no command before
+it lands, and a prompt it would lead then, once the prompt's first command ran
+(as the prompt stands while a command is between its passes), waits for it. A
+prompt that would join with the rows that spare it a command and then wait out
+another's waits for scheduling, and takes no lower resident's lane, until it
+leads; the requests one admission pass tries are judged together, in recovery
+as in ordinary admission, and while one waits so, no suspended lane below it
+resumes into the lane it will take. A command between its passes is abandoned, nothing of it committed, for a
+prompt of a higher priority once that prompt's command runs, the command's
+lanes losing the passes they ran; a prompt of its priority waits for its end
+and batches in the next command, so no rows the command started are run
+again. The command yields so, whole, to the suspension of any of its lanes
+too, whose others run their rows again in a later command, and a lane of it
+that would yield beside one of it that ended gives the command up in its
+place, which gives back the ended lanes' lanes and memory and its captured
+states' buffers. A start of a higher priority takes what the command holds
+before memory that costs anything: giving the command up, as that start does
+anyway once it runs, costs nothing, and frees the buffers of the states the
+command would capture; the lanes of it that ended settle once the preparation
+that gave it up has returned. A start of its priority or a lower one suspends
+no lane of it, so a command of a lower priority completes only in a gap of
+higher work at least as long as all its passes. A request that
+ends between passes, cancelled or at its deadline, stays in the command to its
+last pass, which commits nothing of it, and a command all of whose requests
+have ended stops at once.
+While requests of the same or a higher priority
+decode (a lane waiting for its token mask is owed nothing), each prefill unit owes them
+decode time, `--decode-share` times its own, before the next one runs. These
+policies do not extend client deadlines.
+
+### Resource waits
+
+Memory recovery waits are bounded:
+after a suspension, new work waits for resident requests only while memory is
+still short, and at most for the 30 s resource wait; suspended requests then
+resume first, each within its own resource wait. A request of a strictly higher
+priority than every suspended request waits for neither. A resource wait's limit
+restarts whenever a lane of the command in flight was submitted before the
+waiting request, whatever it holds, or was admitted before the refusal the wait
+records and competes for what the request was refused (`Engine::tick`). The
+refusal recorded is the latest while the request has no lane (a refused start
+or resume, or its suspension), so a waiting start or resume counts the
+competing lanes admitted before its latest refusal; for a lane in service it
+is the first. Any
+lane competes for memory. For the SSD cache's quota a lane competes while it
+holds some of it by its own count (`Cache::holdsActiveKvQuota`): a Spill
+commitment, or a block of its chain with a copy, which every lane holding the
+block counts, even one whose end returns none of the quota because another
+lane holds the block too. A lane that holds none of the quota extends a quota
+wait only if it was submitted before the waiting request. The rule is wide on
+purpose: the lanes it counts may still return what the request needs, and a
+refused Spill start needs memory as well, since a later attempt may place it
+Resident once memory returns. Rules narrowed to the lanes whose end returns quota
+failed requests at the limit that this one completes: a Spill start that fit
+Resident once memory returned, a start whose quota holder a higher priority
+kept from running for a while, and requests that suspended and resumed each
+other in turn.
+The wait fails at its limit once a whole limit passes with no such lane in
+flight; the request's own deadline, its `timeout` or `--request-timeout`,
+applies throughout.
+Readiness does not guarantee that a request-sized allocation fits. A request
+that cannot fit even alone, after every cached prefix was evicted and the expert
+store shrank to its floor, fails with 400 `capacity_exhausted`, naming a smaller
+`--max-context`, or a larger `--max-memory` where one lowered the budget;
+retrying it fails the same way.
 
 ## Sliding windows
 
@@ -1446,15 +1854,16 @@ its window's, the pages a command writes (a chunk, or a group of four where
 the routed experts stream) and one more (`kvWindowFloorPages`), in whole Full
 extents, and the pages of as many whole Slim extents as the rest holds, since an
 extent holds pages of one form; the pool's page ids cover the Slim pages the
-hard budget could hold. A Full shortfall takes trims first, then, while the Slim
+hard budget could hold. The budget can outlast the page ids: with every
+extent allocated the pool refuses a page as the budget does
+(`KvPool::growExtent`), and the claim's need of pages in place takes cached
+pages, which hold ids. A Full shortfall takes trims first, then, while the Slim
 pool has room for their tails, states, a checkpoint first, each followed by a
 trim of the tail it unpinned, while those trims free pages, before any KV leaf
-goes (`Cache::reclaimForPages`). At the memory wall, where the Slim runway
+goes (`Cache::peek`, `Cache::take`). At the memory wall, where the Slim runway
 cannot refill, no state goes for its tail, and the victims go as without a
 window, dead leaves before ordinary states. A state the SSD cache keeps unpins
-nothing: each step that keeps extents (`CacheReclaimMode::KeepExtents`) writes
-one more state there before any leaf goes. Empty Slim extents beyond the runway
-go for the retry to grow by.
+nothing. Empty Slim extents beyond the runway go for the retry to grow by.
 
 ## Disk tier
 
@@ -1529,8 +1938,8 @@ a write that fails for another reason stops a file.
 
 The write budget, set only by `--max-cache-disk-writes`
 (`RuntimeResourcesConfig::cacheDiskWritesPerDay`), is a token bucket in the
-disk budget, counted at submission in whole slots by every write of either
-file. Without it the bucket has no rate and admits every write, so nothing
+disk budget, counted at submission in the host pages each write of either
+file stores. Without it the bucket has no rate and admits every write, so nothing
 below is ever held back. It is the process's: each start begins with a
 quarter of a day's. It decides which states are written, and nothing else: one gate on the engine thread, the state file writable, its
 limit holding a slot and the budget admitting the state's class (a state in
@@ -1538,7 +1947,7 @@ use passes), is read only by the state's admission probes
 (`CompositeState::canOffload`, `Model::canSnapshotToDisk`), never by a
 reservation, an acquire or a write, so a write the engine admitted is never
 refused for it. KV is demoted only for a chain a state on the SSD needs, and
-copied only for a persistent point whose state was written, so those writes
+copied ahead only for a restore point whose state was written, so those writes
 pass the budget: a state the budget let through keeps its chain, and what a
 chain costs comes out of later states' share. The budget therefore paces the
 writes rather than bounding them: writes of states in use and of KV pass it,
@@ -1547,17 +1956,75 @@ While the budget is spent an evicted state is dropped, and `Cache::persist`
 reports the tier busy before it writes anything of a point; once the budget
 admits the point's state, the state is written first and the pages of its
 chain after it. It refuses a point for a file that stopped taking writes, or
-one larger than the tier's limit, its quota or what the volume leaves it. The
-budget refills on the awake clock the native loop schedules its wake-ups on,
-and write-behind wakes when the budget has room again.
+one larger than the room it may take (below). The budget refills on the awake
+clock the native loop schedules its wake-ups on, and write-behind wakes when
+the budget has room again.
 
-Writes happen when RAM reclamation selects a victim. States copy through one
-staging buffer, freeing their RAM immediately. KV leaves needed by a state
-on them or below them are written straight from their extents and released
-after the write succeeds; only then is the block above such a leaf a leaf. A
-chain whose newest blocks have no copy, as a finished request's prompt past the
-chain it restored, so leaves RAM one write at a time, and an allocation refused
-meanwhile waits for each write. Unneeded
+Restore points get their copies ahead of need (`WriteBehind`,
+`Cache::persist`), so that a reclaim later frees a cached conversation at once
+rather than waiting for its writes: an ordinary state published or reused at
+least 2048 tokens deep, 10 s after its publication, unless an ordinary state on
+its only branch below supersedes it by then, its conversation having gone on.
+Its state is written from its own buffers, which stay in RAM, out of every
+eviction order until the write lands, and then the pages of its chain that have
+no copy, root first, at most a quarter of the KV writes in flight
+(`WriteClass::Persist`). Points are copied one at a time, in publication order,
+those that wait passed over.
+Nothing else is copied ahead, as each costs more to write than to lose: the KV
+past a point, which no state restores through and a reclaim drops first, a
+shorter point, which recomputes in less time than its state takes to write, and
+a checkpoint, which a reclaim takes first. A step of a point starts nothing
+while the tier serves what is needed now, a restore that waits, a reclaim's
+demotion or a Spill request's write through, and goes on when they land, which
+wakes the engine, nor while a request the engine retries next, a lane of
+the priority that runs or one admission tries next, waits for memory on its
+way back, up to the resource wait's limit from when it first awaited it, so
+that the request, not a copy started as that memory lands, takes the state
+write next. A demotion or write through started meanwhile waits on the KV
+file's worker behind at most the copies in flight, a quarter of the tier's
+writes, and a state a reclaim writes waits for the point's, the one state write
+in flight, as for any other. A temporary tier's copies serve reclaims alone, so
+they wait for the memory's demand (`WriteBehind::run`), while a recent claim reached cache that a copy would
+have let go at once, and a point is copied only while the cache's victims that
+go at once, waiting for no write to land (the state the idle staging buffer
+writes among them), with what the copies ahead in flight let go once they land,
+hold less than that (the cache's walk,
+`Cache::peek`); a step that stops there, or for a claim that waits, asks for no
+wake-up. The demand is the larger of twice the KV the lanes' next commands add
+and what a pool's last growth lacked, one growth unit (a 1 GiB store chunk) at
+most; a waiting claim adds nothing, as write-behind stops while one waits. A claim
+reached such cache when, within `kCopyDemandSeconds` (60 s), a `free()`
+reached cache that frees only once its write lands, a KV leaf a state needs
+without a copy while the tier takes writes or a state whose write waits for
+the one in flight (`MemoryLedger::copyDemand`), whether it wrote it, waited
+for it or passed over it; what leaves through a copy it has counts for
+nothing, nor does a state the idle staging buffer writes, which frees at
+once, so the copies stop once claims find what they take copied. Without
+that nothing is written ahead. A point that waits for demand keeps its turn
+while it stays its conversation's newest: a publication meanwhile drops the
+queued points their conversations went on from or that are gone
+(`Cache::newestPoint`), so that demand, once it comes, finds no backlog of
+superseded points. There a point also waits while it is in use, as its request
+holds its chain and may go on from it, and its copies take only the room the
+quota has free beside the other copies and the commitments of Spill requests,
+giving up no copy: the redundant copies a full quota gives up first hold what
+reclaims take before such a point, and the only copies what RAM no longer
+holds, while the point may never leave RAM. A point that room cannot hold is
+refused, and once the quota is full a reclaim writes what it takes, as for any
+victim without a copy, giving up redundant copies, those made ahead among them,
+first. A persistent tier copies every point, whether memory has run short or
+not and in use too, so that a start after a crash takes it back, gives up the
+oldest point for it (below), and refuses one larger than its limit. A clean
+stop writes a persistent tier's waiting points, the newest first; a temporary
+tier's copies go with the process.
+
+Otherwise writes happen when RAM reclamation selects a victim without a copy.
+States copy through one staging buffer, freeing their RAM immediately. KV
+leaves needed by a state on them or below them are written straight from their
+extents and released after the write succeeds; only then is the block above
+such a leaf a leaf. A chain whose newest blocks have no copy yet, as a finished
+request's prompt past the chain it restored, so leaves RAM one write at a time,
+and an allocation refused meanwhile waits for each write. Unneeded
 tails are dropped without writing, before any state, together with any disk
 copies below them. Writes run on their file's IO worker. A KV page's slot
 holds what the page holds as it is written: a Slim page's is the first part of a
@@ -1575,7 +2042,7 @@ has landed. While a step waits for SSD
 reads (streamed experts, PLE rows or spilled KV), each 1 MiB of a write waits
 for them, at most 2 ms, unless a read queued behind the write on its file's
 worker would wait as long (`SlotFile::Options::deferWrites`). At most 64 KV
-writes are in flight (`KvPageTier::kWrites`): a persistent point's copies a
+writes are in flight (`KvPageTier::kWrites`): restore points' copies ahead a
 quarter of them and spilling requests' write-through half, so that neither
 starves the demotions a reclaim needs, which may take the rest. When the tier
 takes no more, leaves that need a write stay until a transfer lands, while
@@ -1609,24 +2076,31 @@ the oldest state copy, redundant or not, after which the copies of its chain
 that no other state needs go first in turn. A state in RAM restores through the
 K/V RAM holds, not its copies: a copy of K/V that RAM holds too goes once no
 state on disk restores through it. The only copy of a state in use makes room
-only for a copy in use, and last. Either way an ordinary state that
-finds no other room is dropped. Before reclaim takes a state in RAM, only a
-spilling request's page takes the spilled KV under it, the state first,
-once nothing else is left. A freed slot returns its quota at once and its
-blocks to the volume (`F_PUNCHHOLE`) once its file's IO worker finishes the
-transfer it is in, so the two files together occupy about the live slots instead
-of each keeping its high-water mark; `/status` reports that as `disk.file_bytes`
-beside `disk.used_bytes`. Until the punch the other file can take that quota, so
+only for a copy in use, and last. Either way the only copy of a unit of
+certain reuse, the newest resume point's state or a state or KV block on a
+chain a queued request will restore, makes room only for a Spill lane's
+active KV, since a running lane goes before a queued one; and an ordinary
+state that finds no other room is dropped. A claim's take finds a write's slot
+the same way, through the one replacement order (`Cache::nextDiskReplacement`):
+a full quota gives up the copies it may for the write, and the claim waits for
+the write. With no slot that way and no transfer in flight, the KV goes as with
+no SSD cache (above). Before reclaim takes a state in RAM, only a spilling
+request's page takes the spilled KV under it, the state first, once nothing else
+is left. A freed slot returns its quota at once and its blocks to the volume
+(`F_PUNCHHOLE`) once its file's IO worker finishes the transfer it is in, so the
+two files together occupy about the live slots instead of each keeping its
+high-water mark; `/status` reports that as `disk.file_bytes` beside
+`disk.used_bytes`. Until the punch the other file can take that quota, so
 allocated blocks can briefly exceed the limit by the slots freed but not yet
 punched, bounded by the transfer each file's worker is in: about 2% of a 10G
 tier in a 25-minute churn run on an M5 Max. A write that finds the volume full
 anyway only reports it: its file goes on, and the engine measures the volume at
 once and shrinks to the new limit. If the volume still shows room above the
-floor, the write met a limit the measure cannot see, such as a volume quota or
-a disk image whose host is full, or the volume filled and freed again; after a
+floor, the write met a limit the measure cannot see, such as a volume quota or a
+disk image whose host is full, or the volume filled and freed again; after a
 second such write the tier keeps within what it holds, with one log line, while
-serving continues. On a volume that cannot punch holes the files keep the
-blocks of freed slots, which the runtime reports once; the limit counts them.
+serving continues. On a volume that cannot punch holes the files keep the blocks
+of freed slots, which the runtime reports once; the limit counts them.
 
 Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range.
 Those of the files' IO workers, every write and a state's reads, move whole
@@ -1699,13 +2173,42 @@ but no sampling policy or DFlash decode. Successful scoring emits no Tokens
 event, finishes with Stop, and reports zero decode time. Cancelled requests
 carry no logits.
 
-An engine sends its Ready event first. One whose bootstrap fails, as when
-`--max-context` exceeds what its budget holds, writes its report to stderr,
-sends the report's reason as an engine failure in its place and exits; the
-server ends the start with that reason (`Error · …`, or
-`Engine restart failed · …` for a relaunch). An engine that ends before either,
-as a crashed one or one refusing its arguments does, ends it with
-`native protocol reached EOF`.
+A Stop frame, its payload a request's u64 id, ends a request whose output
+matched a client stop condition: the engine finishes the request as Stop, a
+completion, where a Cancel frame would finish it cancelled. A Stop before the
+request's first token cancels it, and one for a request that has already
+ended is ignored.
+
+An engine sends Warming once it holds its weights, then its Ready event when
+its warm-up runs are done; the server writes the first engine's Warming to
+its serve record, where the app shows it as the start's Warming up step.
+Ready says what the start serves: its lanes, the context it resolved (a
+relaunch may serve less than the first engine did), whether it admits
+images, and the target's vocabulary, stop
+tokens and mask rows, from which the server sizes its token masks and against
+which it checks its tokenizer. Its transport is open before it reads its
+command line, so a start that fails before Ready, as when `--max-context`
+exceeds what the model or its budget holds, writes its report to stderr,
+sends a StartFailed event in its place and exits. A start whose server has
+gone, which closes its input, stops as on a stop signal. StartFailed classes the
+failure for the server's restart policy and the app's words: host memory, a
+driver allocation, the memory budget or the context the plan holds (with what
+the start needed against what it had, and whether this Mac, `--max-memory` or
+the SSD cache's room bounded it), configuration, the model's files, the
+device, a start command short of GPU memory, or internal. The server ends the
+start with its message (`Error · …`, or `Engine restart failed · …` for a
+relaunch). An engine that ends before either, as a crashed one does, ends it
+with `native protocol reached EOF`.
+
+The time limits the processes hold each other to live in
+`runtime/Supervision.hpp`: Metal's 5 s event wait, the 120 s command watchdog,
+the 30 s loop step (a frame waits at most one step to be read, and a status
+request is answered within it), the 6 s flush of a clean stop, the 15 s from
+a stop signal to the engine's exit, the 60 s probation of a start, and the
+30 s a start waits for memory the host or Metal refused. The server mirrors
+the ones it times the engine by (`server/protocol.py` `SUPERVISION`), the app
+the stop budget, and `protocol_golden.txt` pins every copy; the server derives
+each of its thresholds from them in `server/supervision.py`.
 
 ## Failures and crash traces
 

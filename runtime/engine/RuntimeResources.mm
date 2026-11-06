@@ -1,9 +1,10 @@
 #include "engine/RuntimeResources.hpp"
+#include "engine/StreamedMemoryPlan.hpp"
 #include "AwakeClock.hpp"
 #include "Checked.hpp"
 #include "StderrLine.hpp"
+#include "Supervision.hpp"
 #include "engine/DiskLabels.hpp"
-#include "engine/Engine.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/PagedAttention.h"
 #include "model/ExpertStore.hpp"
@@ -17,6 +18,7 @@
 
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <iomanip>
 #include <limits>
 #include <optional>
@@ -26,21 +28,6 @@
 
 namespace splash::engine {
 namespace {
-
-static_assert(model::ExecutionLimits::maximumBatchWidth ==
-              SPLASH_MAXIMUM_BATCH_WIDTH);
-static_assert(model::ExecutionLimits::prefillTokenBudget ==
-              SPLASH_PREFILL_TOKEN_BUDGET);
-static_assert(model::ExecutionLimits::draftQueryRows ==
-              SPLASH_DRAFT_QUERY_ROWS);
-static_assert(model::ExecutionLimits::draftProposalTokens ==
-              SPLASH_DRAFT_PROPOSAL_TOKENS);
-static_assert(model::ExecutionLimits::targetVerifyRows ==
-              SPLASH_TARGET_VERIFY_ROWS);
-static_assert(model::ExecutionLimits::draftContextTokens ==
-              SPLASH_DRAFT_SLIDING_WINDOW);
-static_assert(model::ExecutionLimits::speculativeScratchTokens ==
-              SPLASH_SPECULATIVE_SCRATCH_TOKENS);
 
 uint8_t hexNibble(char value) {
   if (value >= '0' && value <= '9') {
@@ -90,15 +77,14 @@ void requireStartupHeadroom(
 constexpr uint32_t kPersistentCacheFormat = 2;
 // How long a start waits for the cache directory another process holds: one
 // that is closing has finished its flush, or been stopped by the server, by
-// then (server/runtime.py `_shutdown_grace_seconds`).
+// then (supervision::kStop).
 constexpr std::chrono::seconds kCacheLockWait{20};
+static_assert(kCacheLockWait > supervision::kStop);
 // A cache nobody opened or wrote for this long is removed at the next start,
 // whether or not that start keeps a cache itself.
 constexpr std::chrono::hours kStaleCache{24 * 14};
-// How long a start serves on probation: the server counts a failure within
-// that time toward a crash loop (server/backend.py
-// `CRASH_LOOP_WINDOW_SECONDS`) and stops restarting after three in a row.
-constexpr std::chrono::seconds kProbation{60};
+// How long a start serves on probation (supervision::kProbation).
+constexpr auto kProbation = supervision::kProbation;
 
 // A cache root the engine made stays out of Time Machine backups, as
 // ~/Library/Caches and $TMPDIR do: its files change with every write.
@@ -333,20 +319,24 @@ DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &c
 // with what its floors take of those the model has: the stores of parts
 // that stream, and the floors of a block-sparse target's KV on the SSD
 // cache.
-RuntimeResourcesError planRefusal(const StreamedMemoryResult &result, uint64_t hardBudgetBytes,
-                                  const model::StreamableWeights &streamable, const model::ModelDescriptor &model) {
+RuntimeResourcesError planRefusal(const StreamedMemoryResult &result, uint64_t configuredLimitBytes,
+                                  uint64_t hardBudgetBytes, const model::StreamableWeights &streamable,
+                                  const model::ModelDescriptor &model) {
   if (!result.requiredBytes)
     return RuntimeResourcesError(RuntimeResourceStage::Configuration, result.error);
   std::string floors = "model weights with the runtime reserves, one lane's state, the KV runway";
   if (streamable.expertBytes || streamable.tableBytes)
-    floors += ", the streamed stores at their smallest or at the floor --expert-memory sets";
+    floors += ", the streamed stores at their smallest or at the size --expert-memory or --ple-memory sets";
   if (model.capabilities.sparseKv)
     floors += ", the floors of KV on the SSD cache";
   return RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
                                floors + " and any SSD cache state staging require " +
                                    std::to_string(result.requiredBytes) + " bytes but the Metal memory budget is " +
                                    std::to_string(hardBudgetBytes) + " bytes",
-                               {}, RuntimeResourceFailure::EngineCapacity);
+                               {}, RuntimeResourceFailure::EngineCapacity,
+                               protocol::StartShortfall{.bound = memoryBound(configuredLimitBytes, hardBudgetBytes),
+                                                        .requiredBytes = result.requiredBytes,
+                                                        .budgetBytes = hardBudgetBytes});
 }
 
 // An explicit size of `option` that changes nothing: the model has no `what`
@@ -372,23 +362,39 @@ std::string_view streamedOnlyIn(const StreamedMemoryPlan &plan, const StreamedMe
   return {};
 }
 
+// Whether a model loaded with `loaded` holds the stores `next` gives: each
+// part's, and the routed experts' store's floor. A store no size sets keeps
+// a share of its slots as its floor (model::ExpertStoreOptions::floorShare),
+// which matters only above its smallest size (`expertMinimumBytes`): at that
+// size every slot is its floor at any share.
+bool holdsStores(const model::ModelLoadOptions &loaded, const model::ModelLoadOptions &next,
+                 const model::StreamableWeights &streamable) {
+  const bool floorByShare = !loaded.expertFloorBytes && loaded.expertMemoryBytes > streamable.expertMinimumBytes;
+  return loaded.expertMemoryBytes == next.expertMemoryBytes && loaded.expertFloorBytes == next.expertFloorBytes &&
+         loaded.streamedTableBytes == next.streamedTableBytes &&
+         (!floorByShare || loaded.expertFloorShare == next.expertFloorShare);
+}
+
 // What streams of the loaded model, and how an automatic part's store was
-// sized; for the routed experts' store, its cap and chunks, and the floor it
-// gives memory back down to and where that came from.
+// sized; for the routed experts' store, its cap and the floor it starts at
+// and gives memory back down to, the model plan's `floorShare` of its slots:
+// all of them in a store --expert-memory sizes.
 void reportStreamedStores(const model::LoadedModel &loaded, const model::StreamableWeights &streamable,
-                          const StreamedSetting &experts, const StreamedSetting &table) {
-  const auto automatic = [](const StreamedSetting &setting, std::string_view option) {
+                          const StreamedSetting &experts, const StreamedSetting &table, double floorShare) {
+  const auto automatic = [](const StreamedSetting &setting, std::string_view option, std::string_view beside) {
     return setting.mode == StreamedSetting::Mode::Auto
-               ? std::string(", all that ") + std::string(option) +
-                     " auto leaves it beside the floors and the KV kept resident"
+               ? std::string(", all that ") + std::string(option) + " auto leaves it beside " + std::string(beside)
                : std::string();
   };
   if (const model::SparseRowStore *store = loaded.streamedTable()) {
     const model::SparseRowStats stats = store->stats();
     logLine("Table ", stats.table, " streams from its file: ", stats.tableBytes / kMiB,
             " MiB stay on the SSD; row cache of ", stats.cacheCapacityRows, " rows in ",
-            store->committedBytes() / kMiB, " MiB", automatic(table, "--ple-memory"), "; ", model::kSsdReaders,
-            " readers.");
+            store->committedBytes() / kMiB, " MiB",
+            table.mode == StreamedSetting::Mode::Auto && store->committedBytes() == streamable.tableShareBytes
+                ? ", the most --ple-memory auto takes: the rows of every id a 128K-token prompt stages"
+                : automatic(table, "--ple-memory", "the floors and the KV kept resident"),
+            "; ", model::kSsdReaders, " readers.");
   } else if (streamable.tableBytes && table.mode == StreamedSetting::Mode::Auto) {
     logLine("The PLE table loads with the weights: memory holds its ", streamable.tableBytes / kMiB,
             " MiB (--ple-memory auto).");
@@ -396,32 +402,25 @@ void reportStreamedStores(const model::LoadedModel &loaded, const model::Streama
   if (const model::ExpertStore *store = loaded.expertStore()) {
     const model::ExpertStoreStats stats = store->stats();
     const bool sized = experts.mode == StreamedSetting::Mode::Size;
-    // The floor --expert-memory sets, and beside it the store's own where
-    // whole slots and chunks round it.
-    const std::string floor =
-        sized ? "the " + std::to_string(experts.bytes / kMiB) + " MiB --expert-memory sets" +
-                    (stats.floorBytes / kMiB != experts.bytes / kMiB
-                         ? " (" + std::to_string(stats.floorBytes / kMiB) + " MiB in whole slots and chunks)"
-                         : std::string())
-              : std::to_string(stats.floorBytes / kMiB) + " MiB, " +
-                    std::to_string(static_cast<int>(model::kExpertFloorShare * 100)) + "% of its slots";
+    // A store --expert-memory sizes is that size in whole slots and chunks,
+    // all of it its floor.
+    const std::string size =
+        sized ? ", the " + std::to_string(experts.bytes / kMiB) + " MiB --expert-memory sets" +
+                    (stats.capBytes / kMiB != experts.bytes / kMiB ? " in whole slots and chunks" : "")
+              : automatic(experts, "--expert-memory", "the floors and the KV kept resident");
+    const std::string floor = std::to_string(stats.floorBytes / kMiB) + " MiB, " +
+                              std::to_string(static_cast<int>(std::lround(floorShare * 100))) + "% of its slots";
     const std::string shrinks =
         stats.floorBytes < stats.capBytes
-            ? "; while memory is short it gives chunks back down to its floor, " + floor
+            ? "; it starts at its floor and grows toward its cap as memory allows; while memory is short it gives "
+                  "chunks back down to its floor, " + floor
             : "; it gives none back, its floor, " + floor + ", being all of it";
     logLine("Routed experts stream from their files: ", stats.slots, " slots for ", stats.experts, " experts (",
             stats.slots * 100 / std::max<uint64_t>(stats.experts, 1), "%) in ", stats.arenaBytes / kMiB,
-            " MiB, a store of ", stats.capBytes / kMiB, " MiB in ", stats.capChunks, " chunks",
-            sized ? ", all that the floors, its own among them, leave it beside the KV kept resident"
-                  : automatic(experts, "--expert-memory"),
-            shrinks, ".");
+            " MiB, a store of ", stats.capBytes / kMiB, " MiB in ", stats.capChunks, " chunks", size, shrinks, ".");
   } else if (streamable.expertBytes && experts.mode == StreamedSetting::Mode::Auto) {
     logLine("Routed experts load with their layers: memory holds their ", streamable.expertBytes / kMiB,
             " MiB (--expert-memory auto).");
-  } else if (streamable.expertBytes && experts.mode == StreamedSetting::Mode::Size &&
-             experts.bytes < streamable.expertBytes) {
-    logLine("--expert-memory ignored: memory holds every routed expert (", streamable.expertBytes / kMiB,
-            " MiB) beside the KV kept resident, which load with their layers.");
   }
 }
 
@@ -445,8 +444,6 @@ std::string spillOffReason(const model::ModelDescriptor &model, const kv::Layout
     return {};
   if (!model.capabilities.sparseKv)
     return "its attention is dense";
-  if (model.capabilities.sparseKv->localTokens)
-    return "its rows read a local window, which the SSD cache does not keep in memory";
   if (!layout.spillable())
     return "its KV layout cannot keep a page's index alone";
   if (!tierWritable)
@@ -468,8 +465,7 @@ void reportSpill(const model::ModelDescriptor &model, const EngineMemoryBreakdow
   }
   logLine("Long requests keep their KV on the SSD cache: ", bounds.maximum(), " tokens of context (bound: ",
           bounds.bound(), "; window ", bounds.window, ", resident ", bounds.resident, ", spilled ", bounds.spilled,
-          ", disk ", bounds.disk, "); a request whose KV fits ", budget.residentKvBytes / kMiB,
-          " MiB stays in memory; hot block cache ", spill.hotTargetBytes / kMiB, " MiB (floor ",
+          ", disk ", bounds.disk, "); hot block cache ", spill.hotTargetBytes / kMiB, " MiB (floor ",
           spill.hotFloorBytes / kMiB, " MiB); history staging in ", spill.stagingBuffers,
           " buffers; SSD room for active KV ", gibibytes(activeLimitBytes), ".");
 }
@@ -594,16 +590,27 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
 RuntimeResourcesError::RuntimeResourcesError(RuntimeResourceStage stage,
                                              std::string message,
                                              std::string budgetDescription,
-                                             RuntimeResourceFailure failure)
+                                             RuntimeResourceFailure failure,
+                                             std::optional<protocol::StartShortfall> shortfall)
     : std::runtime_error(std::move(message)), stage_(stage), failure_(failure),
-      budgetDescription_(std::move(budgetDescription)) {}
+      budgetDescription_(std::move(budgetDescription)),
+      shortfall_(std::move(shortfall)) {}
+
+RuntimeResourcesError::RuntimeResourcesError(RuntimeResourceStage stage,
+                                             const metal::MetalBackendError &error,
+                                             std::string budgetDescription)
+    : RuntimeResourcesError(stage, error.what(), std::move(budgetDescription)) {
+  commandFailed_ = true;
+  commandOutOfMemory_ = error.outOfMemory();
+}
 
 RuntimeResources::RuntimeResources(
     PersistentCacheFiles persistentCache,
     std::unique_ptr<metal::MetalBackend> backend, std::shared_ptr<model::SsdReaders> readers,
     model::LoadedModel model, ops::ExecutionPlans operators, EngineMemoryPlan memoryPlan,
     RuntimeCacheIdentity cacheIdentity,
-    std::unique_ptr<MemoryGovernor> memoryGovernor,
+    std::unique_ptr<MemoryGovernor> memoryGovernor, ClaimId startClaim,
+    std::unique_ptr<MemoryGovernor::Scope> startScope,
     std::unique_ptr<kv::PageStorage> kvPages,
     std::unique_ptr<model::QwenStateStorage> stateStorage,
     std::unique_ptr<KvPageTier> kvTier, std::unique_ptr<DiskSpace> diskSpace,
@@ -617,7 +624,8 @@ RuntimeResources::RuntimeResources(
       operators_(std::move(operators)),
       memoryPlan_(std::move(memoryPlan)),
       cacheIdentity_(std::move(cacheIdentity)),
-      memoryGovernor_(std::move(memoryGovernor)), kvPages_(std::move(kvPages)),
+      memoryGovernor_(std::move(memoryGovernor)), startClaim_(startClaim), startScope_(std::move(startScope)),
+      kvPages_(std::move(kvPages)),
       stateStorage_(std::move(stateStorage)), kvTier_(std::move(kvTier)),
       diskSpace_(std::move(diskSpace)), kvPool_(std::move(kvPool)),
       cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
@@ -731,6 +739,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   const uint64_t kvSlotBytes = model::SlotFile::slotBytesFor(kvFormat.payloadBytes());
   const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
       device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
+  if (config.maximumMemoryBytes > hardBudgetBytes)
+    logLine("--max-memory ignored: its ", gibibytes(config.maximumMemoryBytes), " exceed this Mac's Metal budget of ",
+            gibibytes(hardBudgetBytes), ", which it can only lower.");
   model::StreamableWeights streamable;
   // The arenas of the loaded model by what streams of it, and those of a
   // runtime whose K/V spills, which only a block-sparse target with a
@@ -756,8 +767,10 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         config.diskVolume(root ? config.cacheRoot : std::filesystem::temp_directory_path(ignored)), heldBytes);
   }
   bool kvFileOpen = true;
-  // The context a relaunch keeps, which only an automatic context does.
-  const uint32_t relaunchContext = requestedContextTokens ? 0 : config.relaunchContext;
+  // The expert store's chunks above its floor, which it starts without and
+  // the ledger grows into: the engine's plan holds them all the same
+  // (ModelMemoryFootprint::hostHeldBackBytes).
+  uint64_t hostHeldBackBytes = 0;
   // The pages of a prefill group's rows (model::kPrefillGroupChunks chunks).
   constexpr uint32_t groupPages =
       model::kPrefillGroupChunks * model::ExecutionLimits::prefillTokenBudget / kv::kPageTokens;
@@ -776,9 +789,10 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .kvLayout = kvLayout,
          .windowTokens = config.model.capabilities.maximumContextTokens,
          .requestedContextTokens = requestedContextTokens,
-         .relaunchContextTokens = relaunchContext,
+         .relaunchContextTokens = config.relaunchContext,
          .experts = {streamable.expertBytes, streamable.expertMinimumBytes, experts},
          .table = {streamable.tableBytes, streamable.tableMinimumBytes, table},
+         .tableShareBytes = streamable.tableShareBytes,
          .hotCacheBytes = config.sparseKvMemory,
          .sparseKv = config.model.capabilities.sparseKv,
          .tierWritable = stagingBytes && kvFileOpen,
@@ -817,16 +831,17 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     diskOff(reason);
     return without;
   };
-  // The stores the plan gives the parts, except that routed experts the
-  // plan streams load through a store of the least the floors charge them
-  // while `floors`, their smallest store or the floor --expert-memory sets:
-  // until the loaded model gives the arenas, which take from all that the
-  // experts stream through.
+  // The stores the plan gives the parts, the expert store at its floor,
+  // except that routed experts the plan streams load through a store of the
+  // least the floors charge them while `floors`, their smallest store or the
+  // store --expert-memory sizes: until the loaded model gives the arenas,
+  // which take from all that automatic experts stream through.
   const auto storesOf = [&](const StreamedMemoryPlan &plan, bool floors) {
     const uint64_t least = plan.expertFloorBytes ? plan.expertFloorBytes : streamable.expertMinimumBytes;
     return model::ModelLoadOptions{.streamedTableBytes = plan.tableBytes,
                                    .expertMemoryBytes = floors && plan.expertBytes ? least : plan.expertBytes,
                                    .expertFloorBytes = plan.expertFloorBytes,
+                                   .expertFloorShare = plan.expertFloorShare,
                                    .readers = readers};
   };
   model::ModelLoadOptions loadOptions;
@@ -848,12 +863,13 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                          "routed experts", "load with their layers");
     // Refuse a model that cannot fit before loading its weights: beside them
     // the plan needs at least the runtime reserves, one lane's state, the
-    // KV runway, the streamed stores at their smallest or at the floor
-    // --expert-memory sets, the floors of KV on the SSD cache and any SSD
-    // cache state staging; the plan after the load adds the arenas.
+    // KV runway, the streamed stores at their smallest or at the size
+    // --expert-memory or --ple-memory sets, the floors of KV on the SSD
+    // cache and any SSD cache state staging; the plan after the load adds
+    // the arenas.
     const StreamedMemoryResult planned = storesPlan(false);
     if (!planned.plan)
-      throw planRefusal(planned, hardBudgetBytes, streamable, config.model);
+      throw planRefusal(planned, config.maximumMemoryBytes, hardBudgetBytes, streamable, config.model);
     loadOptions = storesOf(*planned.plan, true);
     // Fail before loading the model when the machine has no headroom at
     // all; the guard installed above keeps checking as residency grows.
@@ -897,6 +913,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                   error.what(), {},
                                   resourceAllocationFailure(error.failure()));
+    } catch (const metal::MetalBackendError &error) {
+      // A command of the load, the expert store's fill.
+      throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading, error);
     } catch (const std::exception &error) {
       throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                   error.what());
@@ -935,15 +954,17 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // spills. Floors that the spill plan refuses refuse it with the engine
   // plan's breakdown.
   const auto planWith = [&](uint64_t stagingBytes, uint64_t aneFfnBytes) -> EngineMemoryPlanResult {
-    // The routed experts' store counts at its cap, as it loaded: the
-    // context and the KV the plan holds beside it never rest on what the
-    // store gives back, which only adds room.
+    // The routed experts' store counts at its cap, as it loaded, and the PLE
+    // row cache at the share the limit gives it: the context and the KV the
+    // plan holds beside them never rest on what the store gives back, which
+    // only adds room.
     const auto asLoaded = [](uint64_t storeBytes) {
       return storeBytes ? StreamedSetting{StreamedSetting::Mode::Loaded, storeBytes}
                         : StreamedSetting{StreamedSetting::Mode::Off, 0};
     };
     const StreamedMemoryResult streamed = streamedPlan(
-        asLoaded(loadOptions.expertMemoryBytes), asLoaded(loadOptions.streamedTableBytes), stagingBytes, aneFfnBytes);
+        asLoaded(loadOptions.expertMemoryBytes), asLoaded(loadOptions.streamedTableBytes),
+        stagingBytes, aneFfnBytes);
     ModelMemoryFootprint footprint{
         loaded.targetActualAllocatedBytes(),
         loaded.draft.actualAllocatedBytes,
@@ -952,6 +973,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         stagingBytes,
         aneFfnBytes,
         loaded.streamedTable() ? loaded.streamedTable()->committedBytes() : 0,
+        hostHeldBackBytes,
     };
     // A lane's prefill command writes a group of chunks where the routed
     // experts stream (model::RuntimeGeometry::prefillChunks).
@@ -975,48 +997,65 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // The plan with the staging the tier keeps.
   const auto planMemory = [&](uint64_t aneFfnBytes) { return planWith(stateStagingBytes, aneFfnBytes); };
 
+  // The model's side of the split (startAneFfn).
+  AneFfnModel splitModel;
+  // Readies the model as it loaded: the expert store's bytes above the floor
+  // it starts at are held back, as the engine's plan charges the store at its
+  // cap and the weights' allocations count its floor alone; the PLE row cache
+  // takes all of its host memory now, before the checks of the host that the
+  // start and the expert store's growth make, which see it whole from here
+  // on rather than as rows fill it; and the split's side is that model's.
+  const auto ready = [&] {
+    if (const model::ExpertStore *store = loaded.expertStore()) {
+      const model::ExpertStoreStats stats = store->stats();
+      hostHeldBackBytes = stats.capBytes - stats.liveBytes;
+    }
+    if (model::SparseRowStore *table = loaded.streamedTable())
+      table->commit();
+    splitModel = aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled);
+  };
+
   // The plan with the loaded model's arenas sizes the stores, and the start
-  // loads again where it gives a part another store: it loads once where the
-  // plan without the arenas already loads each part so, as for a model with
-  // no part to stream or routed experts whose floor --expert-memory sets as
-  // all the plan gives them, and twice otherwise, as where the routed
+  // loads again where it gives other stores than those loaded (holdsStores):
+  // it loads once where the plan without the arenas already loads each part
+  // so, as for a model with no part to stream or routed experts whose store
+  // --expert-memory sizes, and twice otherwise, as where automatic routed
   // experts stream. Floors that the arenas take beyond the budget stop the
-  // start with the engine plan's breakdown (requirePlan, below).
+  // start with the engine plan's breakdown (requirePlan, below). Nothing
+  // here samples the host: the store starts at its floor, and the ledger
+  // grows it by the host's rule before Ready (MemoryGovernor::growToTargets).
   const StreamedMemoryResult planned = storesPlan(true);
   if (!planned.plan && !planned.requiredBytes)
-    throw planRefusal(planned, hardBudgetBytes, streamable, config.model);
+    throw planRefusal(planned, config.maximumMemoryBytes, hardBudgetBytes, streamable, config.model);
   if (planned.plan) {
     const model::ModelLoadOptions next = storesOf(*planned.plan, false);
-    if (next.expertMemoryBytes != loadOptions.expertMemoryBytes ||
-        next.expertFloorBytes != loadOptions.expertFloorBytes ||
-        next.streamedTableBytes != loadOptions.streamedTableBytes) {
+    if (!holdsStores(loadOptions, next, streamable)) {
       loadOptions = next;
       load(true);
     }
   }
-  // The PLE row cache takes all of its host memory now, before the checks
-  // of the host that the start and the expert store's growth make, which
-  // see it whole from here on rather than as rows fill it.
-  if (model::SparseRowStore *table = loaded.streamedTable())
-    table->commit();
-  reportStreamedStores(loaded, streamable, config.expertMemory, config.pleMemory);
+  ready();
   reportVerifyRows(loaded, config.verifyRows);
-  // The model's side of the split (startAneFfn).
-  const AneFfnModel splitModel =
-      aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled);
 
   // The automatic tier keeps its staging only where the plan holds the model
-  // and the requested context beside it, the parts as they load. The split
-  // wins over it: where the plan refuses the split beside the staging but not
-  // without it, the tier turns off before the split is decided. A relaunch
-  // decides it as its first engine, an automatic start, did, so that it keeps
-  // the staging that engine kept; only its split leaves that engine's context
+  // and the requested context beside it, the parts as they load, or where
+  // turning it off would not help: a spilling plan's context is the tier's
+  // (its spilled KV and SSD quota), so without the tier it holds less. The
+  // split wins over it: where the plan refuses the split beside the staging
+  // but not without it, the tier turns off before the split is decided. A
+  // relaunch decides it as its first engine did, so that it keeps the
+  // staging that engine kept; only its split leaves that engine's context
   // (below).
   if (stateStagingBytes && automaticDisk) {
     const auto withoutStaging = [&](uint64_t aneFfnBytes) { return planWith(0, aneFfnBytes); };
+    const auto holdsContext = [&](const EngineMemoryPlanResult &result) {
+      return result.plan && result.plan->maximumContextTokens() >= std::max<uint32_t>(1, requestedContextTokens);
+    };
     const EngineMemoryPlanResult planResult = planMemory(0);
-    if (!planResult.plan ||
-        planResult.plan->maximumContextTokens() < std::max<uint32_t>(1, requestedContextTokens))
+    if (!planResult.plan)
+      diskOff("the memory plan cannot hold the model beside its state staging");
+    else if (!holdsContext(planResult) &&
+             (!planResult.plan->breakdown().kvSpill.enabled || holdsContext(withoutStaging(0))))
       diskOff(requestedContextTokens
                   ? "the memory plan cannot hold a " + std::to_string(requestedContextTokens) +
                         "-token context beside its state staging"
@@ -1033,13 +1072,22 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
 
   // The engine's plan with the staging the tier keeps; one that cannot hold
   // the model stops the start with its breakdown, before the tier's files
-  // open.
+  // open, and one the budget cannot hold with what its floors require.
   const auto requirePlan = [&] {
     EngineMemoryPlanResult planResult = planMemory(0);
     if (!planResult.plan) {
-      throw RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
-                                  planResult.status.message,
-                                  planResult.status.describe());
+      const EngineMemoryBreakdown &breakdown = planResult.status.breakdown;
+      if (planResult.status.code != BudgetErrorCode::KvPoolDoesNotFit)
+        throw RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
+                                    planResult.status.message,
+                                    planResult.status.describe());
+      throw RuntimeResourcesError(
+          RuntimeResourceStage::MemoryPlanning, planResult.status.message,
+          planResult.status.describe(), RuntimeResourceFailure::EngineCapacity,
+          protocol::StartShortfall{
+              .bound = memoryBound(breakdown.configuredMemoryLimitBytes, breakdown.hardBudgetBytes),
+              .requiredBytes = breakdown.minimumRequiredBytes,
+              .budgetBytes = breakdown.hardBudgetBytes});
     }
     return std::move(*planResult.plan);
   };
@@ -1075,13 +1123,29 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     const model::SlotFile::Options stateFileOptions{.deferWrites = readers->criticalBusyProbe()};
     DiskTier disk = openDiskTier(config, cacheNamespace, stateStagingBytes ? cacheDiskBytes : 0, kvSlotBytes,
                                  kvSlotLabelBytes(kvLayout.windowedLayers != 0), kvFileOptions, stateBytes,
-                                 stateFileOptions, relaunchContext && memoryPlan.breakdown().kvSpill.enabled);
+                                 stateFileOptions, config.relaunchContext && memoryPlan.breakdown().kvSpill.enabled);
     if (memoryPlan.breakdown().kvSpill.enabled) {
       kvFileOpen = disk.kv != nullptr;
       if (disk.budget)
         activeLimitBytes = std::min(activeLimitBytes, disk.budget->activeLimitBytes());
       memoryPlan = requirePlan();
     }
+    // Whether the run spills is settled now, after the stores were sized: an
+    // automatic expert store laid out beside a spill the plan no longer
+    // makes (the tier turned off or its KV file did not open) loads again
+    // with the floor the plan's spill gives (expertFloorShare) where that
+    // floor is another (holdsStores). The plan holds the store at its cap
+    // whatever its floor, and is made again with it. The stores are final
+    // now, and the start reports them.
+    model::ModelLoadOptions served = loadOptions;
+    served.expertFloorShare = expertFloorShare(memoryPlan.breakdown().kvSpill.enabled);
+    if (!holdsStores(loadOptions, served, streamable)) {
+      loadOptions = served;
+      load(true);
+      ready();
+      memoryPlan = requirePlan();
+    }
+    reportStreamedStores(loaded, streamable, config.expertMemory, config.pleMemory, loadOptions.expertFloorShare);
 
     // The governor holds the complete Metal footprint to the hard budget. The
     // plan budgets pipelines and driver allocations inside the pipeline and
@@ -1093,11 +1157,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
     // What the start allocates, the KV runway, the arenas and the warmup, is
-    // memory a request in service needs: like loading, it needs only the
-    // reserve macOS keeps short of critical pressure, which every Metal
-    // operation checks. The host's margins and macOS's warning hold back
-    // only what serving adds (beginServing).
-    memoryGovernor->setServing(true);
+    // the start's one Floor claim until serving begins (beginServing): like
+    // loading, it needs only the reserve macOS keeps short of critical
+    // pressure, which every Metal operation checks. The host's margin and
+    // macOS's warning hold back only what serving adds.
+    const ClaimId startClaim = memoryGovernor->ledger().open({.cls = ClaimClass::Floor});
+    auto startScope = std::make_unique<MemoryGovernor::Scope>(*memoryGovernor, startClaim);
     logLine("Kernel policy for GPU family ", device.appleGpuFamily,
             " with ", device.gpuCoreCount, " cores.");
     if (const model::RopeScaling &rope = config.model.ropeScaling; rope.yarn())
@@ -1157,6 +1222,21 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), disk.budget, spillPolicy, windowPolicy);
     if (disk.space)
       cache->setDiskMeasure([space = disk.space.get()] { space->measure(); });
+    // A target that can spill holds one empty Index extent from the start
+    // (the plan's indexRunwayBytes, one extent): a lane's first conversion
+    // lands its pages there at the memory wall, where no allocation is
+    // granted. It stays through an idle release of the weights; a walk under
+    // critical pressure may take it, and the next control pass refills it.
+    if (spill.enabled)
+      if (const metal::AllocationResult runway = kvPool->fillRunway(kv::PageForm::Index); !runway)
+        throw metal::MetalAllocationError("the KV pool's Index runway was refused", runway.failure);
+    // The ledger's accounts of the KV pages and the lane states, which it
+    // reads from their storage. The engine registers the cache and its own
+    // victims as it is built, and the model's pools follow
+    // (ServingRuntime::start).
+    MemoryLedger &ledger = memoryGovernor->ledger();
+    ledger.addAccount("kv", [pages = kvPages.get()] { return pages->actualAllocatedBytes(); });
+    ledger.addAccount("states", [states = stateStorage.get()] { return states->actualAllocatedBytes(); });
     // A target whose KV spills reads it back through one hot block cache and
     // one history stream, which take KV memory from the governor.
     std::unique_ptr<model::KvBlockCache> blockCache;
@@ -1191,7 +1271,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     auto result = std::unique_ptr<RuntimeResources>(new RuntimeResources(
         std::move(disk.persistent), std::move(backend), std::move(readers), std::move(loaded),
         std::move(operators), std::move(memoryPlan), std::move(cacheIdentity),
-        std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
+        std::move(memoryGovernor), startClaim, std::move(startScope), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(disk.space), std::move(kvPool), std::move(cache),
         std::move(aneFfn.split), std::move(aneFfn.outcome), std::move(blockCache),
         std::move(historyStream), config.kvSpillAlways, config.verifyRows));
@@ -1204,6 +1284,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                 error.what(),
                                 memoryPlan.breakdown().describe(),
                                 resourceAllocationFailure(error.failure()));
+  } catch (const metal::MetalBackendError &error) {
+    // A command before any warmup: the Neural Engine split's setup and
+    // calibration.
+    throw RuntimeResourcesError(RuntimeResourceStage::StorageAllocation, error,
+                                memoryPlan.breakdown().describe());
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::StorageAllocation,
                                 error.what(),
@@ -1243,7 +1328,8 @@ void RuntimeResources::adoptPersistentCache() {
 }
 
 void RuntimeResources::beginServing() {
-  memoryGovernor_->setServing(false);
+  startScope_.reset();
+  memoryGovernor_->ledger().close(startClaim_);
   CacheDirectory *directory = persistentCache_.directory.get();
   if (!directory)
     return;
@@ -1321,7 +1407,6 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       blockCache_.get(),
       historyStream_.get(),
       verifyRows_,
-      memoryGovernor_->growthAdmission(),
   };
 }
 
@@ -1333,15 +1418,20 @@ EngineSpillConfig RuntimeResources::spillConfig() const noexcept {
           .geometry = memoryPlan_.spillGeometry()};
 }
 
-std::optional<KvSpillStatus> RuntimeResources::kvSpillStatus() const {
+std::optional<KvSpillSnapshot> RuntimeResources::kvSpillSnapshot() const {
   if (!memoryPlan_.breakdown().kvSpill.enabled)
     return std::nullopt;
-  KvSpillStatus result{.cache = cache_->spillSnapshot()};
-  if (blockCache_)
-    result.blockCache = blockCache_->stats();
-  if (historyStream_)
-    result.historyStream = historyStream_->stats();
-  return result;
+  return cache_->spillSnapshot();
+}
+
+std::optional<model::KvBlockCacheStats> RuntimeResources::kvBlockCacheStats() const {
+  if (blockCache_) return blockCache_->stats();
+  return std::nullopt;
+}
+
+std::optional<model::KvHistoryStreamStats> RuntimeResources::kvHistoryStreamStats() const {
+  if (historyStream_) return historyStream_->stats();
+  return std::nullopt;
 }
 
 std::optional<model::SparseRowStats> RuntimeResources::streamedTableStats() const {
@@ -1382,9 +1472,9 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   }
   report.kvAllocatedBytes = kvPool_->allocatedBytes();
   if (blockCache_)
-    report.kvBlockCacheBytes = blockCache_->stats().bytes;
+    report.spilledKvHotBytes = blockCache_->stats().bytes;
   if (historyStream_)
-    report.kvHistoryStagingBytes = historyStream_->stats().stagingBytes;
+    report.spilledKvStagingBytes = historyStream_->stats().stagingBytes;
   report.stateStagingBytes = modelMemory.stateStagingBytes;
   report.aneFfnBytes = aneFfn_ ? aneFfn_->allocatedBytes() : 0;
   if (const auto table = streamedTableStats()) report.streamedTableBytes = table->cacheBytes;
@@ -1448,13 +1538,6 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
   model.forget = [key](uint32_t maxAneUnits) { ane::forget(key + std::to_string(maxAneUnits)); };
   model.healthy = [&backend] { return backend.healthy(); };
   return model;
-}
-
-void connectToGovernor(EngineConfig &config, MemoryGovernor &governor) {
-  config.growthPaused = [&governor] {
-    return !governor.snapshot().hostGrowthAllowed;
-  };
-  config.serving = [&governor](bool serving) { return governor.setServing(serving); };
 }
 
 } // namespace splash::engine

@@ -35,8 +35,8 @@ inline void hyper_table16_write(device bfloat *table, device float *sums, uint w
 // projection prepares its own (decode_linear_gguf_prepare, a simdgroup per
 // span and row over the whole GPU). A threadgroup per row writing its row's
 // table stores two bytes at a time into a lane's eight-row tiles from one
-// core, which cost a 20-core M5 Pro 1.5 to 5.2 us per mix more than the
-// plain norm and that preparation, at one to four lanes.
+// core, which costs 1.5 to 5.2 us per mix more than the plain norm and that
+// preparation.
 constant constexpr uint kNormHidden = HYPER_CONNECTION_NORM_HIDDEN;
 constant constexpr uint kNormValues = kNormHidden / kRowThreads; // per thread and stream
 static_assert(kNormHidden % kRowThreads == 0, "a thread's values per stream are whole");

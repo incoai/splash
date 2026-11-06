@@ -2,11 +2,9 @@ import json
 import random
 import re
 import unittest
-from contextlib import nullcontext
 from unittest import mock
 
 from dev.tests.server_fixtures import (
-    FOREVER,
     FakeRuntime,
     FakeTokenizer,
     Harness,
@@ -18,8 +16,8 @@ from dev.tests.server_fixtures import (
     responses_body,
 )
 from dev.tests.tool_output import project, streamed_arguments, streamed_text
-from server import api_shapes
 from server import backend as backend_api
+from server import chat_messages
 from server import output as model_output
 from server.chat_format import (
     QWEN,
@@ -601,14 +599,12 @@ class PartialToolOutputTests(unittest.TestCase):
                                 }
                             ],
                         }
-                        normalized = api_shapes.normalize_messages(
+                        normalized = chat_messages.normalize_messages(
                             [
                                 call,
                                 {"role": "user", "content": "Continue"},
                             ],
                             vision=True,
-                            deadline=FOREVER,
-                            without_slot=nullcontext,
                         )
                         actual = normalized[0]["tool_calls"][0]["function"]
                         self.assertEqual(actual["arguments"], arguments)
@@ -1082,7 +1078,7 @@ class PartialToolOutputTests(unittest.TestCase):
         # produced; refusing the request would leave the agent unable to
         # continue at all.
         def history_arguments(arguments):
-            messages = api_shapes.normalize_messages(
+            messages = chat_messages.normalize_messages(
                 [
                     {"role": "user", "content": "save it"},
                     {
@@ -1100,8 +1096,6 @@ class PartialToolOutputTests(unittest.TestCase):
                     {"role": "user", "content": "continue"},
                 ],
                 vision=True,
-                deadline=FOREVER,
-                without_slot=nullcontext,
             )
             return messages[1]["tool_calls"][0]["function"]["arguments"]
 
@@ -1124,7 +1118,7 @@ class PartialToolOutputTests(unittest.TestCase):
         ):
             with self.subTest(arguments=arguments):
                 self.assertEqual(history_arguments(arguments), expected)
-        rendered = api_shapes.template_messages(
+        rendered = chat_messages.template_messages(
             [
                 {
                     "role": "assistant",

@@ -49,13 +49,11 @@ static_assert(sizeof(SplashChunkedPrefillParams) == 24,
 // per KV head runs in (kernels/common/paged_attention_tile.h
 // splash_attention_tile_part): the fewest that divide its eight rows and leave
 // each at most 64 fused rows, the 256-thread tile's. A group of up to eight
-// is one part, sixteen two, thirty-two four. Measured on an M5 Max (40 cores),
-// the two 64-row parts of a group of sixteen ran its 32K-token prefill and its
-// verify past 128K tokens 20-40% faster than one 128-row tile of 512 threads:
-// both parts read the same pages, the second mostly from cache, and the
-// smaller threadgroups keep more of the GPU busy. Splitting further, a group
-// of eight into two parts or sixteen into four, was slower again at long
-// histories.
+// is one part, sixteen two, thirty-two four. Two 64-row parts of a group of
+// sixteen run long prefill and verify 20-40% faster than one 128-row tile of
+// 512 threads: both parts read the same pages, the second mostly from cache,
+// and the smaller threadgroups keep more of the GPU busy. More parts are
+// slower again at long histories.
 #define SPLASH_ATTENTION_TILE_PARTS(group) \
   ((group) <= 8u ? 1u : (group) <= 16u ? 2u : (group) <= 32u ? 4u : 8u)
 

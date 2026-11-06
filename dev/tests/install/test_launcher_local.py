@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -13,10 +14,11 @@ from dev.tests.installer_fixtures import (
     cached_snapshot,
     draft_dir,
     fixture,
-    loadable_tensors,
     mlx_target,
+    tensor_table,
     vision_fixture,
     write_gguf,
+    write_target,
 )
 from dev.tests.server_fixtures import keep_stop_signals, server_arguments
 from install import assembly, hub, launcher, local
@@ -38,13 +40,8 @@ class LocalServeTests(unittest.TestCase):
         self.enterContext(mock.patch.object(launcher, "_version", return_value="test"))
 
     def gguf(self):
-        headers = self.root / "headers"
-        headers.mkdir(exist_ok=True)
-        values = fixture(native=True)
-        return write_gguf(
-            self.root / "my model.gguf",
-            values,
-            loadable_tensors(values, headers).items(),
+        return write_target(
+            self.root / "my model.gguf", fixture(native=True), tensor_table()
         )
 
     def serve(self, target, *options):
@@ -178,9 +175,20 @@ class LocalServeTests(unittest.TestCase):
             setup.assert_not_called()
 
     def test_failed_local_preparation_does_not_start_the_server(self):
-        result, execute = self.serve(self.root / "missing.gguf")
+        """The line said names the files refused, absolute and resolved, and
+        the record holds the reason alone, as the app names the files."""
+        target = self.root / "missing.gguf"
+        with mock.patch("sys.stderr", io.StringIO()) as error:
+            result, execute = self.serve(self.root / "absent" / ".." / target.name)
         self.assertEqual(result, 1)
         execute.assert_not_called()
+        self.assertEqual(
+            error.getvalue(), f"error: cannot prepare {target}: it does not exist\n"
+        )
+        record = json.loads((self.root / "run/serve-8000.json").read_text())
+        self.assertEqual(
+            record["failure"], {"kind": "model", "message": "it does not exist"}
+        )
 
 
 class LocalPreparationCommandTests(unittest.TestCase):
@@ -194,7 +202,7 @@ class LocalPreparationCommandTests(unittest.TestCase):
 
         with (
             mock.patch.object(
-                local, "prepare_local_model", side_effect=prepare
+                local, "_prepare_paths", side_effect=prepare
             ) as prepare_model,
             mock.patch("sys.stdout", io.StringIO()) as output,
             mock.patch("sys.stderr", io.StringIO()) as progress,
@@ -214,31 +222,33 @@ class LocalPreparationCommandTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "/prepared/model with spaces\n")
         self.assertEqual(progress.getvalue(), "Preparing the model...\n")
         prepare_model.assert_called_once_with(
-            "/target",
-            "/draft",
-            mmproj="/projector",
-            language_only=False,
-            models_dir=Path("/models"),
+            Path("/target"), "/draft", "/projector", False, Path("/models")
         )
 
     def test_helper_reports_refusals_and_interruptions_without_a_traceback(self):
-        for failure, status in (
-            (local.ModelError("bad model"), 1),
-            (OSError("unreadable"), 1),
-            (KeyboardInterrupt(), 130),
+        """A refusal reaches the launcher as a serve record failure, which it
+        reports and records as its own: the reason alone, as the app names the
+        files."""
+        for failure, status, refusal in (
+            (
+                local.ModelError("bad model"),
+                1,
+                {"kind": "model", "message": "bad model"},
+            ),
+            (OSError("unreadable"), 1, {"kind": "internal", "message": "unreadable"}),
+            (KeyboardInterrupt(), 130, None),
         ):
             with (
                 self.subTest(failure=type(failure).__name__),
-                mock.patch.object(local, "prepare_local_model", side_effect=failure),
+                mock.patch.object(local, "_prepare_paths", side_effect=failure),
                 mock.patch("sys.stdout", io.StringIO()) as output,
                 mock.patch("sys.stderr", io.StringIO()) as error,
             ):
                 self.assertEqual(local._main(["/target"]), status)
-            self.assertEqual(output.getvalue(), "")
-            self.assertNotIn("Traceback", error.getvalue())
             self.assertEqual(
-                error.getvalue(), "" if status == 130 else f"error: {failure}\n"
+                json.loads(output.getvalue()) if output.getvalue() else None, refusal
             )
+            self.assertEqual(error.getvalue(), "")
 
 
 if __name__ == "__main__":

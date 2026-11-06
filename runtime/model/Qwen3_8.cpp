@@ -48,6 +48,11 @@ void rotateInputs(metal::MetalBackend &backend, Qwen3_8Weights &weights, const G
 
 } // namespace
 
+const ops::BlockMoeWeights *qwenMoeBlock(const Qwen3_8LayerWeights &) noexcept { return nullptr; }
+std::optional<ops::SwiGluProjections> denseFfn(const Qwen3_8LayerWeights &layer) noexcept {
+  return ops::SwiGluProjections{&layer.gateProjection, &layer.upProjection, &layer.downProjection};
+}
+
 Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout layout,
                                   const QwenTargetFiles &files) {
   const auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer, const BlockTargetFormat &format, uint32_t) {

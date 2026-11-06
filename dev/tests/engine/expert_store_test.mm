@@ -32,18 +32,20 @@
 #include "TestAdmission.hpp"
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
+#include "TestMethodReplacement.hpp"
+#include "TestStderr.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/Model.hpp"
+#include "model/ModelPools.hpp"
 #include "model/WeightLayout.hpp"
 #include "model/WeightSource.hpp"
 #include "ops/MoE.hpp"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#import <objc/runtime.h>
 
 #include <algorithm>
 #include <array>
@@ -83,6 +85,7 @@ using splash::ops::MoePhase;
 using splash::ops::MoePlan;
 using splash::ops::MoeShape;
 using splash::ops::QuantizedSegment;
+using splash::test::MethodReplacement;
 using splash::test::require;
 using namespace gguf_reference;
 using namespace moe_fixture;
@@ -175,6 +178,14 @@ ExpertStoreOptions storeOptions(uint64_t arena, const StreamedBlocks &blocks, co
   return {.memoryBytes = arena + ExpertStore::fixedBytes(blocks, shape), .readers = readers()};
 }
 
+// A store built at its floor taken to its cap, as the engine's ledger takes
+// it before Ready (MemoryGovernor::growToTargets): the cases that load into
+// every slot start from it.
+void growToCap(ExpertStore &store) {
+  while (store.stats().growUnitBytes)
+    require(static_cast<bool>(store.growTowardCap(splash::test::admitAll)), "a store's growth to its cap was refused");
+}
+
 // The host steps of a load of `plan`'s rows, a round each: the staging
 // places the experts of a block a decode cycle's rows may route, and at least
 // two; a decode step's load that they hold stages them all in one round, any
@@ -262,6 +273,7 @@ int streamedExperts(MetalBackend &backend, const MoeShape &shape, const std::fil
     const uint64_t slots = shape.experts + 3;
     ExpertStore store(backend, file.blocks, shape,
                       storeOptions(arenaBytes(m, slots) + kSpareBytes, file.blocks, shape));
+    growToCap(store);
     require(store.stats().slots == slots, formats + ": the store holds another number of slots");
     std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
     for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
@@ -369,6 +381,7 @@ int streamedChunkOrder(MetalBackend &backend, const MoeShape &shape, const std::
     if (selected[route] < shape.experts) routed.insert(selected[route]);
   const uint64_t slots = shape.experts + routed.size() + 3;
   ExpertStore store(backend, blocks, shape, storeOptions(arenaBytes(m, slots) + kSpareBytes, blocks, shape));
+  growToCap(store);
   std::array<BlockMoeWeights, 3> streamed{m.weights, m.weights, m.weights};
   for (uint32_t block = 0; block < 3; ++block) store.bind(block, streamed[block]);
   int failures = 0;
@@ -418,6 +431,7 @@ int streamedUnionLoads(MetalBackend &backend, const MoeShape &shape, const std::
     const uint64_t slots = shape.experts + 3;
     ExpertStore store(backend, file.blocks, shape,
                       storeOptions(arenaBytes(m, slots) + kSpareBytes, file.blocks, shape));
+    growToCap(store);
     std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
     for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
     constexpr std::array<uint32_t, 3> kRows{kMaximumRows, 27, 9};
@@ -470,24 +484,6 @@ int streamedUnionLoads(MetalBackend &backend, const MoeShape &shape, const std::
   return failures;
 }
 
-// Replaces a method of the class of `object`, every command buffer's, while
-// it lives.
-class MethodReplacement final {
-public:
-  MethodReplacement(id object, SEL selector, IMP replacement)
-      : method_(class_getInstanceMethod(object_getClass(object), selector)) {
-    require(method_ != nullptr, "replacement method is missing");
-    original = method_setImplementation(method_, replacement);
-  }
-  ~MethodReplacement() { method_setImplementation(method_, original); }
-  MethodReplacement(const MethodReplacement &) = delete;
-  MethodReplacement &operator=(const MethodReplacement &) = delete;
-  IMP original = nullptr;
-
-private:
-  Method method_ = nullptr;
-};
-
 // Once armed, the command buffer that raises a command's first host step's
 // event (its value 1) never raises it and fails once it ends, as a buffer the
 // GPU faults in, or whose wait Metal times out, does.
@@ -531,6 +527,7 @@ int streamedFaultBeforeRound(const std::string &metallibPath, const MoeShape &sh
   ExpertFile file(m, directory / "experts.bin");
   const uint64_t slots = 2 * shape.experts;
   ExpertStore store(backend, file.blocks, shape, storeOptions(arenaBytes(m, slots), file.blocks, shape));
+  growToCap(store);
   std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
   for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
   Buffers b;
@@ -591,6 +588,7 @@ int streamedLoneBlockSize(MetalBackend &backend, const MoeShape &shape, const st
                         "a size of one block larger than the largest buffer was taken");
   ++options.bufferBytes;
   ExpertStore store(backend, blocks, shape, options);
+  growToCap(store);
   require(store.stats().slots == trunkSlots + shape.experts && store.stats().resident == shape.experts,
           "a size of one block holds another number of slots, or not every expert of its block");
   std::array<BlockMoeWeights, 3> streamed{trunk.weights, trunk.weights, head.weights};
@@ -612,7 +610,7 @@ int streamedLoneBlockSize(MetalBackend &backend, const MoeShape &shape, const st
   for (const Step &step : steps) {
     if (step.restores) {
       store.release();
-      require(store.restore(splash::test::admitAll, splash::test::admitAll) && store.stats().resident == shape.experts,
+      require(store.restore(splash::test::admitAll) && store.stats().resident == shape.experts,
               "a restored store does not hold every expert of a size of one block");
     }
     const Model &m = step.block == 2 ? head : trunk;
@@ -657,6 +655,7 @@ int streamedRounds(MetalBackend &backend, const MoeShape &shape, const std::file
   ExpertFile file(m, directory / "experts.bin");
   const uint64_t slots = 2 * shape.experts;
   ExpertStore store(backend, file.blocks, shape, storeOptions(arenaBytes(m, slots), file.blocks, shape));
+  growToCap(store);
   std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
   for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
   const MoePlan decode = MoE::decodePlan(shape, 1, MoeConfig{});
@@ -677,7 +676,7 @@ int streamedRounds(MetalBackend &backend, const MoeShape &shape, const std::file
   for (const Step &step : steps) {
     if (step.releases) {
       store.release();
-      require(store.restore(splash::test::admitAll, splash::test::admitAll), "the store was not restored");
+      require(store.restore(splash::test::admitAll), "the store was not restored");
     }
     const MoePlan &plan = step.prefill ? chunk : decode;
     if (step.prefill) {
@@ -739,6 +738,7 @@ int streamedReadFailures(const std::string &metallibPath, const MoeShape &shape,
   options.floorBytes = ExpertStore::fixedBytes(blocks, shape) + arenaBytes(m, shape.experts);
   options.elasticChunkBytes = arenaBytes(m, slots / 8);
   ExpertStore store(backend, blocks, shape, options);
+  growToCap(store);
   std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
   for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
   // The down rows are the file's last: cut half of the last expert's.
@@ -797,7 +797,7 @@ int streamedReadFailures(const std::string &metallibPath, const MoeShape &shape,
   // The store refuses to shrink or grow while it holds a failure: it gives
   // no chunk back, though some lie above its floor, and would take none
   // back, though it gave some.
-  if (store.releaseAboveFloor() || store.growthBytes() || store.stats().chunks != stats.chunks ||
+  if (store.releaseAboveFloor() || store.stats().growUnitBytes || store.stats().chunks != stats.chunks ||
       stats.chunks <= 1) {
     printf("  streamed read failures: the store gave a chunk back or would take one after a failed load FAIL\n");
     ++failures;
@@ -840,6 +840,7 @@ int streamedRefusal(MetalBackend &backend, const MoeShape &shape, const std::fil
   }
   ++options.memoryBytes;
   ExpertStore store(backend, file.blocks, shape, options);
+  growToCap(store);
   if (refusal.find("holds fewer slots") == std::string::npos || store.stats().slots != shape.experts) {
     printf("streamed experts: memory a byte short of a block's slots was not refused (%s), or exactly enough holds "
            "%llu slots FAIL\n",
@@ -860,8 +861,8 @@ int streamedRefusal(MetalBackend &backend, const MoeShape &shape, const std::fil
 // prefill chunks on the staged and the register tile, the blocks taking turns
 // so that their slots recycle across the chunks, give the resident experts'
 // bits, their slots holding their planes (gate and up in Q5_K, whose second
-// plane every chunk holds a region of), before and after a release and a
-// restore, the blocks' experts sitting in more than one chunk.
+// plane every chunk holds a region of), before and after a release, a restore
+// and regrows, the blocks' experts sitting in more than one chunk.
 int streamedChunks(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
   using splash::ops::MoeGgufTile;
   const Model m = makeModel(backend, shape, Q5K, true, MoeGgufTile::Register);
@@ -870,6 +871,7 @@ int streamedChunks(MetalBackend &backend, const MoeShape &shape, const std::file
   ExpertStoreOptions options = storeOptions(arena + kSpareBytes, file.blocks, shape);
   options.elasticChunkBytes = arenaBytes(m, slots / 14);
   ExpertStore store(backend, file.blocks, shape, options);
+  growToCap(store);
   std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
   for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
   const splash::ops::ExpertChunks &chunks = streamed[0].chunks;
@@ -904,8 +906,11 @@ int streamedChunks(MetalBackend &backend, const MoeShape &shape, const std::file
   Buffers b;
   for (const bool restored : {false, true}) {
     if (restored) {
+      // The restore takes the floor chunk back; regrows take the rest.
       store.release();
-      require(store.restore(splash::test::admitAll, splash::test::admitAll), "the chunked store did not restore");
+      require(store.restore(splash::test::admitAll), "the chunked store did not restore");
+      while (store.stats().growUnitBytes)
+        require(static_cast<bool>(store.growTowardCap(splash::test::admitAll)), "a regrow after a restore was refused");
     }
     for (const MoePlan &plan : plans)
       for (uint32_t block = 0; block < 2; ++block) {
@@ -953,11 +958,11 @@ int streamedChunks(MetalBackend &backend, const MoeShape &shape, const std::file
 // next block, a decode step's of the experts its prediction names), and the
 // next block's load takes over what it read where the compaction left its
 // slots. At the floor nothing more goes. An idle release after the shrinks
-// releases the live chunks and counts none live, and a restore takes every
-// chunk back; a refused regrow leaves its chunk released, granted ones add free
-// slots up to the cap and read nothing; a restore whose optional admission
-// refuses past an elastic chunk keeps the chunks before it, which regrows
-// complete; and a release to the floor gives every chunk above it back at once.
+// releases the live chunks and counts none live, and a restore takes back the
+// floor chunk and the staging alone, in one admission, leaving the next chunk
+// to grow, which regrows take a chunk each; a refused regrow leaves its chunk
+// released, granted ones add free slots up to the cap and read nothing; and a
+// release to the floor gives every chunk above it back at once.
 int streamedElastic(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
   const Model m = makeModel(backend, shape, Q5K, true);
   ExpertFile file(m, directory / "experts.bin");
@@ -966,6 +971,7 @@ int streamedElastic(MetalBackend &backend, const MoeShape &shape, const std::fil
   options.floorBytes = fixed + arenaBytes(m, shape.experts);
   options.elasticChunkBytes = arenaBytes(m, slots / 8);
   ExpertStore store(backend, file.blocks, shape, options);
+  growToCap(store);
   std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
   for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
   const splash::ops::ExpertChunks &chunks = streamed[0].chunks;
@@ -1094,22 +1100,39 @@ int streamedElastic(MetalBackend &backend, const MoeShape &shape, const std::fil
     stats = store.stats();
   }
   if (live != 1 || stats.slots != floorSlots || stats.arenaBytes + fixed != stats.floorBytes ||
-      store.releaseAboveFloor() || store.growthBytes() != arenaBytes(m, slotsOf(2) - floorSlots))
+      store.releaseAboveFloor() || store.stats().growUnitBytes != arenaBytes(m, slotsOf(2) - floorSlots))
     fail("at the floor: " + std::to_string(live) + " chunks of " + std::to_string(stats.slots) +
          " slots, or it gives more back or would take another chunk than the next");
   // An idle release after the shrinks, which counts nothing live, and a
-  // restore at the cap.
+  // restore of the floor and the staging alone, under one admission, whatever
+  // it would admit; regrows take the elastic chunks back, a chunk each.
   store.release();
   stats = store.stats();
   if (!store.released() || stats.chunks || stats.arenaBytes || stats.slots || stats.resident)
     fail("after a release: " + std::to_string(stats.chunks) + " chunks of " + std::to_string(stats.slots) +
          " slots counted live");
-  require(store.restore(splash::test::admitAll, splash::test::admitAll), "the shrunk store did not restore");
+  uint32_t admissions = 0;
+  const auto counted = [&](uint64_t, const std::function<void()> &allocate) -> AllocationResult {
+    ++admissions;
+    allocate();
+    return {};
+  };
+  require(store.restore(counted), "the shrunk store did not restore");
   stats = store.stats();
-  if (stats.chunks != capChunks || stats.slots != slots || stats.arenaBytes + fixed != stats.capBytes)
+  if (admissions != 1 || stats.chunks != 1 || stats.slots != floorSlots || stats.liveBytes != stats.floorBytes ||
+      store.stats().growUnitBytes != arenaBytes(m, slotsOf(2) - floorSlots))
     fail("after a restore: " + std::to_string(stats.chunks) + " chunks of " + std::to_string(stats.slots) +
-         " slots, not the cap's");
-  requireLists(capChunks, "after a restore");
+         " slots, " + std::to_string(stats.liveBytes) + " bytes live after " + std::to_string(admissions) +
+         " admissions, not the floor and the staging alone after one, the next chunk to grow");
+  requireLists(1, "after a restore");
+  for (live = 1; live < capChunks && store.stats().growUnitBytes; ++live)
+    if (!store.growTowardCap(splash::test::admitAll) || store.stats().chunks != live + 1)
+      fail("a regrow after a restore did not take the next chunk");
+  stats = store.stats();
+  if (live != capChunks || stats.slots != slots || stats.arenaBytes + fixed != stats.capBytes)
+    fail("regrows after a restore took " + std::to_string(stats.chunks) + " chunks of " +
+         std::to_string(stats.slots) + " slots, not the cap's");
+  requireLists(capChunks, "after regrows from a restore");
   // Block 1 holds no expert after the restore, so block 0's decode step
   // reads ahead the experts its prediction names; then, the store full, a
   // long chunk's.
@@ -1129,7 +1152,7 @@ int streamedElastic(MetalBackend &backend, const MoeShape &shape, const std::fil
     fail("a refused regrow did not report its refusal, or took its chunk");
   requireLists(live, "after a refused regrow");
   run("after a refused regrow");
-  for (uint64_t bytes; live < capChunks && (bytes = store.growthBytes()) != 0;) {
+  for (uint64_t bytes; live < capChunks && (bytes = store.stats().growUnitBytes) != 0;) {
     const ExpertStoreStats before = store.stats();
     const std::string when = "after a regrow to " + std::to_string(++live);
     if (!store.growTowardCap(splash::test::admitAll)) fail(when + ": refused under an admission of all");
@@ -1143,32 +1166,9 @@ int streamedElastic(MetalBackend &backend, const MoeShape &shape, const std::fil
     run(when);
   }
   stats = store.stats();
-  if (live != capChunks || store.growthBytes() || !store.growTowardCap(splash::test::admitAll) ||
+  if (live != capChunks || store.stats().growUnitBytes || !store.growTowardCap(splash::test::admitAll) ||
       store.stats().regrows != stats.regrows)
     fail("at the cap: " + std::to_string(live) + " chunks, or a regrow took one more");
-  // A restore whose optional admission refuses the second elastic chunk
-  // keeps the floor and the first, and regrows take the rest.
-  store.release();
-  uint32_t admissions = 0;
-  const auto firstElastic = [&](uint64_t, const std::function<void()> &allocate) -> AllocationResult {
-    if (admissions++ >= 1) return AllocationFailure::HostPressure;
-    allocate();
-    return {};
-  };
-  require(store.restore(splash::test::admitAll, firstElastic), "a restore refused past an elastic chunk did not end");
-  stats = store.stats();
-  if (admissions != 2 || stats.chunks != 2 || stats.slots != slotsOf(2))
-    fail("after a restore refused past an elastic chunk: " + std::to_string(stats.chunks) + " chunks after " +
-         std::to_string(admissions) + " optional admissions, not the floor and one elastic chunk after two");
-  requireLists(2, "after a restore refused past an elastic chunk");
-  run("after a restore refused past an elastic chunk");
-  for (live = 2; live < capChunks && store.growthBytes(); ++live)
-    if (!store.growTowardCap(splash::test::admitAll)) fail("a regrow after a partial restore was refused");
-  if (live != capChunks || store.growthBytes() || store.stats().chunks != capChunks)
-    fail("regrows after a partial restore took " + std::to_string(live) + " chunks, not " +
-         std::to_string(capChunks));
-  requireLists(capChunks, "after regrows from a partial restore");
-  run("after regrows from a partial restore");
   // Critical pressure gives every chunk above the floor back at once.
   stats = store.stats();
   const uint64_t toFloor = store.releaseToFloor();
@@ -1183,9 +1183,87 @@ int streamedElastic(MetalBackend &backend, const MoeShape &shape, const std::fil
   requireLists(1, "after a release to the floor");
   run("after a release to the floor");
   printf("streamed experts in %u chunks, a floor of %llu slots and %llu-slot elastic chunks: given back down to "
-         "the floor and taken back, through a release, a restore and refused regrows and restores, bitwise the "
+         "the floor and taken back, through a release, a restore of the floor and refused regrows, bitwise the "
          "resident experts' %s\n",
          capChunks, (unsigned long long)floorSlots, (unsigned long long)chunkSlots, failures ? "FAIL" : "ok");
+  return failures;
+}
+
+// The store as an elastic pool (model::ExpertStorePool). The pool's state
+// is the store's statistics: its live bytes, its floor and cap, the next
+// chunk a shrink gives back and a regrow takes; release(1) gives the chunk
+// releaseAboveFloor() would, as the store logs it, and everything above the
+// floor goes in one compaction per size as releaseToFloor() would; a
+// refused grow changes nothing and a granted one takes the chunk it named.
+int streamedPool(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
+  const Model m = makeModel(backend, shape, Q5K, true);
+  ExpertFile file(m, directory / "experts.bin");
+  const uint64_t slots = 2 * shape.experts - shape.experts / 8, fixed = ExpertStore::fixedBytes(file.blocks, shape);
+  ExpertStoreOptions options = storeOptions(arenaBytes(m, slots) + kSpareBytes, file.blocks, shape);
+  options.floorBytes = fixed + arenaBytes(m, shape.experts);
+  options.elasticChunkBytes = arenaBytes(m, slots / 8);
+  ExpertStore store(backend, file.blocks, shape, options);
+  growToCap(store);
+  std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
+  for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
+  splash::model::ExpertStorePool pool(store);
+  int failures = 0;
+  const auto fail = [&](const std::string &what) {
+    printf("  expert pool %s FAIL\n", what.c_str());
+    ++failures;
+  };
+  // The state is the store's.
+  const auto requireState = [&](const std::string &when) {
+    const ExpertStoreStats stats = store.stats();
+    const splash::model::PoolState state = pool.state();
+    if (state.name != "experts" || state.currentBytes != stats.liveBytes || state.capBytes != stats.capBytes ||
+        state.floorBytes != (stats.liveBytes ? stats.floorBytes : 0))
+      fail(when + ": its state is not the store's");
+    return state;
+  };
+  Buffers b;
+  const auto load = [&](const MoePlan &plan, uint32_t block) {
+    freshRows(backend, b, shape);
+    static_cast<void>(runWeights(backend, streamed[block], b, plan));
+  };
+  // A long chunk of block 0 leaves its routed experts resident, which the
+  // shrinks below compact.
+  load(prefillPlan(shape, kMaximumRows), 0);
+  // Shrinks: one unit, then everything above the floor at once.
+  splash::model::PoolState state = requireState("at the cap");
+  if (state.growUnitBytes || !state.releaseUnitBytes) fail("at the cap grows or has no unit to give back");
+  ExpertStoreStats before = store.stats();
+  uint64_t given = 0;
+  const std::string logged = splash::test::capturedStderr([&] { given = pool.release(1); });
+  ExpertStoreStats after = store.stats();
+  const size_t in = logged.find(" in "), ms = logged.find(" ms:");
+  const double took = in != std::string::npos && ms != std::string::npos ? std::stod(logged.substr(in + 4)) : -1;
+  if (given != state.releaseUnitBytes || after.shrinks != before.shrinks + 1 || took < 0)
+    fail("release(1) gave back " + std::to_string(given) + " bytes, not the chunk it named, or logged no time");
+  state = requireState("after a release of one unit");
+  before = after;
+  const uint64_t aboveFloor = state.currentBytes - state.floorBytes;
+  given = pool.release(UINT64_MAX);
+  after = store.stats();
+  if (given != aboveFloor || after.liveBytes != after.floorBytes || pool.state().releaseUnitBytes ||
+      after.shrinks <= before.shrinks || pool.release(1))
+    fail("release(UINT64_MAX) gave back " + std::to_string(given) + " bytes, not the " + std::to_string(aboveFloor) +
+         " above the floor at once");
+  // A refused grow changes nothing; a granted one takes the unit it named.
+  state = requireState("at the floor");
+  const auto refuse = [](uint64_t, const std::function<void()> &) -> AllocationResult {
+    return AllocationFailure::EngineBudget;
+  };
+  if (pool.grow(refuse).failure != AllocationFailure::EngineBudget || pool.state().currentBytes != state.currentBytes)
+    fail("a refused grow changed the store");
+  if (!pool.grow(splash::test::admitAll) || pool.state().currentBytes != state.currentBytes + state.growUnitBytes)
+    fail("a granted grow did not take the unit it named");
+  // Released, it holds nothing.
+  store.release();
+  if (pool.state().currentBytes || pool.state().floorBytes || pool.state().releaseUnitBytes ||
+      pool.state().growUnitBytes || pool.release(UINT64_MAX))
+    fail("released, it holds or gives something");
+  printf("streamed experts as a pool: state, release by unit and to the floor and grow %s\n", failures ? "FAIL" : "ok");
   return failures;
 }
 
@@ -1199,6 +1277,96 @@ splash::model::ExpertSlotPlanes slotPlanes(const Model &m) {
     planes[p] = {bytes.plane0, bytes.plane1, bytes.meta};
   }
   return planes;
+}
+
+// A store starts at its floor whatever its cap: its floor chunks live, its
+// elastic chunks reserved without memory, so the Metal memory it allocates
+// holds none of them; regrows take them back with their slots free, up to
+// the cap, and decode steps and prefill chunks give the resident experts'
+// bits throughout. The floor is the share of its slots the model's plan
+// sets (ExpertStoreOptions::floorShare): at 1.0 every chunk, so the store
+// never gives one back; at the default 0.85 it gives chunks back down to it;
+// and a floor given in bytes holds whatever the share. At 16 experts the
+// elastic chunks fill fewer regions than the floor's.
+int streamedStartsAtItsFloor(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
+  if (shape.experts < 256) return 0;
+  const Model m = makeModel(backend, shape, Q5K, true);
+  ExpertFile file(m, directory / "start.bin");
+  const uint64_t cap = 2 * shape.experts - shape.experts / 8, fixed = ExpertStore::fixedBytes(file.blocks, shape);
+  ExpertStoreOptions options = storeOptions(arenaBytes(m, cap) + kSpareBytes, file.blocks, shape);
+  options.elasticChunkBytes = arenaBytes(m, shape.experts / 8);
+  const splash::model::ExpertChunkLayout layout = splash::model::streamedExpertChunkLayout(
+      slotPlanes(m), static_cast<uint32_t>(cap), 0, shape.experts, backend.capabilities().maxBufferLengthBytes,
+      options.elasticChunkBytes, splash::model::kExpertFloorShare);
+  const uint64_t floorSlots = layout.first(layout.floorChunks);
+  int failures = 0;
+  const auto fail = [&](const std::string &what) {
+    printf("  a store's start %s FAIL\n", what.c_str());
+    ++failures;
+  };
+  if (layout.chunks < layout.floorChunks + 2) fail("fixture: fewer than two elastic chunks above the floor");
+  const uint64_t allocated = backend.memoryStats().allocatedBytes;
+  ExpertStore store(backend, file.blocks, shape, options);
+  const uint64_t held = backend.memoryStats().allocatedBytes - allocated;
+  std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
+  for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
+  ExpertStoreStats stats = store.stats();
+  if (stats.capChunks != layout.chunks || stats.chunks != layout.floorChunks || stats.slots != floorSlots ||
+      stats.capBytes != fixed + arenaBytes(m, cap) || stats.floorBytes != stats.liveBytes ||
+      stats.liveBytes != fixed + arenaBytes(m, floorSlots) || held < stats.liveBytes ||
+      held - stats.liveBytes >= stats.capBytes - stats.liveBytes)
+    fail("as it starts: " + std::to_string(stats.chunks) + " of " + std::to_string(stats.capChunks) +
+         " chunks of " + std::to_string(stats.slots) + " slots, " + std::to_string(stats.liveBytes) +
+         " bytes live of " + std::to_string(held) + " allocated, not its floor's " +
+         std::to_string(layout.floorChunks) + " chunks of " + std::to_string(floorSlots) + " slots");
+  std::vector<MoePlan> plans{MoE::decodePlan(shape, 2, MoeConfig{}), prefillPlan(shape, 64),
+                             prefillPlan(shape, kMaximumRows)};
+  Buffers b;
+  const auto run = [&](const std::string &when) {
+    for (const MoePlan &plan : plans)
+      for (uint32_t block = 0; block < 2; ++block) {
+        freshRows(backend, b, shape);
+        const std::vector<uint16_t> want = runWeights(backend, m.weights, b, plan);
+        if (runWeights(backend, streamed[block], b, plan) != want ||
+            !slotsHoldTheirExperts(m, streamed[block], b, plan))
+          fail(when + ", block " + std::to_string(block) + ", " + std::to_string(plan.rows()) +
+               " rows: output or slots differ from the resident experts'");
+      }
+  };
+  run("as it starts");
+  while (store.stats().growUnitBytes)
+    if (!store.growTowardCap(splash::test::admitAll)) fail("a regrow from the floor was refused");
+  stats = store.stats();
+  if (stats.chunks != layout.chunks || stats.slots != cap || stats.liveBytes != stats.capBytes ||
+      stats.regrows != layout.chunks - layout.floorChunks)
+    fail("after regrows: " + std::to_string(stats.chunks) + " chunks of " + std::to_string(stats.slots) +
+         " slots after " + std::to_string(stats.regrows) + " regrows, not the cap");
+  run("after regrows to the cap");
+  if (!store.releaseToFloor() || store.stats().liveBytes != stats.floorBytes)
+    fail("the default floor share's store did not give its chunks back down to its floor");
+  ExpertStoreOptions whole = options;
+  whole.floorShare = 1.0;
+  const ExpertStore pinned(backend, file.blocks, shape, whole);
+  const ExpertStoreStats atCap = pinned.stats();
+  if (atCap.chunks != atCap.capChunks || atCap.floorBytes != atCap.capBytes || atCap.liveBytes != atCap.capBytes ||
+      atCap.releaseUnitBytes)
+    fail("a floor share of 1.0 left a chunk to give back: " + std::to_string(atCap.chunks) + " of " +
+         std::to_string(atCap.capChunks) + " chunks live, a floor of " + std::to_string(atCap.floorBytes) + " bytes");
+  std::array<uint64_t, 2> givenFloors{};
+  for (size_t index = 0; index < givenFloors.size(); ++index) {
+    ExpertStoreOptions given = options;
+    given.floorBytes = fixed + arenaBytes(m, shape.experts + shape.experts / 4) + kSpareBytes;
+    given.floorShare = index ? 1.0 : 0.5;
+    givenFloors[index] = ExpertStore(backend, file.blocks, shape, given).stats().floorBytes;
+  }
+  if (givenFloors[0] != givenFloors[1] || givenFloors[0] >= atCap.capBytes)
+    fail("a floor given moved with the floor share: " + std::to_string(givenFloors[0]) + " and " +
+         std::to_string(givenFloors[1]) + " bytes");
+  printf("a store starting at its floor of %llu of %llu slots in %u of %u chunks, taken back to its cap, a floor "
+         "share of 1.0 at its cap, a floor given kept: %s\n",
+         (unsigned long long)floorSlots, (unsigned long long)cap, layout.floorChunks, layout.chunks,
+         failures ? "FAIL" : "ok");
+  return failures;
 }
 
 // Two streamed sizes beside a size of one block give their chunks back and
@@ -1215,9 +1383,8 @@ splash::model::ExpertSlotPlanes slotPlanes(const Model &m) {
 // past which no slot table names a slot, the floor's bytes those chunks',
 // and the next chunk the size with the smaller share takes back. Each regrow
 // takes back the next chunk of that size, and none of the size of one
-// block's. After a release, a restore whose optional admission refuses the
-// first elastic chunk brings every size back at its floor in one admission,
-// and regrows bring them back to their caps. Every block's decode steps and
+// block's. After a release, a restore brings every size back at its floor in
+// one admission, and regrows bring them back to their caps. Every block's decode steps and
 // prefill chunks give the resident experts' bits at every step, their slots
 // holding their planes, the size of one block reading nothing.
 int streamedElasticSizes(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
@@ -1247,6 +1414,7 @@ int streamedElasticSizes(MetalBackend &backend, const MoeShape &shape, const std
   options.bufferBytes = arenaBytes(lone, shape.experts);
   options.elasticChunkBytes = options.bufferBytes / 2;
   ExpertStore store(backend, blocks, shape, options);
+  growToCap(store);
   std::array<BlockMoeWeights, 5> streamed{big.weights, big.weights, small.weights, small.weights, lone.weights};
   for (uint32_t block = 0; block < 5; ++block) store.bind(block, streamed[block]);
   int failures = 0;
@@ -1259,7 +1427,8 @@ int streamedElasticSizes(MetalBackend &backend, const MoeShape &shape, const std
   for (size_t size = 0; size < 2; ++size) {
     layouts[size] = splash::model::streamedExpertChunkLayout(slotPlanes(*sizes[size]), static_cast<uint32_t>(cap),
                                                              static_cast<uint32_t>(floor), shape.experts,
-                                                             options.bufferBytes, options.elasticChunkBytes);
+                                                             options.bufferBytes, options.elasticChunkBytes,
+                                                             splash::model::kExpertFloorShare);
     const splash::ops::ExpertChunks &chunks = streamed[firstBlock[size]].chunks;
     const ExpertChunkLayout &layout = layouts[size];
     if (streamed[firstBlock[size]].slots != cap || chunks.chunks() != layout.chunks ||
@@ -1359,7 +1528,7 @@ int streamedElasticSizes(MetalBackend &backend, const MoeShape &shape, const std
   }
   const int grows = next(false);
   if (stats.floorBytes != floorBytes || store.releaseAboveFloor() || grows < 0 ||
-      store.growthBytes() != chunkBytes(grows, liveOf(grows)))
+      store.stats().growUnitBytes != chunkBytes(grows, liveOf(grows)))
     fail("at the floor: " + std::to_string(stats.floorBytes) + " bytes, not the floor chunks' " +
          std::to_string(floorBytes) + ", or it gives more back or would take another chunk than the next");
   // Back to the caps, a chunk at a time, by the shares above the floors.
@@ -1374,27 +1543,22 @@ int streamedElasticSizes(MetalBackend &backend, const MoeShape &shape, const std
     }
   }
   run("after the regrows");
-  if (store.growthBytes() || liveOf(0) != layouts[0].chunks || liveOf(1) != layouts[1].chunks)
+  if (store.stats().growUnitBytes || liveOf(0) != layouts[0].chunks || liveOf(1) != layouts[1].chunks)
     fail("after the regrows: the sizes are not at their caps");
-  // A restore whose optional admission refuses the first elastic chunk.
+  // A restore takes back the floors alone, in one admission.
   store.release();
-  uint32_t needed = 0, optional = 0;
+  uint32_t needed = 0;
   const auto admit = [&](uint64_t, const std::function<void()> &allocate) -> AllocationResult {
     ++needed;
     allocate();
     return {};
   };
-  const auto refuse = [&](uint64_t, const std::function<void()> &) -> AllocationResult {
-    ++optional;
-    return AllocationFailure::HostPressure;
-  };
-  require(store.restore(admit, refuse), "a restore refused at its first elastic chunk did not end");
-  if (needed != 1 || optional != 1 || liveOf(0) != layouts[0].floorChunks || liveOf(1) != layouts[1].floorChunks ||
+  require(store.restore(admit), "a restore at the floors did not end");
+  if (needed != 1 || liveOf(0) != layouts[0].floorChunks || liveOf(1) != layouts[1].floorChunks ||
       loneChunks.liveChunks() != 1 || store.stats().resident < shape.experts)
-    fail("a restore refused at its first elastic chunk took " + std::to_string(needed) + " and " +
-         std::to_string(optional) + " admissions, not one for the floors and one refused");
+    fail("a restore took " + std::to_string(needed) + " admissions, not one for the floors alone");
   run("after a restore at the floors");
-  while (store.growthBytes())
+  while (store.stats().growUnitBytes)
     if (!store.growTowardCap(splash::test::admitAll)) {
       fail("a regrow after a restore at the floors was refused");
       break;
@@ -1432,6 +1596,7 @@ int streamedSkippedLoadAfterShrink(const std::string &metallibPath, const MoeSha
   options.floorBytes = ExpertStore::fixedBytes(file.blocks, shape) + arenaBytes(m, shape.experts);
   options.elasticChunkBytes = arenaBytes(m, slots / 8);
   ExpertStore store(backend, file.blocks, shape, options);
+  growToCap(store);
   std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
   for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
   Buffers b;
@@ -1510,6 +1675,7 @@ int streamedSourceChanges(const std::string &metallibPath, const MoeShape &shape
   ExpertFile file(m, directory / "experts.bin");
   const uint64_t slots = shape.experts;
   ExpertStore store(backend, file.blocks, shape, storeOptions(arenaBytes(m, slots), file.blocks, shape));
+  growToCap(store);
   std::array<BlockMoeWeights, 2> blocks{m.weights, m.weights};
   for (uint32_t block = 0; block < 2; ++block) store.bind(block, blocks[block]);
   const BlockMoeWeights &streamed = blocks[0];
@@ -1567,7 +1733,9 @@ int main(int argc, const char *argv[]) {
                     streamedRefusal(backend, shape, directory.path()) +
                     streamedChunks(backend, shape, directory.path()) +
                     streamedElastic(backend, shape, directory.path()) +
+                    streamedPool(backend, shape, directory.path()) +
                     streamedElasticSizes(backend, shape, directory.path()) +
+                    streamedStartsAtItsFloor(backend, shape, directory.path()) +
                     streamedSkippedLoadAfterShrink(argv[1], shape, directory.path()) +
                     streamedChunkLimit(backend, shape, directory.path()) +
                     streamedSourceChanges(argv[1], shape, directory.path());

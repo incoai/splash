@@ -83,7 +83,7 @@ def parse_args(argv=None):
         "--notes",
         required=True,
         type=Path,
-        help="the release notes, in Markdown, outside the checkout (RELEASE_NOTES)",
+        help="the release notes, in Markdown (RELEASE_NOTES)",
     )
     parser.add_argument(
         "--sign",
@@ -239,13 +239,13 @@ def signer(identity):
     )
 
 
-def command_line(version):
+def command_line(version, macos_min):
     """The command line's files of release version, as make package and make
     package-bottle leave them in dist/: the runtime archive, its checksum file
     and the bottles, which the release carries, and the formula, which goes to
     the tap; and why they are not ready, or None."""
     dist = ROOT / "dist"
-    archive = dist / f"splash-{version}-arm64-macos26.tar.gz"
+    archive = dist / f"{package.archive_name(version, macos_min)}.tar.gz"
     bottles = sorted(dist.glob(f"splash-{version}.*.bottle.tar.gz"))
     files = [archive, archive.with_name(f"{archive.name}.sha256"), *bottles]
     formula = dist / "splash.rb"
@@ -596,7 +596,7 @@ def main(argv=None):
         problems.append(f"{release} exists")
     carried = None
     if "-rc." not in args.version:
-        files, formula, problem = command_line(args.version)
+        files, formula, problem = command_line(args.version, args.macos_min)
         problems += [problem] if problem else []
         carried = None if problem else (files, formula)
     if args.dry_run:

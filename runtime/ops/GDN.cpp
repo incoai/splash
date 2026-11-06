@@ -27,7 +27,10 @@ static_assert(offsetof(GDNDecodeBatchParams, conv_layer_bytes) == 8);
 
 // The compiled GDN shapes (kernels/prefill/gdn.metal, kernels/decode/gdn.metal),
 // of either gate, and their kernels' name suffix. The scan reads no packed
-// rows, so shapes of one head layout share its kernel (scanSuffix).
+// rows, so shapes of one head layout share its kernel (scanSuffix). The
+// kernels that read the norm take the norm types the shape's families store
+// (normKernel): F32 and bf16, or F32 alone for Qwen3.8-Flash-Next's, which
+// loads from GGUFs only.
 struct CompiledGdn final {
   GdnShape shape;
   std::string_view suffix;

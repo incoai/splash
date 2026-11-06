@@ -128,6 +128,7 @@
   #attach[hidden] { display: none }
   #attach { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 50%; color: var(--muted) }
   #attach:hover { color: var(--text); background: var(--hover) }
+  #thinking[hidden] { display: none }
   .effort { position: relative; display: flex; align-items: center; gap: 5px; padding: 5px 8px; border-radius: 10px; color: var(--muted); font-size: 13px; line-height: 24px }
   .effort:hover, .effort:focus-within { color: var(--text); background: var(--hover) }
   .effort-chevron { position: absolute; right: 10px; top: 50%; width: 12px; height: 12px; transform: translateY(-50%); pointer-events: none }
@@ -207,12 +208,9 @@
     <textarea id="input" rows="1" placeholder="Message Splash" autofocus></textarea>
   </div>
   <div class="toolbar">
-    <label class="effort"><span>Thinking</span>
+    <label class="effort" id="thinking"><span>Thinking</span>
       <select id="effort" aria-label="Thinking effort">
         <option value="">Auto</option>
-        <option value="xhigh">Extra High</option>
-        <option value="medium">Medium</option>
-        <option value="low">Low</option>
         <option value="none">Off</option>
       </select>
       <svg class="effort-chevron" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 4.5 3 3 3-3"/></svg>
@@ -223,6 +221,7 @@
 
 <script src="/chat-assets/markdown-it-15.0.2.min.js"></script>
 <script src="/chat-assets/highlight-11.12.0.min.js"></script>
+<script src="/chat-assets/markdown-links.js"></script>
 <script>
   const $ = selector => document.querySelector(selector);
   const chat = $('#chat');
@@ -231,6 +230,7 @@
   const attachmentsBox = $('#attachments');
   const imageInput = $('#image-input');
   const attach = $('#attach');
+  const thinking = $('#thinking');
   const effort = $('#effort');
   const apiKey = $('#api-key');
   const credentials = $('#credentials');
@@ -252,7 +252,7 @@
       }
       return ''; // Markdown escapes code for unknown or omitted languages.
     }
-  }).disable('image'); // A reply's image would load its URL without a click.
+  }).use(markdownLinks);
   for (const rule of ['fence', 'code_block']) {
     const renderCode = markdown.renderer.rules[rule];
     markdown.renderer.rules[rule] = (tokens, index, ...args) => {
@@ -278,7 +278,8 @@
   };
   const storeKey = 'splash-chats';
   const effortKey = 'splash-thinking-effort';
-  const allowedEfforts = new Set([...effort.options].map(option => option.value));
+  // The effort picked last, which the menu shows wherever it offers it.
+  let chosenEffort = storageGet(effortKey) || '';
   let conversations = load();
   let activeId = null;
   let messages = [];
@@ -288,8 +289,7 @@
   // Until /v1/models says otherwise; a text-only model takes no images.
   let imagesAccepted = true;
 
-  const savedEffort = storageGet(effortKey);
-  effort.value = allowedEfforts.has(savedEffort) ? savedEffort : '';
+  selectEffort();
 
   function authorization() {
     return apiKey.value ? {Authorization: `Bearer ${apiKey.value}`} : {};
@@ -300,17 +300,52 @@
     if (response.status === 401) credentials.hidden = false;
   }
 
-  async function loadModalities() {
+  // What the served model takes, as /v1/models reports it: images or text
+  // alone, and the efforts it tells apart.
+  async function loadModel() {
     try {
       const response = await fetch('/v1/models', {headers: authorization()});
       askForKeyIfUnauthorized(response);
       if (!response.ok) return;
-      const modalities = (await response.json()).data?.[0]?.input_modalities;
+      const model = (await response.json()).data?.[0];
+      const modalities = model?.input_modalities;
       if (!Array.isArray(modalities)) return;
       imagesAccepted = modalities.includes('image');
       attach.hidden = !imagesAccepted;
       if (!imagesAccepted) clearAttachments();
+      showEfforts(model.reasoning);
     } catch { /* The server still rejects input the model cannot take. */ }
+  }
+
+  function effortTitle(value) {
+    return value === 'xhigh' ? 'Extra High' : value[0].toUpperCase() + value.slice(1);
+  }
+
+  // The menu of the model's efforts, from its reasoning in /v1/models: Auto,
+  // which sends none and names what the model then does, its levels from
+  // most to least, and Off. A model that decides itself whether to think
+  // takes no effort, and the menu hides. Until the server answers, the
+  // markup's Auto and Off.
+  function showEfforts(reasoning) {
+    thinking.hidden = reasoning.thinks === null;
+    const auto = reasoning.thinks === false ? 'Off' : reasoning.default && effortTitle(reasoning.default);
+    const choices = thinking.hidden ? [] : [
+      ['', auto ? `Auto (${auto})` : 'Auto'],
+      ...[...reasoning.efforts].reverse().map(value => [value, effortTitle(value)]),
+      ['none', 'Off'],
+    ];
+    effort.replaceChildren(...choices.map(([value, title]) => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = title;
+      return option;
+    }));
+    selectEffort();
+  }
+
+  // The effort picked last where the menu offers it, else Auto.
+  function selectEffort() {
+    effort.value = [...effort.options].some(option => option.value === chosenEffort) ? chosenEffort : '';
   }
 
   function storageGet(key) {
@@ -862,6 +897,7 @@
 
   form.addEventListener('submit', event => { event.preventDefault(); controller ? controller.abort() : complete(); });
   effort.addEventListener('change', () => {
+    chosenEffort = effort.value;
     storageSet(effortKey, effort.value);
   });
   attach.addEventListener('click', () => imageInput.click());
@@ -886,7 +922,7 @@
     if (event.isComposing || event.keyCode === 229) return;
     if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); complete(); }
   });
-  apiKey.addEventListener('change', loadModalities);
+  apiKey.addEventListener('change', loadModel);
   $('#new-chat').addEventListener('click', newChat);
   $('#mobile-new').addEventListener('click', newChat);
   $('#sidebar-close').addEventListener('click', () => setSidebarOpen(false));
@@ -910,6 +946,6 @@
   renderChat();
   renderRecents();
   updateComposer();
-  loadModalities();
+  loadModel();
 </script>
 </html>
