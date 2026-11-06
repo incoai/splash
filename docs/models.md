@@ -369,8 +369,10 @@ fallen. The log notes, at most once a minute, the cycles counted at under half
 their time (`Verify budget: a cycle of`). A fixed shorter block would do worse:
 in agentic use about one cycle in six accepts all seven proposals and one in
 five accepts none. Rows past a lane's verify rows still run the target's
-layers, whose kernels take eight rows a lane, but their MoE steps route no expert (`moe_group_routes_verified`) and acceptance
-retains none of them. The budget's costs follow wall time and its acceptance
+layers, whose kernels take eight rows a lane, but their MoE steps route no
+expert (`moe_group_routes_verified`), their GDN recurrence is skipped and its
+output left zero (`verify_gdn_fused`), and acceptance retains none of them.
+The budget's costs follow wall time and its acceptance
 model every request's labels, so the rows a cycle verifies depend on the
 machine's timing and on what the server served before, and a MoE row's result
 depends on which rows share its expert tiles ([Kernels](internals.md#kernels)): under the

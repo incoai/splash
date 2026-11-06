@@ -319,7 +319,7 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, o
       step.graph,
       {b.gdnPacked, mixer.convolutionWeights, b.currentGdnStates, b.nextGdnStates, b.gdnTape,
        std::span(b.gdnTapeLanes).first(step.lanes), mixer.decay, mixer.timeBias, mixer.mixerNorm, b.gdnHidden,
-       b.linearScratch},
+       b.verifyRows, b.linearScratch},
       geometry_.gdnShape(), step.lanes, layer, geometry_.stateLayout.strides(),
       mixer.outputHeadOrder, outputPlan.input());
   linear.add(step.graph,
