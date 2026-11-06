@@ -183,8 +183,8 @@ def select_gguf(files, variant):
     target whose name ends in -VARIANT. A repository of one root name and no
     folder names no variant apart from its model, so its one match needs no
     report. Without :VARIANT, the root targets' only name. A name selects
-    its target by named_target. Anything else is an error listing the root
-    targets."""
+    its target by named_target. Anything else is an error listing every
+    target :VARIANT can select, root targets then folders."""
     targets = root_targets(files)
     names = sorted({target.name for target in targets})
     if variant is None:
@@ -206,11 +206,11 @@ def select_gguf(files, variant):
         suffix = "-" + variant.lower()
         ending = [name for name in names if name.lower().endswith(suffix)]
         if target := named_target(targets, ending):
-            several = len(names) + len(folder_targets(files)) > 1
+            several = len(names) + len(selectable_folders(files)) > 1
             return target_files(target), several
         choice = "no single GGUF matches :" + variant
-    listed = ", ".join(map(str, targets)) or "none"
-    raise models.ModelError(f"{choice} (GGUF targets in the repository root: {listed})")
+    listed = ", ".join(map(str, targets + selectable_folders(files))) or "none"
+    raise models.ModelError(f"{choice} (GGUF targets: {listed})")
 
 
 def named_target(targets, names):
@@ -224,6 +224,20 @@ def named_target(targets, names):
         return None
     [name] = names
     return min((t for t in targets if t.name == name), key=lambda t: t.split)
+
+
+def selectable_folders(files):
+    """The folder targets (folder_targets) :VARIANT selects (split_gguf):
+    those whose files are one whole split GGUF, not an incomplete one, nor a
+    folder of other GGUF files such as an MTP head."""
+    selectable = []
+    for target in folder_targets(files):
+        try:
+            split_gguf(files, target.name)
+        except models.ModelError:
+            continue
+        selectable.append(target)
+    return selectable
 
 
 def split_gguf(files, variant):

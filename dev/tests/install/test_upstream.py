@@ -222,12 +222,34 @@ class UpstreamTest(unittest.TestCase):
             upstream.select_gguf(files, "Q4_K_M"),
             (["Qwen3.8-27B-UD-Q4_K_M.gguf"], True),
         )
+        # The one file ending so is the only target :VARIANT selects: an MTP
+        # head's folder is none.
+        self.assertEqual(
+            upstream.select_gguf(
+                {"Qwen3.8-27B-UD-Q4_K_M.gguf", "MTP/mtp-Qwen3.8-27B-Q4_0.gguf"},
+                "Q4_K_M",
+            ),
+            (["Qwen3.8-27B-UD-Q4_K_M.gguf"], False),
+        )
+        # A refusal lists the targets :VARIANT selects: a folder that holds a
+        # whole split GGUF, not an incomplete one, nor an MTP head's folder,
+        # which :MTP cannot select.
         with self.assertRaisesRegex(
             models.ModelError,
             "no single GGUF matches :Q4_K_M .*Qwen3.8-27B-UD-Q4_K_M, "
-            r"Qwen3.8-27B-XL-Q4_K_M\)",
+            r"Qwen3.8-27B-XL-Q4_K_M\)$",
         ):
             upstream.select_gguf(files | {"Qwen3.8-27B-XL-Q4_K_M.gguf"}, "Q4_K_M")
+        with self.assertRaisesRegex(
+            models.ModelError,
+            "^no single GGUF matches :IQ2_XXS .*Qwen3.8-27B-UD-Q4_K_M, "
+            r"BF16 \(split, 2 parts\)\)$",
+        ):
+            upstream.select_gguf(
+                files | {"BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf"}, "IQ2_XXS"
+            )
+        with self.assertRaisesRegex(models.ModelError, "is not one part of"):
+            upstream.select_gguf(files, "MTP")
         # A projector is never a target, however its publisher names it.
         self.assertEqual(
             upstream.select_gguf({"Model-PQ2_0.gguf", "Model-mmproj-BF16.gguf"}, None),
@@ -306,9 +328,27 @@ class UpstreamTest(unittest.TestCase):
         for variant in ("Q4_K_M", None):
             with (
                 self.subTest(variant=variant),
-                self.assertRaisesRegex(models.ModelError, "repository root: none"),
+                self.assertRaisesRegex(models.ModelError, r"\(GGUF targets: none\)$"),
             ):
                 upstream.select_gguf({"Qwen3.8-27B-Q4_K_M.GGUF"}, variant)
+        # A refusal lists the folder targets too, which are all of a
+        # repository that keeps every variant in a folder.
+        iq3 = [f"IQ3_S/Model-IQ3_S-0000{n}-of-00002.gguf" for n in (1, 2)]
+        folders = {*iq3, "IQ3_S/mmproj-F16.gguf", "mmproj-F16.gguf", "README.md"}
+        self.assertEqual(upstream.select_gguf(folders, "IQ3_S"), (iq3, False))
+        for variant, choice in (
+            ("Q2_0", "no single GGUF matches :Q2_0"),
+            (None, "select a GGUF with OWNER/REPO:VARIANT"),
+        ):
+            with (
+                self.subTest(variant=variant),
+                self.assertRaisesRegex(
+                    models.ModelError,
+                    f"^{re.escape(choice)} "
+                    r"\(GGUF targets: IQ3_S \(split, 2 parts\)\)$",
+                ),
+            ):
+                upstream.select_gguf(folders, variant)
 
     def test_a_root_split_gguf_is_one_target(self):
         parts = [f"Model-Q1_0-0000{n}-of-00003.gguf" for n in (1, 2, 3)]
@@ -329,7 +369,7 @@ class UpstreamTest(unittest.TestCase):
         with self.assertRaisesRegex(
             models.ModelError,
             "select a GGUF with OWNER/REPO:VARIANT "
-            r"\(GGUF targets in the repository root: Model-Q1_0 \(split, 3 parts\), "
+            r"\(GGUF targets: Model-Q1_0 \(split, 3 parts\), "
             r"Model-Q4_K_M\)",
         ):
             upstream.select_gguf(files | {whole}, None)
@@ -365,7 +405,7 @@ class UpstreamTest(unittest.TestCase):
                 )
         with self.assertRaisesRegex(
             models.ModelError,
-            r"\(GGUF targets in the repository root: Model-Q1_0, "
+            r"\(GGUF targets: Model-Q1_0, "
             r"Model-Q1_0 \(split, 3 parts\), Model-Q4_K_M\)",
         ):
             upstream.select_gguf(files | {merge, whole}, None)
