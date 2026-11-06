@@ -364,13 +364,16 @@ std::vector<std::byte> encodeRecord(uint64_t recordBytes, uint64_t payloadBytes,
                                     std::span<const std::byte> label) {
   std::vector<std::byte> record(recordBytes);
   const RecordHead head{kRecordMagic, checksums.front(), payloadBytes};
-  const auto rest = std::as_bytes(checksums.subspan(1));
-  std::memcpy(record.data(), &head, sizeof(head));
-  std::memcpy(record.data() + sizeof(head), rest.data(), rest.size());
-  std::memcpy(record.data() + sizeof(head) + rest.size(), label.data(), label.size());
-  const size_t covered = sizeof(head) + rest.size() + label.size();
-  const uint32_t checksum = crc32c(std::span(record).first(covered));
-  std::memcpy(record.data() + covered, &checksum, sizeof(checksum));
+  size_t written = 0;
+  const auto append = [&](std::span<const std::byte> bytes) {
+    std::ranges::copy(bytes, std::span(record).subspan(written).begin());
+    written += bytes.size();
+  };
+  append(std::as_bytes(std::span(&head, 1)));
+  append(std::as_bytes(checksums.subspan(1)));
+  append(label);
+  const uint32_t checksum = crc32c(std::span(record).first(written));
+  append(std::as_bytes(std::span(&checksum, 1)));
   return record;
 }
 
