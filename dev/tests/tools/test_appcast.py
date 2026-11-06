@@ -22,7 +22,7 @@ APPCAST = """<?xml version="1.0" standalone="yes"?>
 # An item as generate_appcast writes it.
 ITEM = """        <item>
             <title>1.5.0</title>
-            <sparkle:version>1600</sparkle:version>
+            <sparkle:version>{build}</sparkle:version>
             <sparkle:shortVersionString>{short}</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>{minimum}</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
@@ -61,14 +61,20 @@ class AppcastTests(unittest.TestCase):
         right = {
             "url": f"{RELEASES}/download/1.5.0/Splash-1.5.0.dmg",
             "length": self.image.stat().st_size,
+            "build": "1600",
             "short": "1.5.0",
             "minimum": "26.4",
         }
         return ITEM.format(**{**right, **fields}, signature=signature)
 
-    def check(self, *items):
+    def check(self, *items, previous=("1.4.1", "1567")):
         appcast.check(
-            APPCAST.format(items="\n".join(items)).encode(), self.image, "1.5.0", "26.4"
+            APPCAST.format(items="\n".join(items)).encode(),
+            self.image,
+            "1.5.0",
+            "26.4",
+            "1600",
+            previous,
         )
 
     def test_the_release_signed_with_the_release_key_is_published(self):
@@ -88,6 +94,7 @@ class AppcastTests(unittest.TestCase):
         for fields in (
             {"url": f"{RELEASES}/download/1.4.9/Splash-1.5.0.dmg"},
             {"length": 1},
+            {"build": "1599"},
             {"short": "1.4.9"},
             {"minimum": "26.0"},
         ):
@@ -102,6 +109,20 @@ class AppcastTests(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, f"offers {len(items)} updates"),
             ):
                 self.check(*items)
+
+    def test_an_update_must_have_a_larger_build_than_the_release_before(self):
+        # Sparkle compares CFBundleVersion alone: the apps of the release
+        # before would never be offered a build no larger than theirs.
+        self.check(self.item(), previous=None)
+        for build in ("1600", "2492"):
+            with (
+                self.subTest(build=build),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    f"offers build 1600, not above build {build} of release 1.4.1",
+                ),
+            ):
+                self.check(self.item(), previous=("1.4.1", build))
 
     def generate_command(self, key_file):
         """The command generate runs, with the files of its folder."""
