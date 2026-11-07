@@ -100,6 +100,7 @@ TEST_WEIGHT_SOURCE := $(ENGINE_TEST_BUILD)/weight-source
 TEST_LEGACY_WEIGHT_CACHE := $(ENGINE_TEST_BUILD)/legacy-weight-cache
 TEST_GGUF_FILE := $(ENGINE_TEST_BUILD)/gguf-file
 TEST_GGUF_PROJECTION := $(ENGINE_TEST_BUILD)/gguf-projection
+TEST_VERIFY_FFN_PACK := $(ENGINE_TEST_BUILD)/verify-ffn-pack
 TEST_ANE_FFN := $(ENGINE_TEST_BUILD)/ane-ffn
 TEST_ANE_FFN_CALIBRATION := $(ENGINE_TEST_BUILD)/ane-ffn-calibration
 TEST_ANE_FFN_STARTUP := $(ENGINE_TEST_BUILD)/ane-ffn-startup
@@ -298,6 +299,10 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(LIB) $(HOST_STEP_LIB) $(TEST_METAL_BACKEND_LIB) $(TEST_PRODUCTION_LIB) $(TEST_HOST_STEP_LIB) \
 	$(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) $(TEST_GGUF_DEQUANT_LIB)
 
+ifeq ($(NATIVE_BATCH_WIDTH),8)
+TEST_METAL_TARGETS += $(TEST_VERIFY_FFN_PACK)
+endif
+
 # Keep every output that uses a flag set together, including standalone
 # benchmarks, real-model tests and intermediate test AIRs/metallibs.
 TEST_CONFIG_TARGETS := $(filter-out $(LIB) $(HOST_STEP_LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))) \
@@ -420,6 +425,9 @@ $(TEST_COMMAND_LIMITS): dev/tests/engine/command_limits_test.cpp $(ENGINE_LIBRAR
 $(TEST_MODEL_CONFIGURATION): dev/tests/engine/model_configuration_test.mm $(ENGINE_LIBRARY)
 $(TEST_DRAFT_PREPARATION): dev/tests/engine/draft_preparation_test.mm $(ENGINE_LIBRARY)
 $(TEST_GGUF_PROJECTION): dev/tests/engine/gguf_projection_test.mm $(ENGINE_LIBRARY) $(LIB)
+$(TEST_VERIFY_FFN_PACK): dev/tests/engine/verify_ffn_pack_metal_test.mm \
+		dev/tests/engine/VerifyPackTestFixtures.hpp dev/tests/engine/VerifyFfnPackChain.hpp \
+		dev/tests/engine/VerifyFfnPackBounds.hpp $(ENGINE_LIBRARY) $(LIB)
 $(TEST_ANE_FFN): dev/tests/engine/ane_ffn_test.mm $(ENGINE_INSTRUMENTED_ANE_OBJECT) $(ENGINE_LIBRARY) $(LIB)
 $(TEST_ANE_PROGRAM_FAULTS): dev/tests/engine/ane_program_faults_test.mm \
 		$(ENGINE_INSTRUMENTED_ANE_OBJECT) $(ENGINE_LIBRARY) $(LIB)
@@ -514,7 +522,7 @@ $(TEST_GGUF_MOE_BENCHMARK): dev/benchmarks/gguf_moe_benchmark.mm \
 		dev/benchmarks/DispatchReplay.hpp \
 		$(ENGINE_LIBRARY) $(LIB)
 
-$(TEST_MODEL_CONFIGURATION) $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(TEST_ANE_FFN) \
+$(TEST_MODEL_CONFIGURATION) $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(TEST_VERIFY_FFN_PACK) $(TEST_ANE_FFN) \
 		$(TEST_ANE_PROGRAM_FAULTS) $(TEST_GGUF_DEQUANT) $(TEST_GGUF_ROTATION) \
 		$(TEST_GGUF_REFERENCE) $(TEST_GGUF_PLANNER) $(TEST_GGUF_PREPARATION) \
 		$(TEST_BOOTSTRAP_TEST) $(TEST_RESOURCES_TEST) \
@@ -669,6 +677,9 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_GGUF_DEQUANT) $(TEST_GGUF_DEQUANT_LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_ROTATION) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_PROJECTION) $(TEST_PRODUCTION_LIB)
+ifeq ($(NATIVE_BATCH_WIDTH),8)
+	$(METAL_TEST_ENV) $(TEST_VERIFY_FFN_PACK) $(LIB)
+endif
 	$(METAL_TEST_ENV) $(TEST_ANE_FFN) $(LIB) kernels
 	$(TEST_ANE_FFN) $(LIB) split
 	$(TEST_ANE_FFN) $(LIB) faults

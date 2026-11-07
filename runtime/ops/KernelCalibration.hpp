@@ -196,7 +196,7 @@ inline constexpr uint32_t kApple10SixteenRowBelowBits16 = 72;
 // for 64, so up to 64 rows run the staged 64-row tile: 6-43% less time on
 // Apple10, 12-22% on a 10-core M4.
 // Larger Apple9 GPUs, unmeasured, keep the prefill tile past 32 rows.
-inline constexpr uint32_t kApple9StagedPrefillRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
+inline constexpr uint32_t kApple9StagedPrefillRows = 4 * SPLASH_TARGET_VERIFY_ROWS;
 inline constexpr uint32_t kApple9SmallStagedPrefillRows = 64;
 inline constexpr uint32_t kApple10StagedPrefillRows = 64;
 
