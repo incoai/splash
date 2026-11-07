@@ -1,6 +1,5 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/activation.h"
-#include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/kernels/common/moe_expert_slab.h"
 
 // Routes group rows by expert so each tile streams its weights once. Each row
@@ -352,68 +351,6 @@ kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
                      : *reinterpret_cast<device const uint4 *>(
                            input + ulong(route / params.routes_per_row) * params.input_size + column);
   }
-}
-
-// The grouped rows as Table16 tiles (kernels/common/gguf_sgmatrix.h), the
-// input of the Apple9 GGUF register expert tile. Threadgroup (tile, part)
-// writes the four 64-input spans [4 part, 4 part + 4) of an 8-row tile, one
-// simdgroup per row, in under two thirds of the time of a threadgroup per
-// span pair or per tile. The gather reads each grouped row's route like
-// moe_gather_rows (padding rows are zero); the prepare reads grouped rows (the
-// down pass's intermediate). Grid (tiles, width / 256), 256 threads.
-template <class Source>
-inline void moe_table16_tile(Source source, device bfloat *table,
-                             device float *sums, uint width, uint2 group,
-                             uint simd_lane, uint simd_group) {
-  // The last part of a width that is not a multiple of 256 (an expert
-  // intermediate of 640) holds fewer spans.
-  for (uint span = group.y * 4; span < min(group.y * 4 + 4, width / 64); ++span) {
-    const bfloat2 values = source(simd_group, span * 64 + 2 * simd_lane);
-    gguf_sg::write_input(table + ulong(group.x) * width * 8,
-                       sums + ulong(group.x) * table16_sums_per_tile(width),
-                       width, span, simd_group, simd_lane, values.x, values.y);
-  }
-}
-
-kernel void moe_gather_table16(device const bfloat *input [[buffer(0)]],
-                               device const uint *grouped_routes [[buffer(1)]],
-                               device const uint *tile_count [[buffer(2)]],
-                               device bfloat *table [[buffer(3)]],
-                               device float *sums [[buffer(4)]],
-                               constant MoeGatherParams &params [[buffer(5)]],
-                               uint2 group [[threadgroup_position_in_grid]],
-                               uint simd_lane [[thread_index_in_simdgroup]],
-                               uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  if (group.x >= *tile_count)
-    return;
-  moe_table16_tile(
-      [&](uint row, uint k) {
-        const uint route = grouped_routes[group.x * 8 + row];
-        return route == ~0u
-                   ? bfloat2(bfloat(0.0f))
-                   : *reinterpret_cast<device const bfloat2 *>(
-                         input + ulong(route / params.routes_per_row) *
-                                     params.input_size + k);
-      },
-      table, sums, params.input_size, group, simd_lane, simd_group);
-}
-
-kernel void moe_prepare_table16(device const bfloat *rows [[buffer(0)]],
-                                device const uint *tile_count [[buffer(1)]],
-                                device bfloat *table [[buffer(2)]],
-                                device float *sums [[buffer(3)]],
-                                constant uint &width [[buffer(4)]],
-                                uint2 group [[threadgroup_position_in_grid]],
-                                uint simd_lane [[thread_index_in_simdgroup]],
-                                uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  if (group.x >= *tile_count)
-    return;
-  moe_table16_tile(
-      [&](uint row, uint k) {
-        return *reinterpret_cast<device const bfloat2 *>(
-            rows + (ulong(group.x) * 8 + row) * width + k);
-      },
-      table, sums, width, group, simd_lane, simd_group);
 }
 
 kernel void moe_combine(

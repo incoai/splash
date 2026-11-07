@@ -348,8 +348,8 @@ MoeFormats formatsOf(const std::vector<BlockMoeWeights> &blocks) {
 std::string describe(const MoePlan &plan) {
   const MoeConfig c = plan.configuration();
   std::ostringstream line;
-  line << "tile " << unsigned(c.expertTile) << " gguf " << unsigned(c.ggufTile) << " router "
-       << unsigned(c.ggufRouterTile) << " tiles " << plan.maximumTiles() << " workspace";
+  line << "tile " << unsigned(c.expertTile) << " router " << unsigned(c.ggufRouterTile) << " tiles "
+       << plan.maximumTiles() << " workspace";
   for (const auto field : kMoeWorkspaceFields) line << " " << plan.workspace().*field;
   return line.str();
 }

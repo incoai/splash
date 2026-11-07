@@ -1,5 +1,4 @@
-// GGUF MoE experts on the staged decode tile (kernels/common/gguf_staged_tile.h); the Apple9 register form is in
-// kernels/decode/linear_gguf_sgmatrix.metal.
+// GGUF MoE experts on the staged decode tile (kernels/common/gguf_staged_tile.h).
 #pragma clang fp reassociate(off)
 #include "metal/kernels/common/gguf_column_tile.h"
 #include "metal/kernels/common/gguf_staged_tile.h"
@@ -11,7 +10,7 @@
 // suffix, ops::kCompiledMoeRoutings), in the format the tile picks at run time (within -11..+8% of a dispatch per
 // format). aux is the gate of the up pass. Two simdgroups each stream their own 32 columns through the decode tile,
 // grid (N / 64, tiles), on 8-row tiles (decode steps, short prefill chunks) or 32-row tiles (longer chunks,
-// ops::moeGgufPrefillTile), where a tile runs the 8-, 16- or 32-row matmul that holds its live rows (moe_live_rows): an
+// ops::selectMoe), where a tile runs the 8-, 16- or 32-row matmul that holds its live rows (moe_live_rows): an
 // expert's last tile is mostly partial, so on the 35B's prefill routes 32-row tiles take 17-30% less time than 64-row
 // ones. An expert's only tile of at most MOE_GGUF_COLUMN_ROWS live rows runs the column tile instead
 // (kernels/common/gguf_column_tile.h, moe_column_tile), each lane one of the simdgroup's columns over the live rows:

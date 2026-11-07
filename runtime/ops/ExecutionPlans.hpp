@@ -26,7 +26,7 @@ public:
       std::span<const uint32_t> historyTokens, AttentionVariant variant = {}) const;
   [[nodiscard]] DraftAttentionPlan draftAttention(
       DraftAttentionShape shape, uint32_t lanes) const;
-  // The plans of a MoE target's blocks, whose experts are in `formats`.
+  // The plans of a MoE target's blocks, whose routers are in `formats`.
   [[nodiscard]] MoePlan moePrefill(MoeShape shape, const MoeFormats &formats, uint32_t rows) const;
   [[nodiscard]] MoePlan moeDecode(MoeShape shape, const MoeFormats &formats, uint32_t lanes) const;
 

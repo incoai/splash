@@ -13,7 +13,7 @@
 namespace splash::ops {
 
 // How selection classes a weight unit's quantized segments together (a
-// projection, a gate/up pair, a MoE block's experts; FormatClassifier):
+// projection or a gate/up pair; FormatClassifier):
 // GridLookup when every segment's register-tile operands come from grid
 // lookups (IQ3_XXS, the IQ2 formats, IQ1); GridLookupOrQ2K when every one is
 // GridLookup or Q2_K, at least one Q2_K; otherwise FourBitsOrMore when every

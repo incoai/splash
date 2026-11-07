@@ -4,11 +4,11 @@
 // 512, an ungated shared expert of two 512-wide slices), by default in the 35B UD-Q4_K_M's formats (Q4_K gate/up and
 // Q5_K down experts, a Q8_0 shared expert) with an F32 router:
 //   gguf-moe-benchmark <metallib> [35b|flash-next|flint] [rounds] [gate/up format] [down format] [shared format]
-// - decode steps of one to four lanes of 8 rows on the device's plan and on the other GGUF tile, each row routed to
-//   top-k experts drawn at random from all of them (random) or, per lane of 8 rows, from a pool of three times top-k
-//   (pooled: the rows of a verify sharing their experts), with the share of the plan's expert tiles that run the
-//   column tile (an expert's only tile of MOE_GGUF_COLUMN_ROWS live rows or fewer);
-// - prefill chunks of 64 to 2048 rows routed at random, on both tiles;
+// - decode steps of one to four lanes of 8 rows on the device's plan, each row routed to top-k experts drawn at random
+//   from all of them (random) or, per lane of 8 rows, from a pool of three times top-k (pooled: the rows of a verify
+//   sharing their experts), with the share of the plan's expert tiles that run the column tile (an expert's only tile
+//   of MOE_GGUF_COLUMN_ROWS live rows or fewer);
+// - prefill chunks of 64 to 2048 rows routed at random;
 // - every dispatch of the 2048-row chunk and of the 8- and 32-row steps replayed as its own command.
 // Each command runs layers of their own routes and buffers over one set of weights larger than the system cache, so a
 // layer streams its experts from DRAM: kDecodeLayers per decode step, kPrefillLayers per prefill chunk. Printed are
@@ -52,10 +52,8 @@ using splash::metal::MetalBuffer;
 using splash::ops::BlockMoeWeights;
 using splash::ops::MoE;
 using splash::ops::MoeBuffers;
-using splash::ops::MoeConfig;
 using splash::ops::MoeScratchField;
 using splash::ops::kMoeScratchFields;
-using splash::ops::MoeGgufTile;
 using splash::ops::MoePlan;
 using splash::ops::MoeShape;
 using splash::ops::QuantizedSegment;
@@ -147,8 +145,7 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
     std::sort(samples.begin(), samples.end());
     return samples[samples.size() / 2];
   };
-  const auto columnShare = [&](const Layers &l, const MoePlan &plan) {
-    if (plan.configuration().ggufTile == MoeGgufTile::Register) return 0.0;
+  const auto columnShare = [&](const Layers &l) {
     uint64_t tiles = 0, column = 0;
     for (const MoeBuffers &b : l.buffers) {
       const uint32_t count = *static_cast<const uint32_t *>(b.scratch.tileCount.contents());
@@ -160,10 +157,6 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
     return 100.0 * column / tiles;
   };
   const splash::ops::ExecutionPlans plans(backend.capabilities());
-  const auto otherTile = [](MoeGgufTile tile) {
-    return tile == MoeGgufTile::Register ? MoeGgufTile::Staged : MoeGgufTile::Register;
-  };
-  const auto tileName = [](MoeGgufTile tile) { return tile == MoeGgufTile::Register ? "register" : "staged"; };
   printf("%s, GPU family %u, %u cores: MoE %ux%u, %u experts, top %u, %s router, %u shared slice(s)%s, %s/%s/%s, "
          "median GPU ms per layer of %u rounds\n",
          backend.capabilities().deviceName.c_str(), backend.capabilities().appleGpuFamily,
@@ -171,40 +164,15 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
          shape.router == splash::ops::MoeRouter::Softmax ? "softmax" : "sigmoid", shape.sharedSlices,
          shape.sharedGate ? " gated" : "", fmtName(gateUpFormat), fmtName(downFormat), fmtName(sharedFormat), rounds);
   // Prefill chunks first: they also bring the GPU clocks up for the short decode layers.
-  for (const uint32_t rows : kPrefillRows) {
-    const MoePlan plan = plans.moePrefill(shape, formats, rows);
-    const MoeGgufTile device = plan.configuration().ggufTile, other = otherTile(device);
-    printf("  prefill chunk of %4u rows: %s %.4f", rows, tileName(device), time(layers(plan, Routing::Random)));
-    // The register tile takes the weights of quant_register_tensor only, on 8-row tiles.
-    if (other == MoeGgufTile::Staged || formats.experts.registerTakes) {
-      MoeConfig config = plan.configuration();
-      config.ggufTile = other;
-      // The other tile's rows as selectMoe gives them: 8 on the register
-      // tile, staged 32 past one route per expert.
-      config.expertTile = other == MoeGgufTile::Register || uint64_t{rows} * topK <= E
-                              ? splash::ops::MoeExpertTile::M8
-                              : splash::ops::MoeExpertTile::M32;
-      printf(", %s %.4f", tileName(other), time(layers(MoE::prefillPlan(shape, rows, config), Routing::Random)));
-    }
-    printf("\n");
-  }
+  for (const uint32_t rows : kPrefillRows)
+    printf("  prefill chunk of %4u rows: %.4f\n", rows,
+           time(layers(plans.moePrefill(shape, formats, rows), Routing::Random)));
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     printf("  decode %2u rows:", lanes * kLaneRows);
     for (const Routing routing : {Routing::Random, Routing::Pooled}) {
-      const MoePlan plan = plans.moeDecode(shape, formats, lanes);
-      const MoeGgufTile device = plan.configuration().ggufTile, other = otherTile(device);
-      MoeConfig config = plan.configuration();
-      config.ggufTile = other;
-      const Layers mine = layers(plan, routing);
-      const double ms = time(mine);
-      printf(" | %s %s %.4f (%2.0f%% column)", routing == Routing::Random ? "random" : "pooled", tileName(device), ms,
-             columnShare(mine, plan));
-      // The register tile takes the weights of quant_register_tensor only.
-      if (other == MoeGgufTile::Register && !formats.experts.registerTakes) continue;
-      const MoePlan otherPlan = MoE::decodePlan(shape, lanes, config);
-      const Layers theirs = layers(otherPlan, routing);
-      const double otherMs = time(theirs);
-      printf(", %s %.4f (%2.0f%% column)", tileName(other), otherMs, columnShare(theirs, otherPlan));
+      const Layers l = layers(plans.moeDecode(shape, formats, lanes), routing);
+      const double ms = time(l);
+      printf(" | %s %.4f (%2.0f%% column)", routing == Routing::Random ? "random" : "pooled", ms, columnShare(l));
     }
     printf("\n");
   }

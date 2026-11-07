@@ -24,7 +24,7 @@ namespace splash::ops {
 enum class MoeRouter : uint8_t { Softmax, SigmoidNormalized };
 
 // The routings the MoE kernels compile (kernels/shared/moe.metal,
-// kernels/shared/moe_gguf.metal, kernels/decode/linear_gguf_sgmatrix.metal):
+// kernels/shared/moe_gguf.metal):
 // a router with a shared expert of sharedSlices slices behind the block's
 // scalar gate or none (MoeShape), the most experts its selection and
 // grouping are compiled for (MoeShape::routerWidth), and their kernels' name
@@ -240,9 +240,7 @@ public:
 
 // Grouped-row scratch. Routes are sorted by expert into tiles of tileRows
 // rows; every routed expert may leave one partially filled tile and no tile
-// is empty, and each shared slice fills one tile per tileRows rows. The gate
-// pass parks its output in expertOutput before the down pass overwrites it,
-// so that field spans the wider of the two widths.
+// is empty, and each shared slice fills one tile per tileRows rows.
 [[nodiscard]] constexpr uint32_t moeMaximumTiles(uint32_t rows, MoeShape shape,
                                                  uint32_t tileRows) noexcept {
   const uint32_t routed = rows * shape.expertsPerToken;
@@ -260,8 +258,6 @@ struct MoeWorkspace final {
   uint64_t groupedInputBytes = 0;
   uint64_t expertIntermediateBytes = 0;
   uint64_t expertOutputBytes = 0;
-  // The row sums of the Table16 tiles the GGUF register expert tile reads.
-  uint64_t groupedSumsBytes = 0;
   bool operator==(const MoeWorkspace &) const = default;
 };
 
@@ -282,8 +278,6 @@ struct MoeScratch final {
   metal::MetalBuffer groupedInput;
   metal::MetalBuffer expertIntermediate;
   metal::MetalBuffer expertOutput;
-  // GGUF register plans: the row sums of the Table16 tiles in groupedInput.
-  metal::MetalBuffer groupedSums;
 };
 
 // Each scratch buffer with the workspace field that sizes it, in field order.
@@ -292,7 +286,7 @@ struct MoeScratchField final {
   uint64_t MoeWorkspace::*bytes;
   const char *name;
 };
-inline constexpr std::array<MoeScratchField, 10> kMoeScratchFields{{
+inline constexpr std::array<MoeScratchField, 9> kMoeScratchFields{{
     {&MoeScratch::selectedExperts, &MoeWorkspace::selectedExpertsBytes, "MoE selected experts"},
     {&MoeScratch::routingWeights, &MoeWorkspace::routingWeightsBytes, "MoE routing weights"},
     {&MoeScratch::tileDescriptors, &MoeWorkspace::tileDescriptorsBytes, "MoE tile descriptors"},
@@ -302,7 +296,6 @@ inline constexpr std::array<MoeScratchField, 10> kMoeScratchFields{{
     {&MoeScratch::groupedInput, &MoeWorkspace::groupedInputBytes, "MoE grouped input"},
     {&MoeScratch::expertIntermediate, &MoeWorkspace::expertIntermediateBytes, "MoE expert intermediate"},
     {&MoeScratch::expertOutput, &MoeWorkspace::expertOutputBytes, "MoE expert output"},
-    {&MoeScratch::groupedSums, &MoeWorkspace::groupedSumsBytes, "MoE grouped sums"},
 }};
 static_assert(sizeof(MoeWorkspace) == kMoeScratchFields.size() * sizeof(uint64_t) &&
               sizeof(MoeScratch) == kMoeScratchFields.size() * sizeof(metal::MetalBuffer),
@@ -319,23 +312,11 @@ inline constexpr auto kMoeWorkspaceFields = [] {
 // passes on M8 tiles, or on M32 tiles to prefill (selectMoe).
 enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 
-// The expert tile of GGUF plans, which run grouped passes (gate, up with
-// silu(gate), down; the staged tile runs gate and up in one pass) over the
-// GGUF image: the half-staged tiles of kernels/shared/moe_gguf.metal, or
-// Register, the exact register tile of
-// kernels/decode/linear_gguf_sgmatrix.metal over Table16 tiles of the grouped
-// rows (8-row tiles only). The device's MoeCalibration picks one
-// (KernelCalibration.hpp, selectMoe).
-enum class MoeGgufTile : uint8_t { Staged, Register };
-
 // The device's policy for a MoE plan, which the execution plans derive.
 struct MoeConfig final {
-  // M8 for decode plans and the register tile; a staged prefill plan's by its
-  // routes per expert (selectMoe).
+  // M8 for decode plans; a prefill plan's by its routes per expert
+  // (selectMoe).
   MoeExpertTile expertTile = MoeExpertTile::M8;
-  // The execution plans derive it from the device's MoeCalibration and the
-  // experts' formats (selectMoe).
-  MoeGgufTile ggufTile = MoeGgufTile::Staged;
   // The router's float tile; the execution plans derive it from the device,
   // the plan's rows and the router's format (selectFloatTile).
   FloatTile ggufRouterTile = FloatTile::Simdgroup;

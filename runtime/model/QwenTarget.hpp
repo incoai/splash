@@ -101,7 +101,7 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
       std::ranges::copy(captureLayers, captureLayerValues.begin());
   }
 
-  // The formats of the sparse MoE blocks' weights, which their plans follow
+  // The formats of the sparse MoE blocks' routers, which their plans follow
   // (ops::moeFormats).
   ops::MoeFormats moeFormats{};
   // The layers whose output rows the DFlash2 draft reads, ascending.

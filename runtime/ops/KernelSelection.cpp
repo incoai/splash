@@ -256,33 +256,21 @@ FloatTile selectFloatTile(const KernelCalibration &calibration, uint32_t rows, u
 }
 
 MoeFormats moeFormats(std::span<const BlockMoeWeights *const> blocks) noexcept {
-  // Routed elements per format, and routers per format, F32 counted one past
-  // the GGUF formats.
-  std::array<uint64_t, GGUF_FMT_COUNT> weights{};
+  // Routers per format, F32 counted one past the GGUF formats.
   std::array<uint32_t, GGUF_FMT_COUNT + 1> routers{};
   MoeFormats formats;
-  for (const BlockMoeWeights *block : blocks) {
-    for (const BlockExpertProjection *projection : {&block->gate, &block->up, &block->down}) {
-      for (const QuantizedSegment *s : {&projection->routed, &projection->shared})
-        formats.experts.registerTakes &= s->isFloat() || quant_register_tensor(s->formatId, s->inputSize);
-      if (!projection->routed.isFloat())
-        weights[projection->routed.formatId] += uint64_t{projection->routed.outputSize} * projection->routed.inputSize;
-    }
-    ++routers[std::min<uint32_t>(block->router.formatId, GGUF_FMT_COUNT)];
-  }
-  FormatClassifier classes;
-  if (const auto most = std::max_element(weights.begin(), weights.end()); *most)
-    classes.add(uint32_t(most - weights.begin()));
-  formats.experts.formatClass = classes.formatClass();
+  for (const BlockMoeWeights *block : blocks) ++routers[std::min<uint32_t>(block->router.formatId, GGUF_FMT_COUNT)];
   const auto router = std::max_element(routers.begin(), routers.end());
   formats.router = *router && router < routers.end() - 1 ? uint32_t(router - routers.begin())
                                                          : QuantizedSegment::kFloat32;
   return formats;
 }
 
-// The register tile where it takes the experts and the class's entry holds;
-// else the staged tile, on 8-row tiles while a prefill chunk's routes average
-// at most one row per expert (rows * topK <= experts), where the two tiles
+// Every GPU runs the experts on the staged tile: against the register tile, a
+// 35B-shaped layer takes 16-42% less time on a 10-core M4 at one to four
+// decode lanes of random routes; Apple9 GPUs of 11 to 40 cores are
+// unmeasured. Plans run 8-row tiles while a prefill chunk's routes average at
+// most one row per expert (rows * topK <= experts), where 8- and 32-row tiles
 // take the same time, and 32-row tiles beyond, which stream an expert's
 // weights once for up to 32 of its rows (its tiles run 8-, 16- or 32-row
 // matmuls by their live rows, moe_live_rows). The router's float tile follows
@@ -290,11 +278,7 @@ MoeFormats moeFormats(std::span<const BlockMoeWeights *const> blocks) noexcept {
 MoeConfig selectMoe(const KernelCalibration &calibration, const MoeShape &shape, const MoeFormats &formats,
                     uint32_t rows, MoePhase phase) noexcept {
   MoeConfig config;
-  config.ggufTile = formats.experts.registerTakes && calibration.moe.registerTile[size_t(formats.experts.formatClass)]
-                        ? MoeGgufTile::Register
-                        : MoeGgufTile::Staged;
-  config.expertTile = phase == MoePhase::Prefill && config.ggufTile == MoeGgufTile::Staged &&
-                              uint64_t{rows} * shape.expertsPerToken > shape.experts
+  config.expertTile = phase == MoePhase::Prefill && uint64_t{rows} * shape.expertsPerToken > shape.experts
                           ? MoeExpertTile::M32
                           : MoeExpertTile::M8;
   config.ggufRouterTile = selectFloatTile(calibration, rows, shape.experts, formats.router);

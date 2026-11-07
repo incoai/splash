@@ -109,19 +109,12 @@ struct AttentionCalibration final {
   uint32_t int8QueriesFromPages;
 };
 
-struct MoeCalibration final {
-  // The expert tile by the block's FormatClass, in both phases: register
-  // where true.
-  std::array<bool, kFormatClasses> registerTile;
-};
-
 // Every measured constant of kernel selection for one device.
 struct KernelCalibration final {
   // DeviceCapabilities::plannedGpuCores.
   uint32_t cores;
   ProjectionCalibration projection;
   FloatTileCalibration floatTile;
-  MoeCalibration moe;
   AttentionCalibration attention;
 
   [[nodiscard]] static KernelCalibration of(const DeviceCapabilities &device) noexcept;
@@ -278,24 +271,6 @@ inline constexpr ProjectionCalibration kApple11Projection = [] {
 inline constexpr FloatTileCalibration kApple9FloatTile{false, 16, 3, 4, 6};
 inline constexpr FloatTileCalibration kApple10FloatTile{true, 16, 3, 4, 6};
 
-// ---- MoE ------------------------------------------------------------------
-
-// Apple9 stages experts only in GridLookup formats, in both phases: a
-// 35B-shaped layer decodes those 4-21% faster staged on a 40-core M3 Max and
-// Q4_K/Q5_K, Q2_K and IQ4_XS 3-34% slower, its matrix operations sharing the
-// FP32 pipe. Apple9 of more than 10 cores is unmeasured since the staged
-// tile's one-pass gate/up turned the 10-core M4 to staging every format.
-inline constexpr MoeCalibration kApple9Moe{{false, true, true, true}};
-
-// Apple9 GPUs of 10 cores or fewer stage experts in every format, in both
-// phases: on a 10-core M4 a layer takes 12-45% less time staged at B1-B4 and
-// 7-28% less on a 2048-row chunk.
-inline constexpr MoeCalibration kApple9SmallMoe{{false, false, false, false}};
-
-// Apple10 stages experts in every format.
-inline constexpr MoeCalibration kApple10Moe{{false, false, false, false}};
-
-
 // ---- Attention ----------------------------------------------------------
 
 // A chunk of a few hundred rows over a long history otherwise leaves much of
@@ -331,11 +306,11 @@ inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device)
   const uint32_t cores = device.plannedGpuCores();
   const GpuClass gpu = device.gpuClass();
   if (gpu != GpuClass::Apple9)
-    return {cores, gpu == GpuClass::Apple11 ? kApple11Projection : kApple10Projection, kApple10FloatTile, kApple10Moe,
+    return {cores, gpu == GpuClass::Apple11 ? kApple11Projection : kApple10Projection, kApple10FloatTile,
             kApple10Attention};
   const bool small = cores <= kApple9SmallGpuCores;
   return {cores, small ? kApple9SmallProjection : kApple9Projection, kApple9FloatTile,
-          small ? kApple9SmallMoe : kApple9Moe, small ? kApple9SmallAttention : kApple9Attention};
+          small ? kApple9SmallAttention : kApple9Attention};
 }
 
 } // namespace splash::ops

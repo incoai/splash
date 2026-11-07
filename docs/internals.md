@@ -430,14 +430,10 @@ The rules:
 3. *Float projection.* The accelerator tile runs where the device has one,
    from `minimumRows` rows and a grid of its tiles of at least half the class's
    half tiles per core for BF16 values, F32 values or a quantized format's rows.
-4. *MoE.* One plan per step serves every block, so a target's routed experts
-   are one unit (`ops::moeFormats`): the class of the format that holds most
-   routed weights, the register tile's take over every routed and shared
-   segment, the router of most blocks' format. The register tile runs where it
-   takes them and the class's `MoeCalibration::registerTile` entry holds, in
-   both phases; otherwise the staged tile, on 8-row tiles while a prefill
-   chunk's routes average at most one row per expert and 32-row tiles beyond.
-   The router follows rule 3.
+4. *MoE.* Every GPU runs the experts on the staged tile, on 8-row tiles
+   while a prefill chunk's routes average at most one row per expert and
+   32-row tiles beyond. One plan per step serves every block, so its router
+   follows rule 3 in the format of most blocks' routers (`ops::moeFormats`).
 5. *Attention.* The kernels follow how a layout reads its pages
    (`kv::Layout::reads`, below). A dense prefill tile takes one history split
    per `AttentionCalibration::prefillPagesPerSplit` pages its rows read (32,
@@ -634,47 +630,40 @@ the register tile's of eight partitions) that do not depend on the batch width.
 Partitions stop at eight, but the register tile splits a grid that eight leave below three
 threadgroups per core into sixteen while partitions keep 512 inputs (Qwen3.8-Flash-Next's
 hyper-connection down projection, 320 columns over 10240 inputs; measured on Apple10, and on Apple9
-by width on the 10-core M4, where eight instead took up to 21% more). The MoE
-experts
-(`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows: the register
-form in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf.metal`, which
-Apple9 takes on GPUs of 10 cores or fewer (the base M3 and M4), and on larger ones for experts
-mostly in the formats it stages (`MoeFormats::experts`) and for experts with an F16 weight
-(`UnitFormats::registerTakes`). One plan serves all of a model's
-MoE layers, so one F16 routed or shared expert tensor in any layer stages every layer's experts
-there. A block routes as one of the routings the kernels compile (`ops::kCompiledMoeRoutings`):
-its router weights a row's top k experts by the softmax of their scores (`MoeRouter::Softmax`,
-the Qwen families) or by each one's sigmoid over the sum of theirs (`SigmoidNormalized`, Flint),
-and every row also visits the `MoeShape::sharedSlices` slices of the shared expert, ids `experts`
-on, of the routed experts' width, each weighted by the sigmoid of the block's scalar gate
-(`sharedGate`) or by 1. A shared expert wider than the routed ones runs as such slices in the
-grouped passes: the planner keeps its gate and up rows and lays its down projection out as column
-windows (`gguf::TensorRows::windows`), so slice s's rows of each projection follow slice s - 1's
-(`moe_gguf_segment`). The select kernel names the routing's select suffix
+by width on the 10-core M4, where eight instead took up to 21% more). The MoE experts
+(`runtime/ops/MoE.cpp`) run the staged tile's numerics over the grouped rows on every GPU
+(`kernels/shared/moe_gguf.metal`). A block routes as one of the routings the kernels compile
+(`ops::kCompiledMoeRoutings`): its router weights a row's top k experts by the softmax of their
+scores (`MoeRouter::Softmax`, the Qwen families) or by each one's sigmoid over the sum of theirs
+(`SigmoidNormalized`, Flint), and every row also visits the `MoeShape::sharedSlices` slices of the
+shared expert, ids `experts` on, of the routed experts' width, each weighted by the sigmoid of the
+block's scalar gate (`sharedGate`) or by 1. A shared expert wider than the routed ones runs as such
+slices in the grouped passes: the planner keeps its gate and up rows and lays its down projection
+out as column windows (`gguf::TensorRows::windows`), so slice s's rows of each projection follow
+slice s - 1's (`moe_gguf_segment`). The select kernel names the routing's select suffix
 (`moe_route_select_f32_sigmoid_s2`), the grouping and expert passes its slices suffix
 (`moe_group_routes_s2`, `moe_expert_gguf_m8_a_s2`); the softmax router's one gated slice is the
-unsuffixed instances. The expert passes launch the live tiles alone: the grouping kernel writes
-each pass's grid with the tile count, and the pass reads it as an indirect dispatch
-(`ComputeDispatch::indirectThreadgroups`). They find a routed expert through the block's slot
-table and the chunks that hold its slots (`ops::ExpertChunks`): slot s below floor_slots is at
-place s of the floor chunk, chunk 0, and slot s from floor_slots on at place
-e - (c - 1) * chunk_slots of elastic chunk c = 1 + e / chunk_slots, where e = s - floor_slots (a
-branch uniform per threadgroup). The passes reach the chunks' regions through a table of
-`MOE_EXPERT_CHUNK_ADDRESSES` GPU addresses per chunk (`MoE.h`, `moe_expert_chunk`,
-[Residency](#residency-and-kv-extents)); a resident block's experts are one chunk of its routed
-planes, floor_slots = chunk_slots = its slots, a streamed block's the expert store's floor and
-elastic chunks of its size (`model/ExpertChunkLayout.hpp`,
-[Streamed experts](server.md#streamed-experts)). The staged tile runs gate and up in one pass, a gate
-and an up simdgroup on the same columns, bitwise the two passes' intermediate; the simdgroups
+unsuffixed instances. The expert passes launch the live tiles alone: the grouping kernel writes each
+pass's grid with the tile count, and the pass reads it as an indirect dispatch
+(`ComputeDispatch::indirectThreadgroups`). They find a routed expert through the block's slot table
+and the chunks that hold its slots (`ops::ExpertChunks`): slot s below floor_slots is at place s of
+the floor chunk, chunk 0, and slot s from floor_slots on at place e - (c - 1) * chunk_slots of
+elastic chunk c = 1 + e / chunk_slots, where e = s - floor_slots (a branch uniform per threadgroup).
+The passes reach the chunks' regions through a table of `MOE_EXPERT_CHUNK_ADDRESSES` GPU addresses
+per chunk (`MoE.h`, `moe_expert_chunk`, [Residency](#residency-and-kv-extents)); a resident block's
+experts are one chunk of its routed planes, floor_slots = chunk_slots = its slots, a streamed
+block's the expert store's floor and elastic chunks of its size (`model/ExpertChunkLayout.hpp`,
+[Streamed experts](server.md#streamed-experts)). The staged tile runs gate and up in one pass, a
+gate and an up simdgroup on the same columns, bitwise the two passes' intermediate; the simdgroups
 share one pair table where gate and up share their routed and their shared formats.
 An expert's only tile of at most `MOE_GGUF_COLUMN_ROWS` live rows runs on the column tile
 (`kernels/common/gguf_column_tile.h`) rather than the staged one, and the two sum a row's
 products in different orders: a route's output depends on how many rows the step routes to its
-expert, so decode results of GGUF MoE targets on the staged tile, the 35B's included, are not
-invariant to the batch (`kernels/common/moe_expert_slab.h`). Under the default `--verify-rows
-auto`, which rows a decode step routes also follows the verify budget ([Drafts](models.md#drafts)), which
-learns from timing and earlier requests, so a MoE target's decode results can differ between runs
-of one request.
+expert, so decode results of GGUF MoE targets, the 35B's included, are not invariant to the
+batch (`kernels/common/moe_expert_slab.h`). Under the default `--verify-rows auto`, which rows a
+decode step routes also follows the verify budget ([Drafts](models.md#drafts)), which learns
+from timing and earlier requests, so a MoE target's decode results can differ between runs of
+one request.
 The float router, QSA indexer and alpha/beta projections run in `kernels/shared/gguf_float.metal`,
 which runs two projections of one input in one dispatch where they take the same tile (the
 indexer's query and key, each on the tile of its own width), and the token rows are gathered by
@@ -720,7 +709,7 @@ up pass with the silu gate. The staged ones are `gguf_decode_<format>_m<rows>_<e
 up in one pass `gguf_decode_<format>_m<rows>_gate_up`, and
 `gguf_prefill_<format>_<e>` (and `gguf_prefill_<format>_r_leading_inputs` over a view of the
 leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lanes>_<e>`, and the
-experts `moe_expert_gguf_m<rows>_<e>` and `moe_expert_gguf_sg_<e>`, with gate and up in one pass
+experts `moe_expert_gguf_m<rows>_<e>`, with gate and up in one pass
 `moe_expert_gguf_m<rows>_gate_up`; the fused projections run
 `gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode and, on Apple10 and on
 Apple9 GPUs of 10 cores or fewer, in prefill chunks of 33 to 64 rows (`gguf_decode_fused_m64`),
@@ -756,13 +745,12 @@ format's up and the prefill tiles, each output inside the fp64 bound of
 `GgufFormatReference.hpp`, the one-pass gate/up bitwise against the two passes at the same K
 split, and one lane on the staged 16-row tile bitwise against the 8-row tile; and
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
-plan, the staged 8- and 32-row tiles and the Apple9 register tile whatever GPU runs it, each in
-every format it takes as each routed and shared expert tensor, against fp64, bitwise against
-the full grids and two gate/up passes, and with the experts in permuted slots across a floor
-chunk and elastic chunks of other, few slots, the last of fewer, bitwise as in one chunk, and
-refuses floor and elastic chunks one unit short, a malformed chunk list or chunks made for
-another block; `gguf-moe-e512` runs all of it at Qwen3.8-Flash-Next's 512 experts and
-`gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated shared slices;
+plan, the staged 8- and 32-row tiles, in every format as each routed and shared expert tensor,
+against fp64, bitwise against the full grids and two gate/up passes, and with the experts in
+permuted slots across a floor chunk and elastic chunks of other, few slots, the last of fewer,
+bitwise as in one chunk, and refuses floor and elastic chunks one unit short, a malformed chunk list
+or chunks made for another block; `gguf-moe-e512` runs all of it at Qwen3.8-Flash-Next's 512 experts
+and `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated shared slices;
 and `expert-store`, streamed experts at four shapes bitwise against the resident ones, in loads
 of every kind, through a release and a restore, in a floor and three smaller elastic chunks,
 beside a size of one block, which the store reads whole into its floor
@@ -786,9 +774,9 @@ a quantized format's native rows (such as `float-af8g64`), time the float projec
 (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
 `selectFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape,
 or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
-device's plans and the other GGUF tile; `GGUF_MOE_ARGS='repack'` times the repack of streamed
-experts into their slots (`moe_expert_load`, 1 to 32 jobs) and of tensors into an image
-(`gguf_repack`) in the streamed formats, each plane checked bytewise against the reference repack.
+device's plans; `GGUF_MOE_ARGS='repack'` times the repack of streamed experts into their slots
+(`moe_expert_load`, 1 to 32 jobs) and of tensors into an image (`gguf_repack`) in the streamed
+formats, each plane checked bytewise against the reference repack.
 
 Target attention runs the geometries of `kCompiledAttention` (`runtime/ops/PagedAttention.cpp`):
 query heads over KV heads of a head dimension (`_d128` in the names of 128-wide heads' kernels;

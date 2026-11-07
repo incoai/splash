@@ -116,14 +116,11 @@ void blockIndexReader() {
 // Expert ids, route rows and grouped routes are uint32, routing weights fp32
 // and activations bf16; a row routes its top k and each shared slice, which
 // fills one tile per tileRows rows. The grouped input first holds the
-// router's fp32 scores, one row of 256 per token. Every plan parks its gate
-// in expertOutput, so that field spans the wider of the hidden and
-// intermediate widths. Plans of the staged tiles hold no sums.
+// router's fp32 scores, one row of 256 per token.
 void checkMoe(splash::ops::MoeWorkspace workspace,
               splash::ops::MoeShape shape, uint32_t rows, uint32_t tileRows) {
   using splash::model::kBFloat16Bytes;
   constexpr uint64_t kRouterScores = 256;
-  const uint64_t outputWidth = std::max(shape.hiddenSize, shape.expertIntermediateSize);
   const uint64_t routes = uint64_t{rows} * (shape.expertsPerToken + shape.sharedSlices);
   const uint64_t routed = uint64_t{rows} * shape.expertsPerToken;
   const uint64_t tiles = std::min(routed / tileRows + shape.experts, routed) +
@@ -140,8 +137,7 @@ void checkMoe(splash::ops::MoeWorkspace workspace,
                                                       uint64_t{rows} * kRouterScores * sizeof(float)) &&
               workspace.expertIntermediateBytes ==
                   grouped * shape.expertIntermediateSize * kBFloat16Bytes &&
-              workspace.expertOutputBytes == grouped * outputWidth * kBFloat16Bytes &&
-              workspace.groupedSumsBytes == 0,
+              workspace.expertOutputBytes == grouped * shape.hiddenSize * kBFloat16Bytes,
           "MoE workspace changed from baseline");
 }
 

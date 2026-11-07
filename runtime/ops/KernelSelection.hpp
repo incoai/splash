@@ -15,8 +15,7 @@
 namespace splash::ops {
 
 // What selection reads of the quantized segments of a weight unit: one
-// projection, a gate/up pair's two, or a MoE target's routed experts (their
-// shared segments enter registerTakes only).
+// projection or a gate/up pair's two.
 struct UnitFormats final {
   FormatClass formatClass = FormatClass::FourBitsOrMore;
   // The register tile takes every quantized segment (quant_register_tensor).
@@ -63,13 +62,10 @@ struct SplitChoice final {
 [[nodiscard]] FloatTile selectFloatTile(const KernelCalibration &calibration, uint32_t rows, uint32_t outputSize,
                                         uint32_t formatId) noexcept;
 
-// The formats a MoE target's plans follow. Its routed experts are one weight
-// unit: one plan per step serves every block (QwenTarget.cpp). Their class is
-// the class of the format holding most routed elements; registerTakes holds
-// over every block's routed and shared segments; the router is the format of
-// most routers' rows, F32 for none.
+// The formats a MoE target's plans follow. One plan per step serves every
+// block (QwenTarget.cpp): the router is the format of most routers' rows, F32
+// for none.
 struct MoeFormats final {
-  UnitFormats experts;
   uint32_t router = QuantizedSegment::kFloat32;
   bool operator==(const MoeFormats &) const = default;
 };

@@ -253,15 +253,15 @@ decodes greedily, its draft's proposals too: it selects what sampling would
 but for equally likely tokens, of which it takes the lowest id.
 
 A lane's arithmetic can depend on the batch it decodes in and on how its prompt
-is chunked. On a GGUF MoE target's staged expert tiles, an expert that a step
-routes at most two rows to runs them on the column tile, which sums in another
-order than the staged matmul, so a row's result also depends on the rows decoded
-or prefilled beside it. With INT8 KV on M5 and later Macs, attention scores INT8
-queries where its splits read 8 pages or more, which follows the chunk's rows
-and history and, in verify, the batch's longest lane. Concurrent requests change
-the batch and the chunking, and chunk boundaries also come from the cached
-boundary a request resumes from, from a boundary another request waits to resume
-from, and from one whose state, or the KV past it, memory could not hold. With
+is chunked. On a GGUF MoE target, an expert that a step routes at most two rows
+to runs them on the column tile, which sums in another order than the staged
+matmul, so a row's result also depends on the rows decoded or prefilled beside
+it. With INT8 KV on M5 and later Macs, attention scores INT8 queries where
+its splits read 8 pages or more, which follows the chunk's rows and history
+and, in verify, the batch's longest lane. Concurrent requests change the batch
+and the chunking, and chunk boundaries also come from the cached boundary a
+request resumes from, from a boundary another request waits to resume from,
+and from one whose state, or the KV past it, memory could not hold. With
 `--state-format bf16` the state is also rounded at each state a chunk captures
 (a replay point, junction or checkpoint). So on a dense target, or a MoE target
 under `--verify-rows all`, a greedy or seeded request repeats its output when it
