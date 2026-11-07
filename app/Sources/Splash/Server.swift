@@ -11,23 +11,22 @@ final class Server {
         case failed(String)
     }
 
-    /// What a start does, as the server's log tells it: the server starts, reads the model's
-    /// weights into memory, then runs the model once at full size so that its first answer comes
-    /// quickly; the first start after an update also prepares the GPU's programs then, which can
-    /// take a minute.
+    /// What a start does, as the server's serve record gives it: the server starts, reads the
+    /// model's weights into memory, then runs the model once at full size so that its first answer
+    /// comes quickly; the first start after an update also prepares the GPU's programs then, which
+    /// can take a minute.
     enum Step: String {
         case starting = "Starting"
         case loading = "Loading weights"
         case warming = "Warming up"
 
-        /// The step `line` of the server's log begins, if it begins one.
-        init?(_ line: String) {
-            if line.contains("Loading · ") {
-                self = .loading
-            } else if line.contains("Weights loaded") {
-                self = .warming
-            } else {
-                return nil
+        /// The step of a start at `phase`; nil once the start has ended.
+        init?(_ phase: ServeRecord.Phase) {
+            switch phase {
+            case .starting: self = .starting
+            case .loading: self = .loading
+            case .warming: self = .warming
+            case .ready, .failed: return nil
             }
         }
     }
@@ -40,7 +39,11 @@ final class Server {
         case recovering = "Recovering…"
     }
 
-    private(set) var phase = Phase.stopped
+    private(set) var phase = Phase.stopped {
+        didSet { phaseChanged() }
+    }
+    /// Called each time `phase` is set.
+    @ObservationIgnored var phaseChanged: () -> Void = {}
     /// While starting: what the start does, and since when.
     private(set) var step = Step.starting
     private(set) var stepSince = Date.now
@@ -68,6 +71,22 @@ final class Server {
     var serving: Serving { recovering ? .recovering : asleep ? .sleeping : .running }
     /// Whether the model answers a request now: ready, and not recovering.
     var answers: Bool { phase == .ready && !recovering }
+
+    /// What the server is at, as the window shows it: its phase and the model a stop makes way
+    /// for, the model, what a ready one does, and what that model takes and how it thinks. A
+    /// change of it changes the window as one (`MainView`); a start's step changes words alone.
+    struct Stage: Equatable {
+        var phase: Phase
+        var next: String?
+        var model: String?
+        var serving: Serving
+        var acceptsImages: Bool
+        var reasoning: Reasoning?
+    }
+
+    var stage: Stage {
+        Stage(phase: phase, next: next, model: model, serving: serving, acceptsImages: acceptsImages, reasoning: reasoning)
+    }
 
     /// Once ready: each request the server finished, as its log line gives it, the latest last.
     private(set) var requestLog: [RequestEntry] = []
@@ -101,19 +120,28 @@ final class Server {
         var `default`: String?
     }
 
-    static let log = URL.libraryDirectory.appending(path: "Logs/Splash/server.log")
+    /// How long a stop gives the server before its process group is killed: the longest its own
+    /// stop of the engine takes.
+    nonisolated static let killAfter = Supervision.stop * 2
 
     private let runtime: Runtime
-    private let log: URL
+    /// Its log, which each start begins again.
+    let log: URL
+    private let killAfter: Duration
     private var child: ChildProcess?
-    private var tail: LogTail?
+    /// The process of the server starting or serving, as its serve record names it.
+    private var pid: pid_t?
+    /// SIGTERM, which a running server takes for Ctrl+C and one already stopping ignores, where a
+    /// second Ctrl+C would stop its engine at once.
+    let record: ChildRecord
     private var stopRequested = false
-    private var firstError: String?
     private var watch: Task<Void, Never>?
 
-    init(runtime: Runtime, log: URL = Server.log) {
+    init(runtime: Runtime, log: URL, defaults: UserDefaults, killAfter: Duration = Server.killAfter) {
         self.runtime = runtime
         self.log = log
+        self.killAfter = killAfter
+        record = ChildRecord(defaults: defaults, key: Preference.serverPID, stop: SIGTERM, killAfter: killAfter)
     }
 
     var running: Bool { child != nil }
@@ -131,23 +159,15 @@ final class Server {
         }
     }
 
-    /// Stops the model, and drops a switch to another one: SIGINT to the process group, as Ctrl+C
-    /// sends; a second one after 10 s, on which the server stops the engine at once; SIGKILL if
-    /// anything still runs 20 s later.
+    /// Stops the model, and drops a switch to another one: SIGINT, as Ctrl+C sends, on which the
+    /// server stops its engine, its flush included (`ChildProcess.stop`).
     func stop() {
         queued = nil
         guard let child, phase != .stopping else { return }
         stopRequested = true
         phase = .stopping
         watch?.cancel()
-        child.signal(SIGINT)
-        Task { [weak self] in
-            for (delay, signal) in [(10, SIGINT), (20, SIGKILL)] {
-                try? await Task.sleep(for: .seconds(delay))
-                guard self?.child === child else { return }
-                child.signal(signal)
-            }
-        }
+        child.stop(SIGINT, killAfter: killAfter)
     }
 
     /// Clears a failure the user has read, stopping a server that still runs but serves nothing.
@@ -156,16 +176,15 @@ final class Server {
         if child != nil { stop() } else { phase = .stopped }
     }
 
-    /// Stops the server this app started before it quit or crashed, if it still serves, and waits
-    /// until it has given its port and memory back; its record stays until then, for the next
-    /// launch should this one end first.
+    /// Stops the server an app started before it quit or crashed, if it still runs, and waits
+    /// until it has given its port and memory back. It stops by itself once that app has ended
+    /// (`SPLASH_APP_PID`), and is left to finish; this stops one that has not yet. An app before
+    /// 1.6 kept its server's ID alone, with its port: the process that still holds that port's
+    /// lock under the ID is that server, which nothing stops by itself.
     func stopLeftover() async {
-        let defaults = UserDefaults.standard
-        let pid = pid_t(defaults.integer(forKey: Preference.serverPID))
-        let port = defaults.integer(forKey: Preference.serverPort)
-        defer { defaults.removeObject(forKey: Preference.serverPID) }
-        guard pid > 0, runtime.serveLockOwner(port: port) == pid, runtime.runsPython(pid) else { return }
-        await stopProcessGroup(pid)
+        let port = record.defaults.integer(forKey: Preference.olderServerPort)
+        await record.stopLeftover { pid in port > 0 && runtime.serveLockHolder(port: port) == pid }
+        record.defaults.removeObject(forKey: Preference.olderServerPort)
     }
 
     private func launch(_ model: String, settings: ServeSettings) {
@@ -178,31 +197,32 @@ final class Server {
         requestLog = []
         acceptsImages = false
         reasoning = nil
-        firstError = nil
         stopRequested = false
         resetLog(log)
         if portInUse(settings.port) {
-            return refuse("Port \(settings.port) is in use by another app. Quit that app, or choose another port in Launch Options › Advanced.")
+            return refuse(Self.portTaken(settings.port))
         }
         since = .now
         step = .starting
         stepSince = .now
         phase = .starting
         do {
-            child = try ChildProcess(
-                command: runtime.command(settings.serveArguments(model: model)),
-                environment: runtime.environment.merging(settings.environment) { $1 },
+            // It stops as SIGTERM stops it once this app has ended, a crash too, giving its memory
+            // back then rather than at the app's next launch.
+            child = try record.start(
+                runtime.command(settings.serveArguments(model: model)),
+                environment: runtime.environment.merging(settings.environment) { $1 }
+                    .merging(["SPLASH_APP_PID": String(getpid())]) { $1 },
                 log: log,
+                line: { [weak self] in self?.received($0) },
                 exited: { [weak self] in self?.exited($0) }
             )
         } catch {
             phase = .failed("Splash couldn’t start it: \(error.localizedDescription)")
             return
         }
-        tail = LogTail(log) { [weak self] in self?.received($0) }
         let pid = child!.pid
-        UserDefaults.standard.set(Int(pid), forKey: Preference.serverPID)
-        UserDefaults.standard.set(settings.port, forKey: Preference.serverPort)
+        self.pid = pid
         watch = Task { [weak self] in await self?.follow(pid) }
     }
 
@@ -213,12 +233,6 @@ final class Server {
     }
 
     private func received(_ line: String) {
-        // Why a start fails; once serving, error lines are about requests.
-        if phase == .starting, firstError == nil { firstError = errorMessage(line) }
-        if phase == .starting, let next = Step(line) {
-            step = next
-            stepSince = .now
-        }
         if phase == .ready, let entry = RequestEntry(line) {
             requestLog.append(entry)
             if requestLog.count > 1000 { requestLog.removeFirst(requestLog.count - 1000) }
@@ -226,67 +240,100 @@ final class Server {
     }
 
     private func exited(_ status: Int32) {
-        tail?.finish()
-        tail = nil
         child = nil
         watch?.cancel()
-        UserDefaults.standard.removeObject(forKey: Preference.serverPID)
         if let queued {
             self.queued = nil
             launch(queued.model, settings: queued.settings)
         } else if stopRequested {
             phase = .stopped
-        } else if phase == .starting, let firstError, let model {
-            phase = .failed(Self.memoryProblem(firstError, settings: settings) ?? plainProblem(firstError, model: model))
+        } else if phase == .starting, let pid {
+            phase = .failed(Self.startProblem(record: runtime.serveRecord(port: settings.port), pid: pid,
+                                              port: settings.port, holder: runtime.serveLockHolder(port: settings.port)))
         } else {
             phase = .failed("It stopped unexpectedly. The log has the details.")
         }
     }
 
-    /// A start the engine refuses for want of memory, in the words of the launch options: the
-    /// model, with its reserves, needs more than the budget, the memory limit set or this Mac's own;
-    /// or the context length set is more than the memory left, or the SSD cache, holds.
-    nonisolated static func memoryProblem(_ message: String, settings: ServeSettings) -> String? {
-        if let match = message.firstMatch(of: /require (\d+) bytes but the Metal memory budget is (\d+) bytes/),
-           let need = Int64(match.1), let budget = Int64(match.2) {
-            let size = { (bytes: Int64) in
-                "\((Double(bytes) / Double(1 << 30)).formatted(.number.precision(.fractionLength(0...1)))) GB"
-            }
-            if let limit = settings.memoryLimit, Int64(limit) << 30 == budget {
-                return "It needs \(size(need)) of memory but the memory limit is \(size(budget)). Raise the memory limit in Launch Options."
-            }
-            return "It needs \(size(need)) of memory but this Mac can give it \(size(budget)). Choose a smaller model."
+    /// Why a start by process `pid` on `port` failed, as this start's serve record says; that another
+    /// Splash server serves the port, where `holder`, the process holding the port's lock, is not
+    /// this start's: the launcher refuses it and leaves that server's record; else that it stopped,
+    /// where it recorded nothing: it crashed or was killed.
+    nonisolated static func startProblem(record: ServeRecord?, pid: pid_t, port: Int, holder: pid_t?) -> String {
+        if let record, record.pid == pid, let failure = record.failure {
+            return problem(failure, port: port)
         }
-        if let match = message.firstMatch(of: /exceeds the (\d+) tokens the model and (.+) allow/), let most = Int(match.1) {
-            let tokens = most >= 1024 ? "\(most / 1024)K" : "\(most)"
-            if match.2.contains("--max-memory") {
-                return "Its context fits up to \(tokens) tokens within the memory limit. Choose a shorter context length, or raise the memory limit."
-            }
-            if match.2.contains("SSD cache") {
-                return "Its context fits up to \(tokens) tokens in the SSD cache. Choose a shorter context length, or a larger SSD cache."
-            }
-            return "Its context fits up to \(tokens) tokens on this Mac. Choose a shorter context length, or Auto."
+        if let holder, holder != pid {
+            return "Another Splash server is using port \(port). Stop it, or choose another port in Launch Options › Advanced."
         }
-        return nil
+        return "It stopped unexpectedly. The log has the details."
     }
 
-    /// Waits until this start's server answers, then follows its status. The port's lock names the
-    /// process serving it, and the server answers only once ready.
+    /// That another app holds `port`.
+    nonisolated static func portTaken(_ port: Int) -> String {
+        "Port \(port) is in use by another app. Quit that app, or choose another port in Launch Options › Advanced."
+    }
+
+    /// A start failure on `port` in the words of the launch options: the model, with its reserves,
+    /// needs more memory than the limit set or this Mac gives; the context length set is more than
+    /// the memory left, or the SSD cache, holds; other apps hold the memory, GPU memory or port it
+    /// needs; an update holds Splash; its files could not be prepared, or Splash cannot serve them;
+    /// a failure of no class, which the log tells more of; else the failure's own message.
+    nonisolated static func problem(_ failure: ServeRecord.Failure, port: Int) -> String {
+        switch (failure.kind, failure.bound) {
+        case ("memory_budget", "max_memory"):
+            return "It needs \(Format.memory(failure.required_bytes ?? 0)) of memory but the memory limit is "
+                + "\(Format.memory(failure.budget_bytes ?? 0)). Raise the memory limit in Launch Options."
+        case ("memory_budget", "device_memory"):
+            return "It needs \(Format.memory(failure.required_bytes ?? 0)) of memory but this Mac can give it "
+                + "\(Format.memory(failure.budget_bytes ?? 0)). Choose a smaller model."
+        case ("context_budget", let bound?):
+            let tokens = ContextLength.figure(failure.plan_context_tokens ?? 0)
+            switch bound {
+            case "max_memory":
+                return "Its context fits up to \(tokens) tokens within the memory limit. Choose a shorter context length, or raise the memory limit."
+            case "disk":
+                return "Its context fits up to \(tokens) tokens in the SSD cache. Choose a shorter context length, or a larger SSD cache."
+            default:
+                return "Its context fits up to \(tokens) tokens on this Mac. Choose a shorter context length, or Auto."
+            }
+        case ("host_memory", _):
+            return "Other apps are using the memory it needs. Quit some, then start it again."
+        case ("command_memory", _):
+            return "Another app is using the GPU memory this model needs, such as another Splash server. Quit it, then start again."
+        case ("port", _):
+            return portTaken(port)
+        case ("upgrade", _):
+            return "Splash is being updated. Wait for the update to finish, then start it again."
+        case ("install", _):
+            return "Splash couldn’t prepare its files: \(failure.message)"
+        case ("model", _):
+            return "Splash can’t serve this model: \(failure.message)"
+        case ("internal", _):
+            return "It stopped while starting: \(failure.message). The log has the details."
+        default:
+            return failure.message
+        }
+    }
+
+    /// Follows this start's server through its start, as its serve record gives it, until it
+    /// answers, then follows its status.
     private func follow(_ pid: pid_t) async {
-        let health = settings.url.appending(path: "health")
         while !Task.isCancelled, phase == .starting {
-            if runtime.serveLockOwner(port: settings.port) == pid,
-               let (_, response) = try? await URLSession.shared.data(from: health),
-               (response as? HTTPURLResponse)?.statusCode == 200,
-               !Task.isCancelled, phase == .starting {
-                // What the model takes and holds, known as it shows as ready.
-                let served = await servedModel()
-                guard !Task.isCancelled, phase == .starting else { break }
-                acceptsImages = served?.input_modalities?.contains("image") ?? false
-                reasoning = served?.reasoning
-                context = served?.context_length
-                phase = .ready
-                break
+            if let record = runtime.serveRecord(port: settings.port), record.pid == pid {
+                if let next = Step(record.phase), next != step {
+                    step = next
+                    stepSince = .now
+                } else if record.phase == .ready {
+                    // What the model takes and holds, known as it shows as ready.
+                    let served = await servedModel()
+                    guard !Task.isCancelled, phase == .starting else { break }
+                    acceptsImages = served?.input_modalities?.contains("image") ?? false
+                    reasoning = served?.reasoning
+                    context = served?.context_length
+                    phase = .ready
+                    break
+                }
             }
             try? await Task.sleep(for: .milliseconds(500))
         }
@@ -296,6 +343,8 @@ final class Server {
                 asleep = report.asleep
                 recovering = report.recovering
                 activity = report.activity
+                // A relaunched engine may serve less context than the first did.
+                if let served = report.context { context = served }
                 if let stopped = report.stopped { phase = .failed(stopped) }
             }
             try? await Task.sleep(for: .seconds(2))
@@ -310,6 +359,8 @@ final class Server {
         var asleep: Bool
         var recovering = false
         var stopped: String?
+        /// The tokens of context the server serves now.
+        var context: Int?
     }
 
     /// The report of `/status`'s body, if it is one.
@@ -330,12 +381,15 @@ final class Server {
             ),
             asleep: status.weights?.released ?? false,
             recovering: status.transport?.recovering ?? false,
-            // The engine failed again and again; the server stays up but serves nothing.
-            stopped: status.transport?.stopped == true ? status.transport?.error ?? "It stopped after failing repeatedly." : nil
+            // The engine failed in a way restarting cannot help; the server stays up but serves
+            // nothing.
+            stopped: status.transport?.stopped == true ? status.transport?.error ?? "Its engine stopped." : nil,
+            context: status.capabilities?.max_context_tokens
         )
     }
 
     private struct Status: Decodable {
+        struct Capabilities: Decodable { let max_context_tokens: Int? }
         struct Weights: Decodable { let released: Bool? }
         struct Transport: Decodable { let recovering: Bool?; let stopped: Bool?; let error: String? }
         struct Requests: Decodable { let completed: Int? }
@@ -350,6 +404,7 @@ final class Server {
         }
         struct Cache: Decodable { let reused_tokens: Int? }
         struct Memory: Decodable { let current_bytes: Int64? }
+        let capabilities: Capabilities?
         let weights: Weights?
         let transport: Transport?
         let requests: Requests?

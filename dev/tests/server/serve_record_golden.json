@@ -1,0 +1,12 @@
+{
+  "pid": 4242,
+  "phase": "failed",
+  "failure": {
+    "kind": "memory_budget",
+    "bound": "max_memory",
+    "required_bytes": 10858659840,
+    "budget_bytes": 1073741824,
+    "plan_context_tokens": 0,
+    "message": "the plan's floors require 10858659840 bytes but the Metal memory budget is 1073741824 bytes"
+  }
+}

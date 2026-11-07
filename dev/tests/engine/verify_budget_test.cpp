@@ -9,7 +9,8 @@
 // costs are the seed's shape before any cycle, then the affine fit of the
 // latest cycles of each lane count and kind, positive and nondecreasing, the
 // seed's slope where their rows do not spread; every kExploreCycles-th cycle
-// of a lane count explores.
+// of a lane count explores; a stall over rows that cluster leaves the cycles
+// after it their tokens per millisecond.
 #include "TestChecks.hpp"
 #include "model/VerifyBudget.hpp"
 
@@ -299,7 +300,8 @@ void learnsTheCosts() {
     const double expected = 50.0 * (VerifyBudget::seed(1, 1) + (rows - 1) * (1.0 - VerifyBudget::seed(1, 1)) / 7.0);
     require(std::fabs(flat[rows] - expected) < 1e-3 * expected, "the costs of unspread rows left the seed's slope");
   }
-  // A stall counts as twice the time the fit gives it.
+  // A stall counts as at most twice the larger of its fitted price and the
+  // cycles' mean.
   const auto before = budget.costs(2, false);
   cycle(2, 9, false, 50.0 * steep(9));
   const auto after = budget.costs(2, false);
@@ -320,6 +322,58 @@ void learnsTheCosts() {
   for (uint32_t rows = 4; rows <= 32; ++rows)
     require(negative[rows] > 0.0F && (rows == 4 || negative[rows] >= negative[rows - 1]),
             "a negative intercept gave a cost that is not positive or decreases");
+}
+
+// Two lanes whose proposals each survive 0.75 of the time, over cycles of the
+// seed's shape, verify the total of the most expected tokens per cost, which
+// draft_verify_rows takes: 10 rows in all, so the fit's rows cluster. A stall
+// that doubles the second exploring cycle tilts the fit's line below zero at
+// the anchors; the 64 cycles after it keep at least 0.9 of the tokens per
+// millisecond the cycles of a run without the stall give.
+void stallOverClusteredRows() {
+  constexpr uint32_t kLanes = 2, kEvery = kLanes * VerifyBudget::kBlockRows, kAfter = 64;
+  constexpr double kSurvival = 0.75;
+  const auto time = [](uint32_t rows) { return 50.0 * VerifyBudget::seed(kLanes, rows); };
+  // The anchors, then each lane's next proposal in turn.
+  const auto expected = [&](uint32_t rows) {
+    double tokens = kLanes;
+    for (uint32_t row = kLanes; row < rows; ++row)
+      tokens += std::pow(kSurvival, 1 + (row - kLanes) / kLanes);
+    return tokens;
+  };
+  const auto choice = [&](const auto &cost) {
+    uint32_t best = kLanes;
+    for (uint32_t rows = kLanes + 1; rows <= kEvery; ++rows)
+      if (expected(rows) / cost(rows) > expected(best) / cost(best))
+        best = rows;
+    return best;
+  };
+  require(choice(time) == 10, "the cycles' times did not make 10 rows the best total");
+  const auto tokensPerMillisecond = [&](bool stall) {
+    VerifyBudget budget;
+    VerifyBudget::Lane lane;
+    lane.labels = false;
+    double tokens = 0.0, milliseconds = 0.0;
+    for (uint32_t explored = 0, after = 0; after < kAfter;) {
+      const auto costs = budget.costs(kLanes, false);
+      const bool explores = budget.explores(kLanes, false);
+      const uint32_t rows = explores ? kEvery : choice([&](uint32_t total) { return double(costs[total]); });
+      const bool second = explores && ++explored == 2;
+      if (explored >= 2 && !second) {
+        ++after;
+        tokens += expected(rows);
+        milliseconds += time(rows);
+      }
+      std::array batch{lane, lane};
+      batch[0].verifyRows = rows - rows / 2;
+      batch[1].verifyRows = rows / 2;
+      budget.observe(batch, false, (stall && second ? 2.0 : 1.0) * time(rows));
+    }
+    return tokens / milliseconds;
+  };
+  const double ratio = tokensPerMillisecond(true) / tokensPerMillisecond(false);
+  require(ratio >= 0.9, "the cycles after a stall gave " + std::to_string(ratio) +
+                            " of the tokens per millisecond of a run without it");
 }
 
 void invalidInputs() {
@@ -362,6 +416,7 @@ int main() {
     fitsTheLabels();
     confidencesThatAreNotProbabilities();
     learnsTheCosts();
+    stallOverClusteredRows();
     invalidInputs();
   } catch (const std::exception &error) {
     std::cerr << "verify_budget_test: FAIL: " << error.what() << '\n';

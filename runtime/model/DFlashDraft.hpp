@@ -245,7 +245,7 @@ public:
   void addContextPrefill(metal::CommandGraph &graph,
                          DFlashPrefillBuffers buffers, uint32_t rows,
                          std::span<const DFlashPrefillSpan> spans,
-                         std::span<const DFlashWindowCapture> windowCaptures = {}) const;
+                         std::span<const DFlashWindowCapture> windowCaptures) const;
   // Computes the rings' keys and values of `rows` positions from
   // startPosition on again from the context window they were kept in, as
   // addContextPrefill writes them from their context rows. The rows pass

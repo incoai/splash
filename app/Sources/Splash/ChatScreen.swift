@@ -1,20 +1,19 @@
 import SwiftUI
 
-/// The width of the composer: the transcript's column (`main`'s max-width in
-/// Transcript/transcript.css), so that the two line up.
+/// The width of the composer: the transcript's column (`main`'s max-width in page.css), so
+/// that the two line up.
 private let column: CGFloat = 680
 
-/// The conversations at the side of the open one. The window's toolbar is the Server's, so the
-/// switch between the two stays where it is.
+/// The conversations at the side of the open one, in a sidebar that hides (`WithSidebar`). The
+/// window's toolbar is the Server's too, so that the switch and the Server's button stay where
+/// they are.
 struct ChatScreen: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
-        HStack(spacing: 0) {
+        WithSidebar {
             ChatList()
-                .frame(width: 260)
-            // Up through the toolbar, as far as the sidebar's background goes.
-            Divider().ignoresSafeArea(edges: .top)
+        } content: {
             ConversationView()
         }
         .onAppear { state.draft.focus() }
@@ -120,14 +119,14 @@ private struct ConversationView: View {
         let shown = state.chats.current.flatMap { $0.messages.isEmpty ? nil : $0 }
         VStack(spacing: 0) {
             if let conversation = shown {
-                TranscriptView(transcript: state.transcript, page: page(conversation))
+                LiveTranscript(page: page(conversation))
                     // The line the window draws under its toolbar over a scroll view there, which
                     // a web view isn't to it.
                     .overlay(alignment: .top) { Rectangle().fill(.separator).frame(height: 1 / displayScale) }
             } else {
                 // A new chat: the mark, showing what the Server does, over the composer.
                 Spacer()
-                StatusMark(look: state.markLook == .failed ? .off : state.markLook, since: state.server.since, size: 44)
+                StatusMark(look: state.serverStatus.look, since: state.server.since, size: 44)
                     .padding(.bottom, 28)
             }
             // One composer either way, so that its text view, and what the input method composes
@@ -138,6 +137,9 @@ private struct ConversationView: View {
                 Spacer()
             }
         }
+        // The composer moves, whole, between a new chat's middle and a conversation's foot, as the
+        // mark and the transcript fade.
+        .animation(Motion.settle, value: shown == nil)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.background)
     }
@@ -149,12 +151,26 @@ private struct ConversationView: View {
             .padding(.bottom, 24)
     }
 
-    /// `conversation` as the page shows it, its reply streaming and Ask Again as the Server allows.
+    /// `conversation` as the page shows it, Ask Again as the Server allows.
     private func page(_ conversation: Conversation) -> TranscriptPage {
         let server = state.server
         let askAgain = TranscriptPage.AskAgain(enabled: server.answers && state.chats.streaming == nil,
                                                help: "Ask \(server.model.map(state.displayName(of:)) ?? "the model") Again")
-        return TranscriptPage(conversation, live: state.chats.live, asleep: server.asleep, askAgain: askAgain,
-                              name: state.displayName(of:))
+        return TranscriptPage(conversation, askAgain: askAgain, name: state.displayName(of:))
+    }
+}
+
+/// The transcript of the open conversation, with the reply that streams in it: a view of its own,
+/// the one that reads the reply, so that each flush of it draws the transcript alone, which sends
+/// the page that reply, and the conversation, the same, is neither built nor compared again.
+private struct LiveTranscript: View {
+    @Environment(AppState.self) private var state
+    let page: TranscriptPage
+
+    var body: some View {
+        let reply = state.chats.reply.flatMap { $0.conversation == page.id ? $0 : nil }
+        TranscriptView(transcript: state.transcript, page: page, reply: reply.map {
+            TranscriptMessage($0.message, live: $0.live, asleep: state.server.asleep, name: state.displayName(of:))
+        })
     }
 }

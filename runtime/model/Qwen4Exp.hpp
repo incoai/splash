@@ -92,8 +92,6 @@ struct Qwen4ExpLayout final : QwenHybridLayout {
                           .pleHeadDimension = 160,
                           .pleConvolutionTaps = 4},
                          "Qwen3.8-Flash-Next"} {}
-  // A family of the architecture.
-  constexpr explicit Qwen4ExpLayout(const QwenHybridLayout &family) : QwenHybridLayout(family) {}
   bool operator==(const Qwen4ExpLayout &) const = default;
 };
 
@@ -114,8 +112,9 @@ static_assert(Qwen4ExpLayout{}.indexerHeads == BLOCK_INDEXER_HEADS &&
 // The longest n-gram the PLE hash mixes (metal/abi/NgramEmbedding.h).
 inline constexpr uint32_t kPleMaximumNgram = NGRAM_EMBEDDING_MAXIMUM_NGRAM;
 
-// The hash of the PLE n-gram embedding, from the GGUF's metadata: the multiplier of each n-gram position (0 past
-// pleNgram), each head's table rows and the table's rows.
+// The hash of the PLE n-gram embedding, from the GGUF's metadata: the
+// multiplier of each n-gram position (0 past pleNgram), each head's table
+// rows and the table's rows.
 struct Qwen4PleHash final {
   std::array<uint64_t, kPleMaximumNgram> multipliers{};
   std::vector<uint32_t> headOffsets;
@@ -171,7 +170,7 @@ struct Qwen4ExpWeights final : QwenTargetWeightsBase {
   std::vector<Qwen4ExpLayerWeights> layers;
   // The last mix, which feeds the head in place of a final norm.
   Qwen4HyperWeights finalHyper;
-  // The PLE table's native rows of pleHeadDimension values; empty when the
+  // The PLE table's rows as stored, of pleHeadDimension values; empty when the
   // table streams from its file (--ple-memory), where streamedTable reads
   // the rows of pleFormat a step gathers.
   ops::EmbeddingWeights pleTable;

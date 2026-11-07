@@ -116,13 +116,8 @@ DraftCheckpointLoader::DraftCheckpointLoader(metal::MetalBackend &backend, Weigh
 }
 
 WeightFile DraftCheckpointLoader::open(size_t index) {
-  const gguf::Image &plan = planned_->images[index];
-  return images_.load({"draft/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
-                       [&backend = backend_, planned = planned_, index](std::span<uint8_t>,
-                                                                         const metal::MetalBuffer &buffer) {
-                         writeGgufImage(backend, buffer, planned->images[index]);
-                         planned->checkpoint.checkUnchanged();
-                       }});
+  return loadImage(backend_, images_, "draft/", {planned_, &planned_->images[index]},
+                   [planned = planned_] { planned->checkpoint.checkUnchanged(); });
 }
 
 WeightFile DraftCheckpointLoader::layer(uint32_t index) {

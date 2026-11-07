@@ -14,7 +14,7 @@ from urllib.parse import unquote
 from jsonschema.exceptions import SchemaError
 from llguidance import LLMatcher
 
-from .chat_format import TOOL_CALL_CLOSE, TOOL_CALL_OPEN
+from .chat_format import THINK_END, TOOL_CALL_CLOSE, TOOL_CALL_OPEN
 from .errors import APIError
 from .lru import LRUCache, memoized
 from .schema_validation import (
@@ -95,15 +95,13 @@ class ToolPolicy:
 
 class ParameterTypes:
     """The JSON types by which the values of a request's tool calls convert,
-    which the projector of its output reads as a call first names a tool of
-    its ToolPolicy and keeps for its later calls: those of each parameter
-    the tool declares, and those of any other; None where its schema
-    constrains no type, as for a tool that was not offered. A strict tool's
-    are those of the arguments its grammar generates. Any other tool's
-    arguments are projected from its schema, within what the budget of the
-    request's tools that are not strict has left, and their types read
-    against that schema; one whose schema cannot be read or whose arguments
-    cannot be projected declares no types."""
+    read by the output projector as a call first names a tool, and kept for
+    its later calls: those of each parameter the tool declares, and those of
+    any other; None where its schema constrains no type, as for a tool that
+    was not offered. A strict tool's are those its grammar generates; any
+    other's are read against its schema as framed within the non-strict
+    tools' budget, and one whose schema cannot be read or framed declares
+    none."""
 
     def __init__(self, policy):
         self._policy = policy
@@ -211,10 +209,9 @@ _pattern_checks = LRUCache(PATTERN_CHECK_CACHE_BYTES, PATTERN_CHECK_CACHE_SIZE)
 # The whitespace a model chooses between the tokens of constrained output, in
 # JSON and around tool calls, is bounded: a model that prefers whitespace to
 # every token the grammar allows next would otherwise write it until
-# max_tokens, as Qwen models do, most of all under speculative decoding (vLLM
-# #38696, #50989). llama.cpp and Outlines bound it more tightly; 64 characters
-# still take pretty printing 15 levels deep at four spaces. Whitespace inside
-# strings is content and unbounded.
+# max_tokens, as Qwen models do, most of all under speculative decoding. 64
+# characters still take pretty printing 15 levels deep at four spaces.
+# Whitespace inside strings is content and unbounded.
 MAX_WHITESPACE = 64
 WHITESPACE = rf"[ \t\n\r]{{0,{MAX_WHITESPACE}}}"
 WHITESPACE_RULE = f"WS: /{WHITESPACE}/"
@@ -651,13 +648,13 @@ def _argument_shape(root, budget):
     branch before the model has written the discriminator or dependent
     properties, so assertions across fields go unenforced.
 
-    A keyword can hold anything: an older declared dialect leaves a newer one
-    unchecked, a reference can reach data that is not a schema, and the
-    schema of a tool that is not strict is not checked. A keyword that holds
-    another kind of value than it takes constrains nothing, as one its
-    dialect does not define, and so do a value that is not a schema where
-    one belongs, a type name that stands for no JSON type (TYPE_NAMES), such
-    as Draft 3's "any", and a reference to nothing in the document.
+    A keyword can hold anything (an older dialect leaves newer keywords
+    unchecked, a reference can reach data that is not a schema, and a
+    non-strict tool's schema is not checked), so a keyword holding another
+    kind of value than it takes constrains nothing, as one its dialect does
+    not define, and nor do a non-schema where a schema belongs, a type name
+    that stands for no JSON type (TYPE_NAMES, such as Draft 3's "any") or a
+    dangling reference.
     """
 
     def combine(shapes, union=False):
@@ -810,6 +807,12 @@ def _lark_regex(pattern):
     return "/" + pattern.replace("/", r"\/") + "/"
 
 
+def _text_rule(*tags):
+    """The TEXT lexeme: any text that spells none of `tags`."""
+    spelled = "|".join(re.escape(tag) for tag in tags)
+    return "TEXT: /(?s:.*)/ & ~" + _lark_regex(f"(?s:.*)({spelled})(?s:.*)")
+
+
 # What the grammars write reads back as written: a name neither starts nor
 # ends with the space reading strips and is no longer than reading takes, and
 # raw text does not run past its value's close.
@@ -897,14 +900,16 @@ def _parameter_rules(rule, prefix, value_schema, syntax):
     """The rules of a parameter of a strict tool, its value written as the
     template writes values, a string as its text and any other value as
     JSON, then the syntax's value close: raw text when it may be any string,
-    else one of the values each member of its union lists, or JSON of a
-    member that lists none. None when no value is possible. Framing makes
-    each parameter schema self-contained, so it is its own reference
-    root."""
+    else one of the values each member of its union lists, or JSON of the
+    members that list none. None when no value is possible. Framing makes
+    each parameter schema self-contained, so it is its own reference root:
+    the members that list no value are one JSON schema, the parameter schema
+    with them as its union, whose references reach its definitions as they
+    are, and the grammar grows with the parameter schema alone."""
     closing = _tags(syntax, syntax.value_close)
     if value_schema is False:
         return None
-    rules, choices = [], []
+    rules, choices, structured = [], [], []
     for member in _union_members(value_schema):
         texts = _literal_texts(member, value_schema)
         if texts is None:
@@ -915,11 +920,7 @@ def _parameter_rules(rule, prefix, value_schema, syntax):
                     f"{rule}: {prefix} {rule}_value",
                     *_raw_value(syntax, f"{rule}_value"),
                 ]
-            if member is not value_schema:
-                # A member refers to the parameter schema's definitions.
-                member = _schema_with_root(member, value_schema)
-            member = _grammar_compatible_schema(member)
-            choices.append(f"%json {json.dumps(member, separators=(',', ':'))}")
+            structured.append(member)
             continue
         for text in texts:
             if syntax.value_close in text:
@@ -929,6 +930,21 @@ def _parameter_rules(rule, prefix, value_schema, syntax):
             else:
                 rules.append(f"{rule}_empty_{len(rules)}:")
                 choices.append(f"{rule}_empty_{len(rules) - 1}")
+    if structured:
+        schema = (
+            value_schema
+            if structured[0] is value_schema
+            else {
+                **{
+                    key: value
+                    for key, value in value_schema.items()
+                    if key not in ("anyOf", "oneOf")
+                },
+                "anyOf": structured,
+            }
+        )
+        schema = _grammar_compatible_schema(schema)
+        choices.append(f"%json {json.dumps(schema, separators=(',', ':'))}")
     if not choices:
         return None
     return [
@@ -1007,7 +1023,7 @@ def json_grammar(schema, thinking, *, chat_format):
     ]
     if think_rule is not None:
         grammar.append(think_rule)
-        grammar.append(r"TEXT: /(?s:.*)/ & ~/(?s:.*)<\/think>(?s:.*)/")
+        grammar.append(_text_rule(THINK_END))
     grammar.append(WHITESPACE_RULE)
     return "\n".join(grammar) + "\n"
 
@@ -1222,7 +1238,7 @@ def tool_grammar(policy, thinking, response_schema=None, *, chat_format):
         [
             *calls,
             WHITESPACE_RULE,
-            r"TEXT: /(?s:.*)/ & ~/(?s:.*)(<tool_call>|<\/think>)(?s:.*)/",
+            _text_rule(TOOL_CALL_OPEN, THINK_END),
         ]
     )
     side_grammars.insert(

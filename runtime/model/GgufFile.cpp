@@ -160,13 +160,13 @@ uint64_t GgufTensor::elements() const {
 
 GgufFile::GgufFile(WeightSource &source) : GgufFile(std::array<WeightSource *, 1>{&source}) {}
 
-GgufFile::GgufFile(std::span<WeightSource *const> sources) : sources_(sources.begin(), sources.end()) {
+GgufFile::GgufFile(std::span<WeightSource *const> sources, GgufContents contents)
+    : sources_(sources.begin(), sources.end()) {
   if (sources_.empty()) throw GgufError("a GGUF needs at least one file");
-  for (uint32_t file = 0; file < sources_.size(); ++file) parse(*sources_[file], file);
+  for (uint32_t file = 0; file < sources_.size(); ++file) parse(*sources_[file], file, contents);
   // The first file's split.count and split.tensors.count, where it states
-  // them, describe the files read, as install/gguf.py merged_split reads
-  // them: a part of a split GGUF read alone is refused here rather than as
-  // the other parts' tensors missing.
+  // them, describe the files read: a part of a split GGUF read alone is
+  // refused here rather than as the other parts' tensors missing.
   if (metadata_.unsignedValue("split.count").value_or(1) != sources_.size())
     throw GgufError("the GGUF's split.count does not match its " + std::to_string(sources_.size()) +
                     (sources_.size() == 1 ? " file" : " files"));
@@ -175,7 +175,7 @@ GgufFile::GgufFile(std::span<WeightSource *const> sources) : sources_(sources.be
   rotation_ = readRotation();
 }
 
-void GgufFile::parse(WeightSource &source, uint32_t file) {
+void GgufFile::parse(WeightSource &source, uint32_t file, GgufContents contents) {
   // Only the first file's metadata is kept: a later split file repeats
   // split.* alone, whose split.no must be its place.
   const bool first = file == 0;
@@ -188,7 +188,7 @@ void GgufFile::parse(WeightSource &source, uint32_t file) {
   const uint64_t tensorCount = reader.scalar<uint64_t>();
   const uint64_t keyCount = reader.scalar<uint64_t>();
   if (tensorCount > 16384 || keyCount > 16384) throw GgufError("implausible GGUF header counts");
-  // A key holds one value, as llama.cpp's reader and install/gguf.py require.
+  // A key holds one value, as llama.cpp's reader requires.
   std::set<std::string, std::less<>> keys;
   for (uint64_t i = 0; i < keyCount; ++i) {
     const std::string key = reader.string();
@@ -267,6 +267,7 @@ void GgufFile::parse(WeightSource &source, uint32_t file) {
     (void)tensor.elements(); // Reject overflowing shapes even when quantized bytes would fit.
     tensor.type = reader.scalar<uint32_t>();
     tensor.offset = reader.scalar<uint64_t>();
+    if (tensor.offset % alignment) throw GgufError("tensor data is misaligned: " + tensor.name);
     const GgmlTypeTraits *traits = ggmlTypeTraits(tensor.type);
     if (!traits) throw GgufError("unknown ggml type " + std::to_string(tensor.type) + " for " + tensor.name);
     if (tensor.columns() % traits->blockElements)
@@ -278,6 +279,8 @@ void GgufFile::parse(WeightSource &source, uint32_t file) {
       throw GgufError("duplicate GGUF tensor: " + tensor.name);
     tensors_.push_back(std::move(tensor));
   }
+  // A header alone ends at its tensor table.
+  if (contents == GgufContents::Headers) return;
   const uint64_t headerEnd = reader.position();
   // A part of no tensors may end at its header, as the first part of a split
   // GGUF that holds the metadata alone does: its data section is empty, and
@@ -290,7 +293,6 @@ void GgufFile::parse(WeightSource &source, uint32_t file) {
   const uint64_t dataBytes = source.bytes() - source.dataOffset();
   for (size_t i = firstTensor; i < tensors_.size(); ++i) {
     const GgufTensor &tensor = tensors_[i];
-    if (tensor.offset % alignment) throw GgufError("tensor data is misaligned: " + tensor.name);
     if (tensor.offset > dataBytes || tensor.bytes > dataBytes - tensor.offset)
       throw GgufError("tensor data runs past the end of the file: " + tensor.name);
   }
@@ -310,8 +312,6 @@ std::optional<GgufRotation> GgufFile::readRotation() const {
   collect(arrays_);
   collect(names_);
   if (keys.empty()) return std::nullopt;
-  // install/gguf.py ROTATION and ROTATION_ARRAYS screen the same keys and
-  // values before download.
   static constexpr std::string_view kKnown[] = {"version",       "block_size",   "transform",
                                                 "axis",          "sign_mode",    "gdn_v_grouped",
                                                 "weight_names",  "inverse_weight_names", "sign_widths",
@@ -400,7 +400,8 @@ const GgufTensor &GgufFile::require(std::string_view name) const {
   return *tensor;
 }
 
-OpenGguf::OpenGguf(const std::vector<std::filesystem::path> &paths) : file_(openSources(sources_, paths)) {}
+OpenGguf::OpenGguf(const std::vector<std::filesystem::path> &paths, GgufContents contents)
+    : file_(openSources(sources_, paths), contents) {}
 
 void OpenGguf::checkUnchanged() const {
   for (const WeightSource &source : sources_) source.checkUnchanged();

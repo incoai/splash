@@ -10,6 +10,11 @@
 // production is server/protocol.py.
 namespace splash::protocol::peer {
 
+// A Ready an engine under test announces where what it says is not what the
+// test checks: four lanes, the test model's 1024 tokens and 64-token
+// vocabulary, one stop token and the mask rows of a draft of eight.
+inline const ReadyEvent kTestReady{4, 1024, false, 64, {1}, 9};
+
 // Header and payload exactly as server/protocol.py writes them, without
 // validation, so tests can send the engine invalid frames.
 [[nodiscard]] std::vector<uint8_t> serialize(const ClientMessage &message);

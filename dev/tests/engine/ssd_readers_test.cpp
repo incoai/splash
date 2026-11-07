@@ -1,15 +1,5 @@
-// The engine's SSD readers (model::SsdReaders) run every task of a batch
-// once: a batch that runs now on the caller and every reader, a background
-// batch on at most its readers, the oldest first; a failed task is tried
-// once more, and a second failure is the batch's (a batch that runs now
-// throws it once every task ended); stop() leaves the tasks no reader took
-// unrun and returns once those taken ended, and the batch's end once every
-// task ran, halt() returns at once and each taken task tells when it ended,
-// finish() runs the rest now and returns once the batch's end has; a batch
-// that runs now never waits behind a background batch's queue, and the pool
-// is busy for writes exactly while one runs, as a probe that outlives it
-// says; and several threads run, start, stop and finish batches at once.
-// Built under TSan too.
+// model::SsdReaders: every task of a batch runs once (a failure is retried once), run-now batches
+// never wait behind background ones, and stop/halt/finish end batches as documented. TSan too.
 #include "TestChecks.hpp"
 #include "model/SsdReaders.hpp"
 
@@ -255,9 +245,7 @@ void runNowPassesTheBackground() {
           "a background batch ran a task other than once");
 }
 
-// A reader takes the background batches in the order they came: one
-// reader runs the tasks of three batches started behind a busy one batch by
-// batch.
+// One reader runs background batches in the order they came, batch by batch.
 void backgroundRunsTheOldestFirst() {
   SsdReaders pool(1);
   Gate gate;
@@ -290,15 +278,13 @@ void backgroundRunsTheOldestFirst() {
   require(std::ranges::is_sorted(order), "a reader took a later background batch first");
 }
 
-// Writes yield to the pool exactly while a batch runs now (criticalBusy, as
-// its probe says): not while it is idle or only reads in the background. The
-// probe outlives the pool and then says nothing runs.
+// The busy probe says busy exactly while a run-now batch runs, and nothing once the pool is gone.
 void criticalBusyWhileABatchRunsNow() {
   std::function<bool()> probe;
   {
     SsdReaders pool(2);
     probe = pool.criticalBusyProbe();
-    require(!pool.criticalBusy() && !probe(), "an idle pool held writes back");
+    require(!probe(), "an idle pool held writes back");
     Gate gate;
     std::atomic<bool> began = false;
     const auto ahead = pool.start(
@@ -309,11 +295,11 @@ void criticalBusyWhileABatchRunsNow() {
         },
         1);
     while (!began.load()) std::this_thread::yield();
-    require(!pool.criticalBusy() && !probe(), "a background batch held writes back");
+    require(!probe(), "a background batch held writes back");
     std::atomic<int> seen = 0;
-    pool.run(8, [&](size_t) { seen += pool.criticalBusy() && probe(); });
-    static_cast<void>(pool.runBatch(8, [&](size_t) { seen += pool.criticalBusy() && probe(); }));
-    require(seen.load() == 16 && !pool.criticalBusy() && !probe(),
+    pool.run(8, [&](size_t) { seen += probe(); });
+    static_cast<void>(pool.runBatch(8, [&](size_t) { seen += probe(); }));
+    require(seen.load() == 16 && !probe(),
             "a batch run now did not hold writes back exactly while it ran");
     gate.open();
     pool.stop(*ahead);

@@ -7,6 +7,10 @@ import UniformTypeIdentifiers
 final class Draft {
     var text = ""
     private(set) var images: [Data] = []
+    /// How many attached images are still being encoded, which join `images` once they are.
+    private(set) var attaching = 0
+    /// The attachment that joins `images` last, which the next one waits for.
+    private var lastAttachment: Task<Void, Never>?
     /// Asks the text field for the keyboard; counts the requests.
     private(set) var focusRequests = 0
 
@@ -16,8 +20,19 @@ final class Draft {
 
     /// Attaches `images` in a form the server takes: at most 2048 pixels on the long side (its
     /// limit is about four million pixels), PNG when they have transparency and JPEG otherwise.
+    /// They are encoded away from the main thread, which a photo would hold for a tenth of a second
+    /// or more, and join the draft in the order they were attached.
     func attach(_ images: [NSImage]) {
-        self.images += images.compactMap(Self.encoded)
+        let sources = images.compactMap { $0.cgImage(forProposedRect: nil, context: nil, hints: nil) }
+        guard !sources.isEmpty else { return }
+        attaching += sources.count
+        let encoding = Task.detached(priority: .userInitiated) { sources.compactMap(Self.encoded) }
+        let previous = lastAttachment
+        lastAttachment = Task {
+            await previous?.value
+            self.images += await encoding.value
+            attaching -= sources.count
+        }
     }
 
     func remove(at index: Int) { images.remove(at: index) }
@@ -28,8 +43,7 @@ final class Draft {
         return (text.trimmingCharacters(in: .whitespacesAndNewlines), images)
     }
 
-    private static func encoded(_ image: NSImage) -> Data? {
-        guard let source = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+    nonisolated private static func encoded(_ source: CGImage) -> Data? {
         let scale = min(1, 2048 / Double(max(source.width, source.height)))
         let width = Int(Double(source.width) * scale), height = Int(Double(source.height) * scale)
         guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
@@ -54,7 +68,6 @@ struct Composer: View {
     @Environment(\.colorScheme) private var colorScheme
     @Bindable var draft: Draft
     @State private var picking = false
-    @State private var height: CGFloat = 22
 
     var body: some View {
         let images = state.server.acceptsImages
@@ -62,10 +75,9 @@ struct Composer: View {
             if !draft.images.isEmpty {
                 Attachments(draft: draft)
             }
-            ComposerField(text: $draft.text, height: $height, focusRequests: draft.focusRequests,
+            ComposerField(text: $draft.text, focusRequests: draft.focusRequests,
                           placeholder: "Message Splash", submit: state.sendDraft, cancel: stop, acceptsImages: images,
                           attach: draft.attach)
-                .frame(height: min(max(height, 22), 220))
             HStack(spacing: 6) {
                 // Only for a model that sees images.
                 if images {
@@ -140,22 +152,15 @@ private struct ContextRing: View {
     let usage: ContextUsage
 
     var body: some View {
-        ZStack {
-            Circle().stroke(.quaternary, lineWidth: 2)
-            Circle()
-                .trim(from: 0, to: usage.fraction)
-                .stroke(tint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-        }
-        .frame(width: 14, height: 14)
-        // Room around the ring for the pointer to find its help.
-        .padding(5)
-        .contentShape(.rect)
-        .animation(Motion.settle, value: usage)
-        .help(usage.explanation)
-        .accessibilityElement()
-        .accessibilityLabel("Context")
-        .accessibilityValue(usage.explanation)
+        Ring(fraction: usage.fraction, tint: tint, size: 14)
+            // Room around the ring for the pointer to find its help.
+            .padding(5)
+            .contentShape(.rect)
+            .animation(Motion.settle, value: usage)
+            .help(usage.explanation)
+            .accessibilityElement()
+            .accessibilityLabel("Context")
+            .accessibilityValue(usage.explanation)
     }
 
     private var tint: AnyShapeStyle {
@@ -167,8 +172,28 @@ private struct ContextRing: View {
     }
 }
 
-/// The send and stop button: a circle in the label color, the composer's one solid element, faded
-/// as the app's controls fade while it can't be used.
+/// How full something is, as a ring that `fraction`, from 0 to 1, fills in `tint` from the top
+/// clockwise, over a faint track, `size` points across: the context in the Chat's composer
+/// (`ContextRing`), and a download in the Server's button (`ServerButton`).
+struct Ring<Tint: ShapeStyle>: View {
+    let fraction: Double
+    let tint: Tint
+    let size: CGFloat
+
+    var body: some View {
+        ZStack {
+            Circle().stroke(.quaternary, lineWidth: 2)
+            Circle()
+                .trim(from: 0, to: fraction)
+                .stroke(tint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+        }
+        .frame(width: size, height: size)
+    }
+}
+
+/// The send and stop button: a circle, the composer's one solid element, in the mark's color, the
+/// app's one accent, while it can send or stop; gray while it can't.
 private struct InkCircle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
 
@@ -176,8 +201,8 @@ private struct InkCircle: ButtonStyle {
         configuration.label
             .foregroundStyle(.background)
             .frame(width: 28, height: 28)
-            .background(.primary, in: .circle)
-            .opacity(isEnabled ? (configuration.isPressed ? 0.7 : 1) : 0.4)
+            .background(isEnabled ? AnyShapeStyle(Color.splash) : AnyShapeStyle(.tertiary), in: .circle)
+            .opacity(configuration.isPressed ? 0.7 : 1)
     }
 }
 
@@ -191,16 +216,14 @@ private struct EngineSlot: View {
         let server = state.server
         let name = server.model.map(state.displayName(of:)) ?? ""
         let words = switch server.phase {
-        case .ready where server.recovering: state.status
-        case .ready: name
-        case .starting, .stopping: state.status
-        case .failed: "\(name) ran into a problem"
+        case .ready where !server.recovering: name
         case .stopped: state.installed.isEmpty ? "No model on this Mac" : "No model running"
+        default: state.status
         }
         let blocked = if case .failed = server.phase { true } else { server.phase == .stopped }
         Button { state.section = .server } label: {
             HStack(spacing: 6) {
-                StatusMark(look: state.markLook, since: server.since, size: 12)
+                StatusMark(look: state.serverStatus.look, since: server.since, size: 12)
                 Text(words).foregroundStyle(.secondary)
                 if blocked { Text("Open Server").foregroundStyle(.tint) }
             }
@@ -261,6 +284,9 @@ private struct EffortMenu: View {
     }
 }
 
+/// The images attached to a draft, each with a button that takes it off. Each has a hairline, so
+/// that a white one keeps its edge on the composer, and its button a solid disc, which stands out
+/// over any image in either appearance.
 private struct Attachments: View {
     let draft: Draft
 
@@ -275,9 +301,12 @@ private struct Attachments: View {
                                 .scaledToFill()
                                 .frame(width: 56, height: 56)
                                 .clipShape(.rect(cornerRadius: 10))
+                                .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(.separator) }
                         }
                         Button { draft.remove(at: index) } label: {
-                            Image(systemName: "xmark.circle.fill").symbolRenderingMode(.hierarchical)
+                            Image(systemName: "xmark.circle.fill")
+                                .symbolRenderingMode(.palette)
+                                .foregroundStyle(.white, .black.opacity(0.6))
                         }
                         .buttonStyle(.borderless)
                         .offset(x: 6, y: -6)
@@ -293,10 +322,10 @@ private struct Attachments: View {
 
 /// The message's text view: Return sends and Shift-Return starts a new line, and Escape stops the
 /// reply, after the input method has finished what it composes; pasted and dropped images attach
-/// when the model sees images.
+/// when the model sees images. It is as tall as its text, from one line to 220 points, past which
+/// the text scrolls.
 private struct ComposerField: NSViewRepresentable {
     @Binding var text: String
-    @Binding var height: CGFloat
     let focusRequests: Int
     let placeholder: String
     let submit: () -> Void
@@ -305,6 +334,17 @@ private struct ComposerField: NSViewRepresentable {
     let attach: ([NSImage]) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    /// The text's height as the view lays it out, at its width; a change of its height asks again
+    /// (`MessageTextView.setFrameSize`).
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView scroll: NSScrollView, context: Context) -> CGSize? {
+        guard let view = scroll.documentView as? NSTextView, let container = view.textContainer,
+              let layout = view.layoutManager else { return nil }
+        layout.ensureLayout(for: container)
+        let height = layout.usedRect(for: container).height + view.textContainerInset.height * 2
+        let width = proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? scroll.frame.width
+        return CGSize(width: width, height: min(max(height, 22), 220))
+    }
 
     func makeNSView(context: Context) -> NSScrollView {
         // TextKit 1: the height is measured with its layout manager.
@@ -350,7 +390,6 @@ private struct ComposerField: NSViewRepresentable {
             // A change made here is no edit to undo.
             view.string = text
             context.coordinator.undo.removeAllActions()
-            context.coordinator.measure(view)
         }
         if context.coordinator.focusRequests != focusRequests {
             context.coordinator.focusRequests = focusRequests
@@ -377,7 +416,6 @@ private struct ComposerField: NSViewRepresentable {
             guard let view = notification.object as? NSTextView else { return }
             published = view.string
             field.text = view.string
-            measure(view)
         }
 
         func textView(_ view: NSTextView, doCommandBy selector: Selector) -> Bool {
@@ -394,14 +432,6 @@ private struct ComposerField: NSViewRepresentable {
             default:
                 return false
             }
-        }
-
-        func measure(_ view: NSTextView) {
-            guard let container = view.textContainer, let layout = view.layoutManager else { return }
-            layout.ensureLayout(for: container)
-            let height = layout.usedRect(for: container).height + view.textContainerInset.height * 2
-            // Not while SwiftUI updates the view, which measures too.
-            DispatchQueue.main.async { [self] in if field.height != height { field.height = height } }
         }
     }
 }
@@ -423,9 +453,18 @@ private final class MessageTextView: NSTextView {
         needsDisplay = true
     }
 
+    // The view is as tall as its text laid out: an edit, what the input method composes, or a new
+    // width that wraps it differently. The field takes the new height in the layout that follows,
+    // before the window shows it, rather than scrolling its text a line meanwhile.
+    override func setFrameSize(_ size: NSSize) {
+        let height = frame.height
+        super.setFrameSize(size)
+        if frame.height != height { enclosingScrollView?.invalidateIntrinsicContentSize() }
+    }
+
     // A plain-text view turns Paste off for a clipboard of image data alone.
     override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
-        if item.action == #selector(paste(_:)), !images(in: .general).isEmpty { return true }
+        if item.action == #selector(paste(_:)), holdsImages(.general) { return true }
         return super.validateUserInterfaceItem(item)
     }
 
@@ -436,11 +475,11 @@ private final class MessageTextView: NSTextView {
 
     // A text view takes only text it can read; images it takes here, when the model sees them.
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        images(in: sender.draggingPasteboard).isEmpty ? super.draggingEntered(sender) : .copy
+        holdsImages(sender.draggingPasteboard) ? .copy : super.draggingEntered(sender)
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        images(in: sender.draggingPasteboard).isEmpty ? super.draggingUpdated(sender) : .copy
+        holdsImages(sender.draggingPasteboard) ? .copy : super.draggingUpdated(sender)
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -455,13 +494,23 @@ private final class MessageTextView: NSTextView {
         return true
     }
 
-    /// The images `pasteboard` holds, image files too, when the model sees images; none for text
-    /// that comes with a picture of itself, as copied rich text does.
+    /// Whether `pasteboard` holds images to attach, when the model sees images: image files, or
+    /// images without text, as copied rich text comes with a picture of itself. Told by their
+    /// types alone: Paste's menu item and every move of a drag ask, so nothing is read until they
+    /// are attached.
+    private func holdsImages(_ pasteboard: NSPasteboard) -> Bool {
+        guard coordinator?.field.acceptsImages == true else { return false }
+        if pasteboard.canReadObject(forClasses: [NSURL.self], options: Self.imageFiles) { return true }
+        return pasteboard.string(forType: .string) == nil && pasteboard.canReadObject(forClasses: [NSImage.self])
+    }
+
+    /// The images `pasteboard` holds to attach (`holdsImages`), image files read.
     private func images(in pasteboard: NSPasteboard) -> [NSImage] {
-        guard coordinator?.field.acceptsImages == true else { return [] }
-        let files = (pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingContentsConformToTypes: [UTType.image.identifier]]) as? [URL]) ?? []
+        guard holdsImages(pasteboard) else { return [] }
+        let files = (pasteboard.readObjects(forClasses: [NSURL.self], options: Self.imageFiles) as? [URL]) ?? []
         if !files.isEmpty { return files.compactMap(NSImage.init(contentsOf:)) }
-        guard pasteboard.string(forType: .string) == nil else { return [] }
         return (pasteboard.readObjects(forClasses: [NSImage.self]) as? [NSImage]) ?? []
     }
+
+    private static let imageFiles: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingContentsConformToTypes: [UTType.image.identifier]]
 }

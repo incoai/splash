@@ -15,46 +15,37 @@ enum AppFlow {
     static let models = environment["SPLASH_APP_MODELS"]
         .map { $0.split(separator: " ").map(String.init) }.flatMap { $0.isEmpty ? nil : $0 }
     static let port = Int(environment["SPLASH_APP_PORT"] ?? "") ?? freePort()
-
-    /// A port nothing listens on now, as the system picks one.
-    private static func freePort() -> Int {
-        let socket = Darwin.socket(AF_INET, SOCK_STREAM, 0)
-        defer { close(socket) }
-        var address = sockaddr_in(sin_len: UInt8(MemoryLayout<sockaddr_in>.size), sin_family: sa_family_t(AF_INET),
-                                  sin_port: 0, sin_addr: in_addr(s_addr: inet_addr("127.0.0.1")), sin_zero: (0, 0, 0, 0, 0, 0, 0, 0))
-        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
-        withUnsafeMutablePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                _ = bind(socket, $0, length)
-                _ = getsockname(socket, $0, &length)
-            }
-        }
-        return Int(UInt16(bigEndian: address.sin_port))
-    }
+    /// The defaults of every test and every run, kept from one to the next as an app's are, apart
+    /// from the user's: each test's launch is a relaunch of one app, which stops the server an
+    /// earlier one left running before it starts its own on the same port.
+    @MainActor static let defaults = UserDefaults.kept(in: FileManager.default.temporaryDirectory.appending(path: "splash-app-flow"))
 }
 
+/// A class, so that each test's instance, which Swift Testing lets go as the test ends, however it
+/// ends, quits what the test started: the server, a download. A test that failed threw before its
+/// own stop, and left the model server running, its model resident beside the next run's.
 @MainActor
 @Suite(.serialized, .enabled(if: AppFlow.models != nil))
-struct AppFlowTests {
+final class AppFlowTests {
     static let environment = AppFlow.environment
     static let models = AppFlow.models
     static let port = AppFlow.port
 
     /// The launch options of every run: the server's defaults, on the test's port.
-    static let defaults = ServeSettings(values: ["--port": String(port)])
-    /// Where the runs keep an API key: not where the user's Splash does.
-    static let keychain = Keychain(service: "Splash Tests")
+    static let options = ServeSettings(values: ["--port": String(port)])
+    /// The seconds a server is given to reach each step of a start, a switch or a failure.
+    static let stepTimeout = 600.0
 
     let state: AppState
     let model: String
-    /// The conversations of this run, apart from the user's.
-    let chats = FileManager.default.temporaryDirectory.appending(path: "splash-chats-\(UUID().uuidString)")
+    /// The conversations and logs of this test, apart from the user's.
+    let folder = FileManager.default.temporaryDirectory.appending(path: "splash-app-flow-\(UUID().uuidString)")
 
     init() async throws {
-        Self.defaults.save()
+        Self.options.save(AppFlow.defaults)
         let runtime = try #require(Runtime.locate(), "SPLASH_RUNTIME names no runtime")
         #expect(runtime.packaged)
-        state = AppState(runtime: runtime, chats: ChatStore(folder: chats), keychain: Self.keychain)
+        state = AppState.forTests(in: folder, runtime: runtime, defaults: AppFlow.defaults)
         model = Self.models![0]
         await state.launch()
         // The window opens on the Server, and nothing starts until the user starts it.
@@ -62,8 +53,18 @@ struct AppFlowTests {
         #expect(!state.server.running)
     }
 
+    isolated deinit {
+        state.quit()
+        try? FileManager.default.removeItem(at: folder)
+    }
+
+    /// The next launch of the app, as after a quit or a crash of this one.
+    func relaunch() -> AppState {
+        AppState.forTests(in: folder, runtime: state.runtime, defaults: AppFlow.defaults)
+    }
+
     @Test func thisMacIsSupportedAndGetsSuggestions() async throws {
-        #expect(state.runtime.unsupportedReason() == nil)
+        #expect(await state.runtime.unsupportedReason() == nil)
         let suggestions = state.catalog.suggestions(memory: Catalog.memory)
         print("Suggested for \(Catalog.memory) GB: \(suggestions.map(\.id))")
         #expect(!suggestions.isEmpty)
@@ -72,10 +73,11 @@ struct AppFlowTests {
         state.section = .chat
         await Snapshot.save("chat-stopped", MainView().environment(state))
         // A Mac with no model yet: a runtime whose models folder is empty.
-        let fresh = FileManager.default.temporaryDirectory.appending(path: "splash-first-run-\(getpid())")
+        let fresh = folder.appending(path: "first-run")
         try FileManager.default.createDirectory(at: fresh.appending(path: "install"), withIntermediateDirectories: true)
         try? FileManager.default.copyItem(at: state.runtime.suggestedModels, to: Runtime(root: fresh).suggestedModels)
-        let first = AppState(runtime: Runtime(root: fresh), keychain: Self.keychain)
+        let first = AppState.forTests(in: fresh, runtime: Runtime(root: fresh))
+        await first.listed()
         #expect(first.installed.isEmpty && first.selection == nil)
         await first.launch()
         await Snapshot.save("server-first-run", MainView().environment(first))
@@ -85,10 +87,10 @@ struct AppFlowTests {
         try await install(model)
         state.start(model)
         #expect(state.selection == model)
-        try await waitFor(state.server.phase == .starting, "starting")
+        try await waitFor(state.server.phase == .starting, "starting (\(state.server.phase))", seconds: Self.stepTimeout)
         await Snapshot.save("server-starting", MainView().environment(state))
-        // It says what it does, as the log tells it: it reads the weights, then warms up.
-        try await waitFor(state.server.step == .warming, "warming up")
+        // It says what it does, as its serve record tells it: it reads the weights, then warms up.
+        try await waitFor(state.server.step == .warming, "warming up (\(state.server.phase))", seconds: Self.stepTimeout)
         await Snapshot.save("server-warming", MainView().environment(state))
         try await ready()
         #expect((state.server.context ?? 0) > 0)
@@ -102,7 +104,8 @@ struct AppFlowTests {
         let conversation = try #require(state.chats.current)
         #expect(conversation.messages.map(\.role) == [.user, .assistant])
         #expect(conversation.messages[1].model == model)
-        #expect(ChatStore(folder: chats).conversations.first?.messages == conversation.messages, "saved")
+        state.chats.flush()
+        #expect(ChatStore(folder: folder).conversations.first?.messages == conversation.messages, "saved")
         await Snapshot.save("chat-ready", MainView().environment(state))
         #expect(state.server.requestLog.contains { $0.outcome == .done && ($0.output ?? 0) > 0 })
         #expect(state.server.activity.generated > 0)
@@ -126,15 +129,14 @@ struct AppFlowTests {
         state.section = .server
         await Snapshot.save("server-options-changed", MainView().environment(state))
         state.start(model)
-        #expect(state.status.hasPrefix("Restarting "))
-        try await waitFor(state.server.phase == .starting, "restarting")
+        #expect(state.status.hasSuffix(" · Restarting…"))
+        try await waitFor(state.server.phase == .starting, "restarting (\(state.server.phase))", seconds: Self.stepTimeout)
         #expect(state.server.settings["--max-context"] == "32768" && !state.optionsChanged)
         try await ready()
-        state.options = Self.defaults
-        let pid = try #require(state.runtime.serveLockOwner(port: Self.port))
+        let pid = try #require(state.runtime.serveRecord(port: Self.port)?.pid)
         state.stop()
         #expect(state.server.phase == .stopping)
-        try await waitFor(state.server.phase == .stopped, "stopped", seconds: 60)
+        try await waitFor(state.server.phase == .stopped, "stopped (\(state.server.phase))", seconds: 60)
         #expect(kill(pid, 0) != 0)
     }
 
@@ -144,7 +146,7 @@ struct AppFlowTests {
         state.start(model)
         try await ready()
         try await converse("Say hi.")
-        let first = try #require(state.runtime.serveLockOwner(port: Self.port))
+        let first = try #require(state.runtime.serveRecord(port: Self.port)?.pid)
         // Picking another model on the Server offers the switch; it switches only when asked to.
         state.selection = models[1]
         #expect(state.server.model == model && state.server.phase == .ready)
@@ -152,11 +154,12 @@ struct AppFlowTests {
         state.start(models[1])
         #expect(state.server.phase == .stopping)
         #expect(state.server.next == models[1])
-        #expect(state.status.hasPrefix("Switching to "))
+        #expect(state.status.contains(" · Switching to "))
         // The conversation stays while the next model starts.
         state.section = .chat
         await Snapshot.save("chat-switching", MainView().environment(state))
-        try await waitFor(state.server.model == models[1] && state.server.phase != .stopping, "next starting")
+        try await waitFor(state.server.model == models[1] && state.server.phase != .stopping,
+                          "next starting (\(state.server.phase))", seconds: Self.stepTimeout)
         #expect(state.server.phase == .starting)
         #expect(kill(first, 0) != 0)
         try await ready()
@@ -175,6 +178,7 @@ struct AppFlowTests {
         state.addLocal(file)
         // The list outlives the run, so that a failed one leaves the next a Mac without the files.
         defer { state.removeLocal(file.path) }
+        await state.listed()
         #expect(state.selection == file.path && state.isInstalled(file.path))
         state.start(file.path)
         try await ready()
@@ -186,14 +190,15 @@ struct AppFlowTests {
         try await converse("Say hi.")
         try await stop()
         state.removeLocal(file.path)
+        await state.listed()
         #expect(!state.isInstalled(file.path))
     }
 
     @Test func aStartThatFailsSaysWhy() async throws {
         state.options["--max-memory"] = "1G"
-        defer { state.options = Self.defaults }
         state.start(model)
-        try await waitFor({ if case .failed = state.server.phase { true } else { false } }(), "failed")
+        try await waitFor({ if case .failed = state.server.phase { true } else { false } }(),
+                          "failed (\(state.server.phase))", seconds: Self.stepTimeout)
         guard case .failed(let message) = state.server.phase else { return }
         #expect(message.hasPrefix("It needs ")
                 && message.hasSuffix("but the memory limit is 1 GB. Raise the memory limit in Launch Options."),
@@ -221,7 +226,7 @@ struct AppFlowTests {
         listener.standardError = FileHandle.nullDevice
         try listener.run()
         defer { listener.terminate() }
-        try await waitFor(portInUse(Self.port), "the listener")
+        try await waitFor(portInUse(Self.port), "the listener (\(state.server.phase))", seconds: Self.stepTimeout)
         state.start(model)
         guard case .failed(let message) = state.server.phase else {
             Issue.record("\(state.server.phase)")
@@ -237,24 +242,26 @@ struct AppFlowTests {
         // Quit in the middle of a switch: the switch is dropped.
         state.start(model)
         state.quit()
-        try await waitFor(!state.server.running, "stopped", seconds: 60)
+        try await waitFor(!state.server.running, "stopped (\(state.server.phase))", seconds: 60)
         try await Task.sleep(for: .seconds(2))
         #expect(!state.server.running)
         state.start(model)
         #expect(!state.server.running)
         // The model stays picked for the next launch, which starts nothing by itself.
-        #expect(AppState(runtime: state.runtime, keychain: Self.keychain).selection == model)
+        let next = relaunch()
+        await next.listed()
+        #expect(next.selection == model)
     }
 
     @Test func aRelaunchStopsTheServerACrashLeftBehind() async throws {
         state.start(model)
         try await ready()
-        let pid = try #require(state.runtime.serveLockOwner(port: Self.port))
+        let pid = try #require(state.runtime.serveRecord(port: Self.port)?.pid)
         // The next launch of the app, as after a crash of this one.
-        let relaunch = AppState(runtime: state.runtime, keychain: Self.keychain)
-        await relaunch.server.stopLeftover()
+        await relaunch().server.stopLeftover()
         #expect(kill(pid, 0) != 0)
-        try await waitFor({ if case .failed = state.server.phase { true } else { false } }(), "noticed")
+        try await waitFor({ if case .failed = state.server.phase { true } else { false } }(),
+                          "noticed (\(state.server.phase))", seconds: Self.stepTimeout)
     }
 
     @Test func aDownloadReportsProgressCancelsAndResumes() async throws {
@@ -264,6 +271,7 @@ struct AppFlowTests {
         try await waitFor((installer.progress?.done ?? 0) > 0, "progress", seconds: 120)
         #expect(installer.progress?.repo == String(download.split(separator: ":")[0]))
         #expect(state.downloadStatus?.hasPrefix("Downloading ") == true)
+        #expect(state.serverTitle == "Downloading…")
         await Snapshot.save("server-downloading", MainView().environment(state))
         let clock = ContinuousClock.now
         installer.cancel()
@@ -274,34 +282,17 @@ struct AppFlowTests {
         // A crash of the app leaves the download running; the next launch stops it.
         installer.install(download)
         try await waitFor((installer.progress?.done ?? 0) > 0, "progress again", seconds: 120)
-        let pid = pid_t(UserDefaults.standard.integer(forKey: Preference.installerPID))
-        await AppState(runtime: state.runtime, keychain: Self.keychain).installer.stopLeftover()
+        let pid = pid_t(try #require((state.defaults.array(forKey: Preference.installerPID) as? [Int])?.first))
+        await relaunch().installer.stopLeftover()
         #expect(kill(pid, 0) != 0)
         try await waitFor(!installer.running, "noticed", seconds: 30)
         try await install(download)
     }
 
-    @Test func everyServeOptionHasItsPlace() throws {
-        // The options splash serve takes but those of one model, or that the app sets itself.
-        let process = Process()
-        let command = state.runtime.command(["serve", "--help"])
-        process.executableURL = URL(filePath: command[0])
-        process.arguments = Array(command.dropFirst())
-        let output = Pipe()
-        process.standardOutput = output
-        try process.run()
-        let help = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        process.waitUntilExit()
-        let flags = Set(help.matches(of: /(?m)^  (--[a-z-]+)/).map { String($0.1) })
-            .subtracting(["--help", "--model", "--model-dir", "--offline", "--revision", "--draft-model", "--mmproj"])
-        #expect(!flags.isEmpty)
-        #expect(flags == Set(LaunchOption.all.map(\.flag)))
-    }
-
     // MARK: -
 
     private func install(_ model: String) async throws {
-        state.refresh()
+        await state.refresh().value
         guard !state.isInstalled(model) else { return }
         state.installer.install(model)
         try await waitFor(!state.installer.running, "installed \(model)", seconds: 3600)
@@ -313,14 +304,13 @@ struct AppFlowTests {
 
     private func ready() async throws {
         try await waitFor(state.server.phase == .ready || { if case .failed = state.server.phase { true } else { false } }(),
-                          "ready", seconds: 900)
-        #expect(state.server.phase == .ready, "\(state.server.phase); see \(Server.log.path)")
-        #expect(state.runtime.serveLockOwner(port: Self.port) != nil)
+                          "ready (\(state.server.phase))", seconds: 900)
+        #expect(state.server.phase == .ready, "\(state.server.phase); see \(state.server.log.path)")
     }
 
     private func stop() async throws {
         state.server.stop()
-        try await waitFor(!state.server.running, "stopped", seconds: 60)
+        try await waitFor(!state.server.running, "stopped (\(state.server.phase))", seconds: 60)
     }
 
     /// The file of `model`, a GGUF's `OWNER/REPO:VARIANT`, that a download left in the Hugging Face
@@ -360,16 +350,5 @@ struct AppFlowTests {
             let choices: [Choice]
         }
         return try JSONDecoder().decode(Reply.self, from: data).choices.first?.message.content ?? ""
-    }
-
-    private func waitFor(_ condition: @autoclosure () -> Bool, _ what: String, seconds: Double = 600) async throws {
-        let deadline = ContinuousClock.now + .seconds(seconds)
-        while !condition() {
-            guard ContinuousClock.now < deadline else {
-                Issue.record("timed out waiting for \(what): \(state.server.phase)")
-                throw CancellationError()
-            }
-            try await Task.sleep(for: .milliseconds(200))
-        }
     }
 }

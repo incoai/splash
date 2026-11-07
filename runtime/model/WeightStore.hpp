@@ -89,8 +89,8 @@ private:
 // A single-tensor projection; its descriptor must hold the layout's sizes.
 [[nodiscard]] ops::Projection readBlockProjection(WeightFile &file, uint32_t outputSize,
                                                   uint32_t inputSize, std::string_view label);
-// Native block_q4_K, block_q6_K or block_q8_0 rows for the token table
-// (gathered, never multiplied).
+// The token table's rows as stored in a GGUF format (ops::StoredRows),
+// gathered, never multiplied.
 [[nodiscard]] ops::EmbeddingWeights readBlockEmbedding(WeightFile &file, uint32_t outputSize,
                                                        uint32_t inputSize, std::string_view label);
 

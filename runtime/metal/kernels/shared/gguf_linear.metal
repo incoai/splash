@@ -29,10 +29,10 @@ inline void gguf_store_sums(thread Acc &acc, uint splits, uint split, device coh
 }
 
 // ---------------- prefill tiles: a shared B stage (TileN x KS, all threads dequantize), each simdgroup owns RowsPerSG
-// rows. `rows` counts the chunk's rows from the tile's first: simdgroups past them (the last tile of a chunk that is not
-// a multiple of the tile) skip their matmuls and stores, so a chunk costs its rows rounded up to RowsPerSG rather than
-// to the tile (a 33-row Q4_K 17408 x 5120 chunk: 1.7x faster on M5 and M3 than a 128-row tile). Full tiles run this
-// loop too; a branch-free copy for them is no faster (M3 Max, M5 Max).
+// rows. `rows` counts the chunk's rows from the tile's first: simdgroups past them (the last tile of a chunk that is
+// not a multiple of the tile) skip their matmuls and stores, so a chunk costs its rows rounded up to RowsPerSG rather
+// than to the tile (a 33-row chunk: 1.7x faster than a 128-row tile). Full tiles run this loop too; a branch-free copy
+// for them is no faster.
 template <class F, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, GgufEpilogue Ep = EpNone>
 inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
                     uint input_size, uint output_origin, uint rows, threadgroup half *stage, threadgroup half2 *tl,
@@ -60,11 +60,11 @@ constant constexpr uint kPrefillStages = 2 * GGUF_TILE_COLUMNS * GGUF_PREFILL_ST
 // ---------------- decode dispatches over (64-column tiles, K partitions): two simdgroups of 32 columns per
 // threadgroup, every request lane in its tile, `splits` partitions of K (grid.y; kernels/common/split_reduce.h).
 // MPP computes 16-row fragments, so a tile holds 8, 16 or 32 rows, or 64 for a prefill chunk of 33 to 64 rows on
-// Apple10 (these kernels and the fused ones): a 3-lane step
+// Apple10 and on Apple9 GPUs of 10 cores or fewer (these kernels and the fused ones): a 3-lane step
 // runs the 32-row tile over the storage of four lanes, and a 1-lane step may run the 16-row tile over two
 // (LinearPlan::storageRows); the padding lane's rows are computed and discarded. Rows are independent, so every active
 // row is the bits of any other tile height (gguf-projection checks it); the 32-row tile at three lanes costs what it
-// costs at four, 3-15% less than a 16-row plus an 8-row matmul per stage (DRAM-cold, 16- and 20-core M5 Pro).
+// costs at four, 3-15% less than a 16-row plus an 8-row matmul per stage.
 // Gate/up runs as a gate pass (a) into the gate scratch and an up pass (g) whose epilogue applies silu(gate) to the bf16
 // up value, as the Apple9 register kernels do. The destination's type Out is bf16, or fp32 for the plain epilogue's
 // logits (a_f32, ops::Projection::destination). Each column tile walks its partition from the step staged_first_step

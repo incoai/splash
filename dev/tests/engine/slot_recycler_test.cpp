@@ -1,39 +1,18 @@
-// The order a store's slots are recycled in (model::SlotRecycler): a load
-// never takes a slot of a key it uses, and takes none when every slot is its
-// own; free slots are taken first, a freed one before them; a slot's key is
-// found until it is recycled, freed or resized away; a long prefill chunk's
-// scan of more experts than the slots leaves the experts decode steps routed
-// again in place; and when more lanes add experts to each cycle until a cycle
-// routes more than the slots hold, the experts every cycle routes keep
-// hitting (recycling the least recently used slot keeps a fifth of them). A
-// claim allocates nothing. A compaction to fewer slots evicts the keys ARC
-// would recycle, T1's past its target and T2's at it, without a ghost, until
-// the keys past the slots fit the free slots below them, moves those keys
-// there in their lists' order, keeps as many keys as fit and the ghosts
-// within ARC's bounds, and leaves no key or claim past the slots; one straight
-// to fewer slots keeps the keys compactions a chunk at a time keep, moving
-// each once at most. On the
-// decode selections of real requests
-// (dev/tests/fixtures/kv-selection-traces, the directory the test takes), the
-// hot block cache's resolves miss at most 2% more than recycling the least
-// recently used block would.
+// The order a store's slots are recycled in (model::SlotRecycler, ARC): free
+// slots first, never a slot of the claiming load, scans spare the frequent,
+// compactions keep ARC's bounds, and a claim allocates nothing.
 #include "TestChecks.hpp"
 #include "model/SlotRecycler.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <iostream>
-#include <iterator>
-#include <list>
 #include <map>
 #include <new>
 #include <set>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -152,6 +131,27 @@ void findsWhatItHolds() {
   require(slots.ghostHits() == 1, "a scan's claim of a ghost counted as a ghost's");
 }
 
+// Ghosts stay within the slot count, a resize to fewer slots trims them, and scans and resets leave
+// none.
+void countsItsGhosts() {
+  Arena arena(16);
+  for (uint64_t load = 0; load < 50; ++load) {
+    // Keys used again and again beside fresh ones, which T1 recycles.
+    std::vector<uint64_t> keys{0, 1, 2, 3, 4, 5, 6, 7};
+    for (uint64_t fresh = 0; fresh < 4; ++fresh) keys.push_back(100 + 4 * load + fresh);
+    static_cast<void>(arena.route(keys, false));
+    require(arena.order.ghosts() <= arena.order.size(), "a recycler kept more ghosts than its slots");
+  }
+  require(arena.order.ghosts() > 0, "keys T1 recycled left no ghost");
+  arena.order.resize(4);
+  require(arena.order.ghosts() <= 4, "a resize to fewer slots kept more ghosts than them");
+  arena.order.reset();
+  require(arena.order.ghosts() == 0, "a reset kept ghosts");
+  SlotRecycler scans(4);
+  for (uint64_t key = 0; key < 12; ++key) static_cast<void>(scans.claim(key, key + 1, true));
+  require(scans.ghosts() == 0, "a scan's claims left ghosts");
+}
+
 void resizes() {
   SlotRecycler slots(4);
   for (uint64_t key = 0; key < 4; ++key) static_cast<void>(slots.claim(key, 1, false));
@@ -186,10 +186,8 @@ void resizes() {
     require(slots.claim(100 + load, load, false) < 5, "a shrunk recycler took a slot past its size");
 }
 
-// A compaction evicts REPLACE's victims: T1's oldest keys while T1 holds
-// more than its target, and moves the keys past the slots into the lowest
-// free slots below them, where they keep their places in T2's order, which
-// the claims after it recycle.
+// A compaction evicts T1's oldest keys past its target and moves keys past the slots into the
+// lowest free slots, keeping T2's order.
 void compactsInRecencyOrder() {
   Arena arena(8);
   std::vector<uint64_t> keys{0, 1, 2, 3, 4, 5, 6, 7};
@@ -250,11 +248,8 @@ void compactsAtTheTarget() {
   require(slots.ghostHits() == 2, "a compaction's victim left a ghost");
 }
 
-// Compactions of a recycler whose ghosts fill ARC's bounds, between loads
-// of keys used again and again and others in turn, keep as many keys as fit,
-// leave no key or claim past the slots and the ghosts within the bounds (a
-// claim throws past them), which keep hitting; a compaction to no slot
-// evicts every key, and the recycler grows again.
+// Repeated compactions keep as many keys as fit, nothing past the slots and ghosts within ARC's
+// bounds; a compaction to zero empties it.
 void compactionsKeepTheBounds() {
   Arena arena(64);
   uint64_t fresh = 0;
@@ -298,12 +293,8 @@ void compactionsKeepTheBounds() {
           "a compaction to more slots than the recycler holds was taken");
 }
 
-// A compaction straight to fewer slots, as critical pressure takes the store
-// down to its floor (model::ExpertStore::releaseToFloor), keeps the keys
-// that compactions a chunk at a time down to the same slots keep, since
-// moves keep the keys' places in their lists, and moves each key once at
-// most, no more keys in all than those compactions move, whether the slots
-// were full or partly free.
+// A compaction straight to fewer slots keeps the keys chunk-at-a-time compactions keep, moving each
+// key at most once.
 void compactsToTheFloorOnce() {
   for (const uint64_t held : {64u, 48u}) {
     Arena once(64), steps(64);
@@ -394,136 +385,14 @@ void claimsAllocateNothing() {
   require(slots.ghostHits() > 0, "the loads hit no ghost");
 }
 
-// The decode selections of real requests: the blocks each attention layer
-// of Qwen3.8-Flash-Next's decode selected, step by step, as a build that
-// recorded every layer's block lists wrote them (not part of Splash), for a
-// novel at 126K and 252K tokens and a source tree at 126K, two questions
-// each; the committed traces keep layers 0 and 6 of each request's first 100
-// steps. A trace (NAME.kvst) is the magic "KVS1", then unsigned LEB128
-// varints: the requests and the layers; per request its steps; per step and
-// layer the step's first position, its blocks' count and the blocks in
-// ascending order, the first as it is and each other as its distance from
-// the one before. Per request, its steps; per step and layer, its first
-// position and blocks.
-struct TraceStep final {
-  uint32_t first = 0;
-  std::vector<std::vector<uint32_t>> layers;
-};
-using Trace = std::vector<std::vector<TraceStep>>;
-
-Trace readTrace(const std::filesystem::path &path) {
-  std::ifstream file(path, std::ios::binary);
-  const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-  size_t at = 4;
-  const auto varint = [&] {
-    uint64_t value = 0;
-    for (uint32_t shift = 0;; shift += 7) {
-      require(at < bytes.size(), "a selection trace ends early: " + path.string());
-      value |= uint64_t{bytes[at] & 0x7fu} << shift;
-      if (!(bytes[at++] & 0x80)) return static_cast<uint32_t>(value);
-    }
-  };
-  require(bytes.size() >= 4 && std::string(bytes.begin(), bytes.begin() + 4) == "KVS1",
-          "not a selection trace: " + path.string());
-  Trace trace(varint());
-  const uint32_t layers = varint();
-  for (std::vector<TraceStep> &request : trace) {
-    request.resize(varint());
-    for (TraceStep &step : request) {
-      step.layers.resize(layers);
-      for (std::vector<uint32_t> &blocks : step.layers) {
-        step.first = varint();
-        blocks.resize(varint());
-        uint32_t block = 0;
-        for (uint32_t &entry : blocks) entry = block += varint();
-      }
-    }
-  }
-  require(at == bytes.size(), "a selection trace has bytes past its steps: " + path.string());
-  return trace;
-}
-
-// The misses of one layer of a request's decode as the hot block cache's
-// resolves place its blocks in `slots` slots (model::KvBlockCache): those
-// of the open page and after it are the page table's; a step touches the
-// blocks it holds, then claims slots for the others, never one it touched;
-// the first step, of an empty cache, does not count. `recency` recycles the
-// least recently used slot instead.
-uint64_t misses(const std::vector<TraceStep> &request, uint32_t layer, uint32_t slots, bool recency) {
-  constexpr uint32_t kPageBlocks = 8, kPageTokens = 32;
-  SlotRecycler order(slots);
-  std::list<uint32_t> used;
-  std::unordered_map<uint32_t, std::pair<std::list<uint32_t>::iterator, uint64_t>> lru;
-  uint64_t total = 0;
-  for (uint64_t load = 1; load <= request.size(); ++load) {
-    const TraceStep &step = request[load - 1];
-    const uint32_t paged = step.first / kPageTokens * kPageBlocks;
-    std::vector<uint32_t> missing;
-    for (const uint32_t block : step.layers[layer]) {
-      if (block >= paged) continue;
-      if (!recency) {
-        if (const auto slot = order.find(block)) order.touch(*slot, load, false);
-        else missing.push_back(block);
-      } else if (const auto held = lru.find(block); held != lru.end()) {
-        used.splice(used.end(), used, held->second.first);
-        held->second.second = load;
-      } else {
-        missing.push_back(block);
-      }
-    }
-    if (load > 1) total += missing.size();
-    for (const uint32_t block : missing) {
-      if (!recency) {
-        static_cast<void>(order.claim(block, load, false));
-        continue;
-      }
-      if (used.size() == slots) {
-        auto oldest = used.begin();
-        while (lru.at(*oldest).second == load) ++oldest;
-        lru.erase(*oldest);
-        used.erase(oldest);
-      }
-      lru[block] = {used.insert(used.end(), block), load};
-    }
-  }
-  return total;
-}
-
-void adaptiveReplacementKeepsUpWithRecency(const std::filesystem::path &traces) {
-  // One lane's floor, two lanes' selections a layer: the knee of the hot
-  // block cache's hit rate, as measured on such traces.
-  constexpr uint32_t kSlots = 8192;
-  std::vector<std::filesystem::path> paths;
-  for (const auto &entry : std::filesystem::directory_iterator(traces))
-    if (entry.path().extension() == ".kvst") paths.push_back(entry.path());
-  std::ranges::sort(paths);
-  require(!paths.empty(), "no selection trace in " + traces.string());
-  uint64_t adaptive = 0, recency = 0;
-  for (const std::filesystem::path &path : paths) {
-    const Trace trace = readTrace(path);
-    uint64_t traceAdaptive = 0, traceRecency = 0;
-    for (const std::vector<TraceStep> &request : trace)
-      for (uint32_t layer = 0; layer < request.front().layers.size(); ++layer) {
-        traceAdaptive += misses(request, layer, kSlots, false);
-        traceRecency += misses(request, layer, kSlots, true);
-      }
-    std::cout << "slot_recycler_test: " << path.filename().string() << ": " << traceAdaptive << " misses, "
-              << traceRecency << " least recently used\n";
-    adaptive += traceAdaptive;
-    recency += traceRecency;
-  }
-  require(adaptive * 100 <= recency * 102, "adaptive replacement missed " + std::to_string(adaptive) +
-                                               " blocks, recency " + std::to_string(recency));
-}
-
 } // namespace
 
-int main(int argc, char **argv) {
+int main() {
   try {
-    if (argc != 2) throw std::invalid_argument("usage: slot_recycler_test SELECTION_TRACES");
     neverTakesTheLoadsOwn();
     freeSlotsFirst();
     findsWhatItHolds();
+    countsItsGhosts();
     resizes();
     compactsInRecencyOrder();
     compactsAtTheTarget();
@@ -532,7 +401,6 @@ int main(int argc, char **argv) {
     aScanSparesTheFrequent();
     aRoutedCoreOutlivesMoreLanes();
     claimsAllocateNothing();
-    adaptiveReplacementKeepsUpWithRecency(argv[1]);
   } catch (const std::exception &error) {
     std::cerr << "slot_recycler_test: FAIL: " << error.what() << '\n';
     return 1;

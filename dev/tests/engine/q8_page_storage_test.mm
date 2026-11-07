@@ -1,8 +1,11 @@
 #include "TestBuffers.hpp"
 #include "ops/PageStorage.hpp"
+#include "engine/KvPool.hpp"
 #include "engine/MemoryGovernor.hpp"
+#include "tests/engine/ClaimScope.hpp"
 #include "tests/engine/HostKvExtents.hpp"
 #include "tests/engine/TestChecks.hpp"
+#include "tests/engine/TestMethodReplacement.hpp"
 #include "tests/engine/TestPageEntries.hpp"
 
 #include <algorithm>
@@ -10,6 +13,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <span>
 #include <stdexcept>
@@ -31,8 +35,8 @@ constexpr kv::Layout bf16Layout{16, 4, 256, kv::Format::BFloat16};
 constexpr kv::Layout compactBf16Layout{10, 2, 256, kv::Format::BFloat16};
 // Qwen3.8-Flash-Next's: token-major values and a QSA index of 128-wide pooled
 // keys.
-constexpr kv::Layout indexedLayout{12, 2, 256, kv::Format::Int8, 128, true};
-constexpr kv::Layout indexedBf16Layout{12, 2, 256, kv::Format::BFloat16, 128, true};
+constexpr kv::Layout indexedLayout{12, 2, 256, kv::Format::Int8, 128, true, 0, 0, kv::Reads::SelectedBlocks};
+constexpr kv::Layout indexedBf16Layout{12, 2, 256, kv::Format::BFloat16, 128, true, 0, 0, kv::Reads::SelectedBlocks};
 // A sliding window over 35 of 49 layers of 4 KV heads of 128, Flint's: every
 // layer but 0, 1, 48 and every fourth from 5 reads the 512 keys before its
 // row's alone.
@@ -137,6 +141,72 @@ void entriesFollowAReallocatedExtent(metal::MetalBackend &backend, kv::PageStora
     }
 }
 
+// A command makes resident only the extents its tables reach, on the
+// encoders that bind them, and nothing for the command queue: an extent only
+// the cache holds costs commands nothing. A table reaches the extents its
+// entries reach, the entries a partial rewrite keeps among them, and a kernel
+// reads through it what another wrote; after a compaction moves a page into
+// an extent only the cache held, the rewritten table reaches that extent
+// alone.
+void commandsDeclareTheExtentsTheirTablesReach(const std::string &metallib) {
+    const test::QueueSets queue;
+    test::EncoderUses uses;
+    metal::MetalBackend backend(metallib);
+    MemoryGovernor governor(
+        backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1, queryHostMemory, 0);
+    const test::ClaimScope start(governor, ClaimClass::Floor);
+    kv::PageStorage storage(backend, governor.allocationAdmission(), kvLayout, 256, 128);
+    // Extent 0 holds pages 0 to 127, extent 1 pages 128 to 255.
+    KvPool pool(storage, 256);
+    const metal::MetalBuffer table = test::sharedBuffer(backend, 2 * sizeof(SplashKvPage));
+    const metal::MetalBuffer mismatches = test::sharedBuffer(backend, sizeof(uint32_t));
+    // A page an extent starts with has the extent's address as its entry,
+    // which the test kernels read as one.
+    const uint32_t words = 1024, seed = 0xcac4e;
+    const metal::ComputeDispatch write{"addressed_write_u32", {{0, table}},
+                                       {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
+                                       {words / 256, 1, 1}, {256, 1, 1}};
+    const metal::ComputeDispatch check{"addressed_check_u32", {{0, table}, {3, mismatches}},
+                                       {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
+                                       {words / 256, 1, 1}, {256, 1, 1}};
+    const auto declaresOnly = [&](std::initializer_list<NSString *> labels) {
+        for (NSString *label : {@"kv-extent-0", @"kv-extent-128"})
+            if (uses.declares(label) != (std::ranges::find(labels, label) != labels.end())) return false;
+        return true;
+    };
+
+    const KvPageAcquisition acquired = pool.acquirePages(1);
+    require(acquired.granted() && acquired.pages == std::vector<uint32_t>{0}, "the first page was not page 0");
+    // Extent 1 holds page 129 for the cache alone.
+    pool.retainPage(129, true);
+    storage.writeEntries(acquired.pages, 0, table);
+    uses.uses.clear();
+    (void)backend.submit(write);
+    require(queue.added.empty(), "a residency set was attached to a command queue");
+    require(declaresOnly({@"kv-extent-0"}),
+            "a command did not declare exactly the extent its table reaches");
+
+    // A table rewritten from its second entry still reaches its first page.
+    const std::array<uint32_t, 2> pages{0, 128};
+    storage.writeEntries(pages, 0, table);
+    storage.writeEntries(pages, 1, table);
+    uses.uses.clear();
+    (void)backend.submit(check);
+    require(declaresOnly({@"kv-extent-0", @"kv-extent-128"}) &&
+                *static_cast<const uint32_t *>(mismatches.contents()) == 0,
+            "a partially rewritten table did not reach the extents of all its pages");
+
+    // Page 0 moves into extent 1, which only the cache held.
+    const KvPageMoves moves = pool.compactExtent({});
+    require(moves.follow(0) == 128, "the compaction did not move page 0 to page 128");
+    storage.writeEntries(std::array<uint32_t, 1>{128}, 0, table);
+    uses.uses.clear();
+    (void)backend.submit(check);
+    require(declaresOnly({@"kv-extent-128"}) && *static_cast<const uint32_t *>(mismatches.contents()) == 0,
+            "a page a compaction moved was not reached through its rewritten table");
+    require(queue.added.empty(), "a residency set was attached to a command queue");
+}
+
 void requireSameSpans(std::span<const std::span<std::byte>> left, std::span<const std::span<std::byte>> right,
                       const char *message) {
     require(std::ranges::equal(left, right,
@@ -171,6 +241,19 @@ void indexPagesHoldOnlyTheirIndex(metal::MetalBackend &backend, MemoryGovernor &
         storage.writeEntries(firsts, 0, table);
         const SplashKvPage kvEntry = entries[0];
         require(kvEntry && entries[1] == SPLASH_KV_PAGE_ABSENT, "an Index page's K/V entry is not absent");
+        {
+            // The page table reaches the Full extent only: its kernel reads
+            // nothing of the Index extent.
+            const test::EncoderUses uses;
+            const metal::MetalBuffer mismatches = test::sharedBuffer(backend, sizeof(uint32_t));
+            const uint32_t words = 256, seed = 0;
+            (void)backend.submit({"addressed_check_u32", {{0, table}, {3, mismatches}},
+                                  {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
+                                  {1, 1, 1}, {words, 1, 1}});
+            require(uses.declares(@"kv-extent-0") &&
+                        !uses.declares(@(("kv-index-extent-" + std::to_string(extent)).c_str())),
+                    "a page table reached the extent of an Index page");
+        }
         storage.writeIndexEntries(firsts, 0, table);
         require(entries[0] == kvEntry + uint64_t{extent} * layout.kvBytesPerModelPage() && entries[1] &&
                     !(entries[1] & SPLASH_KV_PAGE_INDEX_MASK),
@@ -391,6 +474,10 @@ void run(const std::string &metallib) {
         128ULL * 1024 * 1024, 128ULL * 1024 * 1024, [&elasticHostAvailable] {
           return std::optional<HostMemory>(HostMemory{*elasticHostAvailable, *elasticHostAvailable});
         }, 0);
+    // What a case's storage allocates through a governor is a claim's
+    // (design/M.md L7): here a lane's KV growth, which the host gates, and
+    // below a start's, in its Floor claim.
+    const test::ClaimScope growth(hostGated, ClaimClass::InService);
     kv::PageStorage hostGatedStorage(
         backend, hostGated.allocationAdmission(), kvLayout, 256, 128);
     require(hostGatedStorage.allocateExtent(0) &&
@@ -407,9 +494,32 @@ void run(const std::string &metallib) {
                 hostGatedStorage.actualAllocatedBytes() ==
                     uint64_t{256} * hostGatedStorage.bytesPerPage(),
             "KV growth did not recover after host memory became available");
+    // An extent allocated under an admission of its own asks that one alone:
+    // the storage's, which host pressure refuses, does not refuse it, and a
+    // refusing one refuses it with nothing allocated.
+    hostGatedStorage.releaseExtent(1);
+    elasticHostAvailable = 128ULL * 1024 * 1024;
+    uint64_t admitted = 0;
+    const metal::AllocationAdmission own = [&](uint64_t bytes, const std::function<void()> &allocate) {
+        admitted += bytes;
+        allocate();
+        return metal::AllocationResult{};
+    };
+    const metal::AllocationAdmission refusing = [](uint64_t, const std::function<void()> &) {
+        return metal::AllocationResult(metal::AllocationFailure::EngineBudget);
+    };
+    require(hostGatedStorage.allocateExtent(1, kv::PageForm::Full, refusing).failure ==
+                    metal::AllocationFailure::EngineBudget &&
+                !hostGatedStorage.isAllocated(128),
+            "an extent refused by its own admission was allocated");
+    require(hostGatedStorage.allocateExtent(1, kv::PageForm::Full, own) && admitted == hostGatedStorage.extentBytes() &&
+                hostGatedStorage.isAllocated(128),
+            "an extent under its own admission was refused by the storage's");
+    elasticHostAvailable = 4ULL * 1024 * 1024 * 1024;
 
     MemoryGovernor governor(
         backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1, queryHostMemory, 0);
+    const test::ClaimScope start(governor, ClaimClass::Floor);
     rejects([&] { kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 192, 128); },
             "KV page pool is not a whole number of extents",
             "a pool of a part of an extent was accepted");
@@ -626,6 +736,7 @@ void run(const std::string &metallib) {
     indexPagesHoldOnlyTheirIndex(backend, governor);
     windowedLayersComeLast(backend, governor);
     slimPagesHoldTheirFirstRegions(backend, governor);
+    commandsDeclareTheExtentsTheirTablesReach(metallib);
     std::cout << "KV page storage tests passed\n";
 }
 

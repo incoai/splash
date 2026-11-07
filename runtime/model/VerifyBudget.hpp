@@ -1,35 +1,13 @@
 #pragma once
 
-// What a MoE target's decode cycles choose their verify rows by
-// (ops::DraftSelector::addVerifyRows), learned online on the engine thread:
-// an acceptance model of the draft's confidences and a table of what a cycle
-// costs by its rows.
-//
-// The acceptance model: once the proposals before it are accepted, a
-// proposal is accepted with probability p, where logit(p) = slope *
-// logit(confidence) + intercepts[position], the confidence being the largest
-// candidate probability the selector saw at its position. Each completed
-// cycle labels the proposals it verified, up to the first the target
-// rejected, but for those whose confidence is not a probability (a draft row
-// that is not finite); the model is refit every kRefitCycles cycles over the
-// last kLabels labels by damped Newton steps (IRLS) on their log-likelihood
-// with a Gaussian prior around kPrior, which also stands before any label.
-//
-// The costs: a cycle of L lanes that verify R rows in all takes about
-// a + b * R milliseconds, fit to the wall times of the latest cycles of L
-// lanes (which for streamed experts include the store's reads of its
-// misses) by least squares that weigh each cycle kDecay times the next. The
-// latest cycles stand for the requests the batch serves now: what a row costs
-// varies with them (a Qwen3.6-35B-A3B cycle with 4 GB of experts adds about
-// 3 ms a row on prose and 8 ms on reasoning), so the cycles of other requests
-// must not price it. The slope shrinks toward the seed's, the shape the
-// measured MoE targets share, at the cycles' level, as much as
-// kPriorCycles cycles over a lane count's spread of rows would; before any
-// cycle, the seed itself is the cost. A cycle counts at most twice and at
-// least half the time the fit gives it, so that a stall does not price the
-// rows of the next thirty cycles. Constrained cycles, whose verify waits
-// for the host's masks, are fit apart. Every kExploreCycles-th cycle of a
-// lane count verifies every row, which keeps the rows of the fit spread.
+// The verify rows a MoE target's decode cycles choose
+// (ops::DraftSelector::addVerifyRows): the most expected accepted tokens per
+// cost, learned online. Acceptance is logit(p) = slope * logit(confidence) +
+// intercepts[position] over the last kLabels labels; a cycle of R rows costs
+// a + b * R ms, fit per lane count, constrained or not, to its latest cycles.
+// A cycle counts at most twice the larger of its fitted price and the mean:
+// capped at the price alone, one 2x stall over clustered rows had 45 of the
+// next 64 cycles verify their anchors alone.
 #include "metal/abi/ExecutionGeometry.h"
 
 #include <array>
@@ -48,8 +26,14 @@ public:
   static constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
   static constexpr uint32_t kRefitCycles = 64;
   static constexpr uint32_t kLabels = 4096;
+  // Every kExploreCycles-th cycle of a lane count verifies every row, which
+  // keeps the rows of the cost fit spread.
   static constexpr uint32_t kExploreCycles = 32;
+  // Each cycle weighs kDecay times the next (about the last 33 cycles), as
+  // what a row costs follows the requests served.
   static constexpr double kDecay = 0.97;
+  // The slope shrinks toward the seed's as much as kPriorCycles spread
+  // cycles would pull it.
   static constexpr double kPriorCycles = 5.0;
   // The prior's precision on the slope and on each intercept: about twenty
   // labels' worth each (a label tells the slope about its logit squared, some
@@ -125,6 +109,10 @@ private:
   uint64_t cycles_ = 0;
   std::array<std::array<Cost, kLanes>, 2> tables_{};
   std::array<std::array<uint64_t, kLanes>, 2> tableCycles_{};
+  // The cycles counted at under half their time since the last notice of
+  // them, and the awake time (ms) before which no other notice is given.
+  uint64_t cuts_ = 0;
+  double nextNotice_ = 0.0;
 };
 
 } // namespace splash::model

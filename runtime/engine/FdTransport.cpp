@@ -25,19 +25,6 @@
 namespace splash::engine {
 namespace {
 
-class RestoreFdFlags final {
-public:
-  RestoreFdFlags(int fd, int flags) : fd_(fd), flags_(flags) {}
-  ~RestoreFdFlags() { static_cast<void>(fcntl(fd_, F_SETFL, flags_)); }
-
-  RestoreFdFlags(const RestoreFdFlags &) = delete;
-  RestoreFdFlags &operator=(const RestoreFdFlags &) = delete;
-
-private:
-  int fd_;
-  int flags_;
-};
-
 [[noreturn]] void throwIo(const char *operation) {
   throw std::system_error(errno, std::generic_category(), operation);
 }
@@ -56,11 +43,6 @@ int pollTimeout(const NativeRuntime &loop) {
   return timeout;
 }
 
-NativeProcessExit loopFailure(const NativeRuntime &loop) {
-  return loop.engineHealthy() ? NativeProcessExit::ProtocolFailure
-                              : NativeProcessExit::EngineFailure;
-}
-
 } // namespace
 
 struct FdTransport::LoopWake {
@@ -68,6 +50,8 @@ struct FdTransport::LoopWake {
   int writeFd;
   std::atomic<bool> controlPending{false};
   std::atomic<bool> shutdownRequested{false};
+  // Set once run() takes the input, which then hands its end to the loop.
+  std::atomic<bool> inputTaken{false};
 
   LoopWake() {
     int descriptors[2];
@@ -106,6 +90,21 @@ struct FdTransport::LoopWake {
         continue;
       return;
     }
+  }
+
+  // Async-signal-safe.
+  void requestShutdown() noexcept {
+    shutdownRequested.store(true, std::memory_order_release);
+    notify();
+  }
+
+  // The input ended (EOF). Once run() takes the input it hands that to the
+  // loop; before, the server has gone, and it is a shutdown request.
+  void inputEnded() noexcept {
+    if (!inputTaken.load(std::memory_order_acquire))
+      requestShutdown();
+    else
+      notify();
   }
 
   void notifyControl() noexcept {
@@ -246,7 +245,10 @@ private:
       std::lock_guard lock(mutex_);
       end_ = error;
     }
-    wake_->notify();
+    if (error)
+      wake_->notify();
+    else
+      wake_->inputEnded();
   }
 
   int fd_ = -1;
@@ -264,12 +266,30 @@ private:
 };
 
 FdTransport::FdTransport(int inputFd, int outputFd, size_t inputQueueBytes)
-    : inputFd_(inputFd), outputFd_(outputFd), inputQueueBytes_(inputQueueBytes),
-      wake_(std::make_shared<LoopWake>()) {
-  if (inputFd_ < 0 || outputFd_ < 0 || !inputQueueBytes_) {
+    : inputFd_(inputFd), outputFd_(outputFd), wake_(std::make_shared<LoopWake>()) {
+  if (inputFd_ < 0 || outputFd_ < 0 || !inputQueueBytes) {
     throw std::invalid_argument(
         "native transport requires valid fds and room for input");
   }
+  // Nonblocking so that a read after a spurious readiness returns EAGAIN and
+  // the reader goes back to poll, where its stop pipe can end it; without it
+  // ~InputReader could wait forever in read().
+  inputFlags_ = fcntl(inputFd_, F_GETFL);
+  if (inputFlags_ < 0)
+    throwIo("fcntl(F_GETFL)");
+  if (fcntl(inputFd_, F_SETFL, inputFlags_ | O_NONBLOCK) < 0)
+    throwIo("fcntl(F_SETFL)");
+  try {
+    reader_ = std::make_unique<InputReader>(inputFd_, inputQueueBytes, wake_);
+  } catch (...) {
+    static_cast<void>(fcntl(inputFd_, F_SETFL, inputFlags_));
+    throw;
+  }
+}
+
+FdTransport::~FdTransport() {
+  reader_.reset();
+  static_cast<void>(fcntl(inputFd_, F_SETFL, inputFlags_));
 }
 
 NativeRuntime::ByteSink FdTransport::outputSink() {
@@ -288,28 +308,19 @@ void FdTransport::setControlHandler(ControlHandler handler) {
 NativeProcessExit FdTransport::run(NativeRuntime &loop) {
   std::shared_ptr<LoopWake> wake = wake_;
   loop.setCompletionNotifier([wake] { wake->notify(); });
-  // Nonblocking so that a read after a spurious readiness returns EAGAIN and
-  // the reader goes back to poll, where its stop pipe can end it; without it
-  // ~InputReader could wait forever in read().
-  int originalFlags = fcntl(inputFd_, F_GETFL);
-  if (originalFlags < 0)
-    throwIo("fcntl(F_GETFL)");
-  if (fcntl(inputFd_, F_SETFL, originalFlags | O_NONBLOCK) < 0) {
-    throwIo("fcntl(F_SETFL)");
-  }
-  RestoreFdFlags restore(inputFd_, originalFlags);
-  // Stopped and joined on every way out of run(), before the flags return.
-  InputReader reader(inputFd_, inputQueueBytes_, wake);
+  // From here the loop takes the input's end (LoopWake::inputEnded).
+  wake->inputTaken.store(true, std::memory_order_release);
   bool deferredControl = false;
 
   while (!loop.connectionMustClose()) {
     if (shutdownRequested())
       return NativeProcessExit::CleanEof;
+    const auto stepStarted = AwakeClock::now();
     {
-      InputReader::Input input = reader.take();
+      InputReader::Input input = reader_->take();
       for (; !input.chunks.empty(); input.chunks.pop_front())
         if (!loop.receive(input.chunks.front()))
-          return loopFailure(loop);
+          return loopEnded(loop);
       if (input.end) {
         if (*input.end == ENOMEM) {
           failure_ = "the native input reader ran out of memory";
@@ -321,11 +332,10 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
           return NativeProcessExit::IoFailure;
         }
         return loop.finishInput() ? NativeProcessExit::CleanEof
-                                  : loopFailure(loop);
+                                  : loopEnded(loop);
       }
     } // What was taken is freed before control, tick and poll.
 
-    const auto stepStarted = AwakeClock::now();
     deferredControl = wake->takeControl() || deferredControl;
     if (deferredControl && !loop.commandInFlight()) {
       deferredControl = loop.runControl(controlHandler_);
@@ -338,7 +348,7 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
     if (progressed)
       continue;
     if (loop.connectionMustClose())
-      return loopFailure(loop);
+      return loopEnded(loop);
 
     // Input, completions, control notifications and shutdown all wake the
     // loop through this pipe.
@@ -356,7 +366,7 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
     // A zero result is a deadline, health-check or admission-retry wake; the
     // next iteration takes input, runs control and ticks.
   }
-  return loopFailure(loop);
+  return loopEnded(loop);
 }
 
 bool FdTransport::runFlush(NativeRuntime &loop, std::chrono::milliseconds budget) {
@@ -388,29 +398,44 @@ double FdTransport::maxTickMilliseconds() const noexcept {
 
 const std::string &FdTransport::failure() const noexcept { return failure_; }
 
-void FdTransport::requestShutdown() noexcept {
-  wake_->shutdownRequested.store(true, std::memory_order_release);
-  wake_->notify();
+void FdTransport::requestShutdown() noexcept { wake_->requestShutdown(); }
+
+NativeProcessExit FdTransport::loopEnded(const NativeRuntime &loop) {
+  if (!loop.engineHealthy())
+    return NativeProcessExit::EngineFailure;
+  if (!outputError_)
+    return NativeProcessExit::ProtocolFailure;
+  // A server that closed its end or is stopping the engine ends it as a
+  // shutdown, which still flushes a persistent cache.
+  if (outputError_ == EPIPE || shutdownRequested())
+    return NativeProcessExit::CleanEof;
+  failure_ = "write(native output): " + std::string(std::strerror(outputError_));
+  return NativeProcessExit::IoFailure;
 }
 
-void FdTransport::writeAll(std::span<const uint8_t> bytes) const {
+void FdTransport::writeAll(std::span<const uint8_t> bytes) {
   size_t offset = 0;
   while (offset < bytes.size()) {
-    ssize_t count =
+    // Once a shutdown is requested no write starts or resumes: the server
+    // may have stopped draining the pipe, and its one stop signal has
+    // already been spent, so nothing would end a blocked write.
+    if (shutdownRequested())
+      outputFailed(EINTR);
+    const ssize_t count =
         write(outputFd_, bytes.data() + offset, bytes.size() - offset);
     if (count > 0) {
       offset += static_cast<size_t>(count);
       continue;
     }
-    // The signal that requests a shutdown also ends a write the server has
-    // stopped draining.
-    if (count < 0 && errno == EINTR && !shutdownRequested())
+    if (count < 0 && errno == EINTR)
       continue;
-    if (count == 0) {
-      throw std::runtime_error("native output accepted zero bytes");
-    }
-    throwIo("write(native output)");
+    outputFailed(count < 0 ? errno : EIO);
   }
+}
+
+void FdTransport::outputFailed(int error) {
+  outputError_ = error;
+  throw std::system_error(error, std::generic_category(), "write(native output)");
 }
 
 } // namespace splash::engine

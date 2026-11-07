@@ -6,12 +6,16 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import uuid
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from dev.tools import package  # noqa: E402
 
 
 def brew(*args, capture=False, **kwargs):
@@ -38,9 +42,14 @@ def seed_cache(formula, artifact, option):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("build", "check"))
-    parser.add_argument("--version", required=True)
-    parser.add_argument("--dist", type=Path, default=ROOT / "dist")
+    release = argparse.ArgumentParser(add_help=False)
+    release.add_argument("--version", required=True)
+    release.add_argument("--dist", type=Path, default=ROOT / "dist")
+    actions = parser.add_subparsers(dest="action", required=True)
+    # Only a build reads the runtime archive, whose name holds the macOS minimum.
+    build = actions.add_parser("build", parents=[release])
+    build.add_argument("--macos-min", required=True, help="minimum macOS, e.g. 26.4")
+    actions.add_parser("check", parents=[release])
     args = parser.parse_args(argv)
     dist = args.dist.resolve()
     formula_file = dist / "splash.rb"
@@ -66,7 +75,9 @@ def main(argv=None):
             parser.error("formula version does not match --version")
 
         if args.action == "build":
-            archive = dist / f"splash-{args.version}-arm64-macos26.tar.gz"
+            archive = (
+                dist / f"{package.archive_name(args.version, args.macos_min)}.tar.gz"
+            )
             seed_cache(name, archive, "--build-from-source")
             brew("install", "--build-bottle", name)
             brew("test", name)

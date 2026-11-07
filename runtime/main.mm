@@ -1,10 +1,11 @@
 #include "AwakeClock.hpp"
 #include "LegacyWeightCache.hpp"
 #include "StderrLine.hpp"
+#include "Supervision.hpp"
 #include "engine/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
+#include "engine/Json.hpp"
 #include "engine/NativeArguments.hpp"
-#include "engine/Status.hpp"
 #include "model/ModelDescriptor.hpp"
 
 #include <IOKit/pwr_mgt/IOPMLib.h>
@@ -151,11 +152,36 @@ void printUsage(std::string_view executable) {
       " [--max-image-patches PATCHES] [--persistent-cache on|off] [--cache-dir DIRECTORY]"
       " [--max-cache-disk-writes BYTES]"
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]"
-      " [--relaunch-context TOKENS] [--ple-memory BYTES] [--expert-memory BYTES]"
-      " [--verify-rows auto|all]");
+      " [--relaunch-context TOKENS] [--ple-memory BYTES|auto|off]"
+      " [--expert-memory BYTES|auto|off] [--sparse-kv-memory BYTES|auto]"
+      " [--kv-spill always] [--kv-window-trim on|off] [--verify-rows auto|all]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
-  writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_METADATA [DRAFT_CONFIG]");
+  writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " device-check");
+  writeStderrLine("       " + command + " families");
+}
+
+// Reports the exception in flight on stderr, as every command ends on one,
+// and returns its exit status from sysexits(3): EX_USAGE, after the usage,
+// for a command line; EX_DATAERR for a model root it cannot serve; EX_IOERR
+// for an I/O failure; else EX_SOFTWARE.
+int reportFailure(std::string_view executable) {
+  try {
+    throw;
+  } catch (const engine::UsageError &error) {
+    writeStderrLine(std::string("error: ") + error.what());
+    printUsage(executable);
+    return EX_USAGE;
+  } catch (const engine::ModelRootError &error) {
+    writeStderrLine(std::string("error: ") + error.what());
+    return EX_DATAERR;
+  } catch (const std::system_error &error) {
+    writeStderrLine(std::string("error: native runtime I/O failed: ") + error.what());
+    return static_cast<int>(engine::NativeProcessExit::IoFailure);
+  } catch (const std::exception &error) {
+    writeStderrLine(std::string("error: ") + error.what());
+    return static_cast<int>(engine::NativeProcessExit::EngineFailure);
+  }
 }
 
 std::filesystem::path executablePath() {
@@ -219,8 +245,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
 // SIGTERM, SIGINT and SIGHUP end the transport loop instead of killing the
 // process, so the normal destructors run. An inherited ignored SIGHUP (nohup)
 // stays ignored, as it does for the server. SIGPIPE is ignored: a closed
-// parent pipe surfaces as EPIPE, which the transport already reports as an
-// I/O failure.
+// parent pipe surfaces as EPIPE, which ends the transport as a shutdown.
 std::atomic<engine::FdTransport *> gShutdownTransport{nullptr};
 
 void requestShutdownFromSignal(int) {
@@ -258,17 +283,18 @@ public:
   }
 };
 
-// The time a clean stop gives the newest restore points of a persistent
-// cache to reach the disk before it closes the cache. The server waits
-// longer for the engine to exit (server/runtime.py `_shutdown_grace_seconds`).
-constexpr std::chrono::seconds kFlushBudget{6};
+// The time the newest restore points of a persistent cache get to reach the
+// disk once the transport has ended, before the cache closes; the server
+// waits supervision::kStop for the engine to exit.
+constexpr auto kFlushBudget = supervision::kFlush;
 
-// A clean stop of a persistent cache: the newest restore points reach the
-// disk, then the cache closes. An engine that fails meanwhile writes nothing
-// more, and its cache counts as ending uncleanly.
+// A clean close of a persistent cache, however the transport ended: the
+// newest restore points reach the disk, then the cache closes. An engine
+// that fails meanwhile writes nothing more, and its cache counts as ending
+// uncleanly.
 void closePersistentCache(engine::FdTransport &transport,
-                          engine::RuntimeBootstrap &bootstrap) {
-  engine::NativeRuntime &loop = bootstrap.nativeLoop();
+                          engine::ServingRuntime &runtime) {
+  engine::NativeRuntime &loop = runtime.nativeLoop();
   const bool flushed = transport.runFlush(loop, kFlushBudget);
   if (!loop.engineHealthy()) {
     writeStderrLine("error: the engine failed while it saved its newest restore points (" +
@@ -277,95 +303,113 @@ void closePersistentCache(engine::FdTransport &transport,
   }
   if (!flushed)
     logLine("Persistent cache: stopping before every newest restore point reached the disk.");
-  if (!bootstrap.resources().closePersistentCache())
+  if (!runtime.resources().closePersistentCache())
     writeStderrLine("error: the persistent cache did not reach the disk; the next start takes it "
                     "back on probation.");
 }
 
-// A start that fails reports on stderr, as main does for any error, then
-// tells the server its reason in place of the ReadyEvent, as the engine does
-// for a failure once it serves (NativeRuntime::engineError). The frame
-// follows the report, so the server's line about it follows the report too.
-// A server that has gone away does not change the exit.
-void reportStartFailure(engine::FdTransport &transport,
-                        const engine::RuntimeBootstrapError &error) {
-  writeStderrLine(std::string("error: ") + error.what());
-  const auto frame = protocol::serializeEvent(
-      protocol::ErrorEvent{protocol::FailureClass::EngineUnhealthy, 0, false,
-                           "bootstrap_failed", error.report().message},
-      protocol::ProtocolLimits{});
+// Ends a start that failed before Ready, as the exception in flight says: the
+// report and exit status of any failure (reportFailure), then the failure's
+// class in place of the ReadyEvent: Configuration for the command line, Model
+// for the model root it names, the bootstrap's (engine::startFailedEvent),
+// else Internal. The frame follows the report, so the server's line about it
+// follows the report too.
+int refuseStart(engine::FdTransport &transport, std::string_view executable) {
+  const int exit = reportFailure(executable);
+  using Kind = protocol::StartFailureKind;
+  protocol::StartFailedEvent failure;
+  try {
+    throw;
+  } catch (const engine::UsageError &error) {
+    failure = {.kind = Kind::Configuration, .message = error.what()};
+  } catch (const engine::ModelRootError &error) {
+    failure = {.kind = Kind::Model, .message = error.what()};
+  } catch (const engine::RuntimeBootstrapError &error) {
+    failure = engine::startFailedEvent(error.report());
+  } catch (const std::exception &error) {
+    failure = {.kind = Kind::Internal, .message = error.what()};
+  }
+  const auto frame = protocol::serializeEvent(failure, protocol::ProtocolLimits{});
   if (!frame)
-    return;
+    return exit;
   try {
     transport.outputSink()(*frame.value);
   } catch (...) {
   }
+  return exit;
 }
 
-int runNative(const engine::NativeArguments &arguments) {
+// serve-native. Its transport is the server's pipes, open before the command
+// line is read, so that every start that fails before Ready tells the server
+// why (refuseStart), and a start whose server has gone stops: the input's end
+// before run() requests a shutdown (FdTransport).
+int serveNative(int argc, char **argv) {
   if (const std::filesystem::path caches = splashCaches(); !caches.empty())
     reportLegacyWeightCache(caches / "weights");
   engine::FdTransport transport(STDIN_FILENO, STDOUT_FILENO);
   ShutdownSignals signals(transport);
-  MemoryPressureMonitor pressureMonitor(transport.controlNotifier());
+  std::optional<MemoryPressureMonitor> pressureMonitor;
   IdleSleepAssertion idleSleep;
-  engine::RuntimeMetrics metrics;
-  engine::RuntimeBootstrap *published = nullptr;
-  auto statusProvider = [&] {
-    return published->statusJson(
-        metrics.snapshot(),
-        engine::NativeLoopTiming{transport.maxTickMilliseconds()});
-  };
 
-  engine::StartupRetryWindow recovery(engine::kStartupMemoryRecoveryTimeout);
-  bool reportedRecoveryWait = false;
-  std::unique_ptr<engine::RuntimeBootstrap> bootstrap;
-  while (!bootstrap) {
-    if (transport.shutdownRequested())
-      return static_cast<int>(engine::NativeProcessExit::CleanEof);
-    engine::RuntimeBootstrapConfig config = bootstrapConfig(arguments);
-    config.resources.memoryPressure = [&] { return pressureMonitor.pressure(); };
-    config.resources.cancelled = [&] { return transport.shutdownRequested(); };
-    config.nativeLoop.metrics = &metrics;
-    if (arguments.preventIdleSleep)
-      config.nativeLoop.holdingRequests = [&](bool held) { idleSleep.hold(held); };
-    try {
-      bootstrap = engine::RuntimeBootstrap::start(
-          std::move(config), transport.outputSink(), statusProvider);
-    } catch (const engine::RuntimeBootstrapError &error) {
+  std::unique_ptr<engine::ServingRuntime> runtime;
+  try {
+    const engine::NativeArguments arguments = engine::parseNativeArguments(argc, argv);
+    pressureMonitor.emplace(transport.controlNotifier());
+    engine::StartupRetryWindow recovery(supervision::kStartRetryWindow);
+    bool reportedRecoveryWait = false;
+    while (!runtime) {
       if (transport.shutdownRequested())
         return static_cast<int>(engine::NativeProcessExit::CleanEof);
-      const auto now = AwakeClock::now();
-      const auto recoveryDeadline = recovery.retryUntil(error.report(), now);
-      if (!recoveryDeadline) {
-        reportStartFailure(transport, error);
-        return static_cast<int>(engine::NativeProcessExit::EngineFailure);
-      }
-      if (!reportedRecoveryWait) {
-        logLine("Waiting for sufficient available memory to start; "
-                "the macOS reserve remains protected...");
-        reportedRecoveryWait = true;
-      }
-      const auto resumeAt =
-          std::min(now + engine::kStartupMemoryRecoveryPoll, *recoveryDeadline);
-      while (AwakeClock::now() < resumeAt &&
-             !transport.shutdownRequested()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      engine::RuntimeBootstrapConfig config = bootstrapConfig(arguments);
+      config.resources.memoryPressure = [&] { return pressureMonitor->pressure(); };
+      config.resources.cancelled = [&] { return transport.shutdownRequested(); };
+      if (arguments.preventIdleSleep)
+        config.nativeLoop.holdingRequests = [&](bool held) { idleSleep.hold(held); };
+      try {
+        runtime = engine::ServingRuntime::start(std::move(config), transport.outputSink(),
+                                                [&transport] { return transport.maxTickMilliseconds(); });
+      } catch (const engine::RuntimeBootstrapError &error) {
+        if (transport.shutdownRequested())
+          return static_cast<int>(engine::NativeProcessExit::CleanEof);
+        const auto now = AwakeClock::now();
+        const auto recoveryDeadline = recovery.retryUntil(error.report(), now);
+        if (!recoveryDeadline)
+          throw;
+        if (!reportedRecoveryWait) {
+          logLine("Waiting for sufficient available memory to start; "
+                  "the macOS reserve remains protected...");
+          reportedRecoveryWait = true;
+        }
+        const auto resumeAt =
+            std::min(now + engine::kStartupMemoryRecoveryPoll, *recoveryDeadline);
+        while (AwakeClock::now() < resumeAt &&
+               !transport.shutdownRequested()) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
       }
     }
+  } catch (const std::exception &) {
+    return refuseStart(transport, argv[0]);
   }
-  if (transport.shutdownRequested())
-    return static_cast<int>(engine::NativeProcessExit::CleanEof);
-  published = bootstrap.get();
+  // Ready follows the start, out of refuseStart's reach: the server takes a
+  // StartFailed after Ready for a protocol failure, so a failure from Ready
+  // on ends the process with its report alone.
+  try {
+    runtime->announceReady();
+  } catch (const std::exception &) {
+    // A stop requested meanwhile ends the process as a stop: it cuts the
+    // Ready write short (FdTransport::writeAll), which is no failure.
+    if (transport.shutdownRequested())
+      return static_cast<int>(engine::NativeProcessExit::CleanEof);
+    throw;
+  }
 
-  transport.setControlHandler([&pressureMonitor, published] {
-    return published->controlPass(pressureMonitor.pressure());
+  transport.setControlHandler([&pressureMonitor, &runtime] {
+    return runtime->controlPass(pressureMonitor->pressure());
   });
-  const auto exit = transport.run(bootstrap->nativeLoop());
+  const auto exit = transport.run(runtime->nativeLoop());
   switch (exit) {
   case engine::NativeProcessExit::CleanEof:
-    if (bootstrap->resources().cache().persistent())
-      closePersistentCache(transport, *bootstrap);
     break;
   case engine::NativeProcessExit::ProtocolFailure:
     writeStderrLine(
@@ -374,13 +418,13 @@ int runNative(const engine::NativeArguments &arguments) {
   case engine::NativeProcessExit::EngineFailure:
     writeStderrLine(
         "error: native transport stopped after an engine failure (" +
-        (transport.failure().empty() ? bootstrap->nativeLoop().engineFailure()
+        (transport.failure().empty() ? runtime->nativeLoop().engineFailure()
                                      : transport.failure()) +
         ")");
     // A command the backend gave up on may never complete; teardown would
     // wait for it. The OS and the driver reclaim everything, as after
     // SIGKILL.
-    if (!bootstrap->resources().backend().healthy()) {
+    if (!runtime->resources().backend().healthy()) {
       writeStderrLine(
           "error: the Metal backend is unhealthy; exiting without teardown");
       _exit(static_cast<int>(exit));
@@ -392,12 +436,18 @@ int runNative(const engine::NativeArguments &arguments) {
         transport.failure() + ")");
     break;
   }
+  // Not only after CleanEof: a protocol or I/O failure leaves the engine
+  // healthy, and its newest restore points still reach the disk.
+  if (runtime->resources().cache().persistent() && runtime->nativeLoop().engineHealthy())
+    closePersistentCache(transport, *runtime);
   return static_cast<int>(exit);
 }
 
 // The engine's device rule, which the launcher runs before any download:
 // serve-native applies it only once the model is prepared.
-int checkDevice() {
+int checkDevice(int argc) {
+  if (argc != 2)
+    throw engine::UsageError("device-check takes no arguments");
   const auto message = metal::probeDeviceCapabilities().validationMessage();
   if (!message)
     return 0;
@@ -410,11 +460,11 @@ int checkDevice() {
 // JSON, or the refusal (model::inspectSourceConfiguration).
 int checkModel(int argc, char **argv) {
   // The draft's config, when given, follows the target's: its config, and a
-  // GGUF's metadata after it.
+  // GGUF's directory of headers after it.
   const int draftIndex = argc > 2 && std::string_view(argv[2]) == "gguf" ? 6 : 5;
   if (argc != draftIndex && argc != draftIndex + 1)
     throw engine::UsageError(
-        "model-check takes the source formats, the target's config, a GGUF target's metadata and the draft's config");
+        "model-check takes the source formats, the target's config, a GGUF target's headers and the draft's config");
   const auto path = [&](int index) {
     return index < argc ? std::optional<std::filesystem::path>(argv[index]) : std::nullopt;
   };
@@ -424,31 +474,48 @@ int checkModel(int argc, char **argv) {
   return 0;
 }
 
+// What each family's layout gives the options a start takes
+// (model::familyFacts), as JSON by family, which the installer reports to the
+// app (install/families.py).
+int printFamilies(int argc) {
+  if (argc != 2)
+    throw engine::UsageError("families takes no arguments");
+  json::Writer w;
+  w.object([&] {
+    for (const model::FamilyFacts &facts : model::familyFacts())
+      w.object(json::Key(facts.family), [&] {
+        w.field("experts", facts.experts)
+            .field("recurrent_state", facts.recurrentState)
+            .field("ple_table", facts.pleTable)
+            .field("sparse_kv", facts.sparseKv)
+            .field("dense_ffn", facts.denseFfn)
+            .field("context_tokens", facts.contextTokens)
+            .field("max_context_tokens", facts.maximumContextTokens);
+      });
+  });
+  std::printf("%s\n", w.str().c_str());
+  return 0;
+}
+
 } // namespace
 } // namespace splash
 
 int main(int argc, char **argv) {
   @autoreleasepool {
     try {
-      if (argc == 2 && std::string_view(argv[1]) == "device-check")
-        return splash::checkDevice();
-      if (argc > 1 && std::string_view(argv[1]) == "model-check")
+      const std::string_view command = argc > 1 ? argv[1] : "";
+      if (command == "device-check")
+        return splash::checkDevice(argc);
+      if (command == "model-check")
         return splash::checkModel(argc, argv);
-      const splash::engine::NativeArguments arguments =
-          splash::engine::parseNativeArguments(argc, argv);
-      return splash::runNative(arguments);
-    } catch (const splash::engine::UsageError &error) {
-      splash::writeStderrLine(std::string("error: ") + error.what());
-      splash::printUsage(argc > 0 ? argv[0] : "splash");
-      return EX_USAGE;
-    } catch (const std::system_error &error) {
-      splash::writeStderrLine(
-          std::string("error: native runtime I/O failed: ") + error.what());
-      return static_cast<int>(splash::engine::NativeProcessExit::IoFailure);
-    } catch (const std::exception &error) {
-      splash::writeStderrLine(std::string("error: ") + error.what());
-      return static_cast<int>(
-          splash::engine::NativeProcessExit::EngineFailure);
+      if (command == "families")
+        return splash::printFamilies(argc);
+      if (command == "serve-native")
+        return splash::serveNative(argc, argv);
+      throw splash::engine::UsageError(command.empty() ? std::string("expected a command")
+                                                       : "unknown command " + std::string(command));
+    } catch (const std::exception &) {
+      return splash::reportFailure(argc > 0 ? argv[0] : "splash");
     }
   }
 }
