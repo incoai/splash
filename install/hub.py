@@ -79,16 +79,49 @@ def reason(error) -> str:
     return message
 
 
+def failure_kind(error) -> str | None:
+    """What the app words a Hub or network failure by
+    (models.ModelError.kind): no such repository, no connection or access
+    denied; None for any other, which the app shows by its message, such as
+    a revision or file the repository lacks. A gated repository is access
+    denied, though huggingface_hub refuses it as a RepositoryNotFoundError
+    (GatedRepoError)."""
+    import httpx
+    from huggingface_hub.errors import (
+        GatedRepoError,
+        HfHubHTTPError,
+        RepositoryNotFoundError,
+    )
+
+    status = (
+        error.response.status_code
+        if isinstance(error, HfHubHTTPError) and error.response is not None
+        else None
+    )
+    if isinstance(error, GatedRepoError):
+        return "auth"
+    if isinstance(error, RepositoryNotFoundError):
+        return "not_found"
+    if status in (401, 403):
+        return "auth"
+    if isinstance(error, (httpx.ConnectError, httpx.TimeoutException)):
+        return "offline"
+    return None
+
+
 @contextmanager
 def as_model_errors(context: str):
     """Report a Hub, network or cache failure in the block as a ModelError,
-    "context: reason", which callers print without a traceback."""
+    "context: reason", which callers print without a traceback, classed for
+    the app (failure_kind)."""
     import httpx
 
     try:
         yield
     except (OSError, httpx.HTTPError) as error:
-        raise models.ModelError(f"{context}: {reason(error)}") from error
+        raise models.ModelError(
+            f"{context}: {reason(error)}", kind=failure_kind(error)
+        ) from error
 
 
 def folder_name(repo_id: str) -> str:
@@ -174,16 +207,30 @@ def retire_other_pins(pins, replaced=()):
     """Remove the installation's pins beside pins, and beside replaced, its
     pins before these, which may be in repositories pins do not name. Call
     it only after publishing and verifying the installation these pin; other
-    installations own other folders."""
+    installations own other folders. replaced may name a cache by another
+    path than pins do, so pins are told apart as files (_file)."""
     try:
+        kept = {_file(ref) for ref in pins}
         for folder in {ref.parent for ref in (*pins, *replaced)}:
             for previous in folder.iterdir() if folder.is_dir() else ():
-                if previous not in pins and models.is_hex_digest(previous.name, 40):
+                if (
+                    models.is_hex_digest(previous.name, 40)
+                    and _file(previous) not in kept
+                ):
                     previous.unlink()
     except OSError as error:
         # Keeping an old pin uses cache space but cannot invalidate the
         # verified installation or its successfully retained current pin.
         models.warn(f"could not retire old Hub cache references: {error}")
+
+
+def _file(path):
+    """The entry at path, however the path spells it (through a symbolic link
+    to a folder, or in another case on a case-insensitive volume): its device
+    and inode. A symbolic link at path is itself, not the file it names, so
+    one that names nothing is no pin rather than an error."""
+    status = path.lstat()
+    return status.st_dev, status.st_ino
 
 
 def repair_pins(installation: Path, snapshots):
@@ -221,6 +268,7 @@ class Repository:
         *,
         sizes=None,
         unreachable_reason=None,
+        unreachable_kind=None,
         default_branch=False,
     ):
         self.name, self.revision, self.files = name, revision, files
@@ -232,8 +280,10 @@ class Repository:
         # Hub filename -> (bytes, blob ID), to report what a download fetches.
         self.sizes = sizes or {}
         # Why the Hub did not resolve this source, when its cached snapshot
-        # stands in; None when no stand-in was needed.
+        # stands in, and that failure's class (failure_kind); None when no
+        # stand-in was needed.
         self.unreachable_reason = unreachable_reason
+        self.unreachable_kind = unreachable_kind
 
     @classmethod
     def local_directory(cls, path):
@@ -249,48 +299,53 @@ class Repository:
         return cls(name, None, set(paths), dict(paths))
 
     @classmethod
-    def cached(cls, name, commit, *, unreachable_reason=None):
-        """name at commit from its snapshot in the Hub cache, without the Hub;
-        only the files downloaded before are available."""
-        path = snapshot(name, commit)
+    def cached(
+        cls, name, commit, path=None, *, unreachable_reason=None, unreachable_kind=None
+    ):
+        """name at commit from its snapshot folder in a Hub cache, path, by
+        default HF_HUB_CACHE's, without the Hub; only the files downloaded
+        before are available."""
+        path = path or snapshot(name, commit)
         if not path.is_dir():
             raise models.ModelError(f"the Hub cache has no snapshot {commit} of {name}")
         paths = _paths(path)
         return cls(
-            name, commit, set(paths), paths, unreachable_reason=unreachable_reason
+            name,
+            commit,
+            set(paths),
+            paths,
+            unreachable_reason=unreachable_reason,
+            unreachable_kind=unreachable_kind,
         )
 
     @classmethod
-    def recorded(cls, source):
-        """A source as an assembly record names it, without the Hub."""
-        if source["revision"] is None:
-            return cls.local_directory(source["repo"])
-        return cls.cached(source["repo"], source["revision"])
-
-    @classmethod
     def resolve(
-        cls, name, revision=None, *, installation=None, installed=None, unreachable=None
+        cls,
+        name,
+        revision=None,
+        *,
+        installation=None,
+        installed=None,
+        unreachable=None,
+        unreachable_kind=None,
     ):
-        """name at the commit revision names now. This decides whether the
+        """name at the commit revision names now; this decides whether the
         Hub is asked.
 
-        Only an absolute path is a local directory: parse_draft_model makes a
-        --draft-model directory absolute, and a target is always a Hub ID,
-        whatever the working directory holds. installed is the commit a
-        verified installation of this selection records; its links name its
-        files, wherever HF_HUB_CACHE points now. A commit revision never
-        moves and HF_HUB_OFFLINE forbids requests, so with installed either
-        returns that commit, unlisted, without a request or a look at the
-        Hub cache. Otherwise one request resolves revision, and the commit
-        it names for the default branch is recorded in the Hub cache once
-        the cache holds it, now or when a download of it ends
-        (_record_default_branch). When the Hub cannot answer, installed
-        stands in the same way, with the reason in unreachable_reason;
-        without it, the cached snapshot of a commit this selection already
-        names, or the cache records for revision, does (_cached_commits).
-        unreachable, why the Hub did not answer for another repository this
-        start, stands for its answer without a request. A different revision
-        is never substituted."""
+        Only an absolute path is a local directory (parse_draft_model makes
+        --draft-model absolute; a target is always a Hub ID). installed is the
+        commit a verified installation records, whose links name its files
+        wherever HF_HUB_CACHE points now; with it, a commit revision (which
+        never moves) or HF_HUB_OFFLINE returns that commit, unlisted, without a
+        request or a look at the Hub cache. Otherwise one request resolves
+        revision, and the default branch's commit is recorded once the cache
+        holds it (_record_default_branch). When the Hub cannot answer,
+        installed stands in the same way, with unreachable_reason and its class
+        (unreachable_kind, failure_kind); without it, a cached snapshot does
+        (_cached_commits); without either, the ModelError carries that class
+        for the app. unreachable and unreachable_kind, from another repository
+        this start, stand for the Hub's answer without a request. A different
+        revision is never substituted."""
         import httpx
         from huggingface_hub import HfApi, constants
 
@@ -302,16 +357,18 @@ class Repository:
         ):
             return cls(name, installed, frozenset())
         if constants.HF_HUB_OFFLINE:
-            why = "HF_HUB_OFFLINE is set"
+            # Not a network failure: the reason, which the app shows as it
+            # is, names the setting.
+            why, kind = "HF_HUB_OFFLINE is set", None
         elif unreachable:
-            why = unreachable
+            why, kind = unreachable, unreachable_kind
         else:
             try:
                 info = HfApi().model_info(
                     name, revision=revision, files_metadata=True, timeout=HUB_TIMEOUT
                 )
             except (OSError, httpx.HTTPError) as error:
-                why = reason(error)
+                why, kind = reason(error), failure_kind(error)
             else:
                 if not models.is_hex_digest(info.sha, 40):
                     raise models.ModelError(
@@ -334,11 +391,19 @@ class Repository:
                     default_branch=revision is None,
                 )
         if installed:
-            return cls(name, installed, frozenset(), unreachable_reason=why)
+            return cls(
+                name,
+                installed,
+                frozenset(),
+                unreachable_reason=why,
+                unreachable_kind=kind,
+            )
         commits = _cached_commits(name, revision, installation)
         for commit in commits:
             if snapshot(name, commit).is_dir():
-                return cls.cached(name, commit, unreachable_reason=why)
+                return cls.cached(
+                    name, commit, unreachable_reason=why, unreachable_kind=kind
+                )
         branch = revision or "the default branch"
         if commits:
             cache = "the Hub cache has no snapshot of " + ", ".join(commits)
@@ -349,7 +414,7 @@ class Repository:
             )
         else:
             cache = f"the Hub cache records no commit for {branch}"
-        raise models.ModelError(f"cannot resolve {name}: {why}; {cache}")
+        raise models.ModelError(f"cannot resolve {name}: {why}; {cache}", kind=kind)
 
     def _require(self, name):
         if name not in self.files:
@@ -401,6 +466,7 @@ class Repository:
         total = sum(size for size, _ in fetch)
         if fetch:
             _remove_abandoned_downloads(blobs)
+            _require_room(self.name, blobs, total)
             print(
                 f"Fetching {len(fetch)} file(s), {total / 1e9:.2f} GB, "
                 f"from {self.name}@{self.revision[:12]}; cached files are reused.",
@@ -438,13 +504,10 @@ def _cached_commits(name, revision, installation):
     """The commits of name whose cached snapshots may stand in for revision
     without the Hub, most specific first: revision itself when it is a
     commit; the commit installation recorded, then the ones it pinned
-    (refs/splash); then the commit the cache recorded for the branch or tag,
-    refs/main for the default branch. Splash downloads by commit, which
-    records no branch, so it records the default branch's commit itself
-    when the Hub names it (_record_default_branch). Other installations'
-    pins never stand in: a pin does not say which revision it was installed
-    for. The record is read as it is: this is how a damaged installation is
-    rebuilt."""
+    (refs/splash); then the cache's record of the branch or tag (refs/main,
+    _record_default_branch). Other installations' pins never stand in: a pin
+    does not say which revision it was installed for. The record is read as
+    it is, so a damaged installation can be rebuilt."""
     if models.is_hex_digest(revision, 40):
         return [revision.lower()]
     commits = []
@@ -477,14 +540,12 @@ def _cached_commits(name, revision, installation):
 
 
 def _record_default_branch(name, commit):
-    """Record commit as name's default branch in the Hub cache, refs/main,
-    as huggingface_hub does when it downloads the branch, so that a new
-    selection of it installs without the Hub (_cached_commits): once the
-    cache holds the commit's snapshot, so a resolve whose download fails or
-    never runs leaves no record of what the cache lacks, and an
-    installation whose links name another cache's files records nothing
-    here. Only a record that changes is written, so a read-only cache that
-    holds it is left alone."""
+    """Record commit as name's default branch in the Hub cache, refs/main, as
+    huggingface_hub does when it downloads the branch (Splash downloads by
+    commit, which records no branch), so a new selection of it installs without
+    the Hub (_cached_commits). It is recorded only once the cache holds the
+    commit's snapshot, so no record names what the cache lacks, and written
+    only when it changes, so a read-only cache is left alone."""
     if not snapshot(name, commit).is_dir():
         return
     ref = folder(name) / "refs" / "main"
@@ -515,15 +576,80 @@ def _publish(path, content):
             pending.unlink(missing_ok=True)
 
 
+def _require_room(repo_id, blobs, needed):
+    """Refuse a download of needed bytes into the blobs folder that its volume
+    has no room for, before it fills the disk: the Hub cache can be on
+    another volume (HF_HOME, HF_HUB_CACHE) than the home folder."""
+    existing = next(p for p in (blobs, *blobs.parents) if p.exists())
+    available = _available_bytes(existing)
+    if needed > available:
+        raise models.ModelError(
+            f"not enough disk space for {repo_id}: the download needs "
+            f"{needed / 1e9:.2f} GB and {available / 1e9:.2f} GB is available "
+            f"in {blobs.parent.parent}"
+        )
+
+
+def _available_bytes(path):
+    """The bytes the volume of path takes for a download the user asked for,
+    as Finder counts them: with the purgeable space macOS frees as it is
+    needed, which statvfs leaves out (6.6 GB of 53 GB on one Mac). That count
+    reads 0 off volumes Finder does not show (mounted nobrowse), so the larger
+    of it and statvfs's free bytes decides."""
+    import ctypes
+    import shutil
+
+    cf = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+    cf.CFURLCreateFromFileSystemRepresentation.restype = ctypes.c_void_p
+    cf.CFURLCreateFromFileSystemRepresentation.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_long,
+        ctypes.c_bool,
+    )
+    cf.CFURLCopyResourcePropertyForKey.restype = ctypes.c_bool
+    cf.CFURLCopyResourcePropertyForKey.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+    )
+    cf.CFNumberGetValue.restype = ctypes.c_bool
+    cf.CFNumberGetValue.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_long,
+        ctypes.POINTER(ctypes.c_int64),
+    )
+    cf.CFRelease.argtypes = (ctypes.c_void_p,)
+    key = ctypes.c_void_p.in_dll(
+        cf, "kCFURLVolumeAvailableCapacityForImportantUsageKey"
+    )
+    important = ctypes.c_int64()
+    name = os.fsencode(path)
+    url = cf.CFURLCreateFromFileSystemRepresentation(None, name, len(name), True)
+    if url:
+        value = ctypes.c_void_p()
+        if (
+            cf.CFURLCopyResourcePropertyForKey(url, key, ctypes.byref(value), None)
+            and value
+        ):
+            sint64 = 4  # kCFNumberSInt64Type
+            cf.CFNumberGetValue(value, sint64, ctypes.byref(important))
+            cf.CFRelease(value)
+        cf.CFRelease(url)
+    return max(important.value, shutil.disk_usage(path).free)
+
+
 def _remove_abandoned_downloads(blobs):
     """Remove the partial files in the blobs folder that no live download
-    writes, of whichever blob. huggingface_hub writes a blob to
-    <blob>.<random>.incomplete, a name no later download reuses, and holds
-    <Hub cache>/.locks/<repository folder>/<blob>.lock until it renames or
-    removes that file; a killed download leaves it behind, and a cancelled
-    one never retried would keep it. A blob's partial files are removed only
-    while that lock is taken here without waiting, as huggingface_hub takes
-    it, so a live download, of any process, keeps its own and none starts
+    writes. huggingface_hub writes a blob to <blob>.<random>.incomplete, a
+    name no later download reuses, and holds <Hub cache>/.locks/<repository
+    folder>/<blob>.lock until it renames or removes that file, so a killed
+    download leaves it behind. A blob's partial files are removed only while
+    that lock is taken here without waiting, as huggingface_hub takes it, so
+    a live download of any process keeps its own and none starts
     meanwhile."""
     from filelock import FileLock, Timeout
 
@@ -543,14 +669,13 @@ def _remove_abandoned_downloads(blobs):
 
 def _interruptible(call, *args, **kwargs):
     """call(*args, **kwargs) on a thread of its own: its result returned
-    here, or its exception raised. This thread waits on it in joins of
-    INTERRUPT_INTERVAL, so Ctrl+C reaches the caller at once, as
-    KeyboardInterrupt, and every block above it unwinds. Interrupted in its
-    own thread, snapshot_download would first wait for each thread of its
-    pool to finish its file, tens of seconds. An interrupted call goes on,
-    with its pool, which the interpreter would wait for at exit
-    (concurrent.futures joins every pool thread then, daemon or not):
-    install/models.py ends an interrupted installer without that wait."""
+    here, or its exception raised. This thread joins it every
+    INTERRUPT_INTERVAL, so Ctrl+C raises KeyboardInterrupt here at once;
+    interrupted in its own thread, snapshot_download would first let each
+    pool thread finish its file, tens of seconds. The interrupted call goes
+    on, and install/models.py ends the installer without the exit-time join
+    of its pool (concurrent.futures joins every pool thread at exit, daemon
+    or not)."""
     outcome = {}
 
     def run():

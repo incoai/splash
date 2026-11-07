@@ -4,12 +4,12 @@
 // reads it. After the 16-byte file header (model/WeightLayout.hpp)
 // come 16 KiB-aligned sections. A quantized tensor is a descriptor section,
 // then its plane0, optional plane1 and meta sections in its format's layout
-// (metal/abi/QuantFormat.h). A tensor copied as stored (the token
-// embedding's native rows; the MoE router, its F32 or BF16 values or a
-// quantized router's native rows; the F32 shared-expert gate and
-// alpha/beta) is a descriptor and its rows; a norm, the convolution and the
-// GDN head vectors are their rows alone, F32 or narrowed to the bf16 values
-// they equal.
+// (metal/abi/QuantFormat.h). A tensor copied as stored (a token or PLE
+// table's rows; the MoE router, its F32 or BF16 values or a quantized
+// router's native rows; the F32 shared-expert gate and alpha/beta) is a
+// descriptor and its rows (quant_stored_row_bytes); a norm, the convolution
+// and the GDN head vectors are their rows alone, F32 or narrowed to the bf16
+// values they equal.
 
 #include "metal/abi/QuantFormat.h"
 
@@ -74,7 +74,8 @@ struct GgufPlaneBytes {
           rows * (groups / format.meta_groups) * format.meta_bytes};
 }
 
-// Bytes of `columns` values of a row in format's GGUF blocks.
+// Bytes of `columns` values of a row in format's native blocks, which the
+// repack reads; rows kept as stored are quant_stored_row_bytes.
 [[nodiscard]] inline constexpr uint64_t ggufRowBytes(const QuantFormat &format, uint64_t columns) {
   return columns / format.block_elements * format.block_bytes;
 }

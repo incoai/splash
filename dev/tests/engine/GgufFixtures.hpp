@@ -238,25 +238,21 @@ inline std::string architecture(const model::QwenTargetDimensions &g) {
 // The rows of a fixture's PLE table.
 inline constexpr uint64_t kPleTableRows = 96;
 
-// Every tensor of the geometry, zero, in the order GGUF converters write them:
-// with hyper-connected streams, mixes in place of the norms around each mixer
-// and the output norm; with a QSA indexer, its tensors in each
-// full-attention layer; with a PLE embedding, its tensors in the layer it
-// feeds and its table of kPleTableRows rows; and in a flint GGUF, each
-// layer's sinks after its attention and its norm before the FFN named
-// ffn_norm. The queries hold their gate where the attention has one
-// (attentionGate), a MoE geometry's leading layers are dense (isMoeLayer),
-// and its shared expert is sharedExpertSlices routed experts wide, with a
-// scalar gate where its blocks have one (sharedExpertGate).
-inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, const TensorTypes &types) {
+// Every tensor of the geometry, without data (a header's tensor table), in
+// the order GGUF converters write them: with hyper-connected streams, mixes
+// in place of the norms around each mixer and the output norm; with a QSA
+// indexer, its tensors in each full-attention layer; with a PLE embedding,
+// its tensors in the layer it feeds and its table of `pleRows` rows; and in
+// a flint GGUF, each layer's sinks after its attention and its norm before
+// the FFN named ffn_norm. The queries hold their gate where the attention
+// has one (attentionGate), a MoE geometry's leading layers are dense
+// (isMoeLayer), and its shared expert is sharedExpertSlices routed experts
+// wide, with a scalar gate where its blocks have one (sharedExpertGate).
+inline std::vector<Tensor> tensorTable(const model::QwenTargetDimensions &g, const TensorTypes &types,
+                                       uint64_t pleRows = kPleTableRows) {
   std::vector<Tensor> tensors;
   const auto add = [&](std::string name, std::vector<uint64_t> dims) {
-    const uint32_t type = typeOf(types, name);
-    const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(type);
-    uint64_t elements = 1;
-    for (uint64_t dim : dims) elements *= dim;
-    tensors.push_back(
-        {name, std::move(dims), type, test_gguf::Bytes(elements / traits.blockElements * traits.blockBytes)});
+    tensors.push_back({name, std::move(dims), typeOf(types, name), {}});
   };
   const uint64_t hidden = g.hiddenSize, valueRows = uint64_t{g.gdnValueHeads} * g.gdnHeadDimension;
   const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
@@ -319,7 +315,7 @@ inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, c
       add(p + "ffn_up.weight", {hidden, g.intermediateSize});
       add(p + "ffn_down.weight", {g.intermediateSize, hidden});
     }
-    if (g.hasPle() && layer == g.pleLayer) {
+    if (g.pleNgram && layer == g.pleLayer) {
       add(p + "ple_key.weight", {g.pleWidth(), streams});
       add(p + "ple_value.weight", {g.pleWidth(), hidden});
       add(p + "ple_norm_key.weight", {streams});
@@ -331,7 +327,20 @@ inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, c
   mix("output_hc", false, "output_norm.weight");
   add("output.weight", {hidden, g.vocabularySize});
   add("token_embd.weight", {hidden, g.vocabularySize});
-  if (g.hasPle()) add("per_layer_token_embd.weight", {g.pleHeadDimension, kPleTableRows});
+  if (g.pleNgram) add("per_layer_token_embd.weight", {g.pleHeadDimension, pleRows});
+  return tensors;
+}
+
+// tensorTable's tensors, each of zero data.
+inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, const TensorTypes &types,
+                                         uint64_t pleRows = kPleTableRows) {
+  std::vector<Tensor> tensors = tensorTable(g, types, pleRows);
+  for (Tensor &tensor : tensors) {
+    const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(tensor.type);
+    uint64_t elements = 1;
+    for (uint64_t dim : tensor.dims) elements *= dim;
+    tensor.data.resize(elements / traits.blockElements * traits.blockBytes);
+  }
   return tensors;
 }
 
@@ -524,7 +533,7 @@ inline std::vector<test_gguf::Key> metadata(const model::QwenTargetDimensions &g
       ratios.push_back(g.isFullAttentionLayer(layer) ? int32_t(g.indexerBlockTokens) : 0);
     keys.push_back(test_gguf::int32ArrayKey(arch + ".attention.compress_ratios", ratios));
   }
-  if (g.hasPle()) {
+  if (g.pleNgram) {
     key("ple.ngram_size", g.pleNgram);
     key("ple.heads_per_ngram", g.pleHeadsPerNgram);
     key("ple.conv_kernel", g.pleConvolutionTaps);

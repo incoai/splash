@@ -30,6 +30,8 @@ namespace splash::test {
 // The target attention layer a fixture holds: its query and KV heads and
 // their width, its cache format, its value order (kv::Layout::
 // valuesTokenMajor) and its variant of the geometry (a window, RoPE).
+// Token-major values are the sparse attention's, which reads selected blocks
+// (kv::valuesTokenMajorFor).
 struct AttentionShape final {
   uint32_t queryHeads = 0;
   uint32_t kvHeads = 0;
@@ -38,6 +40,15 @@ struct AttentionShape final {
   bool valuesTokenMajor = false;
   ops::AttentionVariant variant{};
 };
+// The pages of `layers` attention layers of a shape.
+[[nodiscard]] inline kv::Layout attentionLayout(const AttentionShape &shape, uint32_t layers = 1) noexcept {
+  return {.attentionLayers = layers,
+          .kvHeads = shape.kvHeads,
+          .headDimension = shape.headDimension,
+          .format = shape.format,
+          .valuesTokenMajor = shape.valuesTokenMajor,
+          .reads = shape.valuesTokenMajor ? kv::Reads::SelectedBlocks : kv::Reads::EveryPage};
+}
 
 // Where a fixture's attention layer sits: layer `layer` of a pool of
 // poolLayers attention layers, in extents of extentPages pages.
@@ -174,13 +185,7 @@ struct AttentionFixturePlan final {
   }
 
 private:
-  [[nodiscard]] kv::Layout layoutOf(uint32_t layers) const noexcept {
-    return {.attentionLayers = layers,
-            .kvHeads = shape.kvHeads,
-            .headDimension = shape.headDimension,
-            .format = shape.format,
-            .valuesTokenMajor = shape.valuesTokenMajor};
-  }
+  [[nodiscard]] kv::Layout layoutOf(uint32_t layers) const noexcept { return attentionLayout(shape, layers); }
   void size(Tensor tensor, uint64_t value) noexcept {
     sizes[static_cast<size_t>(tensor)] = value;
   }
@@ -188,8 +193,8 @@ private:
 
 // A fixture's extents start its one allocation and its tensors are views of
 // the rest; kernels reach the extents only through the lanes' page tables, so
-// the allocation is addressed (metal::BufferReach), resident for every
-// command buffer. Lanes past the plan's lanes bind lane 0's page table, as the
+// the allocation is addressed (metal::BufferReach), and each table names it
+// (HostKvExtents::reachThrough). Lanes past the plan's lanes bind lane 0's page table, as the
 // runtime's padded lanes do.
 class AttentionFixture final {
 public:
@@ -200,10 +205,8 @@ public:
       : plan_(std::move(plan)),
         base_(backend.allocateBuffer(plan_.bytes, metal::BufferStorage::Shared, label,
                                      metal::BufferReach::Addressed)),
-        pages_(HostKvExtents::contiguous(plan_.poolLayout(), plan_.geometry.extentPages,
-                                         plan_.extents,
-                                         static_cast<std::byte *>(base_.contents()),
-                                         base_.gpuAddress())),
+        pages_(HostKvExtents::contiguous(backend, plan_.poolLayout(), plan_.geometry.extentPages,
+                                         plan_.extents, base_)),
         layer_(pages_.layer(plan_.geometry.layer)) {
     uint64_t offset = AttentionFixturePlan::aligned(plan_.poolBytes);
     for (size_t index = 0; index < plan_.sizes.size(); ++index) {
@@ -232,7 +235,7 @@ public:
     auto *queries = data<uint16_t>(Tensor::Queries);
     const uint32_t dimensions = plan_.shape.headDimension;
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
-      pages_.writeTable(pageIds_[lane], tables_[lane].contents());
+      pages_.writeTable(pageIds_[lane], tables_[lane]);
       for (uint32_t token = 0; token < plan_.histories[lane]; ++token) {
         if (token % 256 == 0 && stop && stop()) return false;
         for (uint32_t head = 0; head < plan_.shape.kvHeads; ++head) {

@@ -56,7 +56,7 @@ struct ChatContextTests {
         let context = ChatContext(delay: .zero) { try await probe.count($0) }
         let input = request()
         context.refresh(input)
-        try await waitFor { context.usage(for: input) != nil }
+        try await waitFor(context.usage(for: input) != nil)
         #expect(context.usage(for: input)?.input == input.text.utf8.count)
         // The same prompt again is not counted again.
         context.refresh(input)
@@ -76,11 +76,11 @@ struct ChatContextTests {
         let context = ChatContext(delay: .zero) { await probe.count($0.text) }
         let old = request("old"), current = request("current")
         context.refresh(old)
-        try await waitFor { await probe.started("old") }
+        try await waitFor(await probe.started("old"))
         context.refresh(current)
-        try await waitFor { await probe.started("current") }
+        try await waitFor(await probe.started("current"))
         await probe.finish("current", with: 20)
-        try await waitFor { context.usage(for: current) != nil }
+        try await waitFor(context.usage(for: current) != nil)
         // This counter ignores cancellation, as an HTTP response may arrive meanwhile: its count
         // must still be dropped.
         await probe.finish("old", with: 99999)
@@ -101,16 +101,16 @@ struct ChatContextTests {
         context.refresh(input)
         try await Task.sleep(for: .milliseconds(100))
         #expect(await probe.calls == 0)
-        try await waitFor { context.usage(for: input) != nil }
+        try await waitFor(context.usage(for: input) != nil)
         #expect(await probe.calls == 1)
         #expect(context.shown(history: history, target: target, started: nil) != nil)
         context.refresh(request("Hey?", history: history))
-        try await waitFor { context.counted == nil }
+        try await waitFor(context.counted == nil)
         #expect(await probe.calls == 2)
         #expect(context.shown(history: history, target: target, started: nil) == nil)
         let next = request("Hey!", history: history)
         context.refresh(next)
-        try await waitFor { context.usage(for: next) != nil }
+        try await waitFor(context.usage(for: next) != nil)
         #expect(await probe.calls == 3)
     }
 
@@ -121,7 +121,7 @@ struct ChatContextTests {
         let context = ChatContext(delay: .zero) { $0.text.utf8.count + $0.history.count }
         let history = [ChatMessage(role: .user, text: "Hi"), ChatMessage(role: .assistant, text: "Hello.")]
         context.refresh(request("Next", history: history))
-        try await waitFor { context.counted != nil }
+        try await waitFor(context.counted != nil)
         let usage = context.counted?.usage
         #expect(context.shown(history: history, target: target, started: nil) == usage)
         // The question sent and its reply streaming.
@@ -146,7 +146,7 @@ struct ChatContextTests {
         // A new chat's count shows only on the chat its message started, not on another one of
         // one exchange.
         context.refresh(request("Summarize this"))
-        try await waitFor { context.counted?.request.history.isEmpty == true }
+        try await waitFor(context.counted?.request.history.isEmpty == true)
         let fresh = context.counted?.usage
         #expect(context.shown(history: history, target: target, started: nil) == nil)
         let started = [ChatMessage(role: .user, text: "Summarize this"), ChatMessage(role: .assistant, text: "Wo")]
@@ -182,14 +182,6 @@ struct ChatContextTests {
 
     private func percent(_ share: Double) -> String {
         share.formatted(.percent.precision(.fractionLength(0)))
-    }
-
-    private func waitFor(_ condition: () async -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(3)
-        while !(await condition()) {
-            try #require(ContinuousClock.now < deadline, "The count did not finish")
-            try await Task.sleep(for: .milliseconds(5))
-        }
     }
 }
 

@@ -49,19 +49,19 @@
         chunk_values, params, reductions, normalized, task, thread_index,     \
         lane, simd_group);                                                    \
   }
+// Each geometry's instances for the norm types its families store: bf16 (an
+// MLX target's) and F32, or F32 alone for Qwen3.8-Flash-Next's (_kv2_g12) and
+// Flint's (_kv4_g8_d128), which load from GGUFs only.
 PREFILL_ATTENTION_QKV(prefill_attention_qkv, 24, 4, 256, 32, true, bfloat)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g8, 16, 2, 256, 32, true, bfloat)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_f32, 24, 4, 256, 32, true, float)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g8_f32, 16, 2, 256, 32, true, float)
-PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g12, 24, 2, 256, 32, true, bfloat)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g12_f32, 24, 2, 256, 32, true, float)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g16, 32, 2, 256, 32, true, bfloat)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g16_f32, 32, 2, 256, 32, true, float)
 // Four KV heads of 128 dimensions without an output gate, their whole heads
 // rotated (64 pairs) or unrotated.
-PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv4_g8_d128, 32, 4, 128, 64, false, bfloat)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv4_g8_d128_f32, 32, 4, 128, 64, false, float)
-PREFILL_ATTENTION_QKV_NOPE(prefill_attention_qkv_kv4_g8_d128_nope, 32, 4, 128, false, bfloat)
 PREFILL_ATTENTION_QKV_NOPE(prefill_attention_qkv_kv4_g8_d128_nope_f32, 32, 4, 128, false, float)
 #undef PREFILL_ATTENTION_QKV_NOPE
 #undef PREFILL_ATTENTION_QKV

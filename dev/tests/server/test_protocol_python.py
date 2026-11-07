@@ -122,13 +122,51 @@ def client_messages():
         ),
         "status_request": p.StatusRequestFrame(808),
         "release_request": p.ReleaseRequestFrame(808),
+        "stop": p.StopFrame(91),
     }
 
 
 def engine_events():
     return {
-        "ready": p.ReadyEvent(4, 524_288, False),
-        "ready_vision": p.ReadyEvent(4, 524_288, True),
+        "ready": p.ReadyEvent(4, 524_288, False, 248_320, 9, (248_044, 248_046)),
+        "ready_vision": p.ReadyEvent(
+            4, 524_288, True, 150_144, 9, (150_001, 150_003, 150_005, 150_018)
+        ),
+        "start_failed_memory": p.StartFailedEvent(
+            p.StartFailureKind.MEMORY_BUDGET,
+            p.ShortfallBound.MAX_MEMORY,
+            10_858_659_840,
+            1_073_741_824,
+            0,
+            b"the plan's floors require 10858659840 bytes but the Metal memory "
+            b"budget is 1073741824 bytes",
+        ),
+        "start_failed_context": p.StartFailedEvent(
+            p.StartFailureKind.CONTEXT_BUDGET,
+            p.ShortfallBound.DISK,
+            0,
+            0,
+            73_721,
+            b"--max-context 262144 exceeds the 73721 tokens the model and the SSD "
+            b"cache's room for its KV allow",
+        ),
+        "start_failed_host": p.StartFailedEvent(
+            p.StartFailureKind.HOST_MEMORY,
+            p.ShortfallBound.DEVICE_MEMORY,
+            0,
+            0,
+            0,
+            b"the host has too little free memory to start",
+        ),
+        "start_failed_command_memory": p.StartFailedEvent(
+            p.StartFailureKind.COMMAND_MEMORY,
+            p.ShortfallBound.DEVICE_MEMORY,
+            0,
+            0,
+            0,
+            b"a start command ran out of GPU memory",
+        ),
+        "warming": p.WarmingEvent(),
         "start": p.StartEvent(91, 2, 4096),
         "prompt_progress": p.PromptProgressEvent(91, 2048, 123456),
         "tokens": p.TokensEvent(91, 17, (10, 11, 12)),
@@ -284,6 +322,44 @@ class ProtocolPythonTests(unittest.TestCase):
         for name, event in engine_events().items():
             with self.subTest(name=name):
                 self.assertEqual(decode_event(golden[name]), event)
+
+    def test_the_server_times_the_engine_by_its_own_budgets(self):
+        """SUPERVISION is runtime/Supervision.hpp's, as the golden's
+        supervision line holds it."""
+        self.assertEqual(
+            struct.unpack("<6I", read_golden()["supervision"]),
+            astuple(p.SUPERVISION),
+        )
+
+    def test_ready_and_start_failure_validation(self):
+        """Ready names its tokens and the start failure its class, each
+        within what the engine may send."""
+        for event in (
+            p.ReadyEvent(4, 4096, False, 64, 9, ()),
+            p.ReadyEvent(4, 4096, False, 64, 9, (1, 64)),
+            p.ReadyEvent(4, 4096, False, 0, 9, (1,)),
+            p.ReadyEvent(4, 4096, False, 64, 0, (1,)),
+        ):
+            with self.subTest(event=event):
+                self.assert_fatal_event(p.IssueCode.INVALID_COUNT, event)
+        self.assert_fatal_event(
+            p.IssueCode.INVALID_ENUM_VALUE,
+            p.StartFailedEvent(9, p.ShortfallBound.DISK, 0, 0, 0, b""),
+        )
+        self.assert_fatal_event(
+            p.IssueCode.INVALID_ENUM_VALUE,
+            p.StartFailedEvent(p.StartFailureKind.MODEL, 3, 0, 0, 0, b""),
+        )
+        # A stop count that does not match the payload breaks the frame.
+        ready = bytearray(
+            native_peer.serialize_event(p.ReadyEvent(4, 4096, False, 64, 9, (1, 2)))
+        )
+        struct.pack_into("<I", ready, p.FRAME_HEADER_BYTES + 17, 3)
+        self.assert_protocol_error(
+            p.FailureClass.PROTOCOL_FATAL,
+            p.IssueCode.INVALID_PAYLOAD_LENGTH,
+            lambda: decode_event(bytes(ready)),
+        )
 
     def test_progress_wire_validation(self):
         # A request asks for its prompt's progress with a flag bit.
@@ -1026,9 +1102,11 @@ class ProtocolPythonTests(unittest.TestCase):
             p.IssueCode.INVALID_SAMPLING,
             lambda: p.serialize_message(invalid),
         )
-        self.assert_fatal_event(p.IssueCode.INVALID_COUNT, p.ReadyEvent(0, 4096, False))
         self.assert_fatal_event(
-            p.IssueCode.INVALID_ENUM_VALUE, p.ReadyEvent(4, 4096, 2)
+            p.IssueCode.INVALID_COUNT, p.ReadyEvent(0, 4096, False, 64, 9, (1,))
+        )
+        self.assert_fatal_event(
+            p.IssueCode.INVALID_ENUM_VALUE, p.ReadyEvent(4, 4096, 2, 64, 9, (1,))
         )
 
     def test_unnamed_request_failures_are_fatal(self):
@@ -1048,6 +1126,11 @@ class ProtocolPythonTests(unittest.TestCase):
             ),
             (
                 p.CancelFrame(0),
+                p.IssueCode.INVALID_REQUEST_ID,
+                p.FailureClass.PROTOCOL_FATAL,
+            ),
+            (
+                p.StopFrame(0),
                 p.IssueCode.INVALID_REQUEST_ID,
                 p.FailureClass.PROTOCOL_FATAL,
             ),

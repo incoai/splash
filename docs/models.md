@@ -9,21 +9,21 @@ runs the engine's own check on it, `model-check` (`build/splash model-check`
 in a checkout, `engine/splash model-check` in a packaged installation), which
 holds it to the rules every start applies to the installation
 (`inspectSourceConfiguration` in `ModelDescriptor.mm`) and names the family
-it describes. For a GGUF the check also takes the scalar metadata of its
-header, which the installer copies (`gguf.scalar_metadata`), and holds it to
-the rules every start's planner holds the file to (`gguf::requireMetadata`):
-its sizes, RoPE base, dimensions and scaling, RMS epsilon, GDN sizes, FFN
-widths and experts. The target's text configuration is checked before its
-vision tower (a GGUF's projector, an MLX target's processor and the shards
-holding its tower) and the tower's configuration, so a model of no family
-Splash serves is told so whatever its tower, and the check runs again with the
-draft's `config.json` once the family's draft is chosen.
-A model the engine refuses is refused with its reason, and so is a GGUF with
-tensors of types the loader cannot read or with every projection and expert
-unquantized (`gguf.require_loadable`, [GGUF targets](#gguf-targets)); no
-weight file is downloaded for either. Tensor shapes, and an MLX vision tower's
-weights, which must not be quantized (`VisionLoader.cpp`), are checked only
-when the model loads.
+it describes. For a GGUF the check also takes the headers of its files,
+which the installer copies as it reads them, and plans the target from them
+as every start plans the file (`gguf::planImages`): its metadata (sizes, RoPE
+base, dimensions and scaling, RMS epsilon, GDN sizes, FFN widths, experts and
+a family's arrays) and each tensor's presence, type and shape. The target's
+text configuration is checked before its vision tower (a GGUF's projector, an
+MLX target's processor and the shards holding its tower) and the tower's
+configuration, so a model of no family Splash serves is told so whatever its
+tower, and the check runs again with the draft's `config.json` once the
+family's draft is chosen.
+A GGUF that holds most of its values unquantized is refused first
+(`gguf.require_quantized`, [GGUF targets](#gguf-targets)), and a model the
+engine refuses with its reason; no weight file is downloaded for either. An MLX
+target's tensor shapes, and an MLX vision tower's weights, which must not be
+quantized (`VisionLoader.cpp`), are checked only when the model loads.
 `families.FAMILIES` names the draft trained for each family; repository names
 and model-card `base_model` fields play no part. Families of one model type,
 Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (`qwen3_5_moe_text`, GGUF `qwen35moe`),
@@ -32,11 +32,14 @@ Ornith-1.5-35B-A3B or Ornith-1.5-122B, is its family. A layout type
 (`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp` in
 `runtime/model/`) is an architecture, whose code its families share, and each
 family is a value of it in one list, `model::kFamilies` (`ModelDescriptor.hpp`):
-another size of an architecture is one more value there, its draft in
+another size of an architecture is one more value there, built by the
+constructor from a `QwenHybridLayout` its layout type gains with its second
+family (as `Qwen3_6MoeLayout`'s builds `kQwen3_5_122BLayout`), its draft in
 `families.FAMILIES`, and, for a GDN or attention shape no family had, its kernel
-instances and a row of the compiled shapes in `ops/GDN.cpp` or
-`ops/PagedAttention.cpp`. The kernel tests take every family's shapes from that
-list (`dev/tests/engine/TestFamilies.hpp`). A Qwen config holds its text model
+instances (of bf16 norms only where a family of it loads safetensors) and a row
+of the compiled shapes in `ops/GDN.cpp` or `ops/PagedAttention.cpp`. The kernel
+tests take every family's shapes from that list
+(`dev/tests/engine/TestFamilies.hpp`). A Qwen config holds its text model
 under `text_config`; Flint's is flat, its keys at the top level, which the check
 reads only for a model type whose configs are flat (a layout type's
 `flatConfig`). Flint loads from a GGUF only, and its configuration is held to
@@ -136,15 +139,25 @@ an FP8 weight's F32 or BF16 `.weight_scale` is the tensor's `g` or, `[rows,
 
 ## GGUF targets
 
-`--model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` selects the repository's
-root-level `.gguf` file (a lower-case extension, as the native loader requires)
-for that variant: the file named with the model name its GGUFs share, then
-`-UD-Q4_K_M`, or else the only one whose name ends in `-UD-Q4_K_M`
-(`upstream.select_gguf`). Before any weight download, its header must list
-every tensor the loader reads with a type it accepts for that tensor
-(`gguf.loaded_tensors`, checked by `gguf.require_loadable`; a test holds its
-format types to `runtime/metal/abi/QuantFormat.h`). The native loader checks again
-and lists every unsupported tensor in one error:
+`--model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` selects the repository's GGUF
+target for that variant (`upstream.select_gguf`). A target is a root-level
+`.gguf` file (a lower-case extension, as the native loader requires), the
+parts of a split GGUF at the root named by their model
+(`MODEL-00001-of-0000N.gguf ...`, `upstream.root_targets`), or the parts of a
+split GGUF in a folder, as repositories publish files too large for one
+(`VARIANT/MODEL-VARIANT-00001-of-0000N.gguf`, `upstream.folder_targets`). The
+variant names, in this order: the root target named with the model name the
+root targets share, then `-UD-Q4_K_M`; the folder named `UD-Q4_K_M`, in any
+case; the only root target whose name ends in `-UD-Q4_K_M`, which the
+installer reports when the repository holds several targets. A whole file
+beside split parts of its name, such as their merge, is a target of its own,
+which the name selects before the parts, by the variant or, as a repository's
+or a local directory's only name, without one (`upstream.named_target`).
+Before any weight download, the
+engine's check plans the target from its header, which must list every tensor
+the loader reads, of its shape and of a type it accepts for that tensor; one
+error names each missing or unsupported tensor once, with the layers that
+have it (`ffn_gate_exps.weight (Q8_1) in 40 layers`). The types it accepts:
 
 - linears and experts: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1,
   Q5_0, Q5_1, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
@@ -178,19 +191,21 @@ router (`router_score_function` from `expert_gating_func`, `norm_topk_prob`),
 `mlp_only_layers`, `sliding_window`, `layer_types` from
 `attention.sliding_window_pattern`, `no_rope_layer_indices` from
 `attention.rope_pattern`, and `eos_token_id` from
-`tokenizer.ggml.eog_token_ids`; the engine's check holds each to the family's,
-the two layer patterns included, which the scalar metadata leaves out. The
-token table must be of a format: RecursiveSI's int4 GGUF, whose table is F32,
-is refused before its download.
+`tokenizer.ggml.eog_token_ids`, or, in a header without it (any but
+unsloth's), the IDs of Flint's stop tokens in its vocabulary, each a control
+token, one of them its EOS; the engine's check holds each to the family's,
+and the header's layer patterns to them. The token table must be of a format:
+RecursiveSI's int4 GGUF, whose table is F32, is refused before its download.
 
-A variant no root file names may be a folder of a split GGUF's parts, as
-repositories publish files too large for one
-(`VARIANT/MODEL-VARIANT-00001-of-0000N.gguf`, `upstream.split_gguf`): every
-part from 1 to N must be present. The parts install side by side in
+A split GGUF is the parts of one name, `NAME-0000K-of-0000N.gguf`: every part
+from 1 to N must be present, at the root or in its folder, and a folder that
+mixes the parts of several names is refused (`upstream.split_order`, and
+`findTargetGgufs` in the engine). The parts install side by side in
 `target/`, and the native loader reads them as one GGUF (`findTargetGgufs`,
 `OpenGguf`): the first part's metadata, whose `split.count` and
 `split.tensors.count` must describe the parts, and every part's tensors. The
-installer screens the merged header (`gguf.merged_split`).
+installer copies each part's header under the part's name, and the engine's
+check reads them so.
 
 BF16 and F16 are formats of the image like the quantized ones, for the tensors
 a quantized file keeps unquantized: UD-Q8_K_XL keeps the 27B's attention
@@ -201,11 +216,12 @@ scale of 1 per 256 values; the staged tiles round each value once to half, the
 Apple9 register tile reads BF16 exactly and takes no F16, so a projection with
 an F16 weight stages there, as do all of a model's experts when any expert
 weight is F16. Whole-BF16 and F16 models are not a target: before any weight
-download, the installer refuses a GGUF whose linears and experts, the LM head
-among them, are all BF16, F16 or F32 (`gguf.require_loadable`), with one
-message that asks for a quantized variant, not a list of tensors. The token
-table, alpha and beta do not count, and one quantized linear or expert is
-enough, so these files pass; the native loader does not check this.
+download, and before the engine's model check, the installer refuses a GGUF
+whose BF16, F16 and F32 tensors hold more of its values than its quantized
+ones (`gguf.require_quantized`), with one message that asks for a quantized
+variant. A whole-BF16 file with its token table quantized is still refused;
+these files pass, and so does a MoE whose routed experts alone are quantized.
+The native loader does not check this.
 
 Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B and
 Qwen3.6-35B-A3B from UD-IQ1_S to UD-Q8_K_XL. llama-quantize's default type
@@ -244,8 +260,10 @@ is `block_nvfp4`: 64 elements, a UE4M3 scale per 16 (an E4M3 byte whose bit 7
 llama.cpp ignores, reading 0x7F as 0) and E2M1 codes, beside an optional F32
 `.scale` tensor, one value for a projection or one per expert for an experts
 tensor (`_exps`), which llama.cpp multiplies the products by; a `.scale` beside
-a weight of another type is refused, as only NVFP4's rows hold one. It loads as
-Model Optimizer's NVFP4 does
+a weight of another type is refused, as only NVFP4's rows hold one. An F32
+`.input_scale` beside an NVFP4 weight (NVIDIA's activation scale, as many
+values as `.scale`) plays no part, as in Model Optimizer's targets; beside any
+other weight, or alone, it is refused. It loads as Model Optimizer's NVFP4 does
 ([Model Optimizer targets](#model-optimizer-targets)): four blocks make one
 256-element NVFP4 block, whose meta unit holds the `.scale` value as its `g`
 (1 without one), at 4.625 bits per weight for the file's 4.5.
@@ -267,8 +285,9 @@ transform of each block of 1024 inputs and D an explicit sign per input, and the
 token table, whose rows are stored as H (D e). The engine runs that one form, on
 dense targets whose rotation names exactly the tensors the planner repacks
 (every quantized projection and the head, and alpha/beta when quantized), a
-PQ2_0 token table, and GDN value heads in grouped order (the installer screens
-the parameters, `GgufFile` and the planner check the rest).
+PQ2_0 token table, and GDN value heads in grouped order (`GgufFile` checks the
+parameters and the planner the rest, both before any download through the
+engine's model check).
 
 ## Drafts
 
@@ -276,9 +295,7 @@ Every model decodes with a DFlash2 draft. Each family names the repository
 of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
 it as the release publishes it: `config.json` and BF16 `model.safetensors`
 (or the shards its index names), and `mask_embedding.safetensors` when the
-release ships its mask token's embedding; a family whose draft is not released
-yet names none, and its installation names one with `--draft-model`.
-Installation downloads only those files and follows the repository's default
+release ships its mask token's embedding. Installation downloads only those files and follows the repository's default
 branch as it follows the target's ([Revisions](server.md#revisions)); `--draft-model`
 accepts another repository, followed the same way, or a local directory that
 holds them. A checkpoint is installed only when the engine accepts its
@@ -337,17 +354,22 @@ at a position, the product of p up to it, is what verifying one more row adds to
 its expected tokens; one GPU step after the selector (`draft_verify_rows`) gives
 every lane its anchor and the rows of the largest survivals over the batch, as
 many as maximize the expected tokens over the cycle's cost at that many rows in
-all. The engine prices those rows from the wall times of the lane count's latest
-cycles, which for streamed experts include the store's reads of its misses: a
-least-squares line in the rows over about the last 30 cycles, its slope shrunk
-toward the shape the measured targets share, since what a row costs follows the
-requests served (a Qwen3.6-35B-A3B cycle with 4 GB of experts adds about 3 ms a
-row on prose and 8 ms on reasoning); constrained cycles are fit apart, and every
-32nd cycle of a lane count verifies every row, which keeps the rows of the fit
-spread. A fixed shorter block would do worse: in agentic use about one cycle in
-six accepts all seven proposals and one in five accepts none. Rows past a lane's
-verify rows still run the target's layers, whose kernels take eight rows a lane,
-but their MoE steps route no expert (`moe_group_routes_verified`) and acceptance
+all. The engine takes a cycle's cost at so many rows from the wall times of the
+lane count's latest cycles, which for streamed experts include the store's reads
+of its misses: a least-squares line in the rows over about the last 30 cycles,
+its slope shrunk toward the shape the measured targets share, since what a row
+costs follows the requests served (a Qwen3.6-35B-A3B cycle with 4 GB of experts
+adds about 3 ms a row on prose and 8 ms on reasoning); constrained cycles are fit
+apart, and every 32nd cycle of a lane count verifies every row, which keeps the
+rows of the fit spread. A cycle counts in the fit at most twice the larger of the
+line's cost at its rows and the mean cycle time: one stalled cycle, such as one
+behind a slow SSD read, would otherwise tilt the line so that the next cycles
+verify their anchors alone, and the mean keeps the cap up where the line has
+fallen. The log notes, at most once a minute, the cycles counted at under half
+their time (`Verify budget: a cycle of`). A fixed shorter block would do worse:
+in agentic use about one cycle in six accepts all seven proposals and one in
+five accepts none. Rows past a lane's verify rows still run the target's
+layers, whose kernels take eight rows a lane, but their MoE steps route no expert (`moe_group_routes_verified`) and acceptance
 retains none of them. The budget's costs follow wall time and its acceptance
 model every request's labels, so the rows a cycle verifies depend on the
 machine's timing and on what the server served before, and a MoE row's result
@@ -406,8 +428,8 @@ completed: an encode takes about 0.3 s for a 1000 x 1400 page on an M5 Max
 and seconds for a 4-megapixel image on a small GPU, which Metal would count
 against the 5 s it gives the prefill command's first host step or Neural
 Engine wait ([Host steps](internals.md#host-steps)). The scheduler counts the encodes'
-time in what the prefill owes decoding requests, and leaves it out of its
-prefill estimate.
+time in what the prefill owes decoding requests, and leaves it out of the
+measured time it sizes later prefill commands by.
 
 `--language-only` links and loads no vision weights and removes them from
 memory accounting. It skips a GGUF's mmproj download and an MLX shard that
@@ -521,7 +543,7 @@ message for every family, so a developer message renders as `<|system|>`.
 `splash serve --model-dir PATH` prepares the target at `PATH` with
 `install.local.prepare_local_model` and starts the server on the directory it
 returns. `PATH` names a GGUF file, any part of a split GGUF, a directory
-holding one GGUF target, or an MLX model directory. It names the target
+holding GGUF targets of one name, or an MLX model directory. It names the target
 directly, rather than a library to search by repository ID:
 
 ```sh
@@ -577,7 +599,8 @@ model's source options (`--revision`, `--draft-model`, `--language-only`,
 
 - `target`: a GGUF file, any part of a split GGUF naming all its parts,
   which lie beside it; or a directory whose root holds an MLX model or else
-  a single GGUF target, whole or split, beside any projectors named `mmproj`.
+  GGUF targets of one name ([GGUF targets](#gguf-targets)), beside any
+  projectors named `mmproj`.
 - `draft`: the directory of a DFlash2 draft ([Drafts](#drafts)). Without
   one, the family's released draft is taken from the Hugging Face cache, at
   the commit last recorded there for its default branch, as `hf download
@@ -589,8 +612,8 @@ model's source options (`--revision`, `--draft-model`, `--language-only`,
 - `models_dir`: where prepared models are kept, Splash's own models
   directory by default ([files Splash writes](server.md#files-splash-writes)).
 
-The files are checked as a download is, by the engine's `model-check` and the
-GGUF screening, on their metadata ([Upstream model
+The files are checked as a download is, by the engine's `model-check` on their
+metadata and a GGUF's headers ([Upstream model
 loading](#upstream-model-loading)). When Splash cannot serve them without a
 download (a missing file or split part, an unsupported format, a draft of
 another model), a `ModelError` names the file and the reason. The directory

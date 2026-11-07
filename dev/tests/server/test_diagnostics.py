@@ -1,9 +1,11 @@
+import errno
 import io
 import json
 import os
 import tempfile
 import threading
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from dev.tests.server_fixtures import FakeRuntime, HarnessTestCase, chat_body
@@ -349,6 +351,75 @@ class DiagnosticsTests(HarnessTestCase):
         self.assertEqual(len(lines), 8 * 300)
         for line in lines:
             self.assertRegex(line, r"^\d{2}:\d{2}:\d{2} worker \d line \d+$")
+
+    def test_a_full_log_disk_leaves_the_caller_running(self):
+        class FullDisk(io.StringIO):
+            def flush(self):
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+        with mock.patch("sys.stderr", FullDisk()), mock.patch("sys.stdout", FullDisk()):
+            for _ in range(2):
+                diagnostics.print_status("Stopping", error=False)
+                diagnostics.print_request(
+                    {"outcome": "error", "error_code": "invalid_request_error"}
+                )
+
+    def test_request_lines_are_the_ones_the_app_reads(self):
+        """The server writes its request lines as log_lines_golden.txt holds
+        them, which the app parses (RequestEntry)."""
+        golden = [
+            line
+            for line in (Path(__file__).parent / "log_lines_golden.txt")
+            .read_text()
+            .splitlines()
+            if line and not line.startswith("#")
+        ]
+        records = {
+            "Started": {
+                "outcome": "started",
+                "prompt_tokens": 4096,
+                "cached_tokens": 1024,
+                "reasoning": {
+                    "sent_effort": "none",
+                    "effort": None,
+                    "enable_thinking": None,
+                    "thinking": False,
+                },
+            },
+            "Done": {
+                "outcome": "stop",
+                "prompt_tokens": 4096,
+                "completion_tokens": 574,
+                "metrics": {
+                    "cache": {"matched_tokens": 1024},
+                    "request_latency": {
+                        "ttft_ms": 400,
+                        "stream_tokens_per_second": 36.8,
+                    },
+                    "speculation": {"accepted_draft_tokens": 9, "cycles": 10},
+                },
+            },
+            "Cancelled": {
+                "outcome": "cancelled",
+                "prompt_tokens": 69,
+                "completion_tokens": 12,
+                "metrics": {"cache": {"matched_tokens": 0}},
+            },
+            "Error": {"outcome": "error", "error_code": "invalid_request_error"},
+        }
+        for line in golden:
+            time, kind = line.split()[:2]
+            if kind not in records:
+                continue
+            with (
+                self.subTest(kind=kind),
+                mock.patch.object(api.time, "strftime", return_value=time),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+                mock.patch("sys.stderr", new_callable=io.StringIO) as errors,
+            ):
+                diagnostics.print_request(records.pop(kind))
+                self.assertEqual(output.getvalue() + errors.getvalue(), line + "\n")
+        self.assertEqual(records, {})
 
 
 if __name__ == "__main__":

@@ -83,7 +83,7 @@ def parse_args(argv=None):
         "--notes",
         required=True,
         type=Path,
-        help="the release notes, in Markdown, outside the checkout (RELEASE_NOTES)",
+        help="the release notes, in Markdown (RELEASE_NOTES)",
     )
     parser.add_argument(
         "--sign",
@@ -187,6 +187,33 @@ def checkout_problems(version):
     return problems
 
 
+def previous_release(version):
+    """The release before version, the latest x.y.z, release candidates aside,
+    whose annotated tag is below version's x.y.z, and the build number of its
+    app, its tagged commit's (package_app.build_number); None for none."""
+    tags = subprocess.run(
+        ["git", "for-each-ref", "--format=%(objecttype) %(refname:short)", "refs/tags"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+
+    def number(release):
+        return tuple(map(int, release.split(".")))
+
+    below = number(version.split("-")[0])
+    releases = [
+        tag
+        for kind, _, tag in (line.partition(" ") for line in tags)
+        if kind == "tag" and re.fullmatch(r"\d+\.\d+\.\d+", tag) and number(tag) < below
+    ]
+    if not releases:
+        return None
+    tag = max(releases, key=number)
+    return tag, package_app.build_number(tag)
+
+
 def keychain_identity(identity):
     """The identity valid for signing code that the keychains hold for
     identity, its name or its certificate's SHA-1, as security find-identity
@@ -239,13 +266,13 @@ def signer(identity):
     )
 
 
-def command_line(version):
+def command_line(version, macos_min):
     """The command line's files of release version, as make package and make
     package-bottle leave them in dist/: the runtime archive, its checksum file
     and the bottles, which the release carries, and the formula, which goes to
     the tap; and why they are not ready, or None."""
     dist = ROOT / "dist"
-    archive = dist / f"splash-{version}-arm64-macos26.tar.gz"
+    archive = dist / f"{package.archive_name(version, macos_min)}.tar.gz"
     bottles = sorted(dist.glob(f"splash-{version}.*.bottle.tar.gz"))
     files = [archive, archive.with_name(f"{archive.name}.sha256"), *bottles]
     formula = dist / "splash.rb"
@@ -511,7 +538,14 @@ def make(args, folder, identity, team, carried, run):
     shutil.copyfile(args.notes, folder / "notes.md")
     if package_app.SPARKLE_PUBLIC_KEY:
         feed = appcast.generate(image, args.notes, args.version, args.sparkle_key_file)
-        appcast.check(feed, image, args.version, args.macos_min)
+        appcast.check(
+            feed,
+            image,
+            args.version,
+            args.macos_min,
+            package_app.build_number(),
+            previous_release(args.version),
+        )
         (folder / "appcast.xml").write_bytes(feed)
     else:
         print(
@@ -596,7 +630,7 @@ def main(argv=None):
         problems.append(f"{release} exists")
     carried = None
     if "-rc." not in args.version:
-        files, formula, problem = command_line(args.version)
+        files, formula, problem = command_line(args.version, args.macos_min)
         problems += [problem] if problem else []
         carried = None if problem else (files, formula)
     if args.dry_run:

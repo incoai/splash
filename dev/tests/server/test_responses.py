@@ -12,9 +12,8 @@ from dev.tests.server_fixtures import (
     responses_body,
     rich_weather_tool,
 )
-from server import api_shapes
 from server import protocol as native_wire
-from server.api_shapes import normalize_responses_input
+from server.dialects import responses as responses_dialect
 
 
 class ResponsesTests(HarnessTestCase):
@@ -903,7 +902,7 @@ class ResponsesTests(HarnessTestCase):
             tools=tools,
             tool_choice={"type": "function", "namespace": namespace, "name": names[0]},
         )
-        translated, namespaces = api_shapes.responses_to_chat_body(body, body["input"])
+        translated, namespaces = responses_dialect.to_chat_body(body, body["input"])
         aliases = [f"{namespace}__{name}" for name in names]
         self.assertEqual(
             [tool["function"]["name"] for tool in translated["tools"]], aliases
@@ -1193,7 +1192,7 @@ class ResponsesTests(HarnessTestCase):
         self.assertEqual(runtime.requests, [])
 
     def test_responses_system_items_keep_their_input_position(self):
-        messages = normalize_responses_input(
+        messages = responses_dialect.normalize_input(
             "Be concise.",
             [
                 {"type": "message", "role": "user", "content": "hello"},

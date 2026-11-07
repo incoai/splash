@@ -2,6 +2,7 @@
 
 #include "ops/Vision.hpp"
 #include "DFlashDraft.hpp"
+#include "ExpertChunkLayout.hpp"
 #include "ModelDescriptor.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
@@ -36,8 +37,9 @@ using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWe
 // file through a row cache of that many bytes instead of loading into memory
 // (model/SparseRowStore.hpp, --ple-memory). With expertMemoryBytes, a MoE
 // target's routed experts stream from their files through a store of that
-// many bytes at its cap, which gives memory back down to its floor of
-// expertFloorBytes, zero for the store's own (model/ExpertStore.hpp,
+// many bytes at its cap, which starts at its floor and gives memory back
+// down to it: expertFloorBytes, or where that is zero expertFloorShare of its
+// slots, the share the model's plan sets (model/ExpertStore.hpp,
 // ExpertStoreOptions, --expert-memory). Other models load as without them.
 // Streamed weights read on `readers`, the engine's one pool of SSD readers,
 // which KV reads share.
@@ -45,6 +47,7 @@ struct ModelLoadOptions final {
   uint64_t streamedTableBytes = 0;
   uint64_t expertMemoryBytes = 0;
   uint64_t expertFloorBytes = 0;
+  double expertFloorShare = kExpertFloorShare;
   std::shared_ptr<SsdReaders> readers;
 };
 
@@ -132,11 +135,6 @@ struct RuntimeContext final {
   KvBlockCache *blockCache = nullptr;
   KvHistoryStream *historyStream = nullptr;
   VerifyRows verifyRows = VerifyRows::Auto;
-  // Admits the memory the expert store takes back toward its cap
-  // (Model::growExperts) as growth it can do without
-  // (engine::MemoryGovernor::growthAdmission).
-  // Without it the store never grows, as in the tools that keep it fixed.
-  metal::AllocationAdmission expertAdmission = {};
 };
 
 // Validates only the interface between independently defined target and draft
@@ -166,8 +164,9 @@ loadModel(metal::MetalBackend &backend,
                  const ModelDescriptor &descriptor,
                  const ModelLoadOptions &options = {});
 
-// The FFN layers of a dense target, which the prefill FFN's Neural Engine
-// split (ops::AneFfn) may take; none for another target.
+// The FFN layers of a target whose every layer's FFN is dense (denseFfn),
+// which the prefill FFN's Neural Engine split (ops::AneFfn) may take; none
+// for another target.
 [[nodiscard]] std::vector<ops::SwiGluProjections> aneFfnLayers(const LoadedModel &model);
 // Runs `use` on a prefill arena allocated for the call: on the dense FFN's
 // buffers of a full chunk and the hidden rows layers alternate between.

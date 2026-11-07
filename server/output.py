@@ -26,6 +26,10 @@ TOOL_ARGUMENT_DELTA_CHARS = 16 * 1024
 # Responses carry arguments as strings, read on their own.
 MAX_ARGUMENTS_DEPTH = json_codec.MAX_DEPTH - 5
 _SURROGATE = re.compile("[\ud800-\udfff]")
+# The longest stop sequence a request may carry: StopSearch keeps a table entry
+# of about 40 bytes and a match step for every character of each stop, so
+# four stops this long hold about 3 MB.
+MAX_STOP_CHARACTERS = 16 * 1024
 
 
 def hold_partial(text, *markers):
@@ -39,6 +43,59 @@ def hold_partial(text, *markers):
         ):
             return text[:-length], text[-length:]
     return text, ""
+
+
+class StopSearch:
+    """The first of a request's stop sequences that the output contains, as
+    the output arrives, and how much of its end may begin one. Each stop
+    keeps the length of the output's longest end that begins it (a
+    Knuth-Morris-Pratt state), so a character costs the same however long
+    the stops are: rescanning every length of a 50,000-character stop on
+    every token would copy about a gigabyte per token."""
+
+    def __init__(self, stops):
+        self.stops = tuple(stops)
+        self._fallbacks = [_prefix_function(stop) for stop in self.stops]
+        self._states = [0] * len(self.stops)
+
+    def search(self, text):
+        """The stop that the output, `text` appended, contains first, and how
+        many characters before the end of `text` it begins (more than
+        `text` holds where it began earlier); None where it contains none."""
+        first = None
+        for index, (stop, fallback) in enumerate(zip(self.stops, self._fallbacks)):
+            state = self._states[index]
+            for position, character in enumerate(text):
+                while state and stop[state] != character:
+                    state = fallback[state - 1]
+                if stop[state] == character:
+                    state += 1
+                if state == len(stop):
+                    back = len(text) - position - 1 + len(stop)
+                    if first is None or back > first[1]:
+                        first = (stop, back)
+                    break
+            self._states[index] = state
+        return first
+
+    @property
+    def held(self):
+        """The length of the output's longest end that begins a stop."""
+        return max(self._states)
+
+
+def _prefix_function(text):
+    """For each prefix of `text`, the length of its longest proper end that
+    is also a prefix of `text`."""
+    lengths = [0] * len(text)
+    length = 0
+    for index in range(1, len(text)):
+        while length and text[index] != text[length]:
+            length = lengths[length - 1]
+        if text[index] == text[length]:
+            length += 1
+        lengths[index] = length
+    return lengths
 
 
 class ReasoningSplitter:
@@ -182,22 +239,18 @@ class StreamingToolCallProjector:
 
     A call opens at the syntax's call_open and names its function up to its
     name_end. Each parameter is key_open, a name up to key_close, and a
-    value, without the value_open the template sets before it, that ends at
-    value_close where the next parameter's opening, the arguments' close or
-    the call's close follows (value_ends), so a value may hold the tags in
-    any other order. The arguments' close or the call's close ends the call,
-    and the </tool_call> after an arguments' close (Qwen's </function>) may
-    be left out. Names lose the space around them; an opening that names no
-    function, or a name too long to be one, opens no call and reads as the
-    text the model wrote, other text inside a call is dropped, and a repeated
-    parameter keeps its first value, which may have streamed. A value whose
-    schema gives it no type, or the type string alone, is its text and
-    streams as it is written; any other converts at its end by the types its
-    tool declares for it (convert_value). Text outside calls streams as it
-    arrives, after a call as before one, and a </think> there is dropped: a
-    model may write one again after its reasoning has ended, after its own
-    </think>, a call's opening or a budget's forced end, or with thinking
-    off.
+    value, without the template's value_open, that ends at value_close where
+    the next parameter's opening, the arguments' close or the call's close
+    follows (value_ends), so a value may hold the tags in any other order.
+    The arguments' close or the call's close ends the call; the </tool_call>
+    after an arguments' close (Qwen's </function>) may be left out. Names
+    lose the space around them; an opening that names no function, or a name
+    too long to be one, reads as text; other text inside a call is dropped,
+    and a repeated parameter keeps its first value. A value typed as string
+    alone, or untyped, streams as written; any other converts at its end
+    (convert_value). Text outside calls streams as it arrives, and a
+    </think> there is dropped: a model may write one again after its
+    reasoning has ended, or with thinking off.
 
     Without a tool policy the output has no calls: a call's opening is text,
     and the projector only drops the </think>s, so that every answer reads
@@ -216,7 +269,7 @@ class StreamingToolCallProjector:
         self.pending = ""
         self.state = "output" if structured else "content"
         self.call_index = 0
-        # The open call, None while the text names none or names no function.
+        # The open call, None while the text names none.
         self.call_id = None
         self.function_name = None
         # The types by which its declared parameters and any others convert.
@@ -261,8 +314,6 @@ class StreamingToolCallProjector:
         return "".join(self.content_fragments[: self.streamed_count])
 
     def _emit_argument(self, fragment, events):
-        if self.call_id is None:
-            return
         self.argument_fragments.append(fragment)
         for chunk in argument_deltas(fragment):
             events.append(
@@ -314,9 +365,8 @@ class StreamingToolCallProjector:
     def _begin_parameter(self, name, events):
         name = name.strip(NAME_SPACE)
         # A repeated parameter keeps its first value, which may have streamed;
-        # a parameter without a name, or of a call that names no function,
-        # keeps none.
-        kept = name and name not in self.parameter_names and self.call_id is not None
+        # a parameter without a name keeps none.
+        kept = name and name not in self.parameter_names
         self.parameter_names.add(name)
         self.parameter_name = name if kept else None
         self.value_types = self.parameter_types.get(name, self.other_types)
@@ -364,18 +414,17 @@ class StreamingToolCallProjector:
 
     def _finish_call(self, events):
         self._emit_argument("}", events)
-        if self.call_id is not None:
-            self.closed_calls.append(
-                {
-                    "id": self.call_id,
-                    "type": "function",
-                    "function": {
-                        "name": self.function_name,
-                        "arguments": "".join(self.argument_fragments),
-                    },
-                }
-            )
-            self.call_index += 1
+        self.closed_calls.append(
+            {
+                "id": self.call_id,
+                "type": "function",
+                "function": {
+                    "name": self.function_name,
+                    "arguments": "".join(self.argument_fragments),
+                },
+            }
+        )
+        self.call_index += 1
         self.call_id = None
         self.function_name = None
         self.argument_fragments = []
@@ -495,14 +544,14 @@ class StreamingToolCallProjector:
         still owes for what put() held back.
 
         Output cut short, by the token limit or a stop sequence inside a
-        call, keeps an open call with the arguments it has, and no call whose
-        name it cut; other output that ends inside
-        a call closes the call, and what it held back after a value could
-        only begin the value's close. Cut output with a call has the content
-        the stream published, which leaves out whitespace that no visible
-        text has followed since the start or the last call. Otherwise the
-        content is the text outside calls without whitespace that only frames
-        them and, when cut, a trailing partial tag."""
+        call, keeps an open call with the arguments it has, and no call
+        whose name it cut; other output that ends inside a call closes the
+        call, what it held back after a value being the start of the value's
+        close. Cut output with a call has the content the stream published,
+        which leaves out whitespace that no visible text has followed since
+        the start or the last call. Otherwise the content is the text
+        outside calls without whitespace that only frames them and, when
+        cut, a trailing partial tag."""
         events = []
         if not incomplete:
             if self.state == "name":

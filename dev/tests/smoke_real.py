@@ -477,7 +477,7 @@ def run_images(port: int, model: str, nonce: str) -> None:
 
 
 # What a server without vision answers an image or PDF with
-# (server/api_shapes.py, VISION_UNAVAILABLE).
+# (server/chat_messages.py, VISION_UNAVAILABLE).
 VISION_UNAVAILABLE = "this model is serving without vision"
 LATER_SYSTEM_UNSUPPORTED = "does not accept system messages after the first message"
 # Where the chat template probe of /status says later system messages go.
@@ -586,8 +586,8 @@ def language_only_refusal(code: int, document: dict, modality: str) -> bool:
 
 def run_text_only(port: int, model: str, nonce: str) -> None:
     """A server without vision refuses images and PDFs, in every API shape,
-    with the language-only message before rendering anything, and serves the
-    next text request."""
+    with its message before rendering anything, and serves the next text
+    request."""
     question = f"What color is this image? Answer with one word. Request {nonce}."
     pdf = base64.b64encode(
         (ROOT / "dev/tests/fixtures/documents/plain.pdf").read_bytes()
@@ -697,7 +697,7 @@ def run_text_only(port: int, model: str, nonce: str) -> None:
         code, rejected = request(port, "POST", path, body)
         require(
             language_only_refusal(code, rejected, modality),
-            f"text-only {name} was not refused as language-only: {code} {rejected!r}",
+            f"text-only {name} was not refused for want of vision: {code} {rejected!r}",
         )
     code, chat = request(
         port,
@@ -924,15 +924,17 @@ def run_thinking_budget_under_grammar(port: int, model: str, schema: dict) -> No
     grammar admits the end of thinking only between whole characters, so a
     budget whose last token is part of one thinks on until it is complete.
     Greedy requests that think in Chinese about characters the tokenizer
-    splits, at budgets of 1 to 48, must each succeed with reasoning that
-    breaks no character, those that finish with the schema's JSON. Where
-    their reasoning holds such a character, a budget ended inside it, and
-    that request must have thought past its budget; a model that thinks in
-    English may reach none within these budgets."""
+    splits, at budgets of 0 to 48, must each succeed with reasoning that
+    breaks no character, those that finish with the schema's JSON. A budget
+    of 0 thinks nothing: its reasoning is the end's text before </think>,
+    which every cut adds. Where their reasoning holds such a character, a
+    budget ended inside it, and that request must have thought past its
+    budget by more; a model that thinks in English may reach none within
+    these budgets."""
     words = "、".join(SPLIT_WORDS)
     prompt = f"请用中文思考：{words}这些字分别怎么读？然后按要求返回 JSON。"
-    budgets = range(1, 49)
-    past = 0
+    budgets = range(49)
+    excesses = []
     split = False
     for budget in budgets:
         code, chat = request(
@@ -966,7 +968,10 @@ def run_thinking_budget_under_grammar(port: int, model: str, schema: dict) -> No
             f"thinking budget {budget} under a grammar broke its output: {message!r}",
         )
         split |= any(character in reasoning for character in "".join(SPLIT_WORDS))
-        past += chat["usage"]["completion_tokens_details"]["reasoning_tokens"] > budget
+        excesses.append(
+            chat["usage"]["completion_tokens_details"]["reasoning_tokens"] - budget
+        )
+    past = sum(excess > excesses[0] for excess in excesses)
     require(
         past or not split,
         "the reasoning holds a split character, yet no thinking budget under a "
@@ -1775,10 +1780,9 @@ def add_server_arguments(parser):
     )
     parser.add_argument(
         "--expert-memory",
-        help="serve a MoE model's routed experts from RAM slots that keep at "
-        "least this size in all, reading the others from the SSD (splash serve "
-        "--expert-memory); where memory holds every expert they load whole, "
-        "and streaming them takes a smaller --max-memory too",
+        help="serve a MoE model's routed experts from RAM slots of this size "
+        "in all, reading the others from the SSD (splash serve "
+        "--expert-memory); a size that holds every expert loads them whole",
     )
     parser.add_argument(
         "--verify-rows",

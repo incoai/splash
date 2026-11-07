@@ -1,12 +1,15 @@
 // What a start makes of the prefill FFN's Neural Engine split (engine/AneFfnStartup.cpp) on a model the test plays:
 // each outcome, the memory plan it adopts, the automatic context and the context a relaunch keeps, the calibration it
-// remembers or takes again and the line it logs.
+// remembers or takes again, the line it logs and what a start a command of the split ends reports.
 
+#include "Supervision.hpp"
 #include "TestChecks.hpp"
 #include "TestModel.hpp"
 #include "TestStderr.hpp"
 #include "ane/Program.hpp"
 #include "engine/AneFfnStartup.hpp"
+#include "engine/Bootstrap.hpp"
+#include "metal/MetalBackend.hpp"
 
 #include <array>
 #include <cstdint>
@@ -507,6 +510,66 @@ void testFailures() {
   rejects([&] { static_cast<void>(start(fake)); }, "stopped serving", "a start went on on a backend that stopped");
 }
 
+// A command of the split's calibration or setup that ran out of GPU memory ends the start, and resource assembly fails
+// on it as on any Metal command of its steps (RuntimeResources::create): the start reports CommandMemory, which no
+// start retries, as for a warmup's command. Another process holds what the commands need, and a retry, in the
+// process or the server's relaunch, would take it from that process. So does a command of the load, the expert
+// store's fill. A command that failed otherwise is Internal at any step: the load's too, whose files the loader took
+// (it was Model, which the server never relaunches after). A load the loader refused is still Model.
+void testACommandOutOfMemoryIsCommandMemory() {
+  using FailureKind = protocol::StartFailureKind;
+  for (const bool setup : {false, true}) {
+    for (const bool outOfMemory : {true, false}) {
+      Fake fake;
+      // A failed command stops the backend serving (MetalBackend's markUnhealthy).
+      const auto failed = [&] {
+        fake.healthy = false;
+        return metal::MetalBackendError("Metal command 2 failed: Insufficient Memory", outOfMemory);
+      };
+      if (setup)
+        fake.prepare = [&](uint32_t, bool) -> AneFfnPrepared { throw failed(); };
+      else
+        fake.time = [&]() -> Timings { throw failed(); };
+      const std::string what = std::string(setup ? "setup" : "calibration") + "'s command that failed " +
+                               (outOfMemory ? "for want of GPU memory" : "otherwise");
+      try {
+        static_cast<void>(start(fake));
+        throw std::runtime_error("a start went on after its split's " + what);
+      } catch (const metal::MetalBackendError &error) {
+        const RuntimeBootstrapReport report =
+            RuntimeBootstrapError(RuntimeResourcesError(RuntimeResourceStage::StorageAllocation, error, "budget"))
+                .report();
+        const FailureKind kind = startFailedEvent(report).kind;
+        require(kind == (outOfMemory ? FailureKind::CommandMemory : FailureKind::Internal) &&
+                    report.commandOutOfMemory == outOfMemory &&
+                    report.resourceStage == RuntimeResourceStage::StorageAllocation &&
+                    report.resourceFailure == RuntimeResourceFailure::Other &&
+                    report.message == "Metal command 2 failed: Insufficient Memory" &&
+                    report.budgetDescription == "budget",
+                "a start whose split's " + what + " failed as kind " +
+                    std::to_string(static_cast<int>(kind)) + (report.commandOutOfMemory ? ", out of memory" : ""));
+        StartupRetryWindow window(supervision::kStartRetryWindow);
+        require(!window.retryUntil(report, StartupRetryWindow::Clock::now()),
+                "a start whose split's " + what + " was retried in-process");
+      }
+    }
+  }
+  for (const bool outOfMemory : {true, false}) {
+    const RuntimeBootstrapReport report =
+        RuntimeBootstrapError(RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
+                                                    metal::MetalBackendError("Metal command 1 failed", outOfMemory)))
+            .report();
+    require(startFailedEvent(report).kind == (outOfMemory ? FailureKind::CommandMemory : FailureKind::Internal),
+            std::string("a load whose command failed ") + (outOfMemory ? "for want of GPU memory" : "otherwise") +
+                " was not classed by it");
+  }
+  const RuntimeBootstrapReport refused =
+      RuntimeBootstrapError(RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
+                                                  "the target's safetensors header is truncated"))
+          .report();
+  require(startFailedEvent(refused).kind == FailureKind::Model, "a load the loader refused was not Model");
+}
+
 // No share predicted to gain enough, or no chunk timed to, leaves the GPU alone and remembers that none does.
 void testNoGain() {
   Fake fake;
@@ -612,6 +675,7 @@ int main() {
     testExplicitContext();
     testRelaunchContext();
     testFailures();
+    testACommandOutOfMemoryIsCommandMemory();
     testNoGain();
     testRemembered();
     testGivenShare();

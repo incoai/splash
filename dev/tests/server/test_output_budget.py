@@ -13,6 +13,7 @@ from dev.tests.server_fixtures import (
     make_frontend,
     response_events,
     responses_body,
+    serve_context,
 )
 from server import backend as backend_api
 from server import server as api
@@ -163,7 +164,7 @@ class OutputBudgetTests(HarnessTestCase):
 
         # The window, not a server default, bounds a request that names no
         # limit; one that names a limit inside the window gets it as is.
-        harness.app.max_context = 262144
+        serve_context(harness.app, 262144)
         for path, body, expected in (
             ("/v1/chat/completions", chat_body(), 262142),
             ("/v1/responses", responses_body(), 262142),
@@ -176,7 +177,7 @@ class OutputBudgetTests(HarnessTestCase):
                     runtime.requests[-1].frame.logical_max_output_tokens, expected
                 )
 
-        harness.app.max_context = 100000
+        serve_context(harness.app, 100000)
         for length, expected in ((90000, 10000), (99999, 1)):
             with mock.patch.object(
                 FakeTokenizer, "__call__", return_value={"input_ids": [101] * length}

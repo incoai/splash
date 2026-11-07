@@ -46,7 +46,7 @@ MACH_O_MAGICS = frozenset(
 )
 # The app's own resources, the Chat's transcript page among them: the bundle
 # SwiftPM builds beside the executable, which the app reads from
-# Contents/Resources (Bundle.resources, app/Sources/Splash/Transcript.swift).
+# Contents/Resources (Bundle.resources, app/Sources/Splash/WebPage.swift).
 RESOURCE_BUNDLE = "Splash_Splash.bundle"
 # Signing identifiers of the runtime's two programs, by their paths in the
 # runtime; codesign names every other file after itself.
@@ -67,18 +67,25 @@ def short_version(version):
     return match and match[1]
 
 
-def build_number():
-    """CFBundleVersion: the number of commits HEAD has. It grows with every
-    commit on main, so builds of one release version, as `git describe` names
-    them, differ, and a later build has the larger number macOS prefers. It
-    needs the full history, not a shallow clone."""
-    return subprocess.run(
-        ["git", "rev-list", "--count", "HEAD"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+def build_number(commit="HEAD"):
+    """CFBundleVersion of a build of commit: the number of commits it has. It
+    grows with every commit on main, so builds of one release version, as
+    `git describe` names them, differ, and a later build has the larger number
+    macOS and Sparkle prefer. A shallow clone counts only the commits it
+    holds, a number below the releases', which Sparkle would never offer as
+    an update, so it builds nothing."""
+
+    def git(*arguments):
+        return subprocess.run(
+            ["git", *arguments], cwd=ROOT, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    if git("rev-parse", "--is-shallow-repository") == "true":
+        raise RuntimeError(
+            "the checkout is a shallow clone, whose commit count, the app's build "
+            "number (CFBundleVersion), is below the releases': git fetch --unshallow"
+        )
+    return git("rev-list", "--count", commit)
 
 
 def info_plist(version, build, macos_min):

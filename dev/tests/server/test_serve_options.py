@@ -10,6 +10,7 @@ from unittest import mock
 from install import launcher
 from server import images, serve_options
 from server import server as api
+from server.chat_format import REASONING_EFFORTS
 from server.origins import ANY_ORIGIN
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -66,7 +67,7 @@ OPTIONS = {
     ),
     "--default-reasoning-effort": values(
         "--default-reasoning-effort",
-        {effort: effort for effort in serve_options.REASONING_EFFORTS},
+        {effort: effort for effort in REASONING_EFFORTS},
         ("", "turbo", "XHIGH"),
     ),
     "--thinking-token-budget": values(
@@ -368,7 +369,10 @@ class ServeOptionsTests(unittest.TestCase):
         self.assertEqual(serve_options.serve_argv(defaults), [])
         self.assertEqual(serve_options.serve_environment(defaults), {})
 
-    def test_serve_options_imports_only_the_standard_library(self):
+    def test_the_launcher_imports_only_the_standard_library(self):
+        """The launcher runs before the environment it sets up exists: it,
+        and the serve options it reads, import nothing beside the standard
+        library and Splash's own packages."""
         result = subprocess.run(
             [
                 sys.executable,
@@ -376,7 +380,7 @@ class ServeOptionsTests(unittest.TestCase):
                 "-S",
                 "-c",
                 "import sys; sys.path.insert(0, sys.argv[1]); "
-                "import server.serve_options; "
+                "import install.launcher; "
                 "print(sorted({name.partition('.')[0] for name in sys.modules} "
                 "- set(sys.stdlib_module_names)))",
                 str(ROOT),
@@ -386,7 +390,7 @@ class ServeOptionsTests(unittest.TestCase):
             timeout=30,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "['__main__', 'server']")
+        self.assertEqual(result.stdout.strip(), "['__main__', 'install', 'server']")
 
     def test_server_requires_explicit_model_and_paths(self):
         model = "community/custom-splash"
@@ -437,6 +441,27 @@ class ServeOptionsTests(unittest.TestCase):
                     ),
                     [args.binary, "serve-native", args.model_root, *arguments],
                 )
+
+    def test_a_relaunch_asks_for_the_first_context_as_relaunch_context(self):
+        """A relaunch after --max-context asks for the first engine's context
+        as an automatic one does, past the native window too, and serves
+        what its plan holds of it (it required --max-context again). It keeps
+        --max-context, so that it is planned as the first engine was."""
+        model = "community/custom-splash"
+        required = [str(api.ROOT / "install/models" / model), "--model", model]
+        args = api.parse_args([*required, "--max-context", "1000000"])
+        self.assertEqual(
+            api._native_command(args, args.model_root, 1_000_000),
+            [
+                args.binary,
+                "serve-native",
+                args.model_root,
+                "1000000",
+                "auto",
+                "--relaunch-context",
+                "1000000",
+            ],
+        )
 
 
 if __name__ == "__main__":

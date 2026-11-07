@@ -157,18 +157,23 @@ _install-environment:
 			"$$bootstrap" -m venv "$(VENV)"; \
 		fi; \
 	fi; \
-	hash=$$(shasum -a 256 "$(REQUIREMENTS)" | awk '{print $$1}'); \
-	if test "$$(cat "$(VENV_STAMP)" 2>/dev/null)" = "$$hash"; then \
-		exit 0; \
-	fi; \
-	rm -f "$(VENV_STAMP)"; \
-	"$(PYTHON)" -m pip install --only-binary=:all: -r "$(REQUIREMENTS)"; \
-	"$(PYTHON)" -m pip check; \
-	tmp=$$(mktemp "$(VENV_STAMP).tmp.XXXXXX"); \
-	trap 'rm -f "$$tmp"' EXIT INT TERM; \
-	echo "$$hash" > "$$tmp"; \
-	mv "$$tmp" "$(VENV_STAMP)"; \
-	trap - EXIT INT TERM
+	$(call install-requirements,--only-binary=:all:,$(REQUIREMENTS),$(VENV_STAMP))
+
+# Shell steps that pip install $(1) -r $(2) unless stamp $(3) holds the file's
+# digest. The stamp is written whole and only after pip check passes, so an
+# interrupted or conflicting install is retried.
+install-requirements = \
+	hash=$$(shasum -a 256 "$(2)" | awk '{print $$1}'); \
+	if test "$$(cat "$(3)" 2>/dev/null)" != "$$hash"; then \
+		rm -f "$(3)"; \
+		"$(PYTHON)" -m pip install $(1) -r "$(2)"; \
+		"$(PYTHON)" -m pip check; \
+		tmp=$$(mktemp "$(3).tmp.XXXXXX"); \
+		trap 'rm -f "$$tmp"' EXIT INT TERM; \
+		echo "$$hash" > "$$tmp"; \
+		mv "$$tmp" "$(3)"; \
+		trap - EXIT INT TERM; \
+	fi
 
 preflight: model-selection
 	@test -x $(PYTHON) || { \
@@ -205,13 +210,18 @@ ENGINE_DEPFLAGS := -MMD -MP
 # Configuration belongs to each successful output, not to a shared timestamp:
 # macOS make can treat a new stamp and an old binary in the same second as equal.
 BUILD_CONFIG_TOOL := dev/tools/build_config.py
-BUILD_RULES_DIGEST := $(shell shasum -a 256 Makefile dev/native.mk \
-	$(BUILD_CONFIG_TOOL) | shasum -a 256 | cut -c1-16)
+# Production outputs record only the production rules and their own tools'
+# flags: a test rule in dev/native.mk or a C++ flag does not rebuild the
+# kernels, nor a Metal flag the engine objects.
+BUILD_RULES_DIGEST := $(shell shasum -a 256 Makefile $(BUILD_CONFIG_TOOL) \
+	| shasum -a 256 | cut -c1-16)
 shell-quote = '$(subst ','"'"',$(1))'
 CONFIG_DIGEST := $(shell printf '%s\0' $(BUILD_RULES_DIGEST) \
 	$(call shell-quote,$(CXX)) $(call shell-quote,$(ENGINE_CXXFLAGS)) \
 	$(call shell-quote,$(ENGINE_OBJCXXFLAGS)) $(call shell-quote,$(ENGINE_DEPFLAGS)) \
 	$(call shell-quote,$(ENGINE_LINKFLAGS)) $(call shell-quote,$(AR)) \
+	| shasum -a 256 | cut -c1-16)
+METAL_CONFIG_DIGEST := $(shell printf '%s\0' $(BUILD_RULES_DIGEST) \
 	$(call shell-quote,$(METAL)) $(call shell-quote,$(PROD_METALFLAGS)) \
 	$(call shell-quote,$(METALLIB)) | shasum -a 256 | cut -c1-16)
 RUN_CONFIGURED = $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) record \
@@ -253,6 +263,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/GDN.cpp \
 	runtime/ops/Linear.cpp \
 	runtime/ops/LinearGguf.cpp \
+	runtime/ops/KernelSelection.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/HyperConnection.cpp \
@@ -267,12 +278,17 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/Vision.cpp \
 	runtime/metal/DeviceCapabilities.cpp \
 	runtime/engine/MemoryPlan.cpp \
+	runtime/engine/StreamedMemoryPlan.cpp \
 	runtime/engine/AneFfnStartup.cpp \
 	runtime/engine/Scheduler.cpp \
 	runtime/engine/Cache.cpp \
 	runtime/engine/WriteBehind.cpp \
 	runtime/engine/Engine.cpp \
+	runtime/engine/EngineMemory.cpp \
+	runtime/engine/PassCommand.cpp \
+	runtime/engine/WeightResidency.cpp \
 	runtime/engine/MemoryGovernor.cpp \
+	runtime/engine/MemoryLedger.cpp \
 	runtime/engine/MemoryControl.cpp \
 	runtime/engine/KvPool.cpp \
 	runtime/engine/KvCache.cpp \
@@ -308,7 +324,6 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/Qwen4Steps.cpp \
 	runtime/model/Qwen4ExpTarget.cpp \
 	runtime/model/Flint.cpp \
-	runtime/model/FlintTarget.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \
 	runtime/model/VisionLoader.cpp \
@@ -340,7 +355,7 @@ ENGINE_OBJECTS := \
 PRODUCTION_CONFIG_TARGETS := $(ENGINE_OBJECTS) $(ENGINE_MAIN_OBJECT) \
 	$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_INSTRUMENTED_ANE_OBJECT) \
 	$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT) \
-	$(ENGINE_LIBRARY) $(PRODUCTION_AIRS) $(LIB) $(HOST_STEP_LIB) $(TARGET)
+	$(ENGINE_LIBRARY) $(TARGET)
 ENGINE_DEPFILES := $(ENGINE_OBJECTS:.o=.d) $(ENGINE_MAIN_OBJECT:.o=.d) \
 	$(ENGINE_INSTRUMENTED_METAL_OBJECT:.o=.d) $(ENGINE_INSTRUMENTED_ANE_OBJECT:.o=.d) \
 	$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT:.o=.d)
@@ -407,8 +422,8 @@ clean:
 
 -include dev/Makefile
 
-# The dev include extends these output sets. Check each set in one read-only
-# process; a mismatched output has a real force dependency even within one
+# The dev include defines the test, sanitizer and tool output sets. Check each
+# set in one read-only process; a mismatched output has a real force dependency even within one
 # timestamp tick. Only its successful recipe updates its .config record.
 .PHONY: force-build-config
 force-build-config:
@@ -420,32 +435,31 @@ KERNEL_HEADER_NAMES_DIGEST := $(shell printf '%s\0' $(sort $(KERNEL_HEADERS)) \
 	| shasum -a 256 | cut -c1-16)
 KERNEL_SOURCE_NAMES_DIGEST := $(shell printf '%s\0' $(sort $(PRODUCTION_KERNEL_SOURCES)) \
 	| shasum -a 256 | cut -c1-16)
-PRODUCTION_AIR_CONFIG := $(CONFIG_DIGEST)-$(KERNEL_HEADER_NAMES_DIGEST)
+PRODUCTION_AIR_CONFIG := $(METAL_CONFIG_DIGEST)-$(KERNEL_HEADER_NAMES_DIGEST)
 PRODUCTION_LIB_CONFIG := $(PRODUCTION_AIR_CONFIG)-$(KERNEL_SOURCE_NAMES_DIGEST)
 TEST_KERNEL_CONFIG := $(TEST_CONFIG_DIGEST)-$(KERNEL_HEADER_NAMES_DIGEST)
 TEST_KERNEL_CONFIG_TARGETS := $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) \
 	$(TEST_Q8_ATTENTION_LIB) $(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_DEQUANT_LIB)
-PRODUCTION_CONFIG_TARGETS := $(filter-out $(PRODUCTION_AIRS) $(LIB),$(PRODUCTION_CONFIG_TARGETS))
 TEST_CONFIG_TARGETS := $(filter-out $(TEST_KERNEL_CONFIG_TARGETS),$(TEST_CONFIG_TARGETS))
 
 $(PRODUCTION_CONFIG_TARGETS): BUILD_CONFIG := $(CONFIG_DIGEST)
-$(TEST_CONFIG_TARGETS): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
-$(SANITIZER_CONFIG_TARGETS): BUILD_CONFIG := $(SANITIZER_CONFIG_DIGEST)
+$(HOST_STEP_LIB): BUILD_CONFIG := $(METAL_CONFIG_DIGEST)
 $(PRODUCTION_AIRS): BUILD_CONFIG := $(PRODUCTION_AIR_CONFIG)
 $(LIB): BUILD_CONFIG := $(PRODUCTION_LIB_CONFIG)
+$(PRODUCTION_FLAG_TOOLS): BUILD_CONFIG := $(NATIVE_CONFIG_DIGEST)
+$(TEST_CONFIG_TARGETS): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(SANITIZER_CONFIG_TARGETS): BUILD_CONFIG := $(SANITIZER_CONFIG_DIGEST)
 $(TEST_KERNEL_CONFIG_TARGETS): BUILD_CONFIG := $(TEST_KERNEL_CONFIG)
-STALE_CONFIG_TARGETS := $(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale \
-	--config $(CONFIG_DIGEST) $(PRODUCTION_CONFIG_TARGETS)) \
-	$(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale \
-	--config $(TEST_CONFIG_DIGEST) $(TEST_CONFIG_TARGETS)) \
-	$(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale \
-	--config $(SANITIZER_CONFIG_DIGEST) $(SANITIZER_CONFIG_TARGETS)) \
-	$(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale \
-	--config $(PRODUCTION_AIR_CONFIG) $(PRODUCTION_AIRS)) \
-	$(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale \
-	--config $(PRODUCTION_LIB_CONFIG) $(LIB)) \
-	$(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale \
-	--config $(TEST_KERNEL_CONFIG) $(TEST_KERNEL_CONFIG_TARGETS))
+stale-config = $(shell $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) stale --config $(1) $(2))
+STALE_CONFIG_TARGETS := \
+	$(call stale-config,$(CONFIG_DIGEST),$(PRODUCTION_CONFIG_TARGETS)) \
+	$(call stale-config,$(METAL_CONFIG_DIGEST),$(HOST_STEP_LIB)) \
+	$(call stale-config,$(PRODUCTION_AIR_CONFIG),$(PRODUCTION_AIRS)) \
+	$(call stale-config,$(PRODUCTION_LIB_CONFIG),$(LIB)) \
+	$(call stale-config,$(NATIVE_CONFIG_DIGEST),$(PRODUCTION_FLAG_TOOLS)) \
+	$(call stale-config,$(TEST_CONFIG_DIGEST),$(TEST_CONFIG_TARGETS)) \
+	$(call stale-config,$(SANITIZER_CONFIG_DIGEST),$(SANITIZER_CONFIG_TARGETS)) \
+	$(call stale-config,$(TEST_KERNEL_CONFIG),$(TEST_KERNEL_CONFIG_TARGETS))
 ifneq ($(strip $(STALE_CONFIG_TARGETS)),)
 $(STALE_CONFIG_TARGETS): force-build-config
 endif

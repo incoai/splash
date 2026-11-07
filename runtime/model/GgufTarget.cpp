@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <regex>
+#include <set>
 #include <span>
 #include <string>
 
@@ -15,17 +16,34 @@ std::vector<std::filesystem::path> findTargetGgufs(const std::filesystem::path &
   if (error) throw GgufError("cannot list target directory: " + directory.string());
   if (found.empty()) throw GgufError("target directory holds no GGUF: " + directory.string());
   if (found.size() == 1) return found;
-  // A split GGUF's parts end in -0000K-of-0000N; any other second file is an error.
+  // A split GGUF is the parts of one name, NAME-0000K-of-0000N.gguf, K = 1..N,
+  // as the installer holds it (upstream.split_order); any other second file is
+  // an error. Of one name, name order is split order.
   std::sort(found.begin(), found.end());
-  const std::regex part(R"(.*-(\d{5})-of-(\d{5})\.gguf)");
-  for (size_t index = 0; index < found.size(); ++index) {
+  const std::regex part(R"((.*)-(\d{5})-of-(\d{5})\.gguf)");
+  const std::string notSplit =
+      "target directory holds more than one GGUF, and not the parts of one split GGUF: " + directory.string();
+  struct Part {
+    std::string name;
+    unsigned long number, count;
+  };
+  std::vector<Part> parts;
+  std::set<std::string> names;
+  for (const std::filesystem::path &path : found) {
     std::smatch match;
-    const std::string name = found[index].filename().string();
-    if (!std::regex_match(name, match, part) || std::stoul(match[1]) != index + 1 ||
-        std::stoul(match[2]) != found.size())
-      throw GgufError("target directory holds more than one GGUF, and not the parts of one split GGUF: " +
-                      directory.string());
+    const std::string file = path.filename().string();
+    if (!std::regex_match(file, match, part)) throw GgufError(notSplit);
+    parts.push_back({match[1], std::stoul(match[2]), std::stoul(match[3])});
+    names.insert(parts.back().name);
   }
+  if (names.size() > 1) {
+    std::string listed;
+    for (const std::string &name : names) listed += (listed.empty() ? "" : ", ") + name;
+    throw GgufError("target directory mixes the parts of several split GGUFs (" + listed +
+                    "); a split GGUF is the parts of one name, NAME-0000K-of-0000N.gguf: " + directory.string());
+  }
+  for (size_t index = 0; index < parts.size(); ++index)
+    if (parts[index].number != index + 1 || parts[index].count != parts.size()) throw GgufError(notSplit);
   return found;
 }
 
@@ -72,20 +90,12 @@ std::optional<GgufTargetLoader::StreamedTable> GgufTargetLoader::streamTable() c
       std::make_shared<SparseRowStore>(SparseRowTable{rows.tensor, rows.rows, rows.rowBytes, rows.offset},
                                        openRowReader(std::shared_ptr<const WeightSource>(planned_, &source)),
                                        planned_->table),
-      rows.format,
-      // As WeightImages::load records the image (WeightFile).
-      {"target/" + plan->name, plan->magic, plan->layer, plan->type, plan->bytes, images_.contentIdentity()}};
+      rows.format, imageRecord(images_, "target/", *plan)};
 }
 
 WeightFile GgufTargetLoader::open(size_t index) {
-  const gguf::Image &plan = planned_->images[index];
-  return images_.load({"target/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
-                       [&backend = backend_, planned = planned_, index](std::span<uint8_t>,
-                                                                         const metal::MetalBuffer &buffer) {
-                         writeGgufImage(backend, buffer, planned->images[index]);
-                         planned->source.checkUnchanged();
-                       },
-                       plan.residentBytes});
+  return loadImage(backend_, images_, "target/", {planned_, &planned_->images[index]},
+                   [planned = planned_] { planned->source.checkUnchanged(); });
 }
 
 WeightFile GgufTargetLoader::layer(uint32_t index) {

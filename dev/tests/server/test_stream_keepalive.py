@@ -18,6 +18,7 @@ from server import protocol as native_wire
 from server import server as api
 from server import tool_schema
 from server.chat_format import QWEN
+from server.dialects import responses as responses_dialect
 
 
 class StreamKeepaliveTests(HarnessTestCase):
@@ -142,15 +143,14 @@ class StreamKeepaliveTests(HarnessTestCase):
         handler = object.__new__(api.FrontendHandler)
         handler.wfile = io.BytesIO()
         handler._last_sse_write = 0.0
-        handler._response_started = False
-        handler._client_disconnected = lambda: False
+        handler.response_started = False
+        handler.client_disconnected = lambda: False
         handler.send_response = mock.Mock()
         handler.send_header = mock.Mock()
         handler.end_headers = mock.Mock()
         app = SimpleNamespace(
             response_model="test-model",
             backend=SimpleNamespace(cancel=mock.Mock()),
-            persist_response=mock.Mock(),
         )
         handler.server = SimpleNamespace(app=app)
         job = backend_api.Job(
@@ -183,8 +183,15 @@ class StreamKeepaliveTests(HarnessTestCase):
             return event
 
         job.events = SimpleNamespace(get=next_event)
-        with mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]):
-            handler._responses_stream(job)
+        with (
+            mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]),
+            mock.patch.object(responses_dialect, "persist") as persist,
+        ):
+            responses_dialect.stream(
+                handler,
+                job,
+                conversation=responses_dialect.Conversation(None, False, None),
+            )
 
         raw = handler.wfile.getvalue()
         stream = io.BytesIO(raw)
@@ -215,7 +222,7 @@ class StreamKeepaliveTests(HarnessTestCase):
         self.assertEqual(response["id"], "resp_prefill-heartbeat")
         self.assertEqual(response["output"][0]["content"][0]["text"], "answer")
         app.backend.cancel.assert_not_called()
-        app.persist_response.assert_called_once()
+        persist.assert_called_once()
 
     def test_buffered_tool_generation_keeps_stream_alive(self):
         schema = {
@@ -231,8 +238,8 @@ class StreamKeepaliveTests(HarnessTestCase):
         handler = object.__new__(api.FrontendHandler)
         handler.wfile = io.BytesIO()
         handler._last_sse_write = 0.0
-        handler._response_started = True
-        handler._client_disconnected = lambda: False
+        handler.response_started = True
+        handler.client_disconnected = lambda: False
         clock = [0.0]
         snapshots = []
         fragments = [
@@ -263,11 +270,11 @@ class StreamKeepaliveTests(HarnessTestCase):
             events=SimpleNamespace(get=next_event),
         )
         with mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]):
-            calls = handler._collect(
+            calls = handler.collect(
                 job,
-                on_text=lambda field, text: handler._sse({field: text}),
-                on_tool_delta=handler._sse,
-                on_idle=handler._sse_keepalive,
+                on_text=lambda field, text: handler.sse({field: text}),
+                on_tool_delta=handler.sse,
+                on_idle=handler.sse_keepalive,
             ).tool_calls
         # All native events were immediately available, but the JSON array
         # remained buffered across several heartbeat periods.
@@ -281,21 +288,36 @@ class StreamKeepaliveTests(HarnessTestCase):
         handler = object.__new__(api.FrontendHandler)
         handler.wfile = io.BytesIO()
         handler._last_sse_write = 0.0
-        handler._client_disconnected = lambda: False
+        handler.client_disconnected = lambda: False
         clock = [0.0]
         job = SimpleNamespace(
             deadline=100, events=SimpleNamespace(get=lambda **_: ("text", "x"))
         )
-        heartbeat = mock.Mock(wraps=handler._sse_keepalive)
+        heartbeat = mock.Mock(wraps=handler.sse_keepalive)
         with mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]):
             for index in range(12):
                 clock[0] += 0.5
-                handler._next_event(job, heartbeat)
+                handler.next_event(job, heartbeat)
                 if index % 2:
-                    handler._event_sse("event", {"text": "x"})
+                    handler.event_sse("event", {"text": "x"})
                 else:
-                    handler._sse({"text": "x"})
+                    handler.sse({"text": "x"})
         heartbeat.assert_not_called()
+
+    def test_result_that_lands_at_the_deadline_is_answered(self):
+        handler = object.__new__(api.FrontendHandler)
+        handler.client_disconnected = lambda: False
+        handler.server = mock.Mock()
+        clock = [0.0]
+
+        def finish(**_):
+            clock[0] = 1.0
+            return ("done", "result")
+
+        job = SimpleNamespace(deadline=1.0, events=SimpleNamespace(get=finish))
+        with mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]):
+            self.assertEqual(handler.next_event(job), ("done", "result"))
+        handler.server.app.backend.cancel.assert_not_called()
 
     def test_anthropic_stream_pings_during_prefill_and_decode_waits(self):
         plan = Plan([[4]], before_start=True, block=True)

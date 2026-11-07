@@ -147,9 +147,10 @@ GdnPrefillBuffers prefillBuffers(MetalBackend &backend, const GdnShape &shape,
           shared(backend, uint64_t{tokens} * valueWidth * 2, "hidden")};
 }
 
-// The mixer norm is bf16, or F32 as a GGUF stores it.
+// The mixer norm is F32, as every family's GGUFs store it, or bf16 (an MLX
+// target's).
 GdnPrefillBuffers randomPrefill(MetalBackend &backend, const GdnShape &shape,
-                                uint32_t tokens, bool float32 = false) {
+                                uint32_t tokens, bool float32 = true) {
   const uint32_t valueHeads = shape.valueHeads;
   const uint32_t convDim = shape.convolutionDimension;
   const uint32_t packedWidth = shape.packedWidth;
@@ -211,7 +212,7 @@ void submitPrefill(MetalBackend &backend, const GdnPrefillBuffers &buffers,
 }
 
 void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
-             bool float32 = false) {
+             bool float32) {
   const uint32_t keyHeads = shape.keyHeads, valueHeads = shape.valueHeads;
   const uint32_t convDim = shape.convolutionDimension;
   const uint32_t packedWidth = shape.packedWidth;
@@ -673,7 +674,7 @@ void runTiledCase(MetalBackend &backend, const GdnShape &shape,
                             " tiled f32 norm: ";
   const uint32_t headsPerKey = shape.valueHeads / shape.keyHeads;
   const uint64_t headBytes = uint64_t{kHeadDim} * 2;
-  GdnPrefillBuffers grouped = randomPrefill(backend, shape, tokens, true);
+  GdnPrefillBuffers grouped = randomPrefill(backend, shape, tokens);
   submitPrefill(backend, grouped, shape, tokens, label);
   GdnPrefillBuffers tiled = prefillBuffers(
       backend, shape, tokens, grouped.packed, grouped.convolutionIn,
@@ -704,7 +705,7 @@ void runTiledCase(MetalBackend &backend, const GdnShape &shape,
 // packed rows up to the last row's alpha, the four taps of every channel's
 // convolution weights and its three carried rows, the q/k/v and gate rows of
 // every token, a value head's state in its format, and the mixer norm in
-// either type. The prefill captures a state inside its rows, so each run of its
+// its type. The prefill captures a state inside its rows, so each run of its
 // dispatches reaches its views' extents, and the captured state's buffers have
 // the state's.
 void bufferExtents(MetalBackend &backend, const GdnShape &shape, bool float32,
@@ -773,13 +774,15 @@ void bufferExtents(MetalBackend &backend, const GdnShape &shape, bool float32,
 void run(const std::string &metallib) {
   MetalBackend backend(metallib);
   for (const GdnShape &shape : splash::test::familyGdnShapes()) {
-    for (bool float32 : {false, true})
+    // The reference cases and the fp32 state's extents run norms of each
+    // type the shape's families store; the other cases draw F32 ones.
+    const std::vector<bool> norms = splash::test::familyNorms(shape);
+    for (bool float32 : norms)
       bufferExtents(backend, shape, float32, GdnStateFormat::Float32);
-    bufferExtents(backend, shape, false, GdnStateFormat::BFloat16);
-    for (uint32_t tokens : {1u, 37u, 1000u, 2048u})
-      runCase(backend, shape, tokens);
-    for (uint32_t tokens : {1u, 37u})
-      runCase(backend, shape, tokens, true);
+    bufferExtents(backend, shape, true, GdnStateFormat::BFloat16);
+    for (bool float32 : norms)
+      for (uint32_t tokens : {1u, 37u, 1000u, 2048u})
+        runCase(backend, shape, tokens, float32);
     runSplitCase(backend, shape, 2048, 1000);
     runSplitCase(backend, shape, 37, 17);
     for (uint32_t tokens : {1u, 37u, 1000u})

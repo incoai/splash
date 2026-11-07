@@ -12,7 +12,7 @@ namespace splash::model {
 
 class VisionLoader;
 
-// The current Qwen targets share one vision-tower architecture. Its language
+// The Qwen targets share one vision-tower architecture. Its language
 // projection width belongs to VisionLayout, so the loader is independent of a
 // particular text model and validates the width the family's layout states.
 struct QwenVisionWeights final {

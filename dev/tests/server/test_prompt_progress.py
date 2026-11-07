@@ -165,28 +165,53 @@ class PromptProgressTests(unittest.TestCase):
         runtime = ProgressRuntime()
         harness = Harness(runtime)
         self.addCleanup(harness.close)
-        for path in (
+        progress = "return_progress requires stream: true and must be a boolean"
+        stream = "stream must be a boolean"
+        paths = (
             "/v1/chat/completions",
             "/v1/completions",
             "/v1/responses",
             "/v1/messages",
-        ):
-            for extra in (
-                {"return_progress": True},
-                {"return_progress": True, "stream": False},
-                {"return_progress": 1, "stream": True},
-                {"return_progress": "true", "stream": True},
-            ):
-                with self.subTest(path=path, extra=extra):
-                    body = {
-                        "messages": [{"role": "user", "content": "Hi"}],
-                        "prompt": "Hi",
-                        "input": "Hi",
-                        "max_tokens": 8,
-                        **extra,
-                    }
-                    status, _, _ = harness.request("POST", path, body)
-                    self.assertEqual(status, 400)
+        )
+        cases = [
+            (path, extra, message)
+            for path in paths
+            for extra, message in (
+                ({"return_progress": True}, progress),
+                ({"return_progress": True, "stream": False}, progress),
+                ({"return_progress": 1, "stream": True}, progress),
+                ({"return_progress": "true", "stream": True}, progress),
+                ({"stream": "true"}, stream),
+                ({"stream": 1}, stream),
+                ({"stream": []}, stream),
+                # Every API reads stream before its other fields.
+                ({"stream": "true", "return_progress": True}, stream),
+            )
+        ]
+        cases += [
+            (
+                "/v1/responses",
+                {"stream": "true", "previous_response_id": "resp_unknown"},
+                stream,
+            ),
+            ("/v1/responses", {"stream": "true", "background": True}, stream),
+            ("/v1/messages", {"stream": "true", "max_tokens": None}, stream),
+        ]
+        for path, extra, message in cases:
+            with self.subTest(path=path, extra=extra):
+                body = {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "prompt": "Hi",
+                    "input": "Hi",
+                    "max_tokens": 8,
+                    **extra,
+                }
+                answer, _, payload = harness.request("POST", path, body)
+                self.assertEqual(
+                    (answer, json.loads(payload)["error"]["message"]),
+                    (400, message),
+                )
         self.assertEqual(runtime.requests, [])
 
     def test_runtime_rejects_unsolicited_or_regressing_progress(self):

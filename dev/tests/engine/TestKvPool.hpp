@@ -1,5 +1,6 @@
 #pragma once
 
+#include "FakeMemory.hpp"
 #include "engine/KvPool.hpp"
 
 #include <algorithm>
@@ -11,6 +12,7 @@
 #include <span>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace splash::test {
@@ -23,7 +25,9 @@ namespace splash::test {
 // unless a test names another) past the bytes of budgetPages Full pages,
 // while growthBlocked, or when growthAllowed(extent) says no; a
 // budget-limited pool needs more page ids than its budget, as production's
-// has. A release or a copy throws std::logic_error while commandInFlight()
+// has. With `memory`, growth is allocated through it under `admission`
+// instead (held as "kv"), and a release gives the bytes back. A release or
+// a copy throws std::logic_error while commandInFlight()
 // says a command is in flight, as PageStorage's does. Every page holds one
 // value, which a test sets, a copy carries (between forms too, as what both
 // pages hold) and a clear zeroes, so a test can follow the content of pages
@@ -59,8 +63,13 @@ public:
             throw std::invalid_argument("test KV pages without an index are all Full");
         if (form == kv::PageForm::Slim && !slimBytesPerPage_)
             throw std::invalid_argument("test KV pages without a window keep every layer");
-        if (growthBlocked || (growthAllowed && !growthAllowed(extent)) ||
-            allocatedBytes() + extentPages_ * bytesPerPage(form) > budgetPages * bytesPerPage_) {
+        if (memory) {
+            if (const metal::AllocationResult result =
+                    memory->allocate(admission, "kv", extentPages_ * bytesPerPage(form));
+                !result)
+                return result;
+        } else if (growthBlocked || (growthAllowed && !growthAllowed(extent)) ||
+                   allocatedBytes() + extentPages_ * bytesPerPage(form) > budgetPages * bytesPerPage_) {
             return allocationFailure;
         }
         forms_[extent] = form;
@@ -73,6 +82,8 @@ public:
             throw std::logic_error(
                 "cannot release a KV extent while a command is in flight");
         }
+        if (memory)
+            memory->release("kv", extentPages_ * bytesPerPage(*forms_[extent]));
         forms_[extent].reset();
         const auto start = std::chrono::steady_clock::now();
         std::this_thread::sleep_for(releaseTime);
@@ -125,7 +136,15 @@ public:
             if (form) bytes += extentPages_ * bytesPerPage(*form);
         return bytes;
     }
-
+    // Allocates its extents through `fakeMemory` under `growth` from now on;
+    // returns itself, for the pool built on it.
+    TestKvStorage &through(FakeMemory &fakeMemory, metal::AllocationAdmission growth) {
+        memory = &fakeMemory;
+        admission = std::move(growth);
+        return *this;
+    }
+    FakeMemory *memory = nullptr;
+    metal::AllocationAdmission admission;
     uint32_t budgetPages = std::numeric_limits<uint32_t>::max();
     bool growthBlocked = false;
     std::function<bool(uint32_t extent)> growthAllowed;

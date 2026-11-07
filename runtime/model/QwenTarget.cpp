@@ -1,5 +1,6 @@
 #include "model/QwenTarget.hpp"
 
+#include "model/Flint.hpp"
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/WeightStore.hpp"
@@ -21,15 +22,6 @@ namespace {
 // The rows a decode step verifies of each of its lanes.
 constexpr uint32_t kVerifyRows = ExecutionLimits::targetVerifyRows;
 
-// Whether the register tile takes every routed and shared expert weight of a
-// MoE block (ops::MoeShape::registerFormats).
-bool registerTakes(const ops::BlockMoeWeights &block) {
-  for (const ops::BlockExpertProjection *projection : {&block.gate, &block.up, &block.down})
-    for (const ops::QuantizedSegment *s : {&projection->routed, &projection->shared})
-      if (!s->isFloat() && !quant_register_tensor(s->formatId, s->inputSize)) return false;
-  return true;
-}
-
 // A prefill sequence binds every GDN layer's state cells, in and out, and so
 // does each state it captures; with auxiliary state, its cells too.
 void requirePrefillStates(const QwenTargetGeometry &geometry, const QwenTargetPrefillSequence &sequence) {
@@ -50,23 +42,7 @@ void requirePrefillStates(const QwenTargetGeometry &geometry, const QwenTargetPr
 
 void QwenTargetGeometry::finish(std::span<const ops::BlockMoeWeights *const> moeBlocks,
                                 const ops::Projection &logits) {
-  // The format of most routed expert weights, GGUF_FMT_COUNT for none, and
-  // of most routers, F32 for none (counted one past the GGUF formats).
-  std::array<uint64_t, GGUF_FMT_COUNT> weights{};
-  std::array<uint32_t, GGUF_FMT_COUNT + 1> routers{};
-  moeRegisterFormats = true;
-  for (const ops::BlockMoeWeights *block : moeBlocks) {
-    moeRegisterFormats &= registerTakes(*block);
-    for (const ops::BlockExpertProjection *projection : {&block->gate, &block->up, &block->down})
-      if (!projection->routed.isFloat())
-        weights[projection->routed.formatId] += uint64_t{projection->routed.outputSize} * projection->routed.inputSize;
-    ++routers[std::min<uint32_t>(block->router.formatId, GGUF_FMT_COUNT)];
-  }
-  const auto most = std::max_element(weights.begin(), weights.end());
-  moeExpertFormat = *most ? uint32_t(most - weights.begin()) : GGUF_FMT_COUNT;
-  const auto router = std::max_element(routers.begin(), routers.end());
-  moeRouterFormat = *router && router < routers.end() - 1 ? uint32_t(router - routers.begin())
-                                                          : ops::QuantizedSegment::kFloat32;
+  moeFormats = ops::moeFormats(moeBlocks);
   prefillProjections = decodeProjections;
   include(logits);
   for (auto *shapes : {&prefillProjections, &decodeProjections, &gateUpProjections}) {
@@ -74,8 +50,6 @@ void QwenTargetGeometry::finish(std::span<const ops::BlockMoeWeights *const> moe
     shapes->erase(std::unique(shapes->begin(), shapes->end()), shapes->end());
   }
 }
-
-const ops::BlockMoeWeights *qwenMoeBlock(const Qwen3_8LayerWeights &) noexcept { return nullptr; }
 
 void includeDenseFfn(QwenTargetGeometry &geometry, ops::SwiGluProjections ffn) {
   const ops::ProjectionShape gate = ffn.gate->shape(), up = ffn.up->shape();
@@ -86,12 +60,6 @@ void includeDenseFfn(QwenTargetGeometry &geometry, ops::SwiGluProjections ffn) {
   geometry.include(*ffn.down);
   geometry.gateUpProjections.push_back(up);
 }
-
-void includeFamilyProjections(QwenTargetGeometry &geometry, const Qwen3_8Weights &weights) {
-  for (const Qwen3_8LayerWeights &layer : weights.layers)
-    includeDenseFfn(geometry, {&layer.gateProjection, &layer.upProjection, &layer.downProjection});
-}
-void includeFamilyProjections(QwenTargetGeometry &, const Qwen3_6MoeWeights &) {}
 
 QwenTarget::QwenTarget(const QwenTargetWeightsBase &weights, const QwenTargetGeometry &geometry,
                        metal::MetalBackend &backend, const ops::ExecutionPlans &operators)
@@ -166,6 +134,13 @@ void QwenTarget::requirePrefill(std::span<const QwenTargetPrefillChunk> chunks, 
     throw std::invalid_argument("invalid Qwen prefill");
 }
 
+ops::PrefillAttentionPlan prefillAttentionPlan(const ops::ExecutionPlans &plans, const QwenTargetGeometry &geometry,
+                                               const QwenTargetPrefillSequence &sequence,
+                                               ops::AttentionVariant variant) {
+  return plans.prefillAttention(sequence.rows, sequence.chunk.committed_tokens, geometry.attentionQueryHeads,
+                                geometry.kvLayout, variant);
+}
+
 QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, const QwenTargetPrefillChunk &chunk,
                                                 const kv::PageStorage &kv, SpilledKvReads &spilled,
                                                 ops::AneFfn *aneFfn) const {
@@ -176,13 +151,12 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
   const uint32_t window = geometry_.kvLayout.windowTokens;
   for (const QwenTargetPrefillSequence &sequence : chunk.sequences) {
     requirePrefillStates(geometry_, sequence);
-    step.attention.push_back(
-        operators_.prefillAttention(sequence.rows, geometry_.attentionQueryHeads, geometry_.kvLayout));
+    step.attention.push_back(prefillAttentionPlan(operators_, geometry_, sequence));
     if (window)
-      step.windowedAttention.push_back(operators_.prefillAttention(
-          sequence.rows, geometry_.attentionQueryHeads, geometry_.kvLayout, {.windowTokens = window}));
+      step.windowedAttention.push_back(prefillAttentionPlan(operators_, geometry_, sequence, {.windowTokens = window}));
   }
-  if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moePrefill(geometry_.moeShape(), chunk.rows);
+  if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
+    step.moe = operators_.moePrefill(geometry_.moeBlockShape(), geometry_.moeFormats, chunk.rows);
   if (aneFfn && aneFfn->splits(chunk.rows)) step.aneFfn = aneFfn;
   return step;
 }
@@ -211,7 +185,8 @@ QwenTarget::VerifyStep QwenTarget::verifyStep(metal::CommandGraph &graph, const 
     step.windowedAttention.emplace(operators_.verifyAttention(lanes, geometry_.attentionQueryHeads,
                                                               geometry_.kvLayout, std::span(histories).first(lanes),
                                                               {.windowTokens = window}));
-  if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moeDecode(geometry_.moeShape(), lanes);
+  if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
+    step.moe = operators_.moeDecode(geometry_.moeBlockShape(), geometry_.moeFormats, lanes);
   return step;
 }
 
@@ -467,8 +442,10 @@ template <class Buffers> metal::MetalBuffer mixerOutput(const Buffers &b, const 
   return b.attentionOutput;
 }
 
-// The Qwen3.5 architecture: Qwen3.8-27B (model/Qwen3_8.hpp, a dense FFN) and
-// Qwen3.6-35B-A3B (model/Qwen3_6Moe.hpp, a sparse MoE). Layer l reads its
+// The Qwen3.5 architecture: Qwen3.8-27B (model/Qwen3_8.hpp, a dense FFN),
+// Qwen3.6-35B-A3B (model/Qwen3_6Moe.hpp, a sparse MoE) and Flint
+// (model/Flint.hpp: every layer attends, with its sinks, and its FFN is dense
+// on the leading layers and a MoE block on the others). Layer l reads its
 // input rows from buffers.hidden[l & 1]; its mixer and its FFN each read the
 // RMS norm of the rows before them and add their output to them, into the
 // other buffer. The layers the draft reads copy their output rows into the
@@ -557,25 +534,20 @@ private:
 
   // The FFN of layer `index` (QwenTarget::addPrefillDenseFfn and its kin): a
   // dense FFN, or a MoE's routing, whose routed work addPrefillExperts adds.
-  void addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_8LayerWeights &layer,
-                     metal::MetalBuffer residual, metal::MetalBuffer output) const {
-    addPrefillDenseFfn(step, index, layer.postAttentionNorm, swiGlu(layer), std::move(residual), std::move(output));
+  void addPrefillFfn(PrefillStep &step, uint32_t index, const Layer &layer, metal::MetalBuffer residual,
+                     metal::MetalBuffer output) const {
+    if (const std::optional<ops::SwiGluProjections> dense = denseFfn(layer))
+      addPrefillDenseFfn(step, index, layer.postAttentionNorm, *dense, std::move(residual), std::move(output));
+    else
+      addPrefillMoeRouting(step, layer.postAttentionNorm, *qwenMoeBlock(layer), std::move(residual),
+                           std::move(output));
   }
-  void addPrefillFfn(PrefillStep &step, uint32_t, const Qwen3_6MoeLayerWeights &layer,
-                     metal::MetalBuffer residual, metal::MetalBuffer output) const {
-    addPrefillMoeRouting(step, layer.postAttentionNorm, layer.ffn, std::move(residual), std::move(output));
-  }
-
-  void addVerifyFfn(VerifyStep &step, const Qwen3_8LayerWeights &layer, metal::MetalBuffer residual,
+  void addVerifyFfn(VerifyStep &step, const Layer &layer, metal::MetalBuffer residual,
                     metal::MetalBuffer output) const {
-    addVerifyDenseFfn(step, layer.postAttentionNorm, swiGlu(layer), std::move(residual), std::move(output));
-  }
-  void addVerifyFfn(VerifyStep &step, const Qwen3_6MoeLayerWeights &layer, metal::MetalBuffer residual,
-                    metal::MetalBuffer output) const {
-    addVerifyMoe(step, layer.postAttentionNorm, layer.ffn, std::move(residual), std::move(output));
-  }
-  static ops::SwiGluProjections swiGlu(const Qwen3_8LayerWeights &layer) {
-    return {&layer.gateProjection, &layer.upProjection, &layer.downProjection};
+    if (const std::optional<ops::SwiGluProjections> dense = denseFfn(layer))
+      addVerifyDenseFfn(step, layer.postAttentionNorm, *dense, std::move(residual), std::move(output));
+    else
+      addVerifyMoe(step, layer.postAttentionNorm, *qwenMoeBlock(layer), std::move(residual), std::move(output));
   }
 
   const QwenTargetWeights<Layout, Layer> &weights_;
@@ -593,6 +565,8 @@ std::unique_ptr<QwenTarget> makeQwenTarget(const QwenTargetWeights<Layout, Layer
 template std::unique_ptr<QwenTarget> makeQwenTarget(const Qwen3_8Weights &, const QwenTargetGeometry &,
                                                     metal::MetalBackend &, const ops::ExecutionPlans &, uint32_t);
 template std::unique_ptr<QwenTarget> makeQwenTarget(const Qwen3_6MoeWeights &, const QwenTargetGeometry &,
+                                                    metal::MetalBackend &, const ops::ExecutionPlans &, uint32_t);
+template std::unique_ptr<QwenTarget> makeQwenTarget(const FlintWeights &, const QwenTargetGeometry &,
                                                     metal::MetalBackend &, const ops::ExecutionPlans &, uint32_t);
 
 } // namespace splash::model

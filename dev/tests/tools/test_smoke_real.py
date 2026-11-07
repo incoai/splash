@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from dev.tests import smoke_real
-from server import api_shapes, chat_templates
+from server import chat_messages, chat_templates
 from server.errors import APIError
 
 VISION = ["text", "image", "pdf"]
@@ -44,7 +44,7 @@ def media(body):
 def refusal(modality, anthropic=False):
     """The body the server answers media with when it serves without vision."""
     try:
-        api_shapes._require_vision(modality, False)
+        chat_messages._require_vision(modality, False)
     except APIError as error:
         message = error.message
     if anthropic:
@@ -1041,6 +1041,7 @@ class SmokeRealTests(unittest.TestCase):
             reasoning="饕餮",
             finish="stop",
             bodies=None,
+            end=1,
         ):
             def answer(port, method, path, body=None, **_kwargs):
                 if bodies is not None:
@@ -1049,7 +1050,9 @@ class SmokeRealTests(unittest.TestCase):
                 if budget == failing:
                     return 400, {"error": {"code": "constraint_error"}}
                 message = {"content": content, "reasoning_content": reasoning}
-                usage = {"reasoning_tokens": budget + (budget in past)}
+                # Every cut adds the end's text before </think>, Qwen's line
+                # break unless `end` says otherwise.
+                usage = {"reasoning_tokens": budget + end + (budget in past)}
                 return 200, {
                     "choices": [{"message": message, "finish_reason": finish}],
                     "usage": {"completion_tokens_details": usage},
@@ -1071,7 +1074,7 @@ class SmokeRealTests(unittest.TestCase):
             ):
                 smoke_real.run_thinking_budget_under_grammar(8000, "test-model", schema)
         self.assertEqual(
-            [body["thinking_token_budget"] for body in bodies], list(range(1, 49))
+            [body["thinking_token_budget"] for body in bodies], list(range(49))
         )
         for body in bodies:
             self.assertNotEqual(body["reasoning_effort"], "none")
@@ -1081,6 +1084,7 @@ class SmokeRealTests(unittest.TestCase):
             ("broke its output", serve(content='{"result": "no"}')),
             ("broke its output", serve(reasoning="\ufffd")),
             ("holds a split character, yet no thinking budget", serve(past=())),
+            ("holds a split character, yet no thinking budget", serve(past=(), end=3)),
         ):
             with (
                 self.subTest(failure=failure),
@@ -1183,7 +1187,7 @@ class SmokeRealTests(unittest.TestCase):
                 self.assertFalse(
                     smoke_real.language_only_refusal(200, document, modality)
                 )
-        self.assertIn(smoke_real.VISION_UNAVAILABLE, api_shapes.VISION_UNAVAILABLE)
+        self.assertIn(smoke_real.VISION_UNAVAILABLE, chat_messages.VISION_UNAVAILABLE)
         self.assertIn(
             smoke_real.LATER_SYSTEM_UNSUPPORTED, chat_templates.LATER_SYSTEM_UNSUPPORTED
         )
