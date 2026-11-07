@@ -144,6 +144,11 @@ FrameType write(Writer &out, const ReleaseRequestFrame &request) {
   return FrameType::ReleaseRequest;
 }
 
+FrameType write(Writer &out, const StopFrame &stop) {
+  out.u64(stop.requestId);
+  return FrameType::Stop;
+}
+
 struct Header {
   FrameType type;
   uint64_t payloadBytes;
@@ -168,6 +173,9 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     event.maxConcurrentRequests = in.u32();
     event.maxContextTokens = in.u32();
     event.vision = in.u8() != 0;
+    event.vocabularySize = in.u32();
+    event.maskRows = in.u32();
+    event.stopTokens = in.words(in.u32());
     return event;
   }
   case FrameType::Start: {
@@ -228,12 +236,24 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     event.message = in.text(messageBytes);
     return event;
   }
+  case FrameType::StartFailed: {
+    StartFailedEvent event;
+    event.kind = static_cast<StartFailureKind>(in.u8());
+    event.shortfall.bound = static_cast<ShortfallBound>(in.u8());
+    event.shortfall.requiredBytes = in.u64();
+    event.shortfall.budgetBytes = in.u64();
+    event.shortfall.planContextTokens = in.u32();
+    event.message = in.text(in.u32());
+    return event;
+  }
   case FrameType::StatusJson: {
     StatusJsonEvent event;
     event.correlationId = in.u64();
     event.json = in.rest();
     return event;
   }
+  case FrameType::Warming:
+    return WarmingEvent{};
   default:
     throw std::runtime_error("the engine sent a frame that is not an event");
   }

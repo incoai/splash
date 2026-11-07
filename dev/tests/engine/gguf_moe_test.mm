@@ -85,6 +85,7 @@ using splash::ops::FloatProjection;
 using splash::ops::FloatTile;
 using splash::ops::BlockExpertProjection;
 using splash::ops::BlockMoeWeights;
+using splash::ops::ExpertChunks;
 using splash::ops::QuantizedSegment;
 using splash::ops::MoE;
 using splash::ops::MoeConfig;
@@ -136,6 +137,14 @@ constexpr MoeShape kShape{.hiddenSize = kHidden,
                           .sharedSlices = kSharedSlices,
                           .sharedGate = GGUF_MOE_SHARED_GATE};
 static_assert(kShape.valid(), "the test's routing is compiled");
+// The floor chunk's slots and each elastic chunk's but the last in the tests
+// of chunked experts: neither a power of two, the floor of other slots than
+// an elastic chunk, two elastic chunks or more, and the last holds fewer.
+constexpr uint32_t kMultiChunkFloorSlots = kExperts / 3 + 1;
+constexpr uint32_t kMultiChunkSlots = kExperts / 6 + 1;
+static_assert(kMultiChunkFloorSlots != kMultiChunkSlots && (kExperts - kMultiChunkFloorSlots) % kMultiChunkSlots &&
+                  (kExperts - kMultiChunkFloorSlots) / kMultiChunkSlots >= 2,
+              "the floor differs from an elastic chunk, and the elastic chunks end in a partial one");
 
 [[noreturn]] void fail(const std::string &message) {
   std::cerr << "FAIL: " << message << '\n';
@@ -648,26 +657,29 @@ std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const
       dispatches.push_back(std::move(dispatch));
       continue;
     }
-    // Input, tiles, tile count, gate's and up's routed and shared planes,
-    // output, slot table; a pass binds one projection's planes, its output,
-    // the gate and the slot table.
+    // Input, tiles, tile count, gate's and up's shared planes, output, slot
+    // table, parameters and the routed experts' chunks (an address table); a
+    // pass binds one projection's shared planes, its output, the gate and the
+    // slot table, and reaches the same chunks for its projection.
     for (const bool up : {false, true}) {
       ComputeDispatch pass = dispatch;
       pass.pipelineName = dispatch.pipelineName.substr(0, merged) + (up ? "_g" : "_a") +
                           std::string(kShape.compiledRouting()->slicesSuffix);
       pass.buffers.resize(3);
-      for (uint32_t plane = 0; plane < 6; ++plane)
-        pass.buffers.push_back({3 + plane, dispatch.buffers[(up ? 9 : 3) + plane].buffer});
-      pass.buffers.push_back({9, up ? dispatch.buffers[15].buffer : scratch.expertOutput});
-      pass.buffers.push_back({10, scratch.expertOutput});
-      pass.buffers.push_back({11, dispatch.buffers[16].buffer});
-      // The pass's own parameters: the passes' sizes and this pass's formats.
+      for (uint32_t plane = 0; plane < 3; ++plane)
+        pass.buffers.push_back({3 + plane, dispatch.buffers[(up ? 6 : 3) + plane].buffer});
+      pass.buffers.push_back({6, up ? dispatch.buffers[9].buffer : scratch.expertOutput});
+      pass.buffers.push_back({7, scratch.expertOutput});
+      pass.buffers.push_back({8, dispatch.buffers[10].buffer});
+      // The pass's own parameters: the passes' sizes, floor and chunk slots, and
+      // this pass's projection and formats.
       MoeGgufGateUpParams both;
       std::memcpy(&both, dispatch.bytes[0].data, sizeof(both));
       const MoeGgufExpertParams &params = passes.emplace_back(MoeGgufExpertParams{
           both.input_size, both.output_size, both.experts, up ? both.up_routed_format : both.gate_routed_format,
-          up ? both.up_shared_format : both.gate_shared_format});
-      pass.bytes[0] = {12, &params, sizeof(params)};
+          up ? both.up_shared_format : both.gate_shared_format, both.floor_slots, both.chunk_slots, up ? 1u : 0u});
+      pass.bytes[0] = {9, &params, sizeof(params)};
+      pass.addresses.index = 10;
       pass.threadgroups.x = dispatch.threadgroups.x * GGUF_STAGED_COLUMNS / GGUF_TILE_COLUMNS;
       dispatches.push_back(std::move(pass));
     }
@@ -989,9 +1001,17 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
 
 // Each buffer a register decode plan and a staged 32-row prefill plan reach,
 // at its extent and one element short, and each weight: the planes of every
-// expert tensor, whose rows fill whole tiles, in units of a row's group of
-// 32 inputs or meta unit (metal/abi/QuantFormat.h), and a gated shared
-// expert's scalar gate's fp32 weights.
+// shared expert tensor and each region of every chunk of the routed experts
+// (a floor chunk and elastic chunks of other slots, the last holding fewer),
+// whose rows fill whole tiles, in units of a row's group of 32 inputs or meta
+// unit (metal/abi/QuantFormat.h), also of routed formats with a second plane
+// (Q5_K, Q6_K and Q3_K), and a gated shared expert's scalar gate's fp32
+// weights. A region of the floor chunk or of an elastic chunk one element
+// short, chunks that hold fewer slots than the block, a floor or elastic
+// chunks of more slots than their views hold and a malformed list of them
+// are refused where the chunks are made (ExpertChunks::of); a block
+// without chunks, or with chunks made for another block, is refused by its
+// MoE.
 void bufferExtents(MetalBackend &backend) {
   const MoeShape shape = kShape;
   const Model m = makeModel(backend, shape, 0, false);
@@ -1009,36 +1029,103 @@ void bufferExtents(MetalBackend &backend) {
   const MoePlan plan = MoE::prefillPlan(shape, 33, MoeConfig{MoeExpertTile::M32});
   allocate(backend, b, plan);
   const BlockMoeWeights &blocks = m.weights;
-  // A weight buffer of the block that `with` puts in its place.
-  const auto requireWeightExtent = [&](const MetalBuffer &buffer, uint64_t bytes, uint64_t element,
-                                       const std::string &name, const auto &with) {
+  const uint32_t floorSlots = kMultiChunkFloorSlots, chunkSlots = kMultiChunkSlots;
+  const BlockMoeWeights chunked = chunkedWeights(backend, m, floorSlots, chunkSlots);
+  const BlockMoeWeights chunkedPlane1 =
+      chunkedWeights(backend, makeModel(backend, shape, Q5K, false), floorSlots, chunkSlots);
+  // The chunks `planes`, a floor of `floor` slots and elastic chunks of
+  // `elastic` slots each, for the routed experts of `weights`
+  // (ExpertChunks::of).
+  const auto chunksOf = [](const BlockMoeWeights &weights, std::vector<MetalBuffer> planes, uint32_t floor,
+                           uint32_t elastic) {
+    return ExpertChunks::of(std::move(planes), floor, elastic, weights.slots, weights.gate.routed, weights.up.routed,
+                            weights.down.routed);
+  };
+  // A weight buffer of the block `base` that `with` puts in its place.
+  const auto requireWeightExtent = [&](const BlockMoeWeights &base, const MetalBuffer &buffer, uint64_t bytes,
+                                       uint64_t element, const std::string &name, const auto &with) {
     splash::test::requireExtent(backend, buffer, bytes, element, name, [&](CommandGraph &graph, const MetalBuffer &view) {
-      BlockMoeWeights changed = blocks;
+      BlockMoeWeights changed = base;
       with(changed, view);
       MoE::add(graph, b.moe, changed, plan);
     });
   };
-  for (const auto &[member, name] : {std::pair{&BlockMoeWeights::gate, "gate"}, std::pair{&BlockMoeWeights::up, "up"},
-                                     std::pair{&BlockMoeWeights::down, "down"}})
-    for (const auto &[segment, kind] : {std::pair{&BlockExpertProjection::routed, "MoE expert "},
-                                        std::pair{&BlockExpertProjection::shared, "MoE shared "}}) {
-      const QuantizedSegment &tensor = blocks.*member.*segment;
-      const QuantFormat &format = kQuantFormats[tensor.formatId];
-      const uint64_t groups = uint64_t{tensor.outputSize} * (tensor.inputSize / 32);
-      for (const auto &[plane, planeName, unitBytes, units] :
-           {std::tuple{&QuantizedSegment::plane0, " plane0", format.plane0_bytes, groups},
-            std::tuple{&QuantizedSegment::plane1, " plane1", format.plane1_bytes, groups},
-            std::tuple{&QuantizedSegment::meta, " meta", format.meta_bytes, groups / format.meta_groups}}) {
-        if (!unitBytes) continue;
-        requireWeightExtent(tensor.*plane, units * unitBytes, unitBytes, std::string(kind) + name + planeName,
-                            [&](BlockMoeWeights &changed, const MetalBuffer &view) {
-                              (changed.*member.*segment).*plane = view;
-                            });
+  for (const auto &[member, name, z] : {std::tuple{&BlockMoeWeights::gate, "gate", 0u},
+                                        std::tuple{&BlockMoeWeights::up, "up", 1u},
+                                        std::tuple{&BlockMoeWeights::down, "down", 2u}}) {
+    const QuantizedSegment &tensor = (blocks.*member).shared;
+    const QuantFormat &format = kQuantFormats[tensor.formatId];
+    const uint64_t groups = uint64_t{tensor.outputSize} * (tensor.inputSize / 32);
+    for (const auto &[plane, planeName, unitBytes, units] :
+         {std::tuple{&QuantizedSegment::plane0, " plane0", format.plane0_bytes, groups},
+          std::tuple{&QuantizedSegment::plane1, " plane1", format.plane1_bytes, groups},
+          std::tuple{&QuantizedSegment::meta, " meta", format.meta_bytes, groups / format.meta_groups}}) {
+      if (!unitBytes) continue;
+      requireWeightExtent(blocks, tensor.*plane, units * unitBytes, unitBytes,
+                          std::string("MoE shared ") + name + planeName,
+                          [&](BlockMoeWeights &changed, const MetalBuffer &view) {
+                            (changed.*member).shared.*plane = view;
+                          });
+    }
+    // Each region of each chunk of the routed experts, of its slots' rows.
+    for (const BlockMoeWeights *weights : {&chunked, &chunkedPlane1}) {
+      const QuantizedSegment &routed = (weights->*member).routed;
+      const QuantFormat &routedFormat = kQuantFormats[routed.formatId];
+      const uint64_t slotGroups = uint64_t{routed.outputSize / weights->slots} * (routed.inputSize / 32);
+      const std::vector<MetalBuffer> &planes = *weights->chunks.planes();
+      for (uint32_t chunk = 0, first = 0; first < weights->slots; first += chunk++ ? chunkSlots : floorSlots) {
+        const uint64_t held = std::min(chunk ? chunkSlots : floorSlots, weights->slots - first);
+        for (const auto &[plane, planeName, unitBytes, units] :
+             {std::tuple{0u, " plane0", routedFormat.plane0_bytes, slotGroups},
+              std::tuple{1u, " plane1", routedFormat.plane1_bytes, slotGroups},
+              std::tuple{2u, " meta", routedFormat.meta_bytes, slotGroups / routedFormat.meta_groups}}) {
+          if (!unitBytes) continue;
+          const size_t entry = size_t{chunk} * MOE_EXPERT_CHUNK_ADDRESSES + z * 3 + plane;
+          requireWeightExtent(*weights, planes[entry], held * units * unitBytes, unitBytes,
+                              std::string("MoE expert ") + name + " chunk " + std::to_string(chunk) + planeName,
+                              [&](BlockMoeWeights &changed, const MetalBuffer &view) {
+                                std::vector<MetalBuffer> replaced = planes;
+                                replaced[entry] = view;
+                                changed.chunks = chunksOf(changed, std::move(replaced), floorSlots, chunkSlots);
+                              });
+        }
       }
     }
+  }
+  // Chunks without the last, a floor or elastic chunks of no slots or of
+  // more slots than their views hold, or a list that ends inside a chunk.
+  const std::vector<MetalBuffer> &planes = *chunked.chunks.planes();
+  const auto refused = [&](std::vector<MetalBuffer> changed, uint32_t floor, uint32_t elastic,
+                           std::string_view expected, const std::string &what) {
+    splash::test::rejects([&] { static_cast<void>(chunksOf(chunked, std::move(changed), floor, elastic)); },
+                          expected, "MoE expert chunks that " + what + " were made");
+  };
+  refused({planes.begin(), planes.end() - MOE_EXPERT_CHUNK_ADDRESSES}, floorSlots, chunkSlots,
+          "MoE expert chunks hold", "hold fewer slots than the block");
+  refused(planes, 0, chunkSlots, "MoE expert chunks hold", "have a floor of no slots");
+  refused(planes, floorSlots, 0, "MoE expert chunks hold", "have elastic chunks of no slots");
+  refused(planes, floorSlots + 1, chunkSlots, "MoE expert gate chunk 0 plane0 buffer holds",
+          "have a floor of more slots than the floor chunk's views");
+  refused(planes, floorSlots, chunkSlots + 1, "MoE expert gate chunk 1 plane0 buffer holds",
+          "have elastic chunks of more slots than their views");
+  refused({planes.begin(), planes.end() - 1}, floorSlots, chunkSlots, "MoE expert chunks take",
+          "end inside a chunk");
+  // A block without chunks, or with the chunks made for another block's
+  // routed formats.
+  for (const auto &[chunks, expected, what] :
+       {std::tuple{ExpertChunks{}, "MoE routed experts have no chunks", "no chunks"},
+        std::tuple{chunkedPlane1.chunks, "MoE expert chunks were checked for another block",
+                   "chunks checked for another block"}}) {
+    BlockMoeWeights changed = chunked;
+    changed.chunks = chunks;
+    CommandGraph graph;
+    splash::test::rejects([&] { MoE::add(graph, b.moe, changed, plan); }, expected,
+                          std::string("a block's MoE with ") + what + " was accepted");
+    require(graph.empty(), std::string("a block's MoE with ") + what + " encoded a dispatch");
+  }
   if (shape.sharedGate)
-    requireWeightExtent(blocks.sharedScalarGate.plane0, uint64_t{kHidden} * 4, 4, "MoE shared scalar gate weight",
-                        [](BlockMoeWeights &changed, const MetalBuffer &view) {
+    requireWeightExtent(blocks, blocks.sharedScalarGate.plane0, uint64_t{kHidden} * 4, 4,
+                        "MoE shared scalar gate weight", [](BlockMoeWeights &changed, const MetalBuffer &view) {
                           changed.sharedScalarGate.plane0 = view;
                         });
 }
@@ -1352,6 +1439,70 @@ int permutedSlots(MetalBackend &backend) {
   return failures;
 }
 
+// The kernels find a slot in its chunk (moe_expert_chunk): the experts copied
+// into a floor chunk of kMultiChunkFloorSlots slots and elastic chunks of
+// kMultiChunkSlots, the last of fewer, in slots permuted by sigma across the
+// floor and elastic chunks as permutedSlots permutes them, give the
+// output of the one chunk and identity table bit for bit, in decode B1-B4
+// and prefill 33 and 263, on the staged tile (its column tiles in decode,
+// and gate and up in one pass in their own formats and in the gate's) and on
+// the register tile, each in the tile's first formats and in Q5_K's, whose
+// formats have a second plane, so every chunk's plane1 regions are read.
+int chunkedSlots(MetalBackend &backend) {
+  const MoeShape shape = kShape;
+  const auto sigma = [](uint32_t expert) { return (expert * 7 + 3) % kExperts; };
+  Buffers b;
+  b.input = activations(uint64_t{kMaximumRows} * kHidden);
+  b.residual = activations(uint64_t{kMaximumRows} * kHidden);
+  b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
+  b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
+  b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+  const auto run = [&](const BlockMoeWeights &weights, const MoePlan &plan) {
+    allocate(backend, b, plan);
+    std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
+    CommandGraph graph;
+    MoE::add(graph, b.moe, weights, plan);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    const auto *output = static_cast<const uint16_t *>(b.moe.output.contents());
+    return std::vector<uint16_t>(output, output + uint64_t{plan.rows()} * kHidden);
+  };
+  int failures = 0;
+  for (const auto &[tile, upInGateFormats] : {std::pair{MoeGgufTile::Staged, false},
+                                              std::pair{MoeGgufTile::Staged, true},
+                                              std::pair{MoeGgufTile::Register, false}}) {
+    for (const int format : {int(tileFormats(tile).front()), int(Q5K)}) {
+      const Model m = makeModel(backend, shape, format, upInGateFormats, tile);
+      BlockMoeWeights chunked = chunkedWeights(backend, m, kMultiChunkFloorSlots, kMultiChunkSlots);
+      MetalBuffer table = backend.allocateBuffer(uint64_t{kExperts} * sizeof(uint32_t), BufferStorage::Shared,
+                                                 "chunked-slots");
+      std::vector<float> router(m.router.values.size());
+      for (uint32_t expert = 0; expert < kExperts; ++expert) {
+        static_cast<uint32_t *>(table.contents())[expert] = sigma(expert);
+        std::copy_n(m.router.row(sigma(expert)), kHidden, router.begin() + uint64_t{expert} * kHidden);
+      }
+      chunked.slotTable = table;
+      chunked.router = floatSegment(backend, router, kExperts, kHidden);
+      const MoeExpertTile prefillTile = tile == MoeGgufTile::Register ? MoeExpertTile::M8 : MoeExpertTile::M32;
+      std::vector<MoePlan> plans;
+      for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+        plans.push_back(MoE::decodePlan(shape, lanes, MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = tile}));
+      for (const uint32_t rows : {33u, kMaximumRows})
+        plans.push_back(MoE::prefillPlan(shape, rows, MoeConfig{.expertTile = prefillTile, .ggufTile = tile}));
+      int tileFailures = 0;
+      for (const MoePlan &plan : plans)
+        if (run(m.weights, plan) != run(chunked, plan)) {
+          printf("  chunked slots, %u rows: the output differs from one chunk's FAIL\n", plan.rows());
+          ++tileFailures;
+        }
+      printf("%-20s %s a floor of %u slots and chunks of %u, permuted slots, decode B1-4 and prefill 33/%u: %s\n",
+             formatNames(m).c_str(), tile == MoeGgufTile::Register ? "register" : "staged  ", kMultiChunkFloorSlots,
+             kMultiChunkSlots, kMaximumRows, tileFailures ? "FAIL" : "ok");
+      failures += tileFailures;
+    }
+  }
+  return failures;
+}
+
 // A verify step's grouping routes each lane's verify rows alone
 // (MoeBuffers::verifyRows). With every row verified, its output and tile kinds
 // are bitwise the all-rows grouping's. Over four lanes that verify 8, 5, 2 and
@@ -1480,7 +1631,7 @@ int main(int argc, const char *argv[]) {
                            nativePairs(backend) + floatPairs(backend) +
                            floatSegments(backend, 64) + floatSegments(backend, 96) + floatOnlyChain(backend) +
                            moe(backend) + routingLoads(backend) + nativeRouter(backend) + permutedSlots(backend) +
-                           verifiedRows(backend);
+                           verifiedRows(backend) + chunkedSlots(backend);
       if (failures) {
         std::cerr << "gguf_moe_test: " << failures << " failures\n";
         return 1;

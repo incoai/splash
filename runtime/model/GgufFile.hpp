@@ -93,9 +93,7 @@ struct GgufRotation {
 
 // A GGUF's scalar metadata by key: every integer and boolean as unsigned, a
 // negative integer as its two's complement, every float as a double, and the
-// strings. GgufFile reads it from a header, and model-check from the
-// installer's copy of the header's (install/gguf.py scalar_metadata), so that
-// gguf::requireMetadata holds either to the same rules.
+// strings.
 struct GgufMetadata {
   std::map<std::string, uint64_t, std::less<>> unsigneds;
   std::map<std::string, double, std::less<>> floats;
@@ -108,6 +106,11 @@ struct GgufMetadata {
   [[nodiscard]] std::string architecture() const;
 };
 
+// What a GgufFile's sources hold: whole GGUF files, whose tensor data must
+// lie in them, or only their headers, as the installer copies them before any
+// download for the engine's model check, which plans the target from them.
+enum class GgufContents : uint8_t { Files, Headers };
+
 class GgufFile final {
 public:
   // Parses the header of source and sets where its tensor data starts.
@@ -115,12 +118,12 @@ public:
   // The files of a GGUF: its one file, or every part of a split one
   // (GGUF's split format) in split order. The first file's metadata,
   // whose split.* keys must describe these files (a part read alone is
-  // refused), and every file's tensors, each tagged with its file.
-  explicit GgufFile(std::span<WeightSource *const> sources);
+  // refused), and every file's tensors, each tagged with its file. Of
+  // headers alone, where its tensor data starts is not set.
+  explicit GgufFile(std::span<WeightSource *const> sources, GgufContents contents = GgufContents::Files);
 
   [[nodiscard]] const WeightSource &source() const noexcept { return *sources_.front(); }
   [[nodiscard]] const WeightSource &source(uint32_t file) const { return *sources_.at(file); }
-  [[nodiscard]] uint32_t files() const noexcept { return static_cast<uint32_t>(sources_.size()); }
   [[nodiscard]] const GgufMetadata &metadata() const noexcept { return metadata_; }
   [[nodiscard]] std::optional<std::span<const double>> numericArray(std::string_view key) const;
   // The rotation the metadata declares, if any.
@@ -131,7 +134,7 @@ public:
   [[nodiscard]] const GgufTensor &require(std::string_view name) const;
 
 private:
-  void parse(WeightSource &source, uint32_t file);
+  void parse(WeightSource &source, uint32_t file, GgufContents contents);
   std::vector<WeightSource *> sources_;
   GgufMetadata metadata_;
   std::map<std::string, std::vector<double>, std::less<>> arrays_;
@@ -145,11 +148,12 @@ private:
 };
 
 // A GGUF's files, open, and the header parsed from them (GgufFile): one file
-// or every part of a split one, in split order. The header and the plans
-// made from it read the files in place, so it neither copies nor moves.
+// or every part of a split one, in split order, or their headers alone. The
+// header and the plans made from it read the files in place, so it neither
+// copies nor moves.
 class OpenGguf final {
 public:
-  explicit OpenGguf(const std::vector<std::filesystem::path> &paths);
+  explicit OpenGguf(const std::vector<std::filesystem::path> &paths, GgufContents contents = GgufContents::Files);
   OpenGguf(const OpenGguf &) = delete;
   OpenGguf &operator=(const OpenGguf &) = delete;
 

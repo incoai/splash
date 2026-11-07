@@ -1,11 +1,10 @@
-"""Flint's GGUFs (general.architecture flint): the configuration, tokenizer
-and tensor screen the installer derives from a header like
-unsloth/flint-GGUF's flint-UD-Q4_K_XL.gguf (revision
-20468edfc38ab43d6914cc88b08cbecb05d0fc62), and its installation of one. Its
-scalar metadata and its tensor table, read by HTTP range requests, are
-fixtures (dev/tests/fixtures/model-configs/flint), and so are the
-config.json and the chat template of the release it was made from,
-RecursiveSI/flint."""
+"""Flint's GGUFs (general.architecture flint): the configuration and
+tokenizer the installer derives from a header like unsloth/flint-GGUF's
+flint-UD-Q4_K_XL.gguf (revision 20468edfc38ab43d6914cc88b08cbecb05d0fc62),
+and its installation of one. Its scalar metadata and its tensor table, read
+by HTTP range requests, are fixtures (dev/tests/fixtures/model-configs/flint),
+and so are the config.json and the chat template of the release it was made
+from, RecursiveSI/flint."""
 
 import contextlib
 import io
@@ -18,7 +17,6 @@ from pathlib import Path
 from tokenizers import pre_tokenizers
 from transformers import AutoTokenizer
 
-from dev.tests import fixture_files
 from dev.tests.installer_fixtures import (
     CONFIGS,
     CONTROL,
@@ -28,9 +26,12 @@ from dev.tests.installer_fixtures import (
     FakeHub,
     draft_dir,
     selection,
+    tensor_table,
     vision_fixture,
     write_gguf,
+    write_target,
 )
+from dev.tests.server_fixtures import NATIVE_CONTEXT
 from install import assembly, families, gguf, local, models, upstream
 from server import constraints
 from server.chat_format import FLINT
@@ -40,8 +41,6 @@ from server.tokenization import PromptTokenizer
 FIXTURES = CONFIGS / "flint"
 TEMPLATE = (CONFIGS.parent / "chat_templates/flint.jinja").read_text()
 LAYERS = 49
-# The layers that attend every earlier token, without RoPE; the others slide.
-FULL_LAYERS = (0, 1, *range(5, 46, 4), 48)
 # Flint's added tokens from ID 150000: its control tokens, special, and the
 # tags its template writes in text, user-defined and not special.
 ADDED = [
@@ -98,47 +97,25 @@ FLINT_SPLITS = [
 
 
 def header_values():
-    """The header's metadata: the scalars of the fixture, its two layer
-    patterns, which scalar_metadata leaves out, and a tokenizer of Flint's
-    150144 tokens, its added tokens at their IDs."""
-    typed = json.loads((FIXTURES / "gguf-metadata.json").read_text())
-    pattern = [layer not in FULL_LAYERS for layer in range(LAYERS)]
+    """The header's metadata: the fixture's architecture metadata and a
+    tokenizer of Flint's 150144 tokens, its added tokens at their IDs."""
     tokens = sorted(pre_tokenizers.ByteLevel.alphabet()) + ["12", "123"]
     tokens += [f"[base{index}]" for index in range(BASE - len(tokens))]
-    return (
-        typed["unsigned"]
-        | typed["float"]
-        | typed["string"]
-        | {
-            # A boolean in the header, which scalar_metadata keeps as 1.
-            "flint.expert_weights_norm": True,
-            "flint.attention.sliding_window_pattern": pattern,
-            "flint.attention.rope_pattern": pattern,
-            "tokenizer.ggml.model": "gpt2",
-            "tokenizer.ggml.pre": "flint",
-            "tokenizer.ggml.tokens": tokens + ADDED,
-            "tokenizer.ggml.token_type": [NORMAL] * BASE
-            + [USER_DEFINED if text in ADDED[6:18] else CONTROL for text in ADDED],
-            "tokenizer.ggml.merges": ["1 2", "12 3"],
-            "tokenizer.ggml.bos_token_id": 150000,
-            "tokenizer.ggml.eos_token_id": 150001,
-            "tokenizer.ggml.padding_token_id": 150001,
-            "tokenizer.ggml.add_bos_token": False,
-            "tokenizer.ggml.add_eos_token": False,
-            "tokenizer.ggml.eog_token_ids": [150001, 150003, 150005, 150018],
-            "tokenizer.chat_template": TEMPLATE,
-        }
-    )
-
-
-def tensor_table():
-    """The real file's tensors: name, extents and type, in its order."""
-    return [
-        (name, extents, GGML[kind])
-        for name, (kind, extents) in json.loads(
-            (FIXTURES / "gguf-tensors.json").read_text()
-        ).items()
-    ]
+    return json.loads((FIXTURES / "gguf-metadata.json").read_text()) | {
+        "tokenizer.ggml.model": "gpt2",
+        "tokenizer.ggml.pre": "flint",
+        "tokenizer.ggml.tokens": tokens + ADDED,
+        "tokenizer.ggml.token_type": [NORMAL] * BASE
+        + [USER_DEFINED if text in ADDED[6:18] else CONTROL for text in ADDED],
+        "tokenizer.ggml.merges": ["1 2", "12 3"],
+        "tokenizer.ggml.bos_token_id": 150000,
+        "tokenizer.ggml.eos_token_id": 150001,
+        "tokenizer.ggml.padding_token_id": 150001,
+        "tokenizer.ggml.add_bos_token": False,
+        "tokenizer.ggml.add_eos_token": False,
+        "tokenizer.ggml.eog_token_ids": [150001, 150003, 150005, 150018],
+        "tokenizer.chat_template": TEMPLATE,
+    }
 
 
 class FlintGgufTests(unittest.TestCase):
@@ -147,13 +124,11 @@ class FlintGgufTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
 
-    def metadata(self, values=None, tensors=()):
-        path = fixture_files.write_gguf(
-            self.root / "flint.gguf",
-            header_values() if values is None else values,
-            [(name, extents, kind, b"") for name, extents, kind in tensors],
+    def metadata(self, values=None):
+        path = write_target(
+            self.root / "flint.gguf", header_values() if values is None else values, ()
         )
-        return gguf.Metadata(path, tensors=True)
+        return gguf.Metadata(path)
 
     def test_the_derived_config_is_flint_s_own(self):
         # The keys and values of the release's config.json, flat, that the
@@ -189,9 +164,10 @@ class FlintGgufTests(unittest.TestCase):
         )
 
     def test_each_derived_value_is_the_header_s(self):
-        sliding = [layer not in FULL_LAYERS for layer in range(LAYERS)]
+        values = header_values()
+        sliding = values["flint.attention.sliding_window_pattern"]
         rotated = [layer % 2 == 0 for layer in range(LAYERS)]
-        values = header_values() | {
+        values |= {
             "flint.attention.sliding_window_pattern": sliding,
             "flint.attention.rope_pattern": rotated,
             "flint.expert_gating_func": 1,
@@ -226,10 +202,58 @@ class FlintGgufTests(unittest.TestCase):
             },
         )
 
+    def test_the_tokens_ending_a_turn_are_stated_or_derived(self):
+        # unsloth/flint-GGUF states tokenizer.ggml.eog_token_ids, and the
+        # config takes the list as it is.
+        stated = header_values() | {"tokenizer.ggml.eog_token_ids": [150001, 150005]}
+        config = gguf.model_config(self.metadata(stated))
+        self.assertEqual(config["eos_token_id"], [150001, 150005])
+        # lmstudio-community's, ggml-org's, bartowski's, mradermacher's and
+        # prithivMLmods' state none: the IDs of Flint's stop tokens in the
+        # vocabulary are unsloth's list.
+        values = header_values()
+        unsloth = values.pop("tokenizer.ggml.eog_token_ids")
+        config = gguf.model_config(self.metadata(values))
+        self.assertEqual(config["eos_token_id"], unsloth)
+
+    def test_a_header_without_the_list_or_flint_s_stop_tokens_is_refused(self):
+        def without_list(**changes):
+            values = header_values()
+            del values["tokenizer.ggml.eog_token_ids"]
+            tokens = values["tokenizer.ggml.tokens"] = list(
+                values["tokenizer.ggml.tokens"]
+            )
+            types = values["tokenizer.ggml.token_type"] = list(
+                values["tokenizer.ggml.token_type"]
+            )
+            if "rename" in changes:
+                tokens[changes["rename"]] = "<|renamed|>"
+            if "text" in changes:
+                types[changes["text"]] = USER_DEFINED
+            if "twice" in changes:
+                tokens[changes["twice"]] = "<|developer|>"
+            if "eos" in changes:
+                values["tokenizer.ggml.eos_token_id"] = changes["eos"]
+            return values
+
+        for changes, reason in (
+            ({"rename": 150018}, re.escape("hold <|developer|> once")),
+            ({"text": 150003}, re.escape("hold <|user|> once")),
+            ({"twice": 150019}, re.escape("hold <|developer|> once")),
+            ({"eos": 150000}, "its EOS is none of Flint's stop tokens"),
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(models.ModelError, reason):
+                    gguf.model_config(self.metadata(without_list(**changes)))
+
     def test_metadata_the_config_cannot_state_is_refused(self):
         for key, value, reason in (
-            ("tokenizer.ggml.eog_token_ids", None, "tokenizer.ggml.eog_token_ids"),
             ("tokenizer.ggml.eog_token_ids", [], "tokenizer.ggml.eog_token_ids"),
+            (
+                "tokenizer.ggml.eog_token_ids",
+                [150001.0],
+                "tokenizer.ggml.eog_token_ids",
+            ),
             (
                 "flint.attention.sliding_window_pattern",
                 [True] * (LAYERS - 1),
@@ -303,7 +327,9 @@ class FlintGgufTests(unittest.TestCase):
         # The server reads it in Flint's chat format, reuses its prompts'
         # tokens after <|assistant|> and serves its template unchanged.
         constraints.validate_tokenizer(tokenizer, FLINT)
-        self.assertTrue(PromptTokenizer(tokenizer, FLINT.message_boundary).enabled)
+        self.assertTrue(
+            PromptTokenizer(tokenizer, FLINT.message_boundary, NATIVE_CONTEXT).enabled
+        )
         self.assertEqual(files["tokenizer/chat_template.jinja"].decode(), TEMPLATE)
         template = ChatTemplates(tokenizer).select(None)
         self.assertEqual(template.later_system, NATIVE)
@@ -311,84 +337,15 @@ class FlintGgufTests(unittest.TestCase):
             set(template.generation_prompts.values()), {("<|assistant|>", (150004,))}
         )
 
-    def test_the_screen_reads_every_tensor_of_the_real_file(self):
-        table = tensor_table()
-        metadata = self.metadata(tensors=table)
-        gguf.require_loadable(metadata)
-        self.assertEqual(
-            set(gguf.loaded_tensors(metadata)), {name for name, _, _ in table}
-        )
-        loaded = gguf.loaded_tensors(metadata)
-        # Two dense layers, then MoE layers whose shared expert has no gate;
-        # every layer attends with its sinks and has its norm before the FFN.
-        self.assertIn("blk.1.ffn_gate.weight", loaded)
-        self.assertNotIn("blk.1.ffn_gate_exps.weight", loaded)
-        self.assertIn("blk.2.ffn_gate_exps.weight", loaded)
-        self.assertIn("blk.2.ffn_down_shexp.weight", loaded)
-        self.assertNotIn("blk.2.ffn_gate_inp_shexp.weight", loaded)
-        self.assertEqual(loaded["blk.48.attn_sinks.weight"], {"F32"})
-        self.assertIn("blk.48.ffn_norm.weight", loaded)
-
-    def test_the_screen_refuses_what_the_loader_does_not_read(self):
-        def table(change):
-            return [
-                change(name, extents, kind) for name, extents, kind in tensor_table()
-            ]
-
-        for case, tensors, refusal in (
-            (
-                "sinks of BF16",
-                table(
-                    lambda name, extents, kind: (
-                        name,
-                        extents,
-                        GGML["BF16"] if name.endswith("attn_sinks.weight") else kind,
-                    )
-                ),
-                "attn_sinks.weight BF16 (49 tensors)",
-            ),
-            (
-                "a dense layer without its gate",
-                [
-                    entry
-                    for entry in tensor_table()
-                    if entry[0] != "blk.0.ffn_gate.weight"
-                ],
-                "ffn_gate.weight missing (1 tensor)",
-            ),
-        ):
-            with (
-                self.subTest(case),
-                self.assertRaisesRegex(models.ModelError, re.escape(refusal)),
-            ):
-                gguf.require_loadable(self.metadata(tensors=tensors))
-
-    def test_fused_gate_and_up_experts_load_in_place_of_the_two(self):
-        tensors = []
-        for name, extents, kind in tensor_table():
-            if name == "blk.2.ffn_gate_exps.weight":
-                tensors.append(
-                    (
-                        "blk.2.ffn_gate_up_exps.weight",
-                        [extents[0], 2 * extents[1], extents[2]],
-                        kind,
-                    )
-                )
-            elif name != "blk.2.ffn_up_exps.weight":
-                tensors.append((name, extents, kind))
-        metadata = self.metadata(tensors=tensors)
-        gguf.require_loadable(metadata)
-        self.assertIn("blk.2.ffn_gate_up_exps.weight", gguf.loaded_tensors(metadata))
-
     @staticmethod
-    def flint_gguf(path):
-        """A GGUF target of Flint's header and tensor table at path, and a
-        vision projector beside it."""
+    def flint_gguf(path, values=None):
+        """A GGUF target of Flint's header (values) and tensor table at path,
+        and a vision projector beside it."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        fixture_files.write_gguf(
+        write_target(
             path,
-            header_values(),
-            [(name, extents, kind, b"") for name, extents, kind in tensor_table()],
+            header_values() if values is None else values,
+            tensor_table(families.named("Flint")),
         )
         write_gguf(
             path.parent / "mmproj-F32.gguf",
@@ -428,6 +385,20 @@ class FlintGgufTests(unittest.TestCase):
         self.assertEqual(fake.range_reads, [f"{repo}/{target}"])
         self.assertEqual(fake.downloads, [f"{repo}/{target}"])
 
+    def test_a_header_without_the_list_installs_as_flint(self):
+        # The engine's check holds the derived list to the family's.
+        root = self.root.resolve()
+        values = header_values()
+        del values["tokenizer.ggml.eog_token_ids"]
+        target = self.flint_gguf(root / "model" / "flint.gguf", values)
+        draft = draft_dir(root / "draft", families.named("Flint"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            link = local.prepare_local_model(target, draft, models_dir=root / "models")
+        record = assembly.verify(link, full=True)
+        self.assertEqual(record["family"], "Flint")
+        config = json.loads((link / "config.json").read_text())
+        self.assertEqual(config["eos_token_id"], [150001, 150003, 150005, 150018])
+
     def test_local_files_serve_text_only_and_take_no_projector(self):
         # Resolved, as prepare_local_model names the files it prepares.
         root = self.root.resolve()
@@ -450,20 +421,6 @@ class FlintGgufTests(unittest.TestCase):
             ),
         ):
             prepare(mmproj=mmproj)
-
-    def test_the_fixture_metadata_is_the_header_s_scalars(self):
-        # What the engine's model check takes besides the config: the
-        # header's scalars, Flint's own keys.
-        scalars = gguf.scalar_metadata(self.metadata())
-        own = {
-            kind: {
-                key: value
-                for key, value in values.items()
-                if key.startswith("flint.") or key == "general.architecture"
-            }
-            for kind, values in scalars.items()
-        }
-        self.assertEqual(own, json.loads((FIXTURES / "gguf-metadata.json").read_text()))
 
 
 if __name__ == "__main__":

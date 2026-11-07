@@ -15,8 +15,9 @@ from tokenizers import (
 )
 from transformers import PreTrainedTokenizerFast
 
-from server import judgments
+from dev.tests.server_fixtures import NATIVE_CONTEXT
 from server.chat_format import QWEN
+from server.dialects import scoring
 from server.tokenization import PromptTokenizer, tokenizable
 
 
@@ -46,7 +47,9 @@ def tokenizer():
 class PromptTokenizationTests(unittest.TestCase):
     def setUp(self):
         self.tokenizer = tokenizer()
-        self.cache = PromptTokenizer(self.tokenizer, QWEN.message_boundary)
+        self.cache = PromptTokenizer(
+            self.tokenizer, QWEN.message_boundary, NATIVE_CONTEXT
+        )
         self.assertTrue(self.cache.enabled)
 
     def assert_encoding(self, text, cache=None):
@@ -86,7 +89,7 @@ class PromptTokenizationTests(unittest.TestCase):
         # Encoding text and a label equals the split's tokens followed by the
         # encoded end and label, so a label extends the whole text's tokens
         # by its token exactly when it so extends the end's: a slot check
-        # need encode only the end (judgments.encode_prompt).
+        # need encode only the end (scoring.encode_prompt).
         randomizer = random.Random(1234)
         fragments = [
             "e\u0301",
@@ -141,7 +144,10 @@ class PromptTokenizationTests(unittest.TestCase):
         ):
             with self.subTest(name):
                 self.assertEqual(
-                    PromptTokenizer(t, QWEN.message_boundary).split(text), ([], text)
+                    PromptTokenizer(t, QWEN.message_boundary, NATIVE_CONTEXT).split(
+                        text
+                    ),
+                    ([], text),
                 )
 
     def test_slot_checks_encode_only_the_prompt_end(self):
@@ -154,7 +160,7 @@ class PromptTokenizationTests(unittest.TestCase):
             {"role": "system", "content": "Choose one."},
             {"role": "user", "content": "Release notes 中文 e\u0301. " * 2000},
         ]
-        labels = judgments.slot_labels(self.tokenizer)[:26]
+        labels = scoring.slot_labels(self.tokenizer)[:26]
         encode = self.tokenizer.encode
         encoded = []
 
@@ -163,7 +169,7 @@ class PromptTokenizationTests(unittest.TestCase):
             return encode(text, **options)
 
         with mock.patch.object(self.tokenizer, "encode", counted):
-            ids, slots, prompt = judgments.encode_prompt(
+            ids, slots, prompt = scoring.encode_prompt(
                 self.cache,
                 template,
                 messages,
@@ -186,10 +192,30 @@ class PromptTokenizationTests(unittest.TestCase):
             sorted([end, *labels, *(end + label for label in labels)]),
         )
 
+    def test_storage_holds_four_prompts_of_the_served_context(self):
+        # Even text CPython stores at 4 bytes a character, as it does once
+        # the text holds an emoji: each prompt stays and is read again.
+        prompts = [
+            f"<|im_start|>user\n{i} " + "Hello world!" * 400 + " \U0001f680<|im_end|>"
+            for i in range(4)
+        ]
+        context = max(
+            len(self.tokenizer(prompt, add_special_tokens=False)["input_ids"])
+            for prompt in prompts
+        )
+        cache = PromptTokenizer(self.tokenizer, QWEN.message_boundary, context)
+        for prompt in prompts:
+            self.assert_encoding(prompt, cache)
+        for prompt in prompts:
+            self.assert_encoding(prompt + "\n<|im_start|>assistant\n", cache)
+        self.assertEqual(cache.stats()["entries"], 4)
+        self.assertEqual(cache.stats()["hits"], 4)
+
     def test_concurrent_requests_eviction_and_oversized_prefix(self):
         self.enterContext(mock.patch.object(PromptTokenizer, "CAPACITY", 2))
-        self.enterContext(mock.patch.object(PromptTokenizer, "BUDGET_BYTES", 40000))
-        cache = PromptTokenizer(self.tokenizer, QWEN.message_boundary)
+        # Two prompts of 833 tokens: 39,984 bytes.
+        cache = PromptTokenizer(self.tokenizer, QWEN.message_boundary, 833)
+        budget = cache.stats()["budget_bytes"]
         prompts = [
             "<|im_start|>user\n" + str(i) + " Hello world!" * 400 + "<|im_end|>\n"
             for i in range(8)
@@ -203,7 +229,7 @@ class PromptTokenizationTests(unittest.TestCase):
         self.assertEqual(results, expected * 3)
         stats = cache.stats()
         self.assertLessEqual(stats["entries"], 2)
-        self.assertLessEqual(stats["bytes"], 40000)
+        self.assertLessEqual(stats["bytes"], budget)
         before = stats["bytes"]
         self.assert_encoding("x" * 50000 + "<|im_end|>tail", cache)
         self.assertEqual(cache.stats()["bytes"], before)
@@ -255,7 +281,7 @@ class PromptTokenizationTests(unittest.TestCase):
                     )
                 else:
                     t.backend_tokenizer.model.dropout = 0.1
-                cache = PromptTokenizer(t, QWEN.message_boundary)
+                cache = PromptTokenizer(t, QWEN.message_boundary, NATIVE_CONTEXT)
                 self.assertFalse(cache.enabled)
                 if mode == "dropout":
                     # Check fallback rather than comparing two random encodes.
@@ -270,7 +296,7 @@ class PromptTokenizationTests(unittest.TestCase):
         self.tokenizer.backend_tokenizer.add_special_tokens(
             [AddedToken("hello<|im_end", normalized=False)]
         )
-        cache = PromptTokenizer(self.tokenizer, QWEN.message_boundary)
+        cache = PromptTokenizer(self.tokenizer, QWEN.message_boundary, NATIVE_CONTEXT)
         self.assertTrue(cache.enabled)
         text = "Hello world!" * 500 + "hello<|im_end|>suffix"
         self.assert_encoding(text, cache)
@@ -286,7 +312,7 @@ class PromptTokenizationTests(unittest.TestCase):
         )
         backend.add_special_tokens([AddedToken("<|im_end|>", normalized=False)])
         t = PreTrainedTokenizerFast(tokenizer_object=backend)
-        cache = PromptTokenizer(t, QWEN.message_boundary)
+        cache = PromptTokenizer(t, QWEN.message_boundary, NATIVE_CONTEXT)
         self.assertFalse(cache.enabled)
         prefix, tail = "hello world " * 500 + "<|im_end|>", "tail"
         expected = t(prefix + tail, add_special_tokens=False)["input_ids"]

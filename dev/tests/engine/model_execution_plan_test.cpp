@@ -160,7 +160,7 @@ void checkGateUpLayers() {
               "the arenas are below a gate/up pair in two formats");
     }
     const auto sizes = model::prefillTensorBytes(geometry, plans);
-    for (uint32_t rows : {1U, 8U, 17U, 32U}) {
+    for (uint32_t rows : {1U, 8U, 17U, 32U, 33U, 48U, 64U}) {
       const auto required = plans.linear().plan({{up.outputSize, up.inputSize}, rows,
           ops::LinearPhase::Prefill, ops::LinearEpilogue::None}, up).scratchSize();
       require(sizes[uint32_t(model::PrefillTensor::LinearPartials)] >= required.partials &&
@@ -378,8 +378,28 @@ void checkGdnWidths() {
 
 } // namespace
 
+// A prefill chunk's attention plan follows the history its chunk committed:
+// a short chunk after a long cached prefix shares its tiles' pages out over
+// more splits than the same chunk after none.
+void checkPrefillAttentionHistory() {
+  const auto geometry = model::RuntimeGeometry::from(loadedModel<model::Qwen3_6MoeWeights>(), kv::Format::Int8,
+                                                     ops::GdnStateFormat::Float32);
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  const ops::ExecutionPlans plans(device);
+  model::QwenTargetPrefillSequence sequence;
+  sequence.rows = 300;
+  const auto splitsAfter = [&](uint32_t history) {
+    sequence.chunk.committed_tokens = history;
+    return model::prefillAttentionPlan(plans, geometry.target, sequence).splits;
+  };
+  require(splitsAfter(65'536) > splitsAfter(0), "a chunk's attention plan does not follow its history");
+}
+
 int main() {
   try {
+    checkPrefillAttentionHistory();
     checkUnsizedProjection();
     checkCaptureLayers();
     checkGdnWidths();

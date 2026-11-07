@@ -4,15 +4,17 @@
 
 namespace splash::engine {
 
-// The highest class a reclaim step may take (the class rule). Ordinary:
-// checkpoints, ordinary states and KV, for growth that can wait or yield
-// instead: a start a resident lane holds back, and the lane that would
-// yield first (Engine::laneToYield) while another lane is resident, and
-// for a pressure pass that nothing waits for. InUse: after all of those,
-// the states unfinished requests use and the KV they restore through, for
-// other running work (any other resident lane, or a start no resident lane
-// precedes) and for a pressure pass a request waits for
-// (MemoryReclaimDirective::upTo).
+// A claim's reach (ClaimSpec::reach): the highest class of cached memory
+// its free() may take. Ordinary: checkpoints, ordinary states and KV no
+// request in service restores through. InUse: those too, then the states
+// unfinished requests use and the KV they restore through, oldest first. A
+// request in service reaches InUse unless its lane is the one that would
+// yield first beside another resident lane (Engine::growthClass), and so
+// does the prompt's replay point; a start, an optional allocation, growth
+// and the host claim short of macOS's critical pressure reach only Ordinary.
+// The reach is one input of the claim's take rights (takeRights), which
+// say what of the cache, the pools and the engine it may take; what goes
+// first among that is the ledger's fixed order (MemoryLedger::free).
 enum class ReclaimClass : uint8_t { Ordinary, InUse };
 
 } // namespace splash::engine

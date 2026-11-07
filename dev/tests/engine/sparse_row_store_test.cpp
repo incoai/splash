@@ -5,13 +5,15 @@
 // read or of a written source, and fails every later stage once poisoned;
 // and reads a prefetch's rows ahead, below stages, within its bound,
 // skipping rows an earlier prefetch still reads and dropping a row it fails
-// to read; and a store that goes while a prefetch reads waits for it.
+// to read; a store that goes while a prefetch reads waits for it; and a
+// committed store's cache holds its host memory before rows fill it.
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
 #include "model/SparseRowStore.hpp"
 #include "model/WeightSource.hpp"
 
 #include <fcntl.h>
+#include <mach/mach.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -151,6 +153,37 @@ void cacheBytesHoldTheirRows() {
   require(gib > (uint64_t{1} << 30) / (rowBytes + 28) && gib < (uint64_t{1} << 30) / (rowBytes + 20),
           "1 GiB holds an unexpected row count");
   rejects([] { Fixture(1000, 0); }, "holds no row", "a cache without a row was accepted");
+}
+
+// The process's physical footprint: the memory it holds, which a page
+// counts toward once written.
+uint64_t footprint() {
+  task_vm_info_data_t info{};
+  mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+  require(task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS,
+          "the task's memory is unknown");
+  return info.phys_footprint;
+}
+
+// A store's cache of about 256 MiB holds little of its memory once built,
+// its index at most, and all of it once committed;
+// the rows it cached before stay as they were. It runs first, in a process
+// whose allocator holds no freed memory a store could take already resident.
+void commitTakesTheCacheMemory() {
+  const uint64_t cacheRows = (uint64_t{256} << 20) / (rowBytes + 16);
+  const uint64_t cacheBytes = SparseRowStore::cacheBytesFor(cacheRows, rowBytes);
+  const uint64_t before = footprint();
+  Fixture f(10'000, cacheRows);
+  std::vector<uint32_t> ids(1000);
+  for (uint32_t i = 0; i < ids.size(); ++i) ids[i] = i * 7;
+  require(f.stage(ids).readRows == ids.size(), "a store's first stage did not read its rows");
+  const uint64_t built = footprint();
+  f.store->commit();
+  const uint64_t committed = footprint();
+  const auto grown = [&](uint64_t now) { return now > before ? now - before : 0; };
+  require(grown(built) < cacheBytes / 2, "a store's cache took its memory before it was committed");
+  require(grown(committed) >= cacheBytes / 100 * 95, "a committed store's cache does not hold its memory");
+  require(f.stage(ids).hitRows == ids.size(), "a store's cached rows were lost when it was committed");
 }
 
 void stagesExactRowsOnce() {
@@ -488,6 +521,10 @@ void readsAnOpenFile(const std::filesystem::path &directory) {
 
 int main() {
   try {
+    // Before any store freed memory the allocator could hand a later one
+    // back already resident, which the footprint would not count again.
+    rowBytes = 90;
+    commitTakesTheCacheMemory();
     for (const uint32_t width : {90u, 170u}) {
       rowBytes = width;
       const splash::test::TemporaryDirectory directory("sparse-row-store");

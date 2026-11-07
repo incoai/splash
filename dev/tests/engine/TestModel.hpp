@@ -29,16 +29,15 @@ modelMemoryProfile(uint64_t targetWeightsBytes,
 }
 
 // A block-sparse target's KV, Qwen3.8-Flash-Next's: 12 attention layers of 2
-// KV heads of 256 in int8, a 128-wide block index and token-major values, so
-// its pages can spill (kv::Layout::spillable); each verify row attends at
-// most 512 blocks of 4 tokens, and rows with up to 2,048 tokens of history
-// read their page table.
+// KV heads of 256 in int8, a 128-wide block index and token-major values, read
+// by the blocks the index selects, so its pages can spill
+// (kv::Layout::spillable); each verify row attends at most 512 blocks of 4
+// tokens, and rows with up to 2,048 tokens of history read their page table.
 [[nodiscard]] constexpr kv::Layout sparseKvLayout() noexcept {
-  return {12, 2, 256, kv::Format::Int8, 128, true};
+  return {12, 2, 256, kv::Format::Int8, 128, true, 0, 0, kv::Reads::SelectedBlocks};
 }
 [[nodiscard]] constexpr model::SparseKvShape sparseKvShape() noexcept {
-  return {.blockTokens = 4, .selectedBlocks = 512, .verifyRows = 8, .denseHistoryTokens = 2048,
-          .sinkTokens = 0, .localTokens = 0};
+  return {.blockTokens = 4, .selectedBlocks = 512, .verifyRows = 8, .denseHistoryTokens = 2048};
 }
 static_assert(sparseKvLayout().spillable());
 

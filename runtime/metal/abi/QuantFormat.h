@@ -10,10 +10,8 @@
 // A meta unit is one native block and holds its scale fields.
 //
 // It holds what defines the image's bytes, plus each format's kernel name
-// token, which the host reads.
-// dev/tests/install/test_gguf_metadata.py reads the GGUF type of each
-// kQuantFormats row with a regex on the row's leading number. The decode-only
-// value tables are in metal/abi/QuantTables.h.
+// token, which the host reads. The decode-only value tables are in
+// metal/abi/QuantTables.h.
 //
 // Inside a group of 32 the elements are in lane-owned chunk order: chunk c
 // (0..3) holds elements 4c..4c+3 and 16+4c..16+4c+3 as pairs p = 0..3, pair p
@@ -64,7 +62,9 @@
 // BF16 and F16 hold 16-bit float values x with an FP32 scale g per 256
 // elements, as FP8 holds g: value = g * x. A GGUF tensor of either type has
 // no scale, so its g is 1, which the repack writes; a native block is 256 of
-// its values, a whole number of the type's one-element blocks.
+// its values, a whole number of the type's one-element blocks. That block is
+// the repack's alone: rows kept as stored (quant_stored_row_bytes) hold each
+// value as its own block, at any width.
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 #define QUANT_CONSTANT constant constexpr
@@ -203,6 +203,16 @@ inline constexpr uint32_t gguf_format_of(uint32_t ggml_type) {
   for (uint32_t format = 0; format < GGUF_FMT_COUNT; ++format)
     if (kQuantFormats[format].ggml_type == ggml_type) return format;
   return GGUF_FMT_COUNT;
+}
+
+// The bytes of a row of `columns` values kept as stored, which a gather or
+// the float projection reads in place: BF16's and F16's values each their
+// own block (GGUF's, of one value), so any width; any other format's whole
+// native blocks, else 0.
+inline constexpr uint64_t quant_stored_row_bytes(uint32_t format, uint64_t columns) {
+  if (format == GGUF_FMT_BF16 || format == GGUF_FMT_F16) return columns * 2;
+  if (format >= GGUF_FMT_COUNT || columns % kQuantFormats[format].block_elements) return 0;
+  return columns / kQuantFormats[format].block_elements * kQuantFormats[format].block_bytes;
 }
 
 // Whether a format is MLX affine, and its code bits.

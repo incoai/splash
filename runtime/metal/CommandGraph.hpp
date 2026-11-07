@@ -7,7 +7,9 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -19,7 +21,8 @@ namespace splash::metal {
 // it against another agent or the CPU (EventStep); MetalBackend splits a
 // command into Metal command buffers at its event signals and host steps.
 // Buffers bind at indices 0..n-1; an optional parameter struct binds at
-// index n and is copied into graph-owned storage until submission.
+// index n and is copied into graph-owned storage until submission, and an
+// optional address table (addresses()) binds at the index after them.
 class CommandGraph final {
 public:
   static constexpr uint32_t kDefaultThreads = 256;
@@ -58,6 +61,17 @@ public:
            DispatchSize threads) {
     add(std::move(pipeline), std::move(buffers), params, groups, threads);
     dispatches_.back().indirectThreadgroups = std::move(grid);
+  }
+
+  // Gives the last dispatch the GPU addresses of `buffers` as a table at the
+  // index after its parameter struct (ComputeDispatch::addresses), which it
+  // reads, or reads and writes when `writes`.
+  void addresses(std::shared_ptr<const std::vector<MetalBuffer>> buffers, bool writes = false) {
+    if (dispatches_.empty()) throw std::logic_error("an address table needs a dispatch");
+    if (!buffers || buffers->empty()) throw std::invalid_argument("an address table needs a buffer");
+    ComputeDispatch &dispatch = dispatches_.back();
+    dispatch.addresses = {static_cast<uint32_t>(dispatch.buffers.size() + dispatch.bytes.size()), std::move(buffers),
+                          writes};
   }
 
   // Event steps after the dispatches added so far (EventStep): signal once

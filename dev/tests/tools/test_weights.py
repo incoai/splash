@@ -35,24 +35,6 @@ def digest_tool(build: Path, images: dict, status: int = 0):
     tool.chmod(0o755)
 
 
-def entry(cache: Path, key: str, digest: str, lines: list[str]):
-    """A cache entry of an earlier release whose source file holds lines."""
-    directory = cache / key
-    directory.mkdir(parents=True)
-    (directory / "weights").write_text("")
-    (directory / "sha256").write_text(digest)
-    (directory / "source").write_text("".join(f"{line}\n" for line in lines))
-
-
-def provenance(component: str, source=MODEL_ROOT / "target") -> list[str]:
-    return [
-        weights.PROVENANCE,
-        f"component {component}",
-        "inputs " + "i" * 64,
-        f"source {source}",
-    ]
-
-
 class WeightBytesTests(unittest.TestCase):
     def test_builds_must_load_the_same_images_with_the_same_bytes(self):
         self.assertTrue(weights.compare({"x": A}, {"x": A})["pass"])
@@ -94,79 +76,6 @@ class WeightBytesTests(unittest.TestCase):
             digest_tool(build, {}, status=1)
             with self.assertRaisesRegex(RuntimeError, "exited 1: error: no model"):
                 weights.digests(build, MODEL_ROOT)
-
-    def test_an_earlier_release_prepared_the_images_of_the_model_root(self):
-        with TemporaryDirectory() as directory:
-            output = Path(directory).resolve() / "release/model"
-            environment = weights.baseline_environment(output)
-            cache = output / "baseline-weights"
-            self.assertEqual(environment, {"SPLASH_WEIGHT_CACHE": str(cache)})
-            self.assertTrue(cache.is_dir())
-            self.assertEqual(weights.prepared(environment, MODEL_ROOT), {})
-
-            entry(cache, "1" * 64, A, provenance("target/layer-0.bin"))
-            entry(
-                cache,
-                "2" * 64,
-                B,
-                provenance("vision/model.bin", MODEL_ROOT / "vision"),
-            )
-            # Another model's and another revision's entries, an entry of an
-            # earlier format, one without its digest and staging are not.
-            entry(cache, "3" * 64, C, provenance("target/head.bin", "/other"))
-            entry(
-                cache, "4" * 64, C, provenance("target/head.bin", f"{MODEL_ROOT}-old")
-            )
-            entry(cache, "5" * 64, C, [str(MODEL_ROOT / "target"), "head.bin"])
-            entry(cache, "6" * 64, "not a digest", provenance("target/head.bin"))
-            entry(cache, ".staging-7", C, provenance("target/head.bin"))
-            (cache / ("8" * 64)).mkdir()
-            self.assertEqual(
-                weights.prepared(environment, MODEL_ROOT),
-                {"target/layer-0.bin": A, "vision/model.bin": B},
-            )
-
-    def test_compare_builds_reads_each_baseline_as_it_loads(self):
-        with TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
-            baseline, candidate = root / "baseline", root / "candidate"
-            digest_tool(candidate, {"target/layer-0.bin": A})
-            environment = weights.baseline_environment(root / "release")
-            # An earlier release prepared into its cache, which its build
-            # names.
-            with self.assertRaisesRegex(
-                RuntimeError, "has no engine-tests/weight-digests"
-            ):
-                weights.compare_builds(baseline, candidate, MODEL_ROOT, environment)
-            self.assertFalse((candidate / "arguments").exists())
-            (baseline / weights.IDENTITY_HEADER).parent.mkdir(parents=True)
-            (baseline / weights.IDENTITY_HEADER).write_text("")
-            entry(
-                Path(environment["SPLASH_WEIGHT_CACHE"]),
-                "1" * 64,
-                B,
-                provenance("target/layer-0.bin"),
-            )
-            result = weights.compare_builds(
-                baseline, candidate, MODEL_ROOT, environment
-            )
-            self.assertEqual(
-                result["failures"],
-                [f"target/layer-0.bin: the baseline loaded {B}, the candidate {A}"],
-            )
-            # A baseline that loads into memory is asked, and each build's
-            # weight-digests takes the options.
-            digest_tool(baseline, {"target/layer-0.bin": A})
-            result = weights.compare_builds(
-                baseline, candidate, MODEL_ROOT, None, STREAMED
-            )
-            self.assertTrue(result["pass"], result["failures"])
-            self.assertEqual(len(result["images"]), 1)
-            for build in (baseline, candidate):
-                self.assertEqual(
-                    (build / "arguments").read_text().splitlines()[-1],
-                    " ".join([str(MODEL_ROOT), *STREAMED]),
-                )
 
 
 if __name__ == "__main__":

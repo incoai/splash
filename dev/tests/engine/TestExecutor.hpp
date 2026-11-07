@@ -3,8 +3,11 @@
 // The model the engine, native loop and transport tests run their engines
 // on, and the states and tickets it hands them.
 
+#include "FakeElasticPool.hpp"
+#include "FakeMemory.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
+#include "TimingProfile.hpp"
 #include "engine/KvCache.hpp"
 #include "model/Model.hpp"
 
@@ -14,6 +17,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -44,21 +48,6 @@ class DiskState final : public CompositeState {
 public:
   uint64_t bytes() const noexcept override { return 64; }
   uint64_t residentBytes() const noexcept override { return 0; }
-};
-
-// A state that holds rows its model can rebuild, as a replay point inside an
-// image holds that image's rows: once the cache drops the state, the rows
-// are one more of the model's cache units.
-class RowsHoldingState final : public CompositeState {
-public:
-  RowsHoldingState(std::vector<uint64_t> &cacheUnits, uint64_t rows)
-      : cacheUnits_(cacheUnits), rows_(rows) {}
-  ~RowsHoldingState() override { cacheUnits_.push_back(rows_); }
-  uint64_t bytes() const noexcept override { return 64; }
-
-private:
-  std::vector<uint64_t> &cacheUnits_;
-  uint64_t rows_;
 };
 
 // The buffers of a state a prefill command captures (Executor::reserveState):
@@ -99,7 +88,8 @@ private:
 };
 
 // With a pool, it is a captured state whose buffers return to the model's
-// pool once the cache lets go of them, like State's.
+// pool once the cache lets go of them, like State's. A persistent tier also
+// writes its copy while it stays in RAM (persist).
 class OffloadState final : public CompositeState {
 public:
   explicit OffloadState(std::shared_ptr<OffloadControl> control,
@@ -111,8 +101,12 @@ public:
       *pool_ += bytes();
   }
   uint64_t bytes() const noexcept override { return 64; }
+  bool writable() const noexcept override { return true; }
   bool canOffload(bool) const noexcept override { return true; }
   std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
+    return std::make_unique<OffloadTicket>(control_);
+  }
+  std::unique_ptr<StateOffload> persist(std::function<void()>) const override {
     return std::make_unique<OffloadTicket>(control_);
   }
 private:
@@ -121,12 +115,18 @@ private:
 };
 
 // A captured state whose copy a persistent tier writes while it stays in
-// RAM (persist); the copy is a DiskState.
+// RAM (persist), and a reclaim writes as it leaves RAM through a staging
+// copy (offload), as the model's states are written; the copy is a
+// DiskState.
 class KeptState final : public CompositeState {
 public:
   explicit KeptState(std::shared_ptr<OffloadControl> control) : control_(std::move(control)) {}
   uint64_t bytes() const noexcept override { return 64; }
+  bool writable() const noexcept override { return true; }
   bool canOffload(bool) const noexcept override { return true; }
+  std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
+    return std::make_unique<OffloadTicket>(control_);
+  }
   std::unique_ptr<StateOffload> persist(std::function<void()>) const override {
     return std::make_unique<OffloadTicket>(control_);
   }
@@ -147,6 +147,9 @@ class RestoreTicket final : public StateRestore {
 public:
   std::shared_ptr<RestoreControl> control;
   std::function<void()> commit;
+  // With the model's memory, the RAM copy in buffers it takes as its
+  // reserveState() does (Executor::restoredCopy).
+  std::function<std::shared_ptr<const CompositeState>()> copy;
   bool ready() const noexcept override { return control->ready; }
   bool finish() override {
     if (!control->success || control->cancelled) return false;
@@ -157,7 +160,7 @@ public:
   std::shared_ptr<const CompositeState> snapshot() override {
     if (control->promotionDenied)
       return nullptr;
-    return std::make_shared<State>();
+    return copy ? copy() : std::make_shared<State>();
   }
 };
 
@@ -198,26 +201,19 @@ public:
       throw std::logic_error("mask-overlap ticket completed without input");
     return std::move(results_);
   }
-  double wallMilliseconds() const noexcept override { return 1.0; }
+  model::CommandSample sample() const noexcept override { return {.wallMilliseconds = 1.0}; }
 
 private:
   std::shared_ptr<MaskOverlapState> state_;
   std::vector<ModelStepResult> results_;
 };
 
-// A model that runs no kernels, for the engine, native loop and transport
-// tests. It behaves as model::Runtime does where those tests rely on it: a
-// request takes the first free one of maximumLanes lanes; a prefill step that
-// commits returns the states it captures, in their reserved buffers; the
-// prefill step that completes a prompt asks for a constrained request's first
-// mask, or returns a score request's option logits; every decode cycle of a
-// constrained lane after its first token waits for its verify mask inside its
-// command (MaskOverlapTicket), beside the command's unconstrained lanes; a
-// decode step throws for a lane whose output limit, lowered by a resume after
-// its anchor was selected, leaves it only that anchor, which the runtime emits
-// only as it selects it; and provideMask throws for a request that waits for
-// no mask and refuses one that permits no token. Its other members are the
-// tests' knobs and records.
+// A model that runs no kernels, behaving as model::Runtime does where the
+// engine, loop and transport tests rely on it: lanes, captured states in
+// their reserved buffers, constrained lanes' masks (the verify mask inside
+// the command, MaskOverlapTicket), score logits, and no decode of a lane
+// left only its emitted anchor. Its other members are the tests' knobs and
+// records.
 class Executor final : public model::Model {
 public:
   explicit Executor(
@@ -249,6 +245,8 @@ public:
             return entry.second.resident && entry.second.lane == lane;
           });
       if (!used) {
+        if (const metal::AllocationFailure refused = takeLaneState(); refused != metal::AllocationFailure::None)
+          return {{}, StateFailure::MemoryPressure, refused};
         requests.emplace(
             request.id,
             Request{.lane = lane,
@@ -270,6 +268,7 @@ public:
     pageTables.erase(id);
     spilledReadFloors.erase(id);
     historyStaging.erase(id);
+    releaseLane(id);
     entry.resident = false;
     entry.position = 0;
     ++suspensions;
@@ -293,6 +292,8 @@ public:
                    candidate.second.lane == lane;
           });
       if (!used) {
+        if (const metal::AllocationFailure refused = takeLaneState(); refused != metal::AllocationFailure::None)
+          return {{}, StateFailure::MemoryPressure, refused};
         entry.lane = lane;
         entry.resident = true;
         entry.position = 0;
@@ -317,6 +318,8 @@ public:
     ticket->commit = [this, id, length, state, restoreDraft] {
       applyRestore(id, length, state, restoreDraft);
     };
+    if (memory)
+      ticket->copy = [this] { return restoredCopy(); };
     return ticket;
   }
   void setDraftContextPlan(uint64_t id, DraftContextPlan plan) override {
@@ -479,18 +482,10 @@ public:
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) override {
     checkPageTables(items);
-    // A prefill command streams the history of one lane at most, whose
-    // pages hold only their index, and only whole, as the production
-    // runtime refuses another.
-    if (plan.kind == WorkKind::Prefill) {
-      const auto streams = std::ranges::count_if(items, [](const ModelBatchItem &item) {
-        return item.pageSources && item.pageSources->indexPages();
-      });
-      if (streams > 1)
-        throw std::logic_error("a prefill command streams the history of one sequence");
-      if (streams && plan.passes > 1)
-        throw std::invalid_argument("a prefill command's passes are not ones the runtime runs");
-    }
+    // A command keeps within the model's limits, as the production runtime
+    // runs no other.
+    if (const auto broken = model::commandViolation(commandLimits(), plan, items))
+      throw std::invalid_argument(std::string(*broken));
     // A lane reads the K/V only a copy holds through memory reserved for it
     // before its command, as the production runtime's readers require: a
     // decoding lane's floor of the hot block cache, a prefill's staging of
@@ -544,29 +539,70 @@ public:
       // runtime's returns.
       std::vector<ModelStepResult> results(items.size());
       for (size_t lane = 0; lane < items.size(); ++lane) results[lane].requestId = items[lane].requestId;
-      const CommandTimes times = commandTimes ? commandTimes(plan, items) : CommandTimes{};
-      ticket = immediateTicket(std::move(results), completion, times);
+      ticket = timedTicket(std::move(results), plan, items, completion);
     } else {
-      const CommandTimes times = commandTimes ? commandTimes(plan, items) : CommandTimes{};
-      ticket = immediateTicket(plan.kind == WorkKind::Prefill ? prefill(plan, items)
-                                                              : decode(plan, items),
-                               completion, times);
+      ticket = timedTicket(plan.kind == WorkKind::Prefill ? prefill(plan, items) : decode(plan, items), plan,
+                           items, completion);
     }
     if (submitObserver)
       submitObserver();
     return ticket;
   }
-  uint32_t prefillGroupRows(bool spills) const noexcept override {
-    return spills || !groupsOnlySpilling ? groupRows : model::ExecutionLimits::prefillTokenBudget;
+  // A command holds groupRows rows in up to `passes` passes over as many
+  // layers, the rows of one lane at most past a chunk, and streams the
+  // history of one lane at most.
+  model::CommandLimits commandLimits() const noexcept override {
+    return {.commandRows = groupRows,
+            .layers = passes,
+            .maximumPasses = passes,
+            .lanesPastChunk = 1,
+            .indexPageLanes = 1,
+            .streamsWeights = streamedExperts};
   }
-  uint32_t prefillPasses() const noexcept override { return passes; }
-  uint64_t snapshotBytes() const noexcept override { return stateBytes; }
-  // The production model takes a cached state's buffers from its pool, or
-  // with one admission, for a resident lane's page-aligned boundary, and
-  // returns nullptr with the cause when the governor refuses them. The fake
-  // refuses the next `deniedReservations` calls, every call for the
-  // boundary at `denyReservationAt`, and every call while `reservationRoom`
-  // reports no memory, for `reservationFailure`.
+  // With timing, the profile's work (TimedWork); otherwise the default.
+  model::CommandWork prefillWork(std::span<const model::PrefillLane> lanes, uint32_t first,
+                                 uint32_t passesLeft) const override {
+    return timing ? timing->prefillWork(lanes, first, passesLeft)
+                  : model::Model::prefillWork(lanes, first, passesLeft);
+  }
+  std::span<model::ElasticPool *const> pools() noexcept override {
+    pools_[0] = experts;
+    return experts ? std::span<model::ElasticPool *const>(pools_) : std::span<model::ElasticPool *const>();
+  }
+  // A prefill's staging beyond what it holds.
+  uint64_t stagingShortfall(uint64_t id, uint32_t pages) const override {
+    const auto staged = historyStaging.find(id);
+    const uint32_t held = staged == historyStaging.end() ? 0 : staged->second;
+    return pages > held ? uint64_t{pages - held} * stagingPageBytes : 0;
+  }
+  // Each lane's floor is spilledReadFloorBytes, linear where the real cache
+  // rounds to whole extents (model::KvBlockCache::lanesShortfallBytes); the
+  // lanes waiting for theirs count no stale extents, which a Start may take.
+  uint64_t hotFloorBytes(uint32_t lanes) const override { return uint64_t{lanes} * spilledReadFloorBytes; }
+  uint64_t hotFloorShortfall(std::span<const uint64_t> ids) const override {
+    return static_cast<uint64_t>(std::ranges::count_if(ids, [&](uint64_t id) { return !spilledReadFloors.contains(id); })) *
+           spilledReadFloorBytes;
+  }
+  // Runs the model's commands on `profile`: they report its work and take
+  // its time, the experts pool's residency pricing their reads.
+  void time(const TimingProfile &profile) {
+    timing.emplace(profile,
+                   [this, &profile] { return experts ? experts->residentShare() : profile.measuredResidentShare; });
+    noise_.seed(profile.seed);
+  }
+  // With a clock: when the timed command in flight ends, and its completion,
+  // run once the clock has reached it.
+  [[nodiscard]] std::optional<double> commandEnd() const noexcept { return commandEnd_; }
+  void land(double nowMilliseconds) {
+    if (!commandEnd_ || *commandEnd_ > nowMilliseconds)
+      return;
+    commandEnd_.reset();
+    if (const std::function<void()> completion = std::exchange(timedCompletion_, {}))
+      completion();
+  }
+  // A state's buffers for a resident lane's page boundary, or nullptr with the
+  // cause: refused for the next `deniedReservations` calls, at
+  // `denyReservationAt`, and while `reservationRoom` reports no memory.
   std::shared_ptr<StateReservation> reserveState(uint64_t id, uint32_t tokens,
                                                  metal::AllocationFailure &refusal) override {
     if (!requests.at(id).resident || !tokens || tokens % engine::KvCache::pageTokens)
@@ -582,6 +618,12 @@ public:
     if (denyReservationAt == tokens || (reservationRoom && !reservationRoom())) {
       refusal = reservationFailure;
       return nullptr;
+    }
+    if (memory) {
+      if (const metal::AllocationResult result = takeStateBuffers(); !result) {
+        refusal = result.failure;
+        return nullptr;
+      }
     }
     refusal = metal::AllocationFailure::None;
     ++reservations;
@@ -607,63 +649,73 @@ public:
     ++diskSnapshots;
     return std::make_unique<OffloadTicket>(stateTier);
   }
-  uint32_t statesToActivate() const noexcept override {
-    return statesLacked ? statesLacked() : 0;
+  std::optional<uint32_t> statesToActivate() const noexcept override {
+    return statesLacked ? statesLacked() : std::optional<uint32_t>{0};
   }
-  // The production model reserves a decoding lane's floor of the hot block
-  // cache, which the fake refuses for the requests in refusedSpilledReads,
-  // and while spilledReadsRoom reports no memory for the request's, with
-  // spilledReadsRefusal's cause. The lane holds it until it is suspended or
-  // ends.
-  model::ModelMemoryAdmission reserveSpilledReads(uint64_t id) override {
-    if (refusedSpilledReads.contains(id) || (spilledReadsRoom && !spilledReadsRoom(id)))
-      return {.allocationFailure = spilledReadsRefusal};
-    spilledReadFloors.insert(id);
-    return {.ok = true};
+  // What a lane's start (takeLaneState) and the state it captures
+  // (takeStateBuffers) allocate. Nothing without `memory`.
+  uint64_t startStateBytes() const noexcept override {
+    if (!memory)
+      return 0;
+    return laneTake().allocated + (stateReused() ? 0 : State().bytes());
   }
-  // It stages the history a prefill command streams, as many pages as the
-  // command reads, which the fake refuses for the requests in
-  // refusedStaging.
-  model::ModelMemoryAdmission reserveHistoryStaging(uint64_t id, uint32_t pages) override {
+  // The production model's pool releases the buffers beyond a lane's with
+  // keepLane, else all of them (QwenStateStorage::idleBytes); the fake's are
+  // those of the states the cache let go of and of `evictedStates` more (none
+  // under KeptState), of the pool a start leaves with `afterStart`, less what
+  // refills a lane's footprint with keepLane, else with the footprint pooled.
+  // Nothing without `memory`.
+  uint64_t idleBufferBytes(uint32_t evictedStates, bool afterStart, bool keepLane) const noexcept override {
+    if (!memory)
+      return 0;
+    const LaneTake lane = afterStart ? laneTake() : LaneTake{};
+    const uint64_t pooled = pooledLaneBytes - lane.pooled;
+    const uint64_t each = keptTier ? 0 : State().bytes();
+    const uint64_t returned = *evictedStateBytes - (afterStart && stateReused() ? State().bytes() : 0) +
+                              uint64_t{evictedStates} * each;
+    if (!keepLane)
+      return reclaimableIdleStateBytes - lane.idle + pooled + returned;
+    const uint64_t refill = std::min(returned, laneFootprintBytes - std::min(laneFootprintBytes, pooled));
+    return reclaimableIdleStateBytes - lane.idle + returned - refill;
+  }
+  // A decoding lane's floor of the hot block cache, held until the lane is
+  // suspended or ends, or a prefill's staging of the pages it reads; refused
+  // as refusedSpilledReads, spilledReadsRoom and refusedStaging say.
+  model::ModelMemoryAdmission reserveSpilledReads(uint64_t id, model::SpilledReadNeed need) override {
+    if (need.kind == WorkKind::Decode) {
+      if (refusedSpilledReads.contains(id) || (spilledReadsRoom && !spilledReadsRoom(id)))
+        return {.allocationFailure = spilledReadsRefusal};
+      if (!spilledReadFloors.contains(id)) {
+        const uint64_t stale = std::min(spilledReadFloorBytes, staleHotBytes);
+        if (const metal::AllocationResult result = allocateReads(id, spilledReadFloorBytes - stale); !result)
+          return {.allocationFailure = result.failure};
+        staleHotBytes -= stale;
+      }
+      spilledReadFloors.insert(id);
+      return {.ok = true};
+    }
     if (refusedStaging.contains(id))
       return {.allocationFailure = metal::AllocationFailure::EngineBudget};
+    const auto found = historyStaging.find(id);
+    if (const uint32_t held = found == historyStaging.end() ? 0 : found->second; need.pages > held)
+      if (const metal::AllocationResult result = allocateReads(id, uint64_t{need.pages - held} * stagingPageBytes);
+          !result)
+        return {.allocationFailure = result.failure};
     uint32_t &staged = historyStaging[id];
-    staged = std::max(staged, pages);
-    stagings.push_back(id);
+    staged = std::max(staged, need.pages);
     return {.ok = true};
   }
-  // It grows that cache toward its planned size, which the fake refuses
-  // with refusedGrowth.
-  model::ModelMemoryAdmission growSpilledReads() override {
-    ++growthAttempts;
-    if (refusedGrowth)
-      return {.allocationFailure = *refusedGrowth};
-    return {.ok = true};
-  }
-  uint64_t reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept override {
+  uint64_t releaseIdleBuffer(bool keepLane) noexcept override {
     keptLane = keepLane;
-    // The buffers of states the cache let go of refill the lane's footprint;
-    // the rest is idle.
-    const uint64_t refill = std::min(
-        *evictedStateBytes, laneFootprintBytes - std::min(laneFootprintBytes, pooledLaneBytes));
-    pooledLaneBytes += refill;
-    reclaimableIdleStateBytes += *evictedStateBytes - refill;
-    *evictedStateBytes = 0;
+    poolStates(std::exchange(*evictedStateBytes, 0));
     if (!keepLane && pooledLaneBytes)
-      return std::exchange(pooledLaneBytes, 0);
-    const uint64_t released = reclaimableIdleStateBytes;
+      return giveBackStates(std::exchange(pooledLaneBytes, 0));
+    const uint64_t released = giveBackStates(reclaimableIdleStateBytes);
     reclaimableIdleStateBytes = 0;
     reclaimedIdleStateBytes += released;
     if (released && kvGrowthBlocked)
       *kvGrowthBlocked = false;
-    if (released || scope == model::IdleMemory::Buffers)
-      return released;
-    ++cacheReclaims;
-    if (cacheUnits.empty())
-      return 0;
-    const uint64_t unit = cacheUnits.back();
-    cacheUnits.pop_back();
-    return unit;
+    return released;
   }
   std::optional<std::string> provideMask(uint64_t id,
                                          std::span<const uint32_t> words) override {
@@ -682,9 +734,12 @@ public:
     return std::nullopt;
   }
   void end(uint64_t id) override {
-    if (const auto found = requests.find(id);
-        laneReleased && found != requests.end() && found->second.resident)
-      laneReleased();
+    ++ends;
+    if (const auto found = requests.find(id); found != requests.end() && found->second.resident) {
+      releaseLane(id);
+      if (laneReleased)
+        laneReleased();
+    }
     requests.erase(id);
     pageTables.erase(id);
     spilledReadFloors.erase(id);
@@ -695,13 +750,10 @@ public:
   static uint64_t rows(uint32_t block, uint32_t firstToken) {
     return (uint64_t{block} << 32) | firstToken;
   }
-  // With `kv`, a step names pages of allocated extents only and finds every
-  // prompt block before `position` through the page table the engine handed
-  // it. With a window of windowPages pages too, every page from the window
-  // before `position` on holds every layer's K/V (kv::PageForm::Full), as
-  // the step's windowed layers read them whole, and windowDigest folds in
-  // the step and the marks of those pages that prefill wrote, which
-  // trimming must leave as they are.
+  // With `kv`, a step's page table names allocated extents only and finds
+  // every prompt block before `position`; with windowPages, the window's
+  // pages hold every layer (kv::PageForm::Full), and windowDigest folds in
+  // what the step read there.
   void requireRows(const ModelBatchItem &item, uint64_t position) {
     if (!kv)
       return;
@@ -787,9 +839,9 @@ public:
   // With it, captured states are KeptStates whose copies land when it says
   // so.
   std::shared_ptr<OffloadControl> keptTier;
-  // What a cached state's buffers take; State::bytes() unless a test needs a
-  // state larger than an extent.
-  uint64_t stateBytes = 64;
+  // With it, captured states are OffloadStates, written as the cache lets
+  // them leave RAM, their copies landing when it says so.
+  std::shared_ptr<OffloadControl> offloadTier;
   uint32_t deniedReservations = 0;
   std::optional<uint32_t> denyReservationAt;
   uint32_t beginAttempts = 0;
@@ -802,6 +854,8 @@ public:
   uint32_t suspensions = 0;
   uint32_t resumptions = 0;
   uint32_t resumeAttempts = 0;
+  // Requests the engine ended (end()).
+  uint32_t ends = 0;
   bool resumeDenied = false;
   uint32_t maximumLanes = model::ExecutionLimits::maximumBatchWidth;
   std::function<void()> beginObserver;
@@ -815,24 +869,19 @@ public:
   metal::AllocationFailure beginAllocationFailure =
       metal::AllocationFailure::EngineBudget;
   uint64_t reclaimableIdleStateBytes = 0;
-  // The pooled buffers a lane starts from; only a reclaim that does not keep
-  // the lane releases them. A reclaim first refills them, up to
-  // laneFootprintBytes, from the buffers of evicted states.
+  // The pooled buffers a lane starts from, up to laneFootprintBytes (one
+  // lane's state buffers); only a reclaim that does not keep the lane
+  // releases them. The buffers of states the cache let go of (at a reclaim)
+  // and of a lane that leaves (with memory) refill them, and the rest are
+  // idle (reclaimableIdleStateBytes).
   uint64_t pooledLaneBytes = 0;
   uint64_t laneFootprintBytes = 0;
   // The buffers of states the cache has let go of, and of reservations no
-  // step sealed, until reclaimIdleState takes them into the pool.
+  // step sealed, until releaseIdleBuffer takes them into the pool.
   std::shared_ptr<uint64_t> evictedStateBytes = std::make_shared<uint64_t>(0);
-  // The cached states whose buffers the pool lacks for one activation.
-  std::function<uint32_t()> statesLacked;
+  // The cached states whose buffers the pool lacks for one activation (Model::statesToActivate).
+  std::function<std::optional<uint32_t>()> statesLacked;
   uint64_t reclaimedIdleStateBytes = 0;
-  // Caches the model can rebuild, one released per reclaim step that may
-  // take them once no buffer is idle; cacheReclaims counts those steps.
-  std::vector<uint64_t> cacheUnits;
-  uint32_t cacheReclaims = 0;
-  // Rows each state captured from then on holds (RowsHoldingState); the
-  // executor must outlive the cache that keeps those states.
-  uint64_t stateHeldRows = 0;
   bool keptLane = false;
   // Called when a resident request gives its lane back.
   std::function<void()> laneReleased;
@@ -864,7 +913,7 @@ public:
   // Runs once each command is submitted, a held one's completion stored.
   std::function<void()> submitObserver;
   // The times each command that completes at once reports, from its plan
-  // and items; none without it.
+  // and items, before a profile's (time()); none without either.
   std::function<CommandTimes(const BatchPlan &, std::span<const ModelBatchItem>)> commandTimes;
   // Score requests whose final prompt step reports a non-finite logit.
   std::unordered_set<uint64_t> invalidScores;
@@ -877,36 +926,56 @@ public:
   std::unordered_map<uint64_t, uint32_t> outputLimits;
   // The prefill steps each request took.
   std::unordered_map<uint64_t, uint32_t> prefillChunks;
-  // The most rows of a prefill command (Model::prefillGroupRows): a chunk's,
-  // or a prefill group's, for every lane, as where experts stream, or with
-  // groupsOnlySpilling only for a lane whose K/V spills.
+  // The most rows of a prefill command (CommandLimits::commandRows): a
+  // chunk's, or a prefill group's, as where experts stream.
   uint32_t groupRows = model::ExecutionLimits::prefillTokenBudget;
-  bool groupsOnlySpilling = false;
-  // The most passes over its layers a prefill command runs in
-  // (Model::prefillPasses).
+  // The target's layers, over which a prefill command runs in as many passes
+  // at most (CommandLimits::layers, maximumPasses).
   uint32_t passes = 1;
+  // Whether its experts stream (CommandLimits::streamsWeights).
+  bool streamedExperts = false;
   // The tokens a decode step emits.
   uint32_t decodeTokens = 1;
   // The masks the model took.
   uint32_t providedMasks = 0;
-  // Requests whose floor of the hot block cache is refused
-  // (reserveSpilledReads), and those whose history's staging is
-  // (reserveHistoryStaging).
+  // Requests whose floor of the hot block cache is refused, and those whose
+  // history's staging is (reserveSpilledReads).
   std::unordered_set<uint64_t> refusedSpilledReads;
   std::function<bool(uint64_t)> spilledReadsRoom;
   metal::AllocationFailure spilledReadsRefusal = metal::AllocationFailure::EngineBudget;
   std::unordered_set<uint64_t> refusedStaging;
   // The requests that hold their floor of the hot block cache, and the
-  // pages of history staged for each; the requests the staging was reserved
-  // for, in order.
+  // pages of history staged for each.
   std::unordered_set<uint64_t> spilledReadFloors;
   std::unordered_map<uint64_t, uint32_t> historyStaging;
-  std::vector<uint64_t> stagings;
-  std::optional<metal::AllocationFailure> refusedGrowth;
-  uint32_t growthAttempts = 0;
   // Blocks of KV the SSD cache holds that each request's next step reports
   // it could not read (ModelStepResult::unreadableKvBlocks).
   std::unordered_map<uint64_t, std::vector<uint64_t>> unreadableBlocks;
+
+  // With `memory`, the model allocates under `admission`: lane and state
+  // buffers as "states" (heldStateBytes), hot block floors
+  // (spilledReadFloorBytes) and staging (stagingPageBytes a page) as
+  // "spilled_reads".
+  FakeMemory *memory = nullptr;
+  metal::AllocationAdmission admission;
+  uint64_t spilledReadFloorBytes = 0, stagingPageBytes = 0;
+  // The hot block cache's extents past the floors that no lane reads (a
+  // Spill lane that ended left them): a lane's floor takes them before it
+  // allocates, and no shortfall counts them, as a Start may take them.
+  uint64_t staleHotBytes = 0;
+  uint64_t heldStateBytes = 0;
+  std::unordered_map<uint64_t, uint64_t> spilledReadBytes;
+  // The expert store as an elastic pool (pools()), whose residency prices
+  // the timed commands' reads and which their routing serves.
+  FakeElasticPool *experts = nullptr;
+  // With it (time()), the model reports the profile's work and its commands
+  // take the profile's time and sample its work; with a clock too, each
+  // completes once the clock reaches its end (TimedTicket).
+  std::optional<TimedWork> timing;
+  std::function<double()> clock;
+  // Runs as each command that takes those times (or commandTimes') is
+  // submitted.
+  std::function<void(const BatchPlan &, const CommandTimes &)> commandTimed;
 
   // Holds every command until the flag it returns is set.
   std::shared_ptr<std::atomic<bool>> holdCommands() {
@@ -915,6 +984,133 @@ public:
   }
 
 private:
+  metal::AllocationResult allocateStates(uint64_t bytes) {
+    if (!bytes)
+      return {};
+    const metal::AllocationResult result = memory->allocate(admission, "states", bytes);
+    if (result)
+      heldStateBytes += bytes;
+    return result;
+  }
+  // One state's buffers: those the cache let go of first, else booked.
+  bool stateReused() const noexcept { return *evictedStateBytes >= State().bytes(); }
+  metal::AllocationResult takeStateBuffers() {
+    const uint64_t bytes = State().bytes();
+    if (stateReused()) {
+      *evictedStateBytes -= bytes;
+      return {};
+    }
+    return allocateStates(bytes);
+  }
+  // A restored state's RAM copy, in one state's buffers: nullptr when they
+  // are refused, as the production snapshot of a restore is.
+  std::shared_ptr<const CompositeState> restoredCopy() {
+    if (!takeStateBuffers())
+      return nullptr;
+    return std::make_shared<State>(evictedStateBytes);
+  }
+  // State buffers a reclaim gives back.
+  uint64_t giveBackStates(uint64_t bytes) noexcept {
+    if (memory && bytes) {
+      memory->release("states", bytes);
+      heldStateBytes -= bytes;
+    }
+    return bytes;
+  }
+  // Buffers back in the pool refill those a lane starts from; the rest are
+  // idle.
+  void poolStates(uint64_t bytes) noexcept {
+    const uint64_t refill = std::min(bytes, laneFootprintBytes - std::min(laneFootprintBytes, pooledLaneBytes));
+    pooledLaneBytes += refill;
+    reclaimableIdleStateBytes += bytes - refill;
+  }
+  // A lane's state buffers, from the idle pooled ones first, then those a
+  // lane starts from, and what it allocates.
+  struct LaneTake final {
+    uint64_t idle = 0, pooled = 0, allocated = 0;
+  };
+  LaneTake laneTake() const noexcept {
+    const uint64_t idle = std::min(reclaimableIdleStateBytes, laneFootprintBytes);
+    const uint64_t pooled = std::min(pooledLaneBytes, laneFootprintBytes - idle);
+    return {idle, pooled, laneFootprintBytes - idle - pooled};
+  }
+  // Takes them: the cause of a refusal, or None.
+  metal::AllocationFailure takeLaneState() {
+    if (!memory || !laneFootprintBytes)
+      return metal::AllocationFailure::None;
+    const LaneTake take = laneTake();
+    if (const metal::AllocationResult result = allocateStates(take.allocated); !result)
+      return result.failure;
+    reclaimableIdleStateBytes -= take.idle;
+    pooledLaneBytes -= take.pooled;
+    return metal::AllocationFailure::None;
+  }
+  metal::AllocationResult allocateReads(uint64_t id, uint64_t bytes) {
+    if (!memory || !bytes)
+      return {};
+    const metal::AllocationResult result = memory->allocate(admission, "spilled_reads", bytes);
+    if (result)
+      spilledReadBytes[id] += bytes;
+    return result;
+  }
+  // A resident lane leaves: its state buffers go back to the pool and its
+  // reads' memory to the host.
+  void releaseLane(uint64_t id) {
+    if (memory)
+      poolStates(laneFootprintBytes);
+    if (const auto found = spilledReadBytes.find(id); found != spilledReadBytes.end()) {
+      memory->release("spilled_reads", found->second);
+      spilledReadBytes.erase(found);
+    }
+  }
+  // A command that completes at once, or with a clock once it reaches its
+  // end, taking the times a test gives it (commandTimes), or its work's time
+  // on the profile.
+  std::unique_ptr<ModelBatchTicket> timedTicket(std::vector<ModelStepResult> results, const BatchPlan &plan,
+                                                std::span<const ModelBatchItem> items,
+                                                const std::function<void()> &completion) {
+    const CommandTimes times =
+        commandTimes ? commandTimes(plan, items) : timing ? timedTimes(plan, items) : CommandTimes{};
+    if (commandTimed)
+      commandTimed(plan, times);
+    if (!clock)
+      return immediateTicket(std::move(results), completion, times);
+    commandEnd_ = clock() + times.wallMilliseconds;
+    timedCompletion_ = completion;
+    return std::make_unique<TimedTicket>(std::move(results), times, clock, *commandEnd_);
+  }
+  // A command's time and work on the profile at the experts' residency now: a
+  // decode reads its misses (decodeBytesPerToken a row) of its rows' topK
+  // experts a layer.
+  CommandTimes timedTimes(const BatchPlan &plan, std::span<const ModelBatchItem> items) {
+    const TimingProfile &profile = timing->profile();
+    const double share = timing->residentShare();
+    CommandTimes times;
+    if (plan.kind == WorkKind::Prefill) {
+      std::vector<model::PrefillLane> lanes;
+      for (const ModelBatchItem &item : items)
+        lanes.push_back({.position = static_cast<uint32_t>(item.logicalPosition),
+                         .rows = item.tokenCount,
+                         .indexPages = item.pageSources ? item.pageSources->indexPages() : 0});
+      times = timing->times(lanes, plan.layer, plan.passes - plan.pass);
+    } else {
+      const auto width = static_cast<uint32_t>(items.size());
+      const uint32_t rows = width * model::ExecutionLimits::targetVerifyRows;
+      const auto spilling = static_cast<uint32_t>(std::ranges::count_if(
+          items, [](const ModelBatchItem &item) { return item.pageSources && item.pageSources->indexPages(); }));
+      times = decodeTimes(profile, width, rows, share, spilling);
+      const uint64_t routed = uint64_t{rows} * profile.experts.topK * profile.layers;
+      const uint64_t misses =
+          profile.experts.expertBytes
+              ? std::min(routed, static_cast<uint64_t>(decodeBytesPerToken(profile, share) * rows /
+                                                       double(profile.experts.expertBytes)))
+              : 0;
+      times.sample.work = {.weightReadBytes = misses * profile.experts.expertBytes};
+    }
+    if (profile.noise)
+      times.wallMilliseconds *= std::max(0.0, 1.0 + profile.noise * std::normal_distribution<double>()(noise_));
+    return times;
+  }
   // The blocks the request's step reports it could not read, once.
   std::vector<uint64_t> takeUnreadable(uint64_t id) {
     const auto found = unreadableBlocks.find(id);
@@ -929,8 +1125,8 @@ private:
     std::shared_ptr<uint64_t> pool = reservation.seal();
     if (keptTier)
       return std::make_shared<KeptState>(keptTier);
-    if (stateHeldRows)
-      return std::make_shared<RowsHoldingState>(cacheUnits, stateHeldRows);
+    if (offloadTier)
+      return std::make_shared<OffloadState>(offloadTier, std::move(pool));
     return std::make_shared<State>(std::move(pool));
   }
   void applyRestore(uint64_t id, uint32_t length,
@@ -942,6 +1138,63 @@ private:
     restored += length;
     restoredDraft = restoreDraftState;
   }
+
+  model::ElasticPool *pools_[1] = {};
+  std::mt19937_64 noise_;
+  std::optional<double> commandEnd_;
+  std::function<void()> timedCompletion_;
 };
+
+// A streamed target whose expert reads are small beside its chunks' work
+// (the M6's Flash-Next with an 85 GB/s SSD), so that every command runs in
+// the most passes the engine tests' model allows.
+inline const TimingProfile &passingTarget() {
+  static const TimingProfile profile = [] {
+    TimingProfile result = kM6FlashNextQ2;
+    result.name = "passing-target";
+    result.chunkMilliseconds = 2220.0;
+    result.rowMilliseconds = 0.3;
+    result.weightBytesPerMillisecond = 85e6;
+    result.hostFloorMilliseconds = 0.0;
+    result.hiddenShare = 0.0;
+    return result;
+  }();
+  return profile;
+}
+
+// A target with every expert resident whose spilled history costs a command
+// 80 ms a page to read: a lane holding Index pages runs groups, others chunks.
+inline const TimingProfile &heavyHistoryTarget() {
+  static const TimingProfile profile = [] {
+    TimingProfile result = kStoreLessSpillFlashNext;
+    result.name = "heavy-history-target";
+    result.spilledPageBytes = 1'000'000'000;
+    return result;
+  }();
+  return profile;
+}
+
+// A dense target whose prefill takes 4 ms a row and nothing else, and whose
+// decode commands take 10 ms: beside a decoding lane a command is cut to the
+// floor of 512 rows, as G holds only 125 of them.
+inline const TimingProfile &fourMillisecondRows() {
+  static const TimingProfile profile{
+      .name = "four-millisecond-rows",
+      .rowMilliseconds = 4.0,
+      .decodeMilliseconds = {10.0, 10.0, 10.0, 10.0},
+  };
+  return profile;
+}
+
+// The fake model's command limits (Executor::groupRows, passes,
+// streamedExperts), for a fixture to set before it builds the engine.
+inline std::function<void(Executor &)> commandShape(uint32_t groupRows, uint32_t passes = 1,
+                                                    bool streamsExperts = false) {
+  return [=](Executor &model) {
+    model.groupRows = groupRows;
+    model.passes = passes;
+    model.streamedExperts = streamsExperts;
+  };
+}
 
 } // namespace splash::test

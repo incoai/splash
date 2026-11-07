@@ -179,16 +179,12 @@ ops::EmbeddingWeights readBlockEmbedding(WeightFile &file, uint32_t outputSize, 
     const GgufTensorDescriptor d = readGgufDescriptor(file, label);
     if (d.outputSize != outputSize || d.inputSize != inputSize)
         throw WeightStoreError("GGUF embedding does not match the layout: " + std::string(label));
-    // Embedding floats are raw values, rather than the 256-value blocks
-    // used by projections. PLE's 160-wide BF16 rows need no block padding.
+    // Rows as stored, which the gather reads.
     const uint32_t format = gguf_format_of(d.type);
-    const bool float16 = format == GGUF_FMT_BF16 || format == GGUF_FMT_F16;
-    if (format == GGUF_FMT_COUNT || (!float16 && d.inputSize % kQuantFormats[format].block_elements))
-        throw WeightStoreError("GGUF embedding rows are not native GGUF blocks: " + std::string(label));
-    const uint64_t rowBytes = float16 ? uint64_t{d.inputSize} * sizeof(uint16_t)
-                                        : ggufRowBytes(kQuantFormats[format], d.inputSize);
-    return {outputSize, inputSize,
-            ops::NativeRows(readRows(file, d, rowBytes, label), format)};
+    const uint64_t rowBytes = quant_stored_row_bytes(format, d.inputSize);
+    if (!rowBytes)
+        throw WeightStoreError("GGUF embedding rows are not whole blocks of a GGUF format: " + std::string(label));
+    return {outputSize, inputSize, ops::StoredRows(readRows(file, d, rowBytes, label), format)};
 }
 
 std::string weightManifestFingerprint(

@@ -14,6 +14,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -105,8 +106,9 @@ inline splash::metal::MetalBuffer bfloatBuffer(splash::metal::MetalBackend &back
 // A block of `shape`: its router, shared expert scalar gate (none without
 // shape.sharedGate), routed experts' and shared expert's gate, up and down,
 // the shared expert's shape.sharedSlices slices in the order the kernels read
-// them (ops::BlockExpertProjection), their weights with expert e in slot e,
-// and the formats of the six projections.
+// them (ops::BlockExpertProjection), their weights with expert e in slot e of
+// one chunk of the routed segments (ops::residentExpertChunks), and the
+// formats of the six projections.
 struct Model {
   splash::ops::MoeShape shape;
   Tensor router, sharedGate;
@@ -175,8 +177,59 @@ inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::
   gguf.down = {m.routed[2].segment, m.shared[2].segment};
   gguf.slotTable = splash::model::residentExpertSlots(backend, shape.experts);
   gguf.slots = shape.experts;
+  gguf.chunks = splash::ops::residentExpertChunks(gguf);
   m.weights = gguf;
   return m;
+}
+
+// The weights of `m` with its routed experts copied into a floor chunk of
+// floorSlots slots and elastic chunks of chunkSlots slots each after it, the
+// last of the rest (ops::ExpertChunks): slot s, which holds expert s, at slot
+// s of chunk 0 below floorSlots and at slot (s - floorSlots) % chunkSlots of
+// chunk 1 + (s - floorSlots) / chunkSlots from it on, each chunk one buffer
+// of its nine regions in turn, as an expert store lays them out.
+inline splash::ops::BlockMoeWeights chunkedWeights(splash::metal::MetalBackend &backend, const Model &m,
+                                                   uint32_t floorSlots, uint32_t chunkSlots) {
+  constexpr uint64_t kRegionAlignment = 16 << 10;
+  const std::vector<splash::metal::MetalBuffer> &resident = *m.weights.chunks.planes();
+  const uint32_t slots = m.weights.slots;
+  // Each region's bytes per slot, in the chunks' order.
+  std::array<uint64_t, MOE_EXPERT_CHUNK_ADDRESSES> slotBytes{};
+  for (uint32_t z = 0; z < 3; ++z) {
+    const splash::ops::QuantizedSegment &routed = m.routed[z].segment;
+    const QuantFormat &format = kQuantFormats[routed.formatId];
+    const uint64_t groups = uint64_t{routed.outputSize / slots} * (routed.inputSize / 32);
+    slotBytes[3 * z] = groups * format.plane0_bytes;
+    slotBytes[3 * z + 1] = groups * format.plane1_bytes;
+    slotBytes[3 * z + 2] = groups / format.meta_groups * format.meta_bytes;
+  }
+  std::vector<splash::metal::MetalBuffer> planes;
+  for (uint32_t first = 0; first < slots; first += first ? chunkSlots : floorSlots) {
+    const uint64_t held = std::min(first ? chunkSlots : floorSlots, slots - first);
+    std::array<uint64_t, MOE_EXPERT_CHUNK_ADDRESSES> at{};
+    uint64_t bytes = 0;
+    for (size_t entry = 0; entry < at.size(); ++entry) {
+      at[entry] = bytes;
+      bytes += (held * slotBytes[entry] + kRegionAlignment - 1) / kRegionAlignment * kRegionAlignment;
+    }
+    const splash::metal::MetalBuffer chunk = zeros(backend, bytes, "moe-chunk");
+    for (size_t entry = 0; entry < at.size(); ++entry)
+      if (slotBytes[entry])
+        std::memcpy(static_cast<uint8_t *>(chunk.contents()) + at[entry],
+                    static_cast<const uint8_t *>(resident[entry].contents()) + first * slotBytes[entry],
+                    held * slotBytes[entry]);
+    for (size_t z = 0; z < 3; ++z) {
+      const splash::metal::MetalBuffer meta = backend.view(chunk, at[3 * z + 2], held * slotBytes[3 * z + 2]);
+      planes.push_back(backend.view(chunk, at[3 * z], held * slotBytes[3 * z]));
+      planes.push_back(slotBytes[3 * z + 1] ? backend.view(chunk, at[3 * z + 1], held * slotBytes[3 * z + 1])
+                                            : meta);
+      planes.push_back(meta);
+    }
+  }
+  splash::ops::BlockMoeWeights weights = m.weights;
+  weights.chunks = splash::ops::ExpertChunks::of(std::move(planes), floorSlots, chunkSlots, slots,
+                                                 weights.gate.routed, weights.up.routed, weights.down.routed);
+  return weights;
 }
 
 // The model's six formats, "gate/up/down/shared gate/shared up/shared down".

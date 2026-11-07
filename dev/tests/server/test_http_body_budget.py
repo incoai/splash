@@ -18,6 +18,7 @@ from PIL import Image
 from dev.tests import server_fixtures as fixtures
 from server import frontend, json_codec, serve_options
 from server import server as api
+from server.dialects import responses as responses_dialect
 from server.errors import RequestValidationError
 
 
@@ -75,6 +76,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
         self.wait_bytes(harness, 0)
         for path in (
             "/v1/chat/completions",
+            "/v1/chat/completions/count_tokens",
             "/v1/messages?beta=true",
             "/v1/responses",
             "/tokenize",
@@ -152,6 +154,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
         self.wait_bytes(harness, 256)
         for path in (
             "/v1/chat/completions",
+            "/v1/chat/completions/count_tokens",
             "/v1/messages",
             "/v1/responses",
             "/tokenize",
@@ -324,7 +327,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
     def test_retained_inputs_stay_charged_until_job_is_released(self):
         admission = api.HttpAdmission(1024)
         job = SimpleJob()
-        job.response_history_items = [{"type": "message", "content": "x" * 200}]
+        job.retained_input = [{"type": "message", "content": "x" * 200}]
         reservation = api.RequestBodyReservation(admission, 900)
         reservation.retain_for(job)
         retained_bytes = admission.active
@@ -353,7 +356,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
             self.assertGreater(harness.server.request_bodies.stats()["active"], 16000)
             response.close()
             connection.close()
-            self.assertTrue(plan.cancelled.wait(1))
+            self.assertTrue(plan.ended.wait(1))
             for thread in harness.backend.runtime.threads:
                 thread.join(1)
             # This fixture archives callbacks; the real transport drops them
@@ -383,13 +386,13 @@ class HttpBodyBudgetTests(unittest.TestCase):
     def test_expanded_history_needs_additional_capacity(self):
         admission = api.HttpAdmission(256)
         job = SimpleJob()
-        job.response_history_items = ["x" * 200]
+        job.retained_input = ["x" * 200]
         reservation = api.RequestBodyReservation(admission, 10)
         reservation.retain_for(job)
         self.assertGreater(admission.active, 200)
         blocked = api.RequestBodyReservation(admission, 1)
         other = SimpleJob()
-        other.response_history_items = ["x" * 200]
+        other.retained_input = ["x" * 200]
         with self.assertRaises(api.APIError) as error:
             blocked.retain_for(other)
         self.assertEqual(error.exception.status, 503)
@@ -428,7 +431,8 @@ class HttpBodyBudgetTests(unittest.TestCase):
             {"id": "resp_previous"}, [{"role": "user", "content": "old history"}]
         )
         reservation = api.RequestBodyReservation(harness.server.request_bodies, 100)
-        job = harness.app.prepare_responses(
+        job, _ = responses_dialect.prepare(
+            harness.app,
             {
                 "input": "continue",
                 "previous_response_id": "resp_previous",
@@ -438,7 +442,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
             deadline=fixtures.FOREVER,
         )
         self.assertIn("old history", str(harness.tokenizer.templates))
-        self.assertIsNone(job.response_history_items)
+        self.assertIsNone(job.retained_input)
         reservation.retain_for(job)
         self.wait_bytes(harness, 0)
 
@@ -449,7 +453,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
         )
         body = {"input": "continue", "previous_response_id": "resp_previous"}
         with mock.patch.object(
-            harness.app, "_prepare", side_effect=api.APIError(400, "invalid input")
+            harness.app, "chat_job", side_effect=api.APIError(400, "invalid input")
         ):
             self.assertEqual(harness.request("POST", "/v1/responses", body)[0], 400)
         self.wait_bytes(harness, 0)
@@ -599,6 +603,6 @@ class HttpBodyBudgetTests(unittest.TestCase):
 
 class SimpleJob:
     tool_policy = None
-    response_history_items = None
+    retained_input = None
     response_format = None
     stop_sequences = ()

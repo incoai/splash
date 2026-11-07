@@ -15,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 namespace splash::model {
 
 void SparseRowTable::validate() const {
@@ -355,6 +357,22 @@ const SparseRowTable &SparseRowStore::table() const noexcept { return impl_->tab
 uint64_t SparseRowStore::committedBytes() const noexcept {
   return cacheBytesFor(impl_->capacity, impl_->table.rowBytes) +
          workingBytes(impl_->table.rowBytes, impl_->options.prefetchRows, impl_->options.stageRows);
+}
+
+void SparseRowStore::commit() {
+  Impl &s = *impl_;
+  const std::lock_guard lock(s.cacheMutex);
+  const uint64_t page = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+  // A byte of each page the array spans, read and written back: the write
+  // gives a page that only a read mapped memory of its own.
+  const auto touch = [page](void *array, uint64_t bytes) {
+    auto *const values = static_cast<volatile uint8_t *>(array);
+    for (uint64_t at = 0; at < bytes; at += page) values[at] = values[at];
+    if (bytes) values[bytes - 1] = values[bytes - 1];
+  };
+  touch(s.rows.get(), s.capacity * s.table.rowBytes);
+  for (uint32_t *array : {s.ids.get(), s.previous.get(), s.next.get()}) touch(array, s.capacity * sizeof(uint32_t));
+  touch(s.buckets.get(), (s.bucketMask + 1) * sizeof(uint32_t));
 }
 
 SparseRowStageResult SparseRowStore::stage(std::span<const uint32_t> ids, std::span<uint8_t> rows,

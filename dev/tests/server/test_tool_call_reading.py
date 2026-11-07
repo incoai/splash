@@ -19,7 +19,8 @@ from dev.tests.tool_output import (
 from server import json_codec
 from server import output as model_output
 from server import server as api
-from server.output import MAX_ARGUMENTS_DEPTH
+from server.chat_format import GLM_ARGS
+from server.output import MAX_ARGUMENTS_DEPTH, MAX_NAME_LENGTH
 
 # The deepest a parameter value reads as JSON: one level less than its call's
 # arguments.
@@ -96,7 +97,6 @@ PARSES = {
         call("note", ("count", "2")),
         [("note", {"count": "2"})],
     ),
-    "no function name": (call("", ("item", "x")), []),
     "a value keeps inner newlines and markup": (
         call("roll_cut", ("item", "\nline 1\n<b>line 2</b>\n")),
         [("roll_cut", {"item": "\nline 1\n<b>line 2</b>\n"})],
@@ -485,6 +485,37 @@ class ToolCallReadingTests(unittest.TestCase):
             json.loads(calls[0]["function"]["arguments"]),
             {"x": "hello</function>\n</tool_call>world"},
         )
+
+    def test_a_call_that_names_no_function_reads_as_its_text(self):
+        # Nothing of a call has streamed by the time its name is read, so an
+        # opening without a name, or with one too long to be a name, is the
+        # text the model wrote (#626), and a call after it still reads.
+        for name in ("", "  ", "x" * (MAX_NAME_LENGTH + 1)):
+            nameless = call(name, ("item", "x"))
+            with self.subTest(name=name[:8]):
+                self.assertEqual(self.read(nameless), (nameless, []))
+                content, calls = self.read(
+                    nameless + "\n" + call("roll_cut", ("item", "y"))
+                )
+                self.assertEqual(
+                    (content.strip(), calls), (nameless, [("roll_cut", {"item": "y"})])
+                )
+        # Output that ends inside the name.
+        for ending in (
+            "<tool_call>\n<function= ",
+            "<tool_call>\n<function=" + "x" * (MAX_NAME_LENGTH + 1),
+        ):
+            with self.subTest(ending=ending[:24]):
+                self.assertEqual(self.read(ending), (ending, []))
+        # GLM's layout reads the same.
+        nameless = "<tool_call>\n<arg_key>item</arg_key>\n<arg_value>x</arg_value>\n</tool_call>"
+        for size in (None, 1, 5):
+            content, calls, events = project(
+                nameless, tool_policy(SCHEMAS), size=size, syntax=GLM_ARGS
+            )
+            self.assertEqual(
+                (content, calls, streamed_text(events)), (nameless, [], nameless)
+            )
 
     def test_edge_cases(self):
         # Calls open only where the template writes them: the tags in prose,

@@ -2,7 +2,7 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/gguf_embedding_formats.h"
 
-// The gather of rows of native blocks (ops/Embedding.cpp) of a format of common/gguf_embedding_formats.h, each
+// The gather of rows as stored (ops::StoredRows) of a format of common/gguf_embedding_formats.h, each
 // element its decode as T: bf16, the token gathers', or fp32, the F32 values load-time widening writes
 // (model/GgufPreparation.cpp). Inlined, with the format's decode, so every gather stays one function (the compiler
 // otherwise keeps Q6_K's as a call).
@@ -22,7 +22,7 @@ __attribute__((always_inline)) inline void gguf_embedding(device const uint *tok
                    uint index [[thread_position_in_grid]]) { \
     gguf_embedding<F>(tokens, table, output, p, index); \
   }
-// Two gathers per gguf_embedding_format (metal/abi/Gguf.h), named by its kQuantFormats token: gguf_embed_<token>
+// Two gathers per GGUF format (metal/abi/QuantFormat.h), named by its kQuantFormats token: gguf_embed_<token>
 // into bf16 and gguf_embed_f32_<token> into fp32.
 #define GGUF_EMBEDDING_FORMAT(f, F) GGUF_GATHER(gguf_embed_##f, F, bfloat) GGUF_GATHER(gguf_embed_f32_##f, F, float)
 GGUF_EMBEDDING_FORMATS(GGUF_EMBEDDING_FORMAT)

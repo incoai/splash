@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Restart one installation's installer as a release checks it
-(DEVELOPMENT.md, Release check).
+(docs/validate.md, Release check).
 
 `prepare` runs with the Hub, then three restarts must each start the same
 installation within RESTART_SECONDS without writing to a Hub cache:

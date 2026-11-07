@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import queue
+import signal
 import threading
 import time
 import unittest
@@ -18,7 +19,9 @@ from dev.tests.server_fixtures import (
     FakeTokenizer,
     HarnessTestCase,
     Plan,
+    chat_body,
     main_args,
+    make_frontend,
     make_job,
     unprepared_hold,
 )
@@ -26,6 +29,7 @@ from server import backend as backend_api
 from server import protocol as wire
 from server import runtime as engine_runtime
 from server import server as api
+from server import supervision
 
 
 def answer_status(process, message):
@@ -47,11 +51,15 @@ class RecoveringRuntime(FakeRuntime):
         backend._engine_failed(
             error or engine_runtime.EngineUnhealthy("native protocol reached EOF"),
             served,
+            frozenset(),
+            lambda: None,
         )
 
     def wait_ready(self, timeout=None):
         self.startup_calls += 1
         outcome = self.outcomes.get(timeout=3)
+        # The startup has ended; no engine is being started.
+        self.spawned_at = None
         if outcome is not None:
             raise outcome
         self.ready = True
@@ -120,53 +128,126 @@ class ServerRecoveryTests(HarnessTestCase):
                 self.assertEqual(runtime.startup_calls, 1)
                 self.assertEqual(runtime.requests, [])
 
-    def test_fast_failures_back_off_then_stop_restarting(self):
+    def test_the_sixth_fast_failure_in_a_row_stops(self):
+        """Short-lived failures in a row double the backoff, and the sixth,
+        whose wait would have reached the cap, stops the relaunches: requests
+        get 500 engine_failed with its reason, which /status reports (they went
+        on every 60 s for good, each loading the weights again)."""
         runtime = RecoveringRuntime()
         harness = self.harness(runtime)
         backend = harness.backend
         clock = [100.0]
         with (
-            mock.patch.object(backend_api, "RESTART_BACKOFF_SECONDS", 0.01),
+            mock.patch.object(supervision, "BACKOFF_BASE_SECONDS", 0.01),
             mock.patch.object(
                 backend_api, "time", SimpleNamespace(monotonic=lambda: clock[0])
             ),
             mock.patch.object(backend_api, "print_status") as console,
         ):
-            for delay in (0.0, 0.01):
+            for delay in (0.0, 0.01, 0.02, 0.04, 0.08):
                 runtime.fail(backend, served=1.0)
                 self.assertAlmostEqual(backend.restart_due - clock[0], delay)
+                refusal = backend.refusal()
+                self.assertEqual(
+                    (refusal.status, refusal.code), (503, "engine_recovering")
+                )
                 self.relaunched(runtime, backend)
+            self.assertIsNone(backend.stop_reason)
             runtime.fail(backend, served=1.0)
-        self.assertEqual(runtime.startup_calls, 2)
-        refusal = backend.refusal()
-        self.assertEqual((refusal.status, refusal.code), (500, "engine_failed"))
-        self.assertIn("failed 3 times in a row", refusal.message)
-        self.assertRegex(refusal.message, "Crash trace|SPLASH_CRASH_TRACE")
+        self.assertEqual(runtime.startup_calls, 5)
+        reason = backend.stop_reason
         self.assertEqual(
-            console.call_args_list[-1].args[0], f"Engine stopped · {refusal.message}"
+            reason,
+            "Splash stopped restarting the engine: it failed 6 times in a row, "
+            "each within 60 s of starting (native protocol reached EOF). "
+            "Set SPLASH_CRASH_TRACE=1 to record a crash trace. "
+            "Restart the Splash server after fixing the cause.",
         )
-        self.assertEqual(harness.request("GET", "/ready")[0], 503)
+        self.assertEqual(
+            console.call_args_list[-1].args[0], f"Engine stopped · {reason}"
+        )
+        refusal = backend.refusal()
+        self.assertEqual(
+            (refusal.status, refusal.code, refusal.message),
+            (500, "engine_failed", reason),
+        )
         transport = json.loads(harness.request("GET", "/status")[2])["transport"]
         self.assertTrue(transport["stopped"])
-        self.assertFalse(transport["recovering"])
-        self.assertEqual(transport["error"], refusal.message)
+        self.assertEqual(transport["error"], reason)
         status, _, payload = harness.request(
             "POST", "/v1/chat/completions", self.body()
         )
         self.assertEqual(status, 500)
         self.assertEqual(json.loads(payload)["error"]["code"], "engine_failed")
-        self.assertEqual(runtime.startup_calls, 2)
 
-    def test_full_window_of_service_resets_the_crash_count(self):
+    def test_recovery_refusals_ask_for_the_time_a_relaunch_takes(self):
+        # Until the next bound on the relaunched engine's start: as long after
+        # its spawn as the engine before took to start, then the start retry
+        # window more; before the spawn as long after the later of now and
+        # the relaunch's due time, rounded up: at least 1 s, at most 59 s, the
+        # longest every SDK follows.
+        runtime = RecoveringRuntime()
+        backend = self.backend(runtime)
+        clock = [100.0]
+        with (
+            mock.patch.object(
+                backend_api, "time", SimpleNamespace(monotonic=lambda: clock[0])
+            ),
+            mock.patch.object(backend_api, "print_status"),
+        ):
+            runtime.last_start_seconds = 20.5
+            runtime.fail(backend)
+            self.assertEqual(backend.refusal().retry_after, 21)
+            # The engine before ignores SIGTERM and is still being stopped
+            # past a start's time: the whole start is still to come.
+            clock[0] += 25.0
+            self.assertEqual(backend.refusal().retry_after, 21)
+            # Ten seconds after the spawn, the rest of the start is left.
+            runtime.spawned_at = clock[0]
+            clock[0] += 10.0
+            self.assertEqual(backend.refusal().retry_after, 11)
+            # A spawned engine slower than the one before waits for memory,
+            # up to the start retry window more.
+            clock[0] += 20.0
+            self.assertEqual(backend.refusal().retry_after, 21)
+            self.relaunched(runtime, backend)
+            # The second relaunch in a row is due BACKOFF_BASE_SECONDS on.
+            runtime.fail(backend)
+            for start, retry_after in ((20.5, 26), (0.2, 6), (100.0, 59)):
+                runtime.last_start_seconds = start
+                self.assertEqual(backend.refusal().retry_after, retry_after)
+
+    def test_retry_after_past_the_expected_ready_covers_the_start_retry_window(self):
+        """A relaunch past its usual start waits for memory the host or Metal
+        refused, up to the start retry window (it said 1 s, and clients spent
+        their retries); past that, up to the start timeout."""
+        runtime = RecoveringRuntime()
+        backend = self.backend(runtime)
+        clock = [0.0]
+        with (
+            mock.patch.object(
+                backend_api, "time", SimpleNamespace(monotonic=lambda: clock[0])
+            ),
+            mock.patch.object(backend_api, "print_status"),
+        ):
+            runtime.last_start_seconds = 8.0
+            runtime.fail(backend)
+            runtime.spawned_at = 0.0
+            clock[0] = 9.0
+            self.assertEqual(backend.refusal().retry_after, 29)
+            clock[0] = 40.0
+            self.assertEqual(backend.refusal().retry_after, 59)
+
+    def test_full_window_of_service_resets_the_backoff(self):
         runtime = RecoveringRuntime()
         backend = self.backend(runtime)
         with mock.patch.object(backend_api, "print_status"):
             for _ in range(5):
                 runtime.fail(backend, served=61.0)
-                self.assertEqual(backend.failures, 1)
+                self.assertEqual(backend.policy.streak, 1)
                 self.assertLessEqual(backend.restart_due, time.monotonic())
                 self.relaunched(runtime, backend)
-        self.assertIsNone(backend.fatal_error)
+        self.assertIsNone(backend.stop_reason)
         self.assertEqual(runtime.startup_calls, 5)
 
     def test_failure_during_inflight_refresh_restarts_at_once(self):
@@ -194,137 +275,246 @@ class ServerRecoveryTests(HarnessTestCase):
             release.set()
             self.wait_until(lambda: runtime.startup_calls == 1, 0.5)
 
-    def test_failed_relaunch_counts_toward_the_crash_loop(self):
+    def test_relaunch_refused_for_host_memory_keeps_relaunching(self):
+        """A relaunch the host refuses memory backs off and relaunches again:
+        its retry runs no command (failed relaunches stopped at the third)."""
         runtime = RecoveringRuntime()
-        for reason in ("a", "b"):
-            runtime.outcomes.put(engine_runtime.EngineUnhealthy(reason))
+        host = wire.StartFailedEvent(
+            wire.StartFailureKind.HOST_MEMORY,
+            wire.ShortfallBound.DEVICE_MEMORY,
+            0,
+            0,
+            0,
+            b"the host has too little free memory to start",
+        )
+        for _ in range(3):
+            runtime.outcomes.put(engine_runtime.EngineStartFailed(host))
         backend = self.backend(runtime)
         with (
-            mock.patch.object(backend_api, "RESTART_BACKOFF_SECONDS", 0.01),
+            mock.patch.object(supervision, "BACKOFF_BASE_SECONDS", 0.01),
             mock.patch.object(backend_api, "print_status") as console,
         ):
             runtime.fail(backend, served=1.0)
-            self.wait_until(lambda: backend.fatal_error is not None)
-        self.assertEqual(runtime.startup_calls, 2)
-        self.assertIn("failed 3 times in a row", backend.fatal_error)
-        self.assertIn("(b)", backend.fatal_error)
+            self.wait_until(lambda: runtime.startup_calls == 4)
+            self.relaunched(runtime, backend)
+        self.assertIsNone(backend.stop_reason)
         self.assertEqual(
             [call.args[0] for call in console.call_args_list],
             [
                 "Engine failed · native protocol reached EOF",
-                "Engine restart failed · a",
-                "Engine restart failed · b",
-                f"Engine stopped · {backend.fatal_error}",
+                *[
+                    "Engine restart failed · the host has too little free memory "
+                    "to start"
+                ]
+                * 3,
+                "Engine restarted",
             ],
         )
+        self.assertIsNone(backend.refusal())
 
-    def test_changed_ready_limits_stop_restarting_at_once(self):
+    def stopped_by(self, outcome):
+        """The stop reason of a backend whose first relaunch ends with
+        `outcome`, and its console lines."""
+        runtime = RecoveringRuntime()
+        runtime.outcomes.put(outcome)
+        backend = self.backend(runtime)
+        with mock.patch.object(backend_api, "print_status") as console:
+            runtime.fail(backend, served=1.0)
+            self.wait_until(lambda: backend.stop_reason is not None)
+        self.assertEqual(runtime.startup_calls, 1)
+        refusal = backend.refusal()
+        self.assertEqual(
+            (refusal.status, refusal.code, refusal.message),
+            (500, "engine_failed", backend.stop_reason),
+        )
+        transport = backend.status()["transport"]
+        self.assertTrue(transport["stopped"])
+        self.assertFalse(transport["recovering"])
+        return backend.stop_reason, [call.args[0] for call in console.call_args_list]
+
+    def test_command_memory_start_failure_on_relaunch_stops(self):
+        """A relaunch whose start ran out of GPU memory another process holds
+        is not retried: a retry would take that memory from it (it was
+        retried twice more, then stopped)."""
+        reason, lines = self.stopped_by(
+            engine_runtime.EngineStartFailed(
+                wire.StartFailedEvent(
+                    wire.StartFailureKind.COMMAND_MEMORY,
+                    wire.ShortfallBound.DEVICE_MEMORY,
+                    0,
+                    0,
+                    0,
+                    b"a start command ran out of GPU memory",
+                )
+            )
+        )
+        self.assertEqual(
+            reason,
+            "the engine's start ran out of GPU memory another process holds "
+            "(another Splash server?); Splash stopped restarting it. Quit that "
+            "process, then restart the Splash server.",
+        )
+        self.assertEqual(lines[-1], f"Engine stopped · {reason}")
+
+    def test_configuration_start_failure_on_relaunch_stops(self):
+        reason, _ = self.stopped_by(
+            engine_runtime.EngineStartFailed(
+                wire.StartFailedEvent(
+                    wire.StartFailureKind.CONFIGURATION,
+                    wire.ShortfallBound.DEVICE_MEMORY,
+                    0,
+                    0,
+                    0,
+                    b"--kv-format bf16 is refused",
+                )
+            )
+        )
+        self.assertTrue(
+            reason.startswith(
+                "Splash stopped restarting the engine: --kv-format bf16 is refused. "
+            )
+        )
+        self.assertRegex(reason, "Crash trace|SPLASH_CRASH_TRACE")
+
+    def test_model_start_failure_on_relaunch_stops(self):
+        """A relaunch that finds the model's files it cannot serve is not
+        retried: every relaunch reads the same files (it was retried every
+        60 s for good)."""
+        reason, lines = self.stopped_by(
+            engine_runtime.EngineStartFailed(
+                wire.StartFailedEvent(
+                    wire.StartFailureKind.MODEL,
+                    wire.ShortfallBound.DEVICE_MEMORY,
+                    0,
+                    0,
+                    0,
+                    b"MODEL_DIRECTORY must name an existing directory",
+                )
+            )
+        )
+        self.assertEqual(
+            reason,
+            "the model's files can no longer be served (MODEL_DIRECTORY must name "
+            "an existing directory); Splash stopped restarting the engine. Restore "
+            "or reinstall the model, then restart the Splash server.",
+        )
+        self.assertEqual(lines[-1], f"Engine stopped · {reason}")
+
+    def test_missing_executable_on_relaunch_stops(self):
+        reason, _ = self.stopped_by(
+            engine_runtime.EngineLaunchFailed("native engine executable is missing")
+        )
+        self.assertIn("native engine executable is missing", reason)
+
+    def test_relaunch_serving_less_context_is_adopted(self):
+        """A relaunch whose plan holds less context serves that: the context
+        /v1/models and /status report and requests are checked against
+        follows it, and the server keeps serving (it stopped restarting at
+        once)."""
         factory = FakeFactory(handler=answer_status)
         runtime = engine_runtime.MultiplexedRuntime(
             process_factory=factory, eager_start=True
         )
         backend = self.backend(runtime)
-        factory.initial_output = native_peer.serialize_event(
-            wire.ReadyEvent(4, 65_536, False)
+        app = make_frontend(
+            FakeTokenizer(), backend, "test-model", 128, 1, 2, vision=False
         )
+        self.assertEqual(app.max_context, READY.max_context_tokens)
+        smaller = dataclasses.replace(READY, max_context_tokens=65_536)
+        factory.initial_output = native_peer.serialize_event(smaller)
         with (
             mock.patch.object(runtime._crash_trace, "dump"),
             mock.patch.object(backend_api, "print_status"),
         ):
             factory.processes[0].kill()
-            self.wait_until(lambda: backend.fatal_error is not None, 2)
-        self.assertEqual(len(factory.processes), 2)
-        # The runtime's error already says how to recover.
-        self.assertEqual(
-            backend.fatal_error,
-            "native context window, concurrency or vision changed; "
-            "restart the Splash server",
-        )
-        transport = backend.status()["transport"]
-        self.assertTrue(transport["stopped"])
-        self.assertFalse(transport["recovering"])
-        self.assertEqual(transport["error"], backend.fatal_error)
-        refusal = backend.refusal()
-        self.assertEqual((refusal.status, refusal.code), (500, "engine_failed"))
+            self.wait_until(
+                lambda: (
+                    len(factory.processes) == 2
+                    and runtime.ready
+                    and backend.recovery is None
+                ),
+                2,
+            )
+        self.assertIsNone(backend.stop_reason)
+        self.assertIsNone(backend.refusal())
+        self.assertEqual(app.max_context, 65_536)
+        self.assertEqual(app.status()["capabilities"], {"max_context_tokens": 65_536})
 
-    def test_relaunch_keeps_the_first_engines_context(self):
-        # Without --max-context a relaunch is asked to keep the context the
-        # first engine served, and one that does serves on. One that serves
-        # another, as once the Mac's memory budget shrank, still stops the
-        # restarts at once.
-        args = main_args()
-        first = tuple(api._native_command(args, args.model_root))
-        relaunch = (*first, "--relaunch-context", str(READY.max_context_tokens))
-        for relaunched, serves in (
-            (READY, True),
-            (dataclasses.replace(READY, max_context_tokens=65_536), False),
-        ):
-            with self.subTest(relaunched=relaunched):
-                factory = FakeFactory(handler=answer_status)
-                commands = []
+    def test_relaunch_asks_for_the_first_engines_context(self):
+        # A relaunch is asked for the context the first engine served, with
+        # --max-context as without, and serves what its plan holds of it. It
+        # keeps --max-context, so that it is planned as the first engine was.
+        for max_context in (None, 131072):
+            args = main_args(max_context=max_context)
+            first = tuple(api._native_command(args, args.model_root))
+            relaunch = (*first, "--relaunch-context", str(READY.max_context_tokens))
+            for relaunched in (
+                READY,
+                dataclasses.replace(READY, max_context_tokens=65_536),
+            ):
+                with self.subTest(max_context=max_context, relaunched=relaunched):
+                    factory = FakeFactory(handler=answer_status)
+                    commands = []
 
-                def spawn(command, factory=factory, commands=commands, **_options):
-                    commands.append(command)
-                    return factory()
+                    def spawn(command, factory=factory, commands=commands, **_):
+                        commands.append(command)
+                        return factory()
 
-                runtime = engine_runtime.MultiplexedRuntime(
-                    first,
-                    relaunch_command=lambda ready: api._native_command(
-                        args, args.model_root, ready.max_context_tokens
-                    ),
-                )
-                trace = mock.Mock(last_dump=None)
-                with (
-                    mock.patch.object(
-                        engine_runtime.subprocess, "Popen", side_effect=spawn
-                    ),
-                    mock.patch.object(runtime, "_crash_trace", trace),
-                    mock.patch.object(backend_api, "print_status"),
-                ):
-                    self.assertTrue(runtime.wait_ready(1))
-                    backend = self.backend(runtime)
-                    factory.initial_output = native_peer.serialize_event(relaunched)
-                    factory.processes[0].kill()
-                    self.wait_until(
-                        lambda: (
-                            backend.fatal_error is not None
-                            or (
+                    runtime = engine_runtime.MultiplexedRuntime(
+                        first,
+                        relaunch_command=lambda ready, args=args: api._native_command(
+                            args, args.model_root, ready.max_context_tokens
+                        ),
+                    )
+                    trace = mock.Mock(last_dump=None)
+                    with (
+                        mock.patch.object(
+                            engine_runtime.subprocess, "Popen", side_effect=spawn
+                        ),
+                        mock.patch.object(runtime, "_crash_trace", trace),
+                        mock.patch.object(backend_api, "print_status"),
+                    ):
+                        self.assertTrue(runtime.wait_ready(1))
+                        backend = self.backend(runtime)
+                        factory.initial_output = native_peer.serialize_event(relaunched)
+                        factory.processes[0].kill()
+                        self.wait_until(
+                            lambda: (
                                 len(factory.processes) == 2
                                 and runtime.ready
                                 and backend.recovery is None
-                            )
-                        ),
-                        2,
+                            ),
+                            2,
+                        )
+                    self.assertEqual(commands, [first, relaunch])
+                    # A crash trace of the relaunch replays its own command.
+                    self.assertEqual(
+                        [
+                            call.args[2]
+                            for call in trace.start_generation.call_args_list
+                        ],
+                        [first, relaunch],
                     )
-                self.assertEqual(commands, [first, relaunch])
-                # A crash trace of the relaunch replays its own command.
-                self.assertEqual(
-                    [call.args[2] for call in trace.start_generation.call_args_list],
-                    [first, relaunch],
-                )
-                if serves:
-                    self.assertIsNone(backend.fatal_error)
+                    self.assertIsNone(backend.stop_reason)
                     self.assertIsNone(backend.refusal())
-                    self.assertEqual(runtime.readiness, READY)
-                else:
-                    self.assertEqual(
-                        backend.fatal_error,
-                        "native context window, concurrency or vision changed; "
-                        "restart the Splash server",
-                    )
-                    refusal = backend.refusal()
-                    self.assertEqual(
-                        (refusal.status, refusal.code), (500, "engine_failed")
-                    )
+                    self.assertEqual(runtime.capabilities, relaunched)
 
-    def test_stop_after_failed_relaunches_names_the_last_crash_trace(self):
+    def test_stop_after_a_failed_relaunch_names_the_last_crash_trace(self):
         factory = FakeFactory()
+        configuration = wire.StartFailedEvent(
+            wire.StartFailureKind.CONFIGURATION,
+            wire.ShortfallBound.DEVICE_MEMORY,
+            0,
+            0,
+            0,
+            b"refused",
+        )
 
         def launch():
             process = factory()
             if len(factory.processes) > 1:
-                # Every relaunch fails before Ready.
-                process.close_stdout()
+                # The relaunch refuses its configuration.
+                process.send(configuration)
             return process
 
         runtime = engine_runtime.MultiplexedRuntime(
@@ -342,13 +532,12 @@ class ServerRecoveryTests(HarnessTestCase):
         backend = self.backend(runtime)
         with (
             mock.patch.object(runtime, "_crash_trace", trace),
-            mock.patch.object(backend_api, "RESTART_BACKOFF_SECONDS", 0.01),
             mock.patch.object(backend_api, "print_status"),
         ):
             factory.processes[0].kill()
-            self.wait_until(lambda: backend.fatal_error is not None, 2)
-        self.assertEqual(len(factory.processes), 3)
-        self.assertIn("Crash trace: /traces/g3.json.", backend.fatal_error)
+            self.wait_until(lambda: backend.stop_reason is not None, 2)
+        self.assertEqual(len(factory.processes), 2)
+        self.assertIn("Crash trace: /traces/g2.json.", backend.stop_reason)
 
     def test_failure_right_after_a_relaunch_ready_is_counted_once(self):
         factory = FakeFactory()
@@ -393,40 +582,252 @@ class ServerRecoveryTests(HarnessTestCase):
             [call.args[0] for call in console.call_args_list],
             ["Engine failed · native protocol reached EOF"] * 2,
         )
-        self.assertEqual(backend.failures, 2)
-        self.assertIsNone(backend.fatal_error)
+        self.assertEqual(backend.policy.streak, 2)
+        self.assertIsNone(backend.stop_reason)
 
-    def test_crash_that_stops_restarts_fails_its_request_without_retry(self):
-        factory = FakeFactory(handler=answer_status)
+    def quarantine_server(self, outcome):
+        """A backend over engines that answer each request with
+        `outcome(process, frame)`, relaunched without backoff to speak of."""
+        factory = FakeFactory(
+            handler=lambda process, message: (
+                answer_status(process, message),
+                isinstance(message, wire.RequestFrame) and outcome(process, message),
+            )
+        )
         runtime = engine_runtime.MultiplexedRuntime(
             process_factory=factory, eager_start=True
         )
         backend = self.backend(runtime)
-        job = make_job()
-        with (
-            mock.patch.object(backend_api, "RESTART_BACKOFF_SECONDS", 0.01),
+        for patch in (
+            mock.patch.object(supervision, "BACKOFF_BASE_SECONDS", 0.01),
             mock.patch.object(runtime._crash_trace, "dump"),
             mock.patch.object(backend_api, "print_status"),
         ):
-            for launched in (2, 3):
-                factory.processes[-1].kill()
-                self.wait_until(
-                    lambda: len(factory.processes) == launched and runtime.ready, 2
-                )
-            backend.submit(job)
-            factory.processes[-1].stdin.wait_for(wire.RequestFrame)
-            factory.processes[-1].close_stdout()
-            kind, error = job.events.get(timeout=1)
-        self.assertEqual(
-            (kind, error.status, error.code), ("error", 500, "engine_failed")
+            self.enterContext(patch)
+        return factory, runtime, backend
+
+    def outcome_of(self, backend, runtime, prompt):
+        """What a request for `prompt` gets once the engine serves."""
+        self.wait_until(lambda: runtime.ready and backend.recovery is None, 2)
+        job = make_job()
+        job.prompt_tokens = list(prompt)
+        backend.submit(job)
+        kind, value = job.events.get(timeout=2)
+        while kind not in ("done", "error"):
+            kind, value = job.events.get(timeout=2)
+        return kind, value
+
+    @staticmethod
+    def serve(process, frame):
+        process.send(wire.StartEvent(frame.request_id, 0, 0))
+        process.send(wire.TokensEvent(frame.request_id, 0, (4,)))
+        process.send(
+            wire.DoneEvent(
+                frame.request_id,
+                wire.FinishReason.STOP,
+                len(frame.prompt_tokens),
+                1,
+                100,
+                200,
+                350,
+                (),
+            )
         )
-        self.assertIn("failed 3 times in a row", error.message)
+
+    @staticmethod
+    def crash(code):
+        def fail(process, frame):
+            process.send(wire.StartEvent(frame.request_id, 0, 0))
+            process.send(
+                wire.ErrorEvent(
+                    wire.FailureClass.ENGINE_UNHEALTHY, 0, False, code, b"boom"
+                )
+            )
+
+        return fail
+
+    def test_a_request_started_at_two_engine_failures_in_a_row_is_refused(self):
+        """A request in flight at two engine failures in a row is refused
+        until the server restarts, without reaching the engine; another,
+        started only after the first relaunch, is served."""
+        poison = (1, 2, 3)
+        crash = self.crash(b"engine_execution_failed")
+        factory, runtime, backend = self.quarantine_server(
+            lambda process, frame: (
+                crash if frame.prompt_tokens == poison else self.serve
+            )(process, frame)
+        )
+        for _ in range(2):
+            kind, error = self.outcome_of(backend, runtime, poison)
+            self.assertEqual((kind, error.code), ("error", "runtime_unavailable"))
+        self.assertEqual(self.outcome_of(backend, runtime, (4, 5))[0], "done")
+        sent = len(factory.processes[-1].stdin.messages(wire.RequestFrame))
+        kind, error = self.outcome_of(backend, runtime, poison)
+        self.assertEqual(
+            (kind, error.status, error.code), ("error", 400, "request_quarantined")
+        )
+        self.assertIn("two engine failures in a row", error.message)
+        self.assertEqual(
+            len(factory.processes[-1].stdin.messages(wire.RequestFrame)), sent
+        )
+        self.assertEqual(self.outcome_of(backend, runtime, (4, 5))[0], "done")
+
+    def test_a_request_retried_through_failures_is_refused_before_they_stop(self):
+        """A request whose every run fails the engine, however often its client
+        retries it, is refused at its second failure, long before the failures
+        in a row would stop the relaunches."""
+        poison = (1, 2, 3)
+        crash = self.crash(b"engine_execution_failed")
+        factory, runtime, backend = self.quarantine_server(
+            lambda process, frame: (
+                crash if frame.prompt_tokens == poison else self.serve
+            )(process, frame)
+        )
+        outcomes = [
+            self.outcome_of(backend, runtime, poison)[1].code
+            for _ in range(supervision.CRASH_LOOP_FAILURES + 1)
+        ]
+        self.assertEqual(
+            outcomes,
+            ["runtime_unavailable"] * 2
+            + ["request_quarantined"] * (supervision.CRASH_LOOP_FAILURES - 1),
+        )
+        self.assertIsNone(backend.stop_reason)
         self.assertEqual(len(factory.processes), 3)
+        self.assertEqual(self.outcome_of(backend, runtime, (4, 5))[0], "done")
+
+    def test_a_request_started_at_one_failure_is_served_after_the_relaunch(self):
+        poison = (1, 2, 3)
+        crashes = [self.crash(b"engine_execution_failed")]
+        factory, runtime, backend = self.quarantine_server(
+            lambda process, frame: (
+                crashes.pop()
+                if frame.prompt_tokens == poison and crashes
+                else self.serve
+            )(process, frame)
+        )
+        self.assertEqual(self.outcome_of(backend, runtime, poison)[0], "error")
+        self.assertEqual(self.outcome_of(backend, runtime, poison)[0], "done")
+        self.assertEqual(len(factory.processes), 2)
+
+    def test_requests_started_at_two_kills_are_not_quarantined(self):
+        """A kill (jetsam's, the user's, the server's own fence) says nothing
+        about the requests in flight."""
+        poison = (1, 2, 3)
+
+        def start_then_die(process, frame):
+            process.send(wire.StartEvent(frame.request_id, 0, 0))
+            process.kill()
+
+        factory, runtime, backend = self.quarantine_server(
+            lambda process, frame: (
+                start_then_die if len(factory.processes) <= 2 else self.serve
+            )(process, frame)
+        )
+        for _ in range(2):
+            kind, error = self.outcome_of(backend, runtime, poison)
+            self.assertEqual((kind, error.code), ("error", "runtime_unavailable"))
+        self.assertEqual(self.outcome_of(backend, runtime, poison)[0], "done")
+
+    def test_a_request_started_at_two_fault_deaths_in_a_row_is_refused(self):
+        """An engine that dies by a fault signal ends its output before its
+        exit status is there to read: its failure counts once it has
+        exited."""
+        poison = (1, 2, 3)
+
+        def segfault(process, frame):
+            process.send(wire.StartEvent(frame.request_id, 0, 0))
+            process.crash(signal.SIGSEGV)
+
+        factory, runtime, backend = self.quarantine_server(
+            lambda process, frame: (
+                segfault if frame.prompt_tokens == poison else self.serve
+            )(process, frame)
+        )
+        for _ in range(2):
+            kind, error = self.outcome_of(backend, runtime, poison)
+            self.assertEqual((kind, error.code), ("error", "runtime_unavailable"))
+        kind, error = self.outcome_of(backend, runtime, poison)
+        self.assertEqual(
+            (kind, error.status, error.code), ("error", 400, "request_quarantined")
+        )
+        self.assertEqual(self.outcome_of(backend, runtime, (4, 5))[0], "done")
+
+    def test_requests_started_at_two_kills_mid_frame_are_not_quarantined(self):
+        """A kill that cuts a frame short breaks the protocol, and still says
+        nothing about the requests in flight: the signal decides."""
+        poison = (1, 2, 3)
+
+        def killed_mid_frame(process, frame):
+            process.send(wire.StartEvent(frame.request_id, 0, 0))
+            done = native_peer.serialize_event(
+                wire.DoneEvent(
+                    frame.request_id, wire.FinishReason.STOP, 3, 1, 100, 200, 350, ()
+                )
+            )
+            process.stdout.feed(done[: len(done) // 2])
+            process.kill()
+
+        factory, runtime, backend = self.quarantine_server(
+            lambda process, frame: (
+                killed_mid_frame if len(factory.processes) <= 2 else self.serve
+            )(process, frame)
+        )
+        for _ in range(2):
+            kind, error = self.outcome_of(backend, runtime, poison)
+            self.assertEqual((kind, error.code), ("error", "runtime_unavailable"))
+        self.assertEqual(self.outcome_of(backend, runtime, poison)[0], "done")
+        # Both failures were the frame cut short.
+        failures = [
+            call.args[0]
+            for call in backend_api.print_status.call_args_list
+            if call.args[0].startswith("Engine failed")
+        ]
+        self.assertEqual(len(failures), 2)
+        self.assertTrue(
+            all("stream ended after" in line for line in failures), failures
+        )
+
+    def test_a_queued_request_is_never_quarantined(self):
+        """A request the engine had not started was in no command."""
+        poison, queued = (1, 2, 3), (7, 8)
+        crash = self.crash(b"engine_execution_failed")
+        factory, runtime, backend = self.quarantine_server(
+            lambda process, frame: (
+                frame.prompt_tokens == poison and crash(process, frame)
+            )
+        )
+        for _ in range(2):
+            self.wait_until(lambda: runtime.ready and backend.recovery is None, 2)
+            waiting = make_job(201)
+            waiting.prompt_tokens = list(queued)
+            backend.submit(waiting)
+            factory.processes[-1].stdin.wait_for(wire.RequestFrame)
+            self.assertEqual(self.outcome_of(backend, runtime, poison)[0], "error")
+            self.assertEqual(waiting.events.get(timeout=2)[0], "error")
+        fingerprint = backend._generation_request(waiting).fingerprint
+        self.assertFalse(backend.quarantine.refuses(fingerprint))
+
+    def test_metal_out_of_memory_failures_do_not_count(self):
+        """A command short of GPU memory says nothing about the requests it
+        ran."""
+        poison = (1, 2, 3)
+        crash = self.crash(b"metal_out_of_memory")
+        factory, runtime, backend = self.quarantine_server(
+            lambda process, frame: (
+                crash if len(factory.processes) <= 2 else self.serve
+            )(process, frame)
+        )
+        for _ in range(2):
+            self.assertEqual(self.outcome_of(backend, runtime, poison)[0], "error")
+        self.assertEqual(self.outcome_of(backend, runtime, poison)[0], "done")
 
     def test_generation_recovery_rejects_before_body_or_ingress_and_advertises_retry(
         self,
     ):
         runtime = RecoveringRuntime()
+        # A relaunch is due now and takes as long as the engine before's start.
+        runtime.last_start_seconds = 20.0
         harness = self.harness(runtime, queue_size=1)
         runtime.fail(harness.backend)
         with mock.patch.object(harness.app, "prepare") as prepare:
@@ -448,7 +849,7 @@ class ServerRecoveryTests(HarnessTestCase):
                         connection.endheaders()
                         response = connection.getresponse()
                         self.assertEqual(response.status, status)
-                        self.assertEqual(response.getheader("Retry-After"), "1")
+                        self.assertEqual(response.getheader("Retry-After"), "20")
                         self.assertEqual(
                             json.loads(response.read())["error"]["type"],
                             "overloaded_error"
@@ -462,9 +863,12 @@ class ServerRecoveryTests(HarnessTestCase):
             prepare.assert_not_called()
         self.wait_until(lambda: runtime.startup_calls == 1)
         self.assertEqual(runtime.requests, [])
-        self.assertEqual(
-            harness.request("POST", "/v1/messages/count_tokens", self.body())[0], 200
-        )
+        for path, body in (
+            ("/v1/messages/count_tokens", self.body()),
+            ("/v1/chat/completions/count_tokens", chat_body()),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(harness.request("POST", path, body)[0], 200)
         self.assertEqual(harness.request("GET", "/v1/models")[0], 200)
 
     def test_successful_probe_clears_unanswered_status_and_engine_error(self):
@@ -498,16 +902,19 @@ class ServerRecoveryTests(HarnessTestCase):
             try:
                 self.assertTrue(plan.started.wait(1))
                 self.assertEqual(harness.server.requests.stats()["active"], 1)
-                status, _, payload = harness.request(
-                    "POST", "/v1/messages/count_tokens?beta=true", self.body()
-                )
-                self.assertEqual(status, 200)
-                self.assertEqual(json.loads(payload), {"input_tokens": 2})
-                self.assertEqual(len(runtime.requests), 1)
-                self.wait_until(
-                    lambda: harness.server.token_counts.stats()["active"] == 0
-                )
-                self.assertEqual(harness.server.requests.stats()["active"], 1)
+                for path, body in (
+                    ("/v1/messages/count_tokens?beta=true", self.body()),
+                    ("/v1/chat/completions/count_tokens", chat_body()),
+                ):
+                    with self.subTest(path=path):
+                        status, _, payload = harness.request("POST", path, body)
+                        self.assertEqual(status, 200)
+                        self.assertEqual(json.loads(payload), {"input_tokens": 2})
+                        self.assertEqual(len(runtime.requests), 1)
+                        self.wait_until(
+                            lambda: harness.server.token_counts.stats()["active"] == 0
+                        )
+                        self.assertEqual(harness.server.requests.stats()["active"], 1)
             finally:
                 plan.release.set()
             self.assertEqual(generation.result(1)[0], 200)
@@ -619,14 +1026,16 @@ class ServerRecoveryTests(HarnessTestCase):
                 answer_status(process, message)
 
         factory = FakeFactory(handler=answer_after_the_first)
-        runtime = engine_runtime.MultiplexedRuntime(
-            process_factory=factory, eager_start=True
-        )
-        backend = self.backend(runtime)
-        with (
-            mock.patch.object(engine_runtime, "STATUS_ANSWER_LIMIT_SECONDS", 0.05),
-            mock.patch.object(backend_api, "print_status") as console,
+        with mock.patch.object(
+            supervision,
+            "THRESHOLDS",
+            dataclasses.replace(supervision.THRESHOLDS, status_answer=0.05),
         ):
+            runtime = engine_runtime.MultiplexedRuntime(
+                process_factory=factory, eager_start=True
+            )
+            backend = self.backend(runtime)
+        with mock.patch.object(backend_api, "print_status") as console:
             # The probe's timeout owes a refresh, which goes unanswered too.
             self.assertFalse(backend.status()["ready"])
             self.wait_until(lambda: len(factory.processes) == 2 and runtime.ready, 2)
@@ -643,7 +1052,7 @@ class ServerRecoveryTests(HarnessTestCase):
 
         def launch():
             if factory.processes:
-                raise FileNotFoundError("splash")
+                raise OSError(12, "Cannot allocate memory")
             return factory()
 
         runtime = engine_runtime.MultiplexedRuntime(
@@ -656,13 +1065,16 @@ class ServerRecoveryTests(HarnessTestCase):
             transport = backend.status()["transport"]
         failed, restart = (call.args[0] for call in console.call_args_list[:2])
         self.assertEqual(failed, "Engine failed · native protocol reached EOF")
-        self.assertRegex(
-            restart, "^Engine restart failed · native engine executable is missing"
+        self.assertEqual(
+            restart,
+            "Engine restart failed · could not launch native engine: "
+            "[Errno 12] Cannot allocate memory",
         )
+        # A spawn may fail for want of memory; it backs off and retries.
         self.assertTrue(transport["recovering"])
-        self.assertIn("executable is missing", transport["error"])
+        self.assertIn("Cannot allocate memory", transport["error"])
 
-    def test_failed_restarts_end_in_one_stop_line(self):
+    def test_a_missing_executable_ends_in_one_stop_line(self):
         factory = FakeFactory()
 
         def launch():
@@ -674,20 +1086,16 @@ class ServerRecoveryTests(HarnessTestCase):
             process_factory=launch, eager_start=True
         )
         backend = self.backend(runtime)
-        with (
-            mock.patch.object(backend_api, "RESTART_BACKOFF_SECONDS", 0.01),
-            mock.patch.object(backend_api, "print_status") as console,
-        ):
+        with mock.patch.object(backend_api, "print_status") as console:
             factory.processes[0].kill()
-            self.wait_until(lambda: console.call_count >= 4)
+            self.wait_until(lambda: console.call_count >= 3)
         lines = [call.args[0] for call in console.call_args_list]
-        self.assertEqual(len(lines), 4)
+        self.assertEqual(len(lines), 3)
         self.assertEqual(lines[0], "Engine failed · native protocol reached EOF")
-        for line in lines[1:3]:
-            self.assertRegex(
-                line, "^Engine restart failed · native engine executable is missing"
-            )
-        self.assertEqual(lines[3], f"Engine stopped · {backend.fatal_error}")
+        self.assertRegex(
+            lines[1], "^Engine restart failed · native engine executable is missing"
+        )
+        self.assertEqual(lines[2], f"Engine stopped · {backend.stop_reason}")
         transport = backend.status()["transport"]
         self.assertTrue(transport["stopped"])
         self.assertFalse(transport["recovering"])
@@ -719,7 +1127,21 @@ class ServerRecoveryTests(HarnessTestCase):
                 )
                 backend = self.backend(runtime)
                 job = make_job()
-                with mock.patch.object(backend_api, "print_status") as console:
+                with (
+                    mock.patch.object(backend_api, "print_status") as console,
+                    # A start as long as a large model's, its relaunch not
+                    # spawned yet.
+                    mock.patch.object(
+                        engine_runtime.MultiplexedRuntime,
+                        "last_start_seconds",
+                        mock.PropertyMock(return_value=30.0),
+                    ),
+                    mock.patch.object(
+                        engine_runtime.MultiplexedRuntime,
+                        "spawned_at",
+                        mock.PropertyMock(return_value=None),
+                    ),
+                ):
                     backend.submit(job)
                     factory.processes[0].stdin.wait_for(wire.RequestFrame)
                     fail(factory.processes[0])
@@ -727,12 +1149,13 @@ class ServerRecoveryTests(HarnessTestCase):
                     self.wait_until(lambda: console.called)
                 self.assertEqual(kind, "error")
                 self.assertEqual(
-                    (error.status, error.code, error.message),
+                    (error.status, error.code, error.message, error.retry_after),
                     (
                         503,
                         "runtime_unavailable",
                         "the inference engine stopped unexpectedly and is "
                         "restarting; retry the request",
+                        30,
                     ),
                 )
                 # The engine's own reason stays on the console.
@@ -745,7 +1168,7 @@ class ServerRecoveryTests(HarnessTestCase):
         runtime.outcomes.put(engine_runtime.EngineUnhealthy("GPU is gone"))
         harness = self.harness(runtime)
         with (
-            mock.patch.object(backend_api, "RESTART_BACKOFF_SECONDS", 0.01),
+            mock.patch.object(supervision, "BACKOFF_BASE_SECONDS", 0.01),
             mock.patch.object(backend_api, "print_status") as console,
         ):
             runtime.fail(harness.backend)
@@ -784,11 +1207,12 @@ class ServerRecoveryTests(HarnessTestCase):
             ),
             (
                 native_peer.serialize_event(
-                    wire.ErrorEvent(
-                        wire.FailureClass.ENGINE_UNHEALTHY,
+                    wire.StartFailedEvent(
+                        wire.StartFailureKind.CONTEXT_BUDGET,
+                        wire.ShortfallBound.DEVICE_MEMORY,
                         0,
-                        False,
-                        b"bootstrap_failed",
+                        0,
+                        790_521,
                         refusal.encode(),
                     )
                 ),
@@ -805,6 +1229,7 @@ class ServerRecoveryTests(HarnessTestCase):
                         api.AutoTokenizer, "from_pretrained", return_value=object()
                     ),
                     mock.patch.object(api, "validate_tokenizer"),
+                    mock.patch.object(api, "thinking_end_tokens", return_value=None),
                     mock.patch.object(api, "ChatTemplates"),
                     mock.patch.object(
                         api.engine_runtime,
@@ -825,11 +1250,12 @@ class ServerRecoveryTests(HarnessTestCase):
                 self.assertNotIn("reached EOF", line)
                 self.assertIsNotNone(factory.processes[0].poll())
 
-    def test_restarted_native_must_match_the_original_ready_event(self):
+    def test_a_relaunch_is_served_as_it_announces(self):
+        """The runtime serves what the latest engine announces; it compares
+        nothing with the first engine's Ready."""
         for restarted in (
             READY,
             dataclasses.replace(READY, max_context_tokens=65536),
-            dataclasses.replace(READY, max_concurrent_requests=1),
             dataclasses.replace(READY, vision=True),
         ):
             with self.subTest(restarted=restarted):
@@ -838,27 +1264,14 @@ class ServerRecoveryTests(HarnessTestCase):
                     process_factory=factory, eager_start=True
                 )
                 try:
-                    self.assertEqual(runtime.readiness.max_context_tokens, 131072)
+                    self.assertEqual(runtime.capabilities, READY)
                     with mock.patch.object(runtime._crash_trace, "dump"):
                         factory.processes[0].kill()
                         self.wait_until(lambda: not runtime.ready)
                         factory.initial_output = native_peer.serialize_event(restarted)
-                        if restarted is READY:
-                            self.assertTrue(runtime.wait_ready(1))
-                        else:
-                            # The difference would recur on every relaunch.
-                            for _ in range(2):
-                                with self.assertRaisesRegex(
-                                    engine_runtime.EngineUnhealthy,
-                                    "restart the Splash server",
-                                ):
-                                    runtime.wait_ready(1)
-                            self.assertFalse(runtime.ready)
-                    self.assertEqual(runtime.pending_count, 0)
+                        self.assertTrue(runtime.wait_ready(1))
+                    self.assertEqual(runtime.capabilities, restarted)
                     self.assertEqual(len(factory.processes), 2)
-                    self.assertEqual(
-                        factory.processes[1].stdin.messages(wire.RequestFrame), []
-                    )
                 finally:
                     runtime.close()
 

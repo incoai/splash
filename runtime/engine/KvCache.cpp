@@ -68,6 +68,7 @@ BlockIdentity blockIdentity(uint64_t blockBegin, uint32_t blockTokens,
 }
 
 KvCache::~KvCache() noexcept {
+  pool_.observeActivity({});
   for (const auto &[_, entry] : blocks_) {
     if (entry.page == noPage)
       continue;
@@ -365,8 +366,15 @@ void KvCache::countState(uint64_t blockId, bool added, bool inUse) noexcept {
   reindex(found->second);
   countAbove(blockId, [&](Block &entry) {
     added ? ++entry.statesBelow : --entry.statesBelow;
-    if (inUse)
+    // The first state below a leaf, or in use below it, or the last, changes
+    // its kind.
+    bool kindChanged = entry.statesBelow == (added ? 1u : 0u);
+    if (inUse) {
       added ? ++entry.statesInUseBelow : --entry.statesInUseBelow;
+      kindChanged = kindChanged || entry.statesInUseBelow == (added ? 1u : 0u);
+    }
+    if (kindChanged)
+      placeLeaf(entry);
   });
   // The state's tail, a bounded walk beside the counts above.
   uint64_t id = blockId;
@@ -388,6 +396,8 @@ void KvCache::countState(uint64_t blockId, bool added, bool inUse) noexcept {
 void KvCache::countStateInUse(uint64_t blockId, bool added) noexcept {
   countAbove(blockId, [&](Block &entry) {
     added ? ++entry.statesInUseBelow : --entry.statesInUseBelow;
+    if (entry.statesInUseBelow == (added ? 1u : 0u))
+      placeLeaf(entry);
   });
 }
 
@@ -417,8 +427,6 @@ void KvCache::noteState(uint64_t blockId) { block(blockId).hadState = true; }
 
 bool KvCache::hadState(uint64_t blockId) const { return block(blockId).hadState; }
 
-bool KvCache::windowPinned(uint64_t blockId) const { return block(blockId).windowPins != 0; }
-
 bool KvCache::tailFull(uint64_t blockId) const {
   for (uint32_t index = 0; blockId && index < windowPages_; ++index) {
     const Block &entry = block(blockId);
@@ -436,30 +444,314 @@ std::optional<CacheEvictionCandidate> KvCache::trimCandidate(uint64_t after) con
   return trimmable_.next({after, block(after).lastUsed});
 }
 
-uint32_t KvCache::idlePagesOnChains(std::span<const uint64_t> blocks, kv::PageForm form) const {
-  std::unordered_set<uint64_t> visited;
-  uint32_t pages = 0;
-  for (uint64_t blockId : blocks) {
-    while (blockId && visited.insert(blockId).second) {
-      const Block &entry = block(blockId);
-      if (entry.page != noPage) {
-        // The request holding this page holds every page above it too.
-        if (pool_.pageActive(entry.page))
-          break;
-        if (entry.transfer == Transfer::None && entry.form == form)
-          ++pages;
-      }
-      // A disk-only block holds no page; the walk goes on above it.
-      blockId = entry.parent;
+KvCache::Keeps KvCache::keeps(uint64_t blockId) const { return block(blockId).keeps; }
+
+bool KvCache::trimmable(uint64_t blockId) const { return orders(block(blockId)).trimmable; }
+
+void KvCache::setStateMarks(uint64_t blockId, StateMarks state, bool inRam) noexcept {
+  const auto found = blocks_.find(blockId);
+  if (found == blocks_.end())
+    std::terminate();
+  Block &entry = found->second;
+  if (entry.state == state && entry.stateInRam == inRam)
+    return;
+  entry.state = state;
+  entry.stateInRam = inRam;
+  // Whether the state is in use, or in RAM, places the leaf too.
+  placeLeaf(entry);
+  rekeep(entry);
+}
+
+void KvCache::countWanted(uint64_t blockId, bool added) noexcept {
+  const auto found = blocks_.find(blockId);
+  if (found == blocks_.end() || (!added && !found->second.wanted))
+    std::terminate();
+  Block &entry = found->second;
+  added ? ++entry.wanted : --entry.wanted;
+  if (entry.wanted == (added ? 1u : 0u))
+    rekeep(entry);
+}
+
+void KvCache::moveResumePoint(uint64_t from, uint64_t to) noexcept {
+  if (const auto found = blocks_.find(from); from && found != blocks_.end()) {
+    found->second.resumePoint = false;
+    rekeep(found->second);
+  }
+  if (!to)
+    return;
+  const auto found = blocks_.find(to);
+  if (found == blocks_.end())
+    std::terminate();
+  found->second.resumePoint = true;
+  rekeep(found->second);
+}
+
+KvCache::Reasons KvCache::reasons(const Block &entry, const std::array<uint32_t, kKeeps> &children,
+                                  uint32_t neededChildren) const noexcept {
+  const bool resident = entry.page != noPage;
+  const bool active = resident && pool_.pageActive(entry.page);
+  Reasons result{.here = entry.state.keeps, .needed = entry.state.needed || neededChildren};
+  if (resident && (entry.transfer == Transfer::Filling || entry.activeUsers || active ||
+                   (entry.poisoned && !entry.residentChildren)))
+    result.here |= keepBit(Keep::Busy);
+  if (resident && entry.transfer == Transfer::Draining)
+    result.here |= keepBit(Keep::Moving);
+  if (resident && !entry.slot && result.needed)
+    result.here |= keepBit(Keep::Uncopied);
+  if (entry.wanted)
+    result.here |= keepBit(Keep::Wanted);
+  if (entry.resumePoint)
+    result.here |= keepBit(Keep::ResumePoint);
+  result.keeps = result.here;
+  for (size_t each = 0; each < kKeeps; ++each)
+    if (children[each])
+      result.keeps |= keepBit(static_cast<Keep>(each));
+  // The chains a reclaim keeps count no page from one a request holds up.
+  if (active)
+    result.keeps &= static_cast<Keeps>(~kChainKeeps);
+  if (resident) {
+    result.counted = keepCount(entry.form, result.keeps, !active && entry.transfer == Transfer::None);
+    if (entry.state.candidate)
+      result.candidate = result.keeps;
+  }
+  return result;
+}
+
+void KvCache::rekeep(Block &start) noexcept {
+  for (Block *entry = &start;;) {
+    const auto [here, keeps, needed, counted, candidate] = reasons(*entry, entry->keepChildren, entry->neededChildren);
+    entry->keepsHere = here;
+    if (candidate != entry->candidateCounted) {
+      if (entry->candidateCounted != noCount)
+        --candidateCounts_[entry->candidateCounted];
+      if (candidate != noCount)
+        ++candidateCounts_[candidate];
+      entry->candidateCounted = candidate;
+    }
+    if (counted != entry->counted) {
+      if (entry->counted != noCount)
+        --keepCounts_[entry->counted];
+      if (counted != noCount)
+        ++keepCounts_[counted];
+      entry->counted = counted;
+    }
+    const Keeps changed = keeps ^ entry->keeps;
+    const bool neededChanged = needed != entry->needed;
+    entry->keeps = keeps;
+    entry->needed = needed;
+    if ((!changed && !neededChanged) || !entry->parent)
+      return;
+    const auto parent = blocks_.find(entry->parent);
+    if (parent == blocks_.end())
+      std::terminate();
+    for (size_t each = 0; each < kKeeps; ++each)
+      if (const Keeps bit = keepBit(static_cast<Keep>(each)); changed & bit)
+        keeps & bit ? ++parent->second.keepChildren[each] : --parent->second.keepChildren[each];
+    if (neededChanged)
+      needed ? ++parent->second.neededChildren : --parent->second.neededChildren;
+    entry = &parent->second;
+  }
+}
+
+void KvCache::pageActivity(uint32_t page) noexcept {
+  if (const uint64_t id = page < blockOnPage_.size() ? blockOnPage_[page] : 0) {
+    const auto found = blocks_.find(id);
+    if (found == blocks_.end())
+      std::terminate();
+    rekeep(found->second);
+  }
+}
+
+void KvCache::forget(Block &entry) noexcept {
+  if (entry.counted != noCount)
+    --keepCounts_[entry.counted];
+  entry.counted = noCount;
+  if (entry.candidateCounted != noCount)
+    --candidateCounts_[entry.candidateCounted];
+  entry.candidateCounted = noCount;
+  if (entry.parent) {
+    const auto parent = blocks_.find(entry.parent);
+    if (parent == blocks_.end())
+      std::terminate();
+    for (size_t each = 0; each < kKeeps; ++each)
+      if (entry.keeps & keepBit(static_cast<Keep>(each)))
+        --parent->second.keepChildren[each];
+    if (entry.needed)
+      --parent->second.neededChildren;
+  }
+  entry.keeps = 0;
+  entry.needed = false;
+}
+
+KvCache::PageReach KvCache::pageReach(Keeps mask, std::span<const uint64_t> kept, std::span<const uint64_t> unwaited,
+                                      uint64_t written) const {
+  const PageReach reach = countReach(mask, kept, unwaited, written);
+  if (checkReaches_) {
+    const PageReach rule = reachByRule(mask, kept, unwaited, written);
+    if (reach != rule) {
+      const auto forms = [](const std::array<uint32_t, 3> &pages) {
+        return std::to_string(pages[0]) + "/" + std::to_string(pages[1]) + "/" + std::to_string(pages[2]);
+      };
+      throw std::logic_error("a reach's counts differ from its rule: now " + forms(reach.now) + " vs " +
+                             forms(rule.now) + ", written " + forms(reach.written) + " vs " + forms(rule.written) +
+                             ", reachable " + forms(reach.reachable) + " vs " + forms(rule.reachable) +
+                             ", candidates " + std::to_string(reach.candidates) + " vs " +
+                             std::to_string(rule.candidates));
     }
   }
+  return reach;
+}
+
+KvCache::PageReach KvCache::reachByRule(Keeps mask, std::span<const uint64_t> kept, std::span<const uint64_t> unwaited,
+                                        uint64_t written) const {
+  constexpr Keeps busy = keepBit(Keep::Busy);
+  const Keeps stays = static_cast<Keeps>(busy | (mask & kChainKeeps));
+  // Whether the block is one of `chains`' blocks or above one.
+  const auto on = [&](std::span<const uint64_t> chains, uint64_t id) {
+    for (const uint64_t last : chains)
+      for (uint64_t at = last; at; at = block(at).parent)
+        if (at == id)
+          return true;
+    return false;
+  };
+  PageReach reach;
+  for (const auto &[id, entry] : blocks_) {
+    if (entry.page == noPage)
+      continue;
+    const auto form = static_cast<size_t>(entry.form);
+    const bool idle = !pool_.pageActive(entry.page) && entry.transfer == Transfer::None;
+    const bool keptChain = on(kept, id), aboveWrite = on(unwaited, id);
+    const bool now = !(entry.keeps & mask) && !keptChain && !aboveWrite;
+    reach.now[form] += now ? 1 : 0;
+    reach.candidates += now && entry.state.candidate ? 1 : 0;
+    reach.reachable[form] += !(entry.keeps & (idle ? stays : busy)) && !(keptChain && idle) && !aboveWrite ? 1 : 0;
+  }
+  if (!written)
+    return reach;
+  // Once the written state has left RAM through its write: the reasons at
+  // each block and below it, its own write gone.
+  const Keeps kind = block(written).state.keeps & (keepBit(Keep::Writer) | keepBit(Keep::UsedWriter));
+  const auto after = [&](const auto &self, uint64_t id) -> Keeps {
+    const Block &entry = block(id);
+    Keeps keeps = id == written ? static_cast<Keeps>(entry.keepsHere & ~kind) : entry.keepsHere;
+    for (const uint64_t child : children(id))
+      keeps |= self(self, child);
+    if (entry.page != noPage && pool_.pageActive(entry.page))
+      keeps &= static_cast<Keeps>(~kChainKeeps);
+    return keeps;
+  };
+  // Up its chain while each block frees, it needing every block as a state
+  // on disk does: one without a copy stays where the walk keeps those.
+  bool uncopied = false;
+  for (uint64_t id = written; id; id = block(id).parent) {
+    const Block &entry = block(id);
+    uncopied = uncopied || !entry.slot;
+    const Keeps keeps = static_cast<Keeps>(after(after, id) | (uncopied ? keepBit(Keep::Uncopied) : 0));
+    if (entry.page == noPage || (keeps & mask) || on(kept, id) || on(unwaited, id))
+      break;
+    ++reach.written[static_cast<size_t>(entry.form)];
+  }
+  return reach;
+}
+
+KvCache::PageReach KvCache::countReach(Keeps mask, std::span<const uint64_t> kept, std::span<const uint64_t> unwaited,
+                                       uint64_t written) const {
+  constexpr Keeps busy = keepBit(Keep::Busy);
+  const Keeps chains = mask & kChainKeeps;
+  // What no reclaim of the walk reaches: a page nothing reaches below which
+  // something is busy, and an idle one on a chain the walk keeps. A page a
+  // write drains frees as the write lands, kept or not.
+  const Keeps stays = static_cast<Keeps>(busy | chains);
+  const auto reaches = [&](Keeps keeps, bool idle) { return !(keeps & (idle ? stays : busy)); };
+  PageReach reach;
+  for (unsigned keeps = 0; keeps < (1u << kKeeps); ++keeps) {
+    for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index})
+      for (const bool idle : {false, true}) {
+        const uint32_t pages = keepCounts_[keepCount(form, static_cast<Keeps>(keeps), idle)];
+        if (!(keeps & mask))
+          reach.now[static_cast<size_t>(form)] += pages;
+        if (reaches(static_cast<Keeps>(keeps), idle))
+          reach.reachable[static_cast<size_t>(form)] += pages;
+      }
+    if (!(keeps & mask))
+      reach.candidates += candidateCounts_[keeps];
+  }
+  // Up the chains of `kept`, which the walk keeps: an idle page stays, and
+  // none frees now; past a page a request holds, or one a chain `mask`
+  // names keeps, every block is so already. Then above each write no
+  // reclaim waits for, which holds every page above it until it lands, up
+  // to one something busy holds already. Each block counts out once.
+  std::unordered_set<uint64_t> passed, outOfReach, outOfNow;
+  const auto cut = [&](uint64_t id, bool keptChain) {
+    while (id) {
+      ++reachVisits_;
+      passed.insert(id);
+      const Block &entry = block(id);
+      if (entry.page != noPage) {
+        const bool idle = !pool_.pageActive(entry.page) && entry.transfer == Transfer::None;
+        if (entry.keeps & (keptChain ? stays : busy))
+          break;
+        const auto form = static_cast<size_t>(entry.form);
+        if (reaches(entry.keeps, idle) && (!keptChain || idle) && outOfReach.insert(id).second)
+          --reach.reachable[form];
+        if (!(entry.keeps & mask) && outOfNow.insert(id).second) {
+          --reach.now[form];
+          reach.candidates -= entry.state.candidate ? 1 : 0;
+        }
+      }
+      id = entry.parent;
+    }
+  };
+  for (const uint64_t state : kept)
+    cut(state, true);
+  for (const uint64_t moving : unwaited)
+    cut(moving, false);
+  if (!written)
+    return reach;
+  // Up the written state's chain while its blocks free once it has left RAM:
+  // its write no longer keeps them, and it needs a block without a copy as
+  // a state on disk does.
+  const Keeps kind = block(written).state.keeps & (keepBit(Keep::Writer) | keepBit(Keep::UsedWriter));
+  const auto kindIndex = static_cast<size_t>(kind == keepBit(Keep::Writer) ? Keep::Writer : Keep::UsedWriter);
+  if (!kind || !(kind & mask))
+    throw std::logic_error("the state a reach writes is no state its walk writes");
+  bool below = false, uncopied = false;
+  for (uint64_t id = written; id;) {
+    ++reachVisits_;
+    const Block &entry = block(id);
+    const bool writes =
+        (id != written && (entry.keepsHere & kind)) || entry.keepChildren[kindIndex] > (below ? 1u : 0u);
+    uncopied = uncopied || !entry.slot;
+    Keeps keeps = writes ? entry.keeps : static_cast<Keeps>(entry.keeps & ~kind);
+    if (uncopied)
+      keeps |= keepBit(Keep::Uncopied);
+    if (entry.page == noPage || (keeps & mask) || passed.contains(id))
+      break;
+    ++reach.written[static_cast<size_t>(entry.form)];
+    below = true;
+    id = entry.parent;
+  }
+  return reach;
+}
+
+std::array<uint32_t, 3> KvCache::keptPages(Keeps chains) const {
+  std::array<uint32_t, 3> pages{};
+  for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index})
+    for (unsigned keeps = 0; keeps < (1u << kKeeps); ++keeps)
+      if (keeps & chains)
+        pages[static_cast<size_t>(form)] += keepCounts_[keepCount(form, static_cast<Keeps>(keeps), true)];
   return pages;
 }
 
 bool KvCache::residentLeaf(uint64_t blockId) const {
   const Block &entry = block(blockId);
   return entry.page != noPage && !entry.residentChildren && !entry.activeUsers &&
-         !entry.held && entry.transfer == Transfer::None && !entry.poisoned;
+         !entry.held && !entry.poisoned;
+}
+
+bool KvCache::leafOnceChildrenLeave(uint64_t blockId) const {
+  const Block &entry = block(blockId);
+  return entry.page != noPage && !entry.activeUsers && !entry.held && !entry.poisoned;
 }
 
 void KvCache::setTransfer(uint64_t blockId, Transfer transfer) {
@@ -511,7 +803,8 @@ void KvCache::setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot) {
 
 void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot, kv::PageForm copyForm) {
   setForeignCopy(entry, false);
-  if (static_cast<bool>(entry.slot) != static_cast<bool>(slot)) {
+  const bool changed = static_cast<bool>(entry.slot) != static_cast<bool>(slot);
+  if (changed) {
     slot ? ++diskBlocks_ : --diskBlocks_;
     if (entry.held)
       slot ? ++heldCopies_ : --heldCopies_;
@@ -520,15 +813,21 @@ void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot, kv::P
     rewrites_ += std::exchange(entry.copied, true);
   entry.slot = std::move(slot);
   entry.copyForm = entry.slot ? copyForm : kv::PageForm::Full;
+  if (changed && copyChanged_)
+    copyChanged_(entry.id, entry.depth, entry.page, static_cast<bool>(entry.slot));
 }
 
 void KvCache::setForeignCopy(Block &entry, bool foreign) noexcept {
   if (entry.foreignCopy == foreign)
     return;
-  // Only a copy of what the page holds is active KV.
-  if (entry.held && entry.slot)
-    foreign ? --heldCopies_ : ++heldCopies_;
   entry.foreignCopy = foreign;
+  if (!entry.slot)
+    return;
+  // Only a copy of what the page holds is active KV.
+  if (entry.held)
+    foreign ? --heldCopies_ : ++heldCopies_;
+  if (copyChanged_)
+    copyChanged_(entry.id, entry.depth, entry.page, !foreign);
 }
 
 void KvCache::placeOnPage(Block &entry, uint32_t page) {
@@ -578,8 +877,6 @@ void KvCache::followPages(const KvPageMoves &moves) noexcept {
     entry.page = move.to;
     blockOnPage_[move.to] = id;
     const kv::PageForm form = pool_.form(move.to);
-    if (form == entry.form)
-      continue;
     indexBlocks_ += form == kv::PageForm::Index;
     indexBlocks_ -= entry.form == kv::PageForm::Index;
     entry.form = form;
@@ -659,11 +956,36 @@ void KvCache::poison(uint64_t blockId) {
   erasePoisonedLeaf(blockId);
 }
 
+std::optional<CacheEvictionCandidate> KvCache::oldestLeaf(uint32_t orders, uint64_t after) const {
+  const std::optional<CacheEvictionCandidate> last =
+      after ? std::optional(CacheEvictionCandidate{after, block(after).lastUsed}) : std::nullopt;
+  std::optional<CacheEvictionCandidate> oldest;
+  for (size_t order = 0; order < kLeafOrders; ++order) {
+    if (!(orders & 1u << order))
+      continue;
+    const RecencyOrder &leaves = leaves_[order];
+    const std::optional<CacheEvictionCandidate> candidate = last ? leaves.next(*last) : leaves.oldest();
+    if (candidate &&
+        (!oldest || std::pair{candidate->lastUsed, candidate->id} < std::pair{oldest->lastUsed, oldest->id}))
+      oldest = candidate;
+  }
+  return oldest;
+}
+
 std::optional<CacheEvictionCandidate>
 KvCache::evictionCandidate(uint64_t after) const {
-  if (!after)
-    return ramLeaves_.oldest();
-  return ramLeaves_.next({after, block(after).lastUsed});
+  return oldestLeaf((1u << kLeafOrders) - 1, after);
+}
+
+std::optional<CacheEvictionCandidate> KvCache::leafCandidate(const LeafWalk &walk, uint64_t after) const {
+  uint32_t orders = walk.dead ? 1u << leafOrder({.dead = true}) : 0;
+  for (const bool inRam : {false, true})
+    for (const bool copied : {false, true})
+      if (!walk.dead && (!inRam || walk.withStateInRam) && (inRam || copied || !walk.copiedOnly))
+        orders |= 1u << leafOrder({.inUse = walk.inUse, .stateInRam = inRam, .copied = copied});
+  const std::optional<CacheEvictionCandidate> oldest = oldestLeaf(orders, after);
+  leafVisits_ += oldest ? 1 : 0;
+  return oldest;
 }
 
 std::optional<CacheEvictionCandidate>
@@ -718,6 +1040,7 @@ void KvCache::erase(uint64_t blockId) {
   RecencyOrder::unlink(candidate.diskNode);
   RecencyOrder::unlink(candidate.unneededNode);
   RecencyOrder::unlink(candidate.trimNode);
+  forget(candidate);
   index_.erase(indexed);
   blocks_.erase(blockId);
   ++generation_;
@@ -758,16 +1081,16 @@ const KvCache::Block &KvCache::block(uint64_t blockId) const {
   return found->second;
 }
 
-// Resident leaves wait in one order, disk copies in another: redundant
-// copies of blocks whose page holds their K/V, Full or Slim, or the only
-// copies, of a spilled or disk-only block without children. In a persistent
-// cache the disk copies no state needs wait in a third as well: a redundant
-// one that no state on disk restores through, and the only one of a leaf
-// without a state. A block a request uses or holds, one in transfer, or a
-// poisoned one is in no order: quota never takes a copy active KV reads, nor
-// RAM reclaim a page a request holds. Active KV reads no copy of another
-// command's K/V, which waits as a redundant copy beside a page requests use
-// or hold.
+// Resident leaves wait in the order of their kind, disk copies in another:
+// redundant copies of blocks whose page holds their K/V, Full or Slim, or
+// the only copies, of a spilled or disk-only block without children. In a
+// persistent cache the disk copies no state needs wait in a third as well: a
+// redundant one that no state on disk restores through, and the only one of
+// a leaf without a state. A block a request uses or holds, one in transfer,
+// or a poisoned one is in no order: quota never takes a copy active KV
+// reads, nor RAM reclaim a page a request holds. Active KV reads no copy of
+// another command's K/V, which waits as a redundant copy beside a page
+// requests use or hold.
 KvCache::Orders KvCache::orders(const Block &entry) const noexcept {
   if (entry.transfer != Transfer::None || entry.poisoned)
     return {};
@@ -775,7 +1098,8 @@ KvCache::Orders KvCache::orders(const Block &entry) const noexcept {
   const bool paged = entry.page != noPage;
   const bool holdsKv = paged && entry.form != kv::PageForm::Index;
   Orders result;
-  result.ramLeaf = paged && !entry.residentChildren && !used;
+  if (paged && !entry.residentChildren && !used)
+    result.leaf = leafOrder(leafKind(entry));
   result.trimmable = windowPages_ && paged && entry.form == kv::PageForm::Full && !entry.windowPins;
   if (!entry.slot || (used && !entry.foreignCopy))
     return result;
@@ -785,14 +1109,29 @@ KvCache::Orders KvCache::orders(const Block &entry) const noexcept {
   return result;
 }
 
-void KvCache::reindex(Block &entry) noexcept {
+// A state at the leaf counts once StateCache counts its entry in
+// (statesHere): an entry that no longer holds a valid state stays only while
+// a lease pins it, which keeps the block in use, out of the leaves.
+KvCache::LeafKind KvCache::leafKind(const Block &entry) const noexcept {
+  if (!entry.statesHere && !entry.statesBelow)
+    return {.dead = true};
+  return {.inUse = (entry.state.keeps & keepBit(Keep::Used)) || entry.statesInUseBelow,
+          .stateInRam = entry.stateInRam,
+          .copied = entry.slot != nullptr};
+}
+
+void KvCache::placeLeaf(Block &entry) noexcept {
   RecencyOrder::unlink(entry.ramNode);
+  if (const std::optional<size_t> leaf = orders(entry).leaf)
+    leaves_[*leaf].link(entry.ramNode, entry.lastUsed, entry.id);
+}
+
+void KvCache::reindex(Block &entry) noexcept {
+  placeLeaf(entry);
   RecencyOrder::unlink(entry.diskNode);
   RecencyOrder::unlink(entry.unneededNode);
   RecencyOrder::unlink(entry.trimNode);
   const Orders placed = orders(entry);
-  if (placed.ramLeaf)
-    ramLeaves_.link(entry.ramNode, entry.lastUsed, entry.id);
   if (placed.trimmable)
     trimmable_.link(entry.trimNode, entry.lastUsed, entry.id);
   if (placed.duplicate)
@@ -801,9 +1140,12 @@ void KvCache::reindex(Block &entry) noexcept {
     diskLeaves_.link(entry.diskNode, entry.lastUsed, entry.id);
   if (placed.unneeded)
     unneeded_.link(entry.unneededNode, entry.lastUsed, entry.id);
+  rekeep(entry);
 }
 
-void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &stateOnDisk) const {
+void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &stateOnDisk,
+                              const std::function<Marks(uint64_t blockId)> &marks,
+                              const std::function<LeafKind(uint64_t blockId)> &walkKind) const {
   const auto check = [](bool holds, const char *what) {
     if (!holds)
       throw std::logic_error(std::string("KV cache invariant broken: ") + what);
@@ -921,11 +1263,70 @@ void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &state
                          blocks_, [&](const auto &each) { return placed(orders(each.second)); })),
           what);
   };
-  checkOrder(ramLeaves_, [](const Orders &in) { return in.ramLeaf; }, "the order of resident leaves");
+  // Each resident leaf waits in the order of its kind, the one a walk takes
+  // it as, and no other block in any.
+  size_t leaves = 0;
+  for (size_t order = 0; order < kLeafOrders; ++order)
+    for (auto member = leaves_[order].oldest(); member; member = leaves_[order].next(*member), ++leaves) {
+      const auto found = blocks_.find(member->id);
+      check(found != blocks_.end() && found->second.lastUsed == member->lastUsed &&
+                orders(found->second).leaf == order,
+            "the order of the resident leaves of a kind");
+      check(!walkKind || walkKind(member->id) == leafKind(found->second),
+            "a resident leaf's kind is the one a walk takes it as");
+    }
+  check(leaves == static_cast<size_t>(std::ranges::count_if(
+                      blocks_, [&](const auto &each) { return orders(each.second).leaf.has_value(); })),
+        "the orders of the resident leaves hold every resident leaf");
   checkOrder(duplicates_, [](const Orders &in) { return in.duplicate; }, "the order of redundant copies");
   checkOrder(diskLeaves_, [](const Orders &in) { return in.diskLeaf; }, "the order of only copies");
   checkOrder(unneeded_, [](const Orders &in) { return in.unneeded; }, "the order of copies no state needs");
   checkOrder(trimmable_, [](const Orders &in) { return in.trimmable; }, "the order of Full pages no tail holds");
+  // Each block's reasons to stay (Keep), recounted children before parents
+  // by the rule rekeep keeps them by (reasons): the children with each
+  // reason and those below which a state needs its KV, the block's reasons
+  // from those, and the resident blocks by form, reasons and idleness.
+  std::vector<const Block *> deepestFirst;
+  deepestFirst.reserve(blocks_.size());
+  for (const auto &[_, entry] : blocks_)
+    deepestFirst.push_back(&entry);
+  std::ranges::sort(deepestFirst, [](const Block *left, const Block *right) { return left->depth > right->depth; });
+  // Of each block, its children with each reason and those below which a
+  // state needs its KV.
+  struct Children final {
+    std::array<uint32_t, kKeeps> keeps{};
+    uint32_t needed = 0;
+  };
+  std::unordered_map<uint64_t, Children> withReason;
+  std::array<uint32_t, size_t{3} << (kKeeps + 1)> counts{};
+  std::array<uint32_t, size_t{1} << kKeeps> candidates{};
+  for (const Block *entry : deepestFirst) {
+    check(!marks || marks(entry->id) == Marks{.state = entry->state,
+                                              .stateInRam = entry->stateInRam,
+                                              .wanted = entry->wanted,
+                                              .resumePoint = entry->resumePoint},
+          "a block's marks: what its state asks of its KV, the waiting chains that end at it, the resume point");
+    const Children below = withReason[entry->id];
+    check(entry->keepChildren == below.keeps && entry->neededChildren == below.needed,
+          "a block counts its children with each reason");
+    const auto [here, keeps, needed, counted, candidate] = reasons(*entry, below.keeps, below.needed);
+    check(entry->keepsHere == here && entry->keeps == keeps && entry->needed == needed,
+          "a block's reasons to stay, at it and below it, and whether a state there needs its KV");
+    check(entry->counted == counted, "a block counts under its form, reasons and idleness");
+    if (counted != noCount)
+      ++counts[counted];
+    check(entry->candidateCounted == candidate, "a block with a RAM copy a reclaim may take counts under its reasons");
+    if (candidate != noCount)
+      ++candidates[candidate];
+    if (entry->parent) {
+      Children &parent = withReason[entry->parent];
+      for (size_t each = 0; each < kKeeps; ++each)
+        parent.keeps[each] += (keeps & keepBit(static_cast<Keep>(each))) ? 1 : 0;
+      parent.needed += needed ? 1 : 0;
+    }
+  }
+  check(counts == keepCounts_, "the counts of resident blocks by form, reasons and idleness");
+  check(candidates == candidateCounts_, "the counts of the RAM copies a reclaim may take by their blocks' reasons");
 }
 
 void KvCache::erasePoisonedLeaf(uint64_t blockId) noexcept {

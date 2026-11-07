@@ -97,7 +97,7 @@ and the chat-template probe tests over the embedded templates in
 ## Loading time
 
 Every start writes the weight images from their sources, and the first request
-after an idle release writes them again (DEVELOPMENT.md, Weight loading): a
+after an idle release writes them again (docs/internals.md, Weight loading): a
 start logs `Weights loaded in N s.`, a restore `Weights restored in N s`.
 Measured in October 2026 on an M5 Max (40 GPU cores, 64 GB), otherwise idle,
 from its internal SSD: the time that log reports, for one load in a process of

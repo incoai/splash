@@ -184,8 +184,8 @@ struct DFlashWindowCapture final {
 
 struct DFlashPrefillBuffers final {
   metal::MetalBuffer capturedTargetHidden;
-  // The split partials and counters of the context projections' chunks of
-  // up to a decode batch (Linear::addPrefill).
+  // The split partials and counters of the context projections' chunks the
+  // staged tile runs (Linear::addPrefill).
   ops::LinearScratch linearScratch;
   metal::MetalBuffer projected;
   metal::MetalBuffer hidden;
@@ -245,7 +245,7 @@ public:
   void addContextPrefill(metal::CommandGraph &graph,
                          DFlashPrefillBuffers buffers, uint32_t rows,
                          std::span<const DFlashPrefillSpan> spans,
-                         std::span<const DFlashWindowCapture> windowCaptures = {}) const;
+                         std::span<const DFlashWindowCapture> windowCaptures) const;
   // Computes the rings' keys and values of `rows` positions from
   // startPosition on again from the context window they were kept in, as
   // addContextPrefill writes them from their context rows. The rows pass

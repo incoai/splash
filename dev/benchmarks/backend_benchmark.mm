@@ -3,6 +3,7 @@
 #include "engine/Json.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "model/Runtime.hpp"
+#include "Supervision.hpp"
 #include "PrefillWork.hpp"
 #include "TranscriptPrompts.hpp"
 
@@ -479,10 +480,24 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
   return result;
 }
 
-// One reclaim pass evicts every unpinned entry and releases the extents it
-// empties.
+// In-service work's claim of the cache (MemoryLedger::free) for `need`:
+// whether it took something.
+bool claimCache(engine::Cache &resources, const engine::Need &need) {
+  engine::MemoryLedger ledger;
+  ledger.addSource(resources);
+  const engine::ClaimId claim =
+      ledger.open({.cls = engine::ClaimClass::InService, .reach = engine::ReclaimClass::InUse});
+  const engine::FreeResult freed = ledger.free(claim, need, 0, false);
+  ledger.close(claim);
+  return freed.gave();
+}
+
+// Claims of an extent's bytes until none takes anything: every unpinned
+// entry goes and the extents leave.
 void evictAllCache(engine::Cache &resources) {
-  static_cast<void>(resources.evictAll());
+  while (claimCache(resources, {.bytes = 1})) {
+  }
+  static_cast<void>(resources.releaseEmptyExtents(false));
   const engine::CacheSnapshot snapshot = resources.snapshot();
   if (snapshot.stateCache.entries || snapshot.pool.pagesPrefix)
     throw std::logic_error("native benchmark cache did not drain");
@@ -491,7 +506,7 @@ void evictAllCache(engine::Cache &resources) {
 // Evicts every cached state, one at a time, and leaves the KV graph intact.
 void evictAllCompositeState(engine::Cache &resources) {
   while (resources.snapshot().stateCache.entries) {
-    if (!resources.reclaimStateForLane(engine::ReclaimClass::InUse).madeProgress)
+    if (!claimCache(resources, {.stateBuffers = 1}))
       throw std::logic_error("native benchmark state cache made no progress");
   }
 }
@@ -779,10 +794,11 @@ struct BenchmarkScenarios final {
   bool context = true;
   bool exact = false;
   bool logits = false;
+  bool resume = false;
 };
 
 BenchmarkScenarios parseScenarios(std::string_view value) {
-  BenchmarkScenarios selected{false, false, false, false, false, false, false};
+  BenchmarkScenarios selected{false, false, false, false, false, false, false, false};
   for (;;) {
     const size_t comma = value.find(',');
     const std::string_view name = value.substr(0, comma);
@@ -793,6 +809,7 @@ BenchmarkScenarios parseScenarios(std::string_view value) {
                      : name == "context"     ? &selected.context
                      : name == "exact"       ? &selected.exact
                      : name == "logits"      ? &selected.logits
+                     : name == "resume"      ? &selected.resume
                                              : nullptr;
     if (!scenario)
       throw std::invalid_argument("unknown benchmark scenario");
@@ -879,7 +896,7 @@ int main(int argc, char **argv) {
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
                    "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
                    "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
-                   "  NAME: decode, partial, short, transcripts, context, exact or logits "
+                   "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
                    "(default: decode,partial,context)\n"
                    "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
                    "to run instead of calibrating one (0: GPU alone)\n"
@@ -941,8 +958,6 @@ int main(int argc, char **argv) {
       progress = std::make_unique<ProgressJournal>(*progressPath, samples);
 
     engine::RuntimeBootstrapConfig bootstrapConfig;
-    engine::RuntimeMetrics metrics;
-    bootstrapConfig.nativeLoop.metrics = &metrics;
     auto &config = bootstrapConfig.resources;
     config.metallibPath = std::filesystem::path(argv[1]);
     config.modelRoot = std::filesystem::path(argv[2]);
@@ -957,33 +972,37 @@ int main(int argc, char **argv) {
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
-    // Complete production warmup and memory audit before measuring. Retry
-    // host-capacity refusals while memory from the previous engine settles.
-    std::unique_ptr<engine::RuntimeBootstrap> bootstrap;
-    const auto memoryDeadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(180);
-    bool waitingAnnounced = false;
+    // Complete production warmup and memory audit before measuring. A start
+    // refused memory the host or Metal may give back, as while the previous
+    // engine's memory settles, retries as serve's does (main.mm): within the
+    // same window, opened at its first such refusal.
+    std::unique_ptr<engine::ServingRuntime> bootstrap;
+    engine::StartupRetryWindow recovery(supervision::kStartRetryWindow);
+    std::optional<AwakeClock::time_point> firstRefusal;
     while (!bootstrap) {
       try {
-        bootstrap = engine::RuntimeBootstrap::start(
-            bootstrapConfig, [](std::span<const uint8_t>) {},
-            []() -> std::string {
-              throw std::logic_error("benchmark does not accept native status requests");
-            });
+        bootstrap = engine::ServingRuntime::start(
+            bootstrapConfig, [](std::span<const uint8_t>) {}, [] { return 0.0; });
       } catch (const engine::RuntimeBootstrapError &error) {
-        if (error.report().resourceFailure !=
-                engine::RuntimeResourceFailure::HostCapacity ||
-            std::chrono::steady_clock::now() >= memoryDeadline)
+        const auto now = AwakeClock::now();
+        const auto retryUntil = recovery.retryUntil(error.report(), now);
+        if (!retryUntil)
           throw;
-        if (!waitingAnnounced) {
+        if (!firstRefusal) {
           std::cerr << "backend-benchmark: waiting for host memory to settle "
                        "before loading the model\n";
-          waitingAnnounced = true;
+          firstRefusal = now;
         }
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        std::this_thread::sleep_until(
+            std::min(now + engine::kStartupMemoryRecoveryPoll, *retryUntil));
       }
     }
-    // start() returns once the loop has announced Ready.
+    // How long the start waited for memory (0 without a refusal), which the
+    // report records: a wait near the window says the window is short.
+    const double startWaitMilliseconds =
+        firstRefusal ? std::chrono::duration<double, std::milli>(AwakeClock::now() - *firstRefusal).count()
+                     : 0.0;
+    bootstrap->announceReady();
     if (!bootstrap->nativeLoop().engineHealthy() ||
         bootstrap->nativeLoop().commandInFlight())
       throw std::runtime_error("benchmark production bootstrap did not finish idle and ready");
@@ -996,14 +1015,27 @@ int main(int argc, char **argv) {
     const uint32_t ranAneFfnMinimumRows = resources->aneFfnMinimumRows();
     auto *executor = &bootstrap->modelRuntime();
     const auto &cacheIdentity = resources->cacheIdentity();
-    const std::string identity =
-        "{\"model_root\":" + json::quote(modelRoot) +
-        ",\"loaded_model_layout_sha256\":" +
-        json::quote(cacheIdentity.modelLayoutSha256) + ",\"device\":" +
-        json::quote(resources->backend().capabilities().deviceName) + "}";
+    json::Writer writer;
+    writer.object([&] {
+      writer.field("model_root", modelRoot)
+          .field("loaded_model_layout_sha256", cacheIdentity.modelLayoutSha256)
+          .field("device", resources->backend().capabilities().deviceName);
+    });
+    const std::string identity = writer.str();
     if (progress)
       progress->identity(identity);
 
+    // These warmups run after serving began, and widths 2-4 each add a lane.
+    // They are lanes alone in service, which the engine passes through the
+    // host's margins allocation by allocation once nothing in place meets
+    // one; a warmup retries none, so like a start's warmup they run inside a
+    // Floor claim: only the engine's limit and macOS's critical pressure
+    // refuse what they allocate. Like a start's warmup too, they hold the KV
+    // runway they run on.
+    MemoryGovernor &governor = resources->memoryGovernor();
+    const ClaimId warmups = governor.ledger().open({.cls = ClaimClass::Floor});
+    std::optional<MemoryGovernor::Scope> warmupScope(std::in_place, governor, warmups);
+    std::optional<engine::KvPool::RunwayHold> runway(std::in_place, resources->kvPool());
     if (progress)
       progress->begin("warmup", "prefill_2048", 0,
                       model::ExecutionLimits::prefillTokenBudget);
@@ -1028,10 +1060,13 @@ int main(int argc, char **argv) {
       decodeWarmupGpu[width - 1] =
           executor->telemetry().lastDecodeGpuSeconds * 1000.0;
     }
+    runway.reset();
+    warmupScope.reset();
+    governor.ledger().close(warmups);
 
     Events events;
     engine::EngineConfig engineConfig;
-    engineConfig.maxContext = bootstrap->nativeLoop().snapshot().maximumContextTokens;
+    engineConfig.maxContext = bootstrap->nativeLoop().statusSnapshot().maximumContextTokens;
     engineConfig.vocabularySize = capabilities.vocabularySize;
     engine::connectToGovernor(engineConfig, resources->memoryGovernor());
     engine::Engine engine(engineConfig, resources->cache(),
@@ -1301,6 +1336,46 @@ int main(int argc, char **argv) {
       }
     }
 
+    // Resumes of a cached prefix that re-read a few rows, as a conversation's
+    // next turn does from the replay state of the turn before: a seed of a
+    // page and one token keeps its state at the page boundary, so a prompt of
+    // the seed and `suffix` more tokens re-reads suffix + 1 rows over the
+    // context of that boundary, 2K and 32K. Each context is seeded once; a
+    // resume's own states lie past the seed's last token, where the next
+    // resume's tokens differ.
+    if (selected.resume) {
+      constexpr std::array<uint32_t, 2> resumeContexts{2048, 32768};
+      constexpr std::array<uint32_t, 8> resumeSuffixes{4, 19, 31, 32, 35, 47, 55, 63};
+      for (const uint32_t context : resumeContexts) {
+        // The longest resume, and the token it generates, past what the
+        // memory plan holds on a Mac with less memory.
+        if (context + 1 + resumeSuffixes.back() + 1 >= engineConfig.maxContext) {
+          skippedLengths.push_back(context);
+          continue;
+        }
+        const std::vector<uint32_t> seed = prompt(context + 1, uint64_t{context} << 32 | 0x524553554dULL);
+        evictAllCache(resources->cache());
+        const Measurement seeded = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                                              "resume_seed_" + std::to_string(context), 0, seed);
+        if (seeded.cacheStatus != "miss")
+          throw std::runtime_error("resume seed was not a cold miss: " + seeded.cacheStatus);
+        for (uint32_t sample = 0; sample < samples; ++sample)
+          for (const uint32_t suffix : resumeSuffixes) {
+            std::vector<uint32_t> tokens = seed;
+            const std::vector<uint32_t> more =
+                prompt(suffix, (uint64_t{suffix} << 40) ^ (uint64_t{sample} << 32) ^ context ^ 0x5355464658ULL);
+            tokens.insert(tokens.end(), more.begin(), more.end());
+            Measurement result = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                                            "resume_" + std::to_string(context) + "_r" + std::to_string(suffix + 1),
+                                            sample, std::move(tokens));
+            if (result.cacheStatus != "prefix_hit" || result.matchedTokens != context)
+              throw std::runtime_error("resume of " + std::to_string(suffix + 1) + " rows matched " +
+                                       std::to_string(result.matchedTokens) + " tokens: " + result.cacheStatus);
+            measurements.push_back(std::move(result));
+          }
+      }
+    }
+
     // Cold prefills of one chunk of these rows, around where the prefill
     // FFN's Neural Engine split starts and where its program's functions step
     // (ops::AneFfn): a prompt of these tokens runs as one chunk, which
@@ -1496,7 +1571,8 @@ int main(int argc, char **argv) {
               << ",\"batch_width\":" << model::ExecutionLimits::maximumBatchWidth
               << ",\"kv_block_tokens\":"
               << kv::kPageTokens
-              << "},\"warmup\":{\"prefill_2048_wall_ms\":"
+              << "},\"start_wait_ms\":" << startWaitMilliseconds
+              << ",\"warmup\":{\"prefill_2048_wall_ms\":"
               << prefillWarmup.wallSeconds * 1000.0
               << ",\"prefill_2048_gpu_ms\":"
               << prefillWarmupGpuMilliseconds

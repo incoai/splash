@@ -1,6 +1,7 @@
 import array
-import gc
+import dataclasses
 import io
+import itertools
 import math
 import queue
 import random
@@ -16,6 +17,7 @@ from tokenizers import Tokenizer, decoders, models
 from dev.tests import native_peer
 from dev.tests.server_fixtures import (
     FOREVER,
+    READY,
     FakeFactory,
     FakeRuntime,
     byte_alphabet,
@@ -26,11 +28,12 @@ from dev.tests.server_fixtures import (
 )
 from server import backend as backend_api
 from server import constraints as generation_constraints
-from server import diagnostics, images, runtime
+from server import diagnostics, runtime
 from server import errors as api_errors
 from server import protocol as wire
-from server.chat_format import QWEN
-from server.runtime import STATUS_ANSWER_LIMIT_SECONDS
+from server.chat_format import FLINT, QWEN, THINK_END, THINK_START, TOOL_CALL_OPEN
+from server.output import MAX_STOP_CHARACTERS, ReasoningSplitter
+from server.supervision import THRESHOLDS
 
 
 class DigitTokenizer:
@@ -228,7 +231,7 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(constraint.mask_calls, [(), tuple(range(8))])
 
         with self.assertRaises(api_errors.ConstraintError):
-            generation_constraints.TokenConstraint(None, None, QWEN).masks(
+            generation_constraints.TokenConstraint(None, None, READY).masks(
                 tuple(range(9))
             )
 
@@ -343,7 +346,7 @@ class NativeBackendContractTests(unittest.TestCase):
             deadline=FOREVER,
         )
         self.assertEqual(
-            backend_api.remaining_request_time(job.deadline), threading.TIMEOUT_MAX
+            api_errors.remaining_request_time(job.deadline), threading.TIMEOUT_MAX
         )
 
         transport.submit(job)
@@ -505,43 +508,6 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(lines[0], "Started · input 4 · cached 0")
         self.assertTrue(lines[1].startswith("Done · input 4 · cached 0 · output 1"))
 
-    def test_finalized_request_returns_its_image_budget(self):
-        factory = FakeFactory()
-        transport, _runtime = self.make_transport(
-            runtime.MultiplexedRuntime(
-                process_factory=factory, pending_limit=4, eager_start=True
-            )
-        )
-        self.enterContext(mock.patch.object(images.ImageCache, "BUDGET_BYTES", 0))
-        self.enterContext(
-            mock.patch.object(images.ImageCache, "REQUEST_BUDGET_BYTES", 4)
-        )
-        cache = images.ImageCache()
-        job = make_job()
-        job.image_owner = cache.request_batch()
-        job.image_owner.append(images.PreparedImage(2, 2, b"abcd", 0, 0))
-        self.assertEqual(cache.stats()["request_bytes"], 4)
-
-        transport.submit(job)
-        process = factory.processes[0]
-        frame = process.stdin.wait_for(wire.RequestFrame)[0]
-        process.send(wire.StartEvent(frame.request_id, 0, 0))
-        process.send(
-            wire.DoneEvent(
-                frame.request_id, wire.FinishReason.STOP, 4, 0, 100, 200, 350, ()
-            )
-        )
-        self.assertEqual(self.terminal(job)[0], "done")
-        del job
-
-        # The done event precedes the finalizer dropping the request; the
-        # batch then hangs only on the state/call callback cycle.
-        deadline = time.monotonic() + 1.0
-        while cache.stats()["request_bytes"] and time.monotonic() < deadline:
-            gc.collect()
-            time.sleep(0.001)
-        self.assertEqual(cache.stats()["request_bytes"], 0)
-
     def test_inline_completion_cannot_leave_stale_active_job(self):
         transport, _runtime = self.make_transport(DrivenRuntime("complete_inline"))
         job = make_job()
@@ -649,9 +615,29 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(result.reason, "cancelled")
         self.assertEqual(constraint.finish_calls, 0)
 
+    def test_stop_sequence_end_skips_the_trailing_grammar_check(self):
+        constraint = FakeConstraint(
+            finish_error=api_errors.ConstraintError("invalid token")
+        )
+        transport, runtime = self.make_transport()
+        job = make_job(constraint=constraint)
+        job.stop_sequences = ("7",)
+        transport.submit(job)
+        call = runtime.calls[0]
+
+        call.emit(wire.TokensEvent(call.request_id, 0, (7,)))
+        call.complete(result=success_result(call, tokens=(7,)))
+
+        kind, result = self.terminal(job)
+        self.assertEqual(kind, "done")
+        self.assertEqual(result.reason, "stop")
+        self.assertEqual(result.stop_sequence, "7")
+        self.assertEqual((runtime.stop_count, runtime.cancel_count), (1, 0))
+        self.assertEqual(constraint.finish_calls, 0)
+
     def test_token_constraint_consumes_committed_batches_only_at_mask_or_finish(self):
         matcher = FakeMatcher()
-        constraint = generation_constraints.TokenConstraint(matcher, None, QWEN)
+        constraint = generation_constraints.TokenConstraint(matcher, None, READY)
         constraint.commit((7, 8))
         constraint.commit((9,))
         self.assertEqual(matcher.consumed, [])
@@ -739,6 +725,38 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual((error.status, error.code), (503, "server_shutdown"))
         self.assertFalse(transport.active)
 
+    def test_close_does_not_wait_for_a_frame_being_written(self):
+        # A writer stuck mid-frame holds the write lock for up to its write
+        # budget; shutdown fails the calls and stops the engine without it.
+        engine = runtime.MultiplexedRuntime(
+            process_factory=FakeFactory(), eager_start=True
+        )
+        engine._thresholds = dataclasses.replace(engine._thresholds, write_progress=3.0)
+        transport, _ = self.make_transport(engine)
+        job = make_job()
+        transport.submit(job)
+        writing = threading.Event()
+        written = threading.Event()
+
+        def writer():
+            with engine._write_lock:
+                writing.set()
+                written.wait(5)
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        self.assertTrue(writing.wait(1))
+        started = time.monotonic()
+        try:
+            transport.close()
+            elapsed = time.monotonic() - started
+        finally:
+            written.set()
+            thread.join(1)
+        self.assertLess(elapsed, 1)
+        kind, error = self.terminal(job)
+        self.assertEqual((kind, error.code), ("error", "server_shutdown"))
+
     def test_close_fails_stranded_call_without_hanging_http_waiter(self):
         runtime = DrivenRuntime(complete_on_close=False)
         transport, _runtime = self.make_transport(runtime)
@@ -779,6 +797,28 @@ class NativeBackendContractTests(unittest.TestCase):
         status = transport.status()
         self.assertFalse(status["ready"])
         self.assertIn("error", status["transport"])
+
+    def test_status_reads_a_number_the_engine_wrote_as_null(self):
+        # The engine writes a measurement that is not finite as null; a bare
+        # NaN is not JSON and would fail the whole document closed.
+        transport, runtime = self.make_transport()
+        runtime.status_event = native_peer.status_event(
+            loop={"max_tick_ms": None, "stall_budget_ms": 30000},
+            weights={"idle_release_seconds": None, "released": False},
+        )
+        status = transport.status()
+        self.assertTrue(status["ready"])
+        self.assertNotIn("error", status["transport"])
+        self.assertIsNone(status["loop"]["max_tick_ms"])
+        self.assertIsNone(status["weights"]["idle_release_seconds"])
+
+        runtime.status_event = wire.StatusJsonEvent(
+            1,
+            native_peer.status_event().json.replace(
+                b'"ready":true', b'"ready":true,"loop":{"max_tick_ms":NaN}'
+            ),
+        )
+        self.assertFalse(transport.status()["ready"])
 
     def test_status_adds_only_transport_accounting(self):
         transport, runtime = self.make_transport()
@@ -826,7 +866,7 @@ class NativeBackendContractTests(unittest.TestCase):
             )
             self.assertTrue(transport.is_ready())
 
-            clock[0] += STATUS_ANSWER_LIMIT_SECONDS
+            clock[0] += THRESHOLDS.status_answer
             status = transport.status(timeout=0.01)
             self.assertFalse(status["ready"])
             self.assertTrue(status["transport"]["status_stale"])
@@ -838,7 +878,9 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertTrue(transport.status()["ready"])
         native.mode = "status_timeout"
         with mock.patch.object(backend_api, "print_status"):
-            transport._engine_failed(runtime.EngineUnhealthy("gpu fault"), 120.0)
+            transport._engine_failed(
+                runtime.EngineUnhealthy("gpu fault"), 120.0, frozenset(), lambda: None
+            )
             # The relaunch succeeds; its status refresh is not answered.
             self.wait_for_recovery(transport)
         self.assertTrue(native.ready)
@@ -856,7 +898,12 @@ class NativeBackendContractTests(unittest.TestCase):
             if not answered:
                 answered.append(event)
                 native.ready = False
-                transport._engine_failed(runtime.EngineUnhealthy("gpu fault"), 120.0)
+                transport._engine_failed(
+                    runtime.EngineUnhealthy("gpu fault"),
+                    120.0,
+                    frozenset(),
+                    lambda: None,
+                )
             return decode(event)
 
         with (
@@ -932,7 +979,7 @@ class NativeBackendContractTests(unittest.TestCase):
             release.set()
             self.wait_for_recovery(transport)
             self.assertIsNone(transport.status_unanswered_since)
-            clock[0] += STATUS_ANSWER_LIMIT_SECONDS
+            clock[0] += THRESHOLDS.status_answer
             native.mode = "status_timeout_once"
             # One missed probe later on is a busy loop, not a wedged one.
             self.assertTrue(transport.status()["ready"])
@@ -958,7 +1005,7 @@ class NativeBackendContractTests(unittest.TestCase):
             self.assertTrue(transport.status()["ready"])
             self.wait_for_recovery(transport)
             self.assertIsNone(transport.status_unanswered_since)
-            clock[0] += STATUS_ANSWER_LIMIT_SECONDS
+            clock[0] += THRESHOLDS.status_answer
             self.assertTrue(transport.status()["ready"])
             self.wait_for_recovery(transport)
 
@@ -1198,6 +1245,119 @@ class CallbackStreamerTests(unittest.TestCase):
                 )
                 self.assertEqual(streamer.count_reasoning_tokens(QWEN, False, True), 0)
 
+    def test_reasoning_tokens_count_what_the_splitter_reads(self):
+        """The tokens count_reasoning_tokens counts decode to exactly the
+        reasoning ReasoningSplitter reads from the output's text, over random
+        outputs of THINK_START, THINK_END, a call's opening in one or two
+        tokens after TOOL_CALL_OPEN, a stray TOOL_CALL_OPEN no call follows,
+        and text: the server's two copies of where reasoning ends agree."""
+        # Qwen's generation prompt opens the reasoning, and its THINK_START
+        # is a token as any other; Flint's model opens it itself.
+        for chat_format, think_start in (
+            (QWEN, 248_068),
+            (FLINT, FLINT.think_start_id),
+        ):
+            texts = {
+                1: "a",
+                2: " b",
+                3: "\n",
+                4: "<function=",
+                5: "\n<function=",
+                6: "f>\n",
+                think_start: THINK_START,
+                chat_format.think_end_id: THINK_END,
+                chat_format.call_open_id: TOOL_CALL_OPEN,
+            }
+            tokenizer = SimpleNamespace(
+                backend_tokenizer=None,
+                decode=lambda ids, texts=texts: "".join(texts[token] for token in ids),
+            )
+            vocabulary = sorted(texts)
+            randomizer = random.Random(1175)
+            for _ in range(400):
+                token_ids = randomizer.choices(vocabulary, k=randomizer.randint(0, 10))
+                for thinking, tool_calls in itertools.product((False, True), repeat=2):
+                    streamer = backend_api.CallbackStreamer(tokenizer, lambda *_: None)
+                    streamer.token_ids = token_ids
+                    counted = streamer.count_reasoning_tokens(
+                        chat_format, thinking, tool_calls
+                    )
+                    # The model's own THINK_START opens the reasoning and is
+                    # not part of it.
+                    start = int(
+                        not thinking
+                        and chat_format.think_start_id is not None
+                        and token_ids[:1] == [chat_format.think_start_id]
+                    )
+                    splitter = ReasoningSplitter(thinking, tool_calls, chat_format)
+                    parts = [
+                        part
+                        for token in token_ids
+                        for part in splitter.put(texts[token])
+                    ] + splitter.finish()
+                    with self.subTest(
+                        chat_format=chat_format.message_boundary,
+                        token_ids=token_ids,
+                        thinking=thinking,
+                        tool_calls=tool_calls,
+                    ):
+                        self.assertEqual(
+                            tokenizer.decode(token_ids[start : start + counted]),
+                            "".join(
+                                text
+                                for kind, text in parts
+                                if kind == "reasoning_content"
+                            ),
+                        )
+
+    def test_a_stray_call_open_ends_the_engine_count_not_the_reasoning(self):
+        """Where a call may follow, the engine's thinking ends at the first
+        call-open token (ThinkingBudget.also_ends: it sees one token at a
+        time, and a longer end would change its cutoff kernel), the
+        reasoning only at one a call's opening follows. A stray TOOL_CALL_OPEN
+        ends the engine's count but not the reasoning, which can then run
+        past the budget, as docs/server.md says: a change to either side
+        fails here."""
+        transport = backend_api.NativeBackend(
+            DrivenRuntime(), DigitTokenizer(), lambda _record: None
+        )
+        self.addCleanup(transport.close)
+        job = make_job()
+        job.chat_format = QWEN
+        job.thinking_token_budget = 8
+        job.tool_policy = SimpleNamespace(schemas=("weather",))
+        budget = transport._thinking_budget(job)
+        texts = {
+            1: "a",
+            2: " b",
+            QWEN.call_open_id: TOOL_CALL_OPEN,
+            QWEN.think_end_id: THINK_END,
+        }
+        token_ids = [1, QWEN.call_open_id, 2, QWEN.think_end_id, 1]
+        engine = next(
+            index
+            for index, token in enumerate(token_ids)
+            if token in (budget.end[-1], budget.also_ends)
+        )
+        streamer = backend_api.CallbackStreamer(
+            SimpleNamespace(
+                backend_tokenizer=None,
+                decode=lambda ids: "".join(texts[token] for token in ids),
+            ),
+            lambda *_: None,
+        )
+        streamer.token_ids = token_ids
+        splitter = ReasoningSplitter(True, True, QWEN)
+        parts = [part for token in token_ids for part in splitter.put(texts[token])]
+        self.assertEqual(
+            (
+                engine,
+                streamer.count_reasoning_tokens(QWEN, True, True),
+                "".join(text for kind, text in parts if kind == "reasoning_content"),
+            ),
+            (1, 3, "a<tool_call> b"),
+        )
+
     def test_callback_streamer_matches_one_shot_for_random_token_batches(self):
         family = "👨‍👩‍👧‍👦".encode()
         cases = (
@@ -1302,6 +1462,38 @@ class CallbackStreamerTests(unittest.TestCase):
         self.assertEqual("".join(chunks), "alpha ")
         self.assertEqual(stopped, [True])
         self.assertEqual(streamer.stop_sequence, "<STOP>")
+
+        # Stops that overlap themselves and each other: the output ends where
+        # the earliest-starting stop begins, though a stop listed before it
+        # completes on the same token.
+        tokenizer = ByteLevelTestTokenizer([b"a", b"a", b"ab"])
+        chunks = []
+        streamer = backend_api.CallbackStreamer(tokenizer, chunks.append, ("ab", "aab"))
+        for token in tokenizer.token_ids:
+            streamer.put_tokens([token])
+        streamer.end()
+        self.assertEqual(("".join(chunks), streamer.stop_sequence), ("a", "aab"))
+
+    def test_callback_streamer_holds_two_long_stops_in_linear_time(self):
+        # The output runs deep into one stop as long as a request may carry
+        # while the other's every length is checked again: a rescan of every
+        # length on every token takes tens of seconds here.
+        length = MAX_STOP_CHARACTERS
+        tokenizer = ByteLevelTestTokenizer([b"a", b"Z"])
+        a, z = tokenizer.token_ids
+        chunks = []
+        streamer = backend_api.CallbackStreamer(
+            tokenizer, chunks.append, ("a" * length + "X", "b" * length + "Y")
+        )
+        started = time.monotonic()
+        for _ in range(length):
+            streamer.put_tokens([a])
+        self.assertEqual(chunks, [])
+        streamer.put_tokens([z])
+        streamer.end()
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual("".join(chunks), "a" * length + "Z")
+        self.assertIsNone(streamer.stop_sequence)
 
 
 if __name__ == "__main__":

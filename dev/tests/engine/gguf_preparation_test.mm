@@ -381,46 +381,61 @@ void checkQuantizedRouter(MetalBackend &backend, const std::filesystem::path &di
 // The MoE layer with BF16 or F16 alpha/beta: a BF16 pair stays one BF16
 // tensor of their rows as stored, which the float projection reads as it
 // reads their F32 values; preparation decodes an F16 pair on the GPU into
-// one F32 tensor of the values they equal.
+// one F32 tensor of the values they equal. Both at the target's width and
+// 320 values wide, whole Q8_0 blocks (its projections' format there) but
+// not whole 256-value blocks, which rows as stored need not be.
 void checkFloatAlphaBeta(MetalBackend &backend, const std::filesystem::path &directory) {
-  for (const Fmt f : {BF16, F16}) {
-    SmallTarget target = smallTarget(true);
-    const model::QwenTargetDimensions &g = target.geometry;
-    const auto path = directory / (std::string("moe-") + fmtName(f) + ".gguf");
-    const bool stored = f == BF16;
-    std::map<std::string, std::vector<uint8_t>> rows; // the BF16 rows as stored, or the F32 values of the F16 ones
-    uint32_t seed = 960;
-    for (const std::string name : {"blk.0.ssm_beta.weight", "blk.0.ssm_alpha.weight"}) {
-      Tensor &tensor = tensorNamed(target.tensors, name);
-      tensor.type = *ggufType(f);
-      tensor.data = fixture(f, g.gdnValueHeads, g.hiddenSize, ++seed);
-      std::vector<uint8_t> &values = rows[name];
-      if (stored) {
-        values = tensor.data;
-        continue;
+  for (const uint32_t hidden : {512u, 320u})
+    for (const Fmt f : {BF16, F16}) {
+      SmallTarget target = smallTarget(true);
+      model::QwenTargetDimensions &g = target.geometry;
+      if (hidden != g.hiddenSize) {
+        g.hiddenSize = hidden;
+        TensorTypes types;
+        for (const char *name : {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "ffn_gate_exps.weight",
+                                 "ffn_up_exps.weight", "ffn_down_exps.weight", "ffn_gate_shexp.weight",
+                                 "ffn_up_shexp.weight", "ffn_down_shexp.weight", "output.weight", "token_embd.weight"})
+          types[name] = kQ8_0;
+        target.tensors = targetTensors(g, types);
+        randomize(target.tensors, 1300);
       }
-      values.resize(uint64_t{g.gdnValueHeads} * g.hiddenSize * sizeof(float));
-      for (uint32_t row = 0; row < g.gdnValueHeads; ++row)
-        rowValues(f, tensor.data.data() + row * uint64_t{rowBytes(f, g.hiddenSize)}, g.hiddenSize,
-                  reinterpret_cast<float *>(values.data()) + uint64_t{row} * g.hiddenSize);
+      const std::string what = std::string(fmtName(f)) + " alpha/beta " + std::to_string(hidden) + " wide";
+      const auto path = directory / ("moe-" + std::string(fmtName(f)) + "-" + std::to_string(hidden) + ".gguf");
+      const bool stored = f == BF16;
+      std::map<std::string, std::vector<uint8_t>> rows; // the BF16 rows as stored, or the F32 values of the F16 ones
+      uint32_t seed = 960;
+      for (const std::string name : {"blk.0.ssm_beta.weight", "blk.0.ssm_alpha.weight"}) {
+        Tensor &tensor = tensorNamed(target.tensors, name);
+        tensor.type = *ggufType(f);
+        tensor.data = fixture(f, g.gdnValueHeads, g.hiddenSize, ++seed);
+        std::vector<uint8_t> &values = rows[name];
+        if (stored) {
+          values = tensor.data;
+          continue;
+        }
+        values.resize(uint64_t{g.gdnValueHeads} * g.hiddenSize * sizeof(float));
+        for (uint32_t row = 0; row < g.gdnValueHeads; ++row)
+          rowValues(f, tensor.data.data() + row * uint64_t{rowBytes(f, g.hiddenSize)}, g.hiddenSize,
+                    reinterpret_cast<float *>(values.data()) + uint64_t{row} * g.hiddenSize);
+      }
+      writeGguf(path, target.tensors, g);
+      const std::vector<model::gguf::Image> images = planned(path, g);
+      const auto *beta = copyOf(images[0], "blk.0.ssm_beta.weight");
+      const auto *alpha = copyOf(images[0], "blk.0.ssm_alpha.weight");
+      if (!beta || !alpha) throw std::runtime_error("the plan has no alpha/beta tensor");
+      const auto conversion = stored ? model::gguf::Conversion::None : model::gguf::Conversion::DequantizeToFloat32;
+      check(beta->conversion == conversion && alpha->conversion == conversion &&
+                alpha->destination == beta->destination + rows[beta->source.name].size(),
+            "planner makes " + what + " one " + (stored ? "BF16" : "F32") + " tensor");
+      const std::vector<uint8_t> image = preparedImages(backend, path, g).front();
+      const uint64_t rowSize = uint64_t{g.hiddenSize} * (stored ? sizeof(uint16_t) : sizeof(float));
+      std::vector<uint8_t> gates = orderedRows(rows[beta->source.name], rowSize, beta->source.order);
+      const auto alphaRows = orderedRows(rows[alpha->source.name], rowSize, alpha->source.order);
+      gates.insert(gates.end(), alphaRows.begin(), alphaRows.end());
+      check(slice(image, beta->destination, gates.size()) == gates,
+            "prepared " + what + ": " + (stored ? "their rows as stored" : "their F32 values") +
+                ", beta then alpha rows in grouped order");
     }
-    writeGguf(path, target.tensors, g);
-    const std::vector<model::gguf::Image> images = planned(path, g);
-    const auto *beta = copyOf(images[0], "blk.0.ssm_beta.weight"), *alpha = copyOf(images[0], "blk.0.ssm_alpha.weight");
-    if (!beta || !alpha) throw std::runtime_error("the plan has no alpha/beta tensor");
-    const auto conversion = stored ? model::gguf::Conversion::None : model::gguf::Conversion::DequantizeToFloat32;
-    check(beta->conversion == conversion && alpha->conversion == conversion &&
-              alpha->destination == beta->destination + rows[beta->source.name].size(),
-          std::string("planner makes ") + fmtName(f) + " alpha/beta one " + (stored ? "BF16" : "F32") + " tensor");
-    const std::vector<uint8_t> image = preparedImages(backend, path, g).front();
-    const uint64_t rowSize = uint64_t{g.hiddenSize} * (stored ? sizeof(uint16_t) : sizeof(float));
-    std::vector<uint8_t> gates = orderedRows(rows[beta->source.name], rowSize, beta->source.order);
-    const auto alphaRows = orderedRows(rows[alpha->source.name], rowSize, alpha->source.order);
-    gates.insert(gates.end(), alphaRows.begin(), alphaRows.end());
-    check(slice(image, beta->destination, gates.size()) == gates,
-          std::string("prepared ") + fmtName(f) + " alpha/beta: " +
-              (stored ? "their rows as stored" : "their F32 values") + ", beta then alpha rows in grouped order");
-  }
 }
 
 // The segments of a block projection of `n` x `k`, by output width.
@@ -485,7 +500,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
             std::string_view(weights.logitsProjection.blocks().segments.front().name()) == "q6k" &&
             weights.logitsProjection.destination == ops::FloatOutput::Float32,
         "GGUF target: logits a Q6_K block projection of vocabulary x hidden into fp32");
-  check(weights.tokenEmbedding.blocks().formatId == GGUF_FMT_IQ4XS &&
+  check(weights.tokenEmbedding.rows().formatId == GGUF_FMT_IQ4XS &&
             weights.tokenEmbedding.outputSize == layout.vocabularySize && weights.tokenEmbedding.inputSize == hidden,
         "GGUF target: token table IQ4_XS blocks of vocabulary x hidden");
   const std::array<uint32_t, 2> captured{1, layout.layers - 1};
@@ -920,7 +935,7 @@ void checkGgufNvfp4(MetalBackend &backend, const std::filesystem::path &director
     // A .scale beside a weight of another type, which llama.cpp would apply.
     std::vector<Tensor> beside = target.tensors;
     beside.push_back({"blk.0.ffn_gate.scale", {1}, 0, std::vector<uint8_t>{0x00, 0x00, 0x80, 0x3F}});
-    check(refusal(path, beside, g).find("blk.0.ffn_gate.scale scales a ") != std::string::npos,
+    check(refusal(path, beside, g).find("ffn_gate.scale (unused) in 1 layer") != std::string::npos,
           "a .scale tensor beside a weight of another type than NVFP4 is refused");
   }
 }

@@ -12,7 +12,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 COMPLETIONS = REPO / "install/completions"
-SUGGESTED = ("suggested/Model-4bit",)
+SUGGESTED = ("suggested/Model-GGUF:UD-Q4_K_M", "suggested/Model-4bit")
 LOCAL = ("community/custom-splash", "community/linked-splash")
 GGUF = ("unsloth/Model-GGUF:Q8_0", "unsloth/Model-GGUF:UD-Q4_K_M")
 UPSTREAM = (*GGUF, "mlx-community/Model-4bit")
@@ -91,13 +91,19 @@ class CompletionTests(unittest.TestCase):
         root = self.root / name
         directory = root / "install/completions"
         shutil.copytree(COMPLETIONS, directory)
-        (directory / "suggested-models.txt").write_text("\n".join(SUGGESTED) + "\n")
+        (root / "install/suggested-models.tsv").write_text(
+            "# MODEL<TAB>NAME<TAB>MEMORY<TAB>SIZE<TAB>ABOUT\n"
+            + "".join(
+                f"{model}\tModel\t24\t16\tFast all-rounder\n" for model in SUGGESTED
+            )
+        )
         if release:
             (root / "release.json").write_text("{}")
             models = self.home / "Library/Application Support/Splash/models"
         else:
             models = root / "install/models"
-        for model in (*SUGGESTED, LOCAL[0]):
+        # One suggested model is installed too, and is offered once.
+        for model in (SUGGESTED[1], LOCAL[0]):
             model_root = models / model
             model_root.mkdir(parents=True, exist_ok=True)
             (model_root / "model.json").write_text("{}")
@@ -224,6 +230,9 @@ class CompletionTests(unittest.TestCase):
                     sorted((*SUGGESTED, *LOCAL, *UPSTREAM)),
                 )
                 self.assertEqual(self.run_helper(directory, "unsloth/"), list(GGUF))
+                self.assertEqual(
+                    self.run_helper(directory, "suggested/"), sorted(SUGGESTED)
+                )
                 self.assertEqual(self.run_helper(directory, "community/l"), [LOCAL[1]])
                 self.assertEqual(self.run_helper(directory, "community/*"), [])
                 self.assertEqual(self.run_helper(directory, "["), [])

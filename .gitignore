@@ -9,4 +9,5 @@ install/profiles/
 __pycache__/
 .ruff_cache/
 dist/
+app/.build/
 install/download-token

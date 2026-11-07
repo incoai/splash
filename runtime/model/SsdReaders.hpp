@@ -11,7 +11,7 @@
 // in the background (start), on at most the readers it was given, and only
 // while no batch runs now, so a read ahead never delays a step's reads.
 // A reader takes the oldest background batch with room for it. While a
-// batch runs now, writes to the drive hold back (criticalBusy). The store
+// batch runs now, writes to the drive hold back (criticalBusyProbe). The store
 // that started a background batch ends it: finish() runs the rest of it
 // now, and stop() leaves the rest unread and returns once the tasks readers
 // took ended, the batch's first taken() tasks; halt() leaves the rest unread
@@ -46,9 +46,8 @@
 namespace splash::model {
 
 // The engine's readers: an SSD reads small pieces at full speed only with
-// many in flight (an M5 Pro reads 460 KiB pieces at 8.1 GB/s from four
-// threads and at 12.5 GB/s from sixteen, and random 4 KiB pieces 168K times
-// a second from sixteen and 230K from thirty-two, as the other Macs do).
+// many in flight (random 4 KiB pieces: 230K a second from thirty-two
+// threads on an M5 Pro, 168K from sixteen).
 inline constexpr unsigned kSsdReaders = 32;
 
 class SsdReaders final {
@@ -81,7 +80,12 @@ public:
     bool claim(size_t &index) noexcept;
     // Task `index` ended, `failure` if it failed.
     void end(size_t index, std::exception_ptr failure);
-    [[nodiscard]] bool exhausted() const noexcept { return next_.load(std::memory_order_relaxed) >= limit_; }
+    // The tasks no thread took yet.
+    [[nodiscard]] size_t left() const noexcept {
+      const size_t next = next_.load(std::memory_order_acquire), limit = limit_.load(std::memory_order_acquire);
+      return next < limit ? limit - next : 0;
+    }
+    [[nodiscard]] bool exhausted() const noexcept { return !left(); }
     void wait();
 
     const size_t count_;
@@ -139,10 +143,9 @@ public:
   void finish(Batch &batch);
 
   [[nodiscard]] unsigned readers() const noexcept { return static_cast<unsigned>(threads_.size()); }
-  // A batch runs now, from its start until its last task ended: a step waits
-  // for reads, which writes to the same drive yield to.
-  [[nodiscard]] bool criticalBusy() const noexcept { return running_->load(std::memory_order_acquire) != 0; }
-  // criticalBusy() for what may outlive the readers, a slot file's writes
+  // Whether a batch runs now, from its start until its last task ended: a
+  // step waits for reads, which writes to the same drive yield to. For what
+  // may outlive the readers, a slot file's writes
   // (model::SlotFile::Options::deferWrites): it shares their count of
   // batches running now and nothing else, so it keeps no reader alive, and
   // once they are gone it is false.

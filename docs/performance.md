@@ -27,7 +27,7 @@ grew with load: 3.8× at four concurrent 32K requests on the 35B. The
 [launch post](https://inco.ai/blog/splash/) has the method and the full
 comparison against oMLX, Lily, uzu, and Ollama.
 
-For repeatable measurements on your Mac, see [local benchmarks](../DEVELOPMENT.md#local-benchmarks).
+For repeatable measurements on your Mac, see [local benchmarks](validate.md#local-benchmarks).
 
 ## GGUF against llama.cpp
 
@@ -87,15 +87,15 @@ prompt is about 33K, and at 64K it compacted repeatedly and stopped), so serve
 the 27B with `--language-only` for them; with `--disable-ane` and
 `--max-cache-disk 0` as well it advertises 102,393 tokens.
 
-Splash grows its caches only while macOS reports no memory pressure and its
-spare memory, the free, file-backed and purgeable pages and half of what
+Splash grows into free memory only while macOS reports no memory pressure and
+its spare memory, the free, file-backed and purgeable pages and half of what
 compressing other applications would free, keeps a reserve of 7% of the Mac's
 memory (2 to 7 GiB) and a 1 GiB margin, 3 GiB on these Macs. It gives cached
-memory back when that memory runs short or macOS warns, but a request in service
-still takes the memory it needs within `--max-memory`, so these models leave
-other applications little room. A request that cannot get memory waits for it,
-and so does every request that arrived after it, except one of a higher
-priority. While an earlier request is at work, as one prefilling a prompt near
+memory back when that spare memory runs short of the margin, not for macOS's
+warning alone, but a request in service still takes the memory it needs within
+`--max-memory`, so these models leave other applications little room. A request that cannot get memory waits for it,
+and so do the requests of its priority or below that the scheduler would start
+after it. While an earlier request is at work, as one prefilling a prompt near
 the context limit can be for many minutes, they wait with no time limit; without
 one, the request refused memory fails after 30 s with `resource_timeout`: close
 memory-heavy applications, or serve with `--language-only`. To bound the wait,
@@ -104,7 +104,7 @@ long request too. A streaming request receives a keepalive every 2 s while it
 waits; a non-streaming one receives nothing until its answer, so a client's
 read timeout may end it first.
 Critical memory pressure can suspend a long request; the
-[SSD cache](../DEVELOPMENT.md#ssd-cache), on by default, keeps its progress and
+[SSD cache](server.md#ssd-cache), on by default, keeps its progress and
 cached prefixes, and writes whenever memory runs short: serving
 Ternary-Bonsai-2-27B PQ2_0 to six clients' mixed traffic for 30 minutes, a
 16 GiB SSD cache on the M6 wrote 26 GB, about 50 GB an hour, and read 36 GB.

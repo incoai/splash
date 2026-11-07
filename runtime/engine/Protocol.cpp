@@ -24,11 +24,12 @@ std::string_view frameTypeName(FrameType type);
 std::string_view failureClassName(FailureClass failureClass);
 
 constexpr std::array<uint8_t, 4> kMagic{'S', 'P', 'L', 'H'};
-constexpr uint64_t kCancelFixedBytes = 8;
+// Cancel and Stop: one u64 request id.
+constexpr uint64_t kRequestEndFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
 constexpr uint64_t kStatusRequestFixedBytes = 8;
 constexpr uint64_t kReleaseRequestFixedBytes = 8;
-constexpr uint64_t kReadyFixedBytes = 9;
+constexpr uint64_t kReadyFixedBytes = 21;
 constexpr uint64_t kStartFixedBytes = 16;
 constexpr uint64_t kPromptProgressFixedBytes = 20;
 constexpr uint64_t kTokensFixedBytes = 16;
@@ -36,6 +37,7 @@ constexpr uint64_t kMaskRequestFixedBytes = 24;
 constexpr uint64_t kDoneFixedBytes = 62;
 constexpr uint64_t kErrorFixedBytes = 22;
 constexpr uint64_t kStatusJsonFixedBytes = 8;
+constexpr uint64_t kStartFailedFixedBytes = 26;
 
 struct PayloadBounds {
   uint64_t minimum = 0;
@@ -79,7 +81,8 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
     // Image pixels dominate prompt tokens; the frame limit is the bound.
     return bounded(kRequestFixedBytes, limits.maxFramePayloadBytes);
   case FrameType::Cancel:
-    return bounded(kCancelFixedBytes, kCancelFixedBytes);
+  case FrameType::Stop:
+    return bounded(kRequestEndFixedBytes, kRequestEndFixedBytes);
   case FrameType::MaskResponse:
     if (!checkedMultiply(limits.maxMaskWords, sizeof(uint32_t), variable) ||
         !checkedAdd(kMaskResponseFixedBytes, variable, maximum)) {
@@ -129,6 +132,7 @@ bool clientFrameType(uint16_t raw, FrameType &type) {
   case FrameType::MaskResponse:
   case FrameType::StatusRequest:
   case FrameType::ReleaseRequest:
+  case FrameType::Stop:
     type = static_cast<FrameType>(raw);
     return true;
   default:
@@ -390,13 +394,6 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
   return std::nullopt;
 }
 
-std::optional<ProtocolIssue> validateCancel(const CancelFrame &cancel) {
-  if (cancel.requestId)
-    return std::nullopt;
-  return requestIssue(IssueCode::InvalidRequestId, 0,
-                      "cancel request id must be non-zero");
-}
-
 std::optional<ProtocolIssue>
 validateMaskResponse(const MaskResponseFrame &response,
                      const ProtocolLimits &limits) {
@@ -419,10 +416,16 @@ ProtocolIssue invalidEvent(IssueCode code, uint64_t requestId,
 }
 
 std::optional<ProtocolIssue> validateReady(const ReadyEvent &event) {
-  if (event.maxConcurrentRequests && event.maxContextTokens)
-    return std::nullopt;
-  return invalidEvent(IssueCode::InvalidCount, 0,
-                      "ready event capacities must be non-zero");
+  if (!event.maxConcurrentRequests || !event.maxContextTokens ||
+      !event.vocabularySize || !event.maskRows || event.stopTokens.empty())
+    return invalidEvent(IssueCode::InvalidCount, 0,
+                        "ready event capacities and stop tokens must be "
+                        "non-zero");
+  for (uint32_t token : event.stopTokens)
+    if (token >= event.vocabularySize)
+      return invalidEvent(IssueCode::InvalidCount, 0,
+                          "ready event stop token is outside the vocabulary");
+  return std::nullopt;
 }
 
 std::optional<ProtocolIssue> validateStart(const StartEvent &event) {
@@ -562,6 +565,27 @@ std::optional<ProtocolIssue> validateError(const ErrorEvent &event,
   return std::nullopt;
 }
 
+std::optional<ProtocolIssue>
+validateStartFailed(const StartFailedEvent &event,
+                    const ProtocolLimits &limits) {
+  using Kind = StartFailureKind;
+  using Bound = ShortfallBound;
+  if (!validEnum(static_cast<uint8_t>(event.kind),
+                 {Kind::Internal, Kind::HostMemory, Kind::DriverAllocation,
+                  Kind::MemoryBudget, Kind::ContextBudget, Kind::Configuration,
+                  Kind::Model, Kind::Device, Kind::CommandMemory}) ||
+      !validEnum(static_cast<uint8_t>(event.shortfall.bound),
+                 {Bound::DeviceMemory, Bound::MaxMemory, Bound::Disk})) {
+    return invalidEvent(IssueCode::InvalidEnumValue, 0,
+                        "start failure kind or bound is invalid");
+  }
+  if (event.message.size() > limits.maxErrorStringBytes) {
+    return invalidEvent(IssueCode::LimitExceeded, 0,
+                        "start failure message exceeds its safe limit");
+  }
+  return std::nullopt;
+}
+
 std::optional<ProtocolIssue> validateStatusJson(const StatusJsonEvent &event,
                                                 const ProtocolLimits &limits) {
   if (event.json.empty() || event.json.size() > limits.maxStatusJsonBytes) {
@@ -573,13 +597,24 @@ std::optional<ProtocolIssue> validateStatusJson(const StatusJsonEvent &event,
 
 using EncodedEvent = ProtocolResult<std::vector<uint8_t>>;
 
+EncodedEvent encodeWarming() {
+  return success(frameWriter(FrameType::Warming, 0).take());
+}
+
 EncodedEvent encodeReady(const ReadyEvent &event) {
   if (auto issue = validateReady(event))
     return failure<std::vector<uint8_t>>(std::move(*issue));
-  Writer writer = frameWriter(FrameType::Ready, kReadyFixedBytes);
+  Writer writer =
+      frameWriter(FrameType::Ready,
+                  kReadyFixedBytes + event.stopTokens.size() * sizeof(uint32_t));
   writer.u32(event.maxConcurrentRequests);
   writer.u32(event.maxContextTokens);
   writer.u8(event.vision);
+  writer.u32(event.vocabularySize);
+  writer.u32(event.maskRows);
+  writer.u32(static_cast<uint32_t>(event.stopTokens.size()));
+  for (uint32_t token : event.stopTokens)
+    writer.u32(token);
   return success(writer.take());
 }
 
@@ -675,6 +710,22 @@ EncodedEvent encodeError(const ErrorEvent &event,
   writer.u32(static_cast<uint32_t>(event.code.size()));
   writer.u32(static_cast<uint32_t>(event.message.size()));
   writer.text(event.code);
+  writer.text(event.message);
+  return success(writer.take());
+}
+
+EncodedEvent encodeStartFailed(const StartFailedEvent &event,
+                               const ProtocolLimits &limits) {
+  if (auto issue = validateStartFailed(event, limits))
+    return failure<std::vector<uint8_t>>(std::move(*issue));
+  Writer writer = frameWriter(FrameType::StartFailed,
+                              kStartFailedFixedBytes + event.message.size());
+  writer.u8(static_cast<uint8_t>(event.kind));
+  writer.u8(static_cast<uint8_t>(event.shortfall.bound));
+  writer.u64(event.shortfall.requiredBytes);
+  writer.u64(event.shortfall.budgetBytes);
+  writer.u32(event.shortfall.planContextTokens);
+  writer.u32(static_cast<uint32_t>(event.message.size()));
   writer.text(event.message);
   return success(writer.take());
 }
@@ -795,18 +846,22 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
   return success(ClientMessage{std::move(request)});
 }
 
-ProtocolResult<ClientMessage> decodeCancel(const Frame &frame) {
+// Cancel and Stop: a payload of one non-zero u64 request id.
+template <typename RequestEnd>
+ProtocolResult<ClientMessage> decodeRequestEnd(const Frame &frame) {
+  const std::string name(frameTypeName(frame.type));
   Reader reader(frame.payload);
-  CancelFrame cancel;
-  if (!reader.u64(cancel.requestId) || reader.remaining()) {
+  RequestEnd end;
+  if (!reader.u64(end.requestId) || reader.remaining()) {
     return failure<ClientMessage>(
         makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
-                  0, "cancel payload has an invalid length"));
+                  0, name + " payload has an invalid length"));
   }
-  if (auto issue = validateCancel(cancel)) {
-    return failure<ClientMessage>(std::move(*issue));
+  if (!end.requestId) {
+    return failure<ClientMessage>(requestIssue(
+        IssueCode::InvalidRequestId, 0, name + " request id must be non-zero"));
   }
-  return success(ClientMessage{cancel});
+  return success(ClientMessage{end});
 }
 
 ProtocolResult<ClientMessage> decodeMaskResponse(const Frame &frame,
@@ -873,6 +928,8 @@ std::string_view frameTypeName(FrameType type) {
     return "status_request";
   case FrameType::ReleaseRequest:
     return "release_request";
+  case FrameType::Stop:
+    return "stop";
   case FrameType::Ready:
     return "ready";
   case FrameType::PromptProgress:
@@ -889,6 +946,10 @@ std::string_view frameTypeName(FrameType type) {
     return "error";
   case FrameType::StatusJson:
     return "status_json";
+  case FrameType::StartFailed:
+    return "start_failed";
+  case FrameType::Warming:
+    return "warming";
   }
   return "unknown";
 }
@@ -999,13 +1060,15 @@ ProtocolResult<ClientMessage> decodeFrame(Frame &&frame,
     case FrameType::Request:
       return decodeRequest(std::move(frame.payload), limits);
     case FrameType::Cancel:
-      return decodeCancel(frame);
+      return decodeRequestEnd<CancelFrame>(frame);
     case FrameType::MaskResponse:
       return decodeMaskResponse(frame, limits);
     case FrameType::StatusRequest:
       return decodeStatusRequest(frame);
     case FrameType::ReleaseRequest:
       return decodeReleaseRequest(frame);
+    case FrameType::Stop:
+      return decodeRequestEnd<StopFrame>(frame);
     default:
       break;
     }
@@ -1043,6 +1106,10 @@ serializeEvent(const EngineEvent &event, const ProtocolLimits &limits) {
             return encodeDone(value);
           } else if constexpr (std::is_same_v<T, ErrorEvent>) {
             return encodeError(value, limits);
+          } else if constexpr (std::is_same_v<T, StartFailedEvent>) {
+            return encodeStartFailed(value, limits);
+          } else if constexpr (std::is_same_v<T, WarmingEvent>) {
+            return encodeWarming();
           } else {
             return encodeStatusJson(value, limits);
           }

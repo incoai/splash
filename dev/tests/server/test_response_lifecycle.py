@@ -11,6 +11,7 @@ from unittest import mock
 
 from dev.tests import server_fixtures as fixtures
 from server import frontend
+from server.dialects import responses as responses_dialect
 
 
 class ResponseLifecycleTests(unittest.TestCase):
@@ -77,7 +78,8 @@ class ResponseLifecycleTests(unittest.TestCase):
         harness.app.response_store.put(
             {"id": "resp_previous"}, [{"role": "user", "content": "old history"}]
         )
-        job = harness.app.prepare_responses(
+        job, conversation = responses_dialect.prepare(
+            harness.app,
             {
                 "input": "continue",
                 "previous_response_id": "resp_previous",
@@ -87,8 +89,9 @@ class ResponseLifecycleTests(unittest.TestCase):
             reserve_input=fixtures.reserve_unbounded,
         )
         self.assertIn("old history", str(harness.tokenizer.templates))
-        self.assertIsNone(job.response_history_items)
-        self.assertFalse(job.response_store)
+        self.assertIsNone(job.retained_input)
+        self.assertIsNone(conversation.items)
+        self.assertFalse(conversation.store)
 
     def test_stored_history_is_independent_of_the_request_body(self):
         harness = self.harness()
@@ -99,11 +102,16 @@ class ResponseLifecycleTests(unittest.TestCase):
             "content": [{"type": "output_text", "text": "answer"}],
         }
         body = {"input": [dict(question)]}
-        job = harness.app.prepare_responses(
-            body, deadline=fixtures.FOREVER, reserve_input=fixtures.reserve_unbounded
+        _, conversation = responses_dialect.prepare(
+            harness.app,
+            body,
+            deadline=fixtures.FOREVER,
+            reserve_input=fixtures.reserve_unbounded,
         )
         output = [copy.deepcopy(answer)]
-        harness.app.persist_response(job, {"id": "resp_stored"}, output)
+        responses_dialect.persist(
+            harness.app, conversation, {"id": "resp_stored"}, output
+        )
         # The record was encoded when it was stored.
         body["input"][0]["content"] = "changed"
         output[0]["content"][0]["text"] = "changed"
@@ -184,9 +192,9 @@ class ResponseLifecycleTests(unittest.TestCase):
 
     def test_response_store_is_strictly_byte_bounded_lru(self):
         self.enterContext(
-            mock.patch.object(frontend.ResponseStore, "BUDGET_BYTES", 2048)
+            mock.patch.object(responses_dialect.ResponseStore, "BUDGET_BYTES", 2048)
         )
-        store = frontend.ResponseStore()
+        store = responses_dialect.ResponseStore()
         for index in range(10):
             response = {
                 "id": f"resp_{index}",
@@ -199,18 +207,18 @@ class ResponseLifecycleTests(unittest.TestCase):
         self.assertGreater(stats["evictions"], 0)
         self.assertIsNone(store.get("resp_0"))
         self.assertIsNotNone(store.get("resp_9"))
-        with mock.patch.object(frontend.ResponseStore, "BUDGET_BYTES", 64):
+        with mock.patch.object(responses_dialect.ResponseStore, "BUDGET_BYTES", 64):
             self.assertFalse(
-                frontend.ResponseStore().put(
+                responses_dialect.ResponseStore().put(
                     {"id": "resp_large", "text": "x" * 128}, []
                 )
             )
 
     def test_response_store_concurrent_churn_remains_bounded(self):
         self.enterContext(
-            mock.patch.object(frontend.ResponseStore, "BUDGET_BYTES", 8192)
+            mock.patch.object(responses_dialect.ResponseStore, "BUDGET_BYTES", 8192)
         )
-        store = frontend.ResponseStore()
+        store = responses_dialect.ResponseStore()
         errors = []
 
         def churn(shard):

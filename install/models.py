@@ -66,7 +66,13 @@ ENTRY_STAGING = ".loading-"
 
 
 class ModelError(RuntimeError):
-    pass
+    """A refusal or failure the installers report without a traceback;
+    `kind` classes a Hub or network failure for the app
+    (hub.failure_kind), None for any other."""
+
+    def __init__(self, message, kind=None):
+        super().__init__(message)
+        self.kind = kind
 
 
 class VisionError(ModelError):
@@ -359,7 +365,7 @@ def parse_args(argv=None):
         "--draft-model",
         type=parse_draft_model,
         help="the DFlash2 draft's repository or local directory, in place of the "
-        "family's released one (required for a family without one)",
+        "family's released one",
     )
     parser.add_argument(
         "--language-only",
@@ -367,7 +373,11 @@ def parse_args(argv=None):
         help="skip vision preparation and loading",
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("prepare")
+    commands.add_parser("prepare").add_argument(
+        "--json-progress",
+        action="store_true",
+        help="also report download progress as JSON lines on stdout",
+    )
     commands.add_parser("verify").add_argument("--full", action="store_true")
     commands.add_parser("link", help="print the selection link")
     return parser.parse_args(argv)
@@ -386,13 +396,15 @@ def main(argv=None):
         print(selection.link)
         return 0
     # The installers import this module, so it imports them once it exists.
-    from . import assembly, upstream
+    from . import assembly, hub, upstream
 
     try:
         # The launcher starts this with the stop signals blocked, so that one
         # sent while it starts is not lost; it arrives here.
         signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
         if args.command == "prepare":
+            if args.json_progress:
+                hub.report_json_progress()
             upstream.prepare(selection)
         else:
             kind = installation_kind(selection.link)
@@ -410,6 +422,14 @@ def main(argv=None):
                 f"({'full' if args.full else 'quick'})."
             )
     except (ModelError, OSError) as error:
+        if args.command == "prepare":
+            # The app and the launcher word the failure by it, beside any
+            # progress and messages.
+            kind = error.kind if isinstance(error, ModelError) else None
+            print(
+                json.dumps({"event": "error", "kind": kind, "message": str(error)}),
+                flush=True,
+            )
         print(f"error: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
@@ -424,4 +444,12 @@ if __name__ == "__main__":
     import importlib
 
     installer = importlib.import_module("install.models")
-    raise SystemExit(installer.main())
+    status = installer.main()
+    if status == 130:
+        # Interrupted, a download goes on in huggingface_hub's threads, which
+        # the interpreter would wait for at exit (hub._interruptible): end
+        # the process at once, its output written.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(status)
+    raise SystemExit(status)

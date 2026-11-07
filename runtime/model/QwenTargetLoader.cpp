@@ -83,6 +83,7 @@ ops::BlockMoeWeights readMoeBlock(WeightFile &file, const QwenTargetDimensions &
     ffn.down.routed = readQuantizedSegment(file, "experts-down");
     ffn.slotTable = experts.resident;
     ffn.slots = experts.experts;
+    ffn.chunks = ops::residentExpertChunks(ffn);
   }
   ffn.gate.shared = readQuantizedSegment(file, "shared-expert-gate");
   ffn.up.shared = readQuantizedSegment(file, "shared-expert-up");

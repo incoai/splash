@@ -91,8 +91,6 @@ struct Qwen4ExpLayout final : QwenHybridLayout {
                           .pleHeadDimension = 160,
                           .pleConvolutionTaps = 4},
                          "Qwen3.8-Flash-Next"} {}
-  // A family of the architecture.
-  constexpr explicit Qwen4ExpLayout(const QwenHybridLayout &family) : QwenHybridLayout(family) {}
   bool operator==(const Qwen4ExpLayout &) const = default;
 };
 
@@ -170,7 +168,7 @@ struct Qwen4ExpWeights final : QwenTargetWeightsBase {
   std::vector<Qwen4ExpLayerWeights> layers;
   // The last mix, which feeds the head in place of a final norm.
   Qwen4HyperWeights finalHyper;
-  // The PLE table's native rows of pleHeadDimension values; empty when the
+  // The PLE table's rows as stored, of pleHeadDimension values; empty when the
   // table streams from its file (--ple-memory), where streamedTable reads
   // the rows of pleFormat a step gathers.
   ops::EmbeddingWeights pleTable;

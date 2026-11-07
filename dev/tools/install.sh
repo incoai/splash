@@ -68,6 +68,7 @@ if [ -z "$version" ]; then
     version=$(tr -d '[:space:]' < "$work/latest")
     [ -n "$version" ] || fail "the release index is empty."
 fi
+# package.archive_name for the Makefile's MACOS_MIN_VERSION; a test checks it.
 name="splash-$version-arm64-macos26"
 
 mkdir -p "$APP"
@@ -119,7 +120,7 @@ if ! mv -f "$wrapper.tmp" "$wrapper"; then
     rm -f "$wrapper.tmp"
     fail "could not write $wrapper; Splash $name was not installed."
 fi
-for old in "$APP"/splash-*-arm64-macos26; do
+for old in "$APP"/splash-*-arm64-macos*; do
     [ -d "$old" ] && [ "$old" != "$APP/$name" ] && rm -rf "$old"
 done
 exit 0

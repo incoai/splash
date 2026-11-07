@@ -1,12 +1,13 @@
 // GPU time of one GGUF projection through ops::Linear on both decode tiles (the Apple9 register tile and the staged
 // tile, on the device policy's walk, one lane on its 8- and 16-row tiles, a gate/up pair in two passes and, where the
 // walks spread, in one: pair) at one to four lanes and every K split, the measurements behind the tile rule and split
-// law of runtime/ops/LinearGguf.cpp:
+// law of runtime/ops/KernelCalibration.hpp:
 //   gguf-projection-benchmark <metallib> <fmt[+fmt+fmt]> <N[+N+N]> <K> [none|residual|gateup] [rounds]
 //                             [prefill=R[,R...]]
 // The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 64
 // columns. With prefill=, it times the 128-row prefill tile instead, one case per chunk of R rows (more than 32: the
-// decode tiles run the smaller chunks) of a single segment; gateup is then the up projection's gated epilogue. The
+// decode tiles run the smaller chunks) of a single segment, and for R up to 64 the staged 64-row tile at every K
+// split; gateup is then the up projection's gated epilogue. The
 // weights stay DRAM-cold: a command streams every copy of a ring of at least 384 MiB once, each projection with the
 // next copy (decode gate/up: the gate and up weights of two copies). The register tile reads the activation table its
 // producers write alongside their output (LinearBuffers::prepared), prepared once and not timed. The cases run in
@@ -268,9 +269,18 @@ int main(int argc, char **argv) {
       std::vector<Case> cases;
       for (const uint32_t rows : prefillRows) {
         const LinearWorkload w{{N, K}, rows, LinearPhase::Prefill, epilogue};
+        const LinearConfig policy = linear.plan(w, ring.front()).configuration();
         const LinearConfig config{.tile = LinearTile::GgufPrefill};
         cases.push_back({"R" + std::to_string(rows), "prefill128", Linear::plan(w, config, FloatOutput::BFloat16),
-                         config == linear.plan(w, ring.front()).configuration(), {}});
+                         config == policy, {}});
+        // Chunks of up to kMaximumStagedPrefillRows rows also on the staged 64-row tile, at every split.
+        for (uint32_t splits = 1; rows <= kMaximumStagedPrefillRows && splits <= LinearConfig::kMaximumSplits;
+             splits *= 2) {
+          if ((K / 32) % splits) continue;
+          const LinearConfig staged{.tile = LinearTile::GgufStaged, .splits = splits};
+          cases.push_back({"R" + std::to_string(rows), "staged S" + std::to_string(splits),
+                           Linear::plan(w, staged, FloatOutput::BFloat16), staged == policy, {}});
+        }
       }
       for (uint32_t lanes = 1; lanes <= kMaximumLanes && !prefill; ++lanes) {
         const LinearWorkload w{{N, K}, lanes * kLaneRows, LinearPhase::Decode, epilogue};

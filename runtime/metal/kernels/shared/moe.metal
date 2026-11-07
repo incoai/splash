@@ -12,13 +12,13 @@
 // reduces the shared expert's F32 scalar gate with a fixed partial-sum order,
 // and simdgroup 0 orders the experts, descending score then ascending id,
 // which is the order the shape's routing and tie-break contract requires.
-// Scores and routing weights are fp32. On 40,960 router rows each of real 35B
-// prose, code and chat, top-8 sets chosen from bf16-rounded scores differ from
-// the fp64 choice on 12-15% of rows (fp32: at most 0.0024%), and bf16 weights
-// round 19-20% of the combine's outputs away from bf16 of its exact sum
-// (fp32: 0.008%). The router (ops::MoeRouter) then weights the top_k experts
-// by the softmax of their scores, or by each one's sigmoid over the sum of
-// theirs (SigmoidNormalized), summed in rank order.
+// Scores and routing weights are fp32: on real 35B router rows, top-8 sets
+// chosen from bf16-rounded scores differ from the fp64 choice on 12-15% of
+// rows (fp32: at most 0.0024%), and bf16 weights round a fifth of the
+// combine's outputs away from bf16 of its exact sum. The router
+// (ops::MoeRouter) then weights the top_k experts by the softmax of their
+// scores, or by each one's sigmoid over the sum of theirs
+// (SigmoidNormalized), summed in rank order.
 enum class MoeRouter : uint { Softmax, SigmoidNormalized };
 template <uint Slots, MoeRouter Router, uint Shared, bool SharedGate>
 inline void moe_route_select(device const float *scores, device bfloat *input,
@@ -113,9 +113,10 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
 
 // The router's fp32 scores (kernels/shared/gguf_float.metal) in rows of
 // Slots expert slots and, with a gated shared expert, the F32 shared-expert
-// scalar gate, on SPLASH_MOE_EXPERT_SLOTS slots or (_e512)
-// SPLASH_MOE_WIDE_EXPERT_SLOTS, each routing a compiled routing
-// (ops::kCompiledMoeRoutings) under its select suffix.
+// scalar gate, each routing a compiled routing (ops::kCompiledMoeRoutings)
+// under its select suffix: the softmax one on SPLASH_MOE_EXPERT_SLOTS slots
+// or (_e512) SPLASH_MOE_WIDE_EXPERT_SLOTS, Qwen3.8-Flash-Next's 512 experts,
+// and Flint's on SPLASH_MOE_EXPERT_SLOTS, its 256.
 #define MOE_ROUTE_SELECT_BODY(Slots, Router, Shared, SharedGate, input, shared_gate) \
     threadgroup float row_scores[Slots];                                       \
     threadgroup float ordered[Slots];                                          \
@@ -154,8 +155,6 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
 MOE_ROUTE_SELECT_ENTRY(moe_route_select_f32, SPLASH_MOE_EXPERT_SLOTS, MoeRouter::Softmax, 1)
 MOE_ROUTE_SELECT_ENTRY(moe_route_select_f32_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS, MoeRouter::Softmax, 1)
 MOE_ROUTE_SELECT_UNGATED_ENTRY(moe_route_select_f32_sigmoid_s2, SPLASH_MOE_EXPERT_SLOTS,
-                               MoeRouter::SigmoidNormalized, 2)
-MOE_ROUTE_SELECT_UNGATED_ENTRY(moe_route_select_f32_e512_sigmoid_s2, SPLASH_MOE_WIDE_EXPERT_SLOTS,
                                MoeRouter::SigmoidNormalized, 2)
 #undef MOE_ROUTE_SELECT_UNGATED_ENTRY
 #undef MOE_ROUTE_SELECT_ENTRY
@@ -316,15 +315,13 @@ inline void moe_group_routes_phase(
     MOE_GROUP_ROUTES_BODY(Slots, Shared, true, verify_rows)                    \
   }
 // Each for the shared slices of a compiled routing, under its slices suffix
-// (ops::kCompiledMoeRoutings).
+// (ops::kCompiledMoeRoutings), on the expert slots of its selection.
 MOE_GROUP_ROUTES_ENTRY(moe_group_routes, SPLASH_MOE_EXPERT_SLOTS, 1)
 MOE_GROUP_ROUTES_ENTRY(moe_group_routes_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS, 1)
 MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified, SPLASH_MOE_EXPERT_SLOTS, 1)
 MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS, 1)
 MOE_GROUP_ROUTES_ENTRY(moe_group_routes_s2, SPLASH_MOE_EXPERT_SLOTS, 2)
-MOE_GROUP_ROUTES_ENTRY(moe_group_routes_e512_s2, SPLASH_MOE_WIDE_EXPERT_SLOTS, 2)
 MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_s2, SPLASH_MOE_EXPERT_SLOTS, 2)
-MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_e512_s2, SPLASH_MOE_WIDE_EXPERT_SLOTS, 2)
 #undef MOE_GROUP_ROUTES_VERIFIED_ENTRY
 #undef MOE_GROUP_ROUTES_ENTRY
 #undef MOE_GROUP_ROUTES_BODY
@@ -360,8 +357,7 @@ kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
 // The grouped rows as Table16 tiles (kernels/common/gguf_sgmatrix.h), the
 // input of the Apple9 GGUF register expert tile. Threadgroup (tile, part)
 // writes the four 64-input spans [4 part, 4 part + 4) of an 8-row tile, one
-// simdgroup per row: on the 40-core M3 Max, 8 us per 35B decode layer at one
-// lane and 14 us at four, under two thirds of the time of a threadgroup per
+// simdgroup per row, in under two thirds of the time of a threadgroup per
 // span pair or per tile. The gather reads each grouped row's route like
 // moe_gather_rows (padding rows are zero); the prepare reads grouped rows (the
 // down pass's intermediate). Grid (tiles, width / 256), 256 threads.

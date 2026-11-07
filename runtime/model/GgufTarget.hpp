@@ -20,7 +20,8 @@
 namespace splash::model {
 
 // The .gguf files of a target directory: its one GGUF, or every part of a
-// split one (NAME-0000K-of-0000N.gguf, K = 1..N) in split order.
+// split one, the parts of one name (NAME-0000K-of-0000N.gguf, K = 1..N), in
+// split order.
 [[nodiscard]] std::vector<std::filesystem::path> findTargetGgufs(const std::filesystem::path &directory);
 
 class GgufTargetLoader final {

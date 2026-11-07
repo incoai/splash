@@ -3,21 +3,46 @@ that report it: the probes, /status and /metrics."""
 
 import json
 import os
+import re
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from dev.tests import native_peer
 from dev.tests.server_fixtures import FakeRuntime, HarnessTestCase
+from server import backend as backend_api
 from server import protocol as wire
+from server import supervision
 from server.chat_format import FLINT, QWEN
 from server.metrics import PROMETHEUS_SERIES, prometheus_metrics
 
 # A representative status document, every section of it set, which
 # runtime_status_test.cpp checks the engine writes.
 GOLDEN = Path(__file__).parents[1] / "engine/status_golden.json"
+# The server's sections of a stopped server's /status, which the app decodes.
+TRANSPORT_GOLDEN = Path(__file__).with_name("status_transport_golden.json")
 # The sections the server adds to the engine's document before it renders it.
-SERVER_SECTIONS = {"transport", "frontend", "response_store"}
+SERVER_SECTIONS = {"capabilities", "transport", "frontend", "response_store"}
+# Leaves of the engine's document that /metrics must export, each by a series
+# of PROMETHEUS_SERIES.
+REQUIRED_EXPORTS = (
+    ("metrics", "decode_gap_ms", "max"),
+    ("metrics", "decode_gap_ms", "p99"),
+    ("metrics", "decode_gap_ms", "samples"),
+    ("scheduler", "decode_gap_target_ms"),
+    ("scheduler", "contended_prefill_ms", "max"),
+    ("scheduler", "bound_cuts"),
+    ("scheduler", "index_page_conflicts"),
+    ("scheduler", "replans"),
+    ("memory_governor", "owed", "bytes"),
+    ("memory_governor", "claims", "waiting"),
+    ("streamed_experts", "shrinks"),
+    ("streamed_experts", "regrows"),
+    ("kv_spill", "requests", "converted"),
+    ("loop", "tick_host_ms", "p99"),
+    ("loop", "tick_host_ms", "max"),
+)
 
 
 class StatusContractTests(unittest.TestCase):
@@ -41,6 +66,53 @@ class StatusContractTests(unittest.TestCase):
         self.assertIn('splash_disk_writes_gated{state="no"} 0', lines)
         self.assertIn("splash_disk_read_bytes_total 12345", lines)
         self.assertIn("splash_disk_written_bytes_total 67890", lines)
+
+    def test_required_leaves_are_exported(self):
+        status = json.loads(GOLDEN.read_text())
+        paths = set(PROMETHEUS_SERIES.values())
+        for path in REQUIRED_EXPORTS:
+            with self.subTest(path=path):
+                leaf = status
+                for key in path:
+                    leaf = leaf[key]
+                self.assertIsNotNone(leaf)
+                self.assertIn(path, paths)
+
+    def test_accounts_render_with_labels(self):
+        status = json.loads(GOLDEN.read_text())
+        lines = prometheus_metrics(status).splitlines()
+        accounts = status["memory_governor"]["accounts"]
+        self.assertTrue(accounts)
+        for account in accounts:
+            label = f'account="{account["name"]}"'
+            for measure in ("floor", "current", "cap"):
+                self.assertIn(
+                    f'splash_memory_account_bytes{{{label},measure="{measure}"}} '
+                    f"{account[measure + '_bytes']}",
+                    lines,
+                )
+            self.assertIn(
+                f"splash_memory_account_grows_total{{{label}}} {account['grows']}",
+                lines,
+            )
+            self.assertIn(
+                f"splash_memory_account_shrinks_total{{{label}}} {account['shrinks']}",
+                lines,
+            )
+
+    def test_write_behind_counts_are_documented(self):
+        # A reader waiting for an idle engine goes by this row of docs/api.md
+        # to tell when the restore points queued for their copies (`waiting`)
+        # are SSD work still to come.
+        status = json.loads(GOLDEN.read_text())
+        first, *rest = status["disk"]["write_behind"]
+        api = Path(__file__).parents[3] / "docs/api.md"
+        documented = [
+            re.findall(r"`([^`]+)`", line.split(" | ")[0])
+            for line in api.read_text().splitlines()
+            if line.startswith("| `disk.write_behind.")
+        ]
+        self.assertEqual(documented, [[f"disk.write_behind.{first}", *rest]])
 
 
 class StatusRouteTests(HarnessTestCase):
@@ -71,6 +143,35 @@ class StatusRouteTests(HarnessTestCase):
                 "status_stale": False,
                 "status_age_ms": 0.0,
             },
+        )
+        # The one capability the app reads: the context served now.
+        self.assertEqual(snapshot["capabilities"], {"max_context_tokens": 128})
+
+    def test_a_stopped_servers_sections_are_the_golden_the_app_reads(self):
+        """What /status says of a server that stopped restarting its engine,
+        as the app decodes it (status_transport_golden.json)."""
+        runtime = FakeRuntime()
+        harness = self.harness(runtime, max_context=131072)
+        runtime.ready = False
+        refused = wire.StartFailedEvent(
+            wire.StartFailureKind.CONFIGURATION,
+            wire.ShortfallBound.DEVICE_MEMORY,
+            0,
+            0,
+            0,
+            b"--kv-format bf16 is refused",
+        )
+        with mock.patch.object(backend_api, "print_status"):
+            harness.backend._failed(
+                "Engine restart failed",
+                supervision.EngineFailure(
+                    "start_failed", "--kv-format bf16 is refused", 0.0, start=refused
+                ),
+            )
+        snapshot = json.loads(harness.request("GET", "/status")[2])
+        self.assertEqual(
+            {key: snapshot[key] for key in ("capabilities", "transport")},
+            json.loads(TRANSPORT_GOLDEN.read_text()),
         )
 
     def test_metrics_route_renders_the_engine_status(self):
@@ -108,6 +209,8 @@ class StatusRouteTests(HarnessTestCase):
             kv={
                 "pages_allocated": 8,
                 "pages_active": 4,
+                "extents_active": 1,
+                "active_bytes": 4096,
                 "pages_cache": 4,
                 "pages_free": 2,
                 "allocated_bytes": 8192,
@@ -187,6 +290,8 @@ class StatusRouteTests(HarnessTestCase):
         self.assertIn("splash_scheduler_prefill_rows_total 2048", metrics)
         self.assertIn("splash_scheduler_decode_b3_total 3", metrics)
         self.assertIn("splash_kv_pages_allocated 8", metrics)
+        self.assertIn("splash_kv_extents_active 1", metrics)
+        self.assertIn("splash_kv_active_bytes 4096", metrics)
         self.assertIn("splash_kv_free_allocated_pages 2", metrics)
         self.assertFalse([line for line in metrics if "splash_kv_pages_free" in line])
         self.assertIn("splash_kv_allocated_bytes 8192", metrics)

@@ -48,7 +48,7 @@ class RequestLifetimeTests(unittest.TestCase):
             deadline=time.monotonic() + 30,
             image_owner=owner,
         )
-        return job, cache, weakref.ref(owner)
+        return job, cache, weakref.ref(job)
 
     def terminal(self, job):
         while True:
@@ -56,14 +56,14 @@ class RequestLifetimeTests(unittest.TestCase):
             if event[0] in ("done", "error"):
                 return event
 
-    def assert_released(self, cache, owner):
+    def assert_released(self, cache, job):
         deadline = time.monotonic() + 1
-        while owner() is not None and time.monotonic() < deadline:
+        while job() is not None and time.monotonic() < deadline:
             threading.Event().wait(0.001)
-        self.assertIsNone(owner(), "request retained after all active holders left")
+        self.assertIsNone(job(), "request retained after all active holders left")
         self.assertEqual(cache.stats()["request_bytes"], 0)
 
-    def test_native_terminals_release_images_without_cycle_collection(self):
+    def test_native_terminals_release_the_request_without_cycle_collection(self):
         for outcome in (
             "complete",
             "cancel",
@@ -74,7 +74,7 @@ class RequestLifetimeTests(unittest.TestCase):
         ):
             with self.subTest(outcome=outcome):
                 backend, process = self.backend()
-                job, cache, owner = self.job()
+                job, cache, held = self.job()
                 if outcome == "callback_error":
 
                     class Constraint:
@@ -136,14 +136,14 @@ class RequestLifetimeTests(unittest.TestCase):
                     self.assertEqual(result.message, "event callback failed")
                     self.assertIsNone(call.callback_error.__traceback__)
                 del call, job
-                self.assert_released(cache, owner)
+                self.assert_released(cache, held)
                 self.assertFalse(backend.active)
 
-    def test_pre_admission_and_submit_failures_release_images(self):
+    def test_pre_admission_and_submit_failures_release_the_request(self):
         for outcome in ("expired", "closed", "full", "write_error"):
             with self.subTest(outcome=outcome):
                 backend, _ = self.backend()
-                job, cache, owner = self.job()
+                job, cache, held = self.job()
                 if outcome == "expired":
                     job.deadline = time.monotonic() - 1
                     backend.submit(job)
@@ -174,12 +174,12 @@ class RequestLifetimeTests(unittest.TestCase):
                 self.assertEqual(kind, "error")
                 self.assertIsNone(error.__traceback__)
                 del job
-                self.assert_released(cache, owner)
+                self.assert_released(cache, held)
                 self.assertFalse(backend.active)
 
     def test_pixel_bytes_are_released_once_the_request_frame_is_written(self):
         backend, process = self.backend()
-        job, cache, owner = self.job()
+        job, cache, held = self.job()
         span = wire.ImageSpan(1, 256, 32, 32, 1, 2)
         pixels = bytes(span.pixel_bytes)
         job.prompt_tokens = [101] * 258
@@ -197,15 +197,16 @@ class RequestLifetimeTests(unittest.TestCase):
         self.assertFalse(
             [held for held in gc.get_referrers(pixels) if isinstance(held, holders)]
         )
-        # The charge for the images is a separate lease, held until the end.
-        self.assertGreater(cache.stats()["request_bytes"], 0)
+        # The written frame was the last copy of the pixels: the image charge
+        # ends with it, not with the response.
+        self.assertEqual(cache.stats()["request_bytes"], 0)
         call = backend.active[job.request_id].call
         send_success(process, call, tokens=(4,))
         self.assertEqual(self.terminal(job)[0], "done")
         del call, job
-        self.assert_released(cache, owner)
+        self.assert_released(cache, held)
 
-    def test_mask_worker_keeps_image_lease_until_it_exits(self):
+    def test_mask_worker_releases_the_request_once_it_exits(self):
         backend, process = self.backend()
         entered = threading.Event()
         release = threading.Event()
@@ -218,7 +219,7 @@ class RequestLifetimeTests(unittest.TestCase):
                     raise TimeoutError("test mask was not released")
                 return b"\xff" * (8 * (len(tokens) + 1))
 
-        job, cache, owner = self.job()
+        job, cache, held = self.job()
         job.constraint = Constraint()
         backend.submit(job)
         call = backend.active[job.request_id].call
@@ -233,22 +234,21 @@ class RequestLifetimeTests(unittest.TestCase):
         )
         self.assertEqual(self.terminal(job)[0], "done")
         del call, job
-        self.assertIsNotNone(owner())
-        self.assertEqual(cache.stats()["request_bytes"], len(b"pixels"))
+        self.assertIsNotNone(held())
         release.set()
-        self.assert_released(cache, owner)
+        self.assert_released(cache, held)
 
-    def test_inflight_callback_owns_images_across_terminal_cleanup(self):
-        job, cache, owner = self.job()
+    def test_a_terminal_call_drops_its_callback_once_it_returns(self):
+        job, cache, held = self.job()
         entered = threading.Event()
         release = threading.Event()
         self.addCleanup(release.set)
 
-        def callback(_call, _event, batch=job.image_owner):
+        # The callback holds the request, as a backend's holds its state.
+        def callback(_call, _event, _request=job):
             entered.set()
             if not release.wait(2):
                 raise TimeoutError("test callback was not released")
-            self.assertEqual(batch[0].pixels, b"pixels")
 
         call = engine_runtime.RuntimeCall(None, 1, 1, request(100), callback, None)
         del job, callback
@@ -256,12 +256,11 @@ class RequestLifetimeTests(unittest.TestCase):
         thread.start()
         self.assertTrue(entered.wait(1))
         call._set_terminal(error=engine_runtime.RuntimeClosed("finished"))
-        self.assertIsNotNone(owner())
         release.set()
         thread.join(1)
         self.assertFalse(thread.is_alive())
         self.assertIsNone(call.callback_error)
-        self.assert_released(cache, owner)
+        self.assert_released(cache, held)
 
     def test_callback_failure_after_native_failure_does_not_retain_retired_state(self):
         backend, process = self.backend()
@@ -276,7 +275,7 @@ class RequestLifetimeTests(unittest.TestCase):
                     raise TimeoutError("test callback was not released")
                 raise api.APIError(400, "late callback failure")
 
-        job, cache, owner = self.job()
+        job, cache, held = self.job()
         job.constraint = Constraint()
         backend.submit(job)
         call = backend.active[job.request_id].call
@@ -289,37 +288,37 @@ class RequestLifetimeTests(unittest.TestCase):
             call.generation, engine_runtime.EngineUnhealthy("native failed")
         )
         self.assertEqual(self.terminal(job)[0], "error")
-        self.assertIsNotNone(owner())
+        self.assertIsNotNone(held())
         release.set()
         reader.join(1)
         self.assertFalse(reader.is_alive())
         del call, job
-        self.assert_released(cache, owner)
+        self.assert_released(cache, held)
 
     def test_callback_diagnostics_do_not_retain_request_frames(self):
         for completion in (False, True):
             with self.subTest(completion=completion):
-                job, cache, owner = self.job()
+                job, cache, held = self.job()
 
-                def callback(*_args):
+                def callback(*_args, request_job=job):
                     try:
                         raise ValueError("inner failure")
                     except ValueError as cause:
                         raise RuntimeError("callback failed") from cause
 
                 # A failed event callback cancels its call.
-                client = SimpleNamespace(_cancel_call=lambda _call: None)
+                client = SimpleNamespace(_end_call=lambda _call, _frame: None)
                 call = engine_runtime.RuntimeCall(
                     client,
                     1,
                     1,
-                    request(100, image_owner=job.image_owner),
+                    request(100),
                     None if completion else callback,
                     callback if completion else None,
                 )
                 if not completion:
                     call._emit(None)
-                    self.assertTrue(call.cancel_requested)
+                    self.assertTrue(call.end_requested)
                 call._set_terminal(error=engine_runtime.RuntimeClosed("finished"))
                 failure = call.callback_error
                 self.assertIsInstance(failure, RuntimeError)
@@ -327,8 +326,8 @@ class RequestLifetimeTests(unittest.TestCase):
                 self.assertIsNone(failure.__traceback__)
                 self.assertIsNone(failure.__context__)
                 self.assertIsNone(failure.__cause__)
-                del call, job
-                self.assert_released(cache, owner)
+                del call, job, callback
+                self.assert_released(cache, held)
 
 
 if __name__ == "__main__":
