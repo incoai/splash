@@ -190,7 +190,7 @@ struct ServeSettingsTests {
     @Test func theContextHintIsTheModels() {
         #expect(ContextLength.message(Self.flint).contains("at most 256K, the model’s own window"))
         #expect(!ContextLength.message(Self.flint).contains("YaRN"))
-        #expect(ContextLength.message(Self.moe).contains("at most 1,010,000. Past the model’s own window, 256K, it stretches it with YaRN"))
+        #expect(ContextLength.message(Self.moe).contains("at most \(1_010_000.formatted()). Past the model’s own window, 256K, it stretches it with YaRN"))
         #expect(ContextLength.message(.unknown).contains("YaRN"))
     }
 
@@ -201,7 +201,7 @@ struct ServeSettingsTests {
         #expect(ContextLength.parse("0") == nil && ContextLength.parse("12.5K") == nil && ContextLength.parse("lots") == nil)
         #expect(ContextLength.title(32768) == "32K tokens")
         #expect(ContextLength.title(1_000_000) == "1M tokens")
-        #expect(ContextLength.title(100_000) == "100,000 tokens")
+        #expect(ContextLength.title(100_000) == "\(100_000.formatted()) tokens")
         // As typed, read back alike.
         #expect([32768, 1_000_000, 100_000].map { ContextLength.parse(ContextLength.text($0)) } == [32768, 1_000_000, 100_000])
     }
@@ -1065,7 +1065,9 @@ struct ChatTests {
         server.executableURL = URL(filePath: "/usr/bin/python3")
         server.arguments = [try #require(Bundle.module.path(forResource: "streaming_server", ofType: "py", inDirectory: "Fakes"))]
         let output = Pipe()
+        let advance = Pipe()
         server.standardOutput = output
+        server.standardInput = advance
         try server.run()
         defer { server.terminate() }
         let port = try #require(String(data: output.fileHandleForReading.availableData, encoding: .utf8)
@@ -1076,13 +1078,19 @@ struct ChatTests {
         // the composer read, holds it empty and changes no more.
         try await waitFor(store.reply?.message.text.isEmpty == false)
         let first = store.reply?.message.text ?? ""
+        #expect(first == "One")
         #expect(store.current?.messages.last?.text == "")
         nonisolated(unsafe) var changed = false
         withObservationTracking { _ = store.conversations } onChange: { changed = true }
+        advance.fileHandleForWriting.write(Data("next\n".utf8))
         try await waitFor(store.reply.map { $0.message.text != first } ?? true)
         #expect(store.reply?.message.text.hasPrefix(first) == true)
         #expect(!changed && store.current?.messages.last?.text == "")
+        advance.fileHandleForWriting.write(Data("next\n".utf8))
+        try await waitFor(store.reply?.message.text == "One two three")
+        #expect(!changed && store.current?.messages.last?.text == "")
         // Once it ends, it goes into its conversation, which is written.
+        advance.fileHandleForWriting.write(Data("next\n".utf8))
         try await waitFor(store.streaming == nil)
         #expect(changed && store.reply == nil && store.current?.messages.last?.text == "One two three")
         store.flush()

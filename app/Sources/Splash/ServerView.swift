@@ -21,6 +21,9 @@ struct ServerView: View {
         let first = state.installed.isEmpty
         let failed = if case .failed = state.server.phase { true } else { false }
         Form {
+            if !first, let stage = state.firstUseStage {
+                Section { GettingStartedGuide(stage: stage).padding(.vertical, 6) }
+            }
             if state.server.phase == .ready {
                 ActivitySection(advanced: advanced)
             }
@@ -64,7 +67,7 @@ struct ServerView: View {
                                  lead: first && !state.installer.running && !state.findingCachedModels && variant == suggestions.first)
                 }
             } header: {
-                if !available.isEmpty { SectionTitle(text: "Available to Download") }
+                if !available.isEmpty { SectionTitle(text: first ? "Choose a Model" : "Available to Download") }
             } footer: {
                 if suggestions.isEmpty, let minimum = state.catalog.minimumMemory {
                     Text("The suggested models need a Mac with at least \(minimum) GB of memory; this one has \(Catalog.memory) GB.")
@@ -136,21 +139,25 @@ struct ServerView: View {
     /// The screen's heading before a model is on this Mac, while the ones other tools left are
     /// looked for and after.
     private var welcome: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Welcome to Splash")
-                .font(.title2.weight(.semibold))
-                .foregroundStyle(.primary)
+        Group {
             if state.findingCachedModels {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.small)
-                    Text("Looking for models already on this Mac…")
-                }
-                .font(.body)
-                .foregroundStyle(.secondary)
-            } else {
-                Text("Splash runs AI models privately on this Mac. Download one to get started.")
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Welcome to Splash").font(.title2.weight(.semibold)).foregroundStyle(.primary)
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Looking for models already on this Mac…")
+                    }
                     .font(.body)
                     .foregroundStyle(.secondary)
+                }
+            } else if let stage = state.firstUseStage {
+                GettingStartedGuide(stage: stage)
+            } else {
+                // Existing chats or a blocking problem should not advertise a healthy setup step.
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Welcome to Splash").font(.title2.weight(.semibold)).foregroundStyle(.primary)
+                    Text("Splash runs AI models privately on this Mac.").font(.body).foregroundStyle(.secondary)
+                }
             }
         }
         .textCase(nil)
@@ -240,7 +247,7 @@ private struct ControlBar: View {
         case .stopped, .failed:
             // A server that runs but serves nothing gives way to the model picked.
             let switching = server.running && state.selection != server.model
-            Button(failedPicked ? "Try Again" : switching ? "Switch to \(state.selection.map(state.displayName(of:)) ?? "")" : "Start") {
+            Button(failedPicked ? "Try Again" : switching ? "Switch to \(state.selection.map(state.displayName(of:)) ?? "")" : "Start Model") {
                 if let model = state.selection { state.start(model) }
             }
             .buttonStyle(.borderedProminent)
@@ -572,9 +579,18 @@ private struct SuggestedRow: View {
         } label: {
             // The anatomy of a model row.
             VStack(alignment: .leading, spacing: 2) {
-                Text(variant.name)
-                Text(([recommended ? "Recommended" : nil, variant.about, Format.size(Format.gigabytes(variant.size))]
-                    as [String?]).compactMap { $0 }.joined(separator: " · "))
+                HStack(spacing: 6) {
+                    Text(variant.name)
+                    if recommended {
+                        Text("Recommended")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(.quaternary, in: .capsule)
+                    }
+                }
+                Text("\(variant.about) · \(Format.size(Format.gigabytes(variant.size))) download")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
