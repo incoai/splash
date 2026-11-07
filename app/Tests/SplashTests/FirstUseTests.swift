@@ -96,6 +96,10 @@ struct FirstUseSnapshots {
         do {
             let state = fixture.state
             await state.launch()
+            for stage in [FirstUseStage.download, .downloading, .start, .starting, .chat] {
+                await Snapshot.save("guide-\(stage)", size: CGSize(width: 720, height: 260),
+                                    GettingStartedGuide(stage: stage).padding(24))
+            }
             await Snapshot.save("choose-model", MainView().environment(state))
             state.section = .chat
             await Snapshot.save("chat-no-model", MainView().environment(state))
