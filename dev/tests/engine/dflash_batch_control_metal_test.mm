@@ -50,7 +50,7 @@ using splash::test::rejects;
 using splash::test::require;
 using splash::test::requireExtent;
 
-constexpr std::array<uint32_t, kLanes> kAllRows{kRows, kRows, kRows, kRows};
+constexpr auto kAllRows = [] { std::array<uint32_t, kLanes> a{}; a.fill(kRows); return a; }();
 // The stop token runWidth places, in the last place the kernel compares.
 constexpr uint32_t kStopToken = 248044;
 constexpr StopTokens kFourStops{248046, 150001, 150003, kStopToken};
@@ -247,9 +247,9 @@ int main(int argc, char **argv) {
     if (argc != 2)
       throw std::invalid_argument("usage: dflash-batch-control METALLIB");
     MetalBackend backend(argv[1]);
-    constexpr std::array<uint32_t, kLanes> lowerAccepted{0, 1, 2, 3};
-    constexpr std::array<uint32_t, kLanes> upperAccepted{4, 5, 6, 7};
-    constexpr std::array<uint32_t, kLanes> fullRemaining{8, 8, 8, 8};
+    constexpr auto lowerAccepted = [] { std::array<uint32_t, kLanes> a{}; constexpr std::array<uint32_t, 4> pattern{0,1,2,3}; for (uint32_t i = 0; i < kLanes; ++i) a[i] = pattern[i % pattern.size()]; return a; }();
+    constexpr auto upperAccepted = [] { std::array<uint32_t, kLanes> a{}; constexpr std::array<uint32_t, 4> pattern{4,5,6,7}; for (uint32_t i = 0; i < kLanes; ++i) a[i] = pattern[i % pattern.size()]; return a; }();
+    constexpr auto fullRemaining = [] { std::array<uint32_t, kLanes> a{}; constexpr std::array<uint32_t, 1> pattern{8}; for (uint32_t i = 0; i < kLanes; ++i) a[i] = pattern[i % pattern.size()]; return a; }();
     for (uint32_t width = 1; width <= kLanes; ++width) {
       runWidth(backend, width, lowerAccepted, fullRemaining);
       runWidth(backend, width, upperAccepted, fullRemaining);
@@ -258,8 +258,8 @@ int main(int argc, char **argv) {
     // Output limits and stop tokens shorten the committed prefix without
     // changing the physical eight-row graph.  The accepted proposal count is
     // still seven in every lane; only retained rows move.
-    constexpr std::array<uint32_t, kLanes> allAccepted{7, 7, 7, 7};
-    constexpr std::array<uint32_t, kLanes> shortRemaining{1, 2, 3, 8};
+    constexpr auto allAccepted = [] { std::array<uint32_t, kLanes> a{}; constexpr std::array<uint32_t, 1> pattern{7}; for (uint32_t i = 0; i < kLanes; ++i) a[i] = pattern[i % pattern.size()]; return a; }();
+    constexpr auto shortRemaining = [] { std::array<uint32_t, kLanes> a{}; constexpr std::array<uint32_t, 8> pattern{1,2,3,8,4,5,6,7}; for (uint32_t i = 0; i < kLanes; ++i) a[i] = pattern[i % pattern.size()]; return a; }();
     runWidth(backend, kLanes, allAccepted, shortRemaining, 3, 3);
     // SPLASH_NO_TOKEN, which pads a list of two stop tokens, is no stop token
     // where acceptance retains it: a row with no selectable logit selects it,
@@ -269,7 +269,7 @@ int main(int argc, char **argv) {
              StopTokens{248044, 248046});
     // A lane retains at most the rows its verify verified, below its budget
     // or above it; acceptance still counts every proposal it checked.
-    constexpr std::array<uint32_t, kLanes> fewRows{2, 3, 5, 1};
+    constexpr auto fewRows = [] { std::array<uint32_t, kLanes> a{}; constexpr std::array<uint32_t, 8> pattern{2,3,5,1,8,7,6,4}; for (uint32_t i = 0; i < kLanes; ++i) a[i] = pattern[i % pattern.size()]; return a; }();
     runWidth(backend, kLanes, allAccepted, fullRemaining, kLanes, 0, fewRows);
     runWidth(backend, kLanes, lowerAccepted, shortRemaining, kLanes, 0, fewRows);
     testRowCopy(backend);

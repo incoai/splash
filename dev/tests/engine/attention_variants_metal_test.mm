@@ -9,10 +9,11 @@
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/KvExtent.h"
 #include "model/RopeScaling.hpp"
+#include "ops/KernelCalibration.hpp"
+#include "ops/LaneBindings.hpp"
 #include "ops/Linear.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/RoPE.hpp"
-#include "ops/KernelCalibration.hpp"
 
 #include <algorithm>
 #include <array>
@@ -112,11 +113,11 @@ struct Case final {
   ops::AttentionVariant variant;
   uint32_t lanes;
   uint32_t rows;
-  std::array<uint32_t, 4> histories;
+  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> histories;
   HostKvExtents pool;
   SplashKvLayer layer;
-  std::array<std::vector<uint32_t>, 4> pages;
-  std::array<metal::MetalBuffer, 4> tables;
+  std::array<std::vector<uint32_t>, SPLASH_MAXIMUM_BATCH_WIDTH> pages;
+  std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH> tables;
   uint32_t poisoned = 0;
   metal::MetalBuffer sinks;
 
@@ -154,8 +155,8 @@ float query(uint32_t lane, uint32_t head, uint32_t row, uint32_t dimension) {
 }
 
 Case makeCase(metal::MetalBackend &backend, kv::Format format, ops::AttentionVariant variant, uint32_t lanes,
-              uint32_t rows, std::array<uint32_t, 4> histories) {
-  std::array<uint32_t, 4> pageCounts{};
+              uint32_t rows, std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> histories) {
+  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> pageCounts{};
   uint32_t allPages = 1;  // and the page of NaNs
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     pageCounts[lane] = (histories[lane] + rows + kPageTokens - 1) / kPageTokens;
@@ -411,7 +412,7 @@ template <class Plan> metal::CommandGraph encode(const Case &data, const Staging
     ops::PagedAttention::addPrefill(graph, data.layer, staging.queries, staging.output, partials, statistics,
                                     data.tables[0], chunk, plan, {}, data.sinks);
   } else {
-    std::array<kv::ChunkedPrefillParams, 4> chunks{};
+    std::array<kv::ChunkedPrefillParams, SPLASH_MAXIMUM_BATCH_WIDTH> chunks{};
     for (uint32_t lane = 0; lane < data.lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyParams(data.histories[lane], uint32_t(data.pages[lane].size()));
     ops::PagedAttention::addVerify(graph, data.layer,
@@ -505,7 +506,7 @@ void checkPrefill(metal::MetalBackend &backend, kv::Format format, ops::Attentio
 
 void checkVerify(metal::MetalBackend &backend, kv::Format format, ops::AttentionVariant variant,
                  std::span<const uint32_t> histories) {
-  std::array<uint32_t, 4> lanes{};
+  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> lanes{};
   std::copy(histories.begin(), histories.end(), lanes.begin());
   const auto count = uint32_t(histories.size());
   const Case data = makeCase(backend, format, variant, count, kv::kVerifyRows, lanes);
@@ -533,13 +534,14 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format) {
     const metal::MetalBuffer partials = poisoned(backend, plan.workspace.partialsBytes);
     const metal::MetalBuffer statistics = poisoned(backend, plan.workspace.statisticsBytes);
     std::memset(staging.output.contents(), 0xff, staging.output.sizeBytes());
-    std::array<kv::VerifyAttentionParams, 4> params{};
+    std::array<kv::VerifyAttentionParams, SPLASH_MAXIMUM_BATCH_WIDTH> params{};
     for (uint32_t lane = 0; lane < 3; ++lane)
       params[lane] = {histories[lane], uint32_t(data.pages[lane].size()), data.layer, splits, splits, 0, 0};
     metal::CommandGraph graph;
-    graph.add(plan.splitPipeline,
-              {staging.queries, partials, statistics, data.tables[0], data.tables[1], data.tables[2], data.tables[3]},
-              params, {kKvHeads, splits, 3});
+    std::vector<metal::MetalBuffer> bindings{staging.queries, partials, statistics};
+    const auto tables = ops::laneBindings(std::span(data.tables).first(data.lanes));
+    bindings.insert(bindings.end(), tables.begin(), tables.end());
+    graph.add(plan.splitPipeline, std::move(bindings), params, {kKvHeads, splits, 3});
     graph.add(plan.reducePipeline, {partials, statistics, staging.output, data.sinks}, params,
               {kKvHeads, kv::kVerifyRows * kGroup, 3}, {kHeadDimension, 1, 1});
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
@@ -572,7 +574,7 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format) {
 // splits below the window's pages).
 void checkWindowWithinHistory(metal::MetalBackend &backend, kv::Format format) {
   const auto outputs = [&](ops::AttentionVariant variant, bool verify, uint32_t lanes, uint32_t rows,
-                           std::array<uint32_t, 4> histories) {
+                           std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> histories) {
     const Case data = makeCase(backend, format, variant, lanes, rows, histories);
     const Staging staging = stage(backend, data, 0, rows, verify ? kv::kVerifyChunkStride : (rows + 31) / 32 * 32);
     if (verify)
@@ -857,6 +859,14 @@ int main(int argc, char **argv) {
                {0}, {511, 512}, {513, 544, 1023}, {0, 505, 4097, 10000}, {31, 32, 4096, 7}})
         checkVerify(backend, format, kWindowed, histories);
       checkVerify(backend, format, kWhole, std::vector<uint32_t>{0, 31, 1000, 2047});
+#if SPLASH_MAXIMUM_BATCH_WIDTH == 8
+      for (const uint32_t count : {5u, 6u, 7u, 8u}) {
+        std::vector<uint32_t> histories{0, 505, 4097, 10000, 31, 512, 513, 2047};
+        histories.resize(count);
+        checkVerify(backend, format, kWindowed, histories);
+        checkVerify(backend, format, kWhole, histories);
+      }
+#endif
       checkSplitCounts(backend, format);
       checkWindowWithinHistory(backend, format);
     }

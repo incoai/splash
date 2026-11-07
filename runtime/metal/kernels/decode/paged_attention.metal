@@ -13,11 +13,8 @@
       device bfloat *queries [[buffer(0)]],                                    \
       device float *partials [[buffer(1)]],                                    \
       device float *statistics [[buffer(2)]],                                  \
-      device const SplashKvPage *page_table0 [[buffer(3)]],                    \
-      device const SplashKvPage *page_table1 [[buffer(4)]],                    \
-      device const SplashKvPage *page_table2 [[buffer(5)]],                    \
-      device const SplashKvPage *page_table3 [[buffer(6)]],                    \
-      constant SplashVerifyAttentionParams *params [[buffer(7)]],              \
+      SPLASH_LANE_BUFFERS(device const SplashKvPage *, page_table, 3),                    \
+      constant SplashVerifyAttentionParams *params [[buffer(3 + 1 * SPLASH_MAXIMUM_BATCH_WIDTH)]],              \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]])
 
@@ -56,7 +53,7 @@
                                 Window, CacheElement>(                         \
         queries + tile.offset,                                                 \
         SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2,    \
-                            page_table3),                                      \
+                            page_table3, page_table4, page_table5, page_table6, page_table7),                                      \
         params[group.z].kv, kv_head, tile.first_position, tile.active_rows,    \
         tile.splits, group.y, partials, statistics, tile.first_slot + group.y, \
         scores, probabilities, row_max, row_sum, previous_scale, &rescale,     \

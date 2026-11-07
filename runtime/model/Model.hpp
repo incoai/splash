@@ -605,6 +605,8 @@ maskWordsPerToken(uint32_t vocabularySize) noexcept {
 // attention-kernel geometry live with their operators.
 struct ExecutionLimits final {
   static constexpr uint32_t maximumBatchWidth = SPLASH_MAXIMUM_BATCH_WIDTH;
+  static constexpr uint32_t maximumPrefillBatchWidth = 4;
+  static_assert(maximumPrefillBatchWidth <= maximumBatchWidth);
   // The rows of a prefill chunk. A prefill command's lanes fill its chunks
   // one after another, and the runtime lets at most one lane's rows run past
   // a chunk: a prefill group has one scratch GDN cell for the state between
@@ -654,7 +656,8 @@ static_assert(ExecutionLimits::targetVerifyRows ==
 [[nodiscard]] inline std::optional<std::string_view>
 commandViolation(const CommandLimits &limits, const BatchPlan &plan,
                  std::span<const ModelBatchItem> items) noexcept {
-  if (items.size() > ExecutionLimits::maximumBatchWidth)
+  if (items.size() > (plan.kind == WorkKind::Prefill ? ExecutionLimits::maximumPrefillBatchWidth
+                                                  : ExecutionLimits::maximumBatchWidth))
     return "a command's lanes exceed the batch width";
   if (plan.kind != WorkKind::Prefill)
     return std::nullopt;

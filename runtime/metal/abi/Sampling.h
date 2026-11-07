@@ -60,8 +60,8 @@ struct TargetSamplingParams {
   uint32_t stop_tokens[SPLASH_STOP_TOKENS];
 };
 
-static_assert(sizeof(TargetSamplingParams) == 120,
-              "Target sampling parameters are 120 bytes on both sides");
+static_assert(sizeof(TargetSamplingParams) == 56 + 16 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "batch-dependent ABI size mismatch");
 
 // One shard's share of a sampled row's softmax denominator: the largest
 // logit it admits, the sum of exp((logit - maximum) / temperature) over its
@@ -128,8 +128,8 @@ struct SamplingPenaltyParams {
   float frequency[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(SamplingPenaltyParams) == 112,
-              "Sampling penalty parameters are 112 bytes on both sides");
+static_assert(sizeof(SamplingPenaltyParams) == 16 + 24 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "batch-dependent ABI size mismatch");
 
 // One selection's thinking cutoffs (ops::SamplingPolicy::thinkingCutoff), its
 // rows laid out as in TargetSamplingParams. A lane whose row is below rows
@@ -162,8 +162,8 @@ struct ThinkingCutoffParams {
   uint32_t tokens[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_TARGET_VERIFY_ROWS];
 };
 
-static_assert(sizeof(ThinkingCutoffParams) == 220,
-              "Thinking cutoff parameters are 220 bytes on both sides");
+static_assert(sizeof(ThinkingCutoffParams) == 28 + 4 * (4 + SPLASH_TARGET_VERIFY_ROWS) * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "batch-dependent ABI size mismatch");
 
 // The batched selector and acceptance kernels' grids cover exactly the
 // dispatch's lanes: per-lane arrays hold those lanes, and entries past them
@@ -176,8 +176,8 @@ struct SelectorBatchParams {
   uint32_t vocabulary;
 };
 
-static_assert(sizeof(SelectorBatchParams) == 44,
-              "Draft selector parameters are 44 bytes on both sides");
+static_assert(sizeof(SelectorBatchParams) == 12 + 8 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "batch-dependent ABI size mismatch");
 
 // The rows of its block each lane of a decode cycle verifies (its verify
 // rows, draft_verify_rows), chosen for the whole batch by expected accepted
@@ -204,8 +204,8 @@ struct VerifyRowsParams {
   uint32_t maximum[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(VerifyRowsParams) == 188,
-              "Verify rows parameters are 188 bytes on both sides");
+static_assert(sizeof(VerifyRowsParams) == 44 + 4 * (SPLASH_DRAFT_QUERY_ROWS + 1) * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "batch-dependent ABI size mismatch");
 
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
@@ -213,5 +213,5 @@ struct AcceptBatchParams {
   uint32_t sampling_mask;
 };
 
-static_assert(sizeof(AcceptBatchParams) == 36,
-              "Batched acceptance parameters are 36 bytes on both sides");
+static_assert(sizeof(AcceptBatchParams) == 20 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "batch-dependent ABI size mismatch");

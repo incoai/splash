@@ -451,6 +451,11 @@ enum class DecodeTensor : uint32_t {
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
   MoeScratch,
   MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,
+  PackedFfnInput,
+  PackedFfnResidual,
+  PackedFfnIntermediate,
+  PackedFfnOutput,
+  PackedFfnControl,
   Count,
 };
 
@@ -573,6 +578,13 @@ public:
     return scratch;
   }
 
+  [[nodiscard]] ops::VerifyFfnPackBuffers packedFfn() const {
+    return {batchSlice(DecodeTensor::PackedFfnControl, kLaneCount),
+            batchSlice(DecodeTensor::PackedFfnInput, kLaneCount),
+            batchSlice(DecodeTensor::PackedFfnResidual, kLaneCount),
+            batchSlice(DecodeTensor::PackedFfnIntermediate, kLaneCount),
+            batchSlice(DecodeTensor::PackedFfnOutput, kLaneCount)};
+  }
   [[nodiscard]] ops::LinearScratch linearScratch() const { return linearScratch_; }
   static ops::LinearScratchSize linearScratchSize(const RuntimeGeometry &geometry,
                                                  const ops::ExecutionPlans &operators);

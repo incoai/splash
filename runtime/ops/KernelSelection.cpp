@@ -173,6 +173,13 @@ SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows
 // where both its tensors' own plans take it.
 LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorkload w, const UnitFormats &unit,
                               std::span<const UnitFormats> pairTensors) {
+  if (w.phase == LinearPhase::Decode && w.rows > 32) {
+    LinearWorkload compatible = w;
+    compatible.rows = 32;
+    LinearConfig config = selectProjection(calibration, compatible, unit, pairTensors);
+    config.oneGateUpPass = false;
+    return config;
+  }
   const auto [n, k] = w.matrix;
   const ProjectionCalibration &p = calibration.projection;
   const uint32_t cores = calibration.cores;
@@ -209,6 +216,13 @@ LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorklo
 // and a gate/up pair of one format in one pass where it may.
 std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibration, LinearWorkload w,
                                                bool registerTakes) {
+  if (w.rows > 32) {
+    LinearWorkload compatible = w;
+    compatible.rows = 32;
+    auto configurations = decodeConfigurations(calibration, compatible, registerTakes);
+    for (auto &config : configurations) config.oneGateUpPass = false;
+    return configurations;
+  }
   const ProjectionCalibration &p = calibration.projection;
   const uint32_t cores = calibration.cores, n = w.matrix.outputSize, k = w.matrix.inputSize;
   std::vector<LinearConfig> configurations{

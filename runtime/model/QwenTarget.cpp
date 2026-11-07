@@ -144,7 +144,7 @@ ops::PrefillAttentionPlan prefillAttentionPlan(const ops::ExecutionPlans &plans,
 QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, const QwenTargetPrefillChunk &chunk,
                                                 const kv::PageStorage &kv, SpilledKvReads &spilled,
                                                 ops::AneFfn *aneFfn) const {
-  if (chunk.sequences.empty() || chunk.sequences.size() > ExecutionLimits::maximumBatchWidth || !chunk.rows ||
+  if (chunk.sequences.empty() || chunk.sequences.size() > ExecutionLimits::maximumPrefillBatchWidth || !chunk.rows ||
       chunk.rows > ExecutionLimits::prefillTokenBudget)
     throw std::invalid_argument("invalid Qwen prefill chunk");
   PrefillStep step{graph, chunk.buffers, chunk.sequences, chunk.rows, kv.layers(), spilled};
@@ -394,6 +394,13 @@ void QwenTarget::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &nor
   const ops::PreparedInput normalized =
       ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, step.rows,
                                  b.linearScratch, gateUpPlan.input());
+  const auto downPlan = linear.decodePlan(*ffn.down, step.lanes, ops::LinearEpilogue::Residual);
+  if (ops::addVerifyFfnPack(step.graph, ffn, b.normalized, residual, output, b.denseGateScratch,
+                           b.denseIntermediate, b.linearScratch, b.verifyRows, b.packedFfn,
+                           gateUpPlan, downPlan, step.lanes)) {
+    if (b.packedFfnEncodedLayers) ++*b.packedFfnEncodedLayers;
+    return;
+  }
   linear.add(step.graph,
              {.input = b.normalized, .output = b.denseIntermediate, .gateScratch = b.denseGateScratch,
               .scratch = b.linearScratch, .prepared = normalized},
@@ -401,7 +408,7 @@ void QwenTarget::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &nor
   linear.add(step.graph,
              {.input = b.denseIntermediate, .output = std::move(output), .residual = std::move(residual),
               .scratch = b.linearScratch},
-             *ffn.down, linear.decodePlan(*ffn.down, step.lanes, ops::LinearEpilogue::Residual));
+             *ffn.down, downPlan);
 }
 
 void QwenTarget::addVerifyMoe(VerifyStep &step, const ops::NormWeights &norm, const ops::BlockMoeWeights &ffn,
@@ -456,6 +463,24 @@ public:
                 metal::MetalBackend &backend, const ops::ExecutionPlans &operators)
       : QwenTarget(weights, geometry, backend, operators), weights_(weights) {
     requireLayers(std::span<const Layer>(weights.layers));
+    const auto &linear = operators_.linear();
+    for (uint32_t lanes = 5; lanes <= ExecutionLimits::maximumBatchWidth; ++lanes) {
+      bool supported = !weights.layers.empty();
+      for (const Layer &layer : weights.layers) {
+        const auto dense = denseFfn(layer);
+        if (!dense || !ops::supportsVerifyFfnPack(
+                          *dense, linear.decodePlan(*dense->up, lanes, ops::LinearEpilogue::GateUp),
+                          linear.decodePlan(*dense->down, lanes, ops::LinearEpilogue::Residual), lanes)) {
+          supported = false;
+          break;
+        }
+      }
+      packedFfnSupported_[lanes - 1] = supported;
+    }
+  }
+
+  bool supportsPackedFfn(uint32_t lanes) const noexcept override {
+    return lanes && lanes <= packedFfnSupported_.size() && packedFfnSupported_[lanes - 1];
   }
 
   std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph, std::span<const QwenTargetPrefillChunk> chunks,
@@ -550,6 +575,7 @@ private:
       addVerifyMoe(step, layer.postAttentionNorm, *qwenMoeBlock(layer), std::move(residual), std::move(output));
   }
 
+  std::array<bool, ExecutionLimits::maximumBatchWidth> packedFfnSupported_{};
   const QwenTargetWeights<Layout, Layer> &weights_;
 };
 

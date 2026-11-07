@@ -105,17 +105,11 @@ kernel void block_indexer_project(device const float *query [[buffer(0)]],
 // is in the lane's pending keys, whose open block this is.
 kernel void block_indexer_pool(device const BlockIndexerBlock *blocks [[buffer(0)]],
                                device const bfloat *keys [[buffer(1)]],
-                               device const bfloat *pending0 [[buffer(2)]],
-                               device const bfloat *pending1 [[buffer(3)]],
-                               device const bfloat *pending2 [[buffer(4)]],
-                               device const bfloat *pending3 [[buffer(5)]],
-                               device const float *key_norm [[buffer(6)]],
-                               device const float *inverse_frequencies [[buffer(7)]],
-                               device const SplashKvPage *index_table0 [[buffer(8)]],
-                               device const SplashKvPage *index_table1 [[buffer(9)]],
-                               device const SplashKvPage *index_table2 [[buffer(10)]],
-                               device const SplashKvPage *index_table3 [[buffer(11)]],
-                               constant BlockIndexerParams &p [[buffer(12)]],
+                               SPLASH_LANE_BUFFERS(device const bfloat *, pending, 2),
+                               device const float *key_norm [[buffer(2 + 1 * SPLASH_MAXIMUM_BATCH_WIDTH)]],
+                               device const float *inverse_frequencies [[buffer(3 + 1 * SPLASH_MAXIMUM_BATCH_WIDTH)]],
+                               SPLASH_LANE_BUFFERS(device const SplashKvPage *, index_table, 4 + 1 * SPLASH_MAXIMUM_BATCH_WIDTH),
+                               constant BlockIndexerParams &p [[buffer(4 + 2 * SPLASH_MAXIMUM_BATCH_WIDTH)]],
                                uint2 group [[threadgroup_position_in_grid]],
                                uint tid [[thread_index_in_threadgroup]],
                                uint lane [[thread_index_in_simdgroup]],
@@ -126,8 +120,8 @@ kernel void block_indexer_pool(device const BlockIndexerBlock *blocks [[buffer(0
   const uint index = group.x, batch = group.y;
   if (!indexer_lane(batch, p) || index >= p.counts[batch]) return;
   device const SplashKvPage *index_table =
-      SPLASH_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3);
-  device const bfloat *pending = SPLASH_LANE_BINDING(batch, pending0, pending1, pending2, pending3);
+      SPLASH_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3, index_table4, index_table5, index_table6, index_table7);
+  device const bfloat *pending = SPLASH_LANE_BINDING(batch, pending0, pending1, pending2, pending3, pending4, pending5, pending6, pending7);
   const BlockIndexerBlock block = blocks[ulong(batch) * p.lane_records + index];
   // The block's row of the target's RoPE table, scaled as the queries' are.
   if (tid < kPairs) {
@@ -185,23 +179,17 @@ kernel void block_indexer_pending(device const bfloat *keys [[buffer(0)]],
 // wrote. A lane's pending keys of every layer follow each other.
 kernel void block_indexer_commit(device const bfloat *keys [[buffer(0)]],
                                  device const uint *retained [[buffer(1)]],
-                                 device const bfloat *pending_in0 [[buffer(2)]],
-                                 device const bfloat *pending_in1 [[buffer(3)]],
-                                 device const bfloat *pending_in2 [[buffer(4)]],
-                                 device const bfloat *pending_in3 [[buffer(5)]],
-                                 device bfloat *pending_out0 [[buffer(6)]],
-                                 device bfloat *pending_out1 [[buffer(7)]],
-                                 device bfloat *pending_out2 [[buffer(8)]],
-                                 device bfloat *pending_out3 [[buffer(9)]],
-                                 constant BlockIndexerPendingParams &p [[buffer(10)]],
+                                 SPLASH_LANE_BUFFERS(device const bfloat *, pending_in, 2),
+                                 SPLASH_LANE_BUFFERS(device bfloat *, pending_out, 2 + 1 * SPLASH_MAXIMUM_BATCH_WIDTH),
+                                 constant BlockIndexerPendingParams &p [[buffer(2 + 2 * SPLASH_MAXIMUM_BATCH_WIDTH)]],
                                  uint2 group [[threadgroup_position_in_grid]],
                                  uint tid [[thread_index_in_threadgroup]]) {
   const uint layer = group.x, lane = group.y;
   if (lane >= min(p.lanes, SPLASH_MAXIMUM_BATCH_WIDTH)) return;
   const ulong pending = ulong(layer) * kPending * kDimension;
   indexer_store_pending(keys + (ulong(layer) * p.layer_rows + ulong(lane) * p.rows) * kDimension,
-                        SPLASH_LANE_BINDING(lane, pending_in0, pending_in1, pending_in2, pending_in3) + pending,
-                        SPLASH_LANE_BINDING(lane, pending_out0, pending_out1, pending_out2, pending_out3) + pending,
+                        SPLASH_LANE_BINDING(lane, pending_in0, pending_in1, pending_in2, pending_in3, pending_in4, pending_in5, pending_in6, pending_in7) + pending,
+                        SPLASH_LANE_BINDING(lane, pending_out0, pending_out1, pending_out2, pending_out3, pending_out4, pending_out5, pending_out6, pending_out7) + pending,
                         p.first_position[lane], min(retained[lane], p.rows), tid);
 }
 
@@ -215,12 +203,9 @@ constant constexpr uint kScoreRows = BLOCK_INDEXER_SCORE_ROWS;
 constant constexpr uint kScoreBlocks = BLOCK_INDEXER_SCORE_BLOCKS;
 constant constexpr uint kScoreThreads = BLOCK_INDEXER_SCORE_THREADS;
 kernel void block_indexer_score(device const bfloat *queries [[buffer(0)]],
-                                device const SplashKvPage *index_table0 [[buffer(1)]],
-                                device const SplashKvPage *index_table1 [[buffer(2)]],
-                                device const SplashKvPage *index_table2 [[buffer(3)]],
-                                device const SplashKvPage *index_table3 [[buffer(4)]],
-                                device float *scores [[buffer(5)]],
-                                constant BlockIndexerParams &p [[buffer(6)]],
+                                SPLASH_LANE_BUFFERS(device const SplashKvPage *, index_table, 1),
+                                device float *scores [[buffer(1 + 1 * SPLASH_MAXIMUM_BATCH_WIDTH)]],
+                                constant BlockIndexerParams &p [[buffer(2 + 1 * SPLASH_MAXIMUM_BATCH_WIDTH)]],
                                 uint3 group [[threadgroup_position_in_grid]],
                                 uint tid [[thread_index_in_threadgroup]]) {
   constexpr ushort M = kScoreRows * kHeads, N = kScoreBlocks, D = kDimension;
@@ -237,7 +222,7 @@ kernel void block_indexer_score(device const bfloat *queries [[buffer(0)]],
   const uint complete = (p.first_position[batch] + p.row_offset + last) / kBlock;
   if (block0 >= complete || complete <= p.top_blocks) return;
   device const SplashKvPage *index_table =
-      SPLASH_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3);
+      SPLASH_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3, index_table4, index_table5, index_table6, index_table7);
   device const uint4 *tile_queries = reinterpret_cast<device const uint4 *>(
       queries + (ulong(batch) * p.rows + p.row_offset + row0) * kHeads * D);
   for (uint chunk = tid; chunk < M * Chunks; chunk += kScoreThreads)

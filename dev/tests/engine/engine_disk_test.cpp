@@ -1062,8 +1062,15 @@ void testCopiesAheadDoNotWaitForARequestHeldBehindARefusal() {
   lane(1, 2060, RequestPriority::Foreground);
   lane(2, 9, RequestPriority::Foreground);
   lane(3, 9, RequestPriority::Foreground);
-  tickUntil(engine, now, [&] { return events.outputs.contains(1) && events.outputs.contains(3); },
-            "the Foreground lanes did not decode");
+  for (uint64_t id = 100; id < 100 + model::ExecutionLimits::maximumBatchWidth - 4; ++id)
+    lane(id, 9, RequestPriority::Foreground);
+  tickUntil(
+      engine, now,
+      [&] {
+        return events.outputs.contains(1) && events.outputs.contains(3) &&
+               engine.snapshot().scheduler.decoding == model::ExecutionLimits::maximumBatchWidth;
+      },
+      "the Foreground lanes did not decode");
   const std::optional<double> due = engine.nextWakeupMilliseconds();
   require(due && engine.snapshot().writeBehind.waiting == 1, "the first lane's point did not wait for its delay");
   lane(5, 9, RequestPriority::Foreground, 2);
@@ -1123,7 +1130,7 @@ void testCopiesAheadWaitForALaneRefusedDuringARecovery() {
   require(due && engine.snapshot().writeBehind.waiting == 1 && !tier.demotions,
           "the finished conversation's point did not wait for its delay");
   executor.decodeFinishes = false;
-  const auto promptTokens = [](uint64_t id) { return id == 1 ? 87U : id == 2 ? 65U : 9U; };
+  const auto promptTokens = [](uint64_t id) { return id == 1 ? 87U : id == 2 || id >= 100 ? 65U : 9U; };
   const auto decoding = [&](uint64_t id, RequestPriority priority, uint32_t output) {
     auto value = request(id, std::vector<uint32_t>(promptTokens(id), static_cast<uint32_t>(id)));
     value.priority = priority;
@@ -1133,8 +1140,15 @@ void testCopiesAheadWaitForALaneRefusedDuringARecovery() {
   };
   for (const uint32_t id : {1U, 2U, 3U, 4U})
     decoding(id, RequestPriority::Normal, 1000);
-  tickUntil(engine, now, [&] { return events.outputs.contains(1) && events.outputs.contains(4); },
-            "the Normal lanes did not decode");
+  for (uint64_t id = 100; id < 100 + model::ExecutionLimits::maximumBatchWidth - 4; ++id)
+    decoding(id, RequestPriority::Normal, 1000);
+  tickUntil(
+      engine, now,
+      [&] {
+        return events.outputs.contains(1) && events.outputs.contains(4) &&
+               engine.snapshot().scheduler.decoding == model::ExecutionLimits::maximumBatchWidth;
+      },
+      "the Normal lanes did not decode");
   decoding(5, RequestPriority::Foreground, 2);
   tickUntil(engine, now, [&] { return engine.snapshot().prioritySuspensions != 0; },
             "the Foreground arrival suspended no Normal lane");
@@ -1336,8 +1350,15 @@ void testCopiesAheadDoNotWaitForARequestARecoveryLeavesUntried() {
   };
   for (const uint32_t id : {1U, 2U, 3U})
     decoding(id, std::vector<uint32_t>(9, id), RequestPriority::Normal);
-  tickUntil(engine, now, [&] { return events.outputs.contains(3) && !engine.commandInFlight(); },
-            "the Normal lanes did not decode");
+  for (uint64_t id = 100; id < 100 + model::ExecutionLimits::maximumBatchWidth - 4; ++id)
+    decoding(id, std::vector<uint32_t>(9, id), RequestPriority::Normal);
+  tickUntil(
+      engine, now,
+      [&] {
+        return events.outputs.contains(3) && !engine.commandInFlight() &&
+               engine.snapshot().scheduler.decoding == model::ExecutionLimits::maximumBatchWidth - 1;
+      },
+      "the Normal lanes did not decode");
   storage.growthBlocked = true;
   const KvPageAcquisition held = pool.acquirePages(pool.freePageCount());
   decoding(4, prefix, RequestPriority::Normal);
@@ -1508,6 +1529,7 @@ void testAsyncRestoreLifecycle() {
 // A stop of a lane that has output and is restoring its state from disk
 // waits for the read to drain, then finishes as Stop.
 void testStopWhileRestoringFinishesAfterTheRestore() {
+  constexpr uint64_t capacity = model::ExecutionLimits::maximumBatchWidth;
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache cache(pool, nullptr, nullptr);
@@ -1525,27 +1547,35 @@ void testStopWhileRestoringFinishesAfterTheRestore() {
   publishDiskState(cache, prompt);
   // Lane 1, with the shortest prompt the least work, yields its lane to a
   // Foreground arrival once all the lanes are full.
-  for (uint64_t id = 1; id <= 4; ++id) {
+  for (uint64_t id = 1; id <= capacity; ++id) {
     EngineRequest lane = request(id, id == 1 ? prompt : std::vector<uint32_t>(129, id));
     lane.maxNewTokens = 1000;
     engine.submit(std::move(lane));
   }
   double now = 1;
-  tickUntil(engine, now,
-            [&] {
-              return std::ranges::all_of(std::array<uint64_t, 4>{1, 2, 3, 4},
-                                         [&](uint64_t id) { return !events.outputs[id].empty(); });
-            },
-            "the lanes did not decode");
+  tickUntil(
+      engine, now,
+      [&] {
+        return std::ranges::all_of(
+            [] {
+              std::vector<uint64_t> ids;
+              for (uint64_t id = 1; id <= capacity; ++id)
+                ids.push_back(id);
+              return ids;
+            }(),
+            [&](uint64_t id) { return !events.outputs[id].empty(); });
+      },
+      "the lanes did not decode");
   // Once the arrival finishes, lane 1 resumes into a restore that is held:
   // the second read of the only state on disk.
   executor.restoreControl = std::make_shared<RestoreControl>();
   executor.restoreControl->promotionDenied = true;
-  EngineRequest arriving = request(5, std::vector<uint32_t>(9, 5));
+  EngineRequest arriving = request(capacity + 1, std::vector<uint32_t>(9, capacity + 1));
   arriving.priority = RequestPriority::Foreground;
   engine.submit(std::move(arriving));
-  tickUntil(engine, now, [&] { return events.usage.contains(5) && executor.diskReads == 2; },
-            "the suspended lane did not resume into a disk restore");
+  tickUntil(
+      engine, now, [&] { return events.usage.contains(capacity + 1) && executor.diskReads == 2; },
+      "the suspended lane did not resume into a disk restore");
   require(engine.snapshot().prioritySuspensions == 1 && !events.reasons.contains(1),
           "the arrival did not suspend the lane");
 
@@ -1555,13 +1585,13 @@ void testStopWhileRestoringFinishesAfterTheRestore() {
           "a stop while restoring finished before the restore drained");
   executor.restoreControl->ready = true;
   tickUntil(engine, now, [&] { return events.reasons.contains(1); }, "the stopped request did not end");
-  for (uint64_t id = 2; id <= 4; ++id)
+  for (uint64_t id = 2; id <= capacity; ++id)
     engine.cancel(id);
   tickUntil(engine, now, [&] { return idle(engine); }, "the engine did not become idle");
 
   const EngineSnapshot counts = engine.snapshot();
   require(events.reasons.at(1) == EngineFinishReason::Stop && counts.completed == 2 &&
-              counts.cancelled == 3 && counts.failed == 0,
+              counts.cancelled == capacity - 1 && counts.failed == 0,
           "a stop while restoring did not finish as Stop after the restore");
 }
 

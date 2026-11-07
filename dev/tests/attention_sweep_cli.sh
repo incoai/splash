@@ -2,6 +2,8 @@
 # Invalid benchmark arguments must fail before a device or metallib is opened.
 set -eu
 binary=$1
+maximum=${2:-4}
+case "$maximum" in 4|8) ;; *) exit 2 ;; esac
 work=$(mktemp -d "${TMPDIR:-/tmp}/splash-sweep-cli.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
@@ -18,7 +20,7 @@ reject() {
     test ! -s "$work/out"
 }
 
-for value in 0 5 100 -1 4294967296 4294967297 1x '' '1,' ',1' '1,,4'; do
+for value in 0 "$((maximum + 1))" 100 -1 4294967296 4294967297 1x '' '1,' ',1' '1,,4'; do
     reject '--lanes requires integers' --lanes "$value"
 done
 for value in 0 -1 4294967296 1x ''; do
@@ -50,4 +52,10 @@ reject 'does not hold whole alignment units' --shapes 27b --extent-pages 448
 reject 'unknown option --sentinel' \
     --lanes 1,2,3,4 --histories 0,2048,131072 --rows 1,64,2048 --repeat 1 \
     --shapes 27b,35b,fn,flint-window,flint-full --qsa pages --located --extent-pages 512 --sentinel 1
+# The expanded optional build accepts every new lane before opening Metal.
+lane=1
+while [ "$lane" -le "$maximum" ]; do
+    reject 'unknown option --sentinel' --lanes "$lane" --sentinel 1
+    lane=$((lane + 1))
+done
 echo 'attention-sweep CLI validation: PASS'

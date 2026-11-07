@@ -1,5 +1,5 @@
 ENGINE_TEST_BUILD := $(BUILD)/engine-tests
-ENGINE_TEST_CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev \
+ENGINE_TEST_CXXFLAGS := $(NATIVE_BATCH_FLAG) -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev \
 	$(MACOS_TARGET_FLAG)
 # Production flags less -O3, so Metal optimizes at its default -O2. With
 # metal 32023 the kernels built with them get the same AIR as at -O3, but
@@ -17,7 +17,7 @@ TEST_CONFIG_DIGEST := $(shell printf '%s\0' $(NATIVE_CONFIG_DIGEST) \
 	$(METAL_CONFIG_DIGEST) $(call shell-quote,$(ENGINE_TEST_CXXFLAGS)) \
 	$(call shell-quote,$(TEST_METALFLAGS)) | shasum -a 256 | cut -c1-16)
 ENGINE_SANITIZER_BUILD := $(BUILD)/sanitizers
-ENGINE_SANITIZER_CXXFLAGS := -std=c++20 -O1 -g -fno-omit-frame-pointer \
+ENGINE_SANITIZER_CXXFLAGS := $(NATIVE_BATCH_FLAG) -std=c++20 -O1 -g -fno-omit-frame-pointer \
 	-Wall -Wextra -Werror -Iruntime -Idev $(MACOS_TARGET_FLAG)
 SANITIZER_CONFIG_DIGEST := $(shell printf '%s\0' $(NATIVE_CONFIG_DIGEST) \
 	$(call shell-quote,$(ENGINE_SANITIZER_CXXFLAGS)) \
@@ -100,6 +100,7 @@ TEST_WEIGHT_SOURCE := $(ENGINE_TEST_BUILD)/weight-source
 TEST_LEGACY_WEIGHT_CACHE := $(ENGINE_TEST_BUILD)/legacy-weight-cache
 TEST_GGUF_FILE := $(ENGINE_TEST_BUILD)/gguf-file
 TEST_GGUF_PROJECTION := $(ENGINE_TEST_BUILD)/gguf-projection
+TEST_VERIFY_FFN_PACK := $(ENGINE_TEST_BUILD)/verify-ffn-pack
 TEST_ANE_FFN := $(ENGINE_TEST_BUILD)/ane-ffn
 TEST_ANE_FFN_CALIBRATION := $(ENGINE_TEST_BUILD)/ane-ffn-calibration
 TEST_ANE_FFN_STARTUP := $(ENGINE_TEST_BUILD)/ane-ffn-startup
@@ -298,6 +299,10 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(LIB) $(HOST_STEP_LIB) $(TEST_METAL_BACKEND_LIB) $(TEST_PRODUCTION_LIB) $(TEST_HOST_STEP_LIB) \
 	$(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) $(TEST_GGUF_DEQUANT_LIB)
 
+ifeq ($(NATIVE_BATCH_WIDTH),8)
+TEST_METAL_TARGETS += $(TEST_VERIFY_FFN_PACK)
+endif
+
 # Keep every output that uses a flag set together, including standalone
 # benchmarks, real-model tests and intermediate test AIRs/metallibs.
 TEST_CONFIG_TARGETS := $(filter-out $(LIB) $(HOST_STEP_LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))) \
@@ -420,6 +425,9 @@ $(TEST_COMMAND_LIMITS): dev/tests/engine/command_limits_test.cpp $(ENGINE_LIBRAR
 $(TEST_MODEL_CONFIGURATION): dev/tests/engine/model_configuration_test.mm $(ENGINE_LIBRARY)
 $(TEST_DRAFT_PREPARATION): dev/tests/engine/draft_preparation_test.mm $(ENGINE_LIBRARY)
 $(TEST_GGUF_PROJECTION): dev/tests/engine/gguf_projection_test.mm $(ENGINE_LIBRARY) $(LIB)
+$(TEST_VERIFY_FFN_PACK): dev/tests/engine/verify_ffn_pack_metal_test.mm \
+		dev/tests/engine/VerifyPackTestFixtures.hpp dev/tests/engine/VerifyFfnPackChain.hpp \
+		dev/tests/engine/VerifyFfnPackBounds.hpp $(ENGINE_LIBRARY) $(LIB)
 $(TEST_ANE_FFN): dev/tests/engine/ane_ffn_test.mm $(ENGINE_INSTRUMENTED_ANE_OBJECT) $(ENGINE_LIBRARY) $(LIB)
 $(TEST_ANE_PROGRAM_FAULTS): dev/tests/engine/ane_program_faults_test.mm \
 		$(ENGINE_INSTRUMENTED_ANE_OBJECT) $(ENGINE_LIBRARY) $(LIB)
@@ -514,7 +522,7 @@ $(TEST_GGUF_MOE_BENCHMARK): dev/benchmarks/gguf_moe_benchmark.mm \
 		dev/benchmarks/DispatchReplay.hpp \
 		$(ENGINE_LIBRARY) $(LIB)
 
-$(TEST_MODEL_CONFIGURATION) $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(TEST_ANE_FFN) \
+$(TEST_MODEL_CONFIGURATION) $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(TEST_VERIFY_FFN_PACK) $(TEST_ANE_FFN) \
 		$(TEST_ANE_PROGRAM_FAULTS) $(TEST_GGUF_DEQUANT) $(TEST_GGUF_ROTATION) \
 		$(TEST_GGUF_REFERENCE) $(TEST_GGUF_PLANNER) $(TEST_GGUF_PREPARATION) \
 		$(TEST_BOOTSTRAP_TEST) $(TEST_RESOURCES_TEST) \
@@ -601,6 +609,13 @@ test-engine: test-engine-cpu test-engine-metal
 # test-engine-cpu runs every suite and fails at its end, naming each that
 # failed, so that one run shows every failure instead of the first of 50.
 # engine-sim, the slowest, runs last.
+# The default golden remains the four-request contract. The width-eight
+# experiment has separate reviewed planning and status fixtures.
+TEST_GOLDEN_SUFFIX := $(if $(filter 8,$(NATIVE_BATCH_WIDTH)),_8,)
+TEST_KERNEL_GOLDEN := dev/tests/engine/kernel_selection_golden$(TEST_GOLDEN_SUFFIX).txt
+TEST_STATUS_GOLDEN := dev/tests/engine/status_golden$(TEST_GOLDEN_SUFFIX).json
+TEST_STATUS_VARIANTS_GOLDEN := dev/tests/engine/status_variants_golden$(TEST_GOLDEN_SUFFIX).jsonl
+
 ENGINE_CPU_FAILED := $(ENGINE_TEST_BUILD)/test-engine-cpu.failed
 ENGINE_CPU_STEP = @step() { echo "$$*"; "$$@" || echo "$$*" >> $(ENGINE_CPU_FAILED); }; step
 test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENCHMARK)
@@ -625,13 +640,13 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(ENGINE_CPU_STEP) $(TEST_GGUF_REFERENCE) $(WEIGHT_GOLDENS) $(MLX_QUANTIZATION_FIXTURE)
 	$(ENGINE_CPU_STEP) $(TEST_GGUF_PLANNER)
 	$(ENGINE_CPU_STEP) $(TEST_LINEAR_PLAN) --cpu
-	$(ENGINE_CPU_STEP) /bin/sh dev/tests/attention_sweep_cli.sh $(TEST_ATTENTION_SWEEP)
+	$(ENGINE_CPU_STEP) /bin/sh dev/tests/attention_sweep_cli.sh $(TEST_ATTENTION_SWEEP) $(NATIVE_BATCH_WIDTH)
 	$(ENGINE_CPU_STEP) /bin/sh dev/tests/backend_benchmark_cli.sh $(TEST_BACKEND_BENCHMARK) $(MODEL_CONFIGS)
 	$(ENGINE_CPU_STEP) $(TEST_OPERATOR_WORKSPACE)
 	$(ENGINE_CPU_STEP) $(TEST_ANE_FFN_CALIBRATION)
 	$(ENGINE_CPU_STEP) $(TEST_ANE_FFN_STARTUP)
 	$(ENGINE_CPU_STEP) $(TEST_EXECUTION_PLANS)
-	$(ENGINE_CPU_STEP) $(TEST_KERNEL_SELECTION) dev/tests/engine/kernel_selection_golden.txt
+	$(ENGINE_CPU_STEP) $(TEST_KERNEL_SELECTION) $(TEST_KERNEL_GOLDEN)
 	$(ENGINE_CPU_STEP) $(TEST_MODEL_EXECUTION_PLANS)
 	$(ENGINE_CPU_STEP) $(TEST_COMMAND_LIMITS)
 	$(ENGINE_CPU_STEP) $(TEST_MEMORY_TEST)
@@ -656,7 +671,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(ENGINE_CPU_STEP) $(TEST_MEMORY_AUDIT_TEST)
 	$(ENGINE_CPU_STEP) $(TEST_MEMORY_GOVERNOR_TEST)
 	$(ENGINE_CPU_STEP) $(TEST_MEMORY_LEDGER)
-	$(ENGINE_CPU_STEP) $(TEST_STATUS_TEST) dev/tests/engine/status_golden.json dev/tests/engine/status_variants_golden.jsonl
+	$(ENGINE_CPU_STEP) $(TEST_STATUS_TEST) $(TEST_STATUS_GOLDEN) $(TEST_STATUS_VARIANTS_GOLDEN)
 	$(ENGINE_CPU_STEP) $(TEST_JSON_WRITER)
 	$(ENGINE_CPU_STEP) $(TEST_Q8_CPU_TEST)
 	$(ENGINE_CPU_STEP) $(TEST_ENGINE_SIM)
@@ -669,6 +684,9 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_GGUF_DEQUANT) $(TEST_GGUF_DEQUANT_LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_ROTATION) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_PROJECTION) $(TEST_PRODUCTION_LIB)
+ifeq ($(NATIVE_BATCH_WIDTH),8)
+	$(METAL_TEST_ENV) $(TEST_VERIFY_FFN_PACK) $(LIB)
+endif
 	$(METAL_TEST_ENV) $(TEST_ANE_FFN) $(LIB) kernels
 	$(TEST_ANE_FFN) $(LIB) split
 	$(TEST_ANE_FFN) $(LIB) faults
@@ -941,7 +959,7 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_SLOT_RECYCLER_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_PLAN_ASAN)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_AUDIT_ASAN)
-	$(ASAN_TEST_ENV) $(TEST_STATUS_ASAN) dev/tests/engine/status_golden.json dev/tests/engine/status_variants_golden.jsonl
+	$(ASAN_TEST_ENV) $(TEST_STATUS_ASAN) $(TEST_STATUS_GOLDEN) $(TEST_STATUS_VARIANTS_GOLDEN)
 	$(ASAN_TEST_ENV) $(TEST_JSON_WRITER_ASAN)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_LEDGER_ASAN)
 

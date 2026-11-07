@@ -84,5 +84,5 @@ struct GDNDecodeBatchParams {
   uint32_t pending_rows[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(GDNDecodeBatchParams) == 112,
-              "GDN decode parameters are 112 bytes on both sides");
+static_assert(sizeof(GDNDecodeBatchParams) == 32 + 20 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "batch-dependent ABI size mismatch");
