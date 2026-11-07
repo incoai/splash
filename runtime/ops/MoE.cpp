@@ -86,12 +86,12 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows, MoeG
 // The shape's compiled routing (MoeShape::compiledRouting).
 const CompiledMoeRouting &compiledRouting(MoeShape shape) {
   if (const CompiledMoeRouting *compiled = shape.compiledRouting()) return *compiled;
-  throw std::invalid_argument("no MoE kernel routes the shape's router and shared slices");
+  throw std::invalid_argument("no MoE kernel routes the shape's router, shared slices and experts");
 }
 
 // A routing kernel's instance for the shape's router width (past
-// SPLASH_MOE_EXPERT_SLOTS experts, its wide one) and its compiled routing's
-// `suffix`.
+// SPLASH_MOE_EXPERT_SLOTS experts, the softmax routing's wide one) and its
+// compiled routing's `suffix`.
 std::string routingKernel(std::string name, MoeShape shape, std::string_view CompiledMoeRouting::*suffix) {
   static_assert(SPLASH_MOE_WIDE_EXPERT_SLOTS == 512, "the wide routing kernels are the _e512 instances");
   if (shape.routerWidth() == SPLASH_MOE_WIDE_EXPERT_SLOTS) name += "_e512";
@@ -238,10 +238,9 @@ void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
   addRoutes(graph, buffers.input, weights.router, weights.sharedScalarGate, scratch.groupedInput,
             scratch.selectedExperts, scratch.routingWeights, rows, shape, plan.configuration().ggufRouterTile);
   // The expert passes launch the live tiles alone, on grids the grouping
-  // writes with the tile count. Over every tile a step could fill, a 35B
-  // decode step of one lane launched 65 tiles' threadgroups for a median of
-  // 30 live ones; the rest return at once yet cost a 40-core M5 Max 0.8-4.1%
-  // of a decode cycle, a 12-core M6 0.1-1.0% and a 40-core M3 Max up to 4.8%.
+  // writes with the tile count: a one-lane 35B decode step fills a median of
+  // 30 of the 65 tiles it could, and the idle ones' threadgroups, returning at
+  // once, still cost up to 4.8% of a decode cycle (40-core M3 Max).
   std::vector<metal::MetalBuffer> grouping{scratch.selectedExperts, scratch.tileDescriptors, scratch.tileCount,
                                            scratch.groupedRoutes, scratch.routeRows};
   if (buffers.verifyRows) {

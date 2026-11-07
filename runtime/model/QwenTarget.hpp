@@ -34,13 +34,8 @@ class PageStorage;
 
 namespace splash::model {
 
-struct Qwen3_8Layout;
-struct Qwen3_8LayerWeights;
-struct Qwen3_6MoeLayout;
-struct Qwen3_6MoeLayerWeights;
-
-// Both supported targets bind the same mixer tensors per hybrid layer; only
-// the FFN differs between them.
+// Every Qwen family binds these mixer tensors per layer, a GDN or an
+// attention; their FFNs differ.
 struct QwenGdnWeights final {
   ops::Projection inputProjection;
   metal::MetalBuffer convolutionWeights;
@@ -83,9 +78,8 @@ struct QwenTargetWeightsBase {
   std::shared_ptr<SparseRowStore> streamedTable;
 };
 
-// The weights of a Qwen3.5-architecture target of Layout, whose layers the
-// family keeps in Layer, and the norm the head reads its last layer's output
-// through.
+// The weights of a Qwen target of Layout, whose layers the family keeps in
+// Layer, and the norm the head reads its last layer's output through.
 template <class Layout, class Layer> struct QwenTargetWeights final : QwenTargetWeightsBase {
   Layout layout;
   std::vector<Layer> layers;
@@ -107,12 +101,9 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
       std::ranges::copy(captureLayers, captureLayerValues.begin());
   }
 
-  // The format of most of the sparse MoE blocks' routed expert weights,
-  // whether every routed and shared expert weight is in a format the register
-  // tile takes, and the format of most of their routers' rows (ops::MoeShape).
-  uint32_t moeExpertFormat = GGUF_FMT_COUNT;
-  bool moeRegisterFormats = true;
-  uint32_t moeRouterFormat = ops::QuantizedSegment::kFloat32;
+  // The formats of the sparse MoE blocks' weights, which their plans follow
+  // (ops::moeFormats).
+  ops::MoeFormats moeFormats{};
   // The layers whose output rows the DFlash2 draft reads, ascending.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
@@ -142,13 +133,6 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   }
   [[nodiscard]] constexpr uint32_t capturedHiddenSize() const noexcept {
     return hiddenSize * captureLayerCount;
-  }
-  [[nodiscard]] constexpr ops::MoeShape moeShape() const noexcept {
-    ops::MoeShape shape = moeBlockShape();
-    shape.expertFormat = moeExpertFormat;
-    shape.registerFormats = moeRegisterFormats;
-    shape.routerFormat = moeRouterFormat;
-    return shape;
   }
   // How attention layer `attention` (the a-th attention layer) attends: with
   // the RoPE of the target's pairs unless unrotatedLayers names it, and over
@@ -201,7 +185,7 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
            kvLayout.headDimension == attentionHeadDimension &&
            sized(prefillProjections) && sized(decodeProjections) &&
            ((ffnKind == QwenFfnKind::Dense && dense) ||
-            (ffnKind == QwenFfnKind::SparseMoe && moeShape().valid() && (!leadingDenseLayers || dense)));
+            (ffnKind == QwenFfnKind::SparseMoe && moeBlockShape().valid() && (!leadingDenseLayers || dense)));
   }
 };
 
@@ -298,6 +282,14 @@ struct QwenTargetPrefillBuffers final {
   }
 };
 
+// The attention plan of a prefill sequence's rows after the history its
+// chunk committed (sequence.chunk.committed_tokens): of a geometry's whole
+// layers by default, of its sliding layers with their window.
+[[nodiscard]] ops::PrefillAttentionPlan prefillAttentionPlan(const ops::ExecutionPlans &plans,
+                                                            const QwenTargetGeometry &geometry,
+                                                            const QwenTargetPrefillSequence &sequence,
+                                                            ops::AttentionVariant variant = {});
+
 // A chunk of a prefill command: `rows` rows of its lanes' sequences, packed
 // in sequence order, in its own buffers.
 struct QwenTargetPrefillChunk final {
@@ -351,8 +343,8 @@ struct QwenTargetVerifyBuffers final {
   // (ops::BlockIndex::tables).
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> indexTables;
   ops::MoeScratch moe;
-  // Each lane's verify rows (ops::DraftSelector::addVerifyRows), which a MoE target's
-  // steps route alone (ops::MoeBuffers::verifyRows).
+  // Each lane's verify rows (ops::DraftSelector::addVerifyRows), which a MoE
+  // target's steps route alone (ops::MoeBuffers::verifyRows).
   metal::MetalBuffer verifyRows;
   // Each lane's auxiliary state before the step; the commit writes the one
   // after it (addStateCommit).
@@ -375,10 +367,14 @@ struct QwenTargetScratchBytes final {
   uint64_t decode = 0;
 };
 
-// A layer's MoE block, null for a dense FFN.
-[[nodiscard]] const ops::BlockMoeWeights *qwenMoeBlock(const Qwen3_8LayerWeights &layer) noexcept;
+// A layer's FFN, of one kind: its MoE block, null for a dense FFN, and its
+// dense SwiGLU, empty for a MoE block. A family with dense layers declares
+// its own pair beside its layer type (Qwen3_8.hpp, Flint.hpp).
 template <class Layer> [[nodiscard]] const ops::BlockMoeWeights *qwenMoeBlock(const Layer &layer) noexcept {
   return &layer.ffn;
+}
+template <class Layer> [[nodiscard]] std::optional<ops::SwiGluProjections> denseFfn(const Layer &) noexcept {
+  return std::nullopt;
 }
 
 // The projections of a layer's mixer, of either kind (QwenMixerWeights) or
@@ -394,14 +390,10 @@ inline void includeMixer(QwenTargetGeometry &geometry, const QwenMixerWeights &m
 // which takes them of one size and rotation in any formats.
 void includeDenseFfn(QwenTargetGeometry &geometry, ops::SwiGluProjections ffn);
 
-// The projections a family's layers and head dispatch beyond their mixers'
-// and MoE blocks' (qwenTargetGeometry): Qwen3.8-27B's dense FFN; the
-// Qwen3.6-35B-A3B's none (Qwen3.8-Flash-Next's: model/Qwen4Exp.hpp; Flint's
-// leading dense layers: model/Flint.hpp).
-void includeFamilyProjections(QwenTargetGeometry &geometry,
-                              const QwenTargetWeights<Qwen3_8Layout, Qwen3_8LayerWeights> &weights);
-void includeFamilyProjections(QwenTargetGeometry &geometry,
-                              const QwenTargetWeights<Qwen3_6MoeLayout, Qwen3_6MoeLayerWeights> &weights);
+// The projections a family's layers and head dispatch beyond their mixers',
+// dense FFNs' and MoE blocks' (qwenTargetGeometry): none, but
+// Qwen3.8-Flash-Next's (model/Qwen4Exp.hpp).
+template <class Weights> void includeFamilyProjections(QwenTargetGeometry &, const Weights &) {}
 
 // The geometry of a target of `weights` whose DFlash2 draft reads the output
 // rows of `captureLayers` (DFlashDraftLayout::targetLayerIds): its layout's,
@@ -416,6 +408,7 @@ template <class Weights>
   for (const auto &layer : weights.layers) {
     includeMixer(geometry, layer.mixer);
     if (const ops::BlockMoeWeights *block = qwenMoeBlock(layer)) moeBlocks.push_back(block);
+    if (const std::optional<ops::SwiGluProjections> dense = denseFfn(layer)) includeDenseFfn(geometry, *dense);
   }
   includeFamilyProjections(geometry, weights);
   geometry.finish(moeBlocks, weights.logitsProjection);
@@ -428,9 +421,9 @@ template <class Weights>
 // wiring each for prefill and for verify), the FFNs of a residual of one
 // row (a dense SwiGLU and a MoE block's routing and experts), the draft's
 // captures and the normed head; each family composes them into its layers
-// and residual: the Qwen3.5 architecture's (Qwen3.8-27B and
-// Qwen3.6-35B-A3B, model/QwenTarget.cpp), Qwen3.8-Flash-Next's
-// (model/Qwen4ExpTarget.cpp) and Flint's (model/FlintTarget.cpp).
+// and residual: the Qwen3.5 architecture's (Qwen3.8-27B, Qwen3.6-35B-A3B and
+// Flint, model/QwenTarget.cpp) and Qwen3.8-Flash-Next's
+// (model/Qwen4ExpTarget.cpp).
 // A family that needs more of a step than the buffers the runtime binds
 // keeps that scratch itself (qwenTargetScratchBytes) and makes its own
 // inputs of the step's tokens; the runtime calls the same functions for
@@ -714,8 +707,9 @@ private:
 };
 
 // The target of a Qwen3.5-architecture family's weights (Qwen3.8-27B,
-// Qwen3.6-35B-A3B), whose prefill commands run up to `prefillChunks` chunks,
-// and the step scratch it keeps itself (none: it has no table to stream).
+// Qwen3.6-35B-A3B, Flint), whose prefill commands run up to `prefillChunks`
+// chunks, and the step scratch it keeps itself (none: it has no table to
+// stream).
 template <class Layout, class Layer>
 [[nodiscard]] std::unique_ptr<QwenTarget> makeQwenTarget(const QwenTargetWeights<Layout, Layer> &weights,
                                                          const QwenTargetGeometry &geometry,

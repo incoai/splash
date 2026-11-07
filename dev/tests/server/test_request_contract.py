@@ -1,5 +1,6 @@
 import array
 import base64
+import dataclasses
 import errno
 import http.client
 import json
@@ -8,7 +9,6 @@ import socket
 import struct
 import sys
 import unittest
-from contextlib import nullcontext
 from functools import partial
 from unittest import mock
 
@@ -34,7 +34,9 @@ from server import documents, json_codec, runtime, schema_validation, tool_schem
 from server import frontend as request_frontend
 from server import protocol as wire
 from server import server as api
-from server.api_shapes import anthropic_to_chat_prompt, normalize_messages
+from server.chat_messages import normalize_messages
+from server.dialects import anthropic as anthropic_dialect
+from server.dialects import responses as responses_dialect
 from server.errors import APIError
 
 
@@ -200,7 +202,7 @@ class RequestContractTests(HarnessTestCase):
 
     def test_enabled_thinking_honors_effort(self):
         for effort in ("low", "medium", "high", "xhigh", "max"):
-            converted = anthropic_to_chat_prompt(
+            converted = anthropic_dialect.to_chat_prompt(
                 {
                     "model": "test-model",
                     "messages": [{"role": "user", "content": "Hi"}],
@@ -230,8 +232,6 @@ class RequestContractTests(HarnessTestCase):
             normalize_messages(
                 [{"role": "user", "content": "Hi"}, *messages],
                 vision=True,
-                deadline=FOREVER,
-                without_slot=nullcontext,
             )[1]["tool_calls"][0]["id"],
             "call_42",
         )
@@ -266,8 +266,6 @@ class RequestContractTests(HarnessTestCase):
                 {"role": "user", "content": "why?"},
             ],
             vision=True,
-            deadline=FOREVER,
-            without_slot=nullcontext,
         )
         self.assertEqual(
             normalized[0]["content"],
@@ -297,8 +295,6 @@ class RequestContractTests(HarnessTestCase):
                             {"role": role, "content": [{"type": kind, "text": "x"}]},
                         ],
                         vision=True,
-                        deadline=FOREVER,
-                        without_slot=nullcontext,
                     )
                 self.assertEqual(caught.exception.status, 400)
 
@@ -327,11 +323,11 @@ class RequestContractTests(HarnessTestCase):
         self.addCleanup(peer.close)
         handler = object.__new__(api.FrontendHandler)
         handler.connection = local
-        self.assertFalse(handler._client_disconnected())
+        self.assertFalse(handler.client_disconnected())
         peer.sendall(b"trailing")
         peer.close()
-        self.assertFalse(handler._client_disconnected())
-        self.assertTrue(handler._client_disconnected())
+        self.assertFalse(handler.client_disconnected())
+        self.assertTrue(handler.client_disconnected())
 
     def test_descriptor_exhaustion_does_not_read_as_a_disconnect(self):
         local, peer = socket.socketpair()
@@ -341,7 +337,7 @@ class RequestContractTests(HarnessTestCase):
         handler.connection = local
         exhausted = OSError(errno.EMFILE, "Too many open files")
         with mock.patch("select.kqueue", side_effect=exhausted):
-            self.assertFalse(handler._client_disconnected())
+            self.assertFalse(handler.client_disconnected())
 
     def test_reset_client_reads_as_disconnected(self):
         listener = socket.create_server(("127.0.0.1", 0))
@@ -354,7 +350,7 @@ class RequestContractTests(HarnessTestCase):
         self.assertTrue(select.select([accepted], [], [], 2)[0])
         handler = object.__new__(api.FrontendHandler)
         handler.connection = accepted
-        self.assertTrue(handler._client_disconnected())
+        self.assertTrue(handler.client_disconnected())
 
     def test_unsupported_http_version_is_rejected_before_header_validation(self):
         handler = object.__new__(api.FrontendHandler)
@@ -754,7 +750,9 @@ class RequestContractTests(HarnessTestCase):
         factory = FakeFactory()
         engine = runtime.MultiplexedRuntime(process_factory=factory, eager_start=True)
         self.addCleanup(engine.close)
-        engine._cancel_grace_seconds = 0.02
+        engine._thresholds = dataclasses.replace(
+            engine._thresholds, end_acknowledgement=0.02
+        )
         call = engine.submit(request(10))
         call.cancel()
         with self.assertRaises(runtime.EngineUnhealthy):
@@ -766,7 +764,8 @@ class RequestContractTests(HarnessTestCase):
         for value in ("urgent", 0, None, []):
             with self.assertRaisesRegex(api.APIError, "priority"):
                 harness.app.prepare(chat_body(priority=value), deadline=FOREVER)
-        job = harness.app.prepare_responses(
+        job, _ = responses_dialect.prepare(
+            harness.app,
             responses_body(priority="foreground"),
             deadline=FOREVER,
             reserve_input=reserve_unbounded,

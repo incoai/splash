@@ -101,7 +101,7 @@ inline uint quant_spread2(uint bits) { return (bits & 0x3333u) | ((bits & 0xCCCC
 // block_q4_K / block_q5_K header: s = d * sc and m = -dmin * mn with the 6-bit sc, mn of group j. The 12 scale
 // bytes are hdr.y (0-3), hdr.z (4-7) and hdr.w (8-11), taken with shifts: the group index is not a compile-time
 // constant, and indexing a thread-local byte array or vector by it costs ~8% of the eight-row staged kernel on
-// Apple10 (Yesheng Liang's measurement in incoai/splash 77beaed).
+// Apple10.
 inline QuantCoef quant_k4_coef(uint4 hdr, ushort j) {
   uint sc, m;
   if (j < 4) {

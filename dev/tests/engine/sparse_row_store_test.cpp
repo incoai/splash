@@ -166,7 +166,7 @@ uint64_t footprint() {
 }
 
 // A store's cache of about 256 MiB holds little of its memory once built,
-// its index at most, and all of it once committed, which its stats report;
+// its index at most, and all of it once committed;
 // the rows it cached before stay as they were. It runs first, in a process
 // whose allocator holds no freed memory a store could take already resident.
 void commitTakesTheCacheMemory() {
@@ -178,10 +178,8 @@ void commitTakesTheCacheMemory() {
   for (uint32_t i = 0; i < ids.size(); ++i) ids[i] = i * 7;
   require(f.stage(ids).readRows == ids.size(), "a store's first stage did not read its rows");
   const uint64_t built = footprint();
-  require(!f.store->stats().committed, "a store reports its cache committed before commit()");
   f.store->commit();
   const uint64_t committed = footprint();
-  require(f.store->stats().committed, "a committed store does not report its cache committed");
   const auto grown = [&](uint64_t now) { return now > before ? now - before : 0; };
   require(grown(built) < cacheBytes / 2, "a store's cache took its memory before it was committed");
   require(grown(committed) >= cacheBytes / 100 * 95, "a committed store's cache does not hold its memory");

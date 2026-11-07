@@ -18,6 +18,11 @@ struct SplashApp: App {
                 Button("Check for Updates…") { updates.check() }
                     .disabled(!updates.canCheck)
             }
+            CommandGroup(after: .pasteboard) {
+                // In what has the keyboard: a log of the drawer's, a terminal.
+                Button("Find…") { NSApp.keyWindow?.firstResponder?.showFindBar() }
+                    .keyboardShortcut("f")
+            }
             CommandGroup(replacing: .newItem) {
                 Button("New Chat") {
                     state.section = .chat
@@ -27,8 +32,22 @@ struct SplashApp: App {
                 .keyboardShortcut("n")
                 .disabled(!state.available)
             }
-            // The toolbar holds the switch between the Server and the Chat; it is not to be hidden.
+            // The toolbar holds the switch to the Chat and the Server's button; it is not to be
+            // hidden. The sidebar is.
             CommandGroup(replacing: .toolbar) {
+                Button(state.showsSidebar ? "Hide Sidebar" : "Show Sidebar") { state.toggleSidebar() }
+                    .keyboardShortcut("b")
+                    .disabled(!state.available || state.section == .server)
+                Button(state.showsDrawer ? "Hide Terminal and Logs" : "Show Terminal and Logs") { state.toggleDrawer() }
+                    .keyboardShortcut("j")
+                    .disabled(!state.available)
+                Button("New Terminal") {
+                    state.newTerminal()
+                    state.showDrawer(.terminal)
+                }
+                .keyboardShortcut("t", modifiers: [.command, .shift])
+                .disabled(!state.available)
+                Divider()
                 Button("Server") { state.section = .server }
                     .keyboardShortcut("1")
                     .disabled(!state.available)
@@ -41,8 +60,8 @@ struct SplashApp: App {
                     .environment(state)
             }
             CommandGroup(replacing: .help) {
-                Button("Show Server Log") { NSWorkspace.shared.open(Server.log) }
-                Button("Show Download Log") { NSWorkspace.shared.open(Installer.log) }
+                Button("Show Server Log") { NSWorkspace.shared.open(state.server.log) }
+                Button("Show Download Log") { NSWorkspace.shared.open(state.installer.log) }
             }
         }
 
@@ -57,14 +76,15 @@ struct SplashApp: App {
     }
 }
 
-/// Owns the app's state and its updates, starts them on launch, and stops what runs before the app
-/// quits, for the Quit command, the system, `kill` and an update alike.
+/// Owns the app's state and its updates, starts them on launch, and stops the model and the
+/// downloads before the app quits, for the Quit command, the system, `kill` and an update alike.
+/// The drawer's shells end as the app does, which hangs them up (`TerminalSession`).
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let state: AppState
     let updates = Updates()
 
-    override init() {
+    override convenience init() {
         guard let runtime = Runtime.locate() else {
             let alert = NSAlert()
             alert.messageText = "Splash is damaged"
@@ -72,7 +92,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.runModal()
             exit(1)
         }
-        state = AppState(runtime: runtime)
+        self.init(state: AppState(runtime: runtime))
+    }
+
+    init(state: AppState) {
+        self.state = state
         super.init()
     }
 
@@ -80,6 +104,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// asking first.
     private var termination: DispatchSourceSignal?
     private var signalled = false
+
+    /// SIGTERM caught by a handler that does nothing, for `termination` alone to act on. Not
+    /// ignored: a program the app starts keeps a signal ignored, but not one caught, so that what
+    /// the drawer's terminals run ends on SIGTERM as anywhere.
+    static func catchTerminate() {
+        signal(SIGTERM) { _ in }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // One Splash at a time: another would take over the first one's model. Of two opened at
@@ -97,7 +128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
         }
-        signal(SIGTERM, SIG_IGN)
+        Self.catchTerminate()
         termination = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         termination?.setEventHandler { [weak self] in
             self?.signalled = true
@@ -112,6 +143,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    /// The chats' files written before the app ends, a reply stopped as it quit among them.
+    func applicationWillTerminate(_ notification: Notification) {
+        state.chats.flush()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -133,5 +169,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
+    }
+}
+
+extension NSResponder {
+    /// Shows the find bar of this responder, or of the first after it that has one, as a text
+    /// app's Find… does.
+    func showFindBar() {
+        let find = NSMenuItem()
+        find.tag = Int(NSFindPanelAction.showFindPanel.rawValue)
+        _ = tryToPerform(#selector(NSTextView.performFindPanelAction(_:)), with: find)
     }
 }

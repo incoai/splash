@@ -143,11 +143,12 @@ def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
 
 
 class PreparedImages(list):
-    """Append-only request batch; its owner travels with the pixel payload.
+    """Append-only request batch, charged against the in-flight image budget
+    until it is dropped: the request drops it once its frame is written, the
+    last copy of its pixels in the server.
 
-    Charge each occurrence, even cache hits: concatenation and native transport
-    repeat those pixels. Release only when every holder drops the batch, not
-    when HTTP disconnects while native work or a mask task still owns it.
+    Charge each occurrence, even cache hits: concatenation and the frame
+    repeat those pixels.
     """
 
     def __init__(self, cache):

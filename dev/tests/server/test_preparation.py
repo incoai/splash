@@ -176,18 +176,6 @@ class PreparationTests(HarnessTestCase):
         self.assertEqual(len(results), 3)
         self.assertEqual(tokenizer.maximum_active, 2)
 
-    def test_frontend_rejects_invalid_preparation_capacity(self):
-        with self.assertRaisesRegex(ValueError, "preparation capacity"):
-            make_frontend(
-                FakeTokenizer(),
-                SimpleNamespace(status=lambda: {}),
-                "test-model",
-                128,
-                1,
-                0,
-                vision=True,
-            )
-
     def test_preparation_consumes_original_deadline_and_releases_slots(self):
         app = make_frontend(
             FakeTokenizer(), None, "test-model", 128, 10, 1, vision=True

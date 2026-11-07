@@ -15,9 +15,8 @@
 // instead of device memory, issue their device loads before their stores
 // (the scan loads the next rows' state before storing the current rows'),
 // and the gate runs one simdgroup per row without barriers: over the 27B's 48
-// layers with DRAM-cold states that takes 11-28% less time at one to four
-// lanes than the same phases through device memory (40-core M3 Max, 16-core
-// M5 Pro), with the same bits.
+// layers with DRAM-cold states that takes 11-28% less time than the same
+// phases through device memory, with the same bits.
 //
 // Which of a step's rows a lane retains is known only after the step, so the
 // state a step writes is the one before its rows: it leaves the rows on the
@@ -459,10 +458,9 @@ GDN_DECODE_ENTRY(verify_gdn_fused_vh64, 16, 64, 128, 12288, 20736, bfloat)
 GDN_DECODE_ENTRY(verify_gdn_fused_vh64_f32, 16, 64, 128, 12288, 20736, float)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh64, 16, 64, 128, 12288, 20736, gguf_sg::Table16, bfloat)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh64_f32, 16, 64, 128, 12288, 20736, gguf_sg::Table16, float)
-// Qwen3.8-Flash-Next (16512-column rows).
-GDN_DECODE_ENTRY(verify_gdn_fused_p16512, 16, 48, 128, 10240, 16512, bfloat)
+// Qwen3.8-Flash-Next (16512-column rows), which loads from GGUFs only, whose
+// norms are F32.
 GDN_DECODE_ENTRY(verify_gdn_fused_p16512_f32, 16, 48, 128, 10240, 16512, float)
-GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_p16512, 16, 48, 128, 10240, 16512, gguf_sg::Table16, bfloat)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_p16512_f32, 16, 48, 128, 10240, 16512, gguf_sg::Table16, float)
 #undef GDN_DECODE_ENTRY
 #undef GDN_DECODE_TABLE_ENTRY

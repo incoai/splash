@@ -1,9 +1,9 @@
 import SwiftUI
 
-/// How a model starts: every `splash serve` option of `LaunchOption.all` in one card, the main ones
-/// first and the others under Advanced, which opens them below it in the same card, each part
-/// under a band of its own. Each is on Auto or the server's own default until changed; a change
-/// applies the next time a model starts.
+/// How a model starts: the `splash serve` options of `LaunchOption.all` the model picked can use,
+/// in one card, the main ones first and the others under Advanced, which opens them below it in the
+/// same card, each part under a band of its own. Each is on Auto or the server's own default until
+/// changed; a change applies the next time a model starts.
 struct LaunchOptions: View {
     @Environment(AppState.self) private var state
     @State var advanced = false
@@ -11,31 +11,37 @@ struct LaunchOptions: View {
     @State private var row = ScrollTarget()
 
     var body: some View {
+        let family = state.family(of: state.selection)
         Section {
-            ForEach(Self.options(.main)) { OptionRow(option: $0) }
+            ForEach(Self.options(.main, for: family)) { OptionRow(option: $0, family: family) }
             DisclosureRow(title: "Advanced", open: $advanced)
                 .background(ViewAnchor { row.view = $0 })
                 .onChange(of: advanced) { if advanced { row.scrollToTop() } }
             if advanced {
                 ForEach(LaunchOption.Section.allCases.dropFirst(), id: \.self) { section in
-                    // A band across the card, as a list groups its rows, so that each part reads
-                    // as one.
-                    Text(section.rawValue)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(.quaternary.opacity(0.6), in: .rect(cornerRadius: 6))
-                    ForEach(Self.options(section)) { OptionRow(option: $0) }
+                    let options = Self.options(section, for: family)
+                    if !options.isEmpty {
+                        // A band across the card, as a list groups its rows, so that each part
+                        // reads as one.
+                        Text(section.rawValue)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(.quaternary.opacity(0.6), in: .rect(cornerRadius: 6))
+                        ForEach(options) { OptionRow(option: $0, family: family) }
+                    }
                 }
             }
         } header: {
             HStack(alignment: .firstTextBaseline) {
                 SectionTitle(text: LaunchOption.Section.main.rawValue)
                 Spacer()
-                if state.options != ServeSettings() {
-                    Button("Restore Defaults") { state.options = ServeSettings() }
+                // For the options the card shows.
+                let defaults = state.options.defaults(for: family)
+                if state.options != defaults {
+                    Button("Restore Defaults") { state.options = defaults }
                         .buttonStyle(.hover)
                         .foregroundStyle(.tint)
                         .font(.callout)
@@ -45,41 +51,116 @@ struct LaunchOptions: View {
         }
     }
 
-    private static func options(_ section: LaunchOption.Section) -> [LaunchOption] {
-        LaunchOption.all.filter { $0.section == section }
+    /// The options of `section` the models of `family` can use.
+    nonisolated static func options(_ section: LaunchOption.Section, for family: ModelFamily) -> [LaunchOption] {
+        LaunchOption.all.filter { $0.section == section && family.uses($0.flag) }
+    }
+}
+
+extension EnvironmentValues {
+    /// Whether the pointer is over the launch option's row the view is in (OptionRow).
+    @Entry var optionRowHovered = false
+    /// What the launch option of the row the view is in lacks to apply, while it doesn't
+    /// (`LaunchOption.lacks`).
+    @Entry var optionRowNeeds: String?
+}
+
+/// An option's name, with an info button that shows what it does, and what it needs while it is
+/// dimmed: the one place its explanation shows. The button appears while the pointer is over the
+/// option's row, its explanation is open or it has the keyboard's focus, so the card stays as plain
+/// as a list of names; VoiceOver and the keyboard reach it always.
+private struct OptionLabel: View {
+    let title: String
+    let help: String
+    @Environment(\.optionRowHovered) private var hovered
+    @Environment(\.optionRowNeeds) private var needs
+    @State private var shown = false
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        let visible = hovered || shown || focused
+        HStack(spacing: 4) {
+            Text(title)
+            Button { shown.toggle() } label: {
+                Image(systemName: "info.circle").foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .focused($focused)
+            .opacity(visible ? 1 : 0)
+            .animation(Motion.quick, value: visible)
+            // A dimmed option still says what it does, and what it needs to apply.
+            .environment(\.isEnabled, true)
+            .accessibilityLabel("About \(title)")
+            .popover(isPresented: $shown, arrowEdge: .bottom) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(help)
+                    if let needs { Text(needs).foregroundStyle(.secondary) }
+                }
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(width: 280, alignment: .leading)
+                .padding(12)
+            }
+        }
+    }
+}
+
+/// A row of a value control labeled with its option's name and info button (OptionLabel).
+private struct OptionLabeled<Content: View>: View {
+    let title: String
+    let help: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        LabeledContent {
+            content
+        } label: {
+            OptionLabel(title: title, help: help)
+        }
     }
 }
 
 /// One launch option, with the control its kind takes; dimmed where the others leave it no effect,
-/// and with what to beware of under it.
+/// a switch then off, and with what to beware of under it: why the model picked doesn't take the
+/// value kept, too.
 private struct OptionRow: View {
     @Environment(AppState.self) private var state
     let option: LaunchOption
+    /// The family of the model the options are for.
+    let family: ModelFamily
+    @State private var hovered = false
 
     var body: some View {
         @Bindable var state = state
         let value = Binding(get: { state.options[option.flag] }, set: { state.options[option.flag] = $0 })
+        let applies = option.applies(state.options)
+        let takes = { family.takes(option.flag, $0) }
         VStack(alignment: .leading, spacing: 6) {
             Group {
                 switch option.kind {
                 case .toggle(let on):
-                    Toggle(option.title, isOn: Binding(get: { (value.wrappedValue == "true") == on },
-                                                        set: { value.wrappedValue = $0 == on ? "true" : nil }))
+                    Toggle(isOn: Binding(get: { applies && (value.wrappedValue == "true") == on },
+                                         set: { value.wrappedValue = $0 == on ? "true" : nil })) {
+                        OptionLabel(title: option.title, help: option.help)
+                    }
                 case .choice(let standard, let choices, let custom):
-                    ChoicePicker(title: option.title, standard: standard, choices: choices, custom: custom, value: value)
+                    ChoicePicker(title: option.title, help: option.help, standard: standard, choices: choices, custom: custom,
+                                 family: family, takes: takes, value: value)
                 case .text(let custom, _):
-                    TextRow(title: option.title, custom: custom, value: value)
+                    TextRow(title: option.title, help: option.help, custom: custom, takes: takes, value: value)
                 case .folder:
-                    FolderRow(title: option.title, value: value)
+                    FolderRow(title: option.title, help: option.help, value: value)
                 case .secret:
-                    TextRow(title: option.title, custom: LaunchOption.Value(prompt: "None", message: "", parse: { $0.isEmpty ? nil : $0 }),
-                            secure: true, value: $state.options.apiKey)
+                    TextRow(title: option.title, help: option.help, custom: LaunchOption.Value(prompt: "None", message: "", parse: { $0.isEmpty ? nil : $0 }),
+                            takes: takes, secure: true, value: $state.options.apiKey)
                         .disabled(state.keyProblem != nil)
                 }
             }
-            .help(option.help)
-            .disabled(!option.applies(state.options))
-            if let warning = option.warning(state.options) {
+            .disabled(!applies)
+            .environment(\.optionRowHovered, hovered)
+            .environment(\.optionRowNeeds, option.lacks(state.options))
+            .contentShape(.rect)
+            .onHover { hovered = $0 }
+            if let warning = option.warning(state.options) ?? value.wrappedValue.flatMap({ family.refusal(option.flag, $0) }) {
                 Label(warning, systemImage: "exclamationmark.triangle.fill")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -89,12 +170,17 @@ private struct OptionRow: View {
     }
 }
 
-/// A menu of the server's default, the choices, the value set, and Custom… to type another.
+/// A menu of the server's default, the choices, the value set, dimmed where the model picked doesn't
+/// take it, and Custom… to type another, which asks for it in the words for a model of `family`
+/// and takes only one it `takes`.
 private struct ChoicePicker: View {
     let title: String
+    let help: String
     let standard: String
     let choices: [(value: String, title: String)]
     let custom: LaunchOption.Value?
+    let family: ModelFamily
+    let takes: (String) -> Bool
     @Binding var value: String?
     @State private var typing = false
 
@@ -110,13 +196,14 @@ private struct ChoicePicker: View {
             + choices.map { PopupItem(id: $0.value, title: $0.title) }
             + [typed].compactMap { $0 }
             + (custom == nil ? [] : [PopupItem(id: Self.other, title: "Custom…", separated: true)])
-        LabeledContent(title) {
+        OptionLabeled(title: title, help: help) {
             // Its row names it.
             PopupMenu(items: items, chosen: value ?? Self.none) { choice in
                 if choice == Self.other { typing = true } else { value = choice == Self.none ? nil : choice }
             } label: {
                 HStack(spacing: 5) {
                     Text(items.first { $0.id == (value ?? Self.none) }?.title ?? standard)
+                        .foregroundStyle(value.map(takes) == false ? .tertiary : .primary)
                     MenuChevron()
                 }
                 .optionField()
@@ -126,25 +213,28 @@ private struct ChoicePicker: View {
         }
         .sheet(isPresented: $typing) {
             if let custom {
-                CustomValueSheet(title: title, custom: custom, initial: value.map(custom.text) ?? "") { value = $0 }
+                CustomValueSheet(title: title, custom: custom, message: custom.message(family), takes: takes,
+                                 initial: value.map(custom.text) ?? "") { value = $0 }
             }
         }
     }
 }
 
 /// A value typed in a field, hidden for a secret, taken as it is typed once it is one the option
-/// takes, so that Start uses it at once; empty for the default. Text it doesn't take is ringed, and
-/// gives way to the value taken when the field is left.
+/// and the model picked take, so that Start uses it at once; empty for the default. Text they don't
+/// take is ringed, and gives way to the value taken when the field is left.
 private struct TextRow: View {
     let title: String
+    let help: String
     let custom: LaunchOption.Value
+    let takes: (String) -> Bool
     var secure = false
     @Binding var value: String?
     @State private var text = ""
     @FocusState private var focused: Bool
 
     var body: some View {
-        LabeledContent(title) {
+        OptionLabeled(title: title, help: help) {
             Group {
                 if secure {
                     SecureField(title, text: $text, prompt: Text(custom.prompt))
@@ -167,10 +257,10 @@ private struct TextRow: View {
         .onChange(of: focused) { if !focused { show() } }
     }
 
-    /// The value `text` sets: none for empty text, the value parsed, or nil for text the option
-    /// doesn't take, which sets nothing.
+    /// The value `text` sets: none for empty text, the value parsed, or nil for text the option or
+    /// the model picked doesn't take, which sets nothing.
     private func taken(_ text: String) -> String?? {
-        text.trimmingCharacters(in: .whitespaces).isEmpty ? .some(nil) : custom.parse(text).map(Optional.some)
+        text.trimmingCharacters(in: .whitespaces).isEmpty ? .some(nil) : custom.parse(text).flatMap { takes($0) ? $0 : nil }.map(Optional.some)
     }
 
     /// Shows the value taken.
@@ -182,10 +272,11 @@ private struct TextRow: View {
 /// A folder picked, or the server's default.
 private struct FolderRow: View {
     let title: String
+    let help: String
     @Binding var value: String?
 
     var body: some View {
-        LabeledContent(title) {
+        OptionLabeled(title: title, help: help) {
             HStack {
                 Spacer(minLength: 0)
                 Text(value.map { URL(filePath: $0).lastPathComponent } ?? "Default")
@@ -211,11 +302,13 @@ private struct FolderRow: View {
     }
 }
 
-/// Asks for a value the menu doesn't offer.
+/// Asks for a value the menu doesn't offer, one the model picked `takes`.
 private struct CustomValueSheet: View {
     @Environment(\.dismiss) private var dismiss
     let title: String
     let custom: LaunchOption.Value
+    let message: String
+    let takes: (String) -> Bool
     let initial: String
     let set: (String) -> Void
     @State private var text = ""
@@ -231,7 +324,7 @@ private struct CustomValueSheet: View {
             } header: {
                 Text(title).font(.headline)
             } footer: {
-                Text(custom.message)
+                Text(message)
             }
         }
         .formStyle(.grouped)
@@ -243,13 +336,18 @@ private struct CustomValueSheet: View {
         .toolbar {
             ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
             ToolbarItem(placement: .confirmationAction) {
-                Button("Set", action: done).disabled(custom.parse(text) == nil)
+                Button("Set", action: done).disabled(value == nil)
             }
         }
     }
 
+    /// The value the text typed sets.
+    private var value: String? {
+        custom.parse(text).flatMap { takes($0) ? $0 : nil }
+    }
+
     private func done() {
-        guard let value = custom.parse(text) else { return }
+        guard let value else { return }
         set(value)
         dismiss()
     }

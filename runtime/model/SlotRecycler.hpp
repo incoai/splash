@@ -75,6 +75,8 @@ public:
   [[nodiscard]] uint32_t size() const noexcept { return static_cast<uint32_t>(list_.size()); }
   // The claims, not a scan's, of a key T1 or T2 gave up lately.
   [[nodiscard]] uint64_t ghostHits() const noexcept { return ghostHits_; }
+  // The keys T1 and T2 gave up lately (|B1| + |B2|), at most size().
+  [[nodiscard]] uint32_t ghosts() const noexcept { return recentGhosts_.count + frequentGhosts_.count; }
 
 private:
   enum List : uint8_t { Free, Recent, Frequent };

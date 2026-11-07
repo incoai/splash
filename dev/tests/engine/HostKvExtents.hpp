@@ -24,7 +24,8 @@ namespace splash::test {
 // after them, as in production extents (kv::PageStorage); an extent of Slim
 // pages holds the regions of the layers no window bounds and the index
 // plane, and one of Index pages only the index plane. Kernels reach a page
-// only through its entries. The constructors size each extent exactly, so
+// only through its entries, in a GPU table that names the extents' memory
+// (reachThrough), as kv::PageStorage's tables do. The constructors size each extent exactly, so
 // an access past one fails under shader validation; contiguous() extents
 // lie extentStride() apart in one region, and an access past one runs into
 // its neighbour unchecked.
@@ -71,14 +72,14 @@ public:
   }
 
   // Shared buffers of the backend, zero-filled and addressed
-  // (metal::BufferReach), as the pool's extents: resident for every command
-  // buffer. `extents` Full extents, or an extent of each form of `forms`.
+  // (metal::BufferReach) as the pool's extents. `extents` Full extents, or an
+  // extent of each form of `forms`.
   HostKvExtents(metal::MetalBackend &backend, kv::Layout layout,
                 uint32_t extentPages, uint32_t extents)
       : HostKvExtents(backend, layout, extentPages, std::vector(extents, kv::PageForm::Full)) {}
   HostKvExtents(metal::MetalBackend &backend, kv::Layout layout,
                 uint32_t extentPages, std::span<const kv::PageForm> forms)
-      : layout_(layout), extentPages_(extentPages) {
+      : layout_(layout), extentPages_(extentPages), backend_(&backend) {
     for (const kv::PageForm form : forms) {
       metal::MetalBuffer buffer = backend.allocateBuffer(
           extentBytes(layout, extentPages, form), metal::BufferStorage::Shared,
@@ -91,24 +92,28 @@ public:
     validate();
   }
 
-  // Extents the caller allocated, sized by extentBytes(), and makes resident
-  // for its own commands.
+  // Extents the caller allocated, sized by extentBytes(), which it makes
+  // resident for its own commands: only the host writes tables of them.
   HostKvExtents(kv::Layout layout, uint32_t extentPages,
                 std::vector<Extent> extents)
       : layout_(layout), extentPages_(extentPages), extents_(std::move(extents)) {
     validate();
   }
 
-  // `extents` extents one after another in a region the caller allocated,
-  // extentStride() bytes each, and keeps resident for its commands.
-  [[nodiscard]] static HostKvExtents contiguous(kv::Layout layout, uint32_t extentPages,
-                                                uint32_t extents, std::byte *contents,
-                                                uint64_t gpuAddress) {
+  // `extents` extents one after another from the start of `base`, an
+  // Addressed buffer of the backend's, extentStride() bytes each.
+  [[nodiscard]] static HostKvExtents contiguous(metal::MetalBackend &backend, kv::Layout layout,
+                                                uint32_t extentPages, uint32_t extents,
+                                                const metal::MetalBuffer &base) {
     const uint64_t stride = extentStride(layout, extentPages);
+    auto *contents = static_cast<std::byte *>(base.contents());
     std::vector<Extent> placed;
     for (uint32_t index = 0; index < extents; ++index)
-      placed.push_back({contents + index * stride, gpuAddress + index * stride});
-    return {layout, extentPages, std::move(placed)};
+      placed.push_back({contents + index * stride, base.gpuAddress() + index * stride});
+    HostKvExtents result(layout, extentPages, std::move(placed));
+    result.backend_ = &backend;
+    result.buffers_.push_back(base);
+    return result;
   }
 
   [[nodiscard]] uint32_t extentPages() const noexcept { return extentPages_; }
@@ -138,6 +143,19 @@ public:
                            ? SPLASH_KV_PAGE_ABSENT
                            : splash_kv_page_entry(placed.gpuAddress, pages[index] % extentPages_);
     }
+  }
+  // Names the extents' memory as what a GPU table of their entries reaches
+  // (metal::MetalBackend::setTableReach), as kv::PageStorage does for each
+  // table it writes. std::logic_error for extents the caller allocated.
+  void reachThrough(const metal::MetalBuffer &table) const {
+    if (!backend_)
+      throw std::logic_error("host KV extents the caller allocated reach no GPU table of theirs");
+    backend_->setTableReach(table, buffers_);
+  }
+  // Writes a GPU table, a Shared buffer, and names what it reaches.
+  void writeTable(std::span<const uint32_t> pages, const metal::MetalBuffer &table) const {
+    writeTable(pages, table.contents());
+    reachThrough(table);
   }
   // The same for an index table (kv::PageStorage::writeIndexEntries): the
   // entries that reach the pages' block index, in their extent's index
@@ -257,6 +275,9 @@ private:
 
   kv::Layout layout_;
   uint32_t extentPages_ = 0;
+  // The backend of the extents' memory, and the buffers that hold it: null
+  // and none for extents the caller allocated.
+  metal::MetalBackend *backend_ = nullptr;
   std::vector<Extent> extents_;
   std::vector<metal::MetalBuffer> buffers_;
 };

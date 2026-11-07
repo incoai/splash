@@ -36,8 +36,8 @@ constexpr uint32_t kBlockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
 
 // Qwen3.8-Flash-Next's, int8 and BF16: 12 layers of 2 heads, token-major
 // values and a 128-wide index.
-constexpr kv::Layout kFlashNext{12, 2, 256, kv::Format::Int8, 128, true};
-constexpr kv::Layout kFlashNextBf16{12, 2, 256, kv::Format::BFloat16, 128, true};
+constexpr kv::Layout kFlashNext{12, 2, 256, kv::Format::Int8, 128, true, 0, 0, kv::Reads::SelectedBlocks};
+constexpr kv::Layout kFlashNextBf16{12, 2, 256, kv::Format::BFloat16, 128, true, 0, 0, kv::Reads::SelectedBlocks};
 
 // The bytes a write of the page stores, in slot order.
 std::vector<std::byte> gather(const SlotFormat &format, const test::HostKvPages &pages, uint32_t page) {
@@ -81,13 +81,13 @@ const std::vector<kv::Layout> &spillableLayouts() {
   static const std::vector<kv::Layout> layouts{
       kFlashNext,
       kFlashNextBf16,
-      {12, 4, 256, kv::Format::Int8, 128, true},
-      {12, 4, 256, kv::Format::BFloat16, 128, true},
-      {12, 2, 256, kv::Format::Int8, 64, true},
-      {2, 2, 256, kv::Format::Int8, 64, true},
-      {3, 2, 256, kv::Format::Int8, 128, true},
-      {5, 1, 256, kv::Format::Int8, 128, true},
-      {4, 3, 256, kv::Format::Int8, 64, true},
+      {12, 4, 256, kv::Format::Int8, 128, true, 0, 0, kv::Reads::SelectedBlocks},
+      {12, 4, 256, kv::Format::BFloat16, 128, true, 0, 0, kv::Reads::SelectedBlocks},
+      {12, 2, 256, kv::Format::Int8, 64, true, 0, 0, kv::Reads::SelectedBlocks},
+      {2, 2, 256, kv::Format::Int8, 64, true, 0, 0, kv::Reads::SelectedBlocks},
+      {3, 2, 256, kv::Format::Int8, 128, true, 0, 0, kv::Reads::SelectedBlocks},
+      {5, 1, 256, kv::Format::Int8, 128, true, 0, 0, kv::Reads::SelectedBlocks},
+      {4, 3, 256, kv::Format::Int8, 64, true, 0, 0, kv::Reads::SelectedBlocks},
   };
   return layouts;
 }
@@ -151,19 +151,18 @@ void testPitchRule() {
                 format.segments().front() == base,
             name + ": the segments are not the index region and each record, covering the payload");
   }
-  const SlotFormat padded(kv::Layout{5, 1, 256, kv::Format::Int8, 128, true});
-  const SlotFormat offset(kv::Layout{3, 2, 256, kv::Format::Int8, 128, true});
+  const SlotFormat padded(kv::Layout{5, 1, 256, kv::Format::Int8, 128, true, 0, 0, kv::Reads::SelectedBlocks});
+  const SlotFormat offset(kv::Layout{3, 2, 256, kv::Format::Int8, 128, true, 0, 0, kv::Reads::SelectedBlocks});
   require(padded.recordBytes() == 2080 && padded.recordPitch() == 4096 && offset.recordRange(0, 0).offset == 8192,
           "a record of one head does not take a unit of its own, or three layers' index no aligned end");
 }
 
-// A layout without block records, an index or token-major values, keeps its
-// spans' order as one segment, a windowed layout's region by region
+// A layout without block records, one whose attention reads every page,
+// keeps its spans' order as one segment, a windowed layout's region by region
 // (kv::Layout::region), has no records, and a whole restore puts the payload
-// back in that order.
+// back in that order. A block index under the page loop is no layout.
 void testUnspillableLayouts() {
   for (const kv::Layout &layout : {kv::Layout{16, 4, 256}, kv::Layout{10, 2, 256, kv::Format::BFloat16},
-                                   kv::Layout{12, 2, 256, kv::Format::Int8, 128, false},
                                    kv::Layout{12, 2, 256, kv::Format::Int8, 0, true},
                                    kv::Layout{6, 4, 128, kv::Format::Int8, 0, false, 512, 0b011010}}) {
     const SlotFormat format(layout);
@@ -188,8 +187,8 @@ void testUnspillableLayouts() {
     rejects([&] { format.scatterRecord({}, pages.layerSpans(0, 0), 0); }, "has no block records",
             "a layout that cannot spill scattered a record");
   }
-  rejects([] { static_cast<void>(SlotFormat(kv::Layout{})); }, "layout is invalid",
-          "an invalid layout has a slot format");
+  for (const kv::Layout &layout : {kv::Layout{}, kv::Layout{12, 2, 256, kv::Format::Int8, 128, false}})
+    rejects([&] { static_cast<void>(SlotFormat(layout)); }, "layout is invalid", "an invalid layout has a slot format");
 }
 
 // A Slim page of a windowed layout, which holds the regions of the layers
@@ -301,7 +300,8 @@ void testTransfersAndScatters() {
 // refused before anything is written.
 void testRejections() {
   const SlotFormat format(kFlashNext);
-  test::HostKvPages pages(kFlashNext, 1), other(kv::Layout{12, 4, 256, kv::Format::Int8, 128, true}, 1);
+  test::HostKvPages pages(kFlashNext, 1),
+      other(kv::Layout{12, 4, 256, kv::Format::Int8, 128, true, 0, 0, kv::Reads::SelectedBlocks}, 1);
   const std::vector<std::byte> record(format.recordBytes());
   rejects([&] { static_cast<void>(format.recordRange(12, 0)); }, "outside the page",
           "a record past the layers was placed");

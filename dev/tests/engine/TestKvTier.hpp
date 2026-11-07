@@ -18,13 +18,8 @@
 
 namespace splash::test {
 
-// A tier copy in memory (model::KvCopy), read on any thread as
-// model::SlotFile::readAt reads a slot: the 4 KiB-aligned range around the
-// bytes, cut at the copy's end, lands at the start of `buffer`, which must
-// hold it, and the bytes are returned within it. A read returns nothing
-// while failAll is set, the hook for a copy that cannot be read, and for the
-// next failNext reads, the hook for a failure a retry may or may not meet.
-// Set the bytes before reads start.
+// A tier copy in memory (model::KvCopy), read on any thread as SlotFile::readAt reads a slot;
+// failAll and failNext make reads fail. Set the bytes before reads start.
 class TestKvCopy : public model::KvCopy {
 public:
   static constexpr uint64_t kReadAlignment = 4096;
@@ -67,15 +62,8 @@ private:
   mutable std::atomic<uint64_t> reads_{0};
 };
 
-// A KV disk tier without a disk: slots count against a quota, a bounded
-// number of transfers is in flight, writes of each class within their own
-// bound, and transfers finish when the test says so, a restore only once
-// submitted (submitRestores), as the tier's readers take it then. With a
-// budget, a slot is reserved from it as its draw says
-// (model::DiskBudget::reserve) instead of against the quota. Each slot is
-// its own copy (TestKvCopy, copyOf), which reads of spilled KV hold as they
-// hold a real slot: a copy outlives the cache's reference only as long as a
-// reader keeps it, and its quota with it.
+// A KV disk tier without a disk: slots count against a quota (or a DiskBudget), transfers finish
+// when the test says so, and each slot is its own TestKvCopy that readers may outlive.
 class TestKvTier final : public engine::KvTier {
 public:
   struct Transfer final {
@@ -85,6 +73,8 @@ public:
     bool submitted = true;
     // A write's class; none for a restore.
     std::optional<engine::WriteClass> write;
+    // When it lands, on a tier with a rate.
+    std::optional<double> dueMilliseconds;
   };
 
   TestKvTier() = default;
@@ -140,11 +130,27 @@ public:
 
   // Finishes every transfer still in flight, of the restores those submitted.
   void complete(bool success = true) {
-    for (auto &transfer : transfers) {
+    for (auto &transfer : open()) {
       if (transfer->finished || transfer->ready || !transfer->submitted) continue;
       transfer->ready = true;
       transfer->success = success;
     }
+  }
+  // With a rate, a transfer lands a slot's bytes at bytesPerMillisecond
+  // after it starts, by the test's clock: the next of those to land, and
+  // those due by `nowMilliseconds` landed (a restore once submitted).
+  [[nodiscard]] std::optional<double> nextLanding() const {
+    std::optional<double> next;
+    for (const auto &transfer : open())
+      if (!transfer->finished && !transfer->ready && transfer->submitted && transfer->dueMilliseconds)
+        next = std::min(next.value_or(*transfer->dueMilliseconds), *transfer->dueMilliseconds);
+    return next;
+  }
+  void land(double nowMilliseconds) {
+    for (auto &transfer : open())
+      if (!transfer->finished && !transfer->ready && transfer->submitted && transfer->dueMilliseconds &&
+          *transfer->dueMilliseconds <= nowMilliseconds)
+        transfer->ready = true;
   }
   // Fails every write of the class still in flight.
   void fail(engine::WriteClass write) {
@@ -190,6 +196,8 @@ public:
   bool writableFile = true;
   bool persistentTier = false;
   std::vector<std::shared_ptr<Transfer>> transfers;
+  std::optional<double> bytesPerMillisecond;
+  std::function<double()> clock;
 
 private:
   struct Slot final : engine::KvDiskSlot, TestKvCopy {
@@ -231,15 +239,37 @@ private:
   std::unique_ptr<engine::KvTransfer> start(std::optional<engine::WriteClass> write) {
     auto transfer = std::make_shared<Transfer>();
     transfer->write = write;
+    if (bytesPerMillisecond)
+      transfer->dueMilliseconds = clock() + double(slotBytes()) / *bytesPerMillisecond;
     transfers.push_back(transfer);
     ++inFlight_;
     if (write) ++writesInFlight_[static_cast<size_t>(*write)];
     return std::make_unique<Ticket>(*this, std::move(transfer), write);
   }
 
+  // The transfers from the first one not finished on: every one before it
+  // is, so a long run's scans skip them.
+  [[nodiscard]] std::span<const std::shared_ptr<Transfer>> open() const {
+    if (open_ > transfers.size())
+      open_ = 0;
+    while (open_ < transfers.size() && transfers[open_]->finished)
+      ++open_;
+    return std::span(transfers).subspan(open_);
+  }
+
   uint32_t inFlight_ = 0;
   std::array<uint32_t, 3> writesInFlight_{};
   std::set<const Slot *> live_;
+  mutable size_t open_ = 0;
+};
+
+// A fixture's tier: its quota of slots, its transfers in flight, and with a
+// rate, a transfer lands bytes / rate after it starts. A persistent tier
+// copies points ahead whatever memory holds.
+struct TierOptions final {
+  uint32_t capacity = 4, transferLimit = 2;
+  std::optional<double> bytesPerMillisecond;
+  bool persistent = false;
 };
 
 // A request's page sources (model::KvPageSources), page by page.

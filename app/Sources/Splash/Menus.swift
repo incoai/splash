@@ -5,10 +5,9 @@ struct ServerMenuItems: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
-        let server = state.server
-        if server.running, let model = server.next ?? server.model {
-            Button("Stop \(state.displayName(of: model))") { state.stop() }
-                .disabled(server.phase == .stopping && server.next == nil)
+        if let stop = state.stopItem {
+            Button("Stop \(state.displayName(of: stop.model))") { state.stop() }
+                .disabled(!stop.enabled)
         }
         Menu("Coding Agents") { AgentMenuItems() }
     }
@@ -21,11 +20,8 @@ struct AgentMenuItems: View {
     var body: some View {
         Section("Open in Terminal") {
             ForEach(Agent.allCases) { agent in
-                Button("\(agent.title)…") {
-                    NSApp.activate()
-                    agent.open(runtime: state.runtime, settings: state.server.settings)
-                }
-                .disabled(state.server.phase != .ready)
+                Button("\(agent.title)…") { state.open(agent) }
+                    .disabled(state.server.phase != .ready)
             }
         }
         Divider()
@@ -44,12 +40,12 @@ struct MenuBarPanel: View {
         let server = state.server
         VStack(alignment: .leading, spacing: 1) {
             HStack(spacing: 10) {
-                StatusMark(look: state.markLook, since: server.since)
+                StatusMark(look: state.serverStatus.look, since: server.since)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(server.model.map(state.displayName(of:)) ?? "No model running")
                         .font(.headline)
                         .truncationMode(.middle)
-                    if server.model != nil { Text(phase).font(.callout).foregroundStyle(.secondary) }
+                    if server.model != nil { Text(state.serverStatus.phrase).font(.callout).foregroundStyle(.secondary) }
                 }
                 .lineLimit(1)
             }
@@ -65,18 +61,15 @@ struct MenuBarPanel: View {
             PanelRow(title: "Open Server") { show(.server) }
             PanelRow(title: "Open Chat") { show(.chat) }
             Divider().padding(.horizontal, 8).padding(.vertical, 4)
-            if server.running, let model = server.next ?? server.model {
-                PanelRow(title: "Stop \(state.displayName(of: model))") { state.stop() }
-                    .disabled(server.phase == .stopping && server.next == nil)
+            if let stop = state.stopItem {
+                PanelRow(title: "Stop \(state.displayName(of: stop.model))") { state.stop() }
+                    .disabled(!stop.enabled)
             }
             if server.phase == .ready {
                 PanelRow(title: "Coding Agents", open: agents) { withAnimation(Motion.settle) { agents.toggle() } }
                 if agents {
                     ForEach(Agent.allCases) { agent in
-                        PanelRow(title: "\(agent.title)…", indent: true) {
-                            NSApp.activate()
-                            agent.open(runtime: state.runtime, settings: server.settings)
-                        }
+                        PanelRow(title: "\(agent.title)…", indent: true) { state.open(agent) }
                     }
                     CopyButton(copy: state.copyAPIAddress) { PanelLabel(title: "Copy API Address", indent: true, check: $0) }
                         .buttonStyle(.hoverFlush)
@@ -91,24 +84,10 @@ struct MenuBarPanel: View {
         .frame(width: 300)
     }
 
-    /// What the model in the header does, as the Server screen says it.
-    private var phase: String {
-        let server = state.server
-        switch server.phase {
-        case .starting: return "\(server.step.rawValue)…"
-        case .stopping:
-            guard let next = server.next else { return "Stopping…" }
-            return next == server.model ? "Restarting…" : "Switching to \(state.displayName(of: next))…"
-        case .ready: return server.serving.rawValue
-        case .failed: return server.running ? "Not responding" : "Ran into a problem"
-        case .stopped: return "Not running"
-        }
-    }
-
     /// How the model does since it started: answering speed, requests and memory; the tokens it
     /// generated, read and took from its cache.
     private func totals(_ activity: Server.Activity) -> some View {
-        let memory = activity.memory.map { Format.parts(Format.size($0)) }
+        let memory = activity.memory.map { Format.parts(Format.memory($0)) }
         return VStack(spacing: 10) {
             HStack(spacing: 0) {
                 Figure(value: activity.generation.map(Format.whole), unit: "tok/s", caption: "Answering", compact: true)

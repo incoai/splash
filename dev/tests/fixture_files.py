@@ -46,13 +46,6 @@ def write_safetensors(path, tensors):
     path.write_bytes(safetensors_bytes(header, payload))
 
 
-def read_safetensors(path):
-    """The header and the tensor data of a safetensors file."""
-    data = path.read_bytes()
-    length = struct.unpack("<Q", data[:8])[0]
-    return json.loads(data[8 : 8 + length]), data[8 + length :]
-
-
 def _gguf_string(text):
     data = text.encode()
     return struct.pack("<Q", len(data)) + data

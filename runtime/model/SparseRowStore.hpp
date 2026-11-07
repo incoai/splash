@@ -2,12 +2,12 @@
 
 // A large table of fixed-size native rows that stays in its source file and
 // is read a row at a time: a bounded host cache of rows, read on the engine's
-// SSD readers (model::SsdReaders), and the staging of one command's
-// rows into memory the GPU reads. Its user
-// names the table (SparseRowTable) and sizes the working memory of its
-// stages and prefetches (SparseRowStoreOptions). The store knows nothing of
-// what the rows mean: its user computes the row ids, and gathers the staged
-// rows with its own kernel.
+// SSD readers (model::SsdReaders), and the staging of one command's rows
+// into memory the GPU reads. Its user names the table (SparseRowTable) and
+// sizes the working memory of its stages and prefetches
+// (SparseRowStoreOptions). The store knows nothing of what the rows mean:
+// its user computes the row ids, and gathers the staged rows with its own
+// kernel.
 //
 // stage() copies every distinct row a command reads once into the command's
 // staging and, for each id, the index of its row there. It returns only once
@@ -110,8 +110,6 @@ struct SparseRowStats final {
   uint64_t cacheBytes = 0;    // cache and working-memory reservation
   uint64_t cacheCapacityRows = 0;
   uint64_t cachedRows = 0;
-  // Whether the cache's arrays hold all of their host memory (commit()).
-  bool committed = false;
   // Per SparseRowUse: stages, row ids they took, distinct rows, cache hits
   // and rows read.
   struct Use final {
@@ -179,10 +177,10 @@ public:
   // Blocks until every row is staged. With `adoptPrefetch`, it first
   // finishes the prefetches in flight (a read-ahead of the rows this stage
   // takes), helping read them; otherwise it leaves them to the readers and
-  // may read a row they are reading too. Throws
-  // SparseRowError when a row cannot be read (and poisons the store) or an
-  // id is past the table (a defect of the caller), std::invalid_argument
-  // when rows or slots are too small. Stages are serialized.
+  // may read a row they are reading too. Throws SparseRowError when a row
+  // cannot be read (and poisons the store) or an id is past the table (a
+  // defect of the caller), std::invalid_argument when rows or slots are too
+  // small. Stages are serialized.
   SparseRowStageResult stage(std::span<const uint32_t> ids, std::span<uint8_t> rows, std::span<uint32_t> slots,
                              SparseRowUse use, bool adoptPrefetch = false);
 

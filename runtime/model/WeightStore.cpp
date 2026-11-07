@@ -179,12 +179,12 @@ ops::EmbeddingWeights readBlockEmbedding(WeightFile &file, uint32_t outputSize, 
     const GgufTensorDescriptor d = readGgufDescriptor(file, label);
     if (d.outputSize != outputSize || d.inputSize != inputSize)
         throw WeightStoreError("GGUF embedding does not match the layout: " + std::string(label));
-    // Rows as stored, of whole native blocks.
+    // Rows as stored, which the gather reads.
     const uint32_t format = gguf_format_of(d.type);
-    if (format == GGUF_FMT_COUNT || d.inputSize % kQuantFormats[format].block_elements)
-        throw WeightStoreError("GGUF embedding rows are not native GGUF blocks: " + std::string(label));
-    return {outputSize, inputSize,
-            ops::NativeRows(readRows(file, d, ggufRowBytes(kQuantFormats[format], d.inputSize), label), format)};
+    const uint64_t rowBytes = quant_stored_row_bytes(format, d.inputSize);
+    if (!rowBytes)
+        throw WeightStoreError("GGUF embedding rows are not whole blocks of a GGUF format: " + std::string(label));
+    return {outputSize, inputSize, ops::StoredRows(readRows(file, d, rowBytes, label), format)};
 }
 
 std::string weightManifestFingerprint(

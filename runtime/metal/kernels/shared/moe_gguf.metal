@@ -5,20 +5,18 @@
 #include "metal/kernels/common/gguf_staged_tile.h"
 #include "metal/kernels/common/moe_expert_slab.h"
 
-// MoE experts (ops/MoE.cpp; kernels/shared/moe.metal groups the rows): threadgroup (x, y) computes
-// 64 columns of tile y with the weights of the tile's expert (moe_gguf_segment), the routed ones in the chunks of the
-// table at the index after the parameters (metal/abi/MoE.h), of a block whose shared expert is
-// Shared slices (each instance's slices suffix, ops::kCompiledMoeRoutings), in the format the tile picks
-// at run time: on a 16-core M5 Pro one run-time-format dispatch over two segments is within -11..+8% of a dispatch
-// per format (23040x2048 Q4_K and 92160x512 Q5_K, one to four lanes). aux is the gate of the up pass.
-// Two simdgroups each stream their own 32 columns through the decode tile, grid (N / 64, tiles), on 8-row tiles
-// (decode steps, short prefill chunks) or 32-row tiles (longer chunks, ops::moeGgufPrefillTile), where a tile runs the
-// 8-, 16- or 32-row matmul that holds its live rows (moe_live_rows): an expert's last tile is mostly partial. On the
-// 35B's real prefill routes the 32-row tiles take 17-30% less time than 64-row tiles sharing one 64-column stage over
-// four 16-row simdgroups (512 and 2048 rows, 16-core M5 Pro). An expert's only tile of at most MOE_GGUF_COLUMN_ROWS
-// live rows runs the column tile instead (kernels/common/gguf_column_tile.h, moe_column_tile), each lane one of the
-// simdgroup's columns over the live rows: routes spread over many experts leave most decode tiles at one or two rows,
-// where the staged tile's padded matmul steps bound it.
+// MoE experts (ops/MoE.cpp; kernels/shared/moe.metal groups the rows): threadgroup (x, y) computes 64 columns of tile y
+// with the weights of the tile's expert (moe_gguf_segment), the routed ones in the chunks of the table at the index
+// after the parameters (metal/abi/MoE.h), of a block whose shared expert is Shared slices (each instance's slices
+// suffix, ops::kCompiledMoeRoutings), in the format the tile picks at run time (within -11..+8% of a dispatch per
+// format). aux is the gate of the up pass. Two simdgroups each stream their own 32 columns through the decode tile,
+// grid (N / 64, tiles), on 8-row tiles (decode steps, short prefill chunks) or 32-row tiles (longer chunks,
+// ops::moeGgufPrefillTile), where a tile runs the 8-, 16- or 32-row matmul that holds its live rows (moe_live_rows): an
+// expert's last tile is mostly partial, so on the 35B's prefill routes 32-row tiles take 17-30% less time than 64-row
+// ones. An expert's only tile of at most MOE_GGUF_COLUMN_ROWS live rows runs the column tile instead
+// (kernels/common/gguf_column_tile.h, moe_column_tile), each lane one of the simdgroup's columns over the live rows:
+// routes spread over many experts leave most decode tiles at one or two rows, where the staged tile's padded matmul
+// steps bound it.
 template <ushort Rows, GgufEpilogue Ep, uint Shared>
 inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescriptor *tiles,
                                  device const uint *tile_count, device uchar *sw0, device uchar *sw1,
@@ -84,24 +82,17 @@ template [[host_name("moe_expert_gguf_m32_g_s2")]] kernel MoeExpertGgufKernel mo
 
 // The gate and up passes in one (ops/MoE.cpp): threadgroup (x, y) runs a gate simdgroup and an up simdgroup on the same
 // 32 columns of tile y, grid (N / 32, tiles), each through its own stage in its own pass's formats, as in
-// moe_gguf_expert_tile. Where gate and up share their routed and their shared formats the two read one pair table,
-// otherwise (_gate_up_mixed) each its own, a kilobyte more threadgroup memory: two tables on a layer of hidden 2048 and
-// 256 experts of width 512, 8 per row (gguf-moe-benchmark), took 1-5% longer to prefill 64- to 2048-row chunks and 0-3%
-// to decode on a 20-core M5 Pro (Q4_K/Q5_K/Q8_0), 1-3% on a 12-core M6 (IQ2_XS/IQ3_XXS/Q5_K). Every thread fills the
-// tables before one barrier (none without a table), so the simdgroups' walks, of different formats, meet no barrier but
-// their own. The gate simdgroup parks bf16(gate) in its stage, which its loop no longer reads, and the up simdgroup
+// moe_gguf_expert_tile. Every pass ends in a tail that leaves cores idle; one pass of gate and up has one tail, which
+// runs 1-5% faster than the two passes from two lanes or 16-row chunks up. Where gate and up share their routed and
+// their shared formats the two read one pair table, otherwise (_gate_up_mixed: a GGUF may store a shared expert's gate
+// and up in different formats) each its own, a kilobyte more threadgroup memory that costs up to 5%. Every thread fills
+// the tables before one barrier (none without a table), so the simdgroups' walks, of different formats, meet no barrier
+// but their own. The gate simdgroup parks bf16(gate) in its stage, which its loop no longer reads, and the up simdgroup
 // writes bf16(up) * silu(gate) as the up pass does (gguf_epilogue<EpUpWithGate>), so the intermediate is bitwise the
-// two passes'. A pass of few tiles leaves cores idle and every pass ends in a tail; one pass runs gate and up together
-// and has one tail. Against the two passes, both on live grids, on a model of that layer's shape in MLX 4-bit and mxfp4
-// and in GGUF experts of Q4_K/Q5_K and of IQ2_XS/IQ3_XXS: a 40-core M5 Max decodes 1.1-4.3% faster at two to four lanes
-// and prefills chunks of 16 to 512 rows 1.1-5.1% faster, within noise (-1.4..+0.6%) at one lane and on 8-row chunks; a
-// 12-core M6 runs 0.5-2.7% and a 40-core M3 Max 0.9-5.5% faster. A GGUF may store a shared expert's gate and up in
-// different formats (34 of 48 layers of one 512-expert Q2_0 checkpoint).
-// The gate/up pass's column tile (moe_column_tile), out of line. Inlined, its column dots in every format grew the
-// 32-row kernel until a 10-core M4 (Apple9) under shader validation summed one element of the staged accumulator
-// wrongly (row 0, columns 1, 3, 5 and 7 of each 32-column tile of an F16 shared expert's up; gguf-moe, both shapes),
-// the same kernel right without validation, as was the kernel before the column tile and the kernel without its column
-// branch.
+// two passes'.
+// The gate/up pass's column tile (moe_column_tile), out of line: inlined in every format, it grew the 32-row kernel
+// until a 10-core M4 (Apple9) under shader validation summed one element of the staged accumulator wrongly, the same
+// kernel right without validation.
 __attribute__((noinline)) void moe_gate_up_column(device bfloat *x, uint rows, uint K, uint N, MoeGgufSegment s,
                                                   uint origin, uint simd_lane, threadgroup half2 *table, bool up,
                                                   threadgroup bfloat *gate, device bfloat *output, ulong out) {

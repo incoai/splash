@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from dev.benchmarks import backend_regression, weights
+from dev.benchmarks.serving import run as serving_run
 from dev.tests import agent_real, smoke_real
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -34,7 +35,8 @@ environment=$(cd "$(dirname "$0")/.." && pwd)
 case "$1 $2 $3" in
   -c*) test ! -e "$environment/broken";;
   "-m pip install") shift 3; echo "$*" >> "$environment/../pip.log";;
-  "-m pip --version"|"-m pip check") ;;
+  "-m pip --version") ;;
+  "-m pip check") test ! -e "$environment/conflict";;
   *) echo "$*" >> "$environment/../python.log"
      /usr/bin/lockf -s -k -t 0 "$environment.install.lock" true \\
        || echo "$*" >> "$environment/../locked.log";;
@@ -116,6 +118,13 @@ class MakefileTests(unittest.TestCase):
             # A current environment installs nothing.
             self.assertEqual(self.make(*arguments).returncode, 0)
             self.assertEqual(len((directory / "pip.log").read_text().splitlines()), 4)
+            # Development requirements that break the environment fail the
+            # install and leave no stamp, so the next run installs again.
+            stamp = environment / ".dev-requirements-installed"
+            stamp.write_text("old\n")
+            (environment / "conflict").touch()
+            self.assertNotEqual(self.make(*arguments).returncode, 0)
+            self.assertFalse(stamp.exists())
 
     def test_python_candidates_may_come_from_the_environment(self):
         # As the release job sets them.
@@ -238,22 +247,20 @@ class MakefileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             # backend_regression requires the installation, and builds in
-            # BASELINE and in this checkout, its candidate, whose
-            # weight-digests name the options they take in their usage.
+            # BASELINE and in this checkout, its candidate, each with the
+            # benchmark, the library and weight-digests.
             model_root = directory / "model"
             model_root.mkdir()
             (model_root / "model.json").touch()
             baseline, candidate = directory / "baseline", directory / "candidate"
             for checkout in (baseline, candidate):
                 (checkout / "build/engine-tests").mkdir(parents=True)
-                (checkout / backend_regression.BENCHMARK).touch()
-                (checkout / backend_regression.METALLIB).touch()
-                tool = checkout / "build" / weights.WEIGHT_DIGESTS
-                tool.write_text(
-                    "#!/bin/sh\necho 'usage: weight-digests METALLIB MODEL_DIRECTORY "
-                    "[--expert-memory SIZE] [--ple-memory SIZE]' >&2\nexit 2\n"
-                )
-                tool.chmod(0o755)
+                for path in (
+                    backend_regression.BENCHMARK,
+                    backend_regression.METALLIB,
+                    Path("build") / weights.WEIGHT_DIGESTS,
+                ):
+                    (checkout / path).touch()
             variables = (
                 "MODEL=owner/repo",
                 "REVISION=main",
@@ -274,6 +281,11 @@ class MakefileTests(unittest.TestCase):
                     "test-performance-real",
                     "dev.benchmarks.backend_regression",
                     backend_regression.parse_args,
+                ),
+                (
+                    "test-pressure-real",
+                    "dev.benchmarks.serving.run",
+                    serving_run.parse_args,
                 ),
             ):
                 with (
