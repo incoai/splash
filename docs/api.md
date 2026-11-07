@@ -256,48 +256,50 @@ A lane's arithmetic can depend on the batch it decodes in and on how its prompt
 is chunked. On a GGUF MoE target, an expert that a step routes at most two rows
 to runs them on the column tile, which sums in another order than the staged
 matmul, so a row's result also depends on the rows decoded or prefilled beside
-it. With INT8 KV on M5 and later Macs, attention scores INT8 queries where
-its splits read 8 pages or more, which follows the chunk's rows and history
-and, in verify, the batch's longest lane. Concurrent requests change the batch
-and the chunking, and chunk boundaries also come from the cached boundary a
-request resumes from, from a boundary another request waits to resume from,
-and from one whose state, or the KV past it, memory could not hold. With
-`--state-format bf16` the state is also rounded at each state a chunk captures
-(a replay point, junction or checkpoint). So on a dense target, or a MoE target
-under `--verify-rows all`, a greedy or seeded request repeats its output when it
-runs alone with the same cached prefixes; alongside other requests, or with
-other prefixes cached, it can differ. A request's own repeat is such a case:
-served from the prefix cache, it computes only the rows past the state its first
-run cached, so its output can differ from that run's, which computed the whole
-prompt; repeats meant to match each take a `cache_salt` of their own (below). By
-default a MoE target's decode cycles verify the rows the verify budget chooses
-([Drafts](models.md#drafts)), which follow the machine's timing and the requests served
-before, and a row's MoE result depends on which rows share its expert tiles:
-there the same greedy (temperature 0) or seeded request can give different text
-from run to run even alone on an idle server, as on other engines that batch
-requests, while sampled outputs keep their exact distribution. A request that
-restores nothing can still read cached KV: once a command completes, each block
-it filled whose prefix, tokens and identity (images and cache salt) match a
-cached block is swapped for that block's page, which another command computed,
-and its later commands read it. A request suspended for memory or for a higher
-priority can also resume from a state another request cached past the blocks it
-had computed, and its replay then reads the KV of the blocks it restores there.
-The Done line of the request log counts the tokens of both, as does
-`metrics.cache.deduplicated_tokens` in Chat Completions and text completions
-responses (in a stream, its usage chunk), and `/status` sums them in
-`cache.deduplicated_kv_tokens`. One case goes uncounted: while a request is
-suspended, blocks it computed can be evicted and computed again by another
-request, and when it resumes it reads those as its own. A request with a
-`cache_salt` no other request uses reads no cached KV, though its images'
-encoded rows may come from another request's encoding of the same image, which
-gives the same rows. Alone, it computes what it would on a server that served
-nothing before, with two exceptions. The [Neural Engine
-split](internals.md#neural-engine-prefill) may have stopped: the split stays off for the
-life of the process, so such a server prefills on the GPU alone the chunks a
-fresh one splits. And where other requests' cache leaves its states no free
-memory, a state's prefill command can end at the state's boundary instead of
-capturing it inside a longer command, which changes the chunks. Either way the
-logits differ slightly.
+it. With INT8 KV on M5 and later Macs, attention scores INT8 queries where its
+splits read 8 pages or more, which follows the chunk's rows and history and, in
+verify, the batch's longest lane. On M5 and later Macs with `--prefill-int8` on,
+a target's MLX 4- or 5-bit projection rounds its rows to int8 when their chunk,
+with the rows prefilled beside them, has more than 64 rows. Concurrent requests
+change the batch and the chunking, and chunk boundaries also come from the
+cached boundary a request resumes from, from a boundary another request waits to
+resume from, and from one whose state, or the KV past it, memory could not hold.
+With `--state-format bf16` the state is also rounded at each state a chunk
+captures (a replay point, junction or checkpoint). So on a dense target, or a
+MoE target under `--verify-rows all`, a greedy or seeded request repeats its
+output when it runs alone with the same cached prefixes; alongside other
+requests, or with other prefixes cached, it can differ. A request's own repeat
+is such a case: served from the prefix cache, it computes only the rows past the
+state its first run cached, so its output can differ from that run's, which
+computed the whole prompt; repeats meant to match each take a `cache_salt` of
+their own (below). By default a MoE target's decode cycles verify the rows the
+verify budget chooses ([Drafts](models.md#drafts)), which follow the machine's
+timing and the requests served before, and a row's MoE result depends on which
+rows share its expert tiles: there the same greedy (temperature 0) or seeded
+request can give different text from run to run even alone on an idle server, as
+on other engines that batch requests, while sampled outputs keep their exact
+distribution. A request that restores nothing can still read cached KV: once a
+command completes, each block it filled whose prefix, tokens and identity
+(images and cache salt) match a cached block is swapped for that block's page,
+which another command computed, and its later commands read it. A request
+suspended for memory or for a higher priority can also resume from a state
+another request cached past the blocks it had computed, and its replay then
+reads the KV of the blocks it restores there. The Done line of the request log
+counts the tokens of both, as does `metrics.cache.deduplicated_tokens` in Chat
+Completions and text completions responses (in a stream, its usage chunk), and
+`/status` sums them in `cache.deduplicated_kv_tokens`. One case goes uncounted:
+while a request is suspended, blocks it computed can be evicted and computed
+again by another request, and when it resumes it reads those as its own. A
+request with a `cache_salt` no other request uses reads no cached KV, though its
+images' encoded rows may come from another request's encoding of the same image,
+which gives the same rows. Alone, it computes what it would on a server that
+served nothing before, with two exceptions. The [Neural Engine
+split](internals.md#neural-engine-prefill) may have stopped: the split stays off
+for the life of the process, so such a server prefills on the GPU alone the
+chunks a fresh one splits. And where other requests' cache leaves its states no
+free memory, a state's prefill command can end at the state's boundary instead
+of capturing it inside a longer command, which changes the chunks. Either way
+the logits differ slightly.
 
 ## Output limits and streaming
 

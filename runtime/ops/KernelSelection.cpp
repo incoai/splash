@@ -155,7 +155,7 @@ UnitFormats unitFormats(std::span<const Projection *const> projections) noexcept
   UnitFormats unit;
   FormatClassifier classes;
   uint32_t bits = 0, count = 0;
-  bool decodeInt8 = true, quantized = false;
+  bool decodeInt8 = true, prefillInt8 = true, quantized = false;
   for (const Projection *p : projections) {
     if (!p) continue;
     bits += p->shape().weightBits16, ++count;
@@ -164,10 +164,12 @@ UnitFormats unitFormats(std::span<const Projection *const> projections) noexcept
       unit.registerTakes &= quant_register_tensor(s.formatId, s.inputSize);
       classes.add(s.formatId);
       decodeInt8 &= static_cast<bool>(p->rotation) && quant_decode_int8_format(s.formatId);
+      prefillInt8 &= quant_prefill_int8_format(s.formatId);
       quantized = true;
     }
   }
   unit.decodeInt8Takes = quantized && decodeInt8;
+  unit.prefillInt8Takes = quantized && prefillInt8;
   unit.formatClass = classes.formatClass();
   unit.weightBits16 = count ? bits / count : 0;
   if (projections.size() == 2 && projections[0] && projections[1]) {
@@ -182,7 +184,8 @@ UnitFormats unitFormats(std::span<const Projection *const> projections) noexcept
 UnitFormats unitFormats(const ProjectionShape &shape) noexcept {
   return {.formatClass = shape.formatClass,
           .registerTakes = shape.registerFormats,
-          .weightBits16 = shape.weightBits16};
+          .weightBits16 = shape.weightBits16,
+          .prefillInt8Takes = shape.prefillInt8Formats};
 }
 
 SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows, uint32_t bits16, uint32_t cores,
@@ -192,7 +195,8 @@ SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows
 }
 
 // Prefill chunks of up to stagedPrefillRows rows run the staged tile at their
-// rows' height with stagedSplits, longer ones the prefill tile unsplit. A
+// rows' height with stagedSplits, longer ones the prefill tile unsplit, or the
+// int8 prefill tile where the row has prefillInt8 and it takes the unit. A
 // decode step runs the register tile where it takes every quantized segment
 // and the class's RegisterBoundary holds, a one-pass-eligible gate/up pair's
 // column tiles counting both tensors', splitting by registerSplits; else the
@@ -207,9 +211,10 @@ LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorklo
   const auto [n, k] = w.matrix;
   const ProjectionCalibration &p = calibration.projection;
   const uint32_t cores = calibration.cores;
-  if (w.phase == LinearPhase::Prefill)
-    return w.rows <= p.stagedPrefillRows ? staged(p, n, k, w.rows, unit.weightBits16, cores, Passes::Two)
-                                         : LinearConfig{.tile = LinearTile::GgufPrefill};
+  if (w.phase == LinearPhase::Prefill) {
+    if (w.rows <= p.stagedPrefillRows) return staged(p, n, k, w.rows, unit.weightBits16, cores, Passes::Two);
+    return {.tile = p.prefillInt8 && unit.prefillInt8Takes ? LinearTile::GgufPrefillInt8 : LinearTile::GgufPrefill};
+  }
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
   const bool gateUp = w.epilogue == LinearEpilogue::GateUp,
              onePass = gateUp && unit.oneFormat && cores >= p.onePassFromCores;

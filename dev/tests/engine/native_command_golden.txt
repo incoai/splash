@@ -28,6 +28,8 @@ image_patches_rounded | --max-image-pixels 1000000 | auto auto --max-image-patch
 image_patches_default | --max-image-pixels 4194304 | auto auto
 idle_sleep | --allow-idle-sleep | auto auto --idle-sleep allow
 disable_ane | --disable-ane | auto auto --ane off
+prefill_int8_off | --prefill-int8 off | auto auto --prefill-int8 off
+prefill_int8_on | --prefill-int8 on | auto auto
 verify_rows_all | --verify-rows all | auto auto --verify-rows all
 verify_rows_auto | --verify-rows auto | auto auto
 kv_format_default | --kv-format int8 | auto auto

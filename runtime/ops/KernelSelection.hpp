@@ -32,6 +32,9 @@ struct UnitFormats final {
   // evenly. Never from a shape: the int8 tiles keep the plan's rows, splits
   // and scratch, which the shape bounds.
   bool decodeInt8Takes = false;
+  // The int8 prefill tile takes every quantized segment, of which there is
+  // one at least (quant_prefill_int8_format).
+  bool prefillInt8Takes = false;
   bool operator==(const UnitFormats &) const = default;
 };
 // The formats of the projections of a plan (a gate/up plan's up and gate).

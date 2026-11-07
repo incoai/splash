@@ -137,27 +137,91 @@ void smallApple9StagesShortPrefillChunks() {
 
 // A prefill plan of some of a chunk's rows (Linear::prefillPlan) takes the
 // chunk's tile kind and K splits, at the staged height of its own rows, in no
-// more scratch than the chunk's; rows past the chunk's are refused.
-// gguf-projection checks that such a plan writes the chunk's bits.
+// more scratch than the chunk's; rows past the chunk's are refused, on a
+// Q4_K projection and on an af4g64 one, whose chunks past the staged tile run
+// the int8 prefill tile on Apple10 and Apple11. gguf-projection checks that
+// such a plan writes the chunk's bits.
 void chunkRowPlans() {
-  const Projection p = blockProjection(5120, 17408, 1);
+  const Projection q4k = blockProjection(5120, 17408, 1), af4 = blockProjection(5120, 17408, 1, GGUF_FMT_AF4G64);
   for (const uint32_t family : {9U, 10U, 11U})
     for (const uint32_t cores : {10U, 12U, 16U, 20U, 32U, 40U}) {
       const Linear linear = gpu(family, cores);
-      for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
-        for (const uint32_t chunk : {1U, 7U, 32U, 33U, 64U, 65U, 300U, 2048U})
-          for (const uint32_t rows : {1U, 4U, chunk}) {
-            if (rows > chunk) continue;
-            const LinearPlan whole = linear.prefillPlan(p, chunk, epilogue),
-                             part = linear.prefillPlan(p, rows, epilogue, chunk);
-            const LinearScratchSize own = part.scratchSize(), bound = whole.scratchSize();
-            if (part.configuration() != whole.configuration() || part.workload().rows != rows ||
-                own.partials > bound.partials || own.counters > bound.counters)
-              broke("a chunk's rows departed from its prefill plan", family, cores, part.workload());
-          }
-      rejects([&] { (void)linear.prefillPlan(p, 9, LinearEpilogue::None, 8); },
+      for (const Projection *weights : {&q4k, &af4})
+        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
+          for (const uint32_t chunk : {1U, 7U, 32U, 33U, 64U, 65U, 300U, 2048U})
+            for (const uint32_t rows : {1U, 4U, chunk}) {
+              if (rows > chunk) continue;
+              const LinearPlan whole = linear.prefillPlan(*weights, chunk, epilogue),
+                               part = linear.prefillPlan(*weights, rows, epilogue, chunk);
+              const LinearScratchSize own = part.scratchSize(), bound = whole.scratchSize();
+              if (part.configuration() != whole.configuration() || part.workload().rows != rows ||
+                  own.partials > bound.partials || own.counters > bound.counters || own.input > bound.input ||
+                  own.sums > bound.sums)
+                broke("a chunk's rows departed from its prefill plan", family, cores, part.workload());
+            }
+      rejects([&] { (void)linear.prefillPlan(q4k, 9, LinearEpilogue::None, 8); },
               "a prefill plan takes rows of its chunk", "a plan of more rows than its chunk was accepted");
     }
+}
+
+// The int8 prefill tile (ProjectionCalibration::prefillInt8): Apple10 and
+// Apple11 run every prefill chunk past the staged tile of a unit of af4g64
+// and af5g64 segments on it, at the prefill tile's storage, Apple9 none; a
+// unit with a segment of another format keeps the prefill tile, and so does
+// every unit with --prefill-int8 off, whose plans are then the bf16 ones; a
+// workload of no formats plans the same either way. The arena bound of a shape
+// holds the tile's codes and scales of a full chunk wherever the family runs
+// it on the shape's formats, or on a shape that names none.
+void prefillInt8Rule() {
+  const Projection af4 = blockProjection(5120, 17408, 1, GGUF_FMT_AF4G64);
+  const Projection af5 = blockProjection(12288, 5120, 3, GGUF_FMT_AF5G64);
+  const std::array<uint32_t, 3> mixedFormats{GGUF_FMT_AF4G64, GGUF_FMT_AF5G64, GGUF_FMT_Q4K};
+  const Projection mixed = blockProjection(12288, 5120, mixedFormats);
+  for (const auto [family, cores] : {std::pair{9U, 10U}, {9U, 40U}, {10U, 16U}, {10U, 32U}, {11U, 12U}}) {
+    const Linear linear = gpu(family, cores), bf16(simulatedDevice(family, cores), false);
+    const ProjectionCalibration &law = linear.calibration().projection;
+    const bool int8 = family >= 10;
+    require(law.prefillInt8 == int8 && !bf16.calibration().projection.prefillInt8,
+            "the int8 prefill tile takes Apple10's chunks past the staged tile, no Apple9 chunk and none off");
+    const LinearWorkload noFormats{{5120, 17408}, 2048, LinearPhase::Prefill, LinearEpilogue::None};
+    require(linear.plan(noFormats).configuration() == bf16.plan(noFormats).configuration(),
+            "--prefill-int8 changed a prefill plan of no formats");
+    for (const uint32_t rows : {32U, 64U, 65U, 128U, 2048U})
+      for (const auto &[p, epilogue] : {std::pair{&af4, LinearEpilogue::Residual}, {&af5, LinearEpilogue::None},
+                                        {&af4, LinearEpilogue::UpWithGate}, {&mixed, LinearEpilogue::None}}) {
+        const LinearPlan plan = linear.prefillPlan(*p, rows, epilogue), off = bf16.prefillPlan(*p, rows, epilogue);
+        const LinearTile bf16Tile = rows <= law.stagedPrefillRows ? LinearTile::GgufStaged : LinearTile::GgufPrefill;
+        const LinearTile tile =
+            bf16Tile == LinearTile::GgufPrefill && int8 && p != &mixed ? LinearTile::GgufPrefillInt8 : bf16Tile;
+        const uint32_t k = plan.workload().matrix.inputSize;
+        if (plan.configuration().tile != tile ||
+            (tile == LinearTile::GgufPrefillInt8 &&
+             (plan.storageRows() != (rows + 127) / 128 * 128 || plan.input() != LinearInput::Plain ||
+              !sameScratch(plan.scratchSize(), {gguf_prefill_int8_table_bytes(k, plan.storageRows()),
+                                                gguf_prefill_int8_scale_bytes(k, plan.storageRows()), 0, 0}))))
+          broke("int8 prefill tile rule", family, cores, plan.workload());
+        const LinearConfig bf16Config =
+            tile == LinearTile::GgufPrefillInt8 ? LinearConfig{.tile = LinearTile::GgufPrefill} : plan.configuration();
+        if (off.configuration() != bf16Config)
+          broke("--prefill-int8 off keeps the bf16 plans", family, cores, off.workload());
+      }
+    const LinearScratchSize bound = linear.prefillScratchSize({5120, 17408}),
+                            bf16Bound = bf16.prefillScratchSize({5120, 17408});
+    require(bound.input == (int8 ? gguf_prefill_int8_table_bytes(17408, SPLASH_PREFILL_TOKEN_BUDGET) : 0) &&
+                bound.sums == (int8 ? gguf_prefill_int8_scale_bytes(17408, SPLASH_PREFILL_TOKEN_BUDGET) : 0),
+            "the prefill scratch bound holds the int8 tile's codes and scales where the family runs it");
+    require(!bf16Bound.input && !bf16Bound.sums && bf16Bound.partials == bound.partials &&
+                bf16Bound.counters == bound.counters && bf16Bound.rotated == bound.rotated,
+            "the prefill scratch bound with --prefill-int8 off holds no int8 codes or scales");
+    const LinearScratchSize q4k = linear.prefillScratchSize(blockProjection(5120, 17408, 1).shape()),
+                            mixedBound = linear.prefillScratchSize(mixed.shape());
+    require(sameScratch(linear.prefillScratchSize(af4.shape()), bound) && sameScratch(q4k, bf16Bound) &&
+                !mixedBound.input && !mixedBound.sums,
+            "the prefill scratch bound holds int8 codes and scales for a shape of formats the tile does not take");
+  }
+  rejects([&] { (void)Linear::plan({{5120, 17408}, 8, LinearPhase::Decode, LinearEpilogue::None},
+                                   {.tile = LinearTile::GgufPrefillInt8}, FloatOutput::BFloat16); },
+          "invalid block prefill configuration", "the int8 prefill tile took a decode step");
 }
 
 // A GGUF decode projection whose split count is pinned on one core count.
@@ -1461,6 +1525,7 @@ int main(int argc, char **argv) {
     floatOutputPlans();
     smallApple9StagesShortPrefillChunks();
     chunkRowPlans();
+    prefillInt8Rule();
     if (std::string_view(argv[1]) == "--cpu") {
       std::cout << "Linear CPU plans: PASS\n";
       return 0;

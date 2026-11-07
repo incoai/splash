@@ -423,10 +423,12 @@ The rules:
 1. *Projection, prefill.* A chunk of up to `stagedPrefillRows` rows (64 on
    Apple10 and on Apple9 GPUs of 10 cores or fewer, 32 on larger Apple9 GPUs)
    runs the staged tile at its rows' height (8, 16, 32 or 64) with
-   `stagedSplits`; a longer one runs the 128-row prefill tile, unsplit. A staged
-   chunk of a projection of several segments and no epilogue runs them in one
-   dispatch, in prefill as in decode: a tile choice never adds dispatches to a
-   fused projection.
+   `stagedSplits`; a longer one runs the 128-row prefill tile, unsplit, or on
+   a row with `prefillInt8` (Apple10 and Apple11, with `--prefill-int8` on)
+   the [int8-activation tile](#int8-activation-prefill) where it takes every
+   quantized segment. A staged chunk of a projection of several segments and
+   no epilogue runs them in one dispatch, in prefill as in decode: a tile
+   choice never adds dispatches to a fused projection.
 2. *Projection, decode.* The register tile runs where it takes every quantized
    segment and the unit's `FormatClass` (`GridLookup`: IQ3_XXS, the IQ2 formats
    and IQ1; `GridLookupOrQ2K`; `UnderFourBits`; `FourBitsOrMore`) is below its
@@ -575,14 +577,15 @@ per core unsplit, in four or eight partitions) the 16-row tile takes 4-36% more 
 8-row tile at the same split on a 32-core M5 Max (IQ3_XXS, IQ2_XS and Q2_K, and IQ4_XS where it
 stages), against 2-8% less at 4 to 20 threadgroups per core on the M6 and 7% less to 2% more on
 the 27B's 5120-column projections in four on the M5 Max. Prefill runs the staged kernels on
-every class: the 128-row prefill tile (`LinearTile::GgufPrefill`), and the staged tile for
-chunks of up to 32 rows. On Apple10 and on Apple9 GPUs of 10 cores or fewer chunks of 33 to 64
-rows run the staged tile's 64-row height too, which reads the weights once where the prefill
-tile costs about as much for 33 rows as for 64 (on the 10-core M4 12-22% less time than the
-prefill tile). A fused projection's staged chunk runs its segments in one dispatch, as decode
-does: a dispatch costs about 0.045 ms however narrow, and at 8 to 32 rows one dispatch takes
-16-56% less time than one per segment on the 32-core M5 Max and 3-11% less on the 10-core M4 for
-the 27B attention and 35B GDN inputs.
+every class: the 128-row prefill tile (`LinearTile::GgufPrefill`; on Apple10 and Apple11 the
+[int8-activation tile](#int8-activation-prefill) where it takes the weights), and the staged
+tile for chunks of up to 32 rows. On Apple10 and on Apple9 GPUs of 10 cores or fewer chunks of
+33 to 64 rows run the staged tile's 64-row height too, which reads the weights once where the
+prefill tile costs about as much for 33 rows as for 64 (on the 10-core M4 12-22% less time than
+the prefill tile). A fused projection's staged chunk runs its segments in one dispatch, as
+decode does: a dispatch costs about 0.045 ms however narrow, and at 8 to 32 rows one dispatch
+takes 16-56% less time than one per segment on the 32-core M5 Max and 3-11% less on the 10-core
+M4 for the 27B attention and 35B GDN inputs.
 
 Apple10's staged tile splits K across threadgroups, and runs a gate/up pair in one pass or two,
 by one wave law (`WaveLaw`, `runtime/ops/KernelSelection.cpp`), for decode steps and short
@@ -745,12 +748,13 @@ experts `moe_expert_gguf_m<rows>_<e>`, with gate and up in one pass
 `moe_expert_gguf_m<rows>_gate_up`; the fused projections run
 `gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode and, on Apple10 and on
 Apple9 GPUs of 10 cores or fewer, in prefill chunks of 33 to 64 rows (`gguf_decode_fused_m64`),
-and in longer prefill chunks one `gguf_prefill_<format>_a` per format over that format's segments.
-The norm, GDN, attention-gate and attention-gather variants that also write the register kernels'
-input table carry `table16` in their names. The epilogue kinds of both GGUF families are in
-`kernels/common/gguf_tile.h`, the SiLU and sigmoid every kernel shares in
-`kernels/common/activation.h`, and the MMA helpers every register kernel uses, GGUF or fp32, in
-`kernels/common/sgmatrix.h`.
+and in longer prefill chunks one `gguf_prefill_<format>_a` per format over that format's
+segments (or, on the int8-activation tile, `gguf_prefill_int8_quantize` and one
+`gguf_prefill_int8_<format>_a` per segment). The norm, GDN, attention-gate and attention-gather
+variants that also write the register kernels' input table carry `table16` in their names. The
+epilogue kinds of both GGUF families are in `kernels/common/gguf_tile.h`, the SiLU and sigmoid
+every kernel shares in `kernels/common/activation.h`, and the MMA helpers every register kernel
+uses, GGUF or fp32, in `kernels/common/sgmatrix.h`.
 
 The ABIs are in `runtime/metal/abi/Gguf.h`, which also defines the tile geometry the kernels
 and `LinearGguf.cpp` share, and `MoE.h`; the image formats in
@@ -805,11 +809,12 @@ staged 16-row tile, `staged16`; a gate/up pair on the staged tile in two passes,
 the walks spread also in one, `pair` and `pair16`) and every K split, and marks the device policy's
 pick; widths emulate core counts, since the policy counts threadgroups per core. Or, with a trailing
 `prefill=R[,R...]` after the epilogue and the round count, one format's 128-row prefill tile at each
-chunk of `R` rows (more than 32), and for `R` up to 64 the staged 64-row tile at every K split; the formats `float-bf16` and `float-f32`, and `float-<format>` for
-a quantized format's native rows (such as `float-af8g64`), time the float projection
-(`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
-`selectFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape,
-or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
+chunk of `R` rows (more than 32), for `R` up to 64 the staged 64-row tile at every K split, and for
+`af4g64` and `af5g64` the int8-activation tile (`prefill int8`); the formats `float-bf16` and
+`float-f32`, and `float-<format>` for a quantized format's native rows (such as `float-af8g64`),
+time the float projection (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles
+instead, marking `selectFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B
+shape, or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
 device's plans; `GGUF_MOE_ARGS='repack'` times the repack of streamed experts into their slots
 (`moe_expert_load`, 1 to 32 jobs) and of tensors into an image (`gguf_repack`) in the streamed
 formats, each plane checked bytewise against the reference repack.
@@ -835,6 +840,51 @@ variant through the production encoders against fp64, and
 `make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--shapes flint-window,flint-full'` times
 Flint's two kinds of layers with their sinks: a window of 512 keys with RoPE, and the whole
 history without.
+
+### Int8-activation prefill
+
+On Apple10 and Apple11, which multiply int8 at twice their bf16 rate, a prefill chunk past the
+staged tile (more than 64 rows) of a projection whose quantized segments are all MLX affine 4- or
+5-bit in groups of 64 (`af4g64`, `af5g64`) runs `LinearTile::GgufPrefillInt8`
+(`kernels/prefill/gguf_prefill_int8.metal`) instead of the bf16 tile
+(`ProjectionCalibration::prefillInt8`; Apple9, whose int8 matmul runs at 0.9x its bf16 rate, never).
+`splash serve --prefill-int8 off` turns it off (`ExecutionPlans`' `prefillInt8`): every chunk then
+runs the bf16 tiles and the prefill arena holds no codes, so prefill is what it was before the tile,
+bit for bit. `gguf_prefill_int8_quantize` writes each 64-input group of each row as int8 codes with
+its own scale; the GEMM (`gguf_prefill_int8_<format>_<e>`, one dispatch per segment) feeds the
+weights' 4- or 5-bit codes straight from the planes into int8 `matmul2d` fragments and folds each
+group's affine correction, `(sa s) sum(qa q) + z (sa sum(qa))`, once in fp32. The weights stay
+exact; only the activations round, per row and group, so an outlier channel costs only its own 64
+inputs. A group holding an infinity or a NaN, which its codes alone would round to finite values,
+takes NaN scales, so that its row's outputs are not finite, as the bf16 tile's are: a lane whose
+state went bad still fails alone. A row's prefill results therefore depend on whether its chunk,
+with the rows of the lanes prefilling beside it, has more than 64 rows, but not on its neighbours'
+values: a prefill's last layer runs its read rows alone on the chunk's tile and keeps their bits. A
+tile is two simdgroups of 32 rows by 32 columns for both formats, and threadgroups take 16 row tiles
+down each column tile before the next (`GGUF_PREFILL_INT8_WALK`), so a column tile's weights stream
+once per 16 row tiles: walking every column tile of a row tile first left the M6's 2048-row down
+projections at 0.95-1.12x the bf16 tile's speed. Over the 27B's projection shapes in `af4g64` and
+`af5g64` at 65-2048 rows the tile takes 1.13-2.4x less time than the bf16 tile on a 32-core M5 Max,
+a 16-core M5 Pro and a 12-core M6. The fragment schedule is adapted from oMLX's oQ A8 kernel, whose
+Apache-2.0 notice is in `THIRD_PARTY_NOTICES`. The codes and scales are the prefill arena's
+`LinearTable` and `LinearSums`, sized for a full chunk of the target's widest projection whose
+formats the tile takes (`ProjectionShape::prefillInt8Formats`; 40 MB on Qwen3.8-27B MLX 4-bit, its
+down projection) wherever the family runs the tile; a GGUF target's arena holds none. The tile also
+takes the Neural Engine split's leading-input view. A DFlash2 draft, prepared `af4g64` whatever the
+target's format, prefills on the bf16 tiles (`ExecutionPlans::draftLinear`): its prefill gains
+nothing from the tile, while its context projection, the widest a prefill runs (25,600 inputs on
+the 27B), would set the tile's scratch, 38 MB on Qwen3.6-35B-A3B GGUF, enough at `--max-memory 24G`
+to stream the routed experts its plan otherwise holds whole. Over 24 real 1K-8K prefixes the
+next-token KL against bf16 prefill on the GPU alone is
+2.2e-3 on Qwen3.8-27B MLX 4-bit (median 3.6e-4) and 2.3e-3 on Qwen3.6-35B-A3B MLX 4-bit, the most
+likely token unchanged at every prefix. At default flags on a 20-core M5 Pro, where the 27B's Neural
+Engine split takes 10 of 34 units, it is 9.4e-4, against 1.1e-3 for the bf16 tiles with the split at
+its own 15 units; both change the most likely token at the same one prefix of 24. Time to the first
+token falls by a quarter at 2K and 10K tokens on the 27B (20-core M5 Pro) and by 12-13% on the 35B
+(16-core M5 Pro). `gguf-projection` checks that the tile computes the products of the inputs so
+rounded within the bf16 tile's error, also with an outlier input per row, and bounds the RMS error
+it adds over the bf16 tile on dense inputs at 1%; `gguf-projection-benchmark` times it as
+`prefill int8`.
 
 ## Sparse attention
 
@@ -938,8 +988,9 @@ channels on its prefill kernels, its down projection reading a view of the
 leading inputs of down's rows (`Projection::leadingInputs`) through instances
 of the residual kernels of their own (`<kernel>_leading_inputs`), which run
 the residual kernel's tile on the weight planes advanced past the inputs the
-view leaves unread. The Neural Engine runs the rest as one W8A8 program,
-Hadamard-rotated int8 activations and per-row int8 weights
+view leaves unread, or, on the int8-activation tile, through that tile's
+stride over the planes' rows. The Neural Engine runs the rest as one W8A8
+program, Hadamard-rotated int8 activations and per-row int8 weights
 (`runtime/ane/Program.mm`): a chunk takes the smallest of
 its functions that holds it, one every 128 rows from 512 to 2048, all reading
 and writing one set of surfaces sized for 2048 rows. The ANE service holds
@@ -1015,19 +1066,22 @@ whose T, or T a unit either way, is least at its longest, since the timings can
 put T's least a unit off: a unit past where the ANE's part takes the longer
 costs the ANE's time per unit, a unit short of it the GPU's, and on an M5 Max
 and an M5 Pro the ANE's is the longer (1.7 ms a unit of the full-chunk layer
-against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms). On
-Qwen3.8-27B that takes 8 of the 34 units on an M5 Max, 14-15 on an M5 Pro and
-25-26 on an M6, the best each Mac's sweeps measured. The split runs if T there
-gains 5% on the GPU alone. A start calibrates the split once for a Mac, a
-model, a macOS version, an engine build and the most units its memory plan
-holds, and remembers what it found (`remembered-*` in the cache directory
-below): the units, the least chunk and the GPU alone's layer at 512 and 2048
-rows, or that no split gains enough. Later starts take it untimed: they build
-the split, check it as below and serve, in 0.6 s on an M5 Max, 0.9 s on an M5
-Pro and 1.4 s on an M6. Across many starts over hours of prefill on those three
-Macs the timings chose the same units within their noise, while timing every
-start cost 3-8 s, and a start whose timings strayed could change the share,
-each share compiling a program of its own (half a minute on an M6).
+against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms), all with
+`--prefill-int8 off`. On Qwen3.8-27B that takes 8 of the 34 units on an M5
+Max, 14-15 on an M5 Pro and 25-26 on an M6 with `--prefill-int8 off`, the best
+each Mac's sweeps measured. By default the int8-activation tile makes the
+GPU's part faster, so the split takes fewer: 10 on a 20-core M5 Pro (the M5
+Max and M6 unmeasured). The split runs if T there gains 5% on the GPU alone. A
+start calibrates the split once for a Mac, a model, a macOS version, an engine
+build, `--prefill-int8` and the most units its memory plan holds, and remembers
+what it found (`remembered-*` in the cache directory below): the units, the
+least chunk and the GPU alone's layer at 512 and 2048 rows, or that no split
+gains enough. Later starts take it untimed: they build the split, check it as
+below and serve, in 0.6 s on an M5 Max, 0.9 s on an M5 Pro and 1.4 s on an M6.
+Across many starts over hours of prefill on those three Macs the timings chose
+the same units within their noise, while timing every start cost 3-8 s, and a
+start whose timings strayed could change the share, each share compiling a
+program of its own (half a minute on an M6).
 
 The start then builds the split that serves and checks every function of its
 program against the GPU alone (`AneFfn::verify`): at the function's own rows

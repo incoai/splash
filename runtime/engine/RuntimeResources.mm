@@ -887,7 +887,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
 
   // One plan owner is used both before allocation and during encoding. The
   // engine lends it to model execution without inspecting its plans.
-  ops::ExecutionPlans operators(device);
+  ops::ExecutionPlans operators(device, config.prefillInt8);
   model::LoadedModel loaded;
   // The runtime's lane state and arenas as the model loaded, with its K/V in
   // memory and where it spills.
@@ -1507,27 +1507,29 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
   const auto onArena = [&backend, &loaded, &operators, format](const auto &use) {
     model::withPrefillArena(backend, loaded, operators, format, use);
   };
-  model.time = [&backend, layers, cancelled, onArena] {
+  const ops::Linear &linear = operators.linear();
+  model.time = [&backend, &linear, layers, cancelled, onArena] {
     ops::ane_ffn::Timings timings;
     onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      timings = ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).time();
+      timings = ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).time();
     });
     return timings;
   };
-  model.prepare = [&backend, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
+  model.prepare = [&backend, &linear, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
     AneFfnPrepared prepared;
     onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      prepared.split = std::make_unique<ops::AneFfn>(backend, *layers, aneUnits, cancelled);
+      prepared.split = std::make_unique<ops::AneFfn>(backend, linear, *layers, aneUnits, cancelled);
       prepared.error = prepared.split->verify(*layers, ffn, hidden);
       if (timeChunks)
         prepared.chunks =
-            ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).chunks(*prepared.split);
+            ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).chunks(*prepared.split);
     });
     return prepared;
   };
   const std::string key = calibrationKey(*layers) + " device " + backend.capabilities().deviceName + " macos " +
                           [[NSProcessInfo processInfo] operatingSystemVersionString].UTF8String + " build " +
-                          std::string(buildId) + " most ";
+                          std::string(buildId) + " prefill-int8 " +
+                          (operators.calibration().projection.prefillInt8 ? "on" : "off") + " most ";
   model.recall = [key](uint32_t maxAneUnits) -> std::optional<ops::ane_ffn::Calibration> {
     const std::optional<std::string> line = ane::recall(key + std::to_string(maxAneUnits));
     return line ? ops::ane_ffn::Calibration::parse(*line) : std::nullopt;

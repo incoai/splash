@@ -114,18 +114,21 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
                          kRaggedAttentionRows *
                          geometry.target.attentionHeadDimension));
-  // The split partials and counters and the rotated rows of the largest
-  // prefill plan, the draft's context projections' too.
+  // The split partials and counters, the rotated rows and the int8 tile's
+  // codes and scales of the largest prefill plan: the target's, and the
+  // draft's context projections' on the draft's plans.
+  ops::LinearScratchSize linear;
+  for (const auto &projection : geometry.target.prefillProjections)
+    linear.include(operators.linear().prefillScratchSize(projection));
   const auto &draft = geometry.draft;
-  std::vector<ops::ProjectionShape> prefillProjections = geometry.target.prefillProjections;
-  prefillProjections.push_back({draft.hiddenSize, draft.targetHiddenSize()});
-  prefillProjections.push_back({draft.contextKvSize(), draft.hiddenSize});
-  for (const auto &projection : prefillProjections) {
-    const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection);
-    put(PrefillTensor::LinearPartials, linear.partials);
-    put(PrefillTensor::LinearCounters, linear.counters);
-    put(PrefillTensor::LinearRotated, linear.rotated);
-  }
+  for (const ops::ProjectionShape projection :
+       {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()}, {draft.contextKvSize(), draft.hiddenSize}})
+    linear.include(operators.draftLinear().prefillScratchSize(projection));
+  put(PrefillTensor::LinearPartials, linear.partials);
+  put(PrefillTensor::LinearCounters, linear.counters);
+  put(PrefillTensor::LinearTable, linear.input);
+  put(PrefillTensor::LinearSums, linear.sums);
+  put(PrefillTensor::LinearRotated, linear.rotated);
   if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
         operators.moePrefillWorkspace(geometry.target.moeBlockShape(), geometry.target.moeFormats, kPrefillRows);
@@ -342,7 +345,7 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
        {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
        {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}})
-    result.include(operators.linear().decodeScratchSize(shape));
+    result.include(operators.draftLinear().decodeScratchSize(shape));
   return result;
 }
 

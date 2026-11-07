@@ -12,10 +12,17 @@ namespace splash::ops {
 
 // The device's plans of every operator a model runs. One runtime owns this
 // object and production models borrow it; it never changes after creation.
+// prefillInt8 is serve's --prefill-int8 (Linear).
 class ExecutionPlans final {
 public:
-  explicit ExecutionPlans(const DeviceCapabilities &device);
+  explicit ExecutionPlans(const DeviceCapabilities &device, bool prefillInt8 = true);
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
+  // A DFlash2 draft's plans: linear()'s, but no prefill chunk runs the int8
+  // prefill tile. The draft's prefill gains nothing from it, while its
+  // context projection, the widest a prefill runs, would size the tile's
+  // scratch: 38 MB on Qwen3.6-35B-A3B GGUF, whose own projections never
+  // take the tile.
+  [[nodiscard]] const Linear &draftLinear() const noexcept { return draftLinear_; }
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return linear_.calibration(); }
 
   [[nodiscard]] PrefillAttentionPlan prefillAttention(
@@ -47,6 +54,7 @@ public:
 
 private:
   Linear linear_;
+  Linear draftLinear_;
 };
 
 } // namespace splash::ops

@@ -45,13 +45,14 @@ constexpr uint64_t rotatedBytes(uint32_t width, uint64_t rows) noexcept { return
 
 // Throws if `p` is a view of the leading inputs of wider weight rows
 // (Projection::leadingInputs) that `plan` has no kernel instance for: only the
-// prefill residual tile of quantized segments (GgufPrefill), unrotated, reads
-// one (leadingInputsInstance).
+// prefill residual tiles of quantized segments (GgufPrefill's
+// leadingInputsInstance, GgufPrefillInt8's plane stride), unrotated, read one.
 void requireLeadingInputs(const LinearPlan &plan, const Projection &p) {
   if (!p.planeInputs()) return;
   const LinearWorkload w = plan.workload();
+  const LinearTile tile = plan.configuration().tile;
   if (w.phase != LinearPhase::Prefill || w.epilogue != LinearEpilogue::Residual ||
-      plan.configuration().tile != LinearTile::GgufPrefill || p.rotation)
+      (tile != LinearTile::GgufPrefill && tile != LinearTile::GgufPrefillInt8) || p.rotation)
     throw std::invalid_argument("a view of leading inputs runs only the quantized prefill residual tiles");
 }
 
@@ -141,7 +142,10 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   requireConfiguration();
 }
 
-Linear::Linear(const DeviceCapabilities &device) noexcept : calibration_(KernelCalibration::of(device)) {}
+Linear::Linear(const DeviceCapabilities &device, bool prefillInt8) noexcept
+    : calibration_(KernelCalibration::of(device)) {
+  calibration_.projection.prefillInt8 &= prefillInt8;
+}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
   // The None and Residual plans share a tile; a gate/up pair of one format
@@ -215,6 +219,12 @@ LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
   // Every prefill plan stores at most the token budget.
   static_assert(SPLASH_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, SPLASH_PREFILL_TOKEN_BUDGET);
+  // A full chunk's, which the int8 prefill tile holds where it takes the
+  // shape's formats.
+  const LinearWorkload chunk{
+      {shape.outputSize, shape.inputSize}, SPLASH_PREFILL_TOKEN_BUDGET, LinearPhase::Prefill, LinearEpilogue::None};
+  validate(chunk);
+  bound.include(LinearPlan(chunk, selectProjection(calibration_, chunk, unitFormats(shape))).scratchSize());
   return bound;
 }
 
@@ -244,8 +254,9 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   if (p.rotation) requireBytes(b.scratch.rotated, rotatedBytes(k, rows), "projection rotated input");
   addGguf(graph, b, p, selected, gate);
   // A rotated projection's plan prepares its table, if any, from the rotated
-  // rows, which no other plan reads.
-  if (p.rotation) return {};
+  // rows, which no other plan reads; the int8 prefill tile overwrites the
+  // table with its own codes.
+  if (p.rotation || selected.configuration().tile == LinearTile::GgufPrefillInt8) return {};
   // Only quantized segments run the plan's tile: float segments alone leave
   // the scratch table as it was.
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;

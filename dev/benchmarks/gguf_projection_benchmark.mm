@@ -4,15 +4,16 @@
 // law of runtime/ops/KernelCalibration.hpp:
 //   gguf-projection-benchmark <metallib> <fmt[+fmt+fmt]> <N[+N+N]> <K> [none|residual|gateup] [rounds]
 //                             [prefill=R[,R...]]
-// The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 64
-// columns. With prefill=, it times the 128-row prefill tile instead, one case per chunk of R rows (more than 32: the
-// decode tiles run the smaller chunks) of a single segment, and for R up to 64 the staged 64-row tile at every K
-// split; gateup is then the up projection's gated epilogue. The
-// weights stay DRAM-cold: a command streams every copy of a ring of at least 384 MiB once, each projection with the
-// next copy (decode gate/up: the gate and up weights of two copies). The register tile reads the activation table its
-// producers write alongside their output (LinearBuffers::prepared), prepared once and not timed. The cases run in
-// ABBA order after a warm-up; printed are the medians of `rounds` (20) commands in ms per projection, the device
-// policy's choice marked with *. Widths emulate core counts: the policy's split law counts threadgroups per core.
+// The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 64 columns.
+// With prefill=, it times the 128-row prefill tile instead, one case per chunk of R rows (more than 32: the decode
+// tiles run the smaller chunks) of a single segment, for R up to 64 the staged 64-row tile at every K split, and for
+// segments the int8 prefill tile takes (af4g64, af5g64) that tile (prefill int8); gateup is then the up projection's
+// gated epilogue. The weights stay DRAM-cold: a command streams every copy of a ring of at least 384 MiB once, each
+// projection with the next copy (decode gate/up: the gate and up weights of two copies). The register tile reads the
+// activation table its producers write alongside their output (LinearBuffers::prepared), prepared once and not timed.
+// The cases run in ABBA order after a warm-up; printed are the medians of `rounds` (20) commands in ms per projection,
+// the device policy's choice marked with *. Widths emulate core counts: the policy's split law counts threadgroups per
+// core.
 // PQ2_0 projections of whole rotation blocks run rotated, as Prism's are stored, their decode cases also on the int8
 // tiles of 16 or 32 rows (int8, int8pair: LinearConfig::decodeInt8), each time including the input's rotation.
 // The float formats float-bf16 and float-f32, and float-<fmt> for the native rows of a quantized format (an MLX
@@ -286,6 +287,12 @@ int main(int argc, char **argv) {
         const LinearConfig config{.tile = LinearTile::GgufPrefill};
         cases.push_back({"R" + std::to_string(rows), "prefill128", Linear::plan(w, config, FloatOutput::BFloat16),
                          config == policy, {}});
+        if (std::all_of(images.begin(), images.end(),
+                        [](const Image &i) { return quant_prefill_int8_format(i.format); })) {
+          const LinearConfig int8{.tile = LinearTile::GgufPrefillInt8};
+          cases.push_back({"R" + std::to_string(rows), "prefill int8", Linear::plan(w, int8, FloatOutput::BFloat16),
+                           int8 == policy, {}});
+        }
         // Chunks of up to kMaximumStagedPrefillRows rows also on the staged 64-row tile, at every split.
         for (uint32_t splits = 1; rows <= kMaximumStagedPrefillRows && splits <= LinearConfig::kMaximumSplits;
              splits *= 2) {

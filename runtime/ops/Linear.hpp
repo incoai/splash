@@ -80,7 +80,12 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // GgufRegister: the exact register tile on bf16 8x8 matrix operations
 // (Apple9), over an activation table, every request lane in one threadgroup,
 // optional K splits.
-enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister };
+// GgufPrefillInt8: prefill chunks of MLX affine 4- and 5-bit g64 weights
+// (quant_prefill_int8_format) in int8 activations, quantized per row and
+// 64-input group into the scratch table, against the weights' exact codes
+// (kernels/prefill/gguf_prefill_int8.metal); not exact, unsplit, the prefill
+// tile's storage rows.
+enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister, GgufPrefillInt8 };
 // The decode tiles hold at most a full decode batch.
 inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
 // The staged tile's tallest height, which holds prefill chunks of up to this
@@ -141,7 +146,8 @@ struct LinearConfig final {
 // allocation and restored by each completed split dispatch. Never share this
 // workspace between concurrent command streams.
 struct LinearScratch final {
-  // The register tile's Table16 table and its sums.
+  // The register tile's Table16 table and its sums; the int8 prefill tile's
+  // codes and scales.
   metal::MetalBuffer input;
   metal::MetalBuffer sums;
   metal::MetalBuffer partials;
@@ -241,10 +247,11 @@ struct LinearBuffers final {
 };
 
 // Owns projection pipeline selection and dispatch. Plans follow the device's
-// KernelCalibration (KernelSelection.cpp).
+// KernelCalibration (KernelSelection.cpp); without prefillInt8 (serve's
+// --prefill-int8 off) no prefill chunk runs the int8 prefill tile.
 class Linear final {
 public:
-  explicit Linear(const DeviceCapabilities &device) noexcept;
+  explicit Linear(const DeviceCapabilities &device, bool prefillInt8 = true) noexcept;
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return calibration_; }
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
@@ -271,7 +278,9 @@ public:
   [[nodiscard]] LinearScratchSize decodeScratchSize(ProjectionShape shape) const;
   // The scratch of every prefill chunk and epilogue of a projection of
   // `shape`: the split partials and counters of the chunks that run the
-  // staged tile (LinearGguf.cpp), and the rotated rows of a full chunk.
+  // staged tile (LinearGguf.cpp), the rotated rows of a full chunk, and where
+  // the device runs the int8 prefill tile on the shape's formats, its codes
+  // and scales of a full chunk.
   [[nodiscard]] LinearScratchSize prefillScratchSize(ProjectionShape shape) const;
   // The tile of a float projection of `rows` rows into `outputSize` columns
   // of rows in `formatId` (QuantizedSegment::rows) on this device
@@ -321,6 +330,8 @@ private:
                      const Projection *gate) const;
   void addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &buffers,
                       const Projection &projection, const LinearPlan &plan) const;
+  void addGgufPrefillInt8(metal::CommandGraph &graph, const LinearBuffers &buffers,
+                          const Projection &projection, const LinearPlan &plan) const;
   void addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &buffers,
                        const Projection &projection, const LinearPlan &plan,
                        const Projection *gate) const;

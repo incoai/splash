@@ -93,6 +93,11 @@ struct ProjectionCalibration final {
   // (UnitFormats::decodeInt8Takes) runs them on plans of at least this many
   // rows (one lane's 16-row plan counts 16).
   uint32_t decodeInt8FromRows;
+  // Longer prefill chunks of a unit the int8 prefill tile takes
+  // (UnitFormats::prefillInt8Takes) run that tile, where the family's int8
+  // matmul is faster than its bf16 one and serve's --prefill-int8 is on
+  // (Linear's prefillInt8).
+  bool prefillInt8;
 };
 
 struct FloatTileCalibration final {
@@ -242,9 +247,11 @@ inline constexpr ProjectionCalibration kApple9Projection{
     .sixteenRowBelowBits16 = 0,
     .sixteenRowWaves = 0,
     .stagedPrefillRows = kApple9StagedPrefillRows,
-    // Apple9's matrix operations share the FP32 pipe: it keeps bf16
-    // activations, unmeasured.
+    // Apple9's matrix operations share the FP32 pipe and multiply int8 at
+    // 0.9x their bf16 rate (40-core M3 Max, measured): it keeps bf16
+    // activations in decode and prefill, end to end unmeasured.
     .decodeInt8FromRows = kNever,
+    .prefillInt8 = false,
 };
 inline constexpr ProjectionCalibration kApple9SmallProjection = [] {
   ProjectionCalibration row = kApple9Projection;
@@ -261,6 +268,12 @@ inline constexpr ProjectionCalibration kApple10Projection{
     .sixteenRowWaves = kApple10SixteenRowWaves,
     .stagedPrefillRows = kApple10StagedPrefillRows,
     .decodeInt8FromRows = kApple10DecodeInt8FromRows,
+    // Apple10 and Apple11 multiply int8 faster than bf16, so every chunk past
+    // the staged tile runs the int8 prefill tile where it takes the formats:
+    // at least 1.13x less time than the bf16 tile over the 27B's projection
+    // shapes in af4g64 and af5g64 at 65-2048 rows (M5 Max, M5 Pro and M6,
+    // measured).
+    .prefillInt8 = true,
 };
 
 // Apple11 takes Apple10's row but for the 16-row lane from 4.5 bits: the M6's

@@ -67,6 +67,11 @@ struct ProjectionShape final {
   // with the wave law from 4.5, decide whether one lane runs the 16-row tile,
   // never at 0 (KernelSelection.cpp).
   uint32_t weightBits16 = 0;
+  // The int8 prefill tile takes all its quantized segments
+  // (quant_prefill_int8_format), of which it has one at least; a shape that
+  // names no formats bounds a projection the tile takes
+  // (Linear::prefillScratchSize).
+  bool prefillInt8Formats = true;
   auto operator<=>(const ProjectionShape &) const = default;
 };
 
@@ -167,20 +172,21 @@ public:
 
   [[nodiscard]] const BlockWeights &blocks() const noexcept { return weights_; }
   [[nodiscard]] ProjectionShape shape() const noexcept {
-    bool registerFormats = true;
+    bool registerFormats = true, prefillInt8Formats = true;
     FormatClassifier classes;
     // The quantized segments' weights and the bytes of their native blocks.
     uint64_t weights = 0, bytes = 0;
     for (const QuantizedSegment &s : weights_.segments) {
       registerFormats &= s.isFloat() || quant_register_tensor(s.formatId, s.inputSize);
       if (s.isFloat()) continue;
+      prefillInt8Formats &= quant_prefill_int8_format(s.formatId);
       classes.add(s.formatId);
       const uint64_t n = uint64_t{s.outputSize} * s.inputSize;
       weights += n;
       bytes += n * s.format().block_bytes / s.format().block_elements;
     }
     return {outputSize, inputSize, static_cast<bool>(rotation), registerFormats, classes.formatClass(),
-            weights ? uint32_t(128 * bytes / weights) : 0};
+            weights ? uint32_t(128 * bytes / weights) : 0, weights && prefillInt8Formats};
   }
 
   // Views of a projection of one unrotated quantized tensor (Linear.cpp):

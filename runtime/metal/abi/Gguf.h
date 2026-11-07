@@ -2,14 +2,17 @@
 
 // GGUF quantized projection parameters and tile geometry shared by host
 // dispatch code and Metal kernels: the staged tiles of
-// kernels/shared/gguf_linear.metal and kernels/shared/moe_gguf.metal, and the
-// Apple9 register tile of kernels/decode/linear_gguf_sgmatrix.metal.
+// kernels/shared/gguf_linear.metal and kernels/shared/moe_gguf.metal, the
+// Apple9 register tile of kernels/decode/linear_gguf_sgmatrix.metal, and the
+// int8 prefill tile of kernels/prefill/gguf_prefill_int8.metal.
 #include "metal/abi/QuantFormat.h"
 
 // Vocabulary: a group is 32 inputs (the image's quantization unit), a span 64
 // (Table16's); a plane tile is QUANT_TILE_ROWS rows of the weight image, a
 // column tile the GGUF_TILE_COLUMNS output columns of one threadgroup (grid.x
 // counts column tiles), and an expert tile the grouped rows of one MoE expert.
+// The int8 prefill tile's activation group is the MLX weight group of 64
+// inputs (GGUF_PREFILL_INT8_GROUP).
 #define GGUF_TILE_COLUMNS 64u
 // Decode tile of the staged kernels, which also runs prefill chunks of up to
 // 32 rows (64 on Apple10 and on Apple9 GPUs of 10 cores or fewer): two
@@ -77,6 +80,53 @@ struct GgufPrefillSegmentsParams {
   uint32_t offset[3];   // first destination column per segment
 };
 static_assert(sizeof(GgufPrefillSegmentsParams) == 36, "GGUF segmented prefill parameters are 36 bytes on both sides");
+
+// Int8 prefill tile (kernels/prefill/gguf_prefill_int8.metal), MLX affine
+// weights in groups of 64: gguf_prefill_int8_quantize writes each 64-input
+// group of each chunk row as int8 codes and a float2 (scale, scale * sum of
+// the codes); gguf_prefill_int8_<format>_<a|r|g> multiplies them by the weight
+// codes in int8 and folds each group's affine correction in fp32. A tile is a
+// column tile of GGUF_PREFILL_INT8_SIMDGROUPS simdgroups of 32 columns by
+// GGUF_PREFILL_INT8_ROWS rows, for both formats: af5g64 on 64-row tiles lost
+// to the bf16 tile at 65-96 rows (0.95x, 16-core M5 Pro, measured).
+#define GGUF_PREFILL_INT8_GROUP 64u
+#define GGUF_PREFILL_INT8_SIMDGROUPS (GGUF_TILE_COLUMNS / 32u)
+#define GGUF_PREFILL_INT8_ROWS 32u
+#define GGUF_PREFILL_INT8_THREADS (GGUF_PREFILL_INT8_SIMDGROUPS * 32u)
+// Threadgroups take this many row tiles down a column tile before the next
+// column tile, so the column tile's weights stream once per 16 row tiles while
+// those tiles' activations stay cached: walking every column tile of a row tile
+// first re-streamed the weights per row tile, which left the M6's 2048-row
+// af5g64 down projection (K 17408) at 0.95x the bf16 tile (measured).
+#define GGUF_PREFILL_INT8_WALK 16u
+// gguf_prefill_int8_quantize: one simdgroup per (row, group), this many per
+// threadgroup; grid (group blocks, rows).
+#define GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS 8u
+struct GgufPrefillInt8QuantizeParams {
+  uint32_t input_size;    // K
+  uint32_t rows;          // rows of the chunk
+  uint32_t storage_rows;  // row stride of the scales
+};
+static_assert(sizeof(GgufPrefillInt8QuantizeParams) == 12,
+              "int8 prefill quantize parameters are 12 bytes on both sides");
+// gguf_prefill_int8_<format>_<e>: grid (column tiles of one segment, row tiles).
+struct GgufPrefillInt8Params {
+  uint32_t input_size;        // K
+  uint32_t rows;              // rows of the chunk
+  uint32_t storage_rows;      // row stride of the scales
+  uint32_t out_stride;        // columns of a destination row
+  uint32_t out_offset;        // first destination column of the segment
+  uint32_t plane_input_size;  // inputs a row of the planes holds (Projection::leadingInputs), K for none
+};
+static_assert(sizeof(GgufPrefillInt8Params) == 24, "int8 prefill parameters are 24 bytes on both sides");
+// Scratch of `storage` rows of K inputs: the int8 codes in the table, and in
+// the sums buffer float2 [K / 64][storage].
+inline constexpr uint64_t gguf_prefill_int8_table_bytes(uint32_t k, uint64_t storage) {
+  return uint64_t(k) * storage;
+}
+inline constexpr uint64_t gguf_prefill_int8_scale_bytes(uint32_t k, uint64_t storage) {
+  return uint64_t(k / GGUF_PREFILL_INT8_GROUP) * storage * 8u;
+}
 
 // Decode tiles: the register tile, which Apple9 runs but for the projections
 // it stages (ops/LinearGguf.cpp, apple9Stages), and the staged tile, which

@@ -131,6 +131,44 @@ void baselinePlans() {
   }
 }
 
+// --prefill-int8 (ExecutionPlans' prefillInt8) reaches the plans' Linear:
+// on, Apple10 and Apple11 run the int8 prefill tile; off, no family does.
+// linear-plan checks what each setting plans and bounds.
+void prefillInt8Setting() {
+  for (uint32_t family : {9U, 10U, 11U}) {
+    const ExecutionPlans on(device(family)), off(device(family), false);
+    require(on.linear().calibration().projection.prefillInt8 == (family >= 10) &&
+                !off.linear().calibration().projection.prefillInt8,
+            "--prefill-int8 did not reach the plans' Linear");
+  }
+}
+
+// A DFlash2 draft's plans (draftLinear) run no prefill chunk on the int8
+// prefill tile, --prefill-int8 on or off: the 27B draft's context projection,
+// prepared af4g64, prefills a full chunk on the bf16 prefill tile where the
+// target's plans would take the int8 one, its shorter chunks and its decode
+// steps on the target's plans.
+void draftPlans() {
+  const Projection context(5120, 25600,
+                           BlockWeights{{QuantizedSegment::planes(GGUF_FMT_AF4G64, 5120, 25600, {}, {}, {})}});
+  for (uint32_t family : {9U, 10U, 11U})
+    for (const bool prefillInt8 : {true, false}) {
+      const ExecutionPlans plans(device(family), prefillInt8);
+      const Linear &draft = plans.draftLinear(), &target = plans.linear();
+      for (uint32_t rows : {1U, 64U, 2048U}) {
+        const LinearConfig own = draft.prefillPlan(context, rows, LinearEpilogue::None).configuration(),
+                           targets = target.prefillPlan(context, rows, LinearEpilogue::None).configuration();
+        const bool int8 = family >= 10 && prefillInt8 && rows == 2048;
+        require((targets.tile == LinearTile::GgufPrefillInt8) == int8 &&
+                    own == (int8 ? LinearConfig{.tile = LinearTile::GgufPrefill} : targets),
+                "a draft's prefill chunk took the int8 prefill tile or left the target's bf16 plan");
+      }
+      for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+        require(draft.decodePlan(context, lanes).configuration() == target.decodePlan(context, lanes).configuration(),
+                "a draft's decode plan departed from the target's");
+    }
+}
+
 // MoE plans run the three expert passes on staged tiles on every GPU: 8-row
 // tiles in decode and while a prefill chunk's routes average at most one row
 // per expert, 32-row tiles past that.
@@ -294,13 +332,15 @@ void invalidLookupsAndContextEdges() {
 int main() {
   try {
     baselinePlans();
+    prefillInt8Setting();
+    draftPlans();
     ggufMoePlans();
     unknownCoreCount();
     prefillSplitsFollowTheDeviceRow();
     workspaceBounds();
     invalidLookupsAndContextEdges();
-    std::cout << "PASS execution plans: device policies, device MoE tiles, B1-B4 "
-                 "and prefill workspace bounds (CPU only)\n";
+    std::cout << "PASS execution plans: device policies, --prefill-int8 on and off, the draft's bf16 prefill, "
+                 "device MoE tiles, B1-B4 and prefill workspace bounds (CPU only)\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "FAIL execution plans: " << error.what() << '\n';

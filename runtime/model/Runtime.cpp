@@ -221,10 +221,12 @@ StateAdmission admitIdleLane(const QwenStateStorage &states,
   return {{}, StateFailure::ConcurrencyLimit};
 }
 
-// A prefill arena's linear scratch. Prefill plans read plain bf16 rows, so
-// there is no input table or sums.
+// A prefill arena's linear scratch. Prefill plans read plain bf16 rows; the
+// int8 prefill tile quantizes them into the table and sums.
 ops::LinearScratch prefillScratch(const PrefillArena &arena) {
-  return {.partials = arena.get(PrefillTensor::LinearPartials),
+  return {.input = arena.get(PrefillTensor::LinearTable),
+          .sums = arena.get(PrefillTensor::LinearSums),
+          .partials = arena.get(PrefillTensor::LinearPartials),
           .counters = arena.get(PrefillTensor::LinearCounters),
           .rotated = arena.get(PrefillTensor::LinearRotated)};
 }

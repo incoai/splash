@@ -354,7 +354,7 @@ class EngineArgument:
     """How the server passes an option on to the engine's serve-native. The
     server leaves out an optional one at the option's default, which must
     equal the engine's own (native_arguments_test.cpp pins the KV and state
-    formats, verify rows and image patches)."""
+    formats, verify rows, image patches and prefill-int8)."""
 
     # The engine's flag, or the slot of its positional argument after
     # MODEL_DIRECTORY. An optional positional comes after every required
@@ -763,6 +763,19 @@ SERVE_OPTIONS = (
         ),
         engine=EngineArgument("--ane", text=_spelled("off")),
         needs="dense_ffn",
+    ),
+    ServeOption(
+        "--prefill-int8",
+        "requests",
+        dict(
+            choices=("on", "off"),
+            default="on",
+            help="read long prompts through MLX 4- and 5-bit weights with 8-bit "
+            "activations where the GPU multiplies them twice as fast (M5 and "
+            "later), up to about a quarter less time to the first token; off "
+            "runs those projections in bf16 (default: on)",
+        ),
+        engine=EngineArgument("--prefill-int8"),
     ),
     ServeOption(
         "--verify-rows",

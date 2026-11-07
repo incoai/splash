@@ -594,7 +594,7 @@ class LauncherTests(unittest.TestCase):
             self.assertRaises(SystemExit),
         ):
             launcher.parse_args(["serve", "--help"])
-        flags = set(re.findall(r"(?m)^  (--[a-z-]+)", output.getvalue())) - {
+        flags = set(re.findall(r"(?m)^  (--[a-z0-9-]+)", output.getvalue())) - {
             "--help",
             "--model",
             "--model-dir",
@@ -607,7 +607,7 @@ class LauncherTests(unittest.TestCase):
         table = Path(launcher.__file__).resolve().parents[1] / (
             "app/Sources/Splash/Preferences.swift"
         )
-        options = set(re.findall(r'flag: "(--[a-z-]+)"', table.read_text()))
+        options = set(re.findall(r'flag: "(--[a-z0-9-]+)"', table.read_text()))
         self.assertEqual(options, flags)
 
     def test_distinct_ports_have_independent_locks_and_same_port_is_rejected(self):

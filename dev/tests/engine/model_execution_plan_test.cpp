@@ -6,6 +6,7 @@
 #include "model/QwenTargetLoader.hpp"
 #include "model/RuntimeArenas.hpp"
 
+#include "metal/abi/Gguf.h"
 #include "metal/abi/QuantFormat.h"
 
 #include <algorithm>
@@ -15,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -35,15 +37,16 @@ model::DFlashDraftLayout draftOf() {
 }
 
 // A target of Weights' architecture at the sizes of `family`, its first
-// family's by default, paired with `draft`.
+// family's by default, its projections in `format`, paired with `draft`.
 template <class Weights>
 model::LoadedModel loadedModel(const decltype(Weights::layout) &family = {},
-                               const model::DFlashDraftLayout &draft = draftOf<Weights>()) {
+                               const model::DFlashDraftLayout &draft = draftOf<Weights>(),
+                               uint32_t format = GGUF_FMT_Q4K) {
   model::LoadedModel result;
   Weights target;
   target.layout = family;
-  const auto projection = [](uint32_t n, uint32_t k) {
-    return ops::Projection(n, k, ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, n, k, {}, {}, {})}});
+  const auto projection = [format](uint32_t n, uint32_t k) {
+    return ops::Projection(n, k, ops::BlockWeights{{ops::QuantizedSegment::planes(format, n, k, {}, {}, {})}});
   };
   const auto &layout = target.layout;
   // Qwen3.8-Flash-Next's hyper-connection mixes, QSA indexers and PLE layer.
@@ -167,6 +170,38 @@ void checkGateUpLayers() {
                   sizes[uint32_t(model::PrefillTensor::LinearCounters)] >= required.counters,
               "the short-prefill split scratch is too small");
     }
+  }
+}
+
+// The prefill arena holds the int8 prefill tile's codes and scales of a full
+// chunk of the target's widest projection the tile takes, wherever the family
+// runs it, and none for the draft, which prefills on the bf16 tiles: a GGUF
+// target holds none, and Qwen3.8-27B MLX 4-bit its down projection's (17408
+// inputs), not its draft's context projection's (25600).
+void checkPrefillInt8Scratch() {
+  for (uint32_t family : {9U, 10U, 11U}) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = family;
+    device.gpuCoreCount = 20;
+    const ops::ExecutionPlans plans(device);
+    // The arena's codes and scales for `loaded`.
+    const auto int8Scratch = [&](const model::LoadedModel &loaded) {
+      const auto sizes = model::prefillTensorBytes(
+          model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32), plans);
+      return std::pair{sizes[uint32_t(model::PrefillTensor::LinearTable)],
+                       sizes[uint32_t(model::PrefillTensor::LinearSums)]};
+    };
+    for (const model::LoadedModel &gguf :
+         {loadedModel<model::Qwen3_8Weights>(), loadedModel<model::Qwen3_6MoeWeights>()})
+      require(int8Scratch(gguf) == std::pair<uint64_t, uint64_t>{},
+              "the prefill arena of a GGUF target holds int8 prefill scratch");
+    const uint32_t down = model::Qwen3_8Layout{}.intermediateSize;
+    const auto [table, sums] =
+        int8Scratch(loadedModel<model::Qwen3_8Weights>({}, test::qwen3_8Draft(), GGUF_FMT_AF4G64));
+    const bool int8 = family >= 10;
+    require(table == (int8 ? gguf_prefill_int8_table_bytes(down, SPLASH_PREFILL_TOKEN_BUDGET) : 0) &&
+                sums == (int8 ? gguf_prefill_int8_scale_bytes(down, SPLASH_PREFILL_TOKEN_BUDGET) : 0),
+            "the prefill arena of an MLX target holds other int8 prefill scratch than its down projection's");
   }
 }
 
@@ -408,6 +443,7 @@ int main() {
     checkIndexTables();
     checkSpilledKvGeometry();
     checkArenasWithoutGdnLayers();
+    checkPrefillInt8Scratch();
     checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));

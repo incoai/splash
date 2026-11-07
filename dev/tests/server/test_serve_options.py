@@ -83,6 +83,9 @@ OPTIONS = {
         "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
     ),
     "--disable-ane": ([(["--disable-ane"], True)], []),
+    "--prefill-int8": values(
+        "--prefill-int8", {"on": "on", "off": "off"}, ("", "auto", "OFF", "int8")
+    ),
     "--verify-rows": values(
         "--verify-rows",
         {"auto": "auto", "all": "all"},
