@@ -9,6 +9,7 @@
 #include "ops/GDN.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/Linear.hpp"
+#include "ops/VerifyFfnPack.hpp"
 #include "ops/MoE.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
@@ -354,6 +355,9 @@ struct QwenTargetVerifyBuffers final {
   // Each lane's verify rows (ops::DraftSelector::addVerifyRows), which a MoE target's
   // steps route alone (ops::MoeBuffers::verifyRows).
   metal::MetalBuffer verifyRows;
+  ops::VerifyFfnPackBuffers packedFfn;
+  // Optional host-only instrumentation: counted while encoding, never on the GPU.
+  uint32_t *packedFfnEncodedLayers = nullptr;
   // Each lane's auxiliary state before the step; the commit writes the one
   // after it (addStateCommit).
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliary;

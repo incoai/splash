@@ -66,8 +66,8 @@ struct DraftAttentionBatchParams {
   uint32_t cache_length[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(DraftAttentionBatchParams) == 24,
-              "Draft attention parameters are 24 bytes on both sides");
+static_assert(sizeof(DraftAttentionBatchParams) == 8 + 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "batch-dependent ABI size mismatch");
 
 struct DraftContextParams {
   uint32_t tokens;
@@ -81,8 +81,8 @@ struct DraftContextBatchParams {
   uint32_t start_position[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(DraftContextBatchParams) == 16,
-              "Draft context commit parameters are 16 bytes on both sides");
+static_assert(sizeof(DraftContextBatchParams) == 4 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "batch-dependent ABI size mismatch");
 
 // A context window holds, per ring slot, the draft's context row, from which
 // every layer's ring keys and values are computed: 4-bit codes over groups of

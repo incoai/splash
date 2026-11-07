@@ -59,6 +59,22 @@ using namespace splash::ops;
 constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
 constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
 constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
+
+// Repeat each existing policy/cutoff pattern through every supported lane.
+// A larger compiled ceiling must never leave an empty fixture tail.
+template <class T, std::size_t N>
+constexpr std::array<T, kLanes> lanePattern(const std::array<T, N> &pattern) {
+  std::array<T, kLanes> lanes{};
+  for (uint32_t lane = 0; lane < kLanes; ++lane) lanes[lane] = pattern[lane % N];
+  return lanes;
+}
+constexpr uint32_t kAllSamplingLanes = (1U << kLanes) - 1;
+constexpr uint32_t kAlternatingSamplingLanes = [] {
+  uint32_t mask = 0;
+  for (uint32_t lane = 0; lane < kLanes; lane += 2) mask |= 1U << lane;
+  return mask;
+}();
+
 constexpr uint32_t kUniforms = SPLASH_SAMPLING_UNIFORMS;
 constexpr uint32_t kDraftCandidates = SPLASH_DRAFT_CANDIDATES;
 constexpr float kFloatMax = std::numeric_limits<float>::max();
@@ -493,17 +509,30 @@ void requirePenalizedRows(const Batch &batch, const std::vector<float> &original
 
 // Penalized lanes read table rows that are neither their lane indices nor
 // within the batch width. Plan lanes do not follow state lanes.
-constexpr std::array<std::array<uint32_t, kLanes>, kLanes> kTableRows{
-    {{3}, {2, 0}, {1, 3, 0}, {2, 0, 3, 1}}};
+constexpr auto kTableRows = [] {
+  std::array<std::array<uint32_t, kLanes>, kLanes> rows{};
+  for (uint32_t width = 0; width < kLanes; ++width)
+    for (uint32_t lane = 0; lane < kLanes; ++lane) rows[width][lane] = (lane + width + 3) % kLanes;
+  rows[0][0] = 3;
+  rows[1][0] = 2; rows[1][1] = 0;
+  rows[2][0] = 1; rows[2][1] = 3; rows[2][2] = 0;
+  rows[3][0] = 2; rows[3][1] = 0; rows[3][2] = 3; rows[3][3] = 1;
+  return rows;
+}();
 
 // A sampled lane with every penalty, a constrained greedy lane with
 // presence alone, an unpenalized sampled lane that ignores end-of-sequence,
 // and a greedy lane whose repetition below 1 raises repeated tokens.
-const std::array<SamplingPolicy, kLanes> kMixedPolicies{
+const auto kMixedPolicies = [] {
+  const std::array<SamplingPolicy, 4> patterns{
     SamplingPolicy{32, 0.8F, 0.95F, false, false, {1.3F, 0.5F, 0.25F}},
     SamplingPolicy{1, 0.0F, 1.0F, true, false, {1.0F, 1.5F, 0.0F}},
     SamplingPolicy{20, 1.2F, 0.9F, false, true, {}},
     SamplingPolicy{1, 0.0F, 1.0F, false, false, {0.8F, -2.0F, 2.0F}}};
+  std::array<SamplingPolicy, kLanes> policies{};
+  for (uint32_t lane = 0; lane < kLanes; ++lane) policies[lane] = patterns[lane % patterns.size()];
+  return policies;
+}();
 
 // Penalized logits of every verify row and of the first token at an offset,
 // and the selections the policy makes from them, at B1-B4 with penalized and
@@ -1113,16 +1142,17 @@ void sampledRows(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes,
   const SamplingPolicy heaviest{0, 0.9F, 1.0F, false, false, {}, 1.0F};
   const SamplingPolicy floorless{20, 0.9F, 0.95F, false, true, {}, 1e-30F};
   const SamplingPolicy floorGreedy{1, 0.0F, 1.0F, false, false, {}, 0.5F};
-  const std::array<std::vector<SamplingPolicy>, kLanes> batches =
-      minP ? std::array<std::vector<SamplingPolicy>, kLanes>{
+  const std::array<std::vector<SamplingPolicy>, 4> batches =
+      minP ? std::array<std::vector<SamplingPolicy>, 4>{
                  std::vector{floor}, std::vector{floorNucleus, floorGreedy},
                  std::vector{heaviest, floorless, stoplessGreedy},
                  std::vector{floor, floorNucleus, greedy, heaviest}}
-           : std::array<std::vector<SamplingPolicy>, kLanes>{
+           : std::array<std::vector<SamplingPolicy>, 4>{
                  std::vector{disabled}, std::vector{fifty, maskedGreedy},
                  std::vector{beyond, narrow, stoplessGreedy},
                  std::vector{wide, thousand, greedy, fifty}};
-  const std::vector<SamplingPolicy> &policies = batches[lanes - 1];
+  std::vector<SamplingPolicy> policies = batches[std::min(lanes, 4U) - 1];
+  while (policies.size() < lanes) policies.push_back(batches.back()[policies.size() % 4]);
   for (uint32_t index = 0; index < lanes * (kRows + 1) * batch.maskWords();
        ++index)
     batch.masks()[index] = 0xB6DB6DB6U ^ index;
@@ -1500,10 +1530,10 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
         [uint64_t{lane} * kPositions * kDraftCandidates] = 1.0F;
   }
   std::fill(uniforms, uniforms + kLanes * kUniforms, 0.5F);
-  const std::array<uint32_t, kLanes> maximumRetained{kRows, kRows, kRows, kRows};
+  const auto maximumRetained = lanePattern(std::array{kRows, kRows, kRows, kRows});
   for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
     for (uint32_t excludeMask = 0; excludeMask < (1U << lanes); ++excludeMask) {
-      for (const uint32_t samplingMask : {0U, 0b0101U, 0b1111U}) {
+      for (const uint32_t samplingMask : {0U, kAlternatingSamplingLanes, kAllSamplingLanes}) {
         std::vector<SamplingPolicy> policies;
         for (uint32_t lane = 0; lane < lanes; ++lane)
           policies.push_back({32, (samplingMask >> lane & 1U) ? 0.8F : 0.0F,
@@ -1685,7 +1715,7 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
     static_cast<uint32_t *>(acceptance.candidates.contents())[origin] = token;
     static_cast<float *>(acceptance.proposalProbabilities.contents())[origin] = 1.0F;
   };
-  const std::array<uint32_t, kLanes> maximumRetained{kRows, kRows, kRows, kRows};
+  const auto maximumRetained = lanePattern(std::array{kRows, kRows, kRows, kRows});
   // Acceptance keeps the drafts up to the first one that is not its row's
   // token, and that row's token.
   const auto retainedRows = [](std::span<const uint32_t> drafts, std::span<const uint32_t> rows) {
@@ -1711,12 +1741,12 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
 
   enum class Draft { Best, EndsBefore, AlsoEndsBefore, DraftsFirst, DraftsAll };
   for (const std::vector<uint32_t> &end : ends) {
-    for (const uint32_t samplingMask : {0U, 0b0101U, 0b1111U}) {
+    for (const uint32_t samplingMask : {0U, kAlternatingSamplingLanes, kAllSamplingLanes}) {
       for (const Draft kind :
            {Draft::Best, Draft::EndsBefore, Draft::AlsoEndsBefore, Draft::DraftsFirst, Draft::DraftsAll}) {
         // Lane l's cutoff is at row cuts[l]; kRows cuts nothing.
         for (const std::array<uint32_t, kLanes> cuts :
-             {std::array<uint32_t, kLanes>{0, 3, 6, 7}, std::array<uint32_t, kLanes>{kRows, 2, 5, 1}}) {
+             {lanePattern(std::array<uint32_t, 4>{0, 3, 6, 7}), lanePattern(std::array<uint32_t, 4>{kRows, 2, 5, 1})}) {
           std::vector<SamplingPolicy> policies;
           // The token each lane's row selects, and the lane's draft tokens.
           std::array<std::array<uint32_t, kRows>, kLanes> expected{};
@@ -1772,12 +1802,11 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   // them that ends thinking, which their masks admit, leaves every row its
   // own. Such an end replaces no proposals: only the verify reads its masks.
   enum class Waiting { Best, DraftsFirst, EndsWhileWaiting };
-  using LaneRows = std::array<uint32_t, kLanes>;
   for (const std::vector<uint32_t> &end : ends) {
-    for (const uint32_t samplingMask : {0U, 0b0101U, 0b1111U}) {
+    for (const uint32_t samplingMask : {0U, kAlternatingSamplingLanes, kAllSamplingLanes}) {
       for (const Waiting kind : {Waiting::Best, Waiting::DraftsFirst, Waiting::EndsWhileWaiting}) {
-        for (const auto &[cuts, waits] : {std::pair{LaneRows{0, 3, 6, 2}, LaneRows{1, 2, 1, 3}},
-                                          std::pair{LaneRows{0, 1, 5, 7}, LaneRows{kRows, 0, 3, 1}}}) {
+        for (const auto &[cuts, waits] : {std::pair{lanePattern(std::array<uint32_t, 4>{0, 3, 6, 2}), lanePattern(std::array<uint32_t, 4>{1, 2, 1, 3})},
+                                          std::pair{lanePattern(std::array<uint32_t, 4>{0, 1, 5, 7}), lanePattern(std::array<uint32_t, 4>{kRows, 0, 3, 1})}}) {
           std::vector<SamplingPolicy> policies;
           std::array<std::array<uint32_t, kRows>, kLanes> expected{};
           std::array<std::array<uint32_t, kPositions>, kLanes> drafts{};
@@ -1826,12 +1855,12 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   // its draft keeps.
   const std::vector<uint32_t> &end = ends.back();
   const std::span<const uint32_t> whole(end);
-  const std::array<ThinkingCutoff, kLanes> started{
+  const auto started = lanePattern(std::array<ThinkingCutoff, 4>{
       ThinkingCutoff{0, whole, alsoEnds}, ThinkingCutoff{0, whole.last(3), alsoEnds},
-      ThinkingCutoff{2, whole, alsoEnds}, ThinkingCutoff{0, whole.last(1), alsoEnds}};
+      ThinkingCutoff{2, whole, alsoEnds}, ThinkingCutoff{0, whole.last(1), alsoEnds}});
   MetalBuffer draftInput = allocate(backend, uint64_t{kLanes} * kRows * sizeof(uint32_t));
   auto *anchors = static_cast<uint32_t *>(draftInput.contents());
-  for (const uint32_t samplingMask : {0U, 0b0101U, 0b1111U}) {
+  for (const uint32_t samplingMask : {0U, kAlternatingSamplingLanes, kAllSamplingLanes}) {
     std::vector<SamplingPolicy> policies;
     std::array<std::array<uint32_t, kRows>, kLanes> expected{};
     std::array<std::array<uint32_t, kPositions>, kLanes> drafts{};
@@ -1873,10 +1902,10 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   // Of constrained lanes at row 0, only those whose ends do not wait replace
   // their proposals with their ends, lane 1 three and lane 2 seven, and a
   // batch whose ends all wait dispatches nothing.
-  const std::array<ThinkingCutoff, kLanes> drafting{
+  const auto drafting = lanePattern(std::array<ThinkingCutoff, 4>{
       ThinkingCutoff{0, whole, alsoEnds, true}, ThinkingCutoff{0, whole.last(3), alsoEnds},
-      ThinkingCutoff{0, whole, alsoEnds}, ThinkingCutoff{0, whole.last(1), alsoEnds, true}};
-  const std::array<uint32_t, kLanes> replaced{0, 3, kPositions, 0};
+      ThinkingCutoff{0, whole, alsoEnds}, ThinkingCutoff{0, whole.last(1), alsoEnds, true}});
+  const auto replaced = lanePattern(std::array<uint32_t, 4>{0, 3, kPositions, 0});
   std::vector<SamplingPolicy> draftingPolicies;
   for (uint32_t lane = 0; lane < kLanes; ++lane) {
     SamplingPolicy policy{32, 0.0F, 1.0F, true};
@@ -1903,8 +1932,8 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
   // Lane l's row nonFinite[l] has no selectable logit: it keeps its sentinel,
   // which acceptance retains after the end tokens before it.
   constexpr uint32_t kSentinel = 0xFFFFFFFFU;
-  const std::array<uint32_t, kLanes> nonFinite{0, 2, 5, kRows - 1};
-  for (const uint32_t samplingMask : {0U, 0b0101U, 0b1111U}) {
+  const auto nonFinite = lanePattern(std::array<uint32_t, 4>{0, 2, 5, kRows - 1});
+  for (const uint32_t samplingMask : {0U, kAlternatingSamplingLanes, kAllSamplingLanes}) {
     std::vector<SamplingPolicy> policies;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       SamplingPolicy policy{32, (samplingMask >> lane & 1U) ? 0.8F : 0.0F};

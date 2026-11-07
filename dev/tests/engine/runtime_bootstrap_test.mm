@@ -34,6 +34,9 @@ namespace runtime = splash::engine;
 using splash::test::rejects;
 using splash::test::require;
 
+constexpr int kMaximumDecodeWidth = model::ExecutionLimits::maximumBatchWidth;
+constexpr int kRestoreWarmupStep = kMaximumDecodeWidth + 1;
+
 // The identity reports the loaded model's digests in lowercase hex and the
 // KV layout as loaded; a malformed digest or a missing build id fails before
 // anything is served.
@@ -167,7 +170,7 @@ public:
     return warmup(static_cast<int>(width));
   }
   model::WarmupStepResult warmupCompositeStateRestore() override {
-    return warmup(5);
+    return warmup(kRestoreWarmupStep);
   }
   model::ModelMemoryActual actualRuntimeMemory() const override {
     return {1, 1};
@@ -248,12 +251,15 @@ void testAllNativeWarmupsPrecedeReady() {
   require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid &&
               events.size() == 1 && std::holds_alternative<protocol::ReadyEvent>(events.front()),
           "successful native bootstrap was incomplete");
-  require(harness.executor().calls == std::vector<int>({0, 1, 2, 3, 4, 5}),
-          "bootstrap did not warm fixed prefill and B1/B2/B3/B4 in order");
+  std::vector<int> expected;
+  for (int step = 0; step <= kRestoreWarmupStep; ++step) expected.push_back(step);
+  require(harness.executor().calls == expected,
+          "bootstrap did not warm fixed prefill, every decode width and restore in order");
   require(harness.executor().lastPrefillRows == model::ExecutionLimits::prefillTokenBudget,
           "bootstrap memory warmup did not explicitly use maximum prefill rows");
-  require(report.warmup.decodeBatches[2] == WarmupStepStatus::Complete,
-          "bootstrap report omitted the real B3 graph");
+  for (const auto status : report.warmup.decodeBatches)
+    require(status == WarmupStepStatus::Complete,
+            "bootstrap report omitted a supported decode graph");
 }
 
 RuntimeBootstrapReport warmup(Harness &harness, const EngineMemoryPlan &plan) {
@@ -269,13 +275,13 @@ void requireReadyWithoutReducingConcurrency(
   const auto events = protocol::peer::decodeEvents(harness.output());
   require(events.size() == 1, "bootstrap did not emit one complete Ready frame");
   const auto *ready = std::get_if<protocol::ReadyEvent>(&events.front());
-  require(ready && ready->maxConcurrentRequests == 4,
+  require(ready && ready->maxConcurrentRequests == kMaximumDecodeWidth,
           "startup budget permanently reduced the advertised concurrency");
 }
 
 void testBudgetLimitedWarmupKeepsRuntimeConcurrency() {
   const auto complete = memoryPlan().breakdown();
-  for (uint32_t width : {1U, 2U, 3U}) {
+  for (uint32_t width = 1; width < kMaximumDecodeWidth; ++width) {
     // Enough for the requested lanes' state and the KV runway, with less
     // than one more lane's state to spare. This is a valid single-lane plan.
     const uint64_t ceiling = complete.minimumRequiredBytes +
@@ -290,7 +296,7 @@ void testBudgetLimitedWarmupKeepsRuntimeConcurrency() {
     std::vector<int> expected{0};
     for (uint32_t lane = 1; lane <= width; ++lane)
       expected.push_back(static_cast<int>(lane));
-    expected.push_back(5);
+    expected.push_back(kRestoreWarmupStep);
     require(harness.executor().calls == expected,
             "warmup attempted a decode width that cannot fit the plan");
     for (uint32_t lane = 0; lane < report.warmup.decodeBatches.size(); ++lane) {
@@ -304,22 +310,23 @@ void testBudgetLimitedWarmupKeepsRuntimeConcurrency() {
 
 void testOptionalAllocationFailuresAreMemoryLimited() {
   const EngineMemoryPlan plan = memoryPlan();
-  for (int deniedWidth : {-1, 2, 3, 4}) {
+  for (int deniedWidth = -1; deniedWidth <= kMaximumDecodeWidth; ++deniedWidth) {
+    if (deniedWidth == 0 || deniedWidth == 1) continue;
     for (bool denyRestore : {false, true}) {
       Harness harness;
       harness.executor().warmupHook = [&](int step, model::WarmupStepResult &) {
-        if (step == deniedWidth || (step == 5 && denyRestore))
+        if (step == deniedWidth || (step == kRestoreWarmupStep && denyRestore))
           throw metal::MetalAllocationError("injected allocation denial");
       };
       const auto report = warmup(harness, plan);
       requireReadyWithoutReducingConcurrency(harness, report);
-      const uint32_t completedWidth = deniedWidth < 0 ? 4 : deniedWidth - 1;
+      const uint32_t completedWidth = deniedWidth < 0 ? kMaximumDecodeWidth : deniedWidth - 1;
       std::vector<int> expected{0};
       for (uint32_t width = 1; width <= completedWidth; ++width)
         expected.push_back(static_cast<int>(width));
       if (deniedWidth >= 0)
         expected.push_back(deniedWidth);
-      expected.push_back(5);
+      expected.push_back(kRestoreWarmupStep);
       require(harness.executor().calls == expected,
               "bootstrap retried wider batches after allocation denial");
       for (uint32_t lane = 0; lane < report.warmup.decodeBatches.size(); ++lane) {
@@ -416,21 +423,13 @@ void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
   enum class Failure {
     Allocation, Backend, General, ZeroTime, InfiniteTime, NanTime
   };
-  constexpr RuntimeBootstrapStage stages[] = {
-      RuntimeBootstrapStage::MaximumPrefill,
-      RuntimeBootstrapStage::DecodeWarmup,
-      RuntimeBootstrapStage::DecodeWarmup,
-      RuntimeBootstrapStage::DecodeWarmup,
-      RuntimeBootstrapStage::DecodeWarmup,
-      RuntimeBootstrapStage::CompositeStateRestore,
-  };
   const EngineMemoryPlan plan = memoryPlan();
-  for (int step = 0; step < 6; ++step) {
+  for (int step = 0; step <= kRestoreWarmupStep; ++step) {
     for (Failure failure : {Failure::Allocation, Failure::Backend,
                             Failure::General, Failure::ZeroTime,
                             Failure::InfiniteTime, Failure::NanTime}) {
       if (failure == Failure::Allocation &&
-          (step == 2 || step == 3 || step == 4 || step == 5))
+          step >= 2)
         continue; // Only these paths may skip a real allocation refusal.
       Harness harness;
       harness.executor().warmupHook =
@@ -459,7 +458,10 @@ void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
         static_cast<void>(warmup(harness, plan));
         throw std::runtime_error("invalid warmup announced ready");
       } catch (const RuntimeBootstrapError &error) {
-        require(error.report().stage == stages[step] &&
+        require(error.report().stage ==
+                    (step == 0 ? RuntimeBootstrapStage::MaximumPrefill :
+                     step == kRestoreWarmupStep ? RuntimeBootstrapStage::CompositeStateRestore :
+                     RuntimeBootstrapStage::DecodeWarmup) &&
                     (failure == Failure::Allocation ||
                      error.report().resourceFailure == RuntimeResourceFailure::Other) &&
                     harness.output().empty() &&

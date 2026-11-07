@@ -261,7 +261,9 @@ void ggufPlans() {
   // plan; here the 32-row tile's is the largest, which fused and gate/up
   // plans share.
   const ProjectionShape downShape{5120, 17408};
-  require(linear.decodeScratchSize(downShape).partials == three.scratchSize().partials,
+  require(linear.decodeScratchSize(downShape).partials ==
+              linear.plan({down.matrix, kMaximumDecodeTileRows, LinearPhase::Decode, LinearEpilogue::Residual},
+                          blockProjection(5120, 17408, 1)).scratchSize().partials,
           "GGUF decode scratch bound");
   // Float projections take the neural accelerator tile from 1.5 of its
   // 64 x 32 tiles per core for BF16 values, 2 for F32 values and 3 for a
@@ -318,7 +320,7 @@ void ggufPlans() {
           "Apple9 float projections take the simdgroup tile");
   const LinearScratchSize bound = m3.decodeScratchSize(downShape);
   require(bound.partials ==
-              m3.plan({down.matrix, 32, LinearPhase::Decode, LinearEpilogue::Residual}, blockProjection(5120, 17408, 1))
+              m3.plan({down.matrix, kMaximumDecodeTileRows, LinearPhase::Decode, LinearEpilogue::Residual}, blockProjection(5120, 17408, 1))
                   .scratchSize().partials,
           "Apple9 GGUF decode scratch bound");
   // Apple9 stages the IQ2, IQ3_XXS and IQ1 formats wherever the staged tile
@@ -707,7 +709,7 @@ void scratchBoundsRotated() {
   const Linear linear = gpu(10, 16);
   for (const bool rotated : {false, true}) {
     const ProjectionShape shape{5120, 17408, rotated};
-    require(linear.decodeScratchSize(shape).rotated == (rotated ? uint64_t{17408} * 32 * 2 : 0) &&
+    require(linear.decodeScratchSize(shape).rotated == (rotated ? uint64_t{17408} * kMaximumDecodeTileRows * 2 : 0) &&
                 linear.prefillScratchSize(shape).rotated == (rotated ? uint64_t{17408} * 2048 * 2 : 0),
             "rotated scratch bounds");
   }
@@ -1328,6 +1330,38 @@ void registerSplitUnits(metal::MetalBackend &backend) {
   }
 }
 
+
+// The optional larger ceiling must cover every supported width in its arena,
+// including register formats and fused gate/up. Larger widths retain the
+// four-lane reduction configuration; this checks storage and scratch safety,
+// rather than treating the former four-lane maximum as the arena bound.
+void expandedDecodeBounds() {
+  for (const uint32_t family : {9U, 10U, 11U})
+    for (const uint32_t cores : {1U, 8U, 16U, 20U, 32U, 40U, 64U})
+      for (uint32_t format = 0; format < GGUF_FMT_COUNT; ++format)
+        for (const auto [n, k] : {std::pair{128U, 5120U}, {1024U, 5120U}, {5120U, 17408U}, {17408U, 5120U}}) {
+          const Linear linear = gpu(family, cores);
+          const Projection p = blockProjection(n, k, 1, format);
+          const auto bound = linear.decodeScratchSize(p.shape());
+          for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
+            const auto reference = linear.decodePlan(p, 4, epilogue, epilogue == LinearEpilogue::GateUp ? &p : nullptr);
+            for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
+              const auto plan = linear.decodePlan(p, lanes, epilogue, epilogue == LinearEpilogue::GateUp ? &p : nullptr);
+              const auto need = plan.scratchSize();
+              require(plan.storageRows() >= lanes * SPLASH_TARGET_VERIFY_ROWS &&
+                          plan.storageRows() <= kMaximumDecodeTileRows &&
+                          bound.input >= need.input && bound.sums >= need.sums &&
+                          bound.partials >= need.partials && bound.counters >= need.counters,
+                      "expanded decode exceeds its arena bound");
+              auto expected = reference.configuration();
+              if (lanes > 4) expected.oneGateUpPass = false;
+              require(lanes <= 4 || plan.configuration() == expected,
+                      "expanded decode changed the retained reduction configuration or wide gate/up fallback");
+            }
+          }
+        }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1337,6 +1371,7 @@ int main(int argc, char **argv) {
     scratchBoundsRotated();
     ggufCoreLaws();
     floatOutputPlans();
+    expandedDecodeBounds();
     if (std::string_view(argv[1]) == "--cpu") {
       std::cout << "Linear CPU plans: PASS\n";
       return 0;

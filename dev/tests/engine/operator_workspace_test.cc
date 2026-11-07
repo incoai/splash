@@ -41,7 +41,7 @@ void attention() {
     const auto maximum = ops::PagedAttention::prefillWorkspace(2048, queryHeads, layout);
     require(maximum.partialsBytes == (queryHeads == 24 ? 48U : 32U) * uint64_t{1024 * 1024},
             "2048-row prefill partial workspace changed");
-    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+    for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
       const auto workspace =
           ops::PagedAttention::verifyWorkspace(lanes, queryHeads, layout);
       const uint64_t values =
@@ -55,7 +55,7 @@ void attention() {
       rejects([&] { (void)ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout); },
               "invalid attention workspace rows",
               "a prefill workspace of no rows or past the budget was sized");
-    for (const uint32_t lanes : {0U, 5U})
+    for (const uint32_t lanes : {0U, SPLASH_MAXIMUM_BATCH_WIDTH + 1})
       rejects([&] { (void)ops::PagedAttention::verifyWorkspace(lanes, queryHeads, layout); },
               "invalid attention workspace batch width",
               "a verify workspace of no lanes or more than a batch was sized");
@@ -111,7 +111,7 @@ void moe() {
     for (uint32_t rows = 1; rows <= 2048; ++rows)
       checkMoe(MoE::prefillPlan(shape, rows, {MoeExpertTile::M32}).workspace(), shape, rows, 32);
     const auto single = MoE::decodePlan(shape, 1, {MoeExpertTile::M8}).workspace();
-    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+    for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
       const auto workspace = MoE::decodePlan(shape, lanes, {MoeExpertTile::M8}).workspace();
       checkMoe(workspace, shape, lanes * 8, 8);
       require(workspace.groupedInputBytes <= lanes * single.groupedInputBytes &&
@@ -123,7 +123,7 @@ void moe() {
       rejects([&] { (void)MoE::prefillPlan(shape, rows, {MoeExpertTile::M32}); },
               "invalid MoE prefill rows",
               "a MoE prefill of no rows or past the budget was planned");
-    for (const uint32_t lanes : {0U, 5U})
+    for (const uint32_t lanes : {0U, SPLASH_MAXIMUM_BATCH_WIDTH + 1})
       rejects([&] { (void)MoE::decodePlan(shape, lanes, {MoeExpertTile::M8}); },
               "invalid MoE decode batch width",
               "a MoE decode of no lanes or more than a batch was planned");
@@ -142,7 +142,7 @@ void sampling() {
   using splash::ops::Sampling;
   // Independent ABI formulas, including one lane and B1-B4 batch
   // extents. No backend, allocation or GPU graph is needed to size buffers.
-  for (uint32_t rows : {1U, 8U, 16U, 24U, 32U,
+  for (uint32_t rows : {1U, 8U, 16U, 24U, 32U, 40U, 48U, 56U, 64U,
                         std::numeric_limits<uint32_t>::max()}) {
     const auto workspace = Sampling::workspace(rows);
     const uint64_t count = rows;
@@ -154,7 +154,7 @@ void sampling() {
                 workspace.vocabularyArrivalsBytes == count * 4,
             "target sampling workspace changed from the shipped 16-shard ABI");
   }
-  for (uint32_t positions : {1U, 7U, 14U, 21U, 28U,
+  for (uint32_t positions : {1U, 7U, 14U, 21U, 28U, 35U, 42U, 49U, 56U,
                              std::numeric_limits<uint32_t>::max()}) {
     const auto workspace = DraftSelector::workspace(positions);
     const uint64_t count = positions;

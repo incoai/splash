@@ -365,10 +365,16 @@ kernel void decode_linear_gguf_prepare(device const bfloat *input [[buffer(0)]],
   GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_a_f32, F, L, EpNone, float)                             \
   GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_r, F, L, EpResidual, bfloat)                            \
   GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_g, F, L, EpUpWithGate, bfloat)
+#if SPLASH_MAXIMUM_BATCH_WIDTH == 8u
+#define GGUF_SG_WIDE(F, f) GGUF_SG_EPILOGUES(F, f, 5) GGUF_SG_EPILOGUES(F, f, 6) GGUF_SG_EPILOGUES(F, f, 7) GGUF_SG_EPILOGUES(F, f, 8)
+#else
+#define GGUF_SG_WIDE(F, f)
+#endif
 #define GGUF_SG_FORMAT(F, f) \
-  GGUF_SG_EPILOGUES(F, f, 1) GGUF_SG_EPILOGUES(F, f, 2) GGUF_SG_EPILOGUES(F, f, 3) GGUF_SG_EPILOGUES(F, f, 4)
+  GGUF_SG_EPILOGUES(F, f, 1) GGUF_SG_EPILOGUES(F, f, 2) GGUF_SG_EPILOGUES(F, f, 3) GGUF_SG_EPILOGUES(F, f, 4) GGUF_SG_WIDE(F, f)
 QUANT_REGISTER_FORMATS(GGUF_SG_FORMAT)
 #undef GGUF_SG_FORMAT
+#undef GGUF_SG_WIDE
 #undef GGUF_SG_EPILOGUES
 #undef GGUF_SG_KERNEL
 
@@ -417,6 +423,12 @@ GGUF_SG_FUSED(1)
 GGUF_SG_FUSED(2)
 GGUF_SG_FUSED(3)
 GGUF_SG_FUSED(4)
+#if SPLASH_MAXIMUM_BATCH_WIDTH == 8u
+GGUF_SG_FUSED(5)
+GGUF_SG_FUSED(6)
+GGUF_SG_FUSED(7)
+GGUF_SG_FUSED(8)
+#endif
 #undef GGUF_SG_FUSED
 #undef GGUF_SG_SEGMENT
 

@@ -514,7 +514,7 @@ void testStreamingLaneRunsAlone() {
   overtaken.resourcesReady(1, 0);
   overtaken.setStreamsHistory(1, true);
   uint64_t id = 2;
-  for (; id <= model::ExecutionLimits::maximumBatchWidth; ++id) {
+  for (; id <= model::ExecutionLimits::maximumPrefillBatchWidth; ++id) {
     overtaken.submit(request(id, 100));
     overtaken.resourcesReady(id, 0);
     plan = *overtaken.next({});
@@ -1382,14 +1382,15 @@ void testDecodeCommandContainsOnePriorityTier() {
 
 void testDecodeLanesRotate() {
   engine::Scheduler scheduler(0.0);
-  for (uint64_t id = 1; id <= 6; ++id) {
+  constexpr uint32_t width = model::ExecutionLimits::maximumBatchWidth;
+  for (uint64_t id = 1; id <= width + 2; ++id) {
     scheduler.submit(request(id, 1));
     scheduler.resourcesReady(id, 1);
   }
 
   BatchPlan first = *scheduler.next({});
-  require(first.kind == WorkKind::Decode && first.width() == 4,
-          "the first unconstrained decode did not use the real B4 graph");
+  require(first.kind == WorkKind::Decode && first.width() == width,
+          "the first unconstrained decode did not use the full supported decode graph");
   scheduler.commit(first, {});
   std::vector<StepResult> firstResults;
   for (const BatchItem &item : first.items) {
@@ -1399,8 +1400,8 @@ void testDecodeLanesRotate() {
   scheduler.complete(first, firstResults, 0.0, true);
 
   BatchPlan second = *scheduler.next({});
-  require(second.kind == WorkKind::Decode && second.width() == 4 &&
-              second.items[0].requestId == 5 && second.items[1].requestId == 6,
+  require(second.kind == WorkKind::Decode && second.width() == width &&
+              second.items[0].requestId == width + 1 && second.items[1].requestId == width + 2,
           "decode did not prioritize lanes omitted by the previous batch");
 }
 

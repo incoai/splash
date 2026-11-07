@@ -547,12 +547,12 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
                        blocks.list + lane};
   }
   const auto &tables = buffers.pageTables;
-  graph.add(std::string(plan.storePipeline_),
-            {buffers.chunkKeys, buffers.chunkValues, tables[0], tables[1], tables[2],
-             tables[3]},
+  std::vector<metal::MetalBuffer> store{buffers.chunkKeys, buffers.chunkValues};
+  store.insert(store.end(), tables.begin(), tables.end());
+  graph.add(std::string(plan.storePipeline_), std::move(store),
             stores, plan.storeGroups_, plan.storeThreads_);
-  std::vector<metal::MetalBuffer> split{buffers.queries, buffers.partials, buffers.statistics,
-                                        tables[0], tables[1], tables[2], tables[3]};
+  std::vector<metal::MetalBuffer> split{buffers.queries, buffers.partials, buffers.statistics};
+  split.insert(split.end(), tables.begin(), tables.end());
   std::vector<metal::MetalBuffer> reduce{buffers.partials, buffers.statistics, buffers.output};
   if (plan.sparse) {
     const auto [lists, counts] = blockBindings(blocks, buffers.partials);

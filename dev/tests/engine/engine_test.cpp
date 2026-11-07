@@ -2404,15 +2404,20 @@ void testPressureReclaimFollowsTheChain() {
 // probe or admission attempt, and, as after a failed attempt, a memory wait
 // it was in no longer counts against the resource wait limit.
 void testFullLanesSkipAdmissionAttempts() {
+  constexpr uint32_t width = model::ExecutionLimits::maximumBatchWidth;
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor;
   executor.decodeFinishes = false;
-  // The first pass starts the three short prompts and tries request 5, the
-  // fourth of its batch, which meets pressure. Request 4 arrived before it
-  // with a long prompt, so it is not held back and takes the last lane.
-  executor.beginGrowthBlocked = [&] { return executor.beginAttempts == 4; };
+  bool pressureRefused = false;
+  // Shorter prompts take all but the last slot. The next candidate meets
+  // pressure, leaving the older long prompt eligible for the last slot.
+  executor.beginGrowthBlocked = [&] {
+    if (executor.beginAttempts != width) return false;
+    pressureRefused = true;
+    return true;
+  };
   Events events;
   engine::Engine engine(test::engineConfig({.resourceWaitTimeoutMilliseconds = 1000.0}),
                         resources, executor, events);
@@ -2423,32 +2428,33 @@ void testFullLanesSkipAdmissionAttempts() {
     value.deadlineMilliseconds = 100'000;
     engine.submit(std::move(value));
   };
-  for (uint64_t id = 1; id <= 3; ++id)
-    submit(id, 33);
-  submit(4, 129);
-  submit(5, 64);
-  require(engine.tick(1) && engine.resourceWaitSnapshot(1).memory == 1 &&
-              executor.lastBeginId == 5,
-          "fixture did not leave one request waiting for memory");
-  for (double now = 2; now <= 6; ++now)
+  for (uint64_t id = 1; id < width; ++id) submit(id, 33);
+  submit(width, 129);
+  submit(width + 1, 64);
+  // Prefill and decode have independent ceilings, so filling the decode
+  // slots may need several four-lane prefill commands.
+  for (double now = 1; now <= 32 && executor.requests.size() < width; ++now)
     static_cast<void>(engine.tick(now));
-  require(executor.requests.size() == 4 && executor.requests.contains(4) &&
-              executor.beginAttempts == 5,
-          "fixture did not make every lane resident");
-
+  require(pressureRefused && executor.requests.size() == width && executor.requests.contains(width) &&
+              executor.beginAttempts == width + 1,
+          "fixture did not make every supported lane resident after pressure");
   for (double now : {200.0, 201.0, 1200.0, 1201.0})
     static_cast<void>(engine.tick(now));
   const auto waiting = engine.resourceWaitSnapshot(1201);
-  require(executor.beginAttempts == 5 && events.failedCount == 0 &&
+  require(executor.beginAttempts == width + 1 && events.failedCount == 0 &&
               waiting.concurrency == 1 && waiting.memory == 0,
           "full lanes retried admission or kept the memory wait limit");
   engine.cancel(1);
-  require(engine.tick(1202) && executor.beginAttempts == 6 &&
-              events.startIds.back() == 5,
+  // Cancellation can belong to the command already in flight. One tick
+  // retires that command, then the next admission pass takes its slot.
+  require(engine.tick(1202), "cancellation made no resident progress");
+  if (executor.beginAttempts == width + 1)
+    require(engine.tick(1203), "released slot made no admission progress");
+  require(executor.beginAttempts == width + 2 &&
+              events.startIds.back() == width + 1,
           "a released lane did not admit the waiting request");
-  for (uint64_t id : {2, 3, 4, 5})
-    engine.cancel(id);
-  for (double now = 1203; now < 1220 && !idle(engine); ++now)
+  for (uint64_t id = 2; id <= width + 1; ++id) engine.cancel(id);
+  for (double now = 1204; now < 1280 && !idle(engine); ++now)
     static_cast<void>(engine.tick(now));
   require(idle(engine) && resources.snapshot().activeRequests == 0,
           "full-lane fixture leaked its lanes");
@@ -6047,6 +6053,8 @@ void testHigherPriorityArrivalIsNotHeldByRecovery() {
 // finished, the suspended lane resumes. An arrival of the residents' own
 // priority suspends nothing and waits for a lane.
 void testForegroundArrivalPreemptsWhenLanesAreFull() {
+  constexpr uint64_t width = model::ExecutionLimits::maximumBatchWidth;
+  const uint64_t incoming = width + 1;
   for (const RequestPriority arrival : {RequestPriority::Foreground, RequestPriority::Normal}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
@@ -6057,25 +6065,25 @@ void testForegroundArrivalPreemptsWhenLanesAreFull() {
     engine::Engine engine(test::engineConfig(), resources, executor, events);
     guardReleases(storage, engine);
     // Lane 3's prompt is the shortest, and the lanes decode together.
-    for (uint64_t id = 1; id <= 4; ++id) {
+    for (uint64_t id = 1; id <= width; ++id) {
       auto lane = request(id, std::vector<uint32_t>(id == 3 ? 33 : 65, static_cast<uint32_t>(id)));
       lane.maxNewTokens = 1000;
       engine.submit(std::move(lane));
     }
     double now = 1;
-    tickUntil(engine, now, [&] { return engine.snapshot().scheduler.decoding == 4; },
+    tickUntil(engine, now, [&] { return engine.snapshot().scheduler.decoding == width; },
               "the lanes did not decode");
-    auto arriving = request(5, std::vector<uint32_t>(9, 5));
+    auto arriving = request(incoming, std::vector<uint32_t>(9, incoming));
     arriving.priority = arrival;
     engine.submit(std::move(arriving));
     if (arrival == RequestPriority::Normal) {
       for (uint32_t step = 0; step < 8; ++step)
         static_cast<void>(engine.tick(now++));
-      require(engine.snapshot().prioritySuspensions == 0 && !executor.requests.contains(5) &&
+      require(engine.snapshot().prioritySuspensions == 0 && !executor.requests.contains(incoming) &&
                   engine.resourceWaitSnapshot(now).concurrency == 1,
               "an arrival of the residents' priority took a lane");
     } else {
-      tickUntil(engine, now, [&] { return events.usage.contains(5); },
+      tickUntil(engine, now, [&] { return events.usage.contains(incoming); },
                 "the Foreground arrival did not finish");
       require(engine.snapshot().prioritySuspensions == 1 &&
                   engine.snapshot().resourceSuspensions == 0 && !executor.requests.at(3).resident &&
@@ -6084,7 +6092,7 @@ void testForegroundArrivalPreemptsWhenLanesAreFull() {
       tickUntil(engine, now, [&] { return engine.snapshot().resourceResumptions == 1; },
                 "the suspended lane did not resume after the arrival finished");
     }
-    for (uint64_t id = 1; id <= 5; ++id)
+    for (uint64_t id = 1; id <= incoming; ++id)
       engine.cancel(id);
     tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
     require(events.failedCount == 0, "a lane failed");
@@ -6126,13 +6134,15 @@ void testRefusedHigherPriorityStartPreemptsLowerResident() {
   require(events.completedCount == 2 && events.failedCount == 0, "a request failed");
 }
 
-// Background lanes hold three lanes and a Normal producer the fourth, with
+// Background requests hold all but one lane and a Normal producer the last, with
 // a junction three commands in for a Normal request that shares its prefix.
 // While the request waits for that prefix it takes no lane: the request it
 // suspended would resume into the freed lane first and replay for nothing.
 // Once the junction has landed, it takes a Background lane and starts from
 // it.
 void testPrefixWaiterTakesNoLaneUntilThePrefixLands() {
+  constexpr uint64_t width = model::ExecutionLimits::maximumBatchWidth;
+  const uint64_t producerId = width, waiterId = width + 1;
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, nullptr, nullptr);
@@ -6141,36 +6151,36 @@ void testPrefixWaiterTakesNoLaneUntilThePrefixLands() {
   Events events;
   engine::Engine engine(test::engineConfig(), resources, executor, events);
   guardReleases(storage, engine);
-  for (uint64_t id = 1; id <= 3; ++id) {
+  for (uint64_t id = 1; id < width; ++id) {
     auto lane = request(id, {static_cast<uint32_t>(id)});
     lane.priority = RequestPriority::Background;
     lane.maxNewTokens = 1000;
     engine.submit(std::move(lane));
   }
   double now = 1;
-  tickUntil(engine, now, [&] { return engine.snapshot().scheduler.decoding == 3; },
+  tickUntil(engine, now, [&] { return engine.snapshot().scheduler.decoding == width - 1; },
             "the Background lanes did not decode");
   std::vector<uint32_t> producer(5000, 7);
   std::vector<uint32_t> waiter(5000, 7);
   std::fill(producer.begin() + 4800, producer.end(), 8);
   std::fill(waiter.begin() + 4800, waiter.end(), 9);
-  auto producing = request(4, producer);
+  auto producing = request(producerId, producer);
   producing.maxNewTokens = 1000;
   engine.submit(std::move(producing));
-  engine.submit(request(5, waiter));
+  engine.submit(request(waiterId, waiter));
   // The producer's command ends at the junction the request waits for, and
   // is the last before it lands.
-  tickUntil(engine, now, [&] { return executor.prefillRows == 3 + 4800; },
+  tickUntil(engine, now, [&] { return executor.prefillRows == width - 1 + 4800; },
             "the producer did not reach the junction");
-  require(engine.snapshot().prioritySuspensions == 0 && !executor.requests.contains(5) &&
+  require(engine.snapshot().prioritySuspensions == 0 && !executor.requests.contains(waiterId) &&
               engine.snapshot().captureCuts == 1,
           "the request took a lane while it waited for a prefix");
-  tickUntil(engine, now, [&] { return events.startIds.back() == 5; },
+  tickUntil(engine, now, [&] { return events.startIds.back() == waiterId; },
             "the request did not start once the prefix landed");
   require(engine.snapshot().prioritySuspensions == 1 &&
               events.starts.back() == 4800,
           "the request did not take a lane to start from the prefix");
-  for (uint64_t id = 1; id <= 5; ++id)
+  for (uint64_t id = 1; id <= waiterId; ++id)
     engine.cancel(id);
   tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
   require(events.failedCount == 0, "a lane failed");
@@ -6181,6 +6191,8 @@ void testPrefixWaiterTakesNoLaneUntilThePrefixLands() {
 // no lower resident, and during recovery it leaves a free lane to the
 // suspended request. It starts once the higher priority is done.
 void testRequestBelowARunningPriorityTakesNoLane() {
+  constexpr uint64_t width = model::ExecutionLimits::maximumBatchWidth;
+  const uint64_t streamId = width + 1, waitingId = width + 2;
   for (const bool recovering : {false, true}) {
     test::TestKvStorage storage(512, 4096, 4);
     KvPool pool(storage, 0);
@@ -6191,7 +6203,7 @@ void testRequestBelowARunningPriorityTakesNoLane() {
     engine::Engine engine(test::engineConfig(), resources, executor, events);
     guardReleases(storage, engine);
     // Lane 3's prompt is the shortest.
-    const uint64_t lanes = recovering ? 4 : 3;
+    const uint64_t lanes = recovering ? width : width - 1;
     for (uint64_t id = 1; id <= lanes; ++id) {
       auto lane = request(id, std::vector<uint32_t>(id == 3 ? 33 : 65, static_cast<uint32_t>(id)));
       lane.priority = RequestPriority::Background;
@@ -6202,30 +6214,30 @@ void testRequestBelowARunningPriorityTakesNoLane() {
     tickUntil(engine, now, [&] { return engine.snapshot().scheduler.decoding == lanes; },
               "the Background lanes did not decode");
     // A Foreground stream takes the last lane, during recovery lane 3's.
-    auto stream = request(5, {5});
+    auto stream = request(streamId, {static_cast<uint32_t>(streamId)});
     stream.priority = RequestPriority::Foreground;
     stream.maxNewTokens = 1000;
     engine.submit(std::move(stream));
-    tickUntil(engine, now, [&] { return events.outputs.contains(5); },
+    tickUntil(engine, now, [&] { return events.outputs.contains(streamId); },
               "the Foreground stream did not decode");
     const uint64_t suspended = recovering ? 1 : 0;
     require(engine.snapshot().prioritySuspensions == suspended,
             "the Foreground stream did not take its lane");
-    engine.submit(request(6, {6}));
+    engine.submit(request(waitingId, {static_cast<uint32_t>(waitingId)}));
     if (recovering)
       engine.cancel(1);
     for (uint32_t step = 0; step < 8; ++step)
       static_cast<void>(engine.tick(now++));
-    require(!executor.requests.contains(6) &&
+    require(!executor.requests.contains(waitingId) &&
                 engine.snapshot().prioritySuspensions == suspended &&
                 engine.snapshot().resourceResumptions == suspended,
             "a request below a running priority took a lane");
-    engine.cancel(5);
-    tickUntil(engine, now, [&] { return events.outputs.contains(6); },
+    engine.cancel(streamId);
+    tickUntil(engine, now, [&] { return events.outputs.contains(waitingId); },
               "the request did not start once the higher priority was done");
     require(engine.snapshot().prioritySuspensions == suspended,
             "the request took a lane from a lower resident");
-    for (uint64_t id = 1; id <= 6; ++id)
+    for (uint64_t id = 1; id <= waitingId; ++id)
       engine.cancel(id);
     tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
     require(events.failedCount == 0, "a lane failed");

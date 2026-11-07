@@ -8,7 +8,7 @@ namespace {
 
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kDecodeRows = SPLASH_TARGET_VERIFY_ROWS;
-static_assert(kMaximumLanes == 4);
+static_assert(kMaximumLanes == 4 || kMaximumLanes == 8);
 
 template <typename Workspace, size_t N>
 void include(Workspace &bound, const Workspace &required,

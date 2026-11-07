@@ -372,10 +372,13 @@ void testCleanRuntimeStatus(const char *goldenPath) {
               json.find("\"state_hit_tokens\"") == std::string::npos &&
               json.find("\"deduplicated_publications\"") == std::string::npos,
           "status reported a lookup counter twice");
+  std::string expectedWidths = "\"decode_batches_by_width\":{";
+  for (uint32_t lane = 0; lane < model::ExecutionLimits::maximumBatchWidth; ++lane)
+    expectedWidths += std::string(lane ? "," : "") + "\"b" + std::to_string(lane + 1) + "\":" + (lane < 4 ? "1" : "0");
+  expectedWidths += "}}";
   require(json.find("\"block_tokens\":32") != std::string::npos &&
-              json.find("\"decode_batches_by_width\":{\"b1\":1,\"b2\":1,\"b3\":"
-                        "1,\"b4\":1}}") != std::string::npos,
-          "Page32 or real B3 status is missing");
+              json.find(expectedWidths) != std::string::npos,
+          "Page32 or supported decode widths are missing");
   require(
       json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
           json.find("\"resource_replay_tokens\":1234") != std::string::npos &&
@@ -482,14 +485,12 @@ void testWarmupStepsReportMeasurementTruth() {
 
   struct OptionalStep {
     WarmupStepStatus *state;
-    const char *name;
+    std::string name;
   };
-  const OptionalStep optional[] = {
-      {&warmup.decodeBatches[1], "decode_b2"},
-      {&warmup.decodeBatches[2], "decode_b3"},
-      {&warmup.decodeBatches[3], "decode_b4"},
-      {&warmup.compositeStateRestore, "composite_state_restore"},
-  };
+  std::vector<OptionalStep> optional;
+  for (uint32_t lane = 1; lane < warmup.decodeBatches.size(); ++lane)
+    optional.push_back({&warmup.decodeBatches[lane], "decode_b" + std::to_string(lane + 1)});
+  optional.push_back({&warmup.compositeStateRestore, "composite_state_restore"});
   for (const auto &step : optional) {
     const std::string key = std::string("\"") + step.name + "\":";
     *step.state = WarmupStepStatus::Pending;
@@ -512,9 +513,11 @@ void testWarmupStepsReportMeasurementTruth() {
   for (const auto &step : optional)
     *step.state = WarmupStepStatus::MemoryLimited;
   const std::string limited = status();
-  require(limited.find("\"memory_limited_steps\":[\"decode_b2\",\"decode_b3\","
-                       "\"decode_b4\",\"composite_state_restore\"]") !=
-                  std::string::npos &&
+  std::string expectedLimited = "\"memory_limited_steps\":[";
+  for (uint32_t i = 0; i < optional.size(); ++i)
+    expectedLimited += std::string(i ? "," : "") + "\"" + optional[i].name + "\"";
+  expectedLimited += ']';
+  require(limited.find(expectedLimited) != std::string::npos &&
               limited.find("\"decode_b1\":true") != std::string::npos,
           "single-lane status omitted or mislabeled memory-limited steps");
 }

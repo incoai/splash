@@ -132,7 +132,7 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
                                  Located>(                                     \
         queries + tile.offset,                                                 \
         SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2,    \
-                            page_table3),                                      \
+                            page_table3, page_table4, page_table5, page_table6, page_table7),                                      \
         lane.kv, kv_head, tile.first_position, tile.active_rows, list.entries, \
         list.count, list.locations, LocationPages, Places, tile.splits,        \
         split, partials, statistics, tile.first_slot + split, scratch,         \
@@ -143,13 +143,10 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
       device bfloat *queries [[buffer(0)]],                                    \
       device float *partials [[buffer(1)]],                                    \
       device float *statistics [[buffer(2)]],                                  \
-      device const SplashKvPage *page_table0 [[buffer(3)]],                    \
-      device const SplashKvPage *page_table1 [[buffer(4)]],                    \
-      device const SplashKvPage *page_table2 [[buffer(5)]],                    \
-      device const SplashKvPage *page_table3 [[buffer(6)]],                    \
-      device const uint *lists [[buffer(7)]],                                  \
-      device const uint *counts [[buffer(8)]],                                 \
-      constant SplashVerifyAttentionParams *params [[buffer(9)]],              \
+      SPLASH_LANE_BUFFERS(device const SplashKvPage *, page_table, 3),                    \
+      device const uint *lists [[buffer(3 + 1 * SPLASH_MAXIMUM_BATCH_WIDTH)]],                                  \
+      device const uint *counts [[buffer(4 + 1 * SPLASH_MAXIMUM_BATCH_WIDTH)]],                                 \
+      constant SplashVerifyAttentionParams *params [[buffer(5 + 1 * SPLASH_MAXIMUM_BATCH_WIDTH)]],              \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     SPARSE_VERIFY_SPLIT_BODY(Heads, Group, HeadDim, CacheElement, false,       \
@@ -163,15 +160,12 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
       device bfloat *queries [[buffer(0)]],                                    \
       device float *partials [[buffer(1)]],                                    \
       device float *statistics [[buffer(2)]],                                  \
-      device const SplashKvPage *page_table0 [[buffer(3)]],                    \
-      device const SplashKvPage *page_table1 [[buffer(4)]],                    \
-      device const SplashKvPage *page_table2 [[buffer(5)]],                    \
-      device const SplashKvPage *page_table3 [[buffer(6)]],                    \
-      device const uint *lists [[buffer(7)]],                                  \
-      device const uint *counts [[buffer(8)]],                                 \
-      device const uint *locations [[buffer(9)]],                              \
-      device const SplashKvPage *location_pages [[buffer(10)]],                \
-      constant SplashVerifyAttentionParams *params [[buffer(11)]],             \
+      SPLASH_LANE_BUFFERS(device const SplashKvPage *, page_table, 3),                    \
+      device const uint *lists [[buffer(3 + 1 * SPLASH_MAXIMUM_BATCH_WIDTH)]],                                  \
+      device const uint *counts [[buffer(4 + 1 * SPLASH_MAXIMUM_BATCH_WIDTH)]],                                 \
+      device const uint *locations [[buffer(5 + 1 * SPLASH_MAXIMUM_BATCH_WIDTH)]],                              \
+      device const SplashKvPage *location_pages [[buffer(6 + 1 * SPLASH_MAXIMUM_BATCH_WIDTH)]],                \
+      constant SplashVerifyAttentionParams *params [[buffer(7 + 1 * SPLASH_MAXIMUM_BATCH_WIDTH)]],             \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     threadgroup uint places[SplashSparseStep<CacheElement>::Blocks];           \

@@ -61,7 +61,7 @@ void baselinePlans() {
     const Linear baseline(device(family));
     for (auto matrix : matrices) {
       uint64_t gateBound = 0;
-      for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+      for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
         for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                               LinearEpilogue::GateUp}) {
           const LinearWorkload w{matrix, lanes * 8, LinearPhase::Decode, epilogue};
@@ -73,7 +73,7 @@ void baselinePlans() {
         }
       }
       require(plans.gateUpWorkspace(gateUp(matrix)) == gateBound &&
-                  gateBound == uint64_t{32} * matrix.outputSize * 2,
+                  gateBound == uint64_t{kMaximumDecodeTileRows} * matrix.outputSize * 2,
               "gate/up workspace disagrees with the baseline's gate pass");
       for (uint32_t rows : {1U, 17U, 2048U})
         for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
@@ -90,8 +90,9 @@ void baselinePlans() {
         covers(memory, plans.prefillAttention(rows, queryHeads, kvLayout).workspace, 1,
                attentionFields);
       const auto stride = plans.verifyAttentionWorkspacePerLane(queryHeads, kvLayout);
-      for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-        const std::array<uint32_t, 4> histories{0, 31, 2048, 8192};
+      for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
+        std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> histories{};
+        for (uint32_t i = 0; i < histories.size(); ++i) histories[i] = std::array<uint32_t, 4>{0, 31, 2048, 8192}[i % 4];
         const auto selected = plans.verifyAttention(lanes, queryHeads, kvLayout,
                                                     std::span(histories).first(lanes));
         require(selected.splits == 32, "verify baseline changed");
@@ -108,7 +109,7 @@ void baselinePlans() {
     }
     for (auto shape : draftShapes) {
       const auto stride = plans.draftAttentionWorkspacePerLane(shape);
-      for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+      for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
         covers(stride, plans.draftAttention(shape, lanes).workspace(), lanes, draftFields);
     }
     for (auto shape : moeShapes) {
@@ -117,7 +118,7 @@ void baselinePlans() {
       const auto prefill = plans.moePrefillWorkspace(shape, 2048);
       for (uint32_t rows = 1; rows <= 2048; ++rows)
         covers(prefill, plans.moePrefill(shape, rows).workspace(), 1, kMoeWorkspaceFields);
-      for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+      for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
         const auto selected = plans.moeDecode(shape, lanes);
         require(selected.tileRows() == 8, "MoE decode baseline changed");
         covers(stride, selected.workspace(), lanes, kMoeWorkspaceFields);
@@ -146,7 +147,7 @@ void ggufMoePlans() {
     const uint32_t cores = plannedGpuCores(capabilities);
     require(moeGgufTile(gpuFamilyClass(family), cores, shape) == expected,
             "GGUF expert tile is not gated on GPU family 9 of more than 10 cores");
-    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+    for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
       const MoePlan plan = plans.moeDecode(shape, lanes);
       require(plan.configuration().ggufTile == expected && plan.tileRows() == 8 &&
                   plan.configuration().ggufRouterTile == FloatTile::Simdgroup,
@@ -170,7 +171,7 @@ void ggufMoePlans() {
     f16.registerFormats = false;
     require(moeGgufTile(gpuFamilyClass(family), cores, f16) == MoeGgufTile::Staged,
             "GGUF experts with an F16 weight took the register tile");
-    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+    for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
       const MoePlan plan = plans.moeDecode(staged, lanes);
       require(plan.configuration().ggufTile == MoeGgufTile::Staged && plan.workspace().groupedSumsBytes == 0,
               "GGUF MoE plan of staged experts took the register tile");
@@ -229,13 +230,13 @@ void unknownCoreCount() {
     assumed.gpuCoreCount = kAssumedGpuCores;
     const ExecutionPlans unknown(device(family)), planned(assumed);
     for (auto matrix : matrices)
-      for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+      for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
         for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
           const LinearWorkload w{matrix, lanes * 8, LinearPhase::Decode, epilogue};
           require(unknown.linear().plan(w).configuration() == planned.linear().plan(w).configuration(),
                   "an unknown core count planned a decode projection for other than the assumed cores");
         }
-    for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+    for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
       require(unknown.moeDecode(routedShape, lanes).configuration() ==
                   planned.moeDecode(routedShape, lanes).configuration(),
               "an unknown core count planned a MoE decode step for other than the assumed cores");
@@ -263,9 +264,9 @@ void workspaceBounds() {
               moe.expertIntermediateBytes == 532480 && moe.groupedRoutesBytes == 2080 &&
               moe.tileDescriptorsBytes == 520 && moe.tileCountBytes == 28,
           "MoE decode workspace per lane changed");
-  require(plans.gateUpWorkspace(gateUp(matrices[0])) == 1114112 &&
-              plans.gateUpWorkspace(gateUp(matrices[1])) == 393216,
-          "gate/up workspace omitted the B3/B4 gate pass");
+  require(plans.gateUpWorkspace(gateUp(matrices[0])) == uint64_t{kMaximumDecodeTileRows} * 17408 * 2 &&
+              plans.gateUpWorkspace(gateUp(matrices[1])) == uint64_t{kMaximumDecodeTileRows} * 6144 * 2,
+          "gate/up workspace omitted a supported lane gate pass");
   const auto draft = plans.draftAttentionWorkspacePerLane(draftShapes[0]);
   // Grouped queries per lane plus eight heads x four splits of 32 x 130 fp32
   // attention partials behind them.

@@ -113,10 +113,8 @@ void testLayoutFormulas() {
           "context window formula is wrong");
   require(kStateLayout.laneBytes() == 356'122'624,
           "per-lane byte formula is wrong");
-  require(uint64_t{model::ExecutionLimits::maximumBatchWidth} *
-                  kStateLayout.laneBytes() ==
-              1'424'490'496,
-          "four-lane byte formula is wrong");
+  require(uint64_t{4} * kStateLayout.laneBytes() == 1'424'490'496,
+          "four-lane reference byte formula is wrong");
   require(kStateLayout.cachedBytes() == 160'038'912,
           "prefix byte formula is wrong");
   // A bf16 recurrent state takes half the bytes; the convolution rows keep
@@ -705,6 +703,69 @@ void testAttentionOnlyTarget(metal::MetalBackend &backend) {
           "an attention-only storage's buffers outlived it");
 }
 
+// Every configured slot owns distinct cells, rings and a window. Reusing
+// released even slots cannot change the odd slots still in service.
+void testAllSupportedLaneOwnership(metal::MetalBackend &backend) {
+  constexpr uint32_t width = model::ExecutionLimits::maximumBatchWidth;
+  constexpr model::CompositeStateLayout layout{{1, 3, 128, 1, 128, 128}, {1, 1, 4, 128}};
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
+  const uint64_t before = backend.memoryStats().allocatedBytes;
+  {
+    model::QwenStateStorage storage(backend, governor.allocationAdmission(), layout, nullptr);
+    std::vector<void *> allocations;
+    const auto distinct = [&](const metal::MetalBuffer &buffer) {
+      void *address = buffer.contents();
+      require(address && std::find(allocations.begin(), allocations.end(), address) == allocations.end(),
+              "supported lanes alias an owned allocation");
+      allocations.push_back(address);
+    };
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      require(bool(storage.tryActivateLane(lane, 100 + lane)), "supported lane activation failed");
+      distinct(storage.current(lane).stateBase); distinct(storage.next(lane).stateBase);
+      distinct(storage.draft(lane)[0].keys); distinct(storage.draft(lane)[0].values); distinct(storage.window(lane));
+      word(storage.current(lane).stateBase) = 0x1000 + lane;
+      word(storage.next(lane).stateBase) = 0x2000 + lane;
+      word(storage.draft(lane)[0].keys) = 0x3000 + lane;
+      word(storage.draft(lane)[0].values) = 0x4000 + lane;
+      word(storage.window(lane)) = 0x5000 + lane;
+      require(storage.metadata(lane).requestId == 100 + lane, "supported lane owner metadata differs");
+      storage.swapParity(lane);
+    }
+    require(storage.actualAllocatedBytes() >= uint64_t{width} * layout.laneBytes(),
+            "all-lane native allocations are below the layout bound");
+    for (uint32_t lane = 0; lane < width; ++lane)
+      require(word(storage.current(lane).stateBase) == 0x2000 + lane &&
+                  word(storage.next(lane).stateBase) == 0x1000 + lane &&
+                  word(storage.draft(lane)[0].keys) == 0x3000 + lane &&
+                  word(storage.draft(lane)[0].values) == 0x4000 + lane &&
+                  word(storage.window(lane)) == 0x5000 + lane,
+              "supported lane writes or parity reached a peer");
+    const uint64_t allAllocated = storage.actualAllocatedBytes();
+    for (uint32_t lane = 0; lane < width; lane += 2) storage.releaseLane(lane, 100 + lane);
+    for (uint32_t lane = 0; lane < width; lane += 2) {
+      require(bool(storage.tryActivateLane(lane, 1000 + lane)), "supported lane reuse failed");
+      storage.clearForColdStart(lane);
+      require(storage.metadata(lane).requestId == 1000 + lane &&
+                  storage.metadata(lane).activeParity == 0 &&
+                  storage.metadata(lane).lengths == model::QwenLogicalLengths{} &&
+                  word(storage.current(lane).stateBase) == 0,
+              "reused supported slot kept metadata or readable current state");
+    }
+    require(storage.actualAllocatedBytes() == allAllocated, "reused lanes grew native allocations");
+    for (uint32_t lane = 1; lane < width; lane += 2)
+      require(storage.metadata(lane).requestId == 100 + lane &&
+                  word(storage.current(lane).stateBase) == 0x2000 + lane &&
+                  word(storage.draft(lane)[0].keys) == 0x3000 + lane &&
+                  word(storage.window(lane)) == 0x5000 + lane,
+              "reusing an even slot touched an active odd slot");
+    for (uint32_t lane = 0; lane < width; ++lane) storage.releaseLane(lane, (lane % 2 ? 100 : 1000) + lane);
+    require(releaseAllIdle(storage, false) == allAllocated && storage.actualAllocatedBytes() == 0,
+            "all-lane release/reclaim leaked native allocations");
+  }
+  require(backend.memoryStats().allocatedBytes == before, "all-lane test outlived native buffers");
+}
+
 void run(const std::string &metallib) {
   using model::QwenCompositeState;
   using model::QwenLogicalLengths;
@@ -721,6 +782,7 @@ void run(const std::string &metallib) {
   testPersistKeepsTheRamCopy(backend);
   testReservations(backend);
   testAttentionOnlyTarget(backend);
+  testAllSupportedLaneOwnership(backend);
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
       queryHostMemory, 0);
@@ -752,8 +814,8 @@ void run(const std::string &metallib) {
          lane < model::ExecutionLimits::maximumBatchWidth;
          ++lane)
       require(!storage.metadata(lane).assigned(), "lane was assigned eagerly");
-    rejects([&] { static_cast<void>(storage.current(4)); }, "invalid Qwen lane",
-            "storage exposed more than four lanes");
+    rejects([&] { static_cast<void>(storage.current(model::ExecutionLimits::maximumBatchWidth)); }, "invalid Qwen lane",
+            "storage exposed more than the supported lanes");
 
     require(static_cast<bool>(storage.tryActivateLane(0, 101)),
             "lane activation failed");
@@ -1157,10 +1219,10 @@ void run(const std::string &metallib) {
 
   std::cout << "qwen state storage tests passed: lane_declared="
             << kStateLayout.laneBytes()
-            << " lane_actual=" << observedLaneActual << " four_lanes_declared="
+            << " lane_actual=" << observedLaneActual << " configured_lanes_declared="
             << uint64_t{model::ExecutionLimits::maximumBatchWidth} *
                    kStateLayout.laneBytes()
-            << " four_lanes_actual=" << observedStorageActual
+            << " two_lanes_observed_actual=" << observedStorageActual
             << " composite_declared=" << kStateLayout.cachedBytes()
             << " prefix_actual=" << observedPrefixActual << '\n';
 }

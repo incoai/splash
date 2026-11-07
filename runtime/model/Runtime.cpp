@@ -165,7 +165,9 @@ T *contents(const MetalBuffer &buffer, std::string_view label) {
 
 void validatePlan(const BatchPlan &plan, std::span<const ModelBatchItem> items,
                   WorkKind expected) {
-  if (plan.kind != expected || plan.empty() || plan.width() > kLaneCount ||
+  const uint32_t maximum = expected == WorkKind::Prefill
+                               ? ExecutionLimits::maximumPrefillBatchWidth : kLaneCount;
+  if (plan.kind != expected || plan.empty() || plan.width() > maximum ||
       items.size() != plan.items.size()) {
     throw std::invalid_argument("model runtime received an invalid batch plan");
   }
@@ -433,6 +435,11 @@ struct Runtime::Impl {
   std::vector<std::weak_ptr<const HeldState>> stateHolds;
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
   ModelTelemetry counters;
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+  bool allowPackedFfnTeacherForcing = false;
+  bool lastPackedFfnEligible = false;
+  uint32_t lastPackedFfnLayers = 0;
+#endif
   ops::Sampling sampling;
   std::unique_ptr<QwenTarget> targetModel;
   DFlashDraft draftModel;
@@ -524,6 +531,31 @@ struct Runtime::Impl {
     if (found == requests.end())
       throw std::out_of_range("unknown request");
     return found->second;
+  }
+
+  bool packedFfnEligible(std::span<Request *const> entries) const {
+#if SPLASH_EXPERIMENTAL_FFN_PACK_MODE > 0
+    const auto &t = geometry.target;
+    if (entries.size() < 5 || entries.size() > 8 || kLaneCount != 8 || aneFfn ||
+        geometry.spilledKv || blockCache || historyStream ||
+        t.ffnKind != QwenFfnKind::Dense || t.layers != 64 || t.hiddenSize != 5120 ||
+        t.intermediateSize != 17408 || t.hyperConnections) return false;
+    for (const Request *entry : entries) {
+      if (!entry || !entry->images.empty()) return false;
+      const auto policy = samplingPolicy(*entry);
+      if (policy.samples() || policy.constrained || policy.penalties.active() || policy.excludesStopTokens)
+        return false;
+      bool allowTeacher = false;
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+      allowTeacher = allowPackedFfnTeacherForcing;
+#endif
+      if ((entry->thinking || policy.thinkingCutoff) && !allowTeacher) return false;
+    }
+    return true;
+#else
+    static_cast<void>(entries);
+    return false;
+#endif
   }
 
   static bool samplingEnabled(const Request &entry) noexcept {
@@ -1995,7 +2027,9 @@ struct Runtime::Impl {
          d(DecodeTensor::ProposalProbs), d(DecodeTensor::VerifyConfidence)},
         std::span(anchors).first(lanes), std::span(policies).first(lanes));
     ops::VerifyRowsModel verify;
-    if (verifyBudget && !verifyBudget->explores(lanes, constrained)) {
+    // Cost priors are calibrated through four lanes. Larger batches verify
+    // every row until those widths have their own calibrated cost model.
+    if (verifyBudget && lanes <= 4 && !verifyBudget->explores(lanes, constrained)) {
       const VerifyBudget::Acceptance &acceptance = verifyBudget->acceptance();
       verify = {acceptance.slope, acceptance.intercepts, verifyBudget->costs(lanes, constrained), false};
     }
@@ -2050,6 +2084,14 @@ struct Runtime::Impl {
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
     buffers.verifyRows = decodeArena->batchSlice(DecodeTensor::VerifyRows, lanes);
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+    lastPackedFfnEligible = packedFfnEligible(entries);
+    lastPackedFfnLayers = 0;
+    buffers.packedFfnEncodedLayers = &lastPackedFfnLayers;
+#endif
+#if SPLASH_EXPERIMENTAL_FFN_PACK_MODE == 2
+    if (packedFfnEligible(entries)) buffers.packedFfn = decodeArena->packedFfn();
+#endif
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyParams(
           items[lane].logicalPosition,
@@ -2263,7 +2305,7 @@ struct Runtime::Impl {
     bool commits = true;
     for (uint32_t lane = 0; lane < items.size(); ++lane)
       commits = commits && lanes[lane].failure.empty() && unreadable[lane].empty();
-    if (verifyBudget && commits) {
+    if (verifyBudget && commits && items.size() <= 4) {
       std::array<VerifyBudget::Lane, kLaneCount> observed{};
       for (uint32_t lane = 0; lane < items.size(); ++lane) {
         const float *confidence = contents<float>(
@@ -3052,6 +3094,12 @@ Runtime::decodeAsync(const BatchPlan &plan,
   }
 
   const std::span<Impl::Request *const> entries(requests.data(), width);
+  if (impl_->packedFfnEligible(entries)) {
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      lanes[lane].maximumRetained = std::min(lanes[lane].maximumRetained, 4u);
+      maximumRetained[lane] = lanes[lane].maximumRetained;
+    }
+  }
   const uint32_t ropeRows = width * kDecodeRows;
   CommandGraph commandGraph;
   impl_->addRopeTables(
@@ -3355,7 +3403,13 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
   // lanes follow the explicit BatchPlan, while recurrent and KV state stay
   // addressed by each request's state lane; batching must never assume lanes
   // 0..3.
-  constexpr std::array<uint32_t, kLaneCount> stateLaneOrder{2, 0, 3, 1};
+  constexpr auto stateLaneOrder = [] {
+    std::array<uint32_t, kLaneCount> order{};
+    constexpr std::array<uint32_t, 4> group{2, 0, 3, 1};
+    for (uint32_t lane = 0; lane < kLaneCount; ++lane)
+      order[lane] = lane / 4 * 4 + group[lane % 4];
+    return order;
+  }();
   double wallSeconds = 0.0;
   std::vector<WarmupLaneResult> lanes;
   std::array<std::vector<uint32_t>, kLaneCount> pages;
@@ -3591,6 +3645,21 @@ void RuntimeInstrumentation::captureTargetLogits(Runtime &runtime, bool enabled)
 
 std::vector<std::vector<float>> RuntimeInstrumentation::takeTargetLogits(Runtime &runtime) {
   return std::exchange(runtime.impl_->capturedTargetLogits, {});
+}
+
+void RuntimeInstrumentation::allowPackedFfnTeacherForcing(Runtime &runtime, bool enabled) {
+  runtime.impl_->allowPackedFfnTeacherForcing = enabled;
+}
+
+RuntimeInstrumentation::PackedFfnObservation RuntimeInstrumentation::lastPackedFfn(const Runtime &runtime) {
+  const auto &impl = *runtime.impl_;
+  PackedFfnObservation out{impl.lastPackedFfnEligible, impl.lastPackedFfnLayers, {}};
+  if (out.encodedLayers) {
+    const auto control = impl.decodeArena->packedFfn().control;
+    if (control.sizeBytes() < sizeof(out.control)) throw std::logic_error("packed FFN observation extent");
+    std::memcpy(&out.control, control.contents(), sizeof(out.control));
+  }
+  return out;
 }
 
 std::optional<uint32_t> RuntimeInstrumentation::pendingToken(const Runtime &runtime, uint64_t requestId) {

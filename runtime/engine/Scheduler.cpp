@@ -10,7 +10,7 @@ namespace {
 // A lane yields to later arrivals at most this many prefill commands in a
 // row: the other lanes of a full batch, each finishing one short prompt.
 constexpr uint32_t kMaximumOvertakes =
-    model::ExecutionLimits::maximumBatchWidth - 1;
+    model::ExecutionLimits::maximumPrefillBatchWidth - 1;
 
 // The slice a contended prefill command aims for: while peers of its
 // priority decode, the budget halves until its estimated cost fits, so they
@@ -377,7 +377,7 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
       break;
     budget = std::min(budget, view.request->spec.prefillGroupRows - planned);
     if (!budget || view.request->spec.priority != selectedPriority ||
-        plan.width() == model::ExecutionLimits::maximumBatchWidth)
+        plan.width() == model::ExecutionLimits::maximumPrefillBatchWidth)
       break;
     // A lane that streams its history runs alone: nothing joins a command
     // it leads, and it joins none it does not lead; overtaken often enough,
@@ -509,8 +509,9 @@ std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> exclude
 }
 
 void Scheduler::commit(const BatchPlan &plan, std::span<const uint64_t> excluded) {
-  if (active_ || plan.empty() ||
-      plan.width() > model::ExecutionLimits::maximumBatchWidth) {
+  const uint32_t maximum = plan.kind == WorkKind::Prefill
+      ? model::ExecutionLimits::maximumPrefillBatchWidth : model::ExecutionLimits::maximumBatchWidth;
+  if (active_ || plan.empty() || plan.width() > maximum) {
     throw std::logic_error("invalid scheduler commit");
   }
   for (const BatchItem &item : plan.items) {

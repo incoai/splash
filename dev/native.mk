@@ -1,5 +1,5 @@
 ENGINE_TEST_BUILD := $(BUILD)/engine-tests
-ENGINE_TEST_CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev \
+ENGINE_TEST_CXXFLAGS := $(NATIVE_BATCH_FLAG) -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev \
 	$(MACOS_TARGET_FLAG)
 # Production flags less -O3, so Metal optimizes at its default -O2. With
 # metal 32023 the kernels built with them get the same AIR as at -O3, but
@@ -12,7 +12,7 @@ TEST_CONFIG_DIGEST := $(shell printf '%s\0' $(CONFIG_DIGEST) \
 	$(call shell-quote,$(ENGINE_TEST_CXXFLAGS)) \
 	$(call shell-quote,$(TEST_METALFLAGS)) | shasum -a 256 | cut -c1-16)
 ENGINE_SANITIZER_BUILD := $(BUILD)/sanitizers
-ENGINE_SANITIZER_CXXFLAGS := -std=c++20 -O1 -g -fno-omit-frame-pointer \
+ENGINE_SANITIZER_CXXFLAGS := $(NATIVE_BATCH_FLAG) -std=c++20 -O1 -g -fno-omit-frame-pointer \
 	-Wall -Wextra -Werror -Iruntime -Idev $(MACOS_TARGET_FLAG)
 SANITIZER_CONFIG_DIGEST := $(shell printf '%s\0' $(CONFIG_DIGEST) \
 	$(call shell-quote,$(ENGINE_SANITIZER_CXXFLAGS)) \
@@ -566,7 +566,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(TEST_GGUF_REFERENCE) $(WEIGHT_GOLDENS) $(MLX_QUANTIZATION_FIXTURE)
 	$(TEST_GGUF_PLANNER)
 	$(TEST_LINEAR_PLAN) --cpu
-	/bin/sh dev/tests/attention_sweep_cli.sh $(TEST_ATTENTION_SWEEP)
+	/bin/sh dev/tests/attention_sweep_cli.sh $(TEST_ATTENTION_SWEEP) $(NATIVE_BATCH_WIDTH)
 	/bin/sh dev/tests/backend_benchmark_cli.sh $(TEST_BACKEND_BENCHMARK) $(MODEL_CONFIGS)
 	$(TEST_OPERATOR_WORKSPACE)
 	$(TEST_ANE_FFN_CALIBRATION)
@@ -590,7 +590,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(TEST_METRICS_TEST)
 	$(TEST_MEMORY_AUDIT_TEST)
 	$(TEST_MEMORY_GOVERNOR_TEST)
-	$(TEST_STATUS_TEST) dev/tests/engine/status_golden.json
+	$(TEST_STATUS_TEST) dev/tests/engine/status_golden$(if $(filter 8,$(NATIVE_BATCH_WIDTH)),_8,).json
 	$(TEST_Q8_CPU_TEST)
 
 test-engine-metal: $(TEST_METAL_TARGETS)
@@ -805,7 +805,7 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_SLOT_RECYCLER_TSAN) $(KV_SELECTION_TRACES)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_PLAN_ASAN)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_AUDIT_ASAN)
-	$(ASAN_TEST_ENV) $(TEST_STATUS_ASAN) dev/tests/engine/status_golden.json
+	$(ASAN_TEST_ENV) $(TEST_STATUS_ASAN) dev/tests/engine/status_golden$(if $(filter 8,$(NATIVE_BATCH_WIDTH)),_8,).json
 
 # The Metal tests of the components whose host steps share their state with
 # the engine thread and the SSD readers, the hot block cache and the history

@@ -66,7 +66,7 @@ using splash::test::floatToBf16;
 
 namespace {
 
-constexpr uint32_t kLaneRows = 8, kMaximumLanes = 4, kMaximumRows = kLaneRows * kMaximumLanes;
+constexpr uint32_t kLaneRows = 8, kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH, kMaximumRows = kLaneRows * kMaximumLanes;
 // Every K split a plan takes: the powers of two up to the largest.
 constexpr uint32_t kSplits[] = {1, 2, 4, 8, 16};
 static_assert(kSplits[std::size(kSplits) - 1] == LinearConfig::kMaximumSplits);
@@ -521,7 +521,7 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bo
     }
   }
   section(walkName(tile, spread) + " decode: " + std::to_string(formats.size()) + " formats, K " + std::to_string(K) +
-          ", 1-4 lanes, S 1-" + std::to_string(mostSplits) +
+          ", 1-" + std::to_string(kMaximumLanes) + " lanes, S 1-" + std::to_string(mostSplits) +
           ", plain/residual/gate-up, dense and sparse inputs within fp64, lanes equal to one-lane projections" +
           (staged ? " (one lane on the 16-row tile too)" : "") + ", fp32 plain outputs rounding to bf16's");
 }
@@ -587,7 +587,7 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, b
     }
   }
   section(walkName(tile, spread) + " fused: three segments in " + std::to_string(formats.size()) +
-          " format triples, K " + std::to_string(K) + ", 1-4 lanes, S 1-" + std::to_string(mostSplits) +
+          " format triples, K " + std::to_string(K) + ", 1-" + std::to_string(kMaximumLanes) + " lanes, S 1-" + std::to_string(mostSplits) +
           " within fp64 and equal to each segment's projection" +
           (tile == LinearTile::GgufStaged ? ", one lane on the 16-row tile equal to the 8-row tile" : ""));
 }
@@ -597,7 +597,7 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, b
 // takes on large GPUs.
 void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
   constexpr uint32_t K = 1024;
-  constexpr uint32_t kSplitsByLanes[kMaximumLanes] = {1, 2, 4, 4};
+  constexpr auto kSplitsByLanes = [] { std::array<uint32_t, kMaximumLanes> a{}; a.fill(4); a[0] = 1; a[1] = 2; return a; }();
   const auto pair = [&](Fmt gf, Fmt uf, uint32_t N, uint32_t lanes) {
     const uint32_t columns = N + kPadding;
     const Tensor g = tensor(backend, gf, N, K), u = tensor(backend, uf, N, K);
@@ -616,10 +616,10 @@ void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
   for (size_t i = 0; i < formats.size(); ++i)
     for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes)
       pair(formats[i], formats[(i + 1) % formats.size()], 256, lanes);
-  const std::array<std::array<Fmt, 2>, kMaximumLanes> wide{{{IQ4XS, Q4K}, {Q5K, Q5K}, {Q4K, IQ4XS}, {Q3K, Q6K}}};
+  const auto wide = [] { constexpr std::array<std::array<Fmt, 2>, 4> patterns{{{IQ4XS, Q4K}, {Q5K, Q5K}, {Q4K, IQ4XS}, {Q3K, Q6K}}}; std::array<std::array<Fmt, 2>, kMaximumLanes> a{}; for (uint32_t i = 0; i < kMaximumLanes; ++i) a[i] = patterns[i % patterns.size()]; return a; }();
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) pair(wide[lanes - 1][0], wide[lanes - 1][1], 1024, lanes);
   section(std::string(tileName(tile)) + " gate/up: " + std::to_string(formats.size()) +
-          " gate and up format pairs at N 256 and 4 at N 1024, 1-4 lanes, within fp64");
+          " gate and up format pairs at N 256 and 4 at N 1024, 1-" + std::to_string(kMaximumLanes) + " lanes, within fp64");
 }
 
 // Gate/up in one pass (LinearConfig::oneGateUpPass) on the staged tile, gate and up in each format ([768, K]), and in
@@ -639,6 +639,19 @@ void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
         LinearConfig c = config(LinearTile::GgufStaged, wl, splits, spread);
         const LinearPlan twoPasses = Linear::plan(wl, c, FloatOutput::BFloat16);
         c.oneGateUpPass = true;
+        if (wl.rows > 32) {
+          bool rejected = false;
+          try { (void)Linear::plan(wl, c, FloatOutput::BFloat16); }
+          catch (const std::invalid_argument &e) {
+            rejected = std::string_view(e.what()).find("at most 32 rows") != std::string_view::npos;
+          }
+          if (!rejected) fail("wide one-pass gate/up was admitted after its failed exactness gate");
+          const auto native = linear.decodePlan(up, l, LinearEpilogue::GateUp, &gate);
+          if (native.configuration().oneGateUpPass) fail("wide production gate/up did not select the separate passes");
+          // Dense/sparse numerical and one-lane equality checks for these
+          // expanded separate passes remain in decodeTile above.
+          continue;
+        }
         const LinearPlan onePass = Linear::plan(wl, c, FloatOutput::BFloat16);
         const std::string label = std::string(fmtName(f)) + " " + std::to_string(N) + "x" + std::to_string(K) +
                                   " S=" + std::to_string(splits) + " L=" + std::to_string(l);
@@ -658,11 +671,12 @@ void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
     }
   };
   const uint32_t K = decodeInputs(spread);
-  constexpr uint32_t kAllLanes[] = {1, 2, 3, 4}, kEndLanes[] = {1, kMaximumLanes};
+  constexpr auto kAllLanes = [] { std::array<uint32_t, kMaximumLanes> a{}; for (uint32_t i = 0; i < kMaximumLanes; ++i) a[i] = i + 1; return a; }();
+  constexpr uint32_t kEndLanes[] = {1, kMaximumLanes};
   for (int fi = 0; fi < FMT_COUNT; ++fi) pairs(Fmt(fi), 768, K, 768 + kPadding, kAllLanes);
   for (const Fmt f : {Q4K, Fmt(GGUF_FMT_AF4G64)}) pairs(f, 17408, 5120, 17408, kEndLanes);
-  section(walkName(LinearTile::GgufStaged, spread) + " one-pass gate/up: " + std::to_string(FMT_COUNT) +
-          " formats at 768x" + std::to_string(K) + ", 1-4 lanes, and Q4_K and MLX 4-bit at 17408x5120, 1 and 4 lanes, "
+  section(walkName(LinearTile::GgufStaged, spread) + " gate/up (one pass <=32 rows, wider rejected and production separate): " + std::to_string(FMT_COUNT) +
+          " formats at 768x" + std::to_string(K) + ", 1-" + std::to_string(kMaximumLanes) + " lanes, and Q4_K and MLX 4-bit at 17408x5120, 1 and " + std::to_string(kMaximumLanes) + " lanes, "
           "S 1-" + std::to_string(mostSplits) + ", one lane on the 16-row tile too, bitwise the two passes");
 }
 
@@ -1060,6 +1074,7 @@ void gatherExtents(MetalBackend &backend) {
 
 int main(int argc, char **argv) {
   @autoreleasepool {
+    std::cout << std::unitbuf;
     if (argc != 2) {
       std::cerr << "usage: gguf-projection <production-and-test.metallib>\n";
       return 2;
@@ -1092,7 +1107,7 @@ int main(int argc, char **argv) {
           splitVisibility(backend, linear, tile, {&gdn, &gateUp}, lanes);
           if (tile == LinearTile::GgufRegister) splitVisibility(backend, linear, tile, {&hyperDown, &hyperUp}, lanes);
         }
-      section("split visibility: both tiles, 1 and 4 lanes, every split pair the policy picks for 8-80 cores, and the "
+      section("split visibility: both tiles, 1 and " + std::to_string(kMaximumLanes) + " lanes, every split pair the policy picks for 8-80 cores, and the "
               "register tile's at Flash-Next's hyper-connection pair, independent of poisoned partials and within fp64");
       // Narrow inputs, in formats of 32-input blocks: K 320 and 640, and on the decode tiles 192.
       const std::vector<Fmt> narrow{Q80, MXFP4, Q40};

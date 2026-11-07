@@ -1,5 +1,6 @@
 #pragma once
 
+#include "metal/abi/ExecutionGeometry.h"
 #include "ops/PagedKv.hpp"
 #include "ops/Vision.hpp"
 #include "model/StateTransfer.hpp"
@@ -594,7 +595,10 @@ maskWordsPerToken(uint32_t vocabularySize) noexcept {
 // checkpoint's config for; the other limits are the runtime's own. Cache-page
 // and attention-kernel geometry live with their operators.
 struct ExecutionLimits final {
-  static constexpr uint32_t maximumBatchWidth = 4;
+  static constexpr uint32_t maximumBatchWidth = SPLASH_MAXIMUM_BATCH_WIDTH;
+  // Preserve the established prefill concurrency while widening decode.
+  static constexpr uint32_t maximumPrefillBatchWidth = 4;
+  static_assert(maximumPrefillBatchWidth <= maximumBatchWidth);
   // The rows of a prefill chunk. A prefill command's lanes fill its chunks
   // one after another, and the runtime lets at most one lane's rows run past
   // a chunk: a prefill group has one scratch GDN cell for the state between

@@ -10,6 +10,7 @@
 #include <limits>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 namespace splash::engine {
 namespace {
@@ -534,12 +535,12 @@ std::string runtimeStatusJson(
       << ",\"terminal\":" << scheduler.terminal
       << ",\"prefill_batches\":" << scheduler.prefillBatches
       << ",\"prefill_rows\":" << scheduler.prefillRows
-      << ",\"decode_batches\":" << scheduler.decodeBatches
-      << ",\"decode_batches_by_width\":{\"b1\":"
-      << scheduler.decodeBatchesByWidth[0]
-      << ",\"b2\":" << scheduler.decodeBatchesByWidth[1]
-      << ",\"b3\":" << scheduler.decodeBatchesByWidth[2]
-      << ",\"b4\":" << scheduler.decodeBatchesByWidth[3] << "}}";
+      << ",\"decode_batches\":" << scheduler.decodeBatches;
+  out << ",\"decode_batches_by_width\":{";
+  for (uint32_t lane = 0; lane < scheduler.decodeBatchesByWidth.size(); ++lane)
+    out << (lane ? "," : "") << json::quote("b" + std::to_string(lane + 1))
+        << ':' << scheduler.decodeBatchesByWidth[lane];
+  out << "}}";
   out << ",\"active_requests\":[";
   for (size_t index = 0; index < core.activeRequests.size(); ++index) {
     const engine::ActiveRequestSnapshot &request = core.activeRequests[index];
@@ -584,14 +585,11 @@ std::string runtimeStatusJson(
   appendBatch(out, metrics.currentDecodeBatch);
   const std::string prefillName =
       "prefill_" + std::to_string(SPLASH_PREFILL_TOKEN_BUDGET);
-  const std::pair<std::string_view, WarmupStepStatus> warmupSteps[] = {
-      {prefillName, warmup.maximumPrefill},
-      {"decode_b1", warmup.decodeBatches[0]},
-      {"decode_b2", warmup.decodeBatches[1]},
-      {"decode_b3", warmup.decodeBatches[2]},
-      {"decode_b4", warmup.decodeBatches[3]},
-      {"composite_state_restore", warmup.compositeStateRestore},
-  };
+  std::vector<std::pair<std::string, WarmupStepStatus>> warmupSteps{
+      {prefillName, warmup.maximumPrefill}};
+  for (uint32_t lane = 0; lane < warmup.decodeBatches.size(); ++lane)
+    warmupSteps.emplace_back("decode_b" + std::to_string(lane + 1), warmup.decodeBatches[lane]);
+  warmupSteps.emplace_back("composite_state_restore", warmup.compositeStateRestore);
   out << "},\"warmup\":{";
   for (const auto &[name, status] : warmupSteps) {
     out << json::quote(name) << ':'

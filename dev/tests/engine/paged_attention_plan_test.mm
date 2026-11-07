@@ -146,8 +146,9 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
   }
   const std::string verifySplit = pipelineName("verify", true, queryHeads, layout);
   const std::string verifyReduce = pipelineName("verify", false, queryHeads, layout);
-  for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-    const std::array<uint32_t, 4> histories{0, 31, 16384, 131072};
+  for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
+    std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> histories{};
+    for (uint32_t i = 0; i < histories.size(); ++i) histories[i] = std::array<uint32_t, 4>{0, 31, 16384, 131072}[i % 4];
     const auto plan = ops::PagedAttention::verifyPlan(lanes, queryHeads, layout,
                                                       std::span(histories).first(lanes));
     require(plan.splitPipeline == verifySplit && plan.reducePipeline == verifyReduce,
@@ -182,7 +183,7 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
   for (const uint32_t rows : {0U, 2049U})
     rejects([&] { (void)ops::PagedAttention::prefillPlan(rows, queryHeads, layout); },
             "invalid attention workspace rows", "a prefill plan of no rows or past the budget was accepted");
-  for (const uint32_t lanes : {0U, 5U})
+  for (const uint32_t lanes : {0U, SPLASH_MAXIMUM_BATCH_WIDTH + 1})
     rejects([&] { (void)ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, zeroHistory); },
             "invalid attention workspace batch width",
             "a verify plan of no lanes or more than a batch was accepted");
@@ -225,10 +226,10 @@ struct Case final {
   metal::MetalBuffer keys;
   metal::MetalBuffer values;
   metal::MetalBuffer queries;
-  std::array<metal::MetalBuffer, 4> tables;
+  std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH> tables;
   // Each lane's page ids, which its table holds as entries.
-  std::array<std::vector<uint32_t>, 4> pages;
-  std::array<kv::ChunkedPrefillParams, 4> stores{};
+  std::array<std::vector<uint32_t>, SPLASH_MAXIMUM_BATCH_WIDTH> pages;
+  std::array<kv::ChunkedPrefillParams, SPLASH_MAXIMUM_BATCH_WIDTH> stores{};
   // QSA block masks (sparse layouts): maskWords words per row of every
   // lane's rows, lane by lane; none when maskWords is 0.
   std::vector<uint32_t> mask;
@@ -288,8 +289,8 @@ metal::MetalBuffer allocate(metal::MetalBackend &backend, uint64_t bytes) {
 Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
                kv::Layout layout, uint32_t lanes, uint32_t rows,
                uint32_t history, bool verify, bool oneExtent = false) {
-  std::array<uint32_t, 4> historyLengths{};
-  std::array<uint32_t, 4> pageCounts{};
+  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> historyLengths{};
+  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> pageCounts{};
   uint32_t allPages = 0;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     // Verify lanes differ by more than a split's worth of pages, so long
@@ -373,7 +374,7 @@ Case makeCase(metal::MetalBackend &backend, uint32_t queryHeads,
                               head * dimension * 7) % 1019) - 509) / 1018.0f);
     }
   }
-  for (uint32_t lane = lanes; lane < 4; ++lane) {
+  for (uint32_t lane = lanes; lane < SPLASH_MAXIMUM_BATCH_WIDTH; ++lane) {
     data.tables[lane] = data.tables[0];
     data.pages[lane] = data.pages[0];
   }
@@ -1243,7 +1244,7 @@ void attentionBlocks(metal::MetalBackend &backend) {
                reduce.bytes[0].index == 4;
       };
       require(bindsLists(prefillGraph.dispatches()[0], prefillGraph.dispatches()[1], 4, 0) &&
-                  bindsLists(verifyGraph.dispatches()[1], verifyGraph.dispatches()[2], 7, 0) &&
+                  bindsLists(verifyGraph.dispatches()[1], verifyGraph.dispatches()[2], 3 + SPLASH_MAXIMUM_BATCH_WIDTH, 0) &&
                   verifyGraph.dispatches()[1].pipelineName == verify.splitPipeline,
               "a sparse kernel's block lists are not bound before its parameters");
       metal::CommandGraph refused;
@@ -1251,8 +1252,9 @@ void attentionBlocks(metal::MetalBackend &backend) {
         metal::CommandGraph located;
         addVerify(located, {listBuffer, counts, listStride, first, locations, locationPages});
         const metal::ComputeDispatch &split = located.dispatches()[1];
-        require(bindsLists(split, located.dispatches()[2], 7, 2) && split.buffers[9].buffer.sameView(locations) &&
-                    split.buffers[10].buffer.sameView(locationPages) && split.pipelineName == locatedSplitName(layout),
+        require(bindsLists(split, located.dispatches()[2], 3 + SPLASH_MAXIMUM_BATCH_WIDTH, 2) &&
+                    split.buffers[5 + SPLASH_MAXIMUM_BATCH_WIDTH].buffer.sameView(locations) &&
+                    split.buffers[6 + SPLASH_MAXIMUM_BATCH_WIDTH].buffer.sameView(locationPages) && split.pipelineName == locatedSplitName(layout),
                 "a located verify split does not bind its lists' locations and their pages before its parameters");
         rejects([&] { addVerify(refused, {listBuffer, counts, listStride, first, locations, {}}); },
                 "attention block locations need lists and their pages", "block locations without pages were taken");
@@ -1560,7 +1562,7 @@ int main(int argc, char **argv) {
                                                   {100, 77}, {8064, 130},
                                                   {6145, 2048}}})
         checkPrefill(backend, heads, layout, history, rows);
-      for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+      for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
         checkVerify(backend, heads, layout, 0, lanes);
         checkVerify(backend, heads, layout, 1023, lanes);
       }

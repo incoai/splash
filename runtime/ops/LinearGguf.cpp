@@ -401,6 +401,8 @@ void LinearPlan::requireConfiguration() const {
     throw std::invalid_argument("only the staged block tile spreads its walks");
   if (c.oneGateUpPass && (c.tile != LinearTile::GgufStaged || !decode || workload_.epilogue != LinearEpilogue::GateUp))
     throw std::invalid_argument("only a staged block gate/up decode runs gate and up in one pass");
+  if (c.oneGateUpPass && workload_.rows > 32)
+    throw std::invalid_argument("one-pass block gate/up supports at most 32 rows");
   if (c.sixteenRows && (c.tile != LinearTile::GgufStaged || !decode || workload_.rows != SPLASH_TARGET_VERIFY_ROWS))
     throw std::invalid_argument("only a staged one-lane block decode runs the 16-row tile");
   if (c.tile == LinearTile::GgufRegister) {
@@ -455,6 +457,20 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
 LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *const> projections,
                                   ProjectionShape shape) const {
   const auto [n, k] = w.matrix;
+  // Reuse the established four-lane policy above four lanes. The workload
+  // still owns its actual rows; only its kernel family, K partitions and
+  // gate/up walk come from the 32-row plan. This avoids an uncalibrated
+  // batch extension also changing each row's floating-point expression.
+  if (w.phase == LinearPhase::Decode && w.rows > 4 * SPLASH_TARGET_VERIFY_ROWS) {
+    LinearWorkload compatible = w;
+    compatible.rows = 4 * SPLASH_TARGET_VERIFY_ROWS;
+    LinearConfig config = ggufBaseline(compatible, projections, shape);
+    // The new 64-row paired kernel failed exact one/two-pass comparisons
+    // under shader validation. Keep wide gate/up on the existing separate
+    // kernels, retaining the established K partitions and walk.
+    config.oneGateUpPass = false;
+    return config;
+  }
   // Prefill: 128-row tiles. A chunk of up to 32 rows runs the staged tile
   // of its rows (8, 16 or 32, two simdgroups) with the decode split law:
   // the same half stage and matmul rows, so its outputs equal the prefill
@@ -474,7 +490,7 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // split law's choice (gguf-projection-benchmark prefill=33,48,64). Apple9
   // is unmeasured and keeps the prefill tile.
   if (w.phase == LinearPhase::Prefill) {
-    const bool staged = w.rows <= kMaximumDecodeTileRows ||
+    const bool staged = w.rows <= 32 ||
                         (family_ == GpuFamilyClass::Apple10 && w.rows <= kMaximumStagedPrefillRows);
     return staged ? stagedDecode(n, k, w.rows, weightBits16(projections, shape), gpuCores_, family_)
                   : LinearConfig{.tile = LinearTile::GgufPrefill};
@@ -571,7 +587,7 @@ LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerF
   const bool gateUp = w.epilogue == LinearEpilogue::GateUp;
   if (family_ == GpuFamilyClass::Apple9 || apple10Registers(w.rows, n, gpuCores_, true))
     size.include(LinearPlan(w, stagedDecode(n, k, w.rows, 0, gpuCores_, family_, gateUp)).scratchSize());
-  if (gateUp && spreadsStagedDecode(family_, gpuCores_))
+  if (gateUp && w.rows <= 32 && spreadsStagedDecode(family_, gpuCores_))
     size.include(LinearPlan(w, stagedDecode(n, k, w.rows, 0, gpuCores_, family_, true, Passes::One)).scratchSize());
   return size;
 }
@@ -672,7 +688,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
     // dispatch: a dispatch costs about 0.045 ms however narrow, and one per
     // segment of a 35B GDN layer's qkv|z|ab made its resumes 3-5% slower
     // than the prefill tile's one per format.
-    if (segments.size() > 1 && w.rows > kMaximumDecodeTileRows && w.epilogue == LinearEpilogue::None) {
+    if (segments.size() > 1 && w.rows > 32 && w.epilogue == LinearEpilogue::None) {
       fused();
       return;
     }

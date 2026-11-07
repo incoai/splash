@@ -169,7 +169,7 @@ void QwenTarget::requirePrefill(std::span<const QwenTargetPrefillChunk> chunks, 
 QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, const QwenTargetPrefillChunk &chunk,
                                                 const kv::PageStorage &kv, SpilledKvReads &spilled,
                                                 ops::AneFfn *aneFfn) const {
-  if (chunk.sequences.empty() || chunk.sequences.size() > ExecutionLimits::maximumBatchWidth || !chunk.rows ||
+  if (chunk.sequences.empty() || chunk.sequences.size() > ExecutionLimits::maximumPrefillBatchWidth || !chunk.rows ||
       chunk.rows > ExecutionLimits::prefillTokenBudget)
     throw std::invalid_argument("invalid Qwen prefill chunk");
   PrefillStep step{graph, chunk.buffers, chunk.sequences, chunk.rows, kv.layers(), spilled};
@@ -419,6 +419,13 @@ void QwenTarget::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &nor
   const ops::PreparedInput normalized =
       ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, step.rows,
                                  b.linearScratch, gateUpPlan.input());
+  const auto downPlan = linear.decodePlan(*ffn.down, step.lanes, ops::LinearEpilogue::Residual);
+  if (ops::addVerifyFfnPack(step.graph, ffn, b.normalized, residual, output, b.denseGateScratch,
+                           b.denseIntermediate, b.linearScratch, b.verifyRows, b.packedFfn,
+                           gateUpPlan, downPlan, step.lanes)) {
+    if (b.packedFfnEncodedLayers) ++*b.packedFfnEncodedLayers;
+    return;
+  }
   linear.add(step.graph,
              {.input = b.normalized, .output = b.denseIntermediate, .gateScratch = b.denseGateScratch,
               .scratch = b.linearScratch, .prepared = normalized},
@@ -426,7 +433,7 @@ void QwenTarget::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &nor
   linear.add(step.graph,
              {.input = b.denseIntermediate, .output = std::move(output), .residual = std::move(residual),
               .scratch = b.linearScratch},
-             *ffn.down, linear.decodePlan(*ffn.down, step.lanes, ops::LinearEpilogue::Residual));
+             *ffn.down, downPlan);
 }
 
 void QwenTarget::addVerifyMoe(VerifyStep &step, const ops::NormWeights &norm, const ops::BlockMoeWeights &ffn,

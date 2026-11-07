@@ -36,6 +36,28 @@ MODEL_ROOT = $(if $(MODEL),$(shell $(MODEL_INSTALL) link))
 # CI's artifact upload refuses paths holding one.
 MODEL_RESULTS = build/release/$(subst :,--,$(subst /,--,$(MODEL)))
 
+# Experimental native concurrency. Four lanes remain the default.
+NATIVE_BATCH_WIDTH ?= 4
+ifneq ($(words $(NATIVE_BATCH_WIDTH)),1)
+$(error NATIVE_BATCH_WIDTH must be exactly 4 or 8)
+endif
+ifeq ($(filter 4 8,$(NATIVE_BATCH_WIDTH)),)
+$(error NATIVE_BATCH_WIDTH must be exactly 4 or 8)
+endif
+VERIFY_FFN_PACK_MODE ?= 0
+ifneq ($(words $(VERIFY_FFN_PACK_MODE)),1)
+$(error VERIFY_FFN_PACK_MODE must be exactly 0, 1 or 2)
+endif
+ifeq ($(filter 0 1 2,$(VERIFY_FFN_PACK_MODE)),)
+$(error VERIFY_FFN_PACK_MODE must be exactly 0, 1 or 2)
+endif
+ifneq ($(VERIFY_FFN_PACK_MODE),0)
+ifneq ($(NATIVE_BATCH_WIDTH),8)
+$(error VERIFY_FFN_PACK_MODE 1/2 requires NATIVE_BATCH_WIDTH=8)
+endif
+endif
+NATIVE_BATCH_FLAG := -DSPLASH_MAXIMUM_BATCH_WIDTH=$(NATIVE_BATCH_WIDTH)u -DSPLASH_EXPERIMENTAL_FFN_PACK_MODE=$(VERIFY_FFN_PACK_MODE)
+
 BUILD := build
 TARGET := $(BUILD)/splash
 METAL_BUILD := $(BUILD)/metal
@@ -59,9 +81,9 @@ KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
 # macOS 26.2 or newer, and MPP chooses its code path by this target.
 MACOS_MIN_VERSION := 26.4
 MACOS_TARGET_FLAG := -mmacosx-version-min=$(MACOS_MIN_VERSION)
-PROD_METALFLAGS := -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
+PROD_METALFLAGS := $(NATIVE_BATCH_FLAG) -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
-ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime \
+ENGINE_CXXFLAGS := $(NATIVE_BATCH_FLAG) -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
 LIB := $(BUILD)/splash.metallib
@@ -226,6 +248,8 @@ PRODUCTION_ENGINE_INPUTS := $(sort $(shell find runtime -type f \
 	-print))
 BUILD_ID_CONSTANT_ARGS = \
 	--constant 'runtime=qwen-hybrid-dflash8' \
+	--constant 'native_batch_width=$(NATIVE_BATCH_WIDTH)' \
+	--constant 'verify_ffn_pack_mode=$(VERIFY_FFN_PACK_MODE)' \
 	--constant 'engine_cxxflags=$(ENGINE_CXXFLAGS)' \
 	--constant 'engine_objcxxflags=$(ENGINE_OBJCXXFLAGS)' \
 	--constant 'engine_linkflags=$(ENGINE_LINKFLAGS)' \
@@ -252,6 +276,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
 	runtime/ops/Linear.cpp \
+	runtime/ops/VerifyFfnPack.cpp \
 	runtime/ops/LinearGguf.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \

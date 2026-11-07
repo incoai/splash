@@ -87,9 +87,12 @@ void BlockIndexer::addPool(metal::CommandGraph &graph, const IndexerBlocks &bloc
   requireBytes(blocks.keys, uint64_t{params.lanes} * rows.rows * kKeyBytes, "indexer keys");
   const auto pending = laneBindings(blocks.pending);
   const auto tables = laneBindings(rows.index.tables);
-  graph.add("block_indexer_pool",
-            {blocks.records, blocks.keys, pending[0], pending[1], pending[2], pending[3], keyNorm.buffer,
-             std::move(inverseFrequencies), tables[0], tables[1], tables[2], tables[3]},
+  std::vector<metal::MetalBuffer> bindings{blocks.records, blocks.keys};
+  bindings.insert(bindings.end(), pending.begin(), pending.end());
+  bindings.push_back(keyNorm.buffer);
+  bindings.push_back(std::move(inverseFrequencies));
+  bindings.insert(bindings.end(), tables.begin(), tables.end());
+  graph.add("block_indexer_pool", std::move(bindings),
             params, {most, params.lanes, 1}, {BLOCK_INDEXER_DIMENSION, 1, 1});
 }
 
@@ -118,7 +121,10 @@ void BlockIndexer::addSelect(metal::CommandGraph &graph, metal::MetalBuffer quer
   for (uint32_t offset = 0; offset < rows.rows; offset += batchRows) {
     params.row_offset = offset;
     params.rows = std::min(batchRows, rows.rows - offset);
-    graph.add("block_indexer_score", {queries, tables[0], tables[1], tables[2], tables[3], scores}, params,
+    std::vector<metal::MetalBuffer> bindings{queries};
+    bindings.insert(bindings.end(), tables.begin(), tables.end());
+    bindings.push_back(scores);
+    graph.add("block_indexer_score", std::move(bindings), params,
               {(blocks + BLOCK_INDEXER_SCORE_BLOCKS - 1) / BLOCK_INDEXER_SCORE_BLOCKS,
                (params.rows + BLOCK_INDEXER_SCORE_ROWS - 1) / BLOCK_INDEXER_SCORE_ROWS, params.lanes},
               {BLOCK_INDEXER_SCORE_THREADS, 1, 1});
@@ -156,8 +162,9 @@ void BlockIndexer::addCommit(metal::CommandGraph &graph, metal::MetalBuffer keys
       .lanes = lanes, .rows = laneRows, .layer_rows = layerRows, .first_position = {}, .retained = {}};
   std::ranges::copy(firstPositions, std::begin(params.first_position));
   const auto in = laneBindings(pendingIn), out = laneBindings(pendingOut);
-  graph.add("block_indexer_commit",
-            {std::move(keys), std::move(retained), in[0], in[1], in[2], in[3], out[0], out[1], out[2], out[3]},
+  std::vector<metal::MetalBuffer> bindings{std::move(keys), std::move(retained)};
+  appendLaneBindings(bindings, in, out);
+  graph.add("block_indexer_commit", std::move(bindings),
             params, {layers, lanes, 1}, {BLOCK_INDEXER_DIMENSION, 1, 1});
 }
 
