@@ -815,8 +815,12 @@ void run(const std::string &metallib) {
          lane < model::ExecutionLimits::maximumBatchWidth;
          ++lane)
       require(!storage.metadata(lane).assigned(), "lane was assigned eagerly");
-    rejects([&] { static_cast<void>(storage.current(4)); }, "invalid Qwen lane",
-            "storage exposed more than four lanes");
+    rejects(
+        [&] {
+          static_cast<void>(storage.current(
+              model::ExecutionLimits::maximumBatchWidth));
+        },
+        "invalid Qwen lane", "storage exposed a lane beyond its capacity");
 
     require(static_cast<bool>(storage.tryActivateLane(0, 101)),
             "lane activation failed");
