@@ -783,6 +783,47 @@ def run_sequential(args, tokenizer, report, binaries):
         path.write_text(json.dumps(report, indent=2) + "\n")
 
 
+def finish_report(args, report):
+    """A completed capture is not necessarily a passing comparison."""
+    failures = []
+    if not report.get("complete") or not report.get("cases"):
+        failures.append("comparison is incomplete or has no cases")
+    if report.get("error") or report.get("cleanup_errors"):
+        failures.append("measurement or cleanup failed")
+    improved = []
+    for index, case in enumerate(report.get("cases", [])):
+        comparison = case.get("comparison", {})
+        if len(case.get("rounds", [])) != 4:
+            failures.append(f"case {index}: missing ABBA rounds")
+        if comparison.get("pass") is not True:
+            failures.append(
+                f"case {index}: primary comparison failed or is inconclusive"
+            )
+        if comparison.get("output_equal") is not True:
+            failures.append(f"case {index}: complete output messages differ")
+        for name, metric in comparison.items():
+            if (
+                isinstance(metric, dict)
+                and "verdict" in metric
+                and metric.get("pass") is not True
+            ):
+                failures.append(f"case {index}: {name} failed or is inconclusive")
+        improved.append(
+            comparison.get("pass") is True
+            and comparison.get("regression", 0)
+            <= -comparison.get("bound", float("inf"))
+        )
+    report["qualification"] = {
+        "pass": not failures,
+        "failures": failures,
+        "positive_primary_gain": not failures and all(improved),
+        "scope": "A pass is non-regression; a positive gain must also exceed the measured noise bound.",
+    }
+    report["pass"] = not failures
+    (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    return int(bool(failures))
+
+
 @keep_awake()
 def main():
     args = parse_args()
@@ -846,7 +887,7 @@ def main():
     }
     if args.residency == "sequential":
         run_sequential(args, tokenizer, report, binaries)
-        return
+        return finish_report(args, report)
     servers = []
     cleanup = contextlib.ExitStack()
     try:
@@ -947,7 +988,8 @@ def main():
             (args.output / "report.json").write_text(
                 json.dumps(report, indent=2) + "\n"
             )
+    return finish_report(args, report)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

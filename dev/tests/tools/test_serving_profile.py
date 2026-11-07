@@ -141,6 +141,69 @@ class TraceReportTests(unittest.TestCase):
 
 
 class PairedServingTests(unittest.TestCase):
+    def test_completed_reports_fail_for_noise_output_changes_and_peer_regressions(self):
+        import copy
+        import json
+        import tempfile
+        from argparse import Namespace
+        from pathlib import Path
+
+        from dev.benchmarks import abba
+
+        rounds = [
+            {"seconds_per_token": value, "responses": [{"message_sha256": "same"}]}
+            for value in (1.0, 0.9, 0.9, 1.0)
+        ]
+        report = {
+            "complete": True,
+            "cases": [
+                {"rounds": rounds, "comparison": serving_regression.summarize(rounds)}
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            args = Namespace(output=Path(directory))
+            self.assertEqual(serving_regression.finish_report(args, report), 0)
+            self.assertTrue(report["qualification"]["positive_primary_gain"])
+            mutations = [copy.deepcopy(report) for _ in range(4)]
+            mutations[0]["cases"][0]["comparison"].update(abba.compare(1, 0.9, 1.1, 1))
+            mutations[1]["cases"][0]["comparison"]["output_equal"] = False
+            mutations[2]["cases"][0]["comparison"]["short_ttft_ms"] = abba.compare(
+                1, 1.1, 1.1, 1
+            )
+            mutations[3]["cleanup_errors"] = ["server did not stop"]
+            for changed in mutations:
+                with self.subTest(report=changed):
+                    self.assertEqual(serving_regression.finish_report(args, changed), 1)
+                    saved = json.loads((args.output / "report.json").read_text())
+                    self.assertFalse(saved["pass"])
+                    self.assertFalse(saved["qualification"]["positive_primary_gain"])
+                    self.assertTrue(saved["qualification"]["failures"])
+                    self.assertEqual(saved["cases"][0]["rounds"], rounds)
+
+    def test_nonregression_is_not_a_gain_and_incomplete_reports_fail(self):
+        import tempfile
+        from argparse import Namespace
+        from pathlib import Path
+
+        rounds = [
+            {"seconds_per_token": 1.0, "responses": [{"message_sha256": "same"}]}
+            for _ in range(4)
+        ]
+        report = {
+            "complete": True,
+            "cases": [
+                {"rounds": rounds, "comparison": serving_regression.summarize(rounds)}
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            args = Namespace(output=Path(directory))
+            self.assertEqual(serving_regression.finish_report(args, report), 0)
+            self.assertFalse(report["qualification"]["positive_primary_gain"])
+            report["complete"] = False
+            self.assertEqual(serving_regression.finish_report(args, report), 1)
+            report.update(complete=True, cases=[])
+            self.assertEqual(serving_regression.finish_report(args, report), 1)
+
     def test_trace_option_refuses_a_binary_that_would_ignore_the_trace_environment(
         self,
     ):

@@ -49,6 +49,16 @@ sampling equivalence. A `pass` under ABBA means no detected regression, not a
 qualified gain. Promotion requires gain above `max(2%,2*noise)` and the agreed
 latency/correctness gates; spread >5% is inconclusive.
 
+The CLI exits zero only when the complete report passes every primary and
+reported latency-control comparison, all four rounds have equal output
+messages, and cleanup succeeds. Incomplete, noisy, regressed or mismatched
+comparisons exit nonzero and retain the raw report. `qualification.pass`
+means non-regression; `positive_primary_gain` separately requires an effect
+above the measured noise bound. Equal hashes establish equality for these
+requests, not universal numerical or sampling equivalence. Use the current
+`dev/benchmarks/serving/run.py` and `check.py` release gate for product rollout
+qualification and its quiet-machine checks (`docs/validate.md`).
+
 The benchmark temporarily prevents sleep on macOS, releases its assertion on
 failure too, and compares elapsed UTC against the awake monotonic clock. A
 discrepancy >=1 second rejects the run. Stable ABBA costs alone do not prove
