@@ -381,8 +381,8 @@ void invalidInputs() {
   VerifyBudget::Lane lane;
   lane.verifyRows = 8;
   rejects([&] { budget.observe({}, false, 1.0); }, "invalid verify budget cycle", "an empty cycle was observed");
-  const std::vector<VerifyBudget::Lane> five(5, lane);
-  rejects([&] { budget.observe(five, false, 1.0); }, "invalid verify budget cycle", "five lanes were observed");
+  const std::vector<VerifyBudget::Lane> tooMany(VerifyBudget::kLanes + 1, lane);
+  rejects([&] { budget.observe(tooMany, false, 1.0); }, "invalid verify budget cycle", "more than the supported lanes were observed");
   for (const auto &[rows, accepted] : {std::pair{0U, 0U}, std::pair{9U, 0U}, std::pair{8U, 8U}}) {
     VerifyBudget::Lane bad = lane;
     bad.verifyRows = rows;
@@ -390,7 +390,7 @@ void invalidInputs() {
     rejects([&] { budget.observe(std::array{bad}, false, 1.0); }, "invalid verify budget lane",
             "an impossible lane was observed");
   }
-  for (const uint32_t lanes : {0U, 5U}) {
+  for (const uint32_t lanes : {0U, VerifyBudget::kLanes + 1}) {
     rejects([&] { static_cast<void>(budget.costs(lanes, false)); }, "invalid verify budget lane count",
             "costs of an impossible lane count were given");
     rejects([&] { static_cast<void>(budget.explores(lanes, false)); }, "invalid verify budget lane count",

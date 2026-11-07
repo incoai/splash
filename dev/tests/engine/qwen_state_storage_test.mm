@@ -114,10 +114,11 @@ void testLayoutFormulas() {
           "context window formula is wrong");
   require(kStateLayout.laneBytes() == 356'122'624,
           "per-lane byte formula is wrong");
-  require(uint64_t{model::ExecutionLimits::maximumBatchWidth} *
-                  kStateLayout.laneBytes() ==
-              1'424'490'496,
-          "four-lane byte formula is wrong");
+  constexpr uint64_t expectedLaneBytes = model::ExecutionLimits::maximumBatchWidth == 8
+                                             ? 2'848'980'992
+                                             : 1'424'490'496;
+  require(uint64_t{model::ExecutionLimits::maximumBatchWidth} * kStateLayout.laneBytes() == expectedLaneBytes,
+          "enabled lane byte formula is wrong");
   require(kStateLayout.cachedBytes() == 160'038'912,
           "prefix byte formula is wrong");
   // A bf16 recurrent state takes half the bytes; the convolution rows keep
@@ -814,8 +815,12 @@ void run(const std::string &metallib) {
          lane < model::ExecutionLimits::maximumBatchWidth;
          ++lane)
       require(!storage.metadata(lane).assigned(), "lane was assigned eagerly");
-    rejects([&] { static_cast<void>(storage.current(4)); }, "invalid Qwen lane",
-            "storage exposed more than four lanes");
+    rejects(
+        [&] {
+          static_cast<void>(storage.current(
+              model::ExecutionLimits::maximumBatchWidth));
+        },
+        "invalid Qwen lane", "storage exposed a lane beyond its capacity");
 
     require(static_cast<bool>(storage.tryActivateLane(0, 101)),
             "lane activation failed");

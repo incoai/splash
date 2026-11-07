@@ -573,14 +573,12 @@ void testWarmupStepsReportMeasurementTruth() {
 
   struct OptionalStep {
     WarmupStepStatus *state;
-    const char *name;
+    std::string name;
   };
-  const OptionalStep optional[] = {
-      {&warmup.decodeBatches[1], "decode_b2"},
-      {&warmup.decodeBatches[2], "decode_b3"},
-      {&warmup.decodeBatches[3], "decode_b4"},
-      {&warmup.compositeStateRestore, "composite_state_restore"},
-  };
+  std::vector<OptionalStep> optional;
+  for (uint32_t lane = 1; lane < warmup.decodeBatches.size(); ++lane)
+    optional.push_back({&warmup.decodeBatches[lane], "decode_b" + std::to_string(lane + 1)});
+  optional.push_back({&warmup.compositeStateRestore, "composite_state_restore"});
   for (const auto &step : optional) {
     const std::string key = std::string("\"") + step.name + "\":";
     *step.state = WarmupStepStatus::Pending;
@@ -603,9 +601,14 @@ void testWarmupStepsReportMeasurementTruth() {
   for (const auto &step : optional)
     *step.state = WarmupStepStatus::MemoryLimited;
   const std::string limited = status();
-  require(limited.find("\"memory_limited_steps\":[\"decode_b2\",\"decode_b3\","
-                       "\"decode_b4\",\"composite_state_restore\"]") !=
-                  std::string::npos &&
+  std::string expected = "\"memory_limited_steps\":[";
+  for (const auto &step : optional) {
+    if (expected.back() != '[')
+      expected += ',';
+    expected += "\"" + step.name + "\"";
+  }
+  expected += ']';
+  require(limited.find(expected) != std::string::npos &&
               limited.find("\"decode_b1\":true") != std::string::npos,
           "single-lane status omitted or mislabeled memory-limited steps");
 }

@@ -337,10 +337,8 @@ template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
           uint PackedWidth, uint RowsInFlight, class Table, class W, class State>
 inline void gdn_decode_batch_phase(
     device const bfloat *packed, device const bfloat *conv_weights,
-    device const uchar *current0, device const uchar *current1,
-    device const uchar *current2, device const uchar *current3,
-    device uchar *next0, device uchar *next1, device uchar *next2,
-    device uchar *next3, device uchar *tape, device const float *a_scale,
+    SPLASH_LANE_PARAMETERS(device const uchar *, current),
+    SPLASH_LANE_PARAMETERS(device uchar *, next), device uchar *tape, device const float *a_scale,
     device const bfloat *dt_bias,
     device const W *gdn_norm_weight, device bfloat *gdn_hidden,
     constant GDNDecodeBatchParams &params,
@@ -350,8 +348,8 @@ inline void gdn_decode_batch_phase(
   constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint ValueWidth = ValueHeads * HeadDim;
   uint batch = group.y;
-  device const uchar *current = SPLASH_LANE_BINDING(batch, current0, current1, current2, current3);
-  device uchar *next = SPLASH_LANE_BINDING(batch, next0, next1, next2, next3);
+  device const uchar *current = SPLASH_LANE_BINDING(batch, current0, current1, current2, current3, current4, current5, current6, current7);
+  device uchar *next = SPLASH_LANE_BINDING(batch, next0, next1, next2, next3, next4, next5, next6, next7);
   packed += ulong(batch) * Rows * PackedWidth;
   device const bfloat *conv_state_in =
       reinterpret_cast<device const bfloat *>(
@@ -405,34 +403,31 @@ inline void gdn_decode_batch_phase(
 #define GDN_DECODE_BUFFERS(W) \
     device const bfloat *packed [[buffer(0)]], \
     device const bfloat *conv_weights [[buffer(1)]], \
-    device const uchar *current0 [[buffer(2)]], device const uchar *current1 [[buffer(3)]], \
-    device const uchar *current2 [[buffer(4)]], device const uchar *current3 [[buffer(5)]], \
-    device uchar *next0 [[buffer(6)]], device uchar *next1 [[buffer(7)]], \
-    device uchar *next2 [[buffer(8)]], device uchar *next3 [[buffer(9)]], \
-    device uchar *tape [[buffer(10)]], device const float *a_scale [[buffer(11)]], \
-    device const bfloat *dt_bias [[buffer(12)]], device const W *gdn_norm_weight [[buffer(13)]], \
-    device bfloat *gdn_hidden [[buffer(14)]]
+    SPLASH_LANE_BUFFERS(device const uchar *, current, 2), \
+    SPLASH_LANE_BUFFERS(device uchar *, next, 2 + 1 * SPLASH_MAXIMUM_BATCH_WIDTH), \
+    device uchar *tape [[buffer(2 + 2 * SPLASH_MAXIMUM_BATCH_WIDTH)]], device const float *a_scale [[buffer(3 + 2 * SPLASH_MAXIMUM_BATCH_WIDTH)]], \
+    device const bfloat *dt_bias [[buffer(4 + 2 * SPLASH_MAXIMUM_BATCH_WIDTH)]], device const W *gdn_norm_weight [[buffer(5 + 2 * SPLASH_MAXIMUM_BATCH_WIDTH)]], \
+    device bfloat *gdn_hidden [[buffer(6 + 2 * SPLASH_MAXIMUM_BATCH_WIDTH)]]
 #define GDN_DECODE_THREADS \
     uint2 group [[threadgroup_position_in_grid]], \
     uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
 #define GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout, W, State) \
     threadgroup GdnDecodeShared<HeadDim> shared; \
     gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, 2, Layout, W, State>( \
-        packed, conv_weights, current0, current1, current2, current3, next0, \
-        next1, next2, next3, tape, a_scale, dt_bias, \
+        packed, conv_weights, SPLASH_LANE_ARGUMENTS(current), SPLASH_LANE_ARGUMENTS(next), tape, a_scale, dt_bias, \
         gdn_norm_weight, gdn_hidden, params, group, lane, simd_group, shared, \
         table, sums);
 // Entries without a table pass null pointers, which skip the write; their Layout only completes the template.
 #define GDN_DECODE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W, State) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
-      constant GDNDecodeBatchParams &params [[buffer(15)]], GDN_DECODE_THREADS) { \
+      constant GDNDecodeBatchParams &params [[buffer(7 + 2 * SPLASH_MAXIMUM_BATCH_WIDTH)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, nullptr, nullptr, gguf_sg::Table16, W, State) \
   }
 // The out-projection's table (Layout: gguf_sg::Table16).
 #define GDN_DECODE_TABLE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W, State) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
-      device bfloat *table [[buffer(15)]], device float *sums [[buffer(16)]], \
-      constant GDNDecodeBatchParams &params [[buffer(17)]], GDN_DECODE_THREADS) { \
+      device bfloat *table [[buffer(7 + 2 * SPLASH_MAXIMUM_BATCH_WIDTH)]], device float *sums [[buffer(8 + 2 * SPLASH_MAXIMUM_BATCH_WIDTH)]], \
+      constant GDNDecodeBatchParams &params [[buffer(9 + 2 * SPLASH_MAXIMUM_BATCH_WIDTH)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout, W, State) \
   }
 // Each entry over an fp32 state and, as Name_bf16_state, a bf16 one.

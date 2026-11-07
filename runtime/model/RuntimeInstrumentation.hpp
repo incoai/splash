@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/abi/KvExtent.h"
+#include "metal/abi/VerifyFfnPack.h"
 #include "model/Runtime.hpp"
 
 #include <cstddef>
@@ -16,6 +17,16 @@ namespace splash::model {
 // these; production binaries never link it.
 class RuntimeInstrumentation final {
 public:
+  // Test-only permission to exercise the selected-prefix path on identical forced histories.
+  // This is never defined or called by a production Runtime.
+  static void allowPackedFfnTeacherForcing(Runtime &runtime, bool enabled);
+  struct PackedFfnObservation final {
+    bool eligible = false;
+    uint32_t encodedLayers = 0;
+    VerifyPackControl control{};
+    uint32_t bodyEncodedProjections = 0;
+  };
+  [[nodiscard]] static PackedFfnObservation lastPackedFfn(const Runtime &runtime);
   // The PLE rows the last decode step gathered for batch lane `lane`'s
   // verify rows, each row's heads' in order (Qwen3.8-Flash-Next), until the
   // next decode step; none for a target without them.

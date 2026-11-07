@@ -21,7 +21,7 @@ constexpr double kNoticeMilliseconds = 60'000.0;
 // A cycle's cost at 1, 2, 4 and 8 rows a lane, for one to four lanes (every
 // row costs 1): the mean shape of Qwen3.8-Flash-Next's cycles (resident and
 // with 12 GB of experts) and Qwen3.6-35B-A3B's (resident and with 4 GB).
-constexpr std::array<std::array<double, 4>, VerifyBudget::kLanes> kSeed{{
+constexpr std::array<std::array<double, 4>, 4> kSeed{{
     {0.60, 0.69, 0.85, 1.0},
     {0.50, 0.58, 0.74, 1.0},
     {0.45, 0.52, 0.70, 1.0},
@@ -91,7 +91,10 @@ double VerifyBudget::seed(uint32_t lanes, uint32_t rows) {
     throw std::invalid_argument("invalid verify budget rows");
   const double perLane = double(rows) / lanes;
   const std::array<double, 4> knots{1.0, 2.0, 4.0, 8.0};
-  const std::array<double, 4> &shape = kSeed[lanes - 1];
+  // Larger compiled ceilings retain a positive normalized utility prior.
+  // Runtime verifies every row and skips fitting above four lanes; this is
+  // a conservative copy of the last seed, not a new calibration.
+  const std::array<double, 4> &shape = kSeed[std::min(lanes, uint32_t(kSeed.size())) - 1];
   uint32_t upper = 1;
   while (upper < 3 && perLane > knots[upper])
     ++upper;

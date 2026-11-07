@@ -4,8 +4,7 @@
 template <uint KVHeads, uint HeadDim, typename CacheElement, bool ValuesTokenMajor>
 inline void splash_store_verify_phase(
     device const bfloat *chunk_keys, device const bfloat *chunk_values,
-    device const SplashKvPage *page_table0, device const SplashKvPage *page_table1,
-    device const SplashKvPage *page_table2, device const SplashKvPage *page_table3,
+    SPLASH_LANE_PARAMETERS(device const SplashKvPage *, page_table),
     constant SplashChunkedPrefillParams *params,
     threadgroup float *maxima, uint group, uint thread_index, uint simd_lane,
     uint simd_group) {
@@ -20,7 +19,7 @@ inline void splash_store_verify_phase(
       thread_index >= HeadDim)
     return;
   device const SplashKvPage *page_table =
-      SPLASH_LANE_BINDING(batch, page_table0, page_table1, page_table2, page_table3);
+      SPLASH_LANE_BINDING(batch, page_table0, page_table1, page_table2, page_table3, page_table4, page_table5, page_table6, page_table7);
   constexpr ulong lane_tensor_stride =
       ulong(KVHeads) * SPLASH_VERIFY_CHUNK_STRIDE * HeadDim;
   chunk_keys += batch * lane_tensor_stride;
@@ -40,19 +39,15 @@ inline void splash_store_verify_phase(
   kernel void Name(                                                            \
       device const bfloat *chunk_keys [[buffer(0)]],                           \
       device const bfloat *chunk_values [[buffer(1)]],                         \
-      device const SplashKvPage *page_table0 [[buffer(2)]],                    \
-      device const SplashKvPage *page_table1 [[buffer(3)]],                    \
-      device const SplashKvPage *page_table2 [[buffer(4)]],                    \
-      device const SplashKvPage *page_table3 [[buffer(5)]],                    \
-      constant SplashChunkedPrefillParams *params [[buffer(6)]],               \
+      SPLASH_LANE_BUFFERS(device const SplashKvPage *, page_table, 2),                    \
+      constant SplashChunkedPrefillParams *params [[buffer(2 + 1 * SPLASH_MAXIMUM_BATCH_WIDTH)]],               \
       uint group [[threadgroup_position_in_grid]],                             \
       uint thread_index [[thread_index_in_threadgroup]],                       \
       uint simd_lane [[thread_index_in_simdgroup]],                            \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
     SPLASH_STORE_MAXIMA_##CacheElement(HeadDim)                                \
     splash_store_verify_phase<Heads, HeadDim, CacheElement, ValuesTokenMajor>( \
-        chunk_keys, chunk_values, page_table0, page_table1, page_table2,       \
-        page_table3, params, maxima, group, thread_index, simd_lane,           \
+        chunk_keys, chunk_values, SPLASH_LANE_ARGUMENTS(page_table), params, maxima, group, thread_index, simd_lane,           \
         simd_group);                                                           \
   }
 PAGED_VERIFY_STORE(verify_attention_q8_store, 4, 256, int8_t, false)

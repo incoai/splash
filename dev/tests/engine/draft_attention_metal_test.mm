@@ -42,7 +42,7 @@ constexpr uint32_t kKvHeads = 8;
 constexpr uint32_t kQueryHeadsPerKv = 4;
 constexpr uint32_t kHeadDim = 128;
 constexpr uint32_t kWindow = 2048;
-constexpr uint32_t kLanes = 4;
+constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 // The shipped split count and the fp32 partial one split leaves per (lane,
 // head) behind the grouped queries: 32 rows x (128 + max + sum).
 constexpr uint32_t kSplits = SPLASH_DRAFT_ATTENTION_SPLITS;
@@ -264,7 +264,7 @@ void planGeometry() {
     }
     rejects([&] { (void)DraftAttention::plan(shape, 0); }, "invalid draft batch width",
             "a draft plan of no lanes was accepted");
-    rejects([&] { (void)DraftAttention::plan(shape, 5); }, "invalid draft batch width",
+    rejects([&] { (void)DraftAttention::plan(shape, kLanes + 1); }, "invalid draft batch width",
             "a draft plan wider than a batch was accepted");
   }
   auto unsupported = kShapes[0];
@@ -880,6 +880,9 @@ int main(int argc, char **argv) {
       runCase(backend, 4, shape, {512, 513, 1024, 1536});
       runCase(backend, 4, shape, {2046, 2049, 4095, 4096});
       runCase(backend, 2, shape, {8191, 262144, 0, 0});
+      std::array<uint32_t, kLanes> expanded{};
+      for (uint32_t i = 0; i < kLanes; ++i) expanded[i] = std::array<uint32_t, 8>{0, 31, 500, 2047, 2048, 4095, 6143, 262137}[i];
+      for (uint32_t lanes = 5; lanes <= kLanes; ++lanes) runCase(backend, lanes, shape, expanded);
     }
     std::cout << "draft_attention_metal_test: PASS\n";
     return 0;

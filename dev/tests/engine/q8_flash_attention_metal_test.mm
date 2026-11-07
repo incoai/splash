@@ -540,7 +540,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   // With QSA masks every lane attends through a copy of the case's list,
   // lane l's list kQsaJunkLists + l.
   const BlockLists blocks = data.maskWords ? qsaBlockLists(device, data, width) : BlockLists{partials, partials, 0};
-  std::array<VerifyAttentionParams, 4> params{};
+  std::array<VerifyAttentionParams, SPLASH_MAXIMUM_BATCH_WIDTH> params{};
   for (uint32_t lane = 0; lane < params.size(); ++lane)
     params[lane] = {data.params.committed_tokens, data.params.page_table_entries, data.params.kv, splits, splits,
                     blocks.stride, blocks.stride ? kQsaJunkLists + lane : 0};
@@ -550,11 +550,11 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBuffer:queries offset:0 atIndex:0];
   [encoder setBuffer:partials offset:0 atIndex:1];
   [encoder setBuffer:statistics offset:0 atIndex:2];
-  for (uint32_t index = 3; index < 7; ++index)
+  for (uint32_t index = 3; index < 3 + SPLASH_MAXIMUM_BATCH_WIDTH; ++index)
     [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:index];
   // A sparse split binds the lists and their counts, or without lists
   // another buffer of the dispatch, of which it reads nothing.
-  NSUInteger paramsIndex = 7;
+  NSUInteger paramsIndex = 3 + SPLASH_MAXIMUM_BATCH_WIDTH;
   if (shape.sparse()) {
     [encoder setBuffer:blocks.lists offset:0 atIndex:paramsIndex++];
     [encoder setBuffer:blocks.counts offset:0 atIndex:paramsIndex++];
@@ -794,7 +794,7 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
              uint32_t committed, uint32_t activeRows, uint32_t width,
              bool qualityGate = true, uint32_t splits = kVerifySplits,
              bool qsa = false) {
-  require(width >= 1 && width <= 4 &&
+  require(width >= 1 && width <= SPLASH_MAXIMUM_BATCH_WIDTH &&
               (activeRows == kRows ||
                (width == 1 && splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS)),
           "invalid attention case");
@@ -950,7 +950,7 @@ void run(const char *libraryPath) {
         checkReduce(device, queue, library, shape, splits, 1);
     }
     const Pipelines pipelines = makePipelines(device, library, shape);
-    for (uint32_t width = 1; width <= 4; ++width)
+    for (uint32_t width = 1; width <= SPLASH_MAXIMUM_BATCH_WIDTH; ++width)
       runCase(device, queue, pipelines, shape, 127, 8, width);
     runCase(device, queue, pipelines, shape, 0, 8, 4);
     for (uint32_t activeRows = 1; activeRows < kRows; ++activeRows)

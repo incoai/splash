@@ -144,7 +144,7 @@ ops::PrefillAttentionPlan prefillAttentionPlan(const ops::ExecutionPlans &plans,
 QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, const QwenTargetPrefillChunk &chunk,
                                                 const kv::PageStorage &kv, SpilledKvReads &spilled,
                                                 ops::AneFfn *aneFfn) const {
-  if (chunk.sequences.empty() || chunk.sequences.size() > ExecutionLimits::maximumBatchWidth || !chunk.rows ||
+  if (chunk.sequences.empty() || chunk.sequences.size() > ExecutionLimits::maximumPrefillBatchWidth || !chunk.rows ||
       chunk.rows > ExecutionLimits::prefillTokenBudget)
     throw std::invalid_argument("invalid Qwen prefill chunk");
   PrefillStep step{graph, chunk.buffers, chunk.sequences, chunk.rows, kv.layers(), spilled};
@@ -305,14 +305,28 @@ void QwenTarget::addDecodeProjection(metal::CommandGraph &graph, metal::MetalBuf
              projection, linear.decodePlan(projection, lanes));
 }
 
+void QwenTarget::addVerifyBodyProjection(VerifyStep &step, metal::MetalBuffer input,
+    const ops::Projection &projection, metal::MetalBuffer output, metal::MetalBuffer residual,
+    ops::PreparedInput prepared, const ops::LinearPlan *existingPlan) const {
+  const auto &b=step.buffers;const auto &linear=operators_.linear();
+  const auto plan=existingPlan?*existingPlan:linear.decodePlan(projection,step.lanes,
+      residual?ops::LinearEpilogue::Residual:ops::LinearEpilogue::None);
+  if(ops::addVerifyBodyPack(linear,step.graph,projection,plan,input,residual,output,
+      b.linearScratch,b.verifyRows,b.packedBody,step.lanes)) {
+    if(b.packedBodyEncodedProjections) ++*b.packedBodyEncodedProjections;
+    return;
+  }
+  linear.add(step.graph,{.input=std::move(input),.output=std::move(output),.residual=std::move(residual),
+      .scratch=b.linearScratch,.prepared=std::move(prepared)},projection,plan);
+}
+
 // Each producer emits the table (if any) its consumer's plan reads.
 void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, ops::PreparedInput normalized,
                                 BlockOutput output) const {
   const QwenTargetVerifyBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.gdnLayer++;
-  addDecodeProjection(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, step.lanes, b.linearScratch,
-                      std::move(normalized));
+  addVerifyBodyProjection(step, b.normalized, mixer.inputProjection, b.gdnPacked, {}, std::move(normalized));
   const ops::LinearPlan outputPlan = linear.decodePlan(
       mixer.outputProjection, step.lanes, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
   const ops::PreparedInput hidden = ops::GDN::addDecode(
@@ -322,10 +336,8 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, o
        b.linearScratch},
       geometry_.gdnShape(), step.lanes, layer, geometry_.stateLayout.strides(),
       mixer.outputHeadOrder, outputPlan.input());
-  linear.add(step.graph,
-             {.input = b.gdnHidden, .output = std::move(output.rows), .residual = std::move(output.residual),
-              .scratch = b.linearScratch, .prepared = hidden},
-             mixer.outputProjection, outputPlan);
+  addVerifyBodyProjection(step, b.gdnHidden, mixer.outputProjection, std::move(output.rows),
+      std::move(output.residual), hidden, &outputPlan);
 }
 
 // With `blocks`, each lane's rows attend through its list (ops::AttentionBlocks),
@@ -338,8 +350,7 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
   const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.attentionLayer++;
   const ops::AttentionVariant variant = geometry_.attentionVariant(layer);
-  addDecodeProjection(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.lanes, b.linearScratch,
-                      std::move(normalized));
+  addVerifyBodyProjection(step, b.normalized, mixer.inputProjection, b.fullPacked, {}, std::move(normalized));
   ops::PagedAttention::addVerifyProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos,
                                            b.ropeSin, b.fullQueries, b.chunkKeys[layer], b.chunkValues[layer],
                                            geometry_.attentionQueryHeads, geometry_.kvLayout, step.lanes, variant);
@@ -358,10 +369,8 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
   const ops::PreparedInput hidden = ops::PagedAttention::addVerifyGate(
       step.graph, b.fullPacked, b.fullAttention, b.attentionHidden, geometry_.attentionQueryHeads,
       geometry_.kvLayout, step.lanes, b.linearScratch, outputPlan.input());
-  linear.add(step.graph,
-             {.input = b.attentionHidden, .output = std::move(output.rows), .residual = std::move(output.residual),
-              .scratch = b.linearScratch, .prepared = hidden},
-             mixer.outputProjection, outputPlan);
+  addVerifyBodyProjection(step, b.attentionHidden, mixer.outputProjection, std::move(output.rows),
+      std::move(output.residual), hidden, &outputPlan);
 }
 
 void QwenTarget::addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops::NormWeights &norm,
@@ -394,6 +403,13 @@ void QwenTarget::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &nor
   const ops::PreparedInput normalized =
       ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, step.rows,
                                  b.linearScratch, gateUpPlan.input());
+  const auto downPlan = linear.decodePlan(*ffn.down, step.lanes, ops::LinearEpilogue::Residual);
+  if (ops::addVerifyFfnPack(step.graph, ffn, b.normalized, residual, output, b.denseGateScratch,
+                           b.denseIntermediate, b.linearScratch, b.verifyRows, b.packedFfn,
+                           gateUpPlan, downPlan, step.lanes)) {
+    if (b.packedFfnEncodedLayers) ++*b.packedFfnEncodedLayers;
+    return;
+  }
   linear.add(step.graph,
              {.input = b.normalized, .output = b.denseIntermediate, .gateScratch = b.denseGateScratch,
               .scratch = b.linearScratch, .prepared = normalized},
@@ -401,7 +417,7 @@ void QwenTarget::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &nor
   linear.add(step.graph,
              {.input = b.denseIntermediate, .output = std::move(output), .residual = std::move(residual),
               .scratch = b.linearScratch},
-             *ffn.down, linear.decodePlan(*ffn.down, step.lanes, ops::LinearEpilogue::Residual));
+             *ffn.down, downPlan);
 }
 
 void QwenTarget::addVerifyMoe(VerifyStep &step, const ops::NormWeights &norm, const ops::BlockMoeWeights &ffn,
@@ -456,6 +472,41 @@ public:
                 metal::MetalBackend &backend, const ops::ExecutionPlans &operators)
       : QwenTarget(weights, geometry, backend, operators), weights_(weights) {
     requireLayers(std::span<const Layer>(weights.layers));
+    const auto &linear = operators_.linear();
+    for (uint32_t lanes = 5; lanes <= ExecutionLimits::maximumBatchWidth; ++lanes) {
+      bool supported = !weights.layers.empty();
+      for (const Layer &layer : weights.layers) {
+        const auto dense = denseFfn(layer);
+        if (!dense || !ops::supportsVerifyFfnPack(
+                          *dense, linear.decodePlan(*dense->up, lanes, ops::LinearEpilogue::GateUp),
+                          linear.decodePlan(*dense->down, lanes, ops::LinearEpilogue::Residual), lanes)) {
+          supported = false;
+          break;
+        }
+      }
+      packedFfnSupported_[lanes - 1] = supported;
+#if SPLASH_EXPERIMENTAL_VERIFY_BODY
+      packedBodySupported_[lanes - 1] =
+          supported && std::ranges::all_of(weights.layers, [&](const Layer &layer) {
+            return std::visit(
+                [&](const auto &mixer) {
+                  const auto in = linear.decodePlan(mixer.inputProjection, lanes);
+                  const auto out =
+                      linear.decodePlan(mixer.outputProjection, lanes, ops::LinearEpilogue::Residual);
+                  return ops::supportsVerifyBodyPack(mixer.inputProjection, in, false, lanes) &&
+                         ops::supportsVerifyBodyPack(mixer.outputProjection, out, true, lanes);
+                },
+                layer.mixer);
+          });
+#endif
+    }
+  }
+
+  bool supportsPackedFfn(uint32_t lanes) const noexcept override {
+    return lanes && lanes <= packedFfnSupported_.size() && packedFfnSupported_[lanes - 1];
+  }
+  bool supportsPackedBody(uint32_t lanes) const noexcept override {
+    return lanes && lanes <= packedBodySupported_.size() && packedBodySupported_[lanes - 1];
   }
 
   std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph, std::span<const QwenTargetPrefillChunk> chunks,
@@ -550,6 +601,8 @@ private:
       addVerifyMoe(step, layer.postAttentionNorm, *qwenMoeBlock(layer), std::move(residual), std::move(output));
   }
 
+  std::array<bool, ExecutionLimits::maximumBatchWidth> packedFfnSupported_{};
+  std::array<bool, ExecutionLimits::maximumBatchWidth> packedBodySupported_{};
   const QwenTargetWeights<Layout, Layer> &weights_;
 };
 

@@ -85,7 +85,8 @@ void requireKeeps(const Command &command, std::string_view message,
 }
 
 void testCommandsWithinTheLimitsBreakNoRule() {
-  requireKeeps(command(WorkKind::Decode, {0, 0, 0, 0}), "a decode of four lanes broke a rule");
+  requireKeeps(command(WorkKind::Decode, std::vector<uint32_t>(model::ExecutionLimits::maximumBatchWidth, 0)),
+               "a decode at capacity broke a rule");
   requireKeeps(prefill({500, 500, 500, 548}), "four lanes within a chunk broke a rule");
   requireKeeps(prefill({1000, 4 * kChunk - 1000}, 1),
                "a command's rows with one lane past a chunk and one streaming broke a rule");
@@ -93,7 +94,9 @@ void testCommandsWithinTheLimitsBreakNoRule() {
 }
 
 void testAWideCommandBreaksTheWidth() {
-  requireBreaks(command(WorkKind::Decode, {0, 0, 0, 0, 0}), "batch width", "a decode of five lanes broke no rule");
+  requireBreaks(
+      command(WorkKind::Decode, std::vector<uint32_t>(model::ExecutionLimits::maximumBatchWidth + 1, 0)),
+      "batch width", "a decode over capacity broke no rule");
   requireBreaks(prefill({1, 1, 1, 1, 1}), "batch width", "a prefill of five lanes broke no rule");
 }
 

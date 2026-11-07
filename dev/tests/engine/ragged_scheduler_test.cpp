@@ -36,7 +36,7 @@ constexpr uint32_t kChunk = model::ExecutionLimits::prefillTokenBudget;
 constexpr uint32_t kPageTokens = SPLASH_TARGET_KV_BLOCK_TOKENS;
 // The prefill commands in a row that may serve later arrivals of a request's
 // priority and not it before it is overdue (Scheduler.cpp).
-constexpr uint32_t kOvertakes = model::ExecutionLimits::maximumBatchWidth - 1;
+constexpr uint32_t kOvertakes = model::ExecutionLimits::maximumPrefillBatchWidth - 1;
 constexpr double kGap = 500.0;
 
 model::CommandLimits limits(uint32_t commandRows = kChunk, uint32_t passes = 1, uint32_t indexPageLanes = 1,
@@ -298,13 +298,16 @@ void testRejectedCommitCountsNothing() {
 
 void testDecodeLanesRotate() {
   DenseSim sim;
-  for (uint64_t id = 1; id <= 6; ++id)
+  const uint32_t capacity = model::ExecutionLimits::maximumBatchWidth;
+  for (uint64_t id = 1; id <= capacity + 2; ++id)
     sim.decoder(id);
   const BatchPlan first = sim.plan();
-  require(first.kind == WorkKind::Decode && first.width() == 4, "the first decode did not use the real B4 graph");
+  require(first.kind == WorkKind::Decode && first.width() == capacity,
+          "the first decode did not fill its capacity");
   sim.run(first);
   const BatchPlan second = sim.plan();
-  require(second.width() == 4 && second.items[0].requestId == 5 && second.items[1].requestId == 6,
+  require(second.width() == capacity && second.items[0].requestId == capacity + 1 &&
+              second.items[1].requestId == capacity + 2,
           "decode did not prioritize lanes omitted by the previous batch");
 }
 

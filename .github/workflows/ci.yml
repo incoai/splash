@@ -48,6 +48,27 @@ jobs:
       - name: Test the desktop app
         run: make check-app
 
+  wide-native-cpu:
+    name: Eight-request CPU runtime and native builds
+    runs-on: blacksmith-6vcpu-macos-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Homebrew/actions/setup-homebrew@d482da0e602890d3160aade42e72c8556103bf04
+      - name: Install the Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+      - name: Install Python 3.13
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install python@3.13
+      - name: Check eight-request planning, scheduling, warmup and status
+        run: |
+          options=(NATIVE_BATCH_WIDTH=8 VERIFY_FFN_PACK_MODE=2)
+          # The mixer extension has its own build contract when present.
+          if test -f runtime/ops/VerifyBodyPack.hpp; then
+            options+=(VERIFY_BODY_PACK_MODE=1)
+          fi
+          make check-source check-native-cpu check-native-build "${options[@]}" \
+            PYTHON_CANDIDATES="$(brew --prefix python@3.13)/bin/python3.13"
+
   sanitizers:
     name: Native sanitizers
     runs-on: blacksmith-6vcpu-macos-27

@@ -110,7 +110,7 @@ splash::model::ImagePlan fileImage(const std::filesystem::path &path, std::strin
 
 void testStartupCapabilities() {
     using splash::model::ExecutionLimits;
-    require(ExecutionLimits::maximumBatchWidth == 4 &&
+    require(ExecutionLimits::maximumBatchWidth == SPLASH_MAXIMUM_BATCH_WIDTH &&
                 ExecutionLimits::prefillTokenBudget == 2048 &&
                 ExecutionLimits::draftQueryRows == 8 &&
                 ExecutionLimits::draftProposalTokens == 7 &&

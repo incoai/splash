@@ -1,12 +1,14 @@
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
+#include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Gguf.h"
+#include "metal/abi/QuantFormat.h"
 #include "ops/GDN.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
-#include "metal/abi/ExecutionGeometry.h"
-#include "metal/abi/Gguf.h"
-#include "metal/abi/QuantFormat.h"
+#include "ops/VerifyBodyPack.hpp"
+#include "ops/VerifyFfnPack.hpp"
 
 #include <array>
 #include <cstring>
@@ -283,7 +285,13 @@ void ggufPlans() {
   // plan; here the 32-row tile's is the largest, which fused and gate/up
   // plans share.
   const ProjectionShape downShape{5120, 17408};
-  require(linear.decodeScratchSize(downShape).partials == three.scratchSize().partials,
+  require(linear.decodeScratchSize(downShape).partials ==
+              linear
+                  .plan({down.matrix, SPLASH_MAXIMUM_BATCH_WIDTH * 8, LinearPhase::Decode,
+                         LinearEpilogue::Residual},
+                        blockProjection(5120, 17408, 1))
+                  .scratchSize()
+                  .partials,
           "GGUF decode scratch bound");
   // Float projections take the neural accelerator tile from 1.5 of its
   // 64 x 32 tiles per core for BF16 values, 2 for F32 values and 3 for a
@@ -339,9 +347,11 @@ void ggufPlans() {
   require(m3.ggufFloatTile(2048, 256, QuantizedSegment::kFloat32) == FloatTile::Simdgroup,
           "Apple9 float projections take the simdgroup tile");
   const LinearScratchSize bound = m3.decodeScratchSize(downShape);
-  require(bound.partials ==
-              m3.plan({down.matrix, 32, LinearPhase::Decode, LinearEpilogue::Residual}, blockProjection(5120, 17408, 1))
-                  .scratchSize().partials,
+  require(bound.partials == m3.plan({down.matrix, SPLASH_MAXIMUM_BATCH_WIDTH * 8, LinearPhase::Decode,
+                                     LinearEpilogue::Residual},
+                                    blockProjection(5120, 17408, 1))
+                                .scratchSize()
+                                .partials,
           "Apple9 GGUF decode scratch bound");
   // Apple9 stages the IQ2, IQ3_XXS and IQ1 formats wherever the staged tile
   // holds the lanes' rows unpadded, and Q2_K from two lanes. A projection
@@ -726,13 +736,14 @@ void ggufPlans() {
 }
 
 // A rotated projection's scratch holds the bf16 rotated rows of a full decode
-// batch (32 rows) in decode and of the token budget (2048) in prefill; an
+// batch in decode and of the token budget (2048) in prefill; an
 // unrotated one's holds none.
 void scratchBoundsRotated() {
   const Linear linear = gpu(10, 16);
   for (const bool rotated : {false, true}) {
     const ProjectionShape shape{5120, 17408, rotated};
-    require(linear.decodeScratchSize(shape).rotated == (rotated ? uint64_t{17408} * 32 * 2 : 0) &&
+    require(linear.decodeScratchSize(shape).rotated ==
+                    (rotated ? uint64_t{17408} * SPLASH_MAXIMUM_BATCH_WIDTH * 8 * 2 : 0) &&
                 linear.prefillScratchSize(shape).rotated == (rotated ? uint64_t{17408} * 2048 * 2 : 0),
             "rotated scratch bounds");
   }
@@ -1353,6 +1364,98 @@ void registerSplitUnits(metal::MetalBackend &backend) {
   }
 }
 
+// Retention must stay unrestricted if any of the loaded FFN projections or
+// selected plans cannot take the compact path. No device or weights needed.
+void packedFfnSupportContract() {
+  if (SPLASH_MAXIMUM_BATCH_WIDTH != 8)
+    return;
+  constexpr uint32_t H = 2048, I = 512;
+  const auto projection = [](uint32_t n, uint32_t k, uint32_t format) {
+    return Projection(n, k, BlockWeights{{QuantizedSegment::planes(format, n, k, {}, {}, {})}});
+  };
+  const std::array original{projection(I, H, GGUF_FMT_AF4G64), projection(I, H, GGUF_FMT_AF4G64),
+                            projection(H, I, GGUF_FMT_AF4G64)};
+  const LinearConfig configuration{.tile = LinearTile::GgufStaged, .splits = 1};
+  const auto up = Linear::plan({{I, H}, 64, LinearPhase::Decode, LinearEpilogue::GateUp}, configuration,
+                               FloatOutput::BFloat16);
+  const auto down = Linear::plan({{H, I}, 64, LinearPhase::Decode, LinearEpilogue::Residual}, configuration,
+                                 FloatOutput::BFloat16);
+  const auto ffns = [](const auto &w) { return SwiGluProjections{&w[0], &w[1], &w[2]}; };
+  require(supportsVerifyFfnPack(ffns(original), up, down, 8), "supported loaded FFN was refused");
+  for (uint32_t lanes : {0U, 4U, 9U})
+    require(!supportsVerifyFfnPack(ffns(original), up, down, lanes),
+            "packed FFN accepted an unsupported lane count");
+  for (uint32_t role = 0; role < 3; ++role) {
+    for (uint32_t format : {uint32_t{GGUF_FMT_AF5G64}, uint32_t{GGUF_FMT_BF16}}) {
+      auto w = original;
+      w[role] = projection(w[role].outputSize, w[role].inputSize, format);
+      require(!supportsVerifyFfnPack(ffns(w), up, down, 8),
+              "unsupported loaded FFN format allowed retention capping");
+    }
+    auto w = original;
+    w[role].destination = FloatOutput::Float32;
+    require(!supportsVerifyFfnPack(ffns(w), up, down, 8), "FP32 FFN output allowed retention capping");
+    w = original;
+    w[role].inputSize += 64;
+    require(!supportsVerifyFfnPack(ffns(w), up, down, 8),
+            "FFN segment/shape mismatch allowed retention capping");
+  }
+  const auto narrow = Linear::plan({{I, H}, 32, LinearPhase::Decode, LinearEpilogue::GateUp}, configuration,
+                                   FloatOutput::BFloat16);
+  require(!supportsVerifyFfnPack(ffns(original), narrow, down, 8),
+          "narrow original FFN plan was accepted as wide");
+  const auto prefill = Linear::plan({{H, I}, 64, LinearPhase::Prefill, LinearEpilogue::Residual},
+                                    configuration, FloatOutput::BFloat16);
+  require(!supportsVerifyFfnPack(ffns(original), up, prefill, 8),
+          "prefill FFN plan allowed decode retention capping");
+  const auto wrong = Linear::plan({{I + 64, H}, 64, LinearPhase::Decode, LinearEpilogue::GateUp},
+                                  configuration, FloatOutput::BFloat16);
+  require(!supportsVerifyFfnPack(ffns(original), wrong, down, 8),
+          "FFN plan/shape mismatch allowed retention capping");
+}
+
+void packedBodySupportContract() {
+  if (SPLASH_MAXIMUM_BATCH_WIDTH != 8)
+    return;
+  const auto projection = [](uint32_t n, uint32_t k, uint32_t format) {
+    return Projection(n, k, BlockWeights{{QuantizedSegment::planes(format, n, k, {}, {}, {})}});
+  };
+  const LinearConfig configuration{.tile = LinearTile::GgufStaged, .splits = 1};
+  const auto plan = [&](const Projection &p, bool residual) {
+    return Linear::plan({{p.outputSize, p.inputSize},
+                         64,
+                         LinearPhase::Decode,
+                         residual ? LinearEpilogue::Residual : LinearEpilogue::None},
+                        configuration, FloatOutput::BFloat16);
+  };
+  auto p = projection(768, 2048, GGUF_FMT_AF4G64);
+  for (bool residual : {false, true}) {
+    require(supportsVerifyBodyPack(p, plan(p, residual), residual, 8),
+            "supported body projection was refused");
+    for (uint32_t lanes : {0U, 4U, 9U})
+      require(!supportsVerifyBodyPack(p, plan(p, residual), residual, lanes),
+              "unsupported body lane count was accepted");
+  }
+  auto bad = projection(768, 2048, GGUF_FMT_AF5G64);
+  require(!supportsVerifyBodyPack(bad, plan(bad, false), false, 8),
+          "unsupported body format allowed capping");
+  auto quant = QuantizedSegment::planes(GGUF_FMT_AF4G64, 16384, 5120, {}, {}, {});
+  auto tail = QuantizedSegment::rows(QuantizedSegment::kFloat32, 96, 5120, {});
+  tail.columnOffset = 16384;
+  Projection padded(16640, 5120, BlockWeights{{quant, tail}});
+  require(supportsVerifyBodyPack(padded, plan(padded, false), false, 8),
+          "valid mixed body projection with padding was refused");
+  require(!supportsVerifyBodyPack(padded, plan(padded, true), true, 8),
+          "unsupported mixed residual allowed capping");
+  bad = p;
+  bad.destination = FloatOutput::Float32;
+  require(!supportsVerifyBodyPack(bad, plan(bad, false), false, 8), "FP32 body destination allowed capping");
+  const auto prefill =
+      Linear::plan({{p.outputSize, p.inputSize}, 64, LinearPhase::Prefill, LinearEpilogue::None},
+                   configuration, FloatOutput::BFloat16);
+  require(!supportsVerifyBodyPack(p, prefill, false, 8), "prefill body plan allowed decode capping");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1360,6 +1463,8 @@ int main(int argc, char **argv) {
     require(argc == 2, "usage: linear-plan <production.metallib|--cpu>");
     ggufPlans();
     scratchBoundsRotated();
+    packedFfnSupportContract();
+    packedBodySupportContract();
     ggufCoreLaws();
     floatOutputPlans();
     smallApple9StagesShortPrefillChunks();

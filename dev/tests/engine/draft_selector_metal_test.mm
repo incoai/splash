@@ -404,7 +404,8 @@ void verifyRowsChoice(MetalBackend &backend) {
       return expected / model.costs[total];
     };
     double best = 0.0;
-    std::array<uint32_t, kLanes> rows{1, 1, 1, 1};
+    std::array<uint32_t, kLanes> rows{};
+    rows.fill(1);
     for (bool more = true; more;) {
       best = std::max(best, value(rows));
       more = false;
@@ -417,7 +418,8 @@ void verifyRowsChoice(MetalBackend &backend) {
         }
       }
     }
-    std::array<uint32_t, kLanes> picked{1, 1, 1, 1};
+    std::array<uint32_t, kLanes> picked{};
+    picked.fill(1);
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       require(chosen[lane] >= 1 && chosen[lane] <= maximumRows[lane], "draft_verify_rows left a lane's range");
       picked[lane] = chosen[lane];
@@ -524,8 +526,8 @@ void invalidRequests(MetalBackend &backend) {
   const MetalBuffer confidence = allocate(backend, kLanes * kPositions * sizeof(float));
   rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, {}, {}); },
           "invalid draft verify rows batch", "verify rows of no lane were encoded");
-  rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, {}, std::array<uint32_t, 5>{8, 8, 8, 8, 8}); },
-          "invalid draft verify rows batch", "verify rows of five lanes were encoded");
+  rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, {}, std::array<uint32_t, kLanes + 1>{}); },
+          "invalid draft verify rows batch", "verify rows past the supported lane count were encoded");
   for (const uint32_t maximum : {0U, kRows + 1})
     rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, {}, std::array{maximum}); },
             "invalid draft verify rows maximum", "a maximum of verify rows outside a block was accepted");

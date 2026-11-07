@@ -9,6 +9,8 @@
 #include "ops/GDN.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/Linear.hpp"
+#include "ops/VerifyFfnPack.hpp"
+#include "ops/VerifyBodyPack.hpp"
 #include "ops/MoE.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
@@ -346,6 +348,11 @@ struct QwenTargetVerifyBuffers final {
   // Each lane's verify rows (ops::DraftSelector::addVerifyRows), which a MoE
   // target's steps route alone (ops::MoeBuffers::verifyRows).
   metal::MetalBuffer verifyRows;
+  ops::VerifyFfnPackBuffers packedFfn;
+  ops::VerifyBodyPackBuffers packedBody;
+  uint32_t *packedBodyEncodedProjections = nullptr;
+  // Optional host-only instrumentation: counted while encoding, never on the GPU.
+  uint32_t *packedFfnEncodedLayers = nullptr;
   // Each lane's auxiliary state before the step; the commit writes the one
   // after it (addStateCommit).
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliary;
@@ -433,6 +440,11 @@ public:
   QwenTarget(const QwenTarget &) = delete;
   QwenTarget &operator=(const QwenTarget &) = delete;
   virtual ~QwenTarget();
+
+  // Every dense layer must support the packed path before a request's retention
+  // is restricted. Targets without that whole-model contract keep full rows.
+  [[nodiscard]] virtual bool supportsPackedFfn(uint32_t) const noexcept { return false; }
+  [[nodiscard]] virtual bool supportsPackedBody(uint32_t) const noexcept { return false; }
 
   // The step scratch the target allocated itself (qwenTargetScratchBytes).
   [[nodiscard]] virtual QwenTargetScratchBytes allocatedScratchBytes() const noexcept;
@@ -650,6 +662,9 @@ protected:
   void addDecodeProjection(metal::CommandGraph &graph, metal::MetalBuffer input, const ops::Projection &projection,
                            metal::MetalBuffer output, uint32_t lanes, ops::LinearScratch scratch,
                            ops::PreparedInput prepared = {}) const;
+  void addVerifyBodyProjection(VerifyStep &step, metal::MetalBuffer input,
+      const ops::Projection &projection, metal::MetalBuffer output, metal::MetalBuffer residual,
+      ops::PreparedInput prepared, const ops::LinearPlan *existingPlan = nullptr) const;
   // The FFNs of a layer whose residual is one row of hiddenSize values: each
   // reads the RMS norm `norm` of the mixer's `residual` rows and adds its
   // output to them into `output`. A dense SwiGLU, in a prefill on the

@@ -1,5 +1,6 @@
 #import "MetalBackend.hpp"
 #include "AwakeClock.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 #include "CommandWatchdog.hpp"
 #include "Residency.hpp"
 #include "StderrLine.hpp"
@@ -1979,6 +1980,15 @@ MetalBackend::MetalBackend(std::string metallibPath, double residencyKeepAliveSe
                     DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM))];
 
         impl_->library = loadLibrary(impl_->device, metallibPath);
+        const bool fourLanes = [impl_->library newFunctionWithName:@"splash_batch_geometry_4"] != nil;
+        const bool eightLanes = [impl_->library newFunctionWithName:@"splash_batch_geometry_8"] != nil;
+        // Unmarked legacy libraries have the established four-lane ABI.
+        // Eight-lane hosts require an explicit matching marker.
+        if ((fourLanes && eightLanes) ||
+            (SPLASH_MAXIMUM_BATCH_WIDTH == 4u && eightLanes) ||
+            (SPLASH_MAXIMUM_BATCH_WIDTH == 8u && (!eightLanes || fourLanes))) {
+            throw MetalBackendError("native host and metallib batch widths do not match");
+        }
         impl_->hostStepLibraryPath =
             std::filesystem::path(metallibPath).replace_filename(kHostStepLibrary).string();
         // Ending residency dispatches a kernel built here, so no pipeline or

@@ -17,7 +17,7 @@ constexpr uint32_t kFloorRows = 512;
 // A request yields to later arrivals of its priority at most this many
 // prefill commands in a row: the other lanes of a full batch, each finishing
 // one short prompt.
-constexpr uint32_t kMaximumOvertakes = model::ExecutionLimits::maximumBatchWidth - 1;
+constexpr uint32_t kMaximumOvertakes = model::ExecutionLimits::maximumPrefillBatchWidth - 1;
 
 // A command excludes at most the lanes of a full batch: a linear search.
 bool listed(std::span<const uint64_t> ids, uint64_t id) noexcept {
@@ -525,7 +525,7 @@ std::optional<Scheduler::Planned> Scheduler::planPrefill(std::vector<Lane> ready
   };
   std::vector<Lane> members{leader};
   for (auto view = ready.begin() + 1; view != ready.end(); ++view) {
-    if (view->request->spec.priority != tier || lanes.size() == model::ExecutionLimits::maximumBatchWidth)
+    if (view->request->spec.priority != tier || lanes.size() == model::ExecutionLimits::maximumPrefillBatchWidth)
       break;
     // A lane that runs in passes joins only a command that does.
     if (groups(*view) && !group)
@@ -588,8 +588,9 @@ std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> exclude
 }
 
 void Scheduler::commit(const BatchPlan &plan, const PlanInputs &in) {
-  if (active_ || plan.empty() ||
-      plan.width() > model::ExecutionLimits::maximumBatchWidth) {
+  const uint32_t maximum = plan.kind == WorkKind::Prefill
+      ? model::ExecutionLimits::maximumPrefillBatchWidth : model::ExecutionLimits::maximumBatchWidth;
+  if (active_ || plan.empty() || plan.width() > maximum) {
     throw std::logic_error("invalid scheduler commit");
   }
   const bool prefill = plan.kind == WorkKind::Prefill;

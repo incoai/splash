@@ -187,6 +187,25 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
     size = std::max(size, bytes);
   };
   const uint64_t r = kDecodeRows;
+#if SPLASH_EXPERIMENTAL_FFN_PACK_MODE == 2
+  if (kLaneCount == 8 && geometry.target.ffnKind == QwenFfnKind::Dense &&
+      geometry.target.layers == 64 && geometry.target.hiddenSize == 5120 &&
+      geometry.target.intermediateSize == 17408 && !geometry.target.hyperConnections) {
+    put(DecodeTensor::PackedFfnInput, bytesFor<uint16_t>(4 * geometry.target.hiddenSize));
+    put(DecodeTensor::PackedFfnResidual, bytesFor<uint16_t>(4 * geometry.target.hiddenSize));
+    put(DecodeTensor::PackedFfnIntermediate, bytesFor<uint16_t>(4 * geometry.target.intermediateSize));
+    put(DecodeTensor::PackedFfnOutput, bytesFor<uint16_t>(4 * geometry.target.hiddenSize));
+#if SPLASH_EXPERIMENTAL_VERIFY_BODY
+    const uint64_t width=std::max({geometry.target.hiddenSize,geometry.target.packedGdnWidth,
+                                  geometry.target.packedFullWidth,geometry.target.attentionWidth});
+    put(DecodeTensor::PackedBodyInput,bytesFor<uint16_t>(4*width));
+    put(DecodeTensor::PackedBodyResidual,bytesFor<uint16_t>(4*width));
+    put(DecodeTensor::PackedBodyOutput,bytesFor<uint16_t>(4*width));
+#endif
+    static_assert(sizeof(VerifyPackControl) % 8 == 0);
+    put(DecodeTensor::PackedFfnControl, sizeof(VerifyPackControl) / 8);
+  }
+#endif
   // As in prefill, no GDN scratch without GDN layers.
   const uint64_t gdnRows = geometry.target.stateLayout.layers ? r : 0;
   put(DecodeTensor::Hidden0,
