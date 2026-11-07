@@ -61,6 +61,23 @@ separate installation from the same ID without them.
 
 ## MLX targets
 
+Qwen3.8-Flash-Next also loads from an MLX checkpoint, with its released
+DFlash2 draft and the same expert/PLE streaming controls as its GGUF. The
+loader reads hyper-connection projections, the fused QSA indexer, saved
+integer PLE hash buffers and numbered PLE table shards. It also accepts an
+`mlx-serve-ngram` `ngram_table.bin` sidecar; local preparation retains that
+file with the checkpoint. Streamed PLE rows are assembled from the original
+codes/scales/biases on demand and match resident rows. Raw BF16 table rows
+can be 160 values wide without projection-block padding.
+
+Standard Flash-Next norms are centered weights: their loaded F32 gain is
+`1 + weight`. Marked mlx-serve sidecar packs have already folded that offset.
+Older embedded-table packs with folded offsets need a centered-weight
+re-export; the loader cannot infer an unmarked norm convention from values.
+Model revisions, expert memory and PLE memory determine the working set; a
+large checkpoint can stream within a smaller memory budget. Loading support
+does not establish a throughput improvement over another checkpoint format.
+
 An MLX target's `quantization` gives a mode, bits and group size, and may give
 a module its own, as mlx-lm writes it; a module's entry wins, and its mode
 defaults to affine. The engine loads affine 2, 3, 4, 5, 6 or 8 bits in groups

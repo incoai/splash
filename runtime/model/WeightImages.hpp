@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -14,6 +15,17 @@
 #include <vector>
 
 namespace splash::model {
+
+class SparseRowStore;
+
+// A table read from its source through a row cache instead of loaded as an
+// image. Its record remains the resident image's, so streaming does not
+// change the model's weight identity.
+struct StreamedTable final {
+  std::shared_ptr<SparseRowStore> store;
+  uint32_t format = 0;
+  WeightFileRecord record;
+};
 
 // The source bytes a load task reads, or stages, at most.
 inline constexpr uint64_t kLoadStepBytes = 4 << 20;
