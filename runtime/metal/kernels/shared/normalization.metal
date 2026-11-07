@@ -10,15 +10,14 @@
 // 256 threads of kNormColumns columns each, one chunk for every hidden size
 // in use. The first chunk's input and weight loads are all issued before the
 // reduction instead of per output iteration, so the (cold) weights arrive in
-// one round trip, which makes a chain of eight-row norms of 5120 1.8x (40-core
-// M3 Max) to 3.3x (16-core M5 Pro) faster with the same bits.
+// one round trip: a chain of eight-row norms of 5120 runs up to 3.3x faster
+// with the same bits.
 constant constexpr uint kNormColumns = 32;
 constant constexpr uint kNormThreads = 256;
 constant constexpr uint kNormChunk = kNormThreads * kNormColumns;
 // Rows of at most eight values per thread stream instead: a chunk would leave
-// most of the 256 threads idle (a 2048-wide row fills 64), which made the
-// 35B's MoE-input norms ~25% slower on a 40-core M3 Max. Both paths give the
-// same bits.
+// most of the 256 threads idle (a 2048-wide row fills 64): ~25% slower on the
+// 35B's MoE-input norms. Both paths give the same bits.
 constant constexpr uint kNormStreamingWidth = kNormThreads * 8;
 
 // Columns begin + tid + 256 i of a row, zero past its end.
@@ -109,11 +108,11 @@ NORM_RMS(norm_rms_f32, float)
 // device memory twice as norm_rms does. The reduction is rms_inverse's over
 // the first 256 threads, so the bits match every other norm. On 2048-column
 // rows, up to 64 rows (SPLASH_STAGED_NORM_ROWS), that is 1.3-2.6x faster than
-// norm_rms in chains of dependent norms with DRAM-cold weights (40-core M3
-// Max, 20-core M5 Pro); from 128 rows on, norm_rms's 256-thread groups overlap
-// and match or beat it, and on 5120-column rows it does not beat the register
-// path. WV is the weights' vector type: bfloat4, or packed_float4 for a GGUF's
-// F32 norms, which assume no more than scalar alignment.
+// norm_rms on chains of dependent norms with DRAM-cold weights; from 128 rows
+// on, norm_rms's 256-thread groups overlap and match or beat it, and on
+// 5120-column rows it does not beat the register path. WV is the weights'
+// vector type: bfloat4, or packed_float4 for a GGUF's F32 norms, which assume
+// no more than scalar alignment.
 static_assert(SPLASH_STAGED_NORM_WIDTH % 4 == 0, "the staged row is a whole number of vectors");
 static_assert(SPLASH_STAGED_NORM_THREADS % 256 == 0, "rms_inverse's 256 threads are whole simdgroups");
 template <class WV>

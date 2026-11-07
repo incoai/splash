@@ -11,7 +11,7 @@ from dev.tests.server_fixtures import (
     response_events,
     responses_body,
 )
-from server import api_shapes
+from server.dialects import responses as responses_dialect
 
 PATCH = "*** Begin Patch\n*** Update File: notes.txt\n-a\n+b\n*** End Patch"
 GRAMMAR = 'start: begin_patch hunk+ end_patch\nbegin_patch: "*** Begin Patch" LF\n'
@@ -53,7 +53,7 @@ class CustomToolTests(HarnessTestCase):
 
     def test_the_model_sees_a_function_of_one_string_described_by_its_grammar(self):
         body = responses_body(tools=[EXEC, APPLY_PATCH])
-        chat, names = api_shapes.responses_to_chat_body(body, body["input"])
+        chat, names = responses_dialect.to_chat_body(body, body["input"])
         function = chat["tools"][1]["function"]
         self.assertEqual(function["name"], "apply_patch")
         self.assertEqual(function["description"], APPLY_PATCH["description"])
@@ -64,11 +64,11 @@ class CustomToolTests(HarnessTestCase):
         self.assertIn("lark grammar", described["description"])
         self.assertIn(GRAMMAR, described["description"])
         self.assertEqual(
-            names, {"apply_patch": (api_shapes.CUSTOM_TOOL, "apply_patch")}
+            names, {"apply_patch": (responses_dialect.CUSTOM_TOOL, "apply_patch")}
         )
         # A text format, or none, is described as raw text.
         body = responses_body(tools=[{"type": "custom", "name": "note"}])
-        chat, _ = api_shapes.responses_to_chat_body(body, body["input"])
+        chat, _ = responses_dialect.to_chat_body(body, body["input"])
         self.assertEqual(
             chat["tools"][0]["function"]["parameters"]["properties"]["input"][
                 "description"
@@ -215,7 +215,7 @@ class CustomToolTests(HarnessTestCase):
             tools=[EXEC, APPLY_PATCH],
             tool_choice={"type": "custom", "name": "apply_patch"},
         )
-        chat, _ = api_shapes.responses_to_chat_body(body, body["input"])
+        chat, _ = responses_dialect.to_chat_body(body, body["input"])
         self.assertEqual(
             chat["tool_choice"],
             {"type": "function", "function": {"name": "apply_patch"}},
@@ -270,4 +270,4 @@ class CustomToolTests(HarnessTestCase):
             ("[1]", "[1]"),
         ):
             with self.subTest(arguments=arguments):
-                self.assertEqual(api_shapes.custom_input(arguments), expected)
+                self.assertEqual(responses_dialect.custom_input(arguments), expected)

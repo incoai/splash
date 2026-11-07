@@ -1,14 +1,15 @@
 # Holds the hash of the development requirements last installed.
 DEV_STAMP = $(VENV)/.dev-requirements-installed
 RELEASE_VERSION ?= $(shell git describe --tags --always)
+# The release archive's name holds both (package.archive_name).
+PACKAGE_ARGS = --version "$(RELEASE_VERSION)" --macos-min "$(MACOS_MIN_VERSION)"
 
 .PHONY: package package-bottle package-check
 package: install-environment all
-	$(PYTHON) dev/tools/package.py --version "$(RELEASE_VERSION)" \
-		--macos-min "$(MACOS_MIN_VERSION)"
+	$(PYTHON) dev/tools/package.py $(PACKAGE_ARGS)
 
 package-bottle:
-	$(PYTHON) dev/tools/package_brew.py build --version "$(RELEASE_VERSION)"
+	$(PYTHON) dev/tools/package_brew.py build $(PACKAGE_ARGS)
 
 # Both Homebrew targets use a temporary tap and remove their installation.
 package-check:
@@ -19,7 +20,7 @@ package-check:
 # hardened runtime. dmg also wraps it in dist/Splash-RELEASE_VERSION.dmg, for
 # testing: only release-app notarizes.
 SIGN_IDENTITY ?=
-APP_ARGS = --version "$(RELEASE_VERSION)" --macos-min "$(MACOS_MIN_VERSION)" \
+APP_ARGS = $(PACKAGE_ARGS) \
 	$(if $(SIGN_IDENTITY),--sign "$(SIGN_IDENTITY)")
 .PHONY: app dmg check-app
 app: install-environment all
@@ -34,10 +35,10 @@ dmg: install-environment all
 # NOTARY_PROFILE, a notarytool keychain profile, or NOTARY_KEY, an App Store
 # Connect API key's file, with NOTARY_KEY_ID and NOTARY_ISSUER, and stapled;
 # the command line's files package and package-bottle leave in dist/; the
-# appcast, with RELEASE_NOTES, a Markdown file outside the checkout, signed
-# with the release key from the login keychain or SPARKLE_KEY_FILE; and the
-# tap's formula and cask. DRY_RUN=1 signs ad hoc, prints what needs the
-# Developer ID or the notary service instead of running it, and writes
+# appcast, with RELEASE_NOTES, a Markdown file, signed with the release key
+# from the login keychain or SPARKLE_KEY_FILE; and the tap's formula and cask.
+# DRY_RUN=1 signs ad hoc, prints what needs the Developer ID or the notary
+# service instead of running it, and writes
 # dist/release/RELEASE_VERSION-dry-run.
 NOTARY_PROFILE ?=
 NOTARY_KEY ?=
@@ -70,8 +71,7 @@ TEST_RELEASE_REPO ?=
 .PHONY: publish-test
 publish-test:
 	@test -n "$(TEST_RELEASE_REPO)" || { echo "set TEST_RELEASE_REPO=owner/repo"; exit 1; }
-	$(PYTHON) dev/tools/publish_test.py --version "$(RELEASE_VERSION)" \
-		--repo "$(TEST_RELEASE_REPO)"
+	$(PYTHON) dev/tools/publish_test.py $(PACKAGE_ARGS) --repo "$(TEST_RELEASE_REPO)"
 
 PYTHON_TEST_PATTERN ?= test_*.py
 # Comma-separated subset of claude,opencode,codex,hermes,pi for the real client
@@ -91,7 +91,7 @@ HTTP_SMOKE_ARGS ?=
 	check-native-engine check-native-cpu check-native-metal check-native-build \
 	check-python \
 	install-development _install-development release-check test \
-	test-agent-real test-http-real test-performance-real test-release-real \
+	test-agent-real test-http-real test-performance-real test-pressure-real test-release-real \
 	test-python test-real verify-models \
 	test-engine test-engine-cpu test-engine-metal test-sanitizers
 
@@ -105,12 +105,7 @@ install-development: install-environment
 
 _install-development:
 	@set -eu; \
-	hash=$$(shasum -a 256 dev/requirements.txt | awk '{print $$1}'); \
-	if test "$$(cat "$(DEV_STAMP)" 2>/dev/null)" = "$$hash"; then \
-		exit 0; \
-	fi; \
-	"$(PYTHON)" -m pip install -r dev/requirements.txt; \
-	echo "$$hash" > "$(DEV_STAMP)"
+	$(call install-requirements,,dev/requirements.txt,$(DEV_STAMP))
 
 # Build production and every native test and tool, and run the native tests
 # that do not require model weights.
@@ -118,7 +113,7 @@ check-native-engine: check-native-cpu check-native-metal check-native-build
 
 check-native-cpu: platform-check $(TARGET) test-engine-cpu
 
-check-native-metal: platform-check $(TARGET) test-engine-metal
+check-native-metal: platform-check $(TARGET) test-engine-metal test-sanitizers-metal
 
 # Build every native test, benchmark and tool, the outputs TEST_CONFIG_TARGETS
 # and PRODUCTION_FLAG_TOOLS name, and run none: hosted CI has no GPU the Metal
@@ -176,13 +171,12 @@ test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
 		--http-smoke
 
 # BASELINE is a checkout whose build/ holds another build's splash.metallib,
-# engine-tests/backend-benchmark and, for a build that loads the weights into
-# memory, engine-tests/weight-digests: this build is compared with it on this
-# machine in ABBA order, and so are their weight images
-# (dev/benchmarks/backend_regression.py). Without it, the release scenarios
-# characterize this build alone. ANE_FFN_SHARE, in [0, 1), is the prefill
-# FFN's Neural Engine share every benchmark that takes --ane-ffn-share runs
-# instead of calibrating one (0: the GPU alone).
+# engine-tests/backend-benchmark and engine-tests/weight-digests: this build
+# is compared with it on this machine in ABBA order, and so are their weight
+# images (dev/benchmarks/backend_regression.py). Without it, the release
+# scenarios characterize this build alone. ANE_FFN_SHARE, in [0, 1), is the
+# prefill FFN's Neural Engine share every benchmark runs instead of
+# calibrating one (0: the GPU alone).
 BASELINE ?=
 ANE_FFN_SHARE ?=
 ANE_FFN_SHARE_ARGS = $(if $(ANE_FFN_SHARE),--ane-ffn-share "$(ANE_FFN_SHARE)",)
@@ -204,6 +198,26 @@ else
 		&& $(PYTHON) -m json.tool "$(MODEL_RESULTS)/backend-benchmark.json" >/dev/null
 	@echo "native backend characterization: PASS ($(MODEL_RESULTS)/backend-benchmark.json)"
 endif
+
+# The installed model served by this checkout's own server under
+# PRESSURE_ARGS, the memory cap that makes it stream its routed experts, to
+# the serving benchmark's three churn clients for PRESSURE_MINUTES
+# (dev/benchmarks/serving/run.py), then the run checked on its own
+# (check.py run): the experts streamed from the start, and the gates of
+# docs/validate.md's Serving benchmark, G4, G8, G9, Store (no oscillation),
+# Churn (its load window, every client served) and First token (no
+# starvation). 5 minutes: on the M5 Pro at 18G the 35B's churn runs
+# complete at least 78 requests in 15.
+PRESSURE_ARGS ?= --max-memory 18G
+PRESSURE_MINUTES ?= 5
+PRESSURE_RESULTS = $(MODEL_RESULTS)/pressure
+test-pressure-real: preflight $(TARGET) verify-build-identity
+	@rm -rf "$(PRESSURE_RESULTS)"
+	$(PYTHON) -m dev.benchmarks.serving.run --tree . --machine other --model "$(MODEL)" \
+		--model-root "$(MODEL_ROOT)" --scenario churn --minutes $(PRESSURE_MINUTES) \
+		--server-args="$(PRESSURE_ARGS)" --label pressure --out "$(PRESSURE_RESULTS)"
+	$(PYTHON) -m dev.benchmarks.serving.check run "$(PRESSURE_RESULTS)" pressure \
+		--minutes $(PRESSURE_MINUTES) --streamed
 
 # The installer's restarts without the Hub, a full source hash and the
 # digests of the weight images a load of the installation holds

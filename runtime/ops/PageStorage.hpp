@@ -16,8 +16,9 @@ namespace splash::kv {
 // extentPages pages each, which KvPool alone allocates and releases: its
 // runway when it is built, then an extent when it needs one of its pages.
 // An extent whose pages are all free stays allocated until a reclaim pass
-// between commands releases it (Engine::reclaimMemory); the cleanup after
-// startup warmup keeps one. Inside an extent every attention layer has a
+// between commands releases it (the memory ledger taking the cache's units,
+// engine::Cache); the cleanup after startup warmup keeps one. Inside an
+// extent every attention layer has a
 // region that holds the keys of all its pages, then their key scales, values
 // and value scales (abi/KvExtent.h), in the order Layout::region gives them:
 // a window's layers after the others. With a block index, the index plane
@@ -27,12 +28,15 @@ namespace splash::kv {
 // index plane, an Index extent only the index plane (kv::PageForm). A
 // layer's region sits at one offset in every extent that holds it, so its
 // SplashKvLayer serves a Full page and a Slim one alike. Kernels reach a
-// page through its entries in a request's GPU tables, so extents are
-// allocated metal::BufferReach::Addressed: the command queue's residency set
-// keeps them resident for every command buffer. The host reaches the same
-// bytes through the page's spans(). Active requests may overwrite slots at
-// or beyond their logical commit index. Cached KV blocks reference only
-// fully committed pages, which are immutable while shared.
+// page through its entries in a GPU table, so extents are allocated
+// metal::BufferReach::Addressed, and each table names the extents its
+// entries reach as it is written (metal::MetalBackend::setTableReach): a
+// command makes resident only the extents its tables reach, on the encoders
+// that read them, so an extent only the cache holds costs commands nothing.
+// The host reaches the same bytes through the page's spans(). Active
+// requests may overwrite slots at or beyond their logical commit index.
+// Cached KV blocks reference only fully committed pages, which are
+// immutable while shared.
 class PageStorage final : public ExtentStorage {
 public:
   // pageCount must be a whole number of extents of extentPages pages, a
@@ -66,9 +70,11 @@ public:
   // std::out_of_range for an extent past the pool; std::invalid_argument for
   // Index pages of a layout that cannot spill (Layout::spillable) and Slim
   // pages of one whose pages cannot give up a window's layers
-  // (Layout::slimmable).
+  // (Layout::slimmable). Under the storage's admission, or under `admit`.
   [[nodiscard]] metal::AllocationResult allocateExtent(uint32_t extent,
                                                        PageForm form = PageForm::Full) override;
+  [[nodiscard]] metal::AllocationResult allocateExtent(uint32_t extent, PageForm form,
+                                                       const metal::AllocationAdmission &admit);
   // The caller must prove that no active, prefix, reserved, or in-flight
   // reference remains anywhere in this extent. std::out_of_range for an
   // extent past the pool. KvPool never releases an extent that holds a page
@@ -102,10 +108,13 @@ public:
   // to a CPU-visible GPU page table, which must hold all of them; entries
   // before `first` are left as they are. An Index page's entry is
   // SPLASH_KV_PAGE_ABSENT; a Slim page's reaches the regions it holds, all
-  // that a row its window has passed reads of it. Throws std::logic_error
-  // for a table that is not CPU-visible or too small and for a page whose
-  // extent is not allocated (a GPU table holds only pages of allocated
-  // extents), std::invalid_argument for `first` past the pages.
+  // that a row its window has passed reads of it. The table then names the
+  // extents its entries reach, all of `pages` but Index ones
+  // (metal::MetalBackend::setTableReach), which each encoder that uses it
+  // makes resident. Throws std::logic_error for a table that is not
+  // CPU-visible or too small and for a page whose extent is not allocated (a
+  // GPU table holds only pages of allocated extents); std::invalid_argument
+  // for `first` past the pages.
   void writeEntries(std::span<const uint32_t> pages, uint32_t first,
                     const metal::MetalBuffer &table) const;
   // The same for an index table (ops::BlockIndex::tables), whose entries

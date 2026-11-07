@@ -1,34 +1,33 @@
 """Choose the chat templates once at startup, with later system messages.
 
-Agent clients add instructions during a conversation: a system message after
-the first message (request preparation merges the leading system and developer
-messages into one, so every later one follows another role). Splash renders
-it where it occurs, as a system turn in the template's own markup. Upstream
-templates differ: the official Qwen templates raise for it and Unsloth's
-Qwen3.6 GGUF template skips it silently.
+Agent clients add a system message after the first message (request
+preparation merges the leading system and developer messages into one, so
+every later one follows another role). Splash renders it where it occurs, as
+a system turn in the template's own markup, though the official Qwen
+templates raise for it and Unsloth's Qwen3.6 GGUF template drops it.
 
-Every template the tokenizer defines is probed once, when the server starts,
-by rendering a canary conversation whose later system message carries a
-marker. The outcome is one of:
+Every template the tokenizer defines is probed once at startup by rendering a
+canary conversation whose later system message carries a marker:
 
 - ``native``: the marker renders in place; the template is used unchanged.
-- ``patched``: the template rejected or dropped the message. A structural
-  patch at the construct responsible -- the ``raise_exception`` in the message
-  loop's system branch, or the loop condition that skips system messages --
-  renders it with the template's own system block. The patch is kept only if
-  ordinary conversations still render byte-identically and the canary renders
-  in place.
-- ``unsupported``: the template renders the message out of place, has no
-  single such construct, renders something before its system block (such as
-  a BOS token), or its patch failed a probe. A request with a later system
-  message fails with a 400 instead of losing it.
+- ``patched``: the template rejected or dropped the message, and a patch at
+  the construct responsible (the ``raise_exception`` in the message loop's
+  system branch, or the loop condition that skips system messages) renders
+  it with the template's own system block. It is kept only if ordinary
+  conversations still render byte-identically and the canary in place.
+- ``unsupported``: the message renders out of place, no single such
+  construct exists, the template renders something before its system block
+  (such as a BOS token), or the patch failed a probe. A request with a later
+  system message fails with a 400 instead of losing it.
 
-The probe also records the generation prompt, the text a template appends
-for ``add_generation_prompt``, under each reasoning effort, and under other
-template variables a request sets when it first sets them. A request's prompt
-must end with it, and it says whether generation starts in a think block. The
-next turn may render it differently, so the engine keeps a turn's reusable
-state before it. No chat format's markers are assumed.
+The probe also records the generation prompt under each reasoning effort, and
+under other template variables a request first sets: a request's prompt must
+end with it, it says whether generation starts in a think block, and the
+engine keeps a turn's reusable state before it, since the next turn may
+render it differently. It is found without assuming any chat format's
+markers. The probe records too what a template writes from a reply's
+reasoning through ``</think>``, which ends thinking where a budget runs out
+unless --thinking-end-text sets the end.
 
 Requests and the probe share the reasoning efforts, template options and
 alias retry defined here, so the probe renders exactly as requests do.
@@ -46,8 +45,8 @@ from jinja2 import Environment, TemplateError, TemplateSyntaxError, nodes
 from jinja2.ext import Extension
 from jinja2.lexer import Token
 
+from .chat_format import REASONING_EFFORTS, THINK_END
 from .lru import LRUCache, memoized
-from .serve_options import REASONING_EFFORTS
 
 # Template arguments request preparation sets itself, and apply_chat_template's
 # own controls: a request's template kwargs cannot set them.
@@ -169,6 +168,9 @@ class ChatTemplate:
     # effort each renders like (_reasoning).
     reasoning: dict
     effort_names: dict
+    # What the template writes from a reasoning's end through its close, such
+    # as Qwen's line break and </think>; None where the probe found none.
+    thinking_end: str | None
 
     def accepts(self, messages):
         """Whether requests with these normalized messages are served: a
@@ -302,7 +304,31 @@ def _prepare(render, encode, source):
         _generation_prompts(render, encode, source),
         probe,
         *_reasoning(render, source),
+        _thinking_end(render, source),
     )
+
+
+def _thinking_end(render, source):
+    """What the template writes from the end of a reply's reasoning through
+    its close, such as Qwen's line break then </think>. None where the
+    template renders no reasoning in a turn, or no </think> after it."""
+    rendered = _outcome(
+        render,
+        source,
+        [_SYSTEM, _ASK, _CALL, _RESULT],
+        template_options(
+            reasoning_effort=None,
+            preserve_thinking=None,
+            tools=_TOOLS,
+            add_generation_prompt=False,
+        ),
+    )
+    reasoning = _CALL["reasoning_content"]
+    start = rendered.find(reasoning) if isinstance(rendered, str) else -1
+    end = rendered.find(THINK_END, start) if start >= 0 else -1
+    if end < 0:
+        return None
+    return rendered[start + len(reasoning) : end + len(THINK_END)]
 
 
 # Probe conversations. Leading system messages are already merged, as request

@@ -42,6 +42,10 @@ public:
   // while no check decided (every spin started after its release, the GPU
   // busy with other work).
   [[nodiscard]] static std::optional<bool> awakeHostStepsSpin(MetalBackend &backend);
+  // What the backend's checks decided so far, running none: true once a spin
+  // was seen, false once awake steps were found not to spin, nothing while
+  // no check decided (awake steps then run as plain ones).
+  [[nodiscard]] static std::optional<bool> hostStepSpinDecision(const MetalBackend &backend);
 };
 
 } // namespace splash::metal

@@ -338,6 +338,6 @@ GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh32_f32, 16, 32, 128, 8192, 12544,
 GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh64, 16, 64, 128, 12288, 20736, bfloat)
 GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh64_f32, 16, 64, 128, 12288, 20736,
                        float)
-GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_p16512, 16, 48, 128, 10240, 16512, bfloat)
+// Qwen3.8-Flash-Next loads from GGUFs only, whose norms are F32.
 GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_p16512_f32, 16, 48, 128, 10240, 16512, float)
 #undef GDN_GATE_PREFILL_ENTRY

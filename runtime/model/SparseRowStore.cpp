@@ -150,9 +150,6 @@ struct SparseRowStore::Impl {
   // The cache: slots of rows with their ids, a recency list (head most
   // recent) and an open-addressed index of slot + 1 (0 empty).
   mutable std::mutex cacheMutex;
-  // From commit() on, under cacheMutex: the cache's arrays hold all of their
-  // host memory.
-  bool committed = false;
   uint64_t capacity = 0;
   uint64_t used = 0;
   std::unique_ptr<uint8_t[]> rows;
@@ -376,7 +373,6 @@ void SparseRowStore::commit() {
   touch(s.rows.get(), s.capacity * s.table.rowBytes);
   for (uint32_t *array : {s.ids.get(), s.previous.get(), s.next.get()}) touch(array, s.capacity * sizeof(uint32_t));
   touch(s.buckets.get(), (s.bucketMask + 1) * sizeof(uint32_t));
-  s.committed = true;
 }
 
 SparseRowStageResult SparseRowStore::stage(std::span<const uint32_t> ids, std::span<uint8_t> rows,
@@ -513,7 +509,6 @@ SparseRowStats SparseRowStore::stats() const {
     const std::lock_guard lock(s.cacheMutex);
     result.cachedRows = s.used;
     result.evictions = s.evictions;
-    result.committed = s.committed;
   }
   for (uint32_t use = 0; use < kSparseRowUses; ++use) {
     const Impl::UseCounters &counters = s.uses[use];

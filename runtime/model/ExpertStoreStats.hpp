@@ -8,16 +8,18 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace splash::model {
 
 struct ExpertStoreStats final {
-  // The store at its cap and at its floor, as ExpertStoreOptions counts
-  // them (its staging and tables too), its chunks at the cap and those live.
-  // The live chunks, their bytes and their slots are zero while the store is
-  // released.
+  // The store at its cap, at its floor and as it is, as ExpertStoreOptions
+  // counts them (its staging and tables too), its chunks at the cap and
+  // those live. The store as it is, the live chunks, their bytes and their
+  // slots are zero while the store is released.
   uint64_t capBytes = 0;
   uint64_t floorBytes = 0;
+  uint64_t liveBytes = 0;
   uint64_t capChunks = 0;
   uint64_t chunks = 0;
   uint64_t arenaBytes = 0; // the live chunks of every size
@@ -28,6 +30,14 @@ struct ExpertStoreStats final {
   // The chunks given back while memory was short, and taken back after.
   uint64_t shrinks = 0;
   uint64_t regrows = 0;
+  // The bytes releaseAboveFloor() would give back next and growTowardCap()
+  // would take: zero at the floor and at the cap, while released and after
+  // a failed load.
+  uint64_t releaseUnitBytes = 0;
+  uint64_t growUnitBytes = 0;
+  // The bytes of every chunk above the floors, in the order
+  // releaseAboveFloor() gives them back (the first is releaseUnitBytes).
+  std::vector<uint64_t> releaseUnits;
   // Per ops::MoePhase, at its value (uses[0] prefill, uses[1] decode): the
   // blocks loaded, the distinct experts they routed, those not resident and
   // of them those read ahead, the experts read ahead whole (routed or not),

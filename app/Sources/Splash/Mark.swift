@@ -124,6 +124,9 @@ struct StatusMark: View {
         }
         .frame(width: size + 2, height: size + 2)
         .animation(Motion.glide ?? Motion.quick, value: look)
+        // Its look changes its pose and color, not its place, which moves with the views beside
+        // it: SwiftUI otherwise animates where each part of it draws with its look.
+        .geometryGroup()
         .accessibilityHidden(true)
     }
 

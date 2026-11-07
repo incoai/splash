@@ -49,7 +49,7 @@ uint32_t leastUnits(const AneFfnModel &model, const AneFfnSetting &setting) {
 // Logs `outcome` of a start of `model` as `setting` allows: a model whose FFN
 // layers are not all dense and one --disable-ane leaves alone without its
 // layers said, and a refusal of a context the GPU alone does not hold either,
-// which the start reports on its own (RuntimeBootstrap::start), log nothing. A
+// which the start reports on its own (ServingRuntime::start), log nothing. A
 // refusal of a relaunch's context is a plain line, without the way out the
 // warning of a refused --max-context gives. An automatic context below the GPU
 // alone's is named beside it.

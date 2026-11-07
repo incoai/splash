@@ -108,8 +108,9 @@ uint32_t floorOf(uint32_t slots) { return static_cast<uint32_t>(kExpertFloorShar
 
 ExpertChunkLayout streamed(const ExpertSlotPlanes &planes, uint32_t slots, uint32_t minimum, uint64_t largest,
                            const std::string &what, uint64_t elasticBytes = kExpertElasticChunkBytes) {
-  return checked(streamedExpertChunkLayout(planes, slots, floorOf(slots), minimum, largest, elasticBytes), planes,
-                 slots, largest, what);
+  return checked(
+      streamedExpertChunkLayout(planes, slots, floorOf(slots), minimum, largest, elasticBytes, kExpertFloorShare),
+      planes, slots, largest, what);
 }
 
 // A large size's floor is the floor share of its slots rounded down to whole
@@ -197,20 +198,23 @@ void floorsAskedFor() {
     const uint64_t group = alignedSlotsOf(planes);
     const std::string what = std::string(name) + ", a floor of half the slots";
     const ExpertChunkLayout half = checked(
-        streamedExpertChunkLayout(planes, slots, slots / 2, 512, UINT64_MAX, chunkBytes(planes, alignUp(256, group))),
+        streamedExpertChunkLayout(planes, slots, slots / 2, 512, UINT64_MAX, chunkBytes(planes, alignUp(256, group)),
+                                  kExpertFloorShare),
         planes, slots, UINT64_MAX, what);
     require(half.floorSlots == alignDown(slots / 2, group) && half.floorChunks == 1 &&
                 half.chunkSlots == alignUp(256, group) &&
                 half.chunks == 1 + (slots - half.floorSlots + half.chunkSlots - 1) / half.chunkSlots,
             what + ": the floor or the elastic chunks above it are not what was asked for");
     const ExpertChunkLayout all = checked(
-        streamedExpertChunkLayout(planes, slots, slots, 512, UINT64_MAX, kExpertElasticChunkBytes), planes, slots,
-        UINT64_MAX, std::string(name) + ", a floor of every slot");
+        streamedExpertChunkLayout(planes, slots, slots, 512, UINT64_MAX, kExpertElasticChunkBytes, kExpertFloorShare),
+        planes,
+        slots, UINT64_MAX, std::string(name) + ", a floor of every slot");
     require(all.chunks == 1 && all.floorChunks == 1,
             std::string(name) + ": a floor of every slot takes elastic chunks");
     const ExpertChunkLayout raised = checked(
-        streamedExpertChunkLayout(planes, slots, 100, 512, UINT64_MAX, kExpertElasticChunkBytes), planes, slots,
-        UINT64_MAX, std::string(name) + ", a floor below a block's experts");
+        streamedExpertChunkLayout(planes, slots, 100, 512, UINT64_MAX, kExpertElasticChunkBytes, kExpertFloorShare),
+        planes,
+        slots, UINT64_MAX, std::string(name) + ", a floor below a block's experts");
     require(raised.floorSlots == alignUp(512, group) && raised.floorChunks == 1,
             std::string(name) + ": a floor below a block's experts is not raised to them");
   }
@@ -229,9 +233,38 @@ void largerElasticChunks() {
           "330 GiB: the elastic chunks are not the fewest slots that take 47 chunks");
 }
 
+// The floor share of the model's plan sets the default floor: a share of 1.0
+// keeps every slot in the floor's chunks, so the store never gives a chunk
+// back; the default 0.85 keeps that share of the slots rounded down to whole
+// regions, the elastic chunks above it; and a floor given holds whatever the
+// share. Flash-Next's experts on a 24 GB M6, 5721 slots of 1.3 MiB at the cap.
+void floorShareOfThePlan() {
+  constexpr ExpertSlotPlanes kFlashNext{{{442368, 0, 16384}, {442368, 0, 16384}, {442368, 0, 16384}}};
+  const uint64_t group = alignedSlotsOf(kFlashNext);
+  const auto layout = [&](uint32_t floor, double share, const std::string &what) {
+    return checked(
+        streamedExpertChunkLayout(kFlashNext, 5721, floor, 512, UINT64_MAX, kExpertElasticChunkBytes, share),
+        kFlashNext, 5721, UINT64_MAX, what);
+  };
+  const ExpertChunkLayout whole = layout(0, 1.0, "M6, a floor share of 1.0");
+  require(whole.floorSlots == 5721 && whole.floorChunks == whole.chunks,
+          "M6: a floor share of 1.0 left a chunk to give back");
+  const ExpertChunkLayout share = layout(0, kExpertFloorShare, "M6, the default floor share");
+  require(share.floorSlots == alignDown(floorOf(5721), group) && share.floorChunks == 1 && share.chunks > 1,
+          "M6: the default floor share did not keep 85% of the slots below elastic chunks");
+  const ExpertChunkLayout half = layout(0, 0.5, "M6, a floor share of 0.5");
+  require(half.floorSlots == alignDown(5721 / 2, group) && half.floorChunks == 1,
+          "M6: a floor share of 0.5 did not keep half the slots");
+  for (const double any : {1.0, kExpertFloorShare, 0.5}) {
+    const ExpertChunkLayout given = layout(3000, any, "M6, a floor of 3000 slots given");
+    require(given.floorSlots == alignDown(3000, group) && given.floorChunks == 1,
+            "M6: a floor given moved with the floor share " + std::to_string(any));
+  }
+}
+
 // The smallest largest buffer that holds the size in at most 48 chunks is
 // taken, a byte less refused, and one of a sixtieth of the size refused. The
-// 20000-slot sizes take exactly 48 chunks under it; the 515-slot ones fewer.
+// 20000-slot sizes take exactly 48 chunks under it, the 515-slot ones fewer.
 void tooManyChunks() {
   for (const auto &[planes, name] : kLayouts)
     for (const uint32_t slots : {515u, 20000u}) {
@@ -249,7 +282,8 @@ void tooManyChunks() {
                                    " of the device's largest buffers";
       const auto under = [&](uint64_t buffer) {
         static_cast<void>(
-            streamedExpertChunkLayout(planes, slots, floorOf(slots), 1, buffer, kExpertElasticChunkBytes));
+            streamedExpertChunkLayout(planes, slots, floorOf(slots), 1, buffer, kExpertElasticChunkBytes,
+                                      kExpertFloorShare));
       };
       rejects([&] { under(largest - 1); }, expected,
               what + ": a largest buffer a byte short of the smallest of at most 48 chunks was taken");
@@ -283,6 +317,7 @@ int main() {
     floorCap();
     floorsAskedFor();
     largerElasticChunks();
+    floorShareOfThePlan();
     tooManyChunks();
     oneBlockSizes();
   } catch (const std::exception &error) {

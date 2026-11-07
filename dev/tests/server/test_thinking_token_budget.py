@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import unittest
 from dataclasses import replace
 from unittest import mock
@@ -91,6 +92,41 @@ class ThinkingTokenBudgetTests(unittest.TestCase):
                 fixtures.chat_body(max_tokens=max_tokens),
             )
         self.assertEqual(self.frames(runtime), [None, None, budget(5)])
+
+    def test_thinking_keeps_its_share_of_the_room_the_context_leaves(self):
+        harness, runtime = self.harness()
+        self.post(harness, "/v1/chat/completions", fixtures.chat_body())
+        room = runtime.requests[0].frame.logical_max_output_tokens
+        # The budget keeps the share of the room it had of the limit, a limit
+        # past the budget plus the room counting as the budget plus the room:
+        # under a limit between the room and the budget plus the room it keeps
+        # its share of that limit, and a room four times the budget keeps the
+        # same budget under a limit of four times the room as under 2**31 - 1.
+        # A budget at the limit, or at the room where the request sets no
+        # limit, caps nothing; one below the room there stays whole.
+        share = budget(room // 4 * room // (room // 4 + room))
+        for fields in (
+            {"max_tokens": 2 * room, "thinking_token_budget": room},
+            {"max_tokens": 3 * room // 2, "thinking_token_budget": room},
+            {"max_tokens": 4 * room, "thinking_token_budget": room // 4},
+            {"max_tokens": 2**31 - 1, "thinking_token_budget": room // 4},
+            {"max_tokens": 2 * room, "thinking_token_budget": 2 * room},
+            {"thinking_token_budget": room},
+            {"thinking_token_budget": room - 1},
+        ):
+            self.post(harness, "/v1/chat/completions", fixtures.chat_body(**fields))
+        self.assertEqual(
+            self.frames(runtime)[1:],
+            [
+                budget(room // 2),
+                budget(room * room // (3 * room // 2)),
+                share,
+                share,
+                None,
+                None,
+                budget(room - 1),
+            ],
+        )
 
     def test_a_call_opening_also_ends_thinking_where_a_call_may_follow(self):
         harness, runtime = self.harness()
@@ -313,6 +349,7 @@ class ThinkingEndTextTests(unittest.TestCase):
     # thinking, a call's opening and the end of a turn.
     ENCODINGS = {
         "Time is up.\n</think>": [14, 15, THINK_END_TOKEN_ID],
+        "\n</think>": [198, THINK_END_TOKEN_ID],
         "</think>": [THINK_END_TOKEN_ID],
         "longest": [14] * 63 + [THINK_END_TOKEN_ID],
         "": [],
@@ -354,26 +391,28 @@ class ThinkingEndTextTests(unittest.TestCase):
             "<|im_end|></think>",
         ):
             with self.subTest(text=text):
-                with self.assertRaisesRegex(
-                    ThinkingEndError,
-                    "^--thinking-end-text must end with </think> and hold no other "
-                    "special token$",
-                ):
+                with self.assertRaises(ThinkingEndError) as raised:
                     thinking_end_tokens(self.tokenizer(), text, QWEN)
-        with self.assertRaisesRegex(
-            ThinkingEndError, "^--thinking-end-text takes 65 tokens; the most is 64$"
-        ):
+                self.assertEqual(
+                    str(raised.exception),
+                    f"the thinking end {text!r} must end with </think> and hold no "
+                    "other special token",
+                )
+        with self.assertRaises(ThinkingEndError) as raised:
             thinking_end_tokens(self.tokenizer(), "too long", QWEN)
-
-    def test_startup_refuses_a_text_before_starting_the_native_worker(self):
-        args = server.parse_args(
-            [
-                "model",
-                "--model",
-                "owner/model",
-                "--thinking-end-text=Time is up.",
-            ]
+        self.assertEqual(
+            str(raised.exception),
+            "the thinking end 'too long' takes 65 tokens; the most is 64",
         )
+
+    def start(self, *flags):
+        """Runs main() with these flags up to a native worker that never
+        becomes ready: its stderr, and the native runtime's and backend's
+        types."""
+        with mock.patch.dict(os.environ):
+            # The default ignores the caller's setting.
+            os.environ.pop("SPLASH_THINKING_END_TEXT", None)
+            args = server.parse_args(["model", "--model", "owner/model", *flags])
         http = mock.Mock()
         with (
             mock.patch.object(server, "parse_args", return_value=args),
@@ -384,20 +423,46 @@ class ThinkingEndTextTests(unittest.TestCase):
                 server.AutoTokenizer, "from_pretrained", return_value=self.tokenizer()
             ),
             mock.patch.object(server, "validate_tokenizer"),
+            # Qwen's templates close a reasoning with a line break.
+            mock.patch.object(
+                server,
+                "ChatTemplates",
+                **{"return_value.select.return_value.thinking_end": "\n</think>"},
+            ),
             mock.patch.object(server, "FrontendServer", return_value=http),
-            mock.patch.object(server.engine_runtime, "MultiplexedRuntime") as native,
+            mock.patch.object(
+                server.engine_runtime,
+                "MultiplexedRuntime",
+                **{"return_value.wait_ready.return_value": False},
+            ) as native,
+            mock.patch.object(server, "NativeBackend") as backend,
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
             mock.patch("sys.stdout", new_callable=io.StringIO),
             self.assertRaises(SystemExit) as raised,
         ):
             server.main()
         self.assertEqual(raised.exception.code, 1)
+        http.server_activate.assert_not_called()
+        return stderr.getvalue(), native, backend
+
+    def test_startup_refuses_a_text_before_starting_the_native_worker(self):
+        stderr, native, _ = self.start("--thinking-end-text=Time is up.")
         self.assertIn(
-            "--thinking-end-text must end with </think> and hold no other special token",
-            stderr.getvalue(),
+            "the thinking end 'Time is up.' must end with </think> and hold no other "
+            "special token",
+            stderr,
         )
         native.assert_not_called()
-        http.server_activate.assert_not_called()
+
+    def test_unset_a_budget_ends_thinking_as_the_template_closes_it(self):
+        # A text outranks the template's close.
+        for flags, end in (
+            ((), (198, THINK_END_TOKEN_ID)),
+            (("--thinking-end-text=</think>",), (THINK_END_TOKEN_ID,)),
+        ):
+            with self.subTest(flags=flags):
+                _, _, backend = self.start(*flags)
+                self.assertEqual(backend.call_args.kwargs["thinking_end"], end)
 
 
 if __name__ == "__main__":

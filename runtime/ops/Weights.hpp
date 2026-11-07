@@ -4,12 +4,48 @@
 #include "metal/abi/QuantFormat.h"
 
 #include <compare>
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
 namespace splash::ops {
+
+// How selection classes a weight unit's quantized segments together (a
+// projection, a gate/up pair, a MoE block's experts; FormatClassifier):
+// GridLookup when every segment's register-tile operands come from grid
+// lookups (IQ3_XXS, the IQ2 formats, IQ1); GridLookupOrQ2K when every one is
+// GridLookup or Q2_K, at least one Q2_K; otherwise FourBitsOrMore when every
+// one has at least four bits per weight (quant_four_bits) or none is
+// quantized; otherwise UnderFourBits.
+enum class FormatClass : uint8_t { GridLookup, GridLookupOrQ2K, UnderFourBits, FourBitsOrMore };
+inline constexpr size_t kFormatClasses = 4;
+
+// The FormatClass of the quantized segments' formats it is given.
+class FormatClassifier final {
+public:
+  constexpr void add(uint32_t format) noexcept {
+    grid_ &= gridLookup(format) || format == GGUF_FMT_Q2K;
+    q2k_ |= format == GGUF_FMT_Q2K;
+    fourBits_ &= quant_four_bits(format);
+    any_ = true;
+  }
+  [[nodiscard]] constexpr FormatClass formatClass() const noexcept {
+    if (any_ && grid_) return q2k_ ? FormatClass::GridLookupOrQ2K : FormatClass::GridLookup;
+    return fourBits_ ? FormatClass::FourBitsOrMore : FormatClass::UnderFourBits;
+  }
+
+private:
+  [[nodiscard]] static constexpr bool gridLookup(uint32_t format) noexcept {
+    switch (format) {
+    case GGUF_FMT_IQ3XXS: case GGUF_FMT_IQ2XXS: case GGUF_FMT_IQ2XS: case GGUF_FMT_IQ2S:
+    case GGUF_FMT_IQ1S: case GGUF_FMT_IQ1M: return true;
+    default: return false;
+    }
+  }
+  bool grid_ = true, q2k_ = false, fourBits_ = true, any_ = false;
+};
 
 struct ProjectionShape final {
   uint32_t outputSize = 0;
@@ -21,19 +57,15 @@ struct ProjectionShape final {
   // (quant_register_tensor); a projection with one it does not take stages
   // whatever its rows (Linear::decodeStorageRows, decodeScratchSize).
   bool registerFormats = true;
-  // Its quantized segments store at least four bits per weight
-  // (quant_four_bits); Apple10 runs the register tile on narrower grids of
-  // fewer (Linear::decodeStorageRows).
-  bool fourBits = true;
+  // The FormatClass of its quantized segments, whose RegisterBoundary row
+  // bounds the register tile (Linear::decodeStorageRows).
+  FormatClass formatClass = FormatClass::FourBitsOrMore;
   // The bits per weight its quantized segments store together, its float
   // ones aside, in sixteenths, rounded down; 0 where it has none or they are
   // unknown, which plans take for the most a format stores. Apple10's staged
-  // split law weighs a split's partials against the weights (LinearGguf.cpp).
+  // split law weighs a split's partials against the weights, and one lane of
+  // few bits runs the 16-row tile (KernelSelection.cpp).
   uint32_t weightBits16 = 0;
-  // Whether its quantized segments, together, store fewer than four and a
-  // half bits per weight; Apple10 may decode a lane of it on the staged
-  // 16-row tile (Linear::decodeStorageRows).
-  [[nodiscard]] constexpr bool underFourAndHalfBits() const noexcept { return weightBits16 && weightBits16 < 72; }
   auto operator<=>(const ProjectionShape &) const = default;
 };
 
@@ -134,18 +166,19 @@ public:
 
   [[nodiscard]] const BlockWeights &blocks() const noexcept { return weights_; }
   [[nodiscard]] ProjectionShape shape() const noexcept {
-    bool registerFormats = true, fourBits = true;
+    bool registerFormats = true;
+    FormatClassifier classes;
     // The quantized segments' weights and the bytes of their native blocks.
     uint64_t weights = 0, bytes = 0;
     for (const QuantizedSegment &s : weights_.segments) {
       registerFormats &= s.isFloat() || quant_register_tensor(s.formatId, s.inputSize);
-      fourBits &= s.isFloat() || quant_four_bits(s.formatId);
       if (s.isFloat()) continue;
+      classes.add(s.formatId);
       const uint64_t n = uint64_t{s.outputSize} * s.inputSize;
       weights += n;
       bytes += n * s.format().block_bytes / s.format().block_elements;
     }
-    return {outputSize, inputSize, static_cast<bool>(rotation), registerFormats, fourBits,
+    return {outputSize, inputSize, static_cast<bool>(rotation), registerFormats, classes.formatClass(),
             weights ? uint32_t(128 * bytes / weights) : 0};
   }
 
@@ -163,7 +196,6 @@ public:
   // inputSize. Only the prefill residual tiles of quantized weights take such
   // a view, on kernel instances of their own (Linear::add).
   [[nodiscard]] uint32_t planeInputs() const noexcept { return planeInputs_; }
-  [[nodiscard]] uint32_t planeInputSize() const noexcept { return planeInputs_ ? planeInputs_ : inputSize; }
 
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
@@ -178,13 +210,14 @@ private:
 };
 
 // A token table's rows as stored, gathered, never multiplied (Embedding.cpp):
-// native blocks of a gguf_embedding_format (metal/abi/Gguf.h), BF16 and F16
-// values among them, which a GGUF or a safetensors checkpoint may keep
-// unquantized. A default value holds no rows, which a reader replaces.
-struct NativeRows final {
-  NativeRows() = default;
-  // Rows of a gguf_embedding_format; throws for any other formatId.
-  NativeRows(metal::MetalBuffer rows, uint32_t formatId);
+// whole native blocks of a GGUF format (metal/abi/QuantFormat.h), or BF16 or
+// F16 values at any width (quant_stored_row_bytes), which a GGUF or a
+// safetensors checkpoint may keep unquantized. A default value holds no rows,
+// which a reader replaces.
+struct StoredRows final {
+  StoredRows() = default;
+  // Rows of a GGUF_FMT_*; throws for any other formatId.
+  StoredRows(metal::MetalBuffer rows, uint32_t formatId);
   metal::MetalBuffer rows;
   uint32_t formatId = 0;
   // Its format's native block and kernel name suffix.
@@ -197,18 +230,18 @@ struct NativeRows final {
 class EmbeddingWeights final {
 public:
   EmbeddingWeights() = default;
-  EmbeddingWeights(uint32_t output, uint32_t input, NativeRows rows)
+  EmbeddingWeights(uint32_t output, uint32_t input, StoredRows rows)
       : outputSize(output), inputSize(input), rows_(std::move(rows)) {}
 
-  [[nodiscard]] const NativeRows &blocks() const noexcept { return rows_; }
+  [[nodiscard]] const StoredRows &rows() const noexcept { return rows_; }
 
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
-  // Native rows stored rotated, gathered as D (H r) (InputRotation).
+  // Rows stored rotated, gathered as D (H r) (InputRotation).
   InputRotation rotation;
 
 private:
-  NativeRows rows_;
+  StoredRows rows_;
 };
 
 } // namespace splash::ops

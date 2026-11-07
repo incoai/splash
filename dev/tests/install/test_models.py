@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from dev.tests.installer_fixtures import http_error
+from dev.tests.installer_fixtures import FakeHub, http_error, missing_repository
 from install import hub
 from install import models as installer
 from server import serve_options
@@ -160,6 +160,31 @@ class InstallerTest(unittest.TestCase):
         ):
             installer.parse_args(
                 ["--model", self.MODEL_ID, "verify", "--json-progress"]
+            )
+
+    def test_prepare_reports_a_failure_by_its_kind(self):
+        # The Hub has no such model, and nothing installed or cached stands
+        # in: the error event carries the class the app words, and the
+        # message the launcher records, with or without progress.
+        FakeHub(self, self.root / "hub")
+        argv = ["--models", str(self.root), "--model", self.MODEL_ID, "prepare"]
+        message = (
+            f"cannot resolve {self.MODEL_ID}: {hub.reason(missing_repository())}; "
+            "neither this installation nor the Hub cache records a commit for "
+            "the default branch"
+        )
+        for progress in ([], ["--json-progress"]):
+            with (
+                self.subTest(progress=progress),
+                mock.patch.object(hub, "json_progress", False),
+                mock.patch("huggingface_hub.utils.disable_progress_bars"),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(installer.main([*argv, *progress]), 1)
+            self.assertEqual(
+                json.loads(output.getvalue()),
+                {"event": "error", "kind": "not_found", "message": message},
             )
 
     def test_variant_model_ids_parse_and_name_selection_links(self):

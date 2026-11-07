@@ -1,15 +1,11 @@
 import contextlib
-import dataclasses
 import io
-import math
-import re
 import shutil
 import struct
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from tokenizers import Tokenizer
@@ -19,10 +15,8 @@ from dev.tests import fixture_files
 from dev.tests.fixture_files import GGUF_TYPE_ARRAY, GGUF_TYPE_STRING
 from dev.tests.installer_fixtures import (
     BYTE,
-    DENSE,
     DRAFT_COMMIT,
     FLASH_NEXT,
-    FLASH_NEXT_ARRAYS,
     GGML,
     MOE,
     NORMAL,
@@ -31,12 +25,13 @@ from dev.tests.installer_fixtures import (
     draft_dir,
     family_config,
     fixture,
-    loadable_tensors,
     selection,
+    tensor_table,
     vision_fixture,
     write_gguf,
+    write_target,
 )
-from install import assembly, families, gguf, hub, models, upstream
+from install import assembly, gguf, hub, models, upstream
 
 GGUF_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
 
@@ -152,55 +147,6 @@ class GgufMetadataTests(unittest.TestCase):
         with self.assertRaisesRegex(models.ModelError, "duplicate GGUF tensor: t"):
             gguf.Metadata(path, tensors=True)
 
-    def test_split_headers_merge_in_split_order_or_are_refused(self):
-        # A GGUF split in two as GGUF's split files store it: every
-        # part's split keys, the first part's other keys, tensors in both.
-        def part(number, tensors, *, count=2, total=4):
-            values = {"general.architecture": "qwen35"} if number == 0 else {}
-            values |= {"split.no": number, "split.count": count}
-            values["split.tensors.count"] = total
-            path = write_gguf(self.root / "part.gguf", values, tensors.items())
-            return gguf.Metadata(path, tensors=True)
-
-        first = {"a": GGML["Q4_K"], "b": GGML["F32"]}
-        second = {"c": GGML["Q8_0"], "d": GGML["F32"]}
-        merged = gguf.merged_split([part(0, first), part(1, second)])
-        self.assertEqual(merged.values["general.architecture"], "qwen35")
-        self.assertEqual(merged.tensors, first | second)
-        for case, headers, reason in (
-            ("a lone part", [part(0, first)], "do not match its split.count"),
-            (
-                "parts out of order",
-                [part(1, second), part(0, first)],
-                "GGUF split file 1 is out of order",
-            ),
-            (
-                "a wrong split.no",
-                [part(0, first), part(2, second)],
-                "GGUF split file 2 is out of order",
-            ),
-            (
-                "a part of another split.count",
-                [part(0, first), part(1, second, count=3)],
-                "GGUF split file 2 is out of order",
-            ),
-            (
-                "a tensor in both parts",
-                [part(0, first), part(1, {"b": GGML["F32"]} | second)],
-                "duplicate GGUF tensor across split files: b",
-            ),
-            (
-                "a split.tensors.count the parts do not hold",
-                [part(0, first, total=5), part(1, second, total=5)],
-                "the GGUF's split files hold another number of tensors",
-            ),
-        ):
-            with (
-                self.subTest(case),
-                self.assertRaisesRegex(models.ModelError, reason),
-            ):
-                gguf.merged_split(headers)
-
     def test_bpe_ids_special_tokens_normalization_and_local_reload(self):
         metadata = self.metadata(fixture())
         files = gguf.tokenizer_files(metadata)
@@ -275,383 +221,34 @@ class GgufMetadataTests(unittest.TestCase):
                 with self.assertRaises(models.ModelError):
                     gguf.tokenizer_files(self.metadata(values))
 
-    def test_screening_takes_the_rotation_the_native_loader_runs(self):
-        # A dense target stored for rotated inputs, as Prism ML's GGUFs are:
-        # PQ2_0 projections and token table, BF16 alpha and beta.
-        values = {
-            key.replace("qwen35moe.", "qwen35."): value
-            for key, value in fixture().items()
-            if not key.startswith("qwen35moe.expert")
-        }
-        values["general.architecture"] = "qwen35"
-        rotation = {
-            "prism.hadamard.version": 1,
-            "prism.hadamard.block_size": 1024,
-            "prism.hadamard.transform": "normalized-sylvester-walsh-hadamard",
-            "prism.hadamard.axis": "input-last-dimension",
-            "prism.hadamard.sign_mode": "explicit",
-            "prism.hadamard.gdn_v_grouped": True,
-            "prism.hadamard.weight_names": ["output.weight"],
-            "prism.hadamard.inverse_weight_names": ["token_embd.weight"],
-            "prism.hadamard.sign_widths": [1024],
-            "prism.hadamard.sign_values": [1] * 1024,
-        }
-        tensors = {
-            name: GGML["F32"] if kind == GGML["F32"] else GGML["PQ2_0"]
-            for name, kind in loadable_tensors(values, self.root).items()
-        }
-        tensors |= {
-            n: GGML["BF16"]
-            for n in tensors
-            if n.endswith((".ssm_alpha.weight", ".ssm_beta.weight"))
-        }
-        path = write_gguf(self.root / "ok.gguf", values | rotation, tensors.items())
-        gguf.require_loadable(gguf.Metadata(path, tensors=True))
-        for changes in (
-            {"prism.hadamard.version": 2},
-            {"prism.hadamard.block_size": 512},
-            {"prism.hadamard.sign_mode": "identity"},
-            {"prism.hadamard.gdn_v_grouped": False},
-            {"prism.hadamard.seed": 7},
-        ):
-            with self.subTest(changes=changes):
-                path = write_gguf(
-                    self.root / "bad.gguf", values | rotation | changes, tensors.items()
-                )
-                with self.assertRaisesRegex(models.ModelError, "input rotation"):
-                    gguf.require_loadable(gguf.Metadata(path, tensors=True))
-        # The loader rotates dense targets only.
-        moe = fixture() | rotation
-        path = write_gguf(
-            self.root / "moe.gguf", moe, loadable_tensors(fixture(), self.root).items()
-        )
-        with self.assertRaisesRegex(models.ModelError, "input rotation"):
-            gguf.require_loadable(gguf.Metadata(path, tensors=True))
-
-    def test_screening_accepts_each_tensor_as_the_native_loader_reads_it(self):
-        values = fixture()
-        values["qwen35moe.block_count"] = 41
-        values["qwen35moe.nextn_predict_layers"] = 1
-        tensors = loadable_tensors(values, self.root)
-        # Layer 3 is full attention; the others around it GDN.
-        self.assertIn("blk.3.attn_q.weight", tensors)
-        self.assertNotIn("blk.2.attn_q.weight", tensors)
-        # GDN alpha and beta may be of any one quantized format, F32 or of two
-        # types, and the MTP layer (block 40) is never loaded, so its types do
-        # not matter.
-        tensors |= {"blk.0.ssm_alpha.weight": GGML["IQ4_XS"]}
-        tensors |= {"blk.0.ssm_beta.weight": GGML["IQ4_XS"]}
-        tensors |= {"blk.1.ssm_alpha.weight": GGML["F32"]}
-        tensors |= {"blk.1.ssm_beta.weight": GGML["F32"]}
-        tensors |= {"blk.2.ssm_alpha.weight": GGML["Q8_0"]}
-        tensors |= {"blk.2.ssm_beta.weight": GGML["IQ3_XXS"]}
-        tensors |= {"blk.4.ssm_alpha.weight": GGML["F32"]}
-        tensors |= {"blk.4.ssm_beta.weight": GGML["NVFP4"]}
-        tensors |= {"blk.40.ffn_up_exps.weight": GGML["TQ2_0"]}
-        tensors |= {"blk.0.ffn_down_exps.weight": GGML["IQ4_XS"]}
-        # The low-bit formats of Unsloth's smaller files, the embedding too.
-        tensors |= {"blk.4.ffn_gate_exps.weight": GGML["IQ3_XXS"]}
-        tensors |= {"blk.2.attn_qkv.weight": GGML["IQ1_M"]}
-        tensors |= {"blk.5.ffn_up_exps.weight": GGML["IQ2_XXS"]}
-        tensors |= {"token_embd.weight": GGML["Q2_K"]}
-        # Q5_0 and Q5_1, the shared experts of bartowski's Q4_0 and Q4_1.
-        tensors |= {"blk.4.ffn_gate_shexp.weight": GGML["Q5_0"]}
-        tensors |= {"blk.4.ffn_up_shexp.weight": GGML["Q5_1"]}
-        # llama.cpp's fused gate/up experts in place of the two tensors.
-        del tensors["blk.7.ffn_gate_exps.weight"], tensors["blk.7.ffn_up_exps.weight"]
-        tensors |= {"blk.7.ffn_gate_up_exps.weight": GGML["IQ3_XXS"]}
-        # llama.cpp's NVFP4, its per-expert tensor scales beside it.
-        tensors |= {"blk.6.ffn_up_exps.weight": GGML["NVFP4"]}
-        tensors |= {"blk.6.ffn_up_exps.scale": GGML["F32"]}
-        # BF16 and F16 tensors of quantized files: Unsloth's UD-Q8_K_XL keeps
-        # the attention projections and the LM head in BF16.
-        tensors |= {"blk.3.attn_q.weight": GGML["BF16"]}
-        tensors |= {"output.weight": GGML["BF16"]}
-        tensors |= {"blk.0.ffn_down_shexp.weight": GGML["F16"]}
-        tensors |= {"blk.5.ffn_gate_exps.weight": GGML["BF16"]}
-        tensors |= {"blk.5.ssm_alpha.weight": GGML["F16"]}
-        tensors |= {"blk.5.ssm_beta.weight": GGML["F16"]}
-        # 16-bit floats where the loader reads floats, as some GGUFs
-        # store them: a BF16 router, which the float projection runs as
-        # stored, and a BF16 shared-expert scalar gate and BF16 and F16 norms,
-        # which preparation widens to F32; and their Q2_0 experts.
-        tensors |= {"blk.1.ffn_gate_inp.weight": GGML["BF16"]}
-        tensors |= {"blk.1.ffn_gate_inp_shexp.weight": GGML["BF16"]}
-        tensors |= {"blk.2.attn_norm.weight": GGML["F16"]}
-        tensors |= {"output_norm.weight": GGML["BF16"]}
-        tensors |= {"blk.1.ffn_down_exps.weight": GGML["Q2_0"]}
-        # A Q8_0 shared-expert scalar gate, which preparation decodes to F32.
-        tensors |= {"blk.2.ffn_gate_inp_shexp.weight": GGML["Q8_0"]}
-        path = write_gguf(self.root / "ok.gguf", values, tensors.items())
-        gguf.require_loadable(gguf.Metadata(path, tensors=True))
-        for changes, reason in (
-            (
-                {"blk.4.ffn_gate_exps.weight": GGML["TQ2_0"]},
-                "ffn_gate_exps.weight type 35 [(]1 tensor[)]",
-            ),
-            (
-                {
-                    "blk.0.attn_qkv.weight": GGML["TQ2_0"],
-                    "blk.1.attn_qkv.weight": GGML["TQ2_0"],
-                },
-                "attn_qkv.weight type 35 [(]2 tensors[)]",
-            ),
-            ({"token_embd.weight": GGML["F32"]}, "token_embd.weight F32"),
-            (
-                {"blk.7.ffn_gate_up_exps.weight": GGML["F32"]},
-                "ffn_gate_up_exps.weight F32 [(]1 tensor[)]",
-            ),
-            # Floats only where the loader reads floats: not a projection, an
-            # F32 or BF16 router (or a quantized one, never F16) and an F32,
-            # BF16 or F16 norm, never a quantized one.
-            ({"blk.3.attn_q.weight": GGML["F32"]}, "attn_q.weight F32"),
-            ({"blk.0.ffn_gate_inp.weight": GGML["F16"]}, "ffn_gate_inp.weight F16"),
-            ({"output_norm.weight": GGML["Q8_0"]}, "output_norm.weight Q8_0"),
-            (
-                {
-                    "blk.1.ssm_alpha.weight": GGML["TQ2_0"],
-                    "blk.1.ssm_beta.weight": GGML["TQ2_0"],
-                },
-                "ssm_alpha.weight type 35",
-            ),
-            # A tensor scale beside a weight of another type than NVFP4.
-            (
-                {"blk.0.ffn_down_exps.scale": GGML["F32"]},
-                "ffn_down_exps.scale beside IQ4_XS",
-            ),
-        ):
-            with self.subTest(reason=reason):
-                path = write_gguf(
-                    self.root / "bad.gguf", values, (tensors | changes).items()
-                )
-                with self.assertRaisesRegex(
-                    models.ModelError, "cannot load: .*" + reason
-                ):
-                    gguf.require_loadable(gguf.Metadata(path, tensors=True))
-        # Every tensor the loader reads must be present.
-        missing = {n: k for n, k in tensors.items() if n != "blk.7.attn_k.weight"}
-        path = write_gguf(self.root / "bad.gguf", values, missing.items())
-        with self.assertRaisesRegex(models.ModelError, "attn_k.weight missing"):
-            gguf.require_loadable(gguf.Metadata(path, tensors=True))
-        # Without tensors=True the reader never reads the tensor table.
-        self.assertEqual(gguf.Metadata(path).tensors, {})
-
-    def test_screening_refuses_whole_bf16_and_f16_targets(self):
-        # Splash loads quantized GGUFs. A target whose projections and experts
-        # are all unquantized is refused with one message, whatever its token
-        # table, alpha and beta and whatever else in it the loader refuses; a
-        # target that quantizes any of them loads, the others in BF16 or F16.
-        typed = family_config(DENSE, "gguf-metadata.json")
-        dense = typed["unsigned"] | typed["float"] | typed["string"]
-        moe = fixture()
-
-        def converted(values, kind):
-            # As llama.cpp converts a model: every tensor the loader reads in
-            # a format of that kind, the others F32.
-            return {
-                name: GGML[kind] if found == GGML["Q4_K"] else found
-                for name, found in loadable_tensors(values, self.root).items()
-            }
-
-        def screen(values, tensors):
-            path = write_gguf(self.root / "model.gguf", values, tensors.items())
-            gguf.require_loadable(gguf.Metadata(path, tensors=True))
-
-        bf16 = converted(moe, "BF16")
-        small = ("token_embd.weight", ".ssm_alpha.weight", ".ssm_beta.weight")
-        for case, values, tensors in (
-            ("BF16", moe, bf16),
-            ("F16", dense, converted(dense, "F16")),
-            ("F32", moe, converted(moe, "F32")),
-            # The token table, alpha and beta do not count.
-            (
-                "BF16, small tensors Q8_0",
-                moe,
-                bf16 | {n: GGML["Q8_0"] for n in bf16 if n.endswith(small)},
-            ),
-            (
-                "BF16, a BF16 router the loader refuses too",
-                moe,
-                bf16 | {"blk.0.ffn_gate_inp.weight": GGML["BF16"]},
-            ),
-        ):
-            with (
-                self.subTest(case=case),
-                self.assertRaisesRegex(
-                    models.ModelError,
-                    "^this GGUF stores every projection and expert unquantized "
-                    "[(]BF16, F16 or F32[)]: Splash loads quantized GGUFs, not "
-                    "whole-BF16 or F16 models; choose a quantized variant of the "
-                    "repository$",
+    def test_a_target_quantized_in_its_experts_alone_is_served(self):
+        # The routed experts hold most of a MoE's values: quantized alone, as
+        # in llmfan46's Qwen3.6-35B-A3B NVFP4-Experts-Only, they make a
+        # quantized target, here split with every quantized tensor in its
+        # second part.
+        table = tensor_table()
+        parts = [
+            gguf.Metadata(
+                write_target(
+                    self.root / f"model-0000{part + 1}-of-00002.gguf",
+                    values,
+                    [
+                        (name, extents, GGML[kind])
+                        for name, extents, _ in table
+                        if ("_exps." in name) == bool(part)
+                    ],
                 ),
-            ):
-                screen(values, tensors)
-        # Unsloth's UD-Q8_K_XL of Qwen3.8-27B: the attention q, k and v
-        # projections and the LM head in BF16, the rest in Q8_0 or F32.
-        attention = (".attn_q.weight", ".attn_k.weight", ".attn_v.weight")
-        q8 = converted(dense, "Q8_0")
-        q8 |= {
-            n: GGML["BF16"] for n in q8 if n == "output.weight" or n.endswith(attention)
-        }
-        screen(dense, q8)
-        # One quantized projection or expert is enough: the routed experts
-        # alone, as llmfan46's Qwen3.6-35B-A3B NVFP4-Experts-Only file has.
-        screen(moe, bf16 | {n: GGML["NVFP4"] for n in bf16 if "_exps." in n})
-        # A file of the MTP layer alone lacks the target's tensors, which are
-        # listed instead.
-        mtp = {
-            n.replace("blk.3.", "blk.64."): found
-            for n, found in converted(dense, "BF16").items()
-            if n.startswith("blk.3.")
-        }
-        with self.assertRaisesRegex(models.ModelError, "cannot load: .*missing"):
-            screen(dense, mtp)
-
-    def test_screening_reads_flash_next_as_the_native_loader_does(self):
-        values = fixture(family=FLASH_NEXT)
-        tensors = loadable_tensors(values, self.root)
-        # Layer 3 is full attention, with the QSA indexer, the others around
-        # it GDN; layer 1 alone reads the PLE n-gram embedding's tensors, and
-        # the model its table.
-        self.assertIn("blk.3.indexer.q_proj.weight", tensors)
-        self.assertNotIn("blk.2.indexer.q_proj.weight", tensors)
-        self.assertIn("blk.1.ple_key.weight", tensors)
-        self.assertNotIn("blk.2.ple_key.weight", tensors)
-        self.assertIn("per_layer_token_embd.weight", tensors)
-        # Fused gate/up experts in place of the two tensors.
-        del tensors["blk.7.ffn_gate_exps.weight"], tensors["blk.7.ffn_up_exps.weight"]
-        tensors |= {"blk.7.ffn_gate_up_exps.weight": GGML["Q2_0"]}
-
-        def screen(values, tensors):
-            path = write_gguf(self.root / "model.gguf", values, tensors.items())
-            gguf.require_loadable(gguf.Metadata(path, tensors=True))
-
-        screen(values, tensors)
-        missing = {n: k for n, k in tensors.items() if n != "blk.1.ple_key.weight"}
-        with self.assertRaisesRegex(models.ModelError, "ple_key.weight missing"):
-            screen(values, missing)
-        # The arrays the engine's model check does not see are refused before
-        # download unless they are the planner's: a compress ratio for each
-        # loaded layer (an MTP layer's after them is not read) and the PLE
-        # layer alone. One refusal names each array that differs.
-        compress = "qwen4exp.attention.compress_ratios"
-        ratios = values[compress]
-        screen(values | {compress: ratios + [4]}, tensors)
-        for changes, refusal in (
-            ({compress: ratios[:-1]}, "attention.compress_ratios"),
-            ({compress: [4] * 48}, "attention.compress_ratios"),
-            ({compress: [0] * 48}, "attention.compress_ratios"),
-            ({"qwen4exp.ple.layers": [2]}, "ple.layers"),
-            ({"qwen4exp.ple.layers": [1, 2]}, "ple.layers"),
-            ({"qwen4exp.ple.layers": 1}, "ple.layers"),
-        ):
-            with (
-                self.subTest(changes=changes),
-                self.assertRaisesRegex(
-                    models.ModelError,
-                    f"^GGUF metadata does not match the target: {refusal}$",
-                ),
-            ):
-                screen(values | changes, tensors)
-        unread = {k: v for k, v in values.items() if k not in FLASH_NEXT_ARRAYS}
-        with self.assertRaisesRegex(
-            models.ModelError,
-            "^GGUF metadata does not match the target: "
-            "attention.compress_ratios, ple.layers$",
-        ):
-            screen(unread, tensors)
-
-    def test_loadable_types_are_the_native_formats(self):
-        # The installer's lists must be the loader's own: kQuantFormats' GGML
-        # types (runtime/metal/abi/QuantFormat.h), and those of the formats
-        # gguf_embedding_format does not leave out (runtime/metal/abi/Gguf.h).
-        abi = Path(__file__).resolve().parents[3] / "runtime/metal/abi"
-        header = (abi / "QuantFormat.h").read_text()
-        table = header.split("kQuantFormats[GGUF_FMT_COUNT] = {", 1)[1].split("};", 1)[
-            0
+                tensors=True,
+            )
+            for part, (values, kind) in enumerate(((fixture(), "BF16"), ({}, "NVFP4")))
         ]
-        # Each format's GGML type, by format id: its table type, or for NVFP4
-        # llama.cpp's, which the planner converts into it (ggml::kNVFP4 in
-        # runtime/model/GgufFile.hpp); MLX affine and fp8 have none.
-        ids = {
-            name: int(value)
-            for name, value in re.findall(r"#define GGUF_FMT_(\w+) (\d+)u", header)
-        }
-        rows = re.findall(r"^\s*\{([^,]+),", table, re.M)
-        types = {
-            index: gguf.TENSOR_TYPES[int(row)]
-            for index, row in enumerate(rows)
-            if row.isdigit()
-        }
-        gguf_file = (abi.parents[1] / "model/GgufFile.hpp").read_text()
-        nvfp4 = re.search(r"kNVFP4 = (\d+)", gguf_file).group(1)
-        types[ids["NVFP4"]] = gguf.TENSOR_TYPES[int(nvfp4)]
-        self.assertEqual(set(types.values()), gguf.FORMAT_TYPES)
-        # gguf_embedding_format must keep a form this reads, every format but
-        # those it names with !=, so that another form fails here instead of
-        # being misread.
-        match = re.search(
-            r"bool gguf_embedding_format\(uint32_t format\) \{ return ([^;]*); \}",
-            (abi / "Gguf.h").read_text(),
-        )
-        self.assertIsNotNone(match, "gguf_embedding_format is not one return")
-        self.assertRegex(
-            match[1], r"^format < GGUF_FMT_COUNT( && format != GGUF_FMT_\w+)*$"
-        )
-        left_out = {ids[name] for name in re.findall(r"!= GGUF_FMT_(\w+)", match[1])}
-        self.assertEqual(
-            {name for index, name in types.items() if index not in left_out},
-            gguf.EMBEDDING_TYPES,
-        )
-
-    def test_rotation_screen_is_the_native_loaders(self):
-        # ROTATION and ROTATION_ARRAYS must be what GgufFile::readRotation
-        # (runtime/model/GgufFile.cpp) accepts: the keys it knows, its fixed
-        # parameters and GGUF_ROTATION_BLOCK (runtime/metal/abi/Gguf.h), and
-        # the grouped GDN value heads the planner requires.
-        runtime = Path(__file__).resolve().parents[3] / "runtime"
-        source = (runtime / "model/GgufFile.cpp").read_text()
-        known = source.split("kKnown[] = {", 1)[1].split("};", 1)[0]
-        self.assertEqual(
-            set(re.findall(r'"(\w+)"', known)),
-            gguf.ROTATION.keys() | gguf.ROTATION_ARRAYS,
-        )
-        fixed = dict(re.findall(r'stringValue\(key\("(\w+)"\)\) != "([^"]+)"', source))
-        fixed["version"] = int(re.search(r'key\("version"\)\) != (\d+)', source)[1])
-        header = (runtime / "metal/abi/Gguf.h").read_text()
-        block = re.search(r"#define GGUF_ROTATION_BLOCK (\d+)u", header)[1]
-        fixed["block_size"] = int(block)
-        self.assertEqual(fixed | {"gdn_v_grouped": True}, gguf.ROTATION)
-
-    def test_flash_next_arrays_are_screened_by_the_native_layout(self):
-        # qwen4exp's QSA block and PLE layer must be Qwen4ExpLayout's
-        # (runtime/model/Qwen4Exp.hpp), whose block may name a kernel macro
-        # (runtime/metal/abi/BlockIndexer.h), which may name another's.
-        runtime = Path(__file__).resolve().parents[3] / "runtime"
-        defines = {}
-        for header in ("BlockIndexer.h", "PagedAttention.h"):
-            text = (runtime / "metal/abi" / header).read_text()
-            defines.update(re.findall(r"^#define (\w+) (\d+)u\b", text, re.M))
-            defines.update(re.findall(r"^#define (\w+) ([A-Z]\w*)$", text, re.M))
-
-        def resolve(value):
-            while value in defines:
-                value = defines[value]
-            return int(value)
-
-        layout = (runtime / "model/Qwen4Exp.hpp").read_text()
-        fields = re.findall(r"\.(indexerBlockTokens|pleLayer) = (\w+),", layout)
-        qwen4 = gguf.ARCHITECTURES["qwen4exp"]
-        self.assertEqual(
-            {name: resolve(value) for name, value in fields},
-            {"indexerBlockTokens": qwen4.qsa_block, "pleLayer": qwen4.ple_layer},
-        )
+        gguf.require_quantized(parts)
 
     def test_every_derivation_names_an_unsupported_architecture(self):
         values = fixture()
         values["general.architecture"] = "llama"
         metadata = self.metadata(values)
-        for derive in (gguf.require_loadable, gguf.model_config, gguf.tokenizer_files):
+        for derive in (gguf.model_config, gguf.tokenizer_files):
             with (
                 self.subTest(derive=derive.__name__),
                 self.assertRaisesRegex(
@@ -660,11 +257,11 @@ class GgufMetadataTests(unittest.TestCase):
             ):
                 derive(metadata)
 
-    def test_the_engine_checks_a_gguf_by_its_config_and_metadata(self):
+    def test_the_engine_checks_a_gguf_by_its_config_and_headers(self):
         # The derived config holds the sizes the engine reads in it and a MoE's
         # routed experts, fewer than its family's in a pruned release; the rest
         # of what the planner checks in the GGUF at every start, the engine
-        # checks in the metadata copied from the header.
+        # checks in the copy of its header.
         values = fixture(native=True)
         config = gguf.model_config(self.metadata(values))
         self.assertEqual(
@@ -687,61 +284,31 @@ class GgufMetadataTests(unittest.TestCase):
             gguf.model_config(self.metadata(fixture(native=True, family=FLASH_NEXT))),
             family_config(FLASH_NEXT),
         )
-        path, metadata = self.root / "config.json", self.root / "gguf-metadata.json"
-        mismatch = "GGUF metadata does not match the target: "
+        path, headers = self.root / "config.json", self.root / "target"
+        headers.mkdir()
         for changes, refusal in (
             ({}, None),
-            ({"qwen35moe.expert_count": 128}, None),
-            ({"qwen35moe.expert_count": 264}, "text config num_experts: GGUF 264"),
             (
                 {"qwen35moe.expert_used_count": 16},
-                mismatch + "expert_used_count 16 [(]expected 8",
-            ),
-            (
-                {"qwen35moe.rope.scaling.type": "yarn"},
-                mismatch + "rope.scaling.type yarn",
-            ),
-            (
-                {"qwen35moe.attention.layer_norm_rms_epsilon": 1e-5},
-                mismatch + "attention.layer_norm_rms_epsilon 1e-05 [(]expected 1e-06",
-            ),
-            (
-                {"qwen35moe.expert_feed_forward_length": 768},
-                mismatch + "expert_feed_forward_length 768 [(]expected 512",
+                "GGUF metadata does not match the target: "
+                "expert_used_count 16 [(]expected 8",
             ),
         ):
             with self.subTest(changes=changes):
                 # Both from one header, as the installer derives them.
-                header = self.metadata(values | changes)
-                path.write_bytes(models.json_bytes(gguf.model_config(header)))
-                metadata.write_bytes(models.json_bytes(gguf.scalar_metadata(header)))
+                header = write_target(
+                    headers / "model.gguf", values | changes, tensor_table()
+                )
+                metadata = gguf.Metadata(header)
+                path.write_bytes(models.json_bytes(gguf.model_config(metadata)))
                 if refusal is None:
                     family = upstream.check_model(
-                        "gguf", "none", path, gguf_metadata=metadata
+                        "gguf", "none", path, gguf_headers=headers
                     )
                     self.assertEqual(family.name, "Qwen3.6-35B-A3B")
                     continue
                 with self.assertRaisesRegex(models.ModelError, refusal):
-                    upstream.check_model("gguf", "none", path, gguf_metadata=metadata)
-
-    def test_metadata_is_typed_as_the_native_reader_keeps_it(self):
-        values = {
-            "count": 7,
-            "signed": -1,
-            "flag": True,
-            "base": 0.5,
-            "nan": math.nan,
-            "name": "qwen35",
-            "sections": [11, 11, 10],
-        }
-        self.assertEqual(
-            gguf.scalar_metadata(SimpleNamespace(values=values)),
-            {
-                "unsigned": {"count": 7, "signed": 2**64 - 1, "flag": 1},
-                "float": {"base": 0.5},
-                "string": {"name": "qwen35"},
-            },
-        )
+                    upstream.check_model("gguf", "none", path, gguf_headers=headers)
 
     def test_config_uses_metadata_and_subtracts_only_mtp_layers(self):
         values = fixture()
@@ -751,19 +318,15 @@ class GgufMetadataTests(unittest.TestCase):
         self.assertEqual(text["num_hidden_layers"], 40)
         self.assertEqual(text["hidden_size"], 2048)
         self.assertEqual(text["max_position_embeddings"], 262144)
-        # Tensor screening reads the layer count first, and rejects an
-        # invalid MTP count as configuration derivation does.
         for mtp in (41, "1"):
             values["qwen35moe.nextn_predict_layers"] = mtp
-            metadata = self.metadata(values)
-            for derive in (gguf.require_loadable, gguf.model_config):
-                with (
-                    self.subTest(mtp=mtp, derive=derive.__name__),
-                    self.assertRaisesRegex(
-                        models.ModelError, "invalid GGUF MTP layer count"
-                    ),
-                ):
-                    derive(metadata)
+            with (
+                self.subTest(mtp=mtp),
+                self.assertRaisesRegex(
+                    models.ModelError, "invalid GGUF MTP layer count"
+                ),
+            ):
+                gguf.model_config(self.metadata(values))
 
     def test_vision_config_derives_the_position_grid_and_rejects_other_towers(self):
         vision = self.metadata(vision_fixture())
@@ -920,11 +483,8 @@ class GgufMetadataTests(unittest.TestCase):
 
         def build(root):
             root.mkdir(parents=True)
-            values = fixture(native=True)
-            write_gguf(
-                root / "model-Q4_K_M.gguf",
-                values,
-                loadable_tensors(values, self.root).items(),
+            write_target(
+                root / "model-Q4_K_M.gguf", fixture(native=True), tensor_table()
             )
             if vision:
                 write_gguf(
@@ -987,30 +547,17 @@ class GgufMetadataTests(unittest.TestCase):
         )
 
     def flash_next_repository(self, repo):
-        """A Qwen3.8-Flash-Next GGUF in repo on a FakeHub, as its Q2_0
-        release stores it: Q2_0 experts and 16-bit floats where the loader
-        reads floats (a BF16 router, shared-expert scalar gate and injection
-        weights, an F16 PLE convolution), with the family's DFlash2 draft
-        repository, of the fixture's made-up sizes."""
+        """A Qwen3.8-Flash-Next GGUF in repo on a FakeHub, of a real file's
+        tensors (tensor_table), with the family's DFlash2 draft repository, of
+        the fixture's made-up sizes."""
 
         def build(root):
             root.mkdir(parents=True)
-            values = fixture(native=True, family=FLASH_NEXT)
-            tensors = loadable_tensors(values, self.root)
-            for name in tensors:
-                if name.endswith("_exps.weight"):
-                    tensors[name] = GGML["Q2_0"]
-                elif name.endswith(
-                    (
-                        "ffn_gate_inp.weight",
-                        "ffn_gate_inp_shexp.weight",
-                        "_inject.weight",
-                    )
-                ):
-                    tensors[name] = GGML["BF16"]
-                elif name.endswith("ple_conv1d.weight"):
-                    tensors[name] = GGML["F16"]
-            write_gguf(root / "model-Q2_0.gguf", values, tensors.items())
+            write_target(
+                root / "model-Q2_0.gguf",
+                fixture(native=True, family=FLASH_NEXT),
+                tensor_table(FLASH_NEXT),
+            )
 
         fake = FakeHub(self, self.root / "hub")
         fake.publish(repo, "a" * 40, build)
@@ -1049,41 +596,6 @@ class GgufMetadataTests(unittest.TestCase):
             family_config(FLASH_NEXT, "draft/config.json"),
         )
 
-    def test_a_family_without_a_released_draft_is_refused_before_any_download(self):
-        repo = "someone/Flash-Next-GGUF"
-        fake = self.flash_next_repository(repo)
-        unreleased = dataclasses.replace(FLASH_NEXT, draft_repo=None)
-        with (
-            mock.patch.object(families, "FAMILIES", (unreleased,)),
-            self.assertRaisesRegex(
-                models.ModelError,
-                "no DFlash2 draft is released for Qwen3.8-Flash-Next; "
-                "name one with --draft-model",
-            ),
-        ):
-            self.prepare(selection(self.root, repo + ":Q2_0"))
-        self.assertNotIn(f"{repo}/model-Q2_0.gguf", fake.downloads)
-
-    def test_a_layer_count_no_family_has_is_rejected_before_screening(self):
-        # Screening lists every tensor of every layer a header claims; only
-        # the family bounds the count.
-        fake = self.gguf_repository(vision=False)
-        values = fixture(native=True)
-        values["qwen35moe.block_count"] = 2**32 - 1
-        write_gguf(fake.remote / GGUF_REPO / ("a" * 40) / "model-Q4_K_M.gguf", values)
-        with (
-            mock.patch.object(
-                gguf, "loaded_tensors", side_effect=AssertionError("screened")
-            ),
-            self.assertRaisesRegex(
-                models.ModelError,
-                "no supported model has this architecture [(]text config "
-                "num_hidden_layers: GGUF 4294967295, Qwen3.6-35B-A3B 40[)]",
-            ),
-        ):
-            self.prepare(selection(self.root, GGUF_REPO + ":Q4_K_M"))
-        self.assertEqual(fake.downloads, [])
-
     def test_a_gguf_splash_cannot_serve_is_refused_before_its_projector(self):
         # Another architecture, with a projector Splash would not take either.
         fake = FakeHub(self, self.root / "hub")
@@ -1108,27 +620,59 @@ class GgufMetadataTests(unittest.TestCase):
         self.assertEqual(fake.range_reads, ["someone/gemma-GGUF/model-Q4_K_M.gguf"])
         self.assertEqual(fake.downloads, [])
 
-    def test_metadata_the_engine_refuses_is_refused_before_any_download(self):
+    def test_a_header_splash_refuses_is_refused_before_any_download(self):
         # A GGUF whose header states what the planner refuses at every start,
-        # with its projector: the metadata is checked before the projector is
-        # chosen, and neither a weight file nor the draft is downloaded.
+        # or a model unquantized, with its projector: the header is checked
+        # before the projector is chosen, and neither a weight file nor the
+        # draft is downloaded.
         fake = FakeHub(self, self.root / "hub")
         fake.publish(MOE.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, MOE))
-        for index, (changes, refusal) in enumerate(
+
+        def retyped(kind):
+            return [(name, e, kind(name, k)) for name, e, k in tensor_table()]
+
+        unquantized = (
+            "^this GGUF stores its weights unquantized [(]BF16, F16 or F32[)]: "
+            "Splash loads quantized GGUFs, not whole-BF16 or F16 models; choose "
+            "a quantized variant of the repository$"
+        )
+        for index, (changes, tensors, refusal) in enumerate(
             (
                 (
                     {"qwen35moe.expert_used_count": 16},
+                    tensor_table(),
+                    "GGUF metadata does not match the target: "
                     "expert_used_count 16 [(]expected 8",
                 ),
-                ({"qwen35moe.rope.scaling.type": "yarn"}, "rope.scaling.type yarn"),
+                (
+                    {"qwen35moe.rope.scaling.type": "yarn"},
+                    tensor_table(),
+                    "GGUF metadata does not match the target: rope.scaling.type yarn",
+                ),
+                (
+                    {},
+                    retyped(lambda n, k: GGML["Q8_1"] if "ffn_gate_exps" in n else k),
+                    "GGUF tensors this build cannot load: "
+                    "ffn_gate_exps.weight [(]Q8_1[)] in 40 layers$",
+                ),
+                ({}, retyped(lambda n, k: GGML["F32"]), unquantized),
+                # BF16 with its token table quantized is still a BF16 model.
+                (
+                    {},
+                    retyped(
+                        lambda n, k: GGML[
+                            "Q8_0" if n == "token_embd.weight" else "BF16"
+                        ]
+                    ),
+                    unquantized,
+                ),
             )
         ):
             repo = f"someone/model-{index}-GGUF"
 
-            def build(root, values=fixture(native=True) | changes):
+            def build(root, values=fixture(native=True) | changes, tensors=tensors):
                 root.mkdir(parents=True)
-                tensors = loadable_tensors(values, self.root).items()
-                write_gguf(root / "model-Q4_K_M.gguf", values, tensors)
+                write_target(root / "model-Q4_K_M.gguf", values, tensors)
                 write_gguf(
                     root / "mmproj-F32.gguf",
                     vision_fixture(),
@@ -1137,11 +681,8 @@ class GgufMetadataTests(unittest.TestCase):
 
             fake.publish(repo, "a" * 40, build)
             fake.range_reads.clear()
-            with self.subTest(changes=changes):
-                with self.assertRaisesRegex(
-                    models.ModelError,
-                    "GGUF metadata does not match the target: " + refusal,
-                ):
+            with self.subTest(refusal=refusal):
+                with self.assertRaisesRegex(models.ModelError, refusal):
                     self.prepare(
                         selection(self.root, repo + ":Q4_K_M", language_only=False)
                     )

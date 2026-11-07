@@ -199,7 +199,7 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
         require(!retained.contents() && backend.memoryStats().allocatedBytes == baseline,
                 "released image memory remains");
         rejects([&] { (void)readBack(); }, "binds released memory", "a command bound released image memory");
-        require(images.restore(splash::test::admitAll, splash::test::admitAll) && !images.released() &&
+        require(images.restore(splash::test::admitAll) && !images.released() &&
                     backend.memoryStats().allocatedBytes >= baseline + fileBytes && readBack(),
                 "GPU read of a restored image section was incorrect");
         images.release();
@@ -209,7 +209,7 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
                     pwrite(descriptor, &edit, sizeof(edit), kWeightFileAlignment) == sizeof(edit),
                 "unable to write the loaded file");
         close(descriptor);
-        rejects([&] { static_cast<void>(images.restore(splash::test::admitAll, splash::test::admitAll)); },
+        rejects([&] { static_cast<void>(images.restore(splash::test::admitAll)); },
                 "written while the model is loaded", "a restore read a file written since it was opened");
     }
     retained = MetalBuffer{};
@@ -298,7 +298,7 @@ void testRestoreAdmission(MetalBackend &backend, const std::filesystem::path &ro
 
     images.release();
     require(holdsNone(), "released images hold memory");
-    require(!images.restore(splash::test::admitAll, splash::test::admitAll) && !images.contents()[0].bytes.empty() &&
+    require(!images.restore(splash::test::admitAll) && !images.contents()[0].bytes.empty() &&
                 images.contents()[1].bytes.empty(),
             "a restore did not write back the first image alone");
     const uint64_t firstBack = backend.memoryStats().allocatedBytes;
@@ -309,17 +309,17 @@ void testRestoreAdmission(MetalBackend &backend, const std::filesystem::path &ro
     const splash::metal::AllocationAdmission refuse = [](uint64_t, const std::function<void()> &) {
         return splash::metal::AllocationResult{splash::metal::AllocationFailure::HostPressure};
     };
-    rejects([&] { static_cast<void>(images.restore(refuse, refuse)); }, "host memory reserve protected",
+    rejects([&] { static_cast<void>(images.restore(refuse)); }, "host memory reserve protected",
             "an image admission refused was restored");
     require(keepsTheFirst(), "an image admission refused holds memory, or the image before it went");
     writerRefused = true;
-    rejects([&] { static_cast<void>(images.restore(splash::test::admitAll, splash::test::admitAll)); },
+    rejects([&] { static_cast<void>(images.restore(splash::test::admitAll)); },
             "writer refused memory", "an image whose writer was refused memory was restored");
     require(keepsTheFirst(), "an image whose writer was refused memory holds its own, or the image before it went");
     writerRefused = false;
     images.release();
     require(holdsNone(), "a release during a restore kept an image it wrote back");
-    while (!images.restore(splash::test::admitAll, splash::test::admitAll)) {
+    while (!images.restore(splash::test::admitAll)) {
     }
     for (size_t index = 0; index < loaded.size(); ++index) {
         const auto restored = images.contents()[index].bytes;
@@ -345,7 +345,8 @@ std::filesystem::path writeGgufTensor(const std::filesystem::path &path,
 }
 
 // GGUF image readers hold a tensor to the sizes the layout expects, read F16
-// and BF16 token rows as their formats' native rows, read a quantized
+// and BF16 token rows as stored, also of Flash-Next's 160 PLE values, which
+// are no whole native block, read a quantized
 // tensor's native rows as a float segment only where one is read (the MoE
 // router), never as a projection, and a token gather writes only into
 // buffers holding its rows.
@@ -422,18 +423,18 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
             (void)splash::model::readFloatSegment(file, "router");
         },
         "GGUF rows are inconsistent", "GGUF planes were read as a float segment");
-    // A GGUF's F16 and BF16 token rows read as the native rows of their formats.
+    // A GGUF's F16 and BF16 token rows read as their formats' rows as stored.
     for (const auto &[type, format] : {std::pair{splash::model::ggml::kF16, GGUF_FMT_F16},
-                                       std::pair{splash::model::ggml::kBF16, GGUF_FMT_BF16}}) {
-        WeightFile file = loaded(writeGgufTensor(root / ("embedding-" + std::to_string(type) + ".bin"),
-                                                 {.type = type,
-                                                  .outputSize = rows,
-                                                  .inputSize = columns,
-                                                  .plane0Bytes = uint64_t{rows} * columns * 2}));
-        const auto table = splash::model::readBlockEmbedding(file, rows, columns, "embedding");
-        file.finish();
-        require(table.blocks().formatId == format, "GGUF 16-bit embedding did not read as its format's rows");
-    }
+                                       std::pair{splash::model::ggml::kBF16, GGUF_FMT_BF16}})
+        for (const uint32_t width : {columns, 160u}) {
+            WeightFile file = loaded(writeGgufTensor(
+                root / ("embedding-" + std::to_string(type) + "-" + std::to_string(width) + ".bin"),
+                {.type = type, .outputSize = rows, .inputSize = width, .plane0Bytes = uint64_t{rows} * width * 2}));
+            const auto table = splash::model::readBlockEmbedding(file, rows, width, "embedding");
+            file.finish();
+            require(table.rows().formatId == format,
+                    "GGUF 16-bit embedding did not read as its format's rows at " + std::to_string(width) + " values");
+        }
     WeightFile file = loaded(embedding);
     const auto table = splash::model::readBlockEmbedding(file, rows, columns, "embedding");
     file.finish();
@@ -619,10 +620,10 @@ void testSyntheticModel(MetalBackend &backend,
                         declaredBytes(model.draft.files) - declaredBytes(model.vision.files),
                 "released weights remain in backend accounting");
         // They come back an image at a time, in load order.
-        require(!model.images->restore(splash::test::admitAll, splash::test::admitAll) &&
+        require(!model.images->restore(splash::test::admitAll) &&
                     !model.images->contents()[0].bytes.empty() && model.images->contents()[1].bytes.empty(),
                 "a restore wrote back other than the next image");
-        while (!model.images->restore(splash::test::admitAll, splash::test::admitAll)) {
+        while (!model.images->restore(splash::test::admitAll)) {
         }
         const auto restored = model.images->contents();
         require(restored.size() == loaded.size() &&
@@ -709,7 +710,7 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
                 segmentFormats(weights.layers[1].upProjection) == std::vector<uint32_t>{format("up_proj")} &&
                 segmentFormats(weights.layers[1].downProjection) == std::vector<uint32_t>{format("down_proj")} &&
                 segmentFormats(weights.logitsProjection) == std::vector<uint32_t>{format("lm_head")} &&
-                weights.tokenEmbedding.blocks().formatId == format("embed_tokens"),
+                weights.tokenEmbedding.rows().formatId == format("embed_tokens"),
             "a block FFN, head or token table did not keep its module's format");
     require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned,
             "streamableWeights is not what an MLX block target loads");
@@ -746,7 +747,7 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
             "missing source tensor: language_model.lm_head.weight",
             "a checkpoint without language_model.lm_head was accepted");
     unquantized("language_model.model.embed_tokens");
-    require(std::get<Qwen3_8Weights>(loadModel(backend, root, descriptor).target).tokenEmbedding.blocks().formatId ==
+    require(std::get<Qwen3_8Weights>(loadModel(backend, root, descriptor).target).tokenEmbedding.rows().formatId ==
                 GGUF_FMT_BF16,
             "a bf16 token table did not load as its bf16 rows");
 }
@@ -790,7 +791,7 @@ void testSyntheticFloatModel(MetalBackend &backend, const std::filesystem::path 
                 segmentFormats(weights.layers[1].upProjection) == nvfp4 &&
                 segmentFormats(weights.layers[1].downProjection) == nvfp4 &&
                 segmentFormats(weights.logitsProjection) == fp8 &&
-                weights.tokenEmbedding.blocks().formatId == GGUF_FMT_BF16,
+                weights.tokenEmbedding.rows().formatId == GGUF_FMT_BF16,
             "a " + name + " target did not keep its modules' formats and its bf16 token table");
     // Every stored norm weight is zero: 1 + w is 1, the gated norm's w 0.
     const auto first = [](const splash::ops::NormWeights &norm) {

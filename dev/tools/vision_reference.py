@@ -136,7 +136,7 @@ def read_gguf_tensors(path: Path, names) -> dict:
     # The data section starts at the first multiple of the alignment past
     # the header.
     alignment = header.values.get("general.alignment", 32)
-    data = (header.consumed + alignment - 1) // alignment * alignment
+    data = (len(header.raw) + alignment - 1) // alignment * alignment
     found = {}
     for name in names:
         if name not in header.tensors:

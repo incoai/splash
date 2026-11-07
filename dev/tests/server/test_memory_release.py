@@ -12,7 +12,7 @@ from server import runtime as engine_runtime
 from server import server as api
 
 # The weights section the engine answers a release request with when it keeps
-# the weights, in each case native_engine_loop_test.cpp checks it reports, and
+# the weights, in each case native_loop_weights_test.cpp checks it reports, and
 # the code and the words of the 409 that says why.
 KEPT = {
     # A restore leaves the weights released until its last image is back, and
