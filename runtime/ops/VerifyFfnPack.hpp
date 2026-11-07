@@ -10,6 +10,9 @@ namespace splash::ops {
 struct VerifyFfnPackBuffers final {
   metal::MetalBuffer control, input, residual, intermediate, output;
 };
+// The host-only plan/format contract, also used before limiting retained rows.
+[[nodiscard]] bool supportsVerifyFfnPack(const SwiGluProjections &ffn, const LinearPlan &upPlan,
+                                         const LinearPlan &downPlan, uint32_t lanes);
 // Returns false without dispatching when the original plans/weights are unsupported.
 // Both GPU-selected paths preserve the supplied wide K splits and walk.
 [[nodiscard]] bool addVerifyFfnPack(metal::CommandGraph &graph, const SwiGluProjections &ffn,

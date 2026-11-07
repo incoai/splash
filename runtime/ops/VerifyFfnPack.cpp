@@ -7,26 +7,39 @@ namespace {
 bool supported(const Projection *p) {
   return p && !p->rotation && !p->planeInputs() && p->destination == FloatOutput::BFloat16 &&
          p->blocks().segments.size() == 1 && !p->blocks().segments.front().isFloat() &&
-         p->blocks().segments.front().formatId == GGUF_FMT_AF4G64;
+         p->blocks().segments.front().formatId == GGUF_FMT_AF4G64 &&
+         p->blocks().segments.front().columnOffset == 0 &&
+         p->blocks().segments.front().inputSize == p->inputSize &&
+         p->blocks().segments.front().outputSize == p->outputSize;
 }
 } // namespace
+bool supportsVerifyFfnPack(const SwiGluProjections &ffn, const LinearPlan &upPlan, const LinearPlan &downPlan,
+                           uint32_t lanes) {
+  if (lanes < 5 || lanes > 8 || !supported(ffn.gate) || !supported(ffn.up) || !supported(ffn.down) ||
+      upPlan.configuration().tile != LinearTile::GgufStaged ||
+      downPlan.configuration().tile != LinearTile::GgufStaged || upPlan.storageRows() != 64 ||
+      downPlan.storageRows() != 64 || upPlan.input() != LinearInput::Plain ||
+      downPlan.input() != LinearInput::Plain || upPlan.configuration().oneGateUpPass ||
+      upPlan.workload().epilogue != LinearEpilogue::GateUp ||
+      downPlan.workload().epilogue != LinearEpilogue::Residual ||
+      upPlan.workload().phase != LinearPhase::Decode || downPlan.workload().phase != LinearPhase::Decode)
+    return false;
+  const uint32_t H = ffn.up->inputSize, I = ffn.up->outputSize;
+  if (!H || !I || H % 64 || I % 64 || ffn.gate->inputSize != H || ffn.gate->outputSize != I ||
+      ffn.down->inputSize != I || ffn.down->outputSize != H || upPlan.workload().matrix.inputSize != H ||
+      upPlan.workload().matrix.outputSize != I || downPlan.workload().matrix.inputSize != I ||
+      downPlan.workload().matrix.outputSize != H)
+    return false;
+  return true;
+}
 bool addVerifyFfnPack(metal::CommandGraph &graph, const SwiGluProjections &ffn, metal::MetalBuffer normalized,
                       metal::MetalBuffer residual, metal::MetalBuffer output, metal::MetalBuffer gateScratch,
                       metal::MetalBuffer wideIntermediate, LinearScratch scratch,
                       metal::MetalBuffer verifyRows, const VerifyFfnPackBuffers &b, const LinearPlan &upPlan,
                       const LinearPlan &downPlan, uint32_t lanes) {
-  if (!b.control || lanes < 5 || lanes > 8 || !supported(ffn.gate) || !supported(ffn.up) ||
-      !supported(ffn.down) || upPlan.configuration().tile != LinearTile::GgufStaged ||
-      downPlan.configuration().tile != LinearTile::GgufStaged || upPlan.storageRows() != 64 ||
-      downPlan.storageRows() != 64 || upPlan.input() != LinearInput::Plain ||
-      downPlan.input() != LinearInput::Plain || upPlan.configuration().oneGateUpPass ||
-      upPlan.workload().epilogue != LinearEpilogue::GateUp ||
-      downPlan.workload().epilogue != LinearEpilogue::Residual)
+  if (!b.control || !supportsVerifyFfnPack(ffn, upPlan, downPlan, lanes))
     return false;
   const uint32_t H = ffn.up->inputSize, I = ffn.up->outputSize;
-  if (!H || !I || H % 64 || I % 64 || ffn.gate->inputSize != H || ffn.gate->outputSize != I ||
-      ffn.down->inputSize != I || ffn.down->outputSize != H)
-    return false;
   const auto u = upPlan.configuration(), d = downPlan.configuration();
   auto smallU = u;
   smallU.oneGateUpPass = true;

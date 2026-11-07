@@ -1,12 +1,13 @@
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
+#include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Gguf.h"
+#include "metal/abi/QuantFormat.h"
 #include "ops/GDN.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
-#include "metal/abi/ExecutionGeometry.h"
-#include "metal/abi/Gguf.h"
-#include "metal/abi/QuantFormat.h"
+#include "ops/VerifyFfnPack.hpp"
 
 #include <array>
 #include <cstring>
@@ -1362,6 +1363,56 @@ void registerSplitUnits(metal::MetalBackend &backend) {
   }
 }
 
+// Retention must stay unrestricted if any of the loaded FFN projections or
+// selected plans cannot take the compact path. No device or weights needed.
+void packedFfnSupportContract() {
+  if (SPLASH_MAXIMUM_BATCH_WIDTH != 8)
+    return;
+  constexpr uint32_t H = 2048, I = 512;
+  const auto projection = [](uint32_t n, uint32_t k, uint32_t format) {
+    return Projection(n, k, BlockWeights{{QuantizedSegment::planes(format, n, k, {}, {}, {})}});
+  };
+  const std::array original{projection(I, H, GGUF_FMT_AF4G64), projection(I, H, GGUF_FMT_AF4G64),
+                            projection(H, I, GGUF_FMT_AF4G64)};
+  const LinearConfig configuration{.tile = LinearTile::GgufStaged, .splits = 1};
+  const auto up = Linear::plan({{I, H}, 64, LinearPhase::Decode, LinearEpilogue::GateUp}, configuration,
+                               FloatOutput::BFloat16);
+  const auto down = Linear::plan({{H, I}, 64, LinearPhase::Decode, LinearEpilogue::Residual}, configuration,
+                                 FloatOutput::BFloat16);
+  const auto ffns = [](const auto &w) { return SwiGluProjections{&w[0], &w[1], &w[2]}; };
+  require(supportsVerifyFfnPack(ffns(original), up, down, 8), "supported loaded FFN was refused");
+  for (uint32_t lanes : {0U, 4U, 9U})
+    require(!supportsVerifyFfnPack(ffns(original), up, down, lanes),
+            "packed FFN accepted an unsupported lane count");
+  for (uint32_t role = 0; role < 3; ++role) {
+    for (uint32_t format : {uint32_t{GGUF_FMT_AF5G64}, uint32_t{GGUF_FMT_BF16}}) {
+      auto w = original;
+      w[role] = projection(w[role].outputSize, w[role].inputSize, format);
+      require(!supportsVerifyFfnPack(ffns(w), up, down, 8),
+              "unsupported loaded FFN format allowed retention capping");
+    }
+    auto w = original;
+    w[role].destination = FloatOutput::Float32;
+    require(!supportsVerifyFfnPack(ffns(w), up, down, 8), "FP32 FFN output allowed retention capping");
+    w = original;
+    w[role].inputSize += 64;
+    require(!supportsVerifyFfnPack(ffns(w), up, down, 8),
+            "FFN segment/shape mismatch allowed retention capping");
+  }
+  const auto narrow = Linear::plan({{I, H}, 32, LinearPhase::Decode, LinearEpilogue::GateUp}, configuration,
+                                   FloatOutput::BFloat16);
+  require(!supportsVerifyFfnPack(ffns(original), narrow, down, 8),
+          "narrow original FFN plan was accepted as wide");
+  const auto prefill = Linear::plan({{H, I}, 64, LinearPhase::Prefill, LinearEpilogue::Residual},
+                                    configuration, FloatOutput::BFloat16);
+  require(!supportsVerifyFfnPack(ffns(original), up, prefill, 8),
+          "prefill FFN plan allowed decode retention capping");
+  const auto wrong = Linear::plan({{I + 64, H}, 64, LinearPhase::Decode, LinearEpilogue::GateUp},
+                                  configuration, FloatOutput::BFloat16);
+  require(!supportsVerifyFfnPack(ffns(original), wrong, down, 8),
+          "FFN plan/shape mismatch allowed retention capping");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1369,6 +1420,7 @@ int main(int argc, char **argv) {
     require(argc == 2, "usage: linear-plan <production.metallib|--cpu>");
     ggufPlans();
     scratchBoundsRotated();
+    packedFfnSupportContract();
     ggufCoreLaws();
     floatOutputPlans();
     smallApple9StagesShortPrefillChunks();

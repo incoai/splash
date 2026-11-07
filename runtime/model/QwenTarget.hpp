@@ -441,6 +441,10 @@ public:
   QwenTarget &operator=(const QwenTarget &) = delete;
   virtual ~QwenTarget();
 
+  // Every dense layer must support the packed path before a request's retention
+  // is restricted. Targets without that whole-model contract keep full rows.
+  [[nodiscard]] virtual bool supportsPackedFfn(uint32_t) const noexcept { return false; }
+
   // The step scratch the target allocated itself (qwenTargetScratchBytes).
   [[nodiscard]] virtual QwenTargetScratchBytes allocatedScratchBytes() const noexcept;
 

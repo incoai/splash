@@ -676,12 +676,13 @@ struct Runtime::Impl {
 #if SPLASH_EXPERIMENTAL_FFN_PACK_MODE > 0
     const auto &t = geometry.target;
 #if SPLASH_EXPERIMENTAL_VERIFY_BODY
-    if(backend.capabilities().appleGpuFamily<10) return false;
+    if (backend.capabilities().appleGpuFamily < 10) return false;
 #endif
-    if (entries.size() < 5 || entries.size() > 8 || kLaneCount != 8 || aneFfn ||
-        geometry.spilledKv || blockCache || historyStream ||
-        t.ffnKind != QwenFfnKind::Dense || t.layers != 64 || t.hiddenSize != 5120 ||
-        t.intermediateSize != 17408 || t.hyperConnections) return false;
+    if (entries.size() < 5 || entries.size() > 8 || kLaneCount != 8 || aneFfn || geometry.spilledKv ||
+        blockCache || historyStream || t.ffnKind != QwenFfnKind::Dense || t.layers != 64 ||
+        t.hiddenSize != 5120 || t.intermediateSize != 17408 || t.hyperConnections ||
+        !targetModel->supportsPackedFfn(static_cast<uint32_t>(entries.size())))
+      return false;
     for (const Request *entry : entries) {
       if (!entry || !entry->images.empty()) return false;
       const auto policy = samplingPolicy(*entry);
