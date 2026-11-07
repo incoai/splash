@@ -612,6 +612,13 @@ test-engine: test-engine-cpu test-engine-metal
 # test-engine-cpu runs every suite and fails at its end, naming each that
 # failed, so that one run shows every failure instead of the first of 50.
 # engine-sim, the slowest, runs last.
+# The default golden remains the four-request contract. The width-eight
+# experiment has separate reviewed planning and status fixtures.
+TEST_GOLDEN_SUFFIX := $(if $(filter 8,$(NATIVE_BATCH_WIDTH)),_8,)
+TEST_KERNEL_GOLDEN := dev/tests/engine/kernel_selection_golden$(TEST_GOLDEN_SUFFIX).txt
+TEST_STATUS_GOLDEN := dev/tests/engine/status_golden$(TEST_GOLDEN_SUFFIX).json
+TEST_STATUS_VARIANTS_GOLDEN := dev/tests/engine/status_variants_golden$(TEST_GOLDEN_SUFFIX).jsonl
+
 ENGINE_CPU_FAILED := $(ENGINE_TEST_BUILD)/test-engine-cpu.failed
 ENGINE_CPU_STEP = @step() { echo "$$*"; "$$@" || echo "$$*" >> $(ENGINE_CPU_FAILED); }; step
 test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENCHMARK)
@@ -642,7 +649,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(ENGINE_CPU_STEP) $(TEST_ANE_FFN_CALIBRATION)
 	$(ENGINE_CPU_STEP) $(TEST_ANE_FFN_STARTUP)
 	$(ENGINE_CPU_STEP) $(TEST_EXECUTION_PLANS)
-	$(ENGINE_CPU_STEP) $(TEST_KERNEL_SELECTION) dev/tests/engine/kernel_selection_golden.txt
+	$(ENGINE_CPU_STEP) $(TEST_KERNEL_SELECTION) $(TEST_KERNEL_GOLDEN)
 	$(ENGINE_CPU_STEP) $(TEST_MODEL_EXECUTION_PLANS)
 	$(ENGINE_CPU_STEP) $(TEST_COMMAND_LIMITS)
 	$(ENGINE_CPU_STEP) $(TEST_MEMORY_TEST)
@@ -667,7 +674,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(ENGINE_CPU_STEP) $(TEST_MEMORY_AUDIT_TEST)
 	$(ENGINE_CPU_STEP) $(TEST_MEMORY_GOVERNOR_TEST)
 	$(ENGINE_CPU_STEP) $(TEST_MEMORY_LEDGER)
-	$(ENGINE_CPU_STEP) $(TEST_STATUS_TEST) dev/tests/engine/status_golden.json dev/tests/engine/status_variants_golden.jsonl
+	$(ENGINE_CPU_STEP) $(TEST_STATUS_TEST) $(TEST_STATUS_GOLDEN) $(TEST_STATUS_VARIANTS_GOLDEN)
 	$(ENGINE_CPU_STEP) $(TEST_JSON_WRITER)
 	$(ENGINE_CPU_STEP) $(TEST_Q8_CPU_TEST)
 	$(ENGINE_CPU_STEP) $(TEST_ENGINE_SIM)
@@ -956,7 +963,7 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_SLOT_RECYCLER_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_PLAN_ASAN)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_AUDIT_ASAN)
-	$(ASAN_TEST_ENV) $(TEST_STATUS_ASAN) dev/tests/engine/status_golden.json dev/tests/engine/status_variants_golden.jsonl
+	$(ASAN_TEST_ENV) $(TEST_STATUS_ASAN) $(TEST_STATUS_GOLDEN) $(TEST_STATUS_VARIANTS_GOLDEN)
 	$(ASAN_TEST_ENV) $(TEST_JSON_WRITER_ASAN)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_LEDGER_ASAN)
 

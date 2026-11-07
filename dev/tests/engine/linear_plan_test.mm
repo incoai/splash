@@ -283,7 +283,13 @@ void ggufPlans() {
   // plan; here the 32-row tile's is the largest, which fused and gate/up
   // plans share.
   const ProjectionShape downShape{5120, 17408};
-  require(linear.decodeScratchSize(downShape).partials == three.scratchSize().partials,
+  require(linear.decodeScratchSize(downShape).partials ==
+              linear
+                  .plan({down.matrix, SPLASH_MAXIMUM_BATCH_WIDTH * 8, LinearPhase::Decode,
+                         LinearEpilogue::Residual},
+                        blockProjection(5120, 17408, 1))
+                  .scratchSize()
+                  .partials,
           "GGUF decode scratch bound");
   // Float projections take the neural accelerator tile from 1.5 of its
   // 64 x 32 tiles per core for BF16 values, 2 for F32 values and 3 for a
@@ -339,9 +345,11 @@ void ggufPlans() {
   require(m3.ggufFloatTile(2048, 256, QuantizedSegment::kFloat32) == FloatTile::Simdgroup,
           "Apple9 float projections take the simdgroup tile");
   const LinearScratchSize bound = m3.decodeScratchSize(downShape);
-  require(bound.partials ==
-              m3.plan({down.matrix, 32, LinearPhase::Decode, LinearEpilogue::Residual}, blockProjection(5120, 17408, 1))
-                  .scratchSize().partials,
+  require(bound.partials == m3.plan({down.matrix, SPLASH_MAXIMUM_BATCH_WIDTH * 8, LinearPhase::Decode,
+                                     LinearEpilogue::Residual},
+                                    blockProjection(5120, 17408, 1))
+                                .scratchSize()
+                                .partials,
           "Apple9 GGUF decode scratch bound");
   // Apple9 stages the IQ2, IQ3_XXS and IQ1 formats wherever the staged tile
   // holds the lanes' rows unpadded, and Q2_K from two lanes. A projection
@@ -726,13 +734,14 @@ void ggufPlans() {
 }
 
 // A rotated projection's scratch holds the bf16 rotated rows of a full decode
-// batch (32 rows) in decode and of the token budget (2048) in prefill; an
+// batch in decode and of the token budget (2048) in prefill; an
 // unrotated one's holds none.
 void scratchBoundsRotated() {
   const Linear linear = gpu(10, 16);
   for (const bool rotated : {false, true}) {
     const ProjectionShape shape{5120, 17408, rotated};
-    require(linear.decodeScratchSize(shape).rotated == (rotated ? uint64_t{17408} * 32 * 2 : 0) &&
+    require(linear.decodeScratchSize(shape).rotated ==
+                    (rotated ? uint64_t{17408} * SPLASH_MAXIMUM_BATCH_WIDTH * 8 * 2 : 0) &&
                 linear.prefillScratchSize(shape).rotated == (rotated ? uint64_t{17408} * 2048 * 2 : 0),
             "rotated scratch bounds");
   }

@@ -415,6 +415,19 @@ void testALaneSuspendedBetweenPassesAbandonsItsCommand() {
     // The Foreground start, of a higher priority, abandons the command
     // (Scheduler::yieldsTo).
     passing.targetTimes = true;
+    constexpr uint32_t padding = model::ExecutionLimits::maximumBatchWidth - 4;
+    for (uint64_t id = 100; id < 100 + padding; ++id) {
+      auto lane = request(id, std::vector<uint32_t>(1000, id));
+      lane.priority = RequestPriority::Background;
+      lane.maxNewTokens = 100;
+      passing.engine.submit(std::move(lane));
+    }
+    passing.tickUntil(
+        [&] {
+          return passing.engine.snapshot().scheduler.decoding == padding && !passing.engine.commandInFlight();
+        },
+        "the padding lanes did not decode");
+    passing.commands.clear();
     for (uint64_t id = 1; id <= 4; ++id)
       passing.submit(id, 300, RequestPriority::Background);
     const auto lanes = [](const PassingEngine::Command &command, std::vector<uint64_t> ids) {
@@ -438,16 +451,23 @@ void testALaneSuspendedBetweenPassesAbandonsItsCommand() {
     for (const PassingEngine::Command &command : passing.commands)
       if (command.kind == WorkKind::Prefill)
         prefills.push_back(command);
-    // The lanes that run again, and those once the suspended one resumes.
+    // A suspended lane abandons its whole command. Its remaining lanes start
+    // again at pass zero, together with the resumed lane if it is already back.
+    // Decoders beside them can make the Foreground arrival run first.
     const std::vector<uint64_t> again{1, 2, 3};
     const std::vector<uint64_t> resumed = cancelled ? std::vector<uint64_t>{1, 2, 3} : std::vector<uint64_t>{1, 2, 3, 4};
+    const auto restarted = std::find_if(prefills.begin() + 1, prefills.end(), [](const auto &command) {
+      return std::ranges::find(command.lanes, uint64_t{1}) != command.lanes.end();
+    });
     require(passing.engine.snapshot().prioritySuspensions == !cancelled &&
                 passing.engine.snapshot().cancelled == cancelled && prefills.size() > 2 &&
-                prefills[1].lanes == again && prefills[1].pass == 0 &&
-                std::ranges::count_if(prefills, [&](const PassingEngine::Command &command) {
-                  return lanes(command, resumed) && command.pass;
-                }) == 5 &&
-                passing.events.completedCount == 5 && passing.events.failedCount == 0,
+                restarted != prefills.end() && restarted->pass == 0 &&
+                (restarted->lanes == again || restarted->lanes == resumed) &&
+                std::ranges::count_if(prefills,
+                                      [&](const PassingEngine::Command &command) {
+                                        return lanes(command, resumed) && command.pass;
+                                      }) == 5 &&
+                passing.events.completedCount == 5 + padding && passing.events.failedCount == 0,
             "a command whose lane was suspended between its passes ran on, or its lanes did not run again");
   }
 }
@@ -458,9 +478,10 @@ void testALaneSuspendedBetweenPassesAbandonsItsCommand() {
 // and emits nothing more.
 void testAStopBetweenPassesFinishesAsStop() {
   PassingEngine passing;
+  constexpr uint64_t capacity = model::ExecutionLimits::maximumBatchWidth;
   // Lane 1, with the shortest prompt the least work, yields its lane to a
   // Foreground arrival.
-  for (uint64_t id = 1; id <= 4; ++id) {
+  for (uint64_t id = 1; id <= capacity; ++id) {
     EngineRequest lane = request(id, std::vector<uint32_t>(id == 1 ? 100 : 300, static_cast<uint32_t>(id)));
     lane.priority = RequestPriority::Background;
     lane.maxNewTokens = 1000;
@@ -468,11 +489,17 @@ void testAStopBetweenPassesFinishesAsStop() {
   }
   passing.tickUntil(
       [&] {
-        return std::ranges::all_of(std::array<uint64_t, 4>{1, 2, 3, 4},
-                                   [&](uint64_t id) { return !passing.events.outputs[id].empty(); });
+        return std::ranges::all_of(
+            [] {
+              std::vector<uint64_t> ids;
+              for (uint64_t id = 1; id <= capacity; ++id)
+                ids.push_back(id);
+              return ids;
+            }(),
+            [&](uint64_t id) { return !passing.events.outputs[id].empty(); });
       },
       "the Background lanes did not decode");
-  passing.submit(5, 100, RequestPriority::Foreground);
+  passing.submit(capacity + 1, 100, RequestPriority::Foreground);
   const size_t arrived = passing.commands.size();
   const auto replayBetweenPasses = [&] {
     if (passing.engine.commandInFlight() || passing.commands.size() == arrived)
@@ -480,19 +507,20 @@ void testAStopBetweenPassesFinishesAsStop() {
     const PassingEngine::Command &last = passing.commands.back();
     return last.kind == WorkKind::Prefill && last.lanes == std::vector<uint64_t>{1} && last.pass + 1 < last.passes;
   };
-  passing.tickUntil([&] { return passing.events.usage.contains(5) && replayBetweenPasses(); },
+  passing.tickUntil([&] { return passing.events.usage.contains(capacity + 1) && replayBetweenPasses(); },
                     "the suspended lane did not resume into a replay in passes");
   require(passing.engine.snapshot().prioritySuspensions == 1, "the arrival did not suspend the lane");
   const size_t emitted = passing.events.outputs.at(1).size();
 
   passing.engine.stop(1);
   passing.tickUntil([&] { return passing.events.reasons.contains(1); }, "the stopped lane did not end");
-  for (uint64_t id = 2; id <= 4; ++id)
+  for (uint64_t id = 2; id <= capacity; ++id)
     passing.engine.cancel(id);
   passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
   const EngineSnapshot counts = passing.engine.snapshot();
-  require(passing.events.reasons.at(1) == EngineFinishReason::Stop && passing.events.outputs.at(1).size() == emitted &&
-              counts.completed == 2 && counts.cancelled == 3 && counts.failed == 0,
+  require(passing.events.reasons.at(1) == EngineFinishReason::Stop &&
+              passing.events.outputs.at(1).size() == emitted && counts.completed == 2 &&
+              counts.cancelled == capacity - 1 && counts.failed == 0,
           "a stop between a replay's passes did not finish as Stop with nothing more emitted");
 }
 
@@ -1182,12 +1210,15 @@ uint32_t rowsLeft(const engine::Engine &engine, uint64_t id) {
 // suspends no lane until the Foreground prompt ahead of it ends; one that
 // leads suspends a lane, and the suspended Normal lanes stay so meanwhile.
 void testAPreemptingStartWaitsUntilItLeads() {
+  constexpr uint32_t capacity = model::ExecutionLimits::maximumBatchWidth;
   constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
   // The Normal decoders resident, the second prompt's tokens, whether it is
   // submitted once the first ran a command, and the lanes suspended before
   // the first's last command.
   for (const auto &[normals, second, afterCommand, suspended] :
-       {std::tuple{3u, 3 * chunk + 400, false, 0u}, {4u, 3 * chunk + 400, false, 1u}, {4u, 2 * chunk + 4, true, 2u}}) {
+       {std::tuple{capacity - 1, 3 * chunk + 400, false, 0u},
+        {capacity, 3 * chunk + 400, false, 1u},
+        {capacity, 2 * chunk + 4, true, 2u}}) {
     test::TestKvStorage storage(1024, 4096, 4);
     KvPool pool(storage, 0);
     engine::Cache cache(pool, nullptr, nullptr);
@@ -1208,22 +1239,24 @@ void testAPreemptingStartWaitsUntilItLeads() {
       submit(id, 300, RequestPriority::Normal, 100'000);
     tickUntil(engine, now, [&] { return engine.snapshot().scheduler.decoding == normals; },
               "the Normal requests did not decode");
-    submit(5, 3 * chunk + 100, RequestPriority::Foreground, 1);
-    tickUntil(engine, now, [&] { return std::ranges::count(events.startIds, 5u) == 1; },
-              "the first Foreground prompt did not start");
+    submit(capacity + 1, 3 * chunk + 100, RequestPriority::Foreground, 1);
+    tickUntil(
+        engine, now, [&] { return std::ranges::count(events.startIds, uint64_t{capacity + 1}) == 1; },
+        "the first Foreground prompt did not start");
     if (afterCommand)
-      tickUntil(engine, now, [&] { return rowsLeft(engine, 5) == 2 * chunk + 100; },
-                "the first Foreground prompt did not run a command");
-    submit(6, second, RequestPriority::Foreground, 1);
+      tickUntil(
+          engine, now, [&] { return rowsLeft(engine, capacity + 1) == 2 * chunk + 100; },
+          "the first Foreground prompt did not run a command");
+    submit(capacity + 2, second, RequestPriority::Foreground, 1);
     std::string early;
     tickUntil(
         engine, now,
         [&] {
           const EngineSnapshot counts = engine.snapshot();
-          const bool started = std::ranges::count(events.startIds, 6u) != 0;
-          if (early.empty() &&
-              ((rowsLeft(engine, 5) > chunk && (started || counts.prioritySuspensions > suspended)) ||
-               (!started && counts.resourceResumptions)))
+          const bool started = std::ranges::count(events.startIds, uint64_t{capacity + 2}) != 0;
+          if (early.empty() && ((rowsLeft(engine, capacity + 1) > chunk &&
+                                 (started || counts.prioritySuspensions > suspended)) ||
+                                (!started && counts.resourceResumptions)))
             early = std::to_string(counts.prioritySuspensions) + " lanes suspended, " +
                     std::to_string(counts.resourceResumptions) + " resumed, the second " +
                     (started ? "started" : "not started");
