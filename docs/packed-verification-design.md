@@ -19,8 +19,9 @@ calibration, rather than extrapolation of the four-lane prior.
 
 ## The execution boundary
 
-A compact projection can gather selected prefixes into 32 physical rows.
-Larger totals require the original 64-row projection. Attention, GDN
+In the proposed eight-lane path, a compact projection gathers selected
+prefixes into 32 physical rows. Larger totals require the original 64-row
+projection. Attention, GDN
 recurrence, state addressing and the draft retain their original layouts.
 Consequently, a linear function of selected rows does not represent the
 projection mode boundary. Include the complete cycle cost: selection,
