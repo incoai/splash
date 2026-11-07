@@ -96,8 +96,10 @@ def validate(record, n, k, width):
     _integer(record["cycle"])
     _integer(record["position"], 0, 2**64 - 1)
     verified = _integer(record["verify_rows"], 1, n + 1)
-    accepted = _integer(record["accepted"], 0, verified - 1)
-    retained = _integer(record["retained"], 1, accepted + 1)
+    # Native acceptance scans all scratch rows, then clips retention to the
+    # verify budget. Unverified scratch matches are not additional labels.
+    accepted = _integer(record["accepted"], 0, n)
+    retained = _integer(record["retained"], 1, min(verified, accepted + 1))
     proposed = _vector(record["proposed"], n, True)
     candidates = _vector(record["candidates"], n * k, True)
     unary = _vector(record["unary"], n * k)

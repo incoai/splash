@@ -45,6 +45,10 @@ public:
   };
   [[nodiscard]] static DraftSelection lastDraftSelection(const Runtime &runtime,
                                                         uint32_t lane, uint32_t width);
+  // Restore the prior/seed for controlled capture; no online timing history.
+  static void resetVerifyBudget(Runtime &runtime);
+  // BF16 bit patterns of all final draft hidden rows, anchor included.
+  [[nodiscard]] static std::span<const uint16_t> lastDraftHidden(const Runtime &runtime, uint32_t lane);
   // While capturing, each command that selects first tokens or verifies
   // copies the rows lastLogits returns, as the target's forward wrote them
   // before the policy rewrites them in place: for each of its batch lanes,
