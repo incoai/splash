@@ -34,9 +34,7 @@ struct FirstUseTests {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let runtime = Runtime(root: root)
-        let state = AppState(runtime: runtime, chats: ChatStore(folder: root.appending(path: "chats")),
-                             keychain: Keychain(service: "Splash First Use Tests"),
-                             server: Server(runtime: runtime, log: root.appending(path: "server.log")))
+        let state = AppState.forTests(in: root.appending(path: "App"), runtime: runtime)
         state.server.start("test-model", settings: ServeSettings())
         guard case .failed = state.server.phase else {
             Issue.record("A missing runtime should fail to start")
@@ -134,18 +132,13 @@ private func waitFor(_ condition: () -> Bool) async throws {
 private final class FirstUseFixture {
     let base: ContextFixture
     let state: AppState
-    private let original: ServeSettings
-    private let selection: Any?
 
     init() throws {
         base = try ContextFixture()
         let runtime = base.state.runtime
         try FileManager.default.copyItem(at: Showcase.runtime.suggestedModels, to: runtime.suggestedModels)
         try Self.installer.write(to: base.root.appending(path: "install/models.py"), atomically: true, encoding: .utf8)
-        state = AppState(runtime: runtime, chats: ChatStore(folder: base.root.appending(path: "first-chats")),
-                         keychain: Keychain(service: "Splash First Use Tests"), server: base.state.server)
-        original = state.options
-        selection = UserDefaults.standard.object(forKey: Preference.model)
+        state = AppState.forTests(in: base.root.appending(path: "FirstUse"), runtime: runtime)
         state.options = ServeSettings(values: ["--port": String(base.port)])
     }
 
@@ -155,14 +148,14 @@ private final class FirstUseFixture {
 
     func close() async {
         state.chatContext.refresh(nil)
+        state.chats.stop()
         state.installer.cancel()
+        state.server.stop()
         let deadline = ContinuousClock.now + .seconds(6)
-        while state.installer.running && ContinuousClock.now < deadline {
+        while (state.installer.running || state.server.running) && ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(20))
         }
         await base.close()
-        state.options = original
-        UserDefaults.standard.set(selection, forKey: Preference.model)
     }
 
     private static let installer = #"""
