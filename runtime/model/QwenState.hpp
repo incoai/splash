@@ -356,6 +356,9 @@ public:
     return staging_ ? staging_->buffer.sizeBytes() : 0;
   }
   [[nodiscard]] CompositeStateLayout layout() const noexcept { return layout_; }
+  // Optional rebuildable cache allocation: independently admitted and
+  // tracked with state memory, but never taken from a lane's pooled rings.
+  [[nodiscard]] std::shared_ptr<DFlashDraftRing> reserveRebuiltDraftRing();
 
 private:
   struct Buffers final {

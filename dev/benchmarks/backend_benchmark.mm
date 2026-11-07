@@ -145,6 +145,10 @@ private:
 struct Measurement final {
   std::string scenario;
   uint32_t sample = 0;
+  uint32_t ringAbbaGroup = 0, ringAbbaSlot = 0, ringAbbaReplicate = 0, ringProbeKvTokens = 0;
+  bool ringAbbaEnabled = false;
+  double ringToggleMilliseconds = 0;
+  uint64_t ringBytesBeforeToggle = 0;
   uint32_t promptTokens = 0;
   std::string cacheStatus;
   uint32_t matchedTokens = 0;
@@ -152,12 +156,31 @@ struct Measurement final {
   double ttftMilliseconds = 0.0;
   double prefillGpuMilliseconds = 0.0;
   double decodeGpuMilliseconds = 0.0;
+  double decodeWallMilliseconds = 0.0;
+  uint32_t requestedOutputTokens = 0;
+  uint64_t decodeOutputTokens = 0, decodeBatches = 0, draftedTokens = 0, acceptedDraftTokens = 0;
   uint64_t targetPrefillRows = 0;
   uint64_t draftContextRows = 0;
   uint64_t draftContextRowsAvoided = 0;
   uint64_t draftStateRestoreSkipped = 0;
+  uint64_t draftRingRebuildRows = 0;
+  uint64_t draftRingCacheHits = 0;
+  uint64_t draftRingCacheBuilds = 0;
+  uint64_t draftRingCacheRefusals = 0;
+  uint64_t draftRingCacheEvictions = 0;
+  uint64_t draftRingCacheBytes = 0;
+  uint64_t draftRingCacheBeforeBytes = 0, draftRingCachePeakObservedBytes = 0;
   uint64_t junctionMaterializations = 0;
-  std::vector<uint32_t> outputTokens;
+  uint64_t junctionMaterializationFailures = 0;
+  uint64_t inputTokenHash = 0;
+  uint64_t stateAllocatedBeforeBytes = 0;
+  uint64_t stateAllocatedAfterBytes = 0;
+  uint64_t stateAllocatedPeakObservedBytes = 0;
+  uint64_t cachedStateBytes = 0;
+  uint64_t stateEvictions = 0;
+  uint32_t stateEntries = 0;
+  std::optional<double> ringWorkloadWallMilliseconds;
+  std::vector<uint32_t> inputTokens, outputTokens;
   std::optional<bool> coldOutputMatch;
 };
 
@@ -424,14 +447,24 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
 
   const model::ModelTelemetry before = executor.telemetry();
   const engine::EngineSnapshot engineBefore = engine.snapshot();
+  uint64_t statePeak = before.stateAllocatedBytes;
+  uint64_t ringPeak = before.draftRingCacheBytes;
+  uint64_t decodeOutputTokens = 0, decodeBatches = 0, draftedTokens = 0, acceptedDraftTokens = 0;
   std::vector<uint32_t> prefillBatchRows;
   prefillBatchRows.reserve(
       promptTokens / model::ExecutionLimits::prefillTokenBudget + 3);
   const auto began = Clock::now();
   engine.submit(std::move(request));
   driver.untilIdle([&](const BatchObservation &batch) {
+    statePeak = std::max(statePeak, executor.telemetry().stateAllocatedBytes);
+    ringPeak = std::max(ringPeak, executor.telemetry().draftRingCacheBytes);
     if (batch.kind == WorkKind::Prefill)
       prefillBatchRows.push_back(batch.inputTokens);
+    else {
+      if (batch.width != 1) throw std::logic_error("single request benchmark decoded a non-B1 batch");
+      ++decodeBatches; decodeOutputTokens += batch.outputTokens;
+      draftedTokens += batch.draftedTokens; acceptedDraftTokens += batch.acceptedDraftTokens;
+    }
   });
   const auto ended = Clock::now();
   const model::ModelTelemetry after = executor.telemetry();
@@ -445,6 +478,10 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
   result.scenario = std::move(scenario);
   result.sample = sample;
   result.promptTokens = promptTokens;
+  result.requestedOutputTokens = maxNewTokens;
+  result.decodeOutputTokens = decodeOutputTokens; result.decodeBatches = decodeBatches;
+  result.draftedTokens = draftedTokens; result.acceptedDraftTokens = acceptedDraftTokens;
+  result.decodeWallMilliseconds = (after.totalDecodeWallSeconds - before.totalDecodeWallSeconds) * 1000.0;
   result.cacheStatus = observed.cacheStatus;
   result.matchedTokens = observed.matchedTokens;
   result.wallMilliseconds = milliseconds(ended) - milliseconds(began);
@@ -464,8 +501,25 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
       after.draftContextRowsAvoided - before.draftContextRowsAvoided;
   result.draftStateRestoreSkipped =
       after.draftStateRestoreSkipped - before.draftStateRestoreSkipped;
+  result.draftRingRebuildRows = after.draftRingRebuildRows - before.draftRingRebuildRows;
+  result.draftRingCacheHits = after.draftRingCacheHits - before.draftRingCacheHits;
+  result.draftRingCacheBuilds = after.draftRingCacheBuilds - before.draftRingCacheBuilds;
+  result.draftRingCacheRefusals = after.draftRingCacheRefusals - before.draftRingCacheRefusals;
+  result.draftRingCacheEvictions = after.draftRingCacheEvictions - before.draftRingCacheEvictions;
+  result.draftRingCacheBytes = after.draftRingCacheBytes;
+  result.draftRingCacheBeforeBytes = before.draftRingCacheBytes;
+  result.draftRingCachePeakObservedBytes = std::max(ringPeak, after.draftRingCacheBytes);
   result.junctionMaterializations = engineAfter.junctionMaterializations -
                                     engineBefore.junctionMaterializations;
+  result.junctionMaterializationFailures = engineAfter.junctionMaterializationFailures -
+                                           engineBefore.junctionMaterializationFailures;
+  result.inputTokenHash = inputTokenHash;
+  result.stateAllocatedBeforeBytes = before.stateAllocatedBytes;
+  result.stateAllocatedAfterBytes = after.stateAllocatedBytes;
+  result.stateAllocatedPeakObservedBytes = std::max(statePeak, after.stateAllocatedBytes);
+  result.cachedStateBytes = engineAfter.resources.stateCache.bytes;
+  result.stateEntries = engineAfter.resources.stateCache.entries;
+  result.stateEvictions = engineAfter.resources.stateCache.evictions - engineBefore.resources.stateCache.evictions;
   result.outputTokens = observed.outputTokens;
   if (progress) {
     progress->complete(
@@ -698,22 +752,65 @@ void emitMeasurement(const Measurement &value, bool first) {
             << ",\"ttft_ms\":" << value.ttftMilliseconds
             << ",\"prefill_gpu_ms\":" << value.prefillGpuMilliseconds
             << ",\"decode_gpu_ms\":" << value.decodeGpuMilliseconds
+            << ",\"decode_wall_ms\":" << value.decodeWallMilliseconds
+            << ",\"decode_batches\":" << value.decodeBatches
+            << ",\"decode_output_tokens\":" << value.decodeOutputTokens
+            << ",\"drafted_tokens\":" << value.draftedTokens
+            << ",\"accepted_draft_tokens\":" << value.acceptedDraftTokens
+            << ",\"requested_output_tokens\":" << value.requestedOutputTokens
+            << ",\"actual_output_tokens\":" << value.outputTokens.size()
             << ",\"draft_context_rows\":" << value.draftContextRows
             << ",\"draft_context_rows_avoided\":"
             << value.draftContextRowsAvoided
             << ",\"draft_state_restore_skipped\":"
             << value.draftStateRestoreSkipped
+            << ",\"draft_ring_rebuild_rows\":" << value.draftRingRebuildRows
+            << ",\"draft_ring_cache_hits\":" << value.draftRingCacheHits
+            << ",\"draft_ring_cache_builds\":" << value.draftRingCacheBuilds
+            << ",\"draft_ring_cache_refusals\":" << value.draftRingCacheRefusals
+            << ",\"draft_ring_cache_evictions\":" << value.draftRingCacheEvictions
+            << ",\"draft_ring_cache_bytes\":" << value.draftRingCacheBytes
+            << ",\"draft_ring_cache_before_bytes\":" << value.draftRingCacheBeforeBytes
+            << ",\"draft_ring_cache_peak_observed_bytes\":" << value.draftRingCachePeakObservedBytes
             << ",\"junction_materializations\":"
-            << value.junctionMaterializations << ",\"output_tokens\":[";
+            << value.junctionMaterializations
+            << ",\"junction_materialization_failures\":" << value.junctionMaterializationFailures
+            << ",\"input_token_hash\":" << value.inputTokenHash
+            << ",\"state_allocated_before_bytes\":" << value.stateAllocatedBeforeBytes
+            << ",\"state_allocated_after_bytes\":" << value.stateAllocatedAfterBytes
+            << ",\"state_allocated_peak_observed_bytes\":" << value.stateAllocatedPeakObservedBytes
+            << ",\"cached_state_bytes\":" << value.cachedStateBytes
+            << ",\"state_entries\":" << value.stateEntries
+            << ",\"state_evictions\":" << value.stateEvictions
+            << ",\"output_tokens\":[";
   for (size_t index = 0; index < value.outputTokens.size(); ++index) {
     if (index)
       std::cout << ',';
     std::cout << value.outputTokens[index];
   }
   std::cout << ']';
+  if (!value.inputTokens.empty()) {
+    std::cout << ",\"input_tokens\":[";
+    for (size_t index = 0; index < value.inputTokens.size(); ++index)
+      std::cout << (index ? "," : "") << value.inputTokens[index];
+    std::cout << ']';
+  }
+  if (value.ringProbeKvTokens)
+    std::cout << ",\"ring_short_probe_kv_tokens\":" << value.ringProbeKvTokens;
+  if (value.ringProbeKvTokens) {
+    std::cout << ",\"ring_toggle_wall_ms\":" << value.ringToggleMilliseconds
+              << ",\"ring_bytes_before_toggle\":" << value.ringBytesBeforeToggle;
+  }
+  if (value.ringAbbaGroup)
+    std::cout << ",\"ring_abba_group\":" << value.ringAbbaGroup
+              << ",\"ring_abba_slot\":" << value.ringAbbaSlot
+              << ",\"ring_abba_replicate\":" << value.ringAbbaReplicate
+              << ",\"ring_abba_variant\":\"" << (value.ringAbbaEnabled ? "on" : "off") << "\"";
   if (value.coldOutputMatch)
     std::cout << ",\"cold_output_match\":"
               << (*value.coldOutputMatch ? "true" : "false");
+  if (value.ringWorkloadWallMilliseconds)
+    std::cout << ",\"ring_workload_wall_ms\":" << *value.ringWorkloadWallMilliseconds;
   std::cout << '}';
 }
 
@@ -795,10 +892,12 @@ struct BenchmarkScenarios final {
   bool exact = false;
   bool logits = false;
   bool resume = false;
+  bool ringShortAbba = false;
+  bool ringGenerationAbba = false;
 };
 
 BenchmarkScenarios parseScenarios(std::string_view value) {
-  BenchmarkScenarios selected{false, false, false, false, false, false, false, false};
+  BenchmarkScenarios selected{false, false, false, false, false, false, false, false, false, false};
   for (;;) {
     const size_t comma = value.find(',');
     const std::string_view name = value.substr(0, comma);
@@ -810,6 +909,8 @@ BenchmarkScenarios parseScenarios(std::string_view value) {
                      : name == "exact"       ? &selected.exact
                      : name == "logits"      ? &selected.logits
                      : name == "resume"      ? &selected.resume
+                     : name == "ring-short-abba" ? &selected.ringShortAbba
+                     : name == "ring-generation-abba" ? &selected.ringGenerationAbba
                                              : nullptr;
     if (!scenario)
       throw std::invalid_argument("unknown benchmark scenario");
@@ -896,8 +997,10 @@ int main(int argc, char **argv) {
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
                    "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
                    "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
-                   "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
+                   "  NAME: decode, partial, short, transcripts, context, exact, logits, resume, ring-short-abba or ring-generation-abba "
                    "(default: decode,partial,context)\n"
+                   "  Ring ABBA: samples 1, ANE share 0, no other scenario; fixed 3 groups, 8 workloads per arm\n"
+                   "    short: cap 1, 1280 OFF warmups; generation: cap 128, 96 OFF warmups\n"
                    "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
                    "to run instead of calibrating one (0: GPU alone)\n"
                    "  ROWS: the least rows of a chunk that share takes "
@@ -950,6 +1053,18 @@ int main(int argc, char **argv) {
         throw std::invalid_argument("unknown benchmark option");
       }
     }
+    const bool ringAbba = selected.ringShortAbba || selected.ringGenerationAbba;
+    const uint32_t ringOutputTokens = selected.ringGenerationAbba ? 128 : 1;
+    const uint32_t ringWarmupWorkloads = selected.ringGenerationAbba ? 24 : 320;
+    if (ringAbba && (!aneFfnShare || *aneFfnShare != 0))
+      throw std::invalid_argument("ring ABBA requires --ane-ffn-share 0");
+    if (ringAbba && (samples != 1 || selected.decode || selected.partial || selected.shortPrompts ||
+        selected.transcripts || selected.context || selected.exact || selected.logits || selected.resume ||
+        (selected.ringShortAbba && selected.ringGenerationAbba)))
+      throw std::invalid_argument("ring ABBA requires samples 1 and no other scenario");
+    const uint32_t ringMinimumContext = selected.ringGenerationAbba ? 4256 : 4130;
+    if (ringAbba && maxContext && maxContext < ringMinimumContext)
+      throw std::invalid_argument("ring ABBA context is too small for its fixed fixture");
     if (selected.logits != logitsDirectory.has_value())
       throw std::invalid_argument("the logits scenario and --logits go together");
     if (logitsOptions && !logitsDirectory)
@@ -962,6 +1077,9 @@ int main(int argc, char **argv) {
     config.metallibPath = std::filesystem::path(argv[1]);
     config.modelRoot = std::filesystem::path(argv[2]);
     config.model = model::servedFor(model::inspectModelRoot(config.modelRoot), maxContext);
+    if (ringAbba && config.model.name != "Qwen3.8-27B" &&
+        config.model.name != "mlx-community/Qwen3.8-27B-4bit")
+      throw std::invalid_argument("ring ABBA fixture requires Qwen3.8-27B");
     config.buildId = SPLASH_BUILD_ID;
     config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
     // The verify budget's rows follow the wall times and acceptance of the
@@ -1064,6 +1182,10 @@ int main(int argc, char **argv) {
     warmupScope.reset();
     governor.ledger().close(warmups);
 
+    auto *nativeRuntime = dynamic_cast<model::Runtime *>(executor);
+    if (ringAbba && !nativeRuntime)
+      throw std::logic_error("ring ABBA requires the native Runtime");
+
     Events events;
     engine::EngineConfig engineConfig;
     engineConfig.maxContext = bootstrap->nativeLoop().statusSnapshot().maximumContextTokens;
@@ -1141,6 +1263,7 @@ int main(int argc, char **argv) {
     // The rolling request, a length's longest, appends this many tokens.
     constexpr uint32_t rollingSuffixTokens = 256;
     std::vector<Measurement> measurements;
+    std::vector<Measurement> ringThermalWarmup;
     // Lengths the memory plan cannot hold, on a Mac with less memory.
     std::vector<uint32_t> skippedLengths;
     for (uint32_t length : selected.context || selected.exact
@@ -1488,6 +1611,141 @@ int main(int argc, char **argv) {
                 << logitsDirectory->string() << '\n';
     }
 
+    // Exact repeats of <=32 tail rows still replay every tail row: cache
+    // matching leaves one real token, hence floor((4096+r-1)/32)*32=4096.
+    // The same bound excludes a later composite publication. No descendant
+    // eviction or private Runtime primitive is used for this Engine timing.
+    if (ringAbba) {
+      if (engineConfig.maxContext < ringMinimumContext)
+        throw std::runtime_error("ring ABBA served context is too small");
+      constexpr uint32_t prefixTokens = 4096;
+      constexpr std::array<uint32_t, 4> replayRows{1, 8, 16, 32};
+      const auto setReuseWhileDrained = [&](bool enabled) {
+        const auto counts = engine.snapshot();
+        if (counts.submitted != counts.completed + counts.cancelled + counts.failed || engine.commandInFlight())
+          throw std::logic_error("ring-short toggle requires a drained engine");
+        const auto before = executor->telemetry().draftRingCacheBytes;
+        const auto began = Clock::now();
+        nativeRuntime->experimentalDraftRingReuse(enabled);
+        const double wall = milliseconds(Clock::now()) - milliseconds(began);
+        if (executor->telemetry().draftRingCacheBytes)
+          throw std::logic_error("ring-short toggle did not release previous cache");
+        return std::pair{wall, before};
+      };
+      setReuseWhileDrained(false);
+      const std::vector<uint32_t> prefix = prompt(prefixTokens, 0x53484f5254524553ULL);
+      auto seed = prefix; seed.push_back(200100);
+      evictAllCache(resources->cache());
+      Measurement seeded = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                                      "ring_short_seed", 0, seed);
+      seeded.inputTokens = seed;
+      if (seeded.cacheStatus != "miss" || seeded.matchedTokens || seeded.targetPrefillRows != 4097 ||
+          seeded.stateEntries != 1 || seeded.stateEvictions || seeded.draftRingRebuildRows || seeded.draftRingCacheBytes ||
+          seeded.outputTokens.size() != 1 || seeded.decodeGpuMilliseconds != 0)
+        throw std::runtime_error("ring-short ABBA seed oracle failed");
+      std::array<std::vector<uint32_t>, 4> prompts, references;
+      for (uint32_t index = 0; index < replayRows.size(); ++index) {
+        auto tail = prompt(replayRows[index], 0x5441494cULL ^ replayRows[index]);
+        tail.front() = 200101 + index;
+        prompts[index] = prefix;
+        prompts[index].insert(prompts[index].end(), tail.begin(), tail.end());
+      }
+      const auto runWarm = [&](uint32_t index, uint32_t sample, bool enabled, const std::string &phase) {
+        // Destroy this diagnostic lease before admission. The lookup warms
+        // the same metadata in both arms and is outside request timing.
+        uint32_t matchedKv = 0;
+        {
+          const auto found = resources->cache().lookup(prompts[index], {});
+          matchedKv = found.kvBoundary;
+          if (matchedKv != prefixTokens || found.resumeBoundary() != prefixTokens ||
+              found.junctionBoundary || found.lostState)
+            throw std::runtime_error("ring-short repeated prompt changed its KV/state boundary");
+        }
+        Measurement result = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                                        phase, sample, prompts[index], ringOutputTokens);
+        result.scenario = "ring_short_r" + std::to_string(replayRows[index]);
+        result.inputTokens = prompts[index];
+        result.ringProbeKvTokens = matchedKv;
+        if (result.cacheStatus != "prefix_hit" || result.matchedTokens != prefixTokens ||
+            result.targetPrefillRows != replayRows[index] || result.draftContextRows != replayRows[index] ||
+            result.draftStateRestoreSkipped || result.junctionMaterializations || result.junctionMaterializationFailures ||
+            result.stateEvictions || result.stateEntries != seeded.stateEntries ||
+            result.cachedStateBytes != seeded.cachedStateBytes ||
+            result.stateAllocatedBeforeBytes != seeded.stateAllocatedAfterBytes ||
+            result.stateAllocatedAfterBytes != seeded.stateAllocatedAfterBytes ||
+            result.stateAllocatedPeakObservedBytes != seeded.stateAllocatedAfterBytes ||
+            result.draftRingRebuildRows != (enabled && index ? 0U : 2048U) ||
+            result.draftRingCacheBuilds != (enabled && !index ? 1U : 0U) ||
+            result.draftRingCacheHits != (enabled && index ? 1U : 0U) ||
+            result.draftRingCacheRefusals || result.draftRingCacheEvictions ||
+            result.draftRingCacheBytes != (enabled ? uint64_t{41943040} : 0) ||
+            result.draftRingCacheBeforeBytes != (enabled && index ? uint64_t{41943040} : 0) ||
+            result.draftRingCachePeakObservedBytes != (enabled ? uint64_t{41943040} : 0) ||
+            result.outputTokens.empty() || result.outputTokens.size() > ringOutputTokens ||
+            (ringOutputTokens == 1 && (result.outputTokens.size() != 1 || result.decodeGpuMilliseconds != 0)))
+          throw std::runtime_error("ring-short repeated warm oracle failed at " + std::to_string(replayRows[index]));
+        return result;
+      };
+      // Every four-request workload starts with the existing setter, which releases the prior
+      // cache even ON->ON. Its host cost and first-request allocation/fill are
+      // charged. No toggle occurs between the four requests of a workload.
+      for (uint32_t repetition = 0; repetition < ringWarmupWorkloads; ++repetition) {
+        const auto [toggleWall, oldBytes] = setReuseWhileDrained(false);
+        for (uint32_t index = 0; index < replayRows.size(); ++index) {
+          Measurement result = runWarm(index, repetition, false,
+              "ring_short_warmup_" + std::to_string(repetition + 1) + "_" + std::to_string(replayRows[index]));
+          if (!index) { result.ringToggleMilliseconds = toggleWall; result.ringBytesBeforeToggle = oldBytes; }
+          if (!repetition) references[index] = result.outputTokens;
+          else if (result.outputTokens != references[index])
+            performanceFailures.push_back("ring-short OFF warmup changed full output");
+          ringThermalWarmup.push_back(std::move(result));
+        }
+      }
+      measurements.push_back(seeded);
+      constexpr std::array<bool, 4> order{false, true, true, false};
+      for (uint32_t group = 1; group <= 3; ++group)
+        for (uint32_t slot = 0; slot < order.size(); ++slot)
+          for (uint32_t replicate = 1; replicate <= 8; ++replicate) {
+            // Reset for EVERY four-request workload, including ON->ON, so
+            // eight workloads pay eight fills rather than one fill/31 hits.
+            const auto [toggleWall, oldBytes] = setReuseWhileDrained(order[slot]);
+            double workloadWall = toggleWall;
+            for (uint32_t index = 0; index < replayRows.size(); ++index) {
+              Measurement result = runWarm(index, group - 1, order[slot],
+                  "ring_short_r" + std::to_string(replayRows[index]) + "_g" + std::to_string(group) +
+                  "_s" + std::to_string(slot + 1) + "_rep" + std::to_string(replicate));
+              result.ringAbbaGroup = group; result.ringAbbaSlot = slot + 1;
+              result.ringAbbaReplicate = replicate; result.ringAbbaEnabled = order[slot];
+              if (!index) { result.ringToggleMilliseconds = toggleWall; result.ringBytesBeforeToggle = oldBytes; }
+              workloadWall += result.wallMilliseconds; result.ringWorkloadWallMilliseconds = workloadWall;
+              if (result.outputTokens != references[index])
+                performanceFailures.push_back("ring-short conditioned ABBA changed full output");
+              measurements.push_back(std::move(result));
+            }
+          }
+      // Cold references run only after every warmup/measured restore has
+      // finished. The one shared setup is reported, never replicated into an
+      // invented paired setup-cost comparison.
+      setReuseWhileDrained(false);
+      for (uint32_t index = 0; index < replayRows.size(); ++index) {
+        evictAllCache(resources->cache());
+        const std::string name = "ring_short_r" + std::to_string(replayRows[index]);
+        Measurement cold = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                                      name + "_cold", 0, prompts[index], ringOutputTokens);
+        cold.inputTokens = prompts[index];
+        if (cold.cacheStatus != "miss" || cold.matchedTokens || cold.targetPrefillRows != cold.promptTokens ||
+            cold.draftRingRebuildRows || cold.draftRingCacheHits || cold.draftRingCacheBuilds || cold.draftRingCacheBytes || cold.outputTokens.empty() || cold.outputTokens.size() > ringOutputTokens ||
+            (ringOutputTokens == 1 && (cold.outputTokens.size() != 1 || cold.decodeGpuMilliseconds != 0)))
+          throw std::runtime_error("ring-short ABBA cold reference oracle failed");
+        for (auto *set : {&measurements, &ringThermalWarmup})
+          for (auto &result : *set) if (result.scenario == name) {
+            result.coldOutputMatch = result.outputTokens == cold.outputTokens;
+            if (!*result.coldOutputMatch) performanceFailures.push_back(name + " differs from its cold output");
+          }
+        measurements.push_back(std::move(cold));
+      }
+    }
+
     // A request lazily materializes a KV junction where its match ends past
     // its state at a branch point: another branch goes on below and holds a
     // state there, and the junction lies a draft window or more past the
@@ -1632,12 +1890,25 @@ int main(int argc, char **argv) {
     // and its elastic state/KV budget and the split's.
     const engine::EngineMemoryBreakdown &plan = resources->memoryPlan().breakdown();
     std::cout << "]},\"max_context_tokens\":" << engineConfig.maxContext
+              << ",\"ring_state_accounting\":\"exclusive_pool_v2\""
+              << ",\"experimental_draft_ring_reuse\":false"
+              << ",\"ring_short_prefix_tokens\":4096,\"ring_short_output_tokens\":" << ringOutputTokens
+              << ",\"ring_seed_output_tokens\":1,\"ring_generation_minimum_actual_tokens\":64,\"ring_short_replay_rows\":[1,8,16,32]"
+              << ",\"ring_abba_enabled\":" << (ringAbba ? "true" : "false")
+              << ",\"ring_conditioned_cohort\":\"" << (selected.ringGenerationAbba ? "off96_generation128_workload8_v1" : "off1280_workload8_v1")
+              << "\",\"ring_abba_replicates\":8,\"ring_abba_groups\":3,\"ring_abba_order\":[\"off\",\"on\",\"on\",\"off\"]"
+              << ",\"ring_runtime_instrumented\":false,\"ring_compilation_profile\":\"production_O3_flags\""
+              << ",\"ring_thermal_warmup_requests\":" << ringWarmupWorkloads * 4
+              << ",\"ring_thermal_warmup_in_primary\":false,\"ring_toggle_once_per_four_request_workload\":true,\"ring_toggle_in_primary\":true"
               << ",\"no_ane_context_tokens\":" << resources->aneFfnOutcome().contextWithout
               << ",\"dynamic_budget_bytes\":" << plan.dynamicBudgetBytes
               << ",\"ane_ffn_bytes\":" << plan.aneFfnBytes
               << ",\"skipped_context_lengths\":[";
     for (size_t index = 0; index < skippedLengths.size(); ++index)
       std::cout << (index ? "," : "") << skippedLengths[index];
+    std::cout << "],\"ring_thermal_warmup_measurements\":[";
+    for (size_t index = 0; index < ringThermalWarmup.size(); ++index)
+      emitMeasurement(ringThermalWarmup[index], index == 0);
     std::cout << "],\"measurements\":[";
     for (size_t index = 0; index < measurements.size(); ++index)
       emitMeasurement(measurements[index], index == 0);
