@@ -34,13 +34,12 @@ namespace {
 using namespace splash;
 using namespace splash::ops;
 
-// The devices: Apple9 and Apple10 at the core counts the plans tell apart and
-// the CI runners' Apple9 sizes. Family 11 plans as Apple10 (gpuClass), so its
-// 12 and 20 cores stand for Apple10's. Zero cores is a device that reports
-// none, planned at kAssumedGpuCores (32) on every family, so Apple9's alone.
+// The devices: each class at the core counts the plans tell apart and the CI
+// runners' Apple9 sizes. Zero cores is a device that reports none, planned at
+// kAssumedGpuCores (32) on every family, so Apple9's alone.
 constexpr std::pair<uint32_t, uint32_t> kDevices[] = {
     {9, 0},   {9, 1},   {9, 10},  {9, 11},  {9, 14},  {9, 16},  {9, 20},  {9, 40},
-    {10, 16}, {10, 32}, {10, 40}, {11, 12}, {11, 20}};
+    {10, 10}, {10, 16}, {10, 20}, {10, 32}, {10, 40}, {11, 12}, {11, 20}};
 
 DeviceCapabilities device(uint32_t family, uint32_t cores) {
   DeviceCapabilities result;

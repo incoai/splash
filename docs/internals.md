@@ -386,10 +386,12 @@ engine or the models branches on the GPU:
 
 - `DeviceCapabilities` (`runtime/metal/DeviceCapabilities.hpp`) describes the
   device: its class (`gpuClass()`: Apple9, family 9, whose matrix operations
-  share the FP32 pipe; Apple10, family 10 and later, a neural accelerator per
-  core) and the cores kernel policy plans for (`plannedGpuCores()`, the
-  reported count or 32 when IORegistry reports none, a fallback rather than a
-  calibrated optimum).
+  share the FP32 pipe; Apple10, family 10, a neural accelerator per core;
+  Apple11, family 11 and later, which takes Apple10's rows but for one lane's
+  16-row tile from four and a half bits, so what this page says of Apple10
+  holds for it unless it names Apple11) and the cores kernel policy plans for
+  (`plannedGpuCores()`, the reported count or 32 when IORegistry reports none,
+  a fallback rather than a calibrated optimum).
 - `KernelCalibration` (`runtime/ops/KernelCalibration.hpp`) holds every
   measured constant of selection as data, one row per class and, where a
   measurement says so, per core range (`KernelCalibration::of`, the one place
@@ -418,9 +420,11 @@ The rules:
    splits by `registerSplits`. Otherwise the staged tile runs, split by
    `stagedSplits` (the Apple10 wave law also picks one or two passes for a
    pair of one format from `onePassFromCores`), its walks spread from
-   `spreadFromCores`, and one unsplit lane of fewer than `sixteenRowBelowBits16`
-   sixteenths of a bit per weight on the 16-row tile, a pair's only where both
-   its tensors' own plans take it. A unit stages only where every quantized
+   `spreadFromCores`, and one unsplit lane on the 16-row tile below
+   `sixteenRowBelowBits16` sixteenths of a bit per weight, and from there
+   under the wave law where its grid runs in as many waves of that tile as of
+   the 8-row tile, `sixteenRowWaves` at most; a pair's only where both its
+   tensors' own plans take it. A unit stages only where every quantized
    segment's class does: dense measurements were taken per projection.
 3. *Float projection.* The accelerator tile runs where the device has one,
    from `minimumRows` rows and a grid of its tiles of at least half the class's
@@ -445,7 +449,7 @@ The register-against-staged boundaries are measured table entries, not a
 cost model: the wave law, which describes the Apple10 staged tiles, does not
 describe the register tile (`KernelCalibration.hpp`). `kernel-selection`
 (`dev/tests/engine/kernel_selection_test.cc`) pins every plan of every
-family's projections, float tiles, MoE blocks and attention on thirteen device
+family's projections, float tiles, MoE blocks and attention on fifteen device
 classes and core counts as a golden of one FNV-1a-64 per device, section and
 group, and `--dump <dir>` writes the plan lines; a change of a rule or an entry
 shows as the groups it changes. Kernels and their instances do not depend on
@@ -523,24 +527,42 @@ the staged split law below takes it. Its output is bitwise the two passes' at th
 where its split differs from the two passes', its sums are reassociated. A step of three request
 lanes runs the 32-row tile over four lanes of storage. On Apple10 one lane runs the 16-row tile
 over two lanes of storage (`LinearConfig::sixteenRows`), its padding lane computed and
-discarded, where its staged plan is unsplit and the projection's quantized segments store fewer
-than four and a half bits per weight together (`sixteenRowBelowBits16`), an
-unsplit gate/up pair where both its tensors' own plans do: the lane's rows are bitwise the 8-row
-tile's, in less time (the 27B UD-IQ3_XXS decodes one lane 3.3-3.6% faster on a 12-core M6).
+discarded, where its staged plan is unsplit, and an unsplit gate/up pair, in one pass or two,
+where both its tensors' own plans do, since they size its storage: the lane's rows are bitwise
+the 8-row tile's, and a wave of most formats takes less time (MPP computes 16-row fragments).
+Below four and a half bits per weight (`sixteenRowBelowBits16`) a lane runs it whatever the
+grid: the formats measured there show no residency step and take 3-6% less a wave on 16 rows
+(16-core M5 Pro, 32-core M5 Max), and the 27B UD-IQ3_XXS decodes one lane 3.3-3.6% faster on a
+12-core M6. From four and a half bits the tile's lower residency shows: 5120-input Q4_K and MLX
+4-bit step past 9 threadgroups per core on 16 rows, past 10 on 8 (16-core M5 Pro, 32-core M5
+Max), so a lane runs it where its grid runs in as many waves of the 16-row tile
+(`WaveLaw::sixteenRowResident`) as of the 8-row tile, and in at most `sixteenRowWaves`: two on
+Apple10, the most waves measured end to end. Tied grids of three to nine waves keep 8 rows: of
+them kernel sweeps alone measured one, 24 threadgroups per core, where Q4_K and Q6_K took
+1.4-2.8% less time on 16 rows on macOS 27 (16-core M5 Pro, 32-core M5 Max) and Q4_K 1.0% more
+on a 20-core M5 Pro on macOS 26.5. The 27B's 4.5-bit gate/up passes (17 threadgroups per core
+on 16 cores, two waves of either tile; 8.5 on 32, one) take 7.1-8.2% and 0.7-1.2% less time on
+it, its Q5_K passes 2.6-4.4% more on 16 cores; on 20 cores its pair runs in one pass, which
+takes 4.1-4.5% less on 16 rows. A 10240 x 5120 Q4_K (10 per core on 16 cores: one wave of the
+8-row tile, two of the 16-row tile) keeps 8 rows, where 16 take 17.5-18.7% more, and so do the
+248320-column heads, which run more waves of it (27 against 25 on 16 cores, 14 against 13 on
+32) and took 1.1% less to 2.0% more time on it. Apple11's (the M6's) 16-row tile takes as long
+a wave as its 8-row tile from four and a half bits, so there its lanes keep 8 rows
+(`kApple11Projection`): 16 took 10% more on the 27B UD-IQ3_XXS's Q4_K out-projections.
 Split, the padding lane's partials double the split's traffic: on the narrow grids where the law
 splits K most (the 35B's, the 122B's and Flash-Next's output projections, 1 to 1.5 threadgroups
 per core unsplit, in four or eight partitions) the 16-row tile takes 4-36% more time than the
 8-row tile at the same split on a 32-core M5 Max (IQ3_XXS, IQ2_XS and Q2_K, and IQ4_XS where it
 stages), against 2-8% less at 4 to 20 threadgroups per core on the M6 and 7% less to 2% more on
-the 27B's 5120-column projections in four on the M5 Max. Q4_K's 4.5 bits take more time on it on
-the M6. Prefill runs the staged kernels on both families: the 128-row prefill tile
-(`LinearTile::GgufPrefill`), and the staged tile for chunks of up to 32 rows. On Apple10 and on
-Apple9 GPUs of 10 cores or fewer chunks of 33 to 64 rows run the staged tile's 64-row height too,
-which reads the weights once where the prefill tile costs about as much for 33 rows as for 64 (on
-the 10-core M4 12-22% less time than the prefill tile). A fused projection's staged chunk runs its
-segments in one dispatch, as decode does: a dispatch costs about 0.045 ms however narrow, and at 8
-to 32 rows one dispatch takes 16-56% less time than one per segment on the 32-core M5 Max and 3-11%
-less on the 10-core M4 for the 27B attention and 35B GDN inputs.
+the 27B's 5120-column projections in four on the M5 Max. Prefill runs the staged kernels on
+every class: the 128-row prefill tile (`LinearTile::GgufPrefill`), and the staged tile for
+chunks of up to 32 rows. On Apple10 and on Apple9 GPUs of 10 cores or fewer chunks of 33 to 64
+rows run the staged tile's 64-row height too, which reads the weights once where the prefill
+tile costs about as much for 33 rows as for 64 (on the 10-core M4 12-22% less time than the
+prefill tile). A fused projection's staged chunk runs its segments in one dispatch, as decode
+does: a dispatch costs about 0.045 ms however narrow, and at 8 to 32 rows one dispatch takes
+16-56% less time than one per segment on the 32-core M5 Max and 3-11% less on the 10-core M4 for
+the 27B attention and 35B GDN inputs.
 
 Apple10's staged tile splits K across threadgroups, and runs a gate/up pair in one pass or two,
 by one wave law (`WaveLaw`, `runtime/ops/KernelSelection.cpp`), for decode steps and short
@@ -558,24 +580,25 @@ partition reads back. The constants come from sweeps of 2 to 40 threadgroups per
 32-core M5 Max, the 20-core M5 Pro and the 12-core M6 (`gguf-projection-benchmark`, which times
 a gate/up pair in both pass modes; MLX 4-bit and six GGUF formats at 2048 and 5120 inputs,
 gate/up pairs in MLX 4-bit): time per byte steps up past 10 and 16 threadgroups per core at one
-and two lanes (past 8 or 9 of the two-simdgroup tile on the M5 Pro), and the 32-row tile of
-three and four lanes steps past 9 on the M5 Max, 8 on the M5 Pro and 11 on the M6, which the law
-leaves out. The floors are fitted, not measured: a grid search over every measured case's
-fastest split gave 6 and 10 for `saturating` (a lone chain measures 5.4 and 9 threadgroups'
-bytes) and 2 and 3 for `following` (one threadgroup per core past a full wave measures 2.7-3.5
-of the tile's and 6-8.5 of the pair's); they stand in for what the law leaves out. Floors at the
-measured trailing waves take as much time in total on the sweeps but leave more cases slower.
-The law's totals on the sweeps (1.1%, 1.6% and 0.05% less time than the earlier rules on the M5
-Max, the M5 Pro and the M6) are in-sample, the fit's own records; the ABBA decode runs and a
-16-core emulation are the only out-of-sample checks, and the down projections' 17408 inputs,
-pairs in other formats and low-bit pairs take the law unmeasured. On the 12-core M6 the 35B draft's
-fc projection (2048 columns over 16384 inputs) runs two partitions instead of four at three and
-four lanes, 1.0-1.2% (2 us a cycle) more, within the 1.2-1.4% the benchmark varies between
-repeats; the law keeps it. The benchmark times the 27B's IQ4_XS gate/up pair 6.5% slower in two
-passes than in one at three and four lanes on the M5 Max (318.0 against 298.5 us), yet in the 27B
-UD-Q4_K_M's decode cycles at a 1024-token prompt the law's two passes took 0.8-1.2% less time there
-than a build running IQ4_XS pairs in one pass (1.2-1.8% at one and two lanes, six runs each), so the
-law keeps them.
+lane (past 8 or 9 of the two-simdgroup tile on the M5 Pro; past 9 on 16 rows, above), and the
+32-row tile of three and four lanes steps past 9 on the M5 Max, 8 on the M5 Pro and 11 on the
+M6, which the law's splits leave out: they take the one-lane residency at every height, as a fit
+per height sped no Mac without slowing some model. The floors are fitted, not measured: a grid
+search over every measured case's fastest split gave 6 and 10 for `saturating` (a lone chain
+measures 5.4 and 9 threadgroups' bytes) and 2 and 3 for `following` (one threadgroup per core
+past a full wave measures 2.7-3.5 of the tile's and 6-8.5 of the pair's); they stand in for what
+the law leaves out. Floors at the measured trailing waves take as much time in total on the
+sweeps but leave more cases slower. The law's totals on the sweeps (1.1%, 1.6% and 0.05% less
+time than the earlier rules on the M5 Max, the M5 Pro and the M6) are in-sample, the fit's own
+records; the ABBA decode runs and a 16-core emulation are the only out-of-sample checks, and the
+down projections' 17408 inputs, pairs in other formats and low-bit pairs take the law unmeasured.
+On the 12-core M6 the 35B draft's fc projection (2048 columns over 16384 inputs) runs two
+partitions instead of four at three and four lanes, 1.0-1.2% (2 us a cycle) more, within the
+1.2-1.4% the benchmark varies between repeats; the law keeps it. The benchmark times the 27B's
+IQ4_XS gate/up pair 6.5% slower in two passes than in one at three and four lanes on the M5 Max
+(318.0 against 298.5 us), yet in the 27B UD-Q4_K_M's decode cycles at a 1024-token prompt the
+law's two passes took 0.8-1.2% less time there than a build running IQ4_XS pairs in one pass
+(1.2-1.8% at one and two lanes, six runs each), so the law keeps them.
 
 The law tells a gate/up pair's pass modes apart only where a last wave falls below its floor. On
 the M5 Max the 27B gate/up pair runs two passes (one pass would put 17 threadgroups on each

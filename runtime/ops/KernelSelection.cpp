@@ -13,7 +13,8 @@ namespace {
 
 static_assert(kApple9Projection.stagedPrefillRows <= kMaximumStagedPrefillRows &&
                   kApple9SmallProjection.stagedPrefillRows <= kMaximumStagedPrefillRows &&
-                  kApple10Projection.stagedPrefillRows <= kMaximumStagedPrefillRows,
+                  kApple10Projection.stagedPrefillRows <= kMaximumStagedPrefillRows &&
+                  kApple11Projection.stagedPrefillRows <= kMaximumStagedPrefillRows,
               "the staged tile holds the prefill chunks it runs");
 
 // The register tile runs a unit of any class only at a lane count and grid it
@@ -36,7 +37,8 @@ constexpr bool registerBoundsHold(const RegisterBoundary &boundary) noexcept {
 }
 static_assert(registerBoundsHold(kApple9Projection.decodeRegister) &&
                   registerBoundsHold(kApple9SmallProjection.decodeRegister) &&
-                  registerBoundsHold(kApple10Projection.decodeRegister),
+                  registerBoundsHold(kApple10Projection.decodeRegister) &&
+                  registerBoundsHold(kApple11Projection.decodeRegister),
               "a class registers a grid FourBitsOrMore stages, or a mixed pair stages where its tensors register");
 
 // The most bits per weight a format stores, in sixteenths (BF16 and F16).
@@ -58,6 +60,12 @@ uint32_t tierSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const Spli
   return splits;
 }
 
+// The waves of a dispatch of `groups` threadgroups of a staged tile on
+// `cores` cores, `resident` on each core at once.
+uint64_t waves(uint64_t groups, uint32_t cores, uint32_t resident) {
+  return ((groups + cores - 1) / cores + resident - 1) / resident;
+}
+
 // The time of a dispatch of `groups` threadgroups of a staged tile, `steps`
 // K steps each, on `cores` cores, in bits a core streams at its share of DRAM,
 // times the cores: every wave but the last holds `resident` threadgroups on
@@ -69,9 +77,8 @@ uint32_t tierSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const Spli
 // partition reads back.
 uint64_t stagedTime(uint64_t groups, uint32_t steps, uint32_t splits, uint32_t rows, uint32_t bits16,
                     uint32_t cores, StagedOccupancy tile) {
-  const uint64_t perCore = (groups + cores - 1) / cores, waves = (perCore + tile.resident - 1) / tile.resident;
-  const uint64_t full = (waves - 1) * tile.resident * cores,
-                 floor = uint64_t{waves > 1 ? tile.following : tile.saturating} * cores;
+  const uint64_t count = waves(groups, cores, tile.resident), full = (count - 1) * tile.resident * cores,
+                 floor = uint64_t{count > 1 ? tile.following : tile.saturating} * cores;
   const uint64_t stepBits = uint64_t{GGUF_TILE_COLUMNS} * 32 * bits16 / 16,
                  partialBits = splits > 1 ? 2 * uint64_t{rows} * GGUF_TILE_COLUMNS * 32 : 0;
   return steps * stepBits * (full + std::max(groups - full, floor)) + groups * partialBits;
@@ -124,6 +131,20 @@ LinearConfig staged(const ProjectionCalibration &p, uint32_t n, uint32_t k, uint
   return {.tile = LinearTile::GgufStaged, .splits = choice.splits, .oneGateUpPass = choice.onePass};
 }
 
+// Whether one unsplit lane of `tiles` column tiles of `bits16` sixteenths of
+// a bit per weight runs the 16-row tile: never of 0 bits (float segments
+// alone or unknown formats, unmeasured), below sixteenRowBelowBits16, and
+// from there under a wave law where its grid runs in as many waves of the
+// 16-row tile as of the 8-row tile, sixteenRowWaves at most.
+bool sixteenRowLane(const ProjectionCalibration &p, uint64_t tiles, uint32_t bits16, uint32_t cores) {
+  if (!bits16) return false;
+  if (bits16 < p.sixteenRowBelowBits16) return true;
+  const WaveLaw *law = std::get_if<WaveLaw>(&p.stagedSplits);
+  if (!law) return false;
+  const uint64_t waves16 = waves(tiles, cores, law->sixteenRowResident);
+  return waves16 <= p.sixteenRowWaves && waves16 == waves(tiles, cores, law->tile.resident);
+}
+
 } // namespace
 
 UnitFormats unitFormats(std::span<const Projection *const> projections) noexcept {
@@ -169,7 +190,7 @@ SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows
 // column tiles counting both tensors', splitting by registerSplits; else the
 // staged tile, splitting by stagedSplits (a wave law also picks one or two
 // passes for an eligible pair), its walks spread from spreadFromCores, and one
-// unsplit lane under sixteenRowBelowBits16 on the 16-row tile, a pair's only
+// unsplit lane on the 16-row tile where sixteenRowLane takes it, a pair's only
 // where both its tensors' own plans take it.
 LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorkload w, const UnitFormats &unit,
                               std::span<const UnitFormats> pairTensors) {
@@ -196,7 +217,7 @@ LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorklo
                                                       return selectProjection(calibration, {w.matrix, w.rows}, tensor)
                                                           .sixteenRows;
                                                     })
-              : unit.weightBits16 && unit.weightBits16 < p.sixteenRowBelowBits16);
+              : sixteenRowLane(p, n / GGUF_TILE_COLUMNS, unit.weightBits16, cores));
   return config;
 }
 

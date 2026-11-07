@@ -55,6 +55,9 @@ struct WaveLaw final {
   // gguf_decode_<format>_m<rows>_gate_up: one simdgroup, 32 columns of each
   // tensor.
   StagedOccupancy gateUpPair;
+  // `tile`'s residency at 16 rows, which decides only one unsplit lane's
+  // height (sixteenRowLane).
+  uint32_t sixteenRowResident;
   // Partitions keep this many inputs, maximumSplits at most.
   uint32_t partitionInputs;
   uint32_t maximumSplits;
@@ -80,6 +83,9 @@ struct ProjectionCalibration final {
   // One unsplit decode lane of fewer bits per weight than this, in
   // sixteenths, runs the staged 16-row tile; 0 never.
   uint32_t sixteenRowBelowBits16;
+  // The most waves of the 16-row tile one such lane runs in from there, under
+  // a wave law (sixteenRowLane); 0 never.
+  uint32_t sixteenRowWaves;
   // Prefill chunks of up to this many rows run the staged tile
   // (<= kMaximumStagedPrefillRows); longer ones the prefill tile.
   uint32_t stagedPrefillRows;
@@ -138,8 +144,18 @@ inline constexpr std::span<const SplitTier> kApple9StagedTiers = std::span(kRegi
 // grid search's fit to every measured case's fastest split (32-core M5 Max,
 // 20-core M5 Pro, 12-core M6). On the 27B's projections its choice is at most
 // 65 us a call from the fastest, under the 5% of a decode step that would
-// refit it. Staged partitions keep 512 inputs, eight at most.
-inline constexpr WaveLaw kApple10StagedLaw{{10, 6, 2}, {16, 10, 3}, 512, 8};
+// refit it. Staged partitions keep 512 inputs, eight at most. At 16 rows the
+// tile steps past 9 (5120-input Q4_K and MLX 4-bit, 16-core M5 Pro and
+// 32-core M5 Max), which decides only one lane's height: splits take 10 at
+// every height, as a fit per height sped no measured Mac without slowing some
+// model.
+inline constexpr WaveLaw kApple10StagedLaw{
+    .tile = {10, 6, 2},
+    .gateUpPair = {16, 10, 3},
+    .sixteenRowResident = 9,
+    .partitionInputs = 512,
+    .maximumSplits = 8,
+};
 static_assert(kApple10StagedLaw.tile.resident >= kApple10StagedLaw.tile.saturating &&
                   kApple10StagedLaw.gateUpPair.resident >= kApple10StagedLaw.gateUpPair.saturating,
               "a full wave streams at DRAM's rate");
@@ -181,13 +197,20 @@ inline constexpr uint32_t kApple10SpreadFromCores = 16;
 inline constexpr uint32_t kApple10OnePassFromCores = 16;
 
 // One lane of a projection whose quantized segments store fewer than 4.5
-// bits per weight together runs unsplit on Apple10's 16-row tile, the second
+// bits per weight together runs unsplit on the staged 16-row tile, the second
 // lane of its storage padding: the 8-row tile's bits (gguf-projection checks
-// it) in less time, a 27B UD-IQ3_XXS lane 3.3-3.6% faster (12-core M6), Q4_K
-// at 4.5 bits up to 1.6% slower. Split, the padding lane's partials double
-// the traffic. An unsplit gate/up pair runs it where both its tensors' own
-// plans do.
+// it) in less time at every grid, as no measured format there has a
+// residency step: IQ2, IQ3 and Q3_K take 3-6% less a wave on a 16-core M5 Pro
+// and a 32-core M5 Max, and a 27B UD-IQ3_XXS lane decodes 3.3-3.6% faster on
+// a 12-core M6. Split, the padding lane's partials double the traffic. An
+// unsplit gate/up pair runs it where both its tensors' own plans do.
 inline constexpr uint32_t kApple10SixteenRowBelowBits16 = 72;
+
+// From 4.5 bits one lane runs the 16-row tile where its grid runs in as many
+// waves there as on 8 rows, two at most: a second wave for the 10th
+// threadgroup per core took 18% more (Q4_K, 16-core M5 Pro), and two is the
+// most waves measured end to end (the 27B's gate/up passes, 17 per core).
+inline constexpr uint32_t kApple10SixteenRowWaves = 2;
 
 // Prefill: 128-row tiles. A chunk of up to 32 rows runs the staged tile of its
 // rows with the decode split law (the prefill tile's outputs up to fp32
@@ -211,6 +234,7 @@ inline constexpr ProjectionCalibration kApple9Projection{
     .spreadFromCores = kNever,
     .onePassFromCores = kNever,
     .sixteenRowBelowBits16 = 0,
+    .sixteenRowWaves = 0,
     .stagedPrefillRows = kApple9StagedPrefillRows,
 };
 inline constexpr ProjectionCalibration kApple9SmallProjection = [] {
@@ -225,8 +249,19 @@ inline constexpr ProjectionCalibration kApple10Projection{
     .spreadFromCores = kApple10SpreadFromCores,
     .onePassFromCores = kApple10OnePassFromCores,
     .sixteenRowBelowBits16 = kApple10SixteenRowBelowBits16,
+    .sixteenRowWaves = kApple10SixteenRowWaves,
     .stagedPrefillRows = kApple10StagedPrefillRows,
 };
+
+// Apple11 takes Apple10's row but for the 16-row lane from 4.5 bits: the M6's
+// 16-row tile takes as long a wave as its 8-row tile there (5120-input Q4_K,
+// 12-core M6), so its lanes keep 8 rows; 16 took 10% more on the 27B
+// UD-IQ3_XXS's Q4_K out-projections.
+inline constexpr ProjectionCalibration kApple11Projection = [] {
+  ProjectionCalibration row = kApple10Projection;
+  row.sixteenRowWaves = 0;
+  return row;
+}();
 
 // ---- Float projections ----------------------------------------------------
 
@@ -274,8 +309,10 @@ inline constexpr AttentionCalibration kApple9SmallAttention{64};
 
 inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device) noexcept {
   const uint32_t cores = device.plannedGpuCores();
-  if (device.gpuClass() == GpuClass::Apple10)
-    return {cores, kApple10Projection, kApple10FloatTile, kApple10Moe, kAttention};
+  const GpuClass gpu = device.gpuClass();
+  if (gpu != GpuClass::Apple9)
+    return {cores, gpu == GpuClass::Apple11 ? kApple11Projection : kApple10Projection, kApple10FloatTile, kApple10Moe,
+            kAttention};
   const bool small = cores <= kApple9SmallGpuCores;
   return {cores, small ? kApple9SmallProjection : kApple9Projection, kApple9FloatTile,
           small ? kApple9SmallMoe : kApple9Moe, small ? kApple9SmallAttention : kAttention};

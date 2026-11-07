@@ -62,9 +62,10 @@ struct ProjectionShape final {
   FormatClass formatClass = FormatClass::FourBitsOrMore;
   // The bits per weight its quantized segments store together, its float
   // ones aside, in sixteenths, rounded down; 0 where it has none or they are
-  // unknown, which plans take for the most a format stores. Apple10's staged
-  // split law weighs a split's partials against the weights, and one lane of
-  // few bits runs the 16-row tile (KernelSelection.cpp).
+  // unknown, which Apple10's staged split law takes for the most a format
+  // stores as it weighs a split's partials against the weights. The bits,
+  // with the wave law from 4.5, decide whether one lane runs the 16-row tile,
+  // never at 0 (KernelSelection.cpp).
   uint32_t weightBits16 = 0;
   auto operator<=>(const ProjectionShape &) const = default;
 };
