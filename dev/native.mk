@@ -603,7 +603,7 @@ test-engine: test-engine-cpu test-engine-metal
 # engine-sim, the slowest, runs last.
 ENGINE_CPU_FAILED := $(ENGINE_TEST_BUILD)/test-engine-cpu.failed
 ENGINE_CPU_STEP = @step() { echo "$$*"; "$$@" || echo "$$*" >> $(ENGINE_CPU_FAILED); }; step
-test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENCHMARK)
+test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENCHMARK) $(TEST_GGUF_PROJECTION_BENCHMARK)
 	@: > $(ENGINE_CPU_FAILED)
 	$(ENGINE_CPU_STEP) $(TEST_SLOT_FILE)
 	$(ENGINE_CPU_STEP) $(TEST_KV_SLOT_FORMAT)
@@ -627,6 +627,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(ENGINE_CPU_STEP) $(TEST_LINEAR_PLAN) --cpu
 	$(ENGINE_CPU_STEP) /bin/sh dev/tests/attention_sweep_cli.sh $(TEST_ATTENTION_SWEEP)
 	$(ENGINE_CPU_STEP) /bin/sh dev/tests/backend_benchmark_cli.sh $(TEST_BACKEND_BENCHMARK) $(MODEL_CONFIGS)
+	$(ENGINE_CPU_STEP) /bin/sh dev/tests/gguf_projection_benchmark_cli.sh $(TEST_GGUF_PROJECTION_BENCHMARK)
 	$(ENGINE_CPU_STEP) $(TEST_OPERATOR_WORKSPACE)
 	$(ENGINE_CPU_STEP) $(TEST_ANE_FFN_CALIBRATION)
 	$(ENGINE_CPU_STEP) $(TEST_ANE_FFN_STARTUP)
