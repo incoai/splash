@@ -94,11 +94,11 @@ struct QwenTargetDimensions {
   // streams (hyperConnected), the residual's streams and the mixes' low rank;
   // a QSA indexer (hasIndexer), its heads of indexerHeadDimension values, past
   // indexerTopBlocks blocks of indexerBlockTokens tokens of which a row
-  // attends sparsely; and a PLE n-gram embedding (hasPle), its layer, n-gram
-  // size, heads per n-gram, head width and convolution taps. Shared code
-  // reads them only where zero means none: the KV pages' index region, a
-  // state cell's PLE history and QSA pending keys, and the rows a mixer adds
-  // to (kvLayout, gdnStateLayout, QwenTargetGeometry::mixersAddToHidden).
+  // attends sparsely; and a PLE n-gram embedding, its layer, n-gram size,
+  // heads per n-gram, head width and convolution taps. Shared code reads them
+  // only where zero means none: the KV pages' index region, a state cell's
+  // PLE history and QSA pending keys, and the rows a mixer adds to (kvLayout,
+  // gdnStateLayout, QwenTargetGeometry::mixersAddToHidden).
   uint32_t hyperConnections = 0;
   uint32_t hyperRank = 0;
   uint32_t indexerHeads = 0;
@@ -138,9 +138,6 @@ struct QwenTargetDimensions {
             .sharedSlices = sharedExpertSlices,
             .sharedGate = sharedExpertGate};
   }
-  [[nodiscard]] constexpr uint32_t actualGdnWidth() const noexcept {
-    return convolutionDimension + attentionWidth + 2 * gdnValueHeads;
-  }
   // The window the target serves with `scaling`: the native one, or YaRN's,
   // the native one times its factor, rounded to the nearest token so that a
   // factor taken as a context over the native window (servedFor) serves that
@@ -150,14 +147,16 @@ struct QwenTargetDimensions {
       return nativeContextTokens;
     return static_cast<uint32_t>(std::lround(nativeContextTokens * scaling.factor));
   }
+  // The most context the target serves: YaRN's window, or the native one
+  // for a family YaRN does not stretch (yarnContextTokens 0).
+  [[nodiscard]] constexpr uint32_t maximumContextTokens() const noexcept {
+    return nativeContextTokens > yarnContextTokens ? nativeContextTokens : yarnContextTokens;
+  }
   // Whether the residual is hyperConnections streams, which a mix joins
   // before each mixer, each FFN and the logits in place of a norm.
   [[nodiscard]] constexpr bool hyperConnected() const noexcept { return hyperConnections != 0; }
   // Whether each full-attention layer has a QSA indexer.
   [[nodiscard]] constexpr bool hasIndexer() const noexcept { return indexerHeads != 0; }
-  // Whether a PLE n-gram embedding feeds layer pleLayer from a table of its
-  // own.
-  [[nodiscard]] constexpr bool hasPle() const noexcept { return pleNgram != 0; }
   [[nodiscard]] constexpr uint32_t streamWidth() const noexcept { return hyperConnections * hiddenSize; }
   [[nodiscard]] constexpr uint32_t pleHeads() const noexcept {
     return pleNgram ? (pleNgram - 1) * pleHeadsPerNgram : 0;
@@ -201,16 +200,19 @@ struct QwenHybridLayout : QwenTargetDimensions {
   std::string_view family;
 
   // The KV pages, which also hold a QSA indexer's pooled keys; a QSA target's
-  // sparse attention gathers blocks of tokens, so its values are token-major.
-  // A sliding layer reads the slidingWindow - 1 keys before its row's.
+  // attention reads the blocks its indexer selects, in the value order that
+  // reader takes. A sliding layer reads the slidingWindow - 1 keys before its
+  // row's.
   [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
+    const kv::Reads reads = hasIndexer() ? kv::Reads::SelectedBlocks : kv::Reads::EveryPage;
     return {.attentionLayers = attentionLayerCount(),
             .kvHeads = attentionKvHeads,
             .headDimension = attentionHeadDimension,
             .indexDimension = indexerHeadDimension,
-            .valuesTokenMajor = hasIndexer(),
+            .valuesTokenMajor = kv::valuesTokenMajorFor(reads),
             .windowTokens = slidingWindow ? slidingWindow - 1 : 0,
-            .windowedLayers = slidingLayers};
+            .windowedLayers = slidingLayers,
+            .reads = reads};
   }
   // The GDN layers' state and, after it in a cell, a PLE convolution's
   // history and the QSA indexer's pending keys.

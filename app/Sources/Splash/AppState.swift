@@ -6,9 +6,19 @@ import Observation
 /// conversations.
 @MainActor @Observable
 final class AppState {
-    /// The window's two parts: the Server, where models download, start and change, and the Chat
-    /// with the model that runs. The window opens on the Server.
+    /// The window's two parts: the Server, where models download, start and change, which the
+    /// button at the toolbar's end opens, and the Chat with the model that runs. The window opens
+    /// on the Server.
     enum Section: Hashable { case server, chat }
+
+    /// Where the app keeps what it writes: the logs of its server and downloads, and the chats.
+    struct Folders {
+        let logs: URL
+        let chats: URL
+
+        static let user = Folders(logs: URL.libraryDirectory.appending(path: "Logs/Splash"),
+                                  chats: URL.applicationSupportDirectory.appending(path: "Splash/Chats"))
+    }
 
     /// Why the app cannot run models here.
     struct Blocker: Equatable {
@@ -20,6 +30,8 @@ final class AppState {
     let runtime: Runtime
     /// Where the API key is kept.
     let keychain: Keychain
+    /// Where the preferences and the records of what the app runs (`ChildRecord`) are kept.
+    let defaults: UserDefaults
     let server: Server
     let installer: Installer
     let catalog: Catalog
@@ -31,15 +43,28 @@ final class AppState {
     /// The open conversation's page, kept while the window shows something else, so that the Chat
     /// shows again at once.
     let transcript: Transcript
+    /// Whether the Chat shows its sidebar, as the toolbar's button and ⌘B have it, from one launch
+    /// to the next.
+    var showsSidebar: Bool {
+        didSet { defaults.set(showsSidebar, forKey: Preference.sidebar) }
+    }
+    /// The terminals and logs under the window's content, whether they show, as ⌘J has it, and
+    /// the height the user dragged them to.
+    let drawer: Drawer
+    var showsDrawer = false
+    var drawerHeight: CGFloat = 280
     private(set) var installed: [InstalledModel] = []
+    /// What each model family makes of the launch options, by its name, as the runtime reports it
+    /// at launch; none before, or where the report failed: every option then shows and passes.
+    private(set) var families: [String: ModelFamily] = [:]
     private(set) var blocker: Blocker?
     /// Whether the checks of `launch` are done; nothing starts before.
     private(set) var launched = false
     var section = Section.server
     /// The launch options the next start uses.
-    var options = ServeSettings.current() {
+    var options: ServeSettings {
         didSet {
-            options.save()
+            options.save(defaults)
             if options.apiKey != keptKey { keep(options.apiKey) }
         }
     }
@@ -51,21 +76,31 @@ final class AppState {
     /// Set once the app quits: nothing starts any more.
     private(set) var quitting = false
     /// The installer of the models the Hugging Face cache holds, while it runs (`launch`).
-    private var cachedInstaller: Process?
-    /// The model files the user added, by path, as last measured (`refresh`), and the count of
-    /// measurements started, so that only the latest one counts.
-    @ObservationIgnored private var measured: [String: InstalledModel] = [:]
-    @ObservationIgnored private var measurements = 0
+    private var cachedInstaller: ChildProcess?
+    /// The listing of the models under way or last done (`refresh`), and the count of listings
+    /// started, so that only the latest one counts.
+    @ObservationIgnored private var listing: Task<Void, Never>?
+    @ObservationIgnored private var listings = 0
+    /// The model to pick once the latest listing has it (`refresh`).
+    @ObservationIgnored private var picking: String?
 
-    init(runtime: Runtime, chats: ChatStore = ChatStore(), keychain: Keychain = .app, server: Server? = nil) {
+    init(runtime: Runtime, folders: Folders = .user, keychain: Keychain = .app, defaults: UserDefaults = .standard,
+         shell: @escaping () -> Shell = { .login }) {
         self.runtime = runtime
         self.keychain = keychain
-        self.chats = chats
-        self.server = server ?? Server(runtime: runtime)
-        installer = Installer(runtime: runtime)
+        self.defaults = defaults
+        showsSidebar = defaults.object(forKey: Preference.sidebar) as? Bool ?? true
+        options = ServeSettings.current(defaults)
+        drawer = Drawer(shell: shell)
+        chats = ChatStore(folder: folders.chats)
+        server = Server(runtime: runtime, log: folders.logs.appending(path: "server.log"), defaults: defaults)
+        installer = Installer(runtime: runtime, log: folders.logs.appending(path: "install.log"), defaults: defaults)
         catalog = Catalog(contentsOf: runtime.suggestedModels)
         transcript = Transcript(runtime: runtime)
         installer.installed = { [weak self] in self?.didInstall($0) }
+        // A start prepares model files on this Mac, which then have a family, and the model that
+        // runs stays listed only while it runs.
+        server.phaseChanged = { [weak self] in self?.refresh() }
         // Asked from the page, which then has the keyboard: the composer takes it back.
         transcript.askAgain = { [weak self] in
             self?.retry()
@@ -88,34 +123,39 @@ final class AppState {
     /// Whether the models the Hugging Face cache holds are still being looked for.
     var findingCachedModels: Bool { cachedInstaller != nil }
 
-    /// What runs, in a sentence: VoiceOver announces it, and the Chat's composer says it while a
-    /// model starts or stops.
-    var status: String {
-        let name = server.model.map(displayName(of:)) ?? ""
-        switch server.phase {
-        case .stopped: return "No model running"
-        case .starting: return "\(name) · \(server.step.rawValue)…"
-        case .stopping:
-            guard let next = server.next else { return "Stopping \(name)…" }
-            return next == server.model ? "Restarting \(name)…" : "Switching to \(displayName(of: next))…"
-        case .ready: return "\(name) · \(server.serving.rawValue)"
-        case .failed: return "\(name) ran into a problem"
-        }
+    /// What the server does: the look of its mark, and the phrase most views say of the model
+    /// that runs.
+    struct ServerStatus {
+        let look: MarkLook
+        let phrase: String
     }
 
-    /// What the server does, as the mark shows it.
-    var markLook: MarkLook {
+    var serverStatus: ServerStatus {
         switch server.phase {
-        case .starting: .loading
+        case .stopped:
+            return ServerStatus(look: .off, phrase: "Not running")
+        case .starting:
+            return ServerStatus(look: .loading, phrase: "\(server.step.rawValue)…")
+        case .stopping:
+            guard let next = server.next else { return ServerStatus(look: .off, phrase: "Stopping…") }
+            return ServerStatus(look: .off, phrase: next == server.model ? "Restarting…" : "Switching to \(displayName(of: next))…")
         case .ready:
-            switch server.serving {
+            let look: MarkLook = switch server.serving {
             case .running: .on
             case .sleeping: .asleep
             case .recovering: .loading
             }
-        case .failed: .failed
-        case .stopped, .stopping: .off
+            return ServerStatus(look: look, phrase: server.serving.rawValue)
+        case .failed:
+            return ServerStatus(look: .failed, phrase: server.running ? "Not responding" : "Ran into a problem")
         }
+    }
+
+    /// What runs, in a sentence: VoiceOver announces it, and the Chat's composer says it while a
+    /// model starts, stops or fails.
+    var status: String {
+        guard server.phase != .stopped, let model = server.model else { return "No model running" }
+        return "\(displayName(of: model)) · \(serverStatus.phrase)"
     }
 
     /// The download under way, in the words the menus use.
@@ -126,21 +166,27 @@ final class AppState {
         return "Downloading \(name) · \(progress.fraction.formatted(.percent.precision(.fractionLength(0))))"
     }
 
-    /// The model picked on the Server screen: the last one picked if it is still on this Mac, else
-    /// the first one that is.
+    /// The model picked on the Server screen: the last one picked while it is listed, else the
+    /// first one listed.
     var selection: String? {
         get {
             access(keyPath: \.selection)
-            let picked = UserDefaults.standard.string(forKey: Preference.model)
+            let picked = defaults.string(forKey: Preference.model)
             return picked.flatMap { isInstalled($0) ? $0 : nil } ?? installed.first?.id
         }
-        set { withMutation(keyPath: \.selection) { UserDefaults.standard.set(newValue, forKey: Preference.model) } }
+        set { withMutation(keyPath: \.selection) { defaults.set(newValue, forKey: Preference.model) } }
     }
 
     /// Whether the model that runs would start otherwise with the options set now.
     var optionsChanged: Bool {
         guard server.phase == .ready, let model = server.model else { return false }
-        return server.settings.differs(from: options, model: model)
+        return server.settings.differs(from: options, model: model, family: family(of: model))
+    }
+
+    /// What the family of `model`, a listed one, makes of the launch options; unknown for model
+    /// files on this Mac not prepared yet, or before the runtime has reported its families.
+    func family(of model: String?) -> ModelFamily {
+        installed.first { $0.id == model }?.family.flatMap { families[$0] } ?? .unknown
     }
 
     /// The name to show for model `id`; its variant tells installed variants of a model apart.
@@ -150,12 +196,12 @@ final class AppState {
         return "\(name) (\(Catalog.variant(of: id)))"
     }
 
-    /// Checks this Mac and the app's location, stops what the app left running last time, and
-    /// then, in the background, installs the models the Hugging Face cache holds.
+    /// Checks this Mac and the app's location, waits for the list of the models on it, stops what
+    /// the app left running last time, and then, in the background, installs the models the Hugging
+    /// Face cache holds; meanwhile it reads what each model family makes of the launch options.
     func launch() async {
         defer { launched = true }
-        let runtime = runtime
-        if let reason = await Task.detached(operation: { runtime.unsupportedReason() }).value {
+        if let reason = await runtime.unsupportedReason() {
             blocker = Blocker(title: "This Mac Can’t Run Splash", symbol: "exclamationmark.triangle", message: reason)
             return
         }
@@ -164,6 +210,8 @@ final class AppState {
                               message: "Splash can’t run from the disk image. Drag it to your Applications folder, then open it from there.")
             return
         }
+        await listed()
+        Task { families = await runtime.families() }
         await installer.stopLeftover()
         await server.stopLeftover()
         installCached()
@@ -172,15 +220,11 @@ final class AppState {
     /// Installs, without downloading, the models other tools or a source checkout of Splash left
     /// in the Hugging Face cache that Splash serves (`install/cached.py`), then lists them.
     private func installCached() {
-        let process = runtime.cachedInstaller()
-        process.terminationHandler = { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.cachedInstaller = nil
-                self?.refresh()
-            }
+        cachedInstaller = try? ChildProcess(command: runtime.cachedInstallCommand, environment: runtime.environment,
+                                            log: URL(filePath: "/dev/null")) { [weak self] _ in
+            self?.cachedInstaller = nil
+            self?.refresh()
         }
-        guard (try? process.run()) != nil else { return }
-        cachedInstaller = process
     }
 
     /// Reads the API key kept; a Keychain that doesn't give it is a problem to solve first.
@@ -210,7 +254,7 @@ final class AppState {
         guard ready, keyProblem == nil else { return }
         selection = model
         chats.stop()
-        server.start(model, settings: options)
+        server.start(model, settings: options.usable(by: family(of: model)))
     }
 
     func stop() {
@@ -218,25 +262,28 @@ final class AppState {
         server.stop()
     }
 
+    /// The model Stop names, while a server runs: the one a switch goes to, else the one that runs;
+    /// and whether Stop does anything now, which it doesn't once a stop with no switch is under way.
+    var stopItem: (model: String, enabled: Bool)? {
+        guard server.running, let model = server.next ?? server.model else { return nil }
+        return (model, !(server.phase == .stopping && server.next == nil))
+    }
+
     func download(_ model: String) {
         guard ready else { return }
         installer.install(model)
     }
 
-    /// Stops the download, the model and the installer of cached models for the app to quit, and
-    /// starts nothing after. The last gets SIGINT, as Ctrl+C sends, and SIGTERM 5 s later.
+    /// Stops the download, the model and the installer of cached models, which the app waits for
+    /// as it quits, and the drawer's terminals, and starts nothing after. The installer of cached
+    /// models gets SIGINT, as Ctrl+C sends, and SIGKILL 5 s later.
     func quit() {
         quitting = true
         chats.stop()
+        drawer.endAll()
         installer.cancel()
         server.stop()
-        if let cachedInstaller {
-            cachedInstaller.interrupt()
-            Task {
-                try? await Task.sleep(for: .seconds(5))
-                if cachedInstaller.isRunning { cachedInstaller.terminate() }
-            }
-        }
+        cachedInstaller?.stop(SIGINT, killAfter: .seconds(5))
     }
 
     /// The next prompt, the open conversation and the draft, for the composer to count; nil while
@@ -258,11 +305,12 @@ final class AppState {
         return chatContext.shown(history: history, target: target, started: server.since)
     }
 
-    /// Whether the draft can go: a model answers, no reply streams, and the model's context can
-    /// hold the prompt, as far as it has been counted. A count not done, or failed, holds nothing
-    /// back: the server checks the prompt too, and says so if it is too long.
+    /// Whether the draft can go: its images are all attached, a model answers, no reply streams,
+    /// and the model's context can hold the prompt, as far as it has been counted. A count not
+    /// done, or failed, holds nothing back: the server checks the prompt too, and says so if it is
+    /// too long.
     var canSendDraft: Bool {
-        guard !draft.isEmpty, server.answers, chats.streaming == nil,
+        guard !draft.isEmpty, draft.attaching == 0, server.answers, chats.streaming == nil,
               draft.images.isEmpty || server.acceptsImages else { return false }
         return overflow == nil
     }
@@ -296,17 +344,23 @@ final class AppState {
     var effort: String {
         get {
             access(keyPath: \.effort)
-            let efforts = UserDefaults.standard.dictionary(forKey: Preference.efforts) as? [String: String]
+            let efforts = defaults.dictionary(forKey: Preference.efforts) as? [String: String]
             return server.model.flatMap { efforts?[$0] } ?? ""
         }
         set {
             guard let model = server.model else { return }
             withMutation(keyPath: \.effort) {
-                var efforts = UserDefaults.standard.dictionary(forKey: Preference.efforts) as? [String: String] ?? [:]
+                var efforts = defaults.dictionary(forKey: Preference.efforts) as? [String: String] ?? [:]
                 efforts[model] = newValue.isEmpty ? nil : newValue
-                UserDefaults.standard.set(efforts, forKey: Preference.efforts)
+                defaults.set(efforts, forKey: Preference.efforts)
             }
         }
+    }
+
+    /// Opens `agent` in Terminal, on the model that serves.
+    func open(_ agent: Agent) {
+        NSApp.activate()
+        agent.open(runtime: runtime, settings: server.settings, defaults: defaults)
     }
 
     func copyAPIAddress() {
@@ -314,37 +368,64 @@ final class AppState {
         NSPasteboard.put(settings.url.appending(path: "v1").absoluteString)
     }
 
-    /// The models installed here, the suggested ones first in the list's order, then the model files
-    /// on this Mac the user added, with their sizes as last measured; they are measured again off the
-    /// main thread, as a folder picked may be large.
-    func refresh() {
-        let rank = { (id: String) in self.catalog.variants.firstIndex { $0.id == id } ?? Int.max }
+    /// Lists the models installed here, the suggested ones first in the list's order, then the model
+    /// files on this Mac the user added, measured, with the family of their preparation once
+    /// prepared; the model that runs stays listed as it was while it runs, its files gone or taken
+    /// off the list. It reads them off the main thread, as the Hugging Face cache may be on another
+    /// volume and a folder picked large, and the list stays as it was until it is done; only the
+    /// latest listing counts. `picking` is picked once that listing is done, as the pick of a model
+    /// not listed falls to the first one listed (`selection`).
+    @discardableResult
+    func refresh(picking model: String? = nil) -> Task<Void, Never> {
+        let runtime = runtime
         let paths = localModels
-        installed = runtime.installedModels().sorted { (rank($0.id), $0.id) < (rank($1.id), $1.id) }
-            + paths.map { measured[$0] ?? InstalledModel(id: $0) }
-        guard !paths.isEmpty else { return }
-        measurements += 1
-        let measurement = measurements
-        Task {
-            let models = await Task.detached { paths.map(InstalledModel.local) }.value
-            guard measurement == measurements else { return }
-            measured = Dictionary(models.map { ($0.id, $0) }) { first, _ in first }
-            let current = installed.map { $0.local ? measured[$0.id] ?? $0 : $0 }
-            if current != installed { installed = current }
+        if let model { picking = model }
+        listings += 1
+        let count = listings
+        let task = Task {
+            let (models, prepared, local) = await Task.detached {
+                (runtime.installedModels(), runtime.preparedFamilies(), paths.map(InstalledModel.local))
+            }.value
+            guard count == listings else { return }
+            let found = models + local.map { model in
+                var model = model
+                model.family = prepared[model.id]
+                return model
+            }
+            let all = found + installed.filter { model in
+                server.running && server.model == model.id && !found.contains { $0.id == model.id }
+            }
+            let rank = { (id: String) in self.catalog.variants.firstIndex { $0.id == id } ?? Int.max }
+            let listed = all.filter { !$0.local }.sorted { (rank($0.id), $0.id) < (rank($1.id), $1.id) }
+                + all.filter(\.local)
+            if listed != installed { installed = listed }
+            if let picked = picking {
+                picking = nil
+                selection = picked
+            }
+        }
+        listing = task
+        return task
+    }
+
+    /// Waits for the latest listing of the models (`refresh`) to be done.
+    func listed() async {
+        while let task = listing {
+            await task.value
+            if task == listing { return }
         }
     }
 
     private var localModels: [String] {
-        get { UserDefaults.standard.stringArray(forKey: Preference.localModels) ?? [] }
-        set { UserDefaults.standard.set(newValue, forKey: Preference.localModels) }
+        get { defaults.stringArray(forKey: Preference.localModels) ?? [] }
+        set { defaults.set(newValue, forKey: Preference.localModels) }
     }
 
     /// Adds model files on this Mac, a GGUF file or a model's folder, and picks them: Start has
     /// Splash prepare them, and says why if it cannot serve them.
     func addLocal(_ url: URL) {
         if !localModels.contains(url.path) { localModels.append(url.path) }
-        refresh()
-        selection = url.path
+        refresh(picking: url.path)
     }
 
     /// Takes model files off the list; the files stay where they are.
@@ -359,8 +440,7 @@ final class AppState {
 
     /// Picks the model downloaded, for the user to start.
     private func didInstall(_ model: String) {
-        refresh()
-        selection = model
+        refresh(picking: model)
         if NSApp?.isActive == false { NSApp.requestUserAttention(.informationalRequest) }
     }
 

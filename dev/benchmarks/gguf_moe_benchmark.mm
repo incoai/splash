@@ -23,6 +23,7 @@
 #include "ops/MoE.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -94,6 +95,8 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
                        {planes(downFormat, E * H, I), planes(sharedFormat, shape.sharedSlices * H, I)},
                        splash::model::residentExpertSlots(backend, E), E};
   gguf.chunks = splash::ops::residentExpertChunks(gguf);
+  const std::array<const BlockMoeWeights *, 1> blocks{&gguf};
+  const splash::ops::MoeFormats formats = splash::ops::moeFormats(blocks);
   // Rows whose expert e scores 4 x[e]: the first E inputs rank the experts, the row's routes at 1 - 0.05 rank and the
   // others below 0.05.
   const auto input = [&](uint32_t rows, Routing routing) {
@@ -162,14 +165,18 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
          shape.sharedGate ? " gated" : "", fmtName(gateUpFormat), fmtName(downFormat), fmtName(sharedFormat), rounds);
   // Prefill chunks first: they also bring the GPU clocks up for the short decode layers.
   for (const uint32_t rows : kPrefillRows) {
-    const MoePlan plan = plans.moePrefill(shape, rows);
+    const MoePlan plan = plans.moePrefill(shape, formats, rows);
     const MoeGgufTile device = plan.configuration().ggufTile, other = otherTile(device);
     printf("  prefill chunk of %4u rows: %s %.4f", rows, tileName(device), time(layers(plan, Routing::Random)));
     // The register tile takes the weights of quant_register_tensor only, on 8-row tiles.
-    if (other == MoeGgufTile::Staged || shape.registerFormats) {
+    if (other == MoeGgufTile::Staged || formats.experts.registerTakes) {
       MoeConfig config = plan.configuration();
       config.ggufTile = other;
-      config.expertTile = splash::ops::moeGgufPrefillTile(shape, rows, other);
+      // The other tile's rows as selectMoe gives them: 8 on the register
+      // tile, staged 32 past one route per expert.
+      config.expertTile = other == MoeGgufTile::Register || uint64_t{rows} * topK <= E
+                              ? splash::ops::MoeExpertTile::M8
+                              : splash::ops::MoeExpertTile::M32;
       printf(", %s %.4f", tileName(other), time(layers(MoE::prefillPlan(shape, rows, config), Routing::Random)));
     }
     printf("\n");
@@ -177,7 +184,7 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     printf("  decode %2u rows:", lanes * kLaneRows);
     for (const Routing routing : {Routing::Random, Routing::Pooled}) {
-      const MoePlan plan = plans.moeDecode(shape, lanes);
+      const MoePlan plan = plans.moeDecode(shape, formats, lanes);
       const MoeGgufTile device = plan.configuration().ggufTile, other = otherTile(device);
       MoeConfig config = plan.configuration();
       config.ggufTile = other;
@@ -186,7 +193,7 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
       printf(" | %s %s %.4f (%2.0f%% column)", routing == Routing::Random ? "random" : "pooled", tileName(device), ms,
              columnShare(mine, plan));
       // The register tile takes the weights of quant_register_tensor only.
-      if (other == MoeGgufTile::Register && !shape.registerFormats) continue;
+      if (other == MoeGgufTile::Register && !formats.experts.registerTakes) continue;
       const MoePlan otherPlan = MoE::decodePlan(shape, lanes, config);
       const Layers theirs = layers(otherPlan, routing);
       const double otherMs = time(theirs);
@@ -195,9 +202,9 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
     printf("\n");
   }
   // Where the time goes: every dispatch replayed as its own command.
-  for (const auto &[label, plan] : {std::pair{"prefill 2048", plans.moePrefill(shape, 2048)},
-                                    std::pair{"decode 8", plans.moeDecode(shape, 1)},
-                                    std::pair{"decode 32", plans.moeDecode(shape, 4)}}) {
+  for (const auto &[label, plan] : {std::pair{"prefill 2048", plans.moePrefill(shape, formats, 2048)},
+                                    std::pair{"decode 8", plans.moeDecode(shape, formats, 1)},
+                                    std::pair{"decode 32", plans.moeDecode(shape, formats, 4)}}) {
     const Layers l = layers(plan, Routing::Random);
     std::map<std::string, double> spent;
     for (uint32_t i = 0; i < rounds; ++i)
@@ -225,10 +232,7 @@ int main(int argc, const char *argv[]) {
     }
     const bool flashNext = shapeName == "flash-next", flint = shapeName == "flint";
     const uint32_t H = flashNext ? 2560 : 2048, I = flashNext ? 640 : 512;
-    // gate and up hold most of the routed expert weights.
-    MoeShape shape{H, flashNext ? 512u : 256u, flashNext ? 10u : flint ? 6u : 8u, I, uint32_t(gateUp),
-                   quant_register_tensor(gateUp, H) && quant_register_tensor(down, I) &&
-                       quant_register_tensor(shared, H) && quant_register_tensor(shared, I)};
+    MoeShape shape{H, flashNext ? 512u : 256u, flashNext ? 10u : flint ? 6u : 8u, I};
     if (flint) {
       shape.router = splash::ops::MoeRouter::SigmoidNormalized;
       shape.sharedSlices = 2;

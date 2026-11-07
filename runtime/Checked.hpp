@@ -25,6 +25,20 @@ namespace splash {
   return true;
 }
 
+// The sum, or the largest value where it overflows.
+[[nodiscard]] constexpr uint64_t saturatingAdd(uint64_t left,
+                                               uint64_t right) noexcept {
+  return left <= std::numeric_limits<uint64_t>::max() - right
+             ? left + right
+             : std::numeric_limits<uint64_t>::max();
+}
+
+// The difference, or 0 where `right` exceeds `left`.
+[[nodiscard]] constexpr uint64_t saturatingSubtract(uint64_t left,
+                                                    uint64_t right) noexcept {
+  return left > right ? left - right : 0;
+}
+
 // The sum, or an Error "<what> overflows".
 template <class Error = std::overflow_error>
 [[nodiscard]] uint64_t checkedAdd(uint64_t left, uint64_t right,

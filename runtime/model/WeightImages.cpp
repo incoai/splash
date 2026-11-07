@@ -34,7 +34,7 @@ void WeightImages::release() {
   restored_ = 0;
 }
 
-bool WeightImages::restore(const metal::AllocationAdmission &admit, const metal::AllocationAdmission &) {
+bool WeightImages::restore(const metal::AllocationAdmission &admit) {
   if (!released_) throw std::logic_error("weights are not released");
   if (restored_ < images_.size()) {
     Image &image = images_[restored_];

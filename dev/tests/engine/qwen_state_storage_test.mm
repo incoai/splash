@@ -1,6 +1,7 @@
 #include "Checked.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "tests/engine/AllocationFailure.hpp"
+#include "tests/engine/ClaimScope.hpp"
 #include "model/QwenState.hpp"
 #include "tests/engine/TestChecks.hpp"
 
@@ -132,6 +133,9 @@ void testLayoutFormulas() {
 void testOffloadAllocationFailure(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  // What a case's storage allocates through the governor is a start's, in
+  // its Floor claim (design/M.md L7).
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   constexpr model::CompositeStateLayout layout{{1, 3, 128, 1, 128, 128},
                                                {1, 1, 4, 128}};
   const uint64_t slotBytes = model::SlotFile::slotBytesFor(layout.cachedBytes());
@@ -191,6 +195,7 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
 void testDiskRestore(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
@@ -270,6 +275,7 @@ void testDiskRestore(metal::MetalBackend &backend) {
 void testDirectDiskSnapshot(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
@@ -327,6 +333,7 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
 void testStateWritesDrawOnTheWriteBudget(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   double now = 0.0;
   auto budget = std::make_shared<model::DiskBudget>(4 * kStateSlotBytes, [&now] { return now; });
   // Two slots a day, half a slot at once.
@@ -351,9 +358,10 @@ void testStateWritesDrawOnTheWriteBudget(metal::MetalBackend &backend) {
   storage.releaseLane(0, 456);
 }
 
-// A state need not fill its slot: the write zeros the slot past it and the
-// read leaves the rest, in a slot one host page larger than an aligned state
-// and in the rounded-up slot of a state that is not aligned.
+// A state need not fill its slot: it comes back exactly from a slot one host
+// page larger than an aligned state and from the rounded-up slot of a state
+// that is not aligned. slot_file_test checks that a write stores only the
+// pages its state reaches.
 void testStateSmallerThanSlot(metal::MetalBackend &backend) {
   constexpr model::GdnStateLayout target{1, 3, 128, 1, 128, 128};
   constexpr model::CompositeStateLayout aligned{target, {1, 1, 4, 128}};
@@ -362,6 +370,7 @@ void testStateSmallerThanSlot(metal::MetalBackend &backend) {
                 unaligned.cachedBytes() % kHostPageBytes != 0);
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   for (const auto &[layout, slotBytes] :
        {std::pair{aligned, aligned.cachedBytes() + kHostPageBytes},
         std::pair{unaligned, model::SlotFile::slotBytesFor(unaligned.cachedBytes())}}) {
@@ -399,6 +408,7 @@ void testStateSmallerThanSlot(metal::MetalBackend &backend) {
 void testPersistentStateComesBack(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   std::string name = (std::filesystem::temp_directory_path() / "splash-states-XXXXXX").string();
   require(::mkdtemp(name.data()) != nullptr, "temporary directory could not be made");
   const std::filesystem::path directory = name;
@@ -467,6 +477,7 @@ void testPersistentStateComesBack(metal::MetalBackend &backend) {
 void testPersistKeepsTheRamCopy(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
@@ -505,6 +516,7 @@ void testPersistKeepsTheRamCopy(metal::MetalBackend &backend) {
 void testReservations(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   bool admitNew = true;
   uint32_t admissions = 0;
   const metal::AllocationAdmission admit = [admit = governor.allocationAdmission(), &admitNew, &admissions](
@@ -625,6 +637,7 @@ void testAttentionOnlyTarget(metal::MetalBackend &backend) {
                 !model::GdnStateLayout{48, 3, 10'240, 48, 128, 0}.valid());
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   uint32_t admissions = 0;
   const metal::AllocationAdmission admit = [admit = governor.allocationAdmission(), &admissions](
                                                uint64_t bytes, const std::function<void()> &allocate) {
@@ -695,14 +708,61 @@ void testAttentionOnlyTarget(metal::MetalBackend &backend) {
     storage.releaseLane(1, 2);
     require(storage.idleCells() == 0 && storage.idleRings() == 2 && storage.idleWindows() == 3 &&
                 storage.statesToActivate() == 0 &&
-                storage.idleBytes(1) == kDraftState.ringBytes() + 3 * kDraftState.windowBytes(),
+                storage.idleBytes(1, false, true) == kDraftState.ringBytes() + 3 * kDraftState.windowBytes(),
             "released attention-only lanes pooled a cell, lost a buffer or counted a cell's bytes");
-    require(releaseAllIdle(storage, false) > 0 && storage.actualAllocatedBytes() == 0 &&
+    const uint64_t idle = storage.idleBytes(0, false, false);
+    require(idle > 0 && releaseAllIdle(storage, false) == idle && storage.actualAllocatedBytes() == 0 &&
                 storage.idleRings() == 0 && storage.idleWindows() == 0,
-            "an attention-only pool kept buffers past reclaim");
+            "an attention-only pool kept buffers past reclaim, or released other than its idle bytes");
   }
   require(backend.memoryStats().allocatedBytes == beforeStorage,
           "an attention-only storage's buffers outlived it");
+}
+
+// A lane's start and the state it captures allocate startBytes, and the
+// states its claims then evict leave idleBytes after the start to release:
+// they refill the lane's buffers the start took from the pool first. From
+// an empty pool and from pools holding none to two lanes' buffers and none
+// to two states' cells and windows, with none to three states evicted.
+void testStartBytes(metal::MetalBackend &backend) {
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
+  for (uint32_t pooledLanes = 0; pooledLanes < 3; ++pooledLanes) {
+    for (uint32_t pooledStates = 0; pooledStates < 3; ++pooledStates) {
+      for (uint32_t evicted = 0; evicted < 4; ++evicted) {
+        model::QwenStateStorage storage(backend, governor.allocationAdmission(), kStateLayout, nullptr);
+        metal::AllocationFailure refusal;
+        std::vector<std::shared_ptr<model::QwenStateReservation>> cached, pooled;
+        for (uint32_t each = 0; each < evicted; ++each)
+          cached.push_back(storage.reserve(refusal));
+        for (uint32_t lane = 0; lane < pooledLanes; ++lane)
+          require(static_cast<bool>(storage.tryActivateLane(lane, lane + 1)), "a pool lane did not start");
+        for (uint32_t each = 0; each < pooledStates; ++each)
+          pooled.push_back(storage.reserve(refusal));
+        for (uint32_t lane = 0; lane < pooledLanes; ++lane)
+          storage.releaseLane(lane, lane + 1);
+        const bool reserved = std::ranges::all_of(cached, [](const auto &state) { return state != nullptr; }) &&
+                              std::ranges::all_of(pooled, [](const auto &state) { return state != nullptr; });
+        pooled.clear();
+        const std::string name = std::to_string(evicted) + " evicted states beside " + std::to_string(pooledLanes) +
+                                 " pooled lanes and " + std::to_string(pooledStates) + " pooled states";
+        require(reserved && storage.idleRings() == pooledLanes && storage.idleWindows() == pooledLanes + pooledStates,
+                "the fixture of " + name + " did not hold its states and pool");
+        const uint64_t charged = storage.startBytes();
+        const uint64_t credited = storage.idleBytes(evicted, true, true);
+        const uint64_t before = storage.actualAllocatedBytes();
+        require(static_cast<bool>(storage.tryActivateLane(0, 9)), "the start of " + name + " failed");
+        const auto capture = storage.reserve(refusal);
+        require(capture != nullptr && storage.actualAllocatedBytes() == before + charged,
+                "the start of " + name + " did not allocate what it was charged");
+        cached.clear();
+        require(releaseAllIdle(storage, true) == credited,
+                "the states evicted after the start of " + name + " did not release what was counted");
+        storage.releaseLane(0, 9);
+      }
+    }
+  }
 }
 
 void run(const std::string &metallib) {
@@ -721,9 +781,11 @@ void run(const std::string &metallib) {
   testPersistKeepsTheRamCopy(backend);
   testReservations(backend);
   testAttentionOnlyTarget(backend);
+  testStartBytes(backend);
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
       queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   // Switched off to prove that a pooled cache slot needs no new admission;
   // the count is of the admissions granted.
   bool admitNewAllocations = true;
@@ -1069,19 +1131,19 @@ void run(const std::string &metallib) {
     // What releasing down to one lane's worth frees once the cached state is
     // dropped, counted before at the layout's sizes: a lane's buffers and the
     // state's cell and window.
-    const uint64_t idle = storage.idleBytes(1);
+    const uint64_t idle = storage.idleBytes(1, false, true);
     require(idle == kStateLayout.laneBytes() + kStateLayout.cachedBytes(),
             "the idle bytes a dropped state would leave are not the layout's");
     retained.reset();
     require(storage.idleCells() == 5 && storage.idleRings() == 2 &&
-                storage.idleWindows() == 3 && storage.idleBytes(0) == idle,
+                storage.idleWindows() == 3 && storage.idleBytes(0, false, true) == idle,
             "dropped cached state did not return its cell and window to the pool");
     // Releasing down to one lane's worth keeps two cells, the rings and a
     // window warm, and frees no less than was counted.
     const uint64_t released = releaseAllIdle(storage, true);
     require(released == observedLaneActual + observedPrefixActual && released >= idle &&
                 storage.idleCells() == 2 && storage.idleRings() == 1 &&
-                storage.idleWindows() == 1 && storage.idleBytes(0) == 0,
+                storage.idleWindows() == 1 && storage.idleBytes(0, false, true) == 0,
             "partial idle release did not keep the requested buffers");
     require(releaseAllIdle(storage, false) == observedLaneActual,
             "idle lane buffers were not reclaimed");
@@ -1090,9 +1152,8 @@ void run(const std::string &metallib) {
             "reclaimed buffers remain pooled");
     // No cached state holds rings: without idle rings no number of states
     // makes up a lane.
-    constexpr uint32_t kNoStatesSuffice = std::numeric_limits<uint32_t>::max();
     require(storage.actualAllocatedBytes() == 0 &&
-                storage.statesToActivate() == kNoStatesSuffice,
+                !storage.statesToActivate(),
             "reclaimed state cells remain accounted");
 
     // An activation asks the governor once for everything the pool lacks:
@@ -1100,7 +1161,7 @@ void run(const std::string &metallib) {
     admitNewAllocations = false;
     require(!storage.tryActivateLane(0, 505) && !storage.metadata(0).assigned() &&
                 storage.actualAllocatedBytes() == 0 &&
-                storage.statesToActivate() == kNoStatesSuffice,
+                !storage.statesToActivate(),
             "a denied activation allocated part of its lane");
     admitNewAllocations = true;
     uint32_t admitted = admissions;

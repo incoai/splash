@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace splash::model {
@@ -15,10 +16,14 @@ public:
   explicit Runtime(RuntimeContext context);
   ~Runtime() override;
   void checkHealth() override;
-  [[nodiscard]] uint32_t statesToActivate() const noexcept override;
-  [[nodiscard]] uint64_t idleBufferBytes(uint32_t evictedStates) const noexcept override;
-  [[nodiscard]] uint32_t prefillGroupRows(bool spills) const noexcept override;
-  [[nodiscard]] uint32_t prefillPasses() const noexcept override;
+  [[nodiscard]] std::optional<uint32_t> statesToActivate() const noexcept override;
+  [[nodiscard]] uint64_t idleBufferBytes(uint32_t evictedStates, bool afterStart,
+                                         bool keepLane) const noexcept override;
+  [[nodiscard]] uint64_t startStateBytes() const noexcept override;
+  [[nodiscard]] CommandLimits commandLimits() const noexcept override;
+  [[nodiscard]] CommandWork prefillWork(std::span<const PrefillLane> lanes, uint32_t first,
+                                        uint32_t passesLeft) const override;
+  [[nodiscard]] std::span<ElasticPool *const> pools() noexcept override;
 
   Runtime(const Runtime &) = delete;
   Runtime &operator=(const Runtime &) = delete;
@@ -47,19 +52,14 @@ public:
   reserveState(uint64_t requestId, uint32_t tokens, metal::AllocationFailure &refusal) override;
   [[nodiscard]] std::shared_ptr<const CompositeState>
   snapshot(uint64_t requestId) override;
-  [[nodiscard]] uint64_t snapshotBytes() const noexcept override;
   [[nodiscard]] bool canSnapshotToDisk(bool inUse) const noexcept override;
   [[nodiscard]] std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t requestId, std::function<void()> completion) override;
-  [[nodiscard]] ModelMemoryAdmission reserveSpilledReads(uint64_t requestId) override;
-  [[nodiscard]] ModelMemoryAdmission reserveHistoryStaging(uint64_t requestId, uint32_t pages) override;
-  [[nodiscard]] ModelMemoryAdmission growSpilledReads() override;
-  [[nodiscard]] uint64_t reclaimIdleState(bool keepLane,
-                                          IdleMemory scope) noexcept override;
-  [[nodiscard]] uint64_t releaseExpertChunk() override;
-  [[nodiscard]] uint64_t releaseExpertsToFloor() override;
-  [[nodiscard]] uint64_t expertGrowthBytes() const override;
-  [[nodiscard]] ModelMemoryAdmission growExperts() override;
+  [[nodiscard]] uint64_t stagingShortfall(uint64_t requestId, uint32_t pages) const override;
+  [[nodiscard]] uint64_t hotFloorBytes(uint32_t lanes) const override;
+  [[nodiscard]] uint64_t hotFloorShortfall(std::span<const uint64_t> requestIds) const override;
+  [[nodiscard]] ModelMemoryAdmission reserveSpilledReads(uint64_t requestId, SpilledReadNeed need) override;
+  [[nodiscard]] uint64_t releaseIdleBuffer(bool keepLane) noexcept override;
   [[nodiscard]] std::optional<std::string>
   provideMask(uint64_t requestId, std::span<const uint32_t> words) override;
   void end(uint64_t requestId) override;
@@ -78,7 +78,7 @@ public:
 private:
   // The state lane of a resident request; the storage checks that its
   // committed state can be cached.
-  [[nodiscard]] uint32_t residentLane(uint64_t requestId);
+  [[nodiscard]] uint32_t residentLane(uint64_t requestId) const;
   void finishRestore(uint64_t requestId, uint32_t boundary, bool restoreDraft);
   void prepareWarmupDecode(uint64_t requestId, uint32_t anchor);
   [[nodiscard]] StateAdmission beginAt(const ModelRequest &request,

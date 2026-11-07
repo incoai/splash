@@ -74,11 +74,8 @@ void testImageIdentityKeysBlocks() {
   std::cout << "KV image identity ok\n";
 }
 
-// A persistent tier records each block's identity (KvBlockLabel), and a later
-// process's lookups compute it again: a change to blockIdentity's mixing or
-// seeds would leave the salted and image chains it holds matching nothing.
-// Such a change bumps kPersistentCacheFormat (engine/RuntimeResources.mm) and
-// pins the new values here.
+// A persistent tier's recorded block identities must match a later process's lookups; a change to
+// blockIdentity bumps kPersistentCacheFormat and pins the new values here.
 void testBlockIdentitiesArePinned() {
   const CacheSalt salt{0x0123456789abcdefULL, 0xfedcba9876543210ULL};
   // Two images in the first block, the second through the third.
@@ -237,6 +234,11 @@ void testInputValidation() {
       "KV cache parent block is unknown",
       "nonresident parent was accepted");
   pool.releasePage(acquired.pages[0], false);
+  // The pool tells one cache of its pages' activity: a second cache on it
+  // would leave the first's counts behind.
+  CacheRecency otherRecency;
+  rejects([&] { KvCache second(pool, otherRecency); }, "already has its observer",
+          "a second KV cache on one pool was accepted");
 }
 
 void testCandidateOrderThroughChurn() {
@@ -326,9 +328,8 @@ void testCandidateOrderThroughChurn() {
           "candidate churn leaked a block or physical reference");
 }
 
-// On random trees grown by inserts and shrunk by leaf erasures, subtree()
-// returns every block below each block, each before its parent, or nothing
-// while one of them is in use.
+// On random trees grown by inserts and shrunk by leaf erasures, subtree() returns every block below
+// a block, each before its parent, or nothing while one of them is in use.
 void testSubtreeThroughChurn() {
   constexpr uint32_t steps = 1000;
   test::TestKvStorage storage(steps, 100, 1);
@@ -407,6 +408,282 @@ void testSubtreeThroughChurn() {
 }
 
 struct FakeSlot final : engine::KvDiskSlot {};
+
+// On random trees, as blocks, states, holders, transfers, waiting chains and the resume point change, the counts the
+// cache keeps give what its rule names (pageReach): for a walk's reasons `mask`, a resident block frees now unless
+// one of the reasons sits at it or below it (it or a resident block below is used, has a page a request holds, a
+// restore fills or a write drains, or lacks a copy below a state that needs its KV; a state, a waiting chain's end
+// or the resume point below it has a reason `mask` names), or it is on the chain of a `kept` state or above a write
+// no reclaim waits for (`unwaited`); the written state's chain frees once that state has left RAM and needs its KV;
+// a block is reachable at all unless it or one below is used, held or filled, it is above a write no reclaim waits
+// for, or, idle, it has a chain reason `mask` names at it or below or is on a kept chain; and the RAM copies a
+// reclaim may take count at the blocks that free now. Every step checks the counts against a recount
+// (checkInvariants).
+void testPageReachFollowsItsRule() {
+  using Keep = KvCache::Keep;
+  constexpr uint32_t count = 48;
+  test::TestKvStorage storage(count, 100, 1);
+  KvPool pool(storage, count);
+  CacheRecency recency;
+  KvCache cache(pool, recency);
+  struct Reference {
+    uint64_t parent = 0;
+    uint32_t page = KvCache::noPage;
+    bool live = false;
+    bool used = false;    // retainActive
+    bool held = false;    // a request holds its page
+    bool moving = false;  // in transfer: a write drains it (copied) or a restore fills it
+    bool copied = false;  // has a disk copy
+    bool state = false;   // a state sits at it
+    KvCache::Keeps keeps = 0;
+    bool needed = false;
+    bool candidate = false;  // a RAM copy a reclaim may take
+    bool ram = false;        // the state has a RAM copy
+    uint32_t wanted = 0;
+  };
+  std::vector<Reference> blocks(1);
+  uint64_t resumePoint = 0;
+  std::mt19937 random(733);
+  const auto pick = [&](uint64_t last) { return random() % (last + 1); };
+  const auto resident = [&](uint64_t id) { return blocks[id].live && blocks[id].page != KvCache::noPage; };
+  const auto hasChild = [&](uint64_t id, bool residentOnly) {
+    for (uint64_t other = 1; other < blocks.size(); ++other)
+      if (blocks[other].live && blocks[other].parent == id && (!residentOnly || resident(other)))
+        return true;
+    return false;
+  };
+  const auto atOrBelow = [&](uint64_t id, uint64_t above) {
+    for (; id; id = blocks[id].parent)
+      if (id == above)
+        return true;
+    return false;
+  };
+  const auto bit = [](Keep keep) { return KvCache::keepBit(keep); };
+  uint32_t checks = 0, freeing = 0, written = 0, reachable = 0;
+  for (uint32_t step = 0; step < 6000; ++step) {
+    const uint64_t id = blocks.size() > 1 ? 1 + pick(blocks.size() - 2) : 0;
+    Reference *entry = id && blocks[id].live ? &blocks[id] : nullptr;
+    // A use, a held page or a transfer ends whenever drawn and starts a
+    // third of the time, so that most blocks have none.
+    const bool flip = !pick(2);
+    switch (pick(9)) {
+    case 0:
+    case 1: {
+      // Each resident block owns a page.
+      if (std::ranges::count_if(blocks, [](const Reference &at) { return at.live && at.page != KvCache::noPage; }) ==
+          count)
+        break;
+      const uint64_t parent = entry && resident(id) && pick(3) ? id : 0;
+      auto acquired = pool.acquirePages(1);
+      const auto inserted = cache.insert(parent, page(static_cast<uint32_t>(blocks.size())), acquired.pages[0], {});
+      pool.releasePage(acquired.pages[0], false);
+      require(inserted.id == blocks.size(), "unexpected test block identity");
+      blocks.push_back({.parent = parent, .page = acquired.pages[0], .live = true});
+      break;
+    }
+    case 2:
+      if (entry && !entry->used && !entry->held && !entry->moving && !entry->state && !entry->wanted &&
+          id != resumePoint && !hasChild(id, false)) {
+        cache.erase(id);
+        entry->live = false;
+      }
+      break;
+    case 3:
+      if (entry && (entry->used || flip)) {
+        entry->used ? cache.releaseActive(id) : cache.retainActive(id);
+        entry->used = !entry->used;
+      }
+      break;
+    case 4:
+      if (entry && resident(id) && (entry->held || flip)) {
+        entry->held ? pool.releasePage(entry->page, false) : pool.retainPage(entry->page, false);
+        entry->held = !entry->held;
+      }
+      break;
+    case 5:
+      // A write reads a page with its copy; a restore fills one without.
+      if (entry && resident(id) && (entry->moving || flip)) {
+        cache.setTransfer(id, entry->moving  ? KvCache::Transfer::None
+                              : entry->copied ? KvCache::Transfer::Draining
+                                              : KvCache::Transfer::Filling);
+        entry->moving = !entry->moving;
+      }
+      break;
+    case 6:
+      if (!entry || !resident(id) || entry->moving)
+        break;
+      // A RAM copy and the resume point sit on a page.
+      if (entry->copied && !entry->used && !entry->held && !hasChild(id, true) &&
+          !(entry->keeps & (bit(Keep::Writer) | bit(Keep::UsedWriter))) && id != resumePoint && pick(1)) {
+        cache.dropPage(id);
+        entry->page = KvCache::noPage;
+      } else {
+        cache.setSlot(id, entry->copied ? nullptr : std::make_shared<FakeSlot>());
+        entry->copied = !entry->copied;
+      }
+      break;
+    case 7:
+      // A state comes or goes, or changes what it asks of its KV: a RAM
+      // copy that leaves only through a write (sitting on a page), in use or
+      // not, or one that needs its KV, in use or not.
+      if (entry && (!entry->state || pick(1))) {
+        entry->state = !entry->state || pick(1);
+        const bool use = pick(1);
+        const bool writer = entry->state && resident(id) && pick(1);
+        entry->keeps = !entry->state ? 0
+                       : writer      ? static_cast<KvCache::Keeps>(bit(use ? Keep::UsedWriter : Keep::Writer) |
+                                                              (use ? bit(Keep::Used) : 0))
+                                     : static_cast<KvCache::Keeps>(use ? bit(Keep::Used) : 0);
+        entry->needed = entry->state && !writer;
+        entry->candidate = entry->state && resident(id) && (writer || pick(1));
+        entry->ram = entry->candidate || (entry->state && pick(1));
+        cache.setStateMarks(id, {.keeps = entry->keeps, .needed = entry->needed, .candidate = entry->candidate},
+                            entry->ram);
+      }
+      break;
+    case 8:
+      if (entry && (entry->wanted || flip)) {
+        const bool added = !entry->wanted || pick(1);
+        cache.countWanted(id, added);
+        added ? ++entry->wanted : --entry->wanted;
+      }
+      break;
+    case 9:
+      if (entry || flip) {
+        const uint64_t to = entry && entry->state && resident(id) ? id : 0;
+        cache.moveResumePoint(resumePoint, to);
+        resumePoint = to;
+      }
+      break;
+    }
+    cache.checkInvariants();
+    // A walk: its reasons, some states it keeps, and the state it writes.
+    KvCache::Keeps mask = bit(Keep::Busy);
+    for (const Keep keep : {Keep::Moving, Keep::Uncopied, Keep::Writer, Keep::UsedWriter, Keep::Used, Keep::Wanted,
+                            Keep::ResumePoint})
+      if (pick(1))
+        mask |= bit(keep);
+    std::vector<uint64_t> keptStates;
+    std::vector<uint64_t> writers;
+    std::vector<uint64_t> unwaited;
+    for (uint64_t block = 1; block < blocks.size(); ++block) {
+      if (!blocks[block].live)
+        continue;
+      if (!pick(15))
+        keptStates.push_back(block);
+      if (resident(block) && blocks[block].moving && blocks[block].copied && pick(1))
+        unwaited.push_back(block);
+      if (blocks[block].keeps & mask & (bit(Keep::Writer) | bit(Keep::UsedWriter)))
+        writers.push_back(block);
+    }
+    const uint64_t stateWritten = !writers.empty() && pick(1) ? writers[pick(writers.size() - 1)] : 0;
+    // The rule, block by block, with the written state as it is or once it
+    // has left RAM.
+    const auto filled = [&](const Reference &at) { return at.moving && !at.copied; };
+    const auto drained = [&](const Reference &at) { return at.moving && at.copied; };
+    const auto staysHere = [&](uint64_t block, bool afterWrite) {
+      const Reference &at = blocks[block];
+      if (at.used || at.held || filled(at) || (drained(at) && (mask & bit(Keep::Moving))))
+        return true;
+      bool needed = false;
+      for (uint64_t below = 1; below < blocks.size(); ++below) {
+        const Reference &state = blocks[below];
+        if (!state.live || !atOrBelow(below, block))
+          continue;
+        // Once written, a state no longer waits for its write; one in use
+        // stays in use.
+        const bool gone = afterWrite && below == stateWritten;
+        const KvCache::Keeps keeps = static_cast<KvCache::Keeps>(
+            (gone ? state.keeps & ~(bit(Keep::Writer) | bit(Keep::UsedWriter)) : state.keeps) |
+            (state.wanted ? bit(Keep::Wanted) : 0) | (below == resumePoint ? bit(Keep::ResumePoint) : 0));
+        if (keeps & mask)
+          return true;
+        needed = needed || (state.state && (state.needed || gone));
+      }
+      return (mask & bit(Keep::Uncopied)) && !at.copied && needed;
+    };
+    const auto cut = [&](uint64_t block) {
+      for (const uint64_t state : keptStates)
+        if (atOrBelow(state, block))
+          return true;
+      for (const uint64_t write : unwaited)
+        if (atOrBelow(write, block))
+          return true;
+      return false;
+    };
+    const auto frees = [&](uint64_t block, bool afterWrite) {
+      if (!resident(block) || cut(block))
+        return false;
+      for (uint64_t below = 1; below < blocks.size(); ++below)
+        if (resident(below) && atOrBelow(below, block) && staysHere(below, afterWrite))
+          return false;
+      return true;
+    };
+    // Reachable: nothing at or below it used, held or filled; and for an
+    // idle page, which no write drains, not on a kept chain and no chain
+    // reason `mask` names there. Above a write no reclaim waits for, none.
+    const KvCache::Keeps chains = mask & KvCache::kChainKeeps;
+    const auto reaches = [&](uint64_t block) {
+      if (!resident(block))
+        return false;
+      for (const uint64_t write : unwaited)
+        if (atOrBelow(write, block))
+          return false;
+      const bool idle = !blocks[block].held && !blocks[block].moving;
+      if (idle)
+        for (const uint64_t state : keptStates)
+          if (atOrBelow(state, block))
+            return false;
+      for (uint64_t below = 1; below < blocks.size(); ++below) {
+        const Reference &at = blocks[below];
+        if (!at.live || !atOrBelow(below, block))
+          continue;
+        if (resident(below) && (at.used || at.held || filled(at)))
+          return false;
+        const KvCache::Keeps keeps = static_cast<KvCache::Keeps>(
+            at.keeps | (at.wanted ? bit(Keep::Wanted) : 0) | (below == resumePoint ? bit(Keep::ResumePoint) : 0));
+        if (idle && (keeps & chains))
+          return false;
+      }
+      return true;
+    };
+    uint32_t expectedNow = 0, expectedWritten = 0, expectedReachable = 0, expectedCandidates = 0;
+    for (uint64_t block = 1; block < blocks.size(); ++block) {
+      const bool now = frees(block, false);
+      expectedNow += now;
+      expectedWritten += !now && stateWritten && frees(block, true);
+      expectedReachable += reaches(block);
+      expectedCandidates += now && blocks[block].candidate;
+    }
+    const KvCache::PageReach reach = cache.pageReach(mask, keptStates, unwaited, stateWritten);
+    require(reach.now == std::array<uint32_t, 3>{expectedNow, 0, 0} &&
+                reach.written == std::array<uint32_t, 3>{expectedWritten, 0, 0} &&
+                reach.reachable == std::array<uint32_t, 3>{expectedReachable, 0, 0} &&
+                reach.candidates == expectedCandidates,
+            "pageReach counted " + std::to_string(reach.now[0]) + " now, " + std::to_string(reach.written[0]) +
+                " written and " + std::to_string(reach.reachable[0]) + " reachable pages and " +
+                std::to_string(reach.candidates) + " RAM copies, the rule " + std::to_string(expectedNow) + ", " +
+                std::to_string(expectedWritten) + ", " + std::to_string(expectedReachable) + " and " +
+                std::to_string(expectedCandidates) + " at step " + std::to_string(step));
+    ++checks;
+    freeing += expectedNow;
+    written += expectedWritten;
+    reachable += expectedReachable;
+  }
+  require(freeing > checks && written && reachable > freeing, "the random trees rarely had a page each count names");
+  for (uint64_t block = 1; block < blocks.size(); ++block) {
+    Reference &entry = blocks[block];
+    if (!entry.live)
+      continue;
+    if (entry.used)
+      cache.releaseActive(block);
+    if (entry.held)
+      pool.releasePage(entry.page, false);
+    if (entry.moving)
+      cache.setTransfer(block, KvCache::Transfer::None);
+  }
+  std::cout << "pageReach follows its rule: " << checks << " counts\n";
+}
 
 // A resident block gains a disk copy, gives up its page, and takes a page
 // back; the orders and the parent follow each step.
@@ -506,9 +783,8 @@ void testDiskTierTransitions() {
           "erasing both tiers leaked a page or a copy");
 }
 
-// Publishing the content of a disk-only block gives it the writer's page. A
-// poisoned block matches nothing, leaves with its last user, and takes a
-// poisoned parent with it once the subtree is gone.
+// A disk-only block whose content is published takes the writer's page; a poisoned block matches
+// nothing and leaves with its last user, taking a poisoned parent once its subtree is gone.
 void testDiskOnlyAdoptionAndPoison() {
   test::TestKvStorage storage(8, 100, 1);
   KvPool pool(storage, 8);
@@ -565,9 +841,8 @@ void testDiskOnlyAdoptionAndPoison() {
           "a poisoned parent outlived its subtree");
 }
 
-// A block is matchable while find() can return it: in the graph and not
-// poisoned. A poisoned block its user still holds is in the graph but no
-// longer matchable.
+// A block is matchable while find() can return it; a poisoned block its user still holds stays in
+// the graph but is not matchable.
 void testMatchableExcludesPoisonedBlocks() {
   test::TestKvStorage storage(8, 100, 1);
   KvPool pool(storage, 8);
@@ -592,11 +867,8 @@ void testMatchableExcludesPoisonedBlocks() {
 }
 
 
-// A cache whose requests may spill: a request's reference to a page marks
-// the block on it held, from its insertion on, until the last one goes; a
-// held block is in no order, so neither RAM reclaim nor quota takes it or
-// its copy. Without a spill policy nothing is held and quota strips a copy
-// requests still read through their pages, as it always has.
+// With spilling, a block a request's page reference holds is in no order, so neither RAM reclaim
+// nor quota takes it or its copy; without a spill policy nothing is held.
 void testRequestsHoldTheirBlocks() {
   for (const bool spill : {true, false}) {
     test::TestKvStorage storage(8, 100, 1, 10);
@@ -633,11 +905,8 @@ void testRequestsHoldTheirBlocks() {
   }
 }
 
-// A block's page moves to the other form with its holders' references: a
-// spilled block keeps its index in RAM and its K/V in its copy alone, which
-// it cannot give up and quota takes only with the block, from a leaf; it is
-// a RAM leaf like any other, whose page frees at once. Back on a Full page
-// its copy is redundant again.
+// A spilled block keeps its index in RAM and its K/V only in its copy, which quota takes only with
+// the block; back on a Full page its copy is redundant again.
 void testSpilledBlocksTakeTheirPagesForm() {
   test::TestKvStorage storage(16, 100, 4, 10);
   KvPool pool(storage, 4);
@@ -673,15 +942,8 @@ void testSpilledBlocksTakeTheirPagesForm() {
   cache.checkInvariants();
 }
 
-// A block's page moves to the Slim form of a windowed layout with its
-// holders' references, and the block keeps its K/V there: its copy is
-// redundant as a Full page's is. A copy holds what the page held when it
-// was written (copyForm): one of the Full page it had before holds more and
-// stays its copy, one written from the Slim page holds that, a disk-only
-// block keeps it, and so does one an earlier process left. A writer that
-// computes such a block again gives it a Full page, beside which a copy of
-// the Slim page holds less and goes: whatever copy a block keeps holds what
-// its page does, should the page leave.
+// A block on a Slim page keeps its K/V there, and its copy holds what its page held when written;
+// a writer's Full page drops a copy of the Slim page, which holds less.
 void testSlimBlocksKeepWhatTheirCopiesHold() {
   test::TestKvStorage storage(16, 100, 4, 0, 30);
   KvPool pool(storage, 4);
@@ -725,8 +987,11 @@ void testSlimBlocksKeepWhatTheirCopiesHold() {
   cache.unholdPage(writer.pages[0]);
   cache.checkInvariants();
 
+  // Taken back after a restart, into a pool of its own.
+  test::TestKvStorage nextStorage(16, 100, 4, 0, 30);
+  KvPool nextPool(nextStorage, 4);
   CacheRecency later;
-  KvCache next(pool, later);
+  KvCache next(nextPool, later);
   require(next.adoptDiskBlock(40, 0, page(94), {}, std::make_shared<FakeSlot>(), 1, kv::PageForm::Slim) &&
               next.copyForm(40) == kv::PageForm::Slim,
           "a block taken back lost the form its copy holds");
@@ -737,13 +1002,8 @@ void testSlimBlocksKeepWhatTheirCopiesHold() {
   next.checkInvariants();
 }
 
-// With a window of three pages, a state pins its tail, the three blocks
-// that end at its block, in a walk of three rather than the whole chain:
-// states two blocks apart pin five blocks, removing one unpins what only
-// its tail held, and a Full block no tail holds waits as a trim candidate.
-// A block on a Slim page takes a writer's Full page, and its tail is Full
-// again, unless a transfer moves its own: a copy of the Slim page goes, and
-// one of the Full page before stays as another command's K/V.
+// With a window of three pages a state pins only the three blocks ending at it; a Slim block takes
+// a writer's Full page, making its tail Full again, unless a write is reading it.
 void testStateTailsPinBoundedWindows() {
   test::TestKvStorage storage(32, 100, 4, 0, 30);
   KvPool pool(storage, 4);
@@ -763,12 +1023,14 @@ void testStateTailsPinBoundedWindows() {
   };
   cache.countState(chain[9], true, false);
   cache.countState(chain[7], true, false);
-  require(cache.pinnedBlocks() == 5 && cache.windowPinned(chain[5]) && !cache.windowPinned(chain[4]) &&
+  require(cache.pinnedBlocks() == 5 &&
               candidates() == std::vector<uint64_t>(chain.begin(), chain.begin() + 5),
           "two states two blocks apart did not pin five blocks, or the rest were no trim candidates");
   cache.countState(chain[9], false, false);
-  require(cache.pinnedBlocks() == 3 && !cache.windowPinned(chain[8]) && cache.windowPinned(chain[7]) &&
-              candidates().size() == 7 && cache.tailFull(chain[7]),
+  require(cache.pinnedBlocks() == 3 &&
+              candidates() == std::vector<uint64_t>{chain[0], chain[1], chain[2], chain[3],
+                                                    chain[4], chain[8], chain[9]} &&
+              cache.tailFull(chain[7]),
           "a state's removal did not unpin what its tail alone held");
   cache.checkInvariants();
 
@@ -796,13 +1058,8 @@ void testStateTailsPinBoundedWindows() {
   cache.checkInvariants();
 }
 
-// A writer moves onto its block's page while a write reads it, whose bytes
-// are final, and keeps its own while a restore fills it. A disk-only block
-// that adopts the writer's page keeps its copy, which holds what another
-// command computed: the block's K/V has no copy until one of the page
-// replaces it, or the page goes and the copy holds the block's only K/V.
-// No request reads that copy, so it is no active KV, and quota may take it
-// beside the page the writer holds.
+// A writer moves onto its block's page while a write reads it and keeps its own while a restore
+// fills it; an adopted disk-only block's copy of another command's K/V is no active KV.
 void testWritersAndTheContentOfABlock() {
   for (const bool spill : {true, false}) {
     test::TestKvStorage storage(8, 100, 1, 10);
@@ -851,13 +1108,8 @@ void testWritersAndTheContentOfABlock() {
   }
 }
 
-// A poisoned block that requests hold keeps its copy, which they may still
-// read; it leaves with the block once the last of them lets go. A block
-// written once more after its copy went counts as written again. A reader
-// holds a copy while a request holds its block; one that outlives the
-// holders, as a command's cut does while the engine applies its results,
-// keeps the slot of a block that left until it lets go, and the invariants
-// find it while the block stays.
+// A copy leaves with its block once the last request holding it lets go; a reader that outlives
+// them, as a command's cut does, keeps the slot until it lets go.
 void testCopiesLeaveWithTheirBlocks() {
   test::TestKvStorage storage(8, 100, 1, 10);
   KvPool pool(storage, 8);
@@ -904,6 +1156,7 @@ int main() {
     testCandidateOrderThroughChurn();
     testSubtreeThroughChurn();
     testDiskTierTransitions();
+    testPageReachFollowsItsRule();
     testDiskOnlyAdoptionAndPoison();
     testMatchableExcludesPoisonedBlocks();
     testRequestsHoldTheirBlocks();

@@ -30,6 +30,7 @@ every start, at little cost.
 from __future__ import annotations
 
 import functools
+import json
 import os
 import signal
 import sys
@@ -51,8 +52,9 @@ def prepare_local_model(
 
     target: a GGUF file, any part of a split GGUF naming all of them, which
     lie beside it; or a directory whose root holds an MLX model (config.json,
-    tokenizer files and a safetensors checkpoint) or else a single GGUF
-    target, whole or split, beside any vision projector named mmproj.
+    tokenizer files and a safetensors checkpoint) or else GGUF targets of
+    one name, the name's whole file before its split parts, beside any
+    vision projector named mmproj.
     draft: the directory of a DFlash2 draft (config.json and safetensors
     weights) trained for the target's family. Without one, the draft
     released for the family is taken from the Hugging Face cache
@@ -69,15 +71,14 @@ def prepare_local_model(
     installations `splash serve` makes.
 
     The directory links the files and never changes. Preparing the same
-    files again returns it again: that reads their metadata and their sizes
-    and times, never their content. The first preparation reads each file
-    outside the Hugging Face cache once, for its digest. Once a file
-    changes, or a download moves the draft's default branch, preparing again
-    returns another directory: serve that one. The server holds the
-    directory it serves until it exits; one a later preparation no longer
-    returns is removed only once no server holds it. The server takes
-    models_dir's installation lock to hold it when it starts, so it needs
-    write access there.
+    files again returns it again, reading only their metadata, sizes and
+    times; the first preparation reads each file outside the Hugging Face
+    cache once, for its digest. Once a file changes, or a download moves the
+    draft's default branch, preparing again returns another directory: serve
+    that one. The server holds the directory it serves until it exits, and
+    takes models_dir's installation lock to hold it when it starts, so it
+    needs write access there; a directory a later preparation no longer
+    returns is removed only once no server holds it.
 
     A ModelError, "cannot prepare TARGET: REASON", refuses the files Splash
     cannot serve without a download (a missing file, an unsupported format,
@@ -85,13 +86,19 @@ def prepare_local_model(
     its reason; an OSError is a failure of the file system.
     """
     target = _path(target)
+    try:
+        return _prepare_paths(target, draft, mmproj, language_only, models_dir)
+    except ModelError as error:
+        raise type(error)(f"cannot prepare {target}: {error}") from None
+
+
+def _prepare_paths(target, draft, mmproj, language_only, models_dir):
+    """prepare_local_model of an absolute target, whose ModelError gives the
+    reason alone."""
     draft = None if draft is None else _path(draft)
     mmproj = None if mmproj is None else _path(mmproj)
     models_root = Path(models_dir).expanduser().resolve()
-    try:
-        return _prepare(target, draft, mmproj, language_only, models_root)
-    except ModelError as error:
-        raise type(error)(f"cannot prepare {target}: {error}") from None
+    return _prepare(target, draft, mmproj, language_only, models_root)
 
 
 def _prepare(target, draft, mmproj, language_only, models_root):
@@ -131,7 +138,7 @@ def _path(value) -> Path:
 
 def _inspect(target, mmproj, language_only, scratch):
     """target's files (hub.Repository) and the target upstream finds in
-    them, its configuration and metadata written into scratch."""
+    them, its configuration and headers written into scratch."""
     if target.is_dir():
         repo = hub.Repository.local_directory(target)
         # The files at its root are the target's: a safetensors file in a
@@ -177,51 +184,54 @@ def _inspect(target, mmproj, language_only, scratch):
     return repo, inspected
 
 
-def _model_of(name):
-    """The model a GGUF file holds: NAME for a split GGUF's part,
-    NAME-0000K-of-0000N.gguf, else the file's own name."""
-    match = upstream.SPLIT_NAME.search(name)
-    return name[: match.start()] if match else name
-
-
 def _gguf_in(files):
-    """The files of the one GGUF target at the root of a directory of files,
-    in split order, whatever vision projectors (named mmproj) lie beside
-    it."""
-    candidates = [
-        name
-        for name in upstream.root_ggufs(files)
-        if not upstream.projector_named(name)
-    ]
-    if not candidates:
+    """The files of the GGUF target at the root of a directory of files that
+    the root targets' one name selects (upstream.named_target), in split
+    order, whatever vision projectors (named mmproj) lie beside it."""
+    targets = upstream.root_targets(files)
+    if not targets:
         raise ModelError(
             "it holds no model at its root: no safetensors checkpoint, and no "
             "GGUF file but vision projectors (named mmproj)"
         )
-    if len({_model_of(name) for name in candidates}) > 1:
+    target = upstream.named_target(targets, {found.name for found in targets})
+    if target is None:
+        listed = ", ".join(map(str, targets))
         raise ModelError(
-            f"it holds several GGUF targets ({', '.join(candidates)}); pass the "
-            "target's file"
+            f"it holds several GGUF targets ({listed}); pass the target's file"
         )
-    if _model_of(candidates[0]) == candidates[0]:
-        return candidates
-    return upstream.split_order(candidates, "its split GGUF")
+    return upstream.target_files(target)
 
 
 def _split_parts(target):
-    """The files of the GGUF target, in split order: target alone, or every
-    part of the split GGUF it is one part of, beside it."""
-    model = _model_of(target.name)
-    if model == target.name:
-        return [target.name]
-    parts = [
-        path.name
-        for path in target.parent.iterdir()
-        if path.is_file()
-        and path.name.endswith(".gguf")
-        and _model_of(path.name) == model
-    ]
-    return upstream.split_order(parts, f"the split GGUF {model} in {target.parent}")
+    """The files of the GGUF target, in split order: every part of the split
+    GGUF it is one part of, the root target of the files beside it that
+    holds it (upstream.root_targets), as its directory names them; else
+    target alone. target is its directory entry (_entry), whatever spelling
+    of the entry's name it is given in. A whole file of the same model
+    beside split parts, such as their merge, is a target of its own; a
+    vision projector's part (named mmproj) is no target's and passes on
+    alone."""
+    beside = [path.name for path in target.parent.iterdir() if path.is_file()]
+    entry = _entry(target, beside)
+    for found in upstream.root_targets(beside):
+        if found.split and entry in found.files:
+            return upstream.split_order(
+                found.files, f"the split GGUF {found.name} in {target.parent}"
+            )
+    return [target.name]
+
+
+def _entry(target, names):
+    """The name of target among names, its directory's files: its own, or,
+    as a case- or normalization-insensitive file system (APFS) finds a file
+    by another spelling of its name, the name of the same file."""
+    if target.name in names:
+        return target.name
+    return next(
+        (name for name in names if (target.parent / name).samefile(target)),
+        target.name,
+    )
 
 
 def _projector(mmproj, repo):
@@ -246,11 +256,6 @@ def _draft(family, draft):
     (hub.Repository.resolve)."""
     if draft:
         return hub.Repository.local_directory(draft)
-    if family.draft_repo is None:
-        raise ModelError(
-            f"no DFlash2 draft is released for {family.name}; pass the "
-            "directory of one as draft"
-        )
     try:
         return hub.Repository.resolve(
             family.draft_repo,
@@ -265,8 +270,12 @@ def _draft(family, draft):
 
 def _main(argv=None):
     """The launcher's helper, run by Splash's Python after setup. Its stdout
-    is only prepare_local_model's result; preparation messages use stderr."""
+    is only prepare_local_model's result, or as it exits 1 its refusal, a
+    serve record failure the launcher reports, of the reason alone, without
+    the target the launcher was given. Preparation messages use stderr."""
     import argparse
+
+    from server import serve_record
 
     parser = argparse.ArgumentParser(description="Prepare local Splash model files")
     parser.add_argument("target")
@@ -278,16 +287,19 @@ def _main(argv=None):
     try:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
         with redirect_stdout(sys.stderr):
-            prepared = prepare_local_model(
-                args.target,
+            prepared = _prepare_paths(
+                _path(args.target),
                 args.draft_model,
-                mmproj=args.mmproj,
-                language_only=args.language_only,
-                models_dir=args.models,
+                args.mmproj,
+                args.language_only,
+                args.models,
             )
         print(prepared)
-    except (ModelError, OSError) as error:
-        print(f"error: {error}", file=sys.stderr)
+    except ModelError as error:
+        print(json.dumps(serve_record.failure(serve_record.MODEL, str(error))))
+        return 1
+    except OSError as error:
+        print(json.dumps(serve_record.failure(serve_record.INTERNAL, str(error))))
         return 1
     except KeyboardInterrupt:
         return 130

@@ -67,10 +67,10 @@ struct Qwen4Scratch final {
 };
 
 // The PLE rows of `tokens` from `position` on into `out`, each row's heads'
-// in order: the 2- to
-// n-gram hashes of a row's token and the ones before it, which come from
-// `history` before `position`, an EOS or the sequence start cutting the
-// window there, each n-gram's heads taking its hash modulo their row counts.
+// in order: the 2- to n-gram hashes of a row's token and the ones before it,
+// which come from `history` before `position`, an EOS or the sequence start
+// cutting the window there, each n-gram's heads taking its hash modulo their
+// row counts.
 void qwen4PleRows(const Qwen4ExpWeights &weights, uint64_t position, std::span<const uint32_t> tokens,
                   std::span<const uint32_t> history, uint32_t *out);
 

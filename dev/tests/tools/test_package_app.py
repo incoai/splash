@@ -1,5 +1,6 @@
 import base64
 import io
+import os
 import plistlib
 import re
 import subprocess
@@ -43,6 +44,37 @@ class PackageAppTests(unittest.TestCase):
             with self.subTest(version=version):
                 self.assertEqual(package_app.short_version(version), short)
 
+    def test_the_build_number_counts_commits_and_needs_the_whole_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source, clone = Path(temporary) / "source", Path(temporary) / "clone"
+            source.mkdir()
+            environment = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+            def git(folder, *arguments):
+                subprocess.run(
+                    ["git", "-c", "user.name=Test", "-c", "user.email=t@example.com"]
+                    + list(arguments),
+                    cwd=folder,
+                    env={**os.environ, **environment},
+                    check=True,
+                    capture_output=True,
+                )
+
+            git(source, "init", "-q")
+            for n in range(3):
+                git(source, "commit", "-q", "--allow-empty", "-m", f"Commit {n}")
+            git(source, "tag", "-a", "1.5.0", "-m", "1.5.0", "HEAD~1")
+            with mock.patch.object(package_app, "ROOT", source):
+                self.assertEqual(package_app.build_number(), "3")
+                self.assertEqual(package_app.build_number("1.5.0"), "2")
+            # A shallow clone would count 1, below every release's build.
+            git(temporary, "clone", "-q", "--depth", "1", source.as_uri(), "clone")
+            with (
+                mock.patch.object(package_app, "ROOT", clone),
+                self.assertRaisesRegex(RuntimeError, "shallow clone.*--unshallow"),
+            ):
+                package_app.build_number()
+
     def test_info_plist_describes_the_bundle_assemble_lays_out(self):
         # Without a release key; the next test adds the keys that come with one.
         with mock.patch.object(package_app, "SPARKLE_PUBLIC_KEY", ""):
@@ -73,7 +105,7 @@ class PackageAppTests(unittest.TestCase):
     def test_the_resource_bundle_is_the_one_the_app_reads(self):
         # SwiftPM names it after the package and its target, and the app looks
         # for it by that name in Contents/Resources.
-        source = (package_app.ROOT / "app/Sources/Splash/Transcript.swift").read_text()
+        source = (package_app.ROOT / "app/Sources/Splash/WebPage.swift").read_text()
         name, extension = package_app.RESOURCE_BUNDLE.rsplit(".", 1)
         self.assertIn(
             f'Bundle.main.url(forResource: "{name}", withExtension: "{extension}")',

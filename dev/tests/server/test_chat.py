@@ -27,7 +27,6 @@ class Element {
     this.handlers = {};
     this.value = '';
     this.style = {};
-    this.options = [];
     this.children = [];
     this.queries = {};
     this.scrollHeight = 40;
@@ -42,6 +41,7 @@ class Element {
       },
     };
   }
+  get options() { return this.children.filter(child => child.tagName === 'OPTION'); }
   addEventListener(name, callback) { this.handlers[name] = callback; }
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
@@ -70,10 +70,12 @@ function createChat(storage = new Map(), writable = true, models = null,
   for (const id of ['chat', 'form', 'input', 'attachments', 'image-input',
                    'attach', 'effort', 'api-key', 'send', 'recents', 'new-chat',
                    'mobile-new', 'menu', 'scrim', 'scroll-bottom', 'sidebar',
-                   'sidebar-close', 'sidebar-open', 'credentials']) elements[id] = new Element();
+                   'sidebar-close', 'sidebar-open', 'credentials', 'thinking']) elements[id] = new Element();
   // Elements the markup hides start hidden, as in a browser.
   for (const [, id] of html.matchAll(/<\w+ id="([^"]+)"[^>]* hidden[ >]/g)) elements[id].hidden = true;
-  elements.effort.options = ['', 'xhigh', 'medium', 'low', 'none'].map(value => ({value}));
+  // The menu's options are the markup's.
+  elements.effort.children = [...html.matchAll(/<option value="([^"]*)">([^<]*)<\/option>/g)]
+    .map(([, value, textContent]) => Object.assign(new Element('option'), {value, textContent}));
   class FileReader {
     readAsDataURL(file) {
       this.result = `data:image/png;base64,${file.name}`;
@@ -137,6 +139,15 @@ function createChat(storage = new Map(), writable = true, models = null,
 }
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
+// What /v1/models reports of reasoning: Qwen3.6's template only switches
+// thinking on and off, Qwen3.8's tells three efforts apart, and Flint's model
+// decides itself.
+const QWEN36 = {thinks: true, efforts: [], default: null};
+const QWEN38 = {thinks: true, efforts: ['low', 'medium', 'xhigh'], default: 'xhigh'};
+const FLINT = {thinks: null, efforts: [], default: null};
+const served = (modalities = ['text', 'image', 'pdf'], reasoning = QWEN36) =>
+  ({ok: true, json: async () => ({data: [{input_modalities: modalities, reasoning}]})});
+const effortMenu = chat => chat.elements.effort.options.map(option => [option.value, option.textContent]);
 const submit = chat => chat.elements.form.handlers.submit({preventDefault() {}});
 const enter = chat => chat.elements.input.handlers.keydown({
   key: 'Enter', keyCode: 13, shiftKey: false, isComposing: false,
@@ -222,10 +233,10 @@ assert.equal(fresh.requests[0].headers.Authorization, undefined);
         # chat, and the field stays once the key is entered.
         self.run_chat(r"""
 (async () => {
-  const served = () => ({ok: true, json: async () => ({data: [{input_modalities: ['text']}]})});
+  const text = () => served(['text']);
   const unauthorized = {ok: false, status: 401,
     json: async () => ({error: {message: 'invalid or missing API key', type: 'authentication_error'}})};
-  for (const [name, models] of [['served', served], ['offline', null]]) {
+  for (const [name, models] of [['served', text], ['offline', null]]) {
     const chat = createChat(new Map(), true, models);
     await flush();
     assert.equal(chat.elements.credentials.hidden, true, name);
@@ -236,7 +247,7 @@ assert.equal(fresh.requests[0].headers.Authorization, undefined);
     await flush();
     assert.equal(chat.elements.credentials.hidden, true, name);
   }
-  const locked = createChat(new Map(), true, headers => headers.Authorization ? served() : unauthorized);
+  const locked = createChat(new Map(), true, headers => headers.Authorization ? text() : unauthorized);
   await flush();
   assert.equal(locked.elements.credentials.hidden, false, '/v1/models answered 401');
   locked.elements['api-key'].value = 'key';
@@ -260,7 +271,6 @@ assert.equal(fresh.requests[0].headers.Authorization, undefined);
     def test_image_attachment_follows_the_served_input_modalities(self):
         self.run_chat(r"""
 (async () => {
-  const served = modalities => ({ok: true, json: async () => ({data: [{input_modalities: modalities}]})});
   for (const [modalities, accepted] of [
     [['text'], false], [['text', 'image', 'pdf'], true],
   ]) {
@@ -294,21 +304,87 @@ assert.equal(fresh.requests[0].headers.Authorization, undefined);
 
     def test_restores_saved_chats_and_effort_with_read_only_storage(self):
         self.run_chat(r"""
-const saved = JSON.stringify([{id: 'saved', title: 'Saved chat', updated: 1,
-  messages: [{role: 'user', content: 'remembered message'}]}]);
-for (const writable of [true, false]) {
-  const storage = new Map([
-    ['splash-chats', saved], ['splash-thinking-effort', 'low'],
-  ]);
-  const chat = createChat(storage, writable);
-  assert.equal(chat.elements.effort.value, 'low');
-  assert.equal(chat.elements.recents.children.length, 1);
-  chat.elements.recents.children[0].querySelector('.recent-open').handlers.click();
-  setText(chat, 'continue');
-  submit(chat);
-  assert.equal(chat.requests[0].body.messages[0].content, 'remembered message');
-  assert.equal(storage.get('splash-thinking-effort'), 'low');
-}
+(async () => {
+  const saved = JSON.stringify([{id: 'saved', title: 'Saved chat', updated: 1,
+    messages: [{role: 'user', content: 'remembered message'}]}]);
+  for (const writable of [true, false]) {
+    const storage = new Map([
+      ['splash-chats', saved], ['splash-thinking-effort', 'low'],
+    ]);
+    const chat = createChat(storage, writable, () => served(undefined, QWEN38));
+    await flush();
+    assert.equal(chat.elements.effort.value, 'low');
+    assert.equal(chat.elements.recents.children.length, 1);
+    chat.elements.recents.children[0].querySelector('.recent-open').handlers.click();
+    setText(chat, 'continue');
+    submit(chat);
+    assert.equal(chat.requests[0].body.messages[0].content, 'remembered message');
+    assert.equal(chat.requests[0].body.reasoning_effort, 'low');
+    assert.equal(storage.get('splash-thinking-effort'), 'low');
+  }
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+    def test_the_effort_menu_offers_what_the_served_model_tells_apart(self):
+        self.run_chat(r"""
+(async () => {
+  // Until the server answers, and while it does not, Auto and Off: a saved
+  // effort they offer shows from the page's load, and one they do not
+  // shows as Auto.
+  for (const [saved, value] of [['none', 'none'], ['low', '']]) {
+    const offline = createChat(new Map([['splash-thinking-effort', saved]]));
+    assert.equal(offline.elements.effort.value, value, saved);
+    await flush();
+    assert.deepEqual(effortMenu(offline), [['', 'Auto'], ['none', 'Off']]);
+    assert.equal(offline.elements.effort.value, value, saved);
+    setText(offline, 'hello');
+    submit(offline);
+    assert.equal(offline.requests[0].body.reasoning_effort, value || undefined, saved);
+  }
+  // An effort picked before the menu is rebuilt, as when a server that needs
+  // a key answers /v1/models once it is entered, stays picked.
+  const locked = createChat(new Map(), true, headers => headers.Authorization
+    ? served(undefined, QWEN38) : {ok: false, status: 401, json: async () => ({})});
+  await flush();
+  locked.elements.effort.value = 'none';
+  locked.elements.effort.handlers.change();
+  locked.elements['api-key'].value = 'key';
+  locked.elements['api-key'].handlers.change();
+  await flush();
+  assert.deepEqual(effortMenu(locked).map(([value]) => value), ['', 'xhigh', 'medium', 'low', 'none']);
+  assert.equal(locked.elements.effort.value, 'none');
+  setText(locked, 'hello');
+  submit(locked);
+  assert.equal(locked.requests[0].body.reasoning_effort, 'none');
+  const levels = [['xhigh', 'Extra High'], ['medium', 'Medium'], ['low', 'Low'], ['none', 'Off']];
+  for (const [reasoning, menu, value] of [
+    [QWEN38, [['', 'Auto (Extra High)'], ...levels], 'low'],
+    // With --default-reasoning-effort none, a request that sends none does
+    // not think.
+    [{...QWEN38, thinks: false, default: null}, [['', 'Auto (Off)'], ...levels], 'low'],
+    // The saved effort is not one of Qwen3.6's; storage keeps it for a model
+    // that offers it.
+    [QWEN36, [['', 'Auto'], ['none', 'Off']], ''],
+  ]) {
+    const storage = new Map([['splash-thinking-effort', 'low']]);
+    const chat = createChat(storage, true, () => served(undefined, reasoning));
+    await flush();
+    assert.equal(chat.elements.thinking.hidden, false);
+    assert.deepEqual(effortMenu(chat), menu);
+    assert.equal(chat.elements.effort.value, value);
+    assert.equal(storage.get('splash-thinking-effort'), 'low');
+  }
+  // A model that decides itself whether to think hides the menu and gets no
+  // effort, a saved one included.
+  const flint = createChat(new Map([['splash-thinking-effort', 'low']]), true,
+    () => served(['text'], FLINT));
+  await flush();
+  assert.equal(flint.elements.thinking.hidden, true);
+  assert.deepEqual(effortMenu(flint), []);
+  setText(flint, 'hello');
+  submit(flint);
+  assert.ok(!('reasoning_effort' in flint.requests[0].body));
+})().catch(error => { console.error(error); process.exitCode = 1; });
 """)
 
     def test_default_effort_omits_reasoning_effort(self):
@@ -575,11 +651,13 @@ for (const [name, overrides, shouldSend] of [
   let content = chat.elements.chat.children.at(-1).querySelector('.content');
   assert.match(content.innerHTML, /hljs-keyword/);
   await chunk({content: '\n```\n\n```unknown-lang\n<b>literal</b>\n```\n\n' +
-    '<img src=x onerror=alert(1)>\n\n[bad](javascript:alert(1))\n\n[good](https://example.com)\n\n' +
+    '<img src=x onerror=alert(1)>\n\n[bad](javascript:alert(1))\n\n[app](x-app:open)\n\n[good](https://example.com)\n\n' +
     '![x](https://example.com/a.png)'});
   assert.match(content.innerHTML, /&lt;b&gt;literal&lt;\/b&gt;/);
-  assert.doesNotMatch(content.innerHTML, /href="javascript:/);
+  assert.doesNotMatch(content.innerHTML, /href="(javascript|x-app):/, 'only web and mail links are links');
+  assert.match(content.innerHTML, /<p>app<\/p>/, 'another link keeps its text');
   assert.doesNotMatch(content.innerHTML, /<img/, 'a reply must not load images');
+  assert.match(content.innerHTML, /<p><a href="https:\/\/example.com\/a.png"[^>]*>x<\/a><\/p>/, 'an image is a link to it');
   assert.match(content.innerHTML, /href="https:\/\/example.com" target="_blank" rel="noopener noreferrer"/,
     'a link must open in a new tab');
   const reasoning = '**thinking**\n\n```python\ndef think():\n    return 1\n```';
@@ -942,9 +1020,9 @@ class ChatPageTest(HarnessTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(content_type, "text/html; charset=utf-8")
         self.assertIn(b"/v1/chat/completions", payload)
-        for effort in (b"xhigh", b"medium", b"low", b"none"):
+        for effort in (b"", b"none"):
             self.assertIn(b'value="' + effort + b'"', payload)
-        for label in (b"Auto", b"Extra High", b"Medium", b"Low", b"Off"):
+        for label in (b"Auto", b"Off"):
             self.assertIn(b">" + label + b"</option>", payload)
         for label in (b"Splash", b"New chat", b"Recents"):
             self.assertIn(label, payload)
@@ -954,7 +1032,7 @@ class ChatPageTest(HarnessTestCase):
         self.assertIn(b"reasoning_effort", payload)
         self.assertIn(b"include_usage", payload)
         self.assertIn(b"tokens_per_second", payload)
-        self.assertIn(b"allowedEfforts.has(savedEffort)", payload)
+        self.assertIn(b"showEfforts(model.reasoning)", payload)
         self.assertIn(b"function storageGet", payload)
         self.assertIn(b"function storageSet", payload)
         self.assertIn(b"JSON.parse(storageGet(storeKey))", payload)

@@ -18,11 +18,11 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 11;
+inline constexpr uint16_t kProtocolVersion = 12;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
-inline constexpr uint32_t kStatusSchemaVersion = 6;
+inline constexpr uint32_t kStatusSchemaVersion = 8;
 // Image pixels travel inside the request frame; a multi-image agent turn can
 // carry well over 64 MiB of resized RGB bytes.
 inline constexpr uint64_t kAbsoluteMaxFramePayloadBytes =
@@ -36,6 +36,7 @@ enum class FrameType : uint16_t {
   MaskResponse = 0x0003,
   StatusRequest = 0x0004,
   ReleaseRequest = 0x0005,
+  Stop = 0x0006,
 
   Ready = 0x0100,
   Start = 0x0101,
@@ -45,6 +46,8 @@ enum class FrameType : uint16_t {
   Error = 0x0105,
   StatusJson = 0x0107,
   PromptProgress = 0x0108,
+  StartFailed = 0x0109,
+  Warming = 0x010A,
 };
 
 // Request errors reject one request while preserving the stream.  An
@@ -192,20 +195,27 @@ struct RequestFrame {
 //   MaskResponse   u64 requestId, u64 maskRequestId, u32 count, u32 words
 //   StatusRequest  u64 correlationId
 //   ReleaseRequest u64 correlationId
-//   Ready          u32 maxConcurrentRequests, u32 maxContextTokens, u8 vision
+//   Stop           u64 requestId
+//   Ready          u32 maxConcurrentRequests, u32 maxContextTokens, u8 vision,
+//                  u32 vocabularySize, u32 maskRows, u32 stop token count,
+//                  u32 stop tokens
 //   Start          u64 requestId, u32 lane, u32 matchedPromptTokens
 //   PromptProgress u64 requestId, u32 processedTokens, u64 elapsedMicros
 //   Tokens         u64 requestId, u32 sequenceOffset, u32 count, u32 tokens
 //   MaskRequest    u64 requestId, u64 maskRequestId, u32 wordsPerMask,
 //                  u32 count, u32 simulation tokens
-//   Done           u64 requestId, u8 reason, u32 promptTokens,
+//   Done           u64 requestId, u8 reason, u8 bounded, u32 promptTokens,
 //                  u32 completionTokens, u64 prefillMicros, u64 decodeMicros,
 //                  u64 wallMicros, u32 deduplicatedTokens, u32 draftedTokens,
 //                  u32 acceptedDraftTokens, u32 speculative cycles, u32 count,
 //                  f32 option logits
-//   Error          u8 failureClass, u8 retryable, u64 requestId, u32 code
-//                  bytes, u32 message bytes, the code, the message
+//   Error          u8 failureClass, u8 retryable, u32 retryAfterSeconds,
+//                  u64 requestId, u32 code bytes, u32 message bytes, the code,
+//                  the message
 //   StatusJson     u64 correlationId, the JSON
+//   StartFailed    u8 kind, u8 bound, u64 requiredBytes, u64 budgetBytes,
+//                  u32 planContextTokens, u32 message bytes, the message
+//   Warming        nothing
 struct CancelFrame {
   uint64_t requestId = 0;
 
@@ -236,12 +246,37 @@ struct ReleaseRequestFrame {
   bool operator==(const ReleaseRequestFrame &) const = default;
 };
 
+// The client matched a stop condition: the engine finishes the request as
+// Stop, a completion, or cancels it before its first token. The Done event
+// still ends the request.
+struct StopFrame {
+  uint64_t requestId = 0;
+
+  bool operator==(const StopFrame &) const = default;
+};
+
+// Sent before Ready once the engine holds its weights: what remains of its
+// start is the warm-up runs, which can take a minute on the first start
+// after an update, when they also prepare the GPU's programs.
+struct WarmingEvent {
+  bool operator==(const WarmingEvent &) const = default;
+};
+
 struct ReadyEvent {
   uint32_t maxConcurrentRequests = 0;
+  // The context this start serves: the one asked for, or what its plan holds;
+  // a relaunch may serve less than the first engine did.
   uint32_t maxContextTokens = 0;
   // Requests may carry image spans. A model serving without vision rejects
   // each image request with a request error.
   bool vision = false;
+  // The target's logit rows a token mask covers, and the tokens that end
+  // generation (its layout's vocabularySize and stopTokens).
+  uint32_t vocabularySize = 0;
+  std::vector<uint32_t> stopTokens{};
+  // The rows of one mask request: before the anchor and after each draft
+  // query row (ProtocolLimits::maxSimulationTokens + 1).
+  uint32_t maskRows = 0;
 
   bool operator==(const ReadyEvent &) const = default;
 };
@@ -331,11 +366,71 @@ struct StatusJsonEvent {
   bool operator==(const StatusJsonEvent &) const = default;
 };
 
+// Why a start failed, for the supervisor's restart decision and the app's
+// words (server/protocol.py StartFailureKind).
+enum class StartFailureKind : uint8_t {
+  // A defect, a start command that failed but not for want of GPU memory,
+  // or a failure the engine does not class.
+  Internal = 0,
+  // The host had too little free memory (RuntimeResourceFailure::HostCapacity).
+  HostMemory = 1,
+  // Metal refused an allocation the budget allowed.
+  DriverAllocation = 2,
+  // The plan's floors exceed the Metal memory budget.
+  MemoryBudget = 3,
+  // --max-context exceeds the context the plan holds.
+  ContextBudget = 4,
+  // A setting the engine refuses.
+  Configuration = 5,
+  // The model's files, which the start cannot serve: a model root without
+  // them, or files the loader refuses.
+  Model = 6,
+  // This Mac cannot run Splash.
+  Device = 7,
+  // A start command failed for want of GPU memory
+  // (MTLCommandBufferErrorOutOfMemory): another process holds what the
+  // model's commands need; a retry would take it from that process.
+  CommandMemory = 8,
+};
+
+// What bounds a shortfall: the Metal budget this Mac gives, the one
+// --max-memory set, or the SSD cache's room for spilled KV.
+enum class ShortfallBound : uint8_t {
+  DeviceMemory = 0,
+  MaxMemory = 1,
+  Disk = 2,
+};
+
+// What a start refused for want of memory or context needed against what it
+// had: MemoryBudget sets the bytes, ContextBudget the context its plan holds
+// (at least one token: a plan that holds none fails before the check).
+struct StartShortfall {
+  ShortfallBound bound = ShortfallBound::DeviceMemory;
+  uint64_t requiredBytes = 0;
+  uint64_t budgetBytes = 0;
+  uint32_t planContextTokens = 0;
+
+  bool operator==(const StartShortfall &) const = default;
+};
+
+// Sent in place of Ready by a start that fails (main.mm); the process then
+// exits.
+struct StartFailedEvent {
+  StartFailureKind kind = StartFailureKind::Internal;
+  // All zero but for MemoryBudget and ContextBudget.
+  StartShortfall shortfall;
+  std::string message;
+
+  bool operator==(const StartFailedEvent &) const = default;
+};
+
 using ClientMessage = std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
-                                   StatusRequestFrame, ReleaseRequestFrame>;
+                                   StatusRequestFrame, ReleaseRequestFrame,
+                                   StopFrame>;
 using EngineEvent =
     std::variant<ReadyEvent, StartEvent, PromptProgressEvent, TokensEvent,
-                 MaskRequestEvent, DoneEvent, ErrorEvent, StatusJsonEvent>;
+                 MaskRequestEvent, DoneEvent, ErrorEvent, StatusJsonEvent,
+                 StartFailedEvent, WarmingEvent>;
 
 struct Frame {
   FrameType type = FrameType::Request;

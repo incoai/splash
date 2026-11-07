@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,7 +16,7 @@ from dev.tests.installer_fixtures import (
     mlx_target,
     selection,
 )
-from install import cached, upstream
+from install import assembly, cached, models, upstream
 
 
 def vision_target(root):
@@ -49,7 +50,7 @@ class CachedTest(unittest.TestCase):
 
     def install_cached(self):
         with mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", True):
-            return list(cached.install_cached(self.root / "app"))
+            cached.install_cached(self.root / "app")
 
     def test_installs_what_the_cache_holds_whole_without_the_hub(self):
         """A model another Splash downloaded installs here from the cache, at
@@ -75,19 +76,49 @@ class CachedTest(unittest.TestCase):
         (self.cache / "models--someone--notes/refs/main").write_text("b" * 40)
         cached_snapshot(self.cache, "someone/unrecorded", "c" * 40, readme)
         fake.requests.clear(), fake.downloads.clear()
-        self.assertEqual(self.install_cached(), [MODEL])
-        self.assertEqual(self.install_cached(), [])
+        # What the app lists once the script exits: the selection links.
+        app = (self.root / "app").resolve()
+        link = models.Selection.of(app, MODEL).link
+        self.install_cached()
+        self.assertEqual(models.selection_links(app), [link])
+        with mock.patch.object(upstream, "prepare", wraps=upstream.prepare) as prepare:
+            self.install_cached()
+        self.assertEqual(models.selection_links(app), [link])
+        self.assertNotIn(MODEL, [call.args[0].model for call in prepare.call_args_list])
         self.assertEqual((fake.requests, fake.downloads), ([], []))
+
+    def test_an_installation_whose_files_are_gone_installs_again(self):
+        """An installation whose snapshot was deleted from the cache, which
+        the app then no longer lists, is not present, and installs again
+        from the commit the cache holds now."""
+        fake = fake_hub(self, self.cache)
+        fake.publish(MODEL, "d" * 40, vision_target)
+        checkout = selection(self.root / "checkout", language_only=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            upstream.prepare(checkout)
+        self.install_cached()
+        link = models.Selection.of((self.root / "app").resolve(), MODEL).link
+        self.assertTrue(cached.present(link))
+        fake.publish(MODEL, "f" * 40, vision_target)
+        with contextlib.redirect_stdout(io.StringIO()):
+            upstream.prepare(checkout)
+        shutil.rmtree(fake.snapshot(MODEL, "d" * 40))
+        self.assertFalse(cached.present(link))
+        self.install_cached()
+        self.assertEqual(
+            assembly.verify(link)["sources"]["target"]["revision"], "f" * 40
+        )
 
     def test_candidates_follow_the_installer_s_names(self):
         """One ID for each GGUF target the cached files hold whole, which
         selects it from them and from the Hub's listing of all the
         repository's files alike: a suggested one, or else its own."""
         suggested = {"owner/m-GGUF": ["owner/m-GGUF:UD-Q4_K_M", "owner/m-GGUF:IQ1_S"]}
+        root_split = {"m-Q2_0-00001-of-00002.gguf", "m-Q2_0-00002-of-00002.gguf"}
         hub_files = {
             f"m-{variant}.gguf"
             for variant in ("Q4_K_M", "Q8_0", "UD-Q4_K_M", "UD-Q8_0", "UD-IQ1_S")
-        } | {"mmproj-BF16.gguf", "m.gguf"}
+        } | {"mmproj-BF16.gguf", "m.gguf", *root_split}
         for cached_files, expected in (
             # Variants named as on the Hub, not past the words only the
             # cached files share.
@@ -108,6 +139,33 @@ class CachedTest(unittest.TestCase):
                 },
                 ["owner/m-GGUF:BF16", "owner/m-GGUF:Q4_K_M"],
             ),
+            # A split GGUF's folder takes the ID that names it exactly, before
+            # a root file whose name only ends in -VARIANT.
+            (
+                {
+                    "m-UD-IQ1_S.gguf",
+                    "m-Q8_0.gguf",
+                    "IQ1_S/m-IQ1_S-00001-of-00002.gguf",
+                    "IQ1_S/m-IQ1_S-00002-of-00002.gguf",
+                },
+                ["owner/m-GGUF:IQ1_S", "owner/m-GGUF:Q8_0", "owner/m-GGUF:UD-IQ1_S"],
+            ),
+            # Folders whose names differ in case alone are one target, as
+            # :VARIANT names a folder whatever its case.
+            (
+                {"BF16/m-BF16-00001-of-00002.gguf", "bf16/m-BF16-00002-of-00002.gguf"},
+                ["owner/m-GGUF:BF16"],
+            ),
+            # A split GGUF's parts in the root are one target, which an
+            # incomplete one is not.
+            (
+                root_split | {"m-Q4_K_M.gguf"},
+                ["owner/m-GGUF:Q2_0", "owner/m-GGUF:Q4_K_M"],
+            ),
+            (
+                {"m-Q2_0-00001-of-00002.gguf", "m-Q4_K_M.gguf"},
+                ["owner/m-GGUF:Q4_K_M"],
+            ),
             # No ID selects the GGUF named as the model beside another.
             ({"m.gguf", "m-Q8_0.gguf"}, ["owner/m-GGUF:Q8_0"]),
         ):
@@ -123,6 +181,12 @@ class CachedTest(unittest.TestCase):
                             variant,
                         )[0],
                     )
+        # The parts' merge beside them takes the ID both are named by.
+        merged = root_split | {"m-Q2_0.gguf"}
+        self.assertEqual(
+            cached.candidates("owner/m-GGUF", merged, {}), ["owner/m-GGUF:Q2_0"]
+        )
+        self.assertEqual(upstream.select_gguf(merged, "Q2_0")[0], ["m-Q2_0.gguf"])
         # A suggested repository's cached files take its suggested IDs, and
         # the others their own.
         self.assertEqual(

@@ -42,11 +42,11 @@ rejects_junction_option() {
     fi
 }
 
-rejects_junction_option 'junction benchmark options take positive integers' --minimum-junction-gain 0
-rejects_junction_option 'junction benchmark options take positive integers' --minimum-junction-gain text
-rejects_junction_option 'junction benchmark options take positive integers' --minimum-junction-gain 512x
-rejects_junction_option 'junction benchmark options take positive integers' --minimum-junction-gain 4294967296
-rejects_junction_option 'junction benchmark option is outside its supported range' --minimum-junction-gain 768
+rejects_junction_option 'junction benchmark options take positive integers' --junction-shared-gain 0
+rejects_junction_option 'junction benchmark options take positive integers' --junction-shared-gain text
+rejects_junction_option 'junction benchmark options take positive integers' --junction-shared-gain 512x
+rejects_junction_option 'junction benchmark options take positive integers' --junction-shared-gain 4294967296
+rejects_junction_option 'junction benchmark option is outside its supported range' --junction-shared-gain 768
 rejects_junction_option 'junction benchmark option is outside its supported range' --junction-shared-gain 2048
 rejects_junction_option 'junction benchmark option is outside its supported range' --junction-reuse-count 17
 rejects_junction_option 'junction benchmark option is outside its supported range' --junction-output-tokens 513
