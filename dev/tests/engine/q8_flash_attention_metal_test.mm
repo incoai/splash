@@ -794,7 +794,7 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
              uint32_t committed, uint32_t activeRows, uint32_t width,
              bool qualityGate = true, uint32_t splits = kVerifySplits,
              bool qsa = false) {
-  require(width >= 1 && width <= 4 &&
+  require(width >= 1 && width <= SPLASH_MAXIMUM_BATCH_WIDTH &&
               (activeRows == kRows ||
                (width == 1 && splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS)),
           "invalid attention case");
@@ -950,7 +950,7 @@ void run(const char *libraryPath) {
         checkReduce(device, queue, library, shape, splits, 1);
     }
     const Pipelines pipelines = makePipelines(device, library, shape);
-    for (uint32_t width = 1; width <= 4; ++width)
+    for (uint32_t width = 1; width <= SPLASH_MAXIMUM_BATCH_WIDTH; ++width)
       runCase(device, queue, pipelines, shape, 127, 8, width);
     runCase(device, queue, pipelines, shape, 0, 8, 4);
     for (uint32_t activeRows = 1; activeRows < kRows; ++activeRows)
