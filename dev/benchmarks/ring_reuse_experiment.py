@@ -128,7 +128,10 @@ def verdict(values):
 def analyze(document, cap, model_root=None, layout=None):
     """Validate fixed fixtures, every retained row, charged work and ABBA arithmetic."""
     accounting = document.get("ring_state_accounting", "inclusive_state_v1")
-    require(accounting in ("inclusive_state_v1", "exclusive_pool_v2"), "unknown state accounting contract")
+    require(
+        accounting in ("inclusive_state_v1", "exclusive_pool_v2"),
+        "unknown state accounting contract",
+    )
     warmups = 96 if cap == 128 else 1280
     exact(
         document,
@@ -331,7 +334,11 @@ def analyze(document, cap, model_root=None, layout=None):
                 require(
                     row["state_allocated_" + which + "_bytes"]
                     == seed["state_allocated_after_bytes"]
-                    + (row["draft_ring_cache_" + ring_key + "bytes"] if accounting == "inclusive_state_v1" else 0),
+                    + (
+                        row["draft_ring_cache_" + ring_key + "bytes"]
+                        if accounting == "inclusive_state_v1"
+                        else 0
+                    ),
                     "allocation changed outside ring",
                 )
             require(

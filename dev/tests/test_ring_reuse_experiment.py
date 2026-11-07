@@ -80,9 +80,11 @@ def evidence(cap=1, short_eos=False, exclusive=False):
             draft_context_rows=ring.ROWS[i] if restored else len(inputs[name]),
             state_entries=1,
             cached_state_bytes=ring.COMPOSITE_BYTES,
-            state_allocated_before_bytes=(1 << 29) + (ring.RING_BYTES if hit and not exclusive else 0),
+            state_allocated_before_bytes=(1 << 29)
+            + (ring.RING_BYTES if hit and not exclusive else 0),
             state_allocated_after_bytes=(1 << 29) + (retained if not exclusive else 0),
-            state_allocated_peak_observed_bytes=(1 << 29) + (retained if not exclusive else 0),
+            state_allocated_peak_observed_bytes=(1 << 29)
+            + (retained if not exclusive else 0),
             draft_ring_cache_before_bytes=ring.RING_BYTES if hit else 0,
             draft_ring_cache_bytes=retained,
             draft_ring_cache_peak_observed_bytes=retained,
