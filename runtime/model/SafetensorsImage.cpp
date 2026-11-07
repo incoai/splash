@@ -206,7 +206,7 @@ public:
         const SourceTensor &table = require(name + ".weight", {"BF16"}, {count, width});
         source = rows(name, table, ggml::kBF16, count, width * sizeof(uint16_t));
       }
-      if (!gguf_embedding_format(gguf_format_of(source->type)))
+      if (!quant_stored_row_bytes(gguf_format_of(source->type), width))
         throw WeightStoreError(name + " is in a format the PLE gather does not read");
       if (!sources.empty() && source->type != sources.front().type)
         throw WeightStoreError("PLE table shards must share a quantization format");
@@ -283,7 +283,7 @@ private:
   }
 
   bool externalPle() const {
-    return geometry_.hasPle() && checkpoint_.find("ngram_table.weight") &&
+    return (geometry_.pleNgram != 0) && checkpoint_.find("ngram_table.weight") &&
              !checkpoint_.find(modelPrefix(names_) + "layers." + std::to_string(geometry_.pleLayer) +
                                   ".ple.ple_embedding.ngram_embedding.shards.0.weight");
   }
@@ -493,7 +493,7 @@ void walkLayer(Walk &b, const QwenTargetDimensions &g, ModuleNames names, uint32
     b.projection(mlp + "up_proj", g.intermediateSize, g.hiddenSize);
     b.projection(mlp + "down_proj", g.hiddenSize, g.intermediateSize);
   }
-  if (g.hasPle() && index == g.pleLayer) {
+  if ((g.pleNgram != 0) && index == g.pleLayer) {
     const std::string ple = prefix + "ple.";
     b.projection(ple + "key_proj", g.streamWidth(), g.pleWidth());
     b.projection(ple + "value_proj", g.hiddenSize, g.pleWidth());
@@ -537,7 +537,7 @@ std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, con
   Builder embedding(checkpoint, geometry, names, "embedding.bin", geometry.vocabularySize, geometry.hiddenSize);
   walkEmbedding(embedding, names);
   images.push_back(embedding.finish());
-  if (geometry.hasPle()) {
+  if ((geometry.pleNgram != 0)) {
     Builder table(checkpoint, geometry, names, "ple.bin", geometry.pleLayer, 3);
     table.pleTable(modelPrefix(names) + "layers." + std::to_string(geometry.pleLayer) +
                        ".ple.ple_embedding.ngram_embedding", options.streamTable);
