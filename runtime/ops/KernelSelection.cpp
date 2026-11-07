@@ -184,11 +184,9 @@ LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorklo
   if (w.phase == LinearPhase::Prefill) {
     if (w.rows <= p.stagedPrefillRows)
       return staged(p, n, k, w.rows, unit.weightBits16, cores, Passes::Two);
-    return {.tile = LinearTile::GgufPrefill,
-            .prefillSimdgroupRows = p.prefill16AtCores && cores == p.prefill16AtCores && unit.prefill16Takes &&
-                                            w.rows <= GGUF_PREFILL_ROWS
-                                        ? 16u
-                                        : 32u};
+    const bool use16 = p.prefill16AtCores && cores == p.prefill16AtCores && unit.prefill16Takes &&
+                       w.rows <= GGUF_PREFILL_ROWS;
+    return {.tile = LinearTile::GgufPrefill, .prefillSimdgroupRows = use16 ? 16u : 32u};
   }
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
   const bool gateUp = w.epilogue == LinearEpilogue::GateUp,

@@ -1371,7 +1371,7 @@ void singleTilePrefillPlans() {
                    leading = blockProjection(1024, 2048, 1, GGUF_FMT_AF4G64)
                                  .leadingInputs(1024);
   for (const uint32_t family : {9U, 10U, 11U})
-    for (const uint32_t cores : {0U, 16U, 20U, 32U, 40U})
+    for (uint32_t cores = 0; cores <= 128; ++cores)
       for (const uint32_t rows :
            {33U, 64U, 65U, 80U, 96U, 127U, 128U, 129U, 256U})
         for (const LinearEpilogue epilogue :

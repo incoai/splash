@@ -230,6 +230,8 @@ inline constexpr ProjectionCalibration kApple10Projection{
     .onePassFromCores = kApple10OnePassFromCores,
     .sixteenRowBelowBits16 = kApple10SixteenRowBelowBits16,
     .stagedPrefillRows = kApple10StagedPrefillRows,
+    // Measured single-tile AF4G64 prefill on the 20-core M5 Pro. The
+    // selector keeps staged chunks and requires tensor kernel support.
     .prefill16AtCores = 20,
 };
 
