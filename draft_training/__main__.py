@@ -193,6 +193,11 @@ def inspect_training(args):
     validate_target(args.target)
     config = validate_draft(args.init_draft)
     recipe = Recipe.load(args.config)
+    if (
+        recipe.trainable in ("late_backbone", "recall")
+        and recipe.recall_last_layers > config["num_hidden_layers"]
+    ):
+        raise TrainingError("recall_last_layers exceeds draft depth")
     if recipe.sequence_length > config["max_position_embeddings"]:
         raise TrainingError("sequence_length exceeds model position limit")
     training, validation = (
@@ -299,7 +304,7 @@ def run_training(args, *, family=True):
         from .quantization import enable_affine4
 
         enable_affine4(model, recipe.affine4_scope)
-        configure_trainable(model, recipe.trainable)
+        configure_trainable(model, recipe.trainable, recipe.recall_last_layers)
         with torch.autocast(
             device_type=torch.device(args.device).type, dtype=torch.bfloat16
         ):
