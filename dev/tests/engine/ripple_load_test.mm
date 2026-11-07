@@ -40,7 +40,7 @@ RippleLayout tinyLayout() {
   layout.fullAttentionPeriod = 1;
   layout.ffnKind = splash::model::QwenFfnKind::Dense;
   layout.intermediateSize = 512;
-  layout.embeddingScale = 16.0F;
+  layout.embeddingScale = 1.0F;
   layout.swigluClamp = 6.0F;
   layout.valueResidual = true;
   layout.postFfnNorm = true;

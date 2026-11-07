@@ -143,7 +143,8 @@ ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view la
     if (d.type == ggml::kF32 || (d.type == ggml::kBF16 && !d.metaGroups)) return readFloatRows(file, d, label);
     const uint32_t format = gguf_format_of(d.type);
     if (format == GGUF_FMT_COUNT)
-        throw WeightStoreError("unsupported GGUF tensor type " + std::to_string(d.type));
+        throw WeightStoreError("unsupported GGUF tensor type " + std::to_string(d.type) + ": " +
+                               std::string(label));
     const QuantFormat &layout = kQuantFormats[format];
     // Quantized planes fill whole tiles; float tensors are rows as stored.
     if (d.outputSize % QUANT_TILE_ROWS || d.inputSize % ggufColumnUnit(layout))

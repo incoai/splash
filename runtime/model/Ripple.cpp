@@ -18,9 +18,13 @@ namespace splash::model {
 QwenMixerWeights readRippleMixer(WeightFile &file, const BlockTargetFormat &format,
                                  const QwenTargetDimensions &target, bool) {
   QwenAttentionWeights attention;
-  attention.inputProjection =
+  // The fused projection's rows sit at the packed rows' heads, whose tail
+  // the placed value projection writes: the projection spans the packed rows'
+  // whole width, which its dispatches take as the destination's row stride.
+  attention.inputProjection = ops::Projection::placed(
+      target.packedFullWidth, 0,
       format.fused(file, target.packedFullWidth - target.attentionKvHeads * target.attentionHeadDimension,
-                   target.hiddenSize, {"attn-q", "attn-k"});
+                   target.hiddenSize, {"attn-q", "attn-k"}));
   attention.valueProjection =
       ops::Projection::placed(target.packedFullWidth,
                               target.packedFullWidth - target.attentionKvHeads * target.attentionHeadDimension,

@@ -408,7 +408,7 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
   result.layout = layout;
   result.layers.reserve(layout.layers);
   const uint64_t convolutionBytes = checkedMultiply<WeightStoreError>(
-      checkedMultiply<WeightStoreError>(SPLASH_DRAFT_CONVOLUTION_STAGES * SPLASH_DRAFT_CONVOLUTION_TAPS,
+      checkedMultiply<WeightStoreError>(SPLASH_DRAFT_CONVOLUTION_STAGES * layout.convolutionTaps,
                                         layout.hiddenSize, "draft convolution elements"),
       kBFloat16Bytes, "draft convolution bytes");
   const uint64_t headNormBytes = checkedMultiply<WeightStoreError>(

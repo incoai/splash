@@ -121,21 +121,29 @@ public:
     image_.repack(std::move(repack));
   }
 
-  // Two tensors' rows in order - the queries, then each query head's output
-  // gate - as one projection's, which the packed q holds as the Qwen3.5's
-  // fused rows do (Ripple's GGUF keeps the gate beside the queries).
-  void quantizedPair(const std::string &queries, const std::string &gates, uint64_t rows, uint64_t columns) {
+  // Two tensors' rows interleaved per head - each head's queries, then its
+  // output gate - as one projection's, which the packed q holds as the
+  // Qwen3.5's fused rows do (Ripple's GGUF keeps the gate beside the queries
+  // in a tensor of its own, whose rows the packed q takes per head).
+  void quantizedPair(const std::string &queries, const std::string &gates, uint64_t rows, uint64_t columns,
+                     uint64_t headRows) {
     const GgufTensor *q = find(queries, quantizedType);
     const GgufTensor *gate = find(gates, quantizedType);
     if (!q || !gate) return;
     if (q->rows() != rows || q->columns() != columns || gate->rows() != rows || gate->columns() != columns)
       throw GgufError("unexpected shape for " + queries + " or " + gates);
+    if (rows % headRows) throw GgufError(queries + " does not hold whole heads");
     const uint32_t format = imageFormat(q->type);
     if (imageFormat(gate->type) != format)
       throw GgufError(queries + " and " + gates + " are not of one quantization format");
     Repack repack = image_.planes(format, 2 * rows, columns, queries);
-    for (const GgufTensor *tensor : {q, gate})
-      repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns), {}));
+    const uint64_t rowBytes = ggufRowBytes(kQuantFormats[format], columns);
+    for (uint64_t head = 0; head < rows / headRows; ++head)
+      for (const GgufTensor *tensor : {q, gate}) {
+        TensorRows source = tensorRows(*tensor, headRows, rowBytes, {}, false);
+        source.first = head * headRows;
+        repack.sources.push_back(std::move(source));
+      }
     image_.repack(std::move(repack));
   }
 
@@ -367,14 +375,16 @@ private:
   // expert's by its value of an experts tensor's (_exps), one per expert;
   // only NVFP4's native rows hold such a scale, so a .scale beside any other
   // tensor is refused.
-  TensorRows tensorRows(const GgufTensor &tensor, uint64_t count, uint64_t rowBytes, RowOrder order = {}) const {
+  TensorRows tensorRows(const GgufTensor &tensor, uint64_t count, uint64_t rowBytes, RowOrder order = {},
+                        bool whole = true) const {
     const std::string stem = tensor.name.ends_with(".weight") ? tensor.name.substr(0, tensor.name.size() - 7) : "";
     const GgufTensor *scale = stem.empty() ? nullptr : file_.find(stem + ".scale");
     if (tensor.type != ggml::kNVFP4) {
       if (scale)
         throw GgufError(scale->name + " scales a " + ggmlTypeName(tensor.type) +
                         " tensor; Splash reads a .scale tensor beside an NVFP4 weight only");
-      if (!count || count * rowBytes != tensor.bytes) throw GgufError("unexpected size for " + tensor.name);
+      if (whole && (!count || count * rowBytes != tensor.bytes))
+        throw GgufError("unexpected size for " + tensor.name);
       return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
     }
     const QuantFormat &format = kQuantFormats[GGUF_FMT_NVFP4];
@@ -681,7 +691,8 @@ struct RippleGguf final {
     const std::string p = prefix(index);
     const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
     b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
-    b.quantizedPair(p + "attn_q.weight", p + "attn_gate.weight", g.attentionWidth, g.hiddenSize);
+    b.quantizedPair(p + "attn_q.weight", p + "attn_gate.weight", g.attentionWidth, g.hiddenSize,
+                    g.attentionHeadDimension);
     b.quantized(p + "attn_k.weight", kvRows, g.hiddenSize);
     b.quantized(p + "attn_v.weight", kvRows, g.hiddenSize);
     b.floatNorm(p + "attn_q_norm.weight", g.attentionHeadDimension);
