@@ -113,10 +113,10 @@ void blockIndexReader() {
   require(!everyPage.valid() && !everyPage.spillable(), "the page loop's layout holds a block index");
 }
 
-// Expert ids, route rows and grouped routes are uint32, routing weights fp32
-// and activations bf16; a row routes its top k and each shared slice, which
-// fills one tile per tileRows rows. The grouped input first holds the
-// router's fp32 scores, one row of 256 per token.
+// Expert ids, route rows, grouped routes and the experts' slots are uint32,
+// routing weights fp32 and activations bf16; a row routes its top k and each
+// shared slice, which fills one tile per tileRows rows. The grouped input
+// first holds the router's fp32 scores, one row of 256 per token.
 void checkMoe(splash::ops::MoeWorkspace workspace,
               splash::ops::MoeShape shape, uint32_t rows, uint32_t tileRows) {
   using splash::model::kBFloat16Bytes;
@@ -133,6 +133,7 @@ void checkMoe(splash::ops::MoeWorkspace workspace,
               workspace.tileCountBytes == sizeof(MoeTileCount) &&
               workspace.groupedRoutesBytes == grouped * sizeof(uint32_t) &&
               workspace.routeRowsBytes == routes * sizeof(uint32_t) &&
+              workspace.expertSlotsBytes == uint64_t{shape.experts} * sizeof(uint32_t) &&
               workspace.groupedInputBytes == std::max(grouped * shape.hiddenSize * kBFloat16Bytes,
                                                       uint64_t{rows} * kRouterScores * sizeof(float)) &&
               workspace.expertIntermediateBytes ==

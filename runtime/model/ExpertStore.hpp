@@ -174,7 +174,8 @@ public:
   // block's router and shared-expert gate, set before, which predict its
   // routes.
   void bind(uint32_t block, ops::BlockMoeWeights &weights);
-  void addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block) const override;
+  void addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block,
+               const std::function<void()> &beside = {}) const override;
   [[nodiscard]] ExpertStoreStats stats() const;
   // The bytes its loads read from the sources, of both phases, as the last
   // round published them (ExpertStoreStats::Use::readBytes): a command's

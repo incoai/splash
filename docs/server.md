@@ -440,6 +440,14 @@ off` loads every expert, as a SIZE that holds them all does.
   routed expert through the layer's slot table and the chunks that hold its
   slots, so resident experts, one chunk of every expert, and streamed
   experts run the same kernels.
+- The grouping puts the tiles of the experts already resident first and those
+  a load brings last (their slot-table entry is marked absent). A decode
+  step's expert passes over the resident ones and the shared expert run while
+  its load's host step reads from the SSD, on the grouping's copy of the slot
+  table; the passes over the experts it brought and the combine run after the
+  repack, through a second table of the slots the load routed, which the host
+  step writes and the GPU reads no earlier. Outputs are bitwise the same: each
+  expert's tiles, their kinds and the combine order do not change.
 - An expert's rows a GGUF stores as they are are read straight into the
   staging (`F_NOCACHE`, widened to whole 16 KiB pages, which the kernel reads
   without the buffer cache: an M5 Pro reads 460 KiB pieces from four threads

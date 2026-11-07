@@ -1189,7 +1189,14 @@ any, runs on the same thread once the step let the work after it go: CPU work
 the GPU need not wait for, such as starting reads that would hold the GPU's
 start back if they began as the step ends. It does not run after work that
 threw, and must not throw: the command may have completed by then, so a
-`then` that throws marks the backend unhealthy. A step's work may run after
+`then` that throws marks the backend unhealthy. A step's beside dispatches,
+those right after it (`EventStep::beside`), run while its work runs, in a
+buffer of their own after its signal, and the work after them waits for the
+step (a streamed MoE layer's passes over its resident experts beside its
+load). They write nothing the work reads and read no 128-byte cache line it
+writes: a line the GPU read before the work wrote it is unproven fresh after
+the step, so those MoE passes read the grouping's copy of the slot table, and
+the passes after the load a table of their own. A step's work may run after
 submitCommandAsync or wait() threw (its encoding failed after its first
 buffers were committed, or the watchdog or a shutdown gave the command up),
 so the work owns what it touches.
@@ -1208,14 +1215,15 @@ on a small GPU, run first, and the prefill command is submitted once they
 have completed ([Vision](models.md#vision)).
 
 A step about as short as the GPU's wake-up can keep the GPU awake: one GPU
-thread spins through it until the CPU ends it, so the work after it starts at
-once and at full clocks. The spin sees the CPU end it only through a memory
-scope Metal's public headers leave out (`runtime/metal/kernels/host_step.metal`),
-so it builds apart from the metallib, into `build/host-step.metallib`, and a
-Metal compiler that refuses it only warns. Before the first command with such
-a step, the backend checks that the spin sees the CPU end it; without the
-library, or if it does not, the steps run without the spin, with a warning.
-A completed command reports each step's round trip (`HostStepTiming`).
+thread spins through it, from the end of the work before it until the CPU
+ends it, so the work after it starts at once and at full clocks. The spin
+sees the CPU end it only through a memory scope Metal's public headers leave
+out (`runtime/metal/kernels/host_step.metal`), so it builds apart from the
+metallib, into `build/host-step.metallib`, and a Metal compiler that refuses
+it only warns. Before the first command with such a step, the backend checks
+that the spin sees the CPU end it; without the library, or if it does not,
+the steps run without the spin, with a warning. A completed command reports
+each step's round trip (`HostStepTiming`).
 
 ## Residency and KV extents
 

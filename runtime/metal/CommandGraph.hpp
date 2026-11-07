@@ -87,11 +87,18 @@ public:
   // `work` runs on the CPU between the work before and the work after it,
   // `timed` gets its round trip once the command completed, `gpu` says
   // whether the GPU spins through it, and `then` runs once the work after it
-  // may go.
+  // may go. `beside` adds dispatches, and nothing else, that run while
+  // `work` runs (EventStep::beside).
   void host(std::function<void()> work, std::function<void(const HostStepTiming &)> timed = {},
-            HostStepGpu gpu = HostStepGpu::Idle, std::function<void()> then = {}) {
-    events_.push_back({dispatches_.size(), {}, 0, EventStep::Kind::Host, std::move(work), std::move(timed), gpu,
+            HostStepGpu gpu = HostStepGpu::Idle, std::function<void()> then = {},
+            const std::function<void()> &beside = {}) {
+    const size_t step = events_.size(), before = dispatches_.size();
+    events_.push_back({before, {}, 0, EventStep::Kind::Host, std::move(work), std::move(timed), gpu,
                        std::move(then)});
+    if (!beside) return;
+    beside();
+    if (events_.size() != step + 1) throw std::logic_error("a host step's beside work adds dispatches only");
+    events_[step].beside = dispatches_.size() - before;
   }
 
   [[nodiscard]] bool empty() const noexcept { return dispatches_.empty(); }

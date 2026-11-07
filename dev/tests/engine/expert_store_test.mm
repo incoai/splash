@@ -919,7 +919,9 @@ int streamedChunks(MetalBackend &backend, const MoeShape &shape, const std::file
   std::set<uint32_t> named;
   for (const BlockMoeWeights &weights : streamed)
     for (uint32_t expert = 0; expert < shape.experts; ++expert)
-      named.insert(chunkOf(chunks, static_cast<const uint32_t *>(weights.slotTable.contents())[expert]).first);
+      if (const uint32_t slot = static_cast<const uint32_t *>(weights.slotTable.contents())[expert];
+          slot != MOE_SLOT_ABSENT)
+        named.insert(chunkOf(chunks, slot).first);
   if (named.size() < 2) {
     printf("  chunks: the resident experts sit in one chunk FAIL\n");
     ++failures;
@@ -996,12 +998,13 @@ int streamedElastic(MetalBackend &backend, const MoeShape &shape, const std::fil
         streamed[1].chunks.planes() != chunks.planes() || lists[live] != list || !distinct)
       fail(when + ": the blocks' chunks do not name the " + std::to_string(live) + " live chunks in their one list");
   };
-  // No slot table names a slot past the live chunks'.
+  // No slot table names a slot past the live chunks' (an absent expert's
+  // entry is MOE_SLOT_ABSENT).
   const auto tablesBelow = [&](uint64_t live) {
     for (const BlockMoeWeights &weights : streamed) {
       const auto *table = static_cast<const uint32_t *>(weights.slotTable.contents());
       for (uint32_t expert = 0; expert < shape.experts; ++expert)
-        if (table[expert] >= live) return false;
+        if (table[expert] != MOE_SLOT_ABSENT && table[expert] >= live) return false;
     }
     return true;
   };
@@ -1475,7 +1478,7 @@ int streamedElasticSizes(MetalBackend &backend, const MoeShape &shape, const std
       const uint64_t live = block == 4 ? shape.experts : layouts[block / 2].first(chunks.liveChunks());
       const auto *table = static_cast<const uint32_t *>(streamed[block].slotTable.contents());
       for (uint32_t expert = 0; expert < shape.experts; ++expert)
-        if (table[expert] >= live) {
+        if (table[expert] != MOE_SLOT_ABSENT && table[expert] >= live) {
           fail(when + ", block " + std::to_string(block) + ": its slot table names a slot past its live chunks");
           break;
         }
