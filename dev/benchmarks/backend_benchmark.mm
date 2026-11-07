@@ -157,6 +157,15 @@ struct Measurement final {
   uint64_t draftContextRowsAvoided = 0;
   uint64_t draftStateRestoreSkipped = 0;
   uint64_t junctionMaterializations = 0;
+  uint64_t junctionMaterializationFailures = 0;
+  uint64_t inputTokenHash = 0;
+  uint64_t stateAllocatedBeforeBytes = 0;
+  uint64_t stateAllocatedAfterBytes = 0;
+  uint64_t stateAllocatedPeakObservedBytes = 0;
+  uint64_t cachedStateBytes = 0;
+  uint64_t stateEvictions = 0;
+  uint32_t stateEntries = 0;
+  std::optional<double> junctionWorkloadWallMilliseconds;
   std::vector<uint32_t> outputTokens;
   std::optional<bool> coldOutputMatch;
 };
@@ -424,12 +433,14 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
 
   const model::ModelTelemetry before = executor.telemetry();
   const engine::EngineSnapshot engineBefore = engine.snapshot();
+  uint64_t statePeak = before.stateAllocatedBytes;
   std::vector<uint32_t> prefillBatchRows;
   prefillBatchRows.reserve(
       promptTokens / model::ExecutionLimits::prefillTokenBudget + 3);
   const auto began = Clock::now();
   engine.submit(std::move(request));
   driver.untilIdle([&](const BatchObservation &batch) {
+    statePeak = std::max(statePeak, executor.telemetry().stateAllocatedBytes);
     if (batch.kind == WorkKind::Prefill)
       prefillBatchRows.push_back(batch.inputTokens);
   });
@@ -466,6 +477,16 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
       after.draftStateRestoreSkipped - before.draftStateRestoreSkipped;
   result.junctionMaterializations = engineAfter.junctionMaterializations -
                                     engineBefore.junctionMaterializations;
+  result.junctionMaterializationFailures =
+      engineAfter.junctionMaterializationFailures - engineBefore.junctionMaterializationFailures;
+  result.inputTokenHash = inputTokenHash;
+  result.stateAllocatedBeforeBytes = before.stateAllocatedBytes;
+  result.stateAllocatedAfterBytes = after.stateAllocatedBytes;
+  result.stateAllocatedPeakObservedBytes = std::max(statePeak, after.stateAllocatedBytes);
+  result.cachedStateBytes = engineAfter.resources.stateCache.bytes;
+  result.stateEntries = engineAfter.resources.stateCache.entries;
+  result.stateEvictions =
+      engineAfter.resources.stateCache.evictions - engineBefore.resources.stateCache.evictions;
   result.outputTokens = observed.outputTokens;
   if (progress) {
     progress->complete(
@@ -688,23 +709,25 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
 void emitMeasurement(const Measurement &value, bool first) {
   if (!first)
     std::cout << ',';
-  std::cout << "{\"scenario\":\"" << value.scenario
-            << "\",\"sample\":" << value.sample
+  std::cout << "{\"scenario\":\"" << value.scenario << "\",\"sample\":" << value.sample
             << ",\"prompt_tokens\":" << value.promptTokens
-            << ",\"target_prefill_rows\":" << value.targetPrefillRows
-            << ",\"cache_status\":\"" << value.cacheStatus
-            << "\",\"matched_tokens\":" << value.matchedTokens
-            << ",\"wall_ms\":" << value.wallMilliseconds
-            << ",\"ttft_ms\":" << value.ttftMilliseconds
+            << ",\"target_prefill_rows\":" << value.targetPrefillRows << ",\"cache_status\":\""
+            << value.cacheStatus << "\",\"matched_tokens\":" << value.matchedTokens
+            << ",\"wall_ms\":" << value.wallMilliseconds << ",\"ttft_ms\":" << value.ttftMilliseconds
             << ",\"prefill_gpu_ms\":" << value.prefillGpuMilliseconds
             << ",\"decode_gpu_ms\":" << value.decodeGpuMilliseconds
             << ",\"draft_context_rows\":" << value.draftContextRows
-            << ",\"draft_context_rows_avoided\":"
-            << value.draftContextRowsAvoided
-            << ",\"draft_state_restore_skipped\":"
-            << value.draftStateRestoreSkipped
-            << ",\"junction_materializations\":"
-            << value.junctionMaterializations << ",\"output_tokens\":[";
+            << ",\"draft_context_rows_avoided\":" << value.draftContextRowsAvoided
+            << ",\"draft_state_restore_skipped\":" << value.draftStateRestoreSkipped
+            << ",\"junction_materializations\":" << value.junctionMaterializations
+            << ",\"junction_materialization_failures\":" << value.junctionMaterializationFailures
+            << ",\"input_token_hash\":" << value.inputTokenHash
+            << ",\"state_allocated_before_bytes\":" << value.stateAllocatedBeforeBytes
+            << ",\"state_allocated_after_bytes\":" << value.stateAllocatedAfterBytes
+            << ",\"state_allocated_peak_observed_bytes\":" << value.stateAllocatedPeakObservedBytes
+            << ",\"cached_state_bytes\":" << value.cachedStateBytes
+            << ",\"state_entries\":" << value.stateEntries << ",\"state_evictions\":" << value.stateEvictions
+            << ",\"output_tokens\":[";
   for (size_t index = 0; index < value.outputTokens.size(); ++index) {
     if (index)
       std::cout << ',';
@@ -714,6 +737,8 @@ void emitMeasurement(const Measurement &value, bool first) {
   if (value.coldOutputMatch)
     std::cout << ",\"cold_output_match\":"
               << (*value.coldOutputMatch ? "true" : "false");
+  if (value.junctionWorkloadWallMilliseconds)
+    std::cout << ",\"junction_workload_wall_ms\":" << *value.junctionWorkloadWallMilliseconds;
   std::cout << '}';
 }
 
@@ -795,10 +820,11 @@ struct BenchmarkScenarios final {
   bool exact = false;
   bool logits = false;
   bool resume = false;
+  bool junction = false;
 };
 
 BenchmarkScenarios parseScenarios(std::string_view value) {
-  BenchmarkScenarios selected{false, false, false, false, false, false, false, false};
+  BenchmarkScenarios selected{false, false, false, false, false, false, false, false, false};
   for (;;) {
     const size_t comma = value.find(',');
     const std::string_view name = value.substr(0, comma);
@@ -810,6 +836,7 @@ BenchmarkScenarios parseScenarios(std::string_view value) {
                      : name == "exact"       ? &selected.exact
                      : name == "logits"      ? &selected.logits
                      : name == "resume"      ? &selected.resume
+                     : name == "junction"    ? &selected.junction
                                              : nullptr;
     if (!scenario)
       throw std::invalid_argument("unknown benchmark scenario");
@@ -891,24 +918,27 @@ int main(int argc, char **argv) {
   std::unique_ptr<ProgressJournal> progress;
   try {
     if (argc < 3) {
-      std::cerr << "usage: backend-benchmark METALLIB MODEL_ROOT "
-                   "[--samples COUNT] [--progress PATH] "
-                   "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
-                   "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
-                   "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
-                   "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
-                   "(default: decode,partial,context)\n"
-                   "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
-                   "to run instead of calibrating one (0: GPU alone)\n"
-                   "  ROWS: the least rows of a chunk that share takes "
-                   "(default: 512)\n"
-                   "  TOKENS: the context the engine serves, as serve's "
-                   "--max-context, with YaRN past the model's native window "
-                   "(default: what memory holds)\n"
-                   "  DIR: the logits scenario's dump, and the earlier dump whose "
-                   "prefixes it scores (default: its own greedy transcripts')\n"
-                   "  LANES: the score requests the logits scenario runs at once "
-                   "(default: 1)\n";
+      std::cerr
+          << "usage: backend-benchmark METALLIB MODEL_ROOT "
+             "[--samples COUNT] [--progress PATH] "
+             "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
+             "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
+             "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
+             "  NAME: decode, partial, short, transcripts, context, exact, logits, resume or junction "
+             "(default: decode,partial,context)\n"
+             "                --junction-shared-gain 256|512|1024|1536 (default: 512)\n"
+             "                --junction-reuse-count 1..16 --junction-output-tokens 1..512 (defaults: 1,64)\n"
+             "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
+             "to run instead of calibrating one (0: GPU alone)\n"
+             "  ROWS: the least rows of a chunk that share takes "
+             "(default: 512)\n"
+             "  TOKENS: the context the engine serves, as serve's "
+             "--max-context, with YaRN past the model's native window "
+             "(default: what memory holds)\n"
+             "  DIR: the logits scenario's dump, and the earlier dump whose "
+             "prefixes it scores (default: its own greedy transcripts')\n"
+             "  LANES: the score requests the logits scenario runs at once "
+             "(default: 1)\n";
       return 2;
     }
     uint32_t samples = 1;
@@ -917,6 +947,9 @@ int main(int argc, char **argv) {
     std::optional<double> aneFfnShare;
     std::optional<uint32_t> aneFfnMinimumRows;
     uint32_t maxContext = 0;
+    uint32_t junctionSharedGain = 512;
+    uint32_t junctionReuseCount = 1;
+    uint32_t junctionOutputTokens = 64;
     std::optional<std::filesystem::path> logitsDirectory, logitsFrom;
     uint32_t logitsWidth = 1;
     bool logitsOptions = false;
@@ -936,6 +969,19 @@ int main(int argc, char **argv) {
         aneFfnMinimumRows = parseAneFfnMinimumRows(argv[index + 1]);
       } else if (option == "--max-context") {
         maxContext = parseMaxContext(argv[index + 1]);
+      } else if (option == "--junction-shared-gain" || option == "--junction-reuse-count" ||
+                 option == "--junction-output-tokens") {
+        uint32_t number = 0;
+        const std::string_view value(argv[index + 1]);
+        const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), number);
+        if (error != std::errc{} || end != value.data() + value.size() || !number)
+          throw std::invalid_argument("junction benchmark options take positive integers");
+        if (option == "--junction-shared-gain")
+          junctionSharedGain = number;
+        else if (option == "--junction-reuse-count")
+          junctionReuseCount = number;
+        else
+          junctionOutputTokens = number;
       } else if (option == "--logits") {
         logitsDirectory = std::filesystem::path(argv[index + 1]);
       } else if (option == "--logits-from") {
@@ -952,6 +998,12 @@ int main(int argc, char **argv) {
     }
     if (selected.logits != logitsDirectory.has_value())
       throw std::invalid_argument("the logits scenario and --logits go together");
+    const auto policyGain = [](uint32_t value) {
+      return value == 256 || value == 512 || value == 1024 || value == 1536 || value == 2048;
+    };
+    if (!policyGain(junctionSharedGain) || junctionSharedGain == 2048 || junctionReuseCount > 16 ||
+        junctionOutputTokens > 512)
+      throw std::invalid_argument("junction benchmark option is outside its supported range");
     if (logitsOptions && !logitsDirectory)
       throw std::invalid_argument("--logits-from and --logits-width need --logits");
     if (progressPath)
@@ -1488,6 +1540,82 @@ int main(int argc, char **argv) {
                 << logitsDirectory->string() << '\n';
     }
 
+    // A sparse junction below the original 2048-row gain threshold. Keep an
+    // ordinary replay state at 4096 and a longer 9216-token cached branch;
+    // unique sibling tails then distinguish junction reuse from exact hits.
+    // Only the policy changes: capture, restore and numerical kernels stay
+    // the production ones. The first sibling's extra work is charged before
+    // any benefit on subsequent siblings, whose complete outputs are saved.
+    if (selected.junction) {
+      constexpr uint32_t baseTokens = 4096, seedTokens = 9216, tailTokens = 64;
+      const uint32_t sharedTokens = baseTokens + junctionSharedGain;
+      if (seedTokens + 1 > engineConfig.maxContext ||
+          sharedTokens + tailTokens + junctionOutputTokens > engineConfig.maxContext)
+        throw std::runtime_error("junction scenario exceeds the served context");
+      for (uint32_t sample = 0; sample < samples; ++sample) {
+        evictAllCache(resources->cache());
+        const std::vector<uint32_t> seed = prompt(seedTokens, 0x4a554e4354494f4eULL ^ sample);
+        std::vector<uint32_t> base(seed.begin(), seed.begin() + baseTokens + 1);
+        Measurement baseResult = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                                            "junction_base", sample, std::move(base));
+        Measurement seedResult = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                                            "junction_seed", sample, seed);
+        if (baseResult.cacheStatus != "miss" || seedResult.cacheStatus != "prefix_hit" ||
+            seedResult.matchedTokens != baseTokens)
+          throw std::runtime_error("junction base/seed oracle failed: " +
+                                   lookups({baseResult, seedResult}, baseTokens));
+        std::vector<std::vector<uint32_t>> siblings;
+        std::vector<Measurement> warm;
+        siblings.reserve(junctionReuseCount + 1);
+        warm.reserve(junctionReuseCount + 1);
+        double workloadWall = 0;
+        bool materializes = false;
+        for (uint32_t sibling = 0; sibling <= junctionReuseCount; ++sibling) {
+          std::vector<uint32_t> tokens(seed.begin(), seed.begin() + sharedTokens);
+          std::vector<uint32_t> tail =
+              prompt(tailTokens, 0x5349424c494e47ULL ^ (uint64_t{sample} << 32) ^ sibling);
+          // The first token is guaranteed distinct from the long seed and
+          // every sibling, so the shared Page32 prefix ends exactly here.
+          tail.front() = (seed[sharedTokens] + sibling + 1) % capabilities.vocabularySize;
+          std::copy(decodeThroughputPrompt.begin(), decodeThroughputPrompt.end(),
+                    tail.end() - decodeThroughputPrompt.size());
+          tokens.insert(tokens.end(), tail.begin(), tail.end());
+          siblings.push_back(tokens);
+          const std::string scenario =
+              sibling ? "junction_reuse_" + std::to_string(sibling - 1) : "junction_materialize";
+          Measurement result = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                                          scenario, sample, std::move(tokens), junctionOutputTokens);
+          if (!sibling)
+            materializes = result.junctionMaterializations == 1;
+          const uint32_t expectedBoundary = sibling && materializes ? sharedTokens : baseTokens;
+          if (result.cacheStatus != "prefix_hit" || result.matchedTokens != expectedBoundary ||
+              result.junctionMaterializations != (!sibling && materializes ? 1U : 0U) ||
+              result.junctionMaterializationFailures || result.stateEvictions)
+            throw std::runtime_error("junction policy oracle failed: " + lookups({result}, expectedBoundary) +
+                                     " materializations=" + std::to_string(result.junctionMaterializations) +
+                                     " evictions=" + std::to_string(result.stateEvictions));
+          workloadWall += result.wallMilliseconds;
+          result.junctionWorkloadWallMilliseconds = workloadWall;
+          warm.push_back(std::move(result));
+        }
+        measurements.push_back(std::move(baseResult));
+        measurements.push_back(std::move(seedResult));
+        // Cold references run after every warm sibling, so they cannot
+        // accidentally destroy the junction being measured or warm a tail.
+        for (uint32_t sibling = 0; sibling < siblings.size(); ++sibling) {
+          evictAllCache(resources->cache());
+          Measurement cold = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                                        warm[sibling].scenario + "_cold", sample,
+                                        std::move(siblings[sibling]), junctionOutputTokens);
+          if (cold.cacheStatus != "miss")
+            throw std::runtime_error("junction cold reference was not cold");
+          warm[sibling].coldOutputMatch = warm[sibling].outputTokens == cold.outputTokens;
+          measurements.push_back(std::move(warm[sibling]));
+          measurements.push_back(std::move(cold));
+        }
+      }
+    }
+
     // A request lazily materializes a KV junction where its match ends past
     // its state at a branch point: another branch goes on below and holds a
     // state there, and the junction lies a draft window or more past the
@@ -1632,10 +1760,13 @@ int main(int argc, char **argv) {
     // and its elastic state/KV budget and the split's.
     const engine::EngineMemoryBreakdown &plan = resources->memoryPlan().breakdown();
     std::cout << "]},\"max_context_tokens\":" << engineConfig.maxContext
+              << ",\"junction_shared_gain_tokens\":" << junctionSharedGain
+              << ",\"junction_reuse_count\":" << junctionReuseCount
+              << ",\"junction_output_tokens\":" << junctionOutputTokens
+              << ",\"junction_seed_tokens\":9216,\"junction_base_tokens\":4096,\"junction_tail_tokens\":64"
               << ",\"no_ane_context_tokens\":" << resources->aneFfnOutcome().contextWithout
               << ",\"dynamic_budget_bytes\":" << plan.dynamicBudgetBytes
-              << ",\"ane_ffn_bytes\":" << plan.aneFfnBytes
-              << ",\"skipped_context_lengths\":[";
+              << ",\"ane_ffn_bytes\":" << plan.aneFfnBytes << ",\"skipped_context_lengths\":[";
     for (size_t index = 0; index < skippedLengths.size(); ++index)
       std::cout << (index ? "," : "") << skippedLengths[index];
     std::cout << "],\"measurements\":[";

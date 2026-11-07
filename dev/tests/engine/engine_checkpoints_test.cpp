@@ -28,6 +28,7 @@ using splash::test::guardReleases;
 using splash::test::idle;
 using splash::test::OffloadControl;
 using splash::test::request;
+using splash::test::runUntilIdle;
 using splash::test::State;
 
 namespace {
@@ -1191,27 +1192,232 @@ void testCheckpointsSkipNearResumeAndReplayBoundaries() {
           "a request checkpointed within a chunk of the state it resumed from");
 }
 
+void testSmallJunctionGainThreshold() {
+  constexpr uint32_t minimum = 512;
+  for (uint32_t gain : {256U, 480U, 512U, 544U, 1024U, 1536U}) {
+    test::TestKvStorage storage(512, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, nullptr, nullptr);
+    Executor executor(1);
+    Events events;
+    auto config = test::engineConfig();
+    engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
+    std::vector<uint32_t> seed(9216);
+    std::iota(seed.begin(), seed.end(), 1);
+    std::vector<uint32_t> base(seed.begin(), seed.begin() + 4097);
+    engine.submit(request(1, base));
+    runUntilIdle(engine);
+    engine.submit(request(2, seed));
+    runUntilIdle(engine);
+    require(events.starts.back() == 4096 && resources.lookup(base, {}).resumeBoundary() == 4096,
+            "the long seed retired the ordinary base replay state");
+    const uint32_t shared = 4096 + gain;
+    const auto sibling = [&](uint32_t token) {
+      std::vector<uint32_t> value(seed.begin(), seed.begin() + shared);
+      value.resize(shared + 64, token);
+      return value;
+    };
+    engine.submit(request(3, sibling(20'000)));
+    runUntilIdle(engine);
+    const bool materializes = gain >= minimum;
+    require(events.starts.back() == 4096 &&
+                engine.snapshot().junctionMaterializations == (materializes ? 1U : 0U),
+            "the junction policy changed its source state or planned the wrong branch boundary");
+    engine.submit(request(4, sibling(30'000)));
+    runUntilIdle(engine);
+    const auto snapshot = engine.snapshot();
+    require(events.starts.back() == (materializes ? shared : 4096) &&
+                snapshot.junctionMaterializations == (materializes ? 1U : 0U) &&
+                snapshot.junctionMaterializationFailures == 0 &&
+                snapshot.resources.stateCache.evictions == 0 && events.completedCount == 4 &&
+                events.failedCount == 0 && events.outputs[3] == std::vector<uint32_t>{42} &&
+                events.outputs[4] == std::vector<uint32_t>{42} &&
+                resources.lookup(base, {}).resumeBoundary() == 4096,
+            "the policy failed distinct-sibling reuse, altered output, or retired the ordinary base");
+  }
+}
+
+void testRefusedSmallJunctionKeepsServing() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor(1);
+  Events events;
+  auto config = test::engineConfig();
+  engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> seed(9216);
+  std::iota(seed.begin(), seed.end(), 1);
+  std::vector<uint32_t> base(seed.begin(), seed.begin() + 4097);
+  engine.submit(request(1, base));
+  runUntilIdle(engine);
+  engine.submit(request(2, seed));
+  runUntilIdle(engine);
+  auto pinnedBase = resources.lookup(base, {});
+  require(pinnedBase.resumeBoundary() == 4096, "the pressure fixture did not pin its ordinary fallback");
+  constexpr uint32_t shared = 4608;
+  const auto sibling = [&](uint32_t token) {
+    std::vector<uint32_t> value(seed.begin(), seed.begin() + shared);
+    value.resize(shared + 64, token);
+    return value;
+  };
+  executor.denyReservationAt = shared;
+  engine.submit(request(3, sibling(20'000)));
+  runUntilIdle(engine);
+  require(events.starts.back() == 4096 && engine.snapshot().junctionMaterializationFailures == 1 &&
+              engine.snapshot().junctionMaterializations == 0 && events.completedCount == 3 &&
+              events.failedCount == 0 && events.outputs[3] == std::vector<uint32_t>{42} &&
+              resources.lookup(base, {}).resumeBoundary() == 4096,
+          "refusal of an optional small junction blocked inference or evicted its pinned fallback");
+  executor.denyReservationAt.reset();
+  engine.submit(request(4, sibling(30'000)));
+  runUntilIdle(engine);
+  require(events.starts.back() == 4096 && engine.snapshot().junctionMaterializations == 1 &&
+              events.completedCount == 4 && events.failedCount == 0,
+          "a later sibling did not recover after a refused optional junction");
+}
+
+void testSmallJunctionRequiresUnchangedDraftWork() {
+  for (uint32_t tail : {64U, 1536U, 1568U, 2048U}) {
+    test::TestKvStorage storage(512, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, nullptr, nullptr);
+    Executor executor(1);
+    Events events;
+    auto config = test::engineConfig();
+    engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
+    std::vector<uint32_t> seed(9216);
+    std::iota(seed.begin(), seed.end(), 1);
+    engine.submit(request(1, std::vector<uint32_t>(seed.begin(), seed.begin() + 4097)));
+    runUntilIdle(engine);
+    engine.submit(request(2, seed));
+    runUntilIdle(engine);
+    constexpr uint32_t shared = 4608;
+    const auto sibling = [&](uint32_t token) {
+      std::vector<uint32_t> value(seed.begin(), seed.begin() + shared);
+      value.resize(shared + tail, token);
+      return value;
+    };
+    engine.submit(request(3, sibling(20'000)));
+    runUntilIdle(engine);
+    const bool restores = tail <= 1536;
+    const bool materializes = restores;
+    const DraftContextPlan &plan = executor.plans.at(3);
+    const uint32_t expectedBegin = tail == 2048 ? 4576 : 4096;
+    require(events.starts.back() == 4096 && plan.restoresDraftState == restores &&
+                plan.captureSpans.size() == 1 && plan.captureSpans[0].begin == expectedBegin &&
+                plan.captureSpans[0].end == shared + tail &&
+                plan.captureSpans[0].resetDraftState == !restores &&
+                engine.snapshot().junctionMaterializations == (materializes ? 1U : 0U),
+            "a small junction changed the baseline draft restore, capture rows or reset schedule");
+    engine.submit(request(4, sibling(30'000)));
+    runUntilIdle(engine);
+    require(events.starts.back() == (materializes ? shared : 4096) &&
+                engine.snapshot().junctionMaterializations == (materializes ? 1U : 0U) &&
+                events.outputs[3] == std::vector<uint32_t>{42} &&
+                events.outputs[4] == std::vector<uint32_t>{42} && events.failedCount == 0,
+            "the fixed guarded rule restored the wrong sibling state");
+  }
+}
+
+void testSmallJunctionDoesNotExtendSharedDraftSpan() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor(1);
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> seed(9216);
+  std::iota(seed.begin(), seed.end(), 1);
+  engine.submit(request(1, std::vector<uint32_t>(seed.begin(), seed.begin() + 4097)));
+  runUntilIdle(engine);
+  engine.submit(request(2, seed));
+  runUntilIdle(engine);
+  std::vector<uint32_t> branch(seed.begin(), seed.begin() + 5632);
+  branch.resize(8192, 20'000);
+  auto producer = request(3, branch);
+  producer.priority = RequestPriority::Foreground;
+  engine.submit(std::move(producer));
+  std::vector<uint32_t> peer(seed.begin(), seed.begin() + 4352);
+  peer.resize(4416, 30'000);
+  engine.submit(request(4, peer));
+  runUntilIdle(engine);
+  const DraftContextPlan &plan = executor.plans.at(3);
+  require(plan.restoresDraftState && plan.captureSpans.size() == 2 && plan.captureSpans[0].begin == 4096 &&
+              plan.captureSpans[0].end == 4352 && !plan.captureSpans[0].resetDraftState &&
+              plan.captureSpans[1].begin == 6112 && plan.captureSpans[1].end == 8192 &&
+              plan.captureSpans[1].resetDraftState &&
+              std::none_of(plan.boundaries.begin(), plan.boundaries.end(),
+                           [](const DraftBoundaryPlan &point) { return point.boundary == 5632; }),
+          "a small lazy junction extended draft work despite an already required restore");
+  std::vector<uint32_t> probe(seed.begin(), seed.begin() + 5632);
+  probe.resize(5696, 40'000);
+  require(resources.lookup(probe, {}).resumeBoundary() == 4352 && events.completedCount == 4 &&
+              events.failedCount == 0,
+          "a rejected lazy junction was published or lost the existing shared recovery point");
+}
+
+void testLargeJunctionKeepsExistingPolicy() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor(1);
+  Events events;
+  auto config = test::engineConfig();
+  engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> seed(9216);
+  std::iota(seed.begin(), seed.end(), 1);
+  engine.submit(request(1, std::vector<uint32_t>(seed.begin(), seed.begin() + 4097)));
+  runUntilIdle(engine);
+  engine.submit(request(2, seed));
+  runUntilIdle(engine);
+  std::vector<uint32_t> branch(seed.begin(), seed.begin() + 6144);
+  branch.resize(8192, 20'000);
+  engine.submit(request(3, branch));
+  runUntilIdle(engine);
+  const DraftContextPlan &plan = executor.plans.at(3);
+  require(events.starts.back() == 4096 && engine.snapshot().junctionMaterializations == 1 &&
+              !plan.restoresDraftState && draftContextRows(plan) == 4096 &&
+              std::any_of(plan.boundaries.begin(), plan.boundaries.end(),
+                          [](const DraftBoundaryPlan &point) { return point.boundary == 6144; }),
+          "the new small-gain guard removed the existing full-window junction");
+}
 } // namespace
 
 std::span<const test::TestCase> checkpointsTests() {
   static constexpr test::TestCase kTests[] = {
-      {"testConcurrentProgressRetainsAtMostOnePointPerLane", testConcurrentProgressRetainsAtMostOnePointPerLane},
-      {"testSharedCheckpointSurvivesPeerRollingReplacement", testSharedCheckpointSurvivesPeerRollingReplacement},
+      {"testSmallJunctionGainThreshold", testSmallJunctionGainThreshold},
+      {"testRefusedSmallJunctionKeepsServing", testRefusedSmallJunctionKeepsServing},
+      {"testSmallJunctionRequiresUnchangedDraftWork", testSmallJunctionRequiresUnchangedDraftWork},
+      {"testSmallJunctionDoesNotExtendSharedDraftSpan", testSmallJunctionDoesNotExtendSharedDraftSpan},
+      {"testLargeJunctionKeepsExistingPolicy", testLargeJunctionKeepsExistingPolicy},
+      {"testConcurrentProgressRetainsAtMostOnePointPerLane",
+       testConcurrentProgressRetainsAtMostOnePointPerLane},
+      {"testSharedCheckpointSurvivesPeerRollingReplacement",
+       testSharedCheckpointSurvivesPeerRollingReplacement},
       {"testRepeatedRetriesRollTheRestoredCheckpoint", testRepeatedRetriesRollTheRestoredCheckpoint},
-      {"testRetryCancelledBeforeNextCheckpointKeepsItsSource", testRetryCancelledBeforeNextCheckpointKeepsItsSource},
+      {"testRetryCancelledBeforeNextCheckpointKeepsItsSource",
+       testRetryCancelledBeforeNextCheckpointKeepsItsSource},
       {"testRestoredCheckpointAtReplayEndBecomesOrdinary", testRestoredCheckpointAtReplayEndBecomesOrdinary},
       {"testRetryRetiresCheckpointAtDeeperJunction", testRetryRetiresCheckpointAtDeeperJunction},
       {"testPinnedCheckpointSkipsReplacementButNotOrdinaryState",
        testPinnedCheckpointSkipsReplacementButNotOrdinaryState},
       {"testPinnedPredecessorTakesNoRoomFromOtherStates", testPinnedPredecessorTakesNoRoomFromOtherStates},
       {"testPinnedPredecessorReleasedDuringTheCommand", testPinnedPredecessorReleasedDuringTheCommand},
-      {"testFailedReplacementContinuesWithoutRecoveryPoint", testFailedReplacementContinuesWithoutRecoveryPoint},
+      {"testFailedReplacementContinuesWithoutRecoveryPoint",
+       testFailedReplacementContinuesWithoutRecoveryPoint},
       {"testRollingHandleCannotRetirePromotedState", testRollingHandleCannotRetirePromotedState},
       {"testCheckpointRetiresOnceItsSuccessorIsPublished", testCheckpointRetiresOnceItsSuccessorIsPublished},
       {"testInterruptedCommandKeepsTheLanesCheckpoint", testInterruptedCommandKeepsTheLanesCheckpoint},
-      {"testRefusedStateTakesTheCheckpointAfterItsCommand", testRefusedStateTakesTheCheckpointAfterItsCommand},
+      {"testRefusedStateTakesTheCheckpointAfterItsCommand",
+       testRefusedStateTakesTheCheckpointAfterItsCommand},
       {"testJunctionRetiresEarlierProgressPoint", testJunctionRetiresEarlierProgressPoint},
-      {"testSecondConversationResumesFromTheLastCheckpoint", testSecondConversationResumesFromTheLastCheckpoint},
+      {"testSecondConversationResumesFromTheLastCheckpoint",
+       testSecondConversationResumesFromTheLastCheckpoint},
       {"testShortSharedPrefixFindsAndKeepsNoCheckpoint", testShortSharedPrefixFindsAndKeepsNoCheckpoint},
       {"testKeptCheckpointGoesFirstUnderPressure", testKeptCheckpointGoesFirstUnderPressure},
       {"testSharedCheckpointSurvivesPeerReplayPoint", testSharedCheckpointSurvivesPeerReplayPoint},
@@ -1220,7 +1426,8 @@ std::span<const test::TestCase> checkpointsTests() {
       {"testReplayPointWithoutRoomTakesTheCheckpointItsCommandCaptures",
        testReplayPointWithoutRoomTakesTheCheckpointItsCommandCaptures},
       {"testShortSuffixContinuesCheckpointDraftState", testShortSuffixContinuesCheckpointDraftState},
-      {"testDefaultCheckpointRestoresLatestCommittedPrefix", testDefaultCheckpointRestoresLatestCommittedPrefix},
+      {"testDefaultCheckpointRestoresLatestCommittedPrefix",
+       testDefaultCheckpointRestoresLatestCommittedPrefix},
       {"testCheckpointsSkipNearResumeAndReplayBoundaries", testCheckpointsSkipNearResumeAndReplayBoundaries},
   };
   return kTests;

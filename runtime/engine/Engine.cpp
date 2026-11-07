@@ -21,9 +21,9 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 // A mask request the server leaves unanswered for supervision::kMaskWait
 // fails its request; the batch's command slot is not held longer.
 constexpr double kMaskWaitMilliseconds = double(supervision::kMaskWait.count());
-// A junction costs a cached state, its capture and up to a draft window of
-// draft-context rows; a later request must save at least that much prefill.
-constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftContextTokens;
+// A small junction must save at least 512 target rows without adding draft
+// work; a full draft window keeps the established junction rule.
+constexpr uint32_t kMinimumJunctionGain = 512;
 
 constexpr std::string_view kKvUnreadableMessage =
     "KV of an earlier part of the conversation could not be read from the SSD cache";
@@ -1210,7 +1210,8 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
            stateBoundary, latestReplayBoundary, config_.prefillCheckpointTokens)) {
     addStateBoundary(active, stateBoundary, checkpoint, true, true);
   }
-  if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
+  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
+  if (uint64_t{junctionBoundary} >= uint64_t{stateBoundary} + window)
     addStateBoundary(active, stateBoundary, junctionBoundary, false, true);
   addStateBoundary(active, stateBoundary, latestReplayBoundary,
                    latestReplayBoundary != promptReplayBoundary(active), true);
@@ -1219,7 +1220,31 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   addStateBoundary(active, stateBoundary, promptReplayBoundary(active), false, true);
 
   static_cast<void>(addSharedPrefillBoundaries(active, stateBoundary, true));
-  return pendingDraftStatePlan(active, stateBoundary);
+  DraftContextPlan baseline = pendingDraftStatePlan(active, stateBoundary);
+  if (!baseline.restoresDraftState || junctionBoundary > latestReplayBoundary ||
+      uint64_t{junctionBoundary} < uint64_t{stateBoundary} + kMinimumJunctionGain ||
+      uint64_t{junctionBoundary} >= uint64_t{stateBoundary} + window)
+    return baseline;
+  // Compare a local proposal first: inserting an existing boundary can
+  // otherwise promote a disposable checkpoint even when the proposal loses.
+  std::vector<uint32_t> boundaries;
+  boundaries.reserve(active.stateBoundaries.size() + 1);
+  for (const auto &point : active.stateBoundaries)
+    boundaries.push_back(point.tokens);
+  const auto at = std::lower_bound(boundaries.begin(), boundaries.end(), junctionBoundary);
+  if (at == boundaries.end() || *at != junctionBoundary)
+    boundaries.insert(at, junctionBoundary);
+  DraftContextPlan proposed = planDraftContext(stateBoundary, active.replayTokens, boundaries);
+  const bool sameWork =
+      proposed.restoresDraftState == baseline.restoresDraftState &&
+      std::equal(baseline.captureSpans.begin(), baseline.captureSpans.end(), proposed.captureSpans.begin(),
+                 proposed.captureSpans.end(), [](const DraftCaptureSpan &a, const DraftCaptureSpan &b) {
+                   return a.begin == b.begin && a.end == b.end && a.resetDraftState == b.resetDraftState;
+                 });
+  if (!sameWork)
+    return baseline;
+  addStateBoundary(active, stateBoundary, junctionBoundary, false, true);
+  return proposed;
 }
 
 bool Engine::addStateBoundary(Request &active, uint32_t after, uint32_t tokens,
