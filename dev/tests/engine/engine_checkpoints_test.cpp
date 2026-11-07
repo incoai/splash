@@ -1303,7 +1303,7 @@ void testSmallJunctionRequiresUnchangedDraftWork() {
     engine.submit(request(3, sibling(20'000)));
     runUntilIdle(engine);
     const bool restores = tail <= 1536;
-    const bool materializes = restores && !control;
+    const bool materializes = restores;
     const DraftContextPlan &plan = executor.plans.at(3);
     const uint32_t expectedBegin = tail == 2048 ? 4576 : 4096;
     require(events.starts.back() == 4096 && plan.restoresDraftState == restores &&
