@@ -767,7 +767,7 @@ void testCommitIndexOverwrite(id<MTLDevice> device,
 
 void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
                             id<MTLComputePipelineState> store) {
-  constexpr uint32_t lanes = 4;
+  constexpr uint32_t lanes = SPLASH_MAXIMUM_BATCH_WIDTH;
   constexpr uint32_t committed = 31;
   constexpr uint32_t rows = 8;
   constexpr uint32_t stride = 32;
@@ -817,7 +817,7 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBuffer:chunkValues offset:0 atIndex:1];
   for (uint32_t lane = 0; lane < lanes; ++lane)
     [encoder setBuffer:tableBuffers[lane] offset:0 atIndex:2 + lane];
-  [encoder setBytes:params.data() length:sizeof(params) atIndex:6];
+  [encoder setBytes:params.data() length:sizeof(params) atIndex:2 + lanes];
   pool.use(encoder, MTLResourceUsageWrite);
   [encoder dispatchThreadgroups:MTLSizeMake(
                                      lanes * 2 * rows * kKvHeads, 1, 1)
