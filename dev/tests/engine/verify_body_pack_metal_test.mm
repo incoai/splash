@@ -1,6 +1,4 @@
 #include "VerifyBodyPackCases.hpp"
-#include "VerifyPackTestFixtures.hpp"
-#include "ops/VerifyBodyPack.hpp"
 int main(int argc, char **argv) {
   @autoreleasepool {
     try {

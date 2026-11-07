@@ -1,4 +1,6 @@
 #pragma once
+#include "VerifyPackTestFixtures.hpp"
+#include "ops/VerifyBodyPack.hpp"
 struct Segment final {
   uint32_t offset, N, kind;
   Weight quant;
