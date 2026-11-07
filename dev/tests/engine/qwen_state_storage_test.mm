@@ -727,6 +727,7 @@ void testRebuiltDraftRingCache(metal::MetalBackend &backend) {
   };
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes,
                           1, 1, queryHostMemory, 0);
+  const test::ClaimScope cacheAllocations(governor, ClaimClass::Floor);
   bool allowed = false;
   uint32_t admissions = 0;
   auto admit = [real = governor.allocationAdmission(), &allowed, &admissions](
