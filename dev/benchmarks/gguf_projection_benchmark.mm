@@ -273,6 +273,12 @@ int main(int argc, char **argv) {
         const LinearConfig config{.tile = LinearTile::GgufPrefill};
         cases.push_back({"R" + std::to_string(rows), "prefill128", Linear::plan(w, config, FloatOutput::BFloat16),
                          config == policy, {}});
+        if (images.size() == 1 && images.front().format == Fmt(GGUF_FMT_AF4G64)) {
+          LinearConfig small = config;
+          small.prefillSimdgroupRows = 16;
+          cases.push_back({"R" + std::to_string(rows), "prefill128 SG16", Linear::plan(w, small, FloatOutput::BFloat16),
+                           false, {}});
+        }
         // Chunks of up to kMaximumStagedPrefillRows rows also on the staged 64-row tile, at every split.
         for (uint32_t splits = 1; rows <= kMaximumStagedPrefillRows && splits <= LinearConfig::kMaximumSplits;
              splits *= 2) {

@@ -121,6 +121,8 @@ struct LinearConfig final {
   // (LinearPlan::storageRows), whose padding lane's rows it computes and
   // discards, instead of the 8-row tile.
   bool sixteenRows = false;
+  // Component experiment only; the production planner retains32.
+  uint32_t prefillSimdgroupRows = 32;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }
