@@ -1256,7 +1256,7 @@ void requireFullWindowRestore(model::Runtime &executor,
     const uint64_t cacheBytes = executor.telemetry().draftRingCacheBytes;
     require(cacheBytes && cacheBytes <= model::RebuiltDraftRingCache::maximumBytes,
             "ring cache did not admit exactly one bounded allocation");
-    while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {}
+    releaseIdle(executor);
     require(executor.telemetry().draftRingCacheBytes == cacheBytes,
             "reclaim released a ring held by an admitted restore");
     executor.suspend(request.id);
@@ -1294,7 +1294,7 @@ void requireFullWindowRestore(model::Runtime &executor,
               "cancelled fill/repeated hit/distinct-state sequence reused a stale ring");
       executor.end(request.id);
     }
-    while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {}
+    releaseIdle(executor);
     require(!executor.telemetry().draftRingCacheBytes, "idle ring cache did not reclaim");
     executor.experimentalDraftRingReuse(false);
     std::cout << "rebuilt_ring_reuse=PASS preemption abandoned_ticket fill hit distinct full_state_bytes\n";
