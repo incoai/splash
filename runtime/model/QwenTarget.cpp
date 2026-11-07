@@ -463,6 +463,24 @@ public:
                 metal::MetalBackend &backend, const ops::ExecutionPlans &operators)
       : QwenTarget(weights, geometry, backend, operators), weights_(weights) {
     requireLayers(std::span<const Layer>(weights.layers));
+    const auto &linear = operators_.linear();
+    for (uint32_t lanes = 5; lanes <= ExecutionLimits::maximumBatchWidth; ++lanes) {
+      bool supported = !weights.layers.empty();
+      for (const Layer &layer : weights.layers) {
+        const auto dense = denseFfn(layer);
+        if (!dense || !ops::supportsVerifyFfnPack(
+                          *dense, linear.decodePlan(*dense->up, lanes, ops::LinearEpilogue::GateUp),
+                          linear.decodePlan(*dense->down, lanes, ops::LinearEpilogue::Residual), lanes)) {
+          supported = false;
+          break;
+        }
+      }
+      packedFfnSupported_[lanes - 1] = supported;
+    }
+  }
+
+  bool supportsPackedFfn(uint32_t lanes) const noexcept override {
+    return lanes && lanes <= packedFfnSupported_.size() && packedFfnSupported_[lanes - 1];
   }
 
   std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph, std::span<const QwenTargetPrefillChunk> chunks,
@@ -557,6 +575,7 @@ private:
       addVerifyMoe(step, layer.postAttentionNorm, *qwenMoeBlock(layer), std::move(residual), std::move(output));
   }
 
+  std::array<bool, ExecutionLimits::maximumBatchWidth> packedFfnSupported_{};
   const QwenTargetWeights<Layout, Layer> &weights_;
 };
 
