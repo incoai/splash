@@ -23,8 +23,8 @@ constexpr size_t kFusedSegments = std::extent_v<decltype(GgufDecodeFusedParams::
 std::string decodeKernel(const char *format, uint32_t rows, char epilogue) {
   return std::string("gguf_decode_") + format + "_m" + std::to_string(rows) + "_" + epilogue;
 }
-std::string prefillKernel(const char *format, char epilogue) {
-  return std::string("gguf_prefill_") + format + "_" + epilogue;
+std::string prefillKernel(const char *format, char epilogue, uint32_t groupRows = 32) {
+  return std::string("gguf_prefill_") + format + (groupRows == 16 ? "_sg16_" : "_") + epilogue;
 }
 
 // The projection is the plan's matrix, and each of its segments (which tile
@@ -110,6 +110,8 @@ void LinearPlan::requireConfiguration() const {
   const uint32_t k = workload_.matrix.inputSize;
   const LinearConfig &c = config_;
   const bool decode = workload_.phase == LinearPhase::Decode;
+  if (c.prefillSimdgroupRows != 32 && (c.tile != LinearTile::GgufPrefill || c.prefillSimdgroupRows != 16))
+    throw std::invalid_argument("SG16 requires the prefill tile");
   if (c.spread && c.tile != LinearTile::GgufStaged)
     throw std::invalid_argument("only the staged block tile spreads its walks");
   if (c.oneGateUpPass && (c.tile != LinearTile::GgufStaged || !decode || workload_.epilogue != LinearEpilogue::GateUp))
@@ -310,6 +312,12 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
 void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
                             const Projection &p, const LinearPlan &plan) const {
   const LinearWorkload w = plan.workload();
+  const uint32_t simdgroupRows = plan.configuration().prefillSimdgroupRows;
+  const uint32_t threads = GGUF_PREFILL_ROWS / simdgroupRows * 32;
+  if (simdgroupRows == 16 && (p.planeInputs() || p.rotation || !std::all_of(p.blocks().segments.begin(), p.blocks().segments.end(),
+      [](const auto &segment) { return segment.formatId == GGUF_FMT_AF4G64; })))
+    throw std::invalid_argument(
+        "16-row-group prefill requires unrotated AF4G64 with whole input rows");
   const auto [n, k] = w.matrix;
   const char epilogue = epilogueSuffix(w.epilogue);
   const uint32_t rowTiles = plan.storageRows() / GGUF_PREFILL_ROWS;
@@ -337,8 +345,8 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
         bindings.insert(bindings.end(), {s.plane0, s.plane1Slot(), s.meta});
       }
       bindings.push_back(b.output);
-      graph.add(prefillKernel(group.front()->name(), epilogue), std::move(bindings), params,
-                {rowTiles, columns / GGUF_TILE_COLUMNS, 1}, {GGUF_PREFILL_THREADS, 1, 1});
+      graph.add(prefillKernel(group.front()->name(), epilogue, simdgroupRows), std::move(bindings), params,
+                {rowTiles, columns / GGUF_TILE_COLUMNS, 1}, {threads, 1, 1});
     }
     return;
   }
@@ -348,10 +356,10 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
     const GgufPrefillParams params{k, w.rows, n, s.columnOffset};
     const metal::DispatchSize groups{rowTiles, s.outputSize / GGUF_TILE_COLUMNS, 1};
     if (p.planeInputs())
-      graph.add(leadingInputsInstance(prefillKernel(s.name(), epilogue)), std::move(bindings),
-                GgufPrefillLeadingParams{params, p.planeInputs()}, groups, {GGUF_PREFILL_THREADS, 1, 1});
+      graph.add(leadingInputsInstance(prefillKernel(s.name(), epilogue, simdgroupRows)), std::move(bindings),
+                GgufPrefillLeadingParams{params, p.planeInputs()}, groups, {threads, 1, 1});
     else
-      graph.add(prefillKernel(s.name(), epilogue), std::move(bindings), params, groups, {GGUF_PREFILL_THREADS, 1, 1});
+      graph.add(prefillKernel(s.name(), epilogue, simdgroupRows), std::move(bindings), params, groups, {threads, 1, 1});
   }
 }
 

@@ -83,6 +83,10 @@ struct ProjectionCalibration final {
   // Prefill chunks of up to this many rows run the staged tile
   // (<= kMaximumStagedPrefillRows); longer ones the prefill tile.
   uint32_t stagedPrefillRows;
+  // A single prefill tile above the staged boundary may use 16-row groups
+  // where every tensor has that instance, on this exact core count (0 never).
+  // Larger chunks keep 32-row groups.
+  uint32_t prefill16AtCores = 0;
 };
 
 struct FloatTileCalibration final {
@@ -226,6 +230,9 @@ inline constexpr ProjectionCalibration kApple10Projection{
     .onePassFromCores = kApple10OnePassFromCores,
     .sixteenRowBelowBits16 = kApple10SixteenRowBelowBits16,
     .stagedPrefillRows = kApple10StagedPrefillRows,
+    // Measured single-tile AF4G64 prefill on the 20-core M5 Pro. The
+    // selector keeps staged chunks and requires tensor kernel support.
+    .prefill16AtCores = 20,
 };
 
 // ---- Float projections ----------------------------------------------------

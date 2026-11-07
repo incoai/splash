@@ -195,6 +195,8 @@ std::string describe(const LinearPlan &plan) {
        << c.oneGateUpPass << " sixteen " << c.sixteenRows << " storage " << plan.storageRows() << " input "
        << unsigned(plan.input()) << " scratch " << s.input << "/" << s.sums << "/" << s.partials << "/"
        << s.counters << "/" << s.rotated << " gate " << plan.gateScratchBytes();
+  if (c.prefillSimdgroupRows != 32)
+    line << " prefill-group " << c.prefillSimdgroupRows;
   return line.str();
 }
 

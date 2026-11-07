@@ -27,6 +27,9 @@ struct UnitFormats final {
   // A gate/up pair of single tensors of one format, which the one-pass
   // kernels take.
   bool oneFormat = false;
+  // Every segment has a 16-row-group prefill instance, with whole inputs.
+  // Currently unrotated AF4G64; unknown arena-bound formats keep false.
+  bool prefill16Takes = false;
   bool operator==(const UnitFormats &) const = default;
 };
 // The formats of the projections of a plan (a gate/up plan's up and gate).

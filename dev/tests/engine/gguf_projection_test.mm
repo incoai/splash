@@ -696,7 +696,15 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
     const std::vector<Dot> dots = products(parts, columns, x, kChunks[0]);
     const std::string label = what + " " + epilogueName(epilogue);
     std::vector<uint16_t> tileOutput;  // the first chunk's output on the 128-row tiles
-    for (const uint32_t chunk : kChunks) {
+    std::vector<uint32_t> chunksToCheck(std::begin(kChunks), std::end(kChunks));
+    const bool affine =
+        std::all_of(parts.begin(), parts.end(), [](const Tensor *t) {
+          return t->format == GGUF_FMT_AF4G64;
+        });
+    if (affine)
+      for (const uint32_t rows : {65U, 80U, 96U, 127U, 128U})
+        chunksToCheck.push_back(rows);
+    for (const uint32_t chunk : chunksToCheck) {
       const LinearWorkload w = workload(chunk);
       const std::string name = label + " " + std::to_string(chunk) + " rows";
       const Outcome whole = run(backend, linear, Linear::plan(w, kTiles, FloatOutput::BFloat16), p, nullptr,
@@ -707,6 +715,19 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
                        [](uint16_t v) { return v == kUnwritten; }))
         fail(name + ": simdgroups past the chunk write their rows");
       if (tileOutput.empty()) tileOutput = whole.output;
+      if (affine) {
+        LinearConfig small = kTiles;
+        small.prefillSimdgroupRows = 16;
+        const Outcome out = run(backend, linear, Linear::plan(w, small, FloatOutput::BFloat16), p, nullptr,
+                                storageRows(x, K, chunk, storage), aux, kPoisonNaN, covered, name + " sg16");
+        checkValues(out, dots, {}, aux, w, chunk, covered, true, name + " sg16");
+        if (!sameRows(out.output, 0, whole.output, 0, chunk, columns))
+          fail(name + ": the 16-row simdgroups differ from the 32-row ones");
+        const uint32_t smallWritten = (chunk + 15) / 16 * 16;
+        if (!std::all_of(out.output.begin() + uint64_t{smallWritten} * columns, out.output.end(),
+                         [](uint16_t v) { return v == kUnwritten; }))
+          fail(name + ": 16-row simdgroups past the chunk write their rows");
+      }
     }
     for (const uint32_t rows : {8u, 16u, 24u, 32u, 33u, 40u, 48u, 57u, 64u})
       for (const uint32_t splits : {1u, splitChunk, 8u}) {

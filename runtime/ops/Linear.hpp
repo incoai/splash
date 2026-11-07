@@ -121,6 +121,9 @@ struct LinearConfig final {
   // (LinearPlan::storageRows), whose padding lane's rows it computes and
   // discards, instead of the 8-row tile.
   bool sixteenRows = false;
+  // GgufPrefill: rows per simdgroup; the 128-row tile has four groups at 32
+  // rows or eight at 16 rows. Selection checks the tensor's kernel support.
+  uint32_t prefillSimdgroupRows = 32;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }
