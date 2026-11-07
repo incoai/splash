@@ -1671,9 +1671,9 @@ int main(int argc, char **argv) {
             result.draftStateRestoreSkipped || result.junctionMaterializations || result.junctionMaterializationFailures ||
             result.stateEvictions || result.stateEntries != seeded.stateEntries ||
             result.cachedStateBytes != seeded.cachedStateBytes ||
-            result.stateAllocatedBeforeBytes != seeded.stateAllocatedAfterBytes + result.draftRingCacheBeforeBytes ||
-            result.stateAllocatedAfterBytes != seeded.stateAllocatedAfterBytes + result.draftRingCacheBytes ||
-            result.stateAllocatedPeakObservedBytes != seeded.stateAllocatedAfterBytes + result.draftRingCachePeakObservedBytes ||
+            result.stateAllocatedBeforeBytes != seeded.stateAllocatedAfterBytes ||
+            result.stateAllocatedAfterBytes != seeded.stateAllocatedAfterBytes ||
+            result.stateAllocatedPeakObservedBytes != seeded.stateAllocatedAfterBytes ||
             result.draftRingRebuildRows != (enabled && index ? 0U : 2048U) ||
             result.draftRingCacheBuilds != (enabled && !index ? 1U : 0U) ||
             result.draftRingCacheHits != (enabled && index ? 1U : 0U) ||
@@ -1890,6 +1890,7 @@ int main(int argc, char **argv) {
     // and its elastic state/KV budget and the split's.
     const engine::EngineMemoryBreakdown &plan = resources->memoryPlan().breakdown();
     std::cout << "]},\"max_context_tokens\":" << engineConfig.maxContext
+              << ",\"ring_state_accounting\":\"exclusive_pool_v2\""
               << ",\"experimental_draft_ring_reuse\":false"
               << ",\"ring_short_prefix_tokens\":4096,\"ring_short_output_tokens\":" << ringOutputTokens
               << ",\"ring_seed_output_tokens\":1,\"ring_generation_minimum_actual_tokens\":64,\"ring_short_replay_rows\":[1,8,16,32]"

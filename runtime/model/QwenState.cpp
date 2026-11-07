@@ -279,10 +279,11 @@ QwenStateStorage::~QwenStateStorage() {
 std::shared_ptr<DFlashDraftRing> QwenStateStorage::reserveRebuiltDraftRing() {
   if (layout_.draft.ringBytes() > RebuiltDraftRingCache::maximumBytes)
     return {};
+  // The elastic pool accounts these bytes separately from lane/state buffers.
   std::shared_ptr<DFlashDraftRing> ring;
   if (!admitAllocation_(layout_.draft.ringBytes(), [&] {
         ring = std::make_shared<DFlashDraftRing>(
-            backend_, allocations_, layout_.draft, "rebuilt-draft-ring-cache");
+            backend_, std::make_shared<StateAllocationTracker>(), layout_.draft, "rebuilt-draft-ring-cache");
       }))
     return {};
   if (ring->allocatedBytes() > RebuiltDraftRingCache::maximumBytes)

@@ -749,10 +749,12 @@ void testRebuiltDraftRingCache(metal::MetalBackend &backend) {
               cache.bytes() == 0 && storage.actualAllocatedBytes() == 0,
           "ring cache admission denial retained memory");
   allowed = true;
+  const uint64_t beforeCache = backend.memoryStats().allocatedBytes;
   auto fill = cache.acquire(source, 2048, 2048, allocate);
   require(fill && !fill->ready && admissions == 2 &&
               cache.bytes() >= kDraftState.ringBytes() &&
-              cache.bytes() == storage.actualAllocatedBytes(),
+              storage.actualAllocatedBytes() == 0 &&
+              cache.bytes() == backend.memoryStats().allocatedBytes - beforeCache,
           "a ring cache fill was not admitted/accounted once");
   const auto *physical = fill->ring.get();
   require(cache.releasableBytes() == 0 && cache.release() == 0 && !cache.acquire(other, 2048, 2048, allocate),
@@ -791,7 +793,8 @@ void testRebuiltDraftRingCache(metal::MetalBackend &backend) {
   afterEviction.reset();
   const uint64_t allocated = cache.bytes();
   require(cache.releasableBytes() == allocated, "idle cache memory was held as a floor");
-  require(cache.release() == allocated && !cache.bytes() && !storage.actualAllocatedBytes(),
+  require(cache.release() == allocated && !cache.bytes() && !storage.actualAllocatedBytes() &&
+              backend.memoryStats().allocatedBytes == beforeCache,
           "reclaim did not release the complete optional ring allocation");
   // Nine layers exceed the fixed64MiB cap and never call admission.
   auto oversized = kStateLayout;

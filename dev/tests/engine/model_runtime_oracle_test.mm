@@ -1256,6 +1256,10 @@ void requireFullWindowRestore(model::Runtime &executor,
     const uint64_t cacheBytes = executor.telemetry().draftRingCacheBytes;
     require(cacheBytes && cacheBytes <= model::RebuiltDraftRingCache::maximumBytes,
             "ring cache did not admit exactly one bounded allocation");
+    const auto heldPool = poolNamed(executor, "draft_rings").state();
+    require(heldPool.currentBytes == cacheBytes && heldPool.floorBytes == cacheBytes &&
+                heldPool.releaseUnitBytes == 0 && heldPool.rebuildOnly,
+            "active restore did not hold the ring pool as its floor");
     releaseIdle(executor);
     require(executor.telemetry().draftRingCacheBytes == cacheBytes,
             "reclaim released a ring held by an admitted restore");
@@ -1294,6 +1298,10 @@ void requireFullWindowRestore(model::Runtime &executor,
               "cancelled fill/repeated hit/distinct-state sequence reused a stale ring");
       executor.end(request.id);
     }
+    const auto idlePool = poolNamed(executor, "draft_rings").state();
+    require(idlePool.currentBytes == cacheBytes && idlePool.floorBytes == 0 &&
+                idlePool.releaseUnitBytes == cacheBytes,
+            "idle ring pool did not expose its whole allocation for reclaim");
     releaseIdle(executor);
     require(!executor.telemetry().draftRingCacheBytes, "idle ring cache did not reclaim");
     executor.experimentalDraftRingReuse(false);

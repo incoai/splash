@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))
 import ring_reuse_experiment as ring
 
 
-def evidence(cap=1, short_eos=False):
+def evidence(cap=1, short_eos=False, exclusive=False):
     warmups = 96 if cap == 128 else 1280
     document = dict(
         schema_version=2,
@@ -48,6 +48,8 @@ def evidence(cap=1, short_eos=False):
         ),
         build_id="synthetic-test",
     )
+    if exclusive:
+        document["ring_state_accounting"] = "exclusive_pool_v2"
     inputs = ring.fixture_inputs()
     outputs = []
     for i in range(4):
@@ -78,9 +80,9 @@ def evidence(cap=1, short_eos=False):
             draft_context_rows=ring.ROWS[i] if restored else len(inputs[name]),
             state_entries=1,
             cached_state_bytes=ring.COMPOSITE_BYTES,
-            state_allocated_before_bytes=(1 << 29) + (ring.RING_BYTES if hit else 0),
-            state_allocated_after_bytes=(1 << 29) + retained,
-            state_allocated_peak_observed_bytes=(1 << 29) + retained,
+            state_allocated_before_bytes=(1 << 29) + (ring.RING_BYTES if hit and not exclusive else 0),
+            state_allocated_after_bytes=(1 << 29) + (retained if not exclusive else 0),
+            state_allocated_peak_observed_bytes=(1 << 29) + (retained if not exclusive else 0),
             draft_ring_cache_before_bytes=ring.RING_BYTES if hit else 0,
             draft_ring_cache_bytes=retained,
             draft_ring_cache_peak_observed_bytes=retained,
@@ -144,6 +146,13 @@ class RingEvidenceTests(unittest.TestCase):
             result = ring.analyze(evidence(cap), cap)
             self.assertTrue(result["primary_decision"]["qualified"])
             self.assertEqual(result["measured_requests"], 384)
+
+    def test_exclusive_pool_accounting(self):
+        document = evidence(exclusive=True)
+        self.assertTrue(ring.analyze(document, 1)["primary_decision"]["qualified"])
+        document["measurements"][33]["state_allocated_after_bytes"] += ring.RING_BYTES
+        with self.assertRaises(ValueError):
+            ring.analyze(document, 1)
 
     def test_short_eos_retained_but_unqualified(self):
         result = ring.analyze(evidence(128, True), 128)
