@@ -11,6 +11,7 @@ from unittest import mock
 from dev.tests.installer_fixtures import (
     DENSE,
     DRAFT_COMMIT,
+    FLASH_NEXT,
     GGML,
     MOE,
     PROCESSOR,

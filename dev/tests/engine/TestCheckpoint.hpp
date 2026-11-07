@@ -186,7 +186,7 @@ std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization
     } else {
       ffn(mlp, layout.intermediateSize, 1);
     }
-    if (layout.hasPle() && layer == layout.pleLayer) {
+    if ((layout.pleNgram != 0) && layer == layout.pleLayer) {
       const std::string ple = prefix + "ple.";
       quantized(ple + "key_proj", layout.streamWidth(), layout.pleWidth());
       quantized(ple + "value_proj", hidden, layout.pleWidth());

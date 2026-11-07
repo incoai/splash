@@ -1000,8 +1000,8 @@ void testSyntheticFlashNext(MetalBackend &backend, const std::filesystem::path &
     }
     const auto planned = streamableWeights(root, descriptor, {.streamExperts = true, .streamTable = true});
     auto readers = std::make_shared<splash::model::SsdReaders>(2);
-    splash::model::ModelLoadOptions options{.streamedTableBytes = planned.tableFloorBytes + 4096,
-                                             .expertMemoryBytes = planned.expertFloorBytes, .readers = readers};
+    splash::model::ModelLoadOptions options{.streamedTableBytes = planned.tableMinimumBytes + 4096,
+                                             .expertMemoryBytes = planned.expertMinimumBytes, .readers = readers};
     auto model = loadModel(backend, root, descriptor, options);
     const auto &weights = std::get<splash::model::Qwen4ExpWeights>(model.target);
     require(weights.streamedTable && weights.experts && weights.manifestFingerprintSha256 == fingerprint,
@@ -1064,7 +1064,7 @@ void testSyntheticFlashNext(MetalBackend &backend, const std::filesystem::path &
         {{"weight", "BF16", {16, headWidth}, bf16Bytes}}, "mlx-serve-ngram");
     const auto bf16Plan = streamableWeights(bf16, bf16Descriptor, {.streamTable = true});
     auto bf16Options = options;
-    bf16Options.streamedTableBytes = bf16Plan.tableFloorBytes + 4096;
+    bf16Options.streamedTableBytes = bf16Plan.tableMinimumBytes + 4096;
     auto bf16Model = loadModel(backend, bf16, bf16Descriptor, bf16Options);
     const auto &bf16Weights = std::get<splash::model::Qwen4ExpWeights>(bf16Model.target);
     require(bf16Weights.streamedTable->table().rowBytes == floatRowBytes && bf16Weights.pleFormat == GGUF_FMT_BF16,
