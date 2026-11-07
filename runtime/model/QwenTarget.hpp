@@ -444,6 +444,7 @@ public:
   // Every dense layer must support the packed path before a request's retention
   // is restricted. Targets without that whole-model contract keep full rows.
   [[nodiscard]] virtual bool supportsPackedFfn(uint32_t) const noexcept { return false; }
+  [[nodiscard]] virtual bool supportsPackedBody(uint32_t) const noexcept { return false; }
 
   // The step scratch the target allocated itself (qwenTargetScratchBytes).
   [[nodiscard]] virtual QwenTargetScratchBytes allocatedScratchBytes() const noexcept;

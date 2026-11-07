@@ -3,13 +3,11 @@
 #include "metal/abi/VerifyBodyPack.h"
 #include "ops/BufferExtent.hpp"
 namespace splash::ops {
-bool addVerifyBodyPack(const Linear &linear, metal::CommandGraph &graph, const Projection &projection,
-                       const LinearPlan &widePlan, metal::MetalBuffer input, metal::MetalBuffer residual,
-                       metal::MetalBuffer output, LinearScratch scratch, metal::MetalBuffer verifyRows,
-                       const VerifyBodyPackBuffers &b, uint32_t lanes) {
+bool supportsVerifyBodyPack(const Projection &projection, const LinearPlan &widePlan, bool residual,
+                            uint32_t lanes) {
   const auto w = widePlan.workload();
   const auto config = widePlan.configuration();
-  if (!b.input || lanes < 5 || lanes > 8 || projection.rotation || projection.planeInputs() ||
+  if (lanes < 5 || lanes > 8 || projection.rotation || projection.planeInputs() ||
       projection.destination != FloatOutput::BFloat16 || config.tile != LinearTile::GgufStaged ||
       widePlan.storageRows() != 64 || widePlan.input() != LinearInput::Plain || config.oneGateUpPass ||
       (w.epilogue != LinearEpilogue::None && w.epilogue != LinearEpilogue::Residual) ||
@@ -34,6 +32,19 @@ bool addVerifyBodyPack(const Linear &linear, metal::CommandGraph &graph, const P
   }
   if (!end || end > N)
     return false;
+  return true;
+}
+bool addVerifyBodyPack(const Linear &linear, metal::CommandGraph &graph, const Projection &projection,
+                       const LinearPlan &widePlan, metal::MetalBuffer input, metal::MetalBuffer residual,
+                       metal::MetalBuffer output, LinearScratch scratch, metal::MetalBuffer verifyRows,
+                       const VerifyBodyPackBuffers &b, uint32_t lanes) {
+  if (!b.input || !supportsVerifyBodyPack(projection, widePlan, bool(residual), lanes))
+    return false;
+  const auto w = widePlan.workload();
+  const auto config = widePlan.configuration();
+  const uint32_t K = projection.inputSize, N = projection.outputSize;
+  const auto &last = projection.blocks().segments.back();
+  const uint32_t end = last.columnOffset + last.outputSize;
   auto smallConfig = config;
   smallConfig.sixteenRows = false;
   const auto small =

@@ -8,6 +8,9 @@ namespace splash::ops {
 struct VerifyBodyPackBuffers final {
   metal::MetalBuffer input, residual, output;
 };
+// The host-only contract used before restricting any proposal's prefix.
+[[nodiscard]] bool supportsVerifyBodyPack(const Projection &projection, const LinearPlan &widePlan,
+                                          bool residual, uint32_t lanes);
 // Private target-verify path: caller must cap selector maximumRows to four.
 // No dispatch is added when the host projection/plan is unsupported.
 [[nodiscard]] bool addVerifyBodyPack(const Linear &linear, metal::CommandGraph &graph,

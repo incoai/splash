@@ -7,6 +7,7 @@
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
+#include "ops/VerifyBodyPack.hpp"
 #include "ops/VerifyFfnPack.hpp"
 
 #include <array>
@@ -1413,6 +1414,48 @@ void packedFfnSupportContract() {
           "FFN plan/shape mismatch allowed retention capping");
 }
 
+void packedBodySupportContract() {
+  if (SPLASH_MAXIMUM_BATCH_WIDTH != 8)
+    return;
+  const auto projection = [](uint32_t n, uint32_t k, uint32_t format) {
+    return Projection(n, k, BlockWeights{{QuantizedSegment::planes(format, n, k, {}, {}, {})}});
+  };
+  const LinearConfig configuration{.tile = LinearTile::GgufStaged, .splits = 1};
+  const auto plan = [&](const Projection &p, bool residual) {
+    return Linear::plan({{p.outputSize, p.inputSize},
+                         64,
+                         LinearPhase::Decode,
+                         residual ? LinearEpilogue::Residual : LinearEpilogue::None},
+                        configuration, FloatOutput::BFloat16);
+  };
+  auto p = projection(768, 2048, GGUF_FMT_AF4G64);
+  for (bool residual : {false, true}) {
+    require(supportsVerifyBodyPack(p, plan(p, residual), residual, 8),
+            "supported body projection was refused");
+    for (uint32_t lanes : {0U, 4U, 9U})
+      require(!supportsVerifyBodyPack(p, plan(p, residual), residual, lanes),
+              "unsupported body lane count was accepted");
+  }
+  auto bad = projection(768, 2048, GGUF_FMT_AF5G64);
+  require(!supportsVerifyBodyPack(bad, plan(bad, false), false, 8),
+          "unsupported body format allowed capping");
+  auto quant = QuantizedSegment::planes(GGUF_FMT_AF4G64, 16384, 5120, {}, {}, {});
+  auto tail = QuantizedSegment::rows(QuantizedSegment::kFloat32, 96, 5120, {});
+  tail.columnOffset = 16384;
+  Projection padded(16640, 5120, BlockWeights{{quant, tail}});
+  require(supportsVerifyBodyPack(padded, plan(padded, false), false, 8),
+          "valid mixed body projection with padding was refused");
+  require(!supportsVerifyBodyPack(padded, plan(padded, true), true, 8),
+          "unsupported mixed residual allowed capping");
+  bad = p;
+  bad.destination = FloatOutput::Float32;
+  require(!supportsVerifyBodyPack(bad, plan(bad, false), false, 8), "FP32 body destination allowed capping");
+  const auto prefill =
+      Linear::plan({{p.outputSize, p.inputSize}, 64, LinearPhase::Prefill, LinearEpilogue::None},
+                   configuration, FloatOutput::BFloat16);
+  require(!supportsVerifyBodyPack(p, prefill, false, 8), "prefill body plan allowed decode capping");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1421,6 +1464,7 @@ int main(int argc, char **argv) {
     ggufPlans();
     scratchBoundsRotated();
     packedFfnSupportContract();
+    packedBodySupportContract();
     ggufCoreLaws();
     floatOutputPlans();
     smallApple9StagesShortPrefillChunks();

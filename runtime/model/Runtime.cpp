@@ -676,7 +676,9 @@ struct Runtime::Impl {
 #if SPLASH_EXPERIMENTAL_FFN_PACK_MODE > 0
     const auto &t = geometry.target;
 #if SPLASH_EXPERIMENTAL_VERIFY_BODY
-    if (backend.capabilities().appleGpuFamily < 10) return false;
+    if (backend.capabilities().appleGpuFamily < 10 ||
+        !targetModel->supportsPackedBody(static_cast<uint32_t>(entries.size())))
+      return false;
 #endif
     if (entries.size() < 5 || entries.size() > 8 || kLaneCount != 8 || aneFfn || geometry.spilledKv ||
         blockCache || historyStream || t.ffnKind != QwenFfnKind::Dense || t.layers != 64 ||

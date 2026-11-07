@@ -485,11 +485,28 @@ public:
         }
       }
       packedFfnSupported_[lanes - 1] = supported;
+#if SPLASH_EXPERIMENTAL_VERIFY_BODY
+      packedBodySupported_[lanes - 1] =
+          supported && std::ranges::all_of(weights.layers, [&](const Layer &layer) {
+            return std::visit(
+                [&](const auto &mixer) {
+                  const auto in = linear.decodePlan(mixer.inputProjection, lanes);
+                  const auto out =
+                      linear.decodePlan(mixer.outputProjection, lanes, ops::LinearEpilogue::Residual);
+                  return ops::supportsVerifyBodyPack(mixer.inputProjection, in, false, lanes) &&
+                         ops::supportsVerifyBodyPack(mixer.outputProjection, out, true, lanes);
+                },
+                layer.mixer);
+          });
+#endif
     }
   }
 
   bool supportsPackedFfn(uint32_t lanes) const noexcept override {
     return lanes && lanes <= packedFfnSupported_.size() && packedFfnSupported_[lanes - 1];
+  }
+  bool supportsPackedBody(uint32_t lanes) const noexcept override {
+    return lanes && lanes <= packedBodySupported_.size() && packedBodySupported_[lanes - 1];
   }
 
   std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph, std::span<const QwenTargetPrefillChunk> chunks,
@@ -585,6 +602,7 @@ private:
   }
 
   std::array<bool, ExecutionLimits::maximumBatchWidth> packedFfnSupported_{};
+  std::array<bool, ExecutionLimits::maximumBatchWidth> packedBodySupported_{};
   const QwenTargetWeights<Layout, Layer> &weights_;
 };
 
