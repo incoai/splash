@@ -297,7 +297,10 @@ prefilled four at a time.
 A change of the weight images' layout (`EXPECT_IMAGE_CHANGE=1`) makes
 `backend_regression` report the images it changed instead of failing on them.
 `decode-profile --dispatch-list FILE` writes the profiled B1 cycles'
-dispatches in order with their GPU time.
+dispatches in order with their GPU time. Its `--verify-rows all` verifies
+every row of a MoE target's cycles, as `backend-benchmark` does, so two
+builds' runs route the same experts; each width also reports its tokens per
+cycle and wall ms per token.
 
 To compare the model's numerics with another engine on the same weights,
 `make teacher-logits MODEL=... TEACHER_LOGITS_ARGS='TOKENS OUTPUT --window END:ROWS ...'`

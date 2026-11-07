@@ -225,16 +225,17 @@ instead of mixing two versions. A start logs `Weights loaded in N s.`; loading
 reads the sources at about the speed of the disk that holds them
 ([upstream loading](../dev/benchmarks/upstream-loading.md#loading-time)).
 
-At load time the engine validates the GGUF metadata, including the rotary
-embedding and norm epsilon the kernels assume (`rope.freq_base`,
-`rope.dimension_count`, which a Flint GGUF, whose RoPE rotates whole heads,
-need not state, `attention.layer_norm_rms_epsilon`, and no
-`rope.scaling.type` but `none`), and plans the `MDGG0001` layout. A Flint
-GGUF's family keys hold its window, leading dense layers, shared expert's
-slices, sigmoid router and normalized, unscaled routing weights
-(`expert_weights_scale` 1) and its two layer patterns to the family's, and
-a router bias (`ffn_exp_probs_b`), which its blocks would not add, is
-refused.
+At load time the engine validates the GGUF metadata, including the data
+alignment (`general.alignment`, a power of two of 8 or more, as the GGUF spec
+requires: the repack reads blocks as words) and the rotary embedding and norm
+epsilon the kernels assume (`rope.freq_base`, `rope.dimension_count`, which a
+Flint GGUF, whose RoPE rotates whole heads, need not state,
+`attention.layer_norm_rms_epsilon`, and no `rope.scaling.type` but `none`),
+and plans the `MDGG0001` layout. A Flint GGUF's family keys hold its window,
+leading dense layers, shared expert's slices, sigmoid router and normalized,
+unscaled routing weights (`expert_weights_scale` 1) and its two layer
+patterns to the family's, and a router bias (`ffn_exp_probs_b`), which its
+blocks would not add, is refused.
 `GgufPreparation` stages rows in image order on the CPU within the
 staging bound, splitting rows wider than it into column chunks, and runs the
 `gguf_repack` kernel, which writes their planes into the image. Embeddings and
@@ -785,7 +786,9 @@ a quantized format's native rows (such as `float-af8g64`), time the float projec
 (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
 `selectFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape,
 or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
-device's plans and the other GGUF tile.
+device's plans and the other GGUF tile; `GGUF_MOE_ARGS='repack'` times the repack of streamed
+experts into their slots (`moe_expert_load`, 1 to 32 jobs) and of tensors into an image
+(`gguf_repack`) in the streamed formats, each plane checked bytewise against the reference repack.
 
 Target attention runs the geometries of `kCompiledAttention` (`runtime/ops/PagedAttention.cpp`):
 query heads over KV heads of a head dimension (`_d128` in the names of 128-wide heads' kernels;
