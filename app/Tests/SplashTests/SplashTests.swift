@@ -1065,7 +1065,9 @@ struct ChatTests {
         server.executableURL = URL(filePath: "/usr/bin/python3")
         server.arguments = [try #require(Bundle.module.path(forResource: "streaming_server", ofType: "py", inDirectory: "Fakes"))]
         let output = Pipe()
+        let advance = Pipe()
         server.standardOutput = output
+        server.standardInput = advance
         try server.run()
         defer { server.terminate() }
         let port = try #require(String(data: output.fileHandleForReading.availableData, encoding: .utf8)
@@ -1076,13 +1078,19 @@ struct ChatTests {
         // the composer read, holds it empty and changes no more.
         try await waitFor(store.reply?.message.text.isEmpty == false)
         let first = store.reply?.message.text ?? ""
+        #expect(first == "One")
         #expect(store.current?.messages.last?.text == "")
         nonisolated(unsafe) var changed = false
         withObservationTracking { _ = store.conversations } onChange: { changed = true }
+        advance.fileHandleForWriting.write(Data("next\n".utf8))
         try await waitFor(store.reply.map { $0.message.text != first } ?? true)
         #expect(store.reply?.message.text.hasPrefix(first) == true)
         #expect(!changed && store.current?.messages.last?.text == "")
+        advance.fileHandleForWriting.write(Data("next\n".utf8))
+        try await waitFor(store.reply?.message.text == "One two three")
+        #expect(!changed && store.current?.messages.last?.text == "")
         // Once it ends, it goes into its conversation, which is written.
+        advance.fileHandleForWriting.write(Data("next\n".utf8))
         try await waitFor(store.streaming == nil)
         #expect(changed && store.reply == nil && store.current?.messages.last?.text == "One two three")
         store.flush()
