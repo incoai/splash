@@ -993,7 +993,7 @@ void testSyntheticFlashNext(MetalBackend &backend, const std::filesystem::path &
                   "Flash-Next's fused QSA projection was not split at its key rows");
         require(weights.pleHash.tableRows == 16 && weights.pleHash.multipliers[2] == 7 &&
                     weights.pleHash.headOffsets.back() == 14, "Flash-Next's PLE hash was changed");
-        const auto &table = weights.pleTable.blocks();
+        const auto &table = weights.pleTable.rows();
         residentRows.resize(16 * rowBytes);
         std::memcpy(residentRows.data(), table.rows.contents(), residentRows.size());
         fingerprint = weights.manifestFingerprintSha256;
