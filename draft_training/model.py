@@ -218,7 +218,9 @@ class DraftModel(nn.Module):
             hidden = layer(hidden, context, positions, visible, self.rotary_emb)
         return self.norm(hidden)
 
-    def block_hidden(self, tokens, features, anchor, embedding):
+    def block_hidden(
+        self, tokens, features, anchor, embedding, *, include_anchor=False
+    ):
         """One independent query block; future captured states are never read."""
         rows, window = self.flash["block_size"], self.raw_config["sliding_window"]
         start = max(0, anchor - window + 1)
@@ -235,7 +237,7 @@ class DraftModel(nn.Module):
         key_positions = positions[0]
         visible = (query_positions[:, None] - key_positions[None, :]) < window
         hidden = self(context, noise, positions, visible[None, None])
-        return hidden[:, 1:]
+        return hidden if include_anchor else hidden[:, 1:]
 
 
 def load_draft(directory, config, device="cpu"):
