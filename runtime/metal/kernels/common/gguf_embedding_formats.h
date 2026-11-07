@@ -4,7 +4,7 @@
 #include "metal/kernels/common/quant_formats.h"
 #include <metal_stdlib>
 
-// The native blocks of every format (ops/Embedding.cpp), one struct per format:
+// The stored block of every format (ops::StoredRows), one struct per format:
 // a row is hidden / Weights blocks of Bytes bytes, each laid out as the format's
 // ggml block_* (an MLX affine, nvfp4 or fp8 tensor: the loader's block of
 // metal/abi/QuantFormat.h) at the byte offsets its struct names, and decode is
@@ -366,7 +366,7 @@ GGUF_EMBED_AFFINE(2) GGUF_EMBED_AFFINE(3) GGUF_EMBED_AFFINE(4) GGUF_EMBED_AFFINE
 GGUF_EMBED_AFFINE(8)
 #undef GGUF_EMBED_AFFINE
 
-// Every format's native-block struct as X(kernel name token, struct), the token its kQuantFormats name: the quantized
+// Every format's stored-block struct as X(kernel name token, struct), the token its kQuantFormats name: the quantized
 // formats (GGUF_QUANTIZED_EMBEDDING_FORMATS), whose blocks each hold whole runs of 8 values, then the 16-bit floats.
 #define GGUF_QUANTIZED_EMBEDDING_FORMATS(X)                                                                        \
   X(q4k, GgufEmbedQ4K) X(q6k, GgufEmbedQ6K) X(q80, GgufEmbedQ80) X(q5k, GgufEmbedQ5K) X(q3k, GgufEmbedQ3K)        \

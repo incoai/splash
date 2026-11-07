@@ -2,6 +2,7 @@
 """Serve in the foreground, or connect an installed agent to the local server."""
 
 import argparse
+import contextlib
 import errno
 import fcntl
 import http.client
@@ -24,7 +25,7 @@ if __name__ == "__main__" and not __package__:
 
 # The options serve shares with the server, in modules of the standard
 # library alone: the launcher runs before .venv exists.
-from server import serve_options
+from server import serve_options, serve_record
 
 from . import clients, paths
 from . import models as model_artifacts
@@ -40,7 +41,38 @@ STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
 class LauncherError(RuntimeError):
-    pass
+    """A refusal of the launcher's, of a serve_record kind. said: whether the
+    program that failed printed it already, so the launcher records it
+    without printing it again. subject: what the launcher could not do, as
+    "cannot prepare PATH", which the printed line puts before the message
+    and the record leaves to the app."""
+
+    def __init__(
+        self, message, kind=serve_record.INTERNAL, *, said=False, subject=None
+    ):
+        super().__init__(message)
+        self.kind = kind
+        self.said = said
+        self.subject = subject
+
+
+class ArgumentRefusal(SystemExit):
+    """A command line the launcher refuses, with argparse's status 2."""
+
+    def __init__(self, message):
+        super().__init__(2)
+        self.message = message
+
+
+class _Parser(argparse.ArgumentParser):
+    """An argument parser whose refusal carries its message (ArgumentRefusal),
+    which serve records."""
+
+    def error(self, message):
+        try:
+            super().error(message)
+        except SystemExit:
+            raise ArgumentRefusal(message) from None
 
 
 class StopSignal(KeyboardInterrupt):
@@ -55,14 +87,19 @@ def _interrupt(number, _frame):
     raise StopSignal(number)
 
 
-def _run_held(command, **options):
+def _run_held(command, *, relay=None, **options):
     """Run a program that unblocks the stop signals itself, holding them from
-    its spawn. One the launcher takes meanwhile ends the program too."""
+    its spawn. One the launcher takes meanwhile ends the program too. With
+    `relay`, each line of its output goes there as it comes."""
     signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    if relay is not None:
+        options |= {"stdout": subprocess.PIPE, "text": True, "errors": "replace"}
     try:
         with subprocess.Popen(command, **options) as program:
             try:
                 signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
+                for line in program.stdout if relay is not None else ():
+                    relay(line)
                 return program.wait()
             except BaseException:
                 program.kill()
@@ -75,12 +112,17 @@ def _base_url(port):
     return f"http://127.0.0.1:{port}"
 
 
+# The server is on this Mac's loopback: requests to it connect directly, so
+# no proxy, the environment's or the system's, receives the server's key.
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _request_json(path, timeout=2, *, port=serve_options.DEFAULT_PORT):
     request = urllib.request.Request(_base_url(port) + path)
     if key := os.environ.get("SPLASH_API_KEY"):
         request.add_header("Authorization", f"Bearer {key}")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _DIRECT.open(request, timeout=timeout) as response:
             return json.loads(response.read())
     except urllib.error.HTTPError as error:
         if error.code == 401:
@@ -114,13 +156,13 @@ def _ensure_runtime():
                 if subprocess.run(
                     command, cwd=ROOT, pass_fds=(lock.fileno(),)
                 ).returncode:
-                    raise LauncherError("source build failed; see the output above")
+                    raise LauncherError("source build failed")
     # The engine refuses an unsupported Mac only once the model is prepared;
     # its own check refuses it before tens of GB are downloaded.
     try:
         model_artifacts.run_engine(["device-check"], "device check")
     except model_artifacts.ModelError as error:
-        raise LauncherError(str(error)) from None
+        raise LauncherError(str(error), serve_record.DEVICE) from None
 
 
 def _ensure_installed(selection):
@@ -142,15 +184,38 @@ def _ensure_installed(selection):
             command[-1:-1] = [flag, value]
     if selection.language_only:
         command.insert(-1, "--language-only")
-    if _run_held(command, cwd=ROOT):
-        raise LauncherError("model download or verification failed")
+    # Its messages go on to the terminal; its failure, an error event
+    # (install/models.py main), is what the launcher records. The installer
+    # prints that failure on stderr itself, so only one it ended without is
+    # the launcher's to say.
+    failure = None
+
+    def relay(line):
+        nonlocal failure
+        try:
+            event = json.loads(line)
+        except ValueError:
+            event = None
+        if isinstance(event, dict) and event.get("event") == "error":
+            failure = event["message"]
+        else:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+
+    if _run_held(command, cwd=ROOT, relay=relay):
+        if failure is None:
+            raise LauncherError(
+                "model download or verification failed", serve_record.INSTALL
+            )
+        raise LauncherError(failure, serve_record.INSTALL, said=True)
 
 
 def _prepare_local_model(args):
     _ensure_runtime()
     # Preparation needs Splash's dependencies, which the launcher's Python
-    # need not have. The helper prints only the public interface's result;
-    # progress and refusals go to the terminal on stderr.
+    # need not have. The helper prints only the public interface's result,
+    # or its refusal as a serve record failure; progress goes to the
+    # terminal on stderr.
     command = [
         str(paths.PYTHON),
         "-P",
@@ -166,15 +231,23 @@ def _prepare_local_model(args):
         command = [*command, "--language-only"]
     command = [*command, "--", args.model_dir]
     with tempfile.TemporaryFile(mode="w+") as result:
-        if _run_held(
+        failed = _run_held(
             command,
             cwd=ROOT,
             stdout=result,
             env=dict(os.environ, PYTHONPATH=str(ROOT)),
-        ):
-            raise LauncherError("local model preparation failed; see the output above")
+        )
         result.seek(0)
-        prepared = Path(result.read().strip())
+        output = result.read().strip()
+    if failed:
+        # Its refusal; a helper that crashed printed none.
+        try:
+            refusal = json.loads(output)
+            message, kind = refusal["message"], refusal["kind"]
+        except (ValueError, TypeError, KeyError):
+            raise LauncherError("local model preparation failed") from None
+        raise LauncherError(message, kind, subject=f"cannot prepare {args.model_dir}")
+    prepared = Path(output)
     if not prepared.is_absolute():
         raise LauncherError("local model preparation returned no absolute directory")
     return prepared
@@ -225,6 +298,90 @@ def _check_port(host, port):
             raise OSError(errno.EADDRINUSE, os.strerror(errno.EADDRINUSE))
 
 
+def _prepare_start(args):
+    """The model directory to serve, once the port is free and the model
+    prepared."""
+    # Fail before downloads/builds if another service owns the selected port.
+    # The HTTP server also binds before loading weights, closing the race.
+    try:
+        _check_port(args.host, args.port)
+    except OSError as error:
+        raise LauncherError(
+            f"cannot bind {args.host}:{args.port}: {error}", serve_record.PORT
+        ) from None
+    if args.model_dir is not None:
+        return _prepare_local_model(args)
+    selection = model_artifacts.Selection.of(
+        paths.MODELS,
+        args.model,
+        revision=args.revision,
+        language_only=args.language_only,
+        draft_model=args.draft_model,
+    )
+    _ensure_installed(selection)
+    return selection.link
+
+
+def _server(args, model_dir, record):
+    """The server's command line and environment."""
+    # The server package of this installation, from any working directory:
+    # -P keeps the directory, which may hold a package of the same name, off
+    # sys.path, and PYTHONPATH names the root. The server holds the assembly
+    # the selection link names when it starts, and serves from it until it
+    # exits, however an installation advances the link meanwhile.
+    command = [
+        str(paths.PYTHON),
+        "-u",
+        "-P",
+        "-m",
+        "server.server",
+        str(model_dir),
+        "--model",
+        args.model,
+        "--binary",
+        str(paths.BINARY),
+        "--port",
+        str(args.port),
+        "--serve-record",
+        str(record),
+        *serve_options.serve_argv(args),
+    ]
+    environment = dict(
+        os.environ,
+        PYTHONUNBUFFERED="1",
+        TRANSFORMERS_VERBOSITY="error",
+        PYTHONPATH=str(ROOT),
+        **serve_options.serve_environment(args),
+    )
+    return command, environment
+
+
+def _serve_lock(port):
+    return RUNTIME_DIR / f"serve-{port}.lock"
+
+
+def _serve_record(port):
+    """Beside the port's lock, which cannot be replaced atomically without
+    breaking its flock: the app follows a start there. It is the lock
+    holder's to write."""
+    return RUNTIME_DIR / f"serve-{port}.json"
+
+
+def _record_refusal(port, failure):
+    """Record a start refused before it held the port's lock, under that lock.
+    A lock this process cannot take leaves the record as it is: one another
+    process holds, whose record it is, or one that cannot be created. The
+    refusal printed is the answer."""
+    with contextlib.ExitStack() as held:
+        try:
+            RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+            lock = held.enter_context(_serve_lock(port).open("a+"))
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return
+        serve_record.failed(_serve_record(port), failure)
+
+
 def serve(args):
     # Started in the background from a non-interactive shell, the launcher
     # inherits SIGINT as ignored; take both stop signals from the start.
@@ -235,23 +392,18 @@ def serve(args):
         os.environ["HF_HUB_OFFLINE"] = "1"
     if sys.dont_write_bytecode:
         # A child inherits the environment, not -B: every Python program
-        # serve starts, down to the server's PDF workers, writes no bytecode
-        # either, so a runtime inside a signed app never gains __pycache__
-        # folders, which break its signature.
+        # serve starts writes no bytecode either (the server's PDF workers,
+        # started with no environment, have -B of their own), so a runtime
+        # inside a signed app never gains __pycache__ folders, which break
+        # its signature.
         os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     # Keep both locks across exec until the foreground server exits.
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    record = _serve_record(args.port)
     with (
+        _serve_lock(args.port).open("a+") as lock,
         (RUNTIME_DIR / "serve.lock").open("a+") as installation,
-        (RUNTIME_DIR / f"serve-{args.port}.lock").open("a+") as lock,
     ):
-        # Servers share the installation; upgrades require exclusive access.
-        try:
-            fcntl.flock(installation, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise LauncherError(
-                "Splash is being upgraded; wait for the upgrade to finish"
-            ) from None
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -263,60 +415,36 @@ def serve(args):
         lock.truncate()
         json.dump({"pid": os.getpid(), "model": args.model, "port": args.port}, lock)
         lock.flush()
-        # Fail before downloads/builds if another service owns the selected port.
-        # The HTTP server also binds before loading weights, closing the race.
+        # The record is the lock holder's: from here on a start that fails
+        # says why in it, as the server, which keeps this pid, does too. A
+        # start that cannot record it began fails here, before any model work
+        # (serve_record).
+        serve_record.starting(record)
         try:
-            _check_port(args.host, args.port)
+            # Servers share the installation; upgrades require exclusive
+            # access.
+            try:
+                fcntl.flock(installation, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise LauncherError(
+                    "Splash is being upgraded; wait for the upgrade to finish",
+                    serve_record.UPGRADE,
+                ) from None
+            command, environment = _server(args, _prepare_start(args), record)
+            os.set_inheritable(installation.fileno(), True)
+            os.set_inheritable(lock.fileno(), True)
+            # The exec resets the handlers; the server unblocks the signals
+            # once its own are in place, past its imports.
+            signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+            os.execve(command[0], command, environment)
+        except LauncherError as error:
+            serve_record.failed(record, serve_record.failure(error.kind, str(error)))
+            raise
         except OSError as error:
-            raise LauncherError(
-                f"cannot bind {args.host}:{args.port}: {error}"
-            ) from None
-        if args.model_dir is not None:
-            model_dir = _prepare_local_model(args)
-        else:
-            selection = model_artifacts.Selection.of(
-                paths.MODELS,
-                args.model,
-                revision=args.revision,
-                language_only=args.language_only,
-                draft_model=args.draft_model,
+            serve_record.failed(
+                record, serve_record.failure(serve_record.INTERNAL, str(error))
             )
-            _ensure_installed(selection)
-            model_dir = selection.link
-        # The server package of this installation, from any working
-        # directory: -P keeps the directory, which may hold a package of the
-        # same name, off sys.path, and PYTHONPATH names the root. The server
-        # holds the assembly the selection link names when it starts, and
-        # serves from it until it exits, however an installation advances the
-        # link meanwhile.
-        command = [
-            str(paths.PYTHON),
-            "-u",
-            "-P",
-            "-m",
-            "server.server",
-            str(model_dir),
-            "--model",
-            args.model,
-            "--binary",
-            str(paths.BINARY),
-            "--port",
-            str(args.port),
-            *serve_options.serve_argv(args),
-        ]
-        environment = dict(
-            os.environ,
-            PYTHONUNBUFFERED="1",
-            TRANSFORMERS_VERBOSITY="error",
-            PYTHONPATH=str(ROOT),
-            **serve_options.serve_environment(args),
-        )
-        os.set_inheritable(installation.fileno(), True)
-        os.set_inheritable(lock.fileno(), True)
-        # The exec resets the handlers; the server unblocks the signals once
-        # its own are in place, past its imports.
-        signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
-        os.execve(command[0], command, environment)
+            raise
 
 
 def _renders_later_system(port):
@@ -408,9 +536,12 @@ def _version():
 
 
 def _local_path(value):
-    # Preserve a GGUF's filename symlink in a Hub snapshot: resolving the
-    # file itself would replace its .gguf name with a cache blob's digest.
-    return str(Path(value).expanduser().absolute())
+    # Absolute, its parent resolved, as the local helper takes it and as a
+    # refusal names it. The file's own name stays: resolving a GGUF's link
+    # in a Hub snapshot would replace its .gguf name with a cache blob's
+    # digest.
+    path = Path(os.path.abspath(Path(value).expanduser()))
+    return str(path.parent.resolve() / path.name)
 
 
 def parse_args(argv=None):
@@ -420,7 +551,7 @@ def parse_args(argv=None):
     if not is_client and "--" in argv:
         boundary = argv.index("--")
         argv, client_args = argv[:boundary], argv[boundary + 1 :]
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="splash",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -502,10 +633,9 @@ def parse_args(argv=None):
         action="store_true",
         help="start the installed model without contacting the Hugging Face Hub (as HF_HUB_OFFLINE=1)",
     )
-    groups["network"].add_argument(
-        "--port",
-        type=_parse_port,
-        help=f"HTTP port (default: SPLASH_PORT or {serve_options.DEFAULT_PORT})",
+    _add_port(
+        groups["network"],
+        f"HTTP port (default: SPLASH_PORT or {serve_options.DEFAULT_PORT})",
     )
     serve_options.add_serve_arguments(server, groups)
     for name in clients.INSTALL_URLS:
@@ -515,10 +645,9 @@ def parse_args(argv=None):
             add_help=False,
             allow_abbrev=False,
         )
-        client.add_argument(
-            "--port",
-            type=_parse_port,
-            help=f"server port (default: SPLASH_PORT or {serve_options.DEFAULT_PORT})",
+        _add_port(
+            client,
+            f"server port (default: SPLASH_PORT or {serve_options.DEFAULT_PORT})",
         )
     if is_client:
         # Only --port belongs to Splash; preserve the agent's other arguments,
@@ -532,9 +661,7 @@ def parse_args(argv=None):
     args.explicit_port = args.port is not None
     if not args.explicit_port:
         try:
-            args.port = _parse_port(
-                os.environ.get("SPLASH_PORT", str(serve_options.DEFAULT_PORT))
-            )
+            args.port = _environment_port()
         except argparse.ArgumentTypeError as error:
             parser.error(f"SPLASH_PORT: {error}")
     if args.command == "serve":
@@ -556,11 +683,52 @@ def parse_args(argv=None):
     return args
 
 
+def _add_port(parser, help_text=None):
+    """The --port option, which serve, the agent commands and a refused serve
+    command line (_serve_port) read alike."""
+    parser.add_argument("--port", type=_parse_port, help=help_text)
+
+
+def _environment_port():
+    return _parse_port(os.environ.get("SPLASH_PORT", str(serve_options.DEFAULT_PORT)))
+
+
+def _serve_port(argv):
+    """The port a serve command line names, read alone, so that a refusal of
+    its other arguments still reaches the record there; None for another
+    command, or a port that does not parse."""
+    if argv[:1] != ["serve"]:
+        return None
+    # As serve's parser: no abbreviations.
+    probe = argparse.ArgumentParser(
+        add_help=False, allow_abbrev=False, exit_on_error=False
+    )
+    _add_port(probe)
+    try:
+        port = probe.parse_known_args(argv[1:])[0].port
+        return _environment_port() if port is None else port
+    except (argparse.ArgumentError, argparse.ArgumentTypeError):
+        return None
+
+
 def main(argv=None):
-    args = parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        args = parse_args(argv)
+    except ArgumentRefusal as refusal:
+        if (port := _serve_port(argv)) is not None:
+            _record_refusal(
+                port, serve_record.failure(serve_record.CONFIGURATION, refusal.message)
+            )
+        raise
     try:
         return serve(args) if args.command == "serve" else coding_client(args)
-    except (LauncherError, clients.ClientError, OSError) as error:
+    except LauncherError as error:
+        if not error.said:
+            subject = f"{error.subject}: " if error.subject else ""
+            print(f"error: {subject}{error}", file=sys.stderr)
+        return 1
+    except (clients.ClientError, OSError, serve_record.NotRecorded) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     except StopSignal as stop:

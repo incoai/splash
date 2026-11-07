@@ -1,5 +1,6 @@
 #include "engine/KvPageTier.hpp"
 #include "tests/engine/AllocationFailure.hpp"
+#include "tests/engine/ClaimScope.hpp"
 #include "tests/engine/TestBuffers.hpp"
 #include "tests/engine/TestChecks.hpp"
 #include "tests/engine/TestDrafts.hpp"
@@ -118,10 +119,8 @@ void runUntilReady(KvPageTier &tier, KvTransfer &transfer) {
   throw std::runtime_error("KV transfer did not complete");
 }
 
-// Two pages in different extents go from their extents to disk and back.
-// Between the two the host overwrites them, so what a restore leaves in a
-// page is what the readers read; the pages beside them keep their own bytes.
-// A slot holds its page as the layout's slot format lays it out.
+// Two pages in different extents go to disk and back byte for byte, their neighbours untouched, in
+// the layout's slot format.
 void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
                const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layout) {
   const uint32_t extent = layout.minimumExtentPages();
@@ -129,9 +128,13 @@ void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
                         extent);
   const uint32_t pageA = extent - 1;
   const uint32_t pageB = extent;
-  require(pages.allocateExtent(0) && pages.allocateExtent(1) && pages.isAllocated(pageA) &&
-              pages.isAllocated(pageB),
-          "test pages were not allocated");
+  {
+    // The extents are allocated under a Floor claim; the tier itself allocates nothing.
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(pages.allocateExtent(0) && pages.allocateExtent(1) && pages.isAllocated(pageA) &&
+                pages.isAllocated(pageB),
+            "test pages were not allocated");
+  }
   const kv::SlotFormat format(layout);
   const uint64_t slotBytes = SlotFile::slotBytesFor(format.payloadBytes());
   auto file = slotFile(format, 2);
@@ -184,16 +187,17 @@ void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
             << ": payload_bytes=" << format.payloadBytes() << " slot_bytes=" << slotBytes << '\n';
 }
 
-// A spillable layout's slot holds each block of each layer as a record that
-// one aligned read returns through the slot's copy (model::KvCopy), as
-// reads of spilled K/V take it; and an Index page's restore reads the
-// slot's index alone into the page.
+// A spillable slot holds one record per block and layer that one aligned read returns; an Index
+// restore reads the index alone.
 void blockRecords(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
                   const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layout) {
   const uint32_t extent = layout.minimumExtentPages();
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout, 2 * extent, extent);
-  require(pages.allocateExtent(0) && pages.allocateExtent(1, kv::PageForm::Index),
-          "the test extents were not allocated");
+  {
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(pages.allocateExtent(0) && pages.allocateExtent(1, kv::PageForm::Index),
+            "the test extents were not allocated");
+  }
   const kv::SlotFormat format(layout);
   KvPageTier tier(pages, format, slotFile(format, 2), readers);
   static_cast<void>(fill(pages, 3, 0x7e57u));
@@ -230,17 +234,17 @@ void blockRecords(metal::MetalBackend &backend, engine::MemoryGovernor &governor
             << " pitch=" << format.recordPitch() << '\n';
 }
 
-// Writes in flight are bounded, in all and by class: persistent copies take
-// at most a quarter of the bound and pages written through at most half, so
-// reclaim always keeps a quarter; a write counts until poll() has retired
-// it. Restores go to the readers beside them: a read that fails, of a slot
-// never written, fails its restore alone. A bound of no write is refused.
+// Writes in flight are bounded in all and per class (reclaim always keeps a quarter); a failed
+// restore fails alone.
 void limits(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
             const std::shared_ptr<model::SsdReaders> &readers, kv::Format format) {
   const kv::Layout layout{2, 2, 256, format};
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
-  require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  {
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  }
   const kv::SlotFormat slots(layout);
   auto file = slotFile(slots, 16);
   rejects([&] { KvPageTier refused(pages, slots, file, readers, 0); }, "room for a write",
@@ -287,7 +291,10 @@ void allocationFailure(metal::MetalBackend &backend, engine::MemoryGovernor &gov
   const kv::Layout layout{2, 2, 256, format};
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
-  require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  {
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  }
   const uint64_t bytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   for (bool restoring : {false, true}) {
     bool completed = false;
@@ -333,15 +340,16 @@ void allocationFailure(metal::MetalBackend &backend, engine::MemoryGovernor &gov
   }
 }
 
-// The write budget holds no KV write back: with it spent the tier still
-// takes a demotion, and the demotion's slot is counted against it all the
-// same.
+// A spent write budget holds no KV demotion back; its slot still counts against the budget.
 void demotionsPassTheWriteBudget(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
                                  const std::shared_ptr<model::SsdReaders> &readers, kv::Format format) {
   const kv::Layout layout{2, 2, 256, format};
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
-  require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  {
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  }
   const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   // The clock stands still: what the budget gives out does not come back.
   auto budget = std::make_shared<DiskBudget>(4 * slotBytes, [] { return 0.0; });
@@ -364,18 +372,17 @@ void demotionsPassTheWriteBudget(metal::MetalBackend &backend, engine::MemoryGov
   std::cout << "write budget tests passed\n";
 }
 
-// A write that fails for another reason than a full volume closes the file,
-// and the tier refuses every demotion from then on without throwing. A
-// file-size limit at the file's length fails the next slot's write with
-// EFBIG. The tier refuses here in canDemote(): its refusal of a null write,
-// for a file that closes between canDemote() and the write, has no test of
-// its own, only slot-file's null write from a closed file.
+// A write failing for a reason other than a full volume closes the file, and the tier then refuses
+// demotions without throwing.
 void closedFileRefusesDemotion(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
                                const std::shared_ptr<model::SsdReaders> &readers, kv::Format format) {
   const kv::Layout layout{2, 2, 256, format};
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
-  require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  {
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  }
   const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   auto file = std::make_shared<SlotFile>(slotBytes, std::make_shared<DiskBudget>(4 * slotBytes));
   KvPageTier tier(pages, kv::SlotFormat(layout), file, readers);
@@ -404,19 +411,17 @@ void closedFileRefusesDemotion(metal::MetalBackend &backend, engine::MemoryGover
   std::cout << "closed file tests passed\n";
 }
 
-// Kernels, the worker and the readers share an extent. Kernels write a page
-// through its address, and the worker writes those bytes to disk. Then one
-// command keeps writing and checking the pages around it while the readers
-// read the page back and the worker writes another one out; the read lands
-// while the command runs. The command sees its own data, the restored page
-// holds the disk's bytes, and the next command reads them through the
-// page's address.
+// The worker and readers move a page while a command writes the pages around it in the same extent;
+// each side sees its own bytes.
 void besideACommand(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
                     const std::shared_ptr<model::SsdReaders> &readers, kv::Format format) {
   const kv::Layout layout{10, 2, 256, format}; // Qwen3.6-35B
   const uint32_t extent = layout.minimumExtentPages();
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout, extent, extent);
-  require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  {
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  }
   const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   auto file = std::make_shared<SlotFile>(slotBytes, std::make_shared<DiskBudget>(2 * slotBytes));
   KvPageTier tier(pages, kv::SlotFormat(layout), file, readers);
@@ -439,8 +444,11 @@ void besideACommand(metal::MetalBackend &backend, engine::MemoryGovernor &govern
   for (uint32_t page = restored - neighbours; page <= restored + neighbours; ++page) {
     if (page != restored) slabs(page, around);
   }
+  // A table of slab addresses names the extent they are in as a page table
+  // of the extent's page does (kv::PageStorage::writeEntries).
   const auto tableOf = [&](const std::vector<uint64_t> &entries) {
     metal::MetalBuffer table = test::sharedBuffer(backend, entries.size() * sizeof(uint64_t));
+    pages.writeEntries(std::array<uint32_t, 1>{0}, 0, table);
     std::memcpy(table.contents(), entries.data(), entries.size() * sizeof(uint64_t));
     return table;
   };
@@ -520,15 +528,17 @@ void besideACommand(metal::MetalBackend &backend, engine::MemoryGovernor &govern
             << rounds << " rounds of writes and checks\n";
 }
 
-// A tier goes away with transfers still in flight. They read and write their
-// pages in place, so the worker and the readers have to be done with them
-// first.
+// A tier goes away with transfers in flight only once the worker and readers are done with its
+// pages.
 void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
               const std::shared_ptr<model::SsdReaders> &readers, kv::Format format) {
   const kv::Layout layout{16, 4, 256, format}; // Qwen3.8-27B
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
-  require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  {
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  }
   const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   auto budget = std::make_shared<DiskBudget>(16 * slotBytes);
   auto file = std::make_shared<SlotFile>(slotBytes, budget);
@@ -550,16 +560,16 @@ void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   std::cout << "teardown tests passed\n";
 }
 
-// A persistent tier keeps a demoted page's slot and its label for the next
-// process, whose tier takes the slot back: the page restores byte for byte,
-// and a page whose slot changed after its record fails its restore. Of a
-// spillable layout's slot, a block's record reads back alone, unless the
-// change is in it.
+// A persistent tier's slot comes back in the next process byte for byte; a slot changed after its
+// record fails its restore.
 void persistentRoundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
                          const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layout) {
   const uint32_t extent = layout.minimumExtentPages();
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout, extent, extent);
-  require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  {
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  }
   const kv::SlotFormat format(layout);
   const uint64_t slotBytes = SlotFile::slotBytesFor(format.payloadBytes());
   const SlotFile::Options options{.segments = format.segments()};
@@ -625,10 +635,8 @@ void persistentRoundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &g
   std::filesystem::remove_all(directory, ignored);
 }
 
-// A persistent cache's namespace names how its slots hold a page
-// (KvPageTier::slotFormatToken): a dense layout keeps the namespace every
-// cache before block records was written under, and a spillable layout's
-// changed with its slots, so neither build adopts the other's.
+// A persistent cache's namespace names its slot format, so dense and spillable builds never adopt
+// each other's slots.
 void namespaceNamesTheSlotFormat() {
   const model::ModelDescriptor model = model::makeModelDescriptor(
       "namespace-test", model::Qwen3_8Layout{}, test::qwen3_8Draft(), test::qwen3_8Vision(),
@@ -639,8 +647,8 @@ void namespaceNamesTheSlotFormat() {
         model.stateLayout);
   };
   const kv::Layout dense{16, 4, 256, kv::Format::Int8};
-  const kv::Layout flashNext{12, 2, 256, kv::Format::Int8, 128, true};
-  const kv::Layout flashNextBf16{12, 2, 256, kv::Format::BFloat16, 128, true};
+  const kv::Layout flashNext{12, 2, 256, kv::Format::Int8, 128, true, 0, 0, kv::Reads::SelectedBlocks};
+  const kv::Layout flashNextBf16{12, 2, 256, kv::Format::BFloat16, 128, true, 0, 0, kv::Reads::SelectedBlocks};
   require(KvPageTier::slotFormatToken(dense).empty() &&
               KvPageTier::slotFormatToken(flashNext) == " slots block-records-v1",
           "the slot format's token changed");
@@ -667,7 +675,7 @@ void run(const std::string &metallib) {
     persistentRoundTrip(backend, governor, readers, kv::Layout{16, 4, 256, format});
     // Qwen3.8-Flash-Next's token-major values and QSA index: its slots hold
     // the index, then one record per block of each layer.
-    const kv::Layout flashNext{12, 2, 256, format, 128, true};
+    const kv::Layout flashNext{12, 2, 256, format, 128, true, 0, 0, kv::Reads::SelectedBlocks};
     roundTrip(backend, governor, readers, flashNext);
     blockRecords(backend, governor, readers, flashNext);
     persistentRoundTrip(backend, governor, readers, flashNext);

@@ -64,12 +64,11 @@ inline constexpr uint64_t kAutomaticCacheDiskBytes = uint64_t{32} << 30;
 //   min(quota, max(0, available + held - floor)).
 // The tier's own writes and punches leave it where it is; space anything
 // else takes or frees moves it byte for byte, so tiers with sizes on one
-// volume take its room in turn, down to the floor, with no margin above it:
-// while a local snapshot keeps the blocks such a tier frees, each copy it
-// writes in place of another takes a slot of free space, and the copies a
-// measure then has it give up free nothing, so free space can fall below the
-// floor, as far as a full volume, before the tier has given up every copy it
-// holds or the snapshot goes.
+// volume take its room in turn, down to the floor, with no margin above it.
+// While a local snapshot keeps the blocks such a tier frees, each copy it
+// writes in place of another takes free space and the copy it gives up
+// frees nothing, so free space can fall below the floor, as far as a full
+// volume, until the tier holds no copy or the snapshot goes.
 [[nodiscard]] uint64_t diskActiveLimitBytes(uint64_t quotaBytes, uint64_t availableBytes,
                                             uint64_t heldBytes, uint64_t floorBytes) noexcept;
 // That limit on `volume`, where the tier's files hold `heldBytes`; the quota
@@ -97,15 +96,16 @@ automaticDiskRefusal(const std::optional<DiskVolume> &volume, uint64_t heldBytes
 // off a local volume the quota is both. In a persistent cache's root one
 // limit bounds every namespace together, and the tier may use all of it: the
 // others nobody holds count among what the tier holds, and while the root
-// holds more than its limit, as the tier grows or the volume shrinks, they
-// go, oldest first, before the tier gives up a copy of its own. A write that
-// found the volume full while the volume shows room above the floor, or on a
-// volume whose free space the tier does not follow, met a limit the measure
-// cannot see, such as a volume quota or a disk image whose host is full, or a
-// volume that filled and freed again before the measure. A second such write
-// says it was a limit: the tier then keeps within what it holds, its live
-// slots, both limits, for the rest of the process. It goes on serving and
-// replacing its copies within that, and a later such write lowers it again.
+// holds more than its limit they go, oldest first, before the tier gives up
+// a copy of its own; one someone else removed stops counting at the next
+// measure. A write that found the volume full while the volume shows room
+// above the floor, or on a volume whose free space the tier does not follow,
+// met a limit the measure cannot see (a volume quota, a disk image whose
+// host is full) or a volume that filled and freed again before the measure.
+// A second such write says it was a limit: for the rest of the process both
+// limits stay within what the tier holds then, its live slots, and it goes
+// on serving and replacing its copies within that; a later such write
+// lowers them again.
 class DiskSpace final {
 public:
   // The budget's quota is the automatic one (--max-cache-disk auto) or, not

@@ -43,6 +43,9 @@ public:
   static constexpr uint32_t kMinimumRows = 512, kProgramStep = 128, kMaximumRows = SPLASH_PREFILL_TOKEN_BUDGET;
   static_assert(kMaximumRows >= kMinimumRows && (kMaximumRows - kMinimumRows) % kProgramStep == 0,
                 "the functions cover the chunks the split takes");
+  // The GPU part's down projection is a view of leading inputs, which only
+  // the prefill residual tile runs: no chunk the split takes stages.
+  static_assert(kMinimumRows > kMaximumStagedPrefillRows, "the split's chunks run the prefill residual tile");
 
   // The ANE takes `aneUnits` of the units() of intermediate channels. The
   // program is compiled and loaded here, and the wait for the ANE's service
@@ -147,10 +150,11 @@ private:
   friend class ane_ffn::Measurement;
 
   // The split's channels: hidden and intermediate, the layers', the GPU's and
-  // the ANE's, and the segments of down's inputs the ANE takes.
+  // the ANE's, and the segments of the hidden inputs and of down's inputs the
+  // ANE takes.
   struct Shape final {
     uint32_t hidden = 0, intermediate = 0, layers = 0, gpu = 0, ane = 0;
-    std::vector<uint32_t> downSegments;
+    std::vector<uint32_t> inputSegments, downSegments;
   };
   // A staging set of the ANE's int8 weights: gate's and up's rows over each
   // segment of the hidden inputs, down's rows over each segment of its ANE

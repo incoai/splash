@@ -17,6 +17,7 @@ from dev.tests.server_fixtures import (
     Plan,
     byte_backend,
     chat_body,
+    engine_ready,
     judgment_body,
     keep_stop_signals,
     main_args,
@@ -28,7 +29,6 @@ from dev.tests.server_fixtures import (
     unprepared_hold,
 )
 from install import launcher
-from server import protocol as native_wire
 from server import serve_options
 from server import server as api
 
@@ -337,7 +337,7 @@ class ServedModelNamesTests(unittest.TestCase):
 
     def test_main_wires_served_model_names_into_the_frontend(self):
         runtime = mock.Mock()
-        runtime.readiness = native_wire.ReadyEvent(4, 131072, False)
+        runtime.capabilities = engine_ready(131072)
         args = main_args(served_model_name=["local"], announce_served_name=True)
         with (
             mock.patch.object(api, "parse_args", return_value=args),
@@ -347,6 +347,8 @@ class ServedModelNamesTests(unittest.TestCase):
                 api.AutoTokenizer, "from_pretrained", return_value=object()
             ),
             mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "check_capabilities"),
+            mock.patch.object(api, "thinking_end_tokens", return_value=None),
             mock.patch.object(api, "ChatTemplates"),
             mock.patch.object(
                 api.engine_runtime, "MultiplexedRuntime", return_value=runtime

@@ -5,7 +5,8 @@ import time
 import traceback
 from pathlib import Path
 
-# The server package, whose innermost frame locates an unexpected error.
+# The server package, whose innermost frame, in it or one of its
+# subpackages, locates an unexpected error.
 _PACKAGE = Path(__file__).resolve().parent
 
 
@@ -17,8 +18,8 @@ def log_unexpected(error):
         location = ""
         for frame, line in traceback.walk_tb(error.__traceback__):
             path = Path(frame.f_code.co_filename).resolve()
-            if path.parent == _PACKAGE:
-                location = f" · {_PACKAGE.name}/{path.name}:{line}"
+            if path.is_relative_to(_PACKAGE):
+                location = f" · {path.relative_to(_PACKAGE.parent)}:{line}"
         print_status(
             f"Error · internal_server_error · {type(error).__name__}{location}",
             error=True,
@@ -30,10 +31,15 @@ def log_unexpected(error):
 def print_status(message, *, error=False):
     # One write per line, newline included, so that lines written at once by
     # request threads, or by the native runtime on the shared stderr, stay
-    # whole in a terminal or in one log file.
+    # whole in a terminal or in one log file. Logging is best effort: a full
+    # disk (ENOSPC) or a closed stream must not change how a request is
+    # answered or how the server stops.
     stream = sys.stderr if error else sys.stdout
-    stream.write(f"{time.strftime('%H:%M:%S')} {message}\n")
-    stream.flush()
+    try:
+        stream.write(f"{time.strftime('%H:%M:%S')} {message}\n")
+        stream.flush()
+    except (OSError, ValueError):
+        pass
 
 
 def _reasoning_parts(reasoning):

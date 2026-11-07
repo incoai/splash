@@ -14,6 +14,7 @@
 #include <dispatch/dispatch.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -155,9 +156,26 @@ constexpr auto kTicketWaitSlice = std::chrono::seconds(1);
 // The queue's outstanding command buffers; a command takes one, and one more
 // per buffer its event steps add (addedBuffers).
 constexpr NSUInteger kMaximumCommandBuffers = 512;
-// The most loads host_step_wait spins for: 60-190 ms on the M5 Max (0.23-0.71
-// us a load), longer than nearly every step's work.
+// The most loads host_step_wait spins for through an awake step: 60-190 ms on
+// the M5 Max (0.23-0.71 us a load), longer than nearly every step's work.
+// The spin check bounds its spins by their release (hostStepCheckLoads).
 constexpr uint32_t kHostStepWaitLoads = 1u << 18;
+// The fastest load host_step_wait makes: 0.23 us on the M5 Max, 0.226 us on
+// the 20-core M5 Pro, at the high clocks of a GPU busy with other work.
+constexpr std::chrono::nanoseconds kHostStepFastestLoad{220};
+// How long after its commit the spin check (checkHostStepSpin) releases each
+// of its spins: the later ones wait out a GPU busy with other work.
+constexpr std::chrono::milliseconds kHostStepCheckDelays[] = {std::chrono::milliseconds(2),
+                                                              std::chrono::milliseconds(20),
+                                                              std::chrono::milliseconds(100)};
+// The most loads of a check's spin released `delay` after its commit: four
+// times the delay at the fastest load, so a spin that started before its
+// release still spins at it, at any clock, unless the CPU releases it more
+// than three delays late. kHostStepWaitLoads would not do: at the fastest
+// load it ends 58 ms after its start, before the last release.
+constexpr uint32_t hostStepCheckLoads(std::chrono::milliseconds delay) noexcept {
+    return static_cast<uint32_t>(4 * delay / kHostStepFastestLoad);
+}
 // Where in the spin's release buffer (HostStepSpin) host_step_wait writes the
 // release it saw and the loads it made before: a cache line past the counter
 // the CPU raises (word 0).
@@ -165,7 +183,7 @@ constexpr NSUInteger kHostStepSeenOffset = 128;
 // The library of host_step_wait, beside the backend's own: built apart, as
 // its compiler may refuse it (Makefile), and loaded only for awake steps.
 constexpr std::string_view kHostStepLibrary = "host-step.metallib";
-// How long after a spin check that decided nothing (every spin started after
+// How long after a spin check that decided nothing (no spin was spinning at
 // its release, the GPU busy with other work) awake steps check it again.
 constexpr auto kHostStepSpinRecheck = std::chrono::seconds(10);
 
@@ -284,9 +302,32 @@ id<MTLLibrary> loadLibrary(id<MTLDevice> device, const std::string &metallibPath
 
 }  // namespace
 
+bool commandOutOfMemory(NSError *error) noexcept {
+    return error && [error.domain isEqualToString:MTLCommandBufferErrorDomain] &&
+           error.code == MTLCommandBufferErrorOutOfMemory;
+}
+
 struct AllocationAccounting {
     std::atomic<uint64_t> allocatedBytes{0};
     std::atomic<uint64_t> peakAllocatedBytes{0};
+};
+
+struct MetalAllocation;
+
+// A view of an Addressed buffer whose address a table holds, held weakly:
+// the owner releases it only while no command reaches it.
+struct ReachedView {
+    std::weak_ptr<MetalAllocation> allocation;
+    uint64_t offsetBytes = 0;
+    uint64_t lengthBytes = 0;
+};
+
+// The views of Addressed buffers whose addresses a range of a table's bytes
+// holds (MetalBackend::setTableReach).
+struct TableReach {
+    uint64_t offsetBytes = 0;
+    uint64_t lengthBytes = 0;
+    std::shared_ptr<const std::vector<ReachedView>> reached;
 };
 
 struct MetalAllocation {
@@ -302,6 +343,10 @@ struct MetalAllocation {
     BufferStorage storage = BufferStorage::Shared;
     __strong NSString *label = nil;
     BufferReach reach = BufferReach::Bound;
+    // A table's: the views of Addressed buffers each range of its bytes
+    // holds the addresses of (MetalBackend::setTableReach), which each
+    // encoder that uses those bytes declares. Ranges never overlap.
+    std::vector<TableReach> reaches;
     // The owner of wrapped memory (MetalBackend::wrapSharedMemory), which is
     // never released: our views keep it as well as Metal's deallocator.
     std::shared_ptr<void> owner;
@@ -309,12 +354,15 @@ struct MetalAllocation {
     // may outlive the backend. The set retains the buffer, and with it its
     // memory, so the last view takes it out.
     std::weak_ptr<Residency> residency;
+    // The last encoder that declared the buffer for reading, and for reading
+    // and writing (MetalBackend::Impl::EncoderResidency, its only writer).
+    uint64_t declaredIn[2] = {};
 
     // Takes the buffer, which joins the residency set and the accounting.
     void attach(id<MTLBuffer> allocated) {
         buffer = allocated;
         bytes = allocated.allocatedSize;
-        if (auto kept = residency.lock()) kept->add(buffer, reach);
+        if (auto kept = residency.lock()) kept->add(buffer);
         raisePeak(accounting->peakAllocatedBytes,
                   accounting->allocatedBytes.fetch_add(
                       bytes, std::memory_order_relaxed) + bytes);
@@ -322,7 +370,7 @@ struct MetalAllocation {
     // Lets the buffer go: it leaves the residency set and the accounting.
     void detach() noexcept {
         if (!buffer) return;
-        if (auto kept = residency.lock()) kept->remove(buffer, reach);
+        if (auto kept = residency.lock()) kept->remove(buffer);
         accounting->allocatedBytes.fetch_sub(bytes, std::memory_order_relaxed);
         buffer = nil;
         bytes = 0;
@@ -332,7 +380,7 @@ struct MetalAllocation {
 };
 
 // Every Impl has an allocation, whose buffer is nil only while its memory is
-// released: only allocateBuffer, wrapSharedMemory and view create one.
+// released: only reserveBuffer, wrapSharedMemory and view create one.
 struct MetalBuffer::Impl {
     std::shared_ptr<MetalAllocation> allocation;
     uint64_t offsetBytes = 0;
@@ -503,9 +551,10 @@ struct BackendAsyncState {
 // the work after it waits for. A shared event holds the value written last,
 // and a GPU signal can land after a later value the CPU wrote to the same
 // event (M5 Max, macOS 27: about once in a million steps), which puts it back
-// and holds the work waiting for the CPU's value until Metal fails it after 5
-// s ("Caused GPU Timeout Error"). Past ranEvent of a step that keeps the GPU
-// awake the runner raises the backend's release counter to the step's value,
+// and holds the work waiting for the CPU's value until Metal fails it after
+// supervision::kGpuWaitLimit ("Caused GPU Timeout Error"). Past ranEvent of a
+// step that keeps the GPU awake the runner raises the backend's release
+// counter to the step's value,
 // which ends the GPU's spin through it (host_step_wait), and then runs the
 // step's `then` once its work returned. Each step runs unless the command
 // buffer before it failed or an earlier step of its command did not run or
@@ -534,7 +583,8 @@ struct HostSteps {
     std::shared_ptr<BackendAsyncState> backend;
     // The command's submission (BackendAsyncState::beginSubmission).
     uint64_t sequence = 0;
-    // The spin's release buffer (HostStepSpin), once a step spins.
+    // The spin's release buffer (HostStepSpin) while awake steps spin, set
+    // before the first step reaches the runner, which reads it.
     __strong id<MTLBuffer> releases = nil;
     // A deque, so that the runner holds on to a step while the submission
     // appends the next.
@@ -562,25 +612,20 @@ struct HostSteps {
         step.done = done;
     }
     // Hands each step that ran its round trip, once every buffer of the
-    // command completed, and returns how long the command's GPU work waited
-    // on them (CommandTiming::hostSeconds).
-    double report() {
+    // command completed.
+    void report() {
         std::lock_guard lock(mutex);
-        if (reported) return 0.0;
+        if (reported) return;
         reported = true;
-        double waited = 0.0;
         for (const Step &step : steps) {
             id<MTLCommandBuffer> before = step.before, after = step.after;
-            if (!step.done || !before || !after) continue;
-            waited += std::max(0.0, after.GPUStartTime - before.GPUEndTime);
-            if (!step.timed) continue;
+            if (!step.done || !before || !after || !step.timed) continue;
             HostStepTiming timing;
             timing.pickupSeconds = std::max(0.0, step.pickup - before.GPUEndTime);
             timing.workSeconds = step.done - step.pickup;
             timing.resumeSeconds = std::max(0.0, after.GPUStartTime - step.done);
             step.timed(timing);
         }
-        return waited;
     }
     // A failed command's account of the steps that ran: how many, the longest
     // work, and the longest pickup (from the end of the GPU work before a
@@ -763,6 +808,8 @@ struct CommandTicket::State {
     std::vector<id<MTLCommandBuffer>> leadingCommands;
     std::shared_ptr<HostSteps> hostSteps;
     std::string error;
+    // The failure was a command buffer's want of GPU memory.
+    bool outOfMemory = false;
     bool completed = false;
     bool released = false;
 
@@ -806,16 +853,16 @@ struct CommandTicket::State {
         }
         if (hostSteps && error.empty()) {
             try {
-                timing.hostSeconds = hostSteps->report();
+                hostSteps->report();
             } catch (...) {
                 backend->markUnhealthy("Metal host step timing callback threw an exception");
             }
         }
 
-        finish(timing, std::move(error));
+        finish(timing, std::move(error), host.empty() && failed && commandOutOfMemory(failed.error));
     }
 
-    void finish(CommandTiming result, std::string failure) {
+    void finish(CommandTiming result, std::string failure, bool failedOutOfMemory) {
         CommandCompletion notify;
         {
             std::lock_guard lock(mutex);
@@ -826,6 +873,7 @@ struct CommandTicket::State {
             if (!failure.empty()) backend->markUnhealthy(failure);
             timing = result;
             error = std::move(failure);
+            outOfMemory = failedOutOfMemory;
             completed = true;
             notify = completion;
         }
@@ -910,6 +958,17 @@ struct MetalBackend::Impl {
     explicit Impl(double commandTimeoutSeconds)
         : asyncState(std::make_shared<BackendAsyncState>(commandTimeoutSeconds)) {}
 
+    // An address table of a command (AddressTable), resolved as the command
+    // is prepared: its buffers' GPU addresses at that point, their
+    // allocations, each once, and the entries whose bytes reach other
+    // buffers as a table (setTableReach).
+    struct PreparedTable {
+        const std::vector<MetalBuffer> *source = nullptr;
+        std::vector<uint64_t> addresses;
+        std::vector<MetalAllocation *> allocations;
+        std::vector<const MetalBuffer::Impl *> reaching;
+    };
+
     // One dispatch of a command, validated and resolved to its pipeline.
     struct PreparedDispatch {
         const ComputeDispatch *source = nullptr;
@@ -919,15 +978,159 @@ struct MetalBackend::Impl {
         // The argument table entries its buffers take, one bit each.
         uint32_t bufferIndices = 0;
         __strong id<MTLComputePipelineState> pipeline = nil;
+        // The index of its address table among its command's tables, or
+        // kNoTable.
+        static constexpr size_t kNoTable = SIZE_MAX;
+        size_t table = kNoTable;
     };
 
-    // A command as submission encodes it: its dispatches and every
-    // allocation they bind or reach through an address table, which its
-    // ticket retains.
+    // A command as submission encodes it: its dispatches, their address
+    // tables, each once (dispatches that reach the same buffers share one
+    // list), and every allocation they bind or list, which its ticket
+    // retains.
     struct PreparedCommand {
         std::vector<PreparedDispatch> dispatches;
+        std::vector<PreparedTable> tables;
         std::vector<std::shared_ptr<MetalAllocation>> retainedAllocations;
     };
+
+    // What EncoderResidency keeps between the commands it serves: the count
+    // of the backend's encoders, and the last encoder that declared each of
+    // a command's address tables, by its index, for reading and for reading
+    // and writing. A stamp left by an earlier command holds an older
+    // encoder's number than any of a later one, so the stamps are kept, not
+    // cleared, and grow only to the most tables a command has had: a commit
+    // allocates none for them. Used only by the submitting thread.
+    struct EncoderStamps {
+        uint64_t encoders = 0;
+        std::vector<std::array<uint64_t, 2>> tables;
+    };
+
+    // What an encoder makes resident for its dispatches (useResources), as
+    // opposed to the residency set (Residency), which keeps memory wired
+    // between commands. The rule: an encoder declares each buffer once per
+    // usage, from the first dispatch that uses it to the encoder's end, the
+    // buffers its dispatches list (AddressTable) for reading, or for reading
+    // and writing where a dispatch writes, and the Addressed buffers the
+    // bytes of a view a dispatch binds or lists reach as a table
+    // (setTableReach), and in turn what the bytes of the views they name
+    // reach, for reading and writing. Metal makes a buffer resident for
+    // every usage an encoder declared. A buffer, a table or a reach is
+    // declared in an encoder when its stamp (declaredIn, EncoderStamps)
+    // holds the encoder's number, which counts the backend's encoders, so
+    // nothing is cleared between encoders. One serves a command and keeps
+    // nothing alive: the ticket keeps what its dispatches bind and list, the
+    // owner of a table what the table reaches; the command's prepared data
+    // stays as prepare() made it.
+    class EncoderResidency final {
+    public:
+        // `stamps` are the backend's; `tables` are the command's address
+        // tables.
+        EncoderResidency(EncoderStamps &stamps, std::span<const PreparedTable> tables)
+            : stamps_(stamps), tables_(tables) {
+            if (stamps.tables.size() < tables.size()) stamps.tables.resize(tables.size());
+        }
+
+        // Declares for `encoder`, which follows the last one; the caller
+        // holds it until it ends.
+        void begin(id<MTLComputeCommandEncoder> encoder) {
+            encoder_ = encoder;
+            current_ = ++stamps_.encoders;
+        }
+
+        // Declares what bytes [offsetBytes, offsetBytes + lengthBytes) of
+        // `allocation` reach: those of a view a dispatch binds or lists, and
+        // in turn those of each view a declared reach names, as a kernel may
+        // follow an address it reads in one table to the entries of another.
+        // A reach is declared once per encoder, so a table that reaches
+        // itself ends.
+        void reach(const MetalAllocation &allocation, uint64_t offsetBytes, uint64_t lengthBytes) {
+            for (const TableReach &range : allocation.reaches) {
+                if (range.offsetBytes >= offsetBytes + lengthBytes ||
+                    offsetBytes >= range.offsetBytes + range.lengthBytes)
+                    continue;
+                Reach &resolved = resolve(range.reached);
+                if (resolved.declaredIn == current_) continue;
+                resolved.declaredIn = current_;
+                use(resolved.allocations, true);
+                for (const ReachedTable &table : resolved.tables)
+                    reach(*table.allocation, table.offsetBytes, table.lengthBytes);
+            }
+        }
+
+        // Declares the buffers of the command's table `index`, which a
+        // dispatch lists, and what they reach.
+        void listed(size_t index, bool writes) {
+            uint64_t &declared = stamps_.tables[index][writes];
+            if (declared == current_) return;
+            declared = current_;
+            const PreparedTable &table = tables_[index];
+            use(table.allocations, writes);
+            for (const MetalBuffer::Impl *view : table.reaching)
+                reach(*view->allocation, view->offsetBytes, view->lengthBytes);
+        }
+
+    private:
+        // A view a reach names whose allocation is a table.
+        struct ReachedTable {
+            const MetalAllocation *allocation = nullptr;
+            uint64_t offsetBytes = 0;
+            uint64_t lengthBytes = 0;
+        };
+
+        // A table reach (TableReach), resolved once: the allocations of the
+        // views it names that hold memory, and those views among them whose
+        // allocation is a table. It holds the names, so that no other vector
+        // takes their address while the command is encoded.
+        struct Reach {
+            std::shared_ptr<const std::vector<ReachedView>> source;
+            std::vector<MetalAllocation *> allocations;
+            std::vector<ReachedTable> tables;
+            uint64_t declaredIn = 0;
+        };
+
+        Reach &resolve(const std::shared_ptr<const std::vector<ReachedView>> &source) {
+            const auto known = std::ranges::find(reaches_, source, &Reach::source);
+            if (known != reaches_.end()) return *known;
+            Reach &added = reaches_.emplace_back();
+            added.source = source;
+            for (const ReachedView &view : *source) {
+                const std::shared_ptr<MetalAllocation> allocation = view.allocation.lock();
+                if (!allocation || !allocation->buffer) continue;
+                added.allocations.push_back(allocation.get());
+                if (!allocation->reaches.empty())
+                    added.tables.push_back({allocation.get(), view.offsetBytes, view.lengthBytes});
+            }
+            return added;
+        }
+
+        // Makes the buffers of `allocations` the encoder has not declared for
+        // this usage resident, in one call: the backend's only useResources.
+        void use(std::span<MetalAllocation *const> allocations, bool writes) {
+            pending_.clear();
+            for (MetalAllocation *allocation : allocations) {
+                uint64_t &declared = allocation->declaredIn[writes];
+                if (declared == current_) continue;
+                declared = current_;
+                pending_.push_back(allocation->buffer);
+            }
+            if (!pending_.empty())
+                [encoder_ useResources:pending_.data()
+                                 count:pending_.size()
+                                 usage:writes ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead];
+        }
+
+        EncoderStamps &stamps_;
+        uint64_t current_ = 0;
+        std::span<const PreparedTable> tables_;
+        __unsafe_unretained id<MTLComputeCommandEncoder> encoder_ = nil;
+        // A deque, so a Reach stays where reach() holds it while the reaches
+        // it follows are resolved.
+        std::deque<Reach> reaches_;
+        std::vector<__unsafe_unretained id<MTLResource>> pending_;
+    };
+
+    EncoderStamps encoderStamps;
 
     std::function<void()> operationGuard;
 
@@ -968,8 +1171,12 @@ struct MetalBackend::Impl {
         asyncState->markUnhealthy(std::move(reason));
     }
 
-    id<MTLBuffer> newBuffer(uint64_t bytes, BufferStorage storage,
-                            NSString *label) {
+    // Returned retained, never autoreleased: a buffer's memory returns with
+    // its last reference though the serving thread's autorelease pool never
+    // drains, also where ARC cannot elide an autoreleased return (a
+    // ThreadSanitizer build's instrumentation keeps it from doing so).
+    NS_RETURNS_RETAINED id<MTLBuffer> newBuffer(uint64_t bytes, BufferStorage storage,
+                                                NSString *label) {
         MTLResourceOptions options = storage == BufferStorage::Shared
             ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate;
         id<MTLBuffer> buffer = [device newBufferWithLength:bytes
@@ -1029,10 +1236,10 @@ struct MetalBackend::Impl {
         }
         PreparedCommand command;
         command.dispatches.reserve(dispatches.size());
+        // A command has at most a table per dispatch: room for them all, so
+        // the tables are allocated once.
+        command.tables.reserve(dispatches.size());
         size_t bindings = 0;
-        // The address tables of the command, each checked once: the
-        // dispatches that reach the same buffers share one list.
-        std::vector<const std::vector<MetalBuffer> *> tables;
         for (const ComputeDispatch &dispatch : dispatches) {
             PreparedDispatch item;
             item.source = &dispatch;
@@ -1092,17 +1299,22 @@ struct MetalBackend::Impl {
                 claim(binding.index);
             }
             // An address table takes its entry as bytes do; its buffers are
-            // checked as bindings are.
-            if (const std::vector<MetalBuffer> *table = dispatch.addresses.buffers.get()) {
-                if (table->empty() || table->size() * sizeof(uint64_t) > kBytesArgumentLimit) {
+            // checked as bindings are, and resolved, once per command.
+            if (const std::vector<MetalBuffer> *source = dispatch.addresses.buffers.get()) {
+                if (source->empty() || source->size() * sizeof(uint64_t) > kBytesArgumentLimit) {
                     std::ostringstream message;
-                    message << "compute dispatch '" << dispatch.pipelineName << "' reaches " << table->size()
+                    message << "compute dispatch '" << dispatch.pipelineName << "' reaches " << source->size()
                             << " addresses; a table holds 1 to " << kBytesArgumentLimit / sizeof(uint64_t);
                     throw MetalBackendError(message.str());
                 }
-                if (std::ranges::find(tables, table) == tables.end()) {
-                    for (size_t entry = 0; entry < table->size(); ++entry) {
-                        const MetalBuffer &buffer = (*table)[entry];
+                const auto known = std::ranges::find(command.tables, source, &PreparedTable::source);
+                item.table = static_cast<size_t>(known - command.tables.begin());
+                if (known == command.tables.end()) {
+                    PreparedTable &table = command.tables.emplace_back();
+                    table.source = source;
+                    table.addresses.reserve(source->size());
+                    for (size_t entry = 0; entry < source->size(); ++entry) {
+                        const MetalBuffer &buffer = (*source)[entry];
                         if (!buffer.impl_) {
                             std::ostringstream message;
                             message << "compute dispatch '" << dispatch.pipelineName
@@ -1118,9 +1330,13 @@ struct MetalBackend::Impl {
                                     << "' reaches released memory at address " << entry;
                             throw MetalBackendError(message.str());
                         }
+                        MetalAllocation *allocation = buffer.impl_->allocation.get();
+                        table.addresses.push_back(allocation->buffer.gpuAddress + buffer.impl_->offsetBytes);
+                        if (std::ranges::find(table.allocations, allocation) == table.allocations.end())
+                            table.allocations.push_back(allocation);
+                        if (!allocation->reaches.empty()) table.reaching.push_back(buffer.impl_.get());
                     }
-                    tables.push_back(table);
-                    bindings += table->size();
+                    bindings += source->size();
                 }
                 claim(dispatch.addresses.index);
             }
@@ -1165,8 +1381,8 @@ struct MetalBackend::Impl {
                 bound.push_back(
                     &dispatch.indirectThreadgroups.buffer.impl_->allocation);
         }
-        for (const std::vector<MetalBuffer> *table : tables) {
-            for (const MetalBuffer &buffer : *table)
+        for (const PreparedTable &table : command.tables) {
+            for (const MetalBuffer &buffer : *table.source)
                 bound.push_back(&buffer.impl_->allocation);
         }
         const auto allocation =
@@ -1212,36 +1428,39 @@ struct MetalBackend::Impl {
             steps->readyEvent = [device newSharedEvent];
             steps->ranEvent = [device newSharedEvent];
             if (!steps->readyEvent || !steps->ranEvent) failEncoding("unable to create Metal shared event");
+            if (hostStepSpin) steps->releases = hostStepSpin->releases;
         }
         const uint64_t ready = steps->steps.size() + 1;
         [command encodeSignalEvent:steps->readyEvent value:ready];
-        leading.push_back(command);
+        id<MTLCommandBuffer> awake = nil;
         std::optional<uint32_t> released;
         if (step.gpu == HostStepGpu::Awake && hostStepSpin) {
-            id<MTLCommandBuffer> awake = [queue commandBuffer];
+            awake = [queue commandBuffer];
             if (!awake) failEncoding("unable to create Metal command buffer");
-            released = encodeSpin(*hostStepSpin, awake, failEncoding);
-            steps->releases = hostStepSpin->releases;
-            leading.push_back(awake);
+            released = encodeSpin(*hostStepSpin, awake, kHostStepWaitLoads, failEncoding);
         }
         id<MTLCommandBuffer> next = [queue commandBuffer];
         if (!next) failEncoding("unable to create Metal command buffer");
         [next encodeWaitForEvent:steps->ranEvent value:ready];
         steps->steps.push_back({ready, step.work, step.timed, step.then, command, next, 0.0, 0.0, released});
-        for (auto buffer = leading.end() - (released ? 2 : 1); buffer != leading.end(); ++buffer)
-            [*buffer commit];
+        // `leading` holds the buffers committed, nothing failing in between.
+        for (id<MTLCommandBuffer> buffer : {command, awake}) {
+            if (!buffer) continue;
+            leading.push_back(buffer);
+            [buffer commit];
+        }
         hostStepRunner->add(steps, steps->steps.back());
         return next;
     }
 
     // Encodes into `buffer` one host_step_wait thread, which spins until the
-    // release counter reaches the spin's next release value, and returns that
-    // value.
+    // release counter reaches the spin's next release value, at most `loads`
+    // loads, and returns that value.
     template <class Fail>
-    static uint32_t encodeSpin(HostStepSpin &spin, id<MTLCommandBuffer> buffer, Fail &&fail) {
+    static uint32_t encodeSpin(HostStepSpin &spin, id<MTLCommandBuffer> buffer, uint32_t loads, Fail &&fail) {
         id<MTLComputeCommandEncoder> encoder = [buffer computeCommandEncoder];
         if (!encoder) fail("unable to create Metal compute encoder");
-        const uint32_t release[2] = {++spin.sequence, kHostStepWaitLoads};
+        const uint32_t release[2] = {++spin.sequence, loads};
         [encoder setComputePipelineState:spin.pipeline];
         [encoder setBuffer:spin.releases offset:0 atIndex:0];
         [encoder setBytes:release length:sizeof(release) atIndex:1];
@@ -1252,7 +1471,7 @@ struct MetalBackend::Impl {
     }
 
     // How a check of the spin ended (checkHostStepSpin): a spin ended at its
-    // release, or ran past it, or every spin started after its release.
+    // release, or ran past it, or no spin was spinning at its release.
     enum class SpinCheck : uint8_t { Seen, Unseen, Late };
 
     // Runs spins on a queue of their own, each released while it spins, as
@@ -1263,13 +1482,10 @@ struct MetalBackend::Impl {
         if (!checkQueue) fail("unable to create Metal command queue");
         const auto *seen = reinterpret_cast<const uint32_t *>(
             static_cast<const uint8_t *>(spin.releases.contents) + kHostStepSeenOffset);
-        // A spin that starts after its release sees it at its first load
-        // and shows nothing, so a late one runs again, released later.
-        for (const auto delay : {std::chrono::milliseconds(2), std::chrono::milliseconds(20),
-                                 std::chrono::milliseconds(100)}) {
+        for (const auto delay : kHostStepCheckDelays) {
             id<MTLCommandBuffer> buffer = [checkQueue commandBuffer];
             if (!buffer) fail("unable to create Metal command buffer");
-            const uint32_t value = encodeSpin(spin, buffer, fail);
+            const uint32_t value = encodeSpin(spin, buffer, hostStepCheckLoads(delay), fail);
             [buffer commit];
             std::this_thread::sleep_for(delay);
             const double released = awakeSeconds();
@@ -1277,7 +1493,13 @@ struct MetalBackend::Impl {
             [buffer waitUntilCompleted];
             if (buffer.status != MTLCommandBufferStatusCompleted)
                 fail("a GPU spin failed: " + errorDescription(buffer.error));
-            if (buffer.GPUStartTime >= released) continue;
+            // A spin that was not spinning at its release shows nothing, so it
+            // runs again, released later: one that started after it, as when
+            // the GPU, busy with other work, started it late, or one that
+            // ended before it, which its bound leaves to a GPU four times
+            // faster than any seen or a release more than three delays late
+            // (hostStepCheckLoads).
+            if (buffer.GPUStartTime >= released || buffer.GPUEndTime <= released) continue;
             // A spin that saw its release at its first load proves nothing:
             // a release that came before that load shows to any load.
             if (seen[0] == value && seen[1] == 0) continue;
@@ -1294,15 +1516,16 @@ struct MetalBackend::Impl {
     // with an awake step is encoded, the backend builds the spin
     // (HostStepSpin), and one spin runs on a queue of its own and is released
     // 2 ms after its commit, while it spins: it must end at that release, not
-    // at its bound. A spin that started only after its release shows
-    // nothing, and runs again, released 20 and then 100 ms after its commit.
+    // at its bound, which outlasts the release (hostStepCheckLoads). A spin
+    // that started after its release, or ended before it, shows nothing and
+    // runs again, released 20, then 100 ms after commit (kHostStepCheckDelays).
     // Once a spin ended at its release, awake steps spin. If one ran past its
     // release, or the spin cannot be built or run, awake steps run as plain
     // ones (encodeHostStep), which only gives up the spin's head start, and a
-    // warning says so. If every spin started late, the GPU busy with other
-    // work, the check decides nothing: awake steps run as plain ones for
-    // kHostStepSpinRecheck, and the first command with one after that checks
-    // again.
+    // warning says so. If no spin was spinning at its release, the GPU busy
+    // with other work, the check decides nothing: awake steps run as plain
+    // ones for kHostStepSpinRecheck, and the first command with one after
+    // that checks again.
     void checkHostStepSpin() {
         @autoreleasepool {
             try {
@@ -1340,9 +1563,11 @@ struct MetalBackend::Impl {
         return spin;
     }
 
-    // Encodes and commits prepared dispatches and the event steps between
-    // them; the ticket retains `retained` until it is consumed.
+    // Encodes and commits prepared dispatches, which index `tables`, and the
+    // event steps between them; the ticket retains `retained` until it is
+    // consumed.
     CommandTicket commit(std::span<const PreparedDispatch> dispatches,
+                         std::span<const PreparedTable> tables,
                          std::span<const EventStep> events,
                          std::vector<std::shared_ptr<MetalAllocation>> retained,
                          CommandCompletion completion) {
@@ -1369,17 +1594,18 @@ struct MetalBackend::Impl {
         residency->use();
         // Metal may autorelease the command and its encoder, and the serving
         // loop's pool never drains, so their temporary ownership ends with
-        // this submission (under the validation layer an autoreleased
-        // command holds every member of its queue's residency set). The
-        // command retains everything the GPU still needs.
+        // this submission. The command retains everything the GPU still
+        // needs.
         @autoreleasepool {
-            // The buffers before `command`, each ended by an event signal or
-            // a host step.
+            // The buffers before `command` committed, each ended by an event
+            // signal or a host step.
             std::vector<id<MTLCommandBuffer>> leading;
             // Any failure while encoding, such as Metal creating no buffer or
             // encoder, marks the backend unhealthy. The buffers already
             // committed run on, with the host steps after them, so the backend
-            // keeps their command's state, and with it its allocations.
+            // keeps their command's state, with its allocations, and its
+            // submission, which owners read as a command in flight before
+            // they free memory the buffers may reach by address (KV pages).
             try {
                 id<MTLCommandBuffer> command = [queue commandBuffer];
                 if (!command) {
@@ -1431,33 +1657,7 @@ struct MetalBackend::Impl {
                 // keep the buffers alive.
                 __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
                 NSUInteger offsets[kBufferArgumentEntries];
-                // The command's address tables (AddressTable), each resolved
-                // once: its buffers' GPU addresses as they are now, and the
-                // distinct Metal buffers behind them.
-                struct ResolvedTable {
-                    const std::vector<MetalBuffer> *source = nullptr;
-                    std::vector<uint64_t> addresses;
-                    std::vector<__unsafe_unretained id<MTLResource>> resources;
-                };
-                std::vector<ResolvedTable> tables;
-                const auto resolve = [&](const std::vector<MetalBuffer> &source) -> const ResolvedTable & {
-                    for (const ResolvedTable &table : tables)
-                        if (table.source == &source) return table;
-                    ResolvedTable &table = tables.emplace_back();
-                    table.source = &source;
-                    table.addresses.reserve(source.size());
-                    for (const MetalBuffer &entry : source) {
-                        const MetalBuffer::Impl &buffer = *entry.impl_;
-                        id<MTLBuffer> memory = buffer.allocation->buffer;
-                        table.addresses.push_back(memory.gpuAddress + buffer.offsetBytes);
-                        if (std::ranges::find(table.resources, memory) == table.resources.end())
-                            table.resources.push_back(memory);
-                    }
-                    return table;
-                };
-                // The tables `encoder` already made resident, and whether for
-                // writing: a declaration lasts for the encoder.
-                std::vector<std::pair<const std::vector<MetalBuffer> *, bool>> declared;
+                EncoderResidency encoderResidency(encoderStamps, tables);
                 for (size_t index = 0; index < dispatches.size(); ++index) {
                     encodeSteps(index);
                     const PreparedDispatch &item = dispatches[index];
@@ -1467,13 +1667,14 @@ struct MetalBackend::Impl {
                         if (!encoder) {
                             failEncoding("unable to create Metal compute encoder");
                         }
-                        declared.clear();
+                        encoderResidency.begin(encoder);
                     }
                     [encoder setComputePipelineState:item.pipeline];
                     for (const BufferBinding &binding : dispatch.buffers) {
                         const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
                         buffers[binding.index] = buffer.allocation->buffer;
                         offsets[binding.index] = buffer.offsetBytes;
+                        encoderResidency.reach(*buffer.allocation, buffer.offsetBytes, buffer.lengthBytes);
                     }
                     // One call per run of consecutive entries: a command graph's
                     // dispatch binds a single run.
@@ -1490,20 +1691,12 @@ struct MetalBackend::Impl {
                                    length:binding.sizeBytes
                                   atIndex:binding.index];
                     }
-                    if (const std::vector<MetalBuffer> *source = dispatch.addresses.buffers.get()) {
-                        const ResolvedTable &table = resolve(*source);
+                    if (item.table != PreparedDispatch::kNoTable) {
+                        encoderResidency.listed(item.table, dispatch.addresses.writes);
+                        const PreparedTable &table = tables[item.table];
                         [encoder setBytes:table.addresses.data()
                                    length:table.addresses.size() * sizeof(uint64_t)
                                   atIndex:dispatch.addresses.index];
-                        const std::pair use{source, dispatch.addresses.writes};
-                        if (std::ranges::find(declared, use) == declared.end()) {
-                            [encoder useResources:table.resources.data()
-                                            count:table.resources.size()
-                                            usage:dispatch.addresses.writes
-                                                      ? MTLResourceUsageRead | MTLResourceUsageWrite
-                                                      : MTLResourceUsageRead];
-                            declared.push_back(use);
-                        }
                     }
                     const IndirectGrid &grid = dispatch.indirectThreadgroups;
                     if (grid.buffer) {
@@ -1546,10 +1739,11 @@ struct MetalBackend::Impl {
                 } catch (...) {
                 }
                 markUnhealthy(std::move(reason));
-                asyncState->releaseSubmission(ticketState->sequence);
                 // The state holds the committed buffers too: a host step's
                 // runner reaches the buffer before it only through that.
-                if (!leading.empty()) {
+                if (leading.empty()) {
+                    asyncState->releaseSubmission(ticketState->sequence);
+                } else {
                     ticketState->leadingCommands = leading;
                     abandonedCommands.push_back(ticketState);
                 }
@@ -1584,7 +1778,7 @@ struct MetalBackend::Impl {
             runSteps(index);
             const PreparedDispatch &item = command.dispatches[index];
             const CommandTiming timing =
-                commit({&item, 1}, {}, command.retainedAllocations, {}).wait();
+                commit({&item, 1}, command.tables, {}, command.retainedAllocations, {}).wait();
             dispatchProfile.push_back(
                 {item.source->pipelineName, timing.gpuSeconds});
             total.gpuSeconds += timing.gpuSeconds;
@@ -1613,7 +1807,8 @@ struct MetalBackend::Impl {
     AwakeClock::time_point nextSpinCheck{};
     // Commands whose encoding failed after their first buffers were
     // committed (commit): those buffers, which these hold, still run on these
-    // commands' allocations, with the host steps after them.
+    // commands' allocations, with the host steps after them, and each keeps
+    // its submission, as a command the watchdog gave up does.
     std::vector<std::shared_ptr<CommandTicket::State>> abandonedCommands;
     // Last, so that it stops first, raising the steps it holds.
     std::unique_ptr<HostStepRunner> hostStepRunner;
@@ -1729,13 +1924,15 @@ CommandTiming CommandTicket::wait() {
     }
     CommandTiming timing;
     std::string error;
+    bool outOfMemory = false;
     {
         std::lock_guard lock(state_->mutex);
         timing = state_->timing;
         error = state_->error;
+        outOfMemory = state_->outOfMemory;
     }
     state_->release();
-    if (!error.empty()) throw MetalBackendError(error);
+    if (!error.empty()) throw MetalBackendError(error, outOfMemory);
     return timing;
 }
 
@@ -1787,7 +1984,7 @@ MetalBackend::MetalBackend(std::string metallibPath, double residencyKeepAliveSe
         // Ending residency dispatches a kernel built here, so no pipeline or
         // driver program is compiled when a keep-alive lapses.
         impl_->residency = std::make_shared<Residency>(
-            impl_->device, impl_->queue,
+            impl_->device,
             impl_->newPipeline(impl_->library, Residency::kKickPipeline), residencyKeepAliveSeconds);
     }
     impl_->sampleDeviceMemory();
@@ -1832,6 +2029,15 @@ MetalBuffer MetalBackend::allocateBuffer(uint64_t bytes,
                                          BufferStorage storage,
                                          std::string_view label,
                                          BufferReach reach) {
+    MetalBuffer buffer = reserveBuffer(bytes, storage, label, reach);
+    restoreMemory(buffer);
+    return buffer;
+}
+
+MetalBuffer MetalBackend::reserveBuffer(uint64_t bytes,
+                                        BufferStorage storage,
+                                        std::string_view label,
+                                        BufferReach reach) {
     checkOperation();
     if (!bytes) throw MetalBackendError("Metal buffer size must be positive");
     if (bytes > impl_->capabilities.maxBufferLengthBytes) {
@@ -1846,8 +2052,6 @@ MetalBuffer MetalBackend::allocateBuffer(uint64_t bytes,
     allocation->reach = reach;
     if (!label.empty()) allocation->label = checkedNSString(label, "buffer label");
     allocation->residency = impl_->residency;
-    allocation->attach(impl_->newBuffer(bytes, storage, allocation->label));
-    impl_->sampleDeviceMemory();
     auto result = std::make_shared<MetalBuffer::Impl>();
     result->lengthBytes = bytes;
     result->allocation = std::move(allocation);
@@ -1914,6 +2118,41 @@ void MetalBackend::restoreMemory(const MetalBuffer &buffer) {
     impl_->sampleDeviceMemory();
 }
 
+void MetalBackend::setTableReach(const MetalBuffer &table, std::span<const MetalBuffer> reached) {
+    const auto owned = [&](const MetalBuffer &buffer) {
+        return buffer.impl_ && buffer.impl_->allocation->accounting.get() == impl_->accounting.get();
+    };
+    if (!owned(table)) throw MetalBackendError("Metal buffer is not a buffer of this backend");
+    MetalAllocation &allocation = *table.impl_->allocation;
+    if (allocation.storage != BufferStorage::Shared)
+        throw MetalBackendError("only a Shared Metal buffer holds addresses the host writes");
+    auto weak = std::make_shared<std::vector<ReachedView>>();
+    weak->reserve(reached.size());
+    for (const MetalBuffer &buffer : reached) {
+        if (!owned(buffer)) throw MetalBackendError("Metal buffer is not a buffer of this backend");
+        if (buffer.impl_->allocation->reach != BufferReach::Addressed)
+            throw MetalBackendError("only a Metal buffer allocated BufferReach::Addressed is reached by address");
+        weak->push_back({buffer.impl_->allocation, buffer.impl_->offsetBytes, buffer.impl_->lengthBytes});
+    }
+    const uint64_t offset = table.impl_->offsetBytes, length = table.impl_->lengthBytes;
+    // The new range replaces what the old ranges said of its bytes; the
+    // bytes of theirs outside it keep their reach.
+    std::vector<TableReach> kept;
+    for (TableReach &reach : allocation.reaches) {
+        const uint64_t end = reach.offsetBytes + reach.lengthBytes;
+        if (end <= offset || offset + length <= reach.offsetBytes) {
+            kept.push_back(std::move(reach));
+            continue;
+        }
+        if (reach.offsetBytes < offset)
+            kept.push_back({reach.offsetBytes, offset - reach.offsetBytes, reach.reached});
+        if (offset + length < end)
+            kept.push_back({offset + length, end - offset - length, reach.reached});
+    }
+    if (!weak->empty()) kept.push_back({offset, length, std::move(weak)});
+    allocation.reaches = std::move(kept);
+}
+
 MetalBuffer MetalBackend::view(const MetalBuffer &base,
                                uint64_t offsetBytes,
                                uint64_t lengthBytes) const {
@@ -1970,7 +2209,7 @@ CommandTicket MetalBackend::submitCommandAsync(const Command &command,
         return impl_->submitProfiled(command.dispatches, command.events, std::move(completion));
 #endif
     Impl::PreparedCommand prepared = impl_->prepare(command.dispatches);
-    return impl_->commit(prepared.dispatches, command.events,
+    return impl_->commit(prepared.dispatches, prepared.tables, command.events,
                          std::move(prepared.retainedAllocations),
                          std::move(completion));
 }
@@ -2055,6 +2294,11 @@ std::optional<bool> BackendInstrumentation::awakeHostStepsSpin(MetalBackend &bac
     MetalBackend::Impl &impl = *backend.impl_;
     if (!impl.hostStepSpin && impl.nextSpinCheck != AwakeClock::time_point::max())
         impl.checkHostStepSpin();
+    return hostStepSpinDecision(backend);
+}
+
+std::optional<bool> BackendInstrumentation::hostStepSpinDecision(const MetalBackend &backend) {
+    const MetalBackend::Impl &impl = *backend.impl_;
     if (impl.hostStepSpin) return true;
     if (impl.nextSpinCheck == AwakeClock::time_point::max()) return false;
     return std::nullopt;

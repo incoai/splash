@@ -16,17 +16,14 @@ from pathlib import Path
 from unittest import mock
 
 from dev.tests import native_peer
+from dev.tests.server_fixtures import READY
 from server import crash_trace
 from server import protocol as wire
 
 
 def ready_frame():
     """The frame the server reads for a Ready event."""
-    return (
-        wire.FrameParser()
-        .consume(native_peer.serialize_event(wire.ReadyEvent(4, 131_072, False)))
-        .frame
-    )
+    return wire.FrameParser().consume(native_peer.serialize_event(READY)).frame
 
 
 class CrashTraceTest(unittest.TestCase):
@@ -253,7 +250,7 @@ class CrashTraceTest(unittest.TestCase):
         ready_program = (
             "import sys; from dev.tests import native_peer as n; "
             "from server import protocol as w; "
-            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False))); "
+            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False,248320,9,(248046,)))); "
             "sys.stdout.buffer.flush(); sys.stdin.buffer.read()"
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -305,7 +302,7 @@ class CrashTraceTest(unittest.TestCase):
             "from dev.tests import native_peer as n; "
             "from server import protocol as w; "
             "signal.signal(signal.SIGTERM, signal.SIG_IGN); os.close(0); "
-            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False))); "
+            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False,248320,9,(248046,)))); "
             "sys.stdout.buffer.flush(); time.sleep(60)"
         )
         with self._replay_peer(program) as (path, engines):
@@ -332,7 +329,7 @@ class CrashTraceTest(unittest.TestCase):
                     "from server import protocol as w; "
                     "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
                     "sys.stdout.buffer.write("
-                    "n.serialize_event(w.ReadyEvent(4,1048576,False))); "
+                    "n.serialize_event(w.ReadyEvent(4,1048576,False,248320,9,(248046,)))); "
                     "sys.stdout.buffer.flush(); "
                     "sys.stdin.buffer.read(1); "
                     + {
@@ -377,7 +374,7 @@ class CrashTraceTest(unittest.TestCase):
         program = (
             "import sys; from dev.tests import native_peer as n; "
             "from server import protocol as w; "
-            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False))); "
+            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False,248320,9,(248046,)))); "
             "sys.stdout.buffer.flush(); "
             f"sys.stdin.buffer.read({len(frame)}); raise SystemExit(23)"
         )
@@ -401,7 +398,7 @@ class CrashTraceTest(unittest.TestCase):
                     "from dev.tests import native_peer as n; "
                     "from server import protocol as w; "
                     "sys.stdout.buffer.write("
-                    "n.serialize_event(w.ReadyEvent(4,131072,False))); "
+                    "n.serialize_event(w.ReadyEvent(4,131072,False,248320,9,(248046,)))); "
                     "sys.stdout.buffer.flush(); "
                     "sys.stdin.buffer.read(); os.close(1); "
                     f"time.sleep(0.05); raise SystemExit({returncode})"
@@ -418,7 +415,7 @@ class CrashTraceTest(unittest.TestCase):
             "import signal, sys, time; from dev.tests import native_peer as n; "
             "from server import protocol as w; "
             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False))); "
+            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False,248320,9,(248046,)))); "
             "sys.stdout.buffer.flush(); "
             f"sys.stdin.buffer.read({len(frame)}); "
             "sys.stdout.buffer.write(b'NOPE' + bytes(20)); "
@@ -455,7 +452,7 @@ class CrashTraceTest(unittest.TestCase):
             "import signal, sys, time; from dev.tests import native_peer as n; "
             "from server import protocol as w; "
             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False))); "
+            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False,248320,9,(248046,)))); "
             "sys.stdout.buffer.flush(); sys.stdin.buffer.read(); time.sleep(60)"
         )
         with self._replay_peer(program) as (path, engines):
@@ -487,7 +484,7 @@ class CrashTraceTest(unittest.TestCase):
         capture_program = (
             "import sys; from dev.tests import native_peer as n; "
             "from server import protocol as w; "
-            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False))); "
+            "sys.stdout.buffer.write(n.serialize_event(w.ReadyEvent(4,131072,False,248320,9,(248046,)))); "
             "sys.stdout.buffer.flush(); "
             "open(sys.argv[1], 'wb').write(sys.stdin.buffer.read())"
         )

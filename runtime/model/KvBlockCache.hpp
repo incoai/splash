@@ -78,11 +78,28 @@ public:
   // releaseLane() gives it back when the request ends or is suspended.
   [[nodiscard]] ModelMemoryAdmission reserveLane(uint32_t stateLane);
   void releaseLane(uint32_t stateLane) noexcept;
-  // Between commands, optionally: at most one extent more toward the target.
-  [[nodiscard]] ModelMemoryAdmission growTowardTarget();
+  // Whether the lane holds its floor: reserveLane() granted it, and
+  // releaseLane() has not given it back.
+  [[nodiscard]] bool holdsLane(uint32_t stateLane) const;
+  // Whether a lane reads cache above the floors: a lane holds a floor and
+  // the target is past the floors. Else the extents above the floors cost
+  // only their rebuild.
+  [[nodiscard]] bool readsAboveFloor() const noexcept;
+  // The bytes the floors of `lanes` more lanes need together, in whole
+  // extents once for them all, past the extents that stay for them: all
+  // while a lane reads above the floors, else the floors held.
+  [[nodiscard]] uint64_t lanesShortfallBytes(uint32_t lanes) const;
+  // Between commands, optionally: at most one extent more toward the target,
+  // under `admit`.
+  [[nodiscard]] metal::AllocationResult growTowardTarget(const metal::AllocationAdmission &admit);
   // An idle reclaim: the cache's last extent above its floors, in bytes;
   // zero at its floors. A reclaim that needs more calls again.
   [[nodiscard]] uint64_t releaseAboveFloor();
+  // The bytes of one extent, what the cache grows and gives back at a time.
+  [[nodiscard]] uint64_t extentBytes() const noexcept;
+  // The floors of `lanes` lanes in whole extents, whatever the cache holds:
+  // zero for none.
+  [[nodiscard]] uint64_t floorBytes(uint32_t lanes) const noexcept;
 
   // After `layer`'s block lists: a host step that resolves the entries of
   // lane l's list, whose pages' sources are lanes[l] (null for a lane none
@@ -99,8 +116,8 @@ public:
   [[nodiscard]] std::vector<KvReadFailure> takeFailures();
 
   // Engine thread, once a command completed: its resolves' counts, and the
-  // totals of every command's.
-  void mergeStats(const KvReadStats &stats);
+  // totals of every command's. Returns the bytes its resolves read.
+  uint64_t mergeStats(const KvReadStats &stats);
   [[nodiscard]] KvBlockCacheStats stats() const;
 
 private:

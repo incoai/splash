@@ -40,9 +40,8 @@ DiskVolume localVolume(uint64_t availableBytes, uint64_t sizeBytes = 1000 * kGiB
   return {"/Volumes/Test", availableBytes, sizeBytes, true};
 }
 
-// The floor is 10 GiB, or 5% of a volume smaller than 200 GiB; the automatic
-// quota's limit is a quarter of what the volume has beyond it, the tier's own
-// blocks counted, at most the quota and never below zero.
+// The floor is 10 GiB, or 5% of a volume under 200 GiB; the automatic limit is a quarter of the
+// room beyond it, capped by the quota.
 void testTheRule() {
   require(diskFloorBytes(1000 * kGiB) == 10 * kGiB && diskFloorBytes(100 * kGiB) == 5 * kGiB &&
               diskFloorBytes(12 * kGiB) == 12 * kGiB / 20,
@@ -59,9 +58,8 @@ void testTheRule() {
           "the limit below the floor is not what the tier holds beyond it");
 }
 
-// Automatic tiers sharing a volume, each measuring in turn and filling or
-// giving up to its limit, settle at (available - floor) / (tiers + 3) each,
-// and the free space they leave stays above the floor.
+// Automatic tiers sharing a volume settle at (available - floor) / (tiers + 3) each, above the
+// floor.
 void testTiersOnOneVolumeConverge() {
   const uint64_t floor = 10 * kGiB, before = 100 * kGiB;
   for (uint32_t tiers = 1; tiers <= 4; ++tiers) {
@@ -82,10 +80,7 @@ void testTiersOnOneVolumeConverge() {
   }
 }
 
-// Blocks a snapshot keeps when an automatic tier frees them return nothing
-// to the volume. Each measure then lowers the limit by a quarter of what the
-// last one freed: the tier gives up at most a third more than it first
-// freed, and keeps the rest.
+// Blocks a snapshot keeps cost an automatic tier at most a third more than it first freed.
 void testSnapshotCostsAtMostAThird() {
   const uint64_t floor = 10 * kGiB;
   uint64_t available = 50 * kGiB, held = 0;
@@ -107,11 +102,8 @@ void testSnapshotCostsAtMostAThird() {
           "a snapshot that keeps freed blocks drained the tier");
 }
 
-// Active KV may take all of the room beyond the floor, at most the quota,
-// while the automatic quota's cached copies keep a quarter of it: on a Mac
-// mini's 460 GiB volume with 16 GiB free, 6 GiB against 1.5; with 24 GiB
-// free, 14 GiB. Off a local volume both are the quota; a hidden limit caps
-// both at what the tier holds.
+// Active KV may take all the room beyond the floor, up to the quota, while cached copies keep a
+// quarter of it.
 void testActiveKvTakesTheRoom() {
   const uint64_t floor = 10 * kGiB;
   require(diskActiveLimitBytes(kQuota, 30 * kGiB, 0, floor) == 20 * kGiB &&
@@ -144,13 +136,8 @@ void testActiveKvTakesTheRoom() {
           "a hidden limit did not cap active KV at what the tier holds");
 }
 
-// --max-cache-disk auto holds a quarter of its volume's room, at most 32 GiB;
-// a size is held as given while its volume has room for it beyond the floor,
-// and holds that room, as active KV may, when it has less (#446). On a 2000
-// GiB volume with 730.8 GiB beyond the floor, a size of 500 GiB holds 500,
-// where a quarter of the room would leave 182.7, and auto its 32; with 72
-// GiB beyond it, the size holds the 72 and auto a quarter, 18; below the
-// floor neither holds anything.
+// A --max-cache-disk size is held as given while the volume has room beyond the floor, else that
+// room; auto holds a quarter, at most 32 GiB.
 void testSizeIsHeldAsGiven() {
   const uint64_t size = 500 * kGiB, floor = 10 * kGiB;
   auto automaticBudget = std::make_shared<model::DiskBudget>(kAutomaticCacheDiskBytes);
@@ -195,15 +182,8 @@ void testAutomaticStart() {
           "a volume with room, or the room the tier's own files hold, refused the tier");
 }
 
-// A measure of a real file sets the limit by the rule from what it read and
-// leaves the write budget alone: there is none unless the user sets one, so
-// nothing is held back. A write that found the volume full while it shows
-// none lowers the limit by the rule. One that found it full while it shows
-// room may have met a volume that filled and freed again, and changes
-// nothing; a second met a limit the measure cannot see: the tier keeps
-// within what it holds then, replacing within that, until another such write
-// lowers it again; its files go on taking writes. Off a local volume a
-// second write that found it full does the same.
+// Measuring real files sets the limit by the rule; a full-volume write lowers it only when the
+// volume shows no room.
 void testMeasureOfRealFiles() {
   auto budget = std::make_shared<model::DiskBudget>(kQuota);
   auto file = std::make_shared<model::SlotFile>(kHostPageBytes, budget);
@@ -290,10 +270,8 @@ std::vector<CacheDirectory::Idle> otherCaches(const std::filesystem::path &root)
   return others;
 }
 
-// One limit bounds a persistent cache's root, and the tier may use all of
-// it: the other caches nobody holds count among what the tier holds, and
-// while the root holds more than its limit they go, the oldest first,
-// before a copy of the tier's own. A shrinking volume makes them go.
+// Other caches nobody holds in a persistent root count against the limit and go first, oldest
+// first.
 void testOtherCachesGoFirst() {
   const test::TemporaryDirectory root("splash-disk-space-root");
   const std::vector<CacheDirectory::Idle> others = otherCaches(root.path());
@@ -313,6 +291,20 @@ void testOtherCachesGoFirst() {
               space.othersBytes() == others[1].bytes &&
               budget->limitBytes() == rootLimit,
           "the oldest other cache did not go first, or the tier did not get the root's limit");
+}
+
+// Another cache removed by someone else stops counting at the next measure.
+void testRemovedCachesStopCounting() {
+  const test::TemporaryDirectory root("splash-disk-space-root");
+  const std::vector<CacheDirectory::Idle> others = otherCaches(root.path());
+  auto budget = std::make_shared<model::DiskBudget>(kQuota);
+  auto file = std::make_shared<model::SlotFile>(kHostPageBytes, budget);
+  DiskSpace space(budget, kSize, {file}, others);
+  const DiskVolume volume{"/Volumes/Test", 500 * kGiB, 1000 * kGiB, true};
+  std::filesystem::remove_all(others[1].path);
+  space.measure(volume);
+  require(space.othersBytes() == others[0].bytes && space.heldBytes() == others[0].bytes,
+          "a removed cache still counted among what the root holds");
 }
 
 // The tier growing within the quota makes them go as well, on a volume
@@ -362,6 +354,7 @@ int main() {
     testAutomaticStart();
     testMeasureOfRealFiles();
     testOtherCachesGoFirst();
+    testRemovedCachesStopCounting();
     testOtherCachesGoAsTheTierGrows();
     std::cout << "Disk space tests passed\n";
   } catch (const std::exception &error) {

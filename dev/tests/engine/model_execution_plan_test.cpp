@@ -378,8 +378,28 @@ void checkGdnWidths() {
 
 } // namespace
 
+// A prefill chunk's attention plan follows the history its chunk committed:
+// a short chunk after a long cached prefix shares its tiles' pages out over
+// more splits than the same chunk after none.
+void checkPrefillAttentionHistory() {
+  const auto geometry = model::RuntimeGeometry::from(loadedModel<model::Qwen3_6MoeWeights>(), kv::Format::Int8,
+                                                     ops::GdnStateFormat::Float32);
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  const ops::ExecutionPlans plans(device);
+  model::QwenTargetPrefillSequence sequence;
+  sequence.rows = 300;
+  const auto splitsAfter = [&](uint32_t history) {
+    sequence.chunk.committed_tokens = history;
+    return model::prefillAttentionPlan(plans, geometry.target, sequence).splits;
+  };
+  require(splitsAfter(65'536) > splitsAfter(0), "a chunk's attention plan does not follow its history");
+}
+
 int main() {
   try {
+    checkPrefillAttentionHistory();
     checkUnsizedProjection();
     checkCaptureLayers();
     checkGdnWidths();

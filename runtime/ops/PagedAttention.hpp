@@ -239,6 +239,7 @@ struct PagedVerifyBuffers final {
   metal::MetalBuffer partials;
   metal::MetalBuffer statistics;
   metal::MetalBuffer output;
+  // A page table per lane of the plan, at least.
   std::span<const metal::MetalBuffer> pageTables;
   // The layer's learned sinks, an F32 per query head, for a plan whose
   // reduce adds them (VerifyAttentionPlan::sinks); none otherwise.
@@ -252,10 +253,14 @@ struct PagedVerifyBuffers final {
 // RoPE, and the window of the plans' kernels and of their split counts.
 class PagedAttention final {
 public:
-  // The kernels read a sequence's history from its chunk parameters, so a
-  // plan depends on the rows only.
+  // The kernels read a sequence's history from its chunk parameters; a
+  // plan's split count follows its rows and, unless it is sparse, the pages
+  // its tiles read of the historyTokens committed before them (with a
+  // window, no more than its window's), a split per the device's
+  // `pagesPerSplit` (AttentionCalibration).
   [[nodiscard]] static PrefillAttentionPlan
-  prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout, AttentionVariant variant = {});
+  prefillPlan(uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
+              uint32_t pagesPerSplit, AttentionVariant variant = {});
   // historyTokens holds each lane's committed tokens before its verify rows,
   // one entry per lane.
   [[nodiscard]] static VerifyAttentionPlan

@@ -7,54 +7,69 @@
 namespace splash::engine {
 namespace {
 
-// A lane yields to later arrivals at most this many prefill commands in a
-// row: the other lanes of a full batch, each finishing one short prompt.
-constexpr uint32_t kMaximumOvertakes =
-    model::ExecutionLimits::maximumBatchWidth - 1;
-
-// The slice a contended prefill command aims for: while peers of its
-// priority decode, the budget halves until its estimated cost fits, so they
-// wait about this long between steps. A latency target, not a deadline: the
-// first command has no measurement and the budget stops at
-// kMinimumPrefillRows. A command with a fixed cost (a streamed target's
-// expert reads, which any chunk pays in full) gets twice that cost instead,
-// so its rows take at least as long as its fixed part and its peers wait
-// that long, seconds rather than this slice; where its model runs a command
-// in passes over its layers (Model::prefillPasses), it keeps its rows
-// whatever the contention, and each pass aims for this slice, contended or
-// not, so that decode steps run between passes and a cancel waits for one
-// at most (passesFor). A lane that streams its history sizes its commands
-// by its own reads instead (streamingRows).
-constexpr double kContendedPrefillMilliseconds = 500.0;
-// The fewest rows a contended prefill command is cut to, and the fewest whose
-// time measures prefill throughput: below it a command's fixed costs dominate.
+constexpr uint32_t kChunk = model::ExecutionLimits::prefillTokenBudget;
+// The fewest rows the pair bound halves a lane's command to.
 constexpr uint32_t kMinimumPrefillRows = 64;
-// The weight of a command's measured time in a running estimate (per row,
-// fixed, or a lane's wait on its history's reads): one unusually slow or
-// fast command moves it a quarter of the way, and a lasting change carries
-// it within a few commands.
-constexpr double kPrefillTimeWeight = 0.25;
+// The fewest rows a contended cut leaves a unit, or the model's least rows
+// where more (the Neural Engine FFN split's least chunk): smaller cuts lose
+// prefill throughput (17% fewer rows a second on an M6 below 512 rows).
+constexpr uint32_t kFloorRows = 512;
+// A request yields to later arrivals of its priority at most this many
+// prefill commands in a row: the other lanes of a full batch, each finishing
+// one short prompt.
+constexpr uint32_t kMaximumOvertakes = model::ExecutionLimits::maximumBatchWidth - 1;
 
 // A command excludes at most the lanes of a full batch: a linear search.
 bool listed(std::span<const uint64_t> ids, uint64_t id) noexcept {
   return std::find(ids.begin(), ids.end(), id) != ids.end();
 }
 
+bool holds(std::span<const BatchItem> items, uint64_t id) noexcept {
+  return std::ranges::any_of(items, [id](const BatchItem &item) { return item.requestId == id; });
+}
+
 // The rows of an uncontended command of a lane with `remaining` rows to
-// prefill: up to a chunk, or for a lane whose commands may be prefill groups
-// of up to `groupRows` rows, its remaining chunks split evenly over the
-// fewest groups that hold them (a short last group would pay a whole pass
-// over a target's streamed experts for a few rows).
+// prefill: up to a chunk, or for a lane whose commands are groups of up to
+// `groupRows` rows, its remaining chunks split evenly over the fewest groups
+// that hold them (a short last group would pay a whole fixed part for a few
+// rows).
 uint32_t uncontendedRows(uint32_t remaining, uint32_t groupRows) noexcept {
-  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
-  if (remaining <= chunk || groupRows <= chunk)
-    return std::min(remaining, chunk);
-  const uint32_t chunks = (remaining + chunk - 1) / chunk;
-  const uint32_t groups = (chunks + groupRows / chunk - 1) / (groupRows / chunk);
-  return std::min(remaining, (chunks + groups - 1) / groups * chunk);
+  if (remaining <= kChunk || groupRows <= kChunk)
+    return std::min(remaining, kChunk);
+  const uint32_t chunks = (remaining + kChunk - 1) / kChunk;
+  const uint32_t groups = (chunks + groupRows / kChunk - 1) / (groupRows / kChunk);
+  return std::min(remaining, (chunks + groups - 1) / groups * kChunk);
+}
+
+// The lanes whose rows run past a chunk as they fill the chunks in order
+// (model::commandViolation's count).
+uint32_t lanesPastChunk(std::span<const model::PrefillLane> lanes) noexcept {
+  uint64_t rows = 0;
+  uint32_t past = 0;
+  for (const model::PrefillLane &lane : lanes) {
+    past += lane.rows && rows / kChunk != (rows + lane.rows - 1) / kChunk;
+    rows += lane.rows;
+  }
+  return past;
+}
+
+uint64_t rowsOf(std::span<const model::PrefillLane> lanes) noexcept {
+  uint64_t rows = 0;
+  for (const model::PrefillLane &lane : lanes)
+    rows += lane.rows;
+  return rows;
 }
 
 } // namespace
+
+Scheduler::Scheduler(SchedulerConfig config, const model::PrefillWorkSource &work)
+    : config_(config), work_(work), decodeShare_(config.decodeShare) {
+  if (!std::isfinite(config_.decodeGapMilliseconds) || config_.decodeGapMilliseconds <= 0.0)
+    throw std::invalid_argument("the decode gap target must be positive and finite");
+  if (!config_.limits.commandRows || !config_.limits.maximumPasses)
+    throw std::invalid_argument("a prefill command must hold a row in at least one pass");
+  counters_.decodeGapTargetMilliseconds = config_.decodeGapMilliseconds;
+}
 
 void Scheduler::submit(RequestSpec request) {
   Request state;
@@ -77,11 +92,12 @@ void Scheduler::resourcesReady(uint64_t id, uint32_t processed) {
     throw std::logic_error("suspended request requires resumeFromResources");
   }
   request.promptProcessed = processed;
+  request.rowsCounted = processed;
   request.decodeStage = DecodeStage::Regular;
   request.phase =
       processed == request.spec.prefillTokens ? Phase::Decode : Phase::Prefill;
   if (request.phase == Phase::Decode)
-    startDecodeGap(request);
+    promptCompleted(request);
 }
 
 void Scheduler::suspendForResources(uint64_t id) {
@@ -89,8 +105,6 @@ void Scheduler::suspendForResources(uint64_t id) {
   if (request.phase != Phase::Prefill && request.phase != Phase::Decode) {
     throw std::logic_error("only runnable resident work can be suspended");
   }
-  // A command between its passes is left: the lane replays its rows.
-  request.passes.reset();
   request.suspended = true;
   request.phase = Phase::WaitingResources;
   dropStaleDecodeDebt();
@@ -104,8 +118,14 @@ void Scheduler::resumeFromResources(uint64_t id, uint32_t processed,
   }
   if (processed >= replayTokens)
     throw std::invalid_argument("resource replay must leave an input token");
-  request.spec.prefillTokens = replayTokens;
+  // The replay counts again the rows it runs that ran before it, but not
+  // those it runs that were counted and never ran: an abandoned command's, or
+  // the rest of a command between its passes, [promptProcessed, rowsCounted)
+  // from where it starts.
+  request.rowsCounted = std::max(request.rowsCounted, processed) -
+                        (request.promptProcessed - std::min(request.promptProcessed, processed));
   request.promptProcessed = processed;
+  request.spec.prefillTokens = replayTokens;
   request.phase = Phase::Prefill;
   request.suspended = false;
 }
@@ -148,20 +168,10 @@ void Scheduler::maskReady(uint64_t id) {
     throw std::logic_error("request is not waiting for a mask");
   }
   request.phase = Phase::Decode;
-  startDecodeGap(request);
-}
-
-void Scheduler::setStreamsHistory(uint64_t id, bool streams) {
-  get(id).streamsHistory = streams;
-}
-
-void Scheduler::setPrefillGroupRows(uint64_t id, uint32_t rows) {
-  get(id).spec.prefillGroupRows = rows;
 }
 
 void Scheduler::cancel(uint64_t id) {
   Request &request = get(id);
-  request.passes.reset();
   if (!terminal(request.phase))
     request.phase = Phase::Cancelled;
   dropStaleDecodeDebt();
@@ -169,7 +179,6 @@ void Scheduler::cancel(uint64_t id) {
 
 void Scheduler::finish(uint64_t id) {
   Request &request = get(id);
-  request.passes.reset();
   if (!terminal(request.phase))
     request.phase = Phase::Completed;
   dropStaleDecodeDebt();
@@ -177,7 +186,6 @@ void Scheduler::finish(uint64_t id) {
 
 void Scheduler::fail(uint64_t id) {
   Request &request = get(id);
-  request.passes.reset();
   if (terminal(request.phase))
     return;
   request.phase = Phase::Failed;
@@ -185,38 +193,13 @@ void Scheduler::fail(uint64_t id) {
 }
 
 void Scheduler::remove(uint64_t id) {
-  if (active_) {
-    for (const BatchItem &item : active_->items) {
-      if (item.requestId == id) {
-        throw std::logic_error("cannot remove an active batch member");
-      }
-    }
-  }
+  if (active_ && holds(active_->items, id))
+    throw std::logic_error("cannot remove an active batch member");
   auto found = requests_.find(id);
   if (found == requests_.end() || !terminal(found->second.phase)) {
     throw std::logic_error("only terminal requests can be removed");
   }
   requests_.erase(found);
-}
-
-bool Scheduler::expireDeadlines(double now) {
-  bool changed = false;
-  for (auto &[_, request] : requests_) {
-    const bool inFlight =
-        active_ && std::any_of(active_->items.begin(), active_->items.end(),
-                               [&](const BatchItem &item) {
-                                 return item.requestId == request.spec.id;
-                               });
-    if (!inFlight && !terminal(request.phase) &&
-        request.spec.deadlineMilliseconds <= now) {
-      request.phase = Phase::Failed;
-      request.passes.reset();
-      changed = true;
-    }
-  }
-  if (changed)
-    dropStaleDecodeDebt();
-  return changed;
 }
 
 std::vector<uint64_t> Scheduler::admissionOrder() const {
@@ -237,42 +220,106 @@ std::vector<uint64_t> Scheduler::admissionOrder() const {
   return result;
 }
 
-std::vector<uint64_t> Scheduler::prefillAdmissionOrder(
-    std::span<const PrefillAdmission> candidates) const {
-  std::vector<PrefillRequestView> pending;
-  pending.reserve(candidates.size());
-  for (const auto &candidate : candidates) {
-    const Request &value = get(candidate.requestId);
+std::vector<uint64_t> Scheduler::prefillAdmissionOrder(std::span<const PrefillAdmission> candidates,
+                                                       const PlanInputs &in) const {
+  // A request admission has not started, from the tokens it starts at.
+  const auto unstarted = [&](const PrefillAdmission &entry) {
+    const Request &value = get(entry.requestId);
     if (value.suspended ||
         (value.phase != Phase::Queued && value.phase != Phase::WaitingResources &&
          value.phase != Phase::WaitingPrefix) ||
-        candidate.cachedTokens >= value.spec.prefillTokens)
+        entry.cachedTokens >= value.spec.prefillTokens)
       throw std::logic_error("invalid pending prefill admission");
-    pending.push_back({&value, candidate.cachedTokens});
-  }
-  std::vector<PrefillRequestView> ready;
-  ready.reserve(requests_.size());
+    return lane(value, entry.cachedTokens, in);
+  };
+  std::vector<Lane> pending;
+  pending.reserve(candidates.size());
+  for (const auto &candidate : candidates)
+    pending.push_back(unstarted(candidate));
+  // The lanes of the candidates' first command: the resident prefill lanes,
+  // those of the command between its passes past its rows, which commit at
+  // its last pass before any other prefill runs (nextPrefill). One whose
+  // prompt those rows end is a lane ahead of every candidate of its priority
+  // or a lower one, its prompt ending there, which matters only for a Spill
+  // lane (below): the most urgent such lane's priority.
+  std::vector<Lane> lanes;
+  lanes.reserve(requests_.size());
   std::vector<uint64_t> result;
-  for (const auto &[_, request] : requests_) {
-    // A command between its passes runs before any new prefill.
-    if (request.phase == Phase::Prefill && request.passes)
-      return result;
-    if (request.phase == Phase::Prefill)
-      ready.push_back({&request, request.promptProcessed});
+  std::optional<RequestPriority> spillEnds;
+  for (const auto &[id, request] : requests_) {
+    if (request.phase != Phase::Prefill || shapeOf(id, in).ended)
+      continue;
+    uint32_t processed = request.promptProcessed;
+    if (in.passes)
+      if (const auto item = std::ranges::find(in.passes->plan.items, id, &BatchItem::requestId);
+          item != in.passes->plan.items.end())
+        processed += item->tokenCount;
+    if (processed != request.spec.prefillTokens)
+      lanes.push_back(lane(request, processed, in));
+    else if (shapeOf(id, in).spill && (!spillEnds || request.spec.priority < *spillEnds))
+      spillEnds = request.spec.priority;
   }
-  for (const auto &request : pending)
-    ready.push_back(request);
-  if (const auto plan = planPrefill(std::move(ready))) {
-    // Admission ranks candidates against every decoder, left out of a plan
-    // or not.
-    const auto decode = nextDecode({});
-    if (decode && get(decode->items.front().requestId).spec.priority <
-                      get(plan->items.front().requestId).spec.priority)
+  // The requests restoring their prefix, which prefill once it lands, in no
+  // command planned before then.
+  std::vector<Lane> restoring;
+  restoring.reserve(in.restoring.size());
+  for (const auto &entry : in.restoring)
+    restoring.push_back(unstarted(entry));
+  // Admission starts only lanes their first command serves, overdue or left
+  // waiting for no other prompt: one whose prompt the command ends, or one it
+  // leads or that leads next, every lane ordered before it ending its prompt
+  // there, and that no restoring start leads once it lands. A start holds
+  // its memory from its first command to its last, so a prompt that would
+  // join with the rows that spare it a command and then wait out another's
+  // prompt stays queued until it leads. One that leads next starts beside
+  // no Spill lane, as two Spill lanes prefill together only as the later one
+  // leads or one is overdue: beside the last command of a Spill lane, one
+  // between its passes too, it stays queued. A restoring start holds back a
+  // candidate it leads once it lands: past the candidate's first command,
+  // which this tick plans without it, or as the candidate stands while a
+  // command is between its passes, as it may land before the first command
+  // after them. Admission plans again without the candidates a plan does
+  // not serve until it serves all it plans, as without them the plan can
+  // take another leader.
+  std::optional<Planned> planned;
+  size_t count = 0;
+  do {
+    count = pending.size();
+    std::vector<Lane> ready = lanes;
+    ready.insert(ready.end(), pending.begin(), pending.end());
+    planned = planPrefill(ready);
+    if (!planned)
       return result;
-    for (const auto &item : plan->items)
-      if (get(item.requestId).phase != Phase::Prefill)
-        result.push_back(item.requestId);
-  }
+    const std::vector<BatchItem> &items = planned->plan.items;
+    const auto ends = [&](const Lane &view) {
+      const auto item = std::ranges::find(items, view.request->spec.id, &BatchItem::requestId);
+      return item != items.end() && item->tokenCount == view.remaining();
+    };
+    std::erase_if(pending, [&](const Lane &view) {
+      const auto item = std::ranges::find(items, view.request->spec.id, &BatchItem::requestId);
+      if (item == items.end())
+        return true;
+      if (view.overdue || item->tokenCount == view.remaining())
+        return false;
+      const Lane landed = in.passes ? view : lane(*view.request, view.processed + item->tokenCount, in);
+      return (spillEnds && *spillEnds <= view.request->spec.priority) ||
+             std::ranges::any_of(ready,
+                                 [&](const Lane &other) {
+                                   return other.request != view.request && leadsBefore(other, view) &&
+                                          (!ends(other) || other.shape.spill);
+                                 }) ||
+             std::ranges::any_of(restoring, [&](const Lane &other) { return leadsBefore(other, landed); });
+    });
+  } while (pending.size() != count);
+  // Admission ranks candidates against every decoder, left out of a plan or
+  // not.
+  const auto decode = nextDecode({});
+  if (decode && get(decode->items.front().requestId).spec.priority <
+                    get(planned->plan.items.front().requestId).spec.priority)
+    return result;
+  for (const auto &item : planned->plan.items)
+    if (std::ranges::any_of(pending, [&](const Lane &view) { return view.request->spec.id == item.requestId; }))
+      result.push_back(item.requestId);
   return result;
 }
 
@@ -286,11 +333,19 @@ std::optional<RequestPriority> Scheduler::highestRunnablePriority() const noexce
   return result;
 }
 
-std::optional<BatchPlan> Scheduler::next(std::span<const uint64_t> excluded) const {
+bool Scheduler::yieldsTo(RequestPriority priority, const PlanInputs &in) const {
+  return in.passes && priority < get(in.passes->plan.items.front().requestId).spec.priority;
+}
+
+bool Scheduler::abandonsPasses(const BatchPlan &plan, const PlanInputs &in) const {
+  return in.passes && plan.kind == WorkKind::Prefill && !samePlan(plan, in.passes->plan);
+}
+
+std::optional<BatchPlan> Scheduler::next(const PlanInputs &in) const {
   if (active_)
     return std::nullopt;
-  auto decode = nextDecode(excluded);
-  auto prefill = nextPrefill(excluded);
+  auto decode = nextDecode(in.excluded);
+  auto prefill = nextPrefill(in);
   if (!decode)
     return prefill;
   if (!prefill)
@@ -315,166 +370,190 @@ std::optional<BatchPlan> Scheduler::next(std::span<const uint64_t> excluded) con
                                                  : std::move(decode);
 }
 
-std::optional<BatchPlan> Scheduler::nextPrefill(std::span<const uint64_t> excluded) const {
+std::optional<BatchPlan> Scheduler::nextPrefill(const PlanInputs &in) const {
+  std::optional<Planned> planned = planPrefill(readyLanes(in));
+  // Its commit counts what planning it counted.
+  lastPlanned_ = planned;
   // A command between its passes goes on before any other prefill, whose
-  // rows would take the model's prefill memory its rows' work is in.
-  for (const auto &[id, request] : requests_) {
-    if (request.phase != Phase::Prefill || !request.passes)
-      continue;
-    if (listed(excluded, id))
+  // rows would take the model's prefill memory its rows' work is in, but one
+  // of a higher priority. One of its priority waits for its end: abandoning
+  // it would run its passes again for the rows it started.
+  if (!in.passes || (planned && yieldsTo(get(planned->plan.items.front().requestId).spec.priority, in)))
+    return planned ? std::optional(std::move(planned->plan)) : std::nullopt;
+  for (const BatchItem &item : in.passes->plan.items)
+    if (listed(in.excluded, item.requestId))
       return std::nullopt;
-    BatchPlan plan;
-    plan.kind = WorkKind::Prefill;
-    plan.items.push_back({id, request.passes->rows, request.promptProcessed});
-    plan.pass = request.passes->next;
-    plan.passes = request.passes->passes;
-    return plan;
-  }
-  std::vector<PrefillRequestView> ready;
-  for (const auto &[id, request] : requests_) {
-    if (request.phase == Phase::Prefill && !listed(excluded, id))
-      ready.push_back({&request, request.promptProcessed});
-  }
-  return planPrefill(std::move(ready));
+  return in.passes->plan;
 }
 
-std::optional<BatchPlan>
-Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
+LaneShape Scheduler::shapeOf(uint64_t id, const PlanInputs &in) const {
+  const auto found =
+      std::ranges::find_if(in.shapes, [id](const LaneShape &shape) { return shape.requestId == id; });
+  return found == in.shapes.end() ? LaneShape{.requestId = id} : *found;
+}
+
+Scheduler::Lane Scheduler::lane(const Request &request, uint32_t processed, const PlanInputs &in) const {
+  return {.request = &request,
+          .processed = processed,
+          .shape = shapeOf(request.spec.id, in),
+          .overdue = request.overtaken >= kMaximumOvertakes};
+}
+
+std::vector<model::PrefillLane> Scheduler::prefillLanes(std::span<const BatchItem> items,
+                                                        const PlanInputs &in) const {
+  std::vector<model::PrefillLane> result;
+  result.reserve(items.size());
+  for (const BatchItem &item : items)
+    result.push_back({item.promptOffset, item.tokenCount, shapeOf(item.requestId, in).indexPages});
+  return result;
+}
+
+bool Scheduler::groups(const Lane &lane) const {
+  return config_.limits.streamsWeights || lane.shape.indexPages || lane.shape.gainsIndexPages;
+}
+
+uint32_t Scheduler::groupRows(const Lane &lane) const {
+  return groups(lane) ? config_.limits.commandRows : kChunk;
+}
+
+uint32_t Scheduler::ownRows(const Lane &lane) const {
+  return std::min({uncontendedRows(lane.remaining(), groupRows(lane)), config_.limits.commandRows,
+                   lane.shape.rowCap});
+}
+
+bool Scheduler::contended(RequestPriority priority) const {
+  // Decoders this command is planned without count: they resume once their
+  // memory lands.
+  return std::ranges::any_of(requests_, [&](const auto &entry) {
+    const Request &peer = entry.second;
+    return (peer.phase == Phase::Decode || peer.phase == Phase::WaitingMask) && peer.spec.priority <= priority;
+  });
+}
+
+uint64_t Scheduler::layerPairs(std::span<const model::PrefillLane> lanes) const {
+  return work_.prefillWork(lanes, 0, 1).layerAttentionPairs;
+}
+
+uint32_t Scheduler::passesFor(std::span<const model::PrefillLane> lanes, bool group) const {
+  if (!group)
+    return 1;
+  const uint32_t layers = config_.limits.maximumPasses;
+  if (!measured_)
+    return layers;
+  const double scale = std::max({1.0, double(rowsOf(lanes)) / measured_->rows,
+                                 measured_->pairs ? double(layerPairs(lanes)) / double(measured_->pairs) : 1.0});
+  return passesOver(layers, measured_->layerMilliseconds * scale);
+}
+
+uint32_t Scheduler::passesOver(uint32_t layers, double layerMilliseconds) const {
+  // Passes split the layers evenly (model::passLayers): the largest holds
+  // ceil(layers / passes) of them.
+  const double fits = std::floor(config_.decodeGapMilliseconds / layerMilliseconds);
+  const auto fit = static_cast<uint32_t>(std::clamp(fits, 1.0, double(layers)));
+  return (layers + fit - 1) / fit;
+}
+
+BatchPlan Scheduler::nextPass(const BatchPlan &plan) const {
+  if (plan.kind != WorkKind::Prefill || plan.pass + 1 >= plan.passes)
+    throw std::logic_error("no pass follows the last");
+  const uint32_t layers = config_.limits.maximumPasses;
+  BatchPlan next = followingPass(plan, layers);
+  if (command_.timed && command_.attended)
+    next.passes = next.pass + passesOver(layers - next.layer, command_.layerMilliseconds);
+  return next;
+}
+
+bool Scheduler::withinPairs(std::span<const model::PrefillLane> lanes) const {
+  return layerPairs(lanes) <= config_.limits.attentionPairs;
+}
+
+uint32_t Scheduler::cutRows(const Lane &leader) const {
+  const uint32_t floor = std::max(kFloorRows, config_.limits.minimumUnitRows);
+  uint32_t rows = floor;
+  if (measured_) {
+    // The rows the last command ran in G at its time a row, fewer where this
+    // lane's layers reach more pairs than its heaviest did.
+    const model::PrefillLane probe{leader.processed, measured_->rows, leader.shape.indexPages};
+    const double pairs = double(layerPairs({&probe, 1}));
+    const double deeper =
+        measured_->pairs && pairs > double(measured_->pairs) ? double(measured_->pairs) / pairs : 1.0;
+    rows = static_cast<uint32_t>(std::clamp(
+        measured_->rows * config_.decodeGapMilliseconds / measured_->milliseconds * deeper, double(floor),
+        double(std::max(floor, kChunk))));
+  }
+  // A rest below the floor runs with the unit, up to a chunk.
+  const uint32_t remaining = leader.remaining();
+  return remaining > rows && remaining - rows < floor ? std::max(rows, std::min(remaining, kChunk)) : rows;
+}
+
+std::vector<Scheduler::Lane> Scheduler::readyLanes(const PlanInputs &in) const {
+  std::vector<Lane> ready;
+  for (const auto &[id, request] : requests_)
+    if (request.phase == Phase::Prefill && !listed(in.excluded, id) && !shapeOf(id, in).ended)
+      ready.push_back(lane(request, request.promptProcessed, in));
+  return ready;
+}
+
+std::optional<Scheduler::Planned> Scheduler::planPrefill(std::vector<Lane> ready) const {
   if (ready.empty())
     return std::nullopt;
-  // Order by the remaining prompt. After kMaximumOvertakes consecutive skips,
-  // an older lane leads the next command to prevent starvation.
-  const auto overdue = [](const PrefillRequestView &view) {
-    return view.request->overtaken >= kMaximumOvertakes;
-  };
-  std::sort(ready.begin(), ready.end(),
-            [&](const PrefillRequestView &a, const PrefillRequestView &b) {
-              if (a.request->spec.priority != b.request->spec.priority)
-                return a.request->spec.priority < b.request->spec.priority;
-              if (overdue(a) != overdue(b))
-                return overdue(a);
-              const uint32_t remainingA =
-                  a.request->spec.prefillTokens - a.promptProcessed;
-              const uint32_t remainingB =
-                  b.request->spec.prefillTokens - b.promptProcessed;
-              if (remainingA != remainingB)
-                return remainingA < remainingB;
-              return a.request->order < b.request->order;
-            });
-  const PrefillRequestView &leader = ready.front();
-  const RequestPriority selectedPriority = leader.request->spec.priority;
-
-  BatchPlan plan;
-  plan.kind = WorkKind::Prefill;
-  uint32_t budget = prefillBudget(leader, ready);
-  uint64_t pairs = 0;
-  // The command's rows so far: a lane joins only while they lie within the
-  // first chunk, and its group rows bound the command's
-  // (ExecutionLimits::prefillTokenBudget).
-  uint32_t planned = 0;
-  for (const PrefillRequestView &view : ready) {
-    if (planned > model::ExecutionLimits::prefillTokenBudget)
-      break;
-    budget = std::min(budget, view.request->spec.prefillGroupRows - planned);
-    if (!budget || view.request->spec.priority != selectedPriority ||
-        plan.width() == model::ExecutionLimits::maximumBatchWidth)
-      break;
-    // A lane that streams its history runs alone: nothing joins a command
-    // it leads, and it joins none it does not lead; overtaken often enough,
-    // it leads one.
-    if (view.request->streamsHistory && &view != &leader)
-      continue;
-    uint32_t rows =
-        std::min(view.request->spec.prefillTokens - view.promptProcessed, budget);
-    // The command's attention stays within maximumAttentionPairs_: a lane's
-    // rows halve until they fit, and one that does not fit at
-    // kMinimumPrefillRows waits for a command of its own.
-    const auto exceeds = [&](uint32_t candidate) {
-      return pairs + attentionPairs(view.promptProcessed, candidate) > maximumAttentionPairs_;
-    };
-    while (rows > kMinimumPrefillRows && exceeds(rows))
-      rows /= 2;
-    if (!plan.items.empty() && exceeds(rows))
-      break;
-    pairs += attentionPairs(view.promptProcessed, rows);
-    plan.items.push_back(
-        {view.request->spec.id, rows, view.promptProcessed});
-    planned += rows;
-    budget -= rows;
-    if (leader.request->streamsHistory)
-      break;
-    // A leader whose command runs in passes runs alone.
-    if (&view == &leader) {
-      plan.passes = passesFor(*leader.request, rows);
-      if (plan.passes > 1)
-        break;
-    }
+  std::sort(ready.begin(), ready.end(), leadsBefore);
+  const Lane &leader = ready.front();
+  const RequestPriority tier = leader.request->spec.priority;
+  // A group command runs in passes, contended or not; any other runs whole,
+  // cut while a lane of its priority or a higher one decodes.
+  const bool group = groups(leader);
+  const bool cut = !group && contended(tier);
+  Planned result;
+  std::vector<model::PrefillLane> lanes{{leader.processed, ownRows(leader), leader.shape.indexPages}};
+  // A layer's attention pairs bound the rows, which passes never lower.
+  while (lanes.front().rows > kMinimumPrefillRows && !withinPairs(lanes))
+    lanes.front().rows /= 2;
+  // Joiners never take a unit past its rows: a cut's, a group's or a chunk.
+  const uint32_t unitRows = cut ? cutRows(leader) : groupRows(leader);
+  if (unitRows < lanes.front().rows) {
+    lanes.front().rows = unitRows;
+    ++result.boundCuts;
   }
-  return plan;
-}
-
-uint32_t Scheduler::prefillBudget(
-    const PrefillRequestView &leader,
-    std::span<const PrefillRequestView> ready) const {
-  const uint32_t leaderRemaining =
-      leader.request->spec.prefillTokens - leader.promptProcessed;
-  // Passes bound a command's time, which fewer rows would not shorten.
-  if (leader.request->spec.prefillPasses > 1 && !leader.request->streamsHistory)
-    return uncontendedRows(leaderRemaining, leader.request->spec.prefillGroupRows);
-  const uint32_t maximum = model::ExecutionLimits::prefillTokenBudget;
-  if (prefillMillisecondsPerToken_ <= 0.0 && prefillFixedMilliseconds_ <= 0.0)
-    return maximum;
-  uint32_t rows = maximum;
-  const double slice = std::max(kContendedPrefillMilliseconds, 2.0 * prefillFixedMilliseconds_);
-  while (rows > kMinimumPrefillRows &&
-         prefillFixedMilliseconds_ + rows * prefillMillisecondsPerToken_ > slice)
-    rows /= 2;
-  const bool leaderFinishing = leaderRemaining <= rows;
-  const bool streams = leader.request->streamsHistory;
-  const bool contended = std::any_of(
-      requests_.begin(), requests_.end(), [&](const auto &entry) {
-        const Request &peer = entry.second;
-        return (peer.phase == Phase::Decode || peer.phase == Phase::WaitingMask) &&
-               peer.spec.priority <= leader.request->spec.priority;
-      }) || std::any_of(ready.begin(), ready.end(), [&](
-                           const PrefillRequestView &peer) {
-        return peer.request->spec.id != leader.request->spec.id &&
-               peer.request->spec.priority <= leader.request->spec.priority &&
-               (streams || leaderFinishing ||
-                peer.request->spec.prefillTokens - peer.promptProcessed <= rows);
-      });
-  // Bound commands for peers that decode or wait for a CPU mask, including
-  // decoders left out of this command (their streams resume once their
-  // memory lands), and for peers that can finish prefill within this slice,
-  // or, beside a lane that streams its history and so runs alone, any ready
-  // peer. The first sample and minimum matrix shape remain limits.
-  if (contended)
-    return streams ? streamingRows(*leader.request, rows) : rows;
-  // A leader that finishes within the full budget ends the command at its
-  // last row: prefill cost is linear above the slice, so shortest-first
-  // sequential commands minimise first-token latency. Long prefills share a
-  // command only when no lane finishes. A leader that runs prefill groups
-  // takes up to a group; planPrefill gives what its rows leave to the next
-  // lanes within ExecutionLimits::prefillTokenBudget's contract.
-  return uncontendedRows(leaderRemaining, leader.request->spec.prefillGroupRows);
-}
-
-uint32_t Scheduler::passesFor(const Request &leader, uint32_t rows) const {
-  if (leader.spec.prefillPasses <= 1 || leader.streamsHistory)
-    return 1;
-  const double estimate = prefillFixedMilliseconds_ + rows * prefillMillisecondsPerToken_;
-  return static_cast<uint32_t>(std::clamp(std::ceil(estimate / kContendedPrefillMilliseconds), 1.0,
-                                          static_cast<double>(leader.spec.prefillPasses)));
-}
-
-uint32_t Scheduler::streamingRows(const Request &leader, uint32_t contendedRows) const {
-  if (!leader.streamMilliseconds)
-    return contendedRows;
-  uint32_t rows = std::max(leader.spec.prefillGroupRows, contendedRows);
-  while (rows / 2 >= contendedRows &&
-         rows / 2 * prefillMillisecondsPerToken_ >= *leader.streamMilliseconds)
-    rows /= 2;
-  return rows;
+  uint32_t passes = passesFor(lanes, group);
+  const auto indexPageLanes = [&](const std::vector<model::PrefillLane> &with, std::span<const Lane> of,
+                                  uint32_t passes) {
+    uint32_t count = 0;
+    for (size_t index = 0; index < with.size(); ++index)
+      count += with[index].indexPages || (passes > 1 && of[index].shape.gainsIndexPages);
+    return count;
+  };
+  std::vector<Lane> members{leader};
+  for (auto view = ready.begin() + 1; view != ready.end(); ++view) {
+    if (view->request->spec.priority != tier || lanes.size() == model::ExecutionLimits::maximumBatchWidth)
+      break;
+    // A lane that runs in passes joins only a command that does.
+    if (groups(*view) && !group)
+      continue;
+    // The fewest rows that spare it one of its own commands, each of up to
+    // groupRows rows or its row cap this tick: those past its whole commands,
+    // not past ownRows' even split of them (8492 rows alone run as 6144 and
+    // 2348; 300 of them spare one).
+    const uint32_t rows = (view->remaining() - 1) % std::min(groupRows(*view), view->shape.rowCap) + 1;
+    std::vector<model::PrefillLane> with = lanes;
+    with.push_back({view->processed, rows, view->shape.indexPages});
+    if (rowsOf(with) > unitRows || lanesPastChunk(with) > config_.limits.lanesPastChunk || !withinPairs(with))
+      continue;
+    const uint32_t joined = passesFor(with, group);
+    members.push_back(*view);
+    if (indexPageLanes(with, members, joined) > config_.limits.indexPageLanes) {
+      members.pop_back();
+      ++result.indexPageConflicts;
+      continue;
+    }
+    lanes = std::move(with);
+    passes = joined;
+  }
+  result.plan.kind = WorkKind::Prefill;
+  for (size_t index = 0; index < lanes.size(); ++index)
+    result.plan.items.push_back({members[index].request->spec.id, lanes[index].rows, lanes[index].position});
+  result.plan.passes = passes;
+  return result;
 }
 
 std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> excluded) const {
@@ -508,97 +587,88 @@ std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> exclude
   return plan;
 }
 
-void Scheduler::commit(const BatchPlan &plan, std::span<const uint64_t> excluded) {
+void Scheduler::commit(const BatchPlan &plan, const PlanInputs &in) {
   if (active_ || plan.empty() ||
       plan.width() > model::ExecutionLimits::maximumBatchWidth) {
     throw std::logic_error("invalid scheduler commit");
   }
+  const bool prefill = plan.kind == WorkKind::Prefill;
   for (const BatchItem &item : plan.items) {
     const Request &request = get(item.requestId);
-    const Phase expected =
-        plan.kind == WorkKind::Prefill ? Phase::Prefill : Phase::Decode;
+    const Phase expected = prefill ? Phase::Prefill : Phase::Decode;
     if (request.phase != expected ||
-        (plan.kind == WorkKind::Prefill &&
-         (!item.tokenCount || item.promptOffset != request.promptProcessed)) ||
-        (plan.kind == WorkKind::Decode &&
-         (item.tokenCount || item.promptOffset ||
-          request.decodeStage != plan.decodeStage))) {
+        (prefill && (!item.tokenCount || item.promptOffset != request.promptProcessed)) ||
+        (!prefill && (item.tokenCount || item.promptOffset || request.decodeStage != plan.decodeStage))) {
       throw std::logic_error("batch no longer matches scheduler state");
     }
   }
-  if (plan.passes > 1) {
-    Request &lane = get(plan.items.front().requestId);
-    if (plan.width() != 1 || plan.kind != WorkKind::Prefill || plan.pass >= plan.passes ||
-        (lane.passes ? plan.pass != lane.passes->next || plan.passes != lane.passes->passes ||
-                           plan.items.front().tokenCount != lane.passes->rows
-                     : plan.pass != 0))
-      throw std::logic_error("batch no longer matches scheduler state");
-    if (!lane.passes)
-      lane.passes = Request::Passes{.passes = plan.passes, .rows = plan.items.front().tokenCount};
-  }
-  excluded_.assign(excluded.begin(), excluded.end());
-  active_ = plan;
-  lastCommittedKind_ = plan.kind;
-  // A command counts, and passes others over, once: with its first pass.
-  if (plan.kind == WorkKind::Prefill && !plan.pass) {
+  // A later pass is the command's next; no other prefill commits while a
+  // command is between its passes.
+  if (in.passes ? prefill && !samePlan(plan, in.passes->plan)
+                : plan.pass || (plan.passes > 1 && !prefill))
+    throw std::logic_error("batch no longer matches scheduler state");
+  const RequestPriority priority = get(plan.items.front().requestId).spec.priority;
+  if (prefill && !plan.pass) {
+    counters_.passCommands += plan.passes > 1;
     ++counters_.prefillBatches;
-    for (const BatchItem &item : plan.items)
-      counters_.prefillRows += item.tokenCount;
+    for (const BatchItem &item : plan.items) {
+      Request &request = get(item.requestId);
+      const uint32_t end = item.promptOffset + item.tokenCount;
+      counters_.prefillRows += end - std::clamp(request.rowsCounted, item.promptOffset, end);
+      request.rowsCounted = std::max(request.rowsCounted, end);
+    }
+    // What planning counted for this plan, as next() made it.
+    if (lastPlanned_ && samePlan(lastPlanned_->plan, plan)) {
+      counters_.boundCuts += lastPlanned_->boundCuts;
+      counters_.indexPageConflicts += lastPlanned_->indexPageConflicts;
+    }
+    // A command, its passes one, serves its lanes, joiners too: each starts
+    // its count again. It overtakes the other requests of its priority
+    // submitted before a lane it serves, with a lane or waiting for one: one
+    // overtaken kMaximumOvertakes times in a row is overdue until a command
+    // serves it. Lanes the command is planned without are blocked, not
+    // passed over.
     uint64_t youngestServed = 0;
     for (const BatchItem &item : plan.items)
       youngestServed = std::max(youngestServed, get(item.requestId).order);
     for (auto &[id, request] : requests_) {
-      if (terminal(request.phase) || request.phase == Phase::Decode ||
-          request.phase == Phase::WaitingMask || request.suspended ||
-          listed(excluded, id))
+      if (request.spec.priority != priority || request.suspended || listed(in.excluded, id) ||
+          (request.phase != Phase::Queued && request.phase != Phase::WaitingResources &&
+           request.phase != Phase::WaitingPrefix && request.phase != Phase::Prefill))
         continue;
-      const bool served = std::any_of(
-          plan.items.begin(), plan.items.end(),
-          [id](const BatchItem &item) { return item.requestId == id; });
-      if (served)
+      if (holds(plan.items, id))
         request.overtaken = 0;
-      else if (request.order < youngestServed)
+      else if (request.order < youngestServed && request.overtaken < kMaximumOvertakes)
         ++request.overtaken;
     }
-  } else if (plan.kind == WorkKind::Decode) {
+  } else if (!prefill) {
     const uint64_t dispatchOrder = ++decodeDispatchOrder_;
     for (const BatchItem &item : plan.items)
       get(item.requestId).lastDecodeDispatch = dispatchOrder;
     ++counters_.decodeBatches;
     ++counters_.decodeBatchesByWidth[plan.width() - 1];
   }
+  lastPlanned_.reset();
+  if (prefill && !plan.pass) {
+    const std::vector<model::PrefillLane> lanes = prefillLanes(plan.items, in);
+    command_ = {.rows = static_cast<uint32_t>(rowsOf(lanes)), .pairs = layerPairs(lanes)};
+  }
+  activeContended_ = prefill && contended(priority);
+  excluded_.assign(in.excluded.begin(), in.excluded.end());
+  active_ = plan;
+  lastCommittedKind_ = plan.kind;
 }
 
-void Scheduler::complete(const BatchPlan &plan,
-                         std::span<const StepResult> results,
-                         double wallMilliseconds,
-                         bool representativePrefillTiming,
-                         double hostMilliseconds,
-                         std::optional<double> streamMilliseconds,
-                         double imageEncodeMilliseconds) {
+void Scheduler::complete(const BatchPlan &plan, std::span<const StepResult> results,
+                         const model::CommandSample &sample) {
   if (!active_ || active_->kind != plan.kind ||
       active_->items.size() != plan.items.size() ||
       results.size() != plan.items.size()) {
     throw std::logic_error("completion does not match active batch");
   }
-  if (streamMilliseconds && (plan.kind != WorkKind::Prefill || plan.items.size() != 1))
-    throw std::logic_error("only a prefill command of one lane streams its history");
+  const double wallMilliseconds = sample.wallMilliseconds;
   const bool timed = std::isfinite(wallMilliseconds) && wallMilliseconds > 0.0;
-  // The lane of a prefill command that streamed its history, alone in it. A
-  // lane that streams may run commands that read nothing yet, before its
-  // first pages spill: those say nothing of its reads.
-  Request *const streaming =
-      streamMilliseconds ? &get(plan.items.front().requestId) : nullptr;
-  // Its wait on the reads, which its waits on host steps include; none
-  // without a measurement.
-  const std::optional<double> stream =
-      streaming && std::isfinite(*streamMilliseconds) && std::isfinite(hostMilliseconds)
-          ? std::optional(std::clamp(*streamMilliseconds, 0.0, std::max(hostMilliseconds, 0.0)))
-          : std::nullopt;
-  if (timed) {
-    commandMilliseconds_ += wallMilliseconds;
-    streamingCommands_ += streaming != nullptr;
-  }
+  const bool prefill = plan.kind == WorkKind::Prefill;
   for (size_t index = 0; index < results.size(); ++index) {
     const BatchItem &item = plan.items[index];
     const StepResult &result = results[index];
@@ -606,18 +676,12 @@ void Scheduler::complete(const BatchPlan &plan,
       throw std::logic_error("completion request order changed");
     }
     Request &request = get(item.requestId);
-    if (plan.kind == WorkKind::Prefill && plan.pass + 1 < plan.passes) {
-      // A pass before the last consumes nothing; a request it ends leaves
-      // the rest.
-      if (result.finished) {
-        request.phase = Phase::Completed;
-        request.passes.reset();
-      } else if (result.consumedPromptTokens || !request.passes) {
+    if (prefill && plan.pass + 1 < plan.passes) {
+      // A pass before the last consumes nothing and ends no lane: one that
+      // ends meanwhile stays in the command to its last pass.
+      if (result.consumedPromptTokens || result.finished)
         throw std::logic_error("prefill completion row count changed");
-      } else {
-        ++request.passes->next;
-      }
-    } else if (plan.kind == WorkKind::Prefill) {
+    } else if (prefill) {
       if (result.consumedPromptTokens != item.tokenCount ||
           item.promptOffset != request.promptProcessed) {
         throw std::logic_error("prefill completion row count changed");
@@ -634,74 +698,56 @@ void Scheduler::complete(const BatchPlan &plan,
         request.phase = Phase::WaitingMask;
       } else {
         request.phase = Phase::Decode;
-        startDecodeGap(request);
       }
+      if (request.phase != Phase::Prefill)
+        promptCompleted(request);
     } else {
-      // The gap since its last decode command, recorded when a streaming
-      // prefill command ran within it.
-      if (request.decodeGapStreams != streamingCommands_)
-        decodeGaps_.add(
-            static_cast<uint64_t>((commandMilliseconds_ - request.decodeGapStart) * 1e6));
-      startDecodeGap(request);
       request.decodeStage = result.nextDecodeStage;
       request.phase = result.finished ? Phase::Completed : Phase::Decode;
     }
   }
-  // A streaming command trains the command estimate as if it had not waited
-  // on its history's reads, and its lane's own estimate with that wait; a
-  // command trains it without the encodes of its images. A command in passes
-  // trains it once, with its passes' time together.
-  const double rowsWall =
-      wallMilliseconds - std::clamp(imageEncodeMilliseconds, 0.0, std::max(wallMilliseconds, 0.0));
-  double commandWall = rowsWall, commandHost = hostMilliseconds;
-  bool representative = representativePrefillTiming;
-  if (plan.kind == WorkKind::Prefill && plan.passes > 1) {
-    Request &lane = get(plan.items.front().requestId);
-    if (lane.passes) {
-      commandWall = lane.passes->wallMilliseconds += rowsWall;
-      commandHost = lane.passes->hostMilliseconds += hostMilliseconds;
-      representative = lane.passes->representative = lane.passes->representative && representativePrefillTiming;
+  const RequestPriority priority = get(plan.items.front().requestId).spec.priority;
+  // Whether lanes of its priority or a higher one decode beside it now, those
+  // it finished included, not counting decoders it was planned without, which
+  // could not run either.
+  const bool owesDecode = prefill && std::ranges::any_of(requests_, [&](const auto &entry) {
+                            const auto &[id, peer] = entry;
+                            return peer.phase == Phase::Decode && peer.spec.priority <= priority &&
+                                   !listed(excluded_, id);
+                          });
+  if (prefill) {
+    ++counters_.prefillUnits;
+    const double rowsMilliseconds =
+        wallMilliseconds - std::clamp(sample.imageEncodeMilliseconds, 0.0, std::max(wallMilliseconds, 0.0));
+    // A command's rows' time over its passes sizes its later passes and,
+    // once its last pass ran, the next commands. An abandoned one, one with
+    // a pass whose rows took no time, or one whose completion added work,
+    // sizes nothing.
+    const model::LayerRange ran =
+        model::passLayers(plan.layer, plan.passes - plan.pass, config_.limits.maximumPasses);
+    command_.milliseconds += rowsMilliseconds;
+    if (rowsMilliseconds > command_.heaviestMilliseconds) {
+      command_.heaviestMilliseconds = rowsMilliseconds;
+      command_.layerMilliseconds = rowsMilliseconds / (ran.end - ran.first);
     }
-    if (plan.pass + 1 < plan.passes)
-      representative = false;
-    else
-      lane.passes.reset();
+    command_.timed = command_.timed && timed && rowsMilliseconds > 0.0 && sample.representative;
+    command_.attended = command_.attended || sample.work.attentionPairs >= sample.work.layerAttentionPairs;
+    if (plan.pass + 1 == plan.passes && command_.timed)
+      measured_ = command_;
+    if (timed && activeContended_)
+      contendedPrefill_.add(static_cast<uint64_t>(wallMilliseconds * 1e6));
   }
-  if (representative && plan.kind == WorkKind::Prefill) {
-    uint32_t rows = 0;
-    for (const BatchItem &item : plan.items)
-      rows += item.tokenCount;
-    const double waited = stream.value_or(0.0);
-    observePrefill(rows, commandWall - waited, commandHost - waited);
-  }
-  if (stream)
-    streaming->streamMilliseconds =
-        streaming->streamMilliseconds
-            ? (1.0 - kPrefillTimeWeight) * *streaming->streamMilliseconds +
-                  kPrefillTimeWeight * *stream
-            : *stream;
   // While requests of the same or a higher priority decode, lanes this
   // prefill finished included, it owes decode a share of its time; decode
   // commands work the debt off with their own. A lane waiting for its mask
-  // is owed nothing: it could not have decoded meanwhile, and the slice
+  // is owed nothing: it could not have decoded meanwhile, and the bound
   // already bounds the prefill it waits behind. Nor is a decoder this
   // command was planned without: it could not run either.
   if (timed) {
-    if (plan.kind == WorkKind::Decode) {
-      decodeDebtMilliseconds_ =
-          std::max(0.0, decodeDebtMilliseconds_ - wallMilliseconds);
-    } else if (streaming || decodeShare_ > 0.0) {
-      const RequestPriority priority =
-          get(plan.items.front().requestId).spec.priority;
-      const bool contended = std::any_of(
-          requests_.begin(), requests_.end(), [&](const auto &entry) {
-            const auto &[id, peer] = entry;
-            return peer.phase == Phase::Decode && peer.spec.priority <= priority &&
-                   !listed(excluded_, id);
-          });
-      counters_.contendedStreamingPrefillBatches += contended && streaming;
-      if (contended && decodeShare_ > 0.0)
-        decodeDebtMilliseconds_ += decodeShare_ * wallMilliseconds;
+    if (!prefill)
+      decodeDebtMilliseconds_ = std::max(0.0, decodeDebtMilliseconds_ - wallMilliseconds);
+    else if (owesDecode && decodeShare_ > 0.0) {
+      decodeDebtMilliseconds_ += decodeShare_ * wallMilliseconds;
     }
   }
   dropStaleDecodeDebt();
@@ -709,9 +755,15 @@ void Scheduler::complete(const BatchPlan &plan,
   active_.reset();
 }
 
-void Scheduler::startDecodeGap(Request &request) noexcept {
-  request.decodeGapStart = commandMilliseconds_;
-  request.decodeGapStreams = streamingCommands_;
+void Scheduler::abandoned() {
+  // A command of other lanes may be in flight, never a pass of this one.
+  if (active_ && active_->passes > 1)
+    throw std::logic_error("a command in flight cannot be abandoned");
+  ++counters_.abandonedPassCommands;
+}
+
+void Scheduler::promptCompleted(Request &request) noexcept {
+  request.overtaken = 0;
 }
 
 void Scheduler::dropStaleDecodeDebt() noexcept {
@@ -722,27 +774,6 @@ void Scheduler::dropStaleDecodeDebt() noexcept {
       });
   if (!decoding)
     decodeDebtMilliseconds_ = 0.0;
-}
-
-void Scheduler::observePrefill(uint32_t rows, double wallMilliseconds,
-                               double hostMilliseconds) {
-  // Tiny tails are dominated by fixed command costs, not prefill throughput.
-  if (rows < kMinimumPrefillRows || !std::isfinite(wallMilliseconds) ||
-      wallMilliseconds <= 0.0)
-    return;
-  const double fixed = std::isfinite(hostMilliseconds)
-                           ? std::clamp(hostMilliseconds, 0.0, wallMilliseconds)
-                           : 0.0;
-  const double perToken = (wallMilliseconds - fixed) / rows;
-  const bool measured =
-      prefillMillisecondsPerToken_ > 0.0 || prefillFixedMilliseconds_ > 0.0;
-  const auto mix = [&](double estimate, double observed) {
-    return measured ? (1.0 - kPrefillTimeWeight) * estimate +
-                          kPrefillTimeWeight * observed
-                    : observed;
-  };
-  prefillFixedMilliseconds_ = mix(prefillFixedMilliseconds_, fixed);
-  prefillMillisecondsPerToken_ = mix(prefillMillisecondsPerToken_, perToken);
 }
 
 Phase Scheduler::phase(uint64_t id) const { return get(id).phase; }
@@ -759,7 +790,7 @@ uint32_t Scheduler::promptProcessed(uint64_t id) const {
 
 SchedulerSnapshot Scheduler::snapshot() const noexcept {
   SchedulerSnapshot result = counters_;
-  result.decodeGap = decodeGaps_.snapshot();
+  result.contendedPrefill = contendedPrefill_.snapshot();
   for (const auto &[_, request] : requests_) {
     switch (request.phase) {
     case Phase::Queued:
@@ -814,6 +845,22 @@ bool Scheduler::byPriorityThenOrder(const Request *a,
   if (a->spec.priority != b->spec.priority)
     return a->spec.priority < b->spec.priority;
   return a->order < b->order;
+}
+
+bool Scheduler::leadsBefore(const Lane &a, const Lane &b) noexcept {
+  // Priority first; then overdue lanes, oldest first; then the fewest
+  // remaining rows, then submission order.
+  if (a.request->spec.priority != b.request->spec.priority)
+    return a.request->spec.priority < b.request->spec.priority;
+  if (a.overdue != b.overdue)
+    return a.overdue;
+  if (!a.overdue && a.remaining() != b.remaining())
+    return a.remaining() < b.remaining();
+  return a.request->order < b.request->order;
+}
+
+bool Scheduler::samePlan(const BatchPlan &a, const BatchPlan &b) noexcept {
+  return a.kind == b.kind && a.pass == b.pass && a.passes == b.passes && a.layer == b.layer && a.items == b.items;
 }
 
 } // namespace splash::engine

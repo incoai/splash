@@ -70,6 +70,9 @@ public:
   [[nodiscard]] std::shared_ptr<Entry>
   acquire(const std::shared_ptr<const CompositeState> &source, uint32_t begin,
           uint32_t rows, const std::function<std::shared_ptr<DFlashDraftRing>()> &allocate);
+  [[nodiscard]] uint64_t releasableBytes() const noexcept {
+    return entry_ && entry_.use_count() == 1 ? bytes() : 0;
+  }
   // Returns actual allocation bytes released; an in-use entry stays put.
   [[nodiscard]] uint64_t release() noexcept;
   [[nodiscard]] uint64_t bytes() const noexcept {
@@ -277,7 +280,7 @@ public:
   void addContextPrefill(metal::CommandGraph &graph,
                          DFlashPrefillBuffers buffers, uint32_t rows,
                          std::span<const DFlashPrefillSpan> spans,
-                         std::span<const DFlashWindowCapture> windowCaptures = {}) const;
+                         std::span<const DFlashWindowCapture> windowCaptures) const;
   // Computes the rings' keys and values of `rows` positions from
   // startPosition on again from the context window they were kept in, as
   // addContextPrefill writes them from their context rows. The rows pass

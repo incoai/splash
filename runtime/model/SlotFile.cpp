@@ -364,13 +364,16 @@ std::vector<std::byte> encodeRecord(uint64_t recordBytes, uint64_t payloadBytes,
                                     std::span<const std::byte> label) {
   std::vector<std::byte> record(recordBytes);
   const RecordHead head{kRecordMagic, checksums.front(), payloadBytes};
-  const auto rest = std::as_bytes(checksums.subspan(1));
-  std::memcpy(record.data(), &head, sizeof(head));
-  std::memcpy(record.data() + sizeof(head), rest.data(), rest.size());
-  std::memcpy(record.data() + sizeof(head) + rest.size(), label.data(), label.size());
-  const size_t covered = sizeof(head) + rest.size() + label.size();
-  const uint32_t checksum = crc32c(std::span(record).first(covered));
-  std::memcpy(record.data() + covered, &checksum, sizeof(checksum));
+  size_t written = 0;
+  const auto append = [&](std::span<const std::byte> bytes) {
+    std::ranges::copy(bytes, std::span(record).subspan(written).begin());
+    written += bytes.size();
+  };
+  append(std::as_bytes(std::span(&head, 1)));
+  append(std::as_bytes(checksums.subspan(1)));
+  append(label);
+  const uint32_t checksum = crc32c(std::span(record).first(written));
+  append(std::as_bytes(std::span(&checksum, 1)));
   return record;
 }
 
@@ -560,8 +563,10 @@ void SlotFile::open(const Persistence &persistence) {
       throw std::system_error(errno, std::generic_category(), "reset slot file");
     return;
   }
-  // A record counts only while its slot lies wholly inside the slot file.
-  const uint64_t slots = fileBytes(backing.descriptor, "stat slot file") / backing.slotBytes;
+  // A record counts only while the pages of its payload lie wholly inside
+  // the slot file: a write stores no further than them.
+  const uint64_t slotFileBytes = fileBytes(backing.descriptor, "stat slot file");
+  const uint64_t slots = (slotFileBytes + backing.slotBytes - 1) / backing.slotBytes;
   const uint64_t recorded = (recordFileBytes - kRecordsHeaderBytes) / backing.recordBytes;
   if (std::max(slots, recorded) > std::numeric_limits<uint32_t>::max())
     throw std::runtime_error("slot file holds more slots than it can index");
@@ -572,7 +577,8 @@ void SlotFile::open(const Persistence &persistence) {
   for (uint64_t index = 0; index < records.size() / backing.recordBytes; ++index) {
     const auto record = std::span(records).subspan(index * backing.recordBytes, backing.recordBytes);
     if (auto slot = decodeRecord(record, static_cast<uint32_t>(index), backing.labelBytes, backing.segments(),
-                                 backing.slotBytes, backing.segmentEnds.empty() ? 0 : backing.segmentEnds.back()))
+                                 backing.slotBytes, backing.segmentEnds.empty() ? 0 : backing.segmentEnds.back());
+        slot && slotOffset(index, backing.slotBytes) + slotBytesFor(slot->payloadBytes) <= slotFileBytes)
       records_.push_back(std::move(*slot));
   }
 }
@@ -855,7 +861,9 @@ void SlotFile::punchHole(uint32_t index) noexcept {
 }
 
 // A write gathers its spans into the worker's buffer one chunk at a time and
-// zeros the slot past them; a read moves the chunks its spans reach and
+// zeros the rest of their last host page, and no more: a shorter payload
+// (a trimmed KV page, a third of a full one) leaves the slot past it
+// unwritten, which nothing reads; a read moves the chunks its spans reach and
 // scatters each into them, ignoring the slot past them. A chunk of a span
 // the file can move straight skips the buffer. Every pwrite and pread is an
 // aligned range of the slot, and cancellation is noticed before each chunk.
@@ -896,7 +904,7 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
     if (backing.persistent)
       checksums.emplace(backing.segmentEnds);
     Pieces pieces(source);
-    for (uint64_t done = 0; done < backing.slotBytes;) {
+    for (uint64_t done = 0, end = slotBytesFor(payloadBytes); done < end;) {
       if (cancelled.load(std::memory_order_relaxed)) return false;
       if (!done && backing.back(slot->index_))
         backing.budget->file_.fetch_add(backing.slotBytes, std::memory_order_relaxed);
@@ -908,7 +916,7 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
           checksums->add(chunk);
       } else {
         const auto gathered = buffer.first(
-            pieces.gatherBytes(std::min<uint64_t>(buffer.size(), backing.slotBytes - done)));
+            pieces.gatherBytes(std::min<uint64_t>(buffer.size(), end - done)));
         size_t filled = 0;
         for (auto piece = pieces.next(gathered.size()); !piece.empty();
              piece = pieces.next(gathered.size() - filled)) {
@@ -938,7 +946,7 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
     slot->written_.store(true, std::memory_order_release);
     return true;
   }, std::move(completion));
-  backing_->budget->charge(backing_->slotBytes);
+  backing_->budget->charge(slotBytesFor(payloadBytes));
   return operation;
 }
 
@@ -951,10 +959,14 @@ std::shared_ptr<SlotFile::Operation> SlotFile::read(
                                                              const std::atomic<bool> &cancelled) {
     if (!slot->written_.load(std::memory_order_acquire)) return false;
     Backing &backing = *slot->backing_;
-    // The first read of an adopted slot reads its whole payload and checks
-    // each segment against the record.
+    // A read takes at most the payload's host pages, which is all a write
+    // stores: the payload and zeros to the end of its last page. The first
+    // read of an adopted slot reads its whole payload and checks each
+    // segment against the record.
+    const uint64_t bytes = totalBytes(destination);
+    const uint64_t stored = slotBytesFor(slot->payloadBytes_);
     const bool verify = slot->verify_.load(std::memory_order_relaxed);
-    if (verify && totalBytes(destination) != slot->payloadBytes_) return false;
+    if (bytes > stored || (verify && bytes != slot->payloadBytes_)) return false;
     std::optional<SegmentChecksums> checksums;
     if (verify)
       checksums.emplace(backing.segmentEnds);
@@ -973,7 +985,7 @@ std::shared_ptr<SlotFile::Operation> SlotFile::read(
         continue;
       }
       const auto chunk = buffer.first(
-          pieces.gatherBytes(std::min<uint64_t>(buffer.size(), backing.slotBytes - done)));
+          pieces.gatherBytes(std::min<uint64_t>(buffer.size(), stored - done)));
       if (!backing.load(chunk, offset)) return false;
       size_t used = 0;
       for (auto piece = pieces.next(chunk.size()); !piece.empty();
@@ -1026,6 +1038,8 @@ std::optional<std::span<const std::byte>> SlotFile::readAt(const Slot &slot, uin
         slot.checksums_[index])
       return std::nullopt;
   }
+  if (verify && first == 0 && last + 1 == backing.segments())
+    slot.verify_.store(false, std::memory_order_relaxed);
   return buffer.subspan(offset - from, bytes);
 }
 

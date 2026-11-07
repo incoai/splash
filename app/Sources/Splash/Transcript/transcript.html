@@ -1,14 +1,19 @@
 <!doctype html>
 <!-- The Chat's transcript: the open conversation, which the app sends as data (Transcript.swift).
      Nothing loads from the network: scripts come from this folder, and the app adds markdown-it
-     and highlight.js from its runtime; images are the user's own, as data URLs. -->
+     and highlight.js from its runtime; images are the user's own, which the app serves
+     (chat-image:). -->
 <html lang="en">
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src data:">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src data: chat-image:">
 <meta name="color-scheme" content="light dark">
+<link rel="stylesheet" href="page.css">
+<link rel="stylesheet" href="markdown.css">
 <link rel="stylesheet" href="transcript.css">
 <main id="messages"></main>
 <button id="latest" class="hover" type="button" title="Scroll to Latest" aria-label="Scroll to Latest" aria-hidden="true" tabindex="-1">
   <span class="glyph down"></span>
 </button>
+<script src="page.js"></script>
+<script src="markdown.js"></script>
 <script src="transcript.js"></script>

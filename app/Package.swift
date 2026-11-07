@@ -12,11 +12,14 @@ let package = Package(
         // Pinned to one release: its tools sign the appcast the app checks, so a new one is taken
         // on purpose.
         .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.1"),
+        // The drawer's terminal: a native view over a pseudo-terminal, MIT licensed, pinned as
+        // Sparkle is.
+        .package(url: "https://github.com/migueldeicaza/SwiftTerm", exact: "1.20.0"),
     ],
     targets: [
         .executableTarget(
             name: "Splash",
-            dependencies: [.product(name: "Sparkle", package: "Sparkle")],
+            dependencies: [.product(name: "Sparkle", package: "Sparkle"), .product(name: "SwiftTerm", package: "SwiftTerm")],
             path: "Sources/Splash",
             // The Chat's transcript is a web page, in Transcript/.
             resources: [.copy("Transcript")],
@@ -25,6 +28,7 @@ let package = Package(
             linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks",
                                            "-Xlinker", "-rpath", "-Xlinker", "@executable_path"])]
         ),
-        .testTarget(name: "SplashTests", dependencies: ["Splash"], path: "Tests/SplashTests"),
+        // The fake servers the tests run, Python scripts in Fakes/.
+        .testTarget(name: "SplashTests", dependencies: ["Splash"], path: "Tests/SplashTests", resources: [.copy("Fakes")]),
     ]
 )

@@ -24,6 +24,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/KvBlockCache.hpp"
+#include "model/ModelPools.hpp"
 #include "ops/PagedAttention.hpp"
 
 #import <Foundation/Foundation.h>
@@ -59,7 +60,9 @@ constexpr uint32_t kExtentPages = 256, kPlaces = 8, kLaneSlots = 1024;
 // An extent's slots per layer.
 constexpr uint32_t kExtentSlots = kExtentPages * kPlaces;
 
-constexpr kv::Layout layoutOf(kv::Format format) { return {2, 2, 256, format, 128, true}; }
+constexpr kv::Layout layoutOf(kv::Format format) {
+  return {2, 2, 256, format, 128, true, 0, 0, kv::Reads::SelectedBlocks};
+}
 
 uint64_t extentBytes(kv::Layout layout) { return uint64_t{kExtentPages} * layout.kvBytesPerModelPage(); }
 
@@ -280,19 +283,20 @@ void growsAndReleases(MetalBackend &backend) {
   const kv::Layout layout = layoutOf(kv::Format::Int8);
   const uint64_t extent = extentBytes(layout);
   bool refuse = false;
-  KvBlockCache cache = makeCache(backend, layout, 4, [&](uint64_t bytes, const std::function<void()> &allocate) {
+  const metal::AllocationAdmission admit = [&](uint64_t bytes, const std::function<void()> &allocate) {
     if (refuse) return metal::AllocationResult(metal::AllocationFailure::EngineBudget);
     return test::admitAll(bytes, allocate);
-  });
-  require(cache.stats().bytes == 0 && cache.growTowardTarget().granted() && cache.stats().bytes == 0,
+  };
+  KvBlockCache cache = makeCache(backend, layout, 4, admit);
+  require(cache.stats().bytes == 0 && cache.growTowardTarget(admit) && cache.stats().bytes == 0,
           "a cache without floors took memory");
   refuse = true;
   const model::ModelMemoryAdmission refused = cache.reserveLane(0);
   require(!refused.granted() && refused.allocationFailure == metal::AllocationFailure::EngineBudget &&
-              cache.stats().bytes == 0 && cache.stats().lanes == 0,
+              cache.stats().bytes == 0 && cache.stats().lanes == 0 && !cache.holdsLane(0),
           "a refused floor changed the cache");
   refuse = false;
-  require(cache.reserveLane(0).granted() && cache.stats().bytes == extent &&
+  require(cache.reserveLane(0).granted() && cache.holdsLane(0) && cache.stats().bytes == extent &&
               cache.stats().floorBytes == extent && cache.stats().targetBytes == 4 * extent,
           "one lane's floor is not one extent");
   std::vector<KvPageSource> pages(256);
@@ -301,16 +305,18 @@ void growsAndReleases(MetalBackend &backend) {
   static_cast<void>(resolve(backend, cache, 0, lanes, {blocksOf(0, 200)}, std::make_shared<KvReadStats>()));
   // Toward the target an extent at a time; the blocks stay.
   for (uint32_t extents = 2; extents <= 4; ++extents)
-    require(cache.growTowardTarget().granted() && cache.stats().bytes == extents * extent,
+    require(cache.growTowardTarget(admit) && cache.stats().bytes == extents * extent,
             "growth toward the target is not an extent at a time");
-  require(cache.growTowardTarget().granted() && cache.stats().bytes == 4 * extent, "the cache grew past its target");
+  require(cache.growTowardTarget(admit) && cache.stats().bytes == 4 * extent, "the cache grew past its target");
   auto grown = std::make_shared<KvReadStats>();
   static_cast<void>(resolve(backend, cache, 0, lanes, {blocksOf(0, 256)}, grown));
   require(grown->hits == 200 * kPlaces && grown->misses == 56 * kPlaces, "growing lost the cache's blocks");
   // A second lane's floor fits; giving back what is above the floors, an
   // extent a call, keeps two lanes' (3,072 slots, two extents), then one
   // lane's.
-  require(cache.reserveLane(1).granted() && cache.stats().bytes == 4 * extent &&
+  // holdsLane() is the lane's own floor, not room the cache has for one.
+  require(!cache.holdsLane(1), "a lane held a floor it was not granted");
+  require(cache.reserveLane(1).granted() && cache.holdsLane(1) && cache.stats().bytes == 4 * extent &&
               cache.stats().floorBytes == 2 * extent,
           "a second lane's floor is not two lanes' extents");
   // An idle reclaim gives back one extent above the floors a call.
@@ -318,6 +324,7 @@ void growsAndReleases(MetalBackend &backend) {
               cache.releaseAboveFloor() == extent && cache.stats().slotsPerLayer == 2 * kExtentSlots,
           "an idle reclaim did not give back an extent above the floors at a time");
   cache.releaseLane(1);
+  require(!cache.holdsLane(1) && cache.holdsLane(0), "a released floor was still held");
   require(cache.releaseAboveFloor() == extent && cache.stats().bytes == extent && cache.stats().lanes == 1,
           "an idle reclaim kept a released lane's floor");
   auto shrunk = std::make_shared<KvReadStats>();
@@ -328,28 +335,164 @@ void growsAndReleases(MetalBackend &backend) {
   refuse = true;
   require(!cache.reserveLane(1).granted() && cache.stats().bytes == extent && cache.stats().lanes == 1,
           "a refused floor kept its extent");
-  require(!cache.growTowardTarget().granted() && cache.stats().bytes == extent, "a refused growth changed the cache");
+  require(!cache.growTowardTarget(admit) && cache.stats().bytes == extent, "a refused growth changed the cache");
   refuse = false;
   cache.releaseLane(0);
-  require(cache.growTowardTarget().granted() && cache.stats().bytes == extent,
+  require(cache.growTowardTarget(admit) && cache.stats().bytes == extent,
           "a cache whose lanes released their floors grew");
   require(cache.releaseAboveFloor() == extent && cache.stats().bytes == 0,
           "an idle reclaim kept a cache no lane needs");
   rejects([&] { static_cast<void>(cache.reserveLane(model::ExecutionLimits::maximumBatchWidth)); }, "no such lane",
           "a floor past the lanes was reserved");
-  // A floor of two extents, the second refused, leaves neither.
-  uint32_t grants = 1;
+  // A floor of two extents asks one admission for both, with room for one
+  // and a half: refused, it asked for the two it lacks, which is what the
+  // ledger frees for, and keeps neither; with room for two it takes both.
+  uint64_t room = extent + extent / 2;
+  std::vector<uint64_t> asked;
   KvBlockCache wide = makeCache(
       backend, layout, 2,
       [&](uint64_t bytes, const std::function<void()> &allocate) {
-        if (!grants) return metal::AllocationResult(metal::AllocationFailure::HostPressure);
-        --grants;
+        asked.push_back(bytes);
+        if (bytes > room) return metal::AllocationResult(metal::AllocationFailure::EngineBudget);
+        room -= bytes;
         return test::admitAll(bytes, allocate);
       },
       2 * kLaneSlots);
   require(!wide.reserveLane(0).granted() && wide.stats().bytes == 0 && wide.stats().lanes == 0,
-          "a floor refused its second extent kept its first");
+          "a refused floor of two extents kept one");
+  require(!asked.empty() && asked.back() == 2 * extent,
+          "a refused floor of two extents asked its admission for " +
+              std::to_string(asked.empty() ? 0 : asked.back() / extent) + " extent(s) at once, not the 2 it lacks");
+  room = 2 * extent;
+  asked.clear();
+  require(wide.reserveLane(0).granted() && asked.size() == 1 && asked.front() == 2 * extent &&
+              wide.stats().bytes == 2 * extent && wide.stats().floorBytes == 2 * extent,
+          "a floor of two extents was not one admission of both");
   std::cout << "kv_block_cache_test: growth and release PASS\n";
+}
+
+// A lane's floor allocates what lanesShortfallBytes(1) says one more lane
+// lacks, nothing once the floors' extents hold it; lanes waiting together
+// lack their floors once. Growth under a passed admission consults
+// it, not the cache's, and a refusal changes nothing. As an elastic pool
+// (model::HotBlocksPool): the lanes' floors are its floor and an extent its
+// unit, given back above the floors one at a time or all at once, counted
+// with the time it took; it grows toward its target while a lane holds a
+// floor; its value is its resolves' hits and ghost hits, the bytes of the
+// blocks its layers gave up lately, the read time of a block it missed and
+// the bytes it reads into, a slot of one layer.
+void growsAsAPool(MetalBackend &backend) {
+  const kv::Layout layout = layoutOf(kv::Format::Int8);
+  const uint64_t extent = extentBytes(layout);
+  uint64_t allocated = 0;
+  bool refuse = false;
+  KvBlockCache cache = makeCache(backend, layout, 4, [&](uint64_t bytes, const std::function<void()> &allocate) {
+    if (refuse) return metal::AllocationResult(metal::AllocationFailure::EngineBudget);
+    allocated += bytes;
+    return test::admitAll(bytes, allocate);
+  });
+  require(cache.extentBytes() == extent, "the cache's extent is not the pool's");
+  // One lane's floor is an extent, two lanes' two and three lanes' too: a
+  // lane without a floor lacks one more lane's, and three lanes waiting for
+  // theirs lack two extents together, not one each.
+  require(cache.lanesShortfallBytes(3) == 2 * extent && !cache.lanesShortfallBytes(0),
+          "the floors of lanes waiting together were not counted once in whole extents");
+  for (const uint32_t lane : {0u, 1u, 2u}) {
+    const uint64_t shortfall = cache.lanesShortfallBytes(1);
+    allocated = 0;
+    require(shortfall == (lane == 2 ? 0 : extent) && cache.reserveLane(lane).granted() && allocated == shortfall,
+            "lane " + std::to_string(lane) + "'s floor did not allocate its shortfall");
+  }
+  require(cache.lanesShortfallBytes(1) == extent, "a fourth lane's floor lacks no extent");
+  model::HotBlocksPool pool(cache);
+  model::PoolState state = pool.state();
+  require(state.name == "hot_kv" && state.floorBytes == 2 * extent && state.currentBytes == 2 * extent &&
+              state.capBytes == 4 * extent && !state.releaseUnitBytes && state.growUnitBytes == extent &&
+              !state.rebuildOnly,
+          "the pool's state at its floors is not the cache's");
+  // A passed admission decides growth, whatever the cache's own says.
+  refuse = true;
+  const auto granting = [&](uint64_t bytes, const std::function<void()> &allocate) {
+    return test::admitAll(bytes, allocate);
+  };
+  require(static_cast<bool>(pool.grow(granting)) && cache.stats().bytes == 3 * extent,
+          "growth under a granting admission was refused by the cache's");
+  refuse = false;
+  const auto refusing = [](uint64_t, const std::function<void()> &) {
+    return metal::AllocationResult(metal::AllocationFailure::HostPressure);
+  };
+  require(pool.grow(refusing).failure == metal::AllocationFailure::HostPressure && cache.stats().bytes == 3 * extent,
+          "a refused growth under a passed admission changed the cache");
+  require(static_cast<bool>(pool.grow(test::admitAll)) && cache.stats().bytes == 4 * extent &&
+              !pool.state().growUnitBytes && static_cast<bool>(pool.grow(test::admitAll)) &&
+              cache.stats().bytes == 4 * extent,
+          "the pool grew past its target");
+  // Resolves in one extent's slots of a layer: a page set's blocks, its first
+  // half again (used again, kept), half as many other blocks, which evict
+  // the second half as ghosts, and the second half again, its claims ghost
+  // hits.
+  cache.releaseLane(1);
+  cache.releaseLane(2);
+  require(pool.release(UINT64_MAX) == 3 * extent && cache.stats().bytes == extent && !pool.state().releaseUnitBytes,
+          "everything above the floor did not go at once");
+  std::vector<KvPageSource> first(256), second(256);
+  for (uint32_t page = 0; page < 256; ++page) {
+    first[page] = {1 + page, copyOf(layout)};
+    second[page] = {1001 + page, copyOf(layout)};
+  }
+  const struct {
+    const std::vector<KvPageSource> &pages;
+    uint32_t first, end;
+  } turns[] = {{first, 0, 256}, {first, 0, 128}, {second, 0, 128}, {first, 128, 256}};
+  for (const auto &turn : turns) {
+    const auto stats = std::make_shared<KvReadStats>();
+    static_cast<void>(resolve(backend, cache, 0, {sourcesOf(turn.pages)}, {blocksOf(turn.first, turn.end)}, stats));
+    cache.mergeStats(*stats);
+  }
+  // Above the floor an extent at a time.
+  require(static_cast<bool>(pool.grow(test::admitAll)) && static_cast<bool>(pool.grow(test::admitAll)) &&
+              pool.state().releaseUnitBytes == extent && pool.release(1) == extent &&
+              cache.stats().bytes == 2 * extent,
+          "a release of one unit did not give back an extent");
+  // Once the last lane gives up its floor nothing reads the extents left:
+  // they cost only their rebuild, and the floor is nothing.
+  cache.releaseLane(0);
+  state = pool.state();
+  require(state.rebuildOnly && !state.floorBytes && state.releaseUnitBytes == extent,
+          "the extents no lane reads are not a pool unit that costs only its rebuild");
+  // A Start may take those extents, so a lane waiting for its floor lacks
+  // the whole floor, though its reserveLane() allocates nothing now.
+  allocated = 0;
+  require(cache.lanesShortfallBytes(1) == extent && cache.reserveLane(0).granted() && !allocated,
+          "a waiting lane's floor counted on extents a Start may take");
+  require(!cache.floorBytes(0) && cache.floorBytes(1) == extent && cache.floorBytes(3) == 2 * extent,
+          "the floors of 0, 1 and 3 lanes are not 0, 1 and 2 extents");
+  std::cout << "kv_block_cache_test: shortfall, admitted growth and the pool PASS\n";
+}
+
+// With the target no more than the floors (the default: no
+// --sparse-kv-memory), no lane reads above its floor: the extents a lane's
+// release leaves above the floors cost only their rebuild, and a lane
+// waiting for its floor counts only on the floors held.
+void aTargetAtTheFloorsIsRebuildOnly(MetalBackend &backend) {
+  const kv::Layout layout = layoutOf(kv::Format::Int8);
+  const uint64_t extent = extentBytes(layout);
+  KvBlockCache cache = makeCache(backend, layout, 1);
+  model::HotBlocksPool pool(cache);
+  require(cache.reserveLane(0).granted() && cache.reserveLane(1).granted() && cache.stats().bytes == 2 * extent,
+          "two lanes' floors are not two extents");
+  model::PoolState state = pool.state();
+  require(state.rebuildOnly && !state.releaseUnitBytes && state.floorBytes == 2 * extent,
+          "the floors at a target no larger are not rebuild-only, or gave a unit");
+  cache.releaseLane(1);
+  state = pool.state();
+  require(state.rebuildOnly && state.releaseUnitBytes == extent && state.floorBytes == extent &&
+              cache.floorBytes(1) == extent,
+          "the extent a released floor left at a target no larger is not rebuild-only");
+  require(cache.lanesShortfallBytes(1) == extent && cache.reserveLane(1).granted() &&
+              cache.stats().bytes == 2 * extent,
+          "a waiting lane's floor counted on the extent a Start may take");
+  std::cout << "kv_block_cache_test: a target at the floors PASS\n";
 }
 
 void failsTheLanesOfUnreadBlocks(MetalBackend &backend) {
@@ -525,6 +668,8 @@ int main(int argc, const char *argv[]) {
       resolvesEntries(backend);
       readsAPagesMissesAtOnce(backend);
       growsAndReleases(backend);
+      growsAsAPool(backend);
+      aTargetAtTheFloorsIsRebuildOnly(backend);
       failsTheLanesOfUnreadBlocks(backend);
       attendsThroughLocations<int8_t>(backend, kv::Format::Int8);
       attendsThroughLocations<uint16_t>(backend, kv::Format::BFloat16);

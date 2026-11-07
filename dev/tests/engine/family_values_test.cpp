@@ -1,7 +1,8 @@
-// What the engine's memory and caches take from each family Splash serves
-// (model::kFamilies), against family_values_golden.txt: the bytes of a KV
-// page of each form in each KV format and the extents a pool of each size
-// takes, a lane's and a cached state's bytes in each state format, and the
+// What the start options and the engine's memory and caches take from each
+// family Splash serves (model::kFamilies), against family_values_golden.txt:
+// the facts the options of a start depend on (model::familyFacts), the bytes
+// of a KV page of each form in each KV format and the extents a pool of each
+// size takes, a lane's and a cached state's bytes in each state format, and the
 // persistent cache's namespace of each pair of formats. A change to shared
 // code that moves one of them for a family fails here, and names the values
 // it now has; a new family adds its lines.
@@ -21,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace splash;
 
@@ -51,6 +53,8 @@ constexpr std::array<uint64_t, 22> kPoolPages{
 
 std::string familyValues() {
   std::ostringstream out;
+  const std::vector<model::FamilyFacts> facts = model::familyFacts();
+  size_t index = 0;
   model::forEachFamily([&](const auto &family) {
     const model::DFlashDraftLayout draft = draftOf(family.family);
     // A family whose drafts choose their mask token holds its draft's, the
@@ -63,7 +67,12 @@ std::string familyValues() {
                                    model::VisionSource::None);
     require(model.valid(), std::string(family.family) + "'s descriptor is not valid");
     const kv::Layout &kv = model.targetKvLayout;
+    const model::FamilyFacts &own = facts.at(index++);
+    require(own.family == family.family, std::string(family.family) + "'s facts are another family's");
     out << "family " << family.family << '\n'
+        << "facts experts " << own.experts << " recurrent-state " << own.recurrentState << " ple-table "
+        << own.pleTable << " sparse-kv " << own.sparseKv << " dense-ffn " << own.denseFfn << " context "
+        << own.contextTokens << ".." << own.maximumContextTokens << '\n'
         << "kv layers " << kv.attentionLayers << " heads " << kv.kvHeads << " dimension " << kv.headDimension
         << " index " << kv.indexDimension << (kv.valuesTokenMajor ? " values-token-major" : "");
     if (kv.windowedLayers)
