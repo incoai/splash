@@ -10,6 +10,7 @@
 #include "ops/ExecutionPlans.hpp"
 #include "ops/Linear.hpp"
 #include "ops/VerifyFfnPack.hpp"
+#include "ops/VerifyBodyPack.hpp"
 #include "ops/MoE.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
@@ -348,6 +349,8 @@ struct QwenTargetVerifyBuffers final {
   // target's steps route alone (ops::MoeBuffers::verifyRows).
   metal::MetalBuffer verifyRows;
   ops::VerifyFfnPackBuffers packedFfn;
+  ops::VerifyBodyPackBuffers packedBody;
+  uint32_t *packedBodyEncodedProjections = nullptr;
   // Optional host-only instrumentation: counted while encoding, never on the GPU.
   uint32_t *packedFfnEncodedLayers = nullptr;
   // Each lane's auxiliary state before the step; the commit writes the one
@@ -654,6 +657,9 @@ protected:
   void addDecodeProjection(metal::CommandGraph &graph, metal::MetalBuffer input, const ops::Projection &projection,
                            metal::MetalBuffer output, uint32_t lanes, ops::LinearScratch scratch,
                            ops::PreparedInput prepared = {}) const;
+  void addVerifyBodyProjection(VerifyStep &step, metal::MetalBuffer input,
+      const ops::Projection &projection, metal::MetalBuffer output, metal::MetalBuffer residual,
+      ops::PreparedInput prepared, const ops::LinearPlan *existingPlan = nullptr) const;
   // The FFNs of a layer whose residual is one row of hiddenSize values: each
   // reads the RMS norm `norm` of the mixer's `residual` rows and adds its
   // output to them into `output`. A dense SwiGLU, in a prefill on the

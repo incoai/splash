@@ -24,6 +24,7 @@ public:
     bool eligible = false;
     uint32_t encodedLayers = 0;
     VerifyPackControl control{};
+    uint32_t bodyEncodedProjections = 0;
   };
   [[nodiscard]] static PackedFfnObservation lastPackedFfn(const Runtime &runtime);
   // The PLE rows the last decode step gathered for batch lane `lane`'s

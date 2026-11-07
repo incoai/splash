@@ -56,7 +56,19 @@ ifneq ($(NATIVE_BATCH_WIDTH),8)
 $(error VERIFY_FFN_PACK_MODE 1/2 requires NATIVE_BATCH_WIDTH=8)
 endif
 endif
-NATIVE_BATCH_FLAG := -DSPLASH_MAXIMUM_BATCH_WIDTH=$(NATIVE_BATCH_WIDTH)u -DSPLASH_EXPERIMENTAL_FFN_PACK_MODE=$(VERIFY_FFN_PACK_MODE)
+VERIFY_BODY_PACK_MODE ?= 0
+ifneq ($(words $(VERIFY_BODY_PACK_MODE)),1)
+$(error VERIFY_BODY_PACK_MODE must be exactly 0 or 1)
+endif
+ifeq ($(filter 0 1,$(VERIFY_BODY_PACK_MODE)),)
+$(error VERIFY_BODY_PACK_MODE must be exactly 0 or 1)
+endif
+ifeq ($(VERIFY_BODY_PACK_MODE),1)
+ifneq ($(VERIFY_FFN_PACK_MODE),2)
+$(error VERIFY_BODY_PACK_MODE=1 requires VERIFY_FFN_PACK_MODE=2 and NATIVE_BATCH_WIDTH=8)
+endif
+endif
+NATIVE_BATCH_FLAG := -DSPLASH_MAXIMUM_BATCH_WIDTH=$(NATIVE_BATCH_WIDTH)u -DSPLASH_EXPERIMENTAL_FFN_PACK_MODE=$(VERIFY_FFN_PACK_MODE) -DSPLASH_EXPERIMENTAL_VERIFY_BODY=$(VERIFY_BODY_PACK_MODE)
 
 BUILD := build
 TARGET := $(BUILD)/splash
@@ -260,6 +272,7 @@ BUILD_ID_CONSTANT_ARGS = \
 	--constant 'runtime=qwen-hybrid-dflash8' \
 	--constant 'native_batch_width=$(NATIVE_BATCH_WIDTH)' \
 	--constant 'verify_ffn_pack_mode=$(VERIFY_FFN_PACK_MODE)' \
+	--constant 'verify_body_pack_mode=$(VERIFY_BODY_PACK_MODE)' \
 	--constant 'engine_cxxflags=$(ENGINE_CXXFLAGS)' \
 	--constant 'engine_objcxxflags=$(ENGINE_OBJCXXFLAGS)' \
 	--constant 'engine_linkflags=$(ENGINE_LINKFLAGS)' \
@@ -287,6 +300,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/GDN.cpp \
 	runtime/ops/Linear.cpp \
 	runtime/ops/VerifyFfnPack.cpp \
+	runtime/ops/VerifyBodyPack.cpp \
 	runtime/ops/LinearGguf.cpp \
 	runtime/ops/KernelSelection.cpp \
 	runtime/ops/MoE.cpp \

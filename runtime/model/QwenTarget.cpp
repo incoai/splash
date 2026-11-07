@@ -305,14 +305,28 @@ void QwenTarget::addDecodeProjection(metal::CommandGraph &graph, metal::MetalBuf
              projection, linear.decodePlan(projection, lanes));
 }
 
+void QwenTarget::addVerifyBodyProjection(VerifyStep &step, metal::MetalBuffer input,
+    const ops::Projection &projection, metal::MetalBuffer output, metal::MetalBuffer residual,
+    ops::PreparedInput prepared, const ops::LinearPlan *existingPlan) const {
+  const auto &b=step.buffers;const auto &linear=operators_.linear();
+  const auto plan=existingPlan?*existingPlan:linear.decodePlan(projection,step.lanes,
+      residual?ops::LinearEpilogue::Residual:ops::LinearEpilogue::None);
+  if(ops::addVerifyBodyPack(linear,step.graph,projection,plan,input,residual,output,
+      b.linearScratch,b.verifyRows,b.packedBody,step.lanes)) {
+    if(b.packedBodyEncodedProjections) ++*b.packedBodyEncodedProjections;
+    return;
+  }
+  linear.add(step.graph,{.input=std::move(input),.output=std::move(output),.residual=std::move(residual),
+      .scratch=b.linearScratch,.prepared=std::move(prepared)},projection,plan);
+}
+
 // Each producer emits the table (if any) its consumer's plan reads.
 void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, ops::PreparedInput normalized,
                                 BlockOutput output) const {
   const QwenTargetVerifyBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.gdnLayer++;
-  addDecodeProjection(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, step.lanes, b.linearScratch,
-                      std::move(normalized));
+  addVerifyBodyProjection(step, b.normalized, mixer.inputProjection, b.gdnPacked, {}, std::move(normalized));
   const ops::LinearPlan outputPlan = linear.decodePlan(
       mixer.outputProjection, step.lanes, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
   const ops::PreparedInput hidden = ops::GDN::addDecode(
@@ -322,10 +336,8 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, o
        b.linearScratch},
       geometry_.gdnShape(), step.lanes, layer, geometry_.stateLayout.strides(),
       mixer.outputHeadOrder, outputPlan.input());
-  linear.add(step.graph,
-             {.input = b.gdnHidden, .output = std::move(output.rows), .residual = std::move(output.residual),
-              .scratch = b.linearScratch, .prepared = hidden},
-             mixer.outputProjection, outputPlan);
+  addVerifyBodyProjection(step, b.gdnHidden, mixer.outputProjection, std::move(output.rows),
+      std::move(output.residual), hidden, &outputPlan);
 }
 
 // With `blocks`, each lane's rows attend through its list (ops::AttentionBlocks),
@@ -338,8 +350,7 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
   const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.attentionLayer++;
   const ops::AttentionVariant variant = geometry_.attentionVariant(layer);
-  addDecodeProjection(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.lanes, b.linearScratch,
-                      std::move(normalized));
+  addVerifyBodyProjection(step, b.normalized, mixer.inputProjection, b.fullPacked, {}, std::move(normalized));
   ops::PagedAttention::addVerifyProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos,
                                            b.ropeSin, b.fullQueries, b.chunkKeys[layer], b.chunkValues[layer],
                                            geometry_.attentionQueryHeads, geometry_.kvLayout, step.lanes, variant);
@@ -358,10 +369,8 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
   const ops::PreparedInput hidden = ops::PagedAttention::addVerifyGate(
       step.graph, b.fullPacked, b.fullAttention, b.attentionHidden, geometry_.attentionQueryHeads,
       geometry_.kvLayout, step.lanes, b.linearScratch, outputPlan.input());
-  linear.add(step.graph,
-             {.input = b.attentionHidden, .output = std::move(output.rows), .residual = std::move(output.residual),
-              .scratch = b.linearScratch, .prepared = hidden},
-             mixer.outputProjection, outputPlan);
+  addVerifyBodyProjection(step, b.attentionHidden, mixer.outputProjection, std::move(output.rows),
+      std::move(output.residual), hidden, &outputPlan);
 }
 
 void QwenTarget::addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops::NormWeights &norm,

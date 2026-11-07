@@ -456,6 +456,9 @@ enum class DecodeTensor : uint32_t {
   PackedFfnIntermediate,
   PackedFfnOutput,
   PackedFfnControl,
+  PackedBodyInput,
+  PackedBodyResidual,
+  PackedBodyOutput,
   Count,
 };
 
@@ -584,6 +587,11 @@ public:
             batchSlice(DecodeTensor::PackedFfnResidual, kLaneCount),
             batchSlice(DecodeTensor::PackedFfnIntermediate, kLaneCount),
             batchSlice(DecodeTensor::PackedFfnOutput, kLaneCount)};
+  }
+  [[nodiscard]] ops::VerifyBodyPackBuffers packedBody() const {
+    return {batchSlice(DecodeTensor::PackedBodyInput,kLaneCount),
+            batchSlice(DecodeTensor::PackedBodyResidual,kLaneCount),
+            batchSlice(DecodeTensor::PackedBodyOutput,kLaneCount)};
   }
   [[nodiscard]] ops::LinearScratch linearScratch() const { return linearScratch_; }
   static ops::LinearScratchSize linearScratchSize(const RuntimeGeometry &geometry,

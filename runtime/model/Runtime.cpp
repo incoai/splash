@@ -462,6 +462,7 @@ struct Runtime::Impl {
   bool allowPackedFfnTeacherForcing = false;
   bool lastPackedFfnEligible = false;
   uint32_t lastPackedFfnLayers = 0;
+  uint32_t lastPackedBodyProjections = 0;
 #endif
   ops::Sampling sampling;
   std::unique_ptr<QwenTarget> targetModel;
@@ -674,6 +675,9 @@ struct Runtime::Impl {
   bool packedFfnEligible(std::span<Request *const> entries) const {
 #if SPLASH_EXPERIMENTAL_FFN_PACK_MODE > 0
     const auto &t = geometry.target;
+#if SPLASH_EXPERIMENTAL_VERIFY_BODY
+    if(backend.capabilities().appleGpuFamily<10) return false;
+#endif
     if (entries.size() < 5 || entries.size() > 8 || kLaneCount != 8 || aneFfn ||
         geometry.spilledKv || blockCache || historyStream ||
         t.ffnKind != QwenFfnKind::Dense || t.layers != 64 || t.hiddenSize != 5120 ||
@@ -2232,9 +2236,16 @@ struct Runtime::Impl {
     lastPackedFfnEligible = packedFfnEligible(entries);
     lastPackedFfnLayers = 0;
     buffers.packedFfnEncodedLayers = &lastPackedFfnLayers;
+    lastPackedBodyProjections = 0;
+    buffers.packedBodyEncodedProjections = &lastPackedBodyProjections;
 #endif
 #if SPLASH_EXPERIMENTAL_FFN_PACK_MODE == 2
-    if (packedFfnEligible(entries)) buffers.packedFfn = decodeArena->packedFfn();
+    if (packedFfnEligible(entries)) {
+      buffers.packedFfn = decodeArena->packedFfn();
+#if SPLASH_EXPERIMENTAL_VERIFY_BODY
+      buffers.packedBody = decodeArena->packedBody();
+#endif
+    }
 #endif
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyParams(
@@ -3810,6 +3821,7 @@ void RuntimeInstrumentation::allowPackedFfnTeacherForcing(Runtime &runtime, bool
 RuntimeInstrumentation::PackedFfnObservation RuntimeInstrumentation::lastPackedFfn(const Runtime &runtime) {
   const auto &impl = *runtime.impl_;
   PackedFfnObservation out{impl.lastPackedFfnEligible, impl.lastPackedFfnLayers, {}};
+  out.bodyEncodedProjections = impl.lastPackedBodyProjections;
   if (out.encodedLayers) {
     const auto control = impl.decodeArena->packedFfn().control;
     if (control.sizeBytes() < sizeof(out.control)) throw std::logic_error("packed FFN observation extent");

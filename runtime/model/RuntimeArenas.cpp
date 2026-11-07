@@ -195,6 +195,13 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
     put(DecodeTensor::PackedFfnResidual, bytesFor<uint16_t>(4 * geometry.target.hiddenSize));
     put(DecodeTensor::PackedFfnIntermediate, bytesFor<uint16_t>(4 * geometry.target.intermediateSize));
     put(DecodeTensor::PackedFfnOutput, bytesFor<uint16_t>(4 * geometry.target.hiddenSize));
+#if SPLASH_EXPERIMENTAL_VERIFY_BODY
+    const uint64_t width=std::max({geometry.target.hiddenSize,geometry.target.packedGdnWidth,
+                                  geometry.target.packedFullWidth,geometry.target.attentionWidth});
+    put(DecodeTensor::PackedBodyInput,bytesFor<uint16_t>(4*width));
+    put(DecodeTensor::PackedBodyResidual,bytesFor<uint16_t>(4*width));
+    put(DecodeTensor::PackedBodyOutput,bytesFor<uint16_t>(4*width));
+#endif
     static_assert(sizeof(VerifyPackControl) % 8 == 0);
     put(DecodeTensor::PackedFfnControl, sizeof(VerifyPackControl) / 8);
   }
