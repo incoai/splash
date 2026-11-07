@@ -28,6 +28,7 @@ using splash::test::guardReleases;
 using splash::test::idle;
 using splash::test::OffloadControl;
 using splash::test::request;
+using splash::test::runUntilIdle;
 using splash::test::State;
 
 namespace {
