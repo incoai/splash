@@ -317,6 +317,8 @@ def run_training(args, *, family=True):
                 head,
                 recipe.selector_loss_weight,
                 recipe.vocabulary_chunk_rows,
+                prefix_weight=recipe.prefix_loss_weight,
+                position_decay=recipe.position_decay,
             )
         if not loss.requires_grad:
             raise TrainingError(
