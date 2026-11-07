@@ -160,7 +160,7 @@ public:
     return warmup(static_cast<int>(width));
   }
   model::WarmupStepResult warmupCompositeStateRestore() override {
-    return warmup(5);
+    return warmup(model::ExecutionLimits::maximumBatchWidth + 1);
   }
   model::ModelMemoryActual actualRuntimeMemory() const override {
     return {1, 1};
@@ -220,8 +220,15 @@ void testAllNativeWarmupsPrecedeReady() {
   auto report = warmup(harness, plan);
   require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid,
           "successful native bootstrap was incomplete");
-  require(harness.executor().calls == std::vector<int>({0, 1, 2, 3, 4, 5}),
-          "bootstrap did not warm a prefill and B1/B2/B3/B4 in order");
+  require(
+      harness.executor().calls ==
+          [] {
+            std::vector<int> expected;
+            for (uint32_t step = 0; step <= model::ExecutionLimits::maximumBatchWidth + 1; ++step)
+              expected.push_back(step);
+            return expected;
+          }(),
+      "bootstrap did not warm a prefill, all decode widths and restore in order");
   require(harness.executor().prefillRows == std::vector<uint32_t>({model::ExecutionLimits::prefillTokenBudget}),
           "bootstrap did not warm a prefill of maximum rows");
   require(report.warmup.decodeBatches[2] == WarmupStepStatus::Complete,
@@ -240,14 +247,15 @@ void testWarmupHoldsTheRunway() {
       require(harness.pool().pageActive(page), "a warmup ran on a runway page no request held");
   };
   const auto report = warmup(harness, plan);
-  require(report.stage == RuntimeBootstrapStage::Ready && warmups == 6 &&
+  require(report.stage == RuntimeBootstrapStage::Ready &&
+              warmups == model::ExecutionLimits::maximumBatchWidth + 2 &&
               harness.pool().snapshot().pagesActive == 0,
           "warmup held the runway past Ready");
 }
 
 void testBudgetLimitedWarmupTriesOnlyWidthsThatFit() {
   const auto complete = memoryPlan().breakdown();
-  for (uint32_t width : {1U, 2U, 3U}) {
+  for (uint32_t width = 1; width < model::ExecutionLimits::maximumBatchWidth; ++width) {
     // Enough for the requested lanes' state and the KV runway, with less
     // than one more lane's state to spare. This is a valid single-lane plan.
     const uint64_t ceiling = complete.minimumRequiredBytes +
@@ -262,7 +270,7 @@ void testBudgetLimitedWarmupTriesOnlyWidthsThatFit() {
     std::vector<int> expected{0};
     for (uint32_t lane = 1; lane <= width; ++lane)
       expected.push_back(static_cast<int>(lane));
-    expected.push_back(5);
+    expected.push_back(model::ExecutionLimits::maximumBatchWidth + 1);
     require(harness.executor().calls == expected,
             "warmup attempted a decode width that cannot fit the plan");
     for (uint32_t lane = 0; lane < report.warmup.decodeBatches.size(); ++lane) {
@@ -276,22 +284,26 @@ void testBudgetLimitedWarmupTriesOnlyWidthsThatFit() {
 
 void testOptionalAllocationFailuresAreMemoryLimited() {
   const EngineMemoryPlan plan = memoryPlan();
-  for (int deniedWidth : {-1, 2, 3, 4}) {
+  std::vector<int> denials{-1};
+  for (uint32_t width = 2; width <= model::ExecutionLimits::maximumBatchWidth; ++width)
+    denials.push_back(width);
+  for (int deniedWidth : denials) {
     for (bool denyRestore : {false, true}) {
       Harness harness;
       harness.executor().warmupHook = [&](int step, model::WarmupStepResult &) {
-        if (step == deniedWidth || (step == 5 && denyRestore))
+        if (step == deniedWidth || (step == model::ExecutionLimits::maximumBatchWidth + 1 && denyRestore))
           throw metal::MetalAllocationError("injected allocation denial");
       };
       const auto report = warmup(harness, plan);
       requireReady(report);
-      const uint32_t completedWidth = deniedWidth < 0 ? 4 : deniedWidth - 1;
+      const uint32_t completedWidth =
+          deniedWidth < 0 ? model::ExecutionLimits::maximumBatchWidth : deniedWidth - 1;
       std::vector<int> expected{0};
       for (uint32_t width = 1; width <= completedWidth; ++width)
         expected.push_back(static_cast<int>(width));
       if (deniedWidth >= 0)
         expected.push_back(deniedWidth);
-      expected.push_back(5);
+      expected.push_back(model::ExecutionLimits::maximumBatchWidth + 1);
       require(harness.executor().calls == expected,
               "bootstrap retried wider batches after allocation denial");
       for (uint32_t lane = 0; lane < report.warmup.decodeBatches.size(); ++lane) {
@@ -385,53 +397,50 @@ void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
   enum class Failure {
     Allocation, Backend, General, ZeroTime, InfiniteTime, NanTime
   };
-  constexpr RuntimeBootstrapStage stages[] = {
-      RuntimeBootstrapStage::MaximumPrefill,
-      RuntimeBootstrapStage::DecodeWarmup,
-      RuntimeBootstrapStage::DecodeWarmup,
-      RuntimeBootstrapStage::DecodeWarmup,
-      RuntimeBootstrapStage::DecodeWarmup,
-      RuntimeBootstrapStage::CompositeStateRestore,
+  const auto stage = [](uint32_t step) {
+    if (!step)
+      return RuntimeBootstrapStage::MaximumPrefill;
+    if (step <= model::ExecutionLimits::maximumBatchWidth)
+      return RuntimeBootstrapStage::DecodeWarmup;
+    return RuntimeBootstrapStage::CompositeStateRestore;
   };
   const EngineMemoryPlan plan = memoryPlan();
-  for (int step = 0; step < 6; ++step) {
+  for (uint32_t step = 0; step <= model::ExecutionLimits::maximumBatchWidth + 1; ++step) {
     for (Failure failure : {Failure::Allocation, Failure::Backend,
                             Failure::General, Failure::ZeroTime,
                             Failure::InfiniteTime, Failure::NanTime}) {
-      if (failure == Failure::Allocation &&
-          (step == 2 || step == 3 || step == 4 || step == 5))
+      if (failure == Failure::Allocation && step >= 2)
         continue; // Only these paths may skip a real allocation refusal.
       Harness harness;
-      harness.executor().warmupHook =
-          [&](int current, model::WarmupStepResult &result) {
-            if (current != step)
-              return;
-            switch (failure) {
-            case Failure::Allocation:
-              throw metal::MetalAllocationError("injected required allocation");
-            case Failure::Backend:
-              throw metal::MetalBackendError("injected GPU command failure");
-            case Failure::General:
-              throw std::runtime_error("injected general warmup failure");
-            case Failure::ZeroTime:
-              result.wallSeconds = 0.0;
-              break;
-            case Failure::InfiniteTime:
-              result.wallSeconds = std::numeric_limits<double>::infinity();
-              break;
-            case Failure::NanTime:
-              result.wallSeconds = std::numeric_limits<double>::quiet_NaN();
-              break;
-            }
-          };
+      harness.executor().warmupHook = [&](int current, model::WarmupStepResult &result) {
+        if (current != static_cast<int>(step))
+          return;
+        switch (failure) {
+        case Failure::Allocation:
+          throw metal::MetalAllocationError("injected required allocation");
+        case Failure::Backend:
+          throw metal::MetalBackendError("injected GPU command failure");
+        case Failure::General:
+          throw std::runtime_error("injected general warmup failure");
+        case Failure::ZeroTime:
+          result.wallSeconds = 0.0;
+          break;
+        case Failure::InfiniteTime:
+          result.wallSeconds = std::numeric_limits<double>::infinity();
+          break;
+        case Failure::NanTime:
+          result.wallSeconds = std::numeric_limits<double>::quiet_NaN();
+          break;
+        }
+      };
       try {
         static_cast<void>(warmup(harness, plan));
         throw std::runtime_error("invalid warmup passed");
       } catch (const RuntimeBootstrapError &error) {
-        require(error.report().stage == stages[step] &&
+        require(error.report().stage == stage(step) &&
                     (failure == Failure::Allocation ||
                      error.report().resourceFailure == RuntimeResourceFailure::Other) &&
-                    harness.executor().calls.back() == step,
+                    harness.executor().calls.back() == static_cast<int>(step),
                 "warmup failure was swallowed as a memory-limited success");
       }
     }
@@ -538,7 +547,12 @@ void testReadyEventForTheServedModel() {
   engine.maxImagePatches = 16384;
   const protocol::ReadyEvent vision =
       readyEventFor(flint, engine, protocolLimitsFor(flint.capabilities, engine.maxContext));
-  require(vision == protocol::ReadyEvent{4, 73721, true, 150144, {150001, 150003, 150005, 150018}, 9},
+  require(vision == protocol::ReadyEvent{model::ExecutionLimits::maximumBatchWidth,
+                                         73721,
+                                         true,
+                                         150144,
+                                         {150001, 150003, 150005, 150018},
+                                         9},
           "Ready did not announce what a start serving Flint with images serves");
   model::ModelDescriptor dense;
   dense.target = model::Qwen3_8Layout{};
@@ -547,7 +561,9 @@ void testReadyEventForTheServedModel() {
   engine.maxImagePatches = 0;
   const protocol::ReadyEvent text =
       readyEventFor(dense, engine, protocolLimitsFor(dense.capabilities, engine.maxContext));
-  require(text == protocol::ReadyEvent{4, 262144, false, 248320, {248044, 248046}, 9},
+  require(text ==
+              protocol::ReadyEvent{
+                  model::ExecutionLimits::maximumBatchWidth, 262144, false, 248320, {248044, 248046}, 9},
           "Ready did not announce what a start serving a model without images serves");
 }
 
