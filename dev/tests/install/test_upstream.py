@@ -89,6 +89,7 @@ class UpstreamTest(unittest.TestCase):
                     ),
                     family,
                 )
+
         # The GGUF-only families: the config and
         # metadata the installer derives from it name the family, with and
         # without its draft (Flint's flat config, its release's keys, and a
