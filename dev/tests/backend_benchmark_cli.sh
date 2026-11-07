@@ -25,4 +25,28 @@ if [ "$status" -ne 1 ] ||
     exit 1
 fi
 test ! -s "$work/out"
+# Lookup options fail before model inspection or Metal initialization.
+rejects_lookup_option() {
+    expected_error=$1
+    shift
+    status=0
+    "$binary" "$work/missing.metallib" "$work/missing-model" "$@" >"$work/out" 2>"$work/err" || status=$?
+    if [ "$status" -ne 1 ] ||
+        ! grep -Fqx "backend-benchmark: $expected_error" "$work/err" ||
+        test -s "$work/out"; then
+        echo "backend-benchmark did not reject lookup arguments before model loading: $*" >&2
+        cat "$work/err" >&2
+        exit 1
+    fi
+}
+
+rejects_lookup_option '--lookup-cohort takes complete or fresh' --lookup-cohort invalid
+rejects_lookup_option '--lookup-cohort requires lookup-abba' --lookup-cohort fresh
+rejects_lookup_option 'benchmark option requires a value' --lookup-cohort
+rejects_lookup_option 'lookup-abba must be the only scenario' --scenario lookup-abba,decode
+rejects_lookup_option 'benchmark scenario named twice' --scenario lookup-abba,lookup-abba
+rejects_lookup_option 'lookup-abba requires samples 1' --scenario lookup-abba --samples 2
+rejects_lookup_option 'lookup-abba requires --ane-ffn-share 0' --scenario lookup-abba
+rejects_lookup_option 'lookup-abba requires --ane-ffn-share 0' --scenario lookup-abba --ane-ffn-share 0.5
+
 echo 'backend-benchmark CLI validation: PASS'

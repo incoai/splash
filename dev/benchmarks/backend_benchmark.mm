@@ -3,9 +3,12 @@
 #include "engine/Json.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "model/Runtime.hpp"
+#include "model/PromptLookup.hpp"
 #include "Supervision.hpp"
 #include "PrefillWork.hpp"
 #include "TranscriptPrompts.hpp"
+#include "LookupHeldoutPrompts.hpp"
+#include "LookupFreshPrompts.hpp"
 
 #include <algorithm>
 #include <iterator>
@@ -152,11 +155,35 @@ struct Measurement final {
   double ttftMilliseconds = 0.0;
   double prefillGpuMilliseconds = 0.0;
   double decodeGpuMilliseconds = 0.0;
+  double decodeWallMilliseconds = 0.0;
+  uint64_t decodeBatches = 0;
+  uint64_t decodeOutputTokens = 0;
+  uint64_t draftedTokens = 0;
+  uint64_t acceptedDraftTokens = 0;
+  uint64_t promptLookupSearches = 0;
+  uint64_t promptLookupHits = 0;
+  uint64_t promptLookupBypassedCycles = 0;
+  uint64_t promptLookupProposedTokens = 0;
+  uint64_t promptLookupAcceptedTokens = 0;
+  double promptLookupSearchWallMilliseconds = 0.0;
+  uint32_t lookupAbbaGroup = 0;
+  uint32_t lookupAbbaSlot = 0;
+  bool lookupAbbaEnabled = false;
+  uint32_t requestedOutputTokens = 0;
+  std::vector<uint32_t> inputTokens;
   uint64_t targetPrefillRows = 0;
   uint64_t draftContextRows = 0;
   uint64_t draftContextRowsAvoided = 0;
   uint64_t draftStateRestoreSkipped = 0;
   uint64_t junctionMaterializations = 0;
+  uint64_t junctionMaterializationFailures = 0;
+  uint64_t inputTokenHash = 0;
+  uint64_t stateAllocatedBeforeBytes = 0;
+  uint64_t stateAllocatedAfterBytes = 0;
+  uint64_t stateAllocatedPeakObservedBytes = 0;
+  uint64_t cachedStateBytes = 0;
+  uint64_t stateEvictions = 0;
+  uint32_t stateEntries = 0;
   std::vector<uint32_t> outputTokens;
   std::optional<bool> coldOutputMatch;
 };
@@ -424,14 +451,23 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
 
   const model::ModelTelemetry before = executor.telemetry();
   const engine::EngineSnapshot engineBefore = engine.snapshot();
+  uint64_t statePeak = before.stateAllocatedBytes;
+  uint64_t decodeBatches = 0, decodeOutputTokens = 0, draftedTokens = 0, acceptedDraftTokens = 0;
   std::vector<uint32_t> prefillBatchRows;
   prefillBatchRows.reserve(
       promptTokens / model::ExecutionLimits::prefillTokenBudget + 3);
   const auto began = Clock::now();
   engine.submit(std::move(request));
   driver.untilIdle([&](const BatchObservation &batch) {
+    statePeak = std::max(statePeak, executor.telemetry().stateAllocatedBytes);
     if (batch.kind == WorkKind::Prefill)
       prefillBatchRows.push_back(batch.inputTokens);
+    else if (batch.kind == WorkKind::Decode) {
+      ++decodeBatches;
+      decodeOutputTokens += batch.outputTokens;
+      draftedTokens += batch.draftedTokens;
+      acceptedDraftTokens += batch.acceptedDraftTokens;
+    }
   });
   const auto ended = Clock::now();
   const model::ModelTelemetry after = executor.telemetry();
@@ -456,6 +492,19 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
       (after.totalPrefillGpuSeconds - before.totalPrefillGpuSeconds) * 1000.0;
   result.decodeGpuMilliseconds =
       (after.totalDecodeGpuSeconds - before.totalDecodeGpuSeconds) * 1000.0;
+  result.decodeWallMilliseconds = (after.totalDecodeWallSeconds - before.totalDecodeWallSeconds) * 1000.0;
+  result.decodeBatches = decodeBatches;
+  result.decodeOutputTokens = decodeOutputTokens;
+  result.draftedTokens = draftedTokens;
+  result.acceptedDraftTokens = acceptedDraftTokens;
+  result.promptLookupSearches = after.promptLookupSearches - before.promptLookupSearches;
+  result.promptLookupHits = after.promptLookupHits - before.promptLookupHits;
+  result.promptLookupBypassedCycles = after.promptLookupBypassedCycles - before.promptLookupBypassedCycles;
+  result.promptLookupProposedTokens = after.promptLookupProposedTokens - before.promptLookupProposedTokens;
+  result.promptLookupAcceptedTokens = after.promptLookupAcceptedTokens - before.promptLookupAcceptedTokens;
+  result.promptLookupSearchWallMilliseconds =
+      (after.promptLookupSearchWallSeconds - before.promptLookupSearchWallSeconds) * 1000.0;
+  result.requestedOutputTokens = maxNewTokens;
   result.targetPrefillRows = after.targetPrefillRows - before.targetPrefillRows;
   result.draftContextRows =
       after.draftContextRowsActive + after.draftContextRowsMaterialization -
@@ -466,6 +515,15 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
       after.draftStateRestoreSkipped - before.draftStateRestoreSkipped;
   result.junctionMaterializations = engineAfter.junctionMaterializations -
                                     engineBefore.junctionMaterializations;
+  result.junctionMaterializationFailures = engineAfter.junctionMaterializationFailures -
+                                           engineBefore.junctionMaterializationFailures;
+  result.inputTokenHash = inputTokenHash;
+  result.stateAllocatedBeforeBytes = before.stateAllocatedBytes;
+  result.stateAllocatedAfterBytes = after.stateAllocatedBytes;
+  result.stateAllocatedPeakObservedBytes = std::max(statePeak, after.stateAllocatedBytes);
+  result.cachedStateBytes = engineAfter.resources.stateCache.bytes;
+  result.stateEntries = engineAfter.resources.stateCache.entries;
+  result.stateEvictions = engineAfter.resources.stateCache.evictions - engineBefore.resources.stateCache.evictions;
   result.outputTokens = observed.outputTokens;
   if (progress) {
     progress->complete(
@@ -698,19 +756,51 @@ void emitMeasurement(const Measurement &value, bool first) {
             << ",\"ttft_ms\":" << value.ttftMilliseconds
             << ",\"prefill_gpu_ms\":" << value.prefillGpuMilliseconds
             << ",\"decode_gpu_ms\":" << value.decodeGpuMilliseconds
+            << ",\"decode_wall_ms\":" << value.decodeWallMilliseconds
+            << ",\"decode_batches\":" << value.decodeBatches
+            << ",\"decode_output_tokens\":" << value.decodeOutputTokens
+            << ",\"drafted_tokens\":" << value.draftedTokens
+            << ",\"accepted_draft_tokens\":" << value.acceptedDraftTokens
+            << ",\"prompt_lookup_searches\":" << value.promptLookupSearches
+            << ",\"prompt_lookup_hits\":" << value.promptLookupHits
+            << ",\"prompt_lookup_bypassed_cycles\":" << value.promptLookupBypassedCycles
+            << ",\"prompt_lookup_proposed_tokens\":" << value.promptLookupProposedTokens
+            << ",\"prompt_lookup_accepted_tokens\":" << value.promptLookupAcceptedTokens
+            << ",\"prompt_lookup_search_wall_ms\":" << value.promptLookupSearchWallMilliseconds
+            << ",\"requested_output_tokens\":" << value.requestedOutputTokens
+            << ",\"actual_output_tokens\":" << value.outputTokens.size()
             << ",\"draft_context_rows\":" << value.draftContextRows
             << ",\"draft_context_rows_avoided\":"
             << value.draftContextRowsAvoided
             << ",\"draft_state_restore_skipped\":"
             << value.draftStateRestoreSkipped
             << ",\"junction_materializations\":"
-            << value.junctionMaterializations << ",\"output_tokens\":[";
+            << value.junctionMaterializations
+            << ",\"junction_materialization_failures\":" << value.junctionMaterializationFailures
+            << ",\"input_token_hash\":" << value.inputTokenHash
+            << ",\"state_allocated_before_bytes\":" << value.stateAllocatedBeforeBytes
+            << ",\"state_allocated_after_bytes\":" << value.stateAllocatedAfterBytes
+            << ",\"state_allocated_peak_observed_bytes\":" << value.stateAllocatedPeakObservedBytes
+            << ",\"cached_state_bytes\":" << value.cachedStateBytes
+            << ",\"state_entries\":" << value.stateEntries
+            << ",\"state_evictions\":" << value.stateEvictions
+            << ",\"output_tokens\":[";
   for (size_t index = 0; index < value.outputTokens.size(); ++index) {
     if (index)
       std::cout << ',';
     std::cout << value.outputTokens[index];
   }
   std::cout << ']';
+  if (!value.inputTokens.empty()) {
+    std::cout << ",\"input_tokens\":[";
+    for (size_t index = 0; index < value.inputTokens.size(); ++index)
+      std::cout << (index ? "," : "") << value.inputTokens[index];
+    std::cout << ']';
+  }
+  if (value.lookupAbbaSlot)
+    std::cout << ",\"lookup_abba_group\":" << value.lookupAbbaGroup
+              << ",\"lookup_abba_slot\":" << value.lookupAbbaSlot
+              << ",\"lookup_abba_variant\":\"" << (value.lookupAbbaEnabled ? "on" : "off") << '"';
   if (value.coldOutputMatch)
     std::cout << ",\"cold_output_match\":"
               << (*value.coldOutputMatch ? "true" : "false");
@@ -795,10 +885,11 @@ struct BenchmarkScenarios final {
   bool exact = false;
   bool logits = false;
   bool resume = false;
+  bool lookupAbba = false;
 };
 
 BenchmarkScenarios parseScenarios(std::string_view value) {
-  BenchmarkScenarios selected{false, false, false, false, false, false, false, false};
+  BenchmarkScenarios selected{false, false, false, false, false, false, false, false, false};
   for (;;) {
     const size_t comma = value.find(',');
     const std::string_view name = value.substr(0, comma);
@@ -810,6 +901,7 @@ BenchmarkScenarios parseScenarios(std::string_view value) {
                      : name == "exact"       ? &selected.exact
                      : name == "logits"      ? &selected.logits
                      : name == "resume"      ? &selected.resume
+                     : name == "lookup-abba" ? &selected.lookupAbba
                                              : nullptr;
     if (!scenario)
       throw std::invalid_argument("unknown benchmark scenario");
@@ -896,8 +988,10 @@ int main(int argc, char **argv) {
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
                    "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
                    "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
-                   "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
+                   "  NAME: decode, partial, short, transcripts, context, exact, logits, resume or lookup-abba "
                    "(default: decode,partial,context)\n"
+                   "  lookup-abba: --lookup-cohort complete|fresh (default: complete), --samples 1, --ane-ffn-share 0\n"
+                   "  Eight OFF warmup passes, then three off/on/on/off groups; edits cap1024, controls cap256.\n"
                    "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
                    "to run instead of calibrating one (0: GPU alone)\n"
                    "  ROWS: the least rows of a chunk that share takes "
@@ -917,6 +1011,9 @@ int main(int argc, char **argv) {
     std::optional<double> aneFfnShare;
     std::optional<uint32_t> aneFfnMinimumRows;
     uint32_t maxContext = 0;
+    std::string_view lookupCohort = "complete";
+    bool lookupCohortGiven = false;
+    constexpr uint32_t lookupAbbaGroups = 3;
     std::optional<std::filesystem::path> logitsDirectory, logitsFrom;
     uint32_t logitsWidth = 1;
     bool logitsOptions = false;
@@ -930,6 +1027,11 @@ int main(int argc, char **argv) {
         progressPath = std::filesystem::path(argv[index + 1]);
       } else if (option == "--scenario") {
         selected = parseScenarios(argv[index + 1]);
+      } else if (option == "--lookup-cohort") {
+        lookupCohort = argv[index + 1];
+        if (lookupCohort != "complete" && lookupCohort != "fresh")
+          throw std::invalid_argument("--lookup-cohort takes complete or fresh");
+        lookupCohortGiven = true;
       } else if (option == "--ane-ffn-share") {
         aneFfnShare = parseAneFfnShare(argv[index + 1]);
       } else if (option == "--ane-ffn-minimum-rows") {
@@ -954,6 +1056,17 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("the logits scenario and --logits go together");
     if (logitsOptions && !logitsDirectory)
       throw std::invalid_argument("--logits-from and --logits-width need --logits");
+    if (lookupCohortGiven && !selected.lookupAbba)
+      throw std::invalid_argument("--lookup-cohort requires lookup-abba");
+    if (selected.lookupAbba) {
+      if (selected.decode || selected.partial || selected.shortPrompts || selected.transcripts ||
+          selected.context || selected.exact || selected.logits || selected.resume)
+        throw std::invalid_argument("lookup-abba must be the only scenario");
+      if (samples != 1)
+        throw std::invalid_argument("lookup-abba requires samples 1");
+      if (!aneFfnShare || *aneFfnShare != 0)
+        throw std::invalid_argument("lookup-abba requires --ane-ffn-share 0");
+    }
     if (progressPath)
       progress = std::make_unique<ProgressJournal>(*progressPath, samples);
 
@@ -972,6 +1085,10 @@ int main(int argc, char **argv) {
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
+    if (selected.lookupAbba &&
+        ((config.model.name != "Qwen3.8-27B" && config.model.name != "mlx-community/Qwen3.8-27B-4bit") ||
+         !config.model.stateLayout.target.layers || config.model.stateLayout.target.auxiliaryBytes))
+      throw std::invalid_argument("lookup-abba fixtures require Qwen3.8-27B");
     // Complete production warmup and memory audit before measuring. A start
     // refused memory the host or Metal may give back, as while the previous
     // engine's memory settles, retries as serve's does (main.mm): within the
@@ -1141,6 +1258,7 @@ int main(int argc, char **argv) {
     // The rolling request, a length's longest, appends this many tokens.
     constexpr uint32_t rollingSuffixTokens = 256;
     std::vector<Measurement> measurements;
+    std::vector<Measurement> lookupThermalWarmup;
     // Lengths the memory plan cannot hold, on a Mac with less memory.
     std::vector<uint32_t> skippedLengths;
     for (uint32_t length : selected.context || selected.exact
@@ -1425,6 +1543,106 @@ int main(int argc, char **argv) {
       }
     }
 
+    // Frozen complete-edit and fresh-edit cohorts, each B1 on an empty prefix
+    // cache. Keep every natural-EOS output, including an identical task error
+    // in both variants; edit caps1024 and control caps256 are fixed.
+    if (selected.lookupAbba) {
+      auto *nativeRuntime = dynamic_cast<model::Runtime *>(executor);
+      if (!nativeRuntime)
+        throw std::logic_error("prompt lookup experiment requires the native Runtime");
+      struct LookupCase { const char *name; std::span<const uint32_t> tokens; uint32_t outputCap; };
+      const std::array<LookupCase, 6> completeCases{{
+          {"lookup_edit_python", benchmark::kLookupHeldout0, 1024},
+          {"lookup_edit_markdown", benchmark::kLookupHeldout1, 1024},
+          {"lookup_edit_config", benchmark::kLookupHeldout2, 1024},
+          {"lookup_control_intervals", benchmark::kTranscriptPrompts[0], 256},
+          {"lookup_control_lru", benchmark::kTranscriptPrompts[1], 256},
+          {"lookup_control_http", benchmark::kTranscriptPrompts[2], 256}}};
+      const std::array<LookupCase, 9> freshCases{{
+          {"fresh_edit_sql", benchmark::kLookupFresh0, 1024},
+          {"fresh_edit_toml", benchmark::kLookupFresh1, 1024},
+          {"fresh_edit_js", benchmark::kLookupFresh2, 1024},
+          {"fresh_edit_markdown", benchmark::kLookupFresh3, 1024},
+          {"fresh_edit_csv", benchmark::kLookupFresh4, 1024},
+          {"fresh_edit_clause", benchmark::kLookupFresh5, 1024},
+          {"fresh_control_backpressure", benchmark::kLookupFresh6, 256},
+          {"fresh_control_rehearsal", benchmark::kLookupFresh7, 256},
+          {"fresh_control_experiment", benchmark::kLookupFresh8, 256}}};
+      const std::span<const LookupCase> cases = lookupCohort == "fresh"
+          ? std::span<const LookupCase>{freshCases} : std::span<const LookupCase>{completeCases};
+      // The opt-in Runtime setter changes policy only after every request
+      // and command has ended. No instrumented Runtime is linked.
+      const auto setLookupWhileDrained = [&](bool enabled) {
+        const auto counts = engine.snapshot();
+        if (counts.submitted != counts.completed + counts.cancelled + counts.failed || engine.commandInFlight())
+          throw std::logic_error("lookup-abba toggle requires a drained request");
+        nativeRuntime->experimentalPromptLookup(enabled);
+      };
+      setLookupWhileDrained(false);
+      // Eight complete OFF passes reproduce the predeclared thermal warmup.
+      // Keep every output and timing outside the measured cohort.
+      // Ordinary cold requests are used; no clock or fan controls are set.
+      const uint32_t thermalWarmupRequests = 8 * static_cast<uint32_t>(cases.size());
+      std::vector<std::vector<uint32_t>> thermalReferences(cases.size());
+      for (uint32_t repetition = 0; repetition < thermalWarmupRequests; ++repetition) {
+        const uint32_t index = repetition % cases.size();
+        const LookupCase &fixture = cases[index];
+        if (fixture.tokens.size() + fixture.outputCap > engineConfig.maxContext)
+          throw std::runtime_error("lookup thermal warmup exceeds the served context");
+        evictAllCache(resources->cache());
+        std::vector<uint32_t> tokens(fixture.tokens.begin(), fixture.tokens.end());
+        const std::string phase = "lookup_thermal_warmup_" + std::to_string(repetition + 1) + "_" + fixture.name;
+        Measurement result = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                                        phase, repetition / cases.size(), tokens, fixture.outputCap);
+        result.scenario = fixture.name;
+        result.inputTokens = std::move(tokens);
+        if (result.cacheStatus != "miss" || result.matchedTokens ||
+            result.targetPrefillRows != result.promptTokens || result.stateEvictions ||
+            result.junctionMaterializations || result.junctionMaterializationFailures)
+          throw std::runtime_error(phase + " was not an isolated cold request");
+        if (result.outputTokens.empty() || result.outputTokens.size() > fixture.outputCap)
+          performanceFailures.push_back(phase + " returned an invalid natural-EOS output count");
+        if (repetition < cases.size()) thermalReferences[index] = result.outputTokens;
+        else if (result.outputTokens != thermalReferences[index])
+          performanceFailures.push_back(phase + " changed full output tokens");
+        lookupThermalWarmup.push_back(std::move(result));
+      }
+      constexpr std::array<bool, 4> order{false, true, true, false};
+      // Every measured output must also match the fixed off warmup.
+      const auto &references = thermalReferences;
+      for (uint32_t group = 1; group <= lookupAbbaGroups; ++group) {
+        for (uint32_t index = 0; index < cases.size(); ++index) {
+          const LookupCase &fixture = cases[index];
+          if (fixture.tokens.size() + fixture.outputCap > engineConfig.maxContext)
+            throw std::runtime_error("lookup-abba exceeds the served context");
+          for (uint32_t slot = 0; slot < order.size(); ++slot) {
+            setLookupWhileDrained(order[slot]);
+            evictAllCache(resources->cache());
+            std::vector<uint32_t> tokens(fixture.tokens.begin(), fixture.tokens.end());
+            const std::string phase = std::string(fixture.name) + "_g" + std::to_string(group) +
+                "_s" + std::to_string(slot + 1) + (order[slot] ? "_on" : "_off");
+            Measurement result = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                                            phase, group - 1, tokens, fixture.outputCap);
+            result.scenario = fixture.name;
+            result.inputTokens = std::move(tokens);
+            result.lookupAbbaGroup = group;
+            result.lookupAbbaSlot = slot + 1;
+            result.lookupAbbaEnabled = order[slot];
+            if (result.cacheStatus != "miss" || result.matchedTokens ||
+                result.targetPrefillRows != result.promptTokens || result.stateEvictions ||
+                result.junctionMaterializations || result.junctionMaterializationFailures)
+              throw std::runtime_error(phase + " was not an isolated cold request");
+            if (result.outputTokens.empty() || result.outputTokens.size() > fixture.outputCap)
+              performanceFailures.push_back(phase + " returned an invalid natural-EOS output count");
+            if (result.outputTokens != references[index])
+              performanceFailures.push_back(phase + " changed full output tokens");
+            measurements.push_back(std::move(result));
+          }
+        }
+      }
+      setLookupWhileDrained(false);
+    }
+
     // The full-vocabulary logits after prefixes of greedy transcripts of the
     // real requests (TranscriptPrompts.hpp), 256 answer tokens each, 16
     // prefixes into each answer, or after the prefixes an earlier dump
@@ -1632,12 +1850,41 @@ int main(int argc, char **argv) {
     // and its elastic state/KV budget and the split's.
     const engine::EngineMemoryBreakdown &plan = resources->memoryPlan().breakdown();
     std::cout << "]},\"max_context_tokens\":" << engineConfig.maxContext
+              << ",\"experimental_prompt_lookup\":false"
+              << ",\"experimental_adaptive_prompt_lookup\":false"
+              << ",\"prompt_lookup_baseline_policy\":\"dflash\""
+              << ",\"prompt_lookup_candidate_policy\":\"fixed16\""
+              << ",\"prompt_lookup_match_lengths\":[16]"
+              << ",\"lookup_abba_enabled\":" << (selected.lookupAbba ? "true" : "false")
+              << ",\"lookup_abba_groups\":" << lookupAbbaGroups
+              << ",\"lookup_abba_order\":[\"off\",\"on\",\"on\",\"off\"]"
+              << ",\"lookup_runtime_instrumented\":false"
+              << ",\"lookup_logits_capture_enabled\":false"
+              << ",\"lookup_compilation_profile\":\"production_O3_flags\""
+              << ",\"lookup_fixture_cohort\":\""
+              << (lookupCohort == "fresh" ? "predeclared_fresh_six_edits_cap1024_three_controls256"
+                                            : "predeclared_complete_edits_cap1024_controls256") << '"'
+              << ",\"lookup_fixture_sha256\":\""
+              << (lookupCohort == "fresh" ? benchmark::kLookupFreshFixtureSha256
+                                            : "26f7064d04065fe523914d65d516c475b8877c5603fa1f1795b5bcca53c49861") << '"'
+              << ",\"lookup_edit_output_tokens\":1024,\"lookup_control_output_tokens\":256"
+              << ",\"lookup_output_tokens\":256"
+              << ",\"lookup_fixture_version\":" << (lookupCohort == "fresh" ? 5 : 3)
+              << ",\"prompt_lookup_match_tokens\":" << model::PromptLookup::kMatchTokens
+              << ",\"prompt_lookup_search_tokens\":" << model::PromptLookup::kSearchTokens
+              << ",\"prompt_lookup_proposal_tokens\":" << model::PromptLookup::kProposalTokens
+              << ",\"lookup_tokenizer_sha256\":\"06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523\""
+              << ",\"lookup_template_sha256\":\"c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041\""
               << ",\"no_ane_context_tokens\":" << resources->aneFfnOutcome().contextWithout
               << ",\"dynamic_budget_bytes\":" << plan.dynamicBudgetBytes
               << ",\"ane_ffn_bytes\":" << plan.aneFfnBytes
               << ",\"skipped_context_lengths\":[";
     for (size_t index = 0; index < skippedLengths.size(); ++index)
       std::cout << (index ? "," : "") << skippedLengths[index];
+    std::cout << "],\"lookup_thermal_warmup_requests\":" << lookupThermalWarmup.size()
+              << ",\"lookup_thermal_warmup_in_primary\":false,\"lookup_thermal_warmup_measurements\":[";
+    for (size_t index = 0; index < lookupThermalWarmup.size(); ++index)
+      emitMeasurement(lookupThermalWarmup[index], index == 0);
     std::cout << "],\"measurements\":[";
     for (size_t index = 0; index < measurements.size(); ++index)
       emitMeasurement(measurements[index], index == 0);
