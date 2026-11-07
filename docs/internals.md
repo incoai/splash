@@ -443,7 +443,11 @@ The rules:
    and 64 on Apple9 GPUs of 10 cores or fewer, where 32 made one measured case
    slower than the shared splits), between the splits shared out over the
    chunk's tiles and the longest chunk's tiles' ceiling (`PagedAttention.cpp`);
-   a sparse tile reads its list's blocks and keeps the shared splits.
+   a sparse tile reads its list's blocks and keeps the shared splits. Over
+   INT8 pages a dense split scores INT8 queries (`q8q`) from
+   `AttentionCalibration::int8QueriesFromPages` pages a split of the
+   longest tile or lane reads (8 on Apple10; never on Apple9, whose matrix
+   operations share the FP32 pipe); a verify's lanes share the choice.
 
 The register-against-staged boundaries are measured table entries, not a
 cost model: the wave law, which describes the Apple10 staged tiles, does not
@@ -792,12 +796,15 @@ or a window of the keys before it (`…_w512`: a row at position p attends p −
 windowed split and reduce start at the page of their tile's first row's window start
 (`splash_attention_first_page`), each row masking the keys before its own, and a windowed verify
 lane's or prefill tile's splits stop at the 18 pages such a window reads
-(`kv::windowAttentionPages`). A geometry with learned sinks (`reduce…_sinks`) binds the layer's,
-an F32 per query head, to the reduce, which adds each to its row's softmax after the splits, in
-their order, as a key with no value; one without an output gate (`gather`) gives the
-out-projection its attention rows as they are. The RoPE tables are of the target geometry's pairs
-(`rope_build_tables`, or `rope_build_tables_p64` for 64). `make test-engine-metal` runs
-`attention-variants`, every variant through the production encoders against fp64, and
+(`kv::windowAttentionPages`). Over INT8 pages each dense split kernel (`…q8_split…`) also has a
+`…q8q_split…` entry, `q8q` for INT8 queries: it quantizes its tile's queries once (absmax / 127
+per row) and scores them against the INT8 keys (kernel selection, rule 5). A geometry
+with learned sinks (`reduce…_sinks`) binds the layer's, an F32 per query head, to the reduce,
+which adds each to its row's softmax after the splits, in their order, as a key with no value;
+one without an output gate (`gather`) gives the out-projection its attention rows as they are.
+The RoPE tables are of the target geometry's pairs (`rope_build_tables`, or
+`rope_build_tables_p64` for 64). `make test-engine-metal` runs `attention-variants`, every
+variant through the production encoders against fp64, and
 `make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--shapes flint-window,flint-full'` times
 Flint's two kinds of layers with their sinks: a window of 512 keys with RoPE, and the whole
 history without.

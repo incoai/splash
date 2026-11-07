@@ -26,10 +26,6 @@ using splash::test::HostKvExtents;
 
 namespace {
 
-// The pages per prefill attention split these plans take: the Apple10 row's
-// (KernelCalibration.hpp).
-constexpr uint32_t kPagesPerSplit = splash::ops::kAttention.prefillPagesPerSplit;
-
 constexpr uint32_t kStride = 32;
 constexpr uint32_t kQueryStride = kStride;
 constexpr uint32_t kRows = kVerifyRows;
@@ -41,11 +37,13 @@ static_assert(kStride == SPLASH_VERIFY_CHUNK_STRIDE);
 // attend through block lists, bound before their parameters, and read
 // token-major values; a group of more than eight runs each tile in parts,
 // each a threadgroup of the split with partial slots of its own
-// (splash_attention_tile_part).
+// (splash_attention_tile_part). A dense geometry also runs its INT8-query
+// entries (q8q).
 struct Shape {
   uint32_t kvHeads;
   uint32_t queryHeadsPerKvHead;
   splash::kv::Reads reads;
+  bool int8Queries = false;
   uint32_t queryHeads() const { return kvHeads * queryHeadsPerKvHead; }
   uint32_t fusedRows() const { return kRows * queryHeadsPerKvHead; }
   bool sparse() const { return reads == splash::kv::Reads::SelectedBlocks; }
@@ -70,18 +68,27 @@ struct Shape {
   }
 
 private:
+  // The plans' attention row: the Apple10 row's pages per prefill split
+  // (KernelCalibration.hpp), and INT8 queries in every split or none.
+  splash::ops::AttentionCalibration attention() const {
+    return {.prefillPagesPerSplit = splash::ops::kApple10Attention.prefillPagesPerSplit,
+            .int8QueriesFromPages = int8Queries ? 1U : splash::ops::kNever};
+  }
   splash::ops::PrefillAttentionPlan prefillPlan() const {
-    return splash::ops::PagedAttention::prefillPlan(kRows, 0, queryHeads(), layout(), kPagesPerSplit);
+    return splash::ops::PagedAttention::prefillPlan(kRows, 0, queryHeads(), layout(), attention());
   }
   splash::ops::VerifyAttentionPlan verifyPlan() const {
     const std::array<uint32_t, 1> history{0};
-    return splash::ops::PagedAttention::verifyPlan(1, queryHeads(), layout(), history);
+    return splash::ops::PagedAttention::verifyPlan(1, queryHeads(), layout(), history, attention());
   }
 };
 const std::vector<Shape> kShapes = [] {
   std::vector<Shape> shapes;
-  for (const splash::test::AttentionGeometry &geometry : splash::test::familyAttentionGeometries())
+  for (const splash::test::AttentionGeometry &geometry : splash::test::familyAttentionGeometries()) {
     shapes.push_back({geometry.kvHeads, geometry.queryHeads / geometry.kvHeads, geometry.reads});
+    if (geometry.reads == splash::kv::Reads::EveryPage)
+      shapes.push_back({geometry.kvHeads, geometry.queryHeads / geometry.kvHeads, geometry.reads, true});
+  }
   return shapes;
 }();
 
@@ -944,11 +951,13 @@ void run(const char *libraryPath) {
     throw std::runtime_error(error.localizedDescription.UTF8String);
   id<MTLCommandQueue> queue = [device newCommandQueue];
   for (const Shape shape : kShapes) {
-    for (uint32_t splits : {1U, 3U, 7U, 32U, 65U, 128U}) {
-      checkReduce(device, queue, library, shape, splits, kRows);
-      if (splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS)
-        checkReduce(device, queue, library, shape, splits, 1);
-    }
+    // The INT8-query entries share their geometry's reduce.
+    if (!shape.int8Queries)
+      for (uint32_t splits : {1U, 3U, 7U, 32U, 65U, 128U}) {
+        checkReduce(device, queue, library, shape, splits, kRows);
+        if (splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS)
+          checkReduce(device, queue, library, shape, splits, 1);
+      }
     const Pipelines pipelines = makePipelines(device, library, shape);
     for (uint32_t width = 1; width <= 4; ++width)
       runCase(device, queue, pipelines, shape, 127, 8, width);

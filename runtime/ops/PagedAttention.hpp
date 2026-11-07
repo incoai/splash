@@ -3,6 +3,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/PagedAttention.h"
+#include "ops/KernelCalibration.hpp"
 #include "ops/PagedKv.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
@@ -58,9 +59,10 @@ static_assert(kVerifySplits <= kVerifyMaximumSplits);
 // than kVerifySplits and never more than the maximum the partial workspace
 // is sized for, nor, with a window of windowTokens keys before each row,
 // than the pages the window reads (a split each). It depends only on the
-// lane's own history, so batching never changes a lane's arithmetic; a
+// lane's own history, so batching never changes a lane's partition; a
 // sparse lane's splits likewise follow its own block list alone
-// (kernels/common/sparse_attention_tile.h).
+// (kernels/common/sparse_attention_tile.h). Whether a lane's queries score
+// as INT8 follows the batch's longest lane (ops::PagedAttention::verifyPlan).
 [[nodiscard]] constexpr uint32_t
 verifyAttentionSplits(uint32_t committedTokens, uint32_t windowTokens = 0) noexcept {
   const uint64_t visible = uint64_t{committedTokens} + kVerifyRows;
@@ -257,15 +259,20 @@ public:
   // plan's split count follows its rows and, unless it is sparse, the pages
   // its tiles read of the historyTokens committed before them (with a
   // window, no more than its window's), a split per the device's
-  // `pagesPerSplit` (AttentionCalibration).
+  // `prefillPagesPerSplit` (AttentionCalibration).
+  // INT8 pages score against INT8 queries (the dense split kernels' q8q
+  // entries) where the longest tile's or lane's splits read at least the
+  // device's `int8QueriesFromPages` pages each: a verify's lanes share the
+  // choice.
   [[nodiscard]] static PrefillAttentionPlan
   prefillPlan(uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
-              uint32_t pagesPerSplit, AttentionVariant variant = {});
+              const AttentionCalibration &calibration, AttentionVariant variant = {});
   // historyTokens holds each lane's committed tokens before its verify rows,
   // one entry per lane.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-             std::span<const uint32_t> historyTokens, AttentionVariant variant = {});
+             std::span<const uint32_t> historyTokens, const AttentionCalibration &calibration,
+             AttentionVariant variant = {});
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences

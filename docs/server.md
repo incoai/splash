@@ -563,6 +563,12 @@ to switch formats. Omit `--kv-format` or use `--kv-format int8` for the default.
 The [SSD cache](#ssd-cache) supports both formats, preserving their stored
 bytes without further quantization.
 
+On M5 and later Macs, whose GPUs multiply int8 at twice their bf16 rate, INT8 KV
+also quantizes the attention queries to INT8 where each split of dense attention
+reads at least 8 pages of 32 tokens. Prefill chunks of about 225 tokens or more
+take INT8 queries even with no history, and verify takes them from about 7K
+tokens of history.
+
 ### State precision
 
 The linear-attention (GDN) layers of the targets carry a recurrent state,

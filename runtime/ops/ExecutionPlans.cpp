@@ -27,14 +27,13 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device) : linear_(devic
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
     AttentionVariant variant) const {
-  return PagedAttention::prefillPlan(rows, historyTokens, queryHeads, layout,
-                                     calibration().attention.prefillPagesPerSplit, variant);
+  return PagedAttention::prefillPlan(rows, historyTokens, queryHeads, layout, calibration().attention, variant);
 }
 
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
     std::span<const uint32_t> historyTokens, AttentionVariant variant) const {
-  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, variant);
+  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, calibration().attention, variant);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,

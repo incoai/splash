@@ -27,9 +27,11 @@ using splash::test::HostKvExtents;
 
 namespace {
 
-// The pages per prefill attention split these plans take: the Apple10 row's
-// (KernelCalibration.hpp).
-constexpr uint32_t kPagesPerSplit = splash::ops::kAttention.prefillPagesPerSplit;
+// The attention row these plans take: the Apple10 row's pages per prefill
+// split (KernelCalibration.hpp), with bf16 queries.
+constexpr splash::ops::AttentionCalibration kBf16Queries{
+    .prefillPagesPerSplit = splash::ops::kApple10Attention.prefillPagesPerSplit,
+    .int8QueriesFromPages = splash::ops::kNever};
 
 constexpr uint32_t kQueryHeads = 24;
 constexpr uint32_t kQueryHeadsPerKvHead = 6;
@@ -294,7 +296,7 @@ void encodeAttention(id<MTLComputeCommandEncoder> encoder,
                      const PrefillAttentionParams *overrideParams = nullptr) {
   const auto plan = splash::ops::PagedAttention::prefillPlan(
       data.params.chunk_tokens, data.params.committed_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension},
-      kPagesPerSplit);
+      kBf16Queries);
   require(plan.workspace.partialsBytes <= data.partials.length &&
               plan.workspace.statisticsBytes <= data.statistics.length,
           "attention splits exceed the shared arena");
@@ -701,7 +703,7 @@ void testInvalidAttentionParams(id<MTLDevice> device, id<MTLCommandQueue> queue,
   Case data = makeCase(device, 33, 17, 32);
   const auto plan = splash::ops::PagedAttention::prefillPlan(
       data.params.chunk_tokens, data.params.committed_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension},
-      kPagesPerSplit);
+      kBf16Queries);
   const PrefillAttentionParams valid{
       data.params.committed_tokens, data.params.chunk_tokens,
       data.params.chunk_stride, data.params.page_table_entries,

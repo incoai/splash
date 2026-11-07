@@ -35,9 +35,11 @@
 
 namespace {
 
-// The pages per prefill attention split these plans take: the Apple10 row's
-// (KernelCalibration.hpp).
-constexpr uint32_t kPagesPerSplit = splash::ops::kAttention.prefillPagesPerSplit;
+// The attention row these plans take: the Apple10 row's pages per prefill
+// split (KernelCalibration.hpp), with bf16 queries.
+constexpr splash::ops::AttentionCalibration kBf16Queries{
+    .prefillPagesPerSplit = splash::ops::kApple10Attention.prefillPagesPerSplit,
+    .int8QueriesFromPages = splash::ops::kNever};
 
 using namespace splash;
 using test::HostKvExtents;
@@ -110,6 +112,9 @@ template <class T> T *contents(const metal::MetalBuffer &buffer) { return static
 struct Case final {
   kv::Layout layout;
   ops::AttentionVariant variant;
+  // INT8 pages score against INT8 queries in every split (the q8q entries),
+  // which the reference quantizes as the kernel does.
+  bool int8Queries;
   uint32_t lanes;
   uint32_t rows;
   std::array<uint32_t, 4> histories;
@@ -121,6 +126,12 @@ struct Case final {
   metal::MetalBuffer sinks;
 
   [[nodiscard]] uint32_t page(uint32_t lane, uint32_t token) const { return pages[lane][token / kPageTokens]; }
+  // The plans' attention row: INT8 queries in every split, or none.
+  [[nodiscard]] ops::AttentionCalibration attention() const {
+    ops::AttentionCalibration row = kBf16Queries;
+    if (int8Queries) row.int8QueriesFromPages = 1;
+    return row;
+  }
 
   // The stored K/V of a lane's token, which the reference attends.
   [[nodiscard]] double key(uint32_t lane, uint32_t head, uint32_t token, uint32_t dimension) const {
@@ -153,8 +164,8 @@ float query(uint32_t lane, uint32_t head, uint32_t row, uint32_t dimension) {
   return bf16ToFloat(floatToBf16(2.0f * unit(seedOf(2, lane, head, row, dimension))));
 }
 
-Case makeCase(metal::MetalBackend &backend, kv::Format format, ops::AttentionVariant variant, uint32_t lanes,
-              uint32_t rows, std::array<uint32_t, 4> histories) {
+Case makeCase(metal::MetalBackend &backend, kv::Format format, bool int8Queries, ops::AttentionVariant variant,
+              uint32_t lanes, uint32_t rows, std::array<uint32_t, 4> histories) {
   std::array<uint32_t, 4> pageCounts{};
   uint32_t allPages = 1;  // and the page of NaNs
   for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -163,7 +174,7 @@ Case makeCase(metal::MetalBackend &backend, kv::Format format, ops::AttentionVar
   }
   const auto spread = HostKvExtents::spread(allPages + 2);
   const std::vector<uint32_t> ids = HostKvExtents::mixedPages(spread, allPages, histories[0] + rows + lanes);
-  Case data{layoutOf(format), variant, lanes, rows, histories,
+  Case data{layoutOf(format), variant, int8Queries, lanes, rows, histories,
             HostKvExtents(backend, layoutOf(format, kLayer + 1), spread.extentPages, spread.extents),
             {}, {}, {}, 0, zeroed(backend, kQueryHeads * sizeof(float))};
   data.layer = data.pool.layer(kLayer);
@@ -290,7 +301,8 @@ StoredKv stored(const Case &data, uint32_t lane, uint32_t first, uint32_t end) {
 // history) and query head over the stored K/V of its window, or its whole
 // history, and the head's sink: a key with no value. `mass` is the sum of
 // each key's weight times its value's magnitude, which bounds the error of
-// the kernels' bf16 probabilities.
+// the kernels' bf16 probabilities. With INT8 queries the reference's queries
+// are the kernel's codes: the row's absmax / 127 steps, rounded to nearest.
 struct Reference final {
   std::array<double, kHeadDimension> output{};
   std::array<double, kHeadDimension> mass{};
@@ -303,6 +315,12 @@ Reference reference(const Case &data, const StoredKv &kv, uint32_t lane, uint32_
   std::array<double, kHeadDimension> queries{};
   for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension)
     queries[dimension] = query(lane, head, row, dimension);
+  if (data.int8Queries) {
+    float absmax = 0;
+    for (const double value : queries) absmax = std::max(absmax, float(std::fabs(value)));
+    const float inverse = absmax > 0x1p-100f ? 127.0f / absmax : 0.0f;
+    for (double &value : queries) value = double(std::rint(float(value) * inverse)) * double(absmax / 127.0f);
+  }
   std::vector<double> scores(position + 1 - start);
   double maximum = sink;
   for (uint32_t token = start; token <= position; ++token) {
@@ -431,7 +449,9 @@ void checkPlan(const Case &data, const Staging &staging, const Plan &plan, const
   const std::string phase = prefill ? "prefill" : "verify";
   const std::string window = data.variant.windowTokens ? "_w" + std::to_string(data.variant.windowTokens) : "";
   const std::string format = data.layout.format == kv::Format::Int8 ? "q8" : "bf16";
-  require(plan.sinks && plan.splitPipeline == phase + "_attention_" + format + "_split_kv4_g8_d128" + window &&
+  require(plan.sinks &&
+              plan.splitPipeline ==
+                  phase + "_attention_" + (data.int8Queries ? "q8q" : format) + "_split_kv4_g8_d128" + window &&
               plan.reducePipeline == phase + "_attention_reduce_kv4_g8_d128" + window + "_sinks",
           "the plan names another variant's kernels");
   const auto &dispatches = graph.dispatches();
@@ -469,8 +489,13 @@ template <class Plan> void run(metal::MetalBackend &backend, const Case &data, c
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 }
 
+// A case's KV format, and its queries where they are INT8.
+std::string formatLabel(kv::Format format, bool int8Queries) {
+  return std::string(kv::formatName(format)) + (int8Queries ? " with INT8 queries" : "");
+}
+
 std::string describe(const Case &data, std::string_view phase) {
-  std::string text = std::string(phase) + " " + std::string(kv::formatName(data.layout.format)) +
+  std::string text = std::string(phase) + " " + formatLabel(data.layout.format, data.int8Queries) +
                      (data.variant.windowTokens ? " window " + std::to_string(data.variant.windowTokens) : " whole") +
                      " history";
   for (uint32_t lane = 0; lane < data.lanes; ++lane) text += " " + std::to_string(data.histories[lane]);
@@ -480,9 +505,9 @@ std::string describe(const Case &data, std::string_view phase) {
 // A prefill of `rows` rows after a cached prefix of `history` tokens, as one
 // chunk, and again as the chunks `split` lists, each over the K/V its
 // predecessors stored, each row of each against the reference.
-void checkPrefill(metal::MetalBackend &backend, kv::Format format, ops::AttentionVariant variant, uint32_t history,
-                  uint32_t rows, std::vector<uint32_t> split = {}) {
-  const Case data = makeCase(backend, format, variant, 1, rows, {history, 0, 0, 0});
+void checkPrefill(metal::MetalBackend &backend, kv::Format format, bool int8Queries, ops::AttentionVariant variant,
+                  uint32_t history, uint32_t rows, std::vector<uint32_t> split = {}) {
+  const Case data = makeCase(backend, format, int8Queries, variant, 1, rows, {history, 0, 0, 0});
   const std::string what = describe(data, "prefill") + " rows " + std::to_string(rows);
   double largest = 0;
   split.insert(split.begin(), rows);
@@ -492,7 +517,7 @@ void checkPrefill(metal::MetalBackend &backend, kv::Format format, ops::Attentio
       const uint32_t chunkRows = std::min(chunk, rows - first);
       const Staging staging = stage(backend, data, first, chunkRows, (chunkRows + kPageTokens - 1) / kPageTokens * kPageTokens);
       run(backend, data, staging,
-          ops::PagedAttention::prefillPlan(chunkRows, history + first, kQueryHeads, data.layout, kPagesPerSplit,
+          ops::PagedAttention::prefillPlan(chunkRows, history + first, kQueryHeads, data.layout, data.attention(),
                                            variant));
       checkStore(data, staging, what);
       largest = std::max(largest, checkOutput(data, staging, what + (whole ? "" : " in chunks of " + std::to_string(chunk))));
@@ -503,14 +528,15 @@ void checkPrefill(metal::MetalBackend &backend, kv::Format format, ops::Attentio
             << " table entries of NaNs below the window, largest error " << largest << " of its bound PASS\n";
 }
 
-void checkVerify(metal::MetalBackend &backend, kv::Format format, ops::AttentionVariant variant,
+void checkVerify(metal::MetalBackend &backend, kv::Format format, bool int8Queries, ops::AttentionVariant variant,
                  std::span<const uint32_t> histories) {
   std::array<uint32_t, 4> lanes{};
   std::copy(histories.begin(), histories.end(), lanes.begin());
   const auto count = uint32_t(histories.size());
-  const Case data = makeCase(backend, format, variant, count, kv::kVerifyRows, lanes);
+  const Case data = makeCase(backend, format, int8Queries, variant, count, kv::kVerifyRows, lanes);
   const Staging staging = stage(backend, data, 0, kv::kVerifyRows, kv::kVerifyChunkStride);
-  run(backend, data, staging, ops::PagedAttention::verifyPlan(count, kQueryHeads, data.layout, histories, variant));
+  run(backend, data, staging,
+      ops::PagedAttention::verifyPlan(count, kQueryHeads, data.layout, histories, data.attention(), variant));
   const std::string what = describe(data, "verify");
   checkStore(data, staging, what);
   const double largest = checkOutput(data, staging, what);
@@ -523,11 +549,12 @@ void checkVerify(metal::MetalBackend &backend, kv::Format format, ops::Attention
 // the reduce combining exactly the splits that wrote: each lane of a verify
 // with its split count set, past the window's pages as well, and a prefill
 // tile.
-void checkSplitCounts(metal::MetalBackend &backend, kv::Format format) {
+void checkSplitCounts(metal::MetalBackend &backend, kv::Format format, bool int8Queries) {
   const std::array<uint32_t, 3> histories{4097, 515, 10000};
-  const Case data = makeCase(backend, format, kWindowed, 3, kv::kVerifyRows, {4097, 515, 10000, 0});
+  const Case data = makeCase(backend, format, int8Queries, kWindowed, 3, kv::kVerifyRows, {4097, 515, 10000, 0});
   const Staging staging = stage(backend, data, 0, kv::kVerifyRows, kv::kVerifyChunkStride);
-  const auto plan = ops::PagedAttention::verifyPlan(3, kQueryHeads, data.layout, histories, kWindowed);
+  const auto plan =
+      ops::PagedAttention::verifyPlan(3, kQueryHeads, data.layout, histories, data.attention(), kWindowed);
   run(backend, data, staging, plan);
   for (const uint32_t splits : {1U, 2U, 3U, 7U, 17U, 18U, 19U, 32U, 128U}) {
     const metal::MetalBuffer partials = poisoned(backend, plan.workspace.partialsBytes);
@@ -545,9 +572,10 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format) {
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     checkOutput(data, staging, describe(data, "verify") + " of " + std::to_string(splits) + " splits");
   }
-  const Case tile = makeCase(backend, format, kWindowed, 1, 8, {4103, 0, 0, 0});
+  const Case tile = makeCase(backend, format, int8Queries, kWindowed, 1, 8, {4103, 0, 0, 0});
   const Staging tileStaging = stage(backend, tile, 0, 8, kPageTokens);
-  const auto tilePlan = ops::PagedAttention::prefillPlan(8, 4103, kQueryHeads, tile.layout, kPagesPerSplit, kWindowed);
+  const auto tilePlan =
+      ops::PagedAttention::prefillPlan(8, 4103, kQueryHeads, tile.layout, tile.attention(), kWindowed);
   run(backend, tile, tileStaging, tilePlan);
   for (uint32_t splits = 1; splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS; ++splits) {
     const metal::MetalBuffer partials = poisoned(backend, uint64_t{splits} * kKvHeads * 64 * kHeadDimension * 4);
@@ -563,24 +591,26 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format) {
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     checkOutput(tile, tileStaging, describe(tile, "prefill") + " of " + std::to_string(splits) + " splits");
   }
-  std::cout << "split counts: " << kv::formatName(format) << " verify 1-128 and prefill 1-32 splits PASS\n";
+  std::cout << "split counts: " << formatLabel(format, int8Queries)
+            << " verify 1-128 and prefill 1-32 splits PASS\n";
 }
 
 // Where every row's window holds its whole history, the window changes
 // nothing: the windowed kernels' outputs are the whole history's bit for bit
 // at the same split partition (a page a split in a verify, a prefill's
 // splits below the window's pages).
-void checkWindowWithinHistory(metal::MetalBackend &backend, kv::Format format) {
+void checkWindowWithinHistory(metal::MetalBackend &backend, kv::Format format, bool int8Queries) {
   const auto outputs = [&](ops::AttentionVariant variant, bool verify, uint32_t lanes, uint32_t rows,
                            std::array<uint32_t, 4> histories) {
-    const Case data = makeCase(backend, format, variant, lanes, rows, histories);
+    const Case data = makeCase(backend, format, int8Queries, variant, lanes, rows, histories);
     const Staging staging = stage(backend, data, 0, rows, verify ? kv::kVerifyChunkStride : (rows + 31) / 32 * 32);
     if (verify)
       run(backend, data, staging,
-          ops::PagedAttention::verifyPlan(lanes, kQueryHeads, data.layout, std::span(histories).first(lanes), variant));
+          ops::PagedAttention::verifyPlan(lanes, kQueryHeads, data.layout, std::span(histories).first(lanes),
+                                          data.attention(), variant));
     else
       run(backend, data, staging,
-          ops::PagedAttention::prefillPlan(rows, histories[0], kQueryHeads, data.layout, kPagesPerSplit, variant));
+          ops::PagedAttention::prefillPlan(rows, histories[0], kQueryHeads, data.layout, data.attention(), variant));
     const auto *begin = contents<uint16_t>(staging.output);
     return std::vector<uint16_t>(begin, begin + staging.output.sizeBytes() / 2);
   };
@@ -590,7 +620,8 @@ void checkWindowWithinHistory(metal::MetalBackend &backend, kv::Format format) {
   require(outputs(kWindowed, false, 1, 300, {0, 0, 0, 0}) == outputs(whole, false, 1, 300, {0, 0, 0, 0}) &&
               outputs(kWindowed, false, 1, 24, {200, 0, 0, 0}) == outputs(whole, false, 1, 24, {200, 0, 0, 0}),
           "a windowed prefill inside its window differs from the whole history's");
-  std::cout << "windows within the history: " << kv::formatName(format) << " bit for bit the whole history's PASS\n";
+  std::cout << "windows within the history: " << formatLabel(format, int8Queries)
+            << " bit for bit the whole history's PASS\n";
 }
 
 // The plans of the variants, and what each refuses: a variant the geometry
@@ -606,26 +637,26 @@ void checkPlans(metal::MetalBackend &backend) {
   // windowed chunk keeps its splits as the history grows; a whole layer's
   // chunk takes more.
   const auto splitsAfter = [&](uint32_t history, ops::AttentionVariant variant) {
-    return ops::PagedAttention::prefillPlan(64, history, kQueryHeads, layout, kPagesPerSplit, variant).splits;
+    return ops::PagedAttention::prefillPlan(64, history, kQueryHeads, layout, kBf16Queries, variant).splits;
   };
   require(splitsAfter(1024, kWindowed) == splitsAfter(65536, kWindowed) &&
               splitsAfter(1024, kWhole) < splitsAfter(65536, kWhole),
           "a windowed chunk's splits follow its history, or a whole chunk's do not");
   for (const ops::AttentionVariant variant : {ops::AttentionVariant{.rotated = true, .windowTokens = 256},
                                               ops::AttentionVariant{.rotated = false, .windowTokens = 1024}})
-    rejects([&] { (void)ops::PagedAttention::prefillPlan(8, 0, kQueryHeads, layout, kPagesPerSplit, variant); },
+    rejects([&] { (void)ops::PagedAttention::prefillPlan(8, 0, kQueryHeads, layout, kBf16Queries, variant); },
             "no attention kernel for the layer's variant", "a window the geometry has no kernels for was accepted");
   for (const ops::AttentionVariant variant : {kWindowed, kWhole})
-    rejects([&] { (void)ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kPagesPerSplit, variant); },
+    rejects([&] { (void)ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kBf16Queries, variant); },
             "no attention kernel for the layer's variant", "a variant of a geometry without it was accepted");
-  require(!ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kPagesPerSplit).sinks &&
-              ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kPagesPerSplit).reducePipeline ==
+  require(!ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kBf16Queries).sinks &&
+              ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kBf16Queries).reducePipeline ==
                   "prefill_attention_reduce",
           "a geometry without sinks takes none");
   const metal::MetalBuffer buffer = zeroed(backend, 1 << 23), sinks = zeroed(backend, kQueryHeads * 4);
   const metal::MetalBuffer fewSinks = zeroed(backend, kQueryHeads * 4 - 4);
   const kv::ChunkedPrefillParams chunk = ops::PagedAttention::prefillParams(0, 8, 32, 1);
-  const auto plan = ops::PagedAttention::prefillPlan(8, 0, kQueryHeads, layout, kPagesPerSplit, kWindowed);
+  const auto plan = ops::PagedAttention::prefillPlan(8, 0, kQueryHeads, layout, kBf16Queries, kWindowed);
   metal::CommandGraph graph;
   rejects([&] { ops::PagedAttention::addPrefill(graph, {1, 0}, buffer, buffer, buffer, buffer, buffer, chunk, plan); },
           "attention sinks buffer holds", "a plan with sinks encoded without them");
@@ -634,7 +665,7 @@ void checkPlans(metal::MetalBackend &backend) {
   }, "attention sinks buffer holds", "a plan with sinks encoded with too few");
   rejects([&] {
     ops::PagedAttention::addPrefill(graph, {1, 0}, buffer, buffer, buffer, buffer, buffer, chunk,
-                                    ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kPagesPerSplit), {}, sinks);
+                                    ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kBf16Queries), {}, sinks);
   }, "the attention kernels take no sinks", "a plan without sinks encoded with some");
   require(graph.empty(), "a refused attention encoded a dispatch");
   std::cout << "variant plans PASS\n";
@@ -838,27 +869,31 @@ int main(int argc, char **argv) {
       for (const bool float32 : test::familyNorms(kGeometry))
         for (const bool verify : {false, true}) checkProjection(backend, rotated, float32, verify);
     checkGather(backend);
-    for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
+    // INT8 pages score against bf16 queries and against INT8 ones in every
+    // split (the q8q entries); BF16 pages against bf16 queries.
+    for (const auto &[format, int8Queries] : {std::pair{kv::Format::Int8, false}, std::pair{kv::Format::Int8, true},
+                                              std::pair{kv::Format::BFloat16, false}}) {
       // Prefill tiles whose rows straddle their window's start: from the
       // history's start, after a cached prefix on either side of a window
       // and of a page, and long chunks after a long prefix, whose first tiles
       // read none of the pages below their windows; a chunk again as several.
-      checkPrefill(backend, format, kWindowed, 0, 2048);
+      checkPrefill(backend, format, int8Queries, kWindowed, 0, 2048);
       for (const uint32_t history : {31U, 32U, 511U, 512U, 513U, 544U})
-        for (const uint32_t rows : {1U, 8U, 33U}) checkPrefill(backend, format, kWindowed, history, rows);
-      checkPrefill(backend, format, kWindowed, 4103, 2048, {509});
-      checkPrefill(backend, format, kWindowed, 700, 1057, {31, 512});
-      checkPrefill(backend, format, kWindowed, 505, 13, {1, 3});
-      checkPrefill(backend, format, kWhole, 0, 300);
-      checkPrefill(backend, format, kWhole, 300, 517, {129});
+        for (const uint32_t rows : {1U, 8U, 33U})
+          checkPrefill(backend, format, int8Queries, kWindowed, history, rows);
+      checkPrefill(backend, format, int8Queries, kWindowed, 4103, 2048, {509});
+      checkPrefill(backend, format, int8Queries, kWindowed, 700, 1057, {31, 512});
+      checkPrefill(backend, format, int8Queries, kWindowed, 505, 13, {1, 3});
+      checkPrefill(backend, format, int8Queries, kWhole, 0, 300);
+      checkPrefill(backend, format, int8Queries, kWhole, 300, 517, {129});
       // Verify lanes of one to four, each with a history of its own: before,
       // at and past their windows, up to 10000 tokens.
       for (const std::vector<uint32_t> &histories : std::vector<std::vector<uint32_t>>{
                {0}, {511, 512}, {513, 544, 1023}, {0, 505, 4097, 10000}, {31, 32, 4096, 7}})
-        checkVerify(backend, format, kWindowed, histories);
-      checkVerify(backend, format, kWhole, std::vector<uint32_t>{0, 31, 1000, 2047});
-      checkSplitCounts(backend, format);
-      checkWindowWithinHistory(backend, format);
+        checkVerify(backend, format, int8Queries, kWindowed, histories);
+      checkVerify(backend, format, int8Queries, kWhole, std::vector<uint32_t>{0, 31, 1000, 2047});
+      checkSplitCounts(backend, format, int8Queries);
+      checkWindowWithinHistory(backend, format, int8Queries);
     }
     std::cout << "attention variants: PASS\n";
   } catch (const std::exception &error) {

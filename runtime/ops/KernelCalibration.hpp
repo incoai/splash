@@ -17,8 +17,8 @@
 
 namespace splash::ops {
 
-// A "from N cores" threshold no device reaches, and a register boundary
-// every grid is below.
+// A "from N" threshold nothing reaches (cores, pages), and a register
+// boundary every grid is below.
 inline constexpr uint32_t kNever = UINT32_MAX;
 inline constexpr uint32_t kAlways = UINT32_MAX;
 
@@ -104,6 +104,9 @@ struct AttentionCalibration final {
   // A dense prefill tile takes one history split per this many pages its
   // rows read (PagedAttention.cpp).
   uint32_t prefillPagesPerSplit;
+  // From this many pages each split of the longest tile or lane reads, a
+  // dense split over INT8 pages scores INT8 queries (PagedAttention.cpp).
+  uint32_t int8QueriesFromPages;
 };
 
 struct MoeCalibration final {
@@ -298,12 +301,29 @@ inline constexpr MoeCalibration kApple10Moe{{false, false, false, false}};
 // A chunk of a few hundred rows over a long history otherwise leaves much of
 // the GPU idle: one split per 32 pages runs a 256-row chunk's attention after
 // 32K-128K tokens 23-26% faster on an M5 Max (Apple10, 12-32 cores measured).
-inline constexpr AttentionCalibration kAttention{32};
+// The neural accelerator multiplies INT8 at twice its bf16 rate, so a split
+// of 8 pages or more scores INT8 queries, repaying their quantization once
+// per threadgroup: splits of 1-5 pages took up to 31% more, of 9 less (M6,
+// 20-core M5 Pro).
+inline constexpr AttentionCalibration kApple10Attention{.prefillPagesPerSplit = 32, .int8QueriesFromPages = 8};
+
+// No Apple9 GPU scores INT8 queries: on a 10-core M4 they took 8-12% longer,
+// its matrix operations sharing the FP32 pipe. Larger Apple9 GPUs, unmeasured,
+// share that pipe too.
+inline constexpr AttentionCalibration kApple9Attention = [] {
+  AttentionCalibration row = kApple10Attention;
+  row.int8QueriesFromPages = kNever;
+  return row;
+}();
 
 // On a 10-core M4 one split per 64 pages leaves every case within the A/A
 // spread (0.7%), where one per 32 takes 1.8% more on the 35B's 512-row chunk
 // after 4K tokens. Larger Apple9 GPUs, unmeasured, keep 32.
-inline constexpr AttentionCalibration kApple9SmallAttention{64};
+inline constexpr AttentionCalibration kApple9SmallAttention = [] {
+  AttentionCalibration row = kApple9Attention;
+  row.prefillPagesPerSplit = 64;
+  return row;
+}();
 
 // ---- The device's row ------------------------------------------------------
 
@@ -312,10 +332,10 @@ inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device)
   const GpuClass gpu = device.gpuClass();
   if (gpu != GpuClass::Apple9)
     return {cores, gpu == GpuClass::Apple11 ? kApple11Projection : kApple10Projection, kApple10FloatTile, kApple10Moe,
-            kAttention};
+            kApple10Attention};
   const bool small = cores <= kApple9SmallGpuCores;
   return {cores, small ? kApple9SmallProjection : kApple9Projection, kApple9FloatTile,
-          small ? kApple9SmallMoe : kApple9Moe, small ? kApple9SmallAttention : kAttention};
+          small ? kApple9SmallMoe : kApple9Moe, small ? kApple9SmallAttention : kApple9Attention};
 }
 
 } // namespace splash::ops

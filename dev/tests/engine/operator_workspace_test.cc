@@ -15,9 +15,11 @@
 
 namespace {
 
-// The pages per prefill attention split these plans take: the Apple10 row's
-// (KernelCalibration.hpp).
-constexpr uint32_t kPagesPerSplit = splash::ops::kAttention.prefillPagesPerSplit;
+// The attention row these plans take: the Apple10 row's pages per prefill
+// split (KernelCalibration.hpp), with bf16 queries.
+constexpr splash::ops::AttentionCalibration kBf16Queries{
+    .prefillPagesPerSplit = splash::ops::kApple10Attention.prefillPagesPerSplit,
+    .int8QueriesFromPages = splash::ops::kNever};
 
 using splash::test::rejects;
 using splash::test::require;
@@ -40,7 +42,7 @@ void attention() {
       require(workspace.statisticsBytes == uint64_t{maximumSlots} * 8 * queryHeads * 2 * 4,
               "prefill statistics workspace differs from the maximum over actual row counts");
       for (const uint32_t history : {0U, 65536U, 1'000'000U}) {
-        const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, kPagesPerSplit);
+        const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, kBf16Queries);
         require(workspace.partialsBytes >= plan.workspace.partialsBytes &&
                     workspace.statisticsBytes >= plan.workspace.statisticsBytes,
                 "prefill workspace omitted the plan of its own rows");
@@ -82,15 +84,15 @@ void attentionReads() {
   const kv::Layout selected{.attentionLayers = 1, .kvHeads = 2, .headDimension = 256,
                             .valuesTokenMajor = true, .reads = kv::Reads::SelectedBlocks};
   const std::array<uint32_t, 1> history{4096};
-  require(ops::PagedAttention::prefillPlan(64, 4096, 24, selected, kPagesPerSplit).sparse &&
-              ops::PagedAttention::verifyPlan(1, 24, selected, history).sparse,
+  require(ops::PagedAttention::prefillPlan(64, 4096, 24, selected, kBf16Queries).sparse &&
+              ops::PagedAttention::verifyPlan(1, 24, selected, history, kBf16Queries).sparse,
           "a reader of selected blocks did not plan the sparse kernels");
   kv::Layout everyPage = selected;
   everyPage.reads = kv::Reads::EveryPage;
   require(everyPage.valid(), "a page loop over token-major values is not a layout");
-  rejects([&] { (void)ops::PagedAttention::prefillPlan(64, 4096, 24, everyPage, kPagesPerSplit); },
+  rejects([&] { (void)ops::PagedAttention::prefillPlan(64, 4096, 24, everyPage, kBf16Queries); },
           "no paged-attention kernel for layout", "the page loop planned the sparse kernels of token-major values");
-  rejects([&] { (void)ops::PagedAttention::verifyPlan(1, 24, everyPage, history); },
+  rejects([&] { (void)ops::PagedAttention::verifyPlan(1, 24, everyPage, history, kBf16Queries); },
           "no paged-attention kernel for layout", "the page loop planned the sparse kernels of token-major values");
   kv::Layout dimensionMajor = selected;
   dimensionMajor.valuesTokenMajor = false;
