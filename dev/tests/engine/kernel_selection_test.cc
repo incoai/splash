@@ -11,10 +11,13 @@
 #include "TestChecks.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "ops/ExecutionPlans.hpp"
+#include "ops/KernelSelection.hpp"
 
+#include "metal/abi/Gguf.h"
 #include "metal/abi/QuantFormat.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -22,6 +25,7 @@
 #include <iterator>
 #include <map>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -236,6 +240,33 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
           prefill.add(set.name + " rows " + std::to_string(rows) + " e" + std::to_string(unsigned(epilogue)) +
                       ": " + attempt([&] { return describe(linear.plan(w, *p)); }));
         }
+      // A rotated PQ2_0 unit's decode plans and their int8 activations
+      // (UnitFormats::decodeInt8Takes, which only a rotation's sign buffer
+      // sets, so the CPU plans from its formats).
+      if (set.formats == std::vector<uint32_t>{GGUF_FMT_PQ20} && c.k % GGUF_ROTATION_BLOCK == 0) {
+        Group &int8 = golden.group(name, "projection-decode-int8", c.name);
+        const auto int8Formats = [](std::span<const Projection *const> projections) {
+          UnitFormats unit = unitFormats(projections);
+          unit.decodeInt8Takes = true;
+          return unit;
+        };
+        for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
+          for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
+            const LinearWorkload w{{c.n, c.k}, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
+            const bool pair = epilogue == LinearEpilogue::GateUp;
+            const std::array<const Projection *, 2> units{&*p, pair ? &gate : nullptr};
+            const std::array<UnitFormats, 2> tensors{int8Formats(std::span(&units[0], 1)),
+                                                     int8Formats(std::span(&units[1], 1))};
+            int8.add("lanes " + std::to_string(lanes) + " e" + std::to_string(unsigned(epilogue)) + ": " +
+                     attempt([&] {
+                       const LinearConfig config = selectProjection(
+                           plans.calibration(), w, int8Formats(units),
+                           pair ? std::span<const UnitFormats>(tensors) : std::span<const UnitFormats>{});
+                       return describe(Linear::plan(w, config, FloatOutput::BFloat16)) + " int8 " +
+                              std::to_string(config.decodeInt8);
+                     }));
+          }
+      }
       // The arena bounds, which read the shape alone, and its rotated twin.
       for (const bool rotated : {false, true}) {
         ProjectionShape shape = p->shape();

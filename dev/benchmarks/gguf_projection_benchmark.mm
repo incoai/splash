@@ -13,6 +13,8 @@
 // producers write alongside their output (LinearBuffers::prepared), prepared once and not timed. The cases run in
 // ABBA order after a warm-up; printed are the medians of `rounds` (20) commands in ms per projection, the device
 // policy's choice marked with *. Widths emulate core counts: the policy's split law counts threadgroups per core.
+// PQ2_0 projections of whole rotation blocks run rotated, as Prism's are stored, their decode cases also on the int8
+// tiles of 16 or 32 rows (int8, int8pair: LinearConfig::decodeInt8), each time including the input's rotation.
 // The float formats float-bf16 and float-f32, and float-<fmt> for the native rows of a quantized format (an MLX
 // checkpoint's quantized router), time the float projection (ops::addGgufFloat: the router's, the QSA indexer's, F32
 // alpha/beta) instead, one tensor per width of any multiple of 8 columns, two in one dispatch as the
@@ -22,6 +24,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Gguf.h"
+#include "ops/KernelSelection.hpp"
 #include "ops/Linear.hpp"
 
 #include <algorithm>
@@ -252,6 +255,15 @@ int main(int argc, char **argv) {
           bytes += plane->size();
       }
       const uint32_t copies = ringCopies(bytes);
+      // Rotated PQ2_0 projections (InputRotation), random signs.
+      const bool rotated = K % GGUF_ROTATION_BLOCK == 0 &&
+                           std::all_of(images.begin(), images.end(), [](const Image &i) { return i.format == PQ20; });
+      MetalBuffer signs;
+      if (rotated) {
+        signs = backend.allocateBuffer(K, metal::BufferStorage::Shared, "rotation signs");
+        auto *d = static_cast<int8_t *>(signs.contents());
+        for (uint32_t k = 0; k < K; ++k) d[k] = rng() & 1 ? 1 : -1;
+      }
       std::vector<Projection> ring;
       for (uint32_t c = 0; c < copies; ++c) {
         BlockWeights weights;
@@ -264,6 +276,7 @@ int main(int argc, char **argv) {
           weights.segments.back().columnOffset = image.offset;
         }
         ring.emplace_back(N, K, std::move(weights));
+        ring.back().rotation.signs = signs;
       }
       const Linear linear(backend.capabilities());
       std::vector<Case> cases;
@@ -309,10 +322,20 @@ int main(int argc, char **argv) {
                 if (sixteenRows && (registerTile || lanes > 1)) continue;
                 const LinearConfig config{.tile = tile, .splits = splits, .spread = !registerTile && wide.spread,
                                           .oneGateUpPass = onePass, .sixteenRows = sixteenRows};
+                const LinearPlan plan = Linear::plan(w, config, FloatOutput::BFloat16);
                 cases.push_back({"L" + std::to_string(lanes),
                                  std::string(registerTile ? "register" : onePass ? "pair" : "staged") +
                                      (sixteenRows ? "16" : "") + " S" + std::to_string(splits),
-                                 Linear::plan(w, config, FloatOutput::BFloat16), config == policy, {}});
+                                 plan, config == policy, {}});
+                // The int8 tiles at the same plan where they take it: 16 or 32 rows, whole PQ2_0 blocks per split.
+                if (rotated && !registerTile && decodeInt8TakesSplits(K, splits) && plan.storageRows() >= 16) {
+                  LinearConfig int8 = config;
+                  int8.decodeInt8 = true;
+                  cases.push_back({"L" + std::to_string(lanes),
+                                   std::string(onePass ? "int8pair" : "int8") + (sixteenRows ? "16" : "") + " S" +
+                                       std::to_string(splits),
+                                   Linear::plan(w, int8, FloatOutput::BFloat16), int8 == policy, {}});
+                }
               }
             }
           }
@@ -337,7 +360,8 @@ int main(int argc, char **argv) {
         auto *x = static_cast<__bf16 *>(input.contents());
         for (uint64_t i = 0; i < rows * K; ++i) x[i] = __bf16(unit(rng));
       }
-      const LinearScratch scratch{zeros(size.input), zeros(size.sums), zeros(size.partials), zeros(size.counters)};
+      const LinearScratch scratch{zeros(size.input), zeros(size.sums), zeros(size.partials), zeros(size.counters),
+                                  rotated ? zeros(rows * K * 2) : MetalBuffer{}};
       // The register tile's table, prepared by its widest plan, whose plans of fewer rows read its leading tiles.
       PreparedInput table;
       const Case *widest = nullptr;

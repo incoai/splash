@@ -26,6 +26,12 @@ struct UnitFormats final {
   // A gate/up pair of single tensors of one format, which the one-pass
   // kernels take.
   bool oneFormat = false;
+  // The int8 decode tiles take every quantized segment: a rotated
+  // projection's in a format they take (quant_decode_int8_format), over whose
+  // rotated input one int8 scale per rotation block holds each row's values
+  // evenly. Never from a shape: the int8 tiles keep the plan's rows, splits
+  // and scratch, which the shape bounds.
+  bool decodeInt8Takes = false;
   bool operator==(const UnitFormats &) const = default;
 };
 // The formats of the projections of a plan (a gate/up plan's up and gate).
@@ -46,9 +52,13 @@ struct SplitChoice final {
 [[nodiscard]] SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows, uint32_t bits16,
                                     uint32_t cores, Passes passes = Passes::Two) noexcept;
 
+// Whether the int8 decode tiles take `splits` K partitions of K = k: whole
+// rotation blocks, and whole 128-input PQ2_0 blocks per partition.
+[[nodiscard]] bool decodeInt8TakesSplits(uint32_t k, uint32_t splits) noexcept;
 // A dense GGUF projection's configuration: the tile, its splits, spread, one
-// pass and sixteen rows. A gate/up decode's `pairTensors` are its up's and
-// gate's own formats, whose plans decide its 16-row tile; none, it runs none.
+// pass, sixteen rows and int8 activations. A gate/up decode's `pairTensors`
+// are its up's and gate's own formats, whose plans decide its 16-row tile;
+// none, it runs none.
 [[nodiscard]] LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorkload workload,
                                             const UnitFormats &unit, std::span<const UnitFormats> pairTensors = {});
 // Every configuration a decode plan of the workload may take on the device

@@ -784,6 +784,19 @@ void ggufPlans() {
     rejects([&] { (void)Linear::plan(w, config, FloatOutput::BFloat16); },
             "only a staged one-lane block decode runs the 16-row tile",
             "the 16-row tile took other rows than one decode lane's or another tile");
+  // Int8 activations run on a staged decode plan of 16 or 32 rows whose K splits keep whole PQ2_0 blocks: not on the
+  // register tile, 8 rows, a prefill chunk, or 16 splits of 5120 inputs (160 groups, no multiple of 16 blocks of 4).
+  for (const auto &[w, config] :
+       {std::pair{LinearWorkload{down.matrix, 16, LinearPhase::Decode, LinearEpilogue::Residual},
+                  LinearConfig{.tile = LinearTile::GgufRegister, .decodeInt8 = true}},
+        {down, LinearConfig{.tile = LinearTile::GgufStaged, .decodeInt8 = true}},
+        {LinearWorkload{down.matrix, 16, LinearPhase::Prefill, LinearEpilogue::Residual},
+         LinearConfig{.tile = LinearTile::GgufStaged, .decodeInt8 = true}},
+        {LinearWorkload{{5120, 5120}, 16, LinearPhase::Decode, LinearEpilogue::None},
+         LinearConfig{.tile = LinearTile::GgufStaged, .splits = 16, .decodeInt8 = true}}})
+    rejects([&] { (void)Linear::plan(w, config, FloatOutput::BFloat16); },
+            "only a staged block decode of 16 or 32 rows and whole PQ2_0 blocks per split runs int8 activations",
+            "int8 activations took another tile, rows, phase or a split of a PQ2_0 block");
   rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufPrefill, .spread = true}, FloatOutput::BFloat16); },
           "only the staged block tile spreads its walks", "the prefill tile spread its walks");
 }
@@ -1125,6 +1138,22 @@ void rotatedRegisterInput(metal::MetalBackend &backend) {
   }
 }
 
+// The int8 tiles quantize a rotated input (LinearGguf.cpp): a plan in int8
+// activations over unrotated PQ2_0 weights is refused, not run in bf16.
+void decodeInt8TakesRotation(metal::MetalBackend &backend) {
+  constexpr uint32_t n = 256, k = 2048;
+  const Projection plain(n, k, BlockWeights{{segmentPlanes(backend, GGUF_FMT_PQ20, n, k)}});
+  const LinearPlan plan = Linear::plan({{n, k}, 8, LinearPhase::Decode, LinearEpilogue::None},
+                                       {.tile = LinearTile::GgufStaged, .sixteenRows = true, .decodeInt8 = true},
+                                       FloatOutput::BFloat16);
+  const LinearBuffers buffers{.input = allocate(backend, uint64_t{16} * k * 2),
+                              .output = allocate(backend, uint64_t{16} * n * 2)};
+  metal::CommandGraph graph;
+  rejects([&] { (void)gpu(10, 16).add(graph, buffers, plain, plan); },
+          "only a rotated PQ2_0 projection takes int8 activations", "an unrotated projection took int8 activations");
+  require(graph.empty(), "a refused int8 plan encoded a dispatch");
+}
+
 // Each buffer only a block projection's dispatches reach, at its extent and
 // one element short: a rotated projection's int8 sign of every input and its
 // rotated rows of the plan's storage; a float projection's fp32 weights, its
@@ -1440,6 +1469,7 @@ int main(int argc, char **argv) {
     ggufProjectionMatrix(backend);
     producerTableContract(backend);
     rotatedRegisterInput(backend);
+    decodeInt8TakesRotation(backend);
     blockExtents(backend);
     leadingInputViews(backend);
     registerTileExtents(backend);

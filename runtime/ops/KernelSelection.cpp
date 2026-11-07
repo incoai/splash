@@ -147,10 +147,15 @@ bool sixteenRowLane(const ProjectionCalibration &p, uint64_t tiles, uint32_t bit
 
 } // namespace
 
+bool decodeInt8TakesSplits(uint32_t k, uint32_t splits) noexcept {
+  return k % GGUF_ROTATION_BLOCK == 0 && splits && (k / 32) % (splits * kQuantFormats[GGUF_FMT_PQ20].meta_groups) == 0;
+}
+
 UnitFormats unitFormats(std::span<const Projection *const> projections) noexcept {
   UnitFormats unit;
   FormatClassifier classes;
   uint32_t bits = 0, count = 0;
+  bool decodeInt8 = true, quantized = false;
   for (const Projection *p : projections) {
     if (!p) continue;
     bits += p->shape().weightBits16, ++count;
@@ -158,8 +163,11 @@ UnitFormats unitFormats(std::span<const Projection *const> projections) noexcept
       if (s.isFloat()) continue;
       unit.registerTakes &= quant_register_tensor(s.formatId, s.inputSize);
       classes.add(s.formatId);
+      decodeInt8 &= static_cast<bool>(p->rotation) && quant_decode_int8_format(s.formatId);
+      quantized = true;
     }
   }
+  unit.decodeInt8Takes = quantized && decodeInt8;
   unit.formatClass = classes.formatClass();
   unit.weightBits16 = count ? bits / count : 0;
   if (projections.size() == 2 && projections[0] && projections[1]) {
@@ -191,7 +199,9 @@ SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows
 // staged tile, splitting by stagedSplits (a wave law also picks one or two
 // passes for an eligible pair), its walks spread from spreadFromCores, and one
 // unsplit lane on the 16-row tile where sixteenRowLane takes it, a pair's only
-// where both its tensors' own plans take it.
+// where both its tensors' own plans take it; a unit the int8 decode tiles take
+// stages on them at the plan's rows, splits and passes where the plan holds
+// decodeInt8FromRows rows and whole PQ2_0 blocks per split.
 LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorkload w, const UnitFormats &unit,
                               std::span<const UnitFormats> pairTensors) {
   const auto [n, k] = w.matrix;
@@ -218,6 +228,8 @@ LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorklo
                                                           .sixteenRows;
                                                     })
               : sixteenRowLane(p, n / GGUF_TILE_COLUMNS, unit.weightBits16, cores));
+  config.decodeInt8 = unit.decodeInt8Takes && decodeInt8TakesSplits(k, config.splits) &&
+                      stagedStorageRows(w.rows, config.sixteenRows) >= p.decodeInt8FromRows;
   return config;
 }
 

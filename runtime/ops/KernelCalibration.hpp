@@ -17,7 +17,7 @@
 
 namespace splash::ops {
 
-// A "from N" threshold nothing reaches (cores, pages), and a register
+// A "from N" threshold nothing reaches (cores, pages, rows), and a register
 // boundary every grid is below.
 inline constexpr uint32_t kNever = UINT32_MAX;
 inline constexpr uint32_t kAlways = UINT32_MAX;
@@ -89,6 +89,10 @@ struct ProjectionCalibration final {
   // Prefill chunks of up to this many rows run the staged tile
   // (<= kMaximumStagedPrefillRows); longer ones the prefill tile.
   uint32_t stagedPrefillRows;
+  // The staged decode of a unit the int8 decode tiles take
+  // (UnitFormats::decodeInt8Takes) runs them on plans of at least this many
+  // rows (one lane's 16-row plan counts 16).
+  uint32_t decodeInt8FromRows;
 };
 
 struct FloatTileCalibration final {
@@ -219,6 +223,12 @@ inline constexpr uint32_t kApple9StagedPrefillRows = SPLASH_MAXIMUM_BATCH_WIDTH 
 inline constexpr uint32_t kApple9SmallStagedPrefillRows = 64;
 inline constexpr uint32_t kApple10StagedPrefillRows = 64;
 
+// Rotated PQ2_0 units decode in int8 activations on Apple10 and Apple11,
+// whose neural accelerators multiply int8 operands, from 16 rows: the 8-row
+// int8 matmul takes about twice the 16-row one's time, so one lane's split
+// 8-row plans keep bf16.
+inline constexpr uint32_t kApple10DecodeInt8FromRows = 16;
+
 // Apple9 GPUs of up to this many cores (the base M3 and M4) take the 10-core
 // M4's rows, larger ones the 40-core M3 Max's; the boundary is unmeasured.
 inline constexpr uint32_t kApple9SmallGpuCores = 10;
@@ -232,6 +242,9 @@ inline constexpr ProjectionCalibration kApple9Projection{
     .sixteenRowBelowBits16 = 0,
     .sixteenRowWaves = 0,
     .stagedPrefillRows = kApple9StagedPrefillRows,
+    // Apple9's matrix operations share the FP32 pipe: it keeps bf16
+    // activations, unmeasured.
+    .decodeInt8FromRows = kNever,
 };
 inline constexpr ProjectionCalibration kApple9SmallProjection = [] {
   ProjectionCalibration row = kApple9Projection;
@@ -247,6 +260,7 @@ inline constexpr ProjectionCalibration kApple10Projection{
     .sixteenRowBelowBits16 = kApple10SixteenRowBelowBits16,
     .sixteenRowWaves = kApple10SixteenRowWaves,
     .stagedPrefillRows = kApple10StagedPrefillRows,
+    .decodeInt8FromRows = kApple10DecodeInt8FromRows,
 };
 
 // Apple11 takes Apple10's row but for the 16-row lane from 4.5 bits: the M6's

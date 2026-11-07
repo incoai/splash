@@ -94,6 +94,11 @@ inline constexpr uint32_t kMaximumStagedPrefillRows = 64;
 [[nodiscard]] constexpr uint32_t stagedTileRows(uint32_t rows) noexcept {
   return rows <= 8 ? 8 : rows <= 16 ? 16 : rows <= 32 ? 32 : 64;
 }
+// The rows a staged plan of `rows` rows stores: its tile's, or 16 for one
+// lane on the 16-row tile (LinearConfig::sixteenRows).
+[[nodiscard]] constexpr uint32_t stagedStorageRows(uint32_t rows, bool sixteenRows) noexcept {
+  return sixteenRows ? 16 : stagedTileRows(rows);
+}
 
 struct LinearWorkload final {
   LinearMatrix matrix;
@@ -121,6 +126,11 @@ struct LinearConfig final {
   // (LinearPlan::storageRows), whose padding lane's rows it computes and
   // discards, instead of the 8-row tile.
   bool sixteenRows = false;
+  // GgufStaged decode of rotated PQ2_0 segments in int8 activations: the
+  // rotated input as int8 rows, one scale per row and rotation block
+  // (gguf_rotate_int8), into the int8 tiles (gguf_decode_int8_pq20_m<rows>_*)
+  // at the plan's storage rows, splits, spread and passes.
+  bool decodeInt8 = false;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }
@@ -316,6 +326,8 @@ private:
                        const Projection *gate) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
+  void addGgufDecodeInt8(metal::CommandGraph &graph, const LinearBuffers &buffers, const Projection &projection,
+                         const LinearPlan &plan, const Projection *gate) const;
   KernelCalibration calibration_;
 };
 

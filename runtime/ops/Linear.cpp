@@ -38,7 +38,9 @@ LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilog
   return {matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
 }
 
-// LinearScratch::rotated bytes of `rows` bf16 rows of `width` inputs.
+// LinearScratch::rotated bytes of `rows` bf16 rows of `width` inputs, which
+// also hold the int8 rows' byte per input and fp32 scale per rotation block
+// (gguf_rotate_int8).
 constexpr uint64_t rotatedBytes(uint32_t width, uint64_t rows) noexcept { return uint64_t{width} * rows * 2; }
 
 // Throws if `p` is a view of the leading inputs of wider weight rows
