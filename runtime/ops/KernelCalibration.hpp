@@ -83,6 +83,9 @@ struct ProjectionCalibration final {
   // Prefill chunks of up to this many rows run the staged tile
   // (<= kMaximumStagedPrefillRows); longer ones the prefill tile.
   uint32_t stagedPrefillRows;
+  // A single prefill tile above the staged boundary may use 16-row groups
+  // where every tensor has that instance. Larger chunks keep 32-row groups.
+  bool prefill16OneTile = false;
 };
 
 struct FloatTileCalibration final {
@@ -274,8 +277,14 @@ inline constexpr AttentionCalibration kApple9SmallAttention{64};
 
 inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device) noexcept {
   const uint32_t cores = device.plannedGpuCores();
-  if (device.gpuClass() == GpuClass::Apple10)
-    return {cores, kApple10Projection, kApple10FloatTile, kApple10Moe, kAttention};
+  if (device.gpuClass() == GpuClass::Apple10) {
+    auto projection = kApple10Projection;
+    // 20-core M5 Pro: AF4G64 65-128-row chunks, five grids from 1024-square
+    // through 17408 x 5120, keep the measured 16-row-group advantage. The
+    // staged <=64-row path is faster on the large grids and stays unchanged.
+    projection.prefill16OneTile = cores == 20;
+    return {cores, projection, kApple10FloatTile, kApple10Moe, kAttention};
+  }
   const bool small = cores <= kApple9SmallGpuCores;
   return {cores, small ? kApple9SmallProjection : kApple9Projection, kApple9FloatTile,
           small ? kApple9SmallMoe : kApple9Moe, small ? kApple9SmallAttention : kAttention};

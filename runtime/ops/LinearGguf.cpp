@@ -316,7 +316,8 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
   const uint32_t threads = GGUF_PREFILL_ROWS / simdgroupRows * 32;
   if (simdgroupRows == 16 && (p.planeInputs() || p.rotation || !std::all_of(p.blocks().segments.begin(), p.blocks().segments.end(),
       [](const auto &segment) { return segment.formatId == GGUF_FMT_AF4G64; })))
-    throw std::invalid_argument("the SG16 experiment takes one unrotatedAF4G64 segment");
+    throw std::invalid_argument(
+        "16-row-group prefill requires unrotated AF4G64 with whole input rows");
   const auto [n, k] = w.matrix;
   const char epilogue = epilogueSuffix(w.epilogue);
   const uint32_t rowTiles = plan.storageRows() / GGUF_PREFILL_ROWS;

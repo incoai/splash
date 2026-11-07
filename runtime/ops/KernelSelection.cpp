@@ -130,10 +130,14 @@ UnitFormats unitFormats(std::span<const Projection *const> projections) noexcept
   UnitFormats unit;
   FormatClassifier classes;
   uint32_t bits = 0, count = 0;
+  bool prefill16Takes = true;
   for (const Projection *p : projections) {
     if (!p) continue;
     bits += p->shape().weightBits16, ++count;
+    prefill16Takes &=
+        !p->planeInputs() && !p->rotation && !p->blocks().segments.empty();
     for (const QuantizedSegment &s : p->blocks().segments) {
+      prefill16Takes &= !s.isFloat() && s.formatId == GGUF_FMT_AF4G64;
       if (s.isFloat()) continue;
       unit.registerTakes &= quant_register_tensor(s.formatId, s.inputSize);
       classes.add(s.formatId);
@@ -141,6 +145,7 @@ UnitFormats unitFormats(std::span<const Projection *const> projections) noexcept
   }
   unit.formatClass = classes.formatClass();
   unit.weightBits16 = count ? bits / count : 0;
+  unit.prefill16Takes = count && prefill16Takes;
   if (projections.size() == 2 && projections[0] && projections[1]) {
     const std::vector<QuantizedSegment> &up = projections[0]->blocks().segments,
                                         &gate = projections[1]->blocks().segments;
@@ -176,9 +181,15 @@ LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorklo
   const auto [n, k] = w.matrix;
   const ProjectionCalibration &p = calibration.projection;
   const uint32_t cores = calibration.cores;
-  if (w.phase == LinearPhase::Prefill)
-    return w.rows <= p.stagedPrefillRows ? staged(p, n, k, w.rows, unit.weightBits16, cores, Passes::Two)
-                                         : LinearConfig{.tile = LinearTile::GgufPrefill};
+  if (w.phase == LinearPhase::Prefill) {
+    if (w.rows <= p.stagedPrefillRows)
+      return staged(p, n, k, w.rows, unit.weightBits16, cores, Passes::Two);
+    return {.tile = LinearTile::GgufPrefill,
+            .prefillSimdgroupRows = p.prefill16OneTile && unit.prefill16Takes &&
+                                            w.rows <= GGUF_PREFILL_ROWS
+                                        ? 16u
+                                        : 32u};
+  }
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
   const bool gateUp = w.epilogue == LinearEpilogue::GateUp,
              onePass = gateUp && unit.oneFormat && cores >= p.onePassFromCores;

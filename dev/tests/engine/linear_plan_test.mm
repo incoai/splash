@@ -73,6 +73,49 @@ Projection blockProjection(uint32_t n, uint32_t k, uint32_t segments, uint32_t f
   return blockProjection(n, k, std::vector<uint32_t>(segments, format));
 }
 
+// Keep the staged boundary, allocation height and unsupported tensor/device
+// fallbacks when selecting the smaller simdgroup height for one prefill tile.
+void singleTilePrefillPlans() {
+  const Projection affine = blockProjection(1024, 1024, 1, GGUF_FMT_AF4G64),
+                   fused = blockProjection(1024, 1024, 2, GGUF_FMT_AF4G64),
+                   mixed = blockProjection(
+                       1024, 1024,
+                       std::array<uint32_t, 2>{GGUF_FMT_AF4G64, GGUF_FMT_Q4K}),
+                   leading = blockProjection(1024, 2048, 1, GGUF_FMT_AF4G64)
+                                 .leadingInputs(1024);
+  for (const uint32_t family : {9U, 10U, 11U})
+    for (const uint32_t cores : {0U, 16U, 20U, 32U, 40U})
+      for (const uint32_t rows :
+           {33U, 64U, 65U, 80U, 96U, 127U, 128U, 129U, 256U})
+        for (const LinearEpilogue epilogue :
+             {LinearEpilogue::None, LinearEpilogue::Residual,
+              LinearEpilogue::UpWithGate}) {
+          const Linear linear = gpu(family, cores);
+          const LinearWorkload w{
+              {1024, 1024}, rows, LinearPhase::Prefill, epilogue};
+          const bool supported =
+              family >= 10 && cores == 20 && rows > 64 && rows <= 128;
+          for (const Projection *p : {&affine, &fused, &mixed, &leading}) {
+            const LinearPlan plan = linear.plan(w, *p);
+            require(
+                plan.configuration().prefillSimdgroupRows ==
+                    (supported && (p == &affine || p == &fused) ? 16U : 32U),
+                "single-tile prefill device/format/view boundary");
+            if (supported && (p == &affine || p == &fused)) {
+              const LinearPlan ordinary = Linear::plan(
+                  w, {.tile = LinearTile::GgufPrefill}, FloatOutput::BFloat16);
+              require(
+                  plan.storageRows() == ordinary.storageRows() &&
+                      sameScratch(plan.scratchSize(), ordinary.scratchSize()),
+                  "single-tile prefill changed the arena bound");
+            }
+          }
+          require(linear.plan(w).configuration().prefillSimdgroupRows == 32,
+                  "unknown projection formats selected a specialized prefill "
+                  "instance");
+        }
+}
+
 // fp32 destinations (the logits): the plan of a projection with an fp32
 // destination keeps the configuration, input table and scratch of its bf16
 // plan on every family and core count, and only plain decode workloads take
@@ -1037,6 +1080,13 @@ void producerTableContract(metal::MetalBackend &backend) {
 // Apple9 a rotated PQ2_0 projection keeps the register tile and its input
 // norm runs the plain kernel, where an unrotated one reads Table16.
 void rotatedRegisterInput(metal::MetalBackend &backend) {
+  Projection affine = blockProjection(1024, 1024, 1, GGUF_FMT_AF4G64);
+  affine.rotation.signs = allocate(backend, 1024);
+  require(gpu(10, 20)
+                  .prefillPlan(affine, 96, LinearEpilogue::None)
+                  .configuration()
+                  .prefillSimdgroupRows == 32,
+          "rotated affine prefill selected the unrotated-only instance");
   const Linear m3 = gpu(9, 40);
   Projection rotated = blockProjection(5120, 17408, 1, GGUF_FMT_PQ20);
   const Projection plain = rotated;
@@ -1363,6 +1413,7 @@ int main(int argc, char **argv) {
     ggufCoreLaws();
     floatOutputPlans();
     smallApple9StagesShortPrefillChunks();
+    singleTilePrefillPlans();
     if (std::string_view(argv[1]) == "--cpu") {
       std::cout << "Linear CPU plans: PASS\n";
       return 0;
