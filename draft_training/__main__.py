@@ -3,6 +3,7 @@
 import argparse
 import importlib.metadata
 import json
+import os
 import platform
 import sys
 from pathlib import Path
@@ -31,7 +32,7 @@ def implementation_identity():
 
 
 def execution_context(torch, device):
-    return {
+    context = {
         "device": device,
         "device_name": torch.cuda.get_device_name()
         if device == "cuda"
@@ -41,6 +42,27 @@ def execution_context(torch, device):
         "forward_precision": "BF16 autocast; FP32 rotary frequencies",
         "optimizer_precision": "FP32 trainable masters and Adam moments",
         "attention": "sdpa",
+    }
+    if device == "mps":
+        context.update(
+            device_name=torch.backends.mps.get_name(),
+            macos_version=platform.mac_ver()[0],
+            mps_cpu_fallback=os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") == "1",
+        )
+    return context
+
+
+def memory_snapshot(torch, device):
+    """Synchronize MPS before recording allocator snapshots, not peak estimates."""
+    if device != "mps":
+        return None
+    torch.mps.synchronize()
+    return {
+        "device": "mps",
+        "measurement": "end-of-phase snapshot; not peak memory",
+        "allocated_bytes": torch.mps.current_allocated_memory(),
+        "driver_allocated_bytes": torch.mps.driver_allocated_memory(),
+        "recommended_max_bytes": torch.mps.recommended_max_memory(),
     }
 
 
@@ -80,9 +102,9 @@ def add_train_arguments(parser):
     )
     parser.add_argument(
         "--device",
-        choices=("cuda", "cpu"),
+        choices=("cuda", "cpu", "mps"),
         default="cuda",
-        help="CUDA for production; CPU for reference diagnostics",
+        help="CUDA by default; experimental Apple GPU MPS; CPU reference diagnostics",
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -144,7 +166,7 @@ def parse_args(argv=None):
         "output",
     ):
         evaluate.add_argument("--" + name, type=Path, required=True)
-    evaluate.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    evaluate.add_argument("--device", choices=("cuda", "cpu", "mps"), default="cuda")
     export = commands.add_parser(
         "export", help="export a checkpoint produced by this trainer"
     )
@@ -158,7 +180,11 @@ def require_torch(device):
 
     if device == "cuda" and not torch.cuda.is_available():
         raise TrainingError(
-            "CUDA is unavailable. Run training on a CUDA host; --device cpu is only for reference diagnostics."
+            "CUDA is unavailable. Use --device mps on a supported Apple Silicon Mac, or --device cpu for reference diagnostics."
+        )
+    if device == "mps" and not torch.backends.mps.is_available():
+        raise TrainingError(
+            "MPS is unavailable. Apple GPU training needs a supported Mac, macOS, and an MPS-enabled PyTorch build. Use --device cpu for reference diagnostics."
         )
     return torch
 
@@ -260,6 +286,7 @@ def run_training(args, *, family=True):
         capture_peak = (
             torch.cuda.max_memory_allocated() if args.device == "cuda" else None
         )
+        capture_memory = memory_snapshot(torch, args.device)
         embedding, head = adapter.release_teacher()
         if args.device == "cuda":
             torch.cuda.reset_peak_memory_stats()
@@ -314,6 +341,8 @@ def run_training(args, *, family=True):
             "training_peak_cuda_bytes": torch.cuda.max_memory_allocated()
             if args.device == "cuda"
             else None,
+            "capture_memory": capture_memory,
+            "training_memory": memory_snapshot(torch, args.device),
         }
     target_spec = target_family(read_json(args.target / "config.json"))
     teacher_identity = checkpoint_identity(args.target)
