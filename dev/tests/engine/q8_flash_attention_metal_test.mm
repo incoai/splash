@@ -540,7 +540,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   // With QSA masks every lane attends through a copy of the case's list,
   // lane l's list kQsaJunkLists + l.
   const BlockLists blocks = data.maskWords ? qsaBlockLists(device, data, width) : BlockLists{partials, partials, 0};
-  std::array<VerifyAttentionParams, 4> params{};
+  std::array<VerifyAttentionParams, SPLASH_MAXIMUM_BATCH_WIDTH> params{};
   for (uint32_t lane = 0; lane < params.size(); ++lane)
     params[lane] = {data.params.committed_tokens, data.params.page_table_entries, data.params.kv, splits, splits,
                     blocks.stride, blocks.stride ? kQsaJunkLists + lane : 0};
@@ -550,11 +550,11 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBuffer:queries offset:0 atIndex:0];
   [encoder setBuffer:partials offset:0 atIndex:1];
   [encoder setBuffer:statistics offset:0 atIndex:2];
-  for (uint32_t index = 3; index < 7; ++index)
+  for (uint32_t index = 3; index < 3 + SPLASH_MAXIMUM_BATCH_WIDTH; ++index)
     [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:index];
   // A sparse split binds the lists and their counts, or without lists
   // another buffer of the dispatch, of which it reads nothing.
-  NSUInteger paramsIndex = 7;
+  NSUInteger paramsIndex = 3 + SPLASH_MAXIMUM_BATCH_WIDTH;
   if (shape.sparse()) {
     [encoder setBuffer:blocks.lists offset:0 atIndex:paramsIndex++];
     [encoder setBuffer:blocks.counts offset:0 atIndex:paramsIndex++];
