@@ -2,6 +2,7 @@
 #include "Checked.hpp"
 #include "DraftCheckpoint.hpp"
 #include "metal/abi/DraftAttention.h"
+#include "ops/Embedding.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -343,6 +344,12 @@ void DFlashDraft::addDecode(
              weights_.selectorProjection, linear.decodePlan(weights_.selectorProjection, lanes));
 }
 
+void DFlashDraft::addMaskRows(metal::CommandGraph &graph, metal::MetalBuffer rows, uint32_t lanes) const {
+  if (!weights_.maskEmbedding) return;
+  ops::Embedding::addDraftMaskRows(graph, weights_.maskEmbedding, std::move(rows), weights_.layout.hiddenSize,
+                                   lanes);
+}
+
 void DFlashDraft::addContextCommit(
     metal::CommandGraph &graph, DFlashContextBuffers buffers,
     std::span<const uint32_t> startPositions) const {
@@ -447,6 +454,8 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
         file.section(codebookBytes, "predecessor-codebook");
     result.successorCodebook =
         file.section(codebookBytes, "successor-codebook");
+    if (files.hasMaskEmbedding())
+      result.maskEmbedding = file.section(uint64_t{layout.hiddenSize} * kBFloat16Bytes, "mask-embedding");
     file.finish();
     result.files.push_back(file.record());
   }

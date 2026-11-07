@@ -1,11 +1,11 @@
 annotated-doc==0.0.5
 anyio==4.14.2
 attrs==26.1.0
-certifi==2026.7.22
+certifi==2026.10.19
 cffi==2.1.1
 click==8.4.2
 cryptography==50.0.1
-filelock==3.32.3
+filelock==4.2.4
 fsspec==2026.7.0
 h11==0.16.0
 hf-xet==1.6.0
@@ -22,7 +22,7 @@ MarkupSafe==3.0.3
 mdurl==0.1.2
 numpy==2.5.2
 packaging==26.3
-Pillow==12.3.0
+Pillow==13.0.0
 pip==26.2.1
 Pygments==2.21.0
 pycparser==3.0

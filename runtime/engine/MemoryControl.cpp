@@ -1,8 +1,8 @@
 #include "engine/MemoryControl.hpp"
 
 #include "StderrLine.hpp"
+#include "engine/NativeRuntime.hpp"
 
-#include <optional>
 #include <sstream>
 
 namespace splash::engine {
@@ -33,26 +33,16 @@ bool MemoryControl::run(MemoryPressure pressure) {
   loop_.releaseIdleWeights();
   governor_.setPressure(pressure);
   const double now = loop_.monotonicMilliseconds();
-  // Requests held back by a refusal wait for memory too, the refused one
-  // included while a pass defers it.
-  const ResourceWaitSnapshot wait = loop_.resourceWaitSnapshot();
-  const bool requestWaiting = wait.memory || wait.suspended || wait.heldBehindRefusal;
-  governor_.setRequestWaiting(requestWaiting);
+  loop_.collectLandings(now);
   static_cast<void>(backend_.refreshMemoryStats());
-  const MemoryGovernorSnapshot memory = governor_.evaluate();
-  const std::string diagnostic = reporter_.update(wait, memory.hostGrowthAllowed);
+  const bool again = governor_.controlPass(now);
+  static_cast<void>(backend_.refreshMemoryStats());
+  // Read after the pass, at the last sample of the host it took.
+  const std::string diagnostic =
+      reporter_.update(loop_.resourceWaitSnapshot(), governor_.admits(ClaimClass::Growth));
   if (!diagnostic.empty())
     logLine(diagnostic);
-  const std::optional<MemoryReclaimDirective> directive =
-      policy_.update(memory, now, requestWaiting);
-  if (!directive)
-    return false;
-  const MemoryReclaimResult reclaim = loop_.reclaimMemory(*directive);
-  policy_.reclaimed(*directive, reclaim);
-  governor_.reclaimed(reclaim.outcome);
-  static_cast<void>(backend_.refreshMemoryStats());
-  // What transfers held back continues at the next command-free point.
-  return reclaim.outcome == ReclaimOutcome::Pending;
+  return again;
 }
 
 } // namespace splash::engine

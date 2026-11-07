@@ -11,6 +11,7 @@ import tempfile
 import threading
 import tomllib
 import unittest
+import urllib.request
 from contextlib import contextmanager
 from itertools import product
 from pathlib import Path
@@ -22,6 +23,9 @@ from install import clients, launcher
 from server import serve_options
 
 MODEL = "mlx-community/Qwen3.6-35B-A3B-4bit"
+# What a launch under an environment's proxy adds to the hosts a client
+# reaches without it.
+LOOPBACK_HOSTS = "127.0.0.1,localhost,::1"
 
 
 def hermes_profile_create(argv, *, env, **options):
@@ -33,6 +37,21 @@ def hermes_profile_create(argv, *, env, **options):
     seed = {"model": {"default": "cloud-model", "api_key_env": "CLOUD_API_KEY"}}
     (home / "config.yaml").write_text(yaml.safe_dump(seed))
     return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+def pi_command_output(value, env):
+    """What Pi sends for a models.json value that begins with "!": the
+    command's output in /bin/sh, trimmed; None when the command fails. Popen,
+    since the tests replace subprocess.run."""
+    with subprocess.Popen(
+        ["/bin/sh", "-c", value[1:]],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    ) as process:
+        output = process.stdout.read()
+    return output.strip() if process.returncode == 0 else None
 
 
 class ClientTests(unittest.TestCase):
@@ -65,6 +84,7 @@ class ClientTests(unittest.TestCase):
         client_args=(),
         client_version=None,
         input_modalities=None,
+        later_system=False,
     ):
         return clients.command(
             name,
@@ -78,6 +98,7 @@ class ClientTests(unittest.TestCase):
             input_modalities=["text", "image", "pdf"]
             if input_modalities is None
             else input_modalities,
+            later_system=later_system,
         )
 
     def test_server_key_reaches_every_provider_without_entering_argv(self):
@@ -102,9 +123,17 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(env["SPLASH_API_KEY"], "test-server-key")
                     self.assertNotIn("test-server-key", self.pi_models.read_text())
                     config = json.loads(self.pi_models.read_text())
-                    self.assertEqual(
-                        config["providers"]["splash"]["apiKey"], "$SPLASH_API_KEY"
-                    )
+                    api_key = config["providers"]["splash"]["apiKey"]
+                    # Pi runs a value that begins with "!" in the shell and
+                    # sends its output, in every version: Pi before 0.79.4
+                    # reads a bare variable name, later versions "$NAME".
+                    self.assertTrue(api_key.startswith("!"), api_key)
+                    for key in ("test-server-key", "!test-$HOME 'key'"):
+                        self.assertEqual(
+                            pi_command_output(api_key, {"SPLASH_API_KEY": key}), key
+                        )
+                    # Without the variable it fails, and Pi sends no key.
+                    self.assertIsNone(pi_command_output(api_key, {}))
                 else:
                     # Hermes expands the profile's reference from its
                     # environment.
@@ -150,6 +179,9 @@ class ClientTests(unittest.TestCase):
 
     def test_default_environment_is_a_copy_of_the_process_environment(self):
         with mock.patch.dict(os.environ, {"SPLASH_API_KEY": "process-key"}):
+            for name in list(os.environ):
+                if name.lower() in clients.PROXY_VARIABLES:
+                    os.environ.pop(name)
             before = dict(os.environ)
             _, env = clients.command(
                 "codex",
@@ -161,6 +193,66 @@ class ClientTests(unittest.TestCase):
             )
             self.assertEqual(dict(os.environ), before)
         self.assertEqual(env, before)
+
+    def test_every_client_reaches_the_server_without_a_proxy(self):
+        """Where the environment names a proxy, loopback, where the server
+        is, joins the hosts each client reaches without it, so no proxy
+        receives the server's key. A client reads NO_PROXY or no_proxy, and
+        the other where its own is unset or empty: each keeps the hosts a client found
+        there, and one exempting loopback already, or "*", stays. An
+        environment naming no proxy, whose clients take the system proxy, is
+        left as it is."""
+        proxy = "http://proxy.example:3128"
+        for proxies, no_proxy, expected in (
+            (
+                {"HTTPS_PROXY": proxy},
+                {},
+                (LOOPBACK_HOSTS, LOOPBACK_HOSTS),
+            ),
+            (
+                {"http_proxy": proxy},
+                {"NO_PROXY": "corp.example"},
+                (f"corp.example,{LOOPBACK_HOSTS}", f"corp.example,{LOOPBACK_HOSTS}"),
+            ),
+            (
+                {"all_proxy": proxy},
+                {"NO_PROXY": "", "no_proxy": "corp.example, localhost"},
+                (
+                    "corp.example,localhost,127.0.0.1,::1",
+                    "corp.example,localhost,127.0.0.1,::1",
+                ),
+            ),
+            (
+                {"ALL_PROXY": proxy},
+                {"no_proxy": f"{LOOPBACK_HOSTS},corp.example"},
+                (None, f"{LOOPBACK_HOSTS},corp.example"),
+            ),
+            ({"HTTP_PROXY": proxy}, {"NO_PROXY": "*"}, ("*", None)),
+            ({"https_proxy": proxy}, {"NO_PROXY": "*", "no_proxy": "*"}, ("*", "*")),
+            ({}, {}, (None, None)),
+            ({"http_proxy": ""}, {"NO_PROXY": "corp.example"}, ("corp.example", None)),
+        ):
+            for name in clients.INSTALL_URLS:
+                with self.subTest(client=name, proxies=proxies, no_proxy=no_proxy):
+                    _, env = self.command(name, env=proxies | no_proxy)
+                    self.assertEqual(
+                        (env.get("NO_PROXY"), env.get("no_proxy")), expected
+                    )
+                    self.assertEqual({key: env[key] for key in proxies}, proxies)
+
+    def test_a_system_proxy_alone_stays_the_clients_proxy(self):
+        """Without a proxy variable, Python's urllib takes the macOS system
+        proxy; a NO_PROXY in the agent's environment would make it drop that
+        proxy, so the launch adds none."""
+        system = {"http": "http://sysproxy.example:3128"}
+        _, env = self.command("codex", env={"PATH": "/bin"})
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                urllib.request, "getproxies_macosx_sysconf", return_value=system
+            ),
+        ):
+            self.assertEqual(urllib.request.getproxies(), system)
 
     def test_claude_launch_selects_the_local_server_for_every_model_alias(self):
         # A shell configured for a cloud provider keeps its unrelated
@@ -496,6 +588,13 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(agent.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.pi_models.stat().st_mode & 0o777, 0o600)
         self.assertEqual([path.name for path in agent.iterdir()], ["models.json"])
+
+    def test_pi_keeps_system_messages_in_place_where_the_server_renders_them(self):
+        self.command("pi", later_system=True)
+        (model,) = json.loads(self.pi_models.read_text())["providers"]["splash"][
+            "models"
+        ]
+        self.assertEqual(model["compat"], {"supportsMidConvoSystemMessages": True})
 
     def test_pi_names_a_provider_per_port(self):
         self.command("pi")
@@ -1055,8 +1154,9 @@ class ClientTests(unittest.TestCase):
 
 class ClientLifecycleTests(unittest.TestCase):
     @contextmanager
-    def ready_server(self, client, context=102400, model=None):
-        """Serve model from a ready server; yields the patched exec."""
+    def ready_server(self, client, context=102400, model=None, status=None):
+        """Serve model from a ready server reporting status; yields the
+        patched exec."""
         if model is None:
             model = {
                 "id": MODEL,
@@ -1076,7 +1176,10 @@ class ClientLifecycleTests(unittest.TestCase):
             mock.patch.object(
                 launcher,
                 "_request_json",
-                return_value={"data": [{"context_length": context, **model}]},
+                side_effect=lambda path, **_: {
+                    "/v1/models": {"data": [{"context_length": context, **model}]},
+                    "/status": status,
+                }[path],
             ),
             mock.patch.object(launcher.os, "execvpe") as execute,
             mock.patch("sys.stdout", io.StringIO()),
@@ -1164,6 +1267,31 @@ class ClientLifecycleTests(unittest.TestCase):
                 argv.index('model_reasoning_effort="low"'), argv.index("exec")
             )
             self.assertEqual(argv[-2:], ["exec", "hello"])
+
+    def test_pi_learns_from_the_server_whether_it_renders_later_system_messages(
+        self,
+    ):
+        for later_system, compat in (
+            ("native", True),
+            ("patched", True),
+            ("unsupported", False),
+            ({"default": "native", "tool_use": "patched"}, True),
+            ({"default": "native", "tool_use": "unsupported"}, False),
+            (None, False),
+        ):
+            status = (
+                None
+                if later_system is None
+                else {"chat_template": {"later_system": later_system}}
+            )
+            with (
+                self.subTest(later_system=later_system),
+                self.ready_server("pi", status=status),
+            ):
+                launcher.main(["pi"])
+                path = Path(os.environ["HOME"]) / ".pi/agent/models.json"
+                (model,) = json.loads(path.read_text())["providers"]["splash"]["models"]
+            self.assertEqual("compat" in model, compat)
 
     def test_opencode_launch_probes_the_installed_version(self):
         for version, expected in (

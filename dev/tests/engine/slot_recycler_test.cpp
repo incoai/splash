@@ -1,32 +1,19 @@
-// The order a store's slots are recycled in (model::SlotRecycler): a load
-// never takes a slot of a key it uses, and takes none when every slot is its
-// own; free slots are taken first, a freed one before them; a slot's key is
-// found until it is recycled, freed or resized away; a long prefill chunk's
-// scan of more experts than the slots leaves the experts decode steps routed
-// again in place; and when more lanes add experts to each cycle until a cycle
-// routes more than the slots hold, the experts every cycle routes keep
-// hitting (recycling the least recently used slot keeps a fifth of them). A
-// claim allocates nothing. On the decode selections of real requests
-// (dev/tests/fixtures/kv-selection-traces, the directory the test takes), the
-// hot block cache's resolves miss at most 2% more than recycling the least
-// recently used block would.
+// The order a store's slots are recycled in (model::SlotRecycler, ARC): free
+// slots first, never a slot of the claiming load, scans spare the frequent,
+// compactions keep ARC's bounds, and a claim allocates nothing.
 #include "TestChecks.hpp"
 #include "model/SlotRecycler.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <iostream>
-#include <iterator>
-#include <list>
 #include <map>
 #include <new>
 #include <set>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 // Every allocation of the test's thread, which a claim must not add to.
@@ -53,6 +40,8 @@ struct Arena final {
   std::map<uint64_t, uint32_t> slotOf;
   std::vector<uint64_t> owner;
   uint64_t load = 0;
+  // How often compactions moved each key.
+  std::map<uint64_t, uint32_t> moves;
   // Routes `experts` in one load; returns how many were resident.
   uint32_t route(const std::vector<uint64_t> &experts, bool chunk) {
     ++load;
@@ -72,6 +61,27 @@ struct Arena final {
       slotOf[expert] = slot;
     }
     return hits;
+  }
+  // Compacts to `slots` slots, as the store follows the evictions and moves.
+  void compact(uint32_t slots) {
+    order.compact(
+        slots,
+        [&](uint32_t slot) {
+          require(slot < owner.size() && owner[slot] != kFree, "a compaction evicted a free slot");
+          slotOf.erase(owner[slot]);
+          owner[slot] = kFree;
+        },
+        [&](uint32_t from, uint32_t to) {
+          require(from >= slots && to < slots && owner[from] != kFree && owner[to] == kFree,
+                  "a compaction moved a key from below the slots or into a held slot");
+          ++moves[owner[from]];
+          slotOf[owner[from]] = to;
+          owner[to] = std::exchange(owner[from], kFree);
+        });
+    for (uint32_t slot = slots; slot < owner.size(); ++slot)
+      require(owner[slot] == kFree, "a compaction left a key past the slots");
+    owner.resize(slots);
+    for (const auto &[key, slot] : slotOf) require(order.find(key) == slot, "a compacted key is not where it moved");
   }
 };
 
@@ -121,6 +131,27 @@ void findsWhatItHolds() {
   require(slots.ghostHits() == 1, "a scan's claim of a ghost counted as a ghost's");
 }
 
+// Ghosts stay within the slot count, a resize to fewer slots trims them, and scans and resets leave
+// none.
+void countsItsGhosts() {
+  Arena arena(16);
+  for (uint64_t load = 0; load < 50; ++load) {
+    // Keys used again and again beside fresh ones, which T1 recycles.
+    std::vector<uint64_t> keys{0, 1, 2, 3, 4, 5, 6, 7};
+    for (uint64_t fresh = 0; fresh < 4; ++fresh) keys.push_back(100 + 4 * load + fresh);
+    static_cast<void>(arena.route(keys, false));
+    require(arena.order.ghosts() <= arena.order.size(), "a recycler kept more ghosts than its slots");
+  }
+  require(arena.order.ghosts() > 0, "keys T1 recycled left no ghost");
+  arena.order.resize(4);
+  require(arena.order.ghosts() <= 4, "a resize to fewer slots kept more ghosts than them");
+  arena.order.reset();
+  require(arena.order.ghosts() == 0, "a reset kept ghosts");
+  SlotRecycler scans(4);
+  for (uint64_t key = 0; key < 12; ++key) static_cast<void>(scans.claim(key, key + 1, true));
+  require(scans.ghosts() == 0, "a scan's claims left ghosts");
+}
+
 void resizes() {
   SlotRecycler slots(4);
   for (uint64_t key = 0; key < 4; ++key) static_cast<void>(slots.claim(key, 1, false));
@@ -153,6 +184,146 @@ void resizes() {
   require(slots.ghostHits() == 2, "shrinking forgot a ghost within the slots");
   for (uint64_t load = 7; load < 40; ++load)
     require(slots.claim(100 + load, load, false) < 5, "a shrunk recycler took a slot past its size");
+}
+
+// A compaction evicts T1's oldest keys past its target and moves keys past the slots into the
+// lowest free slots, keeping T2's order.
+void compactsInRecencyOrder() {
+  Arena arena(8);
+  std::vector<uint64_t> keys{0, 1, 2, 3, 4, 5, 6, 7};
+  static_cast<void>(arena.route(keys, false));
+  for (uint64_t key = 0; key < 8; ++key) require(arena.slotOf.at(key) == key, "a fresh recycler's claims moved");
+  // T2 holds 7, 2, 5, 0 and 6 in that order, T1 1, 3 and 4.
+  for (const uint64_t key : {7, 2, 5, 0, 6}) arena.order.touch(arena.slotOf.at(key), 2, false);
+  std::vector<uint32_t> evicted;
+  std::vector<std::pair<uint32_t, uint32_t>> moved;
+  arena.order.compact(
+      5, [&](uint32_t slot) { evicted.push_back(slot); },
+      [&](uint32_t from, uint32_t to) { moved.emplace_back(from, to); });
+  require(evicted == std::vector<uint32_t>{1, 3, 4}, "a compaction evicted other keys than T1's oldest");
+  require(moved == std::vector<std::pair<uint32_t, uint32_t>>{{5, 1}, {6, 3}, {7, 4}},
+          "a compaction moved the keys past the slots elsewhere than the lowest free slots");
+  require(arena.order.size() == 5 && arena.order.find(0) == 0 && arena.order.find(2) == 2 &&
+              arena.order.find(5) == 1 && arena.order.find(6) == 3 && arena.order.find(7) == 4 &&
+              !arena.order.find(1) && !arena.order.find(3) && !arena.order.find(4),
+          "a compacted key is not where it moved, or an evicted one is still found");
+  // One load's claims recycle T2 in its order: 7, 2, 5, 0, 6.
+  const std::vector<uint64_t> recycled{7, 2, 5, 0, 6};
+  for (uint64_t claim = 0; claim < recycled.size(); ++claim) {
+    static_cast<void>(arena.order.claim(100 + claim, 3, false));
+    require(!arena.order.find(recycled[claim]), "a compaction changed T2's order: claim " + std::to_string(claim) +
+                                                    " did not recycle key " + std::to_string(recycled[claim]));
+  }
+  for (uint64_t load = 4; load < 40; ++load)
+    require(arena.order.claim(1000 + load, load, false) < 5, "a compacted recycler took a slot past its size");
+}
+
+// With T1 at its target, a compaction evicts T2's oldest keys, and a ghost
+// T1 gave up stays one in the fewer slots.
+void compactsAtTheTarget() {
+  SlotRecycler slots(4);
+  for (uint64_t key = 0; key < 4; ++key) require(slots.claim(key, 1, false) == key, "a fresh claim moved");
+  slots.touch(0, 2, false);
+  slots.touch(1, 2, false);
+  // Key 4 recycles T1's 2, whose claim as a ghost grows T1's target to one
+  // and recycles T1's 3 into a ghost: T1 holds 4, T2 0, 1 and 2.
+  require(slots.claim(4, 3, false) == 2 && slots.claim(2, 4, false) == 3 && slots.ghostHits() == 1,
+          "the claims before the compaction recycled other slots");
+  std::vector<uint32_t> evicted;
+  std::vector<std::pair<uint32_t, uint32_t>> moved;
+  slots.compact(
+      2, [&](uint32_t slot) { evicted.push_back(slot); },
+      [&](uint32_t from, uint32_t to) { moved.emplace_back(from, to); });
+  require(evicted == std::vector<uint32_t>{0, 1} &&
+              moved == std::vector<std::pair<uint32_t, uint32_t>>{{2, 0}, {3, 1}},
+          "a compaction with T1 at its target evicted other keys than T2's oldest");
+  require(slots.find(4) == 0 && slots.find(2) == 1 && !slots.find(0) && !slots.find(1),
+          "a compacted key is not where it moved");
+  // 3 is claimed as the ghost T1 gave up, and the victims, which left none,
+  // as new keys.
+  static_cast<void>(slots.claim(3, 5, false));
+  require(slots.ghostHits() == 2, "a compaction forgot a ghost within the slots");
+  static_cast<void>(slots.claim(0, 6, false));
+  static_cast<void>(slots.claim(1, 7, false));
+  require(slots.ghostHits() == 2, "a compaction's victim left a ghost");
+}
+
+// Repeated compactions keep as many keys as fit, nothing past the slots and ghosts within ARC's
+// bounds; a compaction to zero empties it.
+void compactionsKeepTheBounds() {
+  Arena arena(64);
+  uint64_t fresh = 0;
+  const auto loads = [&](uint32_t count) {
+    for (uint32_t load = 0; load < count; ++load) {
+      std::vector<uint64_t> keys;
+      for (uint64_t key = 0; key < arena.order.size() / 2; ++key) keys.push_back(key);
+      // More others in turn than the slots the keys used again leave.
+      for (uint64_t other = 0; other < arena.order.size() / 4; ++other)
+        keys.push_back(1000 + fresh++ % arena.order.size());
+      static_cast<void>(arena.route(keys, load % 7 == 3));
+      if (load % 11 == 5 && !arena.slotOf.empty()) {
+        const auto [key, slot] = *arena.slotOf.begin();
+        arena.order.free(slot);
+        arena.slotOf.erase(key);
+        arena.owner[slot] = Arena::kFree;
+      }
+    }
+  };
+  for (const uint32_t slots : {48u, 47u, 20u, 9u, 1u}) {
+    loads(60);
+    const size_t keys = arena.slotOf.size();
+    const uint64_t hits = arena.order.ghostHits();
+    arena.compact(slots);
+    require(arena.order.size() == slots && arena.slotOf.size() == std::min<size_t>(keys, slots),
+            "a compaction to " + std::to_string(slots) + " slots kept " + std::to_string(arena.slotOf.size()) +
+                " of " + std::to_string(keys) + " keys");
+    loads(40);
+    require(slots == 1 || arena.order.ghostHits() > hits,
+            "the loads after a compaction to " + std::to_string(slots) + " slots hit no ghost");
+    for (const auto &[key, slot] : arena.slotOf)
+      require(slot < slots, "a claim after a compaction took a slot past its size");
+  }
+  arena.compact(0);
+  require(arena.order.size() == 0 && arena.slotOf.empty(), "a compaction to no slot kept a key");
+  arena.order.resize(16);
+  arena.owner.assign(16, Arena::kFree);
+  loads(20);
+  require(!arena.slotOf.empty(), "a recycler compacted to no slot did not grow again");
+  rejects([&] { arena.order.compact(17, [](uint32_t) {}, [](uint32_t, uint32_t) {}); }, "more slots",
+          "a compaction to more slots than the recycler holds was taken");
+}
+
+// A compaction straight to fewer slots keeps the keys chunk-at-a-time compactions keep, moving each
+// key at most once.
+void compactsToTheFloorOnce() {
+  for (const uint64_t held : {64u, 48u}) {
+    Arena once(64), steps(64);
+    for (Arena *arena : {&once, &steps}) {
+      for (uint64_t key = 0; key < held; ++key) static_cast<void>(arena->route({key}, false));
+      // Every third key routed again, into T2.
+      std::vector<uint64_t> again;
+      for (uint64_t key = 0; key < held; key += 3) again.push_back(key);
+      static_cast<void>(arena->route(again, false));
+    }
+    once.compact(16);
+    for (const uint32_t slots : {52u, 40u, 28u, 16u}) steps.compact(slots);
+    const auto keys = [](const Arena &arena) {
+      std::set<uint64_t> result;
+      for (const auto &[key, slot] : arena.slotOf) result.insert(key);
+      return result;
+    };
+    uint64_t movedOnce = 0, movedSteps = 0;
+    for (const auto &[key, count] : once.moves) {
+      require(count == 1, "a compaction straight to fewer slots moved key " + std::to_string(key) + " twice");
+      movedOnce += count;
+    }
+    for (const auto &[key, count] : steps.moves) movedSteps += count;
+    require(keys(once) == keys(steps) && once.slotOf.size() == 16,
+            "a compaction straight to fewer slots kept other keys than compactions a chunk at a time");
+    require(movedOnce <= movedSteps, "a compaction straight to fewer slots moved " + std::to_string(movedOnce) +
+                                         " keys, more than compactions a chunk at a time, " +
+                                         std::to_string(movedSteps));
+  }
 }
 
 void aScanSparesTheFrequent() {
@@ -214,141 +385,22 @@ void claimsAllocateNothing() {
   require(slots.ghostHits() > 0, "the loads hit no ghost");
 }
 
-// The decode selections of real requests: the blocks each attention layer
-// of Qwen3.8-Flash-Next's decode selected, step by step, as a build that
-// recorded every layer's block lists wrote them (not part of Splash), for a
-// novel at 126K and 252K tokens and a source tree at 126K, two questions
-// each; the committed traces keep layers 0 and 6 of each request's first 100
-// steps. A trace (NAME.kvst) is the magic "KVS1", then unsigned LEB128
-// varints: the requests and the layers; per request its steps; per step and
-// layer the step's first position, its blocks' count and the blocks in
-// ascending order, the first as it is and each other as its distance from
-// the one before. Per request, its steps; per step and layer, its first
-// position and blocks.
-struct TraceStep final {
-  uint32_t first = 0;
-  std::vector<std::vector<uint32_t>> layers;
-};
-using Trace = std::vector<std::vector<TraceStep>>;
-
-Trace readTrace(const std::filesystem::path &path) {
-  std::ifstream file(path, std::ios::binary);
-  const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-  size_t at = 4;
-  const auto varint = [&] {
-    uint64_t value = 0;
-    for (uint32_t shift = 0;; shift += 7) {
-      require(at < bytes.size(), "a selection trace ends early: " + path.string());
-      value |= uint64_t{bytes[at] & 0x7fu} << shift;
-      if (!(bytes[at++] & 0x80)) return static_cast<uint32_t>(value);
-    }
-  };
-  require(bytes.size() >= 4 && std::string(bytes.begin(), bytes.begin() + 4) == "KVS1",
-          "not a selection trace: " + path.string());
-  Trace trace(varint());
-  const uint32_t layers = varint();
-  for (std::vector<TraceStep> &request : trace) {
-    request.resize(varint());
-    for (TraceStep &step : request) {
-      step.layers.resize(layers);
-      for (std::vector<uint32_t> &blocks : step.layers) {
-        step.first = varint();
-        blocks.resize(varint());
-        uint32_t block = 0;
-        for (uint32_t &entry : blocks) entry = block += varint();
-      }
-    }
-  }
-  require(at == bytes.size(), "a selection trace has bytes past its steps: " + path.string());
-  return trace;
-}
-
-// The misses of one layer of a request's decode as the hot block cache's
-// resolves place its blocks in `slots` slots (model::KvBlockCache): those
-// of the open page and after it are the page table's; a step touches the
-// blocks it holds, then claims slots for the others, never one it touched;
-// the first step, of an empty cache, does not count. `recency` recycles the
-// least recently used slot instead.
-uint64_t misses(const std::vector<TraceStep> &request, uint32_t layer, uint32_t slots, bool recency) {
-  constexpr uint32_t kPageBlocks = 8, kPageTokens = 32;
-  SlotRecycler order(slots);
-  std::list<uint32_t> used;
-  std::unordered_map<uint32_t, std::pair<std::list<uint32_t>::iterator, uint64_t>> lru;
-  uint64_t total = 0;
-  for (uint64_t load = 1; load <= request.size(); ++load) {
-    const TraceStep &step = request[load - 1];
-    const uint32_t paged = step.first / kPageTokens * kPageBlocks;
-    std::vector<uint32_t> missing;
-    for (const uint32_t block : step.layers[layer]) {
-      if (block >= paged) continue;
-      if (!recency) {
-        if (const auto slot = order.find(block)) order.touch(*slot, load, false);
-        else missing.push_back(block);
-      } else if (const auto held = lru.find(block); held != lru.end()) {
-        used.splice(used.end(), used, held->second.first);
-        held->second.second = load;
-      } else {
-        missing.push_back(block);
-      }
-    }
-    if (load > 1) total += missing.size();
-    for (const uint32_t block : missing) {
-      if (!recency) {
-        static_cast<void>(order.claim(block, load, false));
-        continue;
-      }
-      if (used.size() == slots) {
-        auto oldest = used.begin();
-        while (lru.at(*oldest).second == load) ++oldest;
-        lru.erase(*oldest);
-        used.erase(oldest);
-      }
-      lru[block] = {used.insert(used.end(), block), load};
-    }
-  }
-  return total;
-}
-
-void adaptiveReplacementKeepsUpWithRecency(const std::filesystem::path &traces) {
-  // One lane's floor, two lanes' selections a layer: the knee of the hot
-  // block cache's hit rate, as measured on such traces.
-  constexpr uint32_t kSlots = 8192;
-  std::vector<std::filesystem::path> paths;
-  for (const auto &entry : std::filesystem::directory_iterator(traces))
-    if (entry.path().extension() == ".kvst") paths.push_back(entry.path());
-  std::ranges::sort(paths);
-  require(!paths.empty(), "no selection trace in " + traces.string());
-  uint64_t adaptive = 0, recency = 0;
-  for (const std::filesystem::path &path : paths) {
-    const Trace trace = readTrace(path);
-    uint64_t traceAdaptive = 0, traceRecency = 0;
-    for (const std::vector<TraceStep> &request : trace)
-      for (uint32_t layer = 0; layer < request.front().layers.size(); ++layer) {
-        traceAdaptive += misses(request, layer, kSlots, false);
-        traceRecency += misses(request, layer, kSlots, true);
-      }
-    std::cout << "slot_recycler_test: " << path.filename().string() << ": " << traceAdaptive << " misses, "
-              << traceRecency << " least recently used\n";
-    adaptive += traceAdaptive;
-    recency += traceRecency;
-  }
-  require(adaptive * 100 <= recency * 102, "adaptive replacement missed " + std::to_string(adaptive) +
-                                               " blocks, recency " + std::to_string(recency));
-}
-
 } // namespace
 
-int main(int argc, char **argv) {
+int main() {
   try {
-    if (argc != 2) throw std::invalid_argument("usage: slot_recycler_test SELECTION_TRACES");
     neverTakesTheLoadsOwn();
     freeSlotsFirst();
     findsWhatItHolds();
+    countsItsGhosts();
     resizes();
+    compactsInRecencyOrder();
+    compactsAtTheTarget();
+    compactionsKeepTheBounds();
+    compactsToTheFloorOnce();
     aScanSparesTheFrequent();
     aRoutedCoreOutlivesMoreLanes();
     claimsAllocateNothing();
-    adaptiveReplacementKeepsUpWithRecency(argv[1]);
   } catch (const std::exception &error) {
     std::cerr << "slot_recycler_test: FAIL: " << error.what() << '\n';
     return 1;

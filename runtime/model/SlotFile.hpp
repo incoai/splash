@@ -41,18 +41,18 @@ namespace splash::model {
 // page's slot draws on it (Draw::Commitment). Every draw checks what the
 // files hold against its limit, so none passes a full volume.
 //
-// A write budget that spares the drive is the user's to set
-// (setWriteBudget, --max-cache-disk-writes); without one, the default, every
-// write passes and nothing is held back. With one, every write a file of the
-// tier submits draws on it: a token bucket of this process, counted at
-// submission in whole slots, which each start begins full. The budget then
+// A write budget that spares the drive is the user's to set (setWriteBudget,
+// --max-cache-disk-writes); without one, the default, every write passes and
+// nothing is held back. With one, every write a file of the tier submits
+// draws on it: a token bucket of this process, counted at submission in the
+// host pages each write stores, which each start begins full. The budget then
 // decides which states are written: while it is spent, an evicted state is
-// dropped instead and a persistent restore point waits, unless the state is
-// in use (the state a conversation resumes from), which passes. KV is written
-// only for a state the budget let through, its chain's pages kept reachable
-// or copied after it: those writes pass, counted all the same, so such a
-// state never loses its chain for want of budget, and what a chain costs
-// comes out of later states' share. Writes are submitted on the engine
+// dropped instead and a restore point waits for its copies, unless the state
+// is in use (the state a conversation resumes from), which passes. KV is
+// written only for a state the budget let through, its chain's pages kept
+// reachable or copied after it: those writes pass, counted all the same, so
+// such a state never loses its chain for want of budget, and what a chain
+// costs comes out of later states' share. Writes are submitted on the engine
 // thread, which alone reads the budget (admits), so a write the engine
 // admitted is never refused for it.
 class DiskBudget final {
@@ -212,8 +212,9 @@ public:
   [[nodiscard]] uint64_t writtenBytes() const noexcept {
     return written_.load(std::memory_order_relaxed);
   }
-  // Bytes the budget's files occupy on disk: the slots written since their
-  // blocks last went back.
+  // Bytes the budget's files hold on disk, counting each slot written since
+  // its blocks last went back as a whole slot, though a shorter payload
+  // stores only its own pages.
   [[nodiscard]] uint64_t fileBytes() const noexcept {
     return file_.load(std::memory_order_relaxed);
   }
@@ -231,7 +232,7 @@ private:
   [[nodiscard]] double balanceAt(double now) const noexcept {
     return std::min(burstBytes_, balance_ + refillPerMillisecond_ * (now - balanceTime_));
   }
-  // A write's whole slot, as SlotFile::write submits it.
+  // The host pages a write stores, as SlotFile::write submits it.
   void charge(uint64_t bytes) noexcept {
     if (!refillPerMillisecond_)
       return;
@@ -303,11 +304,11 @@ struct SlotRecord final {
 // payload, which the worker computed while writing it. A freed slot's record
 // is cleared before its blocks return. The next process reads the records,
 // adopts the slots it keeps, and frees the others. A read of an adopted
-// slot fails unless each segment it covers matches its record, and the
-// worker's first read covers the whole payload, after which the slot is
-// trusted; so a slot that changed after its record was written, or whose
-// blocks never reached the drive, is a cache miss and nothing worse. Slots
-// this process wrote are trusted as a temporary file's are.
+// slot fails unless each segment it covers matches its record, and once a
+// read covered and matched the whole payload the slot is trusted; so a slot
+// that changed after its record was written, or whose blocks never reached
+// the drive, is a cache miss and nothing worse. Slots this process wrote are
+// trusted as a temporary file's are.
 class SlotFile final {
   struct Backing;
 
@@ -322,7 +323,7 @@ public:
     uint32_t labelBytes = 0;
   };
 
-  // The slot that holds payloadBytes: writes zero the rest.
+  // The slot that holds payloadBytes: writes zero the rest of its page.
   [[nodiscard]] static constexpr uint64_t slotBytesFor(uint64_t payloadBytes) noexcept {
     return alignUp(payloadBytes);
   }
@@ -368,11 +369,10 @@ public:
     // The size of the payload the last complete write stored and, in a
     // persistent file, the CRC-32C of each of its segments. Reads of an
     // adopted slot check the segments they cover against them while verify_
-    // holds, which the worker's first read clears once the whole payload
-    // matched.
+    // holds, which the first read that matched the whole payload clears.
     uint64_t payloadBytes_ = 0;
     std::vector<uint32_t> checksums_;
-    std::atomic<bool> verify_{false};
+    mutable std::atomic<bool> verify_{false};
     // Set when a write is submitted: freeing the slot then returns the
     // blocks that write may have taken.
     bool returnsBlocks_ = false;
@@ -454,12 +454,13 @@ public:
   void seal() noexcept;
   // The spans total at most one slot, a write's exactly the segments in a
   // file of several, and stay valid until the operation is ready. A write
-  // stores them in order from the start of the slot and zeros the rest, and
-  // takes the whole slot from the write budget as it is submitted; a read
-  // fills them from the start of the slot, the whole payload while an
-  // adopted slot is not yet trusted. A write is null once the file accepts
-  // no further writes, as acquire() is null at the limit; the write budget
-  // never makes it null.
+  // stores them in order from the start of the slot, zeros the rest of their
+  // last host page, and takes those pages from the write budget as it is
+  // submitted; a read fills them from the start of the slot, at most those
+  // pages and exactly the payload while an adopted slot is not yet trusted,
+  // and fails otherwise. A write is null once the file accepts no further
+  // writes, as acquire() is null at the limit; the write budget never makes
+  // it null.
   [[nodiscard]] std::shared_ptr<Operation> write(
       std::shared_ptr<Slot> slot, std::vector<std::span<const std::byte>> source,
       std::function<void()> completion);

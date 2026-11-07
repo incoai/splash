@@ -1,0 +1,81 @@
+/* The Chat's transcript: its messages in the column of page.css, the user's words as it draws
+   them, the model's replies under their line with their actions, messages off the screen, and the
+   way back to the latest. */
+
+main {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+/* MARK: Messages */
+
+/* A reply: its line, its Markdown, why it stopped short, its actions. */
+.reply {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* A line over a reply that didn't think has nothing to open. */
+.line:not(.reasoned) .toggle { pointer-events: none; }
+.line:not(.reasoned) .chevron { opacity: 0; }
+
+.glyph.again { mask-image: var(--again); width: var(--again-width); height: var(--again-height); }
+
+/* They show under the pointer and on the last reply, a little slower to come than to go, and
+   never while it streams. */
+.reply:is(:hover, .last):not(.live) .actions {
+  opacity: 1;
+  pointer-events: auto;
+  transition-delay: .08s;
+}
+
+.reply:not(.last) .again { display: none; }
+
+/* MARK: Messages off the screen */
+
+/* A message away from the screen is neither laid out nor painted, so that a long conversation's
+   resize, as the sidebar slides, or a line that folds, lays out only those near it: one never
+   drawn keeps the room page.estimator guesses for it, and once drawn, its own. Its paint is cut at
+   its edges, so that it takes room at its sides for the highlights that reach past the column, the
+   toggles' and the actions'. */
+#messages > article {
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto var(--estimate, 120px);
+  margin-inline: -8px;
+  padding-inline: 8px;
+}
+
+/* The user's words keep the column's first 80 px clear, 88 as the article reaches 8 px out. */
+#messages > .user { padding-left: 88px; }
+
+/* MARK: Back to the latest */
+
+/* A circle over the bottom of the page, once the reader has scrolled up from it: solid, in place
+   of a material, the window's background a shade deeper. */
+#latest {
+  position: fixed;
+  left: 50%;
+  bottom: 12px;
+  translate: -50% 0;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 50%;
+  background: linear-gradient(var(--fill), var(--fill)) -apple-system-text-background;
+  box-shadow: inset 0 0 0 1px var(--separator);
+  color: var(--label);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--quick), background-image var(--quick);
+}
+
+#latest.shown {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+#latest:hover { background-image: linear-gradient(var(--hover), var(--hover)); }
+#latest:active { background-image: linear-gradient(var(--quaternary), var(--quaternary)); }

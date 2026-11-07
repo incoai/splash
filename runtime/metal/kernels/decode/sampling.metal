@@ -14,6 +14,16 @@
 // verify rows (TargetSamplingParams): each dispatch covers the selected rows
 // of every lane, and the groups of the other policy's lanes return at once.
 
+// Whether `token` is one of a target's stop tokens (metal/abi/Sampling.h).
+// SPLASH_NO_TOKEN, which pads them, is none, also where acceptance retains
+// it as the selection of a row with no selectable logit.
+inline bool stop_token(constant uint *stop_tokens, uint token) {
+  bool stop = false;
+  for (uint place = 0; place < SPLASH_STOP_TOKENS; ++place)
+    stop |= token == stop_tokens[place];
+  return stop && token != SPLASH_NO_TOKEN;
+}
+
 // The row a lane selects from: its logits, the tokens it admits (its
 // constraint mask row, less the stop tokens when the lane ignores
 // end-of-sequence) and, for a sampled row whose maximum is known, their
@@ -23,8 +33,7 @@ struct TargetRow {
   device const uint *mask;
   bool constrained;
   bool exclude_stop;
-  uint stop_token_0;
-  uint stop_token_1;
+  constant uint *stop_tokens;
   uint vocabulary;
   float temperature;
   float maximum;
@@ -32,7 +41,7 @@ struct TargetRow {
   bool admits(uint token) const {
     if (constrained && (mask[token / 32] & (1u << (token % 32))) == 0)
       return false;
-    return !exclude_stop || (token != stop_token_0 && token != stop_token_1);
+    return !exclude_stop || !stop_token(stop_tokens, token);
   }
   float weight(float value) const {
     return exp((value - maximum) / temperature);
@@ -61,8 +70,7 @@ inline TargetRow selected_row(device const float *logits,
                            params.mask_words,
           (params.constrained_mask & (1u << lane)) != 0,
           (params.exclude_stop_mask & (1u << lane)) != 0,
-          params.stop_token_0,
-          params.stop_token_1,
+          params.stop_tokens,
           params.vocabulary,
           params.temperature[lane],
           0.0f};
@@ -1452,8 +1460,7 @@ inline float sparse_lookup(device const uint *ids,
 // One lane's view of AcceptBatchParams, built by decode_accept_dflash.
 struct AcceptParams {
   uint remaining;
-  uint stop_token_0;
-  uint stop_token_1;
+  constant uint *stop_tokens;
 };
 
 // Keeps at most params.remaining of the accepted tokens plus the correction,
@@ -1465,7 +1472,7 @@ inline void finish_acceptance(device const uint *tokens, uint accepted,
   accepted_count = accepted;
   retained = min(accepted + 1, params.remaining);
   for (uint i = 0; i < retained; ++i) {
-    if (tokens[i] == params.stop_token_0 || tokens[i] == params.stop_token_1) {
+    if (stop_token(params.stop_tokens, tokens[i])) {
       retained = i + 1;
       break;
     }
@@ -1682,8 +1689,7 @@ kernel void decode_accept_dflash(
   // A lane retains at most the rows its verify verified (the selector's
   // verify rows, SelectorBatchParams).
   uint remaining = min(params.remaining[batch], verify_rows[batch]);
-  AcceptParams lane_params{remaining, params.stop_token_0,
-                           params.stop_token_1};
+  AcceptParams lane_params{remaining, params.stop_tokens};
   device const uint *lane_draft =
       draft_tokens + batch * SPLASH_DRAFT_PROPOSAL_TOKENS;
   device uint *lane_target =

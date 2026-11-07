@@ -184,8 +184,8 @@ struct DFlashWindowCapture final {
 
 struct DFlashPrefillBuffers final {
   metal::MetalBuffer capturedTargetHidden;
-  // The split partials and counters of the context projections' chunks of
-  // up to a decode batch (Linear::addPrefill).
+  // The split partials and counters of the context projections' chunks the
+  // staged tile runs (Linear::addPrefill).
   ops::LinearScratch linearScratch;
   metal::MetalBuffer projected;
   metal::MetalBuffer hidden;
@@ -219,6 +219,9 @@ struct DFlashDraftWeights final {
   ops::Projection selectorProjection;
   metal::MetalBuffer predecessorCodebook;
   metal::MetalBuffer successorCodebook;
+  // The mask token's BF16 embedding the checkpoint ships, or none
+  // (kDraftMaskEmbedding).
+  metal::MetalBuffer maskEmbedding;
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
 };
@@ -242,7 +245,7 @@ public:
   void addContextPrefill(metal::CommandGraph &graph,
                          DFlashPrefillBuffers buffers, uint32_t rows,
                          std::span<const DFlashPrefillSpan> spans,
-                         std::span<const DFlashWindowCapture> windowCaptures = {}) const;
+                         std::span<const DFlashWindowCapture> windowCaptures) const;
   // Computes the rings' keys and values of `rows` positions from
   // startPosition on again from the context window they were kept in, as
   // addContextPrefill writes them from their context rows. The rows pass
@@ -264,6 +267,11 @@ public:
                     const ops::DraftSelectorBuffers &buffers,
                     std::span<const uint32_t> anchors,
                     std::span<const ops::SamplingPolicy> policies) const;
+  // Sets each of `lanes` lanes' mask rows of the draft input `rows` (all but
+  // its anchor's, row 0 of its draftQueryRows) to the mask embedding the
+  // checkpoint ships; without one they keep the target table's row.
+  void addMaskRows(metal::CommandGraph &graph, metal::MetalBuffer rows, uint32_t lanes) const;
+
   void addContextCommit(metal::CommandGraph &graph,
                         DFlashContextBuffers buffers,
                         std::span<const uint32_t> startPositions) const;

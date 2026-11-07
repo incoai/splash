@@ -245,14 +245,6 @@ void StateCache::makeOrdinary(uint64_t kvBlock, Entry &entry) {
     labelDisk(kvBlock, entry);
 }
 
-std::vector<uint64_t> StateCache::usedStates() const {
-  std::vector<uint64_t> blocks;
-  for (const auto &[kvBlock, _] : uses_)
-    if (contains(kvBlock))
-      blocks.push_back(kvBlock);
-  return blocks;
-}
-
 bool StateCache::contains(uint64_t kvBlock) const noexcept {
   const auto found = entries_.find(kvBlock);
   return found != entries_.end() && !found->second.invalid;
@@ -262,9 +254,8 @@ uint64_t StateCache::resumePoint() const noexcept {
   // Speculative protection keeps the newest ordinary publication, such as
   // the point of a request that just finished, and a checkpoint only without
   // one: checkpoints can survive cancellation but remain disposable. A state
-  // in use needs no such protection: a pass that nothing waits for takes
-  // nothing in use (MemoryReclaimDirective::upTo), and other work takes it
-  // after everything else.
+  // in use needs no such protection: only a claim that reaches InUse takes
+  // it (ReclaimClass), after everything else.
   std::optional<CacheEvictionCandidate> newest = ordinary_.newest();
   if (!newest)
     newest = checkpoints_.newest();
@@ -294,7 +285,7 @@ bool StateCache::onDisk(uint64_t kvBlock) const noexcept {
   return found != entries_.end() && found->second.disk != nullptr;
 }
 
-PersistStatus StateCache::persist(uint64_t kvBlock) {
+PersistStatus StateCache::persist(uint64_t kvBlock, bool makeRoom) {
   const auto found = entries_.find(kvBlock);
   if (found == entries_.end() || found->second.invalid)
     return PersistStatus::Unneeded;
@@ -311,7 +302,7 @@ PersistStatus StateCache::persist(uint64_t kvBlock) {
   std::unique_ptr<StateOffload> transfer =
       startWrite(kvBlock, [&source](std::function<void()> done) {
         return source->persist(std::move(done));
-      });
+      }, makeRoom);
   if (!transfer)
     return PersistStatus::Refused;
   beginWrite(kvBlock, entry, std::move(transfer), std::move(source));
@@ -327,37 +318,35 @@ void StateCache::relabel() const {
 }
 
 std::optional<CacheEvictionCandidate>
-StateCache::oldestOf(const RecencyOrder &order, bool keepResumePoint) const noexcept {
-  const std::optional<CacheEvictionCandidate> oldest = order.oldest();
-  if (oldest && keepResumePoint && oldest->id == resumePoint())
-    return std::nullopt;
-  return oldest;
+StateCache::oldestOf(const RecencyOrder &order, const std::optional<CacheEvictionCandidate> &after) noexcept {
+  return after ? order.next(*after) : order.oldest();
 }
 
 std::optional<CacheEvictionCandidate>
-StateCache::checkpointCandidate(bool keepResumePoint) const noexcept {
-  return oldestOf(checkpoints_, keepResumePoint);
+StateCache::checkpointCandidate(const std::optional<CacheEvictionCandidate> &after) const noexcept {
+  return oldestOf(checkpoints_, after);
 }
 
 std::optional<CacheEvictionCandidate>
-StateCache::ordinaryCandidate(bool keepResumePoint) const noexcept {
-  return oldestOf(ordinary_, keepResumePoint);
-}
-
-std::optional<CacheEvictionCandidate> StateCache::inUseCandidate() const noexcept {
-  return inUse_.oldest();
+StateCache::ordinaryCandidate(const std::optional<CacheEvictionCandidate> &after) const noexcept {
+  return oldestOf(ordinary_, after);
 }
 
 std::optional<CacheEvictionCandidate>
-StateCache::diskCandidate(bool duplicate) const noexcept {
-  return duplicate ? duplicates_.oldest() : diskOnly_.oldest();
+StateCache::inUseCandidate(const std::optional<CacheEvictionCandidate> &after) const noexcept {
+  return oldestOf(inUse_, after);
+}
+
+std::optional<CacheEvictionCandidate>
+StateCache::diskCandidate(bool duplicate, const std::optional<CacheEvictionCandidate> &after) const noexcept {
+  return oldestOf(duplicate ? duplicates_ : diskOnly_, after);
 }
 
 std::optional<CacheEvictionCandidate> StateCache::inUseDiskCandidate() const noexcept {
   return inUseOnDisk_.oldest();
 }
 
-StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
+StateEviction StateCache::reclaim(uint64_t kvBlock) {
   auto found = entries_.find(kvBlock);
   if (found == entries_.end() || found->second.pins || !found->second.ram)
     throw std::logic_error("state eviction candidate became pinned");
@@ -366,8 +355,8 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
   if (persisting(kvBlock))
     return {false, true};
   // One write at a time, of a class the tier takes now.
-  const bool writable = !entry.disk && entry.ram->canOffload(inUse(kvBlock));
-  if (writable && pending_ && unwritten != Unwritten::Drop)
+  const bool writable = reclaimWrites(kvBlock);
+  if (writable && pending_)
     return {false, true};
   if (writable) {
     if (auto transfer = startWrite(kvBlock, [state = entry.ram](std::function<void()> done) {
@@ -378,10 +367,109 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
     }
   }
   if (!entry.disk)
-    return unwritten == Unwritten::Keep ? StateEviction{} : erase(kvBlock, false);
+    return erase(kvBlock, false);
   // A write reads its own copy, so the RAM copy is free at once.
   discardRam(entry);
   reindex(kvBlock, entry);
+  return {true};
+}
+
+bool StateCache::reclaimable(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  return found != entries_.end() && found->second.ram && !found->second.pins && !found->second.invalid;
+}
+
+bool StateCache::pinned(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  return found != entries_.end() && found->second.pins;
+}
+
+uint64_t StateCache::lastUsed(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  return found == entries_.end() ? 0 : found->second.lastUsed;
+}
+
+bool StateCache::reclaimWrites(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  return found != entries_.end() && found->second.ram && !found->second.disk &&
+         found->second.ram->canOffload(inUse(kvBlock));
+}
+
+bool StateCache::takesWrite(bool inUse) const noexcept {
+  std::optional<CacheEvictionCandidate> oldest = inUse ? inUseWrites_.oldest() : checkpointWrites_.oldest();
+  if (!oldest && !inUse)
+    oldest = ordinaryWrites_.oldest();
+  const auto found = oldest ? entries_.find(oldest->id) : entries_.end();
+  return found != entries_.end() && found->second.ram->canOffload(inUse);
+}
+
+StateCache::Reclaims StateCache::reclaims(bool inUse, std::span<const uint64_t> kept) const {
+  Reclaims result{.writes = takesWrite(false), .usedWrites = inUse && takesWrite(true)};
+  std::vector<uint64_t> keeps(kept.begin(), kept.end());
+  std::ranges::sort(keeps);
+  keeps.erase(std::ranges::unique(keeps).begin(), keeps.end());
+  auto candidates = static_cast<uint32_t>(checkpoints_.size() + ordinary_.size() + (inUse ? inUse_.size() : 0));
+  auto writers = static_cast<uint32_t>((result.writes ? checkpointWrites_.size() + ordinaryWrites_.size() : 0) +
+                                       (result.usedWrites ? inUseWrites_.size() : 0));
+  for (const uint64_t kvBlock : keeps) {
+    ++reclaimVisits_;
+    const auto found = entries_.find(kvBlock);
+    if (found == entries_.end() || !candidate(kvBlock, found->second) || this->inUse(kvBlock))
+      continue;
+    --candidates;
+    writers -= result.writes && !found->second.disk && found->second.ram->writable() ? 1 : 0;
+  }
+  // The walk's order: checkpoints, ordinary states, states in use.
+  if (!pending_ && writers) {
+    for (const RecencyOrder *order : {&checkpointWrites_, &ordinaryWrites_, &inUseWrites_}) {
+      if (order == &inUseWrites_ ? !result.usedWrites : !result.writes)
+        continue;
+      for (auto state = order->oldest(); state && !result.staged; state = order->next(*state)) {
+        ++reclaimVisits_;
+        if (order == &inUseWrites_ || !std::ranges::binary_search(keeps, state->id))
+          result.staged = state->id;
+      }
+      if (result.staged)
+        break;
+    }
+  }
+  result.now = candidates - writers;
+  result.later = writers - (result.staged ? 1 : 0);
+  return result;
+}
+
+KvCache::StateMarks StateCache::marks(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  return found == entries_.end() ? KvCache::StateMarks{} : marks(kvBlock, found->second);
+}
+
+bool StateCache::candidate(uint64_t kvBlock, const Entry &target) const noexcept {
+  return !target.pins && !target.invalid && target.ram && !persisting(kvBlock);
+}
+
+KvCache::StateMarks StateCache::marks(uint64_t kvBlock, const Entry &target) const noexcept {
+  using Keep = KvCache::Keep;
+  const bool used = inUse(kvBlock) && !target.invalid;
+  // A RAM copy a reclaim may take without a disk copy leaves through a write
+  // where the tier can take one, and else with no copy: in neither case
+  // does it need its KV as it is.
+  const bool leaves = candidate(kvBlock, target) && !target.disk;
+  KvCache::Keeps keeps = used ? KvCache::keepBit(Keep::Used) : 0;
+  if (leaves && target.ram->writable())
+    keeps |= KvCache::keepBit(used ? Keep::UsedWriter : Keep::Writer);
+  return {.keeps = keeps, .needed = !leaves, .candidate = candidate(kvBlock, target)};
+}
+
+void StateCache::markResumePoint() noexcept {
+  const uint64_t point = resumePoint();
+  if (point != resumeMarked_)
+    kv_.moveResumePoint(std::exchange(resumeMarked_, point), point);
+}
+
+StateEviction StateCache::reclaimOutcome(uint64_t kvBlock) const noexcept {
+  // As reclaim() decides it.
+  if (persisting(kvBlock) || (reclaimWrites(kvBlock) && pending_))
+    return {false, true};
   return {true};
 }
 
@@ -519,7 +607,10 @@ StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {
     ++inUseEvictions_;
   RecencyOrder::unlink(target.ramNode);
   RecencyOrder::unlink(target.diskNode);
+  RecencyOrder::unlink(target.writeNode);
   entries_.erase(found);
+  kv_.setStateMarks(kvBlock, {}, false);
+  markResumePoint();
   kv_.countState(kvBlock, false, inUse(kvBlock));
   if (disk)
     kv_.countDiskState(kvBlock, false);
@@ -587,9 +678,11 @@ StateCache::Entry &StateCache::entryFor(uint64_t kvBlock) {
   Entry fresh;
   fresh.ramNode = RecencyOrder::allocate();
   fresh.diskNode = RecencyOrder::allocate();
+  fresh.writeNode = RecencyOrder::allocate();
   fresh.publication = publications_ + 1;
   Entry &placed = entries_.emplace(kvBlock, std::move(fresh)).first->second;
   kv_.countState(kvBlock, true, inUse(kvBlock));
+  reindex(kvBlock, placed);
   return placed;
 }
 
@@ -613,7 +706,8 @@ StateCache::Entry &StateCache::publicationEntry(uint64_t kvBlock, bool checkpoin
   return entry;
 }
 
-std::unique_ptr<StateOffload> StateCache::startWrite(uint64_t kvBlock, const StateWriter &write) {
+std::unique_ptr<StateOffload> StateCache::startWrite(uint64_t kvBlock, const StateWriter &write,
+                                                     bool makeRoom) {
   if (pending_)
     return {};
   // A publication at a used block is in use before its entry exists.
@@ -622,7 +716,7 @@ std::unique_ptr<StateOffload> StateCache::startWrite(uint64_t kvBlock, const Sta
   // none of the KV copies it restores through.
   kv_.countDiskState(kvBlock, true);
   std::unique_ptr<StateOffload> transfer = write(completion_);
-  while (!transfer && makeRoom_(used))
+  while (!transfer && makeRoom && makeRoom_(used))
     transfer = write(completion_);
   if (!transfer)
     kv_.countDiskState(kvBlock, false);
@@ -647,22 +741,27 @@ void StateCache::labelDisk(uint64_t kvBlock, const Entry &target) const {
 }
 
 // RAM copies wait for eviction in one order per class: checkpoints,
-// ordinary states, states in use. Disk copies wait for replacement as
+// ordinary states, states in use, the writable ones without a disk copy in
+// an order of the class's writes too. Disk copies wait for replacement as
 // redundant copies or as the only copy, of a state in use or not. A pinned
 // or invalid entry, a copy being written, or a RAM copy a write reads, is in
 // no order.
 void StateCache::reindex(uint64_t kvBlock, Entry &target) noexcept {
   RecencyOrder::unlink(target.ramNode);
   RecencyOrder::unlink(target.diskNode);
-  if (target.pins || target.invalid)
-    return;
+  RecencyOrder::unlink(target.writeNode);
   const bool used = inUse(kvBlock);
-  if (target.ram && !persisting(kvBlock))
-    (used ? inUse_ : target.checkpoint ? checkpoints_ : ordinary_)
-        .link(target.ramNode, target.lastUsed, kvBlock);
-  if (target.disk && !writing(kvBlock))
+  if (candidate(kvBlock, target)) {
+    (used ? inUse_ : target.checkpoint ? checkpoints_ : ordinary_).link(target.ramNode, target.lastUsed, kvBlock);
+    if (!target.disk && target.ram->writable())
+      (used ? inUseWrites_ : target.checkpoint ? checkpointWrites_ : ordinaryWrites_)
+          .link(target.writeNode, target.lastUsed, kvBlock);
+  }
+  if (target.disk && !writing(kvBlock) && !target.pins && !target.invalid)
     (target.ram ? duplicates_ : used ? inUseOnDisk_ : diskOnly_)
         .link(target.diskNode, target.lastUsed, kvBlock);
+  kv_.setStateMarks(kvBlock, marks(kvBlock, target), target.ram != nullptr);
+  markResumePoint();
 }
 
 void StateCache::discardRam(Entry &target) noexcept {

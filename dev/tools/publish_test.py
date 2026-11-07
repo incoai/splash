@@ -8,11 +8,15 @@ from pathlib import Path
 from huggingface_hub import HfApi
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from dev.tools import package  # noqa: E402
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--macos-min", required=True, help="minimum macOS, e.g. 26.4")
     parser.add_argument("--repo", required=True, help="e.g. owner/splash-releases")
     parser.add_argument(
         "--no-latest",
@@ -20,7 +24,9 @@ def main(argv=None):
         help="upload without moving the `latest` pointer",
     )
     args = parser.parse_args(argv)
-    archive = ROOT / "dist" / f"splash-{args.version}-arm64-macos26.tar.gz"
+    archive = (
+        ROOT / "dist" / f"{package.archive_name(args.version, args.macos_min)}.tar.gz"
+    )
     checksum = archive.with_suffix(archive.suffix + ".sha256")
     installer = ROOT / "dev/tools/install.sh"
     for path in (archive, checksum, installer):

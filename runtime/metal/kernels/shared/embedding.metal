@@ -2,7 +2,7 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/gguf_embedding_formats.h"
 
-// The gather of rows of native blocks (ops/Embedding.cpp) of a format of common/gguf_embedding_formats.h, each
+// The gather of rows as stored (ops::StoredRows) of a format of common/gguf_embedding_formats.h, each
 // element its decode as T: bf16, the token gathers', or fp32, the F32 values load-time widening writes
 // (model/GgufPreparation.cpp). Inlined, with the format's decode, so every gather stays one function (the compiler
 // otherwise keeps Q6_K's as a call).
@@ -22,42 +22,10 @@ __attribute__((always_inline)) inline void gguf_embedding(device const uint *tok
                    uint index [[thread_position_in_grid]]) { \
     gguf_embedding<F>(tokens, table, output, p, index); \
   }
-// Two gathers per gguf_embedding_format (metal/abi/Gguf.h), named by its kQuantFormats token: gguf_embed_<token>
+// Two gathers per GGUF format (metal/abi/QuantFormat.h), named by its kQuantFormats token: gguf_embed_<token>
 // into bf16 and gguf_embed_f32_<token> into fp32.
 #define GGUF_EMBEDDING_FORMAT(f, F) GGUF_GATHER(gguf_embed_##f, F, bfloat) GGUF_GATHER(gguf_embed_f32_##f, F, float)
-GGUF_EMBEDDING_FORMAT(q4k, GgufEmbedQ4K)
-GGUF_EMBEDDING_FORMAT(q6k, GgufEmbedQ6K)
-GGUF_EMBEDDING_FORMAT(q80, GgufEmbedQ80)
-GGUF_EMBEDDING_FORMAT(q5k, GgufEmbedQ5K)
-GGUF_EMBEDDING_FORMAT(q3k, GgufEmbedQ3K)
-GGUF_EMBEDDING_FORMAT(q2k, GgufEmbedQ2K)
-GGUF_EMBEDDING_FORMAT(q40, GgufEmbedQ40)
-GGUF_EMBEDDING_FORMAT(q41, GgufEmbedQ41)
-GGUF_EMBEDDING_FORMAT(q50, GgufEmbedQ50)
-GGUF_EMBEDDING_FORMAT(q51, GgufEmbedQ51)
-GGUF_EMBEDDING_FORMAT(pq20, GgufEmbedPQ20)
-GGUF_EMBEDDING_FORMAT(q20, GgufEmbedQ20)
-GGUF_EMBEDDING_FORMAT(iq4nl, GgufEmbedIQ4NL)
-GGUF_EMBEDDING_FORMAT(iq4xs, GgufEmbedIQ4XS)
-GGUF_EMBEDDING_FORMAT(iq3s, GgufEmbedIQ3S)
-GGUF_EMBEDDING_FORMAT(iq3xxs, GgufEmbedIQ3XXS)
-GGUF_EMBEDDING_FORMAT(iq2xxs, GgufEmbedIQ2XXS)
-GGUF_EMBEDDING_FORMAT(iq2xs, GgufEmbedIQ2XS)
-GGUF_EMBEDDING_FORMAT(iq2s, GgufEmbedIQ2S)
-GGUF_EMBEDDING_FORMAT(iq1s, GgufEmbedIQ1S)
-GGUF_EMBEDDING_FORMAT(iq1m, GgufEmbedIQ1M)
-GGUF_EMBEDDING_FORMAT(mxfp4, GgufEmbedMXFP4)
-GGUF_EMBEDDING_FORMAT(nvfp4, GgufEmbedNVFP4)
-GGUF_EMBEDDING_FORMAT(fp8, GgufEmbedFP8)
-GGUF_EMBEDDING_FORMAT(bf16, GgufEmbedBF16)
-GGUF_EMBEDDING_FORMAT(f16, GgufEmbedF16)
-#define GGUF_EMBEDDING_AFFINE(B)                                                                \
-  GGUF_EMBEDDING_FORMAT(af##B##g32, GgufEmbedAF##B##G32)                                        \
-  GGUF_EMBEDDING_FORMAT(af##B##g64, GgufEmbedAF##B##G64)                                        \
-  GGUF_EMBEDDING_FORMAT(af##B##g128, GgufEmbedAF##B##G128)
-GGUF_EMBEDDING_AFFINE(2) GGUF_EMBEDDING_AFFINE(3) GGUF_EMBEDDING_AFFINE(4) GGUF_EMBEDDING_AFFINE(5)
-GGUF_EMBEDDING_AFFINE(6) GGUF_EMBEDDING_AFFINE(8)
-#undef GGUF_EMBEDDING_AFFINE
+GGUF_EMBEDDING_FORMATS(GGUF_EMBEDDING_FORMAT)
 #undef GGUF_EMBEDDING_FORMAT
 #undef GGUF_GATHER
 
@@ -77,4 +45,19 @@ kernel void verify_input_tokens(
                    : draft_tokens[batch * SPLASH_DRAFT_PROPOSAL_TOKENS +
                                   row - 1];
   verify_input[index] = min(token, params.vocabulary - 1u);
+}
+
+// Each lane's mask rows of its draft input, rows 1 to SPLASH_TARGET_VERIFY_ROWS - 1 (the
+// rows after its anchor), set to the mask embedding the draft's checkpoint ships
+// (ops/Embedding.cpp addDraftMaskRows): x a span of 256 columns, y the mask row, z the lane.
+kernel void draft_mask_rows(
+    device const bfloat *mask [[buffer(0)]],
+    device bfloat *rows [[buffer(1)]],
+    constant DraftMaskRowsParams &params [[buffer(2)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  const uint column = group.x * 256 + thread_index;
+  if (column >= params.width)
+    return;
+  rows[(ulong(group.z) * SPLASH_TARGET_VERIFY_ROWS + 1 + group.y) * params.width + column] = mask[column];
 }

@@ -36,7 +36,7 @@ void addIndexerProjections(metal::CommandGraph &graph, const ops::Linear &linear
     if (segments.size() != 1 || !segments.front().isFloat())
       throw std::invalid_argument("the QSA indexer projections are single float segments");
     return ops::FloatProjection{&segments.front(), std::move(output), weights.outputSize, 0,
-                                linear.ggufFloatTile(rows, weights.outputSize)};
+                                linear.ggufFloatTile(rows, weights.outputSize, segments.front().formatId)};
   };
   const std::array<ops::FloatProjection, 2> projections{projection(indexer.query, std::move(query)),
                                                         projection(indexer.key, std::move(key))};
@@ -418,7 +418,7 @@ void Qwen4ExpTarget::addPleGather(metal::CommandGraph &graph, const Qwen4Scratch
   // table's rows with the staging as a table of `count` rows, so a row's
   // values are computed exactly as from the table.
   const ops::EmbeddingWeights staged{count, geometry_.pleHeadDimension,
-                                     ops::NativeRows(scratch.pleStaging, weights_.pleFormat)};
+                                     ops::StoredRows(scratch.pleStaging, weights_.pleFormat)};
   ops::Embedding::add(graph, scratch.pleSlots, staged, scratch.pleRows, count);
 }
 

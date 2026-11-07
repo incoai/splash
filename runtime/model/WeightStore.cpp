@@ -112,21 +112,35 @@ GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label
     if (!d.outputSize || !d.inputSize) throw WeightStoreError("GGUF tensor is empty: " + std::string(label));
     return d;
 }
+
+// A tensor's rows as stored, rowBytes each, after a descriptor that names no
+// planes or meta units (model/GgufImageLayout.hpp): a float segment's rows or
+// a token table's.
+metal::MetalBuffer readRows(WeightFile &file, const GgufTensorDescriptor &d, uint64_t rowBytes,
+                            std::string_view label) {
+    if (!rowBytes || d.p0 || d.p1 || d.metaBytes || d.metaGroups || d.plane1Bytes || d.metaTotalBytes ||
+        d.plane0Bytes != uint64_t{d.outputSize} * rowBytes)
+        throw WeightStoreError("GGUF rows are inconsistent: " + std::string(label));
+    return file.section(d.plane0Bytes, std::string(label) + "-rows");
+}
+
+// A float segment (ops::QuantizedSegment::rows): F32 or BF16 values, or the
+// native blocks of a quantized type.
+ops::QuantizedSegment readFloatRows(WeightFile &file, const GgufTensorDescriptor &d, std::string_view label) {
+    const uint32_t format = d.type == ggml::kF32 ? ops::QuantizedSegment::kFloat32 : gguf_format_of(d.type);
+    const uint64_t rowBytes = ops::QuantizedSegment::rowBytes(format, d.inputSize);
+    if (!rowBytes)
+        throw WeightStoreError("GGUF tensor type " + std::to_string(d.type) + " has no float rows of " +
+                               std::to_string(d.inputSize) + " values: " + std::string(label));
+    return ops::QuantizedSegment::rows(format, d.outputSize, d.inputSize, readRows(file, d, rowBytes, label));
+}
 } // namespace
 
 ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view label) {
     const GgufTensorDescriptor d = readGgufDescriptor(file, label);
-    // A float tensor's rows as stored, which no meta unit describes: F32, or
-    // BF16 (a MoE router a GGUF stores so; a repacked BF16 tensor has planes).
-    if (d.type == ggml::kF32 || (d.type == ggml::kBF16 && !d.metaGroups)) {
-        const bool bfloat16 = d.type == ggml::kBF16;
-        if (d.p0 || d.p1 || d.metaBytes || d.metaGroups || d.plane1Bytes || d.metaTotalBytes ||
-            d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * (bfloat16 ? sizeof(uint16_t) : sizeof(float)))
-            throw WeightStoreError("GGUF float section sizes are inconsistent: " + std::string(label));
-        return ops::QuantizedSegment::floats(
-            d.outputSize, d.inputSize, file.section(d.plane0Bytes, std::string(label) + "-floats"),
-            bfloat16 ? ops::QuantizedSegment::kBFloat16 : ops::QuantizedSegment::kFloat32);
-    }
+    // F32 or BF16 values as stored, which no meta unit describes (a GGUF's F32
+    // alpha/beta, its QSA indexer); a repacked BF16 tensor has planes.
+    if (d.type == ggml::kF32 || (d.type == ggml::kBF16 && !d.metaGroups)) return readFloatRows(file, d, label);
     const uint32_t format = gguf_format_of(d.type);
     if (format == GGUF_FMT_COUNT)
         throw WeightStoreError("unsupported GGUF tensor type " + std::to_string(d.type));
@@ -147,6 +161,11 @@ ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view la
                                          std::move(plane1), std::move(meta));
 }
 
+ops::QuantizedSegment readFloatSegment(WeightFile &file, std::string_view label) {
+    const GgufTensorDescriptor d = readGgufDescriptor(file, label);
+    return readFloatRows(file, d, label);
+}
+
 ops::Projection readBlockProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
                                     std::string_view label) {
     ops::QuantizedSegment segment = readQuantizedSegment(file, label);
@@ -160,13 +179,12 @@ ops::EmbeddingWeights readBlockEmbedding(WeightFile &file, uint32_t outputSize, 
     const GgufTensorDescriptor d = readGgufDescriptor(file, label);
     if (d.outputSize != outputSize || d.inputSize != inputSize)
         throw WeightStoreError("GGUF embedding does not match the layout: " + std::string(label));
-    // Rows as stored, of whole native blocks.
+    // Rows as stored, which the gather reads.
     const uint32_t format = gguf_format_of(d.type);
-    if (format == GGUF_FMT_COUNT || d.inputSize % kQuantFormats[format].block_elements ||
-        d.plane0Bytes != d.outputSize * ggufRowBytes(kQuantFormats[format], d.inputSize))
-        throw WeightStoreError("GGUF embedding rows are not native GGUF blocks: " + std::string(label));
-    return {outputSize, inputSize,
-            ops::NativeRows(file.section(d.plane0Bytes, std::string(label) + "-native"), format)};
+    const uint64_t rowBytes = quant_stored_row_bytes(format, d.inputSize);
+    if (!rowBytes)
+        throw WeightStoreError("GGUF embedding rows are not whole blocks of a GGUF format: " + std::string(label));
+    return {outputSize, inputSize, ops::StoredRows(readRows(file, d, rowBytes, label), format)};
 }
 
 std::string weightManifestFingerprint(

@@ -53,10 +53,15 @@ struct BlockTargetFormat final {
   }
 };
 
-// Reads the mixer sections that follow a layer's input norm, in file order.
+// Reads the mixer sections that follow a layer's input norm, in file order:
+// an attention layer's (readQwenAttention) or a GDN layer's.
 [[nodiscard]] QwenMixerWeights readQwenMixer(WeightFile &file, const BlockTargetFormat &format,
                                              const QwenTargetDimensions &target,
                                              bool fullAttention);
+// An attention layer's: its fused q, k and v projection, the q and k norms
+// and its output projection.
+[[nodiscard]] QwenAttentionWeights readQwenAttention(WeightFile &file, const BlockTargetFormat &format,
+                                                     const QwenTargetDimensions &target);
 
 // How a MoE target's blocks reach their routed experts: through a store when
 // they stream (its files' loader streamsExperts()), the target's layers its
@@ -70,11 +75,35 @@ struct MoeExperts final {
 [[nodiscard]] MoeExperts openMoeExperts(metal::MetalBackend &backend, const QwenTargetFiles &files,
                                         const QwenTargetDimensions &target);
 
-// A MoE block's sections in image order: its router, its routed experts'
-// gate, up and down (none when they stream), its shared expert's gate, up
-// and down and its scalar gate. Block `block` of the store when its experts
-// stream.
-[[nodiscard]] ops::BlockMoeWeights readMoeBlock(WeightFile &file, const MoeExperts &experts, uint32_t block);
+// A MoE block of `target`'s sections in image order: its router, its routed
+// experts' gate, up and down (none when they stream), its shared expert's
+// gate, up and down and, where the target's has one, its scalar gate. Block
+// `block` of the store when its experts stream.
+[[nodiscard]] ops::BlockMoeWeights readMoeBlock(WeightFile &file, const QwenTargetDimensions &target,
+                                                const MoeExperts &experts, uint32_t block);
+
+// Reads, into `result`, the head of a target whose last layer's rows read a
+// final norm, then its token embedding: the images after its layers'.
+template <class Weights, class Layout, class Files>
+void readQwenTargetHead(Weights &result, const Layout &layout, Files &&files, const BlockTargetFormat &format) {
+  {
+    WeightFile file = files.head();
+    result.finalNorm = format.norm(file, layout.hiddenSize, "final-norm");
+    result.logitsProjection =
+        format.projection(file, layout.vocabularySize, layout.hiddenSize, "logits");
+    // bf16 logits would round near-ties together: their spacing is 0.125 at
+    // logits of 16 to 32.
+    result.logitsProjection.destination = ops::FloatOutput::Float32;
+    file.finish();
+    result.files.push_back(file.record());
+  }
+  {
+    WeightFile file = files.embedding();
+    result.tokenEmbedding = format.embedding(file, layout.vocabularySize, layout.hiddenSize);
+    file.finish();
+    result.files.push_back(file.record());
+  }
+}
 
 // Reads a target through the files of its images, written from an upstream
 // source, in their format: per layer the input norm, mixer,
@@ -100,51 +129,50 @@ readQwenTargetWeights(const Layout &layout, Files &&files, const BlockTargetForm
     file.finish();
     result.files.push_back(file.record());
   }
-
-  {
-    WeightFile file = files.head();
-    result.finalNorm = format.norm(file, layout.hiddenSize, "final-norm");
-    result.logitsProjection =
-        format.projection(file, layout.vocabularySize, layout.hiddenSize, "logits");
-    // bf16 logits would round near-ties together: their spacing is 0.125 at
-    // logits of 16 to 32.
-    result.logitsProjection.destination = ops::FloatOutput::Float32;
-    file.finish();
-    result.files.push_back(file.record());
-  }
-  {
-    WeightFile file = files.embedding();
-    result.tokenEmbedding = format.embedding(file, layout.vocabularySize, layout.hiddenSize);
-    file.finish();
-    result.files.push_back(file.record());
-  }
+  readQwenTargetHead(result, layout, files, format);
   return result;
 }
 
 // Throws unless every dimension of a family's layout is set and the
-// dimensions agree with each other. The image planners hold each tensor to
-// whole plane tiles.
+// dimensions agree with each other: the GDN's where it has GDN layers (and
+// none without), the packed attention rows of every query head's queries and,
+// gated, gates (attentionGate), a MoE target's leading dense layers
+// (intermediateSize wide) before at least one MoE layer, and the sliding and
+// unrotated layers among the attention layers. The image planners hold each
+// tensor to whole plane tiles.
 template <class Layout> void requireQwenLayout(const Layout &layout) {
   const auto zero = [](auto... dimensions) { return ((dimensions == 0) || ...); };
+  const auto nonzero = [](auto... dimensions) { return ((dimensions != 0) || ...); };
   const bool dense = layout.ffnKind == QwenFfnKind::Dense;
   const uint32_t ffnWidth = dense ? layout.intermediateSize : layout.expertIntermediateSize;
-  const bool ffnZero = dense ? zero(ffnWidth) : zero(layout.experts, layout.expertsPerToken, ffnWidth);
-  const bool routingInconsistent = !dense && layout.expertsPerToken > layout.experts;
-  if (ffnZero || !(layout.rotaryTheta > 0.0F) ||
+  const bool ffnZero = dense ? zero(ffnWidth)
+                             : zero(layout.experts, layout.expertsPerToken, ffnWidth, layout.sharedExpertSlices) ||
+                                   (layout.leadingDenseLayers && zero(layout.intermediateSize));
+  const bool routingInconsistent =
+      !dense && (layout.expertsPerToken > layout.experts || layout.leadingDenseLayers >= layout.layers);
+  const bool gdn = layout.gdnLayerCount() != 0;
+  const bool gdnZero = zero(layout.packedGdnWidth, layout.convolutionDimension, layout.gdnKeyHeads,
+                            layout.gdnValueHeads, layout.gdnHeadDimension);
+  if (ffnZero || !(layout.rotaryTheta > 0.0F) || (gdn && gdnZero) ||
       zero(layout.nativeContextTokens, layout.layers, layout.hiddenSize, layout.vocabularySize,
-           layout.packedGdnWidth, layout.packedFullWidth, layout.convolutionDimension, layout.gdnKeyHeads,
-           layout.gdnValueHeads, layout.gdnHeadDimension, layout.attentionWidth, layout.attentionQueryHeads,
-           layout.attentionKvHeads, layout.attentionHeadDimension, layout.rotaryPairs,
-           layout.fullAttentionPeriod))
+           layout.packedFullWidth, layout.attentionWidth, layout.attentionQueryHeads, layout.attentionKvHeads,
+           layout.attentionHeadDimension, layout.rotaryPairs, layout.fullAttentionPeriod))
     throw WeightStoreError("Qwen target layout contains a zero dimension");
-  if (routingInconsistent || layout.gdnValueHeads % layout.gdnKeyHeads ||
-      layout.convolutionDimension != (2 * layout.gdnKeyHeads + layout.gdnValueHeads) * layout.gdnHeadDimension ||
+  const uint32_t kvWidth = 2 * layout.attentionKvHeads * layout.attentionHeadDimension;
+  const auto attentionMask = [&](uint64_t mask) {
+    return layout.attentionLayerCount() >= 64 || !(mask >> layout.attentionLayerCount());
+  };
+  if (routingInconsistent ||
+      (gdn ? layout.gdnValueHeads % layout.gdnKeyHeads ||
+                 layout.convolutionDimension !=
+                     (2 * layout.gdnKeyHeads + layout.gdnValueHeads) * layout.gdnHeadDimension ||
+                 // The GDN value rows are sized with attentionWidth throughout.
+                 layout.gdnValueHeads * layout.gdnHeadDimension != layout.attentionWidth
+           : nonzero(layout.packedGdnWidth, layout.convolutionDimension, layout.gdnKeyHeads, layout.gdnValueHeads,
+                     layout.gdnHeadDimension)) ||
       layout.attentionWidth != layout.attentionQueryHeads * layout.attentionHeadDimension ||
-      // The GDN value rows are sized with attentionWidth throughout.
-      layout.gdnValueHeads * layout.gdnHeadDimension != layout.attentionWidth ||
-      layout.packedFullWidth !=
-          2 * layout.attentionWidth + 2 * layout.attentionKvHeads * layout.attentionHeadDimension ||
-      !layout.kvLayout().valid() || !layout.gdnStateLayout().valid())
+      layout.packedFullWidth != (layout.attentionGate ? 2 : 1) * layout.attentionWidth + kvWidth ||
+      !attentionMask(layout.unrotatedLayers) || !layout.kvLayout().valid() || !layout.gdnStateLayout().valid())
     throw WeightStoreError("Qwen target layout is inconsistent");
 }
 
@@ -169,7 +197,7 @@ loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTar
       SafetensorsTargetLoader &safetensors = std::get<std::reference_wrapper<SafetensorsTargetLoader>>(files).get();
       return read(safetensors, BlockTargetFormat{safetensors.float32Norms(), ops::GdnHeadOrder::Grouped}, experts);
     } else {
-      throw WeightStoreError(std::string(Layout::family) + " loads from a GGUF only");
+      throw WeightStoreError(std::string(layout.family) + " loads from a GGUF only");
     }
   }();
   weights.experts = experts.store;

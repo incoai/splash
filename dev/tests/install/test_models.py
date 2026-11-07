@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from dev.tests.installer_fixtures import http_error
+from dev.tests.installer_fixtures import FakeHub, http_error, missing_repository
 from install import hub
 from install import models as installer
 from server import serve_options
@@ -30,10 +30,13 @@ class InstallerTest(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.fixture_number = 0
-        # Never use real user credentials or contact the network in these tests.
+        # Never use real user credentials or contact the network in these
+        # tests. huggingface_hub read HF_HUB_OFFLINE when it was imported, so
+        # clearing os.environ leaves the caller's setting in force.
         for patch in (
             mock.patch.dict(os.environ, {}, clear=True),
             mock.patch("huggingface_hub.get_token", return_value=None),
+            mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", False),
         ):
             patch.start()
             self.addCleanup(patch.stop)
@@ -132,6 +135,57 @@ class InstallerTest(unittest.TestCase):
     def test_command_line_takes_required_model_before_command(self):
         args = installer.parse_args(["--model", self.MODEL_ID, "prepare"])
         self.assertEqual((args.command, args.model), ("prepare", self.MODEL_ID))
+
+    def test_prepare_json_progress_has_downloads_report_their_progress(self):
+        reporting = []
+        base = ["--models", str(self.root), "--model", self.MODEL_ID, "prepare"]
+        with (
+            mock.patch.object(hub, "json_progress", False),
+            mock.patch("huggingface_hub.utils.disable_progress_bars") as bars,
+            mock.patch(
+                "install.upstream.prepare",
+                side_effect=lambda selection: reporting.append(
+                    (hub.json_progress, bars.call_count)
+                ),
+            ),
+        ):
+            self.assertEqual(installer.main(base), 0)
+            self.assertEqual(installer.main([*base, "--json-progress"]), 0)
+        # JSON lines in place of huggingface_hub's bars, which would break them.
+        self.assertEqual(reporting, [(False, 0), (True, 1)])
+        # Only prepare downloads.
+        with (
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            installer.parse_args(
+                ["--model", self.MODEL_ID, "verify", "--json-progress"]
+            )
+
+    def test_prepare_reports_a_failure_by_its_kind(self):
+        # The Hub has no such model, and nothing installed or cached stands
+        # in: the error event carries the class the app words, and the
+        # message the launcher records, with or without progress.
+        FakeHub(self, self.root / "hub")
+        argv = ["--models", str(self.root), "--model", self.MODEL_ID, "prepare"]
+        message = (
+            f"cannot resolve {self.MODEL_ID}: {hub.reason(missing_repository())}; "
+            "neither this installation nor the Hub cache records a commit for "
+            "the default branch"
+        )
+        for progress in ([], ["--json-progress"]):
+            with (
+                self.subTest(progress=progress),
+                mock.patch.object(hub, "json_progress", False),
+                mock.patch("huggingface_hub.utils.disable_progress_bars"),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(installer.main([*argv, *progress]), 1)
+            self.assertEqual(
+                json.loads(output.getvalue()),
+                {"event": "error", "kind": "not_found", "message": message},
+            )
 
     def test_variant_model_ids_parse_and_name_selection_links(self):
         self.assertEqual(
@@ -405,6 +459,41 @@ class ScriptEntryTests(unittest.TestCase):
                 timeout=60,
             )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_an_interrupted_installer_exits_without_waiting_for_its_downloads(self):
+        # Interrupted, a download goes on in huggingface_hub's pool, whose
+        # thread the interpreter would join at exit, a minute here.
+        script = (
+            "import runpy, time\n"
+            "from concurrent.futures import ThreadPoolExecutor\n"
+            "from install import upstream\n"
+            "def prepare(selection):\n"
+            "    ThreadPoolExecutor(1).submit(time.sleep, 60)\n"
+            "    raise KeyboardInterrupt\n"
+            "upstream.prepare = prepare\n"
+            "runpy.run_path('install/models.py', run_name='__main__')\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    script,
+                    "--models",
+                    temporary,
+                    "--model",
+                    "someone/model",
+                    "prepare",
+                ],
+                cwd=Path(installer.__file__).resolve().parents[1],
+                env={"HOME": temporary, "HF_HUB_OFFLINE": "1"},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self.assertEqual(
+            (result.returncode, result.stdout, result.stderr), (130, "", "")
+        )
 
 
 if __name__ == "__main__":

@@ -11,8 +11,9 @@ using namespace metal;
 // 16-group and pairs 2, 3 are elements 16+4c..16+4c+3 of the second. A format
 // has its id, its sizes P0, P1, MetaBytes and MetaGroups from kQuantFormats,
 // its code offset Zero (0 but for the linear formats with a zero point), the
-// Group of elements one coefficient covers (32, or 16 when the halves of a
-// group have their own) and
+// Group of elements one coefficient covers (32, 16 when the halves of a group
+// have their own, or every group of a meta unit when they share one: MLX
+// affine's 64 and 128, PQ2_0's 128, Q2_0's 64, FP8's and BF16's 256) and
 //   load(plane0, plane1) -> Payload, loadMeta(meta) -> Meta
 //   chunk(Payload, c) -> Chunk
 //   loadChunk(plane0, plane1, c) -> Chunk, the same chunk read on its own
@@ -50,16 +51,18 @@ inline half4 quant_e4m3_word(uint word) {
   return half4(even.x, odd.x, even.y, odd.y);
 }
 
-// s.x scales and m.x offsets pairs 0, 1, s.y and m.y pairs 2, 3 (equal for
-// 32-element coefficient groups).
+// s.x scales and m.x offsets pairs 0, 1, s.y and m.y pairs 2, 3 (equal where
+// one coefficient covers 32 elements or more: the register tile then reads the
+// x halves alone).
 struct QuantCoef {
   float2 s;
   float2 m = float2(0.0f);
 };
 
 // The id, sizes and traits of format F of kind K with code offset Z, whose
-// coefficients cover G elements and, with InChunk, whose scales are in every
-// chunk of a group.
+// coefficients cover G elements (32 * MetaGroups where the groups of a meta
+// unit share one) and, with InChunk, whose scales are in every chunk of a
+// group.
 #define QUANT_FORMAT(F, K, Z, G, InChunk)                                                                        \
   enum : uint { Id = F, P0 = kQuantFormats[F].plane0_bytes, P1 = kQuantFormats[F].plane1_bytes, MetaBytes = kQuantFormats[F].meta_bytes }; \
   enum : ushort { MetaGroups = kQuantFormats[F].meta_groups, Zero = Z, Group = G };                              \
@@ -98,7 +101,7 @@ inline uint quant_spread2(uint bits) { return (bits & 0x3333u) | ((bits & 0xCCCC
 // block_q4_K / block_q5_K header: s = d * sc and m = -dmin * mn with the 6-bit sc, mn of group j. The 12 scale
 // bytes are hdr.y (0-3), hdr.z (4-7) and hdr.w (8-11), taken with shifts: the group index is not a compile-time
 // constant, and indexing a thread-local byte array or vector by it costs ~8% of the eight-row staged kernel on
-// Apple10 (Yesheng Liang's measurement in incoai/splash 77beaed).
+// Apple10.
 inline QuantCoef quant_k4_coef(uint4 hdr, ushort j) {
   uint sc, m;
   if (j < 4) {
@@ -485,7 +488,7 @@ struct FmtNVFP4 {
 // FP8: plane0 E4M3 values (bytes 8c..8c+7 = chunk c, as Q8_0's); meta the tensor's FP32 scale g. value = g * e4m3,
 // whose scale is 256 g.
 struct FmtFP8 {
-  QUANT_FORMAT(GGUF_FMT_FP8, QuantFloat8, 0, 32, false);
+  QUANT_FORMAT(GGUF_FMT_FP8, QuantFloat8, 0, 32 * MetaGroups, false);
   struct Payload { uint4 a; uint4 b; }; typedef uint2 Chunk; typedef float Meta;
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0), *((device uint4 *)(p0 + 16))}; }
   static Meta loadMeta(device uchar *m) { return *((device float *)m); }
@@ -497,7 +500,7 @@ struct FmtFP8 {
 // BF16, F16: plane0 the group's 16-bit values (16 bytes 16c..16c+15 = chunk c); meta the FP32 scale g of 256
 // elements (1 for a GGUF tensor). value = g * x.
 template <uint F, class V> struct FmtFloat16 {
-  QUANT_FORMAT(F, QuantFloat16, 0, 32, false);
+  QUANT_FORMAT(F, QuantFloat16, 0, 32 * MetaGroups, false);
   typedef V Value;
   struct Payload { uint4 a, b, c, d; }; typedef uint4 Chunk; typedef float Meta;
   static Payload load(device uchar *p0, device uchar *) {
@@ -515,7 +518,7 @@ typedef FmtFloat16<GGUF_FMT_F16, half> FmtF16;
 // PQ2_0 (GGUF tensor type 142) and Q2_0 (type 42): plane0 2-bit codes as Q2_K's; meta the
 // half d of the native block, four groups (PQ2_0's 128 elements) or two (Q2_0's 64). value = d * (q - 1).
 template <uint F> struct FmtTwoBit {
-  QUANT_FORMAT(F, QuantLinear, 1, 32, false);
+  QUANT_FORMAT(F, QuantLinear, 1, 32 * MetaGroups, false);
   struct Payload { uint2 a; }; typedef uint Chunk; typedef ushort Meta;
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint2 *)p0)}; }
   static Meta loadMeta(device uchar *m) { return *((device ushort *)m); }
@@ -540,7 +543,7 @@ template <> struct AffinePlanes<8> { typedef FmtQ80 F; };
 // unsigned; meta the group's bf16 scale s and bias z. value = s * code + z.
 template <uint Bits, uint Groups> struct FmtAffine {
   typedef typename AffinePlanes<Bits>::F Planes;
-  QUANT_FORMAT(quant_affine_format_of(Bits, 32 * Groups), QuantLinear, 0, 32, false);
+  QUANT_FORMAT(quant_affine_format_of(Bits, 32 * Groups), QuantLinear, 0, 32 * MetaGroups, false);
   typedef typename Planes::Payload Payload; typedef typename Planes::Chunk Chunk; typedef uint Meta;
   static Payload load(device uchar *p0, device uchar *p1) { return Planes::load(p0, p1); }
   static Meta loadMeta(device uchar *m) { return *((device uint *)m); }

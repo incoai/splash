@@ -10,18 +10,21 @@ from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers, 
 from transformers import PreTrainedTokenizerFast
 
 from dev.tests import server_fixtures as fixtures
-from server import api_shapes, chat_templates
+from server import chat_messages, chat_templates
 from server import frontend as request_frontend
+from server.chat_format import QWEN, REASONING_EFFORTS
 from server.chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
     NATIVE,
     PATCHED,
-    REASONING_EFFORTS,
     UNSUPPORTED,
     ChatTemplateError,
     ChatTemplates,
     template_options,
 )
+from server.dialects import anthropic as anthropic_dialect
+from server.dialects import responses as responses_dialect
+from server.dialects import scoring
 from server.errors import APIError
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/chat_templates"
@@ -220,6 +223,31 @@ class ChatTemplateProbeTests(unittest.TestCase):
                     "generation prompt 1 token",
                 )
 
+    def test_the_close_of_thinking_is_probed(self):
+        # As the template writes it after a reply's reasoning, the close a
+        # thinking budget ends with by default.
+        for name, close in (
+            ("qwen36", "\n</think>"),
+            ("qwen36_gguf", "\n</think>"),
+            ("qwen38", "\n</think>"),
+            ("qwen38_gguf", "\n</think>"),
+            ("flint", "</think>"),
+        ):
+            with self.subTest(name=name):
+                templates = ChatTemplates(tokenizer(source(name)))
+                self.assertEqual(templates.select(None).thinking_end, close)
+        # Whatever the template writes there.
+        written = BY_EFFORT.replace(
+            "{{ m.content }}",
+            "{% if m.reasoning_content %}<think>{{ m.reasoning_content }} Done.\n"
+            "</think>{% endif %}{{ m.content }}",
+        )
+        self.assertEqual(
+            ChatTemplates(tokenizer(written)).select(None).thinking_end,
+            " Done.\n</think>",
+        )
+        self.assertIsNone(ChatTemplates(tokenizer(BY_EFFORT)).select(None).thinking_end)
+
     def test_original_templates_reject_or_drop_what_the_patch_renders(self):
         for name in UPSTREAM:
             with self.subTest(name=name):
@@ -416,7 +444,7 @@ class ChatTemplateProbeTests(unittest.TestCase):
         # The guard also raises for the leading system message under one
         # effort, so there the patch would render that message twice.
         guard = "{%- if not loop.first %}"
-        for effort in chat_templates.REASONING_EFFORTS:
+        for effort in REASONING_EFFORTS:
             text = source("qwen36").replace(
                 guard, f"{{%- if not loop.first or reasoning_effort == '{effort}' %}}"
             )
@@ -425,6 +453,67 @@ class ChatTemplateProbeTests(unittest.TestCase):
                 self.assertEqual(
                     (chosen.later_system, chosen.source), (UNSUPPORTED, text)
                 )
+
+    def test_reasoning_names_the_efforts_a_template_tells_apart(self):
+        """Qwen3.8's templates tell three efforts apart, the others rendering
+        as their aliases, and reason at xhigh by default; Qwen3.6's reason or
+        not, at any effort; a template without reasoning tells none apart,
+        and one that rejects an effort without an alias it renders leaves
+        that effort out. The server's own default effort stands in for the
+        template's, named by the effort it renders like."""
+        levels = {
+            "thinks": True,
+            "efforts": ["low", "medium", "xhigh"],
+            "default": "xhigh",
+        }
+        switch = {"thinks": True, "efforts": [], "default": None}
+        for name, reasoning in (
+            ("qwen36", switch),
+            ("qwen36_gguf", switch),
+            ("qwen38", levels),
+            ("qwen38_gguf", levels),
+        ):
+            with self.subTest(name=name):
+                template = ChatTemplates(tokenizer(source(name))).select(None)
+                self.assertEqual(template.reasoning, reasoning)
+        plain = (
+            "{% for m in messages %}{{ m.content }}{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+        )
+        self.assertEqual(
+            ChatTemplates(chat_tokenizer(plain)).select(None).reasoning,
+            {"thinks": False, "efforts": [], "default": None},
+        )
+        rejecting = (
+            "{% set effort = reasoning_effort | default('high') %}"
+            "{% if effort not in ('none', 'low', 'high') %}"
+            "{{ raise_exception('Unsupported effort ' + effort) }}{% endif %}"
+            "{% for m in messages %}{{ m.content }}{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n"
+            "{% if effort != 'none' %}<think>{{ effort }}{% endif %}{% endif %}"
+        )
+        self.assertEqual(
+            ChatTemplates(chat_tokenizer(rejecting)).select(None).reasoning,
+            {"thinks": True, "efforts": ["low", "high"], "default": "high"},
+        )
+        for effort, reasoning in (
+            ("medium", {**levels, "default": "medium"}),
+            ("high", {**levels, "default": "xhigh"}),
+            ("minimal", {**levels, "default": "low"}),
+            ("none", {**levels, "thinks": False, "default": None}),
+        ):
+            with self.subTest(effort=effort):
+                frontend = fixtures.make_frontend(
+                    tokenizer(source("qwen38")),
+                    None,
+                    "test-model",
+                    4096,
+                    10,
+                    2,
+                    vision=False,
+                    default_reasoning_effort=effort,
+                )
+                self.assertEqual(frontend.reasoning, reasoning)
 
     def test_named_templates_are_probed_and_selected_like_the_tokenizer(self):
         native = (
@@ -500,9 +589,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         # Image rendering swaps the pad token for a marker in that template.
         chosen_sources = {
             chosen.source,
-            chosen.source.replace(
-                api_shapes.IMAGE_PAD_TOKEN, request_frontend.IMAGE_RENDER_MARKER
-            ),
+            chosen.source.replace(QWEN.image_pad, request_frontend.IMAGE_RENDER_MARKER),
         }
         for path, render in (
             (
@@ -579,9 +666,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             )
 
         for name in ("qwen36_gguf", "qwen38_gguf"):
-            app = frontend(
-                name, "<|im_start|>", "<|im_end|>", api_shapes.IMAGE_PAD_TOKEN
-            )
+            app = frontend(name, "<|im_start|>", "<|im_end|>", QWEN.image_pad)
             self.assertTrue(
                 app.chat_templates.describe().endswith("generation prompt 5-7 tokens")
             )
@@ -899,12 +984,14 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             tokenizer, None, "test-model", 8192, 10, 2, vision=True
         )
         tokenizer.templates.clear()
-        judgment, _ = app.prepare_judgment(
+        judgment, _ = scoring.prepare_judgment(
+            app,
             fixtures.judgment_body(),
             deadline=fixtures.FOREVER,
             disconnected=fixtures.stays_connected,
         )
-        systemone = app.prepare_systemone(
+        systemone = scoring.prepare_systemone(
+            app,
             {"model": "test-model", "state": {}, "questions": {"q": {"type": "noul"}}},
             deadline=fixtures.FOREVER,
             disconnected=fixtures.stays_connected,
@@ -929,7 +1016,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 {"type": "message", "role": "user", "content": "Continue"},
             ],
         }
-        chat, _ = api_shapes.responses_to_chat_body(body, body["input"])
+        chat, _ = responses_dialect.to_chat_body(body, body["input"])
         prompt = harness.app._render_prompt(
             harness.app._prepare_prompt(
                 chat, None, deadline=fixtures.FOREVER, without_slot=nullcontext
@@ -996,7 +1083,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
 
 class LeadingSystemMergeTests(unittest.TestCase):
     def test_leading_system_and_developer_messages_merge_into_one(self):
-        merged = api_shapes.normalize_messages(
+        merged = chat_messages.normalize_messages(
             [
                 {"role": "system", "content": "One"},
                 {"role": "developer", "content": [{"type": "text", "text": "Two"}]},
@@ -1007,8 +1094,6 @@ class LeadingSystemMergeTests(unittest.TestCase):
                 {"role": "system", "content": "Later still"},
             ],
             vision=True,
-            deadline=fixtures.FOREVER,
-            without_slot=nullcontext,
         )
         self.assertEqual(
             merged,
@@ -1020,27 +1105,25 @@ class LeadingSystemMergeTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            api_shapes.normalize_messages(
+            chat_messages.normalize_messages(
                 [
                     {"role": "system", "content": "  Only  "},
                     {"role": "user", "content": "x"},
                 ],
                 vision=True,
-                deadline=fixtures.FOREVER,
-                without_slot=nullcontext,
             )[0],
             {"role": "system", "content": "  Only  "},
         )
 
     def test_every_api_shape_leads_with_one_system_message(self):
-        responses = api_shapes.responses_to_chat_body(
+        responses = responses_dialect.to_chat_body(
             {"instructions": "Base"},
             [
                 {"role": "developer", "content": "Developer"},
                 {"role": "user", "content": "Ask"},
             ],
         )[0]["messages"]
-        anthropic = api_shapes.anthropic_to_chat_prompt(
+        anthropic = anthropic_dialect.to_chat_prompt(
             {
                 "model": "m",
                 "system": "Base",
@@ -1054,12 +1137,7 @@ class LeadingSystemMergeTests(unittest.TestCase):
         for messages in (responses, anthropic):
             with self.subTest(messages=messages):
                 self.assertEqual(
-                    api_shapes.normalize_messages(
-                        messages,
-                        vision=True,
-                        deadline=fixtures.FOREVER,
-                        without_slot=nullcontext,
-                    ),
+                    chat_messages.normalize_messages(messages, vision=True),
                     [
                         {"role": "system", "content": "Base\n\nDeveloper"},
                         {"role": "user", "content": "Ask"},

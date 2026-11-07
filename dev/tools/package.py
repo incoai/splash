@@ -30,15 +30,16 @@ INSTALL_FILES = (
     "assembly.py",
     "upstream.py",
     "local.py",
+    "cached.py",
     "gguf.py",
     "requirements.txt",
+    "suggested-models.tsv",
 )
 COMPLETION_FILES = (
     "models",
     "_splash",
     "splash.bash",
     "splash.fish",
-    "suggested-models.txt",
 )
 SERVER_FILES = (
     "__init__.py",
@@ -48,9 +49,9 @@ SERVER_FILES = (
     "output.py",
     "frontend.py",
     "chat_templates.py",
-    "judgments.py",
     "diagnostics.py",
-    "api_shapes.py",
+    "chat_messages.py",
+    "chat_format.py",
     "tool_schema.py",
     "tokenization.py",
     "json_codec.py",
@@ -58,6 +59,7 @@ SERVER_FILES = (
     "latency.py",
     "metrics.py",
     "errors.py",
+    "request_fields.py",
     "runtime.py",
     "protocol.py",
     "images.py",
@@ -70,23 +72,57 @@ SERVER_FILES = (
     "thinking.py",
     "schema_validation.py",
     "crash_trace.py",
+    "supervision.py",
+    "serve_record.py",
     "chat.html",
     "favicon.svg",
+)
+# How each API dialect answers (server/dialects).
+DIALECT_FILES = (
+    "__init__.py",
+    "anthropic.py",
+    "openai.py",
+    "responses.py",
+    "scoring.py",
 )
 CHAT_ASSET_FILES = (
     "markdown-it-15.0.2.min.js",
     "highlight-11.12.0.min.js",
+    "markdown-links.js",
     "github-11.12.0.min.css",
     "github-dark-11.12.0.min.css",
 )
+# The source folders the release ships, each with the files it ships of it.
+SOURCE_FOLDERS = (
+    ("install", INSTALL_FILES),
+    ("install/completions", COMPLETION_FILES),
+    ("server", SERVER_FILES),
+    ("server/dialects", DIALECT_FILES),
+    ("server/chat-assets", CHAT_ASSET_FILES),
+)
 # Splash's license and the notices of the third-party code it ships.
 LICENSE_FILES = ("LICENSE", "THIRD_PARTY_NOTICES")
+# The GitHub repository releases are published from.
+REPOSITORY = "incoai/splash"
 # The engine's files in build/, and the host-step spin's library beside them
 # when the build has one: a Metal compiler that refuses its kernel leaves none
 # (Makefile, HOST_STEP_LIB), and the engine then runs awake host steps without
 # the spin.
 ENGINE_FILES = ("splash", "splash.metallib")
 OPTIONAL_ENGINE_FILES = ("host-step.metallib",)
+# Imports that exercise the staged runtime's native libraries and Splash's own
+# entry modules, run from the runtime's directory.
+SMOKE_IMPORTS = (
+    "import sys; sys.path.insert(0, '.'); "
+    "import tokenizers, llguidance, numpy, PIL, transformers, huggingface_hub, pypdfium2; "
+    "import server.server, install.launcher"
+)
+
+
+def archive_name(version, macos_min):
+    """The release archive's name without its suffix. It names the major macOS
+    the runtime is built for (26 for 26.4), as the formula and the cask do."""
+    return f"splash-{version}-arm64-macos{macos_min.split('.')[0]}"
 
 
 def digest(path):
@@ -94,14 +130,30 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def python_distribution():
+    """The pinned standalone Python, downloaded into build/release once and
+    checked against PYTHON_SHA256."""
+    cached = ROOT / "build/release/python-runtime.tar.gz"
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    if not cached.exists() or digest(cached) != PYTHON_SHA256:
+        with tempfile.NamedTemporaryFile(dir=cached.parent) as download:
+            with urllib.request.urlopen(PYTHON_URL, timeout=60) as response:
+                shutil.copyfileobj(response, download)
+            download.flush()
+            if digest(Path(download.name)) != PYTHON_SHA256:
+                raise ValueError("Python distribution checksum mismatch")
+            # Linked into place whole, so a concurrent build never reads part of it;
+            # the download itself goes away with its temporary file.
+            temporary = cached.with_name(f".{Path(download.name).name}")
+            os.link(download.name, temporary)
+            temporary.replace(cached)
+    return cached
+
+
 def stage_runtime(destination, version):
-    for folder, names in (
-        ("install", INSTALL_FILES),
-        ("install/completions", COMPLETION_FILES),
-        ("server", SERVER_FILES),
-        ("server/chat-assets", CHAT_ASSET_FILES),
-        ("engine", ENGINE_FILES),
-    ):
+    """Copy the allowlisted files Splash ships into destination and write its
+    release.json."""
+    for folder, names in (*SOURCE_FOLDERS, ("engine", ENGINE_FILES)):
         (destination / folder).mkdir()
         source = ROOT / ("build" if folder == "engine" else folder)
         for name in names:
@@ -112,16 +164,65 @@ def stage_runtime(destination, version):
     for name in LICENSE_FILES:
         shutil.copy2(ROOT / name, destination / name)
     (destination / "release.json").write_text(
-        json.dumps(
-            {
-                "version": version,
-                "binary_sha256": digest(destination / "engine/splash"),
-                "metallib_sha256": digest(destination / "engine/splash.metallib"),
-            },
-            indent=2,
-        )
-        + "\n"
+        json.dumps({"version": version}, indent=2) + "\n"
     )
+
+
+def build_runtime(destination, version):
+    """Build the complete runtime in destination, an empty directory: the
+    files stage_runtime copies and the standalone Python with
+    install/requirements.txt, smoke-tested in place. The release archive and
+    Splash.app (package_app.py) ship this tree as it is: it holds no bytecode
+    and no console script, and the runtime, which runs with
+    PYTHONDONTWRITEBYTECODE=1, writes nothing into it."""
+    distribution = python_distribution()
+    stage_runtime(destination, version)
+    with tarfile.open(distribution) as python:
+        python.extractall(destination, filter="data")
+    python = destination / "python/bin/python3"
+    subprocess.run(
+        [
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--only-binary=:all:",
+            "--no-compile",
+            "-r",
+            str(destination / "install/requirements.txt"),
+        ],
+        check=True,
+    )
+    # Exercise imports and the public entry point from the actual staged
+    # runtime, not the developer's virtualenv or source PYTHONPATH, and, as
+    # the runtime runs, without writing bytecode.
+    subprocess.run(
+        [str(python), "-I", "-B", "-c", SMOKE_IMPORTS], cwd=destination, check=True
+    )
+    # The server's entry point as the launcher starts it, which the
+    # import above does not run. Not isolated: -I would ignore PYTHONPATH.
+    subprocess.run(
+        [str(python), "-B", "-P", "-m", "server.server", "--help"],
+        cwd=destination,
+        env={**os.environ, "PYTHONPATH": str(destination)},
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        [str(python), "-B", str(destination / "install/launcher.py"), "--help"],
+        cwd=destination,
+        check=True,
+    )
+    # Only the interpreter stays in python/bin. The other entries are scripts
+    # Splash never runs: the distribution's (pip, pydoc, ...) and the console
+    # scripts pip installs (hf, tqdm, ...), whose shebangs name this stage.
+    for entry in (destination / "python/bin").iterdir():
+        if not re.fullmatch(r"python3(\.\d+)?", entry.name):
+            entry.unlink()
+    # The bytecode the distribution ships and pip's run writes.
+    for cache in list(destination.rglob("__pycache__")):
+        shutil.rmtree(cache)
 
 
 def formula(version, url, checksum, macos_min):
@@ -143,7 +244,7 @@ end
 
 class Splash < Formula
   desc "Local inference engine for Apple silicon, built around the model"
-  homepage "https://github.com/incoai/splash"
+  homepage "https://github.com/{REPOSITORY}"
   url {quote(url)}
   sha256 {quote(checksum)}
   license "Apache-2.0"
@@ -192,84 +293,23 @@ def main(argv=None):
         parser.error("invalid release version")
     dist = ROOT / "dist"
     dist.mkdir(exist_ok=True)
-    name = f"splash-{args.version}-arm64-macos26"
+    name = archive_name(args.version, args.macos_min)
     archive = dist / f"{name}.tar.gz"
     if archive.exists():
         parser.error(f"release already exists: {archive}")
-    cached = ROOT / "build/release/python-runtime.tar.gz"
-    cached.parent.mkdir(parents=True, exist_ok=True)
-    if not cached.exists() or digest(cached) != PYTHON_SHA256:
-        with tempfile.NamedTemporaryFile(dir=cached.parent) as download:
-            with urllib.request.urlopen(PYTHON_URL, timeout=60) as response:
-                shutil.copyfileobj(response, download)
-            download.flush()
-            if digest(Path(download.name)) != PYTHON_SHA256:
-                raise ValueError("Python distribution checksum mismatch")
-            shutil.copyfile(download.name, cached)
     with tempfile.TemporaryDirectory(prefix=".package-", dir=dist) as temporary:
         stage = Path(temporary) / name
         stage.mkdir()
-        stage_runtime(stage, args.version)
-        with tarfile.open(cached) as python:
-            python.extractall(stage, filter="data")
-        python = stage / "python/bin/python3"
-        subprocess.run(
-            [
-                str(python),
-                "-m",
-                "pip",
-                "install",
-                "--disable-pip-version-check",
-                "--only-binary=:all:",
-                "--no-compile",
-                "-r",
-                str(stage / "install/requirements.txt"),
-            ],
-            check=True,
-        )
-        # Exercise imports and the public entry point from the actual staged
-        # runtime, not the developer's virtualenv or source PYTHONPATH.
-        subprocess.run(
-            [
-                str(python),
-                "-I",
-                "-c",
-                "import sys; sys.path.insert(0, '.'); "
-                "import tokenizers, llguidance, numpy, PIL, transformers, huggingface_hub, pypdfium2; "
-                "import server.server, install.launcher",
-            ],
-            cwd=stage,
-            check=True,
-        )
-        # The server's entry point as the launcher starts it, which the
-        # import above does not run. Not isolated: -I would ignore PYTHONPATH.
-        subprocess.run(
-            [str(python), "-P", "-m", "server.server", "--help"],
-            cwd=stage,
-            env={**os.environ, "PYTHONPATH": str(stage)},
-            check=True,
-            stdout=subprocess.DEVNULL,
-        )
-        subprocess.run(
-            [str(python), "-B", str(stage / "install/launcher.py"), "--help"],
-            cwd=stage,
-            check=True,
-        )
+        build_runtime(stage, args.version)
         temporary_archive = Path(temporary) / archive.name
         with tarfile.open(temporary_archive, "w:gz") as release:
-            release.add(
-                stage,
-                arcname=name,
-                filter=lambda item: (
-                    None if "__pycache__" in Path(item.name).parts else item
-                ),
-            )
+            release.add(stage, arcname=name)
         temporary_archive.replace(archive)
     checksum = digest(archive)
     archive.with_suffix(archive.suffix + ".sha256").write_text(checksum + "\n")
     url = (
         args.url
-        or f"https://github.com/incoai/splash/releases/download/{args.version}/{archive.name}"
+        or f"https://github.com/{REPOSITORY}/releases/download/{args.version}/{archive.name}"
     )
     (dist / "splash.rb").write_text(
         formula(args.version, url, checksum, args.macos_min)

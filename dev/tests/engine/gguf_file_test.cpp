@@ -69,8 +69,8 @@ void checkSplit(const std::filesystem::path &directory) {
   {
     const splash::model::OpenGguf split(paths);
     const splash::model::GgufFile &file = split.file();
-    require(file.files() == 2 && file.tensors().size() == 4 && file.metadata().architecture() == "fixture" &&
-                file.metadata().unsignedValue("split.count") == 2,
+    require(file.tensors().size() == 4 && file.tensors().back().file == 1 &&
+                file.metadata().architecture() == "fixture" && file.metadata().unsignedValue("split.count") == 2,
             "a split GGUF's tensors and its first part's metadata changed");
     // The parts' headers differ in size, so a tensor read at the other
     // part's data offset reads other bytes.
@@ -96,6 +96,34 @@ void checkSplit(const std::filesystem::path &directory) {
   splash::test::rejects([&] { splash::model::OpenGguf split(paths); },
                         "the GGUF's split files hold another number of tensors than split.tensors.count",
                         "accepted a split.tensors.count the parts do not hold");
+}
+
+// A split GGUF whose first part holds the metadata alone and ends at its
+// header, unpadded (its data section is empty), and whose tensors are in the
+// parts after it.
+void checkMetadataPart(const std::filesystem::path &directory) {
+  const std::vector<gguf::Tensor> tensors{filled("a", 8, 0xa1), filled("b", 16, 0xb2)};
+  const std::vector<std::filesystem::path> paths{directory / "metadata-00001-of-00002.gguf",
+                                                 directory / "metadata-00002-of-00002.gguf"};
+  // An architecture name of the length that leaves the header unaligned.
+  std::string architecture = "fixture";
+  gguf::Bytes first = part({gguf::stringKey("general.architecture", architecture)}, 0, 2, 2, {});
+  if (first.size() % gguf::kAlignment == 0)
+    first = part({gguf::stringKey("general.architecture", architecture += "s")}, 0, 2, 2, {});
+  splash::test::writeFile(paths[0], first);
+  splash::test::writeFile(paths[1], part({}, 1, 2, 2, tensors));
+  const splash::model::OpenGguf split(paths);
+  const splash::model::GgufFile &file = split.file();
+  require(file.tensors().size() == 2 && file.tensors().front().file == 1 &&
+              file.metadata().architecture() == architecture && file.source(0).dataOffset() == first.size(),
+          "a split GGUF's metadata-only first part was not read as an empty data section");
+  for (const gguf::Tensor &expected : tensors) {
+    const splash::model::GgufTensor &tensor = file.require(expected.name);
+    gguf::Bytes read(tensor.bytes);
+    file.source(tensor.file).readData(tensor.offset, read);
+    require(tensor.file == 1 && read == expected.data,
+            "split GGUF tensor " + expected.name + " is not read from the part after the metadata");
+  }
 }
 } // namespace
 
@@ -159,6 +187,7 @@ int main() {
     }
     rejects("excessive nesting", array(nested), "nesting is too deep");
     checkSplit(directory.path());
+    checkMetadataPart(directory.path());
     std::cout << "GGUF parser bounds tests passed\n";
     return 0;
   } catch (const std::exception &error) {

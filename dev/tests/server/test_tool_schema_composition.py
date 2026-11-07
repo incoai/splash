@@ -19,7 +19,10 @@ from dev.tests.tool_output import (
     streamed_arguments,
     tool_policy,
 )
-from server import api_shapes, tool_schema
+from server import tool_schema
+from server.chat_format import QWEN
+from server.dialects import anthropic as anthropic_dialect
+from server.dialects import responses as responses_dialect
 from server.errors import APIError
 from server.tool_schema import _grammar_compatible_schema
 
@@ -44,7 +47,9 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         cls.tokenizer, cls.guidance = grammar_tokenizers()
 
     def accepts(self, policy, xml):
-        matcher = LLMatcher(self.guidance, tool_schema.tool_grammar(policy, False))
+        matcher = LLMatcher(
+            self.guidance, tool_schema.tool_grammar(policy, False, chat_format=QWEN)
+        )
         tokens = self.tokenizer.encode(xml).ids
         return (
             matcher.validate_tokens(tokens) == len(tokens)
@@ -60,7 +65,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         policy = strict_policy(schema)
         self.assertFalse(
             LLMatcher.validate_grammar(
-                tool_schema.tool_grammar(policy, False), self.guidance
+                tool_schema.tool_grammar(policy, False, chat_format=QWEN), self.guidance
             )
         )
         shape = policy.argument_schemas["t0"]
@@ -94,11 +99,11 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         }
         function = {"name": "test", "parameters": schema}
         chat = {"tools": [{"type": "function", "function": function}]}
-        responses, _ = api_shapes.responses_to_chat_body(
+        responses, _ = responses_dialect.to_chat_body(
             {"tools": [{"type": "function", **function}]},
             [{"role": "user", "content": "Create a note"}],
         )
-        messages, _ = api_shapes.anthropic_to_chat_body(
+        messages, _ = anthropic_dialect.to_chat_body(
             {
                 "model": "test",
                 "max_tokens": 128,
@@ -176,7 +181,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
                     tool_schema, "_lookup_tool_reference", side_effect=lookup
                 ) as counted,
             ):
-                tool_schema.tool_grammar(policy, False)
+                tool_schema.tool_grammar(policy, False, chat_format=QWEN)
             # A few lookups per reference, rather than one per path.
             self.assertLess(counted.call_count, 4 * (depth + 1))
             self.check_arguments(schema, arguments)
@@ -193,7 +198,9 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         }
         definitions[f"d{depth}"] = {"enum": ["a", "b"]}
         schema = {"$defs": definitions, "properties": {"value": {"$ref": "#/$defs/d0"}}}
-        grammar = tool_schema.tool_grammar(strict_policy(schema), False)
+        grammar = tool_schema.tool_grammar(
+            strict_policy(schema), False, chat_format=QWEN
+        )
         arguments = json.loads(grammar)["grammars"][1]["lark_grammar"]
         self.assertIn('("a" | "b")', arguments)
         self.check_arguments(schema, {"value": "b"})
@@ -223,7 +230,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         nested["$ref"] = "#/$defs/d0"
         half = {"properties": {"x": {"description": "d" * 12_000}}}
         with mock.patch.object(tool_schema, "MAX_FRAMED_SCHEMA_BYTES", 20_000):
-            tool_schema.tool_grammar(strict_policy(half), False)
+            tool_schema.tool_grammar(strict_policy(half), False, chat_format=QWEN)
             for name, schemas in (
                 ("wide union", [wide]),
                 ("root copies", [copies]),
@@ -234,7 +241,9 @@ class ToolSchemaCompositionTests(HarnessTestCase):
                     self.subTest(name),
                     self.assertRaisesRegex(APIError, "too complex") as caught,
                 ):
-                    tool_schema.tool_grammar(strict_policy(*schemas), False)
+                    tool_schema.tool_grammar(
+                        strict_policy(*schemas), False, chat_format=QWEN
+                    )
                 self.assertEqual(caught.exception.status, 400)
 
     def test_tools_that_are_not_strict_are_framed_for_their_types_alone(self):
@@ -270,7 +279,9 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         )
         with mock.patch.object(tool_schema, "MAX_FRAMED_SCHEMA_BYTES", 20_000):
             with self.assertRaisesRegex(APIError, "too complex"):
-                tool_schema.tool_grammar(strict_policy(referring), False)
+                tool_schema.tool_grammar(
+                    strict_policy(referring), False, chat_format=QWEN
+                )
             tools = [
                 {"function": {"name": "referring", "parameters": referring}},
                 {"function": {"name": "composed", "parameters": composed}},
@@ -278,7 +289,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
                 {"function": {"name": "strict", "parameters": plain, "strict": True}},
             ]
             policy = tool_schema.normalize_tools(tools, "auto", True)[1]
-            tool_schema.tool_grammar(policy, False)
+            tool_schema.tool_grammar(policy, False, chat_format=QWEN)
             names = ("referring", "composed", "plain", "strict")
             _, calls, _ = project("".join(map(call.format, names)), policy)
             self.assertEqual(
@@ -707,6 +718,90 @@ class ToolSchemaCompositionTests(HarnessTestCase):
             grammar = argument_grammar(schema)
             self.assertIn("%json", grammar)
             self.assertNotIn("RAW_START", grammar)
+
+    def test_a_union_of_ref_members_builds_a_grammar_linear_in_its_schema(self):
+        """The members of a strict parameter's union that list no value are
+        one JSON schema: twice the members make about twice the grammar,
+        where a schema of each member with its own copy of the definitions
+        made four times."""
+
+        def grammar(members):
+            definitions = {
+                f"d{index}": {
+                    "type": "object",
+                    "properties": {f"k{index}": {"type": "integer"}},
+                    "required": [f"k{index}"],
+                }
+                for index in range(members)
+            }
+            union = [{"$ref": f"#/$defs/d{index}"} for index in range(members)]
+            return argument_grammar(
+                {
+                    "type": "object",
+                    "properties": {"value": {"anyOf": union}},
+                    "$defs": definitions,
+                }
+            )
+
+        self.assertLessEqual(len(grammar(400)) / len(grammar(200)), 2.2)
+
+    def test_a_union_of_ref_members_accepts_what_it_accepted(self):
+        """A union of literals and members that refer to definitions takes
+        the values it took when each such member had a JSON schema of its
+        own, recorded here from that grammar."""
+        policy = strict_policy(
+            {
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "anyOf": [
+                            {"const": "auto"},
+                            {"$ref": "#/$defs/point"},
+                            {"$ref": "#/$defs/pair"},
+                            {"enum": [1, 2]},
+                        ]
+                    }
+                },
+                "required": ["value"],
+                "$defs": {
+                    "point": {
+                        "type": "object",
+                        "properties": {
+                            "x": {"type": "integer"},
+                            "y": {"type": "integer"},
+                        },
+                        "required": ["x", "y"],
+                        "additionalProperties": False,
+                    },
+                    "pair": {"type": "array", "items": {"type": "number"}},
+                },
+            }
+        )
+        accepted = {
+            "auto": True,
+            '{"x": 1, "y": 2}': True,
+            "[1.5, 2]": True,
+            "[]": True,
+            "1": True,
+            "2": True,
+            "manual": False,
+            '{"x": 1}': False,
+            '{"x": 1, "y": 2, "z": 3}': False,
+            '["a"]': False,
+            "3": False,
+            "null": False,
+        }
+        self.assertEqual(
+            {
+                value: self.accepts(
+                    policy,
+                    "<tool_call>\n<function=t0>\n<parameter=value>\n"
+                    f"{value}\n</parameter>\n</function>\n</tool_call>",
+                )
+                for value in accepted
+            },
+            accepted,
+        )
 
     def test_cyclic_tool_alternatives_compile_without_recursing(self):
         runtime = FakeRuntime()

@@ -1,11 +1,5 @@
-// The KV tier over pages in host memory (engine::BasicKvPageTier), for the
-// sanitizers: pages leave for their slots on the file's worker and come back
-// on the SSD readers, index restores in a batch of their own beside the
-// whole ones, while the engine thread polls; a restore of a slot never
-// written fails alone; and a tier goes away with its transfers in flight,
-// and right after its last batch retired, whose end ran on a reader, with
-// nothing it started running past it. kv_page_tier_test runs the tier over
-// the pool's extents beside the GPU. Built under ASan and TSan too.
+// The KV tier over host-memory pages (engine::BasicKvPageTier) for the sanitizers: round trips,
+// failed restores and teardown with transfers in flight. kv_page_tier_test covers the GPU side.
 #include "HostKvPages.hpp"
 #include "TestChecks.hpp"
 #include "engine/KvPageTier.hpp"
@@ -46,9 +40,7 @@ std::shared_ptr<SlotFile> slotFile(const kv::SlotFormat &format, uint32_t slots,
   return std::make_shared<SlotFile>(bytes, budget, SlotFile::Options{.segments = format.segments()});
 }
 
-// Drives the tier the way the engine does until every transfer is ready:
-// restores asked for go out together, and polls retire what the worker and
-// the readers did.
+// Drives the tier as the engine does until every transfer is ready.
 void runUntilReady(Tier &tier, std::span<const std::unique_ptr<KvTransfer>> transfers) {
   tier.submitRestores();
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
@@ -72,10 +64,8 @@ std::vector<std::byte> indexOf(const test::HostKvPages &pages, uint32_t page) {
   return bytes;
 }
 
-// Pages leave for their slots and come back byte for byte, all at once: a
-// whole restore brings a page back, and, of a spillable layout, an index
-// restore every other page's index alone. Each kind's batch wakes the engine
-// once. A restore of a slot never written fails, the others beside it land.
+// Pages round-trip byte for byte (whole, Slim and index restores); a restore of an unwritten slot
+// fails alone.
 void roundTrips(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layout) {
   constexpr uint32_t kPages = 48;
   test::HostKvPages pages(layout, 2 * kPages + 1);
@@ -84,8 +74,13 @@ void roundTrips(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout la
   Tier tier(pages, format, slotFile(format, kPages + 1, budget), readers);
   std::vector<std::shared_ptr<engine::KvDiskSlot>> slots;
   std::vector<std::unique_ptr<KvTransfer>> writes;
+  const auto slim = [&](uint32_t page) { return layout.slimmable() && page % 3 == 0; };
   for (uint32_t page = 0; page < kPages; ++page) {
     pages.fill(page, page + 1);
+    if (slim(page)) {
+      pages.setForm(page, kv::PageForm::Slim);
+      pages.setForm(kPages + page, kv::PageForm::Slim);
+    }
     slots.push_back(tier.acquireSlot(cached));
     writes.push_back(tier.demote(page, slots.back(), WriteClass::Reclaim, {}));
     require(writes.back() != nullptr, "a write within the tier's bound was refused");
@@ -106,9 +101,10 @@ void roundTrips(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout la
   for (uint32_t page = 0; page < kPages; ++page) {
     const uint32_t into = kPages + page;
     const bool index = pages.form(into) == kv::PageForm::Index;
+    const uint64_t bytes = layout.bytesPerModelPage(pages.form(into));
     require(restores[page]->finish() &&
                 (index ? indexOf(pages, into) == indexOf(pages, page)
-                       : std::ranges::equal(pages.page(into), pages.page(page))),
+                       : std::ranges::equal(pages.page(into).first(bytes), pages.page(page).first(bytes))),
             "a page did not come back from its slot byte for byte");
   }
   require(!restores.back()->finish(), "a slot never written was restored");
@@ -116,10 +112,8 @@ void roundTrips(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout la
   std::cout << "round trips " << kv::formatName(layout.format) << " slot format v" << format.version() << '\n';
 }
 
-// A tier goes away with writes and restores in flight: the worker and the
-// readers are done with its pages first. And a tier that goes right after
-// its last restore retired leaves no batch end running on a reader, so the
-// restore's completion never runs past it.
+// A tier goes away with transfers in flight, and right after its last restore, without anything
+// running past it.
 void teardown(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layout) {
   test::HostKvPages pages(layout, 16);
   const kv::SlotFormat format(layout);
@@ -165,9 +159,12 @@ int main() {
   try {
     const auto readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
     for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
-      // Qwen3.6-35B's layout, which keeps its spans' order, and
-      // Qwen3.8-Flash-Next's, whose slots hold block records.
-      for (const kv::Layout layout : {kv::Layout{10, 2, 256, format}, kv::Layout{12, 2, 256, format, 128, true}}) {
+      // Qwen3.6-35B's layout, which keeps its spans' order, a windowed one
+      // with Slim pages, and Qwen3.8-Flash-Next's, whose slots hold block
+      // records.
+      for (const kv::Layout layout : {kv::Layout{10, 2, 256, format},
+                                      kv::Layout{6, 2, 256, format, 0, false, 512, 0b010110},
+                                      kv::Layout{12, 2, 256, format, 128, true, 0, 0, kv::Reads::SelectedBlocks}}) {
         roundTrips(readers, layout);
         teardown(readers, layout);
       }

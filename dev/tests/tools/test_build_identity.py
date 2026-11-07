@@ -294,30 +294,33 @@ class CompileConfigurationTests(unittest.TestCase):
             self.assertEqual(self.query(*options, changed, sweep), 0)
             self.build(*options, sweep)
 
-            for flags, linked in (
-                ("ENGINE_LINKFLAGS=-Wl,-dead_strip", targets[0]),
-                ("TEST_METALFLAGS=-O0", targets[3]),
-                ("ENGINE_SANITIZER_CXXFLAGS=-O0", targets[4]),
+            splash, engine = targets[0], str(build / "engine/libsplash.a")
+            kernels = str(build / "splash.metallib")
+            test_kernels = (targets[3], str(build / "engine-tests/metal-backend.air"))
+            # A C++ flag leaves the kernels' recorded configuration current,
+            # and a Metal flag the engine's.
+            for flags, target, rebuilds, keeps in (
+                (
+                    "ENGINE_LINKFLAGS=-Wl,-dead_strip",
+                    splash,
+                    (splash, engine),
+                    (kernels,),
+                ),
+                ("PROD_METALFLAGS=-O0", splash, (kernels,), (engine,)),
+                ("TEST_METALFLAGS=-O0", targets[3], test_kernels, ()),
+                ("ENGINE_SANITIZER_CXXFLAGS=-O0", targets[4], (targets[4],), ()),
             ):
                 with self.subTest(flags=flags):
                     for configuration in ([flags], []):
                         start = len(calls())
-                        self.build(*options, *configuration, linked)
-                        self.assertIn(linked, calls()[start:])
-                        if linked == targets[0]:
-                            self.assertIn(
-                                str(build / "engine/libsplash.a"), calls()[start:]
-                            )
-                            self.assertIn(
-                                str(build / "splash.metallib"), calls()[start:]
-                            )
-                        if linked == targets[3]:
-                            self.assertIn(
-                                str(build / "engine-tests/metal-backend.air"),
-                                calls()[start:],
-                            )
+                        self.build(*options, *configuration, target)
+                        rebuilt = calls()[start:]
+                        for output in rebuilds:
+                            self.assertIn(output, rebuilt)
+                        for output in keeps:
+                            self.assertNotIn(output, rebuilt)
                         start = len(calls())
-                        self.build(*options, *configuration, linked)
+                        self.build(*options, *configuration, target)
                         self.assertEqual(len(calls()), start)
 
     def test_an_engine_change_recompiles_the_startup_object_with_its_identity(self):
@@ -425,6 +428,12 @@ class CompileConfigurationTests(unittest.TestCase):
 
             rebuild(*targets)
             self.assertEqual(rebuild(*targets), set())
+            # A test rule's change leaves production current.
+            with (root / "dev/native.mk").open("a") as rules:
+                rules.write("# test rule\n")
+            self.assertEqual(self.query(*options, library, native), 0)
+            self.assertEqual(self.query(*options, unrelated), 1)
+            self.assertIn(unrelated, rebuild(*targets))
             (root / removed_source).unlink()
             before = self.snapshot(build)
             self.assertEqual(self.query(*options, library), 1)

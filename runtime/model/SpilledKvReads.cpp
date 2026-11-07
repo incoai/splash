@@ -13,9 +13,10 @@ SpilledKvReads::SpilledKvReads(KvBlockCache &cache, std::vector<std::shared_ptr<
 
 SpilledKvReads::SpilledKvReads(KvHistoryStream &stream, uint32_t sequence,
                                std::shared_ptr<const KvPageSources> sources, uint32_t pages,
-                               metal::MetalBuffer poolTable, std::span<const SplashKvLayer> poolLayers)
+                               metal::MetalBuffer poolTable, std::span<const SplashKvLayer> poolLayers,
+                               AttentionLayers layers)
     : stream_(&stream), sources_{std::move(sources)}, sequence_(sequence), pages_(pages),
-      poolTable_(std::move(poolTable)), poolLayers_(poolLayers) {
+      poolTable_(std::move(poolTable)), poolLayers_(poolLayers), layers_(layers) {
   if (!sources_.front()) throw std::invalid_argument("a streamed prefill has no page sources");
 }
 
@@ -46,7 +47,7 @@ PrefillKv SpilledKvReads::prefill(metal::CommandGraph &graph, uint32_t layer, ui
                                   uint32_t chunkFirstPage, uint32_t chunkPages, const PrefillKv &pool) {
   if (!stream_ || sequence != sequence_) return pool;
   if (!running_) {
-    stream_->begin(*sources_.front(), pages_, poolTable_, poolLayers_);
+    stream_->begin(*sources_.front(), pages_, poolTable_, poolLayers_, layers_);
     running_ = true;
   }
   if (stagedLayer_ != layer) {
@@ -65,14 +66,14 @@ void SpilledKvReads::end() {
   if (!running_) return;
   running_ = false;
   if (cache_) {
-    cache_->mergeStats(*stats_);
+    readBytes_ += cache_->mergeStats(*stats_);
     const std::vector<KvReadFailure> failed = cache_->takeFailures();
     failures_.insert(failures_.end(), failed.begin(), failed.end());
     return;
   }
   const KvStreamResult result = stream_->end();
   for (const KvReadFailure &failure : result.failures) failures_.push_back({sequence_, failure.block});
-  streamMilliseconds_ += result.streamMilliseconds;
+  readBytes_ += result.readBytes;
   stagedLayer_.reset();
 }
 

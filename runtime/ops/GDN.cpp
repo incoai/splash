@@ -6,6 +6,7 @@
 #include "ops/LaneBindings.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
@@ -24,33 +25,33 @@ uint32_t headFlags(GdnShape shape, GdnHeadOrder order) noexcept {
 
 static_assert(offsetof(GDNDecodeBatchParams, conv_layer_bytes) == 8);
 
-// Value48P16512: Qwen3.8-Flash-Next's 48 value heads, whose packed rows are
-// 16512 columns wide.
-enum class KernelLayout : uint8_t { Value48, Value32, Value48P16512 };
+// The compiled GDN shapes (kernels/prefill/gdn.metal, kernels/decode/gdn.metal),
+// of either gate, and their kernels' name suffix. The scan reads no packed
+// rows, so shapes of one head layout share its kernel (scanSuffix). The
+// kernels that read the norm take the norm types the shape's families store
+// (normKernel): F32 and bf16, or F32 alone for Qwen3.8-Flash-Next's, which
+// loads from GGUFs only.
+struct CompiledGdn final {
+  GdnShape shape;
+  std::string_view suffix;
+  std::string_view scanSuffix;
+};
+constexpr std::array kCompiledGdn{
+    CompiledGdn{{16, 48, 128, 10240, 16640}, "", ""},
+    CompiledGdn{{16, 32, 128, 8192, 12544}, "_vh32", "_vh32"},
+    // Qwen3.8-Flash-Next's 48 value heads, whose packed rows are 16512 columns wide.
+    CompiledGdn{{16, 48, 128, 10240, 16512}, "_p16512", ""},
+    CompiledGdn{{16, 64, 128, 12288, 20736}, "_vh64", "_vh64"},
+};
 
-[[nodiscard]] KernelLayout kernelShape(const GdnShape &shape) {
+[[nodiscard]] const CompiledGdn &compiledGdn(const GdnShape &shape) {
   if (!shape.valid())
     throw std::invalid_argument("invalid GDN shape");
   GdnShape heads = shape;
   heads.sigmoidGate = false;
-  if (heads == GdnShape{16, 48, 128, 10240, 16640})
-    return KernelLayout::Value48;
-  if (heads == GdnShape{16, 32, 128, 8192, 12544})
-    return KernelLayout::Value32;
-  if (heads == GdnShape{16, 48, 128, 10240, 16512})
-    return KernelLayout::Value48P16512;
+  for (const CompiledGdn &compiled : kCompiledGdn)
+    if (compiled.shape == heads) return compiled;
   throw std::invalid_argument("unsupported compiled GDN shape");
-}
-
-// A kernel's variant: the scan reads no packed rows, so all 48-head layouts
-// share it (`packed` false).
-[[nodiscard]] std::string kernelName(KernelLayout shape, std::string_view value48,
-                                     std::string_view value32, bool packed = true) {
-  if (shape == KernelLayout::Value32)
-    return std::string(value32);
-  if (shape == KernelLayout::Value48P16512 && packed)
-    return std::string(value48) + "_p16512";
-  return std::string(value48);
 }
 
 uint64_t valueWidth(const GdnShape &shape) { return uint64_t{shape.valueHeads} * shape.headDimension; }
@@ -120,8 +121,8 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
                      std::span<const GdnPrefillCapture> captures) {
   if (!tokens || !validFormat(state))
     throw std::invalid_argument("invalid GDN prefill geometry");
-  const KernelLayout kernel = kernelShape(shape);
-  const std::string gate = normKernel(kernelName(kernel, "prefill_gdn_gate", "prefill_gdn_gate_vh32"),
+  const CompiledGdn &kernel = compiledGdn(shape);
+  const std::string gate = normKernel(std::string("prefill_gdn_gate") + std::string(kernel.suffix),
                                       buffers.mixerNorm, shape.headDimension);
   const uint64_t keyWidth = uint64_t{shape.keyHeads} * shape.headDimension;
   const uint64_t keyRows = tokens * keyWidth * 2;
@@ -146,9 +147,9 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
     requireBytes(capture.convolution, carriedBytes(shape), "GDN captured convolution state");
     requireBytes(capture.recurrent, recurrentBytes(shape, state), "GDN captured recurrent state");
   }
-  const std::string prepare = kernelName(kernel, "prefill_gdn_prepare", "prefill_gdn_prepare_vh32");
+  const std::string prepare = std::string("prefill_gdn_prepare") + std::string(kernel.suffix);
   const std::string scan =
-      stateKernel(kernelName(kernel, "prefill_gdn_scan", "prefill_gdn_scan_vh32", false), state);
+      stateKernel(std::string("prefill_gdn_scan") + std::string(kernel.scanSuffix), state);
   metal::MetalBuffer convolution = buffers.convolutionIn;
   metal::MetalBuffer recurrent = buffers.recurrentIn;
   uint32_t begin = 0;
@@ -192,7 +193,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                              GdnStateStrides state, GdnHeadOrder order, LinearInput input) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid() || buffers.tapeLanes.size() < lanes)
     throw std::invalid_argument("invalid GDN decode geometry");
-  const KernelLayout kernel = kernelShape(shape);
+  const CompiledGdn &kernel = compiledGdn(shape);
   // Lane l's rows of the packed and hidden rows are rows [8 l, 8 l + 8).
   const uint64_t rows = uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS;
   requireBytes(buffers.packed, packedBytes(shape, rows), "GDN packed");
@@ -247,7 +248,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                    buffers.hidden});
   if (prepare)
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
-  const std::string name = std::string("verify_gdn_fused") + tableSuffix(input) + kernelName(kernel, "", "_vh32");
+  const std::string name = std::string("verify_gdn_fused") + tableSuffix(input) + std::string(kernel.suffix);
   graph.add(stateKernel(normKernel(name, buffers.mixerNorm, shape.headDimension), state.format),
             std::move(bindings), params, {shape.valueHeads, lanes, 1});
   if (!prepare) return {};

@@ -7,7 +7,10 @@ from dev.tests.server_fixtures import (
     Harness,
     HarnessTestCase,
     Plan,
+    anthropic_body,
     chat_body,
+    response_events,
+    responses_body,
 )
 from server.backend import CacheInfo, NativeResult
 from server.metrics import metrics_dict, timings_dict
@@ -78,6 +81,44 @@ class ResponseTimingsTests(HarnessTestCase):
                                 "cache_n": cached,
                             },
                         )
+
+    def test_messages_and_responses_report_chats_timings(self):
+        # The same generation's timings, in a complete response and in the
+        # event that ends a stream: Messages message_delta, Responses
+        # response.completed or, at the output limit, response.incomplete.
+        def timings(path, body, reason="stop"):
+            harness = Harness(FakeRuntime(Plan([[14, 15], [14, 15, 4]], reason)))
+            try:
+                status, _, payload = harness.request("POST", path, body)
+            finally:
+                harness.close()
+            self.assertEqual(status, 200, payload)
+            if not body.get("stream"):
+                return json.loads(payload)["timings"]
+            events = response_events(payload)
+            if path == "/v1/messages":
+                (timed,) = (event for event in events if "timings" in event)
+                self.assertEqual(timed["type"], "message_delta")
+                self.assertNotIn("timings", events[0]["message"])
+                return timed["timings"]
+            self.assertNotIn("timings", events[0]["response"])
+            status = "incomplete" if reason == "length" else "completed"
+            (done,) = (e for e in events if e["type"] == f"response.{status}")
+            return done["response"]["timings"]
+
+        expected = timings("/v1/chat/completions", chat_body(reasoning_effort="none"))
+        self.assertEqual(expected["predicted_n"], 5)
+        for path, body, reason in (
+            ("/v1/messages", anthropic_body(), "stop"),
+            ("/v1/messages", anthropic_body(stream=True), "stop"),
+            ("/v1/messages", anthropic_body(stream=True), "length"),
+            ("/v1/responses", responses_body(), "stop"),
+            ("/v1/responses", responses_body(stream=True), "stop"),
+            ("/v1/responses", responses_body(stream=True), "length"),
+        ):
+            stream = body.get("stream", False)
+            with self.subTest(path=path, stream=stream, reason=reason):
+                self.assertEqual(timings(path, body, reason), expected)
 
     def test_no_invalid_json_numbers_or_invented_rates(self):
         for interval in (0.0, -1.0, math.nan, math.inf, 5e-324):

@@ -34,11 +34,14 @@ model::DFlashDraftLayout draftOf() {
     return test::qwen3_8Draft();
 }
 
+// A target of Weights' architecture at the sizes of `family`, its first
+// family's by default, paired with `draft`.
 template <class Weights>
-model::LoadedModel loadedModel() {
+model::LoadedModel loadedModel(const decltype(Weights::layout) &family = {},
+                               const model::DFlashDraftLayout &draft = draftOf<Weights>()) {
   model::LoadedModel result;
   Weights target;
-  const model::DFlashDraftLayout draft = draftOf<Weights>();
+  target.layout = family;
   const auto projection = [](uint32_t n, uint32_t k) {
     return ops::Projection(n, k, ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, n, k, {}, {}, {})}});
   };
@@ -157,7 +160,7 @@ void checkGateUpLayers() {
               "the arenas are below a gate/up pair in two formats");
     }
     const auto sizes = model::prefillTensorBytes(geometry, plans);
-    for (uint32_t rows : {1U, 8U, 17U, 32U}) {
+    for (uint32_t rows : {1U, 8U, 17U, 32U, 33U, 48U, 64U}) {
       const auto required = plans.linear().plan({{up.outputSize, up.inputSize}, rows,
           ops::LinearPhase::Prefill, ops::LinearEpilogue::None}, up).scratchSize();
       require(sizes[uint32_t(model::PrefillTensor::LinearPartials)] >= required.partials &&
@@ -263,6 +266,51 @@ void checkSpilledKvGeometry() {
     }, "invalid model runtime geometry", "the K/V of a target without a block index was let spill");
 }
 
+// A target without GDN layers (model::GdnStateLayout without layers) has no
+// GDN scratch: its arenas leave out exactly the GDN layers' tensors, the
+// decode tape among them, and a prefill group's scratch cell, whose cell
+// holds nothing, and size every other tensor as a hybrid target's.
+void checkArenasWithoutGdnLayers() {
+  const auto sparse = loadedModel<model::Qwen3_6MoeWeights>();
+  // Streamed experts make a prefill command a group, which a hybrid target's
+  // scratch cell serves.
+  model::StreamedParts parts = model::StreamedParts::loaded(sparse);
+  parts.experts = true;
+  const auto hybrid = model::RuntimeGeometry::from(sparse, kv::Format::Int8, ops::GdnStateFormat::Float32, parts);
+  auto attentionOnly = hybrid;
+  attentionOnly.target.stateLayout = {};
+  require(hybrid.prefillChunks > 1 && attentionOnly.target.stateLayout.valid() &&
+              !attentionOnly.target.stateLayout.cellBytes(),
+          "the arenas' geometries are not a prefill group's with and without GDN layers");
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  const ops::ExecutionPlans plans(device);
+  // Whether `bytes` are the hybrid's but for the GDN tensors, which only the
+  // hybrid's arena holds.
+  const auto withoutGdn = [](const auto &hybridBytes, const auto &bytes, const auto &gdnTensors) {
+    using Tensor = typename std::decay_t<decltype(gdnTensors)>::value_type;
+    for (uint32_t index = 0; index < hybridBytes.size(); ++index) {
+      const bool gdn = std::ranges::find(gdnTensors, static_cast<Tensor>(index)) != gdnTensors.end();
+      if (gdn ? !hybridBytes[index] || bytes[index] : bytes[index] != hybridBytes[index]) return false;
+    }
+    return true;
+  };
+  using model::DecodeTensor;
+  using model::PrefillTensor;
+  constexpr std::array gdnPrefill{PrefillTensor::GdnPacked, PrefillTensor::GdnQueries, PrefillTensor::GdnKeys,
+                                  PrefillTensor::GdnValues, PrefillTensor::GdnDecay, PrefillTensor::GdnBeta,
+                                  PrefillTensor::Recurrent, PrefillTensor::GdnHidden, PrefillTensor::GdnOutput,
+                                  PrefillTensor::GroupCell};
+  constexpr std::array gdnDecode{DecodeTensor::GdnHidden, DecodeTensor::GdnOutput, DecodeTensor::GdnTape};
+  require(withoutGdn(model::prefillTensorBytes(hybrid, plans), model::prefillTensorBytes(attentionOnly, plans),
+                     gdnPrefill),
+          "the prefill arena without GDN layers is not a hybrid's without its GDN scratch");
+  require(withoutGdn(model::decodeTensorBytes(hybrid, plans), model::decodeTensorBytes(attentionOnly, plans),
+                     gdnDecode),
+          "the decode arena without GDN layers is not a hybrid's without its GDN scratch");
+}
+
 // Arenas are sized from the projections the weights hold, so each must have
 // sizes; an empty one would drop its workspace from the bound silently.
 void checkUnsizedProjection() {
@@ -311,6 +359,13 @@ void checkGdnWidths() {
   withoutGates.packedGdnWidth = shipped.convolutionDimension + shipped.attentionWidth;
   rejects([&] { sizeArenas(withoutGates); }, "invalid model runtime geometry",
           "packed GDN rows without the gates reached arena sizing");
+  // Every family's layout, the 122B's among them, passes the layout check.
+  model::forEachFamily([](const auto &family) { model::requireQwenLayout(family); });
+  // A layout without GDN layers sets none of the GDN dimensions.
+  auto strayGdn = model::FlintLayout{};
+  strayGdn.gdnKeyHeads = 16;
+  rejects([&] { model::requireQwenLayout(strayGdn); }, "Qwen target layout is inconsistent",
+          "a layout without GDN layers was accepted with a GDN dimension");
   // The dense layout is checked like the sparse one: its convolution width
   // against its GDN heads.
   const model::Qwen3_8Layout dense;
@@ -323,8 +378,28 @@ void checkGdnWidths() {
 
 } // namespace
 
+// A prefill chunk's attention plan follows the history its chunk committed:
+// a short chunk after a long cached prefix shares its tiles' pages out over
+// more splits than the same chunk after none.
+void checkPrefillAttentionHistory() {
+  const auto geometry = model::RuntimeGeometry::from(loadedModel<model::Qwen3_6MoeWeights>(), kv::Format::Int8,
+                                                     ops::GdnStateFormat::Float32);
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  const ops::ExecutionPlans plans(device);
+  model::QwenTargetPrefillSequence sequence;
+  sequence.rows = 300;
+  const auto splitsAfter = [&](uint32_t history) {
+    sequence.chunk.committed_tokens = history;
+    return model::prefillAttentionPlan(plans, geometry.target, sequence).splits;
+  };
+  require(splitsAfter(65'536) > splitsAfter(0), "a chunk's attention plan does not follow its history");
+}
+
 int main() {
   try {
+    checkPrefillAttentionHistory();
     checkUnsizedProjection();
     checkCaptureLayers();
     checkGdnWidths();
@@ -332,11 +407,11 @@ int main() {
     checkYarnGeometry();
     checkIndexTables();
     checkSpilledKvGeometry();
-    const auto dense = loadedModel<model::Qwen3_8Weights>();
-    const auto sparse = loadedModel<model::Qwen3_6MoeWeights>();
-    checkLaneScratch(dense);
-    checkLaneScratch(sparse);
-    std::cout << "model execution plans: PASS (two paired geometries)\n";
+    checkArenasWithoutGdnLayers();
+    checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
+    checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
+    checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
+    std::cout << "model execution plans: PASS (three paired geometries)\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

@@ -69,6 +69,14 @@ inline Key int32ArrayKey(std::string name, const std::vector<int32_t> &values) {
   return key;
 }
 
+inline Key boolArrayKey(std::string name, const std::vector<bool> &values) {
+  Key key{std::move(name), kArray, {}};
+  append(key.value, kBool);
+  append<uint64_t>(key.value, values.size());
+  for (bool value : values) append<uint8_t>(key.value, value);
+  return key;
+}
+
 inline Key stringArrayKey(std::string name, const std::vector<std::string> &values) {
   Key key{std::move(name), kArray, {}};
   append(key.value, kString);

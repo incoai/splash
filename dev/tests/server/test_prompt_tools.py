@@ -8,7 +8,7 @@ from unittest import mock
 from tokenizers import Tokenizer, models, pre_tokenizers, processors
 from transformers import PreTrainedTokenizerFast
 
-from dev.tests.server_fixtures import FOREVER, FakeRuntime, Harness
+from dev.tests.server_fixtures import FOREVER, FakeRuntime, Harness, serve_context
 from server.errors import APIError
 
 
@@ -225,7 +225,7 @@ class PromptToolsTests(unittest.TestCase):
             self.assertNotIn("private text", json.dumps(data))
 
     def test_utilities_do_not_require_engine_admission_or_fit_context(self):
-        self.harness.app.max_context = 1
+        serve_context(self.harness.app, 1)
         with (
             mock.patch.object(
                 self.harness.backend,

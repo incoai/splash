@@ -4,13 +4,16 @@
 #include "model/RuntimeInstrumentation.hpp"
 #endif
 #include "AwakeClock.hpp"
+#include "model/ExpertStore.hpp"
 #include "model/KvBlockCache.hpp"
 #include "model/KvHistoryStream.hpp"
+#include "model/ModelPools.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
 #include "model/SpilledKvReads.hpp"
 #include "model/VerifyBudget.hpp"
+#include "model/WorkFormulas.hpp"
 
 #include "metal/CommandGraph.hpp"
 #include "ops/AneFfn.hpp"
@@ -29,6 +32,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <list>
 #include <numeric>
@@ -51,21 +55,56 @@ using metal::CommandTiming;
 using metal::MetalBackend;
 using metal::MetalBuffer;
 
+// What a command's sample reports of its work (ModelBatchTicket::sample):
+// the work it encodes, with the weights it read on demand as the store's
+// reads moved from before its submission to its completion
+// (ExpertStore::readBytes), as commands never overlap, and the spilled K/V
+// its reads brought (SpilledKvReads::readBytes). It holds the command's
+// reads, which its completion ends, until it realizes the work.
+class WorkCount final {
+public:
+  WorkCount(CommandWork work, const ExpertStore *store, std::shared_ptr<const SpilledKvReads> reads = {})
+      : work_(work), store_(store), reads_(std::move(reads)), weightReadBytes_(store ? store->readBytes() : 0) {}
+
+  // Once the command completed; lets go of its reads.
+  [[nodiscard]] CommandWork realize() {
+    CommandWork work = work_;
+    work.weightReadBytes = store_ ? store_->readBytes() - weightReadBytes_ : 0;
+    if (reads_) work.spilledKvReadBytes = std::exchange(reads_, {})->readBytes();
+    return work;
+  }
+
+private:
+  CommandWork work_;
+  const ExpertStore *store_ = nullptr;
+  std::shared_ptr<const SpilledKvReads> reads_;
+  uint64_t weightReadBytes_ = 0;
+};
+
 class DeferredMetalTicket final : public ModelBatchTicket {
 public:
   // Runs once the command has completed, and may add work of its own to its
   // timing, as a rerun of the command does.
   using Completion = std::function<std::vector<ModelStepResult>(CommandTiming &)>;
+  // Submits the command once the image encodes ahead of it took `encodes`.
+  using Submission = std::function<CommandTicket(const CommandTiming &encodes)>;
 
-  // `reads` are the command's reads of spilled K/V, which its completion
-  // ends.
-  DeferredMetalTicket(CommandTicket ticket, Completion completion,
-                      bool representativePrefillTiming = true,
-                      std::shared_ptr<const SpilledKvReads> reads = {})
-      : completion_(std::move(completion)), reads_(std::move(reads)), ticket_(std::move(ticket)),
-        representativePrefillTiming_(representativePrefillTiming) {}
+  // `count` counts its work from before its submission.
+  DeferredMetalTicket(CommandTicket ticket, Completion completion, WorkCount count)
+      : count_(std::move(count)), completion_(std::move(completion)), ticket_(std::move(ticket)) {}
 
-  bool ready() const noexcept override { return ticket_.ready(); }
+  // A command submitted once `encodes`, the command of the image encodes
+  // ahead of it, has completed (Runtime::prefillAsync).
+  DeferredMetalTicket(CommandTicket encodes, Submission submit, Completion completion, WorkCount count)
+      : count_(std::move(count)), completion_(std::move(completion)), submit_(std::move(submit)),
+        ticket_(std::move(encodes)) {}
+
+  void advance() override {
+    if (submit_ && ticket_.ready())
+      submitAfterEncodes();
+  }
+
+  bool ready() const noexcept override { return !submit_ && ticket_.ready(); }
 
   // What the command holds goes with the completion and the reads once it
   // ran, before the engine applies the results: the page sources of its
@@ -74,14 +113,18 @@ public:
     if (!completion_) {
       throw std::logic_error("Metal ticket was already consumed");
     }
+    if (submit_)
+      submitAfterEncodes();
     CommandTiming timing = ticket_.wait();
+    // The command's time counts its encodes', which it also reports apart.
+    timing.gpuSeconds += encodes_.gpuSeconds;
+    timing.wallSeconds += encodes_.wallSeconds;
+    imageEncodeMilliseconds_ = encodes_.wallSeconds * 1000.0;
     const double commandSeconds = timing.wallSeconds;
     Completion completion = std::move(completion_);
     std::vector<ModelStepResult> results = completion(timing);
     wallMilliseconds_ = timing.wallSeconds * 1000.0;
-    hostMilliseconds_ = timing.hostSeconds * 1000.0;
-    if (reads_)
-      streamMilliseconds_ = std::exchange(reads_, {})->streamMilliseconds();
+    work_ = count_.realize();
     // Work the completion added takes wall time, but is no sample of the
     // command's rows.
     if (timing.wallSeconds != commandSeconds)
@@ -89,34 +132,42 @@ public:
     return results;
   }
 
-  double wallMilliseconds() const noexcept override {
-    return wallMilliseconds_;
-  }
-  double hostMilliseconds() const noexcept override { return hostMilliseconds_; }
-  double streamMilliseconds() const noexcept override { return streamMilliseconds_; }
-  bool prefillTimingIsRepresentative() const noexcept override {
-    return representativePrefillTiming_;
+  CommandSample sample() const noexcept override {
+    return {.work = work_,
+            .wallMilliseconds = wallMilliseconds_,
+            .imageEncodeMilliseconds = imageEncodeMilliseconds_,
+            .representative = representativePrefillTiming_};
   }
 
 private:
+  // Waits for the encodes, which lets the backend take the next command, and
+  // submits the command.
+  void submitAfterEncodes() {
+    encodes_ = ticket_.wait();
+    ticket_ = submit_(encodes_);
+    submit_ = {};
+  }
+
+  WorkCount count_;
+  CommandWork work_;
   // Before the ticket, which goes first: a ticket dropped unconsumed waits for
   // its command before the completion lets go of what the command writes,
   // such as the state reservations of its items and the staging its reads
   // of spilled K/V fill.
   Completion completion_;
-  std::shared_ptr<const SpilledKvReads> reads_;
+  // The command's submission, while the ticket is its encodes'.
+  Submission submit_;
   CommandTicket ticket_;
+  CommandTiming encodes_;
   double wallMilliseconds_ = 0.0;
-  double hostMilliseconds_ = 0.0;
-  double streamMilliseconds_ = 0.0;
-  bool representativePrefillTiming_;
+  double imageEncodeMilliseconds_ = 0.0;
+  bool representativePrefillTiming_ = true;
 };
 
 using kv::ChunkedPrefillParams;
 
 bool isStopToken(const RuntimeGeometry &geometry, uint32_t token) noexcept {
-  return token == geometry.target.stopTokens[0] ||
-         token == geometry.target.stopTokens[1];
+  return geometry.target.stopTokens.contains(token);
 }
 
 void requireShared(const MetalBuffer &buffer, std::string_view label) {
@@ -134,8 +185,7 @@ T *contents(const MetalBuffer &buffer, std::string_view label) {
 
 void validatePlan(const BatchPlan &plan, std::span<const ModelBatchItem> items,
                   WorkKind expected) {
-  if (plan.kind != expected || plan.empty() || plan.width() > kLaneCount ||
-      items.size() != plan.items.size()) {
+  if (plan.kind != expected || plan.empty() || items.size() != plan.items.size()) {
     throw std::invalid_argument("model runtime received an invalid batch plan");
   }
   for (size_t index = 0; index < items.size(); ++index) {
@@ -273,6 +323,10 @@ struct Runtime::Impl {
     // Rebuild state from already-emitted tokens without sampling an initial
     // anchor, consuming RNG, or replaying output to the caller.
     bool replayingGeneration = false;
+    // The blocks the reads of spilled history of its prefill command's
+    // passes before the last could not read, which fail the command at its
+    // last pass (BatchPlan::passes).
+    std::vector<uint64_t> unreadableBlocks;
     uint32_t promptTokens = 0;
     uint32_t maxNewTokens = 0;
     uint32_t generatedTokens = 0;
@@ -347,7 +401,9 @@ struct Runtime::Impl {
 
   // What a lane's GPU tables were last written from. Their entries stay
   // valid while the revision does: KvPool never releases the extent of a
-  // page a request holds (PageStorage::releaseExtent).
+  // page a request holds (PageStorage::releaseExtent), and the tables name
+  // the extents of their pages, which commands binding them make resident
+  // (PageStorage::writeEntries).
   struct PageTableBinding final {
     uint64_t requestId = 0;
     uint64_t revision = 0;
@@ -413,9 +469,123 @@ struct Runtime::Impl {
   // The readers of spilled K/V, when the target's K/V spills.
   KvBlockCache *blockCache;
   KvHistoryStream *historyStream;
-  // The request the history's staging was last reserved for
-  // (reserveHistoryStaging), whose next prefill command streams into it.
-  uint64_t stagingRequest = 0;
+  // The resident requests the history's staging was reserved for
+  // (reserveSpilledReads) since it was last given back, whose prefill
+  // commands stream into it. A command in passes reserves it once, before
+  // its first pass, so a reservation for another prompt between its passes
+  // leaves it the command's too.
+  std::vector<uint64_t> stagingRequests;
+  // What one prefill command may hold (Runtime::commandLimits).
+  const CommandLimits limits;
+
+  // The history's staging (KvHistoryStream) as an elastic pool: a streaming
+  // prompt's reservation allocates it, and it goes whole once no prompt
+  // holds it (stagingHeld).
+  class StagingPool final : public ElasticPool {
+  public:
+    explicit StagingPool(Impl &runtime) noexcept : runtime_(runtime) {}
+    [[nodiscard]] PoolState state() const override {
+      const uint64_t bytes = runtime_.historyStream->stats().stagingBytes;
+      const bool held = runtime_.stagingHeld();
+      return {.name = "kv_staging",
+              .floorBytes = held ? bytes : 0,
+              .currentBytes = bytes,
+              .capBytes = bytes,
+              .releaseUnitBytes = held ? 0 : bytes,
+              .rebuildOnly = true};
+    }
+    uint64_t release(uint64_t bytes) override {
+      if (!bytes || runtime_.stagingHeld()) return 0;
+      return runtime_.releaseStaging();
+    }
+    metal::AllocationResult grow(const metal::AllocationAdmission &) override { return {}; }
+
+  private:
+    Impl &runtime_;
+  };
+
+  // The vision arena as an elastic pool: the encoder goes whole once no
+  // image waits for its encode and nothing else holds it, and the next start
+  // that needs one builds it.
+  class VisionArenaPool final : public ElasticPool {
+  public:
+    explicit VisionArenaPool(Impl &runtime) noexcept : runtime_(runtime) {}
+    [[nodiscard]] PoolState state() const override {
+      const uint64_t bytes = runtime_.vision ? runtime_.vision->arenaBytes() : 0;
+      const bool idle = releasable();
+      return {.name = "vision_arena",
+              .floorBytes = idle ? 0 : bytes,
+              .currentBytes = bytes,
+              .capBytes = bytes,
+              .releaseUnitBytes = idle ? bytes : 0,
+              .rebuildOnly = true};
+    }
+    uint64_t release(uint64_t bytes) override {
+      if (!bytes || !releasable()) return 0;
+      const uint64_t arena = runtime_.vision->arenaBytes();
+      runtime_.vision.reset();
+      return arena;
+    }
+    metal::AllocationResult grow(const metal::AllocationAdmission &) override { return {}; }
+
+  private:
+    [[nodiscard]] bool releasable() const {
+      return runtime_.vision && runtime_.vision.use_count() == 1 && runtime_.visionIdle();
+    }
+
+    Impl &runtime_;
+  };
+
+  // The embedding cache as an elastic pool: an entry nothing else holds is a
+  // unit, the least recently used first, and the entries something else
+  // holds are its floor.
+  class EmbeddingsPool final : public ElasticPool {
+  public:
+    explicit EmbeddingsPool(Impl &runtime) noexcept : runtime_(runtime) {}
+    [[nodiscard]] PoolState state() const override {
+      uint64_t held = 0, unit = 0;
+      for (const std::shared_ptr<ImageRows> &entry : runtime_.embeddingCache) {
+        const uint64_t bytes = entry->embeddings.sizeBytes();
+        if (entry.use_count() > 1) held += bytes;
+        else unit = bytes;
+      }
+      return {.name = "embeddings",
+              .floorBytes = held,
+              .currentBytes = runtime_.embeddingCacheBytes,
+              .capBytes = runtime_.embeddingCacheBytes,
+              .releaseUnitBytes = unit,
+              .rebuildOnly = true};
+    }
+    uint64_t release(uint64_t bytes) override {
+      uint64_t released = 0;
+      for (auto entry = runtime_.embeddingCache.end();
+           released < bytes && entry != runtime_.embeddingCache.begin();) {
+        if ((--entry)->use_count() == 1) released += runtime_.uncache(entry++);
+      }
+      return released;
+    }
+    metal::AllocationResult grow(const metal::AllocationAdmission &) override { return {}; }
+
+  private:
+    Impl &runtime_;
+  };
+
+  // The model's elastic memories (Runtime::pools): the store's when its
+  // experts stream, the readers' hot blocks and staging when K/V spills, and
+  // the vision arena and embeddings when the model serves vision.
+  std::optional<ExpertStorePool> expertPool;
+  std::optional<HotBlocksPool> hotBlocksPool;
+  StagingPool stagingPool{*this};
+  VisionArenaPool visionPool{*this};
+  EmbeddingsPool embeddingsPool{*this};
+  std::vector<ElasticPool *> pools;
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+  // Whether commands copy the target's logits before their policy
+  // (RuntimeInstrumentation::captureTargetLogits), and the copies, one per
+  // batch lane of the last command that made them.
+  bool capturingTargetLogits = false;
+  std::vector<std::vector<float>> capturedTargetLogits;
+#endif
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         model(value.model),
@@ -433,7 +603,8 @@ struct Runtime::Impl {
                         },
                         value.model.target)),
         draftModel(value.model.draft, value.backend, operators),
-        aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream) {
+        aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream),
+        limits(splash::model::commandLimits(geometry, aneFfn ? aneFfn->minimumRows() : 0)) {
     if (states.layout() != model.stateLayout(states.layout().target.format) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format) || !blockCache != !historyStream) {
       throw std::invalid_argument(
@@ -445,6 +616,16 @@ struct Runtime::Impl {
         decodeArena->batchSlice(DecodeTensor::PenaltyState, kLaneCount);
     if (budgetsVerifyRows(model, value.verifyRows))
       verifyBudget.emplace();
+    if (ExpertStore *store = model.expertStore())
+      pools.push_back(&expertPool.emplace(*store));
+    if (blockCache) {
+      pools.push_back(&hotBlocksPool.emplace(*blockCache));
+      pools.push_back(&stagingPool);
+    }
+    if (model.descriptor.hasVision()) {
+      pools.push_back(&visionPool);
+      pools.push_back(&embeddingsPool);
+    }
     preparePolicyPipelines();
   }
 
@@ -469,14 +650,12 @@ struct Runtime::Impl {
     const ops::PenaltyTable penalties{penaltyTable, stateLanes};
     CommandGraph graph;
     sampling.addInitial(graph, policies, samplingBuffers(2), 0,
-                        geometry.target.stopTokens[0],
-                        geometry.target.stopTokens[1], penalties);
+                        geometry.target.stopTokens, penalties);
     sampling.addThinkingDrafts(
         graph, policies,
         decodeArena->batchSlice(DecodeTensor::ProposedTokens, 2));
     sampling.addVerify(graph, policies, samplingBuffers(2),
-                       geometry.target.stopTokens[0],
-                       geometry.target.stopTokens[1], penalties);
+                       geometry.target.stopTokens, penalties);
     backend.preparePipelines(graph.dispatches());
   }
 
@@ -637,49 +816,53 @@ struct Runtime::Impl {
     entry.images.clear();
   }
 
-  // Whether the history's staging is still a prompt's: that of the request
-  // it was last reserved for, while the request is resident and its prompt
-  // goes on. Releasing it would only make its next command allocate it
-  // again, and could never fund its own growth. Once it is not, a decoding
-  // lane's floor replaces it (reserveSpilledReads), or an idle reclaim
-  // gives it back.
-  [[nodiscard]] bool stagingHeld() const noexcept {
-    const auto holder = requests.find(stagingRequest);
-    return holder != requests.end() && holder->second.resident && !holder->second.promptComplete;
+  // Whether the request has begun and holds its lane.
+  [[nodiscard]] bool residentRequest(uint64_t id) const noexcept {
+    const auto found = requests.find(id);
+    return found != requests.end() && found->second.resident;
   }
 
-  // Frees one cache that can be rebuilt and returns its bytes. The vision
-  // arena goes first, when no image waits for its encode and nothing holds
-  // it: an image whose rows are encoded never needs it, and the next start
-  // that does builds one sized for its own images. Then the memory of the
-  // readers of spilled K/V while no command reads through them: the staging
-  // of spilled history once no prompt holds it (stagingHeld), which the next
-  // streamed prefill takes again
-  // (KvHistoryStream::releaseIdle), and an extent of the hot block cache
-  // above its lanes' floors, which grows back between commands
-  // (KvBlockCache::releaseAboveFloor).
-  // Then the least recently used embedding entry nothing else holds, one at
-  // a time, since only an encode rebuilds it. An entry something else holds
-  // is skipped, since dropping it frees nothing.
-  uint64_t releaseOneCache() noexcept {
-    if (vision && vision.use_count() == 1 && visionIdle()) {
-      const uint64_t bytes = vision->arenaBytes();
-      vision.reset();
-      return bytes;
-    }
-    if (!backend.commandInFlight()) {
-      if (historyStream && !stagingHeld())
-        if (const uint64_t bytes = historyStream->releaseIdle())
-          return bytes;
-      if (blockCache)
-        if (const uint64_t bytes = blockCache->releaseAboveFloor())
-          return bytes;
-    }
-    for (auto entry = embeddingCache.end(); entry != embeddingCache.begin();) {
-      if ((--entry)->use_count() == 1)
-        return uncache(entry);
-    }
-    return 0;
+  // Whether the history's staging is still a prompt's: that of a request it
+  // was reserved for, while the request is resident and its prompt goes on.
+  // Releasing it would only make the request's next command allocate it
+  // again, could never fund its own growth, and would take the pages a
+  // command between its passes streams. Once it is not, a decoding lane's
+  // floor replaces it (reserveSpilledReads), it goes once its requests left
+  // (releaseLeftStaging), or an idle reclaim gives it back.
+  [[nodiscard]] bool stagingHeld() const noexcept {
+    return std::ranges::any_of(stagingRequests, [this](uint64_t id) {
+      const auto holder = requests.find(id);
+      return holder != requests.end() && holder->second.resident && !holder->second.promptComplete;
+    });
+  }
+
+  // The history's staging for a request's prompt, granted or refused; it
+  // stays the staging of the other resident requests it was reserved for.
+  [[nodiscard]] ModelMemoryAdmission reserveStaging(uint64_t requestId, uint32_t pages) {
+    std::erase_if(stagingRequests, [this](uint64_t id) { return !residentRequest(id); });
+    if (std::ranges::find(stagingRequests, requestId) == stagingRequests.end())
+      stagingRequests.push_back(requestId);
+    return historyStream->reserve(pages);
+  }
+
+  // Gives the history's staging back, which then is no request's.
+  uint64_t releaseStaging() {
+    stagingRequests.clear();
+    return historyStream->releaseIdle();
+  }
+
+  // Gives the history's staging back once every request it was reserved
+  // for left, ended or suspended (cancelled, scored, stopped at its first
+  // token, timed out), at the first point no command runs, which releasing
+  // its extents needs: as the last request leaves, or else before the next
+  // command (Runtime::submit, which the engine calls with none in flight).
+  // While one of them holds its lane, the staging waits for its decoding
+  // floor or an idle reclaim instead.
+  void releaseLeftStaging() {
+    if (!historyStream || backend.commandInFlight())
+      return;
+    if (std::ranges::none_of(stagingRequests, [this](uint64_t id) { return residentRequest(id); }))
+      static_cast<void>(releaseStaging());
   }
 
   // Puts back the encoder a start replaced, or drops the one it built,
@@ -761,8 +944,7 @@ struct Runtime::Impl {
     const uint8_t *pixels = request.imagePixels.data();
     const auto allocate = [&] {
       if (encoderBytes) {
-        encoder = std::make_shared<ops::Vision>(
-            backend, model.vision.tensors, encodePatches);
+        encoder = std::make_shared<ops::Vision>(backend, model.vision.tensors, encodePatches);
       }
       for (ImageState &image : staged) {
         const ImageSpan &span = image.span;
@@ -800,11 +982,12 @@ struct Runtime::Impl {
     });
   }
 
-  // Encodes every image whose rows first appear in this chunk and overwrites
-  // the chunk's placeholder embedding rows, the item's from row `rowBegin` of
-  // `hidden` on, with the image rows. Text-only requests add no dispatches.
-  void addImageRows(CommandGraph &graph, Request &entry, const ModelBatchItem &item, const MetalBuffer &hidden,
-                    uint32_t rowBegin) {
+  // Encodes in `encodes` every image whose rows first appear in this chunk
+  // and overwrites the chunk's placeholder embedding rows, the item's from
+  // row `rowBegin` of `hidden` on, with the image rows. Text-only requests
+  // add no dispatches.
+  void addImageRows(CommandGraph &graph, CommandGraph &encodes, Request &entry, const ModelBatchItem &item,
+                    const MetalBuffer &hidden, uint32_t rowBegin) {
     const uint64_t chunkBegin = item.logicalPosition;
     const uint64_t chunkEnd = chunkBegin + item.tokenCount;
     for (ImageState &image : entry.images) {
@@ -818,7 +1001,7 @@ struct Runtime::Impl {
       if (!rows.encoded && !rows.encoding) {
         if (!vision)
           throw std::logic_error("image request has no vision encoder");
-        vision->encode(graph, image.span.grid(), rows.pixels, rows.embeddings);
+        vision->encode(encodes, image.span.grid(), rows.pixels, rows.embeddings);
         rows.encoding = true;
         ++counters.imageEncodes;
       }
@@ -912,31 +1095,42 @@ struct Runtime::Impl {
   }
 
   // A prefill command's: the null one unless a lane's history holds Index
-  // pages, which one lane of a command streams, alone.
-  [[nodiscard]] std::shared_ptr<SpilledKvReads> prefillReads(std::span<const ModelBatchItem> items) {
+  // pages, which one lane of a command streams (CommandLimits::
+  // indexPageLanes), over the attention layers of the command's `layers`.
+  [[nodiscard]] std::shared_ptr<SpilledKvReads> prefillReads(std::span<const ModelBatchItem> items,
+                                                             QwenPrefillLayers layers) {
     const auto streamed = std::ranges::find_if(items, readsSpilledKv);
     if (streamed == items.end())
       return std::make_shared<SpilledKvReads>();
-    if (std::any_of(streamed + 1, items.end(), readsSpilledKv))
-      throw std::logic_error("a prefill command streams the history of one sequence");
     const uint64_t end = streamed->logicalPosition + streamed->tokenCount;
     return std::make_shared<SpilledKvReads>(
         spilledReader(historyStream), static_cast<uint32_t>(streamed - items.begin()), streamed->pageSources,
         static_cast<uint32_t>((end + kv::kPageTokens - 1) / kv::kPageTokens),
-        laneTables(request(streamed->requestId).stateLane).pages, kvPages.layers());
+        laneTables(request(streamed->requestId).stateLane).pages, kvPages.layers(),
+        AttentionLayers{attentionLayersBefore(geometry.target, layers.first),
+                        attentionLayersBefore(geometry.target, layers.end)});
   }
 
-  // The layers a prefill command's pass runs (BatchPlan::passes): the
-  // pass's even share of them, all of them for a command that runs whole.
-  // Only a command of one lane whose history stays in memory runs in passes,
-  // as many as the runtime allows (Runtime::prefillPasses).
-  [[nodiscard]] QwenPrefillLayers passLayers(const BatchPlan &plan, std::span<const ModelBatchItem> items,
-                                             uint32_t passes) const {
-    const uint32_t all = geometry.target.layers;
-    if (!plan.passes || plan.pass >= plan.passes || plan.passes > passes ||
-        (plan.passes > 1 && (items.size() != 1 || readsSpilledKv(items.front()))))
-      throw std::invalid_argument("a prefill command's passes are not ones the runtime runs");
-    return {plan.pass * all / plan.passes, (plan.pass + 1) * all / plan.passes};
+  // A command keeps every rule of the commands the runtime runs
+  // (commandViolation), checked before anything of it is encoded or
+  // written: std::invalid_argument names the first it breaks.
+  void requireCommand(const BatchPlan &plan, std::span<const ModelBatchItem> items) const {
+    if (const std::optional<std::string_view> broken = commandViolation(limits, plan, items))
+      throw std::invalid_argument(std::string(*broken));
+  }
+
+  // The layers a prefill command's pass runs (BatchPlan::passes): from
+  // BatchPlan::layer, an even share of the layers left over the passes left
+  // (model::passLayers), all of them for a command that runs whole.
+  [[nodiscard]] QwenPrefillLayers passLayers(const BatchPlan &plan) const noexcept {
+    const LayerRange layers = splash::model::passLayers(plan.layer, plan.passes - plan.pass, limits.layers);
+    return {layers.first, layers.end};
+  }
+
+  // Runtime::prefillWork: what the pass computes (prefillCommandWork).
+  [[nodiscard]] CommandWork prefillWork(std::span<const PrefillLane> lanes, uint32_t first,
+                                        uint32_t passesLeft) const {
+    return prefillCommandWork(geometry.target, lanes, first, passesLeft);
   }
 
   // The blocks each lane of a command could not read
@@ -966,7 +1160,7 @@ struct Runtime::Impl {
         {.target_rows = targetRows,
          .draft_rows = draftRows,
          .target_scale = geometry.target.ropeScaling.attentionFactor()},
-        kPrefillRows);
+        kPrefillRows, geometry.target.rotaryPairs);
   }
 
   // A constrained lane keeps its final prompt row, which prefill leaves at
@@ -1206,6 +1400,28 @@ struct Runtime::Impl {
     uploadSamplingUniforms(entry, lane);
   }
 
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+  // While capturing, a host step before the policy that copies the logits
+  // the target's forward left in each of the command's `lanes` batch lanes:
+  // row 0 for a selection (`rows` 1), the lane's verified rows for a verify.
+  void encodeTargetLogitsCapture(CommandGraph &graph, uint32_t lanes, uint32_t rows) {
+    if (!capturingTargetLogits)
+      return;
+    graph.host([this, lanes, rows] {
+      const uint64_t vocabulary = geometry.target.vocabularySize;
+      capturedTargetLogits.resize(lanes);
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        const uint32_t copied =
+            rows == 1 ? 1 : *contents<uint32_t>(decodeArena->get(lane, DecodeTensor::VerifyRows), "verify rows");
+        if (!copied || copied > rows)
+          throw std::logic_error("captured verify rows are out of range");
+        const float *logits = contents<float>(decodeArena->get(lane, DecodeTensor::Logits), "logits");
+        capturedTargetLogits[lane].assign(logits, logits + copied * vocabulary);
+      }
+    });
+  }
+#endif
+
   // One LM head over the batch's `width` lanes, then one selection of the
   // first token of every selecting lane from its logits row 0, which
   // initialToken() reads. The head computes, and nothing reads, the other
@@ -1233,10 +1449,12 @@ struct Runtime::Impl {
       policies[lane.lane] = samplingPolicy(*lane.entry);
       stateLanes[lane.lane] = lane.entry->stateLane;
     }
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+    encodeTargetLogitsCapture(graph, width, 1);
+#endif
     sampling.addInitial(graph, std::span(policies).first(width),
                         samplingBuffers(width), 0,
-                        geometry.target.stopTokens[0],
-                        geometry.target.stopTokens[1],
+                        geometry.target.stopTokens,
                         {penaltyTable, std::span(stateLanes).first(width)});
   }
 
@@ -1301,8 +1519,8 @@ struct Runtime::Impl {
       }
       return results;
     };
-    return std::make_unique<DeferredMetalTicket>(std::move(command),
-                                                 std::move(finish));
+    // It selects from rows the prompts left, through no layer.
+    return std::make_unique<DeferredMetalTicket>(std::move(command), std::move(finish), WorkCount({}, nullptr));
   }
 
   ChunkedPrefillParams chunkParams(uint64_t logicalPosition,
@@ -1478,10 +1696,6 @@ struct Runtime::Impl {
   // DFlash2 draft captures.
   std::vector<PrefillChunk> preparePrefill(std::span<const ModelBatchItem> items,
                                            std::array<Request *, kLaneCount> &entries) {
-    uint64_t rows = 0;
-    for (const ModelBatchItem &item : items) rows += item.tokenCount;
-    if (!rows || rows > uint64_t{kPrefillRows} * prefillArena->chunks())
-      throw std::invalid_argument("a prefill command's rows exceed its chunks");
     std::vector<PrefillChunk> chunks(1);
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const ModelBatchItem &item = items[lane];
@@ -1645,7 +1859,8 @@ struct Runtime::Impl {
   // A prefill command (preparePrefill), or the pass of it that runs
   // `layers` (BatchPlan::passes): with the first layer, a restored lane's
   // draft rings (DFlash2) first and each chunk's RoPE tables, embedding and
-  // image rows in its own tensors; the target's layers over the chunks
+  // image rows in its own tensors, the images it begins encoded in
+  // `encodes`; the target's layers over the chunks
   // (QwenTarget::addPrefill), which read spilled history through `reads`;
   // with the last layer, the draft's context of each chunk's captured rows,
   // the first token of each lane whose rows end its prompt, and each lane's
@@ -1655,8 +1870,10 @@ struct Runtime::Impl {
   // a state it captures writes that state's cell, another the next cell or
   // the arena's scratch cell, whichever the part after it does not write. So
   // no part writes the cell it reads, and none the lane's current cell; with
-  // one scratch cell, at most one lane's rows run past a chunk.
-  PrefillOutputs encodePrefillGraph(CommandGraph &graph, std::span<const ModelBatchItem> items,
+  // one scratch cell, at most one lane's rows run past a chunk
+  // (CommandLimits::lanesPastChunk).
+  PrefillOutputs encodePrefillGraph(CommandGraph &graph, CommandGraph &encodes,
+                                    std::span<const ModelBatchItem> items,
                                     std::array<Request *, kLaneCount> &entries, SpilledKvReads &reads,
                                     QwenPrefillLayers layers) {
     const bool begins = !layers.first, ends = layers.end == geometry.target.layers;
@@ -1668,13 +1885,11 @@ struct Runtime::Impl {
       for (uint32_t s = 0; s < chunks[c].sequences.size(); ++s) parts[chunks[c].sequences[s].lane].push_back({c, s});
     std::vector<std::vector<const GdnParityBuffers *>> written(chunks.size());
     for (uint32_t c = 0; c < chunks.size(); ++c) written[c].resize(chunks[c].sequences.size());
-    uint32_t spanning = 0;
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       const GdnParityBuffers *const next = &states.next(entries[lane]->stateLane);
       // The cell the part after this one writes; none after the last part,
       // whose end is the lane's rows' (a state there is `atEnd`).
       const GdnParityBuffers *after = nullptr;
-      spanning += parts[lane].size() > 1;
       for (size_t index = parts[lane].size(); index-- > 0;) {
         const auto [c, s] = parts[lane][index];
         const PrefillSequence &sequence = chunks[c].sequences[s];
@@ -1690,7 +1905,6 @@ struct Runtime::Impl {
         written[c][s] = after = cell;
       }
     }
-    if (spanning > 1) throw std::invalid_argument("several lanes' rows run past a prefill chunk");
 
     // A restored lane's rings first: they pass through the context buffers
     // and the draft RoPE tables before the command's rows do. Once the window
@@ -1723,7 +1937,7 @@ struct Runtime::Impl {
       for (uint32_t s = 0; s < chunk.sequences.size(); ++s) {
         const PrefillSequence &sequence = chunk.sequences[s];
         const ModelBatchItem &part = sequence.part;
-        if (begins) addImageRows(graph, *sequence.entry, part, model.buffers.hidden[0], sequence.rowBegin);
+        if (begins) addImageRows(graph, encodes, *sequence.entry, part, model.buffers.hidden[0], sequence.rowBegin);
         const GdnParityBuffers &in = *from[sequence.lane], &out = *written[c][s];
         from[sequence.lane] = &out;
         QwenTargetPrefillSequence &destination = sequences[c].emplace_back();
@@ -2027,9 +2241,11 @@ struct Runtime::Impl {
       policies[lane] = samplingPolicy(*entries[lane]);
       stateLanes[lane] = entries[lane]->stateLane;
     }
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+    encodeTargetLogitsCapture(graph, lanes, kDecodeRows);
+#endif
     sampling.addVerify(graph, std::span(policies).first(lanes),
-                       samplingBuffers(lanes), geometry.target.stopTokens[0],
-                       geometry.target.stopTokens[1],
+                       samplingBuffers(lanes), geometry.target.stopTokens,
                        {penaltyTable, std::span(stateLanes).first(lanes)});
   }
 
@@ -2091,7 +2307,7 @@ struct Runtime::Impl {
          decodeArena->batchSlice(DecodeTensor::AcceptedCount, width),
          decodeArena->batchSlice(DecodeTensor::VerifyRows, width)},
         maximumRetained, std::span(policies).first(width),
-        geometry.target.stopTokens[0], geometry.target.stopTokens[1]);
+        geometry.target.stopTokens);
   }
 
   // The target's commit after acceptance (QwenTarget::addStateCommit): each
@@ -2291,19 +2507,19 @@ struct Runtime::Impl {
   // ticket.
   class ConstrainedDecodeTicket final : public ModelBatchTicket {
   public:
+    // `count` counts its work from before its first command.
     ConstrainedDecodeTicket(Impl &impl, std::vector<DecodeLaneResult> lanes,
                             std::span<const ModelBatchItem> items,
                             std::shared_ptr<SpilledKvReads> reads,
-                            const CommandGraph &draft,
+                            const CommandGraph &draft, WorkCount count,
                             std::function<void()> completion)
         : impl_(impl), lanes_(std::move(lanes)),
           items_(items.begin(), items.end()), reads_(std::move(reads)),
-          wake_(std::move(completion)) {
+          count_(std::move(count)), wake_(std::move(completion)) {
       submit(draft);
     }
 
-    std::vector<ModelMaskRequest> takeMaskRequests() override {
-      std::vector<ModelMaskRequest> requests;
+    void advance() override {
       if (stage_ == Stage::Draft && command_.ready()) {
         addTiming(command_.wait());
         std::array<Request *, kLaneCount> entries{};
@@ -2327,7 +2543,7 @@ struct Runtime::Impl {
             request.simulationTokens.insert(request.simulationTokens.end(),
                                             proposed,
                                             proposed + kDraftProposalTokens);
-            requests.push_back(std::move(request));
+            requests_.push_back(std::move(request));
           }
         }
 
@@ -2383,8 +2599,9 @@ struct Runtime::Impl {
           stage_ = Stage::Commit;
         }
       }
-      return requests;
     }
+
+    std::vector<ModelMaskRequest> takeMaskRequests() override { return std::exchange(requests_, {}); }
 
     bool ownsMaskWait(uint64_t requestId) const noexcept override {
       if (stage_ == Stage::Draft || stage_ == Stage::Done)
@@ -2431,11 +2648,12 @@ struct Runtime::Impl {
       // before the engine applies its results (DeferredMetalTicket::wait).
       items_.clear();
       reads_.reset();
+      work_ = count_.realize();
       return results;
     }
 
-    double wallMilliseconds() const noexcept override {
-      return timing_.wallSeconds * 1000.0;
+    CommandSample sample() const noexcept override {
+      return {.work = work_, .wallMilliseconds = timing_.wallSeconds * 1000.0};
     }
 
   private:
@@ -2466,9 +2684,13 @@ struct Runtime::Impl {
     std::vector<ModelBatchItem> items_;
     // Before the command, which goes first and waits for the GPU.
     std::shared_ptr<SpilledKvReads> reads_;
+    WorkCount count_;
+    CommandWork work_;
     Stage stage_ = Stage::Draft;
     CommandTicket command_;
     CommandTiming timing_;
+    // The mask requests of the draft's lanes, until takeMaskRequests().
+    std::vector<ModelMaskRequest> requests_;
     std::array<bool, kLaneCount> abandoned_{};
     double targetForwardGpuSeconds_ = 0.0;
     double maskWaitSeconds_ = 0.0;
@@ -2522,6 +2744,7 @@ void Runtime::suspend(uint64_t requestId) {
   entry.replayingGeneration |= entry.promptComplete;
   entry.promptComplete = false;
   entry.resident = false;
+  impl_->releaseLeftStaging();
 }
 
 StateAdmission Runtime::resume(const ModelRequest &request) {
@@ -2660,6 +2883,8 @@ Runtime::prefill(const BatchPlan &plan, std::span<const ModelBatchItem> items) {
 std::unique_ptr<ModelBatchTicket>
 Runtime::submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
                 std::function<void()> completion) {
+  // The staging of a request that left while another command ran.
+  impl_->releaseLeftStaging();
   switch (plan.kind) {
   case WorkKind::Prefill:
     return prefillAsync(plan, items, std::move(completion));
@@ -2673,31 +2898,30 @@ std::unique_ptr<ModelBatchTicket>
 Runtime::prefillAsync(const BatchPlan &plan,
                       std::span<const ModelBatchItem> items,
                       std::function<void()> completion) {
+  impl_->requireCommand(plan, items);
   validatePlan(plan, items, WorkKind::Prefill);
   if (plan.decodeStage != DecodeStage::Regular) {
     throw std::invalid_argument("Qwen prefill cannot resume a mask plan");
   }
-  const QwenPrefillLayers layers = impl_->passLayers(plan, items, prefillPasses());
+  const QwenPrefillLayers layers = impl_->passLayers(plan);
   const bool begins = !layers.first, ends = layers.end == impl_->geometry.target.layers;
 
   std::array<Impl::Request *, kLaneCount> entries{};
   // Each request's draws before the chunk, which a rerun of it restores.
   std::array<uint64_t, kLaneCount> draws{};
+  // A command's first pass forgets what the passes of one given up before
+  // could not read.
+  for (uint32_t lane = 0; begins && lane < items.size(); ++lane)
+    impl_->request(items[lane].requestId).unreadableBlocks.clear();
   CommandGraph graph;
   if (impl_->aneFfn) {
     for (uint32_t lane = 0; lane < items.size(); ++lane)
       draws[lane] = impl_->request(items[lane].requestId).rngCounter;
     impl_->aneFfn->begin();
   }
-  const std::shared_ptr<SpilledKvReads> reads = impl_->prefillReads(items);
-  const auto outputs = impl_->encodePrefillGraph(graph, items, entries, *reads, layers);
-  const bool encodesImages = std::any_of(
-      entries.begin(), entries.begin() + items.size(), [](const auto *entry) {
-        return std::any_of(entry->images.begin(), entry->images.end(),
-                           [](const auto &image) {
-                             return image.rows && image.rows->encoding;
-                           });
-      });
+  const std::shared_ptr<SpilledKvReads> reads = impl_->prefillReads(items, layers);
+  CommandGraph encodes;
+  const auto outputs = impl_->encodePrefillGraph(graph, encodes, items, entries, *reads, layers);
   // A state captured inside the command starts from the lane's context
   // window as the command finds it, whose older rows the command's own rows
   // overwrite. It is copied once, before the command's first pass runs: a
@@ -2709,11 +2933,8 @@ Runtime::prefillAsync(const BatchPlan &plan,
   // The completion's items hold the states' reservations until the ticket
   // has waited for every run of the command.
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
-  CommandTicket command =
-      impl_->aneFfn ? impl_->aneFfn->commit(graph, std::move(completion))
-                    : impl_->backend.submitCommandAsync(graph.command(), std::move(completion));
   Impl *impl = impl_.get();
-  auto finish = [impl, entries, outputs, draws, reads, ends,
+  auto finish = [impl, entries, outputs, draws, reads, layers, ends,
                  items = std::move(copiedItems)](CommandTiming &timing) mutable {
     // A chunk whose Neural Engine work failed holds no usable outputs, and
     // the split has stopped: the GPU runs the chunk again alone, which
@@ -2727,7 +2948,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
     // captures again, and that capture overwrites the ring slot after the
     // rebuild; clearForColdStart clears the current state again, which
     // neither command writes; synchronizedTables writes nothing at the
-    // same revision; image rows the first command encoded are still
+    // same revision; image rows encoded ahead of the first run are still
     // `encoding` and are copied, not encoded again; the requests' draws
     // restored, a sampled first token draws the same uniform; and the reads
     // of spilled history end before the rerun reads it again, keeping what
@@ -2738,24 +2959,34 @@ Runtime::prefillAsync(const BatchPlan &plan,
       for (uint32_t lane = 0; lane < items.size(); ++lane)
         entries[lane]->rngCounter = draws[lane];
       reads->end();
-      CommandGraph again;
-      static_cast<void>(impl->encodePrefillGraph(again, items, entries, *reads, {0, impl->geometry.target.layers}));
+      CommandGraph again, encodes;
+      static_cast<void>(
+          impl->encodePrefillGraph(again, encodes, items, entries, *reads, layers));
       const CommandTiming rerun = impl->backend.submitCommandAsync(again.command()).wait();
       timing.gpuSeconds += rerun.gpuSeconds;
       timing.wallSeconds += rerun.wallSeconds;
-      timing.hostSeconds += rerun.hostSeconds;
       ++impl->counters.aneFfnReruns;
     }
     reads->end();
-    // A pass before the last commits nothing: the rows go on in the next.
+    std::array<std::vector<uint64_t>, kLaneCount> unreadable = Impl::unreadableBlocks(*reads);
+    // A pass before the last commits nothing: the rows go on in the next,
+    // and the blocks its reads could not read fail them at the last.
     if (!ends) {
       impl->counters.totalPrefillWallSeconds += timing.wallSeconds;
       impl->counters.totalPrefillGpuSeconds += timing.gpuSeconds;
       std::vector<ModelStepResult> results(items.size());
-      for (uint32_t lane = 0; lane < items.size(); ++lane) results[lane].requestId = entries[lane]->id;
+      for (uint32_t lane = 0; lane < items.size(); ++lane) {
+        results[lane].requestId = entries[lane]->id;
+        std::ranges::copy(unreadable[lane], std::back_inserter(entries[lane]->unreadableBlocks));
+      }
       return results;
     }
-    std::array<std::vector<uint64_t>, kLaneCount> unreadable = Impl::unreadableBlocks(*reads);
+    for (uint32_t lane = 0; lane < items.size(); ++lane) {
+      std::vector<uint64_t> &blocks = unreadable[lane];
+      std::ranges::copy(std::exchange(entries[lane]->unreadableBlocks, {}), std::back_inserter(blocks));
+      std::ranges::sort(blocks);
+      blocks.erase(std::ranges::unique(blocks).begin(), blocks.end());
+    }
     // A row that is not finite, of the chunk or of the state it computed
     // from, reaches the lane's last row through the recurrent state, and
     // through attention on a GPU whose tile weighs non-finite keys and values
@@ -2910,8 +3141,27 @@ Runtime::prefillAsync(const BatchPlan &plan,
     impl->counters.totalPrefillGpuSeconds += timing.gpuSeconds;
     return results;
   };
-  return std::make_unique<DeferredMetalTicket>(
-      std::move(command), std::move(finish), !encodesImages, reads);
+  const auto submit = [impl, graph = std::make_shared<CommandGraph>(std::move(graph)),
+                       completion](const CommandTiming &) {
+    return impl->aneFfn ? impl->aneFfn->commit(*graph, completion)
+                        : impl->backend.submitCommandAsync(graph->command(), completion);
+  };
+  std::array<PrefillLane, kLaneCount> lanes{};
+  for (uint32_t lane = 0; lane < items.size(); ++lane)
+    lanes[lane] = {static_cast<uint32_t>(items[lane].logicalPosition), items[lane].tokenCount};
+  WorkCount count(prefillCommandWork(impl_->geometry.target, std::span(lanes).first(items.size()), plan.layer,
+                                     plan.passes - plan.pass),
+                  impl_->model.expertStore(), reads);
+  if (encodes.empty())
+    return std::make_unique<DeferredMetalTicket>(submit({}), std::move(finish), std::move(count));
+  // Metal fails an event wait unmet 5 s after its queue reached it, which it
+  // does for a command's first host step or Neural Engine wait as the
+  // command is submitted, whatever work runs ahead of it (MetalBackend.hpp,
+  // EventStep): the images' encodes, seconds of GPU work on a small GPU, run
+  // as a command of their own, and the command is submitted once they have
+  // completed.
+  return std::make_unique<DeferredMetalTicket>(impl_->backend.submitCommandAsync(encodes.command(), completion),
+                                               submit, std::move(finish), std::move(count));
 }
 
 std::vector<ModelStepResult>
@@ -2923,6 +3173,7 @@ std::unique_ptr<ModelBatchTicket>
 Runtime::decodeAsync(const BatchPlan &plan,
                      std::span<const ModelBatchItem> items,
                      std::function<void()> completion) {
+  impl_->requireCommand(plan, items);
   validatePlan(plan, items, WorkKind::Decode);
   if (plan.decodeStage != DecodeStage::Regular)
     return impl_->submitInitialSelection(items, std::move(completion));
@@ -2990,13 +3241,17 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
                               DecodeTensor::DraftHidden0, width);
+  impl_->draftModel.addMaskRows(commandGraph, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
+                                width);
   impl_->encodeDraftBatchGraph(commandGraph, entries,
                                {logicalPositions.data(), width},
                                {maximumRetained.data(), width}, constrained);
   std::shared_ptr<SpilledKvReads> reads = impl_->decodeReads(items);
+  // The weights it reads on demand and the spilled K/V its reads bring.
+  WorkCount count({}, impl_->model.expertStore(), reads);
   if (constrained) {
-    return std::make_unique<Impl::ConstrainedDecodeTicket>(
-        *impl_, std::move(lanes), items, std::move(reads), commandGraph, std::move(completion));
+    return std::make_unique<Impl::ConstrainedDecodeTicket>(*impl_, std::move(lanes), items, std::move(reads),
+                                                           commandGraph, std::move(count), std::move(completion));
   }
   impl_->encodeBatchVerifyInput(commandGraph, width);
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
@@ -3006,17 +3261,16 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
-  auto finish = [impl, lanes = std::move(lanes), reads = std::move(reads),
+  auto finish = [impl, lanes = std::move(lanes), reads,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
     return impl->finalizeDecode(lanes, items, timing, *reads, false);
   };
   CommandTicket command = impl_->backend.submitCommandAsync(
       commandGraph.command(), std::move(completion));
-  return std::make_unique<DeferredMetalTicket>(std::move(command),
-                                               std::move(finish));
+  return std::make_unique<DeferredMetalTicket>(std::move(command), std::move(finish), std::move(count));
 }
 
-uint32_t Runtime::residentLane(uint64_t requestId) {
+uint32_t Runtime::residentLane(uint64_t requestId) const {
   Impl::Request &entry = impl_->request(requestId);
   if (!entry.resident)
     throw std::logic_error("request is not resident");
@@ -3041,10 +3295,6 @@ std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
                                   std::move(state));
 }
 
-uint64_t Runtime::snapshotBytes() const noexcept {
-  return impl_->states.layout().cachedBytes();
-}
-
 bool Runtime::canSnapshotToDisk(bool inUse) const noexcept {
   return impl_->states.canSnapshotToDisk(inUse);
 }
@@ -3054,54 +3304,68 @@ Runtime::snapshotToDisk(uint64_t requestId, std::function<void()> completion) {
   return impl_->states.snapshotToDisk(residentLane(requestId), std::move(completion));
 }
 
-uint32_t Runtime::prefillGroupRows(bool spills) const noexcept {
-  const bool groups = impl_->model.expertStore() || (spills && impl_->geometry.spilledKv);
-  return (groups ? impl_->geometry.prefillChunks : 1) * kPrefillRows;
+CommandLimits Runtime::commandLimits() const noexcept { return impl_->limits; }
+
+CommandWork Runtime::prefillWork(std::span<const PrefillLane> lanes, uint32_t first, uint32_t passesLeft) const {
+  return impl_->prefillWork(lanes, first, passesLeft);
 }
 
-// A command over streamed experts reads each layer's that its rows route,
-// almost all of them however few its rows: such a command may run a pass
-// per layer. The Neural Engine's split runs a command whole.
-uint32_t Runtime::prefillPasses() const noexcept {
-  return impl_->model.expertStore() && !impl_->aneFfn ? impl_->geometry.target.layers : 1;
-}
+std::span<ElasticPool *const> Runtime::pools() noexcept { return impl_->pools; }
 
-uint32_t Runtime::statesToActivate() const noexcept {
+std::optional<uint32_t> Runtime::statesToActivate() const noexcept {
   return impl_->states.statesToActivate();
+}
+
+uint64_t Runtime::idleBufferBytes(uint32_t evictedStates, bool afterStart, bool keepLane) const noexcept {
+  return impl_->states.idleBytes(evictedStates, afterStart, keepLane);
+}
+
+uint64_t Runtime::startStateBytes() const noexcept { return impl_->states.startBytes(); }
+
+// The staging is the prompts', whichever request holds it, so also for a
+// request the runtime has not begun, as the engine places a fresh start
+// before it begins it.
+uint64_t Runtime::stagingShortfall(uint64_t, uint32_t pages) const {
+  return impl_->historyStream ? impl_->historyStream->shortfallBytes(pages) : 0;
+}
+
+uint64_t Runtime::hotFloorBytes(uint32_t lanes) const {
+  return impl_->blockCache ? impl_->blockCache->floorBytes(lanes) : 0;
+}
+
+// A request the runtime has not begun waits for its floor too, as the
+// engine places a fresh start before it begins it.
+uint64_t Runtime::hotFloorShortfall(std::span<const uint64_t> requestIds) const {
+  if (!impl_->blockCache) return 0;
+  uint32_t waiting = 0;
+  for (const uint64_t id : requestIds) {
+    const auto found = impl_->requests.find(id);
+    waiting += found == impl_->requests.end() || !found->second.resident ||
+               !impl_->blockCache->holdsLane(found->second.stateLane);
+  }
+  return impl_->blockCache->lanesShortfallBytes(waiting);
 }
 
 // A prompt reads its spilled history through the staging, a decode through
 // the hot block cache: the floor a decoding lane takes replaces the staging
 // once no prompt holds it, so a lane never holds both (the memory plan
 // counts the larger of the two). The staging holds nothing between
-// commands, and a next prompt allocates it again as it streams; the hot
-// block cache keeps its blocks.
-ModelMemoryAdmission Runtime::reserveSpilledReads(uint64_t requestId) {
+// prompts, and a next prompt allocates it again as it streams; the hot
+// block cache keeps its blocks. The staging is the prompt's from its
+// reservation on, also when its growth is refused: the reclaim that funds a
+// retry spares it (Impl::stagingHeld). It stays the other prompts' it was
+// reserved for, whose commands between their passes stream into it.
+ModelMemoryAdmission Runtime::reserveSpilledReads(uint64_t requestId, SpilledReadNeed need) {
   const uint32_t lane = residentLane(requestId);
+  if (need.kind == WorkKind::Prefill)
+    return impl_->historyStream ? impl_->reserveStaging(requestId, need.pages) : ModelMemoryAdmission{.ok = true};
   if (!impl_->blockCache) return {.ok = true};
-  if (impl_->historyStream && !impl_->stagingHeld()) static_cast<void>(impl_->historyStream->releaseIdle());
+  if (impl_->historyStream && !impl_->stagingHeld()) static_cast<void>(impl_->releaseStaging());
   return impl_->blockCache->reserveLane(lane);
 }
 
-// The staging is the request's from now on, also when its growth is
-// refused: the reclaim that funds a retry spares it (Impl::stagingHeld).
-ModelMemoryAdmission Runtime::reserveHistoryStaging(uint64_t requestId, uint32_t pages) {
-  static_cast<void>(residentLane(requestId));
-  if (!impl_->historyStream) return {.ok = true};
-  impl_->stagingRequest = requestId;
-  return impl_->historyStream->reserve(pages);
-}
-
-ModelMemoryAdmission Runtime::growSpilledReads() {
-  return impl_->blockCache ? impl_->blockCache->growTowardTarget() : ModelMemoryAdmission{.ok = true};
-}
-
-uint64_t Runtime::reclaimIdleState(bool keepLane, IdleMemory scope) noexcept {
-  // One unit per call, so a denied allocation frees only what it needs;
-  // rebuildable caches go once the pool has nothing more to give.
-  if (const uint64_t buffer = impl_->states.releaseOneIdle(keepLane))
-    return buffer;
-  return scope == IdleMemory::BuffersThenCaches ? impl_->releaseOneCache() : 0;
+uint64_t Runtime::releaseIdleBuffer(bool keepLane) noexcept {
+  return impl_->states.releaseOneIdle(keepLane);
 }
 
 std::optional<std::string>
@@ -3149,6 +3413,7 @@ void Runtime::end(uint64_t requestId) {
   if (found->second.resident)
     impl_->releaseLane(found->second);
   impl_->requests.erase(found);
+  impl_->releaseLeftStaging();
 }
 
 namespace {
@@ -3162,7 +3427,8 @@ void requireLanesSucceeded(std::span<const ModelStepResult> results) {
 }
 
 // Warmup runs on the startup runway the engine's KV pool allocated
-// (ExecutionLimits::warmupKvPages); it never allocates KV.
+// (ExecutionLimits::warmupKvPages), whose pages its caller holds while it
+// runs (engine::KvPool::RunwayHold); it never allocates KV.
 void requireRunwayPages(const kv::PageStorage &storage,
                         std::span<const uint32_t> pages) {
   for (uint32_t page : pages) {
@@ -3203,7 +3469,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   if (!rows || rows > kPrefillRows)
     throw std::invalid_argument("invalid prefill warmup row count");
   constexpr uint64_t id = std::numeric_limits<uint64_t>::max() - 100;
-  double wallSeconds = 0.0, hostSeconds = 0.0;
+  double wallSeconds = 0.0;
   std::vector<WarmupLaneResult> lanes;
   std::vector<uint32_t> warmupPrompt(rows, 0);
   ModelRequest request;
@@ -3224,7 +3490,6 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
     const std::unique_ptr<ModelBatchTicket> ticket = prefillAsync(plan, std::span<const ModelBatchItem>(&item, 1), {});
     auto result = ticket->wait();
     wallSeconds = std::chrono::duration<double>(AwakeClock::now() - phaseStart).count();
-    hostSeconds = ticket->hostMilliseconds() / 1000.0;
     requireLanesSucceeded(result);
     if (result.size() != 1 || result[0].consumedPromptTokens != rows) {
       throw std::runtime_error("prefill warmup result mismatch");
@@ -3238,22 +3503,22 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   }
   return {"real " + std::to_string(rows) +
               "-row KV target+draft prefill [M32]",
-          wallSeconds, std::move(lanes), hostSeconds};
+          wallSeconds, std::move(lanes)};
 }
 
 WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
-  if (!width || width > kLaneCount) {
+  if (!width || width > ExecutionLimits::maximumBatchWidth) {
     throw std::invalid_argument("invalid decode warmup width");
   }
   constexpr uint64_t firstId = std::numeric_limits<uint64_t>::max() - 110;
-  // Plan order is deliberately unrelated to state-lane order. DecodeArena
-  // lanes follow the explicit BatchPlan, while recurrent and KV state stay
-  // addressed by each request's state lane; batching must never assume lanes
-  // 0..3.
-  constexpr std::array<uint32_t, kLaneCount> stateLaneOrder{2, 0, 3, 1};
+  // Plan order is deliberately unrelated to state-lane order: DecodeArena
+  // lanes follow the BatchPlan, while recurrent and KV state stay addressed
+  // by each request's state lane, so plan lane k runs on state lane
+  // maximumBatchWidth - 1 - k and batching never assumes lanes 0..width-1.
+  const auto stateLane = [](uint32_t lane) { return ExecutionLimits::maximumBatchWidth - 1 - lane; };
   double wallSeconds = 0.0;
   std::vector<WarmupLaneResult> lanes;
-  std::array<std::vector<uint32_t>, kLaneCount> pages;
+  std::array<std::vector<uint32_t>, ExecutionLimits::maximumBatchWidth> pages;
   try {
     for (uint32_t lane = 0; lane < width; ++lane) {
       std::vector<uint32_t> warmupPrompt{lane};
@@ -3261,7 +3526,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
       request.id = firstId + lane;
       request.prompt = warmupPrompt;
       request.maxNewTokens = 16;
-      beginColdRequest(request, stateLaneOrder[lane]);
+      beginColdRequest(request, stateLane(lane));
       pages[lane] = {5 + lane};
       requireRunwayPages(impl_->kvPages, pages[lane]);
       BatchPlan prefillPlan{.kind = WorkKind::Prefill,
@@ -3286,7 +3551,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     requireLanesSucceeded(decoded);
     bool committedEveryLane = decoded.size() == width;
     for (uint32_t lane = 0; committedEveryLane && lane < width; ++lane) {
-      const auto &lengths = impl_->states.metadata(stateLaneOrder[lane]).lengths;
+      const auto &lengths = impl_->states.metadata(stateLane(lane)).lengths;
       committedEveryLane = !decoded[lane].outputTokens.empty() &&
                            lengths.targetTokens > 1 &&
                            lengths.targetTokens ==
@@ -3302,7 +3567,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     for (uint32_t lane = 0; lane < width; ++lane) {
       lanes.push_back({std::move(decoded[lane]),
                        impl_->request(firstId + lane).pendingToken,
-                       impl_->states.metadata(stateLaneOrder[lane]).lengths.targetTokens});
+                       impl_->states.metadata(stateLane(lane)).lengths.targetTokens});
       end(firstId + lane);
     }
   } catch (...) {
@@ -3422,11 +3687,17 @@ ModelTelemetry Runtime::telemetry() const noexcept {
 }
 
 std::vector<ops::SwiGluProjections> aneFfnLayers(const LoadedModel &model) {
-  std::vector<ops::SwiGluProjections> layers;
-  if (const auto *dense = std::get_if<Qwen3_8Weights>(&model.target))
-    for (const Qwen3_8LayerWeights &layer : dense->layers)
-      layers.push_back({&layer.gateProjection, &layer.upProjection, &layer.downProjection});
-  return layers;
+  return std::visit(
+      [](const auto &weights) {
+        std::vector<ops::SwiGluProjections> layers;
+        for (const auto &layer : weights.layers) {
+          const std::optional<ops::SwiGluProjections> dense = denseFfn(layer);
+          if (!dense) return std::vector<ops::SwiGluProjections>{};
+          layers.push_back(*dense);
+        }
+        return layers;
+      },
+      model.target);
 }
 
 void withPrefillArena(
@@ -3471,8 +3742,25 @@ std::span<const float> RuntimeInstrumentation::lastLogits(const Runtime &runtime
           uint64_t{ExecutionLimits::targetVerifyRows} * impl.geometry.target.vocabularySize};
 }
 
+std::span<const uint16_t> RuntimeInstrumentation::lastCapturedRows(const Runtime &runtime, uint32_t chunk) {
+  const MetalBuffer captured = runtime.impl_->prefillArena->get(PrefillTensor::Captured, chunk);
+  return {contents<uint16_t>(captured, "captured target rows"), captured.sizeBytes() / sizeof(uint16_t)};
+}
+
 uint32_t RuntimeInstrumentation::lastVerifyRows(const Runtime &runtime, uint32_t lane) {
   return *contents<uint32_t>(runtime.impl_->decodeArena->get(lane, DecodeTensor::VerifyRows), "verify rows");
+}
+
+void RuntimeInstrumentation::captureTargetLogits(Runtime &runtime, bool enabled) {
+  runtime.impl_->capturingTargetLogits = enabled;
+}
+
+std::vector<std::vector<float>> RuntimeInstrumentation::takeTargetLogits(Runtime &runtime) {
+  return std::exchange(runtime.impl_->capturedTargetLogits, {});
+}
+
+std::optional<uint32_t> RuntimeInstrumentation::pendingToken(const Runtime &runtime, uint64_t requestId) {
+  return runtime.impl_->requests.at(requestId).pendingToken;
 }
 
 RuntimeInstrumentation::LaneTables RuntimeInstrumentation::laneTables(const Runtime &runtime, uint64_t requestId) {
@@ -3490,6 +3778,9 @@ std::vector<uint8_t> RuntimeInstrumentation::pendingGdnRows(const Runtime &runti
   const Runtime::Impl::Request &entry = impl.requests.at(requestId);
   if (!entry.resident)
     throw std::logic_error("request is not resident");
+  // A target without GDN layers keeps no tape.
+  if (!impl.geometry.target.stateLayout.layers)
+    return {};
   const QwenLaneMetadata &metadata = impl.states.metadata(entry.stateLane);
   const ops::GdnShape shape = impl.geometry.target.gdnShape();
   const uint32_t kvWidth = (shape.keyHeads + shape.valueHeads) * shape.headDimension;

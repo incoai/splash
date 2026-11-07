@@ -3,8 +3,10 @@
 
 #include "HostKvExtents.hpp"
 #include "TestChecks.hpp"
+#include "TestFamilies.hpp"
 #include "ops/PagedAttention.hpp"
 #include "Q8PageFormatReference.hpp"
+#include "ops/KernelCalibration.hpp"
 
 #include <algorithm>
 #include <array>
@@ -24,35 +26,64 @@ using splash::test::HostKvExtents;
 
 namespace {
 
+// The pages per prefill attention split these plans take: the Apple10 row's
+// (KernelCalibration.hpp).
+constexpr uint32_t kPagesPerSplit = splash::ops::kAttention.prefillPagesPerSplit;
+
 constexpr uint32_t kStride = 32;
 constexpr uint32_t kQueryStride = kStride;
 constexpr uint32_t kRows = kVerifyRows;
 static_assert(kStride == SPLASH_VERIFY_CHUNK_STRIDE);
 
-// The production GQA geometries. The group size selects the kernel
-// specialization; the suffix names its pipelines. The group of twelve runs
-// the sparse kernels, which attend through block lists, bound before their
-// parameters, and read token-major values.
+// The production GQA geometries, every family's (TestFamilies.hpp). The
+// group size selects the kernel specialization, which the plans name
+// (ops::PagedAttention). A QSA family's group runs the sparse kernels, which
+// attend through block lists, bound before their parameters, and read
+// token-major values; a group of more than eight runs each tile in parts,
+// each a threadgroup of the split with partial slots of its own
+// (splash_attention_tile_part).
 struct Shape {
   uint32_t kvHeads;
   uint32_t queryHeadsPerKvHead;
-  const char *suffix;
+  splash::kv::Reads reads;
   uint32_t queryHeads() const { return kvHeads * queryHeadsPerKvHead; }
   uint32_t fusedRows() const { return kRows * queryHeadsPerKvHead; }
-  bool sparse() const { return queryHeadsPerKvHead == 12; }
+  bool sparse() const { return reads == splash::kv::Reads::SelectedBlocks; }
+  uint32_t parts() const { return sparse() ? 1 : SPLASH_ATTENTION_TILE_PARTS(queryHeadsPerKvHead); }
+  // The partial of a fused row of the tile of KV head `head` from split
+  // `split` of `slotSplits`: [KV head][part][split][part's fused row].
+  uint64_t partialRow(uint32_t head, uint32_t slotSplits, uint32_t split, uint32_t row) const {
+    const uint32_t partRows = fusedRows() / parts();
+    return ((uint64_t{head} * parts() + row / partRows) * slotSplits + split) * partRows + row % partRows;
+  }
   Layout layout() const {
     return {.attentionLayers = 1, .kvHeads = kvHeads, .headDimension = kHeadDimension,
-            .valuesTokenMajor = sparse()};
+            .valuesTokenMajor = splash::kv::valuesTokenMajorFor(reads), .reads = reads};
   }
-  // A phase's ("verify" or "prefill") split and reduce entries.
-  std::string split(const char *phase) const {
-    return std::string(phase) + (sparse() ? "_attention_q8_sparse" : "_attention_q8_split") + suffix;
+  // A phase's ("verify" or "prefill") split and reduce entries, as its plans
+  // name them.
+  std::string split(std::string_view phase) const {
+    return phase == "verify" ? verifyPlan().splitPipeline : prefillPlan().splitPipeline;
   }
-  std::string reduce(const char *phase) const {
-    return std::string(phase) + (sparse() ? "_attention_sparse_reduce" : "_attention_reduce") + suffix;
+  std::string reduce(std::string_view phase) const {
+    return phase == "verify" ? verifyPlan().reducePipeline : prefillPlan().reducePipeline;
+  }
+
+private:
+  splash::ops::PrefillAttentionPlan prefillPlan() const {
+    return splash::ops::PagedAttention::prefillPlan(kRows, 0, queryHeads(), layout(), kPagesPerSplit);
+  }
+  splash::ops::VerifyAttentionPlan verifyPlan() const {
+    const std::array<uint32_t, 1> history{0};
+    return splash::ops::PagedAttention::verifyPlan(1, queryHeads(), layout(), history);
   }
 };
-constexpr std::array<Shape, 3> kShapes{{{4, 6, ""}, {2, 8, "_kv2_g8"}, {2, 12, "_kv2_g12"}}};
+const std::vector<Shape> kShapes = [] {
+  std::vector<Shape> shapes;
+  for (const splash::test::AttentionGeometry &geometry : splash::test::familyAttentionGeometries())
+    shapes.push_back({geometry.kvHeads, geometry.queryHeads / geometry.kvHeads, geometry.reads});
+  return shapes;
+}();
 
 using splash::test::require;
 
@@ -536,7 +567,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
     [encoder useResource:extent usage:MTLResourceUsageRead];
   // The sparse split's grid is one-dimensional (ops::PagedAttention::verifyPlan).
   [encoder dispatchThreadgroups:shape.sparse() ? MTLSizeMake(shape.kvHeads * splits, 1, width)
-                                               : MTLSizeMake(shape.kvHeads, splits, width)
+                                               : MTLSizeMake(shape.kvHeads * shape.parts(), splits, width)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder setComputePipelineState:reduce];
   [encoder setBuffer:partials offset:0 atIndex:0];
@@ -589,7 +620,7 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBytes:&params length:sizeof(params) atIndex:paramsIndex];
   for (id<MTLBuffer> extent : data.extents)
     [encoder useResource:extent usage:MTLResourceUsageRead];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, 1, splits)
+  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads * shape.parts(), 1, splits)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder setComputePipelineState:reduce];
   [encoder setBuffer:partials offset:0 atIndex:0];
@@ -805,7 +836,7 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
   for (uint32_t head = 0; head < shape.kvHeads; ++head)
     for (uint32_t split = 0; split < splits; ++split)
       for (uint32_t row = 0; row < m; ++row) {
-        const uint64_t index = (uint64_t{head} * splits + split) * m + row;
+        const uint64_t index = shape.partialRow(head, splits, split, row);
         const bool active = row / shape.queryHeadsPerKvHead < activeRows;
         // Alternate underflow-scale differences and fractional exp weights.
         const float spacing = row % 2 ? 0.25f : 500.0f;
@@ -852,11 +883,11 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
         }
         double maximum = -INFINITY;
         for (uint32_t split = 0; split < splits; ++split)
-          maximum = std::max(maximum, double(t[((uint64_t{head} * splits + split) * m + row) * 2]));
+          maximum = std::max(maximum, double(t[shape.partialRow(head, splits, split, row) * 2]));
         for (uint32_t dim = 0; dim < d; ++dim) {
           double numerator = 0, denominator = 0;
           for (uint32_t split = 0; split < splits; ++split) {
-            const uint64_t index = (uint64_t{head} * splits + split) * m + row;
+            const uint64_t index = shape.partialRow(head, splits, split, row);
             const double weight = std::exp(double(t[index * 2]) - maximum);
             numerator += weight * p[index * d + dim];
             denominator += weight * t[index * 2 + 1];

@@ -1,0 +1,20 @@
+# The models Splash suggests, best first: the desktop app offers them and shell
+# completion completes them. MODEL<TAB>NAME<TAB>MEMORY<TAB>SIZE<TAB>ABOUT: the
+# ID splash serve --model takes, the model's name, the smallest Mac memory in
+# GB the variant is meant for, its download in whole GB (the model, its vision
+# projector if it has one, and its DFlash2 draft), and a few words for choosing
+# among the models, the same for every variant of a name. The app offers, per
+# name, the variant with the most MEMORY that the Mac has; README.md's Models
+# table must list only these IDs.
+unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M	Qwen3.6-35B-A3B	36	24	Fast all-rounder
+mlx-community/Qwen3.6-35B-A3B-4bit	Qwen3.6-35B-A3B	36	21	Fast all-rounder
+unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q2_K_XL	Qwen3.6-35B-A3B	24	14	Fast all-rounder
+unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M	Qwen3.8-27B	36	21	Strongest at this size, slower
+mlx-community/Qwen3.8-27B-4bit	Qwen3.8-27B	36	20	Strongest at this size, slower
+unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS	Qwen3.8-27B	24	16	Strongest at this size, slower
+ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:IQ3_S	Qwen3.8-Flash-Next	96	86	Most capable
+ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0	Qwen3.8-Flash-Next	64	69	Most capable
+unsloth/flint-GGUF:UD-Q4_K_XL	Flint	48	26	Text only
+unsloth/Ornith-1.5-122B-GGUF:UD-Q4_K_XL	Ornith-1.5-122B	128	82	Largest model
+ornith-ai/Ornith-1.5-122B-MLX-4bit	Ornith-1.5-122B	128	71	Largest model
+prism-ml/Ternary-Bonsai-2-27B-gguf:PQ2_0	Ternary-Bonsai-2-27B	24	12	Smallest download

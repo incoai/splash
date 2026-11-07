@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DFlashDraft.hpp"
+#include "Flint.hpp"
 #include "Model.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
@@ -13,11 +14,25 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <variant>
+#include <vector>
 
 namespace splash::model {
 
-using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout>;
+using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout, FlintLayout>;
+
+// The families Splash serves, values of the layout types TargetLayout holds,
+// one type for each architecture's code. A family of an architecture is one
+// more value here. Refusals name them in this order, and a config's model type
+// finds its family among those of its type in it (describeSourceModel).
+inline constexpr std::tuple kFamilies{Qwen3_8Layout{}, Qwen3_6MoeLayout{}, kQwen3_5_122BLayout, Qwen4ExpLayout{},
+                                      FlintLayout{}};
+
+// Calls `use` with each family's layout, in kFamilies' order.
+template <class Use> constexpr void forEachFamily(Use use) {
+  std::apply([&](const auto &...family) { (use(family), ...); }, kFamilies);
+}
 
 // Where a model's weights come from: a safetensors checkpoint (MLX's, Model
 // Optimizer's or compressed-tensors') or a GGUF, prepared into images when it
@@ -78,19 +93,43 @@ inspectModelRoot(const std::filesystem::path &root);
 // serve, or for a model that is already scaled.
 [[nodiscard]] ModelDescriptor servedFor(ModelDescriptor model, uint32_t contextTokens);
 
+// What a family's layout gives the options a start takes, which the
+// installer reports to the app (the engine's families command): whether its
+// FFN is a MoE, whose experts can stream from the SSD (ModelSizing) and
+// whose verify rows a budget sizes (budgetsVerifyRows); whether it keeps GDN
+// state; whether it has a PLE n-gram table; whether its attention selects KV
+// blocks, which a cache reads back from the SSD (SparseKvShape); whether every
+// FFN layer is dense, as the ANE split takes them (aneFfnLayers); and its
+// native window and the most context it serves, past that window with YaRN
+// (servedFor).
+struct FamilyFacts final {
+  std::string_view family;
+  bool experts = false;
+  bool recurrentState = false;
+  bool pleTable = false;
+  bool sparseKv = false;
+  bool denseFfn = false;
+  uint32_t contextTokens = 0;
+  uint32_t maximumContextTokens = 0;
+};
+
+// Each family's facts, in kFamilies' order.
+[[nodiscard]] std::vector<FamilyFacts> familyFacts();
+
 // The family of an upstream model's configuration, checked by the rules
 // inspectModelRoot holds its assembly to: config, the target's config.json
 // or the one the installer derives from its GGUF; targetFormat and
 // visionFormat, the source formats its record names (mlx-affine or gguf;
-// none, safetensors or gguf); ggufMetadata, a GGUF target's scalar metadata
-// as the installer read it from the header, which every start's planner
-// checks in the GGUF (gguf::requireMetadata); and draft, once chosen, the
-// DFlash2 draft's config.json. The installer runs it before any weight
-// download (the engine's model-check command).
+// none, safetensors or gguf); ggufHeaders, the directory of a GGUF target's
+// headers as the installer read them (its one file's, or each split part's
+// under the part's name), from which it plans the target as every start
+// plans the GGUF (gguf::planImages); and draft, once chosen, the DFlash2
+// draft's config.json. The installer runs it before any weight download
+// (the engine's model-check command).
 [[nodiscard]] std::string_view
 inspectSourceConfiguration(std::string_view targetFormat, std::string_view visionFormat,
                            const std::filesystem::path &config,
-                           const std::optional<std::filesystem::path> &ggufMetadata,
+                           const std::optional<std::filesystem::path> &ggufHeaders,
                            const std::optional<std::filesystem::path> &draft);
 
 } // namespace splash::model

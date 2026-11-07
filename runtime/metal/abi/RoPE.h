@@ -9,8 +9,10 @@
 #endif
 
 // Rotary pairs in a row of the RoPE tables (ops::RoPE), which the attention
-// kernels read: the target rotates 64 of its 256 head dimensions (Qwen3.5's
-// partial rotary factor 1/4), the draft its whole head.
+// kernels read: Qwen3.5's target rotates 64 of its 256 head dimensions (its
+// partial rotary factor 1/4), the draft its whole head. A target attention
+// geometry that rotates other pairs reads tables of its own pairs
+// (ops::RoPE::addTables, ops::PagedAttention's compiled geometries).
 #define SPLASH_TARGET_ROPE_PAIRS 32u
 #define SPLASH_DRAFT_ROPE_PAIRS (SPLASH_DRAFT_HEAD_DIMENSION / 2u)
 

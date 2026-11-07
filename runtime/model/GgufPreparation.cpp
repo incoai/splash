@@ -38,6 +38,12 @@ uint64_t sourceRow(const gguf::TensorRows &rows, uint64_t row) {
   return rows.first + source;
 }
 
+// Whether a source row of `rows` splits into its `windows` equal windows and
+// it names one of them (gguf::TensorRows::windows), as imageRowBytes() needs.
+bool validWindow(const gguf::TensorRows &rows) {
+  return rows.windows && rows.window < rows.windows && rows.rowBytes % rows.windows == 0;
+}
+
 void requireRange(uint64_t offset, uint64_t bytes, uint64_t available) {
   if (offset > available || bytes > available - offset)
     throw GgufError("prepared weight section is out of bounds");
@@ -308,11 +314,14 @@ void readGgufNvfp4Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t co
 }
 
 // Image rows [first, first + count) of `rows`, bytes [column, column + span)
-// of each, back to back. Consecutive source rows are read together.
+// of each, back to back, from their column window on. Consecutive whole
+// source rows are read together.
 void readRows(const gguf::TensorRows &rows, uint64_t first, uint64_t count, uint64_t column, uint64_t span,
               uint8_t *to) {
-  if (first > rows.rows || count > rows.rows - first || column > rows.rowBytes || span > rows.rowBytes - column)
+  if (!validWindow(rows) || first > rows.rows || count > rows.rows - first || column > rows.imageRowBytes() ||
+      span > rows.imageRowBytes() - column)
     throw GgufError("prepared weight rows are out of bounds");
+  column += rows.window * rows.imageRowBytes();
   for (uint64_t row = 0; row < count;) {
     const uint64_t start = sourceRow(rows, first + row);
     uint64_t run = 1;
@@ -457,7 +466,8 @@ void requireRepack(const gguf::Repack &repack, uint64_t imageBytes) {
   const uint64_t rowBytes = ggufRowBytes(format, repack.columns);
   uint64_t sourceRows = 0;
   for (const gguf::TensorRows &rows : repack.sources) {
-    if (rows.rowBytes != rowBytes) throw GgufError("invalid prepared weight source size");
+    if (!validWindow(rows) || rows.imageRowBytes() != rowBytes)
+      throw GgufError("invalid prepared weight source size");
     sourceRows += rows.rows;
   }
   if (sourceRows > repack.rows) throw GgufError("invalid prepared weight source size");
@@ -545,16 +555,15 @@ uint64_t decodedRun(const gguf::Copy &copy) {
   return run;
 }
 
-// Writes a DequantizeToFloat32 copy: runs of its native rows staged in input,
-// each gathered on the GPU (kernels/shared/embedding.metal,
+// Writes a DequantizeToFloat32 copy: runs of its rows as stored staged in
+// input, each gathered on the GPU (kernels/shared/embedding.metal,
 // gguf_embed_f32_<format>) into the F32 values of its format's decode, the run's
 // rows by their ids in `ids` (0, 1, ...).
 void writeDecoded(metal::MetalBackend &backend, const metal::MetalBuffer &image, const gguf::Copy &copy,
                   const metal::MetalBuffer &input, const metal::MetalBuffer &ids) {
   const gguf::TensorRows &rows = copy.source;
+  const uint64_t columns = gguf::decodedColumns(rows), run = decodedRun(copy);
   const QuantFormat &format = kQuantFormats[gguf_format_of(rows.type)];
-  if (rows.rowBytes % format.block_bytes) throw GgufError("decoded rows are not whole native blocks: " + rows.name);
-  const uint64_t columns = rows.rowBytes / format.block_bytes * format.block_elements, run = decodedRun(copy);
   for (uint64_t first = 0; first < rows.rows; first += run) {
     const uint64_t count = std::min(run, rows.rows - first);
     readRows(rows, first, count, 0, rows.rowBytes, static_cast<uint8_t *>(input.contents()));
@@ -584,7 +593,7 @@ void readRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count, 
   }
 }
 
-std::optional<StoredRows> storedRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count) {
+std::optional<FileRows> storedRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count) {
   const uint64_t rowBytes = ggufRowBytes(kQuantFormats[repack.format], repack.columns);
   uint64_t start = 0;
   for (const gguf::TensorRows &tensor : repack.sources) {
@@ -594,7 +603,7 @@ std::optional<StoredRows> storedRepackRows(const gguf::Repack &repack, uint64_t 
       if (count > tensor.rows - row || rowReader(tensor) != RowReader::Stored || tensor.rowBytes != rowBytes ||
           !tensor.file || (count > 1 && tensor.order.from < row + count))
         return std::nullopt;
-      return StoredRows{tensor.file, tensor.file->dataOffset() + tensor.offset + sourceRow(tensor, row) * rowBytes};
+      return FileRows{tensor.file, tensor.file->dataOffset() + tensor.offset + sourceRow(tensor, row) * rowBytes};
     }
     start += tensor.rows;
   }
@@ -607,12 +616,12 @@ void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &imag
   std::vector<std::pair<uint64_t, uint64_t>> extents;
   for (const gguf::Fill &fill : plan.fills) extents.emplace_back(fill.offset, fill.bytes.size());
   // Copies the CPU converts read whole 4-byte values; the GPU decodes the
-  // others from whole native blocks.
+  // others from their rows as stored.
   std::vector<const gguf::Copy *> decoded;
   uint64_t staging = 0, ids = 0;
   for (const gguf::Copy &copy : plan.copies) {
     const bool decodes = copy.conversion == gguf::Conversion::DequantizeToFloat32;
-    if (!copy.source.rows || !copy.source.rowBytes ||
+    if (!copy.source.rows || !copy.source.rowBytes || copy.source.windows != 1 ||
         (copy.conversion != gguf::Conversion::None && !decodes && copy.source.rowBytes % 4))
       throw GgufError("invalid prepared weight copy");
     extents.emplace_back(copy.destination, copyBytes(copy));
@@ -649,6 +658,23 @@ void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &imag
   auto *id = static_cast<uint32_t *>(rowIds.contents());
   for (uint32_t row = 0; row < ids; ++row) id[row] = row;
   for (const gguf::Copy *copy : decoded) writeDecoded(backend, image, *copy, input, rowIds);
+}
+
+WeightFile loadImage(metal::MetalBackend &backend, WeightImages &images, std::string_view prefix,
+                     std::shared_ptr<const gguf::Image> plan, std::function<void()> checkUnchanged) {
+  ImagePlan image{std::string(prefix) + plan->name, plan->magic, plan->layer, plan->type, plan->bytes,
+                  [&backend, plan, checkUnchanged = std::move(checkUnchanged)](std::span<uint8_t>,
+                                                                               const metal::MetalBuffer &buffer) {
+                    writeGgufImage(backend, buffer, *plan);
+                    checkUnchanged();
+                  },
+                  plan->residentBytes};
+  return images.load(std::move(image));
+}
+
+WeightFileRecord imageRecord(const WeightImages &images, std::string_view prefix, const gguf::Image &plan) {
+  return {std::string(prefix) + plan.name, plan.magic, plan.layer, plan.type, plan.residentBytes,
+          images.contentIdentity()};
 }
 
 } // namespace splash::model

@@ -6,7 +6,7 @@ esac
 
 _splash() {
     local cur prev prefix value_prefix= trim= repository variant source directory
-    local target model i
+    local target model i option
     COMPREPLY=()
     cur=${COMP_WORDS[COMP_CWORD]}
     prev=${COMP_WORDS[COMP_CWORD-1]}
@@ -18,16 +18,33 @@ _splash() {
     for ((i=2; i<COMP_CWORD; i++)); do
         [[ ${COMP_WORDS[i]} == -- ]] && return 0
     done
-    if [[ $cur == --model=* ]]; then
-        prefix=${cur#--model=}
-        [[ ${COMP_WORDBREAKS-} == *=* ]] || value_prefix=--model=
-    elif [[ $prev == --model ]]; then
-        prefix=$cur
-        [[ $cur == = ]] && prefix=
-    elif [[ $prev == = && $COMP_CWORD -ge 3 &&
-            ${COMP_WORDS[COMP_CWORD-2]} == --model ]]; then
-        prefix=$cur
+    # The option whose value this completes and the value typed so far. Bash 4
+    # and later split --option=value at an '=' in COMP_WORDBREAKS into the
+    # option, '=' and the value, so the word is the '=' until a value is typed.
+    if [[ $cur == --*=* ]]; then
+        option=${cur%%=*} prefix=${cur#*=}
+        [[ ${COMP_WORDBREAKS-} == *=* ]] || value_prefix=$option=
+    elif [[ $cur == = ]]; then
+        option=$prev prefix=
+    elif [[ $prev == = ]]; then
+        option=${COMP_WORDS[COMP_CWORD-2]} prefix=$cur
     else
+        option=$prev prefix=$cur
+    fi
+    case $option in
+        --model-dir|--draft-model|--mmproj)
+            # compgen -f run in this shell, unlike the subshell below, has
+            # readline treat these candidates as file names: quoted, with a
+            # directory's ending in '/'. Bash 3.2 has no compopt, and complete's
+            # filenames option would treat model IDs so too, escaping their ':'.
+            compgen -f -- "$prefix" > /dev/null
+            while IFS= read -r target; do
+                COMPREPLY[${#COMPREPLY[@]}]=$value_prefix$target
+            done < <(compgen -f -- "$prefix")
+            return 0
+            ;;
+    esac
+    if [[ $option != --model ]]; then
         # Bash 4 and later split owner/repo:VARIANT at a ':' in COMP_WORDBREAKS
         # into the repository, ':' and the variant typed so far.
         if [[ $cur == : ]]; then

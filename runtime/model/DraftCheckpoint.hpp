@@ -27,6 +27,9 @@ public:
 
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile model();
+  // Whether the checkpoint ships its mask token's embedding (kDraftMaskEmbedding),
+  // which model.bin then holds after the selector's codebooks.
+  [[nodiscard]] bool hasMaskEmbedding() const noexcept;
 
 private:
   // The checkpoint and its images, which their writers share.
@@ -41,6 +44,12 @@ private:
   WeightImages &images_;
   std::shared_ptr<Planned> planned_;
 };
+
+// The BF16 [hidden] embedding of the mask token a draft's checkpoint may ship,
+// in a file of its own beside its weights (mask_embedding.safetensors): its
+// draft rows' input in place of the target's token table row, which a
+// quantized table can lose (DFlashDraft::addMaskRows).
+inline constexpr std::string_view kDraftMaskEmbedding = "mask_embedding";
 
 // The images of a draft checkpoint, in the order DFlashDraft.cpp reads them:
 // the layers, then model.bin. The checkpoint outlives them: their rows read

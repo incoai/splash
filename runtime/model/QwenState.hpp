@@ -11,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -30,6 +31,9 @@ struct GdnParityBuffers final {
 [[nodiscard]] GdnParityBuffers gdnCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer base,
                                               const GdnStateLayout &layout);
 
+// One GDN cell: one buffer of layout.cellBytes() and its views. A cell of no
+// bytes (a target without GDN layers or other state) has no buffer, views
+// or memory.
 class QwenGdnCell final {
 public:
   ~QwenGdnCell();
@@ -99,7 +103,8 @@ struct QwenCachedBuffers final {
 
 // Free buffers available for reuse: a lane takes two cells, the draft rings
 // and a context window, a cached state a cell and a window. Both return them
-// here; idle buffers are released only by reclaim.
+// here; idle buffers are released only by reclaim. The empty cell of cells
+// of no bytes (QwenStateStorage) is never pooled.
 struct QwenBufferPool final {
   std::vector<std::shared_ptr<QwenGdnCell>> cells;
   std::vector<std::shared_ptr<DFlashDraftRing>> rings;
@@ -107,11 +112,16 @@ struct QwenBufferPool final {
   // Cleared when the storage goes away; late returns then just free.
   bool open = true;
 
+  // Takes back a cell, unless it is the empty cell.
+  void giveCell(std::shared_ptr<QwenGdnCell> cell) {
+    if (cell->buffers().stateBase)
+      cells.push_back(std::move(cell));
+  }
   // Takes back the buffers of a cached state.
   void give(QwenCachedBuffers buffers) {
     if (!open)
       return;
-    cells.push_back(std::move(buffers.gdn));
+    giveCell(std::move(buffers.gdn));
     windows.push_back(std::move(buffers.window));
   }
 };
@@ -166,9 +176,8 @@ public:
   [[nodiscard]] uint64_t residentBytes() const noexcept override {
     return disk_ ? 0 : bytes();
   }
-  [[nodiscard]] bool canOffload(bool inUse) const noexcept override {
-    return !disk_ && file_ && file_->takesWrite(inUse);
-  }
+  [[nodiscard]] bool writable() const noexcept override { return !disk_ && file_; }
+  [[nodiscard]] bool canOffload(bool inUse) const noexcept override { return writable() && file_->takesWrite(inUse); }
   [[nodiscard]] std::unique_ptr<StateOffload>
   offload(std::function<void()> completion) const override;
   [[nodiscard]] std::unique_ptr<StateOffload>
@@ -206,7 +215,9 @@ private:
   friend class QwenStateStorage;
 };
 
-// Live cells keep their buffers; only idle buffers may be reclaimed.
+// Live cells keep their buffers; only idle buffers may be reclaimed. Cells of
+// no bytes are all one empty cell (QwenGdnCell), which every lane and state
+// shares: it holds nothing to read or write, and nothing to pool or reclaim.
 class QwenStateStorage final {
 public:
   // The file, when given, holds one state per slot and shares the cache's
@@ -264,10 +275,22 @@ public:
   [[nodiscard]] uint32_t idleRings() const noexcept;
   [[nodiscard]] uint32_t idleWindows() const noexcept;
   // What activating a lane lacks in the idle pool, in cached states: each
-  // holds one GDN cell and one context window, a lane two cells, a window
-  // and the draft rings, which no cached state holds: without idle rings no
-  // number of states makes up the lack.
-  [[nodiscard]] uint32_t statesToActivate() const noexcept;
+  // holds one GDN cell and one context window, a lane two cells (none of the
+  // pool's when cells have no bytes), a window and the draft rings, which no
+  // cached state holds: without idle rings no number of states makes up the
+  // lack, and it gives no value.
+  [[nodiscard]] std::optional<uint32_t> statesToActivate() const noexcept;
+  // What releaseOneIdle(keepLane), called until it gives none, releases
+  // once `evictedStates` more cached states have returned their cell and
+  // context window to the pool (QwenBufferPool::give), at the layout's
+  // sizes, which each allocation covers: with keepLane a lane keeps two
+  // cells, the draft rings and a window, and cells of no bytes count none.
+  // With `afterStart`, of the pool a lane's activation and a state reserved
+  // beside it leave once they took their buffers from it first (startBytes).
+  [[nodiscard]] uint64_t idleBytes(uint32_t evictedStates, bool afterStart, bool keepLane) const noexcept;
+  // What a lane's activation and a state reserved beside it allocate: their
+  // buffers (kStartBuffers) that the idle pool lacks.
+  [[nodiscard]] uint64_t startBytes() const noexcept;
 
   // Hot-path metadata operations; none performs a buffer copy. A step makes
   // next() current. swapParity: a prefill step's, which read the lane's
@@ -346,21 +369,34 @@ private:
     QwenLaneMetadata metadata;
     Buffers cells;
   };
+  // Counts of the pool's buffers: a lane takes two GDN cells, the draft
+  // rings and a context window, a cached state a cell and a window, and a
+  // lane's start the lane's and those of the state it captures.
+  struct BufferCounts final {
+    uint32_t cells = 0, rings = 0, windows = 0;
+  };
+  static constexpr BufferCounts kLaneBuffers{CompositeStateLayout::kLaneGdnCells, 1, 1};
+  static constexpr BufferCounts kStateBuffers{1, 0, 1};
+  static constexpr BufferCounts kStartBuffers{kLaneBuffers.cells + kStateBuffers.cells,
+                                              kLaneBuffers.rings + kStateBuffers.rings,
+                                              kLaneBuffers.windows + kStateBuffers.windows};
 
   [[nodiscard]] Lane &lane(uint32_t index);
   [[nodiscard]] const Lane &lane(uint32_t index) const;
   static void requireAssigned(const Lane &lane);
   // Assigned, with no decoded rows pending: its current cell holds its state.
   static void requireCommitted(const Lane &lane);
-  // `cells` GDN cells, the draft rings when `rings` and a context window:
-  // the pool's buffers, and one admission for everything the pool lacks and
-  // for the caller's extra. A refusal allocates nothing and takes nothing
-  // from the pool.
+  // A lane's or a cached state's buffers (`counts`): the pool's, and one
+  // admission for everything the pool lacks and for the caller's extra. A
+  // refusal allocates nothing and takes nothing from the pool.
   [[nodiscard]] metal::AllocationResult
-  acquire(uint32_t cells, bool rings, std::string_view label, Buffers &buffers,
-          uint64_t extraBytes = 0, const std::function<void()> &allocateExtra = {});
-  // The bytes of those buffers the pool lacks.
-  [[nodiscard]] uint64_t missingBytes(uint32_t cells, bool rings) const noexcept;
+  acquire(BufferCounts counts, std::string_view label, Buffers &buffers, uint64_t extraBytes = 0,
+          const std::function<void()> &allocateExtra = {});
+  [[nodiscard]] BufferCounts idle() const noexcept;
+  // The buffers of `count` beyond those of `taken`, each kind apart.
+  [[nodiscard]] static BufferCounts beyond(BufferCounts count, BufferCounts taken) noexcept;
+  // Their bytes at the layout's sizes.
+  [[nodiscard]] uint64_t bytes(BufferCounts buffers) const noexcept;
   void restore(uint32_t lane, const QwenCompositeState &state,
                bool restoreDraftState);
   void restoreLengths(uint32_t lane, QwenLogicalLengths lengths, bool restoreDraft);
@@ -375,6 +411,8 @@ private:
   std::array<Lane, ExecutionLimits::maximumBatchWidth> lanes_;
   std::shared_ptr<SlotFile> file_;
   std::shared_ptr<StateStaging> staging_;
+  // Every lane's and state's cell when cells have no bytes; null otherwise.
+  std::shared_ptr<QwenGdnCell> emptyCell_;
 };
 
 } // namespace splash::model

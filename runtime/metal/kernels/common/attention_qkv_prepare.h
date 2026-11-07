@@ -3,9 +3,16 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/rms_inverse.h"
 
-// q_norm and k_norm are read in their stored type W: bfloat for an MLX
-// target's, float for a GGUF's F32 norms.
-template <uint QHeads, uint KHeads, class W>
+// A threadgroup of HeadDim threads normalizes one head of one row of the
+// packed projection: each query head's queries (and, Gated, its output gate
+// after them), then the K and V heads. q_norm and k_norm are read in their
+// stored type W: bfloat for an MLX target's, float for a GGUF's F32 norms.
+// The pairs of dimensions (i, i + RotaryPairs) then rotate by the row's RoPE
+// table row of RotaryPairs pairs, the half split of the first 2 x RotaryPairs
+// dimensions: Qwen3.5's first 64, or with HeadDim / 2 pairs the whole head
+// (NeoX's). With no pairs (NoPE) the head is stored as normalized, and no
+// table is read.
+template <uint QHeads, uint KHeads, uint HeadDim, uint RotaryPairs, bool Gated, class W>
 inline void full_qkv_storage_phase(
     device const bfloat *qkv, device const W *q_norm,
     device const W *k_norm, device const float *rope_cos,
@@ -15,7 +22,8 @@ inline void full_qkv_storage_phase(
     threadgroup bfloat *normalized, uint task, uint thread_index, uint lane,
     uint simd_group) {
   static_assert(QHeads % KHeads == 0);
-  constexpr uint HeadDim = 256, RotaryPairs = SPLASH_TARGET_ROPE_PAIRS, QStride = 2 * HeadDim;
+  static_assert(2 * RotaryPairs <= HeadDim, "the rotated pairs are dimensions of the head");
+  constexpr uint QStride = Gated ? 2 * HeadDim : HeadDim;
   constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
   constexpr uint QWidth = QHeads * QStride, KWidth = KHeads * HeadDim;
   uint query_tasks = params.tokens * QHeads;
@@ -43,9 +51,9 @@ inline void full_qkv_storage_phase(
   }
 
   float element = float(source[thread_index]);
-  const float inverse = rms_inverse_of_sums(element * element, HeadDim,
-                                            reductions, thread_index, lane,
-                                            simd_group);
+  const float inverse = rms_inverse_of_sums<HeadDim / 32>(element * element, HeadDim,
+                                                          reductions, thread_index, lane,
+                                                          simd_group);
   normalized[thread_index] =
       bfloat(element * inverse * float(weight[thread_index]));
   if (!query) {

@@ -1,4 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#171717" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-  <style>@media (prefers-color-scheme: dark) { svg { stroke: #ececec } }</style>
-  <path d="M13.5 2 5 13h6l-.5 9L19 11h-6z"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="162 172 700 700">
+  <!-- Splash's mark, as app/AppIcon.icon/Assets/mark.svg draws it: the icon's aqua, deepened on a light ground. -->
+  <style>
+    .line { fill: none; stroke: #0E9A96; stroke-width: 76; stroke-linecap: round }
+    .drop { fill: #0E9A96 }
+    @media (prefers-color-scheme: dark) { .line { stroke: #58E6E0 } .drop { fill: #58E6E0 } }
+  </style>
+  <path class="line" d="M200 717.2C270 699.2 340 699.2 398 717.2C444 733.2 560 733.2 606 717.2C670 699.2 744 699.2 824 717.2M502 711.2C500 593.2 534 471.2 604 399.2M516 711.2C544 633.2 606 567.2 700 547.2M490 711.2C466 653.2 424 621.2 364 609.2"/>
+  <circle class="drop" cx="684.3" cy="312.8" r="36"/>
+  <circle class="drop" cx="805.2" cy="522.6" r="30"/>
+  <circle class="drop" cx="267.2" cy="588.4" r="25"/>
 </svg>
