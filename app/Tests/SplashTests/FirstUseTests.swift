@@ -16,13 +16,16 @@ struct FirstUseTests {
         }
     }
 
-    @Test func examplesLeaveExistingTextAndAttachmentsAlone() throws {
+    @Test func examplesLeaveExistingTextAndAttachmentsAlone() async throws {
         let draft = Draft()
         draft.text = "My unfinished message"
         draft.suggest(ChatExample.explain.text)
         #expect(draft.text == "My unfinished message" && draft.focusRequests == 0)
         draft.text = ""
         draft.attach([try #require(NSImage(data: Showcase.picture))])
+        draft.suggest(ChatExample.write.text)
+        #expect(draft.text.isEmpty && draft.focusRequests == 0)
+        try await waitFor { draft.attaching == 0 }
         let images = draft.images
         #expect(!images.isEmpty)
         draft.suggest(ChatExample.write.text)
@@ -56,12 +59,12 @@ struct FirstUseFlowTests {
             state.download("test-model")
             #expect(state.firstUseStage == .downloading)
             try fixture.finishDownload()
-            try await waitFor { !state.installer.running && state.isInstalled("test-model") }
+            try await waitFor("installer completion") { !state.installer.running && state.isInstalled("test-model") }
             #expect(state.firstUseStage == .start && state.selection == "test-model")
             #expect(!state.server.running)
             state.start("test-model")
             #expect(state.firstUseStage == .starting)
-            try await waitFor { state.server.phase == .ready }
+            try await waitFor("server ready") { state.server.phase == .ready }
             #expect(state.firstUseStage == .chat)
             state.section = .chat
             state.draft.suggest(ChatExample.explain.text)
@@ -69,8 +72,9 @@ struct FirstUseFlowTests {
             #expect(try fixture.base.sent().isEmpty)
             state.draft.text += " Use short sentences."
             let edited = state.draft.text
+            #expect(state.canSendDraft)
             state.sendDraft()
-            try await waitFor { state.chats.current?.messages.last?.text == "Answer" && state.chats.streaming == nil }
+            try await waitFor("reply completion: \(state.chats.current?.messages.last?.error ?? "no error")") { state.chats.current?.messages.last?.text == "Answer" && state.chats.streaming == nil }
             #expect(state.firstUseStage == nil)
             #expect(state.chats.current?.messages.first?.text == edited)
             #expect(try fixture.base.sent().count == 1)
@@ -100,10 +104,10 @@ struct FirstUseSnapshots {
             try await waitFor { state.installer.progress != nil }
             await Snapshot.save("model-downloading", MainView().environment(state))
             try fixture.finishDownload()
-            try await waitFor { !state.installer.running && state.isInstalled("test-model") }
+            try await waitFor("installer completion") { !state.installer.running && state.isInstalled("test-model") }
             await Snapshot.save("model-start", MainView().environment(state))
             state.start("test-model")
-            try await waitFor { state.server.phase == .ready }
+            try await waitFor("server ready") { state.server.phase == .ready }
             await Snapshot.save("model-ready", MainView().environment(state))
             state.section = .chat
             await Snapshot.save("chat-ready", MainView().environment(state))
@@ -119,10 +123,10 @@ struct FirstUseSnapshots {
 }
 
 @MainActor
-private func waitFor(_ condition: () -> Bool) async throws {
+private func waitFor(_ step: String = "next step", _ condition: () -> Bool) async throws {
     let deadline = ContinuousClock.now + .seconds(10)
     while !condition() {
-        try #require(ContinuousClock.now < deadline, "The first-use fixture did not reach the next step")
+        try #require(ContinuousClock.now < deadline, "The first-use fixture did not reach \(step)")
         try await Task.sleep(for: .milliseconds(20))
     }
 }
@@ -167,7 +171,8 @@ private final class FirstUseFixture {
         time.sleep(0.02)
     folder = root / 'install/models/fixture/model'
     folder.mkdir(parents=True)
-    record = {'model': 'test-model', 'files': {'target': {'path': 'fixture.gguf', 'bytes': 1000000000}}}
+    (folder / 'fixture.gguf').write_bytes(b'fixture')
+    record = {'model': 'test-model', 'files': {'target': {'path': str(folder / 'fixture.gguf'), 'bytes': 7}}}
     (folder / 'model.json').write_text(json.dumps(record))
     """#
 }

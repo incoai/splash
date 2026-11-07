@@ -20,7 +20,7 @@ final class Draft {
 
     /// An example helps start an empty draft; text and attachments already being written stay.
     func suggest(_ text: String) {
-        guard isEmpty else { return }
+        guard isEmpty, attaching == 0 else { return }
         self.text = text
         focus()
     }
