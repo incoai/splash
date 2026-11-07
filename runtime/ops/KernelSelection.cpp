@@ -185,7 +185,7 @@ LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorklo
     if (w.rows <= p.stagedPrefillRows)
       return staged(p, n, k, w.rows, unit.weightBits16, cores, Passes::Two);
     return {.tile = LinearTile::GgufPrefill,
-            .prefillSimdgroupRows = p.prefill16OneTile && unit.prefill16Takes &&
+            .prefillSimdgroupRows = p.prefill16AtCores && cores == p.prefill16AtCores && unit.prefill16Takes &&
                                             w.rows <= GGUF_PREFILL_ROWS
                                         ? 16u
                                         : 32u};
