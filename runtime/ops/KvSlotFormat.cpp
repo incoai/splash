@@ -63,8 +63,9 @@ SlotFormat::SlotFormat(const Layout &layout) : layout_(layout) {
   recordPitch_ = pitchFor(recordsOffset_, recordBytes_, layout_.attentionLayers * kBlocksPerPage);
 }
 
-uint64_t SlotFormat::payloadBytes() const noexcept {
-  if (!version()) return layout_.bytesPerModelPage();
+uint64_t SlotFormat::payloadBytes(PageForm form) const {
+  if (!version()) return layout_.bytesPerModelPage(form);
+  if (form != PageForm::Full) throw std::logic_error("a KV slot of block records holds a Full page");
   return recordsOffset_ + (uint64_t{layout_.attentionLayers} * kBlocksPerPage - 1) * recordPitch_ + recordBytes_;
 }
 

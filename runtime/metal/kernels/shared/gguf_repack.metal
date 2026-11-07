@@ -1,6 +1,7 @@
 #pragma clang fp reassociate(off)
 #include "metal/abi/GgufRepack.h"
 #include "metal/abi/MoE.h"
+#include "metal/kernels/common/moe_expert_chunk.h"
 #include <metal_stdlib>
 
 using namespace metal;
@@ -198,19 +199,19 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
 
 // Streamed experts into their slots (model/ExpertStore.cpp): threadgroup (x, y, z) repacks MOE_EXPERT_LOAD_THREADS
 // (row, 32-wide K group) pairs of projection z of job y, as gguf_repack does, from the native rows the host staged
-// for it from staging + sources[3y + z] on into the planes of slot slots[y]. The grid's jobs are the host's (an
-// indirect grid it writes in the step before).
-kernel void moe_expert_load(device const uchar *staging [[buffer(0)]], device uchar *arena [[buffer(1)]],
-                            device const uint *slots [[buffer(2)]], device const ulong *sources [[buffer(3)]],
-                            constant MoeExpertLoadParams &p [[buffer(4)]],
-                            uint3 group [[threadgroup_position_in_grid]],
+// for it from staging + sources[3y + z] on into the planes of slot slots[y], in the chunks of the table at the index
+// after the parameters (metal/abi/MoE.h, moe_expert_chunk). The grid's jobs are the host's (an indirect grid it
+// writes in the step before).
+kernel void moe_expert_load(device const uchar *staging [[buffer(0)]], device const uint *slots [[buffer(1)]],
+                            device const ulong *sources [[buffer(2)]], constant MoeExpertLoadParams &p [[buffer(3)]],
+                            constant ulong *chunks [[buffer(4)]], uint3 group [[threadgroup_position_in_grid]],
                             uint index [[thread_index_in_threadgroup]]) {
   constant MoeExpertLoadProjection &q = p.projections[group.z];
   const uint G = q.columns / 32, t = group.x * MOE_EXPERT_LOAD_THREADS + index;
   if (t >= q.rows * G) return;
   const uint n = t / G, g = t % G;
-  const ulong slot = slots[group.y];
+  const MoeExpertChunk c = moe_expert_chunk(chunks, p.floor_slots, p.chunk_slots, slots[group.y], group.z);
+  const ulong local = c.local;
   gguf_repack_group(staging + sources[group.y * 3 + group.z] + ulong(n) * q.row_bytes, q.format, G, n, g,
-                    arena + q.planes[0] + slot * q.slot_bytes[0], arena + q.planes[1] + slot * q.slot_bytes[1],
-                    arena + q.planes[2] + slot * q.slot_bytes[2]);
+                    c.w0 + local * q.slot_bytes[0], c.w1 + local * q.slot_bytes[1], c.meta + local * q.slot_bytes[2]);
 }

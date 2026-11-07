@@ -1,6 +1,6 @@
 #include "model/SafetensorsImage.hpp"
 
-#include "metal/abi/Gguf.h"
+#include "metal/abi/QuantFormat.h"
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
 #include "model/WeightStore.hpp"
@@ -123,8 +123,23 @@ public:
     floatRows(alpha, heads, hidden, destination + heads * rowBytes);
   }
 
-  // An F32 [rows, columns] tensor (the MoE router and the shared-expert
-  // gate, which the block kernels read unquantized).
+  // The MoE router [rows, columns], which the float projection runs in the
+  // format the checkpoint holds it (ops::QuantizedSegment): a quantized
+  // tensor's native rows, or its bf16 or F32 values, as stored.
+  void router(const std::string &module, uint64_t rows, uint64_t columns) {
+    if (const std::optional<TensorRows> source = quantized(module, rows, columns)) {
+      image_.descriptor(source->type, rows, columns, {}, {rows * source->rowBytes, 0, 0}, module);
+      image_.copy(*source);
+      return;
+    }
+    const SourceTensor &weight = require(module + ".weight", {"BF16", "F32"}, {rows, columns});
+    const uint32_t type = weight.dtype == "BF16" ? ggml::kBF16 : ggml::kF32;
+    image_.descriptor(type, rows, columns, {}, {weight.bytes, 0, 0}, module);
+    image_.copy(this->rows(module, weight, type, rows, weight.bytes / rows));
+  }
+
+  // An F32 [rows, columns] tensor (the shared-expert scalar gate, which the
+  // MoE selection reads in F32).
   void floatTensor(const std::string &module, uint64_t rows, uint64_t columns) {
     const uint64_t bytes = rows * columns * sizeof(float);
     image_.descriptor(ggml::kF32, rows, columns, {}, {bytes, 0, 0}, module);
@@ -136,8 +151,6 @@ public:
   void embedding(const std::string &module) {
     const uint64_t vocabulary = geometry_.vocabularySize, hidden = geometry_.hiddenSize;
     if (const std::optional<TensorRows> source = quantized(module, vocabulary, hidden)) {
-      if (!gguf_embedding_format(gguf_format_of(source->type)))
-        throw WeightStoreError(module + " is in a format the token gather does not read");
       image_.descriptor(source->type, vocabulary, hidden, {}, {vocabulary * source->rowBytes, 0, 0}, module);
       image_.copy(*source);
       return;
@@ -209,20 +222,17 @@ private:
         codes.shape.back() * 32 % columns)
       throw WeightStoreError("source tensor type or shape does not match: " + module);
     const uint64_t group = columns / scales->shape.back(), bits = codes.shape.back() * 32 / columns;
-    uint32_t format = GGUF_FMT_COUNT;
-    const SourceTensor *biases = nullptr;
-    if (scales->dtype == "BF16") {
-      format = quant_affine_format_of(uint32_t(bits), uint32_t(group));
-      biases = &require(module + ".biases", {"BF16"}, scales->shape);
-    } else if (scales->dtype == "U8" && bits == 4 && group == 32) {
-      format = GGUF_FMT_MXFP4;
-    } else if (scales->dtype == "U8" && bits == 4 && group == 16) {
-      format = GGUF_FMT_NVFP4;
-    }
+    // The mode MLX infers from the scales: bf16 affine's, uint8 nvfp4's in
+    // groups of 16 and mxfp4's otherwise.
+    const bool affine = scales->dtype == "BF16";
+    const std::string_view mode = affine ? "affine" : scales->dtype != "U8" ? "" : group == 16 ? "nvfp4" : "mxfp4";
+    const uint32_t format = mlxFormat(mode, uint32_t(bits), uint32_t(group));
+    const SourceTensor *biases = affine ? &require(module + ".biases", {"BF16"}, scales->shape) : nullptr;
     if (format == GGUF_FMT_COUNT)
       throw WeightStoreError(module + " is " + std::to_string(bits) + "-bit in groups of " + std::to_string(group) +
-                             " with " + scales->dtype + " scales; MLX weights load as affine 2, 3, 4, 5, 6 or 8 "
-                             "bits in groups of 32, 64 or 128 with bf16 scales, or as mxfp4 or nvfp4");
+                             " with " + scales->dtype + " scales; MLX weights load as " +
+                             std::string(kMlxAffineFormats) + " with bf16 scales, or as " +
+                             std::string(kMlxFloatFormats));
     requireWholeBlocks(module, format, columns);
     return TensorRows{module, kQuantFormats[format].ggml_type, 0, experts * rows,
                       ggufRowBytes(kQuantFormats[format], columns), {}, codes.file, {&codes, scales, biases}};
@@ -318,6 +328,7 @@ struct QuantizedModules {
     if (modules.empty() || modules.back() != module) modules.push_back(module);
   }
   void alphaBeta(const std::string &, const std::string &) {}
+  void router(const std::string &, uint64_t, uint64_t) {}
   void floatTensor(const std::string &, uint64_t, uint64_t) {}
   void embedding(const std::string &) {}
 
@@ -355,7 +366,7 @@ void walkLayer(Walk &b, const QwenTargetDimensions &g, ModuleNames names, uint32
   const std::string mlp = prefix + "mlp.";
   if (g.ffnKind == QwenFfnKind::SparseMoe) {
     const uint64_t width = g.expertIntermediateSize;
-    b.floatTensor(mlp + "gate", g.experts, g.hiddenSize);
+    b.router(mlp + "gate", g.experts, g.hiddenSize);
     b.experts(mlp, "gate_proj", width, g.hiddenSize);
     b.experts(mlp, "up_proj", width, g.hiddenSize);
     b.experts(mlp, "down_proj", g.hiddenSize, width);
@@ -403,6 +414,13 @@ std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, con
   walkEmbedding(embedding, names);
   images.push_back(embedding.finish());
   return images;
+}
+
+uint32_t mlxFormat(std::string_view mode, uint32_t bits, uint32_t group) noexcept {
+  if (mode == "affine") return quant_affine_format_of(bits, group);
+  if (mode == "mxfp4" && bits == 4 && group == 32) return GGUF_FMT_MXFP4;
+  if (mode == "nvfp4" && bits == 4 && group == 16) return GGUF_FMT_NVFP4;
+  return GGUF_FMT_COUNT;
 }
 
 std::vector<std::string> quantizedModules(const QwenTargetDimensions &geometry, ModuleNames names) {

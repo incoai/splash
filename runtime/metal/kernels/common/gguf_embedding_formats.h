@@ -4,7 +4,7 @@
 #include "metal/kernels/common/quant_formats.h"
 #include <metal_stdlib>
 
-// The native blocks of every format (ops/Embedding.cpp), one struct per format:
+// The stored block of every format (ops::StoredRows), one struct per format:
 // a row is hidden / Weights blocks of Bytes bytes, each laid out as the format's
 // ggml block_* (an MLX affine, nvfp4 or fp8 tensor: the loader's block of
 // metal/abi/QuantFormat.h) at the byte offsets its struct names, and decode is
@@ -311,6 +311,39 @@ template <uint Bits, uint Group> struct GgufEmbedAffine {
     const float z = float(as_type<bfloat>(ushort(block[Z] | (block[Z + 1] << 8))));
     return fma(code, s, z);
   }
+  // Elements k to k + 7 of a block (k a multiple of 8), as the float projection reads them
+  // (kernels/shared/gguf_float.metal): the Bits bytes of their codes and the block's s and z, read together;
+  // run[i] is decode's value of element k + i.
+  struct Run {
+    ulong codes;
+    ushort s, z;
+    __attribute__((always_inline)) static Run fetch(device const uchar *block, uint k) {
+      // Blocks are whole 4-byte words, so a row of them holds s | z in one word and the codes of 2, 4 and 8 bits in
+      // aligned halfwords, words and pairs of words.
+      static_assert(Bytes % 4 == 0, "affine blocks are whole words");
+      static_assert(S == 0 && Z == 2 && Codes == 4, "a block's first word is s | z, its codes follow");
+      device const uchar *at = block + Codes + (k % Weights) / 8 * Bits;
+      ulong codes = 0;
+      if constexpr (Bits == 8) {
+        device const uint *words = reinterpret_cast<device const uint *>(at);
+        codes = ulong(words[0]) | ulong(words[1]) << 32;
+      } else if constexpr (Bits == 4) {
+        codes = *reinterpret_cast<device const uint *>(at);
+      } else if constexpr (Bits == 2) {
+        codes = *reinterpret_cast<device const ushort *>(at);
+      } else {
+#pragma unroll
+        for (uint b = 0; b < Bits; ++b) codes |= ulong(at[b]) << (8 * b);
+      }
+      const uint scales = *reinterpret_cast<device const uint *>(block);
+      return {codes, ushort(scales), ushort(scales >> 16)};
+    }
+    float operator[](uint i) const {
+#pragma clang fp reassociate(off)
+      const float code = float(uint(codes >> (i * Bits)) & ((1u << Bits) - 1));
+      return fma(code, float(as_type<bfloat>(s)), float(as_type<bfloat>(z)));
+    }
+  };
 };
 // BF16 and F16 values, which a GGUF keeps unquantized (a safetensors checkpoint its bf16 token table): each value is
 // its own block, ggml's; the token gathers round an F16 value to bf16.
@@ -332,3 +365,26 @@ struct GgufEmbedF16 {
 GGUF_EMBED_AFFINE(2) GGUF_EMBED_AFFINE(3) GGUF_EMBED_AFFINE(4) GGUF_EMBED_AFFINE(5) GGUF_EMBED_AFFINE(6)
 GGUF_EMBED_AFFINE(8)
 #undef GGUF_EMBED_AFFINE
+
+// Every format's stored-block struct as X(kernel name token, struct), the token its kQuantFormats name: the quantized
+// formats (GGUF_QUANTIZED_EMBEDDING_FORMATS), whose blocks each hold whole runs of 8 values, then the 16-bit floats.
+#define GGUF_QUANTIZED_EMBEDDING_FORMATS(X)                                                                        \
+  X(q4k, GgufEmbedQ4K) X(q6k, GgufEmbedQ6K) X(q80, GgufEmbedQ80) X(q5k, GgufEmbedQ5K) X(q3k, GgufEmbedQ3K)        \
+  X(q2k, GgufEmbedQ2K) X(q40, GgufEmbedQ40) X(q41, GgufEmbedQ41) X(q50, GgufEmbedQ50) X(q51, GgufEmbedQ51)        \
+  X(pq20, GgufEmbedPQ20) X(q20, GgufEmbedQ20) X(iq4nl, GgufEmbedIQ4NL) X(iq4xs, GgufEmbedIQ4XS)                    \
+  X(iq3s, GgufEmbedIQ3S) X(iq3xxs, GgufEmbedIQ3XXS) X(iq2xxs, GgufEmbedIQ2XXS) X(iq2xs, GgufEmbedIQ2XS)            \
+  X(iq2s, GgufEmbedIQ2S) X(iq1s, GgufEmbedIQ1S) X(iq1m, GgufEmbedIQ1M) X(mxfp4, GgufEmbedMXFP4)                    \
+  X(nvfp4, GgufEmbedNVFP4) X(fp8, GgufEmbedFP8)                                                                   \
+  X(af2g32, GgufEmbedAF2G32) X(af2g64, GgufEmbedAF2G64) X(af2g128, GgufEmbedAF2G128)                               \
+  X(af3g32, GgufEmbedAF3G32) X(af3g64, GgufEmbedAF3G64) X(af3g128, GgufEmbedAF3G128)                               \
+  X(af4g32, GgufEmbedAF4G32) X(af4g64, GgufEmbedAF4G64) X(af4g128, GgufEmbedAF4G128)                               \
+  X(af5g32, GgufEmbedAF5G32) X(af5g64, GgufEmbedAF5G64) X(af5g128, GgufEmbedAF5G128)                               \
+  X(af6g32, GgufEmbedAF6G32) X(af6g64, GgufEmbedAF6G64) X(af6g128, GgufEmbedAF6G128)                               \
+  X(af8g32, GgufEmbedAF8G32) X(af8g64, GgufEmbedAF8G64) X(af8g128, GgufEmbedAF8G128)
+#define GGUF_EMBEDDING_FORMATS(X) GGUF_QUANTIZED_EMBEDDING_FORMATS(X) X(bf16, GgufEmbedBF16) X(f16, GgufEmbedF16)
+#define GGUF_EMBEDDING_ONE(f, F) +1
+static_assert(0 GGUF_EMBEDDING_FORMATS(GGUF_EMBEDDING_ONE) == GGUF_FMT_COUNT, "GGUF_EMBEDDING_FORMATS lists every format");
+#undef GGUF_EMBEDDING_ONE
+#define GGUF_EMBEDDING_RUNS(f, F) static_assert(F::Weights % 8 == 0, #f " blocks hold whole runs of 8 values");
+GGUF_QUANTIZED_EMBEDDING_FORMATS(GGUF_EMBEDDING_RUNS)
+#undef GGUF_EMBEDDING_RUNS

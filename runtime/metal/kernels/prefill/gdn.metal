@@ -192,6 +192,7 @@ inline void gdn_scan_prefill_phase(
 
 GDN_SCAN_PREFILL_ENTRY(prefill_gdn_scan, 16, 48, 128)
 GDN_SCAN_PREFILL_ENTRY(prefill_gdn_scan_vh32, 16, 32, 128)
+GDN_SCAN_PREFILL_ENTRY(prefill_gdn_scan_vh64, 16, 64, 128)
 #undef GDN_SCAN_PREFILL_ENTRY
 #undef GDN_SCAN_PREFILL_KERNEL
 
@@ -304,6 +305,7 @@ inline void gdn_prepare_prefill_phase(
 
 GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare, 16, 48, 128, 10240, 16640)
 GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare_vh32, 16, 32, 128, 8192, 12544)
+GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare_vh64, 16, 64, 128, 12288, 20736)
 // Qwen3.8-Flash-Next packs the 48-head rows to 16512 columns.
 GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare_p16512, 16, 48, 128, 10240, 16512)
 #undef GDN_PREPARE_PREFILL_ENTRY
@@ -333,6 +335,9 @@ GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh32, 16, 32, 128, 8192, 12544, bfloat)
 GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_f32, 16, 48, 128, 10240, 16640, float)
 GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh32_f32, 16, 32, 128, 8192, 12544,
                        float)
-GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_p16512, 16, 48, 128, 10240, 16512, bfloat)
+GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh64, 16, 64, 128, 12288, 20736, bfloat)
+GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh64_f32, 16, 64, 128, 12288, 20736,
+                       float)
+// Qwen3.8-Flash-Next loads from GGUFs only, whose norms are F32.
 GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_p16512_f32, 16, 48, 128, 10240, 16512, float)
 #undef GDN_GATE_PREFILL_ENTRY

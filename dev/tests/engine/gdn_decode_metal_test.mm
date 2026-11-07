@@ -15,6 +15,7 @@
 // decode over a bf16 state is checked against the fp32 decode.
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
+#include "TestFamilies.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/GDN.h"
@@ -58,12 +59,9 @@ constexpr uint32_t kTaps = SPLASH_GDN_CONVOLUTION_TAPS, kCarried = kTaps - 1;
 constexpr uint32_t kLayers = 2;
 // The scales of the normalized q and k rows.
 constexpr double kQueryScale = 0.0078125, kKeyScale = 0.08838834765;
-// Qwen3.6-35B-A3B's, Qwen3.8-27B's and Qwen3.8-Flash-Next's, whose 16512-column
-// packed rows have kernel variants of their own (_p16512) and whose output
-// gate is sigmoid(z), the others' silu(z).
-constexpr std::array kShapes{GdnShape{16, 48, 128, 10240, 16640},
-                             GdnShape{16, 32, 128, 8192, 12544},
-                             GdnShape{16, 48, 128, 10240, 16512, true}};
+// Every family's shape (Qwen3.8-Flash-Next's gate is sigmoid(z), the others'
+// silu(z)).
+const std::vector<GdnShape> kShapes = splash::test::familyGdnShapes();
 
 double roundBfloat(double value) {
   return bf16ToFloat(floatToBf16(static_cast<float>(value)));
@@ -578,9 +576,9 @@ void runDecode(MetalBackend &backend, const GdnShape &shape, uint32_t lanes,
       firstSteps[layer].push_back(firstStep(fixture, layer, lane));
     }
   }
-  // The norm weights only reach the hidden rows; the bf16 pass covers the
-  // second step.
-  if (float32)
+  // The norm weights only reach the hidden rows; the pass of the first norm
+  // type the shape's families store covers the second step.
+  if (float32 != familyNorms(shape).front())
     return;
 
   // The second step folds the rows of the first its lane retained into the
@@ -1051,7 +1049,7 @@ void gateMatchesPrefill(MetalBackend &backend, const GdnShape &shape, bool float
 }
 
 void rejectsInvalid(MetalBackend &backend) {
-  const GdnShape &shape = kShapes[1];
+  const GdnShape &shape = kShapes.front();
   Fixture fixture(backend, shape, 1);
   CommandGraph graph;
   for (const uint32_t lanes : {0U, kMaxLanes + 1})
@@ -1251,35 +1249,37 @@ int main(int argc, char **argv) {
     rejectsInvalid(backend);
     for (const GdnShape &shape : kShapes)
       for (const uint32_t lanes : {1U, kMaxLanes})
-        for (const bool float32 : {false, true}) bufferExtents(backend, shape, LinearInput::Table16, float32, lanes);
+        for (const bool float32 : familyNorms(shape))
+          bufferExtents(backend, shape, LinearInput::Table16, float32, lanes);
     // Table16 feeds the register tile after norms that are F32 (a GGUF's, in
-    // tiled head order) or bf16 (an MLX target's, grouped).
+    // tiled head order) or bf16 (an MLX target's, grouped), each norm type
+    // the shape's families store.
     for (const GdnShape &shape : kShapes)
       for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes) {
-        fusedPreparation(backend, shape, lanes, LinearInput::Table16, true);
+        for (const bool float32 : familyNorms(shape))
+          fusedPreparation(backend, shape, lanes, LinearInput::Table16, float32);
         tiledHeadOrder(backend, shape, lanes, LinearInput::Table16, true);
-        fusedPreparation(backend, shape, lanes, LinearInput::Table16, false);
       }
     // A GGUF's out-projection on the staged tile reads the tiled rows plain.
     for (const GdnShape &shape : kShapes)
       for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
         tiledHeadOrder(backend, shape, lanes, LinearInput::Plain, true);
-    for (bool float32 : {false, true})
-      for (const GdnShape &shape : kShapes)
+    for (const GdnShape &shape : kShapes)
+      for (bool float32 : familyNorms(shape))
         for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
           runDecode(backend, shape, lanes, float32);
-    for (bool float32 : {false, true})
-      for (const GdnShape &shape : kShapes)
+    for (const GdnShape &shape : kShapes)
+      for (bool float32 : familyNorms(shape))
         for (GdnHeadOrder order : {GdnHeadOrder::Grouped, GdnHeadOrder::Tiled})
           gateMatchesPrefill(backend, shape, float32, order);
     for (const GdnShape &shape : kShapes)
-      for (bool float32 : {false, true})
+      for (bool float32 : familyNorms(shape))
         for (GdnHeadOrder order : {GdnHeadOrder::Grouped, GdnHeadOrder::Tiled})
           for (LinearInput layout : {LinearInput::Plain, LinearInput::Table16})
             replayAcrossBatches(backend, shape, float32, order, layout);
     for (const GdnShape &shape : kShapes)
       for (const uint32_t lanes : {1U, kMaxLanes})
-        for (bool float32 : {false, true})
+        for (bool float32 : familyNorms(shape))
           for (LinearInput layout : {LinearInput::Plain, LinearInput::Table16})
             bfloatState(backend, shape, lanes, float32, layout);
     std::cout << "gdn_decode_metal_test: PASS\n";

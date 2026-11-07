@@ -5,13 +5,19 @@
 #include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/Sampling.hpp"
+#include "ops/KernelCalibration.hpp"
 
 #include <algorithm>
+#include <array>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
 
 namespace {
+
+// The pages per prefill attention split these plans take: the Apple10 row's
+// (KernelCalibration.hpp).
+constexpr uint32_t kPagesPerSplit = splash::ops::kAttention.prefillPagesPerSplit;
 
 using splash::test::rejects;
 using splash::test::require;
@@ -23,19 +29,22 @@ void attention() {
     uint32_t maximumSlots = 0;
     for (uint32_t rows = 1; rows <= 2048; ++rows) {
       // Split counts decrease as the M8 tile count grows, so a shorter
-      // request can need more scratch than the exact requested row count.
+      // request can need more scratch than the exact requested row count;
+      // the longest history takes the most, its 256 tile splits shared out.
       const uint32_t tiles = (rows + 7) / 8;
-      const uint32_t splits = std::clamp(32U / tiles, 1U, 32U);
+      const uint32_t splits = std::clamp(256U / tiles, 1U, 32U);
       maximumSlots = std::max(maximumSlots, tiles * splits);
       const auto workspace = ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout);
       require(workspace.partialsBytes == uint64_t{maximumSlots} * 8 * queryHeads * 256 * 4,
               "prefill partial workspace differs from the maximum over actual row counts");
       require(workspace.statisticsBytes == uint64_t{maximumSlots} * 8 * queryHeads * 2 * 4,
               "prefill statistics workspace differs from the maximum over actual row counts");
-      const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout);
-      require(workspace.partialsBytes >= plan.workspace.partialsBytes &&
-                  workspace.statisticsBytes >= plan.workspace.statisticsBytes,
-              "prefill workspace omitted the plan of its own rows");
+      for (const uint32_t history : {0U, 65536U, 1'000'000U}) {
+        const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, kPagesPerSplit);
+        require(workspace.partialsBytes >= plan.workspace.partialsBytes &&
+                    workspace.statisticsBytes >= plan.workspace.statisticsBytes,
+                "prefill workspace omitted the plan of its own rows");
+      }
     }
     const auto maximum = ops::PagedAttention::prefillWorkspace(2048, queryHeads, layout);
     require(maximum.partialsBytes == (queryHeads == 24 ? 48U : 32U) * uint64_t{1024 * 1024},
@@ -64,18 +73,60 @@ void attention() {
   }
 }
 
+// The attention kernels follow how a layout reads its pages, not its value
+// order: Qwen3.8-Flash-Next's geometry read page by page has no kernel (its
+// sparse kernels read selected blocks), and a reader of selected blocks takes
+// token-major values, the only order whose blocks are contiguous.
+void attentionReads() {
+  using namespace splash;
+  const kv::Layout selected{.attentionLayers = 1, .kvHeads = 2, .headDimension = 256,
+                            .valuesTokenMajor = true, .reads = kv::Reads::SelectedBlocks};
+  const std::array<uint32_t, 1> history{4096};
+  require(ops::PagedAttention::prefillPlan(64, 4096, 24, selected, kPagesPerSplit).sparse &&
+              ops::PagedAttention::verifyPlan(1, 24, selected, history).sparse,
+          "a reader of selected blocks did not plan the sparse kernels");
+  kv::Layout everyPage = selected;
+  everyPage.reads = kv::Reads::EveryPage;
+  require(everyPage.valid(), "a page loop over token-major values is not a layout");
+  rejects([&] { (void)ops::PagedAttention::prefillPlan(64, 4096, 24, everyPage, kPagesPerSplit); },
+          "no paged-attention kernel for layout", "the page loop planned the sparse kernels of token-major values");
+  rejects([&] { (void)ops::PagedAttention::verifyPlan(1, 24, everyPage, history); },
+          "no paged-attention kernel for layout", "the page loop planned the sparse kernels of token-major values");
+  kv::Layout dimensionMajor = selected;
+  dimensionMajor.valuesTokenMajor = false;
+  require(!dimensionMajor.valid(), "a reader of selected blocks took dimension-major values");
+}
+
+// Only a reader of selected blocks reads a block index, so only its layout
+// holds one and only its pages can leave memory while their index stays:
+// Qwen3.8-Flash-Next's pages read page by page are no layout, whose K/V
+// every row would read.
+void blockIndexReader() {
+  using namespace splash;
+  const kv::Layout selected{.attentionLayers = 12, .kvHeads = 2, .headDimension = 256, .indexDimension = 128,
+                            .valuesTokenMajor = true, .reads = kv::Reads::SelectedBlocks};
+  require(selected.valid() && selected.spillable(), "a reader of selected blocks cannot spill its pages");
+  kv::Layout everyPage = selected;
+  everyPage.reads = kv::Reads::EveryPage;
+  require(!everyPage.valid() && !everyPage.spillable(), "the page loop's layout holds a block index");
+}
+
 // Expert ids, route rows and grouped routes are uint32, routing weights fp32
-// and activations bf16. The grouped input first holds the router's fp32
-// scores, one row of 256 per token. Every plan parks its gate in
-// expertOutput, so that field spans the wider of the hidden and intermediate
-// widths. Plans of the staged tiles hold no sums.
+// and activations bf16; a row routes its top k and each shared slice, which
+// fills one tile per tileRows rows. The grouped input first holds the
+// router's fp32 scores, one row of 256 per token. Every plan parks its gate
+// in expertOutput, so that field spans the wider of the hidden and
+// intermediate widths. Plans of the staged tiles hold no sums.
 void checkMoe(splash::ops::MoeWorkspace workspace,
               splash::ops::MoeShape shape, uint32_t rows, uint32_t tileRows) {
   using splash::model::kBFloat16Bytes;
   constexpr uint64_t kRouterScores = 256;
   const uint64_t outputWidth = std::max(shape.hiddenSize, shape.expertIntermediateSize);
-  const uint64_t routes = uint64_t{rows} * shape.routesPerToken();
-  const uint64_t tiles = splash::ops::moeMaximumTiles(rows, shape, tileRows);
+  const uint64_t routes = uint64_t{rows} * (shape.expertsPerToken + shape.sharedSlices);
+  const uint64_t routed = uint64_t{rows} * shape.expertsPerToken;
+  const uint64_t tiles = std::min(routed / tileRows + shape.experts, routed) +
+                         uint64_t{shape.sharedSlices} * ((rows + tileRows - 1) / tileRows);
+  require(tiles == splash::ops::moeMaximumTiles(rows, shape, tileRows), "MoE maximum tiles changed from baseline");
   const uint64_t grouped = tiles * tileRows;
   require(workspace.selectedExpertsBytes == routes * sizeof(uint32_t) &&
               workspace.routingWeightsBytes == routes * sizeof(float) &&
@@ -94,8 +145,15 @@ void checkMoe(splash::ops::MoeWorkspace workspace,
 
 void moe() {
   using namespace splash::ops;
-  for (const MoeShape shape : {MoeShape{256, 8, 2, 512},
-                               MoeShape{2048, 256, 8, 512}}) {
+  // Flint's: two ungated shared slices behind a sigmoid router.
+  constexpr MoeShape kSlices{.hiddenSize = 2048,
+                             .experts = 256,
+                             .expertsPerToken = 6,
+                             .expertIntermediateSize = 512,
+                             .router = MoeRouter::SigmoidNormalized,
+                             .sharedSlices = 2,
+                             .sharedGate = false};
+  for (const MoeShape shape : {MoeShape{256, 8, 2, 512}, MoeShape{2048, 256, 8, 512}, kSlices}) {
     for (uint32_t rows = 1; rows <= 2048; ++rows)
       checkMoe(MoE::prefillPlan(shape, rows, {MoeExpertTile::M32}).workspace(), shape, rows, 32);
     const auto single = MoE::decodePlan(shape, 1, {MoeExpertTile::M8}).workspace();
@@ -118,6 +176,16 @@ void moe() {
   }
   rejects([] { (void)MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); },
           "invalid MoE workspace shape", "a MoE plan of an empty shape was sized");
+  // No kernel routes a softmax router's two shared slices.
+  MoeShape uncompiled = kSlices;
+  uncompiled.router = MoeRouter::Softmax;
+  rejects([&] { (void)MoE::prefillPlan(uncompiled, 1, {MoeExpertTile::M32}); }, "invalid MoE workspace shape",
+          "a MoE plan of a routing no kernel compiles was sized");
+  // Nor a sigmoid router past the experts its kernels route.
+  uncompiled = kSlices;
+  uncompiled.experts = SPLASH_MOE_EXPERT_SLOTS + 1;
+  rejects([&] { (void)MoE::prefillPlan(uncompiled, 1, {MoeExpertTile::M32}); }, "invalid MoE workspace shape",
+          "a MoE plan of more experts than its routing's kernels route was sized");
 }
 
 void sampling() {
@@ -155,6 +223,19 @@ void sampling() {
   rejects([] { (void)DraftSelector::workspace(0); },
           "invalid draft selector workspace position count",
           "a draft selector workspace of no positions was sized");
+  // A family's stop tokens fill the places the kernels compare, those past
+  // its list with SPLASH_NO_TOKEN, which is no stop token.
+  using splash::ops::StopTokens;
+  constexpr StopTokens two{248044, 248046};
+  static_assert(std::ranges::equal(two.ids, std::array{248044U, 248046U, SPLASH_NO_TOKEN, SPLASH_NO_TOKEN}) &&
+                std::ranges::equal(two.tokens(), std::array{248044U, 248046U}) && two.contains(248046) &&
+                !two.contains(SPLASH_NO_TOKEN) && StopTokens{}.tokens().empty());
+  constexpr StopTokens four{150001, 150003, 150005, 150018};
+  static_assert(four.tokens().size() == SPLASH_STOP_TOKENS && four.contains(150018) && !four.contains(150002));
+  rejects([] { (void)StopTokens{1, 2, 3, 4, 5}; }, "more stop tokens than the sampling kernels compare",
+          "five stop tokens were taken");
+  rejects([] { (void)StopTokens{1, SPLASH_NO_TOKEN}; }, "SPLASH_NO_TOKEN",
+          "SPLASH_NO_TOKEN was taken as a stop token");
 }
 
 } // namespace
@@ -162,6 +243,8 @@ void sampling() {
 int main() {
   try {
     attention();
+    attentionReads();
+    blockIndexReader();
     moe();
     sampling();
     std::cout << "operator workspace: PASS\n";

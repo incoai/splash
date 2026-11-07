@@ -29,7 +29,10 @@ typedef uint64_t SplashKvPage;
 // goes through a page table off such pages.
 #define SPLASH_KV_PAGE_ABSENT ((SplashKvPage)0)
 
-// The dimension of every KV head a page holds.
+// The dimension of the KV heads of Qwen3.5's pages, the default of the
+// element functions below. A layout holds its own (kv::Layout::
+// headDimension); a kernel takes its own as a template value, HeadDim
+// (kernels/common/kv_paging.h).
 #define SPLASH_KV_HEAD_DIMENSION 256u
 
 // The tensors of a layer, in the order they sit in its region of an extent.
@@ -47,19 +50,21 @@ inline uint32_t splash_kv_page_bytes(uint32_t data_bytes, uint32_t scale_bytes,
 }
 
 // Where one element of one KV head sits in a page's slab of a tensor, in
-// elements, for `token` of the page's SPLASH_TARGET_KV_BLOCK_TOKENS: keys
-// token-major, values dimension-major, and one scale per (head, token) for
-// either of them.
+// elements, for `token` of the page's SPLASH_TARGET_KV_BLOCK_TOKENS, in heads
+// of head_dimension dimensions: keys token-major, values dimension-major, and
+// one scale per (head, token) for either of them.
 inline uint64_t splash_kv_key_element(uint32_t head, uint32_t token,
-                                      uint32_t dimension) {
+                                      uint32_t dimension,
+                                      uint32_t head_dimension = SPLASH_KV_HEAD_DIMENSION) {
   return (uint64_t(head) * SPLASH_TARGET_KV_BLOCK_TOKENS + token) *
-             SPLASH_KV_HEAD_DIMENSION +
+             head_dimension +
          dimension;
 }
 
 inline uint64_t splash_kv_value_element(uint32_t head, uint32_t token,
-                                        uint32_t dimension) {
-  return (uint64_t(head) * SPLASH_KV_HEAD_DIMENSION + dimension) *
+                                        uint32_t dimension,
+                                        uint32_t head_dimension = SPLASH_KV_HEAD_DIMENSION) {
+  return (uint64_t(head) * head_dimension + dimension) *
              SPLASH_TARGET_KV_BLOCK_TOKENS +
          token;
 }

@@ -1,10 +1,12 @@
 #include "ModelDescriptor.hpp"
 #include "GgufImage.hpp"
+#include "GgufTarget.hpp"
 #include "SafetensorsImage.hpp"
 #include "WeightStore.hpp"
 #include "metal/abi/DraftAttention.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/PagedAttention.h"
+#include "ops/MoE.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -14,6 +16,7 @@
 #include <fnmatch.h>
 #include <initializer_list>
 #include <iterator>
+#include <numeric>
 #include <optional>
 #include <regex>
 #include <span>
@@ -176,29 +179,24 @@ void requireBooleans(NSDictionary *object, std::string_view where,
   }
 }
 
-// Each layer's type in a layer_types array: full_attention for a
-// full-attention layer, linear_attention for a GDN layer.
-void requireLayerTypes(NSArray *types, const QwenTargetDimensions &target,
+// Each layer's type in a layer_types array: linear_attention for a GDN
+// layer; for an attention layer, sliding_attention where a window bounds it
+// (kv::Layout::windowed), else full_attention.
+void requireLayerTypes(NSArray *types, const QwenHybridLayout &target,
                        std::string_view source, std::string_view label) {
   if (types.count != target.layers)
     throw std::invalid_argument(std::string(label) + " count mismatch: " + std::string(source) +
                                 " " + std::to_string(types.count) + ", runtime " +
                                 std::to_string(target.layers));
-  for (uint32_t layer = 0; layer < target.layers; ++layer) {
-    NSString *expected =
-        target.isFullAttentionLayer(layer) ? @"full_attention" : @"linear_attention";
+  for (uint32_t layer = 0, attention = 0; layer < target.layers; ++layer) {
+    NSString *expected = !target.isFullAttentionLayer(layer)       ? @"linear_attention"
+                         : target.kvLayout().windowed(attention++) ? @"sliding_attention"
+                                                                   : @"full_attention";
     if (![types[layer] isEqual:expected])
       throw std::invalid_argument(std::string(label) + " " +
                                   std::to_string(layer) + " must be " +
                                   expected.UTF8String);
   }
-}
-
-// Calls `use` with each family's layout, in TargetLayout's order.
-template <class Use> constexpr void forEachFamily(Use use) {
-  [&]<size_t... Family>(std::index_sequence<Family...>) {
-    (use(std::variant_alternative_t<Family, TargetLayout>{}), ...);
-  }(std::make_index_sequence<std::variant_size_v<TargetLayout>>{});
 }
 
 // Each family's native window, which its config's max_position_embeddings
@@ -230,29 +228,44 @@ std::invalid_argument unsupportedModel(const std::string &difference) {
                                supported);
 }
 
-// The target's text configuration, of the family its model type names. Every
-// one holds the sizes the descriptor shares with it, which tell the family's
-// target from other models of its architecture. A safetensors target's
-// config.json also holds the rest of what the kernels compute; a GGUF's is
-// what the installer derived from the GGUF's metadata, which the GGUF planner
-// checks (gguf::requireMetadata).
-void validateTextConfig(NSDictionary *text, const QwenTargetDimensions &target, std::string_view family,
-                        TargetSource source) {
-  const std::string_view name = sourceName(source);
-  for (const ExpectedNumber &size : std::initializer_list<ExpectedNumber>{
-           {"hidden_size", target.hiddenSize},
-           {"num_hidden_layers", target.layers},
-           {"vocab_size", target.vocabularySize},
-           {"max_position_embeddings", target.nativeContextTokens},
-           {"num_attention_heads", target.attentionQueryHeads},
-           {"num_key_value_heads", target.attentionKvHeads},
-           {"head_dim", target.attentionHeadDimension}}) {
+// How a text configuration differs from a family in the sizes every one
+// holds, which tell the family's target from other models of its
+// architecture: the first that differs, after `matched` that agree.
+struct SizeDifference final {
+  size_t matched;
+  std::string difference;
+};
+std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybridLayout &target,
+                                             TargetSource source) {
+  const std::initializer_list<ExpectedNumber> sizes{
+      {"hidden_size", target.hiddenSize},
+      {"num_hidden_layers", target.layers},
+      {"vocab_size", target.vocabularySize},
+      {"max_position_embeddings", target.nativeContextTokens},
+      {"num_attention_heads", target.attentionQueryHeads},
+      {"num_key_value_heads", target.attentionKvHeads},
+      {"head_dim", target.attentionHeadDimension}};
+  size_t matched = 0;
+  for (const ExpectedNumber &size : sizes) {
     const std::string label = std::string("text config ") + size.key;
     NSNumber *value = requireNumber(text[@(size.key)], label);
     if (value.doubleValue != size.value)
-      throw unsupportedModel(label + ": " + std::string(name) + " " + value.description.UTF8String + ", " +
-                             std::string(family) + " " + @(size.value).description.UTF8String);
+      return SizeDifference{matched, label + ": " + std::string(sourceName(source)) + " " +
+                                         value.description.UTF8String + ", " + std::string(target.family) +
+                                         " " + @(size.value).description.UTF8String};
+    ++matched;
   }
+  return std::nullopt;
+}
+
+// The target's text configuration, of its family (describeSourceModel), whose
+// sizes it holds (sizeDifference). A safetensors target's config.json also
+// holds the rest of what the kernels compute; a GGUF's is what the installer
+// derived from the GGUF's metadata, which the GGUF planner checks
+// (gguf::planImages).
+void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, TargetSource source) {
+  const std::string_view name = sourceName(source);
+  if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
   if (source != TargetSource::Safetensors) return;
   requireNumbers(text, name, "text config",
                  {{"linear_num_key_heads", target.gdnKeyHeads},
@@ -268,7 +281,7 @@ void validateTextConfig(NSDictionary *text, const QwenTargetDimensions &target, 
                     {"num_experts_per_tok", target.expertsPerToken},
                     {"moe_intermediate_size", target.expertIntermediateSize},
                     {"shared_expert_intermediate_size",
-                     target.expertIntermediateSize}});
+                     target.sharedExpertSlices * target.expertIntermediateSize}});
   else
     requireNumbers(text, name, "text config",
                    {{"intermediate_size", target.intermediateSize}});
@@ -294,6 +307,114 @@ void validateTextConfig(NSDictionary *text, const QwenTargetDimensions &target, 
   requireEqual(requireString(rope, typeKey, typeLabel), "default", name, typeLabel);
 }
 
+// The whole numbers of a JSON array, which must be `expected`, in order.
+void requireWholes(NSArray *values, std::span<const uint32_t> expected, std::string_view source,
+                   const std::string &label) {
+  std::vector<uint32_t> found;
+  for (id value in values) found.push_back(requireWhole(value, label + " " + std::to_string(found.size())));
+  if (std::ranges::equal(found, expected)) return;
+  const auto text = [](std::span<const uint32_t> numbers) {
+    std::string list = "[";
+    for (const uint32_t number : numbers) list += (list.size() > 1 ? ", " : "") + std::to_string(number);
+    return list + "]";
+  };
+  throw std::invalid_argument(label + " mismatch: " + std::string(source) + " " + text(found) + ", runtime " +
+                              text(expected));
+}
+
+// The layers of `mask` among `layers`, a bit each, in order.
+std::vector<uint32_t> layersOf(uint64_t mask, uint32_t layers) {
+  std::vector<uint32_t> result;
+  for (uint32_t layer = 0; layer < layers && layer < 64; ++layer)
+    if (mask >> layer & 1) result.push_back(layer);
+  return result;
+}
+
+// Flint's text configuration, its config.json at the top level: the sizes
+// every family's holds (sizeDifference), then the rest as the layout's
+// values make them: its dense, routed and shared FFN widths, the experts a
+// token takes and how its router weighs them, its leading dense layers
+// (mlp_only_layers), its window, the layers that slide (layer_types) and
+// those without RoPE (no_rope_layer_indices), and its stop tokens. A
+// config the installer derives from a GGUF states those, as the header
+// holds them; where a config states them too (the release's config.json
+// does), its learned sinks, RoPE base, RMS epsilon, activation, bias-free
+// attention and untied head.
+void validateTextConfig(NSDictionary *text, const FlintLayout &target, TargetSource source) {
+  const std::string_view name = sourceName(source);
+  if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
+  requireNumbers(text, name, "text config",
+                 {{"intermediate_size", target.intermediateSize},
+                  {"moe_intermediate_size", target.expertIntermediateSize},
+                  {"shared_expert_intermediate_size", target.sharedExpertSlices * target.expertIntermediateSize},
+                  {"num_experts_per_tok", target.expertsPerToken},
+                  {"sliding_window", target.slidingWindow}});
+  const bool sigmoid = target.moeRouter == ops::MoeRouter::SigmoidNormalized;
+  requireEqual(requireString(text, @"router_score_function", "text config router_score_function"),
+               sigmoid ? "sigmoid" : "softmax", name, "text config router_score_function");
+  requireBooleans(text, "text config", {{"norm_topk_prob", true}});
+  requireLayerTypes(requireArray(text, @"layer_types", "text config layer_types"), target, name,
+                    "text config layer_types");
+  std::vector<uint32_t> dense(target.leadingDenseLayers);
+  std::iota(dense.begin(), dense.end(), 0u);
+  requireWholes(requireArray(text, @"mlp_only_layers", "text config mlp_only_layers"), dense, name,
+                "text config mlp_only_layers");
+  requireWholes(requireArray(text, @"no_rope_layer_indices", "text config no_rope_layer_indices"),
+                layersOf(target.unrotatedLayers, target.layers), name, "text config no_rope_layer_indices");
+  requireWholes(requireArray(text, @"eos_token_id", "text config eos_token_id"), target.stopTokens.tokens(), name,
+                "text config eos_token_id");
+  if (text[@"softmax_type"])
+    requireEqual(requireString(text, @"softmax_type", "text config softmax_type"), "learnable", name,
+                 "text config softmax_type");
+  if (text[@"rope_theta"]) requireNumbers(text, name, "text config", {{"rope_theta", target.rotaryTheta}});
+  if (text[@"rms_norm_eps"]) requireNumbers(text, name, "text config", {{"rms_norm_eps", SPLASH_RMS_EPSILON}});
+  if (text[@"hidden_act"])
+    requireEqual(requireString(text, @"hidden_act", "text config hidden_act"), "silu", name, "text config hidden_act");
+  for (const char *key : {"attention_bias", "tie_word_embeddings"})
+    if (text[@(key)]) requireBooleans(text, "text config", {{key, false}});
+}
+
+// The mask token a DFlash2 draft of a family whose drafts choose theirs
+// names (dflash_config.mask_token_id), which must be one of the target's
+// reserved tokens; readDraftLayout then holds the draft to it.
+uint32_t draftMaskToken(NSDictionary *draft, const QwenTargetDimensions &target) {
+  NSDictionary *flash = requireObject(draft, @"dflash_config", "draft config dflash_config");
+  const uint32_t token = requireWhole(flash[@"mask_token_id"], "draft config dflash_config mask_token_id");
+  if (token < target.firstDraftMaskToken || token > target.lastDraftMaskToken)
+    throw std::invalid_argument("draft config dflash_config mask_token_id " + std::to_string(token) +
+                                " is not one of the target's reserved tokens " +
+                                std::to_string(target.firstDraftMaskToken) + " to " +
+                                std::to_string(target.lastDraftMaskToken));
+  return token;
+}
+
+// The routed experts of a GGUF target of `target`'s family: its header's
+// expert_count, which the installer derives into the config's num_experts
+// (gguf.model_config), fewer than the family's in a pruned release. A count
+// is served when it is at most the family's, a shape the MoE kernels route
+// (ops::MoeShape: from the experts each token takes to the wide slots), and
+// whole 8-column tiles of the router's float projection (GgufFloatParams);
+// every start's planner holds the header and each expert tensor to it
+// (gguf::planImages). A config without it, which an earlier release
+// derived, states the family's.
+uint32_t ggufRoutedExperts(NSDictionary *text, const QwenHybridLayout &target) {
+  if (!text[@"num_experts"]) return target.experts;
+  constexpr uint32_t routerTile = 8;
+  const auto served = [&](uint32_t experts) {
+    ops::MoeShape shape = target.moeBlockShape();
+    shape.experts = experts;
+    return experts <= target.experts && experts % routerTile == 0 && shape.valid();
+  };
+  const uint32_t experts = requireWhole(text[@"num_experts"], "text config num_experts");
+  if (served(experts)) return experts;
+  // The refusal names the counts served, from the fewest to the family's.
+  uint32_t fewest = routerTile;
+  while (fewest < target.experts && !served(fewest)) fewest += routerTile;
+  throw unsupportedModel("text config num_experts: GGUF " + std::to_string(experts) + ", " +
+                         std::string(target.family) + " a multiple of " + std::to_string(routerTile) + " from " +
+                         std::to_string(fewest) + " to " + std::to_string(target.experts));
+}
+
 // An MLX target's quantization, the "quantization" object of its config.json:
 // the object and each module's own entry name a format the block kernels hold
 // (metal/abi/QuantFormat.h), as MLX loads it: an entry's mode is MLX's default,
@@ -317,12 +438,11 @@ void requireMlxQuantization(NSDictionary *quantization, const QwenTargetDimensio
       return module && !entry[key] ? modeDefault : requireWhole(entry[key], label + " " + key.UTF8String);
     };
     const uint32_t bits = number(@"bits", 4), group = number(@"group_size", affine ? 64 : nvfp4 ? 16 : 32);
-    if (affine ? quant_affine_format_of(bits, group) == GGUF_FMT_COUNT
-               : nvfp4 ? bits != 4 || group != 16 : ![mode isEqual:@"mxfp4"] || bits != 4 || group != 32)
+    if (safetensors::mlxFormat(mode.UTF8String ?: "", bits, group) == GGUF_FMT_COUNT)
       throw std::invalid_argument(label + " is " + mode.UTF8String + " " + std::to_string(bits) +
-                                  "-bit in groups of " + std::to_string(group) +
-                                  "; MLX weights load as affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or "
-                                  "128, or as mxfp4 or nvfp4");
+                                  "-bit in groups of " + std::to_string(group) + "; MLX weights load as " +
+                                  std::string(safetensors::kMlxAffineFormats) + ", or as " +
+                                  std::string(safetensors::kMlxFloatFormats));
   };
   require(quantization, "quantization", false);
   // A module's entry is an object; the object's other values are its own.
@@ -529,16 +649,18 @@ void requireQuantization(NSDictionary *config, const QwenTargetDimensions &geome
     if ([quantization[@"quant_method"] isEqual:@"compressed-tensors"])
       return requireCompressedTensorsQuantization(quantization, geometry);
   }
-  throw std::invalid_argument(
-      "this model requires an MLX checkpoint (affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or 128, mxfp4 or "
-      "nvfp4), an NVFP4 or FP8 checkpoint of Model Optimizer or compressed-tensors, or a supported GGUF");
+  throw std::invalid_argument("this model requires an MLX checkpoint (" + std::string(safetensors::kMlxAffineFormats) +
+                              ", " + std::string(safetensors::kMlxFloatFormats) +
+                              "), an NVFP4 or FP8 checkpoint of Model Optimizer or compressed-tensors, or a supported "
+                              "GGUF");
 }
 
 // A DFlash2 checkpoint's config: the draft's layout. Its attention widths,
-// block, window, convolutions and selector must be those the draft kernels
-// are built for; its hidden size, vocabulary and mask token the target's;
-// and the target layers it reads (target_layer_ids) some of the target's,
-// ascending. Its layers, intermediate size and rotary base are its own.
+// window, convolutions and selector must be those the draft kernels are built
+// for, and its block at least their rows; its hidden size, vocabulary and
+// mask token the target's; and the target layers it reads (target_layer_ids)
+// some of the target's, ascending. Its layers, intermediate size and rotary
+// base are its own.
 DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimensions &target) {
   NSArray *architectures =
       requireArray(draft, @"architectures", "draft architectures");
@@ -567,12 +689,18 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   NSDictionary *flash =
       requireObject(draft, @"dflash_config", "draft config dflash_config");
   requireNumbers(flash, "checkpoint", "draft config dflash_config",
-                 {{"block_size", ExecutionLimits::draftQueryRows},
-                  {"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
+                 {{"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
                   {"conv_kernel_size", SPLASH_DRAFT_CONVOLUTION_TAPS},
                   {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
                   {"selector_top_k", SPLASH_DRAFT_CANDIDATES},
                   {"mask_token_id", target.maskToken}});
+  // The block it was trained to fill: the kernels' rows or more, of which a
+  // cycle drafts the first (Ornith-1.5-122B's fills 16). Its weights have no
+  // part of the block's length.
+  if (requireWhole(flash[@"block_size"], "draft config dflash_config block_size") <
+      ExecutionLimits::draftQueryRows)
+    throw std::invalid_argument("draft config dflash_config block_size is less than the " +
+                                std::to_string(ExecutionLimits::draftQueryRows) + " rows a cycle drafts");
   // How a target layer's output row becomes the hidden values the draft reads
   // of it, as the draft was trained (target_hidden_reduction): a
   // hyper-connected target's streams by their mean (Qwen4ExpTarget's
@@ -625,23 +753,37 @@ void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
 // config's model type names, from the source formats its record names, with
 // each config checked: the target's, as those formats require, its vision
 // tower's, and its DFlash2 draft's, whose layout it reads (readDraftLayout),
-// unless draft is nil.
+// unless draft is nil. A GGUF MoE target has the routed experts its config
+// states (ggufRoutedExperts).
 ModelDescriptor describeSourceModel(std::string name, std::string_view targetFormat,
                                     std::string_view visionFormat, NSDictionary *config,
                                     NSDictionary *draft) {
-  NSDictionary *text = config[@"text_config"];
+  // A family whose config is flat (flatConfig) holds its text model's keys
+  // in the config itself, which then names its model type.
+  bool flat = false;
+  forEachFamily([&](const auto &layout) {
+    flat = flat || (layout.flatConfig && [config[@"model_type"] isEqual:@(std::string(layout.modelType).c_str())]);
+  });
+  NSDictionary *text = flat ? config : config[@"text_config"];
   if (![text isKindOfClass:[NSDictionary class]]) throw unsupportedModel("its config has no text_config");
   const auto type = requireString(text, @"model_type", "text model type");
-  std::optional<TargetLayout> target;
-  forEachFamily([&](const auto &layout) {
-    if (layout.modelType == type) target = layout;
-  });
-  if (!target) throw unsupportedModel("text model type " + type);
   TargetSource targetSource;
   // "mlx-affine" names every safetensors target, as installations record it.
   if (targetFormat == "mlx-affine") targetSource = TargetSource::Safetensors;
   else if (targetFormat == "gguf") targetSource = TargetSource::Gguf;
   else throw std::invalid_argument("unsupported target source format: " + std::string(targetFormat));
+  // The family of the model type whose sizes the config holds, as
+  // Qwen3.6-35B-A3B's and Qwen3.5-122B-A10B's tell those two apart; of none,
+  // the refusal names how it differs from the one it matches furthest.
+  std::optional<TargetLayout> target;
+  std::optional<SizeDifference> nearest;
+  forEachFamily([&](const auto &layout) {
+    if (layout.modelType != type || layout.flatConfig != flat || target) return;
+    auto difference = sizeDifference(text, layout, targetSource);
+    if (!difference) target = layout;
+    else if (!nearest || difference->matched > nearest->matched) nearest = std::move(difference);
+  });
+  if (!target) throw unsupportedModel(nearest ? nearest->difference : "text model type " + type);
   VisionSource visionSource;
   if (visionFormat == "none") visionSource = VisionSource::None;
   else if (visionFormat == "safetensors") visionSource = VisionSource::Safetensors;
@@ -651,11 +793,14 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   // (inspectSourceConfiguration), and is not valid; a model root always
   // holds its draft's.
   DFlashDraftLayout dflashLayout;
-  std::visit([&](const auto &layout) {
+  std::visit([&](auto &layout) {
     if (targetSource == TargetSource::Safetensors && !layout.loadsSafetensors)
       throw std::invalid_argument(std::string(layout.family) + " loads from a GGUF only");
-    validateTextConfig(text, layout, layout.family, targetSource);
+    validateTextConfig(text, layout, targetSource);
     if (targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
+    if (targetSource == TargetSource::Gguf && layout.ffnKind == QwenFfnKind::SparseMoe)
+      layout.experts = ggufRoutedExperts(text, layout);
+    if (draft && layout.draftChoosesMaskToken()) layout.maskToken = draftMaskToken(draft, layout);
     if (draft) dflashLayout = readDraftLayout(draft, layout);
   }, *target);
   ModelDescriptor result = makeModelDescriptor(std::move(name), *target, dflashLayout,
@@ -668,48 +813,16 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   return result;
 }
 
-// A GGUF's scalar metadata as the installer copies it from the header it read
-// (install/gguf.py scalar_metadata): "unsigned", "float" and "string" objects
-// of the values of each kind. An unsigned one is a whole number from 0 to
-// 2^64 - 1, which NSJSONSerialization keeps exactly as a signed or, past
-// 2^63 - 1, an unsigned 64-bit integer.
-GgufMetadata readGgufMetadata(const std::filesystem::path &path) {
-  NSDictionary *object = readObject(path, "GGUF metadata");
-  GgufMetadata metadata;
-  NSDictionary *unsigneds = requireObject(object, @"unsigned", "GGUF metadata unsigned");
-  for (id key in unsigneds) {
-    const std::string name = requireText(key, "GGUF metadata key");
-    id value = unsigneds[key];
-    const std::string_view type = [value isKindOfClass:[NSNumber class]] ? [value objCType] : "";
-    if (type != "Q" && (type != "q" || [value longLongValue] < 0))
-      throw std::invalid_argument("GGUF metadata " + name + " must be a whole number from 0 to 2^64 - 1");
-    metadata.unsigneds.emplace(name, [value unsignedLongLongValue]);
-  }
-  NSDictionary *floats = requireObject(object, @"float", "GGUF metadata float");
-  for (id key in floats) {
-    const std::string name = requireText(key, "GGUF metadata key");
-    metadata.floats.emplace(name, requireNumber(floats[key], "GGUF metadata " + name).doubleValue);
-  }
-  NSDictionary *strings = requireObject(object, @"string", "GGUF metadata string");
-  for (id key in strings) {
-    const std::string name = requireText(key, "GGUF metadata key");
-    metadata.strings.emplace(name, requireText(strings[key], "GGUF metadata " + name));
-  }
-  return metadata;
-}
-
 // The attention of a target whose full-attention layers select blocks (a
 // block indexer): a verify row attends its top blocks, and a row whose
 // history holds no more than those attends it all, through its page table.
 // None for a target whose rows attend every token.
-std::optional<SparseKvShape> sparseKvShape(const QwenTargetDimensions &layout) {
-  if (!layout.hasIndexer()) return std::nullopt;
+std::optional<SparseKvShape> sparseKvShape(const QwenHybridLayout &layout) {
+  if (layout.kvLayout().reads != kv::Reads::SelectedBlocks) return std::nullopt;
   return SparseKvShape{.blockTokens = layout.indexerBlockTokens,
                        .selectedBlocks = layout.indexerTopBlocks,
                        .verifyRows = ExecutionLimits::targetVerifyRows,
-                       .denseHistoryTokens = layout.indexerTokens(),
-                       .sinkTokens = 0,
-                       .localTokens = 0};
+                       .denseHistoryTokens = layout.indexerTokens()};
 }
 
 } // namespace
@@ -761,6 +874,9 @@ bool ModelDescriptor::valid() const noexcept {
                layout.hiddenSize == draft.hiddenSize &&
                draft.targetLayerCount && draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
                draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
+               // A family whose drafts choose the mask token holds its draft's.
+               (!layout.draftChoosesMaskToken() ||
+                (layout.maskToken >= layout.firstDraftMaskToken && layout.maskToken <= layout.lastDraftMaskToken)) &&
                layout.kvLayout() == targetKvLayout &&
                layout.gdnStateLayout() == stateLayout.target;
       },
@@ -777,13 +893,28 @@ ModelDescriptor servedFor(ModelDescriptor model, uint32_t contextTokens) {
         if (contextTokens > layout.yarnContextTokens)
           throw std::invalid_argument(
               std::string(layout.family) + " serves at most " +
-              std::to_string(std::max(layout.nativeContextTokens, layout.yarnContextTokens)) + " tokens of context");
+              std::to_string(layout.maximumContextTokens()) + " tokens of context");
         model.ropeScaling = {.factor = static_cast<double>(contextTokens) / layout.nativeContextTokens,
                              .originalContextTokens = layout.nativeContextTokens};
         model.capabilities.maximumContextTokens = layout.servedContextTokens(model.ropeScaling);
       },
       model.target);
   return model;
+}
+
+std::vector<FamilyFacts> familyFacts() {
+  std::vector<FamilyFacts> facts;
+  forEachFamily([&](const auto &layout) {
+    facts.push_back({.family = layout.family,
+                     .experts = layout.ffnKind == QwenFfnKind::SparseMoe,
+                     .recurrentState = layout.gdnStateLayout().layers > 0,
+                     .pleTable = layout.pleNgram > 0,
+                     .sparseKv = sparseKvShape(layout).has_value(),
+                     .denseFfn = layout.ffnKind == QwenFfnKind::Dense,
+                     .contextTokens = layout.nativeContextTokens,
+                     .maximumContextTokens = layout.maximumContextTokens()});
+  });
+  return facts;
 }
 
 ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
@@ -808,7 +939,7 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
 
 std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::string_view visionFormat,
                                             const std::filesystem::path &config,
-                                            const std::optional<std::filesystem::path> &ggufMetadata,
+                                            const std::optional<std::filesystem::path> &ggufHeaders,
                                             const std::optional<std::filesystem::path> &draft) {
   @autoreleasepool {
     NSDictionary *target = readObject(config, "upstream model config");
@@ -816,10 +947,13 @@ std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::
     // Unnamed: the record names an installation, which this precedes.
     const ModelDescriptor descriptor = describeSourceModel({}, targetFormat, visionFormat, target, checkpoint);
     if (descriptor.targetSource == TargetSource::Gguf) {
-      if (!ggufMetadata) throw std::invalid_argument("a GGUF target is checked with its metadata");
-      const GgufMetadata metadata = readGgufMetadata(*ggufMetadata);
-      std::visit([&](const auto &layout) { gguf::requireMetadata(metadata, layout.ggufArchitecture, layout); },
-                 descriptor.target);
+      if (!ggufHeaders) throw std::invalid_argument("a GGUF target is checked with its headers");
+      const OpenGguf headers(findTargetGgufs(*ggufHeaders), GgufContents::Headers);
+      std::visit(
+          [&](const auto &layout) {
+            static_cast<void>(gguf::planImages(headers.file(), layout.ggufArchitecture, layout));
+          },
+          descriptor.target);
     }
     return descriptor.family();
   }

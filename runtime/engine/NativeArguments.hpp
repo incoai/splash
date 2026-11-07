@@ -17,6 +17,14 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+// A model root serve-native cannot serve: MODEL_DIRECTORY names no directory
+// holding the model's target/ and draft/, or one whose model
+// model::inspectModelRoot refuses.
+class ModelRootError final : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
 // What the serve-native command line asks for. server/server.py
 // `_native_command` writes it, and dev/tests/engine/native_command_golden.txt
 // pins the lines both sides agree on.
@@ -27,9 +35,9 @@ struct NativeArguments final {
   model::ModelDescriptor model;
   // Zero for auto.
   uint32_t maxContext = 0;
-  // --relaunch-context TOKENS, with MAX_CONTEXT auto: the context the
-  // server's first engine served, which the server passes to every relaunch
-  // (RuntimeResourcesConfig::relaunchContext); zero for none.
+  // --relaunch-context TOKENS: the context the server's first engine served,
+  // which the server passes to every relaunch beside that engine's
+  // MAX_CONTEXT (RuntimeResourcesConfig::relaunchContext); zero for none.
   uint32_t relaunchContext = 0;
   uint64_t maxMemoryBytes = 0;
   // Automatic without MAX_CACHE_DISK_BYTES, as the server's default.
@@ -57,9 +65,10 @@ struct NativeArguments final {
   // off).
   bool neuralEngine = true;
   // --ple-memory BYTES|auto|off and --expert-memory BYTES|auto|off: a
-  // Qwen3.8-Flash-Next GGUF's PLE table and a MoE target's routed experts,
-  // through a store of BYTES that streams the rest from the SSD, as the
-  // memory planner decides (auto, without the option) or loaded whole (off)
+  // target's per-layer embedding (PLE) table through a row cache of BYTES and
+  // a MoE target's routed experts through a store of BYTES, which
+  // stream the rest from the SSD, as the memory planner decides (auto,
+  // without the option) or loaded whole (off)
   // (RuntimeResourcesConfig::pleMemory, expertMemory).
   StreamedSetting pleMemory;
   StreamedSetting expertMemory;
@@ -70,15 +79,21 @@ struct NativeArguments final {
   // KV on the SSD cache, for validation; without it, the requests memory
   // cannot hold (EngineSpillConfig::always).
   bool kvSpillAlways = false;
+  // --kv-window-trim on|off: whether a windowed target's pages give up their
+  // windowed layers' K/V once every window has passed them; off, for
+  // validation, keeps them Full, which changes no output
+  // (RuntimeResourcesConfig::kvWindowTrim).
+  bool kvWindowTrim = true;
   // --verify-rows auto|all: the rows of the draft's block a decode
   // cycle verifies (RuntimeResourcesConfig::verifyRows).
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto
-// [MAX_CACHE_DISK_BYTES] [--name value]...` and inspects the model the
-// directory, its model root, holds. Throws UsageError for a command line it
-// refuses.
+// [MAX_CACHE_DISK_BYTES] [--name value]...`, whose command main has matched,
+// and inspects the model the directory, its model root, holds. Throws
+// UsageError for a command line it refuses and ModelRootError for the model
+// root it names.
 [[nodiscard]] NativeArguments parseNativeArguments(int argc,
                                                    const char *const *argv);
 

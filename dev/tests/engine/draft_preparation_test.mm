@@ -11,13 +11,19 @@
 // how to update it.
 #include "GgufFixtures.hpp"
 #include "TestAdmission.hpp"
+#include "TestCheckpoint.hpp"
+#include "TestFiles.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 #include "model/DFlashDraft.hpp"
 #include "model/DraftCheckpoint.hpp"
 #include "model/GgufPreparation.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
 #include "model/WeightImages.hpp"
+#include "ops/Embedding.hpp"
 
+#include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <vector>
 
 using namespace gguf_fixtures;
@@ -80,6 +86,59 @@ void checkImage(const std::vector<uint8_t> &image, const model::gguf::Image &pla
   }
 }
 
+// A checkpoint that ships its mask token's embedding beside its weights
+// (mask_embedding.safetensors): model.bin holds it after the codebooks, the
+// loader reads it as shipped, and each lane's mask rows of the draft input
+// take it, the lane's anchor row as the table gave it. An embedding of
+// another shape is refused.
+void checkMaskEmbedding(MetalBackend &backend, const std::filesystem::path &root,
+                        const model::DFlashDraftLayout &layout) {
+  const splash::test::TemporaryDirectory directory("splash-draft-mask");
+  for (const auto &entry : std::filesystem::directory_iterator(root))
+    if (entry.path().extension() == ".safetensors")
+      std::filesystem::copy_file(entry.path(), directory.path() / entry.path().filename());
+  const uint64_t rowBytes = uint64_t{layout.hiddenSize} * 2;
+  std::vector<uint8_t> mask(rowBytes);
+  for (uint32_t column = 0; column < layout.hiddenSize; ++column) {
+    const uint16_t bits = uint16_t(0x3400 + column);
+    std::memcpy(mask.data() + uint64_t{column} * 2, &bits, 2);
+  }
+  const std::filesystem::path path = directory.path() / "mask_embedding.safetensors";
+  splash::test::writeSyntheticShard(path, {{"mask_embedding", "BF16", {layout.hiddenSize}, mask}});
+  model::WeightImages images(backend, "mask fixture");
+  model::DraftCheckpointLoader loader(backend, images, directory.path(), layout);
+  check(loader.hasMaskEmbedding(), "the loader finds the mask embedding the checkpoint ships");
+  const model::DFlashDraftWeights draft = model::loadDFlashDraftWeights(backend, loader, layout);
+  check(draft.maskEmbedding && bytesOf(model::contentsOf(draft.maskEmbedding)) == mask,
+        "the draft reads the mask embedding as shipped");
+  // Two lanes of poisoned draft input rows.
+  const uint32_t lanes = 2, rows = lanes * SPLASH_TARGET_VERIFY_ROWS;
+  const auto input =
+      backend.allocateBuffer(rows * rowBytes, splash::metal::BufferStorage::Shared, "draft input rows");
+  std::memset(input.contents(), 0xA5, rows * rowBytes);
+  splash::metal::CommandGraph graph;
+  ops::Embedding::addDraftMaskRows(graph, draft.maskEmbedding, input, layout.hiddenSize, lanes);
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
+  const std::vector<uint8_t> written = bytesOf(model::contentsOf(input));
+  bool set = true;
+  for (uint32_t row = 0; row < rows; ++row) {
+    const auto begin = written.begin() + row * rowBytes;
+    set = set && (row % SPLASH_TARGET_VERIFY_ROWS
+                      ? std::equal(mask.begin(), mask.end(), begin)
+                      : std::all_of(begin, begin + rowBytes, [](uint8_t byte) { return byte == 0xA5; }));
+  }
+  check(set, "each lane's mask rows take the mask embedding, its anchor row as it was");
+  splash::test::writeSyntheticShard(path, {{"mask_embedding", "BF16", {layout.hiddenSize / 2}, {}}});
+  bool refused = false;
+  try {
+    const model::SafetensorsCheckpoint checkpoint(directory.path());
+    static_cast<void>(model::planDraftImages(checkpoint, layout));
+  } catch (const std::exception &error) {
+    refused = std::string_view(error.what()).find("mask_embedding") != std::string_view::npos;
+  }
+  check(refused, "a mask embedding of another shape is refused");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -131,8 +190,9 @@ int main(int argc, char **argv) {
                projection(layer.qkvProjection, layout.qkvSize, layout.hiddenSize) &&
                projection(layer.outputProjection, layout.hiddenSize, layout.attentionSize) &&
                projection(layer.downProjection, layout.hiddenSize, layout.intermediateSize);
-      check(read, "the draft loader reads the draft images");
+      check(read && !draft.maskEmbedding, "the draft loader reads the draft images");
     });
+    guarded("draft mask embedding", [&] { checkMaskEmbedding(backend, root, layout); });
     std::printf("%s (%d failures)\n", failures ? "draft preparation tests FAILED" : "draft preparation tests passed",
                 failures);
     return failures ? 1 : 0;

@@ -2,12 +2,12 @@
 
 // A large table of fixed-size native rows that stays in its source file and
 // is read a row at a time: a bounded host cache of rows, read on the engine's
-// SSD readers (model::SsdReaders), and the staging of one command's
-// rows into memory the GPU reads. Its user
-// names the table (SparseRowTable) and sizes the working memory of its
-// stages and prefetches (SparseRowStoreOptions). The store knows nothing of
-// what the rows mean: its user computes the row ids, and gathers the staged
-// rows with its own kernel.
+// SSD readers (model::SsdReaders), and the staging of one command's rows
+// into memory the GPU reads. Its user names the table (SparseRowTable) and
+// sizes the working memory of its stages and prefetches
+// (SparseRowStoreOptions). The store knows nothing of what the rows mean:
+// its user computes the row ids, and gathers the staged rows with its own
+// kernel.
 //
 // stage() copies every distinct row a command reads once into the command's
 // staging and, for each id, the index of its row there. It returns only once
@@ -162,6 +162,14 @@ public:
   // Cache bytes plus the fixed working-memory reservation, at most
   // options.cacheBytes; not the store's measured allocation high-water mark.
   [[nodiscard]] uint64_t committedBytes() const noexcept;
+  // Makes the cache's arrays, its rows with their ids, recency links and
+  // index, take all of their host memory now, by writing each of their pages
+  // back as it is: until then a page takes memory only once a row is cached
+  // in it, so that host memory measured meanwhile counts room the cache
+  // takes later. The working memory of stages and prefetches is not
+  // committed, as they allocate it while they run. The engine commits the
+  // store of the model it serves once, before it serves (RuntimeResources).
+  void commit();
 
   // Stages the rows of `ids` (any order, repeats allowed): row u of `rows`
   // (u * rowBytes) holds the u-th distinct id's row, and slots[i] = u for
@@ -169,10 +177,10 @@ public:
   // Blocks until every row is staged. With `adoptPrefetch`, it first
   // finishes the prefetches in flight (a read-ahead of the rows this stage
   // takes), helping read them; otherwise it leaves them to the readers and
-  // may read a row they are reading too. Throws
-  // SparseRowError when a row cannot be read (and poisons the store) or an
-  // id is past the table (a defect of the caller), std::invalid_argument
-  // when rows or slots are too small. Stages are serialized.
+  // may read a row they are reading too. Throws SparseRowError when a row
+  // cannot be read (and poisons the store) or an id is past the table (a
+  // defect of the caller), std::invalid_argument when rows or slots are too
+  // small. Stages are serialized.
   SparseRowStageResult stage(std::span<const uint32_t> ids, std::span<uint8_t> rows, std::span<uint32_t> slots,
                              SparseRowUse use, bool adoptPrefetch = false);
 

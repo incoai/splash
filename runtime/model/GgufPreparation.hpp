@@ -2,10 +2,14 @@
 
 #include "metal/MetalBackend.hpp"
 #include "model/GgufImage.hpp"
+#include "model/WeightImages.hpp"
 #include "model/WeightSource.hpp"
 
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <optional>
+#include <string_view>
 
 namespace splash::model {
 
@@ -19,6 +23,17 @@ inline constexpr uint64_t kGgufRepackStagingBytes = 32 << 20;
 // tensors).
 void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &image, const gguf::Image &plan);
 
+// Loads planned image `plan` into `images` as component `prefix` + its name:
+// writeGgufImage writes it, then `checkUnchanged` finds the sources it was
+// planned from unwritten since. The image holds both, to write it again on a
+// restore. Its record declares the image's resident bytes
+// (gguf::Image::residentBytes).
+[[nodiscard]] WeightFile loadImage(metal::MetalBackend &backend, WeightImages &images, std::string_view prefix,
+                                   std::shared_ptr<const gguf::Image> plan, std::function<void()> checkUnchanged);
+// The record loadImage gives `plan`, for an image whose rows stream instead.
+[[nodiscard]] WeightFileRecord imageRecord(const WeightImages &images, std::string_view prefix,
+                                           const gguf::Image &plan);
+
 // Rows [first, first + count) of a repack (its sources' rows in order), whole
 // and back to back into `to`, count * ggufRowBytes(format, columns) bytes:
 // the native rows the GPU repacks into those rows' planes. A streamed
@@ -30,10 +45,10 @@ void readRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count, 
 // with the file's bytes alone: the file and the offset of the first row from
 // its start. None when they are built (a quantized safetensors tensor's,
 // NVFP4 rows, a quantized float tensor) or permuted, or span two sources.
-struct StoredRows final {
+struct FileRows final {
   const WeightSource *file = nullptr;
   uint64_t offset = 0;
 };
-[[nodiscard]] std::optional<StoredRows> storedRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count);
+[[nodiscard]] std::optional<FileRows> storedRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count);
 
 } // namespace splash::model

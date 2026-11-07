@@ -30,8 +30,10 @@ idle_sleep | --allow-idle-sleep | auto auto --idle-sleep allow
 disable_ane | --disable-ane | auto auto --ane off
 verify_rows_all | --verify-rows all | auto auto --verify-rows all
 verify_rows_auto | --verify-rows auto | auto auto
+kv_format_default | --kv-format int8 | auto auto
+state_format_default | --state-format fp32 | auto auto
 relaunch |  | auto auto --relaunch-context 61433
-relaunch_limits | --max-context 100K --max-memory 32G | 102400 34359738368
+relaunch_limits | --max-context 100K --max-memory 32G | 102400 34359738368 --relaunch-context 61433
 yarn | --max-context 1M | 1000000 auto
 yarn_double | --max-context 512K | 524288 auto
 ple_memory | --ple-memory 2G | auto auto --ple-memory 2147483648

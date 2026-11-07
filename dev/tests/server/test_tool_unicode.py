@@ -3,6 +3,7 @@ import unittest
 
 from dev.tests.tool_output import project, streamed_arguments
 from server import output, tool_schema
+from server.chat_format import QWEN_XML
 
 
 def policy(schema):
@@ -47,7 +48,7 @@ class ToolUnicodeTests(unittest.TestCase):
                 for split in range(0, len(text) + 1, 7):
                     with self.subTest(schema=schema, raw=raw, split=split):
                         projector = output.StreamingToolCallProjector(
-                            policy(schema), "test"
+                            policy(schema), "test", syntax=QWEN_XML
                         )
                         events = projector.put(text[:split]) + projector.put(
                             text[split:]
@@ -79,7 +80,9 @@ class ToolUnicodeTests(unittest.TestCase):
             )
             for split in range(len(text) + 1):
                 with self.subTest(raw=raw, split=split):
-                    projector = output.StreamingToolCallProjector(tool_policy, "test")
+                    projector = output.StreamingToolCallProjector(
+                        tool_policy, "test", syntax=QWEN_XML
+                    )
                     events = projector.put(text[:split]) + projector.put(text[split:])
                     _, calls, owed = projector.finish(False)
                     self.assertEqual(calls[0]["function"]["arguments"], canonical)

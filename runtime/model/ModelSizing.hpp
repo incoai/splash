@@ -24,14 +24,17 @@ struct StreamableWeights final {
   // (residentExpertSlots), and the smallest store that streams them
   // (ExpertStore::minimumBytes); zero for a dense FFN.
   uint64_t expertBytes = 0;
-  uint64_t expertFloorBytes = 0;
+  uint64_t expertMinimumBytes = 0;
   // The table a GGUF target holds (Qwen3.8-Flash-Next's PLE n-gram table):
   // what its image takes where it loads, the smallest row cache that
   // streams it, which holds one row beside its working memory
-  // (SparseRowStore), and the bytes of a row, which a step stages
-  // (StreamedParts::tableRowBytes); zero without one.
+  // (SparseRowStore), the row cache an automatic table takes at most, which
+  // holds the rows of every id a 128K-token prompt stages, and the bytes of
+  // a row, which a step stages (StreamedParts::tableRowBytes); zero without
+  // one.
   uint64_t tableBytes = 0;
-  uint64_t tableFloorBytes = 0;
+  uint64_t tableMinimumBytes = 0;
+  uint64_t tableShareBytes = 0;
   uint64_t tableRowBytes = 0;
   // Why the table cannot stream (gguf::tableRows), which then loads with
   // the weights: among loadedBytes, with no part of its own.

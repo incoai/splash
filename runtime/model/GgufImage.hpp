@@ -1,11 +1,11 @@
 #pragma once
 
 // Plans the images (model/GgufImageLayout.hpp) of a target read straight
-// from a GGUF of its family's architecture (each layout's
-// ggufArchitecture: qwen35, qwen35moe or qwen4exp), from its metadata alone:
-// section offsets, the header and descriptor bytes, and the source rows each
-// tensor section is written from (model/GgufPreparation.hpp). A 3-D expert
-// tensor is one quantized tensor of experts * N rows.
+// from a GGUF of its family's architecture (each layout's ggufArchitecture:
+// qwen35, qwen35moe, qwen4exp or flint), from its metadata alone: section
+// offsets, the header and descriptor bytes, and the source rows each tensor
+// section is written from (model/GgufPreparation.hpp). A 3-D expert tensor
+// is one quantized tensor of experts * N rows.
 
 #include <array>
 #include <cstdint>
@@ -77,7 +77,11 @@ struct TensorScale {
 // llama.cpp's NVFP4 rows (ggufNvfp4RowBytes set: rows of block_nvfp4 that long
 // from `offset` on) or by quantizing a GGUF tensor of BF16 or F16 values into
 // Q8_0 (ggufFloatRowBytes set: rows of ggufFloatType values that long from
-// `offset` on).
+// `offset` on). An image row is column window `window` of `windows` equal
+// windows of such a row, whole native blocks: its imageRowBytes() bytes from
+// window * imageRowBytes() on (a shared expert's down projection split into
+// slices of the routed experts' width, ops::MoeShape::sharedSlices). One
+// window is the whole row.
 struct TensorRows {
   std::string name;
   uint32_t type = 0;   // ggml type, or a loader's (metal/abi/QuantFormat.h)
@@ -92,6 +96,10 @@ struct TensorRows {
   uint32_t ggufFloatType = 0;
   uint64_t ggufFloatRowBytes = 0;
   uint64_t first = 0; // the source row of image row 0
+  uint32_t windows = 1;
+  uint32_t window = 0;
+
+  [[nodiscard]] uint64_t imageRowBytes() const noexcept { return rowBytes / windows; }
 };
 
 // Header and descriptor bytes.
@@ -104,9 +112,9 @@ struct Fill {
 // or F16 to the F32 value it equals (rows the kernels read as F32), as the F32
 // decay -exp(A_log) of a safetensors GDN's A_log, BF16 or F32, which
 // float(-exp(double)) rounds once, as the F32 values of a quantized tensor's
-// native rows, which the GPU decodes as the format's gather does
-// (kernels/common/gguf_embedding_formats.h) and the kernels read unquantized
-// (a safetensors MoE router and shared-expert gate, GDN alpha and beta of two
+// rows as stored (decodedColumns), which the GPU decodes as the format's
+// gather does (kernels/common/gguf_embedding_formats.h) and the kernels read
+// unquantized (a safetensors shared-expert gate, GDN alpha and beta of two
 // types or of F16, and a GGUF's Q8_0 hyper-connection injection weights and
 // shared-expert scalar gate), or as the F32 1 + w of a BF16 RMSNorm weight w,
 // which a checkpoint stores 1 below the weight the norm multiplies by (exact
@@ -143,7 +151,7 @@ struct StreamedRows final {
   uint64_t offset = 0; // of row 0, from the start of that file
   uint64_t rows = 0;
   uint32_t rowBytes = 0;
-  uint32_t format = 0; // its gguf_embedding_format (GGUF_FMT_*)
+  uint32_t format = 0; // its GGUF_FMT_*
 };
 struct Image {
   std::string name; // layer-N.bin, head.bin, embedding.bin, a family's table's (ple.bin)
@@ -180,16 +188,19 @@ struct PlanOptions {
 // The routed experts each layer's image streams (Image::experts), in layer
 // order; throws unless every layer's do.
 [[nodiscard]] std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers);
-// The bytes of the table rows an image streams (Image::streamedRows), 0 for
-// none.
-[[nodiscard]] uint64_t streamedTableBytes(const Image &image);
 // The bytes an image takes once loaded: none for a table whose rows stream.
 [[nodiscard]] uint64_t loadedBytes(const Image &image);
 
 // The destination bytes of `sourceBytes` bytes of rows copied with
 // `conversion`: halved when narrowed, doubled when widened (and for the decay
-// of BF16 values and a centered norm), four per element when decoded to F32.
+// of BF16 values and a centered norm), four per element of whole rows when
+// decoded to F32 (decodedColumns).
 [[nodiscard]] uint64_t convertedBytes(const TensorRows &source, Conversion conversion, uint64_t sourceBytes);
+// The values of each row of a copy decoded to F32: the columns whose rows as
+// stored (quant_stored_row_bytes) take rows.rowBytes, whole native blocks but
+// for BF16's and F16's, which hold any width; throws for rows of no such
+// width.
+[[nodiscard]] uint64_t decodedColumns(const TensorRows &rows);
 
 // Lays out one image: its header block, then 16 KiB-aligned sections, each a
 // descriptor, copied rows or a quantized tensor's planes. The planners of a
@@ -232,27 +243,22 @@ private:
   uint32_t expertProjections_ = 0;
 };
 
-// The target geometry a GGUF of `architecture` (its family's layout's
-// ggufArchitecture) declares in its metadata, the architecture included,
-// with the rotary embedding and norms the kernels compute: the RoPE base and
-// rotated dimensions, the RMS epsilon and no RoPE scaling; and the keys of
-// what the family adds. planImages checks the file's first, and model-check
-// the installer's copy before any weight download. Throws GgufError naming
-// every mismatch.
-void requireMetadata(const GgufMetadata &metadata, std::string_view architecture,
-                     const QwenTargetDimensions &geometry);
-
-// The images of a target from its GGUF of `architecture`: each layer's, then
-// the head's and the embedding's, then those of the tables its family adds
-// (Qwen3.8-Flash-Next's PLE n-gram table, ple.bin). Checks the metadata
-// (requireMetadata, and the arrays a family's file declares) and each
-// tensor's shape; throws GgufError naming every missing tensor and every
-// tensor of a type this build cannot load.
+// The images of a target from its GGUF of `architecture` (its family's
+// layout's ggufArchitecture): each layer's, then the head's and the
+// embedding's, then those of the tables its family adds (Qwen3.8-Flash-Next's
+// PLE n-gram table, ple.bin). Checks first that the metadata declares the
+// geometry, the architecture included, with the rotary embedding and norms
+// the kernels compute (the RoPE base and rotated dimensions, the RMS epsilon
+// and no RoPE scaling) and what the family adds, its arrays included, then
+// each tensor's shape; throws GgufError naming every metadata mismatch, or
+// every missing tensor and every tensor of a type this build cannot load. It
+// reads the header alone: every start plans from the GGUF, and the engine's
+// model check from the installer's copy of its headers before any download.
 [[nodiscard]] std::vector<Image> planImages(const GgufFile &file, std::string_view architecture,
                                             const QwenTargetDimensions &geometry, PlanOptions options = {});
 
 // Where the GGUF holds the rows of the tensor `name`, a table of `columns`
-// values a row whose image copies its native rows as stored (a family's
+// values a row whose image copies its rows as stored (a family's
 // table), for reading them from the file. Throws GgufError for a tensor of a
 // type its image does not copy as stored, of another width or of a rotated
 // GGUF.

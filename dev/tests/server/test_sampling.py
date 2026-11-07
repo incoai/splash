@@ -182,7 +182,8 @@ class SamplingTests(HarnessTestCase):
             set(native_wire.SAMPLING_FIELDS),
         )
         runtime = FakeRuntime()
-        harness = self.harness(runtime)
+        defaults = {"temperature": 0.7, "top_p": 0.8, "top_k": 40}
+        harness = self.harness(runtime, sampling_defaults=defaults)
         status, _, payload = harness.request(
             "POST",
             "/v1/chat/completions",
@@ -191,11 +192,7 @@ class SamplingTests(HarnessTestCase):
         self.assertEqual(status, 200, payload)
         self.assertEqual(
             runtime.requests[0].frame.sampling,
-            native_wire.SamplingParameters(
-                temperature=1.0,
-                top_p=0.95,
-                top_k=request_frontend.TOP_K_DEFAULT,
-            ),
+            native_wire.SamplingParameters(**defaults),
         )
 
     def test_responses_forward_the_sampling_fields_chat_validates(self):
@@ -229,21 +226,62 @@ class SamplingTests(HarnessTestCase):
         )
         self.assertEqual(len(runtime.requests), 1)
 
-    def test_official_sampling_defaults_and_random_seed(self):
+    def test_requests_get_the_served_familys_sampling_unless_they_name_their_own(
+        self,
+    ):
+        tokenizer = FakeTokenizer()
+        backend = backend_api.NativeBackend(
+            FakeRuntime(), tokenizer, lambda _record: None
+        )
+        self.addCleanup(backend.close)
+        app = make_frontend(
+            tokenizer,
+            backend,
+            "test-model",
+            128,
+            1,
+            2,
+            vision=True,
+            sampling_defaults={"temperature": 0.7, "top_p": 0.8, "top_k": 40},
+        )
+        body = chat_body()
+        body.pop("temperature")
+        job = app.prepare(body, deadline=FOREVER)
+        self.assertEqual(job.sampling, native_wire.SamplingParameters(0.7, 0.8, 40))
+        # A request's own fields replace them.
+        job = app.prepare(
+            chat_body(temperature=0.3, top_p=0.5, top_k=5), deadline=FOREVER
+        )
+        self.assertEqual(job.sampling, native_wire.SamplingParameters(0.3, 0.5, 5))
+
+    def test_a_familys_sampling_is_what_a_request_may_send(self):
+        # A default a request could not send would refuse every request that
+        # leaves the field out, blaming the client.
+        tokenizer = FakeTokenizer()
+        for defaults in ({"top_p": 0}, {"top_k": 1.5}, {"seed": 1}):
+            with self.subTest(defaults=defaults):
+                with self.assertRaisesRegex(ValueError, "invalid sampling default"):
+                    make_frontend(
+                        tokenizer,
+                        None,
+                        "test-model",
+                        128,
+                        1,
+                        2,
+                        vision=True,
+                        sampling_defaults=defaults,
+                    )
+
+    def test_a_request_without_a_seed_gets_a_random_one(self):
         tokenizer = FakeTokenizer()
         backend = backend_api.NativeBackend(
             FakeRuntime(), tokenizer, lambda _record: None
         )
         self.addCleanup(backend.close)
         app = make_frontend(tokenizer, backend, "test-model", 128, 1, 2, vision=True)
-        body = chat_body()
-        body.pop("temperature")
         with mock.patch("server.frontend.secrets.randbits", return_value=123):
-            job = app.prepare(body, deadline=FOREVER)
-            self.assertEqual(
-                (job.sampling, job.seed),
-                (native_wire.SamplingParameters(1.0, 0.95, 20), 123),
-            )
+            job = app.prepare(chat_body(), deadline=FOREVER)
+            self.assertEqual(job.seed, 123)
             # -1 asks for a random seed too; another negative one is taken
             # as its 64 bits.
             for seed, expected in (

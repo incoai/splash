@@ -1,5 +1,6 @@
 #include "engine/MemoryAudit.hpp"
 #include "Checked.hpp"
+#include "engine/Json.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -80,8 +81,8 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
       {"shared prefill", actual.sharedPrefillBytes, budget.sharedPrefillBytes},
       {"shared decode", actual.sharedDecodeBytes, budget.sharedDecodeBytes},
       {"KV", actual.kvAllocatedBytes, budget.kvCapacityBytes},
-      {"hot KV block cache", actual.kvBlockCacheBytes, budget.kvSpill.hotLimitBytes},
-      {"KV history staging", actual.kvHistoryStagingBytes, budget.kvSpill.stagingBytes},
+      {"hot KV block cache", actual.spilledKvHotBytes, budget.kvSpill.hotLimitBytes},
+      {"KV history staging", actual.spilledKvStagingBytes, budget.kvSpill.stagingBytes},
       {"state staging", actual.stateStagingBytes, budget.stateStagingBytes},
       {"Neural Engine split", actual.aneFfnBytes, budget.aneFfnBytes},
   };
@@ -110,8 +111,8 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
       budget.hardBudgetBytes -
       std::min(budget.hardBudgetBytes, actual.streamedTableBytes);
   uint64_t dynamic = 0;
-  for (const uint64_t bytes : {actual.stateAllocatedBytes, actual.kvAllocatedBytes, actual.kvBlockCacheBytes,
-                               actual.kvHistoryStagingBytes})
+  for (const uint64_t bytes : {actual.stateAllocatedBytes, actual.kvAllocatedBytes, actual.spilledKvHotBytes,
+                               actual.spilledKvStagingBytes})
     if (!checkedAdd(dynamic, bytes, dynamic)) {
       return fail(MemoryAuditError::ArithmeticOverflow,
                   "elastic memory sum overflowed", actual);
@@ -120,10 +121,17 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
     return fail(MemoryAuditError::ArithmeticOverflow,
                 "elastic memory sum overflowed", actual);
   }
-  if (dynamic > budget.dynamicBudgetBytes) {
+  // The expert store starts at its floor, the chunks above it the plan's
+  // all the same (hostHeldBackBytes): until it grows into them, state and
+  // KV may take what it has not, which the ledger takes back for its growth.
+  const uint64_t weightsGrown = actual.targetWeightsBytes > budget.targetWeightsBytes
+                                    ? actual.targetWeightsBytes - budget.targetWeightsBytes
+                                    : 0;
+  const uint64_t ungrownBytes = budget.hostHeldBackBytes > weightsGrown ? budget.hostHeldBackBytes - weightsGrown : 0;
+  if (dynamic > budget.dynamicBudgetBytes + ungrownBytes) {
     return fail(MemoryAuditError::CategoryExceedsPlan,
                 "allocated state, KV and the readers of spilled KV exceed the "
-                "unified dynamic budget",
+                "unified dynamic budget and what the expert store has not grown into",
                 actual);
   }
   if (categorized > actual.backendAllocatedBytes ||
@@ -196,25 +204,21 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
   return result;
 }
 
-std::string MemoryAuditResult::toStatusJson() const {
-  std::ostringstream out;
-  out << '{' << "\"scope\":\"startup_warmup\","
-      << "\"valid\":" << (valid ? "true" : "false") << ',' << "\"error\":\""
-      << memoryAuditErrorName(error) << "\","
-      << "\"categorized_bytes\":" << categorizedBytes << ','
-      << "\"backend_unclassified_bytes\":" << backendUnclassifiedBytes << ','
-      << "\"device_untracked_bytes\":" << deviceUntrackedBytes << ','
-      << "\"device_peak_deviation_basis_points\":"
-      << devicePeakDeviationBasisPoints << ','
-      << "\"actual_headroom_bytes\":" << actualHeadroomBytes << ','
-      << "\"backend_allocated_bytes\":" << actual.backendAllocatedBytes << ','
-      << "\"device_current_allocated_bytes\":"
-      << actual.deviceCurrentAllocatedBytes << ','
-      << "\"device_peak_allocated_bytes\":" << actual.devicePeakAllocatedBytes
-      << ','
-      << "\"backend_peak_allocated_bytes\":" << actual.backendPeakAllocatedBytes
-      << '}';
-  return out.str();
+void writeJson(json::Writer &w, const MemoryAuditResult &audit) {
+  w.object([&] {
+    w.field("scope", "startup_warmup")
+        .field("valid", audit.valid)
+        .field("error", memoryAuditErrorName(audit.error))
+        .field("categorized_bytes", audit.categorizedBytes)
+        .field("backend_unclassified_bytes", audit.backendUnclassifiedBytes)
+        .field("device_untracked_bytes", audit.deviceUntrackedBytes)
+        .field("device_peak_deviation_basis_points", audit.devicePeakDeviationBasisPoints)
+        .field("actual_headroom_bytes", audit.actualHeadroomBytes)
+        .field("backend_allocated_bytes", audit.actual.backendAllocatedBytes)
+        .field("device_current_allocated_bytes", audit.actual.deviceCurrentAllocatedBytes)
+        .field("device_peak_allocated_bytes", audit.actual.devicePeakAllocatedBytes)
+        .field("backend_peak_allocated_bytes", audit.actual.backendPeakAllocatedBytes);
+  });
 }
 
 std::string MemoryAuditResult::describe() const {

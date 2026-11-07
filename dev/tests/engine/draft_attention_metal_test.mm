@@ -51,12 +51,13 @@ constexpr uint32_t kAttention = kKvHeads * kQueryHeadsPerKv * kHeadDim;
 constexpr uint32_t kGroupRows = kQueryHeadsPerKv * kRows;
 constexpr float kScale = 0.08838834765F;
 
-// The drafts of Qwen3.8-27B, Qwen3.8-Flash-Next and Qwen3.6-35B-A3B: one
-// convolution kernel takes every hidden width.
+// The drafts of Qwen3.8-27B, Qwen3.8-Flash-Next, Qwen3.6-35B-A3B and
+// Qwen3.5-122B-A10B: one convolution kernel takes every hidden width.
 constexpr std::array kShapes{
     DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128},
     DraftAttentionShape{2560, 640, 6144, 4096, 32, 8, 128},
-    DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128}};
+    DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128},
+    DraftAttentionShape{3072, 768, 6144, 4096, 32, 8, 128}};
 
 using splash::test::rejects;
 using splash::test::require;

@@ -1,18 +1,21 @@
 // GPU time of one GGUF projection through ops::Linear on both decode tiles (the Apple9 register tile and the staged
-// tile, on the device policy's walk, one lane on its 8- and 16-row tiles) at one to four lanes and every K split, the
-// measurements behind the tile rule and split tiers of runtime/ops/LinearGguf.cpp:
+// tile, on the device policy's walk, one lane on its 8- and 16-row tiles, a gate/up pair in two passes and, where the
+// walks spread, in one: pair) at one to four lanes and every K split, the measurements behind the tile rule and split
+// law of runtime/ops/KernelCalibration.hpp:
 //   gguf-projection-benchmark <metallib> <fmt[+fmt+fmt]> <N[+N+N]> <K> [none|residual|gateup] [rounds]
 //                             [prefill=R[,R...]]
 // The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 64
 // columns. With prefill=, it times the 128-row prefill tile instead, one case per chunk of R rows (more than 32: the
-// decode tiles run the smaller chunks) of a single segment; gateup is then the up projection's gated epilogue. The
+// decode tiles run the smaller chunks) of a single segment, and for R up to 64 the staged 64-row tile at every K
+// split; gateup is then the up projection's gated epilogue. The
 // weights stay DRAM-cold: a command streams every copy of a ring of at least 384 MiB once, each projection with the
 // next copy (decode gate/up: the gate and up weights of two copies). The register tile reads the activation table its
 // producers write alongside their output (LinearBuffers::prepared), prepared once and not timed. The cases run in
 // ABBA order after a warm-up; printed are the medians of `rounds` (20) commands in ms per projection, the device
-// policy's choice marked with *. Widths emulate core counts: the policy's tiers count threadgroups per core.
-// The float formats float-bf16 and float-f32 time the float projection (ops::addGgufFloat: the router's, the QSA
-// indexer's, F32 alpha/beta) instead, one tensor per width of any multiple of 8 columns, two in one dispatch as the
+// policy's choice marked with *. Widths emulate core counts: the policy's split law counts threadgroups per core.
+// The float formats float-bf16 and float-f32, and float-<fmt> for the native rows of a quantized format (an MLX
+// checkpoint's quantized router), time the float projection (ops::addGgufFloat: the router's, the QSA indexer's, F32
+// alpha/beta) instead, one tensor per width of any multiple of 8 columns, two in one dispatch as the
 // indexer's query and key run, on both float tiles at one to four lanes or each prefill chunk of R rows (the
 // accelerator tile from 16 rows), the tile the device takes for every width marked with *.
 #include "../tests/engine/GgufFormatReference.hpp"
@@ -41,8 +44,14 @@ using splash::metal::MetalBuffer;
 namespace {
 
 constexpr uint64_t kRingBytes = 384ull << 20;
-constexpr uint32_t kMinimumCopies = 3, kMaximumCopies = 64, kMaximumLanes = 4, kLaneRows = 8;
+constexpr uint32_t kMinimumCopies = 3, kMaximumLanes = 4, kLaneRows = 8;
 constexpr double kWarmupSeconds = 0.1;
+
+// The copies of `bytes` of weights in a ring of at least kRingBytes, so that every copy a command reads comes from
+// DRAM whatever the tensor's size.
+uint32_t ringCopies(uint64_t bytes) {
+  return uint32_t(std::max<uint64_t>((kRingBytes + bytes - 1) / bytes, kMinimumCopies));
+}
 
 std::vector<std::string> split(const std::string &text, char separator) {
   std::vector<std::string> parts;
@@ -105,16 +114,22 @@ std::string heading(const MetalBackend &backend, const char *formats, const char
   return line;
 }
 
-// The float projections of one float format (float-bf16, float-f32) of `widths` columns each, the segments of one
-// fp32 destination row, at one to four lanes or each of `prefillRows`.
+// The float projections of one float format (float-bf16, float-f32, float-<fmt>) of `widths` columns each, the
+// segments of one fp32 destination row, at one to four lanes or each of `prefillRows`.
 void floatProjections(MetalBackend &backend, const char *formatList, const char *widthList,
                       const std::vector<std::string> &formats, const std::vector<std::string> &widths, uint32_t K,
                       LinearEpilogue epilogue, uint32_t rounds, const std::vector<uint32_t> &prefillRows) {
   if (!std::all_of(formats.begin(), formats.end(), [&](const std::string &f) { return f == formats.front(); }) ||
-      (formats.front() != "float-bf16" && formats.front() != "float-f32") || epilogue != LinearEpilogue::None)
-    throw std::invalid_argument("float projections take one float format, float-bf16 or float-f32, and no epilogue");
-  const uint32_t type = formats.front() == "float-bf16" ? QuantizedSegment::kBFloat16 : QuantizedSegment::kFloat32;
-  const uint32_t valueBytes = type == QuantizedSegment::kBFloat16 ? 2 : 4;
+      epilogue != LinearEpilogue::None)
+    throw std::invalid_argument("float projections take one float format and no epilogue");
+  const std::string name = formats.front().substr(std::string("float-").size());
+  // A quantized format's native rows, or F32 or BF16 values.
+  const bool native = name != "bf16" && name != "f32";
+  const Fmt format = native ? fmtNamed(name) : Fmt(0);
+  if (native && (format >= FMT_COUNT || float16(format)))
+    throw std::invalid_argument("float-" + name + ": native rows take a quantized format");
+  const uint32_t type = native ? uint32_t(format) : name == "bf16" ? GGUF_FMT_BF16 : QuantizedSegment::kFloat32;
+  const uint32_t valueBytes = type == GGUF_FMT_BF16 ? 2 : 4;
   std::mt19937 rng(9);
   std::normal_distribution<float> normal(0.0f, 0.05f);
   std::vector<uint32_t> sizes;
@@ -124,9 +139,13 @@ void floatProjections(MetalBackend &backend, const char *formatList, const char 
     if (!sizes.back() || sizes.back() % 8 || !K || K % 8) throw std::invalid_argument("bad float tensor " + width);
     N += sizes.back();
   }
-  const uint64_t bytes = uint64_t{N} * K * valueBytes;
+  const uint64_t bytes = native ? uint64_t{N} * rowBytes(format, K) : uint64_t{N} * K * valueBytes;
   std::vector<std::vector<uint8_t>> tensors;
   for (const uint32_t size : sizes) {
+    if (native) {
+      tensors.push_back(makeNative(format, size, K, rng));
+      continue;
+    }
     std::vector<uint8_t> &values = tensors.emplace_back(uint64_t{size} * K * valueBytes);
     for (uint64_t i = 0; i < uint64_t{size} * K; ++i) {
       const float value = normal(rng);
@@ -135,12 +154,11 @@ void floatProjections(MetalBackend &backend, const char *formatList, const char 
                   valueBytes);
     }
   }
-  const uint32_t copies = uint32_t(std::clamp<uint64_t>((kRingBytes + bytes - 1) / bytes, kMinimumCopies,
-                                                        kMaximumCopies));
+  const uint32_t copies = ringCopies(bytes);
   std::vector<std::vector<QuantizedSegment>> ring(copies);
   for (std::vector<QuantizedSegment> &segments : ring)
     for (uint32_t i = 0, offset = 0; i < sizes.size(); offset += sizes[i++]) {
-      segments.push_back(QuantizedSegment::floats(sizes[i], K, upload(backend, tensors[i]), type));
+      segments.push_back(QuantizedSegment::rows(type, sizes[i], K, upload(backend, tensors[i])));
       segments.back().columnOffset = offset;
     }
   const Linear linear(backend.capabilities());
@@ -153,7 +171,7 @@ void floatProjections(MetalBackend &backend, const char *formatList, const char 
       const bool accelerator = tile == FloatTile::NeuralAccelerator;
       if (accelerator && (rows < 16 || K % 32)) continue;
       const bool chosen = std::all_of(sizes.begin(), sizes.end(),
-                                      [&](uint32_t n) { return linear.ggufFloatTile(rows, n) == tile; });
+                                      [&](uint32_t n) { return linear.ggufFloatTile(rows, n, type) == tile; });
       cases.push_back({(prefillRows.empty() ? "L" + std::to_string(rows / kLaneRows) : "R" + std::to_string(rows)),
                        accelerator ? "accelerator" : "simdgroup", tile, rows, chosen, {}});
     }
@@ -233,8 +251,7 @@ int main(int argc, char **argv) {
                                                   &images.back().planes.meta})
           bytes += plane->size();
       }
-      const uint32_t copies = uint32_t(std::clamp<uint64_t>((kRingBytes + bytes - 1) / bytes, kMinimumCopies,
-                                                            kMaximumCopies));
+      const uint32_t copies = ringCopies(bytes);
       std::vector<Projection> ring;
       for (uint32_t c = 0; c < copies; ++c) {
         BlockWeights weights;
@@ -252,9 +269,18 @@ int main(int argc, char **argv) {
       std::vector<Case> cases;
       for (const uint32_t rows : prefillRows) {
         const LinearWorkload w{{N, K}, rows, LinearPhase::Prefill, epilogue};
+        const LinearConfig policy = linear.plan(w, ring.front()).configuration();
         const LinearConfig config{.tile = LinearTile::GgufPrefill};
         cases.push_back({"R" + std::to_string(rows), "prefill128", Linear::plan(w, config, FloatOutput::BFloat16),
-                         config == linear.plan(w, ring.front()).configuration(), {}});
+                         config == policy, {}});
+        // Chunks of up to kMaximumStagedPrefillRows rows also on the staged 64-row tile, at every split.
+        for (uint32_t splits = 1; rows <= kMaximumStagedPrefillRows && splits <= LinearConfig::kMaximumSplits;
+             splits *= 2) {
+          if ((K / 32) % splits) continue;
+          const LinearConfig staged{.tile = LinearTile::GgufStaged, .splits = splits};
+          cases.push_back({"R" + std::to_string(rows), "staged S" + std::to_string(splits),
+                           Linear::plan(w, staged, FloatOutput::BFloat16), staged == policy, {}});
+        }
       }
       for (uint32_t lanes = 1; lanes <= kMaximumLanes && !prefill; ++lanes) {
         const LinearWorkload w{{N, K}, lanes * kLaneRows, LinearPhase::Decode, epilogue};
@@ -275,16 +301,19 @@ int main(int argc, char **argv) {
                 }))
               continue;
             if (!registerTile && (K / 32) % splits) continue;
-            // One lane stages on the 8-row tile and on the 16-row tile (staged16).
-            for (const bool sixteenRows : {false, true}) {
-              if (sixteenRows && (registerTile || lanes > 1)) continue;
-              const LinearConfig config{.tile = tile, .splits = splits, .spread = !registerTile && wide.spread,
-                                        .oneGateUpPass = !registerTile && wide.oneGateUpPass,
-                                        .sixteenRows = sixteenRows};
-              cases.push_back({"L" + std::to_string(lanes),
-                               std::string(registerTile ? "register" : sixteenRows ? "staged16" : "staged") + " S" +
-                                   std::to_string(splits),
-                               Linear::plan(w, config, FloatOutput::BFloat16), config == policy, {}});
+            // One lane stages on the 8-row tile and on the 16-row tile (staged16); a gate/up pair on the staged tile
+            // runs as two passes and, where the walks spread, also in one pass (pair).
+            for (const bool onePass : {false, true}) {
+              if (onePass && (registerTile || epilogue != LinearEpilogue::GateUp || !wide.spread)) continue;
+              for (const bool sixteenRows : {false, true}) {
+                if (sixteenRows && (registerTile || lanes > 1)) continue;
+                const LinearConfig config{.tile = tile, .splits = splits, .spread = !registerTile && wide.spread,
+                                          .oneGateUpPass = onePass, .sixteenRows = sixteenRows};
+                cases.push_back({"L" + std::to_string(lanes),
+                                 std::string(registerTile ? "register" : onePass ? "pair" : "staged") +
+                                     (sixteenRows ? "16" : "") + " S" + std::to_string(splits),
+                                 Linear::plan(w, config, FloatOutput::BFloat16), config == policy, {}});
+              }
             }
           }
       }

@@ -1,7 +1,6 @@
 import copy
 import json
 from itertools import product
-from unittest import mock
 
 from llguidance import LLMatcher
 
@@ -21,6 +20,7 @@ from dev.tests.tool_output import argument_grammar, project, tool_policy
 from server import output as model_output
 from server import server as api
 from server import tool_schema
+from server.chat_format import QWEN, QWEN_XML
 
 
 class SchemaFallbackTests(HarnessTestCase):
@@ -60,10 +60,7 @@ class SchemaFallbackTests(HarnessTestCase):
     def verify(self, schema, accepted, rejected, expected):
         original = copy.deepcopy(schema)
         policy = self.policy(schema)
-        with mock.patch.object(
-            tool_schema, "THINK_END_TOKEN_ID", self.tokenizer.token_to_id("</think>")
-        ):
-            grammar = tool_schema.tool_grammar(policy, False)
+        grammar = tool_schema.tool_grammar(policy, False, chat_format=QWEN)
         self.assertFalse(LLMatcher.validate_grammar(grammar, self.guidance))
         for value, valid in [(accepted, True), *((v, False) for v in rejected)]:
             with self.subTest(value=value):
@@ -75,7 +72,9 @@ class SchemaFallbackTests(HarnessTestCase):
                     self.assertTrue(matcher.consume_tokens(tokens))
                     complete = matcher.is_accepting()
                 self.assertEqual(complete, valid)
-        projector = model_output.StreamingToolCallProjector(policy, "owned")
+        projector = model_output.StreamingToolCallProjector(
+            policy, "owned", syntax=QWEN_XML
+        )
         deltas = []
         for character in self.call(accepted):
             deltas.extend(projector.put(character))
@@ -143,7 +142,7 @@ class SchemaFallbackTests(HarnessTestCase):
             "required": ["order", "code", "path"],
             "additionalProperties": False,
         }
-        grammar = tool_schema.json_grammar(schema, False)
+        grammar = tool_schema.json_grammar(schema, False, chat_format=QWEN)
         self.assertFalse(LLMatcher.validate_grammar(grammar, self.guidance))
         for order_id, code, valid in (
             ("ORD-1234", "xABCx", True),
@@ -204,10 +203,16 @@ class SchemaFallbackTests(HarnessTestCase):
             False,
         )[1]
         for grammar, text in (
-            (tool_schema.tool_grammar(policy, False), self.call('["red","red"]')),
-            (tool_schema.json_grammar(schema, False), '{"value":["red","red"]}'),
             (
-                tool_schema.tool_grammar(optional, False, schema),
+                tool_schema.tool_grammar(policy, False, chat_format=QWEN),
+                self.call('["red","red"]'),
+            ),
+            (
+                tool_schema.json_grammar(schema, False, chat_format=QWEN),
+                '{"value":["red","red"]}',
+            ),
+            (
+                tool_schema.tool_grammar(optional, False, schema, chat_format=QWEN),
                 '{"value":["red","red"]}',
             ),
         ):
@@ -220,7 +225,9 @@ class SchemaFallbackTests(HarnessTestCase):
         with self.assertRaises(api.APIError) as caught:
             model_output.validate_response_content('{"value":["red","red"]}', validator)
         self.assertEqual(caught.exception.code, "invalid_model_output")
-        projector = model_output.StreamingToolCallProjector(policy, "owned")
+        projector = model_output.StreamingToolCallProjector(
+            policy, "owned", syntax=QWEN_XML
+        )
         for character in self.call('["red","red"]'):
             projector.put(character)
         _, calls, _ = projector.finish(False)
@@ -251,9 +258,9 @@ class SchemaFallbackTests(HarnessTestCase):
             }
             policy = self.policy(schema)
             for grammar in (
-                tool_schema.tool_grammar(policy, False),
-                tool_schema.json_grammar(schema, False),
-                tool_schema.tool_grammar(policy, False, schema),
+                tool_schema.tool_grammar(policy, False, chat_format=QWEN),
+                tool_schema.json_grammar(schema, False, chat_format=QWEN),
+                tool_schema.tool_grammar(policy, False, schema, chat_format=QWEN),
             ):
                 with self.subTest(keyword=keyword, grammar=grammar[:60]):
                     for compiled in self.json_schemas(grammar):
@@ -283,7 +290,8 @@ class SchemaFallbackTests(HarnessTestCase):
             with self.subTest(keyword=keyword, bound=bound):
                 policy = self.policy(schema)
                 matcher = LLMatcher(
-                    self.guidance, tool_schema.tool_grammar(policy, False)
+                    self.guidance,
+                    tool_schema.tool_grammar(policy, False, chat_format=QWEN),
                 )
                 text = self.call(json.dumps(value, separators=(",", ":")))
                 tokens = self.tokenizer.encode(text).ids
@@ -420,7 +428,7 @@ class SchemaFallbackTests(HarnessTestCase):
             original = copy.deepcopy(schema)
             with self.subTest(keyword=keyword):
                 policy = self.policy(schema)
-                grammar = tool_schema.tool_grammar(policy, False)
+                grammar = tool_schema.tool_grammar(policy, False, chat_format=QWEN)
                 self.assertFalse(LLMatcher.validate_grammar(grammar, self.guidance))
                 self.assertEqual(schema, original)
                 self.assertEqual(policy.schemas["test"], original)
@@ -435,10 +443,12 @@ class SchemaFallbackTests(HarnessTestCase):
                 self.subTest(reference=reference),
                 self.assertRaises(api.APIError) as caught,
             ):
-                tool_schema.tool_grammar(self.policy(schema), False)
+                tool_schema.tool_grammar(self.policy(schema), False, chat_format=QWEN)
             self.assertEqual(caught.exception.status, 400)
         with self.assertRaises(api.APIError) as caught:
-            tool_schema.tool_grammar(self.policy({"$ref": "#/$defs/missing"}), False)
+            tool_schema.tool_grammar(
+                self.policy({"$ref": "#/$defs/missing"}), False, chat_format=QWEN
+            )
         self.assertEqual(caught.exception.status, 400)
 
     def test_remote_references_in_draft3_schema_keywords_are_request_errors(self):
@@ -546,7 +556,10 @@ class SchemaFallbackTests(HarnessTestCase):
             "type": "object",
             "properties": {"value": {"anyOf": 5}},
         }
-        self.assertIn("/(?s:.*)/", tool_schema.tool_grammar(self.policy(schema), False))
+        self.assertIn(
+            "/(?s:.*)/",
+            tool_schema.tool_grammar(self.policy(schema), False, chat_format=QWEN),
+        )
         for draft, keywords in (
             ("draft-07", {"dependentSchemas": 5}),
             ("draft-03", {"allOf": 5}),

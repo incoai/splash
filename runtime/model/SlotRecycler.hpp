@@ -2,8 +2,8 @@
 
 // The order the slots of a store are recycled in, and which key each holds:
 // which slot a load's missing key takes, never one of a key the same load
-// uses. The stores are an expert arena (model::ExpertStore), whose keys are
-// experts, and a layer of the hot block cache of spilled K/V
+// uses. The stores are an expert size's slots (model::ExpertStore), whose
+// keys are experts, and a layer of the hot block cache of spilled K/V
 // (model::KvBlockCache), whose keys are blocks' tier copies. A load is a
 // number that grows from load to load; a long prefill chunk's (`chunk`)
 // routes nearly every expert of its block, a scan of them.
@@ -24,12 +24,14 @@
 //
 // The keys of the slots and of the ghosts are in flat tables, and the ghosts
 // in lists over arrays as many as the slots: a claim allocates nothing, and
-// only resize() does.
+// only resize() and compact() do.
 //
-// The store's own thread uses it alone (no locking).
+// One thread at a time uses it (no locking): the store's own, or the engine's
+// between commands, which the store's mutex orders.
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -60,10 +62,21 @@ public:
   // their keys. The ghosts stay, as many as the slots at most: fewer keep the
   // newest, those of T1 within what T1 leaves of the slots.
   void resize(uint32_t slots);
+  // `slots` slots, at most size(), keeping the keys that fit: while the keys
+  // of the slots past them outnumber the free slots below them, the slot
+  // ARC's REPLACE recycles gives its key up (`evicted`), without a ghost, as
+  // resize() drops keys; then each key past them moves to the lowest free
+  // slot below them, keeping its place in its list (`moved`, from and to),
+  // and the slots past them go as resize() takes them. No load is under way,
+  // so no slot is pinned.
+  void compact(uint32_t slots, const std::function<void(uint32_t)> &evicted,
+               const std::function<void(uint32_t, uint32_t)> &moved);
 
   [[nodiscard]] uint32_t size() const noexcept { return static_cast<uint32_t>(list_.size()); }
   // The claims, not a scan's, of a key T1 or T2 gave up lately.
   [[nodiscard]] uint64_t ghostHits() const noexcept { return ghostHits_; }
+  // The keys T1 and T2 gave up lately (|B1| + |B2|), at most size().
+  [[nodiscard]] uint32_t ghosts() const noexcept { return recentGhosts_.count + frequentGhosts_.count; }
 
 private:
   enum List : uint8_t { Free, Recent, Frequent };

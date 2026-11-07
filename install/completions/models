@@ -11,10 +11,9 @@ else
 fi
 
 {
-    # The upstream models the README starts with.
-    if [ -r "$completion_dir/suggested-models.txt" ]; then
-        cat "$completion_dir/suggested-models.txt"
-        printf '\n'
+    # The models Splash suggests, the MODEL field of each row.
+    if [ -r "$root/install/suggested-models.tsv" ]; then
+        awk -F '\t' '!/^#/ { print $1 }' "$root/install/suggested-models.tsv"
     fi
     # The record models.installation_kind reads, an assembly's model.json; a
     # GGUF selection's link is repo:VARIANT.

@@ -154,14 +154,20 @@ void testServerCommandLines(const char *path) {
       {"idle_sleep", [](NativeArguments &read) { read.preventIdleSleep = false; }},
       {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
       {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
-      // Auto is the engine's default, which the server leaves out.
-      {"verify_rows_auto", [](NativeArguments &) {}},
-      // A relaunch keeps the first engine's context; with --max-context,
-      // which every start holds, its command is the first one's.
+      // The defaults the server leaves out are the engine's: each meaning
+      // names the value, so a change of the engine's default fails it.
+      {"verify_rows_auto", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::Auto; }},
+      {"kv_format_default", [](NativeArguments &read) { read.kvFormat = kv::Format::Int8; }},
+      {"state_format_default",
+       [](NativeArguments &read) { read.stateFormat = ops::GdnStateFormat::Float32; }},
+      // A relaunch asks for the first engine's context beside that engine's
+      // MAX_CONTEXT: it is planned as that engine was, and serves what its
+      // plan holds of the context.
       {"relaunch", [](NativeArguments &read) { read.relaunchContext = 61433; }},
       {"relaunch_limits",
        [](NativeArguments &read) {
          read.maxContext = 102400;
+         read.relaunchContext = 61433;
          read.maxMemoryBytes = 32 * kGiB;
        }},
       // Past the native window, YaRN by the context over it.
@@ -202,7 +208,8 @@ void testServerCommandLines(const char *path) {
            read.preventIdleSleep == meant.preventIdleSleep &&
            read.neuralEngine == meant.neuralEngine && read.pleMemory == meant.pleMemory &&
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
-           read.kvSpillAlways == meant.kvSpillAlways && read.verifyRows == meant.verifyRows;
+           read.kvSpillAlways == meant.kvSpillAlways && read.kvWindowTrim == meant.kvWindowTrim &&
+           read.verifyRows == meant.verifyRows;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -249,6 +256,16 @@ void testStreamedMemoryAndSpill() {
   require(parse(model, {"auto", "auto", "--kv-spill", "always"}).kvSpillAlways, "--kv-spill always was not read");
 }
 
+// A windowed target trims the pages every window has passed unless
+// --kv-window-trim off, which only validation passes, keeps them Full.
+void testWindowTrim() {
+  const ModelDirectory model;
+  require(parse(model, {"auto", "auto"}).kvWindowTrim &&
+              parse(model, {"auto", "auto", "--kv-window-trim", "on"}).kvWindowTrim &&
+              !parse(model, {"auto", "auto", "--kv-window-trim", "off"}).kvWindowTrim,
+          "--kv-window-trim did not reach the arguments as given");
+}
+
 // A command line the server never writes is refused with what is wrong.
 void testRefusals() {
   const ModelDirectory model;
@@ -289,6 +306,8 @@ void testRefusals() {
     refuses({"auto", "auto", "--sparse-kv-memory", size}, "--sparse-kv-memory requires a positive byte count or auto");
   for (const char *spill : {"never", "auto", ""})
     refuses({"auto", "auto", "--kv-spill", spill}, "--kv-spill requires always");
+  for (const char *trim : {"never", "auto", ""})
+    refuses({"auto", "auto", "--kv-window-trim", trim}, "--kv-window-trim requires on or off");
   refuses({"auto", "auto", "--persistent-cache", "yes"}, "--persistent-cache requires on or off");
   refuses({"auto", "auto", "0", "--persistent-cache", "on"},
           "--persistent-cache requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
@@ -329,16 +348,16 @@ void testRefusals() {
                 stretched.model.ropeScaling == model::RopeScaling{factor, 262144},
             "MAX_CONTEXT " + std::to_string(context) + " was not served with YaRN by its ratio to the native window");
   }
-  // A relaunch's context is one the model holds, and only without
-  // MAX_CONTEXT, which every start holds; auto never serves it with YaRN.
+  // A relaunch's context is one its first engine served: at most MAX_CONTEXT,
+  // and without it at most the model holds; auto never serves it with YaRN.
   for (const std::string &context : {std::string("0"), std::string("auto"), std::string("100K"),
                                      std::to_string(std::stoull(maximum) + 1), std::string()})
     refuses({"auto", "auto", "--relaunch-context", context},
             "--relaunch-context requires an integer in [1, " + maximum + "]");
   refuses({"auto", "auto", "--relaunch-context"},
           "--relaunch-context requires an integer in [1, " + maximum + "]");
-  refuses({"102400", "auto", "--relaunch-context", "102400"},
-          "--relaunch-context requires MAX_CONTEXT auto");
+  refuses({"102400", "auto", "--relaunch-context", "102401"},
+          "--relaunch-context requires an integer in [1, 102400]");
   require(parse(model, {"auto", "auto", "--relaunch-context", maximum}).relaunchContext ==
               std::stoul(maximum),
           "the model's whole context was refused a relaunch");
@@ -348,10 +367,8 @@ void testRefusals() {
     rejects([&] { static_cast<void>(parseCommand(command)); }, expected,
             "the engine ran a command it must refuse");
   };
-  commandRefused({"serve", model.path().string(), "auto", "auto"},
-                 "expected the serve-native command");
   commandRefused({"serve-native", model.path().string(), "auto"},
-                 "expected the serve-native command");
+                 "serve-native requires MODEL_DIRECTORY, MAX_CONTEXT and MAX_MEMORY_BYTES");
   commandRefused({"serve-native", (model.path() / "missing").string(), "auto", "auto"},
                  "MODEL_DIRECTORY must name an existing directory");
   const test::TemporaryDirectory empty("splash-native-arguments-empty");
@@ -360,6 +377,22 @@ void testRefusals() {
 }
 
 } // namespace
+
+// A relaunch of a server started with --max-context keeps it as MAX_CONTEXT
+// beside the first engine's context, so that it is planned as that engine
+// was (RuntimeResources::create) and serves the model as that engine did,
+// with YaRN past the native window.
+void testARelaunchKeepsItsFirstEnginesMaxContext() {
+  const ModelDirectory model;
+  const NativeArguments relaunch = parse(model, {"1000000", "auto", "--relaunch-context", "1000000"});
+  require(relaunch.maxContext == 1'000'000 && relaunch.relaunchContext == 1'000'000 &&
+              relaunch.model.ropeScaling == model::RopeScaling{3.814697265625, 262144} &&
+              relaunch.model.capabilities.maximumContextTokens == 1'000'000,
+          "a relaunch of a --max-context past the native window lost it or its YaRN");
+  const NativeArguments native = parse(model, {"102400", "auto", "--relaunch-context", "102400"});
+  require(native.maxContext == 102400 && native.relaunchContext == 102400 && !native.model.ropeScaling.yarn(),
+          "a relaunch of a --max-context within the native window lost it, or was served with YaRN");
+}
 
 int main(int argc, char **argv) {
   if (argc != 3) {
@@ -372,7 +405,9 @@ int main(int argc, char **argv) {
     testNeuralEngine();
     testVerifyRows();
     testStreamedMemoryAndSpill();
+    testWindowTrim();
     testRefusals();
+    testARelaunchKeepsItsFirstEnginesMaxContext();
     std::cout << "native arguments tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

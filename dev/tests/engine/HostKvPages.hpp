@@ -12,9 +12,11 @@
 namespace splash::test {
 
 // Pages in host memory, reached as kv::PageStorage reaches its pages: each
-// layer's keys, key scales, values and value scales, then each layer's
-// index. Every page is Full until a test gives it the index form, which a
-// tier reads its index alone into (engine::BasicKvPageTier).
+// layer's keys, key scales, values and value scales, in the order of the
+// layers' regions (kv::Layout::region), then each layer's index. Every page
+// is Full until a test gives it another form: the index form, which a tier
+// reads its index alone into (engine::BasicKvPageTier), or the Slim form,
+// whose spans are the regions it holds (kv::Layout::regions) and the index.
 class HostKvPages final {
 public:
   HostKvPages(kv::Layout layout, uint32_t pages)
@@ -26,7 +28,8 @@ public:
   void setForm(uint32_t page, kv::PageForm form) { forms_.at(page) = form; }
 
   [[nodiscard]] kv::SlotFormat::LayerSpans layerSpans(uint32_t page, uint32_t layer) const {
-    std::byte *at = bytes_.data() + page * layout_.bytesPerModelPage() + layer * layout_.bytesPerLayerPage();
+    std::byte *at =
+        bytes_.data() + page * layout_.bytesPerModelPage() + layout_.region(layer) * layout_.bytesPerLayerPage();
     kv::SlotFormat::LayerSpans result;
     for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES; ++tensor) {
       const uint64_t bytes = tensor % 2 ? layout_.scaleBytesPerLayerPage() : layout_.dataBytesPerLayerPage();
@@ -43,8 +46,12 @@ public:
     return result;
   }
   [[nodiscard]] std::vector<std::span<std::byte>> spans(uint32_t page) const {
-    std::vector<std::span<std::byte>> result;
+    std::vector<uint32_t> regionLayers(layout_.attentionLayers);
     for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
+      regionLayers[layout_.region(layer)] = layer;
+    regionLayers.resize(layout_.regions(form(page)));
+    std::vector<std::span<std::byte>> result;
+    for (const uint32_t layer : regionLayers)
       for (const std::span<std::byte> tensor : layerSpans(page, layer))
         if (!tensor.empty()) result.push_back(tensor);
     const std::vector<std::span<std::byte>> index = indexSpans(page);

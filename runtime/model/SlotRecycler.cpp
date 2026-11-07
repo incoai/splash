@@ -294,4 +294,45 @@ void SlotRecycler::resize(uint32_t slots) {
   ghostOf_.reserve(slots);
 }
 
+void SlotRecycler::compact(uint32_t slots, const std::function<void(uint32_t)> &evicted,
+                           const std::function<void(uint32_t, uint32_t)> &moved) {
+  const uint32_t held = size();
+  if (slots > held) throw std::invalid_argument("a slot recycler compacts to more slots than it holds");
+  uint32_t past = 0;
+  for (uint32_t slot = slots; slot < held; ++slot) past += list_[slot] != Free;
+  std::erase_if(free_, [slots](uint32_t slot) { return slot >= slots; });
+  // REPLACE's choice: T1's least recently used slot while T1 holds more than
+  // its target, else T2's; a victim below the slots frees one there, and one
+  // past them takes a key less to move.
+  while (past > free_.size()) {
+    const bool fromRecent = recent_.count > target_;
+    uint32_t slot = fromRecent ? recent_.head : frequent_.head;
+    if (slot == kNone) slot = fromRecent ? frequent_.head : recent_.head;
+    evict(slot, false);
+    lastLoad_[slot] = 0;
+    if (slot < slots) free_.push_back(slot);
+    else --past;
+    evicted(slot);
+  }
+  // The lowest free slot first, here and for the claims after.
+  std::ranges::sort(free_, std::ranges::greater{});
+  for (uint32_t from = slots; from < held; ++from) {
+    if (list_[from] == Free) continue;
+    const uint32_t to = free_.back();
+    free_.pop_back();
+    const List list = List(list_[from]);
+    links_.replace(this->slots(list), from, to);
+    list_[to] = list;
+    list_[from] = Free;
+    key_[to] = key_[from];
+    lastLoad_[to] = lastLoad_[from];
+    scan_[to] = scan_[from];
+    scan_[from] = 0;
+    slotOf_.erase(key_[to]);
+    slotOf_.insert(key_[to], to);
+    moved(from, to);
+  }
+  resize(slots);
+}
+
 } // namespace splash::model

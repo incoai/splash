@@ -4,13 +4,19 @@
 // - weights enter the MMA as exact bf16: 128 + code for linear codes with a
 //   min, 160 + code - zero for seeded linear codes (one add), the code itself
 //   (converted) for 8-bit linear codes, or the codebook, int8 or grid value;
-// - one MMA chain per coefficient group, closed by the fp32 epilogue
-//   s * chain + b * sum (b = m - 128 s, formats with a min per 32 inputs, or
-//   b = m for 8-bit codes) or
-//   s * chain with the chain seeded by -160 * sum from the table (formats
-//   with a zero point, and Q2_K, whose min per 16 inputs adds b * seed with
-//   b = m / -160);
-// - coefficients decoded once per simdgroup into threadgroup memory;
+// - one MMA chain per 32 inputs (per 16 for 16-input scales), closed by the
+//   fp32 epilogue s * chain; a format with a min adds b * sum once per
+//   coefficient group, the F::Group inputs one scale and min cover (16, 32,
+//   or 64 to 256 where the groups of a meta unit share them, as MLX affine's
+//   groups of 64 and 128 do), but at least once per 64-input span of the
+//   table, with the last chain of either (b = m - 128 s, or b = m for 8-bit
+//   codes; sum those inputs, from the span's sums of 32), so that it reads
+//   the current span alone; with a zero point, that chain starts from
+//   -160 * sum instead (the operand being 160 + code - zero), the table's
+//   seed of 16 inputs for 16-input scales, and Q2_K's min per 16 inputs adds
+//   b * seed with b = m / -160;
+// - coefficients decoded once per simdgroup and coefficient group into
+//   threadgroup memory;
 // - L request lanes per threadgroup share the weight operands and coefficients;
 //   each lane's chains and epilogue run as with L = 1, so its result does not
 //   depend on the batch width.
@@ -34,16 +40,20 @@ template <class F> struct Shape {
     HasMin = Linear && F::Zero == 0,                          // Q4_K, Q5_K, Q4_1, Q5_1, Q2_K, MLX affine: s code + m
     // Linear codes past 127 (MLX affine 8-bit), which enter the MMA as the code itself: no bf16 128 + code holds them
     Wide = QuantWideCodes<F>::value,
-    // Linear codes chained from the table's seed of their 16 inputs: s (code - zero) with a zero point (Q6_K, Q3_K,
-    // Q4_0, Q5_0, IQ1, PQ2_0, Q2_0), and Q2_K's min per 16 inputs
+    // Linear codes whose chains start from -160 times the sum of their inputs, so that 160 + code - zero enters the
+    // MMA: s (code - zero) with a zero point, once per coefficient group and span from the table's sums of 32 where a
+    // scale covers 32 inputs or more (Q4_0, Q5_0, IQ1_S, PQ2_0, Q2_0) and per 16-input chain from the table's seeds
+    // (Q6_K, Q3_K, IQ1_M); and Q2_K's min per 16 inputs
     Seeded = Linear && (!HasMin || F::Group == 16),
     // bf16 bits of the operand of code 0: 128, or 160 - zero when seeded
     Operand = 0x4300 + (Seeded ? kZeroPointOffset - 128 - F::Zero : 0),
-    CG = Seeded || F::Group == 16 ? 2 : 1,                    // coefficient groups per 32 inputs
+    CG = F::Group == 16 ? 2 : 1,                              // MMA chains per 32 inputs
+    CPG = CG * F::Group / 32,                                 // chains per coefficient group
+    MinChains = CPG < 2 * CG ? CPG : 2 * CG,                  // chains per term: the group's, at most a span's
     // Spans decoded per coefficient unit: every span of eight groups (one meta unit of eight, or two of four), or
     // half of them where a span's coefficients take twice Q4_K's storage (Q2_K's (s, b) per 16 inputs)
     UnitSpans = F::MetaGroups == 1 ? 1 : CG * (HasMin ? 2 : 1) <= 2 ? 4 : 2,
-    J = 2 * UnitSpans * CG,                                   // coefficients per column and unit
+    J = 2 * UnitSpans * CG / CPG,                             // coefficients per column and unit
   };
   // Each coefficient reads its own group's meta unit (coefficient_source), so a unit of two or four groups (MLX
   // affine's 64 or 128 elements, PQ2_0's 128, Q2_0's 64) splits a coefficient unit of four spans: such a format takes
@@ -52,7 +62,15 @@ template <class F> struct Shape {
                 "a meta unit is one, two, four or eight groups");
   static_assert(UnitSpans * GGUF_TABLE16_SPAN_INPUTS == quant_register_unit(F::Id),
                 "the host splits K in the coefficient units of quant_register_unit");
-  static_assert(!Wide || (HasMin && !Seeded), "wide codes have a min per 32 inputs");
+  static_assert(!Wide || (HasMin && !Seeded), "wide codes have a min per group");
+  static_assert(F::Group == 16 || (F::Group % 32 == 0 && F::Group <= 32 * F::MetaGroups),
+                "a coefficient covers 16 inputs, or whole groups of one meta unit");
+  static_assert(CPG >= 1 && 2 * UnitSpans * CG % CPG == 0, "a coefficient unit holds whole coefficient groups");
+  // decode adds a min term with its last chain, or starts that chain from a zero point's, from the span's 32-input
+  // sums of the term's chains: a chain covers one 32-input group, and a term's chains lie in one span, so it reads
+  // no sum before the span.
+  static_assert(!(HasMin && !Seeded) || CG == 1, "a min term's chains are 32-input groups");
+  static_assert(2 * CG % MinChains == 0, "a min term's chains lie in one span");
 };
 template <class F> using Coef = metal::conditional_t<Shape<F>::HasMin != 0, float2, float>;
 // The coefficients of a threadgroup's simdgroups for one unit; the run-time-format kernels hold every format's in
@@ -95,8 +113,8 @@ inline bfloat2 operand(typename F::Chunk ch, uint f, threadgroup const bfloat2 *
 }
 
 // What coefficient j of a column in coefficient unit u is decoded from: its
-// meta unit and, with ScaleInChunk, chunk 0 of its group (which holds the
-// scale).
+// meta unit and, with ScaleInChunk, chunk 0 of its first group (which holds
+// the scale).
 template <class F> struct CoefSource {
   typename F::Meta meta;
   typename F::Chunk chunk;
@@ -105,7 +123,7 @@ template <class F>
 inline CoefSource<F> coefficient_source(device uchar *w0, device uchar *w1, device uchar *meta, uint plane_tile,
                                         uint groups, uint column, uint u, uint j) {
   typedef Shape<F> S;
-  const uint g = u * 2 * S::UnitSpans + j / S::CG;
+  const uint g = u * 2 * S::UnitSpans + j * S::CPG / S::CG;   // its first chain's 32-input group
   const uint units = groups / F::MetaGroups;
   CoefSource<F> src;
   src.meta = F::loadMeta(meta + ((ulong(plane_tile) * units + g / F::MetaGroups) * QUANT_TILE_ROWS + column) * F::MetaBytes);
@@ -115,13 +133,14 @@ inline CoefSource<F> coefficient_source(device uchar *w0, device uchar *w1, devi
   }
   return src;
 }
-// Coefficient j of a column in coefficient unit u: group gi = j / CG of the
-// unit, 16-group half h = j % CG. Formats with a min return (s, m - 128 s),
-// (s, m) with wide codes, or with a seeded min (s, m / -160), whose product
-// with the seed is m times the sum of the inputs.
+// Coefficient j of a column in coefficient unit u, that of its first chain c =
+// j CPG: 32-input group c / CG of the unit, and of 16-input coefficients half
+// h = c % CG. Formats with a min return (s, m - 128 s), (s, m) with wide
+// codes, or with a seeded min (s, m / -160), whose product with the seed is m
+// times the sum of the inputs.
 template <class F> inline Coef<F> coefficient(CoefSource<F> src, uint u, uint j) {
   typedef Shape<F> S;
-  const uint g = u * 2 * S::UnitSpans + j / S::CG, h = j % S::CG;
+  const uint g = u * 2 * S::UnitSpans + j * S::CPG / S::CG, h = j * S::CPG % S::CG;
   QuantCoef k;
   if constexpr (F::ScaleInChunk) k = F::coef(src.meta, src.chunk);
   else k = F::coef(src.meta, ushort(g % F::MetaGroups));
@@ -143,7 +162,7 @@ inline void decode(device const bfloat *table, device const float *sums, device 
                    threadgroup uint *arrival) {
   typedef Shape<F> S;
   typedef Coef<F> C;
-  constexpr uint FG = 4 / S::CG;  // fragments per coefficient group
+  constexpr uint FG = 4 / S::CG;  // fragments per chain
   const uint K = p.input_size, spans = K / GGUF_TABLE16_SPAN_INPUTS, groups = K / 32, splits = p.splits;
   const ulong tileSums = table16_sums_per_tile(K);
   const uint units = spans / S::UnitSpans;
@@ -185,8 +204,8 @@ inline void decode(device const bfloat *table, device const float *sums, device 
   for (uint u = u0; u < u1; ++u) {
     // This unit's coefficients for the simdgroup's NC columns, each decoded
     // once. Every source load is issued before the first decode waits for one,
-    // which takes 1-8% off the zero-point formats (16 coefficients per column
-    // and unit) at one to four lanes on the 40-core M3 Max.
+    // which takes up to 8% off the zero-point formats of 16-input scales (16
+    // coefficients per column and unit).
     constexpr uint I = (NC * S::J + 31) / 32;
     CoefSource<F> src[I];
 #pragma unroll
@@ -219,17 +238,28 @@ inline void decode(device const bfloat *table, device const float *sums, device 
 #pragma unroll
           for (uint f = 0; f < 4; ++f) a[nf][f] = operand<F>(cur[nf][q], f, lut);
 #pragma unroll
-          for (uint h = 0; h < S::CG; ++h) cs[h][nf] = cu[((us * 2 + q) * S::CG + h) * NC + nf * 8 + fm];
+          for (uint h = 0; h < S::CG; ++h) cs[h][nf] = cu[((us * 2 + q) * S::CG + h) / S::CPG * NC + nf * 8 + fm];
         }
+        // Whether this 32-input group of the table closes a term's inputs, a coefficient group or its span.
+        const bool closes = ((us * 2 + q) * S::CG + S::CG) % S::MinChains == 0;
 #pragma unroll
         for (uint r = 0; r < L; ++r) {
           const vec<bfloat, 8> bq = xt[ulong(r) * K + (8 * q + fm) * 4 + c];
           float2 sum = float2(0), seed[S::CG];
-          if (S::HasMin && !S::Seeded) sum = *(device const float2 *)(s32 + ulong(r) * tileSums + q * 8 + fn);
+          if ((S::HasMin || S::Seeded) && S::CG == 1 && closes) {
+            // The sum of the term's inputs: this 32-input sum and, closing a term of 64 inputs, the span's other.
+            sum = *(device const float2 *)(s32 + ulong(r) * tileSums + q * 8 + fn);
 #pragma unroll
-          for (uint h = 0; h < S::CG; ++h)
-            seed[h] = S::Seeded ? *(device const float2 *)(seeds + ulong(r) * tileSums + (2 * q + h) * 8 + fn)
-                                : float2(0);
+            for (uint t = 1; t < S::MinChains; ++t) {
+              const int earlier = int(q) - int(t);   // an earlier 32-input group of the span
+              sum += *(device const float2 *)(s32 + ulong(r) * tileSums + fn + earlier * 8);
+            }
+          }
+#pragma unroll
+          for (uint h = 0; h < S::CG; ++h)   // a 16-input chain's seed from the table, a term's once from its sum
+            seed[h] = !S::Seeded ? float2(0)
+                      : S::CG == 2 ? *(device const float2 *)(seeds + ulong(r) * tileSums + (2 * q + h) * 8 + fn)
+                                   : -float(kZeroPointOffset) * sum;
 #pragma unroll
           for (uint h = 0; h < S::CG; ++h) {
 #pragma unroll
@@ -240,7 +270,7 @@ inline void decode(device const bfloat *table, device const float *sums, device 
                 sgmatrix::mma_acc<bfloat>(dot, a[nf][f], reinterpret_cast<thread const bfloat2 *>(&bq)[f]);
               if constexpr (S::HasMin) {
                 acc[r][nf] = fma(dot, cs[h][nf].x, acc[r][nf]);
-                acc[r][nf] = fma(S::Seeded ? seed[h] : sum, cs[h][nf].y, acc[r][nf]);
+                if (S::Seeded || closes) acc[r][nf] = fma(S::Seeded ? seed[h] : sum, cs[h][nf].y, acc[r][nf]);
               } else {
                 acc[r][nf] = fma(dot, float(cs[h][nf]), acc[r][nf]);
               }
@@ -390,19 +420,19 @@ GGUF_SG_FUSED(4)
 #undef GGUF_SG_SEGMENT
 
 // MoE experts (ops/MoE.cpp): threadgroup (x, y) computes 64 columns of grouped 8-row tile y from its Table16 tile
-// (kernels/shared/moe.metal) with the weights of the tile's expert (moe_gguf_segment), in the format the tile picks
-// at run time: on the 40-core M3 Max one run-time-format kernel is within +1.6% of the per-format kernels
-// (23040x2048 Q4_K and 92160x512 Q5_K, one to four lanes). No K splits, so no partials or counters.
-// aux is the gate of the up pass. Grid (column tiles, expert tiles), GGUF_REGISTER_THREADS threads.
-template <GgufEpilogue Ep>
+// (kernels/shared/moe.metal) with the weights of the tile's expert (moe_gguf_segment), the routed ones in the chunks of
+// the table at the index after the parameters (metal/abi/MoE.h), of a block whose shared expert is Shared slices (each
+// instance's slices suffix, ops::kCompiledMoeRoutings), in the format the tile picks at run time (within 1.6% of
+// per-format kernels). No K splits, so no partials or counters. aux is the gate of the up pass. Grid (column tiles,
+// expert tiles), GGUF_REGISTER_THREADS threads.
+template <GgufEpilogue Ep, uint Shared>
 inline void gguf_sg_expert(device const bfloat *table, device const float *sums, device const MoeTileDescriptor *tiles,
-                           device const uint *tile_count, device uchar *w0, device uchar *w1, device uchar *meta,
-                           device uchar *sw0, device uchar *sw1, device uchar *smeta, device bfloat *out,
-                           device const bfloat *aux, device const uint *slots, constant MoeGgufExpertParams &p,
-                           uint2 tg, uint tid, uint sg, uint lane, threadgroup bfloat2 *lut, threadgroup float2 *coefs,
-                           threadgroup uint *arrival) {
+                           device const uint *tile_count, device uchar *sw0, device uchar *sw1, device uchar *smeta,
+                           device bfloat *out, device const bfloat *aux, device const uint *slots,
+                           constant MoeGgufExpertParams &p, constant ulong *chunks, uint2 tg, uint tid, uint sg,
+                           uint lane, threadgroup bfloat2 *lut, threadgroup float2 *coefs, threadgroup uint *arrival) {
   if (tg.y >= *tile_count) return;
-  const MoeGgufSegment s = moe_gguf_segment(tiles[tg.y].expert, p, slots, w0, w1, meta, sw0, sw1, smeta);
+  const MoeGgufSegment s = moe_gguf_segment<Shared>(tiles[tg.y].expert, p, slots, chunks, sw0, sw1, smeta);
   const uint K = p.input_size, N = p.output_size;
   const ulong rows = ulong(tg.y) * 8;
   const GgufDecodeParams q{K, 1, N, 0, 0};
@@ -415,22 +445,24 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
         arrival);
   });
 }
-#define GGUF_SG_EXPERT(Name, EP)                                                                                    \
+#define GGUF_SG_EXPERT(Name, EP, Shared)                                                                            \
   kernel void Name(device const bfloat *table [[buffer(0)]], device const float *sums [[buffer(1)]],              \
                    device const MoeTileDescriptor *tiles [[buffer(2)]], device const uint *tile_count [[buffer(3)]], \
-                   device uchar *w0 [[buffer(4)]], device uchar *w1 [[buffer(5)]], device uchar *meta [[buffer(6)]], \
-                   device uchar *sw0 [[buffer(7)]], device uchar *sw1 [[buffer(8)]], device uchar *smeta [[buffer(9)]], \
-                   device bfloat *out [[buffer(10)]], device const bfloat *aux [[buffer(11)]],                      \
-                   device const uint *slots [[buffer(12)]], constant MoeGgufExpertParams &p [[buffer(13)]],         \
+                   device uchar *sw0 [[buffer(4)]], device uchar *sw1 [[buffer(5)]],                                \
+                   device uchar *smeta [[buffer(6)]], device bfloat *out [[buffer(7)]],                             \
+                   device const bfloat *aux [[buffer(8)]], device const uint *slots [[buffer(9)]],                  \
+                   constant MoeGgufExpertParams &p [[buffer(10)]], constant ulong *chunks [[buffer(11)]],           \
                    uint2 tg [[threadgroup_position_in_grid]],                                                       \
                    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],            \
                    uint lane [[thread_index_in_simdgroup]]) {                                                       \
     threadgroup bfloat2 lut[kQuantPairTableEntries];                                                                \
     threadgroup float2 coefs[gguf_sg::kCoefFloat2s];                                                                \
     threadgroup uint arrival;                                                                                       \
-    gguf_sg_expert<EP>(table, sums, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, out, aux, slots, p, tg, tid, sg, \
-                       lane, lut, coefs, &arrival);                                                                 \
+    gguf_sg_expert<EP, Shared>(table, sums, tiles, tile_count, sw0, sw1, smeta, out, aux, slots, p, chunks, tg, tid, \
+                               sg, lane, lut, coefs, &arrival);                                                     \
   }
-GGUF_SG_EXPERT(moe_expert_gguf_sg_a, EpNone)
-GGUF_SG_EXPERT(moe_expert_gguf_sg_g, EpUpWithGate)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_a, EpNone, 1)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_g, EpUpWithGate, 1)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_a_s2, EpNone, 2)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_g_s2, EpUpWithGate, 2)
 #undef GGUF_SG_EXPERT

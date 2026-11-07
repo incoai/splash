@@ -12,8 +12,10 @@
 // counts column tiles), and an expert tile the grouped rows of one MoE expert.
 #define GGUF_TILE_COLUMNS 64u
 // Decode tile of the staged kernels, which also runs prefill chunks of up to
-// 32 rows: two simdgroups, each staging its own GGUF_STAGED_COLUMNS columns
-// GGUF_STAGED_STEP inputs at a time over 8, 16 or 32 rows.
+// 32 rows (64 on Apple10 and on Apple9 GPUs of 10 cores or fewer): two
+// simdgroups, each staging its own
+// GGUF_STAGED_COLUMNS columns GGUF_STAGED_STEP inputs at a time over 8, 16,
+// 32 or 64 rows.
 #define GGUF_STAGED_COLUMNS 32u
 #define GGUF_STAGED_STEP 32u
 #define GGUF_STAGED_THREADS (GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS * 32u)
@@ -78,7 +80,8 @@ static_assert(sizeof(GgufPrefillSegmentsParams) == 36, "GGUF segmented prefill p
 
 // Decode tiles: the register tile, which Apple9 runs but for the projections
 // it stages (ops/LinearGguf.cpp, apple9Stages), and the staged tile, which
-// runs every other decode and prefill chunks of up to 32 rows. One tensor per
+// runs every other decode and prefill chunks of up to 32 rows (64 on
+// Apple10 and on Apple9 GPUs of 10 cores or fewer). One tensor per
 // dispatch, over the dispatch's tiles (grid.x) and K partitions (grid.y).
 struct GgufDecodeParams {
   uint32_t input_size;  // K
@@ -108,11 +111,6 @@ struct GgufEmbedParams {
   uint32_t hidden;
 };
 static_assert(sizeof(GgufEmbedParams) == 12, "GGUF embedding parameters are 12 bytes on both sides");
-// The formats whose native rows the embedding kernels gather, in bf16 as token
-// tables and in fp32 as the F32 values load-time widening writes
-// (kernels/shared/embedding.metal, gguf_embed_<kQuantFormats name> and
-// gguf_embed_f32_<name>): every format.
-inline constexpr bool gguf_embedding_format(uint32_t format) { return format < GGUF_FMT_COUNT; }
 
 // Prism ML's input rotation (kernels/shared/gguf_rotation.metal): weights
 // stored for rotated inputs multiply H (D x), H the normalized Walsh-Hadamard

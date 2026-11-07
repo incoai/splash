@@ -9,14 +9,18 @@ using namespace metal;
 // image (metal/abi/QuantFormat.h): fragment 4q + f holds pair f of every
 // chunk of the span's 32-element group q, so fragments 4q + 2h and
 // 4q + 2h + 1 cover its 16-element group h. Per row, the sum of every 32
-// inputs (formats with a min) and the chain seed of every 16 inputs (formats
-// with a zero point) are stored row-minor, so a lane reads its two rows at
-// once.
+// inputs (the min or zero-point term of formats whose scale covers 32 inputs
+// or more) and the chain seed of every 16 inputs (zero-point formats of
+// 16-input scales, and Q2_K's min) are stored row-minor, so a lane reads its
+// two rows at once.
 namespace gguf_sg {
 
-// Formats with a zero point (Q6_K, Q3_K) enter the MMA as 160 + code - zero,
-// exact in bf16 (160 = 128 + 32, Q6_K's zero point), so each 16-input chain
-// starts from -160 times the sum of its inputs: the seed the table stores.
+// Formats with a zero point enter the MMA as 160 + code - zero, exact in bf16
+// (160 = 128 + 32, Q6_K's zero point), so their chains start from -160 times
+// the sum of their inputs: the seed the table stores per 16 inputs, or, where
+// a scale covers 32 inputs or more, -160 times its sums of 32 once per
+// coefficient group and 64-input span
+// (kernels/decode/linear_gguf_sgmatrix.metal).
 constant constexpr uint kZeroPointOffset = 160;
 
 // The rows of a table: one lane's verify rows.

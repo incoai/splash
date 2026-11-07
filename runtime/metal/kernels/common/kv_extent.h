@@ -23,10 +23,10 @@ inline device uchar *splash_kv_extent(SplashKvPage page, uint index) {
 }
 
 // One page's bytes of keys (or values) and of their scales in one layer.
-template <uint KVHeads, typename CacheElement> struct SplashKvPageBytes {
+template <uint KVHeads, uint HeadDim, typename CacheElement> struct SplashKvPageBytes {
   static constexpr constant bool Quantized = is_same<CacheElement, int8_t>::value;
   static constexpr constant uint Data =
-      KVHeads * SplashKvPageTokens * SplashKvHeadDimension * sizeof(CacheElement);
+      KVHeads * SplashKvPageTokens * HeadDim * sizeof(CacheElement);
   static constexpr constant uint Scale =
       Quantized ? KVHeads * SplashKvPageTokens * sizeof(float) : 0;
 };
@@ -39,8 +39,8 @@ template <typename CacheElement> struct SplashKvPageTensors {
   device float *value_scales;
 };
 
-template <uint KVHeads, typename CacheElement> struct SplashKvAddressing {
-  using Bytes = SplashKvPageBytes<KVHeads, CacheElement>;
+template <uint KVHeads, uint HeadDim, typename CacheElement> struct SplashKvAddressing {
+  using Bytes = SplashKvPageBytes<KVHeads, HeadDim, CacheElement>;
   uint layer_offset;
   uint head;
   ulong key_scales_offset;
@@ -62,9 +62,9 @@ template <uint KVHeads, typename CacheElement> struct SplashKvAddressing {
     device uchar *region = splash_kv_extent(entry, index) + layer_offset;
     SplashKvPageTensors<CacheElement> tensors{};
     tensors.keys = reinterpret_cast<device CacheElement *>(region) +
-                   splash_kv_key_index<KVHeads>(index, head, 0, 0);
+                   splash_kv_key_index<KVHeads, HeadDim>(index, head, 0, 0);
     tensors.values = reinterpret_cast<device CacheElement *>(region + values_offset) +
-                     splash_kv_value_index<KVHeads>(index, head, 0, 0);
+                     splash_kv_value_index<KVHeads, HeadDim>(index, head, 0, 0);
     if constexpr (Bytes::Quantized) {
       const ulong scale_index = splash_q8_scale_index<KVHeads>(index, head, 0);
       tensors.key_scales =

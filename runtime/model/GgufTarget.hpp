@@ -20,7 +20,8 @@
 namespace splash::model {
 
 // The .gguf files of a target directory: its one GGUF, or every part of a
-// split one (NAME-0000K-of-0000N.gguf, K = 1..N) in split order.
+// split one, the parts of one name (NAME-0000K-of-0000N.gguf, K = 1..N), in
+// split order.
 [[nodiscard]] std::vector<std::filesystem::path> findTargetGgufs(const std::filesystem::path &directory);
 
 class GgufTargetLoader final {
@@ -65,7 +66,8 @@ public:
   // every quantized tensor of the target and its token table.
   [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return file().rotation(); }
   // Whether the routed experts stream, then the store's options and every
-  // layer's experts, which read the open files the metadata was parsed from.
+  // MoE layer's experts (a block each, those of the leading dense layers'
+  // none), which read the open files the metadata was parsed from.
   [[nodiscard]] bool streamsExperts() const noexcept { return planned_->experts.memoryBytes != 0; }
   [[nodiscard]] const ExpertStoreOptions &expertStoreOptions() const noexcept { return planned_->experts; }
   [[nodiscard]] StreamedBlocks streamedExperts() const;
@@ -79,6 +81,8 @@ private:
     // (gguf::planImages).
     std::vector<gguf::Image> images;
     uint32_t layers = 0;
+    // The first MoE layer (QwenTargetDimensions::leadingDenseLayers).
+    uint32_t firstMoeLayer = 0;
     SparseRowStoreOptions table;
     ExpertStoreOptions experts;
   };

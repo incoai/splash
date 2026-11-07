@@ -8,3 +8,10 @@
 # so ThreadSanitizer reports the handlers' reads against those writes. Nothing
 # of the spilled-KV readers runs in a completed handler.
 race:invocation*for*block*in*splash::metal::MetalBackend::Impl::commit
+#
+# A shared event's listener calls a notify() block on a thread of Metal's
+# once the event reaches its value, which SharedEvent::notify registered after
+# the block captured the callback and what the callback reads was written.
+# That order lies inside Metal (the event's IOSurface notification), so
+# ThreadSanitizer reports the callbacks' reads against those writes.
+race:invocation*for*block*in*splash::metal::SharedEvent::notify

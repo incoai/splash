@@ -7,4 +7,3 @@
 /.gitattributes export-ignore
 *.patch -whitespace
 *.pdf binary
-*.kvst binary

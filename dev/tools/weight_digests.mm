@@ -11,9 +11,12 @@
 // whose largest Metal buffer cannot hold one. What streams has no image: the
 // layers' images leave out their routed experts and a table that streams has
 // none (ple.bin), so the digests cover neither; the engine reads their bytes
-// from the source files. Any SIZE the stores take loads the same images.
+// from the source files. Any SIZE the stores take loads the same images. A
+// load whose images and stores the engine's Metal memory budget cannot hold
+// is refused before any image loads, naming the options.
 #import <Foundation/Foundation.h>
 
+#include "engine/MemoryPlan.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "model/ModelFactory.hpp"
@@ -21,11 +24,13 @@
 #include "model/WeightImages.hpp"
 #include "tools/LoadOptions.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -48,8 +53,18 @@ int main(int argc, char **argv) {
       options.readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
       metal::MetalBackend backend(argv[1]);
       const std::filesystem::path root = std::filesystem::canonical(argv[2]);
-      const model::LoadedModel loaded =
-          model::loadModel(backend, root, model::inspectModelRoot(root), options);
+      const model::ModelDescriptor descriptor = model::inspectModelRoot(root);
+      // No start of the engine loads weights past its Metal memory budget,
+      // which --max-memory only lowers, and a load past it can fail in a Metal
+      // command for memory: refuse it before any image loads.
+      const uint64_t budget =
+          engine::EngineMemoryPolicy::hardBudgetBytes(backend.capabilities().recommendedMaxWorkingSetBytes, 0);
+      if (const uint64_t bytes = tools::weightBytes(root, descriptor, options); bytes > budget)
+        throw std::runtime_error("the weights need " + std::to_string(bytes / engine::kMiB) +
+                                 " MiB, and the Metal memory budget is " + std::to_string(budget / engine::kMiB) +
+                                 " MiB; --expert-memory SIZE streams a MoE target's routed experts and "
+                                 "--ple-memory SIZE a Qwen3.8-Flash-Next target's PLE table");
+      const model::LoadedModel loaded = model::loadModel(backend, root, descriptor, options);
       const auto images = loaded.images->contents();
       std::vector<std::string> digests(images.size());
       model::parallelFor(images.size(), [&](size_t index, unsigned) {

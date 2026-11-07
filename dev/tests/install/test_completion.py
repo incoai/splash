@@ -12,7 +12,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 COMPLETIONS = REPO / "install/completions"
-SUGGESTED = ("suggested/Model-4bit",)
+SUGGESTED = ("suggested/Model-GGUF:UD-Q4_K_M", "suggested/Model-4bit")
 LOCAL = ("community/custom-splash", "community/linked-splash")
 GGUF = ("unsloth/Model-GGUF:Q8_0", "unsloth/Model-GGUF:UD-Q4_K_M")
 UPSTREAM = (*GGUF, "mlx-community/Model-4bit")
@@ -91,13 +91,19 @@ class CompletionTests(unittest.TestCase):
         root = self.root / name
         directory = root / "install/completions"
         shutil.copytree(COMPLETIONS, directory)
-        (directory / "suggested-models.txt").write_text("\n".join(SUGGESTED) + "\n")
+        (root / "install/suggested-models.tsv").write_text(
+            "# MODEL<TAB>NAME<TAB>MEMORY<TAB>SIZE<TAB>ABOUT\n"
+            + "".join(
+                f"{model}\tModel\t24\t16\tFast all-rounder\n" for model in SUGGESTED
+            )
+        )
         if release:
             (root / "release.json").write_text("{}")
             models = self.home / "Library/Application Support/Splash/models"
         else:
             models = root / "install/models"
-        for model in (*SUGGESTED, LOCAL[0]):
+        # One suggested model is installed too, and is offered once.
+        for model in (SUGGESTED[1], LOCAL[0]):
             model_root = models / model
             model_root.mkdir(parents=True, exist_ok=True)
             (model_root / "model.json").write_text("{}")
@@ -152,7 +158,9 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         return result.stdout.splitlines()
 
-    def bash_complete(self, shell, script, words, *, upgrade=None, unbroken=""):
+    def bash_complete(
+        self, shell, script, words, *, upgrade=None, unbroken="", cwd=None
+    ):
         setup = ""
         if upgrade:
             link, new, old = upgrade
@@ -183,6 +191,7 @@ class CompletionTests(unittest.TestCase):
                 str(script),
                 *words,
             ],
+            cwd=cwd,
             env=self.env,
             capture_output=True,
             timeout=10,
@@ -221,6 +230,9 @@ class CompletionTests(unittest.TestCase):
                     sorted((*SUGGESTED, *LOCAL, *UPSTREAM)),
                 )
                 self.assertEqual(self.run_helper(directory, "unsloth/"), list(GGUF))
+                self.assertEqual(
+                    self.run_helper(directory, "suggested/"), sorted(SUGGESTED)
+                )
                 self.assertEqual(self.run_helper(directory, "community/l"), [LOCAL[1]])
                 self.assertEqual(self.run_helper(directory, "community/*"), [])
                 self.assertEqual(self.run_helper(directory, "["), [])
@@ -313,6 +325,67 @@ class CompletionTests(unittest.TestCase):
                         ),
                         [],
                     )
+
+    def test_bash_completes_local_model_paths_with_spaces(self):
+        _, directory = self.layout()
+        (self.root / "local dir").mkdir()
+        (self.root / "local dir/target.gguf").touch()
+        for shell in bash_paths():
+            for flag in ("--model-dir", "--draft-model", "--mmproj"):
+                # Words as Bash 4 and later split flag= and flag=t.
+                for words in ([flag, "="], [flag, "=", "t"]):
+                    with self.subTest(shell=shell, words=words):
+                        self.assertEqual(
+                            self.bash_complete(
+                                shell,
+                                directory / "splash.bash",
+                                ["splash", "serve", *words],
+                                cwd=self.root / "local dir",
+                            ),
+                            ["target.gguf"],
+                        )
+                # Readline quotes the space and ends the directory with '/'.
+                for typed, unbroken, expected in (
+                    (f"{flag} local\\ d\t", "", [flag, "local dir/target.gguf"]),
+                    (f"{flag}=local\\ d\t", "", [f"{flag}=local dir/target.gguf"]),
+                    (f"{flag}=local\\ dir/t", "=", [f"{flag}=local dir/target.gguf"]),
+                ):
+                    with self.subTest(shell=shell, typed=typed, unbroken=unbroken):
+                        actual = self.shell_tab(
+                            directory / "splash.bash",
+                            f"splash serve {typed}",
+                            shell=shell,
+                            unbroken=unbroken,
+                        )
+                        self.assertEqual(actual.splitlines(), ["serve", *expected])
+
+    def test_zsh_completes_local_model_paths_with_spaces(self):
+        _, directory = self.layout()
+        (self.root / "local target.gguf").touch()
+        for flag in ("--model-dir", "--draft-model", "--mmproj"):
+            with self.subTest(flag=flag):
+                result = self.shell_tab(
+                    directory / "_splash", f"splash serve {flag} local\\ t"
+                )
+                self.assertEqual(
+                    shlex.split(result), ["splash", "serve", flag, "local target.gguf"]
+                )
+
+    @unittest.skipUnless(FISH, "fish is not installed")
+    def test_fish_completes_local_model_paths_with_spaces(self):
+        _, directory = self.layout()
+        target = self.root / "local target.gguf"
+        target.touch()
+        for flag in ("--model-dir", "--draft-model", "--mmproj"):
+            with self.subTest(flag=flag):
+                self.assertEqual(
+                    self.fish_complete(
+                        "source $argv[2]; complete -C $argv[1]",
+                        f"splash serve {flag} {shlex.quote(str(self.root / 'local t'))}",
+                        directory / "splash.fish",
+                    ),
+                    [str(target)],
+                )
 
     def test_bash_loaded_completion_survives_release_upgrade(self):
         for index, shell in enumerate(bash_paths()):
@@ -464,6 +537,8 @@ class CompletionTests(unittest.TestCase):
                     for typed, model in (
                         ("community/l", LOCAL[1]),
                         ("unsloth/Model-GGUF:UD", GGUF[1]),
+                        # The first tab inserts the ':' itself.
+                        ("unsloth/Model-GGUF\tUD", GGUF[1]),
                     ):
                         with self.subTest(
                             shell=shell,

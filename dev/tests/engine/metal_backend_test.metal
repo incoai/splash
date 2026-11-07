@@ -44,7 +44,27 @@ kernel void addressed_check_u32(device const ulong *table [[buffer(0)]],
     }
 }
 
-// A host_step_wait that ends without seeing its release, as a spin would on a
-// Metal that stopped honoring its memory scope: the test of the backend's
-// spin check names this library host-step.metallib.
+// addressed_write_u32 and addressed_check_u32 through the table of addresses
+// the backend writes for a dispatch (metal::AddressTable), in the constant
+// address space after the parameters: the words of a row and the seed.
+kernel void address_table_write_u32(constant uint2 &p [[buffer(0)]],
+                                    constant ulong *table [[buffer(1)]],
+                                    uint2 id [[thread_position_in_grid]]) {
+    if (id.x < p.x) {
+        reinterpret_cast<device uint *>(table[id.y])[id.x] = p.y ^ (id.y * 131071u + id.x);
+    }
+}
+
+kernel void address_table_check_u32(device atomic_uint *mismatches [[buffer(0)]],
+                                    constant uint2 &p [[buffer(1)]],
+                                    constant ulong *table [[buffer(2)]],
+                                    uint2 id [[thread_position_in_grid]]) {
+    if (id.x < p.x &&
+        reinterpret_cast<device const uint *>(table[id.y])[id.x] != (p.y ^ (id.y * 131071u + id.x))) {
+        atomic_fetch_add_explicit(mismatches, 1u, memory_order_relaxed);
+    }
+}
+
+// A host_step_wait that ends at once, without seeing its release: a test
+// of the backend's spin check names this library host-step.metallib.
 kernel void host_step_wait() {}
