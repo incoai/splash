@@ -310,3 +310,25 @@ where the format says the tags are text:
 The tool responses render through the model's own template, which the
 installer carries from the GGUF; nothing on the prompt side needs the
 format's tags.
+
+## The served tool loop, and the mask's word boundary
+
+The installed model serves through the server over HTTP: plain
+completions, a reasoning turn, and a full tool loop — the call emitted
+with its arguments as one JSON value, the tool result rendered back
+through the template, and the model's answer reading it ("It's currently
+14:00 (2:00 PM) CET in Paris") — at about 45 tok/s of decode per cycle.
+
+The tool loop's second turn crashed the engine: a page of the Slim runway
+refused layer 0's K/V. The mask's countBelow read a layer past the first
+word's bits as count minus the word's suffix, which only holds when no
+windowed layer sits at or above the layer; the first family whose window
+runs past bit 64 read every later layer's region wrong, and the trim
+moved its pages by the wrong regions. The count walks the whole words
+below the layer's, then its word's bits below its bit.
+
+Two smaller catches on the way: the spilled history's one-layer staging
+layout drops its windowed mask (a one-region page cannot hold a windowed
+layer's region), and the engine's memory plan carries the family's own
+prefill scratch, which the audit counted against the plan it did not
+know.
