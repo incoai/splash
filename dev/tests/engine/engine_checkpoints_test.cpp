@@ -1251,6 +1251,83 @@ void testTrimmedTailRestoresNearItsDivergence() {
           "a turn that rewrote the tail did not restore near its divergence");
 }
 
+// Memory refuses the replay point its own buffers while the lane holds its
+// tail checkpoint, published by the command before. The ledger keeps the tail,
+// its recovery point: it makes room from the oldest checkpoint, another
+// conversation's, or with the SSD and none older the lane's kept rolling one
+// at 8192, which goes without a write, before the replay point would take the
+// tail's buffers. A next turn that rewrites the tail restores from it.
+void testTailCheckpointSurvivesARefusedReplayPoint() {
+  for (const bool disk : {true, false}) {
+    test::EngineHarness h({.pages = 2048, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+    engine::Cache &resources = h.cache;
+    Executor &executor = h.model;
+    Events &events = h.events;
+    engine::Engine &engine = h.engine;
+    if (disk) {
+      executor.offloadTier = std::make_shared<OffloadControl>();
+      executor.offloadTier->ready = true;
+      executor.restoreControl->ready = true;
+    }
+    bool memoryFull = false;
+    executor.reservationRoom = [&] {
+      if (*executor.evictedStateBytes >= 64) {
+        *executor.evictedStateBytes -= 64;
+        return true;
+      }
+      return !memoryFull;
+    };
+    // Without the SSD, another conversation's checkpoint at 4096 is older.
+    const std::vector<uint32_t> other(25001, 41);
+    if (!disk) {
+      engine.submit(request(3, other));
+      runUntilCheckpoint(h, 1);
+      engine.cancel(3);
+      h.runUntilIdle();
+    }
+    const uint64_t published = engine.snapshot().checkpointPublications;
+    // Checkpoints at 4096 and 8192, the tail's at 12160 in the command that
+    // ends at 12288, the replay point at 12416 in the next.
+    std::vector<uint32_t> prompt(12417);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    engine.submit(request(1, prompt));
+    double now = 1;
+    tickUntil(h, now,
+              [&] {
+                return executor.requests.contains(1) && executor.requests.at(1).position == 12288 &&
+                       !engine.commandInFlight();
+              },
+              "the prompt did not reach the command of its replay point");
+    std::vector<uint32_t> tail(prompt.begin(), prompt.begin() + 12161);
+    require(engine.snapshot().checkpointPublications == published + 3 &&
+                resources.probe(tail, {}).cachedTokens() == 12160,
+            "fixture did not leave the lane its tail checkpoint");
+    // The state pool is exhausted: its idle buffers went back to the host.
+    memoryFull = true;
+    *executor.evictedStateBytes = 0;
+    tickUntil(h, now, [&] { return engine.snapshot().replayStatePublications == 1; },
+              "the replay point was not published");
+    const auto states = resources.snapshot().stateCache;
+    const std::vector<uint32_t> kept(prompt.begin(), prompt.begin() + 8193);
+    require(states.checkpointEntries == (disk ? 1U : 2U) && states.checkpointRetirements == 1 &&
+                states.checkpointEvictions == 1 && states.offloads == 0 &&
+                resources.probe(disk ? kept : other, {}).cachedTokens() == 0 &&
+                resources.probe(tail, {}).cachedTokens() == 12160 &&
+                resources.probe(prompt, {}).cachedTokens() == 12416,
+            "the replay point took the tail checkpoint's buffers before the ledger made room");
+    memoryFull = false;
+    tickUntil(h, now, [&] { return idle(engine); }, "the prompt did not finish");
+    // The next turn trims 60 tokens of the prompt's last message.
+    prompt.resize(12416 - 60);
+    prompt.resize(13000, 7);
+    engine.submit(request(2, prompt));
+    h.runUntilIdle();
+    require(events.starts.back() == 12160 && executor.restored == 12160 &&
+                events.failedCount == 0,
+            "a turn that rewrote the tail did not restore from the tail checkpoint");
+  }
+}
+
 // Turn B rewrites the tail of turn A's last message and restores from A's
 // tail checkpoint, 192 tokens below where they part, too near for a junction:
 // the restored checkpoint is kept as one, so B's own checkpoints do not retire
@@ -1417,6 +1494,54 @@ void testDroppedTailKeepsTheRecoveryPoint() {
           "the retry did not resume from the recovery checkpoint");
 }
 
+// The replay point, in the command that captures the tail checkpoint before
+// it, refused buffers of its own, takes what the ledger frees, another
+// conversation's state, before the tail's; the lane's recovery checkpoint
+// stays out of the ledger's reach.
+void testReplayPointBesideItsTailTakesTheLedgerFirst() {
+  test::EngineHarness h({.pages = 2048, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  engine::Cache &resources = h.cache;
+  Executor &executor = h.model;
+  engine::Engine &engine = h.engine;
+  bool memoryFull = false;
+  executor.reservationRoom = [&] {
+    if (*executor.evictedStateBytes >= 64) {
+      *executor.evictedStateBytes -= 64;
+      return true;
+    }
+    return !memoryFull;
+  };
+  const std::vector<uint32_t> other(65, 5);
+  engine.submit(request(2, other));
+  h.runUntilIdle();
+  // A checkpoint at 4096; the tail's at 8736 and the replay point at 8992 in
+  // the command [8192, 9000).
+  std::vector<uint32_t> prompt(9000);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  engine.submit(request(1, prompt));
+  double now = 1;
+  tickUntil(h, now,
+            [&] {
+              return executor.requests.contains(1) && executor.requests.at(1).position == 8192 &&
+                     !engine.commandInFlight();
+            },
+            "the prompt did not reach the command of its tail");
+  // One state's buffers are idle in the pool, and the tail takes them.
+  memoryFull = true;
+  *executor.evictedStateBytes = 64;
+  tickUntil(h, now, [&] { return engine.snapshot().replayStatePublications == 2; },
+            "the replay point was not published");
+  const std::vector<uint32_t> tail(prompt.begin(), prompt.begin() + 8737);
+  const std::vector<uint32_t> recovery(prompt.begin(), prompt.begin() + 4097);
+  require(engine.snapshot().captureCuts == 0 && resources.probe(other, {}).cachedTokens() == 0 &&
+              resources.probe(recovery, {}).cachedTokens() == 4096 &&
+              resources.probe(tail, {}).cachedTokens() == 8736 &&
+              resources.probe(prompt, {}).cachedTokens() == 8992,
+          "the replay point took its tail's buffers, or the ledger took the recovery checkpoint");
+  memoryFull = false;
+  tickUntil(h, now, [&] { return idle(engine); }, "the prompt did not finish");
+}
+
 } // namespace
 
 std::span<const test::TestCase> checkpointsTests() {
@@ -1449,10 +1574,12 @@ std::span<const test::TestCase> checkpointsTests() {
       {"testDefaultCheckpointRestoresLatestCommittedPrefix", testDefaultCheckpointRestoresLatestCommittedPrefix},
       {"testCheckpointsSkipNearResumeAndReplayBoundaries", testCheckpointsSkipNearResumeAndReplayBoundaries},
       {"testTrimmedTailRestoresNearItsDivergence", testTrimmedTailRestoresNearItsDivergence},
+      {"testTailCheckpointSurvivesARefusedReplayPoint", testTailCheckpointSurvivesARefusedReplayPoint},
       {"testRestoredBranchPointIsKept", testRestoredBranchPointIsKept},
       {"testBranchPointsStayBoundedAlongAConversation", testBranchPointsStayBoundedAlongAConversation},
       {"testRecoveryPointIsNoSecondaryCheckpoint", testRecoveryPointIsNoSecondaryCheckpoint},
       {"testDroppedTailKeepsTheRecoveryPoint", testDroppedTailKeepsTheRecoveryPoint},
+      {"testReplayPointBesideItsTailTakesTheLedgerFirst", testReplayPointBesideItsTailTakesTheLedgerFirst},
   };
   return kTests;
 }

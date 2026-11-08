@@ -438,6 +438,9 @@ public:
     return states_.branchPointOf(block);
   }
   void retireBranchPoint(uint64_t block) noexcept { states_.retireBranchPoint(block); }
+  // The one state write is in flight: a state published to disk now is
+  // refused.
+  [[nodiscard]] bool stateWriting() const noexcept { return states_.writing(); }
   [[nodiscard]] bool secondaryCheckpoint(uint64_t block) const noexcept {
     return kv_.contains(block) && states_.secondary(block);
   }
@@ -811,6 +814,11 @@ public:
   // The request holding the handle is unfinished and its conversation
   // resumes from the state at this block: see StateCache::useState.
   [[nodiscard]] StateUse useState(uint64_t kvBlock) { return states_.useState(kvBlock); }
+  // Pins the state at this block, when there is one, out of every victim
+  // choice until the lease ends.
+  [[nodiscard]] std::optional<CompositeStateLease> pinState(uint64_t kvBlock) {
+    return states_.acquireDeepest(std::span<const uint64_t>(&kvBlock, 1));
+  }
   // A state at this block is in use, published or yet to be: its writes
   // pass the disk tier's write budget.
   [[nodiscard]] bool stateInUse(uint64_t kvBlock) const noexcept { return states_.inUse(kvBlock); }

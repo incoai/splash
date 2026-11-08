@@ -869,6 +869,10 @@ uint32_t Engine::tailBoundary(const Request &active) noexcept {
   return replay > kTrimmedTailTokens ? replay - kTrimmedTailTokens : 0;
 }
 
+bool Engine::holdsTailCheckpoint(const Request &active) noexcept {
+  return active.latestCheckpoint && active.latestCheckpointTail;
+}
+
 uint32_t Engine::sharedPrefillBoundary(const Request &left,
                                        const Request &right) {
   // Requests of different cache salts share no block.
@@ -1150,6 +1154,7 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
     const uint64_t restored = lookup.state->kvBlock();
     active.latestCheckpoint = cache_.checkpointState(restored);
     active.latestCheckpointTokens = resumeBoundary;
+    active.latestCheckpointTail = false;
     // The conversation's newest branch point on this chain: the restored
     // state's own, or the one it recorded.
     active.branchPoint = cache_.branchPointOf(restored);
@@ -1548,25 +1553,40 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
     // checkpoint is taken from the lane now. The replay point keeps that
     // checkpoint only beside buffers of its own; refused them, it takes
     // the checkpoint's unless a peer still holds it. Then what the ledger
-    // frees for the state's claim (stateClaim).
+    // frees for the state's claim (stateClaim). The tail checkpoint goes
+    // last: the ledger frees first, and only then does the replay point
+    // take its buffers. That costs one ledger pass, at the prompt's end,
+    // claimed as the tail's own: optional, not past the host's reserve.
     if (fromLane) {
+      const bool takesCheckpoint = replay && resident && !checkpointShared(active);
+      const bool tailLast = takesCheckpoint && holdsTailCheckpoint(active);
       bool first = true;
       recycled = allocate(
                      [&] {
                        state = model_.snapshot(active.request.id);
-                       if (!state && std::exchange(first, false) && replay && resident &&
-                           !checkpointShared(active) && retireCheckpoint(active))
+                       if (!state && std::exchange(first, false) && takesCheckpoint &&
+                           !tailLast && retireCheckpoint(active))
                          state = model_.snapshot(active.request.id);
                        return StateBuffers{.ok = state != nullptr};
                      },
                      stateClaim(active,
-                                checkpoint ? StateClass::Checkpoint
-                                : replay   ? StateClass::InUse
-                                           : StateClass::Ordinary,
+                                checkpoint || tailLast ? StateClass::Checkpoint
+                                : replay               ? StateClass::InUse
+                                                       : StateClass::Ordinary,
                                 false),
                      Refusal::Settled)
                      .freed &&
                  state;
+      // The ledger may have written the tail to the SSD for its RAM: it
+      // stays there, and only one still resident gives its buffers.
+      if (!state && tailLast && cache_.stateResident(active.latestCheckpoint.kvBlock) &&
+          !checkpointShared(active) && retireCheckpoint(active))
+        static_cast<void>(allocate(
+            [&] {
+              state = model_.snapshot(active.request.id);
+              return StateBuffers{.ok = state != nullptr};
+            },
+            stateClaim(active, StateClass::InUse, false), Refusal::SettledOnce));
     }
     if (state) {
       cache_.publishCompositeState(block, std::move(state), checkpoint);
@@ -1613,6 +1633,7 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
   active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
                                        : StateCheckpoint{};
   active.latestCheckpointTokens = objective.tokens;
+  active.latestCheckpointTail = tail;
   // A recovery point is no secondary checkpoint, one another lane kept
   // either (reuseCompositeState above).
   if (checkpoint)

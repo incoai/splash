@@ -530,6 +530,8 @@ private:
     bool rendersReplies = false;
     // The boundary of latestCheckpoint, which keptCheckpoint records.
     uint32_t latestCheckpointTokens = 0;
+    // latestCheckpoint is the tail checkpoint this request published.
+    bool latestCheckpointTail = false;
     // The rolling checkpoint the tail checkpoint kept, secondary, which the
     // replay point's publication queues on the write-behind; secondary no
     // more if the request ends before that.
@@ -794,6 +796,10 @@ private:
   // Where the tail checkpoint sits, kTrimmedTailTokens before the prompt's
   // replay boundary (addTailCheckpoint); 0 for a prompt too short for one.
   [[nodiscard]] static uint32_t tailBoundary(const Request &request) noexcept;
+  // The lane's checkpoint is the tail checkpoint it published, which the
+  // ledger keeps: the replay point takes its buffers only once the ledger
+  // freed nothing for its own.
+  [[nodiscard]] static bool holdsTailCheckpoint(const Request &request) noexcept;
   [[nodiscard]] static uint32_t sharedPrefillBoundary(const Request &left,
                                                       const Request &right);
   // An unstarted request waits while a resident producer has yet to publish
@@ -906,9 +912,13 @@ private:
   // later one follows the state before it in the command. A checkpoint whose
   // predecessor a reader pins takes only the pool or the admission too:
   // refused, its command ends at it, and apply publishes it from the lane
-  // only if the pin has gone by then. Null buffers when refused.
+  // only if the pin has gone by then. Null buffers when refused. The tail
+  // checkpoint (`tail`), and the replay point that follows it as the lane's
+  // checkpoint, take what the ledger frees all the same: the tail is worth
+  // the lane's recovery point, and refused, it is dropped unless the SSD
+  // can take it from the lane.
   [[nodiscard]] Reservation reserveCapture(Request &request, StateClass kind, uint32_t tokens,
-                                           bool followsCheckpoint, bool supersedes);
+                                           bool followsCheckpoint, bool supersedes, bool tail);
   // Reserves the buffers of the state a decoding lane captures in its next
   // cycle (Model::capturesInDecode): at the next page past the tokens it
   // holds, when the rows it may retain reach it. Its claim is a
@@ -916,6 +926,10 @@ private:
   // nothing is freed for one.
   void reserveReplyCapture(Request &request, std::vector<StateCapture> &states,
                            std::vector<LaneCapture> &captures, bool supersedes);
+  // Pins the lane's recovery checkpoint, its latestCheckpoint, while a claim
+  // made before its command ends lets the ledger free: no reclaim takes it
+  // until the lease goes. One lease per such claim, at most one a prompt.
+  [[nodiscard]] std::optional<CompositeStateLease> keepRecoveryPoint(const Request &request);
   // The claim of a state's buffers of class `kind`: the prompt's replay
   // point, the state the request's next turn resumes from, is work in
   // service that may wait for memory on its way back and reaches what is in
