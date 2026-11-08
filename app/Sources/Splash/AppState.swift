@@ -118,8 +118,8 @@ final class AppState {
     var ready: Bool { available && !quitting }
 
     /// Whether a model can start, or the one that runs give way to another, now: the app is ready
-    /// and the Keychain gives the API key (`keyProblem`). The Server's buttons and the menu bar's
-    /// panel ask it.
+    /// and the Keychain gives the API key (`keyProblem`). The Server's buttons, the menu bar's
+    /// panel and the composer's model menu ask it.
     var canStart: Bool { ready && keyProblem == nil }
 
     /// Whether the app runs something it must stop or wait for before it quits.
@@ -274,15 +274,16 @@ final class AppState {
         return (model, !(server.phase == .stopping && server.next == nil))
     }
 
-    /// The model the menu bar's panel checks: the one a switch goes to, else the one that starts or
-    /// serves; none while it stops or once it failed, so that choosing it starts it again.
+    /// The model the menu bar's panel and the composer's model menu check: the one a switch goes
+    /// to, else the one that starts or serves; none while it stops or once it failed, so that
+    /// choosing it starts it again.
     var checkedModel: String? {
         if let next = server.next { return next }
         return server.phase == .starting || server.phase == .ready ? server.model : nil
     }
 
-    /// What choosing `model` in the menu bar's panel does: starts it, or switches to it from the one
-    /// that runs; the one checked goes on as it is.
+    /// What choosing `model` in the menu bar's panel or the composer does: starts it, or switches to
+    /// it from the one that runs; the one checked goes on as it is.
     func choose(_ model: String) {
         guard model != checkedModel else { return }
         start(model)

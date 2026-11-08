@@ -206,9 +206,11 @@ private struct InkCircle: ButtonStyle {
     }
 }
 
-/// What the Server runs, at the composer's start, which opens the Server: the model's name, the
-/// mark showing what it does; or why nothing answers, with Open Server. Models change on the
-/// Server only.
+/// What the Server runs, at the composer's start: the model's name and the mark showing what it
+/// does, or why nothing answers. It opens the models on this Mac, the one that runs checked, to
+/// start one or switch to it, as the menu bar's panel does (`AppState.choose`), and Manage
+/// Models…, which opens the Server; with no model on this Mac, or none it can start now
+/// (`AppState.canStart`, the Keychain refusing the API key), it opens the Server itself.
 private struct EngineSlot: View {
     @Environment(AppState.self) private var state
 
@@ -220,18 +222,39 @@ private struct EngineSlot: View {
         case .stopped: state.installed.isEmpty ? "No model on this Mac" : "No model running"
         default: state.status
         }
-        let blocked = if case .failed = server.phase { true } else { server.phase == .stopped }
-        Button { state.section = .server } label: {
-            HStack(spacing: 6) {
-                StatusMark(look: state.serverStatus.look, since: server.since, size: 12)
-                Text(words).foregroundStyle(.secondary)
-                if blocked { Text("Open Server").foregroundStyle(.tint) }
+        let mark = StatusMark(look: state.serverStatus.look, since: server.since, size: 12)
+        if state.installed.isEmpty || !state.canStart {
+            Button { state.section = .server } label: {
+                HStack(spacing: 6) {
+                    mark
+                    Text(words).foregroundStyle(.secondary)
+                    Text("Open Server").foregroundStyle(.tint)
+                }
+                .font(.callout)
+                .lineLimit(1)
             }
-            .font(.callout)
-            .lineLimit(1)
-            .truncationMode(.middle)
+            .help("Open Server (⌘1)")
+        } else {
+            // The models by their ids, and Manage Models… by an empty one, which no model has.
+            PopupMenu(header: "Model", items: state.installed.map { PopupItem(id: $0.id, title: state.displayName(of: $0.id)) }
+                + [PopupItem(id: "", title: "Manage Models…", separated: true)], chosen: state.checkedModel, above: true) { choice in
+                if choice.isEmpty { state.section = .server } else { state.choose(choice) }
+            } label: {
+                HStack(spacing: 6) {
+                    mark
+                    Text(words).foregroundStyle(.secondary)
+                    MenuChevron()
+                }
+                .font(.callout)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+            }
+            .help("Start or Switch Models")
+            .accessibilityLabel("Model")
+            .accessibilityValue(words)
         }
-        .help("Open Server (⌘1)")
     }
 }
 

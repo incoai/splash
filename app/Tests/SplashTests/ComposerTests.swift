@@ -70,11 +70,13 @@ struct ComposerTests {
     }
 
     /// A model becoming ready changes the composer's controls in one animation: Attach Images and
-    /// Thinking fade in as the mark and the model's name move along beside them, none of them in
-    /// its place at once while the others move; with Reduce Motion all of them are in their places
-    /// at once, the mark taking its color within `quick`.
+    /// Thinking fade in as the mark, the model's name and its menu's chevron move along beside them,
+    /// none of them in its place at once while the others move; with Reduce Motion all of them are
+    /// in their places at once, the mark taking its color within `quick`.
     @Test func theComposersControlsChangeWithTheServerAsOne() async throws {
         let fake = try FakeRuntime("splash-composer-stage", launcher: "stepped_server")
+        // Installed, as a model that runs is, so that its name opens the models' menu.
+        try fake.install("example/Model")
         let state = fake.state(keychain: Keychain(service: "Splash Tests"))
         defer {
             state.quit()
@@ -113,14 +115,14 @@ struct ComposerTests {
         let settled = try Self.picture(row, in: window)
 
         // The controls as they settle, each a run of columns drawn on the composer: Attach Images,
-        // the mark, the model's name, Thinking and Send.
+        // the mark, the model's name, its menu's chevron, Thinking and Send.
         let controls = Self.runs(in: settled)
         print("The row's controls before \(Self.runs(in: before)), at the start \(Self.runs(in: start)), settled \(controls)")
-        try #require(controls.count >= 4, "the row's controls: \(controls)")
+        try #require(controls.count >= 5, "the row's controls: \(controls)")
         if Motion.reduced {
             #expect(Self.runs(in: start) == controls, "every control in its place at once")
         }
-        let named = ["Attach Images", "the mark", "the model's name", "Thinking"]
+        let named = ["Attach Images", "the mark", "the model's name", "the chevron", "Thinking"]
         for (control, columns) in zip(named, controls) {
             let change = Self.difference(before, settled, in: columns)
             let left = Self.difference(start, settled, in: columns)

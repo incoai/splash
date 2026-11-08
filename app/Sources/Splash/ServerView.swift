@@ -6,8 +6,9 @@ private let column: CGFloat = 640
 
 /// The Server screen, where the window opens: the models on this Mac to pick from, how they
 /// start, the suggested ones this Mac can run to download, and, under them all, what runs with
-/// Start, Stop and Switch. Models start and change here and from the menu bar's panel
-/// (`MenuBarPanel`), with the same launch options and by the same rule (`AppState.canStart`).
+/// Start, Stop and Switch. Models start and change here, from the menu bar's panel
+/// (`MenuBarPanel`) and from the composer (`EngineSlot`), with the same launch options and by the
+/// same rule (`AppState.canStart`).
 struct ServerView: View {
     @Environment(AppState.self) private var state
     @State private var customModel = false
