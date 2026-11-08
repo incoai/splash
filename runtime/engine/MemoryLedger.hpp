@@ -184,9 +184,11 @@ struct TakeRights final {
   // The units of certain reuse: none, the newest resume point, or that and
   // the chains queued requests restore.
   enum class CertainReuse : uint8_t { None, ResumePoint, All };
-  // The reserves kept for the work to come it may take: none, the empty
-  // extent the next request takes, or also the Index runway.
-  enum class Reserves : uint8_t { None, NextExtent, All };
+  // The reserves kept for the work to come it may take: none, or the empty
+  // extent the next request takes. No claim takes the Index runway: the
+  // pages a spill moves land there without an allocation, under critical
+  // pressure too (Cache::spillWritten).
+  enum class Reserves : uint8_t { None, NextExtent };
   // The pooled state buffers the next lane starts from: kept, taken last of
   // all (VictimKind::LaneStart), or taken first with the idle buffers.
   enum class LaneStart : uint8_t { Kept, Last, First };
@@ -225,7 +227,7 @@ struct TakeRights final {
 // lone restore takes its whole chain. Every other need keeps them: a need of
 // state buffers (a lane's start among them), which their release would only
 // make allocate again, and the model's other memory. At critical pressure
-// every claim takes them first, with every reserve. A Floor
+// every claim takes them first, and the next extent. A Floor
 // claim takes nothing (logic_error). The engine's own optional work, an
 // Optional claim of no request (the Index runway's refill with no Spill lane
 // in service, trims with no lane in service), takes no unit: its rights are

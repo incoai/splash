@@ -62,9 +62,7 @@ TakeRights takeRights(const ClaimSpec &spec, const Need &need, bool critical,
           .certainReuse = inService || hostCritical ? Reuse::All
                           : spec.cls == ClaimClass::Start || spec.cls == ClaimClass::Optional ? Reuse::ResumePoint
                                                                                               : Reuse::None,
-          .reserves = critical                                        ? Reserves::All
-                      : inService || spec.cls == ClaimClass::Start ? Reserves::NextExtent
-                                                                     : Reserves::None,
+          .reserves = critical || inService || spec.cls == ClaimClass::Start ? Reserves::NextExtent : Reserves::None,
           .rebuiltPools = !belowALane && spec.cls != ClaimClass::Growth,
           .storeAboveFloor = !belowALane && ((inService && waits) || hostCritical),
           .passCommand = inService && waits && spec.supersedes,

@@ -501,14 +501,15 @@ public:
   // returns the writes started.
   uint32_t writeThrough();
   // Between commands: moves the eligible pages whose copies landed to the
-  // index form, into free Index pages, the runway's among them, and the
-  // rest into extents of the index form it allocates; then refills the
-  // runway, an extent's worth of free Index pages, which the next spill
-  // takes without an allocation; and once it stands, the Full extents the
-  // moves left empty go as `extents` says. Denied, of the index form, when
-  // an allocation was refused: the pages it leaves Full, or the runway's;
-  // the caller makes room for them or does without.
-  [[nodiscard]] TokenAdmission spillWritten(SpilledExtents extents);
+  // index form, a runway at a time: into free Index pages, the runway's
+  // among them; then the Full extents those moves left empty go as
+  // `extents` says, their bytes told to `funds` (MemoryGovernor::fund), and
+  // the runway, an extent's worth of free Index pages, refills from them;
+  // the next spill takes it without an allocation. Denied, of the index
+  // form, when an allocation was refused: the pages it leaves Full, or the
+  // runway's; the caller makes room for them or does without.
+  [[nodiscard]] TokenAdmission spillWritten(SpilledExtents extents,
+                                            const std::function<void(uint64_t bytes)> &funds = {});
   // Pages of the form that transfers in flight will free: demotions, and
   // for Full the pages Spill requests hold that spill once their copies in
   // flight land, written through or copied ahead, as far as free Index
@@ -986,7 +987,6 @@ private:
     const RestoredChains *reused = nullptr;
     std::optional<Shortfall> refused;
     bool keepRunway = false;
-    bool keepIndexRunway = false;
     bool device = false;
     // A device need that lacks pages too: its reclaims take KV for those
     // pages in place as well as for whole extents (Cache::formsInReach,
@@ -1008,9 +1008,11 @@ private:
     [[nodiscard]] bool keepsBlock(uint64_t block) const {
       return (restored && restored->holds(block)) || (reused && reused->holds(block));
     }
-    // Whether its releases leave the form one empty extent.
+    // Whether its releases leave the form one empty extent: the runway its
+    // reserves keep, and for every walk the Index runway
+    // (TakeRights::Reserves).
     [[nodiscard]] bool keeps(kv::PageForm form) const noexcept {
-      return keepRunway || (form == kv::PageForm::Index && keepIndexRunway);
+      return keepRunway || form == kv::PageForm::Index;
     }
     // Whether its releases may take an extent of the form, which has
     // `freePages` free: only past the free pages it keeps (keptPages).
@@ -1450,10 +1452,15 @@ private:
   // Rescans every Spill request's blocks from its dense history: a holder
   // that kept some of them Full ended or began to spill.
   void rescanSpills() noexcept;
-  // spillWritten(*extents), or without `extents` only its moves into free
-  // Index pages, which allocate nothing: those past them stay Full, and so
-  // do the Full extents they empty.
-  [[nodiscard]] TokenAdmission moveLandedPages(std::optional<SpilledExtents> extents);
+  // The Spill requests' pages past their dense history and window whose
+  // copies landed (spillEligibility), each once and in page order; each
+  // request's scan mark (Request::spillScan) passes the pages that settle.
+  [[nodiscard]] std::vector<uint32_t> landedPages();
+  // spillWritten(*extents, funds), or without `extents` only its moves into
+  // free Index pages, which allocate nothing: those past them stay Full, and
+  // so do the Full extents they empty.
+  [[nodiscard]] TokenAdmission moveLandedPages(std::optional<SpilledExtents> extents,
+                                               const std::function<void(uint64_t bytes)> &funds);
   // The copy of the K/V on an Index page.
   [[nodiscard]] model::KvPageSource sourceOf(uint32_t page) const;
   // Every request that holds the page, at chain index `index`, has

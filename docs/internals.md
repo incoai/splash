@@ -1313,8 +1313,15 @@ a pass that evicts everything copies only what is left afterwards. Every extent
 a pass empties is released, except that the host's pass short of critical
 pressure, a pool's growth, optional work and startup cleanup keep one empty
 extent as the runway the next request starts from, and a pool that spills
-keeps an extent's worth of free Index pages, which spilling draws on first, so
-that a page spills at the memory wall, and a lane's conversion lands in them.
+keeps, under critical pressure too, an extent's worth of free Index pages, which
+spilling draws on first, so that a page spills at the memory wall, and a lane's
+conversion lands in them. Spilling moves pages a runway at a time: the Full
+extents each runway's moves empty leave before the runway refills, and their
+bytes pay for its Index extent, which therefore passes the host at every
+pressure level (`MemoryGovernor::fund`); a Full extent returns 17 times an
+Index one's bytes on Qwen3.8-Flash-Next. Under critical pressure every one
+leaves, the Full pages left first gathered in the fewest extents, so that each
+runway's moves pay for the next (`Engine::landedExtents`).
 `/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
 those requests and the cache hold (`pages_active`, `pages_cache`) and those
 nothing holds (`pages_free`), the extents of the pages requests hold and their
@@ -1390,7 +1397,9 @@ place meets its refusal: the governor exempts that allocation's retries from
 the margin and the pressure test (`MemoryGovernor::free`), since waiting would
 stall work in service; so does the KV a prefill command takes past its first state
 boundary, which the lane's next command would take anyway. A `Floor` claim
-passes short of critical pressure, and critical pressure refuses every claim.
+passes short of critical pressure, and critical pressure refuses every claim,
+except an allocation that the same work's releases have paid for already
+(`MemoryGovernor::fund`).
 The engine's start needs only what macOS can hand out at all beyond a reserve
 of a tenth of a small Mac's memory and 2 GiB of a larger one, counting what
 compressing the anonymous pages would free at the compressor's present ratio,
@@ -1452,7 +1461,8 @@ every source of units reads (`MemoryLedger::Order`, `Cache::walkFor`):
 | A need the host refused | in place | no | yes | no | no | as its class | as its class | no | no |
 
 Under critical pressure every claim that takes units takes the next lane's buffers
-first, with the idle ones.
+first, with the idle ones, and the empty extent the next request starts from,
+never the Index runway.
 
 The resume point is the newest ordinary state in RAM (`StateCache::resumePoint`),
 the one a conversation's next turn most likely resumes from. A claim of no
@@ -1499,9 +1509,13 @@ went unmet or took a pool unit above a floor, the pass command, a conversion
 or a unit in use (`MemoryLedger::free`). Nothing grows while a request's claim waits. The
 unit goes first into free room beyond the waiting claims' holds and the lanes'
 projected growth, then takes by the `Growth` row. A unit the cache pays for
-whole needs only no critical pressure and no host deficit; one that needs free
-room needs normal pressure, the margin and the host out of its band
-(`MemoryGovernor::growthHost`). Nothing is taken before the host admits it.
+whole needs only no critical pressure and no host deficit: it returns the host
+nothing, and a host short of memory takes those cache units itself. One that
+needs free room needs normal pressure, the margin and the host out of its band
+(`MemoryGovernor::growthHost`). Nothing is taken before the host admits it. The
+Index extent spilling refills needs neither once the Full extents its moves
+emptied have paid for it (`MemoryGovernor::fund`): they returned more than it
+takes back, and the refill is what lets the moves go on returning memory.
 
 **Placement** (`Engine::placement`, `runtime/engine/EngineMemory.cpp`). A
 start's projection is its tokens plus up to 4096 output tokens. It runs

@@ -313,6 +313,42 @@ void testAnAllocationOutsideAClaimThrows() {
           "an allocation outside a claim ran, or one inside a claim was refused");
 }
 
+// What a scope's work released (fund) pays for that scope's allocations past the host's rule, under critical
+// pressure too, as far as its bytes left go; a nested or later scope, of the same claim too, starts with none, and a
+// release outside any scope is a defect.
+void testReleasedBytesPayOnlyForTheirScope() {
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  MemoryGovernor governor(backend, 4 * kGiB, kGiB, kGiB, [] { return hostMemory(8 * kGiB); }, 0);
+  governor.setPressure(MemoryPressure::Critical);
+  static_cast<void>(governor.evaluate());
+  rejects([&] { governor.fund(4096); }, "outside a claim's scope", "memory released outside a claim was credited");
+  const metal::AllocationAdmission admission = governor.allocationAdmission();
+  const auto admits = [&](uint64_t bytes) { return static_cast<bool>(admission(bytes, [] {})); };
+  const auto hostRefuses = [&](uint64_t bytes) {
+    const metal::AllocationResult result = admission(bytes, [] {});
+    return !result && result.failure == metal::AllocationFailure::HostPressure;
+  };
+  const ClaimId claim = governor.ledger().open({.cls = ClaimClass::InService});
+  {
+    const MemoryGovernor::Scope scope(governor, claim);
+    governor.fund(3 * 4096);
+    require(admits(4096), "critical pressure refused an allocation its scope's releases paid for");
+    {
+      const MemoryGovernor::Scope nested(governor, claim);
+      require(hostRefuses(4096), "a nested scope allocated on its outer scope's releases");
+    }
+    require(hostRefuses(3 * 4096) && admits(4096),
+            "an allocation passed past what its scope's releases had left, or that refusal or a nested scope took "
+            "them");
+  }
+  {
+    const MemoryGovernor::Scope later(governor, claim);
+    require(hostRefuses(4096), "a later scope of the claim allocated on an earlier scope's releases");
+  }
+  governor.ledger().close(claim);
+}
+
 // The host telemetry reads the task's footprint and compressed bytes, not its resident size, and the host's
 // file-backed, inactive plus speculative and file cache pages, not its active ones; the snapshot carries it.
 void testHostTelemetryReadsTheTaskAndTheHost() {
@@ -352,6 +388,7 @@ int main() {
     testHostHeldBytesAreCharged();
     testHostRefusalComesBeforeTheEngineLimit();
     testAnAllocationOutsideAClaimThrows();
+    testReleasedBytesPayOnlyForTheirScope();
     testHostTelemetryReadsTheTaskAndTheHost();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;

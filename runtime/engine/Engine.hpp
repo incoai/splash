@@ -708,10 +708,11 @@ private:
   [[nodiscard]] bool laneInService() const;
   // What becomes of the Full extents the spill of pages whose copies landed
   // empties (Cache::spillWritten): all of them while a lane that converted
-  // is in service, whose conversion was for those bytes; else they leave
-  // memory but the runway while a spilling prompt still grows into it or the
-  // host holds growth back, when it could not be allocated again; otherwise
-  // all of them.
+  // is in service, whose conversion was for those bytes, or under critical
+  // pressure, where only those bytes pay for the next Index extent; else
+  // they leave memory but the runway while a spilling prompt still grows
+  // into it or the host holds growth back, when it could not be allocated
+  // again; otherwise all of them.
   [[nodiscard]] SpilledExtents landedExtents() const;
   // Between commands, on a target whose KV can live on the SSD cache: the
   // pages whose copies have landed leave memory (Cache::spillWritten) before
@@ -721,7 +722,9 @@ private:
   // memory a Spill lane in service needs (an InService claim of the
   // engine's), and with none in service an Optional one that takes only
   // what costs nothing (allocate()), which only the control pass asks: no
-  // command needs the runway then, and a refusal would run at each.
+  // command needs the runway then, and a refusal would run at each. The
+  // Full extents the moves release pay for them past the host
+  // (MemoryGovernor::fund).
   void spillLanded(bool controlPass);
   // Ends a request at its length outside a command: in Spill mode, once
   // the SSD cache can hold no more of its KV.

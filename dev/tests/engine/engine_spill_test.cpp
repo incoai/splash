@@ -1303,6 +1303,30 @@ void testSpillMovesThroughTheHostPause() {
           "a Spill prompt kept its landed pages Full under the host's pause until the engine's limit");
 }
 
+// Under critical pressure, which refuses every allocation the host's rule judges, a Spill lane's landed pages
+// still move past the Index runway: the Full extents each runway's moves empty leave and pay for the next Index
+// extent (MemoryGovernor::fund).
+void testLandedPagesSpillAtCriticalPressure() {
+  Spilling spill{4'096, true, 100'000, 0, Spilling::Extent{256}, {}, {}, true, FlashNextLanes::kPages};
+  const auto fullBytes = [&] {
+    const KvPoolSnapshot pool = spill.pool.snapshot();
+    return pool.allocatedBytes - pool.index.allocatedBytes;
+  };
+  // Three extents of pages past the dense history and the window, with no
+  // copies until the lane decodes.
+  spill.allowSpillWrites(false);
+  spill.engine.submit(Spilling::prompt(1, 1, 3 * 256 + 2, 4'096));
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the lane did not decode");
+  const uint64_t full = fullBytes();
+  spill.host.setPressure(MemoryPressure::Critical);
+  spill.allowSpillWrites(true);
+  spill.runUntil([&] { return spill.cache.spillSnapshot().spilledPages >= 3 * 256; },
+                 "under critical pressure the landed pages stayed Full once the Index runway was used");
+  require(fullBytes() + 3 * 256 * FlashNextLanes::kPages.fullBytes <= full && spill.events.failures.empty() &&
+              spill.engine.snapshot().resourceSuspensions == 0,
+          "the moves kept the Full extents they emptied, or the lane failed or yielded");
+}
+
 // A suspended Spill request returns its commitment and commits again on resume; a short quota
 // bounds the resumed output, and each attempt bounds it afresh.
 void testSpillResumeCommitsAgain() {
@@ -2928,6 +2952,7 @@ std::span<const test::TestCase> spillTests() {
        testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups},
       {"testSpilledFullExtentsLeaveOnceNoPromptGrows", testSpilledFullExtentsLeaveOnceNoPromptGrows},
       {"testSpillMovesThroughTheHostPause", testSpillMovesThroughTheHostPause},
+      {"testLandedPagesSpillAtCriticalPressure", testLandedPagesSpillAtCriticalPressure},
       {"testSpillResumeCommitsAgain", testSpillResumeCommitsAgain},
       {"testABoundAtStartAndResumeCountsOnce", testABoundAtStartAndResumeCountsOnce},
       {"testSpillResumeOnAClosedTier", testSpillResumeOnAClosedTier},

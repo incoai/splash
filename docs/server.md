@@ -831,8 +831,10 @@ what memory holds, as a dense target's is.
   rather than fail. Its first 2,048 tokens, which rows with less history read
   whole, its last 64 pages and up to two prefill groups' pages still being
   written stay whole. The memory the pages free leaves with the extents they
-  empty, all of them once every spilling request decodes, but one while a
-  spilling prompt still grows into it or the host holds growth back.
+  empty, all of them once every spilling request decodes or under macOS's
+  critical pressure, but one while a spilling prompt still grows into it or
+  the host holds growth back. That memory pays for the index pages the next
+  pages move into, so pages keep spilling under critical pressure too.
 - A decode step reads, after each attention layer selects its blocks, the
   selected blocks not in memory into one hot block cache that all requests
   share, a page's in one read from its first missed block to its last on the

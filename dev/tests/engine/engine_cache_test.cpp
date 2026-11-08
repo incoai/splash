@@ -4177,6 +4177,24 @@ void testFullShortfallReleasesEmptyIndexExtents() {
           "a Full shortfall did not release the empty Index extents past the runway first");
 }
 
+// Under critical pressure the host's pass takes the empty Full extent the next request would start from, never the
+// Index runway: a spill's moves land there without an allocation.
+void testCriticalKeepsTheIndexRunway() {
+  Spilling spill;
+  engine::MemoryLedger ledger;
+  ledger.addSource(spill.cache);
+  // As the host's pass asks (MemoryGovernor::hostPass): what it finds of
+  // all the cache holds, a Full and an Index extent, both empty.
+  const ClaimSpec host{.cls = ClaimClass::Host};
+  const uint64_t found = ledger.available(host, {.bytes = spill.storage.allocatedBytes()}, 0, true);
+  const engine::ClaimId claim = ledger.open(host);
+  const FreeResult freed = ledger.free(claim, {.bytes = found}, 0, true);
+  ledger.close(claim);
+  require(freed.nowBytes == 4 * spill.storage.bytesPerPage(kv::PageForm::Full) &&
+              !spill.pool.allocatedExtents(kv::PageForm::Full) && spill.pool.freePageCount(kv::PageForm::Index) == 4,
+          "under critical pressure the host's pass took the Index runway, or kept the empty Full extent");
+}
+
 // An Index shortfall empties only Full extents; moving Index pages frees nothing it can grow by.
 void testIndexShortfallCompactsOnlyFullExtents() {
   Spilling spill;
@@ -6852,6 +6870,7 @@ int main() {
     testSpillAtTheMemoryWall();
     testFullReclaimReachesAnIdleSpilledChain();
     testFullShortfallReleasesEmptyIndexExtents();
+    testCriticalKeepsTheIndexRunway();
     testIndexShortfallCompactsOnlyFullExtents();
     testAPageNeedOfAFormTheCacheHoldsNoneOfCountsNothing();
     testReusablePagesCountTheirForm();

@@ -716,16 +716,15 @@ Cache::Walk Cache::walkFor(const VictimQuery &query) const {
   Walk walk;
   // The walk leaves out what the claim may not take (takeRights): a device
   // or a page need's reclaims take many victims, so nothing is marked. Every
-  // walk keeps the chain a start's placement reuses (VictimQuery::kept). The
-  // Index runway kept is where landed copies spill at the memory wall
-  // (moveLandedPages) and a conversion lands.
+  // walk keeps the chain a start's placement reuses (VictimQuery::kept), and
+  // the Index runway (Walk::keeps), where landed copies spill without an
+  // allocation (moveLandedPages) and a conversion lands.
   walk.scope.upTo = rights.inUse ? ReclaimClass::InUse : ReclaimClass::Ordinary;
   walk.keepResumePoint = rights.certainReuse == Reuse::None;
   walk.restored = rights.certainReuse == Reuse::All ? nullptr : &wanted_;
   walk.reused = query.kept;
   walk.timing = rights.waitsForWrites ? ReclaimTiming::CanWait : ReclaimTiming::Immediate;
   walk.keepRunway = rights.reserves == Reserves::None;
-  walk.keepIndexRunway = rights.reserves != Reserves::All;
   walk.hostRefused = need.hostRefused;
   // A state that goes ends a unit for a need of its buffers, and of bytes,
   // which its buffers meet once they leave the model's pool.
@@ -1824,7 +1823,7 @@ bool Cache::convertToSpill(uint64_t requestId, uint32_t pages) {
   // pages the retry takes.
   rescanSpills();
   static_cast<void>(writeThrough());
-  static_cast<void>(moveLandedPages(std::nullopt));
+  static_cast<void>(moveLandedPages(std::nullopt, {}));
   return true;
 }
 
@@ -1982,11 +1981,11 @@ void Cache::rescanSpills() noexcept {
     active.spillScan = 0;
 }
 
-TokenAdmission Cache::spillWritten(SpilledExtents extents) { return moveLandedPages(extents); }
+TokenAdmission Cache::spillWritten(SpilledExtents extents, const std::function<void(uint64_t)> &funds) {
+  return moveLandedPages(extents, funds);
+}
 
-TokenAdmission Cache::moveLandedPages(std::optional<SpilledExtents> extents) {
-  if (!spill_)
-    return {};
+std::vector<uint32_t> Cache::landedPages() {
   std::vector<uint32_t> pages;
   for (auto &[_, active] : requests_) {
     if (active.mode != KvMode::Spill)
@@ -2020,46 +2019,51 @@ TokenAdmission Cache::moveLandedPages(std::optional<SpilledExtents> extents) {
   // Requests on one prefix find its pages each.
   std::sort(pages.begin(), pages.end());
   pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
-  // Free Index pages first, the runway's among them: a spill never waits
-  // for an allocation. The rest, if it may allocate, asks for extents of
-  // the index form.
-  const auto now = std::min<size_t>(pages.size(), pool_.freePageCount(kv::PageForm::Index));
-  if (!extents)
-    pages.resize(now);
-  for (const std::span<const uint32_t> part :
-       {std::span<const uint32_t>(pages).first(now), std::span<const uint32_t>(pages).subspan(now)}) {
-    if (part.empty())
-      continue;
-    const KvPageMoveResult moved = pool_.movePages(part, kv::PageForm::Index);
-    if (!moved.granted())
-      return {TokenAdmissionFailure::Denied, static_cast<uint32_t>(part.size()),
-              pool_.freePageCount(kv::PageForm::Index), moved.failure, kv::PageForm::Index};
-    followMoves(moved.moves);
-    spilled_.spillMoves += part.size();
-  }
-  if (!extents)
+  return pages;
+}
+
+TokenAdmission Cache::moveLandedPages(std::optional<SpilledExtents> extents,
+                                      const std::function<void(uint64_t)> &funds) {
+  if (!spill_)
     return {};
-  // Then the runway, an extent's free Index pages, is refilled: the next
-  // spill frees Full pages without an allocation, at the memory wall too,
-  // where a converted request's pages spill through it (pendingPages).
-  const uint32_t free = pool_.freePageCount(kv::PageForm::Index);
-  if (free < pool_.extentPages()) {
+  // Free Index pages take the landed pages first, the runway's among them,
+  // so a spill never waits for an allocation; without `extents` the rest
+  // stays Full. With them the pages move a runway at a time: the Full
+  // extents each runway's moves empty leave as `extents` says (released,
+  // the Full pages left first gather in the fewest extents), and their
+  // bytes pay for the Index extent the runway refills with next (`funds`):
+  // it so passes the host under critical pressure too, since on
+  // Qwen3.8-Flash-Next a Full extent returns 17 times an Index one's bytes.
+  // The pages that wait are found again for each runway, since gathering
+  // moves them. The runway then stands for the next spill, at the memory
+  // wall too, where a converted request's pages spill through it
+  // (pendingPages).
+  for (std::vector<uint32_t> pages = landedPages();; pages = landedPages()) {
+    const size_t count = std::min<size_t>(pages.size(), pool_.freePageCount(kv::PageForm::Index));
+    if (count) {
+      followMoves(pool_.movePages(std::span<const uint32_t>(pages).first(count), kv::PageForm::Index).moves);
+      spilled_.spillMoves += count;
+    }
+    if (!extents)
+      return {};
+    if (!pages.empty()) {
+      if (*extents == SpilledExtents::Released)
+        while (compactExtent(kv::PageForm::Full)) {
+        }
+      const uint64_t released = pool_.reclaimEmptyExtents(*extents == SpilledExtents::KeepRunway,
+                                                          std::numeric_limits<uint32_t>::max(), kv::PageForm::Full);
+      if (released && funds)
+        funds(released);
+    }
+    const bool waiting = count < pages.size();
+    const uint32_t free = pool_.freePageCount(kv::PageForm::Index);
+    if (!waiting && free >= pool_.extentPages())
+      return {};
     if (const metal::AllocationResult runway = pool_.fillRunway(kv::PageForm::Index); !runway)
-      return {TokenAdmissionFailure::Denied, pool_.extentPages() - free, free, runway.failure,
-              kv::PageForm::Index};
+      return {TokenAdmissionFailure::Denied,
+              waiting ? static_cast<uint32_t>(pages.size() - count) : pool_.extentPages() - free, free,
+              runway.failure, kv::PageForm::Index};
   }
-  // The memory the moves freed leaves with the Full extents they emptied,
-  // once the runway stands: at the wall, which refuses it, they stay, and
-  // the requests grow into their pages. Released, the Full pages left first
-  // gather in the fewest extents.
-  if (!pages.empty()) {
-    if (*extents == SpilledExtents::Released)
-      while (compactExtent(kv::PageForm::Full)) {
-      }
-    static_cast<void>(pool_.reclaimEmptyExtents(*extents == SpilledExtents::KeepRunway,
-                                                std::numeric_limits<uint32_t>::max(), kv::PageForm::Full));
-  }
-  return {};
 }
 
 uint32_t Cache::indexPages(uint64_t requestId) const { return request(requestId).indexPages; }

@@ -844,7 +844,7 @@ void testTakeRightsTable() {
         .convertLane = 0}},
       {"the host at critical pressure", rights({.cls = ClaimClass::Host}, {.bytes = kMiB}, true),
        {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = true, .certainReuse = Reuse::All,
-        .reserves = Reserves::All, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = false,
+        .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = false,
         .convertLane = 0, .laneStart = LaneStart::First}},
       {"a need the host refused in service", rights(everything, {.bytes = kMiB, .hostRefused = true, .kv = true}),
        {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::All,
@@ -860,7 +860,7 @@ void testTakeRightsTable() {
         .convertLane = 7, .laneStart = LaneStart::Last}},
       {"in service at critical pressure", rights(everything, {.bytes = kMiB}, true),
        {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
-        .reserves = Reserves::All, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = true,
+        .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = true,
         .convertLane = 7, .laneStart = LaneStart::First}},
   };
   for (const Row &row : rows)
