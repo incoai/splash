@@ -30,6 +30,7 @@ from install.models import ModelError
 
 from . import dialects, json_codec, serve_options, serve_record
 from . import runtime as engine_runtime
+from . import videos as video_input
 from .backend import (
     NativeBackend,
     NativeResult,
@@ -1316,6 +1317,11 @@ def main():
         # --max-context it cannot serve.
         served = runtime.capabilities
         check_capabilities(tokenizer, family.chat_format, served)
+        # How the model's video processor samples, from its installation.
+        try:
+            video_config = video_input.installed_config(model_root / "vision")
+        except video_input.VideoError as error:
+            raise ModelError(f"{args.model}: {error}: prepare it again") from None
         app = Frontend(
             tokenizer,
             backend,
@@ -1328,6 +1334,9 @@ def main():
             chat_format=family.chat_format,
             sampling_defaults=asdict(family.sampling),
             max_image_pixels=args.max_image_pixels,
+            max_video_pixels=args.max_video_pixels,
+            video_config=video_config,
+            video_decoder=args.binary,
             thinking_codec=thinking_codec,
             response_store=dialects.responses.ResponseStore(),
             served_model_names=args.served_model_name,

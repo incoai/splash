@@ -16,7 +16,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 12
+PROTOCOL_VERSION = 13
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -40,7 +40,10 @@ MAX_PROMPT_TOKENS = 1 << 20
 MAX_LOGICAL_OUTPUT_TOKENS = 1 << 20
 MAX_TOKEN_BATCH = 4096
 MAX_SIMULATION_TOKENS = 32
-MAX_IMAGE_SPANS = 64
+# Images and video temporal patches together: a 768-frame video fills 384.
+MAX_IMAGE_SPANS = 1024
+# Images (or rendered PDF pages) one request may carry.
+MAX_REQUEST_IMAGES = 64
 MAX_MASK_WORDS = 1 << 20
 
 _MAGIC = b"SPLH"
@@ -48,7 +51,7 @@ _HEADER = struct.Struct("<4sHHQ")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBQQ")
 _REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIffffQIIIQQIII")
-_IMAGE_SPAN = struct.Struct("<IIIIQQ")
+_IMAGE_SPAN = struct.Struct("<IIIIQQII")
 # Cancel and Stop: one request id.
 _REQUEST_END = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
@@ -73,7 +76,7 @@ assert (
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
 assert _REQUEST.size == 114
-assert _IMAGE_SPAN.size == 32
+assert _IMAGE_SPAN.size == 40
 assert _READY.size == 21
 assert _START.size == 16
 assert _DONE.size == 62
@@ -237,6 +240,9 @@ class ImageSpan:
     """One image in the prompt: its placeholder token run, the patch grid of
     the resized pixels, and a 128-bit digest of that content. Placeholder
     token ids are identical for every image, so cache identity keys on spans.
+
+    A video contributes one span per temporal patch, with ``frames`` 2: its
+    pixels hold the patch's two consecutive frames, one after the other.
     """
 
     offset: int
@@ -245,10 +251,11 @@ class ImageSpan:
     grid_width: int
     digest_lo: int
     digest_hi: int
+    frames: int = 1
 
     @property
     def pixel_bytes(self) -> int:
-        return self.grid_height * 16 * self.grid_width * 16 * 3
+        return self.grid_height * 16 * self.grid_width * 16 * 3 * self.frames
 
 
 @dataclass(slots=True, frozen=True)
@@ -727,6 +734,8 @@ def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
         grid_width = _u32(span.grid_width, "image grid width")
         _u64(span.digest_lo, "image digest")
         _u64(span.digest_hi, "image digest")
+        if span.frames not in (1, 2):
+            raise ValueError("image span frames must be 1 (image) or 2 (video)")
         if (
             grid_height < 2
             or grid_width < 2
@@ -952,6 +961,8 @@ def _request_frame(request: RequestFrame) -> bytearray:
             span.grid_width,
             span.digest_lo,
             span.digest_hi,
+            span.frames,
+            0,
         )
     # A bytearray copies a slice assignment's source first; its view does not.
     with memoryview(frame) as view:

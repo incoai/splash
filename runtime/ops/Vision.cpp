@@ -188,7 +188,7 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
 
   const uint32_t padded = roundUp(tokens, kKeyTile);
   const uint32_t merged = grid.mergedTokens();
-  const VisionGridParams gridParams{grid.height, grid.width};
+  const VisionGridParams gridParams{grid.height, grid.width, grid.frames};
   const VisionQkvParams qkvParams{tokens, padded};
   const VisionAttentionParams attentionParams{
       tokens, padded, 1.0F / std::sqrt(static_cast<float>(layout.headDimension))};

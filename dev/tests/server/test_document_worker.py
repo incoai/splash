@@ -17,7 +17,7 @@ from dev.tests.server_fixtures import (
     pdf_bytes,
     render_pdf,
 )
-from server import document_worker, documents
+from server import document_worker, documents, workers
 from server.errors import APIError
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "documents"
@@ -103,11 +103,18 @@ def run(arguments, payload=b"", sandboxed=True):
             if sandboxed
             else mock.patch.object(document_worker, "_sandbox", return_value=[])
         ):
-            process = document_worker._start(arguments, source, output)
+            process = subprocess.Popen(
+                document_worker._command(arguments),
+                stdin=source,
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                cwd=document_worker.ROOT,
+                env={},
+            )
         try:
             process.wait(timeout=60)
         finally:
-            document_worker._stop(process)
+            workers._stop(process)
         output.seek(0)
         return process.returncode, output.read()
 
@@ -139,15 +146,15 @@ class DocumentWorkerTests(unittest.TestCase):
                 [sys.executable, "-c", "import time; time.sleep(10)"], **kwargs
             )
             children.append(process)
-            self.addCleanup(document_worker._stop, process)
+            self.addCleanup(workers._stop, process)
             return process
 
-        return mock.patch.object(document_worker.subprocess, "Popen", spawn)
+        return mock.patch.object(workers.subprocess, "Popen", spawn)
 
     def assert_released(self, children):
         self.assertEqual(len(children), 1)
         self.assertIsNotNone(children[0].poll())
-        self.assertFalse(document_worker._workers)
+        self.assertFalse(workers._workers)
         self.assertFalse(documents._cache)
         self.assertFalse(documents._render_lock.locked())
         self.assertIn("ALPHA 42", render_pdf()[0]["text"])
@@ -182,7 +189,7 @@ class DocumentWorkerTests(unittest.TestCase):
         with (
             self.sleeping_worker(children),
             mock.patch.object(
-                document_worker,
+                workers,
                 "_memory_bytes",
                 return_value=document_worker.MAX_MEMORY_BYTES + 1,
             ),
@@ -195,7 +202,7 @@ class DocumentWorkerTests(unittest.TestCase):
         children = []
         with (
             self.sleeping_worker(children),
-            mock.patch.object(document_worker, "_memory_bytes", side_effect=OSError),
+            mock.patch.object(workers, "_memory_bytes", side_effect=OSError),
         ):
             with self.assertRaises(APIError) as caught:
                 render_pdf()
@@ -209,25 +216,23 @@ class DocumentWorkerTests(unittest.TestCase):
         def spawn(command, **kwargs):
             return start([sys.executable, "-c", "print('not JSON')"], **kwargs)
 
-        with mock.patch.object(document_worker.subprocess, "Popen", spawn):
+        with mock.patch.object(workers.subprocess, "Popen", spawn):
             with self.assertRaises(APIError) as caught:
                 render_pdf()
         self.assertEqual(
             (caught.exception.status, caught.exception.code),
             (500, "document_worker_failed"),
         )
-        self.assertFalse(document_worker._workers)
+        self.assertFalse(workers._workers)
         self.assertFalse(documents._cache)
 
     def test_spawn_failure_is_transient_and_leaves_no_worker(self):
-        with mock.patch.object(
-            document_worker.subprocess, "Popen", side_effect=OSError
-        ):
+        with mock.patch.object(workers.subprocess, "Popen", side_effect=OSError):
             with self.assertRaises(APIError) as caught:
                 render_pdf()
         self.assertEqual(caught.exception.status, 503)
         self.assertEqual(caught.exception.code, "document_unavailable")
-        self.assertFalse(document_worker._workers)
+        self.assertFalse(workers._workers)
         self.assertFalse(documents._cache)
 
 
@@ -262,7 +267,7 @@ class SandboxTests(unittest.TestCase):
             other = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(60)"], env=OTHERS
             )
-            self.addCleanup(document_worker._stop, other)
+            self.addCleanup(workers._stop, other)
             private = Path(folder, "private")
             private.write_text("private")
             arguments = [
@@ -417,7 +422,7 @@ class SandboxTests(unittest.TestCase):
             (caught.exception.status, caught.exception.code),
             (503, "document_unavailable"),
         )
-        self.assertFalse(document_worker._workers)
+        self.assertFalse(workers._workers)
 
 
 if __name__ == "__main__":

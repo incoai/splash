@@ -52,6 +52,14 @@ def image_part(url):
     return {"type": "image_url", "image_url": {"url": url}}
 
 
+def video_part(url):
+    """The canonical video part the chat template recognizes ({"type":
+    "video"}); OpenAI-style requests send it as a video_url part."""
+    if not isinstance(url, str):
+        raise APIError(400, "invalid video content part")
+    return {"type": "video", "video": {"url": url}}
+
+
 def media_content(parts):
     """Canonical parts, or their text when they carry no image or file."""
     if any(part["type"] != "text" for part in parts):
@@ -67,7 +75,8 @@ def _require_vision(modality, vision):
 
 def _user_content(content, vision):
     """Text for plain user content; a canonical parts list when it carries
-    images or PDFs, so the chat template places each where the author put it.
+    images, PDFs or videos, so the chat template places each where the author
+    put it.
 
     The one place media is accepted or rejected: every API shape converts its
     image and PDF parts to image_url and file parts that reach this point
@@ -91,7 +100,12 @@ def _user_content(content, vision):
             _require_vision("PDF", vision)
             data = checked_file(part.get("file"))
             parts.append({"type": "file", "file": {"file_data": data}})
-        elif kind in ("video", "video_url", "input_audio"):
+        elif kind == "video_url":
+            _require_vision("video", vision)
+            video_url = part.get("video_url")
+            url = video_url.get("url") if isinstance(video_url, dict) else video_url
+            parts.append(video_part(url))
+        elif kind in ("video", "input_audio"):
             raise APIError(400, f"{kind} content is not supported")
         else:
             raise APIError(400, "unsupported message content part")

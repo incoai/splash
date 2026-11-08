@@ -180,9 +180,9 @@ class DocumentTests(unittest.TestCase):
         self.assertIn("ALPHA 42", render_pdf()[0]["text"])
 
     def test_small_pdf_uses_native_page_limit_instead_of_twenty_pages(self):
-        from server.protocol import MAX_IMAGE_SPANS
+        from server.protocol import MAX_REQUEST_IMAGES
 
-        self.assertEqual(documents.MAX_PAGES, MAX_IMAGE_SPANS)
+        self.assertEqual(documents.MAX_PAGES, MAX_REQUEST_IMAGES)
         for pages in (21, documents.MAX_PAGES):
             with self.subTest(pages=pages):
                 parts = render_pdf(pdf_bytes(pages=pages, width=64, height=64))

@@ -41,10 +41,11 @@ inline uint2 vision_patch_position(uint token, uint grid_width) {
                  (block % blocks_w) * kVisionMerge + inner % kVisionMerge);
 }
 
-// Patchify: uint8 RGB pixels (H, W, 3) -> bf16 patch rows (tokens, 1536) in
-// block-major token order with per-patch feature order (channel, temporal,
-// row, col). Normalization is mean 0.5 / std 0.5, and the single frame is
-// duplicated across the temporal patch dimension.
+// Patchify: uint8 RGB pixels (frames, H, W, 3) -> bf16 patch rows
+// (tokens, 1536) in block-major token order with per-patch feature order
+// (channel, temporal, row, col). Normalization is mean 0.5 / std 0.5. An
+// image's single frame is duplicated across the temporal patch dimension; a
+// video temporal patch supplies its two consecutive frames.
 
 kernel void vision_patchify(
     device const uchar *pixels [[buffer(0)]],
@@ -55,14 +56,20 @@ kernel void vision_patchify(
 {
     uint2 position = vision_patch_position(token, params.grid_width);
     uint image_width = params.grid_width * kVisionPatch;
+    ulong frame_bytes =
+        ulong(params.grid_height * kVisionPatch) * image_width * 3;
     device bfloat *row = patches + ulong(token) * kVisionPatchDim;
     for (uint feature = thread_index; feature < kVisionPatchDim;
          feature += 256) {
         uint channel = feature / (2 * kVisionPatch * kVisionPatch);
+        uint frame = params.frames > 1
+                         ? feature / (kVisionPatch * kVisionPatch) % 2
+                         : 0;
         uint within = feature % (kVisionPatch * kVisionPatch);
         uint patch_row = within / kVisionPatch;
         uint patch_col = within % kVisionPatch;
-        ulong pixel = (ulong(position.x * kVisionPatch + patch_row) *
+        ulong pixel = frame * frame_bytes +
+                      (ulong(position.x * kVisionPatch + patch_row) *
                            image_width +
                        position.y * kVisionPatch + patch_col) * 3 + channel;
         row[feature] = bfloat(float(pixels[pixel]) * (1.0f / 127.5f) - 1.0f);
