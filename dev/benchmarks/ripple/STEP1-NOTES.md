@@ -257,3 +257,26 @@ withPrefillArena hands its caller the whole prefill buffer set (the ANE
 FFN's timing and preparation take it apart as before), which the harness
 uses to reach the arena's RoPE tables, hidden ring and attention scratch
 without the Runtime.
+
+## The model runtime serves the real model
+
+The real model runs through the model::Runtime the engine serves through
+(ripple-serve): the request's tokens and page table prefill in the runtime's
+chunks, and its decode cycles run the draft's proposal and the target's
+verification end to end. Measured on this machine (M5 Max, 128 GB):
+
+- a 32-token greedy continuation: 44.8 tok/s of decode, the draft proposed
+  42 tokens of which 25 were accepted (59.5%);
+- a 128-token reasoning prompt: 71.4 tok/s, 109 of 132 accepted (82.6%);
+- a chat-templated prompt at temperature 0.7: 78.6 tok/s, 111 of 116
+  accepted (95.7%);
+- a short reasoning question: 28.7 tok/s, 13 of 56 accepted (23.2%).
+
+Against the single-token weight-read ceiling of about 19 tok/s (40.4 GB at
+800 GB/s), the draft's accepted rows put the served rate at 1.5-4x the
+ceiling, and the acceptance varies with the task as a draft's does.
+
+The model's own format serves: at 'What is 2+2?' it opens its reasoning
+block, reasons briefly, closes it and answers 4 - the tags it writes are
+the text ones the server's detection has to read (chat_format's gap, which
+still gates families.py).

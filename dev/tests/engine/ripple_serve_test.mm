@@ -117,7 +117,12 @@ int main(int argc, char **argv) {
     request.id = 1;
     request.prompt = tokens;
     request.maxNewTokens = budget;
-    request.sampling = {};
+    // Sampling parameters from the environment, so a served prompt can
+    // sample: SPLASH_SERVE_TEMPERATURE and SPLASH_SERVE_SEED.
+    if (const char *temperature = getenv("SPLASH_SERVE_TEMPERATURE"))
+      request.sampling.temperature = std::strtof(temperature, nullptr);
+    if (const char *seed = getenv("SPLASH_SERVE_SEED"))
+      request.sampling.seed = std::strtoull(seed, nullptr, 10);
         runtime.beginColdRequest(request.modelView(), 0);
 
     const std::vector<uint32_t> pageTable(pages);
