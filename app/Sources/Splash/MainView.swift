@@ -143,12 +143,13 @@ struct Segments<Value: Hashable>: View {
     }
 }
 
+/// The width of the Chat's sidebar, its divider's point not included.
+let sidebarWidth: CGFloat = 280
+
 /// The Chat's sidebar beside its content, a column of the window's height, up through the toolbar,
 /// that slides away as the toolbar's button and ⌘B hide it. Hidden, it keeps its place in the
 /// window at no width, with what was typed in it and how far it scrolled; the keyboard leaves it.
 struct WithSidebar<Side: View, Content: View>: View {
-    static var width: CGFloat { 280 }
-
     @Environment(AppState.self) private var state
     @FocusState private var focused: Bool
     @ViewBuilder let side: Side
@@ -158,7 +159,7 @@ struct WithSidebar<Side: View, Content: View>: View {
         let shown = state.showsSidebar
         HStack(spacing: 0) {
             HStack(spacing: 0) {
-                side.frame(width: Self.width)
+                side.frame(width: sidebarWidth)
                 // Up through the toolbar, as far as the sidebar's background goes.
                 Divider().ignoresSafeArea(edges: .top)
             }

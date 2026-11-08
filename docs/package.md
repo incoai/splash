@@ -111,8 +111,8 @@ of the server's log, folded. Its chat is its own, not the chat page: it streams
 `/v1/chat/completions` and keeps each conversation as a JSON file in
 `~/Library/Application Support/Splash/Chats`, so a conversation outlives a
 switch of models. The list puts the pinned chats first, then the others by day;
-a chat's menu, at its row's end, pins, renames and deletes it, and its Select
-picks chats, or all of them, to delete at once.
+a chat's menu, at its row's end or its title in the toolbar, pins, renames and
+deletes it, and its Select picks chats, or all of them, to delete at once.
 The window's drawer, ⌘J or the toolbar's terminal button,
 holds terminals, each the user's login shell in the home folder, through
 SwiftTerm, and the server's and the downloads' logs as they are written.
