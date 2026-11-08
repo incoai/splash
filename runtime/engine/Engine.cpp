@@ -969,7 +969,7 @@ bool Engine::admit(Request &active, double now) {
     // not get may fail it.
     if (state.admission.failure == StateFailure::MemoryPressure &&
         judge(state.denial, active.request.id) == Verdict::Fail) {
-      settle(active, capacityExhausted("request state",
+      settle(active, capacityExhausted(active, "request state",
                                        state.admission.allocationFailure));
       return true;
     }
@@ -1033,7 +1033,7 @@ bool Engine::admit(Request &active, double now) {
     vacateLane(active, resuming);
     const Verdict verdict = judge(kv.denial, requestId);
     if (verdict == Verdict::Fail && !restoring) {
-      settle(active, capacityExhausted("KV target", kv.admission.allocationFailure,
+      settle(active, capacityExhausted(active, "KV target", kv.admission.allocationFailure,
                                        pageShortfall(kv.admission)));
       return true;
     }
@@ -2035,20 +2035,33 @@ Engine::LaneEnd Engine::deadlineEnd() {
   return {LaneOutcome::DeadlineExceeded, std::string(kDeadlineExceededMessage)};
 }
 
-Engine::LaneEnd Engine::capacityExhausted(std::string_view what,
+Engine::LaneEnd Engine::capacityExhausted(const Request &active,
+                                          std::string_view what,
                                           metal::AllocationFailure failure,
-                                          std::string_view detail) {
-  std::string message = "could not allocate " + std::string(what) + ": " +
+                                          std::string_view detail) const {
+  const uint64_t id = active.request.id;
+  const Phase phase = scheduler_.phase(id);
+  const char *const when = phase == Phase::Prefill                                   ? "in prefill"
+                           : phase == Phase::Decode || phase == Phase::WaitingMask ? "in decode"
+                           : scheduler_.suspended(id)                              ? "at its resume"
+                                                                                    : "at its start";
+  std::string message = "could not allocate " + std::string(what) + " for a " +
+                        (active.kvMode == KvMode::Spill ? "Spill" : "Resident") + " lane of " +
+                        std::to_string(active.exactTokens.size()) + " tokens " + when + ": " +
                         metal::allocationFailureName(failure);
   if (!detail.empty())
     message += " (" + std::string(detail) + ")";
-  // A lone lane judge failed: only other limits fit it. --max-memory only
-  // lowers this Mac's budget (EngineMemoryPolicy::hardBudgetBytes), so a
-  // larger one helps only where one lowered it.
-  message += "; the request does not fit in the memory this server may use, even after "
-             "every cached prefix was evicted and any store of streamed experts shrank to its "
-             "floor: restart the server with a smaller --max-context, or with a larger "
-             "--max-memory where one lowered it";
+  // A lone lane judge failed: only other limits fit it, or less Metal
+  // memory outside the server's buffers, which the limit charges past the
+  // runtime reserves (17 MB of it on a 64 GB M5 Pro serving Flash-Next).
+  // --max-memory only lowers this Mac's budget
+  // (EngineMemoryPolicy::hardBudgetBytes), so a larger one helps only where
+  // one lowered it.
+  message += "; beside device_untracked_bytes=" + std::to_string(governor().untrackedBytes()) +
+             " of Metal memory outside the server's buffers, the request does not fit in the "
+             "memory this server may use, even after every cached prefix was evicted and any "
+             "store of streamed experts shrank to its floor: restart the server with a smaller "
+             "--max-context, or with a larger --max-memory where one lowered it";
   return {LaneOutcome::CapacityExhausted, std::move(message)};
 }
 

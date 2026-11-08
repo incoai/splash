@@ -214,6 +214,11 @@ public:
   // snapshot(), with the host's band moved to its sample, as a
   // reservation's and the control pass's move it.
   MemoryGovernorSnapshot evaluate() noexcept;
+  // Metal memory outside the backend's buffers (pipelines, driver
+  // allocations, whatever else in the process allocates) as the device last
+  // counted it: the quantity memory_audit.device_untracked_bytes measures at
+  // startup, read now. The limit charges it past the untracked reserve.
+  [[nodiscard]] uint64_t untrackedBytes() const noexcept;
 
   // The accounts, claims and victim sources the governor's rule works on.
   [[nodiscard]] MemoryLedger &ledger() noexcept { return ledger_; }

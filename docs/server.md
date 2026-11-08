@@ -325,6 +325,16 @@ aliases. Clients can impose a smaller limit. This is a capacity limit, not a
 guarantee of a fast first token for a long uncached prompt. If the model cannot
 fit, startup prints a memory budget breakdown and stops.
 
+A request that cannot fit even alone, after every cached prefix was evicted
+and the expert store shrank to its floor, fails with `capacity_exhausted`. Its
+message names what it could not allocate, its lane's KV mode (`Resident`, its
+KV in memory, or `Spill`, its KV partly [on the SSD](#kv-on-the-ssd)), its
+phase and its tokens, and the Metal memory outside the server's buffers then
+(`device_untracked_bytes`, as `/status` reports it under `memory_audit` at
+startup: 17 MB on a 64 GB M5 Pro serving Flash-Next), which the budget charges
+past the runtime reserves. It says the SSD cache took no more of the request's
+KV only for a `Spill` lane, the one whose KV goes there.
+
 ### PLE table streaming
 
 Qwen3.8-Flash-Next's PLE n-gram table (`per_layer_token_embd.weight`, 320M rows

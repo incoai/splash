@@ -1907,9 +1907,11 @@ flight; the request's own deadline, its `timeout` or `--request-timeout`,
 applies throughout.
 Readiness does not guarantee that a request-sized allocation fits. A request
 that cannot fit even alone, after every cached prefix was evicted and the expert
-store shrank to its floor, fails with 400 `capacity_exhausted`, naming a smaller
-`--max-context`, or a larger `--max-memory` where one lowered the budget;
-retrying it fails the same way.
+store shrank to its floor, fails with 400 `capacity_exhausted`
+(`Engine::capacityExhausted`), naming its lane's mode, phase and tokens, the
+Metal memory outside the backend's buffers (`MemoryGovernor::untrackedBytes`),
+the SSD cache only for a Spill lane, and a smaller `--max-context`, or a larger
+`--max-memory` where one lowered the budget; retrying it fails the same way.
 
 ## Sliding windows
 

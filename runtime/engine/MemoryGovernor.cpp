@@ -285,6 +285,11 @@ MemoryGovernorSnapshot MemoryGovernor::evaluate() noexcept {
   return snapshot(host, hostRule_);
 }
 
+uint64_t MemoryGovernor::untrackedBytes() const noexcept {
+  const metal::MetalMemoryStats memory = backend_.memoryStats();
+  return saturatingSubtract(memory.deviceCurrentAllocatedBytes, memory.allocatedBytes);
+}
+
 MemoryGovernorSnapshot
 MemoryGovernor::snapshot(const std::optional<HostMemory> &hostMemory,
                          const HostRule &rule) const noexcept {

@@ -574,16 +574,19 @@ Engine::Prepared Engine::refuse(std::span<const Denied> denied, const PlanContex
     break;
   }
   // Alone with nothing on its way back. A Spill lane that decodes ends at
-  // its length once the SSD cache can hold no more of its KV.
+  // its length once the SSD cache can hold no more of its KV; any other
+  // lane fails, naming the SSD cache only for a Spill lane, whose KV alone
+  // goes there.
   Request &lone = request(victim.requestId);
   if (!victim.kv)
-    settle(lone, capacityExhausted(victim.memory, victim.denial.allocationFailure));
+    settle(lone, capacityExhausted(lone, victim.memory, victim.denial.allocationFailure));
   else if (lone.kvMode == KvMode::Spill && !plan.prefill)
     endAtLength(lone);
   else
-    settle(lone, capacityExhausted("KV target", victim.denial.allocationFailure,
-                                   pageShortfall(*victim.kv) +
-                                       (spill ? "; the SSD cache took no more of its KV" : "")));
+    settle(lone, capacityExhausted(lone, "KV target", victim.denial.allocationFailure,
+                                   pageShortfall(*victim.kv) + (lone.kvMode == KvMode::Spill
+                                                                    ? "; the SSD cache took no more of its KV"
+                                                                    : "")));
   return Prepared::Yielded;
 }
 

@@ -129,7 +129,8 @@ void testSpillCommitmentCoversTheChainWithoutCopies() {
 }
 
 // A Resident lane at the wall converts where the quota holds its whole history, waits for its
-// copies and grows into the freed pages; a quota short of the history refuses it, and it fails.
+// copies and grows into the freed pages; a quota short of the history refuses it, and it fails,
+// naming its lane Resident in decode: none of its KV went to the SSD cache.
 void testConversionCommitsTheHistoryWithoutCopies() {
   for (const uint32_t slots : {5U, 8U}) {
     Spilling spill(slots, false);
@@ -142,10 +143,13 @@ void testConversionCommitsTheHistoryWithoutCopies() {
     const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
     if (slots == 5) {
       require(counts.converted == 0 && spill.tier.writes.empty() &&
-                  spill.events.failures == std::vector<std::string>{"capacity_exhausted"} &&
-                  spill.events.failureDetails.front().first.find("SSD cache") !=
-                      std::string::npos,
+                  spill.events.failures == std::vector<std::string>{"capacity_exhausted"},
               "a conversion the quota could not hold with the history went ahead");
+      const std::string &message = spill.events.failureDetails.front().first;
+      require(message.find(" for a Resident lane of ") != std::string::npos &&
+                  message.find(" tokens in decode: ") != std::string::npos &&
+                  message.find("SSD cache") == std::string::npos,
+              "the lane the quota refused did not fail naming its mode and phase alone: " + message);
     } else {
       require(counts.converted == 1 && counts.resident == 1 &&
                   spill.events.completedCount == 1 && spill.events.usage.at(1).second == 40 &&
@@ -404,7 +408,8 @@ void testASharedPrefixCountsForNoConversion() {
 }
 
 // A 32K lane, which frees less than the hot block floor, and a prefilling lane never convert;
-// alone at the wall each fails as on a target that cannot spill.
+// alone at the wall each fails as on a target that cannot spill, naming its lane Resident in its
+// phase and not the SSD cache, which holds none of its KV.
 void testAShortOrPrefillingLaneDoesNotConvert() {
   for (const bool prefilling : {true, false}) {
     FlashNextLanes lanes;
@@ -429,7 +434,38 @@ void testAShortOrPrefillingLaneDoesNotConvert() {
             std::string("a ") + (prefilling ? "prefilling" : "short") + " lane converted to Spill");
     require(spill.events.failures == std::vector<std::string>{"capacity_exhausted"},
             "the lone lane did not fail at the wall");
+    const std::string &message = spill.events.failureDetails.front().first;
+    require(message.find(" for a Resident lane of ") != std::string::npos &&
+                message.find(prefilling ? " tokens in prefill: " : " tokens in decode: ") != std::string::npos &&
+                message.find("SSD cache") == std::string::npos,
+            "the lone lane's failure did not name its mode and phase alone: " + message);
   }
+}
+
+// A lone Resident prefill at the engine's limit, Metal memory outside the engine's buffers taking
+// the room its KV would grow into, fails naming its lane's mode, phase and tokens and those bytes,
+// and not the SSD cache, which holds none of its KV.
+void testALoneResidentWallNamesItsModeAndPhase() {
+  const test::GovernorLimits limits;
+  Spilling spill{16'384, false, 0, 200'000, Spilling::Extent{256}, {}, limits, true, FlashNextLanes::kPages};
+  // A 64K prompt that starts Resident, as while the SSD cache takes no writes.
+  spill.tier.writableFile = false;
+  spill.engine.submit(Spilling::prompt(1, 1, 2'046, 200));
+  spill.runUntil([&] { return spill.model.prefillChunks[1] >= 1; }, "the prompt did not start");
+  spill.tier.writableFile = true;
+  // Memory outside the engine's buffers takes the room the limit leaves.
+  const uint64_t untracked = limits.limitBytes - std::min(limits.limitBytes, spill.host.memory.total());
+  spill.host.memory.holdUntracked(untracked);
+  spill.runUntilIdle();
+  require(spill.events.failures == std::vector<std::string>{"capacity_exhausted"},
+          "the lone prefill did not fail at the limit");
+  const std::string &message = spill.events.failureDetails.front().first;
+  require(message.find(" for a Resident lane of 65473 tokens in prefill: ") != std::string::npos &&
+              message.find("; beside device_untracked_bytes=" + std::to_string(untracked) + " of Metal memory") !=
+                  std::string::npos &&
+              message.find("SSD cache") == std::string::npos,
+          "the lone prefill's failure did not name its lane and the memory outside the engine's buffers alone: " +
+              message);
 }
 
 // A lane's growth converts no other lane: a short lane refused at the wall leaves a 64K neighbour
@@ -2170,7 +2206,7 @@ void testAConversionLeavesNoLaneWithoutItsFloor() {
 }
 
 // A lone Spill lane the tier takes no more pages of: decoding, it ends with Length at its bound;
-// prefilling, it fails naming the SSD cache.
+// prefilling, it fails naming its lane Spill in prefill and the SSD cache.
 void testLoneSpillLaneEndsAtTheWall() {
   for (const bool decoding : {true, false}) {
     Spilling spill(64);
@@ -2188,10 +2224,12 @@ void testLoneSpillLaneEndsAtTheWall() {
                   spill.events.boundedIds == std::vector<uint64_t>{1},
               "a lone Spill lane at the wall did not end with Length at its bound");
     } else {
-      require(spill.events.failures == std::vector<std::string>{"capacity_exhausted"} &&
-                  spill.events.failureDetails.front().first.find("SSD cache") !=
-                      std::string::npos,
-              "a lone Spill prefill at the wall did not fail naming the SSD cache");
+      require(spill.events.failures == std::vector<std::string>{"capacity_exhausted"},
+              "a lone Spill prefill at the wall did not fail");
+      const std::string &message = spill.events.failureDetails.front().first;
+      require(message.find(" for a Spill lane of 321 tokens in prefill: ") != std::string::npos &&
+                  message.find("; the SSD cache took no more of its KV") != std::string::npos,
+              "a lone Spill prefill at the wall did not fail naming its lane and the SSD cache: " + message);
     }
     require(spill.committedSlots() == 0, "the lane kept its commitment");
   }
@@ -2729,6 +2767,7 @@ std::span<const test::TestCase> spillTests() {
       {"testALongLaneConvertsItselfBesideAnother", testALongLaneConvertsItselfBesideAnother},
       {"testASharedPrefixCountsForNoConversion", testASharedPrefixCountsForNoConversion},
       {"testAShortOrPrefillingLaneDoesNotConvert", testAShortOrPrefillingLaneDoesNotConvert},
+      {"testALoneResidentWallNamesItsModeAndPhase", testALoneResidentWallNamesItsModeAndPhase},
       {"testALanesGrowthConvertsNoOtherLane", testALanesGrowthConvertsNoOtherLane},
       {"testLaneDemandCountsTheHotFloorALaneWaitsFor", testLaneDemandCountsTheHotFloorALaneWaitsFor},
       {"testAStartRefusedMemoryCountsNoConversion", testAStartRefusedMemoryCountsNoConversion},
