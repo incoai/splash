@@ -56,6 +56,20 @@ private struct ChatList: View {
                 || conversation.messages.contains { $0.text.localizedStandardContains(query) }
         }
         VStack(spacing: 0) {
+            // A new chat, at the top of the chats it joins, its icon in line with the search's.
+            Button {
+                chats.newChat()
+                state.draft.focus()
+            } label: {
+                Label("New Chat", systemImage: "plus")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(HoverStyle(padding: EdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8)))
+            .help("New Chat (⌘N)")
+            .padding(.horizontal, 10)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                 TextField("Search", text: $query, prompt: Text("Search"))
@@ -65,7 +79,6 @@ private struct ChatList: View {
             .padding(.vertical, 6)
             .background(.quaternary.opacity(0.6), in: .rect(cornerRadius: 7))
             .padding(.horizontal, 10)
-            .padding(.top, 10)
             .padding(.bottom, 4)
             if let picked {
                 picking(picked, shown: shown)

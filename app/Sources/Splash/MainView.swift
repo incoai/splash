@@ -30,21 +30,9 @@ struct MainView: View {
                     ToolbarItem(placement: .navigation) { SectionSwitch() }
                         .sharedBackgroundVisibility(.hidden)
                 }
-                // At the toolbar's end, clear of the sidebar: what the Chat makes, then the Server,
-                // last in every part, where an item that came and went with the part would leave it
-                // in place.
+                // At the toolbar's end, clear of the sidebar: the terminal's button, then the
+                // Server's, last in every part.
                 ToolbarSpacer(.flexible)
-                if state.available && state.section == .chat {
-                    ToolbarItem {
-                        Button {
-                            state.chats.newChat()
-                            state.draft.focus()
-                        } label: {
-                            Label("New Chat", systemImage: "square.and.pencil")
-                        }
-                        .help("New Chat (⌘N)")
-                    }
-                }
                 if state.available {
                     ToolbarItem {
                         Button { state.toggleDrawer() } label: {
