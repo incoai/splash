@@ -1147,6 +1147,83 @@ struct ChatTests {
         #expect(ChatStore(folder: folder).conversations.first?.pinned == nil)
     }
 
+    /// A title is the first line of the model's reply that holds any, without a Title: label,
+    /// quotes, Markdown's marks or a closing stop, in at most 80 characters; a reply with none
+    /// gives no title.
+    @Test func aTitleIsTheReplysFirstLineTidied() {
+        #expect(ChatClient.title(in: "Planning a Lisbon Trip") == "Planning a Lisbon Trip")
+        #expect(ChatClient.title(in: "Title: \"Swift Concurrency Basics.\"") == "Swift Concurrency Basics")
+        #expect(ChatClient.title(in: "**KV Cache Paging**\nIt covers…") == "KV Cache Paging")
+        #expect(ChatClient.title(in: "\n  “法语学习计划。”  ") == "法语学习计划")
+        #expect(ChatClient.title(in: "What Is Speculative Decoding?") == "What Is Speculative Decoding?")
+        #expect(ChatClient.title(in: "## Learning C#") == "Learning C#")
+        #expect(ChatClient.title(in: "**Title:** Trip Plans") == "Trip Plans")
+        #expect(ChatClient.title(in: "# Title: Trip Plans") == "Trip Plans")
+        #expect(ChatClient.title(in: "**Trip Plans**.") == "Trip Plans")
+        #expect(ChatClient.title(in: "**\nTrip Plans") == "Trip Plans")
+        #expect(ChatClient.title(in: String(repeating: "a", count: 100))?.count == 80)
+        #expect(ChatClient.title(in: " \n ") == nil)
+        #expect(ChatClient.title(in: "\"\"") == nil)
+    }
+
+    /// A title is asked of the start of the first exchange, in the background, without thinking, in a
+    /// few tokens and not streamed.
+    @Test func aTitleIsAskedOfTheFirstExchangeWithoutThinking() throws {
+        let body = try JSONSerialization.jsonObject(with: ChatClient.titleBody(question: "Hi", answer: String(repeating: "x", count: 3000))) as! [String: Any]
+        #expect(body["reasoning_effort"] as? String == "none" && body["thinking_token_budget"] as? Int == 0)
+        #expect(body["priority"] as? String == "background")
+        #expect(body["max_tokens"] as? Int == 32)
+        #expect(body["stream"] == nil)
+        let content = try #require(((body["messages"] as? [[String: Any]])?.first?["content"]) as? String)
+        #expect(content.contains("User: Hi\n\nAssistant: " + String(repeating: "x", count: 1000)) && !content.contains(String(repeating: "x", count: 1001)))
+    }
+
+    /// Its first exchange answered, a chat takes the title the model sums it up in, tidied; until
+    /// then it has its first line.
+    @MainActor @Test func aChatTakesTheTitleTheModelSumsItUpIn() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let server = Process()
+        server.executableURL = URL(filePath: "/usr/bin/python3")
+        server.arguments = [try #require(Bundle.module.path(forResource: "streaming_server", ofType: "py", inDirectory: "Fakes")),
+                            "--title", "“Greeting the user.”"]
+        let output = Pipe()
+        server.standardOutput = output
+        try server.run()
+        defer { server.terminate() }
+        let port = try #require(String(data: output.fileHandleForReading.availableData, encoding: .utf8)
+            .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+        let store = ChatStore(folder: folder)
+        store.send("Hello\nthere", images: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        #expect(store.current?.title == "Hello")
+        try await waitFor(store.current?.title == "Greeting the user", "the model's title")
+        store.flush()
+        #expect(ChatStore(folder: folder).conversations.first?.title == "Greeting the user")
+    }
+
+    /// A chat renamed before its first reply ends keeps its name: no title is asked for.
+    @MainActor @Test func aChatRenamedKeepsItsName() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let server = Process()
+        server.executableURL = URL(filePath: "/usr/bin/python3")
+        server.arguments = [try #require(Bundle.module.path(forResource: "streaming_server", ofType: "py", inDirectory: "Fakes")),
+                            "--title", "Not Mine"]
+        let output = Pipe()
+        server.standardOutput = output
+        try server.run()
+        defer { server.terminate() }
+        let port = try #require(String(data: output.fileHandleForReading.availableData, encoding: .utf8)
+            .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+        let store = ChatStore(folder: folder)
+        store.send("Hello", images: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        let id = try #require(store.current?.id)
+        store.rename(id, to: "Mine")
+        try await waitFor(store.streaming == nil, "the reply to end")
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(store.current?.title == "Mine")
+    }
+
     /// The question to delete chats names one by its title, and else how many.
     @MainActor @Test func theQuestionToDeleteChatsNamesOneByItsTitleElseHowMany() {
         let one = ChatDeletion([Conversation(title: "Greeting")])

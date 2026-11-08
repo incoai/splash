@@ -87,6 +87,8 @@ final class ChatStore {
 
     private let folder: URL
     private var replying: Task<Void, Never>?
+    /// The requests for titles under way, by conversation (`title`).
+    @ObservationIgnored private var titling: [UUID: Task<Void, Never>] = [:]
     /// Writes and removes the conversations' files in the order they change, off the main thread:
     /// a conversation with images takes milliseconds to encode and write, which a send and a
     /// reply's end would otherwise wait for.
@@ -113,6 +115,7 @@ final class ChatStore {
     /// in one; the open one deleted, a new chat opens.
     func delete(_ ids: Set<UUID>) {
         if let streaming, ids.contains(streaming) { stop() }
+        for id in ids { titling.removeValue(forKey: id)?.cancel() }
         let removed = conversations.filter { ids.contains($0.id) }.map { file($0.id) }
         conversations.removeAll { ids.contains($0.id) }
         files.async { removed.forEach { try? FileManager.default.removeItem(at: $0) } }
@@ -120,6 +123,7 @@ final class ChatStore {
     }
 
     func rename(_ id: UUID, to title: String) {
+        titling.removeValue(forKey: id)?.cancel()
         guard let index = conversations.firstIndex(where: { $0.id == id }) else { return }
         conversations[index].title = title
         write(conversations[index])
@@ -137,12 +141,31 @@ final class ChatStore {
     func send(_ text: String, images: [Data], to server: ChatTarget) {
         guard streaming == nil else { return }
         var conversation = current ?? Conversation()
-        if conversation.title.isEmpty {
-            let line = text.split(separator: "\n").first.map(String.init) ?? "Image"
-            conversation.title = String(line.prefix(80))
-        }
+        if conversation.title.isEmpty { conversation.title = Self.firstLine(text) }
         conversation.messages.append(ChatMessage(role: .user, text: text, images: images))
         stream(conversation, to: server)
+    }
+
+    /// A chat's title until the model sums it up (`title`): the first line of its first message,
+    /// or Image for one of images alone.
+    static func firstLine(_ text: String) -> String {
+        String((text.split(separator: "\n").first.map(String.init) ?? "Image").prefix(80))
+    }
+
+    /// Titles conversation `id` as the model sums up its first exchange, `question` and `answer`,
+    /// while its title is still the first line; renaming or deleting it meanwhile cancels the
+    /// request, and where the model gives no title, the first line stays.
+    private func title(_ id: UUID, question: String, answer: String, with server: ChatTarget) {
+        guard conversations.first(where: { $0.id == id })?.title == Self.firstLine(question) else { return }
+        titling[id]?.cancel()
+        titling[id] = Task { [weak self] in
+            let title = try? await ChatClient.title(question: question, answer: answer, with: server)
+            guard let self, !Task.isCancelled else { return }
+            titling[id] = nil
+            guard let title, let index = conversations.firstIndex(where: { $0.id == id }) else { return }
+            conversations[index].title = title
+            write(conversations[index])
+        }
     }
 
     /// Answers the open conversation's last message again, in place of the last answer.
@@ -204,6 +227,10 @@ final class ChatStore {
             if let thinking, answer.thinkingTime == nil { answer.thinkingTime = Date.now.timeIntervalSince(thinking) }
             self?.finish(answer, in: conversation.id)
             self?.reply = nil
+            // A first exchange answered in full gets the title the model sums it up in.
+            if history.count == 1, answer.error == nil, answer.stopped == nil, !answer.text.isEmpty {
+                self?.title(conversation.id, question: history[0].text, answer: answer.text, with: server)
+            }
         }
     }
 
@@ -338,6 +365,50 @@ enum ChatClient {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    /// A title of a few words for a chat that begins with `question` and `answer`, as the model
+    /// sums them up; nil where its reply holds none, or its few tokens cut it short.
+    static func title(question: String, answer: String, with server: ChatTarget, session: URLSession = .shared) async throws -> String? {
+        let ask = try titleBody(question: question, answer: answer)
+        let (data, response) = try await session.data(for: request("v1/chat/completions", ask, to: server, timeout: 120))
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+        struct Completion: Decodable {
+            struct Choice: Decodable {
+                struct Message: Decodable { let content: String? }
+                let message: Message
+                let finish_reason: String?
+            }
+            let choices: [Choice]
+        }
+        guard let choice = (try? JSONDecoder().decode(Completion.self, from: data))?.choices.first,
+              choice.finish_reason != "length" else { return nil }
+        return choice.message.content.flatMap(title(in:))
+    }
+
+    /// The request for a title: the start of a chat's first exchange and what to answer, in the
+    /// background, where a request of the user's comes first, without thinking, in a few tokens and
+    /// not streamed.
+    static func titleBody(question: String, answer: String) throws -> Data {
+        let ask = "Give the chat below a title of at most six words, in the chat's language. Reply with the title alone."
+            + "\n\nUser: \(question.prefix(1000))\n\nAssistant: \(answer.prefix(1000))"
+        return try JSONSerialization.data(withJSONObject: [
+            "messages": [["role": "user", "content": ask]], "priority": "background", "reasoning_effort": "none",
+            "thinking_token_budget": 0, "max_tokens": 32, "temperature": 0.2,
+        ] as [String: Any])
+    }
+
+    /// The title in a model's reply: its first line that holds any, without a Title: label, quotes,
+    /// Markdown's marks or a closing stop, in at most 80 characters; nil where none is left.
+    static func title(in reply: String) -> String? {
+        // A heading's marks lead it, emphasis and quotes wrap it; a # within, as C#'s, stays.
+        func tidy(_ text: some StringProtocol) -> String {
+            String(text.drop { $0 == "#" }).trimmingCharacters(in: CharacterSet(charactersIn: "\"'“”‘’「」*`").union(.whitespaces))
+        }
+        var line = tidy(reply.split(whereSeparator: \.isNewline).first { !tidy($0).isEmpty } ?? "")
+        if line.lowercased().hasPrefix("title:") { line = tidy(line.dropFirst(6)) }
+        while let last = line.last, ".。".contains(last) { line = tidy(line.dropLast()) }
+        return line.isEmpty ? nil : String(line.prefix(80))
     }
 
     /// The request for `messages`: the prompt, streamed, with its progress and the usage asked for.

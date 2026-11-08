@@ -60,6 +60,9 @@ class Handler(BaseHTTPRequestHandler):
                 for m in body["messages"]
             )
             return self.reply({"input_tokens": count})
+        # A title, which the app asks for once a first exchange is answered, streams nothing.
+        if not body.get("stream"):
+            return self.reply({"choices": [{"message": {"content": "A Title"}}]})
         with (root / "sent.jsonl").open("a") as output:
             output.write(json.dumps(body["messages"]) + "\n")
         self.reply(
