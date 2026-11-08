@@ -1125,7 +1125,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                                  .deferWrites = readers->criticalBusyProbe()};
     const model::SlotFile::Options stateFileOptions{.deferWrites = readers->criticalBusyProbe()};
     DiskTier disk = openDiskTier(config, cacheNamespace, stateStagingBytes ? cacheDiskBytes : 0, kvSlotBytes,
-                                 kvSlotLabelBytes(kvLayout.windowedLayers != 0), kvFileOptions, stateBytes,
+                                 kvSlotLabelBytes(!kvLayout.windowedLayers.empty()), kvFileOptions, stateBytes,
                                  stateFileOptions, config.relaunchContext && memoryPlan.breakdown().kvSpill.enabled);
     if (memoryPlan.breakdown().kvSpill.enabled) {
       kvFileOpen = disk.kv != nullptr;

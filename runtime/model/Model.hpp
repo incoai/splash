@@ -864,10 +864,12 @@ public:
   snapshotToDisk(uint64_t, std::function<void()>) { return {}; }
   // The cached states whose eviction would return to the pool what a lane's
   // activation still has to allocate: zero when the pool holds a lane's
-<<<<<<< HEAD
   // buffers, and no value when no number of states does (a buffer no cached
   // state holds, such as Qwen's draft rings).
   [[nodiscard]] virtual std::optional<uint32_t> statesToActivate() const noexcept { return 0; }
+  // The draft ring's slots the served model's draft keeps (its compiled
+  // variant's window), which its context plans and length checks read.
+  [[nodiscard]] virtual uint32_t draftWindow() const noexcept { return 0; }
   // The bytes releaseIdleBuffer(keepLane), called until it gives none,
   // releases once the cache has let go of `evictedStates` more cached states,
   // whose buffers return to the pool: the pooled buffers, beyond those one
@@ -879,20 +881,6 @@ public:
   // which counts on no more than it releases.
   [[nodiscard]] virtual uint64_t idleBufferBytes(uint32_t evictedStates, bool afterStart,
                                                  bool keepLane) const noexcept {
-=======
-  // buffers, and the maximum when no number of states does (a buffer no
-  // cached state holds, such as Qwen's draft rings).
-  [[nodiscard]] virtual uint32_t statesToActivate() const noexcept { return 0; }
-  // The draft ring's slots the served model's draft keeps.
-  [[nodiscard]] virtual uint32_t draftWindow() const noexcept { return 0; }
-  // The bytes reclaimIdleState(true, IdleMemory::Buffers), called until it
-  // gives none, releases once the cache has let go of `evictedStates` more
-  // cached states, whose buffers return to the pool: the pooled buffers
-  // beyond those one lane starts from, at the sizes their layout declares,
-  // which no allocation falls short of. Zero where the model does not
-  // describe its pool, which counts on no more than it releases.
-  [[nodiscard]] virtual uint64_t idleBufferBytes(uint32_t evictedStates) const noexcept {
->>>>>>> bbc660bf
     static_cast<void>(evictedStates);
     static_cast<void>(afterStart);
     static_cast<void>(keepLane);

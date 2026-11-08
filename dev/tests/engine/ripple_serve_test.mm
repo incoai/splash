@@ -8,6 +8,7 @@
 //
 // usage: ripple-serve-test METALLIB MODEL_ROOT TOKENS_FILE NEW_TOKENS
 #include "TestChecks.hpp"
+#include "ClaimScope.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/Types.hpp"
 #include "model/QwenState.hpp"
@@ -150,6 +151,7 @@ int main(int argc, char **argv) {
     const splash::ops::ExecutionPlans operators(backend.capabilities());
     engine::MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                                     engine::queryHostMemory, 0);
+    const test::ClaimScope claim(governor, engine::ClaimClass::Floor);
     const kv::Layout kvLayout = model.targetKvLayout(kv::Format::BFloat16);
     const uint32_t extent = kvLayout.minimumExtentPages();
     // A page of 32 tokens; the request's pages the runtime's tables name.
@@ -188,7 +190,8 @@ int main(int argc, char **argv) {
     // The prompt's chunks: the runtime's prefill group bounds each.
     uint32_t position = 0;
     while (position < tokens.size()) {
-      const uint32_t count = std::min<uint32_t>(tokens.size() - position, runtime.prefillGroupRows(false));
+      const uint32_t count =
+          std::min<uint32_t>(tokens.size() - position, runtime.commandLimits().commandRows);
       BatchPlan plan{.kind = WorkKind::Prefill, .items = {{1, count, 0}}, .decodeStage = DecodeStage::Regular};
       ModelBatchItem item{1, position, count, pageTable};
       item.pageTableRevision = ++revision;

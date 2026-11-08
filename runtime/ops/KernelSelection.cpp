@@ -180,8 +180,10 @@ LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorklo
     return w.rows <= p.stagedPrefillRows ? staged(p, n, k, w.rows, unit.weightBits16, cores, Passes::Two)
                                          : LinearConfig{.tile = LinearTile::GgufPrefill};
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
-  const bool gateUp = w.epilogue == LinearEpilogue::GateUp,
-             onePass = gateUp && unit.oneFormat && cores >= p.onePassFromCores;
+  const bool gateUp = w.epilogue == LinearEpilogue::GateUp ||
+                      w.epilogue == LinearEpilogue::ClampedGateUp,
+             onePass = w.epilogue == LinearEpilogue::GateUp && unit.oneFormat &&
+                       cores >= p.onePassFromCores;
   if (unit.registerTakes &&
       registers(p.decodeRegister, unit.formatClass, lanes, (onePass ? 2 : 1) * uint64_t{n / GGUF_TILE_COLUMNS},
                 cores))

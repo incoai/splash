@@ -687,11 +687,11 @@ struct FlintGguf final {
     expect("expert_weights_norm", 1);
     expectFloat("expert_weights_scale", 1.0);
     // Every layer attends: a layer's bit is its attention layer's.
-    const auto pattern = [&g](uint64_t mask) {
-      return [&g, mask](std::span<const double> values) {
+    const auto pattern = [&g](const kv::LayerMask &mask) {
+      return [&g, &mask](std::span<const double> values) {
         bool matches = values.size() == g.layers;
         for (uint32_t layer = 0; matches && layer < g.layers; ++layer)
-          matches = values[layer] == double(layer < 64 && (mask >> layer & 1));
+          matches = values[layer] == double(mask.test(layer));
         return matches;
       };
     };
@@ -713,16 +713,9 @@ struct FlintGguf final {
 };
 
 // Calls `use` with what the GGUFs of `architecture` hold: Qwen3.8-Flash-Next's
-// (Qwen4ExpGguf), Flint's (FlintGguf) or the Qwen3.5 hybrid's (HybridGguf).
-// Another architecture is refused, so a layout without a family here fails
-// by name rather than planning as the hybrid.
-template <class Use> decltype(auto) withFamily(std::string_view architecture, Use &&use) {
-  if (architecture == Qwen4ExpGguf::architecture) return use(Qwen4ExpGguf{});
-  if (architecture == FlintGguf::architecture) return use(FlintGguf{});
-  if (std::ranges::find(HybridGguf::architectures, architecture) == HybridGguf::architectures.end())
-    throw GgufError("no GGUF family plans architecture " + std::string(architecture));
-// (Qwen4ExpGguf), Flint's (FlintGguf), or else the Qwen3.5 hybrid's
-// (HybridGguf).
+// (Qwen4ExpGguf), Flint's (FlintGguf), the Qwen3.5 hybrid's (HybridGguf) or
+// Ripple's (RippleGguf). Another architecture is refused, so a layout without
+// a family here fails by name rather than planning as the hybrid.
 // Ripple's GGUFs (ricursive): the hybrid's mixer and FFN sections with a
 // norm after each FFN, the packed q holding the gate rows as the Qwen3.5's
 // own do, a value-residual lambda a block, and the 4+1 sliding pattern the
@@ -739,11 +732,11 @@ struct RippleGguf final {
     expectFloat("swiglu_clamp", g.swigluClamp);
     // The 4+1 sliding pattern the layout holds; the installer's copy of the
     // scalar metadata leaves it out.
-    const auto pattern = [&g](uint64_t mask) {
-      return [&g, mask](std::span<const double> values) {
+    const auto pattern = [&g](const kv::LayerMask &mask) {
+      return [&g, &mask](std::span<const double> values) {
         bool matches = values.size() == g.layers;
         for (uint32_t layer = 0; matches && layer < g.layers; ++layer)
-          matches = values[layer] == double(layer < 64 && (mask >> layer & 1));
+          matches = values[layer] == double(mask.test(layer));
         return matches;
       };
     };
@@ -783,6 +776,8 @@ template <class Use> decltype(auto) withFamily(std::string_view architecture, Us
   if (architecture == Qwen4ExpGguf::architecture) return use(Qwen4ExpGguf{});
   if (architecture == FlintGguf::architecture) return use(FlintGguf{});
   if (architecture == RippleGguf::architecture) return use(RippleGguf{});
+  if (std::ranges::find(HybridGguf::architectures, architecture) == HybridGguf::architectures.end())
+    throw GgufError("no GGUF family plans architecture " + std::string(architecture));
   return use(HybridGguf{});
 }
 

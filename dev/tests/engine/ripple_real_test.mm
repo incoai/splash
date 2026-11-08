@@ -8,6 +8,7 @@
 //
 // usage: ripple-real-test METALLIB MODEL_ROOT TOKENS_FILE STEPS
 #include "TestChecks.hpp"
+#include "ClaimScope.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/Ripple.hpp"
@@ -217,6 +218,7 @@ int main(int argc, char **argv) {
 
     engine::MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                                     engine::queryHostMemory, 0);
+    const test::ClaimScope claim(governor, engine::ClaimClass::Floor);
     const kv::Layout kvLayout = model.targetKvLayout(kv::Format::BFloat16);
     const uint32_t extent = kvLayout.minimumExtentPages();
     kv::PageStorage pages(backend, governor.allocationAdmission(), kvLayout, 2 * extent, extent);
