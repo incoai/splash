@@ -6,6 +6,7 @@ requests that keep failing the engine."""
 import math
 import signal
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -204,27 +205,45 @@ class RestartPolicy:
         )
 
 
-class Quarantine:
-    """Refuses a request, until the server restarts, whose fingerprint was
-    among the started requests at each of the last two engine failures a
-    request may have caused. A failure no request could have caused neither
-    adds to the suspects nor clears them."""
+# How long a quarantined request is refused. Every request the engine had
+# started at both failures is refused, not only the one that caused them, so
+# with four lanes a refusal can fall on a request that did nothing; refused
+# for good, an agent's conversation that resends it could never go on. A
+# request that does crash the engine costs one failure an hour once let back:
+# it is still a suspect, so the next failure it is started at refuses it again.
+QUARANTINE_SECONDS = 3600.0
 
-    def __init__(self):
+
+class Quarantine:
+    """Refuses a request, for QUARANTINE_SECONDS, whose fingerprint was among
+    the started requests at each of the last two engine failures a request
+    may have caused. A failure no request could have caused neither adds to
+    the suspects nor clears them."""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic):
+        self._clock = clock
         self._lock = threading.Lock()
         self._suspects: frozenset[bytes] = frozenset()
-        # Replaced, never changed in place, so refuses() reads it unlocked.
-        self._refused: frozenset[bytes] = frozenset()
+        # Each refused fingerprint and when it is let back. Replaced, never
+        # changed in place, so refuses() reads it unlocked.
+        self._refused: dict[bytes, float] = {}
 
     def refuses(self, fingerprint: bytes) -> bool:
-        return fingerprint in self._refused
+        return self._clock() < self._refused.get(fingerprint, -math.inf)
 
     def after(self, started: frozenset[bytes]) -> frozenset[bytes]:
         """Counts a failure a request may have caused, with the fingerprints
         of the requests the engine had started; returns those it now
         refuses."""
         with self._lock:
-            refused = (self._suspects & started) - self._refused
-            self._refused |= refused
+            now = self._clock()
+            refused = {
+                fingerprint: until
+                for fingerprint, until in self._refused.items()
+                if now < until
+            }
+            newly = (self._suspects & started) - refused.keys()
+            refused.update(dict.fromkeys(newly, now + QUARANTINE_SECONDS))
+            self._refused = refused
             self._suspects = started
-            return refused
+            return frozenset(newly)

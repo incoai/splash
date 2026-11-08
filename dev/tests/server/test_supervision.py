@@ -134,12 +134,27 @@ class QuarantineTests(unittest.TestCase):
         self.assertEqual(quarantine.after(frozenset({b"x", b"z"})), frozenset({b"x"}))
         self.assertTrue(quarantine.refuses(b"x"))
         self.assertFalse(quarantine.refuses(b"y") or quarantine.refuses(b"z"))
-        # Refused until the server restarts, whatever fails next.
+        # Refused for the hour, whatever fails next.
         self.assertEqual(quarantine.after(frozenset({b"y"})), frozenset())
         self.assertTrue(quarantine.refuses(b"x"))
         # Only the last two failures count: y was started at the first and
         # the third, not at two in a row.
         self.assertFalse(quarantine.refuses(b"y"))
+
+    def test_a_refusal_ends_after_the_quarantine(self):
+        now = [0.0]
+        quarantine = supervision.Quarantine(clock=lambda: now[0])
+        quarantine.after(frozenset({b"x"}))
+        quarantine.after(frozenset({b"x"}))
+        now[0] = supervision.QUARANTINE_SECONDS - 1
+        self.assertTrue(quarantine.refuses(b"x"))
+        now[0] = supervision.QUARANTINE_SECONDS
+        self.assertFalse(quarantine.refuses(b"x"))
+        # Let back, it is still a suspect: the next failure it is started at
+        # refuses it again, for a new hour.
+        self.assertEqual(quarantine.after(frozenset({b"x"})), frozenset({b"x"}))
+        now[0] = 2 * supervision.QUARANTINE_SECONDS - 1
+        self.assertTrue(quarantine.refuses(b"x"))
 
     def test_only_a_failure_a_request_may_have_caused_counts(self):
         """How the engine exited decides first: a fault signal counts, a kill
