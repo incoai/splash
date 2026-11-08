@@ -339,6 +339,11 @@ struct SpillGeometry final {
     const uint64_t full = std::min<uint64_t>(all, uint64_t{densePages} + windowPages + 2ULL * groupPages);
     return full * fullPageBytes + (all - full) * indexPageBytes;
   }
+  // What a page frees as it moves to the index form: 399,360 B on
+  // Qwen3.8-Flash-Next.
+  [[nodiscard]] uint64_t releasedPageBytes() const noexcept {
+    return fullPageBytes - std::min(fullPageBytes, indexPageBytes);
+  }
 
 private:
   [[nodiscard]] static constexpr uint64_t pages(uint64_t tokens) noexcept {

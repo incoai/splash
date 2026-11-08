@@ -290,7 +290,7 @@ public:
 
   // The control pass's engine side, between commands (std::logic_error
   // while a command is in flight). collectLandings lands what transfers
-  // finished and spills the pages whose copies landed, then gives the ledger
+  // finished and refills the Index runway (spillLanded), then gives the ledger
   // the lanes' projected growth and highest priority, and the cache the
   // chains of the requests without a lane, which their start restores
   // (Cache::setWantedChains): those admission probed, their probes brought
@@ -691,43 +691,44 @@ private:
   // (competesForQuota, Request::refusedResources).
   void waitForDiskQuota(Request &request, double nowMilliseconds);
   // Whether the lane's history may gain Index pages between a command's
-  // passes: in Spill mode, a prompt `processed` rows in reaches past its
-  // dense history and tail window, where its pages spill as their copies
-  // land (spillLanded runs before every pass).
+  // passes: under --kv-spill always, in Spill mode, a prompt `processed`
+  // rows in reaches past its dense history and tail window, where its pages
+  // spill as their copies land (spillLanded runs before every pass). No
+  // other lane does: a release takes no lane between passes.
   [[nodiscard]] bool gainsIndexPages(std::optional<KvMode> mode, uint64_t processed) const;
   // The shapes planning reads (PlanInputs::shapes): every resident prefill
   // lane's, with its Index pages, whether it gains them, its row cap this
-  // tick, whether it is a Spill lane and whether it ended
+  // tick, whether it reads spilled history and whether it ended
   // (Request::pendingEnd), and each candidate's, from the placement found for
   // it in the memory's current state (placeCandidates).
   [[nodiscard]] std::vector<LaneShape> laneShapes(std::span<const PrefillAdmission> candidates = {}) const;
   // Whether a resident Spill request's prompt goes on: its next commands
-  // take Full pages that spill as their copies land.
+  // take Full pages, written through, which under --kv-spill always spill
+  // as their copies land.
   [[nodiscard]] bool spillingPrompt() const;
   // Whether a lane is in service.
   [[nodiscard]] bool laneInService() const;
   // What becomes of the Full extents the spill of pages whose copies landed
-  // empties (Cache::spillWritten): all of them while a lane that converted
-  // is in service, whose conversion was for those bytes, or under critical
-  // pressure, where only those bytes pay for the next Index extent; else
-  // they leave memory but the runway while a spilling prompt still grows
-  // into it or the host holds growth back, when it could not be allocated
-  // again; otherwise all of them.
+  // empties under --kv-spill always (Cache::spillWritten): all of them while
+  // a lane that converted is in service, whose conversion was for those
+  // bytes, or under critical pressure, where only those bytes pay for the
+  // next Index extent; else they leave memory but the runway while a
+  // spilling prompt still grows into it or the host holds growth back, when
+  // it could not be allocated again; otherwise all of them.
   [[nodiscard]] SpilledExtents landedExtents() const;
   // Between commands, on a target whose KV can live on the SSD cache: the
-  // pages whose copies have landed leave memory (Cache::spillWritten) before
-  // admission, at a command's start and in the control pass
-  // (collectLandings), so that a request that waits for a conversion's
-  // memory finds it rather than taking more. The Index pages they take are
-  // memory a Spill lane in service needs (an InService claim of the
-  // engine's), and with none in service an Optional one that takes only
-  // what costs nothing (allocate()), which only the control pass asks: no
-  // command needs the runway then, and a refusal would run at each. The
-  // Full extents the moves release pay for them past the host
-  // (MemoryGovernor::fund).
+  // Index runway a lane's release moves its pages into refills
+  // (Cache::spillWritten), before admission, at a command's start and in the
+  // control pass (collectLandings); under --kv-spill always the pages whose
+  // copies have landed leave memory first. The Index pages are memory a
+  // Spill lane in service needs (an InService claim of the engine's), and
+  // with none in service an Optional one that takes only what costs nothing
+  // (allocate()), which only the control pass asks: no command needs the
+  // runway then, and a refusal would run at each. The Full extents the
+  // moves release pay for them past the host (MemoryGovernor::fund).
   void spillLanded(bool controlPass);
-  // Ends a request at its length outside a command: in Spill mode, once
-  // the SSD cache can hold no more of its KV.
+  // Ends a request at its length outside a command: in Spill mode, once its
+  // KV gives no more memory back, by the SSD cache or a release (refuse).
   void endAtLength(Request &request);
   // Where the lane's last state is kept: the last whole page before the
   // replay's final input token and, while the lane replays only its prompt,
@@ -851,18 +852,24 @@ private:
   // which cost nothing and are taken as they go (Model::releaseIdleBuffer),
   // of at least Model::idleBufferBytes of no evicted states, keeping one
   // lane's start unless the rights take it first (TakeRights::laneStart);
-  // the command between
-  // its passes (TakeRights::passCommand), at no cost; the lane's conversion
-  // to Spill (TakeRights::convertLane) while it decodes Resident, not ended
-  // and not between passes, on a target that can spill with the tier open
-  // and its quota holding the lane's pages, and only where the pages it
-  // would spill free, net of the first lane's hot block floor its decode
-  // then reads through, cover what the claim lacks. It frees its memory as
-  // its copies land. The command between its passes gives back the
-  // buffers of the states it would capture, which the model's pool releases
-  // at once; its lanes that ended are left to settleEndedBetweenPasses.
-  // Last, for in-service KV (TakeRights::LaneStart::Last), the pooled
-  // buffers one lane starts from, all the pool keeps released.
+  // the command between its passes (TakeRights::passCommand), at no cost;
+  // with no command in flight, the releases of the Spill lanes the claim's
+  // rights reach (TakeRights::lanes), neither restoring, ended nor between
+  // passes, the lowest-ranked lane's first: each lane's pages whose copies
+  // landed (Cache::releasablePages) whose every holder is such a lane, off
+  // the chain a Resident start restores, then for a claim that waits for
+  // writes those whose copies land, which it releases once they have
+  // (releases); the lane's conversion to Spill (TakeRights::convertLane)
+  // while it decodes Resident, not ended and not between passes, on a target
+  // that can spill with the tier open and its quota holding the lane's
+  // pages, and only where the pages it would spill free, net of the first
+  // lane's hot block floor its decode then reads through, cover what the
+  // claim lacks; its claim's retries release its pages as their copies land.
+  // The command between its passes gives back the buffers of the states it
+  // would capture, which the model's pool releases at once; its lanes that
+  // ended are left to settleEndedBetweenPasses. Last, for in-service KV
+  // (TakeRights::LaneStart::Last), the pooled buffers one lane starts from,
+  // all the pool keeps released.
   class EngineVictims final : public VictimSource {
   public:
     explicit EngineVictims(Engine &engine) noexcept : engine_(engine) {}
@@ -871,8 +878,32 @@ private:
     FreeResult take(const VictimQuery &query, const Victim &victim) override;
 
   private:
+    // What the claim's releases may move: the pages of the Spill lanes its
+    // rights reach (VictimQuery::reaches), neither restoring, ended nor
+    // between their command's passes, off the chain a Resident start restores.
+    [[nodiscard]] ReleaseRule releaseRule(const VictimQuery &query) const;
+    // Each lane's units: for a need of Full pages, the claim's pages moved
+    // in place, with the bytes of the extent more that keeps the Index runway
+    // (Cache::inPlaceMoves), offered where the reads of the lanes they give
+    // Index pages lack nothing, since what it frees is not sized for them;
+    // then for a need of bytes the host did not refuse, whole extents of
+    // pages, each page freeing its Full bytes less its Index page's, less
+    // what those reads take (readsShortfall), offered where they free some;
+    // last, after every lane's, outside --kv-spill always, for a claim that
+    // waits for writes, those whose copies land, which leave it Pending
+    // (later). The units for bytes count what their takes in turn free as
+    // the copies stand, each page and each lane's first reads once
+    // (Cache::ReleaseCount): copies that land before the takes can lower the
+    // count, by 102 MB for two lanes on one conversation, as a lane's landed
+    // pages then join, in its whole extents, shared pages a later lane's
+    // unit counted. A key is the lane's request.
+    [[nodiscard]] std::vector<Victim> releases(const VictimQuery &query) const;
     [[nodiscard]] std::vector<Victim> conversions(const VictimQuery &query) const;
     Engine &engine_;
+    // The release and conversion units the pass over the order in progress
+    // counted as it reached them (peek), so that a pass counts the releases
+    // once, not once a unit.
+    mutable std::vector<Victim> reached_;
   };
   // The governor whose ledger holds the requests' claims.
   [[nodiscard]] MemoryGovernor &governor() const;
@@ -938,7 +969,8 @@ private:
   // (`restoring`) counted; false when it cannot (no SSD cache, the tier
   // closed, its quota short, or a lane already Spill) or must not: a lane
   // of the command between its passes, which reads all its lanes' history
-  // from memory. Its pages whose copies landed spill at once.
+  // from memory. Its claim's retries release its pages as their copies land
+  // (EngineVictims::releases).
   [[nodiscard]] bool convertToSpill(Request &request);
   // What a lane does about memory it could not get. Pending memory returns
   // by itself: the lane waits (the ledger finds it, its own lanes' owed
@@ -1120,6 +1152,15 @@ private:
   // lanes' next commands add and what a pool's last growth lacked, one
   // growth unit at most (MemoryLedger::growthLackBytes).
   [[nodiscard]] uint64_t copyDemandBytes() const;
+  // The pages of KV through what a lane's next command reaches: in prefill
+  // as many rows as one command holds, within its prompt; in decode its
+  // verify rows.
+  [[nodiscard]] uint32_t nextCommandPages(const Request &request) const;
+  // What the model's memory for the reads of spilled KV lacks once the lanes
+  // hold Index pages: none for one that holds some already; else in prefill
+  // its history's staging through its next command, in decode its floor of
+  // the hot block cache, the floors counted once for them all.
+  [[nodiscard]] uint64_t readsShortfall(std::span<const uint64_t> lanes) const;
   // The wait limit tick() enforces, or zero while it enforces none: a
   // pending wait that has seen progress waits for its next attempt. The
   // limit restarts whenever a lane submitted before the request, or one

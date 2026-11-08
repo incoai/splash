@@ -24,6 +24,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <random>
 #include <ranges>
 #include <set>
 #include <span>
@@ -132,10 +133,11 @@ std::vector<uint32_t> prompt(uint64_t seed, uint32_t tokens) {
   return result;
 }
 
-protocol::RequestFrame frame(uint64_t id, std::vector<uint32_t> tokens, uint32_t output) {
+protocol::RequestFrame frame(uint64_t id, std::vector<uint32_t> tokens, uint32_t output,
+                             engine::RequestPriority priority = engine::RequestPriority::Normal) {
   protocol::RequestFrame result;
   result.requestId = id;
-  result.priority = engine::RequestPriority::Normal;
+  result.priority = priority;
   result.constraint = ConstraintMode::None;
   // An hour, on the fixture's unix clock (1 s).
   result.absoluteDeadlineUnixMicros = 1'000'000 + 3'600'000'000ULL;
@@ -235,9 +237,10 @@ struct Serving final {
   }
 
   // Sends a request now.
-  void submit(uint64_t id, std::vector<uint32_t> tokens, uint32_t output) {
+  void submit(uint64_t id, std::vector<uint32_t> tokens, uint32_t output,
+              engine::RequestPriority priority = engine::RequestPriority::Normal) {
     submittedAt[id] = fixture.monotonic;
-    require(fixture.loop.receive(protocol::peer::serialize(frame(id, std::move(tokens), output))),
+    require(fixture.loop.receive(protocol::peer::serialize(frame(id, std::move(tokens), output, priority))),
             "a request frame was refused");
   }
   [[nodiscard]] bool active(uint64_t id) const { return submittedAt.contains(id) && !ended.contains(id); }
@@ -248,6 +251,7 @@ struct Serving final {
     for (const protocol::EngineEvent &event : reader.feed(fixture.output)) {
       if (const auto *done = std::get_if<protocol::DoneEvent>(&event)) {
         ended.insert(done->requestId);
+        endings[done->requestId] = {done->completionTokens, done->reason};
       } else if (const auto *error = std::get_if<protocol::ErrorEvent>(&event)) {
         ended.insert(error->requestId);
         errors.push_back(std::to_string(error->requestId) + " " + error->code + ": " + error->message);
@@ -306,6 +310,8 @@ struct Serving final {
   double lastCommandEnd = 0.0;
   std::map<uint64_t, double> submittedAt;
   std::set<uint64_t> ended;
+  // How each request that completed ended: its output and finish reason.
+  std::map<uint64_t, std::pair<uint32_t, engine::EngineFinishReason>> endings;
   std::vector<std::string> errors;
   protocol::peer::EventReader reader;
 };
@@ -760,6 +766,85 @@ void testAColdPromptStartsWithinTheOvertakesAmidCachedResends() {
        " cached resends");
 }
 
+// Guard: random schedules of four requests on the Studio at 1 GiB less than 18G: prompts of 80K to 110K tokens, which
+// memory holds only in part, one of them in odd seeds an earlier one's conversation and 2,000 tokens more, outputs of
+// 64 to 1,504 tokens, each priority, arrivals within 2 s, and three seconds of macOS's critical pressure between the
+// first minute and the third. Spill lanes keep their pages Full, so the lanes' growth and reads, the starts and the
+// host's critical passes release the pages whose copies landed, between commands. Nothing breaks an engine rule
+// (std::logic_error), the cache's invariants hold after every step, and each request ends as it does where the limit
+// and the host hold every request, at twice the limit: with the same output and finish reason (the fake model's
+// tokens do not depend on the K/V it reads).
+void testRandomSchedulesWithReleasesEndAsWithoutThem() {
+  Machine tight = kStudio18G;
+  tight.name = "studio-17g";
+  tight.limitBytes -= 1ULL << 30;
+  Machine ample = kStudio18G;
+  ample.name = "studio-ample";
+  ample.limitBytes *= 2;
+  ample.hostBytes *= 2;
+  uint64_t releases = 0;
+  for (uint32_t seed = 1; seed <= 4; ++seed) {
+    std::mt19937 random(seed);
+    const auto pick = [&](uint32_t first, uint32_t last) {
+      return std::uniform_int_distribution<uint32_t>(first, last)(random);
+    };
+    struct Arrival final {
+      double at = 0.0;
+      uint64_t id = 0;
+      std::vector<uint32_t> tokens;
+      uint32_t output = 0;
+      engine::RequestPriority priority = engine::RequestPriority::Normal;
+    };
+    std::vector<Arrival> schedule;
+    for (uint64_t id = 1; id <= 4; ++id) {
+      Arrival arrival{.at = double(pick(0, 20)) * 100.0,
+                      .id = id,
+                      .tokens = prompt(1'000 * seed + id, pick(80'000, 110'000)),
+                      .output = 8 * pick(8, 188),
+                      .priority = static_cast<engine::RequestPriority>(pick(0, 2))};
+      if (id == 4 && seed % 2) {
+        arrival.at = std::max(arrival.at, schedule.front().at);
+        arrival.tokens = schedule.front().tokens;
+        const std::vector<uint32_t> more = prompt(9'000 + seed, 2'000);
+        arrival.tokens.insert(arrival.tokens.end(), more.begin(), more.end());
+      }
+      schedule.push_back(std::move(arrival));
+    }
+    std::ranges::sort(schedule, {}, &Arrival::at);
+    const double critical = double(pick(60, 180)) * 1'000.0;
+    const std::vector<test::HostEvent> script{
+        {critical, kStudio18G.otherBytes, engine::MemoryPressure::Critical},
+        {critical + 3'000.0, kStudio18G.otherBytes, engine::MemoryPressure::Normal}};
+    const auto run = [&](const Machine &machine) {
+      Serving serving(machine, &machine == &tight ? script : std::vector<test::HostEvent>{});
+      size_t next = 0;
+      const auto observe = [&] {
+        if (!serving.fixture.loop.commandInFlight())
+          serving.fixture.cache.checkInvariants();
+      };
+      while (serving.ended.size() < schedule.size()) {
+        for (; next < schedule.size() && schedule[next].at <= serving.now(); ++next)
+          serving.submit(schedule[next].id, schedule[next].tokens, schedule[next].output, schedule[next].priority);
+        const double arrival = next < schedule.size() ? schedule[next].at : std::numeric_limits<double>::infinity();
+        const size_t ended = serving.ended.size();
+        serving.run([&] { return serving.ended.size() != ended || serving.now() >= arrival; }, observe,
+                    "the schedule did not move", 1'800'000.0);
+        require(serving.now() < 1'800'000.0, at(machine) + "seed " + std::to_string(seed) +
+                                                  ": the requests did not end within 30 minutes");
+      }
+      require(serving.errors.empty(), at(machine) + "seed " + std::to_string(seed) + ": a request failed: " +
+                                          (serving.errors.empty() ? std::string() : serving.errors.front()));
+      releases += serving.fixture.cache.spillSnapshot().releases;
+      return serving.endings;
+    };
+    const auto ends = run(tight);
+    require(ends == run(ample), "seed " + std::to_string(seed) +
+                                    ": a request ended otherwise than where the limit and the host hold them all");
+  }
+  require(releases != 0, "no schedule released a lane's pages");
+  note("random schedules with " + std::to_string(releases) + " releases ended as where nothing was short");
+}
+
 } // namespace
 
 std::span<const test::TestCase> simTests() {
@@ -772,6 +857,7 @@ std::span<const test::TestCase> simTests() {
       {"testAResendStartsBesideARefusedLongerPrompt", testAResendStartsBesideARefusedLongerPrompt},
       {"testAColdPromptStartsWithinTheOvertakesAmidCachedResends",
        testAColdPromptStartsWithinTheOvertakesAmidCachedResends},
+      {"testRandomSchedulesWithReleasesEndAsWithoutThem", testRandomSchedulesWithReleasesEndAsWithoutThem},
   };
   return kTests;
 }

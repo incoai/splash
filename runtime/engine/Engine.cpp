@@ -325,7 +325,8 @@ bool Engine::tick(double now) {
       return progressed;
     }
   }
-  // Pages whose copies landed leave memory before admission judges it.
+  // The Index runway refills before admission judges memory, and under
+  // --kv-spill always the pages whose copies landed leave first.
   spillLanded(false);
   // The tick's host time runs from here, its first planning call, to the
   // submission of the command it plans (tickHostMilliseconds).
@@ -1016,7 +1017,7 @@ bool Engine::admit(Request &active, double now) {
     // Resident lane that resumes takes the KV target it was suspended with
     // at once. A Spill lane takes the first work's page, as a start that
     // waits for its restore does: its replay takes Full pages a command at a
-    // time (prepare), which spill as their copies land, as its output's did.
+    // time (prepare), written through as its output's were.
     const auto workEnd = [&] {
       return resuming && active.kvMode == KvMode::Resident ? active.resumeKvTargetTokens
                                                            : uint64_t{resumeBoundary} + 1;
@@ -1551,9 +1552,8 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
   // prefill's history up to the command's end, for a lane whose history
   // holds Index pages, or may gain them before a later pass of the command
   // (gainsIndexPages), as a pass streams what it holds then. It is reserved
-  // once every lane has its KV, since a lane whose own growth converts it to
-  // Spill moves the landed pages of lanes admitted before it to the index
-  // form too (Cache::convertToSpill).
+  // once every lane has its KV, since a lane's growth may release the pages
+  // of lanes admitted before it (EngineVictims::releases).
   if (spill) {
     std::vector<BatchItem> kept;
     kept.reserve(admitted.size());
@@ -1609,7 +1609,7 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
     return refuse(denied, context);
   // A lane refused leaves the plan: the others are planned again without
   // it, keeping what they were granted. So does a lane that converted to
-  // Spill, or took Index pages, while the command took shape.
+  // Spill, or took Index pages by a release, while the command took shape.
   if (!denied.empty()) {
     for (const Denied &entry : denied)
       excluded.push_back(entry.requestId);
@@ -1690,25 +1690,33 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
 
 bool Engine::gainsIndexPages(std::optional<KvMode> mode, uint64_t processed) const {
   const SpillGeometry &geometry = config_.spill.geometry;
-  return mode == KvMode::Spill &&
+  return config_.spill.always && mode == KvMode::Spill &&
          processed > uint64_t{geometry.densePages + geometry.windowPages} * KvCache::pageTokens;
 }
 
 std::vector<LaneShape> Engine::laneShapes(std::span<const PrefillAdmission> candidates) const {
   std::vector<LaneShape> shapes;
+  // A lane reads spilled history where it holds Index pages, a candidate
+  // where its restore comes back with them (Cache::restoresIndexPages), and
+  // under --kv-spill always every Spill lane, whose pages move as their
+  // copies land.
+  const auto spills = [&](KvMode mode) { return config_.spill.always && mode == KvMode::Spill; };
   for (const auto &[id, active] : requests_)
     if (active.lane && scheduler_.phase(id) == Phase::Prefill)
       shapes.push_back({.requestId = id,
                         .indexPages = cache_.indexPages(id),
                         .gainsIndexPages = gainsIndexPages(active.kvMode, scheduler_.promptProcessed(id)),
                         .rowCap = active.rowCap.value_or(std::numeric_limits<uint32_t>::max()),
-                        .spill = active.kvMode == KvMode::Spill,
+                        .spill = spills(active.kvMode) || cache_.holdsIndexPages(id),
                         .ended = active.pendingEnd.has_value()});
   for (const PrefillAdmission &candidate : candidates) {
-    const KvMode mode = *requests_.at(candidate.requestId).placement;
+    const Request &active = requests_.at(candidate.requestId);
+    const KvMode mode = *active.placement;
+    const bool restored = mode == KvMode::Spill && active.admissionProbe && !active.skipCache &&
+                          cache_.restoresIndexPages(active.admissionProbe->restoredChain());
     shapes.push_back({.requestId = candidate.requestId,
                       .gainsIndexPages = gainsIndexPages(mode, candidate.cachedTokens),
-                      .spill = mode == KvMode::Spill});
+                      .spill = spills(mode) || restored});
   }
   return shapes;
 }

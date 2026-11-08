@@ -80,9 +80,10 @@ KvMode Engine::placement(const Request &active) const {
   if (resident <= peak)
     return KvMode::Resident;
   // Its Resident KV beside what the lanes still grow into, from what a
-  // start may take: the room, what lands, the cache and the pools that cost
-  // only their rebuild, never the expert store, whose chunks a Spill lane
-  // leaves in place.
+  // start may take: the room, what lands, the cache, the pools that cost
+  // only their rebuild and the releases of Spill lanes of its priority or a
+  // lower one (TakeRights::lanes), never the expert store, whose chunks a
+  // Spill lane leaves in place.
   return residentRoom(active, claimFor(active, ClaimClass::Start)).holds() ? KvMode::Resident : KvMode::Spill;
 }
 
@@ -127,16 +128,20 @@ Engine::LaneDemand Engine::laneDemand() const {
   const SpillGeometry &geometry = config_.spill.geometry;
   const auto pages = [](uint64_t tokens) { return (tokens + KvCache::pageTokens - 1) / KvCache::pageTokens; };
   LaneDemand demand;
-  // The lanes that read spilled KV, Spill lanes and lanes holding Index
-  // pages: those without their floor of the hot block cache yet lack it
-  // once for them all, in whole extents: floorExtents(2) for two, not
-  // 2 x floorExtents(1).
+  // The lanes that read spilled KV, those holding Index pages: those
+  // without their floor of the hot block cache yet lack it once for them
+  // all, in whole extents: floorExtents(2) for two, not 2 x floorExtents(1);
+  // and one in prefill the staging of its history through its next command.
+  // A Spill lane with none reads nothing spilled.
   std::vector<uint64_t> readers;
   for (const auto &[id, peer] : requests_) {
     if (!peer.lane || peer.pendingEnd)
       continue;
-    if (peer.kvMode == KvMode::Spill || cache_.holdsIndexPages(id))
+    if (cache_.holdsIndexPages(id)) {
       readers.push_back(id);
+      if (scheduler_.phase(id) == Phase::Prefill)
+        demand.bytes += model_.stagingShortfall(id, nextCommandPages(peer));
+    }
     const uint64_t projection = projectedTokens(peer);
     const uint64_t held = kvCapacity(id);
     if (peer.kvMode == KvMode::Spill) {
@@ -216,18 +221,13 @@ uint64_t Engine::copyDemandBytes() const {
     return 0;
   // The KV pages the lanes' next commands add: a prefill lane's next
   // command's rows, a decoding lane's verify rows.
-  const uint32_t rows = model_.commandLimits().commandRows;
   uint64_t pages = 0;
   for (const auto &[id, active] : requests_) {
     if (!active.lane || active.pendingEnd)
       continue;
-    const Phase phase = scheduler_.phase(id);
-    uint64_t end = active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
-    if (phase == Phase::Prefill)
-      end = std::min<uint64_t>(scheduler_.promptProcessed(id) + rows, active.promptTokens);
-    else if (phase != Phase::Decode)
+    if (const Phase phase = scheduler_.phase(id); phase != Phase::Prefill && phase != Phase::Decode)
       continue;
-    const uint64_t needed = (end + KvCache::pageTokens - 1) / KvCache::pageTokens;
+    const uint64_t needed = nextCommandPages(active);
     const uint64_t held = kvCapacity(id) / KvCache::pageTokens;
     pages += needed > held ? needed - held : 0;
   }
@@ -239,6 +239,29 @@ uint64_t Engine::copyDemandBytes() const {
   const MemoryLedger &ledger = memory.ledger();
   return std::max(2 * pages * cache_.bytesPerPage(kv::PageForm::Full),
                   std::min(ledger.growthLackBytes(), ledger.largestGrowthUnit()));
+}
+
+uint32_t Engine::nextCommandPages(const Request &active) const {
+  const uint64_t id = active.request.id;
+  const uint64_t end =
+      scheduler_.phase(id) == Phase::Prefill
+          ? std::min<uint64_t>(scheduler_.promptProcessed(id) + model_.commandLimits().commandRows, active.promptTokens)
+          : active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
+  return static_cast<uint32_t>((end + KvCache::pageTokens - 1) / KvCache::pageTokens);
+}
+
+uint64_t Engine::readsShortfall(std::span<const uint64_t> lanes) const {
+  uint64_t bytes = 0;
+  std::vector<uint64_t> decoding;
+  for (const uint64_t id : lanes) {
+    if (cache_.holdsIndexPages(id))
+      continue;
+    if (scheduler_.phase(id) == Phase::Prefill)
+      bytes += model_.stagingShortfall(id, nextCommandPages(requests_.at(id)));
+    else
+      decoding.push_back(id);
+  }
+  return bytes + model_.hotFloorShortfall(decoding);
 }
 
 bool Engine::fitsResidentAlone(const Request &active) const {
@@ -412,10 +435,10 @@ bool Engine::laneInService() const {
 }
 
 SpilledExtents Engine::landedExtents() const {
-  // A converted lane's moves always release the Full extents they empty:
-  // its conversion was for those bytes, which its hot block floor needs. So
-  // do all moves under critical pressure, which refuses even the floor:
-  // only those bytes pay for the Index extents the next pages move into
+  // Under --kv-spill always a converted lane's moves release the Full extents
+  // they empty: its conversion was for those bytes, which its hot block floor
+  // needs. So do all moves under critical pressure, which refuses even the
+  // floor: only those bytes pay for the Index extents the next pages move into
   // (MemoryGovernor::fund), and the host's pass takes a kept one anyway.
   const bool converting = std::ranges::any_of(
       requests_, [](const auto &entry) { return entry.second.lane && entry.second.converted; });
@@ -434,7 +457,7 @@ void Engine::spillLanded(bool controlPass) {
   // pays for them past the host (MemoryGovernor::fund): with no such lane
   // in service they take only what costs nothing; with one, they are the
   // highest-ranked such lane's, at its priority, since the room its waiting
-  // claim holds is the room its landed pages move into.
+  // claim holds is the room its released pages move into.
   const SpilledExtents extents = landedExtents();
   const Request *needed = nullptr;
   for (const auto &[_, active] : requests_)
@@ -580,7 +603,7 @@ Engine::Prepared Engine::refuse(std::span<const Denied> denied, const PlanContex
   // restored chain's before its first command, or those the control pass
   // left when it collected the landed ones) start now, and the lanes wait.
   // Their next attempt finds the copies in flight, which a claim alone waits
-  // for (MemoryLedger::free).
+  // for, and releases their pages once they land (EngineVictims::releases).
   const bool written = spill && cache_.writeThrough() != 0;
   // Memory on its way back arrives without anyone yielding. The lanes still
   // take a retry deadline: the transfer's completion wakes the engine, and
@@ -617,19 +640,23 @@ Engine::Prepared Engine::refuse(std::span<const Denied> denied, const PlanContex
     break;
   }
   // Alone with nothing on its way back. A Spill lane that decodes ends at
-  // its length once the SSD cache can hold no more of its KV; any other
-  // lane fails, naming the SSD cache only for a Spill lane, whose KV alone
-  // goes there.
+  // its length once its KV gives no more memory back: the SSD cache takes
+  // no more of it, or a release down to its floor does not cover what it
+  // lacks; any other lane fails. A Spill lane, whose KV alone goes to the
+  // SSD cache, names which: the SSD cache where it owes copies no write
+  // started, for the quota or the tier; otherwise the release.
   Request &lone = request(victim.requestId);
+  std::string spilled;
+  if (lone.kvMode == KvMode::Spill)
+    spilled = cache_.owesCopies(victim.requestId) ? "the SSD cache took no more of its KV"
+                                                  : "even with its KV released down to its floor";
   if (!victim.kv)
-    settle(lone, capacityExhausted(lone, victim.memory, victim.denial.allocationFailure));
+    settle(lone, capacityExhausted(lone, victim.memory, victim.denial.allocationFailure, spilled));
   else if (lone.kvMode == KvMode::Spill && !plan.prefill)
     endAtLength(lone);
   else
     settle(lone, capacityExhausted(lone, "KV target", victim.denial.allocationFailure,
-                                   pageShortfall(*victim.kv) + (lone.kvMode == KvMode::Spill
-                                                                    ? "; the SSD cache took no more of its KV"
-                                                                    : "")));
+                                   pageShortfall(*victim.kv) + (spilled.empty() ? "" : "; " + spilled)));
   return Prepared::Yielded;
 }
 
@@ -877,12 +904,105 @@ Engine::Verdict Engine::judge(const Denial &denial, uint64_t requestId) const {
   return Verdict::Fail;
 }
 
+ReleaseRule Engine::EngineVictims::releaseRule(const VictimQuery &query) const {
+  const Engine &engine = engine_;
+  // A command between its passes reads its lanes' history as its first pass
+  // cut it.
+  const auto releasable = [&engine, &query](uint64_t id) {
+    const auto found = engine.requests_.find(id);
+    if (found == engine.requests_.end())
+      return false;
+    const Request &active = found->second;
+    return active.lane && !active.restore && !active.finalized && !active.pendingEnd &&
+           active.kvMode == KvMode::Spill && !engine.passCommand_.holds(id) &&
+           query.reaches(id, active.request.priority);
+  };
+  // A Resident start reads its history Full, so its count as Resident
+  // (VictimQuery::kept, Engine::residentRoom) and its own claims hold the
+  // chain its admission probe restores in place.
+  ReleaseRule rule{.takesFrom = releasable};
+  const auto claimant = engine.requests_.find(query.requestId);
+  if (claimant != engine.requests_.end() && claimant->second.admissionProbe && !claimant->second.skipCache &&
+      (query.kept || claimant->second.kvMode == KvMode::Resident))
+    rule.kept = claimant->second.admissionProbe->restoredChain();
+  return rule;
+}
+
+std::vector<Victim> Engine::EngineVictims::releases(const VictimQuery &query) const {
+  const Engine &engine = engine_;
+  std::vector<Victim> units;
+  if (query.rights.lanes == TakeRights::Lanes::None || !engine.config_.spill.capable || engine.pending_)
+    return units;
+  // The lanes the claim releases, the lowest-ranked first.
+  const ReleaseRule rule = releaseRule(query);
+  std::vector<const Request *> lanes;
+  for (const auto &[id, active] : engine.requests_)
+    if (rule.takesFrom(id))
+      lanes.push_back(&active);
+  std::ranges::sort(lanes, [&](const Request *left, const Request *right) {
+    return engine.rankOf(*left) < engine.rankOf(*right);
+  });
+  const uint32_t extentPages = engine.cache_.extentPages();
+  const uint64_t pageBytes = engine.config_.spill.geometry.releasedPageBytes();
+  // A lane's unit for a need of bytes, of `pages` pages: whole extents of
+  // them, each page freeing its Full bytes less its Index page's, less the
+  // first reads of the lanes they give Index pages: a growth's extent takes
+  // two extents of pages. They free only where the first runway's moves
+  // empty a Full extent. A need the host refused lacks no bytes. These units
+  // add up as their takes in turn free them, each moving its lane's oldest
+  // pages, so each counts only the pages and first reads those before it
+  // leave: a page lanes share counts once (Cache::ReleaseCount).
+  Cache::ReleaseCount count;
+  const bool forBytes = query.need.bytes && !query.need.hostRefused;
+  const auto offer = [&](uint64_t id, uint32_t pages, uint64_t reads, bool landing) {
+    const uint32_t whole = pages / extentPages * extentPages;
+    Victim unit{.key = id, .form = kv::PageForm::Full, .write = landing, .later = landing, .kind = VictimKind::Release};
+    if (forBytes && engine.cache_.releaseFreesAnExtent(pages))
+      unit.bytes = saturatingSubtract(uint64_t{whole} * pageBytes, reads);
+    if (!unit.bytes)
+      return;
+    units.push_back(unit);
+    engine.cache_.countRelease(id, whole, landing, rule, count);
+  };
+  // Each lane's units. For a need of Full pages, first the claim's pages
+  // moved in place, with an extent more where they would leave the Index
+  // runway short (Cache::inPlaceMoves), whose bytes it counts, where the
+  // reads of the lanes they give Index pages lack nothing, since what it
+  // frees is not sized for those: it moves the fewest pages, and a release
+  // for bytes before it could take the pages it needs yet leave the claim
+  // short of its extent, by 6.3 MB on Qwen3.8-Flash-Next. Then the unit for
+  // bytes, where it frees some.
+  for (const Request *lane : lanes) {
+    const uint64_t id = lane->request.id;
+    const Cache::ReleasablePages pages = engine.cache_.releasablePages(id, rule, count);
+    const uint64_t reads = engine.readsShortfall(pages.holders);
+    const uint32_t moves = engine.cache_.inPlaceMoves(query.need.pages, pages.clean);
+    if (!reads && query.need.form == kv::PageForm::Full && moves)
+      units.push_back({.key = id,
+                       .bytes = uint64_t{moves - query.need.pages} * pageBytes,
+                       .pages = query.need.pages,
+                       .form = kv::PageForm::Full,
+                       .kind = VictimKind::Release});
+    offer(id, pages.clean, reads, false);
+  }
+  // Last, after every lane's, for a need of bytes the pages whose copies
+  // land, which free nothing by themselves outside --kv-spill always: the
+  // claim waits for them (Pending). Under it their landings count already
+  // (Cache::returning).
+  if (forBytes && !engine.config_.spill.always)
+    for (const Request *lane : lanes) {
+      const Cache::ReleasablePages pages = engine.cache_.releasablePages(lane->request.id, rule, count);
+      offer(lane->request.id, pages.clean + pages.landing, engine.readsShortfall(pages.holders), true);
+    }
+  return units;
+}
+
 std::vector<Victim> Engine::EngineVictims::conversions(const VictimQuery &query) const {
   const Engine &engine = engine_;
   std::vector<Victim> units;
-  // Only the claimant's own lane converts (TakeRights::convertLane). The
-  // first copies land in the Index runway, so with none free nothing
-  // converts.
+  // Only the claimant's own lane converts (TakeRights::convertLane). Its
+  // claim's retries release its pages into the Index runway, so with none
+  // free nothing converts.
   const uint64_t id = query.rights.convertLane;
   if (!id || !engine.config_.spill.capable || engine.cache_.spillGate() != SpillGate::Open ||
       !engine.cache_.freePages(kv::PageForm::Index))
@@ -907,7 +1027,7 @@ std::vector<Victim> Engine::EngineVictims::conversions(const VictimQuery &query)
   // floor its decode then reads through, they must cover what the claim
   // lacks. On Flash-Next a lane converts from about 46K tokens.
   const uint64_t pages = engine.cache_.convertiblePages(id);
-  const uint64_t freed = pages * (geometry.fullPageBytes - std::min(geometry.fullPageBytes, geometry.indexPageBytes));
+  const uint64_t freed = pages * geometry.releasedPageBytes();
   const uint64_t reads = engine.model_.hotFloorBytes(1);
   const uint64_t missing = std::max(query.need.bytes, uint64_t{query.need.pages} * geometry.fullPageBytes);
   if (freed <= reads || freed - reads < missing)
@@ -933,18 +1053,28 @@ std::optional<Victim> Engine::EngineVictims::peek(const VictimQuery &query, cons
   // Then, for work that supersedes it, the command between its passes with
   // none in flight: the buffers its captures hold, counted as bytes for a
   // need of bytes. It costs that work nothing, so it comes before the
-  // conversions, which cost their lanes the spilled reads.
+  // releases and the conversions, which cost their lanes the spilled reads.
   if (after->kind == VictimKind::Memory && engine.passCommand_.active() && !engine.pending_ &&
       query.rights.passCommand)
     return Victim{.stateBuffers = engine.passCommand_.captureBuffers(), .kind = VictimKind::PassCommand};
-  const std::vector<Victim> units = conversions(query);
-  auto next = units.begin();
-  if (after->kind == VictimKind::Conversion) {
-    next = std::ranges::find(units, after->key, &Victim::key);
-    if (next != units.end())
+  // The releases free now, or as copies land, without a conversion's
+  // writes: they come before it. A pass over the order counts them once, as
+  // it reaches them, and finds the unit after each among those (reached_).
+  auto next = reached_.begin();
+  if (after->kind == VictimKind::Release || after->kind == VictimKind::Conversion) {
+    next = std::ranges::find_if(reached_, [&](const Victim &unit) {
+      return unit.kind == after->kind && unit.key == after->key && unit.later == after->later &&
+             (unit.pages != 0) == (after->pages != 0);
+    });
+    if (next != reached_.end())
       ++next;
+  } else {
+    reached_ = releases(query);
+    const std::vector<Victim> converting = conversions(query);
+    reached_.insert(reached_.end(), converting.begin(), converting.end());
+    next = reached_.begin();
   }
-  if (next != units.end())
+  if (next != reached_.end())
     return *next;
   // Last, the pooled buffers the next lane starts from.
   if (query.rights.laneStart == TakeRights::LaneStart::Last)
@@ -971,12 +1101,47 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
       return {FreeOutcome::Met, bytes};
     return {};
   case VictimKind::Conversion:
-    // Its Full pages as peek counted them, once their copies land.
+    // Its Full pages as peek counted them, which the claim's retries
+    // release once their copies land.
     if (engine.convertToSpill(engine.request(victim.key)))
       return {.outcome = FreeOutcome::Pending,
               .laterBytes = victim.bytes,
               .pages = query.need.form == victim.form ? victim.pages : 0};
     return {};
+  case VictimKind::Release: {
+    // Pages whose copies land free nothing yet: the claim waits for them.
+    if (victim.later)
+      return {.outcome = FreeOutcome::Pending};
+    const ReleaseRule rule = releaseRule(query);
+    // In place, the pages the claim lacks still. Else what it lacks still in
+    // bytes and the first reads of the lanes the pages give Index pages
+    // beside it, in whole extents, each page freeing its Full bytes less its
+    // Index page's: four extents of pages for a 390 MiB hot block floor.
+    const bool inPlace = victim.pages != 0;
+    uint32_t pages = std::min(query.lackingPages, victim.pages);
+    if (!inPlace) {
+      const Cache::ReleasablePages releasable = engine.cache_.releasablePages(victim.key, rule);
+      const uint64_t pageBytes = engine.config_.spill.geometry.releasedPageBytes();
+      const uint64_t extent = engine.cache_.extentPages();
+      const uint64_t lacking = saturatingAdd(query.lackingBytes, engine.readsShortfall(releasable.holders));
+      const uint64_t whole = ((lacking + pageBytes - 1) / pageBytes + extent - 1) / extent * extent;
+      pages = static_cast<uint32_t>(std::min<uint64_t>(whole, uint64_t{releasable.clean} / extent * extent));
+    }
+    const uint64_t before = engine.cache_.allocatedBytes();
+    const uint32_t moved = engine.cache_.releasePages(victim.key, pages, inPlace, rule,
+                                                       [&](uint64_t bytes) { engine.governor().fund(bytes); });
+    if (!moved)
+      return {};
+    ++engine.ledgerChanges_;
+    // Moves whose Full extent a page in transfer holds back free nothing; in
+    // place an extent more may leave beside the claim's pages (inPlaceMoves).
+    const uint64_t freed = saturatingSubtract(before, engine.cache_.allocatedBytes());
+    if (inPlace)
+      return {.outcome = FreeOutcome::Met, .nowBytes = freed, .pages = std::min(moved, pages)};
+    if (!freed)
+      return {};
+    return {FreeOutcome::Met, freed};
+  }
   case VictimKind::PassCommand:
     // The buffers its captures held. Settling here would change the ledger
     // inside its own free() (settleEndedBetweenPasses).

@@ -49,8 +49,9 @@ public:
 
   [[nodiscard]] std::string_view name() const noexcept override { return name_; }
   // Only the units the query's rights take (VictimSource): units in use,
-  // the pass command, the buffers a lane starts from and a conversion of the
-  // claimant's own lane (its key) only for a claim whose rights take them.
+  // the pass command, the buffers a lane starts from, a conversion of the
+  // claimant's own lane (its key) and a release of a lane (its key) of the
+  // claimant's priority only for a claim whose rights take them.
   [[nodiscard]] std::optional<Victim> peek(const VictimQuery &query, const Victim *after) const override {
     ++peeks;
     peeked.push_back(after ? after->key : 0);
@@ -58,6 +59,7 @@ public:
       switch (unit.kind) {
       case VictimKind::Memory: return unit.cls != ReclaimClass::InUse || query.rights.inUse;
       case VictimKind::Conversion: return unit.key == query.rights.convertLane;
+      case VictimKind::Release: return query.reaches(unit.key, query.priority);
       case VictimKind::PassCommand: return query.rights.passCommand;
       case VictimKind::LaneStart: return query.rights.laneStart == TakeRights::LaneStart::Last;
       }
@@ -784,6 +786,7 @@ void testTakeRightsTable() {
   using Reuse = TakeRights::CertainReuse;
   using Reserves = TakeRights::Reserves;
   using LaneStart = TakeRights::LaneStart;
+  using Lanes = TakeRights::Lanes;
   const auto rights = [](const ClaimSpec &spec, const Need &need = {.bytes = kMiB}, bool critical = false,
                          std::optional<RequestPriority> highest = std::nullopt) {
     return takeRights(spec, need, critical, highest);
@@ -807,23 +810,23 @@ void testTakeRightsTable() {
       {"in service, can wait", rights(everything),
        {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = true,
-        .convertLane = 7}},
+        .convertLane = 7, .lanes = Lanes::AtOrBelow}},
       {"in service, can wait, for KV", rights(everything, {.bytes = kMiB, .kv = true}),
        {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = true,
-        .convertLane = 7, .laneStart = LaneStart::Last}},
+        .convertLane = 7, .lanes = Lanes::AtOrBelow, .laneStart = LaneStart::Last}},
       {"in service, can wait, for a state's buffers", rights(everything, {.bytes = kMiB, .stateBuffers = 1}),
        {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = true,
-        .convertLane = 7}},
+        .convertLane = 7, .lanes = Lanes::AtOrBelow}},
       {"in service, can wait, ordinary reach", rights({.cls = ClaimClass::InService}),
        {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = false, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = false,
-        .convertLane = 0}},
+        .convertLane = 0, .lanes = Lanes::AtOrBelow}},
       {"in service, can wait, ordinary reach, for KV", rights({.cls = ClaimClass::InService}, {.pages = 1, .kv = true}),
        {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = false, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = false,
-        .convertLane = 0, .laneStart = LaneStart::Last}},
+        .convertLane = 0, .lanes = Lanes::AtOrBelow, .laneStart = LaneStart::Last}},
       {"in service, Immediate", rights(immediate, {.bytes = kMiB, .kv = true}),
        {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
@@ -831,7 +834,7 @@ void testTakeRightsTable() {
       {"start", rights(start, {.bytes = kMiB, .kv = true}),
        {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = false, .certainReuse = Reuse::ResumePoint,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
-        .convertLane = 0}},
+        .convertLane = 0, .lanes = Lanes::AtOrBelow}},
       {"optional", rights(optional, {.bytes = kMiB, .kv = true}),
        {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::ResumePoint,
         .reserves = Reserves::None, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
@@ -845,23 +848,23 @@ void testTakeRightsTable() {
       {"the host at critical pressure", rights({.cls = ClaimClass::Host}, {.bytes = kMiB}, true),
        {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = true, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = false,
-        .convertLane = 0, .laneStart = LaneStart::First}},
+        .convertLane = 0, .lanes = Lanes::All, .laneStart = LaneStart::First}},
       {"a need the host refused in service", rights(everything, {.bytes = kMiB, .hostRefused = true, .kv = true}),
        {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
-        .convertLane = 0}},
+        .convertLane = 0, .lanes = Lanes::Own}},
       {"a need the host refused a start", rights(start, {.bytes = kMiB, .hostRefused = true}),
        {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::ResumePoint,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
-        .convertLane = 0}},
+        .convertLane = 0, .lanes = Lanes::Own}},
       {"in service below a lane", rights(below, {.bytes = kMiB, .kv = true}, false, RequestPriority::Foreground),
        {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = false, .storeAboveFloor = false, .passCommand = true,
-        .convertLane = 7, .laneStart = LaneStart::Last}},
+        .convertLane = 7, .lanes = Lanes::AtOrBelow, .laneStart = LaneStart::Last}},
       {"in service at critical pressure", rights(everything, {.bytes = kMiB}, true),
        {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = true,
-        .convertLane = 7, .laneStart = LaneStart::First}},
+        .convertLane = 7, .lanes = Lanes::AtOrBelow, .laneStart = LaneStart::First}},
   };
   for (const Row &row : rows)
     require(row.actual == row.expected, row.name + ": the take rights differ from the table");
@@ -2123,18 +2126,19 @@ void testAHostExemptionLogsMetPastTheHost() {
           "the host exemption did not log one met line: " + (lines.empty() ? std::string() : lines.back()));
 }
 
-// The fixed take order: cache, rebuild-only pools, the lane's conversion, then the store, each only for what the
-// ones before leave.
-void testTheOrderTakesCacheThenRebuiltPoolsThenConversionsThenTheStore() {
+// The fixed take order: cache, rebuild-only pools, a lane's release, then the store, each only for what the ones
+// before leave.
+void testTheOrderTakesCacheThenRebuiltPoolsThenReleasesThenTheStore() {
   FakeMemory memory({});
   FakeElasticPool experts("experts", memory, kGiB, 2, 6, 7, 6);
   FakeElasticPool vision("vision", memory, 256 * kMiB, 0, 1, 1, 1);
   vision.rebuildOnly = true;
   MemoryLedger ledger;
   TestSource engine("engine"), cache("cache");
-  // The lane of request 3, which its own growth converts.
-  Victim lane = unit(3, kGiB, true);
-  lane.kind = VictimKind::Conversion;
+  // The landed pages of the lane of request 3, which another lane's growth
+  // releases.
+  Victim lane = unit(3, kGiB);
+  lane.kind = VictimKind::Release;
   engine.units = {lane};
   cache.units = {unit(1, 256 * kMiB)};
   ledger.addPool(experts);
@@ -2152,11 +2156,11 @@ void testTheOrderTakesCacheThenRebuiltPoolsThenConversionsThenTheStore() {
           "the cache did not go first");
   lacks(2, 256 * kMiB);
   require(vision.units() == 0 && engine.taken.empty() && experts.units() == 6,
-          "the pool that costs only its rebuild did not go before conversions and the store");
-  lacks(3, kGiB);
-  require(engine.taken == std::vector<uint64_t>{3} && experts.units() == 6,
-          "the lane's conversion did not go before the store");
+          "the pool that costs only its rebuild did not go before releases and the store");
   lacks(4, kGiB);
+  require(engine.taken == std::vector<uint64_t>{3} && experts.units() == 6,
+          "the lane's release did not go before the store");
+  lacks(5, kGiB);
   require(experts.units() == 5, "the store did not give a unit once nothing else was left");
 }
 
@@ -2411,8 +2415,8 @@ std::span<const test::TestCase> ledgerTests() {
       {"testEachDecisionLogsOneLine", testEachDecisionLogsOneLine},
       {"testARetryBackToALoggedOutcomeLogsNothing", testARetryBackToALoggedOutcomeLogsNothing},
       {"testAHostExemptionLogsMetPastTheHost", testAHostExemptionLogsMetPastTheHost},
-      {"testTheOrderTakesCacheThenRebuiltPoolsThenConversionsThenTheStore",
-       testTheOrderTakesCacheThenRebuiltPoolsThenConversionsThenTheStore},
+      {"testTheOrderTakesCacheThenRebuiltPoolsThenReleasesThenTheStore",
+       testTheOrderTakesCacheThenRebuiltPoolsThenReleasesThenTheStore},
       {"testGrowthCountsWhatTheHostDoesNotShowYet", testGrowthCountsWhatTheHostDoesNotShowYet},
       {"testGrowthLeavesTheHostWhatTheLanesGrowInto", testGrowthLeavesTheHostWhatTheLanesGrowInto},
       {"testRequestsMetFromCacheLeaveRegrowthQuiet", testRequestsMetFromCacheLeaveRegrowthQuiet},

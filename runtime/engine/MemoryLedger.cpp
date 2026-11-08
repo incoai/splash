@@ -44,6 +44,7 @@ TakeRights takeRights(const ClaimSpec &spec, const Need &need, bool critical,
   using Reuse = TakeRights::CertainReuse;
   using Reserves = TakeRights::Reserves;
   using LaneStart = TakeRights::LaneStart;
+  using Lanes = TakeRights::Lanes;
   if (spec.cls == ClaimClass::Floor)
     throw std::logic_error("a Floor claim takes nothing: the start and a weights restore pass only the host's rule");
   // The engine's own optional work takes no unit, so every right is the
@@ -67,9 +68,23 @@ TakeRights takeRights(const ClaimSpec &spec, const Need &need, bool critical,
           .storeAboveFloor = !belowALane && ((inService && waits) || hostCritical),
           .passCommand = inService && waits && spec.supersedes,
           .convertLane = inService && waits && spec.kvGrowth ? spec.requestId : 0,
+          .lanes = need.hostRefused                                        ? Lanes::Own
+                   : hostCritical                                          ? Lanes::All
+                   : waits && (inService || spec.cls == ClaimClass::Start) ? Lanes::AtOrBelow
+                                                                           : Lanes::None,
           .laneStart = critical                         ? LaneStart::First
                        : inService && waits && need.kv ? LaneStart::Last
                                                        : LaneStart::Kept};
+}
+
+bool VictimQuery::reaches(uint64_t lane, RequestPriority lanePriority) const noexcept {
+  switch (rights.lanes) {
+  case TakeRights::Lanes::None: return false;
+  case TakeRights::Lanes::Own: return lane == requestId;
+  case TakeRights::Lanes::AtOrBelow: return lane == requestId || lanePriority >= priority;
+  case TakeRights::Lanes::All: return true;
+  }
+  return false;
 }
 
 // What a claim lacks, in each measure that can meet it: device bytes beyond
@@ -293,27 +308,28 @@ struct MemoryLedger::Run final {
   // It reached a cached unit that frees memory only once its copy lands.
   bool uncopied = false;
   // take: it took a unit whose loss costs work later: a store chunk, the
-  // command between its passes, a conversion, a unit in use, the buffers
-  // the next lane starts from.
+  // command between its passes, a release, a conversion, a unit in use, the
+  // buffers the next lane starts from.
   bool costly = false;
 };
 
 // The one order units are counted and taken in: memory nothing needs that
-// frees now (the cache's units that need no write, by its walk); the units
-// of pools that cost only their rebuild; the cache's units that need a
-// write (Victim::write), a state the idle staging buffer writes, which
-// frees at once, and what frees once a write lands; the claimant's own
-// conversion to Spill and the command between its passes; the other pools'
-// units (the expert store's chunks, top first) down to their floors, which
-// cost reads while they stay away; what another request uses, since its
-// state in use costs it a re-prefill of its whole prompt while a store
-// chunk costs only reads until it regrows; last the pooled buffers the next
-// lane starts from, which the claim takes only once nothing else in its
-// reach is left. Within a stage the source registered first goes first,
-// then the pools; each source's own order is kept. What the claim may not
-// take (TakeRights) is left out, by its source or here for the pools, not
-// stopped at; a claim that does not wait for writes passes over what frees
-// only once one lands (Victim::later).
+// frees now (the cache's units that need no write, by its walk); the units of
+// pools that cost only their rebuild; the cache's units that need a write
+// (Victim::write), a state the idle staging buffer writes, which frees at
+// once, and what frees once a write lands; the command between its passes,
+// the pages whose copies landed of the Spill lanes the claim releases, which
+// cost those lanes their blocks' reads, and the claimant's own conversion to
+// Spill; the other pools' units (the expert store's chunks, top first) down
+// to their floors, which cost reads while they stay away; what another
+// request uses, since its state in use costs it a re-prefill of its whole
+// prompt while a store chunk costs only reads until it regrows; last the
+// pooled buffers the next lane starts from, which the claim takes only once
+// nothing else in its reach is left. Within a stage the source registered
+// first goes first, then the pools; each source's own order is kept. What the
+// claim may not take (TakeRights) is left out, by its source or here for the
+// pools, not stopped at; a claim that does not wait for writes passes over
+// what frees only once one lands (Victim::later).
 class MemoryLedger::Order final {
 public:
   struct Head final {
@@ -346,16 +362,16 @@ public:
   }
 
   // The order's stages. What frees without a write comes first; from
-  // PassOrConversion on, a unit's loss costs work later (Run::costly), and a
+  // PassOrRelease on, a unit's loss costs work later (Run::costly), and a
   // pending unit holds those stages back.
-  enum class Stage : uint8_t { FreeNow, Rebuild, NeedsWrite, PassOrConversion, StoreAboveFloor, InUse, LaneStart };
+  enum class Stage : uint8_t { FreeNow, Rebuild, NeedsWrite, PassOrRelease, StoreAboveFloor, InUse, LaneStart };
   [[nodiscard]] static Stage stage(const Head &head) {
     if (head.pool)
       return head.state.rebuildOnly ? Stage::Rebuild : Stage::StoreAboveFloor;
     if (head.victim->kind == VictimKind::LaneStart)
       return Stage::LaneStart;
     if (head.victim->kind != VictimKind::Memory)
-      return Stage::PassOrConversion;
+      return Stage::PassOrRelease;
     if (head.victim->cls == ReclaimClass::InUse)
       return Stage::InUse;
     return head.victim->write ? Stage::NeedsWrite : Stage::FreeNow;
@@ -468,7 +484,8 @@ MemoryLedger::Run MemoryLedger::bound(const VictimQuery &query, const Lacking &l
 }
 
 // Takes the order's units one at a time until what they freed, now and as
-// the transfers they started land, covers the lack. After a take that freed
+// the transfers they started land, covers the lack, each for what the lack
+// leaves of it (VictimQuery::lackingBytes). After a take that freed
 // something its source is peeked again from its head; a unit whose take
 // frees nothing is passed over: a transfer in flight may hold it (pending),
 // or nothing of it is left. A claim that can wait takes nothing past the
@@ -511,7 +528,11 @@ MemoryLedger::Run MemoryLedger::take(const VictimQuery &query, const Lacking &la
         ++account.shrinks;
       }
     } else {
-      taken = sources_[best->source]->take(query, unit);
+      // The source takes for what the claim lacks still.
+      VictimQuery lacking = query;
+      lacking.lackingBytes = saturatingSubtract(lack.bytes, run.bytes);
+      lacking.lackingPages = static_cast<uint32_t>(saturatingSubtract(lack.pages, run.pages));
+      taken = sources_[best->source]->take(lacking, unit);
       if (unit.later && unit.kind == VictimKind::Memory)
         run.uncopied = true;
     }
@@ -581,7 +602,10 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
   const uint64_t id = claimId.value;
   ClaimState &claim = claims_.at(id);
   const ClaimSpec &spec = claim.spec;
-  const VictimQuery query{.rights = takeRights(spec, need, critical, lanePriority_), .need = need};
+  const VictimQuery query{.rights = takeRights(spec, need, critical, lanePriority_),
+                          .need = need,
+                          .requestId = spec.requestId,
+                          .priority = spec.priority};
 
   FreeResult result{.nowBytes = takeUnsized(query)};
   const uint64_t room = saturatingAdd(freeBytes, result.nowBytes);
@@ -729,7 +753,11 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
 // victims, as free() counts them.
 uint64_t MemoryLedger::available(const ClaimSpec &spec, const Need &need, uint64_t freeBytes, bool critical,
                                  const RestoredChains *kept) const {
-  const VictimQuery query{.rights = takeRights(spec, need, critical, lanePriority_), .need = need, .kept = kept};
+  const VictimQuery query{.rights = takeRights(spec, need, critical, lanePriority_),
+                          .need = need,
+                          .kept = kept,
+                          .requestId = spec.requestId,
+                          .priority = spec.priority};
   const uint64_t enough = need.bytes;
   const uint64_t held = heldFor(spec, std::nullopt);
   uint64_t landing = 0;
@@ -907,6 +935,7 @@ void MemoryLedger::log(const ClaimSpec &spec, const Need &need, const Run *run, 
       else
         line << sources_[took.source]->name()
              << (took.unit.kind == VictimKind::Conversion    ? " conversion"
+                 : took.unit.kind == VictimKind::Release     ? " release"
                  : took.unit.kind == VictimKind::PassCommand ? " pass command"
                  : took.unit.kind == VictimKind::LaneStart   ? " lane start"
                  : took.unit.cls == ReclaimClass::InUse      ? " in use"

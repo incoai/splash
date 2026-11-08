@@ -254,10 +254,11 @@ void writeKvWindow(json::Writer &w, const KvWindowSnapshot &window, const KvPool
 // waiting for the quota; the pages that hold only their index, the pool's
 // pages of that form in use (each a spilled block's, which requests may hold
 // as the cache does), of `indexPageBytes` each, and those spilled; the
-// write-through of Spill requests' pages; the moves between page forms,
-// rewrites and restores; the quota of active KV; the Index runway, the free
-// pages of that form; and the readers' memory and reads. A target that keeps
-// its KV in memory has no kv_spill section.
+// write-through of Spill requests' pages; the moves between page forms, the
+// releases of lanes' pages and their pages, rewrites and restores; the quota
+// of active KV; the Index runway, the free pages of that form; and the
+// readers' memory and reads. A target that keeps its KV in memory has no
+// kv_spill section.
 void writeKvSpill(json::Writer &w, const StatusSample::KvSpill &spill, uint64_t indexPageBytes,
                   const engine::EngineSnapshot &core, const ResourceWaitSnapshot &resourceWait) {
   const KvSpillSnapshot &cache = spill.cache;
@@ -293,7 +294,11 @@ void writeKvSpill(json::Writer &w, const StatusSample::KvSpill &spill, uint64_t 
           .field("failures", cache.writeThroughFailures)
           .field("paused", cache.writeThroughPaused);
     });
-    w.field("spill_moves", cache.spillMoves).field("unspills", cache.unspills).field("rewrites", cache.rewrites);
+    w.field("spill_moves", cache.spillMoves)
+        .field("unspills", cache.unspills)
+        .field("releases", cache.releases)
+        .field("released_pages", cache.releasedPages)
+        .field("rewrites", cache.rewrites);
     w.object("restores", [&] {
       w.field("index_pages", cache.indexRestores).field("whole_pages", cache.wholeRestores).key("ms");
       writeLatency(w, cache.restore);

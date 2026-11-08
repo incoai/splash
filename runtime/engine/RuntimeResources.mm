@@ -1217,7 +1217,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       kvTier = std::make_unique<KvPageTier>(*kvPages, kvFormat, disk.kv, readers);
     std::optional<CacheSpillPolicy> spillPolicy;
     if (spill.enabled)
-      spillPolicy = CacheSpillPolicy{.densePages = spill.densePages, .windowPages = spill.windowPages};
+      spillPolicy = CacheSpillPolicy{
+          .densePages = spill.densePages, .windowPages = spill.windowPages, .always = config.kvSpillAlways};
     // A windowed layout's pages give up their windowed layers' K/V where
     // they can (kv::Layout::slimmable), unless --kv-window-trim off.
     std::optional<CacheWindowPolicy> windowPolicy;

@@ -244,11 +244,12 @@ public:
   // The scope's work released `bytes`, which its allocations take back
   // past the host's rule (allocationAdmission) while the scope lives: a
   // spill's moves pay for the Index extents they move into with the Full
-  // extents they empty (Cache::spillWritten), 17 times an Index extent's
-  // bytes on Qwen3.8-Flash-Next, and the refill is what lets the moves go
-  // on returning memory; a pool's growth the cache funds whole returns the
-  // host nothing, and so still waits out critical pressure and a deficit
-  // (growthHost). std::logic_error outside any scope.
+  // extents they empty (Cache::spillWritten, Cache::releasePages), 17 times
+  // an Index extent's bytes on Qwen3.8-Flash-Next, and the refill is what
+  // lets the moves go on returning memory; a pool's growth the cache funds
+  // whole returns the host nothing, and so still waits out critical
+  // pressure and a deficit (growthHost). std::logic_error outside any
+  // scope.
   void fund(uint64_t bytes);
   // The need its scope's refusals recorded, with the caller's in-place part.
   [[nodiscard]] Need need(ClaimId claim, const std::optional<Need> &inPlace = {}) const;
@@ -257,8 +258,9 @@ public:
   // beyond its margin at normal pressure, read now, since pages are handed
   // out between the host rule's samples.
   [[nodiscard]] std::array<uint32_t, 3> heldPages(ClaimId claim) const;
-  // Frees what the claim lacks (MemoryLedger::free). A need the host refused
-  // is met in place first, from the pages and state buffers already
+  // Frees what the claim lacks (MemoryLedger::free), in its scope: a lane's
+  // release allocates the Index extents its pages move into. A need the host
+  // refused is met in place first, from the pages and state buffers already
   // allocated; failing that, the retries of an InService claim, or
   // of an Optional one its lane needs (ClaimSpec::laneNeeds), pass the host,
   // and another claim falls short.

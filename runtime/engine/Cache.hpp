@@ -140,7 +140,8 @@ struct CacheAdoption final {
 // pages hold only their index, and their copies' bytes; write-through of
 // Spill requests' pages: pages and bytes written, writes in flight and
 // failed, and a pause after the volume filled; pages that moved to the index
-// form and back, and blocks written again once their copy had gone;
+// form and back, the releases that gave a lane's pages' memory back for a
+// claim and their pages, and blocks written again once their copy had gone;
 // restores of a page's index and of a whole page, and how long they took;
 // the quota of active KV, the copies of the KV requests hold and the
 // commitments of Spill requests within it, and commitments revoked.
@@ -154,6 +155,8 @@ struct KvSpillSnapshot final {
   bool writeThroughPaused = false;
   uint64_t spillMoves = 0;
   uint64_t unspills = 0;
+  uint64_t releases = 0;
+  uint64_t releasedPages = 0;
   uint64_t rewrites = 0;
   uint64_t indexRestores = 0;
   uint64_t wholeRestores = 0;
@@ -243,10 +246,16 @@ struct PageTableState final {
 // What a spill-capable target's cache keeps Full for each request that
 // spills: the pages its rows read through page tables from the start (its
 // dense history, SparseKvShape), and the last pages it committed before its
-// open page (the tail window, at least its local rows').
+// open page (the tail window, at least its local rows'). A Spill request's
+// other pages stay Full once their copies land, until a claim releases them
+// (Cache::releasePages): a lane decodes on its pages in memory while memory
+// lasts, and reads back only the blocks a release took. With `always`
+// (--kv-spill always, for validation) they move to the index form as their
+// copies land (Cache::spillWritten).
 struct CacheSpillPolicy final {
   uint32_t densePages = 0;
   uint32_t windowPages = 0;
+  bool always = false;
 };
 
 // What the cache of a layout with a sliding window (kv::Layout::windowTokens)
@@ -311,6 +320,15 @@ public:
 private:
   std::unordered_set<uint64_t> blocks_;
   std::vector<uint64_t> states_;
+};
+
+// The pages a release may move (Cache::releasePages): requests on one prefix
+// share its pages, so only those whose every holder is a request `takesFrom`
+// takes pages from, and none on the chain a Resident start restores (`kept`,
+// by position), which its count holds as its own in place.
+struct ReleaseRule final {
+  std::function<bool(uint64_t holder)> takesFrom;
+  std::span<const uint64_t> kept;
 };
 
 // KV restores a request waits for before it can run.
@@ -480,10 +498,10 @@ public:
   [[nodiscard]] bool commitSpill(uint64_t requestId, uint32_t pages, const ChainCopies &copies = {});
   // Turns a Resident request whose growth was denied into a Spill request:
   // checks the tier, the write budget and the room for `pages` pages,
-  // commits them, starts write-through of its published blocks and moves
-  // those whose copies landed already into free Index pages at once. It
-  // allocates nothing; false, changing nothing, when spilling cannot relieve
-  // it.
+  // commits them and starts write-through of its published blocks; its
+  // pages whose copies landed, as a chain it restored has them, are its
+  // claim's to release (releasePages). It allocates nothing; false, changing
+  // nothing, when spilling cannot relieve it.
   [[nodiscard]] bool convertToSpill(uint64_t requestId, uint32_t pages);
   // Whether a start that restores this chain would take some of the quota
   // of active KV (spillRoom): a copy on it no request holds (takesQuota). A
@@ -500,25 +518,91 @@ public:
   // what they hold (KvCache::kvCopied), as the tier's share for them allows;
   // returns the writes started.
   uint32_t writeThrough();
-  // Between commands: moves the eligible pages whose copies landed to the
-  // index form, a runway at a time: into free Index pages, the runway's
-  // among them; then the Full extents those moves left empty go as
-  // `extents` says, their bytes told to `funds` (MemoryGovernor::fund), and
-  // the runway, an extent's worth of free Index pages, refills from them;
-  // the next spill takes it without an allocation. Denied, of the index
-  // form, when an allocation was refused: the pages it leaves Full, or the
-  // runway's; the caller makes room for them or does without.
+  // Between commands: refills the Index runway, an extent's worth of free
+  // Index pages, which the next spill takes without an allocation. Under
+  // --kv-spill always (CacheSpillPolicy::always) it first moves the eligible
+  // pages whose copies landed to the index form, a runway at a time: into
+  // free Index pages, the runway's among them; then the Full extents those
+  // moves left empty go as `extents` says, their bytes told to `funds`
+  // (MemoryGovernor::fund), and the runway refills from them. Denied, of the
+  // index form, when an allocation was refused: the pages it leaves Full, or
+  // the runway's; the caller makes room for them or does without.
   [[nodiscard]] TokenAdmission spillWritten(SpilledExtents extents,
                                             const std::function<void(uint64_t bytes)> &funds = {});
+  // A count of releases of requests in turn (EngineVictims::releases), each
+  // moving its request's oldest pages as its take would: the pages those it
+  // counted move and the requests they give Index pages, so that a page
+  // requests on one prefix share, and a holder's first reads, count once.
+  // Counted for each alone, two lanes on one conversation gave 307 MB more
+  // than their takes free.
+  struct ReleaseCount final {
+    std::unordered_set<uint64_t> blocks;
+    std::unordered_set<uint64_t> holders;
+  };
+  // A Spill request's pages a release moves to the index form, oldest
+  // first: Full pages of its own blocks past its dense history and short of
+  // its tail window, every holder of which spills and has passed them, that
+  // the rule lets a release take (ReleaseRule). Clean: their copies landed.
+  // Landing: their copies are being written, or owed while the SSD cache
+  // writes Spill requests' copies; a release takes them once they land.
+  // Holders: those of the oldest, among whom is every holder of a later one,
+  // as a block's holders hold its chain: the requests a release gives Index
+  // pages. The count starts at the request's scan mark, past what is spilled
+  // or kept Full. Past the releases `count` counted, it leaves out the pages
+  // they move and, of the holders, the requests they give Index pages.
+  struct ReleasablePages final {
+    uint32_t clean = 0;
+    uint32_t landing = 0;
+    std::vector<uint64_t> holders;
+  };
+  [[nodiscard]] ReleasablePages releasablePages(uint64_t requestId, const ReleaseRule &rule,
+                                                const ReleaseCount &count = {}) const;
+  // Counts in `count` a release of the request's `pages` oldest pages of
+  // those releasablePages finds with it, clean or, with `landing`, landing
+  // too: the pages, and the holders of the oldest.
+  void countRelease(uint64_t requestId, uint32_t pages, bool landing, const ReleaseRule &rule,
+                    ReleaseCount &count) const;
+  // Whether a release of `pages` pages for bytes frees memory: the Full
+  // pages its first runway's moves into free Index pages leave, with those
+  // free already, fill a Full extent, which leaves and pays for the next
+  // runway.
+  [[nodiscard]] bool releaseFreesAnExtent(uint32_t pages) const noexcept;
+  // The pages a release freeing `pages` Full pages in place moves, of a
+  // request's `clean` ones, so that an extent of free Index pages stays, the
+  // runway the next release moves into: those pages where free Index pages
+  // hold them beside it; else an extent more, as for bytes, whose emptied
+  // Full extent refills it, where releaseFreesAnExtent; else none. Moved
+  // alone into the runway they could leave it short where the room holds no
+  // Index extent (6.3 MB on Qwen3.8-Flash-Next), and no release for bytes
+  // could start again.
+  [[nodiscard]] uint32_t inPlaceMoves(uint32_t pages, uint32_t clean) const noexcept;
+  // Between commands: moves the request's `pages` oldest clean pages
+  // (releasablePages, by the same rule) to the index form, as spillWritten
+  // moves landed pages: into free Index pages; for a need of bytes, where
+  // releaseFreesAnExtent, the Full extents they empty then leave, the Full
+  // pages left first gathered in the fewest extents, their bytes told to
+  // `funds`, and the runway refills from them, a runway at a time; for a
+  // need of pages in place (`inPlace`) its inPlaceMoves, an extent past
+  // `pages` moving as for bytes, the `pages` Full pages staying free for the
+  // claim. A refused refill ends it with what it moved. Returns the pages
+  // moved; a release counts (KvSpillSnapshot::releases) where it freed what
+  // it was for.
+  uint32_t releasePages(uint64_t requestId, uint32_t pages, bool inPlace, const ReleaseRule &rule,
+                        const std::function<void(uint64_t bytes)> &funds = {});
+  // Whether a Spill request owes copies no write has started: the SSD
+  // cache takes no more of its KV, for the quota, the write budget or a
+  // closed tier, or writes other requests' first.
+  [[nodiscard]] bool owesCopies(uint64_t requestId) const;
   // Pages of the form that transfers in flight will free: demotions, and
-  // for Full the pages Spill requests hold that spill once their copies in
-  // flight land, written through or copied ahead, as far as free Index
-  // pages take them (spillingWrites).
+  // for Full under --kv-spill always the pages Spill requests hold that
+  // spill once their copies in flight land, written through or copied
+  // ahead, as far as free Index pages take them (spillingWrites).
   [[nodiscard]] uint32_t pendingPages(kv::PageForm form) const noexcept;
   // The bytes the KV pool's extents take, of every form.
   [[nodiscard]] uint64_t allocatedBytes() const noexcept { return pool_.allocatedBytes(); }
-  // The bytes one page of the form takes.
+  // The bytes one page of the form takes, and the pages of an extent.
   [[nodiscard]] uint64_t bytesPerPage(kv::PageForm form) const noexcept { return pool_.bytesPerPage(form); }
+  [[nodiscard]] uint32_t extentPages() const noexcept { return pool_.extentPages(); }
   // The pages a Resident request's conversion to Spill would move to the
   // Index form: its Full pages that spillEligibility would find Eligible
   // were it Spill, past its dense history and short of its tail window, no
@@ -550,6 +634,12 @@ public:
   // holds.
   [[nodiscard]] uint32_t indexPages(uint64_t requestId) const;
   [[nodiscard]] bool holdsIndexPages(uint64_t requestId) const;
+  // Whether a Spill start that restores `chain` holds Index pages once it
+  // has (restoreRequest): a block of it past the dense history that only
+  // the SSD cache holds, or one on an Index page. A probe's chain may have
+  // changed since it was made: it reads the chain up to its first block no
+  // longer matchable.
+  [[nodiscard]] bool restoresIndexPages(std::span<const uint64_t> chain) const;
   // The block's copy could not be read (ModelStepResult::unreadableKvBlocks):
   // it matches nothing any more, and its copy goes with the block.
   void poisonCopy(uint64_t block);
@@ -718,25 +808,30 @@ public:
   FreeResult take(const VictimQuery &query, const engine::Victim &victim) override;
   // What the transfers in flight and the copies Spill requests owe free as
   // they land. Landing: demotions whose pages free as they land
-  // (freesOnLanding), by the form of their pages, and the pages
-  // Spill requests hold, written through or copied ahead, that spill once
-  // their copies land, as far as free Index pages take them. Owed: the
-  // copies Spill requests owe of the pages that spill once copied, while the
-  // SSD cache writes their copies (a Spill write in flight), all of them: the
-  // Full extents they empty fund their Index pages. The bytes are the whole
-  // extents those pages add to the free pages of their form, which
-  // compaction returns. A restore frees nothing, nor does the state write,
-  // whose RAM copy left as it started, nor a copy ahead of a page that stays.
+  // (freesOnLanding), by the form of their pages, and under --kv-spill
+  // always the pages Spill requests hold, written through or copied ahead,
+  // that spill once their copies land, as far as free Index pages take
+  // them. Owed: under --kv-spill always, the copies Spill requests owe of
+  // the pages that spill once copied, while the SSD cache writes their
+  // copies (a Spill write in flight), all of them: the Full extents they
+  // empty fund their Index pages. Otherwise a Spill request's pages free
+  // only as a claim releases them (releasePages), which counts those whose
+  // copies land as a release of their own (releasablePages). The bytes are
+  // the whole extents those pages add to the free pages of their form,
+  // which compaction returns. A restore frees nothing, nor does the state
+  // write, whose RAM copy left as it started, nor a copy ahead of a page
+  // that stays.
   [[nodiscard]] Returning returning() const;
   // What returning() counts of the requests' own pages: those of their page
   // tables, written through or copied ahead, that spill once their copies
   // land, as far as free Index pages take them, and the copies they owe,
   // each block once; their owed bytes are the extents the owed pages
   // complete beside every landing, which returning()'s landing bytes count.
+  // None but under --kv-spill always.
   [[nodiscard]] Returning returningFor(std::span<const uint64_t> requestIds) const;
-  // The pages the demotions in flight free as they land, by form:
-  // returning()'s landing pages less the Full pages that spill once their
-  // copies land, which free only as spillWritten() moves them.
+  // The pages the demotions in flight free as they land, by form: returning()'s
+  // landing pages less the Full pages that under --kv-spill always spill as
+  // their copies land, which free only as spillWritten() moves them.
   [[nodiscard]] std::array<uint32_t, 3> demotedPages() const;
   // The chains the requests waiting to start restore (their admission
   // probes): the KV of every block of each, and the state at its last, which
@@ -750,9 +845,9 @@ public:
   // A KV demotion, a KV restore or the one state write is in flight, so
   // memory or quota returns by itself and its completion wakes the engine;
   // so is a copy ahead whose block a reclaim that takes all it may then
-  // frees through it (copyAheadReturns), or a page written through or copied
-  // ahead that spills once its copy lands. A walk's takes wait for those
-  // that return to it (transfersInFlight(walk)).
+  // frees through it (copyAheadReturns), or under --kv-spill always a page
+  // written through or copied ahead that spills once its copy lands. A
+  // walk's takes wait for those that return to it (transfersInFlight(walk)).
   [[nodiscard]] bool transfersInFlight() const noexcept;
   // The most pages of the form a page need's evictions can leave free: every
   // allocated page of the form no request holds, but with Ordinary not the
@@ -802,7 +897,7 @@ private:
     // spill (revocation goes newest first), the blocks it holds whose copy
     // it still owes, in publication order after those whose write failed,
     // and how far its blocks are known spilled or kept Full by another
-    // holder (spillWritten).
+    // holder (landedPages).
     uint32_t committedPages = 0;
     // The copies on the chain it restores that its commitment counted
     // (commitSpill).
@@ -833,7 +928,8 @@ private:
   // A page being written to the tier, and what for (WriteClass): a reclaim
   // demotion, whose page frees once the copy lands; a copy persist() writes
   // ahead of need of a page that stays; or a Spill request's page written
-  // through, which stays Full until spillWritten moves it.
+  // through, which stays Full until a claim releases it (releasePages), or
+  // under --kv-spill always spillWritten moves it.
   struct Write final {
     uint64_t block = 0;
     WriteClass write = WriteClass::Reclaim;
@@ -1342,12 +1438,12 @@ private:
   // `demoting` pages a unit found in flight and the runway the walk keeps
   // leave one. That counts the leaves that need a demotion too, which an
   // Immediate step passes over while the tier takes writes. A page written
-  // through is none of them: its Spill request holds it, though it frees
-  // once its copy lands (pendingPages). For a need of pages (Walk::inPlace)
-  // the walk's form is in reach too while KV of it can leave past its free
-  // pages and the pages all demotions in flight bring, this take's
-  // included: each page that leaves meets the need in place, as reach()
-  // counts it, with no extent emptied.
+  // through is none of them: its Spill request holds it, though under
+  // --kv-spill always it frees once its copy lands (pendingPages). For a need
+  // of pages (Walk::inPlace) the walk's form is in reach too while KV of it
+  // can leave past its free pages and the pages all demotions in flight
+  // bring, this take's included: each page that leaves meets the need in
+  // place, as reach() counts it, with no extent emptied.
   [[nodiscard]] std::array<bool, 3> formsInReach(const Walk &walk, const std::array<uint32_t, 3> &demoting) const;
   // Evicting the resident leaf may lead to an extent of a form in `reach`
   // emptying: its page is of such a form, or the page of a block above it,
@@ -1416,19 +1512,20 @@ private:
   // Whether a Full block whose copy has landed may move to the index form:
   // it lies past the dense history, and requests hold it, all of them
   // spilling and outside their tail windows (Eligible). Later: one holds it
-  // in its window, which moves on as it commits. KeptFull while a holder
-  // reads it Full, a Resident one or its dense history, and without
-  // holders.
+  // in its window, which moves on as it commits, or the rule does not let a
+  // release take it. KeptFull while a holder reads it Full, a Resident one
+  // or its dense history, and without holders.
   enum class Eligibility : uint8_t { Eligible, Later, KeptFull };
-  [[nodiscard]] Eligibility spillEligibility(uint64_t block) const;
+  [[nodiscard]] Eligibility spillEligibility(uint64_t block, const ReleaseRule &rule = {}) const;
   // Writes of the class in flight.
   [[nodiscard]] uint32_t writes(WriteClass write) const noexcept;
   // Pages Spill requests hold, written through or copied ahead, whose Full
-  // pages free once their copies land (spillsOnLanding).
+  // pages free as their copies land under --kv-spill always (spillsOnLanding).
   [[nodiscard]] uint32_t spillingWrites() const noexcept;
-  // Whether a write's page spills once it lands: a page a Spill request
-  // holds past its dense history and tail window, whatever wrote it but a
-  // demotion.
+  // Whether a write's page spills once it lands: under --kv-spill always, a
+  // page a Spill request holds past its dense history and tail window,
+  // whatever wrote it but a demotion. Otherwise none does: a lane's pages
+  // stay Full until a claim releases them.
   [[nodiscard]] bool spillsOnLanding(const Write &write) const;
   // Whether a demotion of the block frees its page as its copy lands: no
   // state in RAM keeps the page (pollTierTransfers), no request holds it,
@@ -1453,14 +1550,29 @@ private:
   // that kept some of them Full ended or began to spill.
   void rescanSpills() noexcept;
   // The Spill requests' pages past their dense history and window whose
-  // copies landed (spillEligibility), each once and in page order; each
-  // request's scan mark (Request::spillScan) passes the pages that settle.
+  // copies landed (spillEligibility), each once and in page order.
   [[nodiscard]] std::vector<uint32_t> landedPages();
-  // spillWritten(*extents, funds), or without `extents` only its moves into
-  // free Index pages, which allocate nothing: those past them stay Full, and
-  // so do the Full extents they empty.
-  [[nodiscard]] TokenAdmission moveLandedPages(std::optional<SpilledExtents> extents,
-                                               const std::function<void(uint64_t bytes)> &funds);
+  // The request's `most` oldest of them the rule lets a release take
+  // (spillEligibility); its scan mark (Request::spillScan) passes the pages
+  // that settle.
+  [[nodiscard]] std::vector<uint32_t> landedPages(Request &active, uint32_t most, const ReleaseRule &rule);
+  // Calls `each` with the index and block of each page releasablePages
+  // finds of the request with `count`, oldest first, and whether its copy
+  // landed, while `each` returns true.
+  void forReleasable(const Request &active, const ReleaseRule &rule, const ReleaseCount &count,
+                     const std::function<bool(uint32_t index, uint64_t block, bool clean)> &each) const;
+  // The requests whose chains hold `block` at `index`: a release that moves
+  // its page gives each of them Index pages.
+  [[nodiscard]] std::vector<uint64_t> holdersAt(uint32_t index, uint64_t block) const;
+  // Moves the pages `landed` finds to the index form as spillWritten says,
+  // the Full extents they empty leaving past the `claimed` free Full pages a
+  // claim takes in place, or without `extents` only into free Index pages,
+  // which allocate nothing: those past them stay Full, and so do the Full
+  // extents they empty.
+  [[nodiscard]] TokenAdmission moveLandedPages(const std::function<std::vector<uint32_t>()> &landed,
+                                               std::optional<SpilledExtents> extents,
+                                               const std::function<void(uint64_t bytes)> &funds,
+                                               uint32_t claimed = 0);
   // The copy of the K/V on an Index page.
   [[nodiscard]] model::KvPageSource sourceOf(uint32_t page) const;
   // Every request that holds the page, at chain index `index`, has
@@ -1503,9 +1615,9 @@ private:
   // The chains requests waiting to start restore (setWantedChains).
   RestoredChains wanted_;
   // Writes in flight, in the order they started. Only reclaim demotions,
-  // and writes of pages that spill once they land, free memory a reclaim
-  // waits for (pendingPages); the other copies persist() keeps hold only
-  // their blocks.
+  // and under --kv-spill always writes of pages that spill once they land,
+  // free memory a reclaim waits for (pendingPages); the other copies
+  // persist() keeps hold only their blocks.
   std::vector<Write> writes_;
   PersistCursor persisting_;
   // Write-through waits after a write found the volume full, until the

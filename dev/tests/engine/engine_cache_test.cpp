@@ -3917,14 +3917,16 @@ void testReplacementKeepsTheExtentItEmpties() {
           "releasing the empty extents did not release the reused one");
 }
 
-// A cache whose requests may spill: its pool's extents hold four
-// pages, 100 bytes a Full page and 10 an Index page, one extent of each form
-// allocated from the start (the Index one the runway spilling draws on, as
-// the cache's first spill pass allocates it), and its tier's slots of 100
-// bytes draw on a quota of `slots` of them. The dense history and the tail
-// window are a page each unless a test says otherwise.
+// A cache whose requests may spill, under --kv-spill always: their pages
+// move to the index form as their copies land (Cache::spillWritten). Its
+// pool's extents hold four pages, 100 bytes a Full page and 10 an Index
+// page, one extent of each form allocated from the start (the Index one the
+// runway spilling draws on, as the cache's first spill pass allocates it),
+// and its tier's slots of 100 bytes draw on a quota of `slots` of them. The
+// dense history and the tail window are a page each unless a test says
+// otherwise.
 struct Spilling {
-  explicit Spilling(CacheSpillPolicy policy = {1, 1}, uint32_t slots = 64)
+  explicit Spilling(CacheSpillPolicy policy = {1, 1, true}, uint32_t slots = 64)
       : budget(std::make_shared<model::DiskBudget>(uint64_t{slots} * 100)),
         cache(pool, &tier, budget, policy) {
     tier.budget = budget;
@@ -4572,7 +4574,7 @@ void testWritersMoveOntoPagesBeingWritten() {
 // Quota never gives up a copy a running request reads; its slots return once the command's cut
 // goes.
 void testQuotaGivesUpOnlyCopiesNothingReads() {
-  Spilling spill({1, 1}, 64);
+  Spilling spill({1, 1, true}, 64);
   const std::vector<uint32_t> prompt = Spilling::prompt(1000, 5);
   spill.start(1, prompt, 5);
   static_cast<void>(test::spillRound(spill.cache, spill.tier));
@@ -4628,7 +4630,7 @@ void testQuotaKeepsTheSpilledLeafOfAStateInRam() {
 // A committed page's slot comes before any cached copy, the spilled chain of a state in RAM
 // included.
 void testCommittedPagesTakeTheSpilledChainOfAStateInRam() {
-  Spilling spill({1, 1}, 6);
+  Spilling spill({1, 1, true}, 6);
   const std::vector<uint32_t> prompt = Spilling::prompt(1000, 6);
   spill.start(1, prompt, 6);
   static_cast<void>(test::spillRound(spill.cache, spill.tier));
@@ -4681,7 +4683,7 @@ void testUnreadableCopyLeavesBeforeTheCommandThatReadIt() {
 // A commitment locks quota until its pages are written; a lower active limit drops the newest
 // commitment first.
 void testCommitmentsLockQuotaUntilWritten() {
-  Spilling spill({1, 1}, 10);
+  Spilling spill({1, 1, true}, 10);
   const std::vector<uint32_t> cached = Spilling::prompt(1000, 4);
   spill.start(1, cached, 4);
   static_cast<void>(test::spillRound(spill.cache, spill.tier));
@@ -4753,7 +4755,7 @@ void testCommitmentsLockQuotaUntilWritten() {
 // cached copy up.
 void testWriteThroughResumesBesideCopiesThatFillTheRoom() {
   // Every page stays Full, so that each cached copy is a redundant one.
-  Spilling spill({8, 1}, 10);
+  Spilling spill({8, 1, true}, 10);
   spill.start(1, Spilling::prompt(5000, 4), 4);
   require(spill.cache.writeThrough() == 4, "the cached copies were not written");
   spill.tier.complete();
@@ -4990,8 +4992,9 @@ void testPagesPastTheCommitmentCommitTheirSlots() {
   spill.cache.endRequest(1);
 }
 
-// A conversion whose history already has copies spills those pages at once, without an allocation.
-void testConversionSpillsTheHistoryWithCopiesAtOnce() {
+// A conversion whose history already has copies writes none of them again and moves nothing: its claim releases
+// those pages at once, into free Index pages without an allocation (Cache::releasePages).
+void testAConversionsHistoryWithCopiesIsReleasedAtOnce() {
   Spilling spill;
   const std::vector<uint32_t> prompt = Spilling::prompt(1000, 6);
   spill.start(1, prompt, 6);
@@ -5013,12 +5016,16 @@ void testConversionSpillsTheHistoryWithCopiesAtOnce() {
           "the fixture's growth was not denied");
   const uint32_t writes = static_cast<uint32_t>(spill.tier.writes.size());
   const uint32_t allocations = spill.storage.allocationAttempts;
+  const ReleaseRule every{.takesFrom = [](uint64_t) { return true; }};
   require(spill.cache.convertToSpill(2, 0) && spill.tier.writes.size() == writes &&
+              spill.spilled(2) == std::vector<bool>(6, false) && spill.cache.releasablePages(2, every).clean == 4,
+          "the conversion wrote its history's pages again, moved them, or left them no release's");
+  require(spill.cache.releasePages(2, 4, true, every) == 4 &&
               spill.spilled(2) == std::vector<bool>{false, true, true, true, true, false} &&
-              spill.storage.allocationAttempts == allocations,
-          "the conversion did not spill the pages whose copies had landed at once, or wrote or allocated");
+              spill.storage.allocationAttempts == allocations && spill.cache.spillSnapshot().releasedPages == 4,
+          "a release of the pages whose copies had landed did not move them at once, or allocated");
   require(spill.cache.ensureTokens(2, tokens).granted(),
-          "the converted request did not grow into the pages its spill freed");
+          "the converted request did not grow into the pages its release freed");
   spill.cache.checkInvariants();
   lookup = {};
   spill.cache.endRequest(2);
@@ -5026,7 +5033,7 @@ void testConversionSpillsTheHistoryWithCopiesAtOnce() {
 
 // A page spills only once every holder spills and holds it past its dense history and window.
 void testEveryHolderDecidesWhetherAPageSpills() {
-  Spilling spill({2, 2});
+  Spilling spill({2, 2, true});
   const std::vector<uint32_t> prompt = Spilling::prompt(1000, 8);
   spill.start(1, prompt, 8);
   spill.start(2, prompt, 5);
@@ -5068,7 +5075,7 @@ void testBlocksAreWrittenOnce() {
 // A Spill request's owed copies count as returning Full pages while any of its copies is written.
 void testOwedCopiesReturnWhileAnyIsWritten() {
   // A dense history of four pages; one write at a time.
-  Spilling spill(CacheSpillPolicy{4, 1});
+  Spilling spill(CacheSpillPolicy{4, 1, true});
   spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 1;
   const std::vector<uint32_t> tokens = Spilling::prompt(1, 12);
   spill.start(1, tokens, 12);
@@ -5552,7 +5559,7 @@ void testImmediateEvictionCountsNoLandingPage() {
 // What spilling returns splits into landing (in-flight writes that spill) and owed (copies not
 // started); per request.
 void testReturningSplitsLandingAndOwed() {
-  Spilling spill(CacheSpillPolicy{1, 1});
+  Spilling spill(CacheSpillPolicy{1, 1, true});
   spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 2;
   spill.start(1, Spilling::prompt(1000, 8), 8);
   spill.start(2, Spilling::prompt(5000, 4), 4);
@@ -6895,7 +6902,7 @@ int main() {
     testWriteThroughResumesBesideCopiesThatFillTheRoom();
     testFailedWritesKeepTheirCommitment();
     testPagesPastTheCommitmentCommitTheirSlots();
-    testConversionSpillsTheHistoryWithCopiesAtOnce();
+    testAConversionsHistoryWithCopiesIsReleasedAtOnce();
     testEveryHolderDecidesWhetherAPageSpills();
     testBlocksAreWrittenOnce();
     testOwedCopiesReturnWhileAnyIsWritten();

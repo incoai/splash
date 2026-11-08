@@ -131,13 +131,8 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, Refusal refusal)
       ledger.setWaiting(claim.id, false);
     // What it freed now, the units that cost nothing among them, the
     // attempt may fit in.
-    if (freed.outcome != FreeOutcome::Met && !freed.nowBytes) {
-      // A conversion frees later, and at once the pages whose copies landed
-      // before (Cache::convertToSpill), which one more attempt may fit in.
-      if (freed.laterBytes)
-        admission = tryOnce();
+    if (freed.outcome != FreeOutcome::Met && !freed.nowBytes)
       break;
-    }
     // The host's exemption takes nothing for it.
     result.freed = result.freed || exempt || !ledger.claim(claim.id).hostExempt;
     met.push_back(need);
