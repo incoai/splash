@@ -20,6 +20,7 @@ from dev.tests.server_fixtures import (
     HarnessTestCase,
     Plan,
     chat_body,
+    console_written,
     main_args,
     make_frontend,
     make_job,
@@ -1251,6 +1252,7 @@ class ServerRecoveryTests(HarnessTestCase):
                     self.assertRaisesRegex(SystemExit, "1"),
                 ):
                     api.main()
+                console_written()
                 (line,) = stderr.getvalue().splitlines()
                 self.assertIn(f"Error · {reason}", line)
                 self.assertNotIn("reached EOF", line)

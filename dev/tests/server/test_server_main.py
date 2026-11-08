@@ -17,6 +17,7 @@ from dev.tests.installer_fixtures import DENSE, MODEL, family_config
 from dev.tests.server_fixtures import (
     NO_THINKING_END,
     FakeRuntime,
+    console_written,
     engine_ready,
     keep_stop_signals,
     main_args,
@@ -594,6 +595,7 @@ class ServerMainTests(unittest.TestCase):
                         api.main()
                 if ends is SystemExit:
                     self.assertEqual(ended.exception.code, 1)
+                console_written()
                 self.assertIn(
                     f"Warning · cannot write the serve record {record}: "
                     "No such file or directory",
@@ -625,6 +627,7 @@ class ServerMainTests(unittest.TestCase):
                 api.main()
         self.assertEqual(ended.exception.code, 1)
         server.serve_forever.assert_not_called()
+        console_written()
         (line,) = log.getvalue().splitlines()
         self.assertTrue(
             line.endswith(
@@ -719,6 +722,7 @@ class ServerMainTests(unittest.TestCase):
         server.server_activate.assert_not_called()
         server.server_close.assert_called_once_with()
         backend.close.assert_called_once()
+        console_written()
         self.assertIn("Error · late", stderr.getvalue())
 
     def test_main_rejects_an_unservable_chat_template_before_starting_native(self):
@@ -744,6 +748,7 @@ class ServerMainTests(unittest.TestCase):
         runtime.assert_not_called()
         server.server_activate.assert_not_called()
         server.server_close.assert_called_once_with()
+        console_written()
         self.assertIn(
             "Error · the tokenizer defines no chat template", stderr.getvalue()
         )
@@ -766,6 +771,7 @@ class ServerMainTests(unittest.TestCase):
         runtime.assert_not_called()
         server.server_activate.assert_not_called()
         server.server_close.assert_called_once_with()
+        console_written()
         self.assertIn("Address already in use", stderr.getvalue())
 
     def test_main_holds_and_serves_the_assembly_its_model_directory_names(self):
@@ -898,6 +904,7 @@ class ServerMainTests(unittest.TestCase):
         tokenizer.assert_not_called()
         runtime.assert_not_called()
         server.server_close.assert_called_once_with()
+        console_written()
         return stderr.getvalue()
 
 

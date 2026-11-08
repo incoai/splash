@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from dev.tests.server_fixtures import console_written
 from server import serve_record
 
 
@@ -37,6 +38,7 @@ class ServeRecordTests(unittest.TestCase):
                     mock.patch("sys.stderr", io.StringIO()) as log,
                 ):
                     write(path, argument)
+                    console_written()
                     (line,) = log.getvalue().splitlines()
                     self.assertTrue(
                         line.endswith(
@@ -67,6 +69,7 @@ class ServeRecordTests(unittest.TestCase):
                     str(failed.exception),
                     f"cannot write the serve record {path}: {reason}",
                 )
+                console_written()
                 self.assertEqual(log.getvalue(), "")
                 self.assertEqual(
                     list(self.directory.iterdir()), [self.directory / "taken.json"]

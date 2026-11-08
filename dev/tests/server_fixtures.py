@@ -28,7 +28,7 @@ from tokenizers import Regex, Tokenizer, decoders, models, pre_tokenizers
 from dev.tests import native_peer
 from install import families, launcher
 from server import backend as backend_api
-from server import documents, images, serve_options
+from server import diagnostics, documents, images, serve_options
 from server import errors as api_errors
 from server import frontend as request_frontend
 from server import protocol as wire
@@ -582,6 +582,29 @@ class FakeRuntime:
         self.ready = False
 
 
+def console_written():
+    """Wait for the console lines printed so far to be written
+    (diagnostics.flush_console); a failure once 5 s pass first."""
+    if not diagnostics.flush_console(5.0):
+        raise AssertionError("the console did not write its lines within 5 s")
+
+
+class StalledConsole(io.StringIO):
+    """A console that stops draining, as a pipe whose reader stalled: each
+    write waits until `drained` is set, or 10 s; `writing` is set once one
+    began."""
+
+    def __init__(self, drained):
+        super().__init__()
+        self.drained = drained
+        self.writing = threading.Event()
+
+    def write(self, text):
+        self.writing.set()
+        self.drained.wait(10.0)
+        return super().write(text)
+
+
 class FakeOutput:
     def __init__(self):
         self._condition = threading.Condition()
@@ -692,6 +715,8 @@ class FakeProcess:
         self.input_handler = input_handler
         self.stdout = FakeOutput()
         self.stdin = FakeInput(self)
+        # It writes nothing to its stderr.
+        self.stderr = io.BytesIO()
         self._condition = threading.Condition()
         self._exit_code = None
         # The fault signal it is dying by (crash), which no other signal

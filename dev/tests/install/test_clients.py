@@ -7,6 +7,7 @@ import secrets
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import tomllib
@@ -19,6 +20,7 @@ from unittest import mock
 
 import yaml
 
+from dev.tests.server_fixtures import console_written
 from install import clients, launcher
 from server import serve_options
 
@@ -1234,6 +1236,43 @@ class ClientLifecycleTests(unittest.TestCase):
             self.assertEqual(result.exception.code, 0)
             request.assert_not_called()
 
+    def test_the_launch_lines_come_before_the_clients_output(self):
+        # The client the launcher executes replaces it: the launcher's lines
+        # are written before, never dropped with it.
+        with tempfile.TemporaryDirectory() as directory:
+            client = Path(directory) / "claude"
+            client.write_text("#!/bin/sh\necho client\n")
+            client.chmod(0o755)
+            program = "\n".join(
+                (
+                    "from unittest import mock",
+                    "from install import launcher",
+                    "model = {'id': 'm', 'owned_by': 'splash', 'context_length': 8192}",
+                    "listing = {'data': [{**model, 'input_modalities': ['text']}]}",
+                    "with mock.patch.object(launcher, '_request_json') as request:",
+                    "    request.return_value = listing",
+                    "    launcher.main(['claude'])",
+                )
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", program],
+                cwd=launcher.ROOT,
+                env={**os.environ, "PATH": f"{directory}:/usr/bin:/bin"},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "Starting claude: m · 8,192 context tokens",
+                "Claude hosted WebSearch is unavailable. "
+                "WebFetch, local tools and MCP are unchanged.",
+                "client",
+            ],
+            result.stderr,
+        )
+
     def test_missing_client_is_checked_before_connection(self):
         with (
             mock.patch.object(clients.shutil, "which", return_value=None),
@@ -1242,6 +1281,7 @@ class ClientLifecycleTests(unittest.TestCase):
         ):
             self.assertEqual(launcher.main(["claude"]), 1)
         request.assert_not_called()
+        console_written()
         self.assertIn("claude is not installed", error.getvalue())
 
     def test_ready_server_is_source_of_model_and_context(self):
@@ -1325,6 +1365,7 @@ class ClientLifecycleTests(unittest.TestCase):
             if reported is None:
                 # A server started by an older Splash reports only vision.
                 self.assertEqual(result, 1)
+                console_written()
                 self.assertIn(
                     "restart it with this version of Splash", error.getvalue()
                 )
@@ -1390,6 +1431,7 @@ class ClientLifecycleTests(unittest.TestCase):
                 mock.patch("sys.stderr", io.StringIO()) as error,
             ):
                 self.assertEqual(launcher.main(["claude", *payload]), 1)
+            console_written()
             self.assertIn("splash serve", error.getvalue())
             execute.assert_not_called()
             install.assert_not_called()

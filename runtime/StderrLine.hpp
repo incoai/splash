@@ -10,8 +10,9 @@
 
 namespace splash {
 
-// The server and this runtime write to the same stderr. Each line goes out
-// in one write, newline included, so that lines written at once stay whole.
+// The server reads this stderr line by line and writes each line to its
+// console. Each line goes out in one write, newline included, so that lines
+// the runtime's threads write at once stay whole.
 inline void writeStderrLine(std::string_view text) noexcept {
   try {
     std::string line(text);

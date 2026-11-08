@@ -44,7 +44,7 @@ from .constraints import (
     check_capabilities,
     validate_tokenizer,
 )
-from .diagnostics import log_unexpected, print_request, print_status
+from .diagnostics import console_stats, log_unexpected, print_request, print_status
 from .errors import (
     OPENAI_ERRORS,
     RETRY_STATUSES,
@@ -1060,6 +1060,7 @@ class FrontendServer(HTTPServer):
             "token_counts": self.token_counts.stats(),
             "connections": self.connections.stats(),
         }
+        status["console"] = console_stats()
         return status
 
     def server_activate(self):
@@ -1117,10 +1118,12 @@ class FrontendServer(HTTPServer):
         self.connections.idle.wait(min(2.0, HTTP_IO_TIMEOUT))
 
     def handle_error(self, request, client_address):
+        # A client that left is no error. Any other is one console line, as a
+        # request's unexpected error is: socketserver's own writes a traceback
+        # straight to stderr, on the connection worker.
         error = sys.exc_info()[1]
-        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
-            return
-        super().handle_error(request, client_address)
+        if not isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            log_unexpected(error)
 
 
 def parse_args(argv=None):

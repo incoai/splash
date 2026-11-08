@@ -77,6 +77,20 @@ the Mac from sleeping automatically, as `caffeinate -i` does; the display may
 still sleep, and closing the lid or choosing Sleep still sleeps the Mac.
 `serve --allow-idle-sleep` lets it sleep automatically.
 
+### Console
+
+The server writes its console lines, and its engine's, from one thread, in
+the order they come, so that a log of both streams, as `2>&1` or the app's
+server log, keeps that order: status and request lines go to stdout, errors,
+warnings and the engine's lines to stderr. A stdout that stops draining
+therefore holds up stderr too. Output that stops draining, as a log pipe whose
+reader stalls, holds up that thread alone, never a request, the engine or an
+HTTP answer. Once 1024 lines wait, each further line is dropped, and `/status`
+counts them as `console.dropped_lines`. A failed engine's last lines, why it
+failed or what it saved as it stopped, come before the server's report of the
+failure, which waits up to 1 s for them; at exit the server waits up to 1 s
+for its last lines.
+
 ### Shell completion
 
 A Homebrew install links the completions into Homebrew's directories for them

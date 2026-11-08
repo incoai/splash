@@ -4,6 +4,7 @@ import os
 import select
 import struct
 import subprocess
+import sys
 import threading
 import time
 import typing
@@ -44,6 +45,9 @@ def f32_sampling(sampling):
 
 
 READY_STATUS = b'{"schema_version":%d,"ready":true}' % wire.STATUS_SCHEMA_VERSION
+# The source of the Ready an engine program of a test's own sends (w:
+# server.protocol).
+READY_SOURCE = "w.ReadyEvent(4, 131072, False, 248320, 9, (248046,))"
 
 
 def answer_status(process, message):
@@ -1767,6 +1771,117 @@ class RuntimeTests(unittest.TestCase):
                 ):
                     runtime.wait_ready(1)
                 self.assertIs(type(caught.exception), kind)
+
+    def test_an_engine_starts_while_the_servers_stderr_stops_draining(self):
+        # The engine writes a line at each request's first token, on its loop.
+        # Here it writes 160 KB before its Ready: on a server stderr that
+        # nobody reads, a pipe of 64 KiB, they would block it before Ready.
+        engine = (
+            "import sys; from dev.tests import native_peer as n; "
+            "from server import protocol as w; "
+            "sys.stderr.write(('x' * 79 + '\\n') * 2000); sys.stderr.flush(); "
+            f"sys.stdout.buffer.write(n.serialize_event({READY_SOURCE})); "
+            "sys.stdout.buffer.flush(); sys.stdin.buffer.read()"
+        )
+        server = "\n".join(
+            (
+                "import sys",
+                "from server import runtime",
+                "native = runtime.MultiplexedRuntime(",
+                f"    (sys.executable, '-c', {engine!r}), pending_limit=1",
+                ")",
+                "try:",
+                "    print(native.wait_ready(5), flush=True)",
+                "except Exception as error:",
+                "    print(type(error).__name__, flush=True)",
+                "native.close()",
+            )
+        )
+        unread, stderr = os.pipe()
+        self.addCleanup(os.close, unread)
+        try:
+            child = subprocess.Popen(
+                [sys.executable, "-u", "-c", server],
+                cwd=Path(engine_runtime.__file__).resolve().parents[1],
+                stdout=subprocess.PIPE,
+                stderr=stderr,
+                text=True,
+            )
+        finally:
+            os.close(stderr)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        self.addCleanup(child.stdout.close)
+        self.assertTrue(select.select([child.stdout], [], [], 10)[0])
+        self.assertEqual(child.stdout.readline(), "True\n")
+
+    def test_an_engines_last_lines_come_before_its_failure(self):
+        # An engine says on stderr why it failed as it exits, and what it
+        # saved as it stops once the server fails it. A stop signal only ends
+        # its loop (main.mm): these take SIGTERM only where they wait for it.
+        # The first two end their stdout, which fails them, 0.3 s before their
+        # line: after Ready, which the failure listener reports, or before,
+        # which wait_ready raises. The third sends Ready, then bytes that start
+        # no frame, for which the server fails it.
+        cause = "error: native transport stopped after an engine failure (test)"
+        ready = (
+            f"sys.stdout.buffer.write(n.serialize_event({READY_SOURCE})); "
+            "sys.stdout.buffer.flush(); "
+        )
+        fails = (
+            "os.close(1); time.sleep(0.3); "
+            f"sys.stderr.write({cause!r} + '\\n'); sys.stderr.flush(); "
+            "os._exit(1)"
+        )
+        stops = (
+            "sys.stdout.buffer.write(b'\\xff' * 64); sys.stdout.buffer.flush(); "
+            "signal.sigwait({signal.SIGTERM}); "
+            "sys.stderr.write('Stopped\\n'); sys.stderr.flush(); "
+            "os._exit(0)"
+        )
+        for case, body, line in (
+            ("failed after Ready", ready + fails, cause),
+            ("failed before Ready", fails, cause),
+            ("failed by the server", ready + stops, "Stopped"),
+        ):
+            engine = (
+                "import os, signal, sys, time; "
+                "from dev.tests import native_peer as n; "
+                "from server import protocol as w; "
+                "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM}); " + body
+            )
+            server = "\n".join(
+                (
+                    "import sys, threading",
+                    "from server import diagnostics, runtime",
+                    "reported = threading.Event()",
+                    "def failed(*_failure):",
+                    "    diagnostics.print_status('Engine failed', error=True)",
+                    "    reported.set()",
+                    "native = runtime.MultiplexedRuntime(",
+                    f"    (sys.executable, '-c', {engine!r}), pending_limit=1",
+                    ")",
+                    "native.on_engine_failure = failed",
+                    "try:",
+                    "    native.wait_ready(10)",
+                    "    reported.wait(10)",
+                    "except runtime.EngineUnhealthy:",
+                    "    failed()",
+                    "native.close()",
+                )
+            )
+            with self.subTest(case=case):
+                result = subprocess.run(
+                    [sys.executable, "-c", server],
+                    cwd=Path(engine_runtime.__file__).resolve().parents[1],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                lines = result.stderr.splitlines()
+                self.assertEqual(len(lines), 2, result.stderr)
+                self.assertEqual(lines[0], line)
+                self.assertRegex(lines[1], r"^\d{2}:\d{2}:\d{2} Engine failed$")
 
     def test_the_failure_listener_hears_which_requests_had_started(self):
         """The fingerprints of the started requests reach the listener with

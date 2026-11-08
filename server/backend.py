@@ -372,9 +372,7 @@ class NativeBackend:
         # Why the engine cannot serve: its failure, the last failed restart or
         # why restarts stopped.
         self.engine_error = None
-        # What the finalizer runs, in order: requests' Started lines and
-        # terminals, which must not hold up the runtime's reader thread.
-        self.finalizer_queue = queue.Queue()
+        self.terminals = queue.Queue()
         self.finalizer = threading.Thread(
             target=self._finalize_loop,
             name="splash-http-finalizer",
@@ -868,7 +866,7 @@ class NativeBackend:
                 if state.call is None:
                     state.call = call
                 state.terminal_enqueued = True
-                self.finalizer_queue.put(functools.partial(self._finalize, state, call))
+                self.terminals.put((state, call))
 
         try:
             self._admit(state, request, on_event, on_complete)
@@ -969,10 +967,7 @@ class NativeBackend:
                     "enable_thinking": job.reasoning.enable_thinking,
                     "thinking": job.thinking,
                 }
-            # The finalizer prints it, as it prints the Done line: a console
-            # that stops draining must not hold up the reader thread, which
-            # delivers every request's tokens and masks.
-            self.finalizer_queue.put(functools.partial(self._log, record))
+            self._log(record)
             job.events.put(("start", None))
         elif isinstance(event, wire.PromptProgressEvent):
             job.events.put(
@@ -1006,11 +1001,15 @@ class NativeBackend:
             call.cancel()
 
     def _finalize_loop(self):
-        while (work := self.finalizer_queue.get()) is not None:
-            work()
+        while True:
+            item = self.terminals.get()
+            if item is None:
+                return
+            state, call = item
+            self._finalize(state, call)
             # Do not keep a finished request, its output and its events,
             # alive while waiting for the next one.
-            del work
+            del item, state, call
 
     def _finalize(self, state, call):
         job = state.job
@@ -1203,5 +1202,5 @@ class NativeBackend:
                 error = APIError(503, "server is shutting down", "server_shutdown")
                 self._record(state.job, error=error)
                 state.job.events.put(("error", error))
-            self.finalizer_queue.put(None)
+            self.terminals.put(None)
             self.finalizer.join()

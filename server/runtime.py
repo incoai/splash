@@ -20,8 +20,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import BinaryIO, Callable, Protocol, Sequence, TypeAlias
 
+from . import diagnostics, supervision
 from . import protocol as wire
-from . import supervision
 from .crash_trace import CrashTraceRing
 
 
@@ -533,6 +533,9 @@ class MultiplexedRuntime:
         self._closed = False
         self._process: ProcessLike | None = None
         self._reader_thread: threading.Thread | None = None
+        # The thread that relays the engine's stderr to the console, which
+        # ends once the engine has exited (diagnostics.relay_engine_lines).
+        self._stderr_relay: threading.Thread | None = None
         self._generation = 0
         self._startup_attempt: _StartupAttempt | None = None
         self._ready_message: wire.ReadyEvent | None = None
@@ -586,7 +589,7 @@ class MultiplexedRuntime:
             command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=None,
+            stderr=subprocess.PIPE,
             bufsize=0,
         )
 
@@ -804,6 +807,7 @@ class MultiplexedRuntime:
         with self._state_lock:
             self._process = None
             self._reader_thread = None
+            self._stderr_relay = None
             self._ready_message = None
         self._mask_executor.shutdown(wait=True, cancel_futures=True)
 
@@ -964,13 +968,17 @@ class MultiplexedRuntime:
             attempt.spawned = time.monotonic()
 
         process = None
+        relay = None
         try:
             command = self._launch_command()
-            process = (
-                self._spawn(command)
-                if self._process_factory is None
-                else self._process_factory()
-            )
+            if self._process_factory is None:
+                process = self._spawn(command)
+                # The engine's lines reach the console as the server's do: one
+                # that stops draining never blocks the engine loop, which
+                # writes one at each request's first token.
+                relay = diagnostics.relay_engine_lines(process.stderr)
+            else:
+                process = self._process_factory()
             if process.stdin is None or process.stdout is None:
                 raise EngineUnhealthy(
                     "native process did not expose binary stdin/stdout"
@@ -1006,6 +1014,7 @@ class MultiplexedRuntime:
                 self._generation += 1
                 generation = self._generation
                 self._process = process
+                self._stderr_relay = relay
                 self._terminal_error = None
                 self._ready_message = None
                 self._last_status = None
@@ -1482,6 +1491,7 @@ class MultiplexedRuntime:
             self._ready_at = None
             attempt = self._startup_attempt
             process = self._process
+            relay = self._stderr_relay
             calls = tuple(self._pending.values())
             self._pending.clear()
             # A queued request was in no command: only the started may have
@@ -1507,7 +1517,22 @@ class MultiplexedRuntime:
             return process.poll()
 
         def finish() -> None:
+            # A failed engine is asked to stop at once, and killed if it still
+            # runs past the stop grace: its report below waits for its exit.
+            if process is not None and process.poll() is None:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+                self._arm_kill_fallback(process)
             if not isinstance(failure, RuntimeClosed):
+                if relay is not None:
+                    # An engine says on stderr why it failed as it exits
+                    # (main.mm's error: lines), and what it saved as it stops:
+                    # those lines reach the console before its failure is
+                    # reported, which waits for its exit, LAST_LINES_SECONDS
+                    # at most.
+                    relay.join(diagnostics.LAST_LINES_SECONDS)
                 try:
                     self._crash_trace.dump(
                         generation,
@@ -1517,7 +1542,7 @@ class MultiplexedRuntime:
                     )
                 except Exception:
                     # A diagnostic: one not written must not keep the failure
-                    # from reaching the listener, the calls and the engine.
+                    # from reaching the listener and the calls.
                     pass
                 listener = self.on_engine_failure
                 if served_seconds is not None and listener:
@@ -1534,12 +1559,6 @@ class MultiplexedRuntime:
             for call in calls:
                 self._admission_slots.release()
                 call._set_terminal(error=failure)
-            if process is not None and process.poll() is None:
-                try:
-                    process.terminate()
-                except OSError:
-                    pass
-                self._arm_kill_fallback(process)
 
         return finish
 
