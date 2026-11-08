@@ -93,6 +93,15 @@ DESCRIPTOR_LIMIT = 10240
 # EX_UNAVAILABLE.
 ENGINE_STOPPED_STATUS = os.EX_UNAVAILABLE
 SSE_KEEPALIVE_SECONDS = 2.0
+# A client gone without a FIN or RST (a Mac asleep, off its network) sends
+# nothing a non-streaming request reads; keepalive probes the idle connection
+# and drops it once its peer stops answering, 60 s after its last data.
+TCP_KEEPALIVE_OPTIONS = (
+    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 30),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3),
+)
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
 CHAT_ASSETS = {
@@ -222,6 +231,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._allow_origin = None
         self._unread_body = 0
         self._last_sse_write = time.monotonic()
+        try:
+            for level, option, value in TCP_KEEPALIVE_OPTIONS:
+                self.request.setsockopt(level, option, value)
+        except OSError as error:
+            # macOS refuses options on a connection its client reset before
+            # it was served (EINVAL): it ends as any reset does.
+            raise ConnectionResetError from error
         super().setup()
         self.connection.settimeout(HTTP_IO_TIMEOUT)
 
@@ -729,7 +745,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
         except BlockingIOError:
             return False
-        except ConnectionError:
+        except (ConnectionError, TimeoutError):
+            # A connection keepalive dropped fails its read with ETIMEDOUT.
             return True
 
     def _finalize_content(self, content, job, result, projector, cut_in_call):
