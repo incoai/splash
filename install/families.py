@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from server.chat_format import FLINT, QWEN, ChatFormat
+from server.chat_format import FLINT, QWEN, RIPPLE, ChatFormat
 
 
 @dataclass(frozen=True)
@@ -42,6 +42,11 @@ FAMILIES = (
     ModelFamily("Qwen3.8-Flash-Next", "incoai/Qwen3.8-Flash-Next-DFlash2", QWEN),
     # It has no vision tower.
     ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, vision=False),
+    # Its draft reads five of its blocks, and its think and call tags are
+    # text (server/chat_format.py's RIPPLE).
+    ModelFamily(
+        "Ripple-65B", "ricursiveAI/Ripple-65B-Preview-DFlash2", RIPPLE, vision=False
+    ),
 )
 
 

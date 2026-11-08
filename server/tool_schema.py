@@ -988,11 +988,24 @@ def _reasoning(thinking, chat_format):
     the model opens one itself, an optional block from its opening to its
     close; otherwise none. Each tag is its token, as the template writes it,
     and the text between is TEXT, which cannot spell the close."""
-    close = f"<[{chat_format.think_end_id}]>"
+    close = (
+        json.dumps(THINK_END)
+        if chat_format.tags_are_text
+        else f"<[{chat_format.think_end_id}]>"
+    )
+    open_ = (
+        json.dumps(THINK_START)
+        if chat_format.tags_are_text
+        else f"<[{chat_format.think_start_id}]>"
+    )
     if thinking:
         return "think ", f"think: TEXT {close}"
     if chat_format.think_start_id is not None:
         return "think? ", f"think: <[{chat_format.think_start_id}]> TEXT {close}"
+    if chat_format.tags_are_text:
+        # The model opens its reasoning itself, with the opener as text: an
+        # optional block from the opener's text through the close's.
+        return "think? ", f"think: {open_} TEXT {close}"
     return "", None
 
 
@@ -1191,9 +1204,14 @@ def tool_grammar(policy, thinking, response_schema=None, *, chat_format):
             side_grammars.append(
                 {"name": arguments, "lark_grammar": strict_arguments[name]}
             )
+        open_, close_ = (
+            (json.dumps(TOOL_CALL_OPEN), json.dumps(TOOL_CALL_CLOSE))
+            if chat_format.tags_are_text
+            else (TOOL_CALL_OPEN, TOOL_CALL_CLOSE)
+        )
         calls.append(
-            f"call_{index}: {TOOL_CALL_OPEN} {_function_opening(syntax, name)} "
-            f"@{arguments}{closing} {TOOL_CALL_CLOSE}"
+            f"call_{index}: {open_} {_function_opening(syntax, name)} "
+            f"@{arguments}{closing} {close_}"
         )
     call = "(" + " | ".join(f"call_{index}" for index in range(len(calls))) + ")"
     if not calls:

@@ -110,8 +110,10 @@ def validate_tokenizer(tokenizer, chat_format):
     the engine and the server read the model's output by, as that format
     has them: its vocabulary must fit the model's, the engine's stop tokens,
     the close of thinking, the model's own opening of it where the model
-    opens it, and a call's opening must each be one token, and its EOS one
-    of the stop tokens."""
+    opens it, and a call's opening must each be one token where the format
+    holds a token for one, and text the tokenizer encodes and decodes back
+    unchanged where its tags are text; its EOS must be one of the stop
+    tokens."""
     vocabulary = tokenizer.get_vocab()
     if not vocabulary or any(
         type(token_id) is not int or not 0 <= token_id < chat_format.vocabulary
@@ -128,6 +130,19 @@ def validate_tokenizer(tokenizer, chat_format):
     if chat_format.think_start_id is not None:
         expected[THINK_START] = chat_format.think_start_id
     for token, token_id in expected.items():
+        if token_id is None:
+            # The template's tag is text the tokenizer splits (Ripple's), which
+            # the output's decoding matches: the tokenizer must encode it and
+            # decode it back unchanged, so that a match in the decoded stream
+            # is the tag the template wrote.
+            encoded = tokenizer(token, add_special_tokens=False)['input_ids']
+            if not encoded or tokenizer.decode(
+                encoded, skip_special_tokens=True
+            ) != token:
+                raise engine_runtime.EngineUnhealthy(
+                    f"tokenizer must encode {token!r} and decode it back as text"
+                )
+            continue
         if vocabulary.get(token) != token_id or tokenizer.encode(
             token, add_special_tokens=False
         ) != [token_id]:
