@@ -377,3 +377,38 @@ The decode levers, in the order the numbers put them: the trained
 selector's 32-candidate kernels (the subset proposal caps acceptance),
 the acceptance itself on real workloads, and the last 15-30% of
 bandwidth.
+
+## Why the decode levers are not a constants bump
+
+The trained proposal wants what the ABI does not carry: Ripple's draft was
+trained for 16-row blocks and a 32-candidate selector; the kernels run
+8-row blocks (SPLASH_DRAFT_QUERY_ROWS / SPLASH_TARGET_VERIFY_ROWS) and
+keep 16 candidates (SPLASH_DRAFT_CANDIDATES) — the shipped families'
+numbers (Qwen3.8's draft: block 8, top-16). Both sides are real: the
+config's block and candidate count name what the draft was trained for,
+and the ABI names what the kernels, buffers, state layout and wire carry.
+
+A global bump is a no-go: the descriptor refuses a draft whose
+block_size or selector_top_k is below the kernels' (the shipped
+Qwen3.8-27B draft, block 8 and top-16, would be refused by kernels at 16
+and 32). The fix is the attention variants' own pattern: the draft
+variant carries its proposal rows and candidate count, the affected
+kernels instantiate per variant, and the buffers, state layout and
+descriptor check read the variant's numbers.
+
+The consumers, enumerated: the metal kernels that bake the constants
+(draft.metal's forward and proposal, sampling.metal's three selector
+kernels, the decode qkv and verify staging, paged attention's verify
+tiles, embedding and gdn staging, sparse attention, ngram embedding, the
+store) instantiate per variant; the decode arena's tensors (FullPacked,
+logits, verify rows, proposal probabilities) size from the geometry's
+variant; the state layout's rings and the KV block's rows follow; the
+descriptor's check becomes "the config's counts are ones the build
+compiles"; the wire's proposal arrays follow the descriptor.
+
+The measured prize: the draft proposes ~7 of its 16 rows a cycle (a
+confidence early-stop the truncated candidate list makes fire early) and
+88% of them are accepted; the trained 16-row block at the trained 32
+candidates would propose and accept more per cycle at the same 42.8 GB
+pass. That, with the last 15% of bandwidth, is the decode headroom the
+refactor buys.
