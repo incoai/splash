@@ -1104,7 +1104,9 @@ void testACaptureCutReplansWithARowCap() {
   engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, model, events);
   guardReleases(storage, engine);
   model.time(test::passingTarget());
-  engine.submit(request(1, std::vector<uint32_t>(7000, 7)));
+  // Its replay point at 6272 lies too near 4096 for a tail checkpoint, which
+  // the command would pass the checkpoint at 4096 for.
+  engine.submit(request(1, std::vector<uint32_t>(6273, 7)));
   runUntilIdle(engine);
   const EngineSnapshot counts = engine.snapshot();
   require(events.completedCount == 1 && !commands.empty() &&
@@ -1112,7 +1114,7 @@ void testACaptureCutReplansWithARowCap() {
           "the command did not end at the boundary whose capture was refused");
   require(counts.captureCuts == 1 && counts.replans >= 1,
           "the capture cut was not planned again with the lane's rows capped");
-  require(commands.size() >= 2 && commands[1].front() == std::pair<uint64_t, uint32_t>{1, 7000 - 4096},
+  require(commands.size() >= 2 && commands[1].front() == std::pair<uint64_t, uint32_t>{1, 6273 - 4096},
           "the next command did not go on from the boundary");
 }
 

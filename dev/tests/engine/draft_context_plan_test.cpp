@@ -113,12 +113,13 @@ void testBenchmarkWorkIncludesRecoveryPoints() {
   using benchmark::expectedDraftContextRows;
   // No checkpoint lies within one prefill chunk of an end: not 8192 before
   // the 10K prompt's replay boundary at 9984, nor 12288 before the 14K
-  // prompt's at 14080.
-  require(expectedDraftContextRows(10000, interval) == 4112,
+  // prompt's at 14080. The tail checkpoint kTrimmedTailTokens before the
+  // replay boundary widens its window by that many rows.
+  require(expectedDraftContextRows(10000, interval) == 4368,
           "10K cold benchmark omitted rolling recovery windows");
-  require(expectedDraftContextRows(14096, interval, 9984) == 2064,
+  require(expectedDraftContextRows(14096, interval, 9984) == 2320,
           "4K suffix benchmark planned a checkpoint within a chunk of an end");
-  require(expectedDraftContextRows(14096, interval) == 6160,
+  require(expectedDraftContextRows(14096, interval) == 6416,
           "partial-hit benchmark confused cold work with restored work");
   require(expectedDraftContextRows(10000, 0) == 2064 &&
               expectedDraftContextRows(2048, interval) == 2048 &&

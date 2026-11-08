@@ -699,14 +699,19 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
            : boundaries[index].tokens == promptReplayBoundary(active) ? StateClass::InUse
                                                                       : StateClass::Ordinary;
   };
+  const auto isTail = [&](size_t index) { return boundaries[index].tail; };
+  // The class of the last state the command captured, a checkpoint's
+  // buffers the replay point may take.
+  bool lastDisposable = false;
   // Takes the buffers of the state at boundaries[index]; false when refused.
   // Only the command's first state follows the lane's checkpoint, its
   // recovery point; each later one follows the state before it, since a
-  // checkpoint the command passes is no recovery point.
+  // checkpoint the command passes is no recovery point. The tail checkpoint
+  // refused its buffers is dropped, not cut at: the command goes on past it.
   const auto reserve = [&](size_t index) {
     const uint32_t tokens = boundaries[index].tokens;
     const StateClass kind = stateClass(index);
-    if (kind == StateClass::InUse && !states.empty() && boundaries[index - 1].disposable) {
+    if (kind == StateClass::InUse && !states.empty() && lastDisposable) {
       // The prompt's replay point keeps the checkpoint captured before it
       // beside buffers of its own, in its claim. Refused the pool and the
       // admission, it takes that checkpoint's buffers, as it takes its
@@ -726,28 +731,36 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
         states.back().tokens = tokens;
         captures.back().tokens = tokens;
       }
+      lastDisposable = false;
       return true;
     }
     Reservation reservation = reserveCapture(active, kind, tokens, states.empty(), supersedes);
     if (!reservation.buffers) {
+      // A lost tail costs up to a checkpoint interval of prefill on a turn
+      // that trims it, a cut a command boundary on every refused prompt: it
+      // is dropped, except at the command's end, where the lane's state is
+      // the tail's.
+      if (isTail(index) && (tokens != end || !reservation.fromLane))
+        return true;
       if (reservation.fromLane)
         captures.push_back({tokens, false, true});
       return false;
     }
     states.push_back({tokens, std::move(reservation.buffers)});
     captures.push_back({tokens, reservation.recycled});
+    lastDisposable = boundaries[index].disposable;
     return true;
   };
   for (size_t index = active.stateBoundaryCursor;
        index < boundaries.size() && boundaries[index].tokens <= end; ++index) {
     const uint32_t tokens = boundaries[index].tokens;
-    // Published, every state but the prompt's replay point retires the
-    // checkpoint before it (apply): a checkpoint the command passes on its
-    // way to such a state is not captured, and that state takes buffers of
-    // its own class.
+    // Published, every state but the prompt's replay point and its tail
+    // retires the checkpoint before it (apply): a checkpoint the command
+    // passes on its way to such a state is not captured, and that state takes
+    // buffers of its own class.
     const bool passed = boundaries[index].disposable && index + 1 < boundaries.size() &&
                         boundaries[index + 1].tokens <= end &&
-                        stateClass(index + 1) != StateClass::InUse;
+                        stateClass(index + 1) != StateClass::InUse && !isTail(index + 1);
     if (!passed && !reserve(index))
       return tokens - start;
     if (tokens == end)
