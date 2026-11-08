@@ -88,6 +88,13 @@ ANSWERED_LINGER_SECONDS = 2.0
 # macOS's OPEN_MAX.
 DESCRIPTOR_LIMIT = 10240
 SSE_KEEPALIVE_SECONDS = 2.0
+# A client gone without a FIN or RST (a laptop asleep, a dropped VPN) sends
+# nothing a non-streaming request would read, so it held its lane until the
+# output ended. TCP keepalive probes the idle peer and resets the connection
+# when it is gone: after 30 s idle, 3 probes 10 s apart, 60 s in all.
+TCP_KEEPALIVE_IDLE_SECONDS = 30
+TCP_KEEPALIVE_INTERVAL_SECONDS = 10
+TCP_KEEPALIVE_PROBES = 3
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
 CHAT_ASSETS = {
@@ -219,6 +226,16 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._last_sse_write = time.monotonic()
         super().setup()
         self.connection.settimeout(HTTP_IO_TIMEOUT)
+        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        self.connection.setsockopt(
+            socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, TCP_KEEPALIVE_IDLE_SECONDS
+        )
+        self.connection.setsockopt(
+            socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPALIVE_INTERVAL_SECONDS
+        )
+        self.connection.setsockopt(
+            socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPALIVE_PROBES
+        )
 
     def finish(self):
         if self._unread_body:
@@ -724,7 +741,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
         except BlockingIOError:
             return False
-        except ConnectionError:
+        except (ConnectionError, TimeoutError):
+            # A peer keepalive found gone fails the read with ETIMEDOUT.
             return True
 
     def _finalize_content(self, content, job, result, projector, cut_in_call):
