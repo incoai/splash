@@ -65,13 +65,17 @@ struct DraftCodebooks final {
 // confidence at each position as it walks.
 class DraftSelector final {
 public:
-  explicit DraftSelector(uint32_t vocabulary);
+  // The selector keeps the layout's candidates per proposal position, one
+  // instantiation per count: the shipped drafts keep 16, Ripple's 32.
+  explicit DraftSelector(uint32_t vocabulary, uint32_t candidates);
 
   // Exact scratch/output bytes for that many proposal positions.
-  [[nodiscard]] static DraftSelectorWorkspace workspace(uint32_t positions);
+  [[nodiscard]] static DraftSelectorWorkspace workspace(uint32_t positions,
+                                                        uint32_t candidates);
 
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
-           const DraftCodebooks &codebooks, std::span<const uint32_t> anchors,
+           const DraftCodebooks &codebooks, uint32_t candidates,
+           std::span<const uint32_t> anchors,
            std::span<const SamplingPolicy> policies) const;
   // After add: each lane's verify rows (a uint32 per lane in `verifyRows`) by
   // `model` from its confidences, at most maximumRows[lane] of them.
@@ -81,6 +85,7 @@ public:
 
 private:
   uint32_t vocabulary_ = 0;
+  uint32_t candidates_ = SPLASH_DRAFT_CANDIDATES;
 };
 
 } // namespace splash::ops

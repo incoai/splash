@@ -161,7 +161,7 @@ class ChatFormat:
         effort or enable_thinking opening the generation prompt's think block
         or leaving it out; a model that opens its reasoning itself decides
         each turn, whatever the request says."""
-        return self.think_start_id is None
+        return self.think_start_id is None and not self.tags_are_text
 
     @property
     def calls_end_reasoning(self):

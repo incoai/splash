@@ -685,7 +685,9 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
       {"num_key_value_heads", &SplashDraftVariant::kv_heads, draft},
       {"head_dim", &SplashDraftVariant::head_dimension, draft},
       {"sliding_window", &SplashDraftVariant::window, draft},
-      {"conv_kernel_size", &SplashDraftVariant::convolution_taps, flash}};
+      {"conv_kernel_size", &SplashDraftVariant::convolution_taps, flash},
+      {"block_size", &SplashDraftVariant::rows, flash},
+      {"selector_top_k", &SplashDraftVariant::candidates, flash}};
   const SplashDraftVariant *variant = nullptr;
   size_t matched = 0;
   std::string mismatch;
@@ -714,8 +716,10 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
     supported += (supported.empty() ? "" : ", ") + std::to_string(compiled.query_heads) + " query heads over " +
                  std::to_string(compiled.kv_heads) + " KV heads of " +
                  std::to_string(compiled.head_dimension) + ", a ring of " +
-                 std::to_string(compiled.window) + " and " +
-                 std::to_string(compiled.convolution_taps) + "-tap convolutions";
+                 std::to_string(compiled.window) + ", " +
+                 std::to_string(compiled.convolution_taps) + "-tap convolutions, " +
+                 std::to_string(compiled.rows) + "-row proposals of " +
+                 std::to_string(compiled.candidates) + " candidates";
   }
   if (!variant)
     throw std::invalid_argument(mismatch.empty()
@@ -741,22 +745,6 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                  {{"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
                   {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
                   {"mask_token_id", target.maskToken}});
-  // The proposal may keep fewer of the trained candidates than the config
-  // names: its softmax and the acceptance read the kept ones' list, so the
-  // rejection sampling stays exact over the truncated proposal, whose reach
-  // the acceptance rate pays for. Fewer than the kernels keep cannot select
-  // the kernels' list.
-  if (requireWhole(flash[@"selector_top_k"], "draft config dflash_config selector_top_k") <
-      SPLASH_DRAFT_CANDIDATES)
-    throw std::invalid_argument("draft config dflash_config selector_top_k is below the " +
-                                std::to_string(SPLASH_DRAFT_CANDIDATES) + " candidates the kernels keep");
-  // The block it was trained to fill: the kernels' rows or more, of which a
-  // cycle drafts the first (Ornith-1.5-122B's fills 16). Its weights have no
-  // part of the block's length.
-  if (requireWhole(flash[@"block_size"], "draft config dflash_config block_size") <
-      ExecutionLimits::draftQueryRows)
-    throw std::invalid_argument("draft config dflash_config block_size is less than the " +
-                                std::to_string(ExecutionLimits::draftQueryRows) + " rows a cycle drafts");
   // How a target layer's output row becomes the hidden values the draft reads
   // of it, as the draft was trained (target_hidden_reduction): a
   // hyper-connected target's streams by their mean (Qwen4ExpTarget's

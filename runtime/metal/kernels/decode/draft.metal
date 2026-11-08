@@ -14,14 +14,13 @@
 // groups hold disjoint query heads, so only the split order a reduce
 // combines is rounding-relevant.
 
-template <uint Taps>
+template <uint Rows, uint Taps>
 inline void draft_conv_phase(device const bfloat *input,
                              device const bfloat *dynamic,
                              device const bfloat *base,
                              device const bfloat *residual,
                              device bfloat *output, bool finish, uint hidden,
                              uint group, uint thread_index) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
   static_assert(SPLASH_DRAFT_CONVOLUTION_STAGES == 2,
                 "a stage prepares or finishes; its taps weigh the row and "
                 "the rows before it, which the block holds for its rows");
@@ -50,7 +49,7 @@ inline void draft_conv_phase(device const bfloat *input,
   output[element] = bfloat(value);
 }
 
-template <uint QueryHeads>
+template <uint Rows, uint QueryHeads>
 inline void draft_qkv_prepare_phase(
     device const bfloat *proposal_qkv, device bfloat *queries,
     device const bfloat *q_norm, device const bfloat *k_norm,
@@ -58,8 +57,7 @@ inline void draft_qkv_prepare_phase(
     device bfloat *query_keys, device bfloat *query_values,
     threadgroup float *reductions, threadgroup bfloat *head, uint group,
     uint thread_index, uint lane, uint simd_group) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS,
-                 KVHeads = SPLASH_DRAFT_KV_HEADS,
+  constexpr uint KVHeads = SPLASH_DRAFT_KV_HEADS,
                  HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
   constexpr uint QWidth = QueryHeads * HeadDim;
   constexpr uint KWidth = KVHeads * HeadDim;
@@ -149,7 +147,7 @@ inline void draft_context_kv_commit_phase(
 // softmax over its tiles, the last split adds the eight current rows, and
 // the unnormalized fp32 accumulator with its row maxima and sums lands in
 // `partial` for the fixed-order reduce.
-template <uint HeadsPerGroup, uint Splits, uint Window>
+template <uint Rows, uint HeadsPerGroup, uint Splits, uint Window>
 inline void draft_attention_split_phase(
     device bfloat *queries, device bfloat *keys, device bfloat *values,
     device bfloat *query_keys, device bfloat *query_values,
@@ -157,9 +155,8 @@ inline void draft_attention_split_phase(
     threadgroup float *score_storage, threadgroup float *row_max,
     threadgroup float *row_sum, threadgroup float *previous_scale,
     uint thread_index, uint lane, uint simd_group) {
-  constexpr ushort M = HeadsPerGroup * SPLASH_DRAFT_QUERY_ROWS, N = 128,
+  constexpr ushort M = HeadsPerGroup * Rows, N = 128,
                    D = SPLASH_DRAFT_HEAD_DIMENSION, TileK = 64;
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
   uint common_start =
       cache_length >= Window - 1 ? cache_length - (Window - 1) : 0;
   uint old_count = cache_length - common_start;
@@ -450,12 +447,11 @@ inline void draft_attention_reduce_phase(device const float *partials,
   }
 }
 
-template <uint QueryHeads>
+template <uint Rows, uint QueryHeads>
 inline void draft_attention_reorder_phase(device const bfloat *grouped,
                                           device bfloat *row_major, uint group,
                                           uint thread_index) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS,
-                 HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
+  constexpr uint HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
   const uint element = group * 256 + thread_index;
   if (element >= Rows * QueryHeads * HeadDim)
     return;
@@ -467,7 +463,7 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
   row_major[element] = grouped[grouped_index];
 }
 
-#define SPLASH_DRAFT_CONV_KERNEL(name, taps)                                   \
+#define SPLASH_DRAFT_CONV_KERNEL(name, taps, rows)                             \
   kernel void name(                                                            \
       device const bfloat *input [[buffer(0)]],                                \
       device const bfloat *dynamic [[buffer(1)]],                              \
@@ -477,13 +473,13 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
       constant DraftConvBatchParams &params [[buffer(5)]],                     \
       uint2 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
-    constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;                            \
+    constexpr ulong Rows = (rows);                                             \
     const ulong hidden = params.hidden;                                        \
     const ulong dynamic_width =                                                \
         SPLASH_DRAFT_CONVOLUTION_STAGES * (taps) *                             \
         (hidden / SPLASH_DRAFT_CONVOLUTION_GROUP);                             \
     uint batch = group.y;                                                      \
-    draft_conv_phase<(taps)>(                                                  \
+    draft_conv_phase<(rows), (taps)>(                                                  \
         input + batch * Rows * hidden,                                         \
         dynamic + batch * Rows * dynamic_width, base,                          \
         residual + batch * Rows * hidden,                                      \
@@ -491,7 +487,7 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
         group.x, thread_index);                                                \
   }
 
-#define SPLASH_DRAFT_QKV_KERNEL(name, queryHeads)                              \
+#define SPLASH_DRAFT_QKV_KERNEL(name, queryHeads, rows)                        \
   kernel void name(                                                            \
       device const bfloat *proposal_qkv [[buffer(0)]],                         \
       device bfloat *queries [[buffer(1)]],                                    \
@@ -505,7 +501,7 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
       uint thread_index [[thread_index_in_threadgroup]],                       \
       uint lane [[thread_index_in_simdgroup]],                                 \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
-    constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;                            \
+    constexpr ulong Rows = (rows);                                             \
     constexpr ulong KVHeads = SPLASH_DRAFT_KV_HEADS;                           \
     constexpr ulong HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;                     \
     constexpr ulong Packed =                                                   \
@@ -515,7 +511,7 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
     uint batch = group.y;                                                      \
     threadgroup float reductions[8];                                           \
     threadgroup bfloat head[SPLASH_DRAFT_HEAD_DIMENSION];                      \
-    draft_qkv_prepare_phase<(queryHeads)>(                                     \
+    draft_qkv_prepare_phase<(rows), (queryHeads)>(                                     \
         proposal_qkv + batch * Rows * Packed,                                  \
         queries + batch * Rows * Attention, q_norm, k_norm,                    \
         rope_cos + batch * RopeStride, rope_sin + batch * RopeStride,          \
@@ -555,7 +551,7 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
 // current rows. Partials follow the grouped queries in the same allocation,
 // one M x (128 + 2) fp32 block per (lane, head, head group, split).
 #define SPLASH_DRAFT_SPLIT_KERNEL(name, queryHeads, headsPerGroup, splits,     \
-                                  window)                                      \
+                                  window, rows)                               \
   kernel void name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
       device bfloat *keys0 [[buffer(1)]], device bfloat *keys1 [[buffer(2)]],  \
@@ -573,8 +569,8 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
     constexpr uint HeadGroups =                                                \
         (queryHeads) / SPLASH_DRAFT_KV_HEADS / (headsPerGroup);                \
-    constexpr uint M = (headsPerGroup)*SPLASH_DRAFT_QUERY_ROWS;                \
-    constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;                            \
+    constexpr uint M = (headsPerGroup)*(rows);                                 \
+    constexpr ulong Rows = (rows);                                             \
     constexpr ulong HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;                     \
     constexpr ulong Attention = (queryHeads)*HeadDim;                          \
     constexpr ulong HeadRows =                                                 \
@@ -599,7 +595,7 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
          group.z) *                                                            \
             PartialFloats;                                                     \
     threadgroup float workspace[M * 128 + 3 * M];                              \
-    draft_attention_split_phase<(headsPerGroup), (splits), (window)>(          \
+    draft_attention_split_phase<(rows), (headsPerGroup), (splits), (window)>(          \
         queries + batch * Rows * Attention +                                   \
             head * HeadRows * HeadDim + head_group * M * HeadDim,              \
         keys + head * (window)*HeadDim,                                        \
@@ -615,7 +611,8 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
         workspace + M * 128 + 2 * M, thread_index, lane, simd_group);          \
   }
 
-#define SPLASH_DRAFT_REDUCE_KERNEL(name, queryHeads, headsPerGroup, splits)    \
+#define SPLASH_DRAFT_REDUCE_KERNEL(name, queryHeads, headsPerGroup, splits,    \
+                                   rows)                                 \
   kernel void name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
       constant DraftAttentionBatchParams &params [[buffer(1)]],                \
@@ -623,8 +620,8 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     constexpr uint HeadGroups =                                                \
         (queryHeads) / SPLASH_DRAFT_KV_HEADS / (headsPerGroup);                \
-    constexpr uint M = (headsPerGroup)*SPLASH_DRAFT_QUERY_ROWS;                \
-    constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;                            \
+    constexpr uint M = (headsPerGroup)*(rows);                                 \
+    constexpr ulong Rows = (rows);                                             \
     constexpr ulong HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;                     \
     constexpr ulong Attention = (queryHeads)*HeadDim;                          \
     constexpr ulong HeadRows =                                                 \
@@ -645,7 +642,7 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
         thread_index);                                                         \
   }
 
-#define SPLASH_DRAFT_REORDER_KERNEL(name, queryHeads)                          \
+#define SPLASH_DRAFT_REORDER_KERNEL(name, queryHeads, rows)                          \
   kernel void name(                                                            \
       device const bfloat *grouped [[buffer(0)]],                              \
       device bfloat *row_major [[buffer(1)]],                                  \
@@ -654,34 +651,34 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
     constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;                            \
     constexpr ulong Attention = (queryHeads)*SPLASH_DRAFT_HEAD_DIMENSION;      \
     uint batch = group.y;                                                      \
-    draft_attention_reorder_phase<(queryHeads)>(                               \
+    draft_attention_reorder_phase<(rows), (queryHeads)>(                               \
         grouped + batch * Rows * Attention,                                    \
         row_major + batch * Rows * Attention, group.x, thread_index);          \
   }
 
 // The shipped drafts' kernels.
-SPLASH_DRAFT_CONV_KERNEL(draft_conv, SPLASH_DRAFT_CONVOLUTION_TAPS)
-SPLASH_DRAFT_QKV_KERNEL(draft_attention_qkv, SPLASH_DRAFT_QUERY_HEADS)
+SPLASH_DRAFT_CONV_KERNEL(draft_conv, SPLASH_DRAFT_CONVOLUTION_TAPS, SPLASH_DRAFT_QUERY_ROWS)
+SPLASH_DRAFT_QKV_KERNEL(draft_attention_qkv, SPLASH_DRAFT_QUERY_HEADS, SPLASH_DRAFT_QUERY_ROWS)
 SPLASH_DRAFT_COMMIT_KERNEL(draft_context_kv_commit, SPLASH_DRAFT_SLIDING_WINDOW)
 SPLASH_DRAFT_SPLIT_KERNEL(draft_attention_bf16_split, SPLASH_DRAFT_QUERY_HEADS,
                           SPLASH_DRAFT_QUERY_HEADS / SPLASH_DRAFT_KV_HEADS,
                           SPLASH_DRAFT_ATTENTION_SPLITS,
-                          SPLASH_DRAFT_SLIDING_WINDOW)
+                          SPLASH_DRAFT_SLIDING_WINDOW, SPLASH_DRAFT_QUERY_ROWS)
 SPLASH_DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce, SPLASH_DRAFT_QUERY_HEADS,
                            SPLASH_DRAFT_QUERY_HEADS / SPLASH_DRAFT_KV_HEADS,
-                           SPLASH_DRAFT_ATTENTION_SPLITS)
-SPLASH_DRAFT_REORDER_KERNEL(draft_attention_reorder, SPLASH_DRAFT_QUERY_HEADS)
+                           SPLASH_DRAFT_ATTENTION_SPLITS, SPLASH_DRAFT_QUERY_ROWS)
+SPLASH_DRAFT_REORDER_KERNEL(draft_attention_reorder, SPLASH_DRAFT_QUERY_HEADS, SPLASH_DRAFT_QUERY_ROWS)
 
 // Ripple's draft's kernels: 80 query heads over the 8 KV heads, a 4096-slot
 // ring, four-tap convolutions, and head groups of five query heads (two
 // threadgroups per KV head, 40 rows each).
-SPLASH_DRAFT_CONV_KERNEL(draft_conv_kv8_h5_d128_w4096_s8, 4)
-SPLASH_DRAFT_QKV_KERNEL(draft_attention_qkv_kv8_h5_d128_w4096_s8, 80)
-SPLASH_DRAFT_COMMIT_KERNEL(draft_context_kv_commit_kv8_h5_d128_w4096_s8, 4096)
-SPLASH_DRAFT_SPLIT_KERNEL(draft_attention_bf16_split_kv8_h5_d128_w4096_s4, 80, 5,
-                          4, 4096)
-SPLASH_DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_kv8_h5_d128_s4, 80, 5, 4)
-SPLASH_DRAFT_SPLIT_KERNEL(draft_attention_bf16_split_kv8_h5_d128_w4096_s8, 80, 5,
-                          8, 4096)
-SPLASH_DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_kv8_h5_d128_w4096_s8, 80, 5, 8)
-SPLASH_DRAFT_REORDER_KERNEL(draft_attention_reorder_kv8_h5_d128_w4096_s8, 80)
+SPLASH_DRAFT_CONV_KERNEL(draft_conv_kv8_h2_d128_w4096_s8, 4, 16)
+SPLASH_DRAFT_QKV_KERNEL(draft_attention_qkv_kv8_h2_d128_w4096_s8, 80, 16)
+SPLASH_DRAFT_COMMIT_KERNEL(draft_context_kv_commit_kv8_h2_d128_w4096_s8, 4096)
+SPLASH_DRAFT_SPLIT_KERNEL(draft_attention_bf16_split_kv8_h2_d128_w4096_s4, 80, 2,
+                          4, 4096, 16)
+SPLASH_DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_kv8_h2_d128_s4, 80, 2, 4, 16)
+SPLASH_DRAFT_SPLIT_KERNEL(draft_attention_bf16_split_kv8_h2_d128_w4096_s8, 80, 2,
+                          8, 4096, 16)
+SPLASH_DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_kv8_h2_d128_w4096_s8, 80, 2, 8, 16)
+SPLASH_DRAFT_REORDER_KERNEL(draft_attention_reorder_kv8_h2_d128_w4096_s8, 80, 16)

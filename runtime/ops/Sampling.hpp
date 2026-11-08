@@ -148,7 +148,9 @@ struct AcceptanceBuffers final {
 // stop tokens. The draft's own selector is ops::DraftSelector.
 class Sampling final {
 public:
-  explicit Sampling(uint32_t vocabulary);
+  // The draft's kept candidates the acceptance and the draw read: the
+  // shipped drafts keep 16, Ripple's 32.
+  explicit Sampling(uint32_t vocabulary, uint32_t draftCandidates);
 
   // Exact scratch/output bytes for the fixed precompiled sampling ABI.
   // Counts may cover one lane or a batch of lanes; the operator owns sharding.
@@ -237,6 +239,7 @@ private:
                     std::span<const SamplingPolicy> policies, const SamplingBuffers &buffers) const;
 
   uint32_t vocabulary_ = 0;
+  uint32_t draftCandidates_ = SPLASH_DRAFT_CANDIDATES;
   uint32_t maskWords_ = 0;
 };
 

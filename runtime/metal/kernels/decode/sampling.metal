@@ -269,6 +269,7 @@ struct VocabularyScratch {
   Selection selection;
 };
 
+template <uint Candidates>
 struct DrawScratch {
   uint arrival;
   // Per range of the draw: the kept weight of its tokens other than the
@@ -279,11 +280,11 @@ struct DrawScratch {
   float range_weights[kVocabularyRanges];
   // The draft's candidates, each listed once: its draft probability, kept
   // weight, weight in the draw and range.
-  uint draft_ids[kDraftCandidates];
-  float draft_probabilities[kDraftCandidates];
-  float draft_weights[kDraftCandidates];
-  float draft_draw_weights[kDraftCandidates];
-  uint draft_ranges[kDraftCandidates];
+  uint draft_ids[Candidates];
+  float draft_probabilities[Candidates];
+  float draft_weights[Candidates];
+  float draft_draw_weights[Candidates];
+  uint draft_ranges[Candidates];
   float kept_mass;
   uint drawn_range;
   float drawn_target;
@@ -659,7 +660,8 @@ inline float kept_weight(TargetRow row, OrderBoundary end, uint token) {
 }
 
 // The draft's candidates in one range of the draw, one bit per staged entry.
-inline uint range_candidates(uint range, threadgroup DrawScratch &scratch) {
+template <uint Candidates>
+inline uint range_candidates(uint range, threadgroup DrawScratch<Candidates> &scratch) {
   uint held = 0;
   for (uint index = 0; index < kDraftCandidates; ++index)
     held |= scratch.draft_ranges[index] == range ? 1u << index : 0u;
@@ -668,7 +670,8 @@ inline uint range_candidates(uint range, threadgroup DrawScratch &scratch) {
 
 // One range's weight in the draw: the kept weight of its tokens other than
 // the draft's candidates, plus its candidates' draw weights.
-inline float range_weight(uint range, threadgroup DrawScratch &scratch) {
+template <uint Candidates>
+inline float range_weight(uint range, threadgroup DrawScratch<Candidates> &scratch) {
   float weight = scratch.range_rest[range];
   for (uint held = range_candidates(range, scratch); held; held &= held - 1)
     weight += scratch.draft_draw_weights[ctz(held)];
@@ -677,7 +680,8 @@ inline float range_weight(uint range, threadgroup DrawScratch &scratch) {
 
 // The last token of a range with weight in the draw, which the draw takes
 // when rounding leaves its target unreached.
-inline uint range_last(uint range, threadgroup DrawScratch &scratch) {
+template <uint Candidates>
+inline uint range_last(uint range, threadgroup DrawScratch<Candidates> &scratch) {
   uint after = scratch.range_last[range];
   for (uint held = range_candidates(range, scratch); held; held &= held - 1) {
     const uint index = ctz(held);
@@ -698,11 +702,13 @@ inline uint range_last(uint range, threadgroup DrawScratch &scratch) {
 // weights once, adds the ranges in order and walks the one that holds the
 // draw with prefix sums. A range's weight and its walk add the same token
 // weights, so the range the draw picks always has a token to draw.
+template <uint Candidates>
 inline bool vocabulary_draw(
     TargetRow row, OrderBoundary end, bool drafted, uint draft_token,
     device const uint *draft_ids, device const float *draft_probabilities,
     float uniform, device coherent(device) TargetVocabularyRange *ranges,
-    device atomic_uint *arrivals, uint slice, threadgroup DrawScratch &scratch,
+    device atomic_uint *arrivals, uint slice,
+    threadgroup DrawScratch<Candidates> &scratch,
     uint thread_index, uint lane, uint simd_group, thread uint &drawn,
     thread float &draft_probability) {
   const uint range_tokens = (row.vocabulary + kVocabularyRanges * 32 - 1) /
@@ -880,52 +886,57 @@ kernel void decode_sample_vocabulary_search(
 // groups per row: the first token after a prompt, a verify row's draft
 // token's probability and the correction a rejection takes or, for the last
 // verify row, which follows the whole draft, its bonus token.
-kernel void decode_sample_vocabulary_draw(
-    device const float *logits [[buffer(0)]],
-    device const uint *token_mask [[buffer(1)]],
-    device TargetVocabularyRow *vocabulary_rows [[buffer(2)]],
-    device const uint *input_tokens [[buffer(3)]],
-    device const uint *draft_ids [[buffer(4)]],
-    device const float *draft_probabilities [[buffer(5)]],
-    device const float *uniforms [[buffer(6)]],
-    device uint *tokens [[buffer(7)]],
-    device coherent(device) TargetVocabularyRange *ranges [[buffer(8)]],
-    device atomic_uint *arrivals [[buffer(9)]],
-    constant TargetSamplingParams &params [[buffer(10)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  threadgroup DrawScratch scratch;
-  const uint s = group / kVocabularyGroups;
-  if (!lane_samples(params, s))
-    return;
-  const uint batch = selected_lane(params, s);
-  const uint index = s % params.rows;
-  device TargetVocabularyRow &record = vocabulary_rows[s];
-  TargetRow row = selected_row(logits, token_mask, params, s);
-  row.maximum = record.maximum;
-  // A drafted row follows its draft token, the next verify input row.
-  const bool drafted = index < params.drafted_rows;
-  const ulong position =
-      ulong(batch) * SPLASH_DRAFT_PROPOSAL_TOKENS + (drafted ? index : 0);
-  uint token;
-  float draft_probability;
-  if (vocabulary_draw(
-          row, {record.end_key, record.end_last}, drafted,
-          drafted ? input_tokens[s + 1] : 0u,
-          draft_ids + position * kDraftCandidates,
-          draft_probabilities + position * kDraftCandidates,
-          uniforms[ulong(batch) * SPLASH_SAMPLING_UNIFORMS + params.uniform],
-          ranges + ulong(s) * kVocabularyRanges, arrivals + s,
-          group % kVocabularyGroups, scratch, thread_index, lane, simd_group,
-          token, draft_probability) &&
-      thread_index == 0) {
-    tokens[s] = token;
-    if (drafted)
-      record.draft_probability = draft_probability;
-  }
+// The shipped drafts' draw kernel; Ripple's draft keeps 32 candidates.
+#define DECODE_SAMPLE_VOCABULARY_DRAW_KERNEL(name, Candidates) \
+  kernel void name(                                                           \
+    device const float *logits [[buffer(0)]],                                 \
+    device const uint *token_mask [[buffer(1)]],                              \
+    device TargetVocabularyRow *vocabulary_rows [[buffer(2)]],                \
+    device const uint *input_tokens [[buffer(3)]],                            \
+    device const uint *draft_ids [[buffer(4)]],                               \
+    device const float *draft_probabilities [[buffer(5)]],                    \
+    device const float *uniforms [[buffer(6)]],                               \
+    device uint *tokens [[buffer(7)]],                                        \
+    device coherent(device) TargetVocabularyRange *ranges [[buffer(8)]],      \
+    device atomic_uint *arrivals [[buffer(9)]],                               \
+    constant TargetSamplingParams &params [[buffer(10)]],                     \
+    uint group [[threadgroup_position_in_grid]],                              \
+    uint thread_index [[thread_index_in_threadgroup]],                        \
+    uint lane [[thread_index_in_simdgroup]],                                  \
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {                     \
+  threadgroup DrawScratch<Candidates> scratch;                                \
+  const uint s = group / kVocabularyGroups;                                   \
+  if (!lane_samples(params, s))                                               \
+    return;                                                                   \
+  const uint batch = selected_lane(params, s);                                \
+  const uint index = s % params.rows;                                         \
+  device TargetVocabularyRow &record = vocabulary_rows[s];                    \
+  TargetRow row = selected_row(logits, token_mask, params, s);                \
+  row.maximum = record.maximum;                                               \
+  /* A drafted row follows its draft token, the next verify input row. */     \
+  const bool drafted = index < params.drafted_rows;                           \
+  const ulong position =                                                      \
+      ulong(batch) * SPLASH_DRAFT_PROPOSAL_TOKENS + (drafted ? index : 0);    \
+  uint token;                                                                 \
+  float draft_probability;                                                    \
+  if (vocabulary_draw(                                                        \
+          row, {record.end_key, record.end_last}, drafted,                    \
+          drafted ? input_tokens[s + 1] : 0u,                                 \
+          draft_ids + position * Candidates,                                  \
+          draft_probabilities + position * Candidates,                        \
+          uniforms[ulong(batch) * SPLASH_SAMPLING_UNIFORMS + params.uniform], \
+          ranges + ulong(s) * kVocabularyRanges, arrivals + s,                \
+          group % kVocabularyGroups, scratch, thread_index, lane, simd_group, \
+          token, draft_probability) &&                                        \
+      thread_index == 0) {                                                    \
+    tokens[s] = token;                                                        \
+    if (drafted)                                                              \
+      record.draft_probability = draft_probability;                           \
+  }                                                                           \
 }
+DECODE_SAMPLE_VOCABULARY_DRAW_KERNEL(decode_sample_vocabulary_draw,
+                                    SPLASH_DRAFT_CANDIDATES)
+DECODE_SAMPLE_VOCABULARY_DRAW_KERNEL(decode_sample_vocabulary_draw_k32, 32)
 
 // Whether no token can be selected for a logit: NaN has no order and -inf
 // no probability. A bit test, which Metal's fast math keeps.
@@ -1015,10 +1026,11 @@ inline bool top_beats(float value, uint token, float other, uint other_token) {
 
 // Register-resident sorted top-16 insert for an entry the caller has already
 // checked against the last slot; the unrolled shift keeps every index static.
-inline void top16_insert(thread float (&values)[16], thread uint (&ids)[16],
+template <uint Count>
+inline void top16_insert(thread float (&values)[Count], thread uint (&ids)[Count],
                          float value, uint token) {
 #pragma clang loop unroll(full)
-  for (uint slot = 15; slot > 0; --slot) {
+  for (uint slot = Count - 1; slot > 0; --slot) {
     bool here = top_beats(value, token, values[slot], ids[slot]);
     bool above = top_beats(value, token, values[slot - 1], ids[slot - 1]);
     values[slot] = here ? (above ? values[slot - 1] : value) : values[slot];
@@ -1056,145 +1068,146 @@ inline void simd_best_head(float value, uint token, thread float &best,
 // only runs for the few survivors. The group then pops its best sixteen in
 // rank order. The (value desc, id asc) order is total, so the partial is the
 // same set in the same order whatever the thread partition.
-kernel void draft_select_top16_sharded(
-    device const float *logits [[buffer(0)]],
-    device uint *partial_ids [[buffer(1)]],
-    device float *partial_values [[buffer(2)]],
-    constant uint &vocabulary [[buffer(3)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
-  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
-  constexpr uint K = SPLASH_DRAFT_CANDIDATES;
-  constexpr uint VectorTokens = 4, ChunkVectors = 16;
-  uint batch = group / (Positions * Shards);
-  uint local = group % (Positions * Shards);
-  uint position = local / Shards;
-  uint shard = local % Shards;
-  ulong row_start = (ulong(batch) * Rows + position + 1) * vocabulary;
-  uint shard_tokens = (vocabulary + Shards - 1) / Shards;
-  uint begin = min(shard * shard_tokens, vocabulary);
-  uint end = min(begin + shard_tokens, vocabulary);
-  // Vector loads require 16-byte alignment. Handle the shard's unaligned head
-  // and tail with scalar inserts; the logits binding must also be aligned.
-  uint head = uint((VectorTokens - (row_start + begin) % VectorTokens) %
-                   VectorTokens);
-  head = min(head, end - begin);
-  uint vectors = (end - begin - head) / VectorTokens;
-  uint vector_begin = begin + head;
-  uint tail_begin = vector_begin + vectors * VectorTokens;
-  device const float *row = logits + row_start;
-  device const float4 *vector_row =
-      reinterpret_cast<device const float4 *>(row + vector_begin);
-
-  float values[K];
-  uint ids[K];
-  for (uint i = 0; i < K; ++i) {
-    values[i] = -INFINITY;
-    ids[i] = 0xffffffffu;
-  }
-  if (thread_index < head) {
-    uint token = begin + thread_index;
-    float value = row[token];
-    if (top_beats(value, token, values[K - 1], ids[K - 1]))
-      top16_insert(values, ids, value, token);
-  }
-  if (thread_index < end - tail_begin) {
-    uint token = tail_begin + thread_index;
-    float value = row[token];
-    if (top_beats(value, token, values[K - 1], ids[K - 1]))
-      top16_insert(values, ids, value, token);
-  }
-
-  threadgroup float maxima[256];
-  threadgroup float thresholds[8];
-  for (uint chunk = 0; chunk < vectors; chunk += 256 * ChunkVectors) {
-    float4 loaded[ChunkVectors];
-    float best = -INFINITY;
-    for (uint i = 0; i < ChunkVectors; ++i) {
-      uint index = chunk + thread_index + i * 256;
-      loaded[i] = index < vectors ? vector_row[index] : float4(0.0f);
-      if (index < vectors) {
-        for (uint j = 0; j < VectorTokens; ++j)
-          if (loaded[i][j] > best)
-            best = loaded[i][j];
-      }
-    }
-    // The 16th largest thread maximum: the minimum over the maxima that
-    // fewer than sixteen others exceed.
-    maxima[thread_index] = best;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint above = 0;
-    for (uint other = 0; other < 256; ++other)
-      above += maxima[other] > best ? 1u : 0u;
-    float candidate = simd_min(above < K ? best : INFINITY);
-    if (lane == 0)
-      thresholds[simd_group] = candidate;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float threshold = thresholds[0];
-    for (uint other = 1; other < 8; ++other)
-      threshold = min(threshold, thresholds[other]);
-
-    for (uint i = 0; i < ChunkVectors; ++i) {
-      uint index = chunk + thread_index + i * 256;
-      if (index >= vectors)
-        continue;
-      uint token = vector_begin + index * VectorTokens;
-      for (uint j = 0; j < VectorTokens; ++j) {
-        float value = loaded[i][j];
-        if (value >= threshold &&
-            top_beats(value, token + j, values[K - 1], ids[K - 1]))
-          top16_insert(values, ids, value, token + j);
-      }
-    }
-  }
-
-  // Sixteen rounds pop the group-wide best head; the simdgroup bests
-  // alternate between two slots so one barrier per round suffices.
-  threadgroup float round_values[2][8];
-  threadgroup uint round_ids[2][8];
-  for (uint rank = 0; rank < K; ++rank) {
-    float head_value = values[0];
-    uint head_id = ids[0];
-    float simd_value;
-    uint simd_id;
-    simd_best_head(head_value, head_id, simd_value, simd_id);
-    uint slot = rank & 1;
-    if (lane == 0) {
-      round_values[slot][simd_group] = simd_value;
-      round_ids[slot][simd_group] = simd_id;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float best = round_values[slot][0];
-    uint best_id = round_ids[slot][0];
-    for (uint other = 1; other < 8; ++other) {
-      float value = round_values[slot][other];
-      uint token = round_ids[slot][other];
-      if (top_beats(value, token, best, best_id)) {
-        best = value;
-        best_id = token;
-      }
-    }
-    if (thread_index == rank) {
-      partial_ids[group * K + rank] = best_id;
-      partial_values[group * K + rank] = best;
-    }
-    if (head_value == best && head_id == best_id)
-      top_pop<K>(values, ids);
-  }
+#define DRAFT_SELECT_TOP_KERNEL(name, candidate_count) \
+  kernel void name(                                        \
+      device const float *logits [[buffer(0)]],                               \
+    device uint *partial_ids [[buffer(1)]],                                   \
+    device float *partial_values [[buffer(2)]],                               \
+    constant uint &vocabulary [[buffer(3)]],                                  \
+    uint group [[threadgroup_position_in_grid]],                              \
+    uint thread_index [[thread_index_in_threadgroup]],                        \
+    uint lane [[thread_index_in_simdgroup]],                                  \
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {                     \
+  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;                              \
+  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;                    \
+  constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;                       \
+  constexpr uint K = candidate_count;                                              \
+  constexpr uint VectorTokens = 4, ChunkVectors = 16;                         \
+  uint batch = group / (Positions * Shards);                                  \
+  uint local = group % (Positions * Shards);                                  \
+  uint position = local / Shards;                                             \
+  uint shard = local % Shards;                                                \
+  ulong row_start = (ulong(batch) * Rows + position + 1) * vocabulary;        \
+  uint shard_tokens = (vocabulary + Shards - 1) / Shards;                     \
+  uint begin = min(shard * shard_tokens, vocabulary);                         \
+  uint end = min(begin + shard_tokens, vocabulary);                           \
+  /* Vector loads require 16-byte alignment. Handle the shard's unaligned head */ \
+  /* and tail with scalar inserts; the logits binding must also be aligned. */ \
+  uint head = uint((VectorTokens - (row_start + begin) % VectorTokens) %      \
+                   VectorTokens);                                             \
+  head = min(head, end - begin);                                              \
+  uint vectors = (end - begin - head) / VectorTokens;                         \
+  uint vector_begin = begin + head;                                           \
+  uint tail_begin = vector_begin + vectors * VectorTokens;                    \
+  device const float *row = logits + row_start;                               \
+  device const float4 *vector_row =                                           \
+      reinterpret_cast<device const float4 *>(row + vector_begin);            \
+                                                                              \
+  float values[K];                                                            \
+  uint ids[K];                                                                \
+  for (uint i = 0; i < K; ++i) {                                              \
+    values[i] = -INFINITY;                                                    \
+    ids[i] = 0xffffffffu;                                                     \
+  }                                                                           \
+  if (thread_index < head) {                                                  \
+    uint token = begin + thread_index;                                        \
+    float value = row[token];                                                 \
+    if (top_beats(value, token, values[K - 1], ids[K - 1]))                   \
+      top16_insert<K>(values, ids, value, token);                                \
+  }                                                                           \
+  if (thread_index < end - tail_begin) {                                      \
+    uint token = tail_begin + thread_index;                                   \
+    float value = row[token];                                                 \
+    if (top_beats(value, token, values[K - 1], ids[K - 1]))                   \
+      top16_insert<K>(values, ids, value, token);                                \
+  }                                                                           \
+                                                                              \
+  threadgroup float maxima[256];                                              \
+  threadgroup float thresholds[8];                                            \
+  for (uint chunk = 0; chunk < vectors; chunk += 256 * ChunkVectors) {        \
+    float4 loaded[ChunkVectors];                                              \
+    float best = -INFINITY;                                                   \
+    for (uint i = 0; i < ChunkVectors; ++i) {                                 \
+      uint index = chunk + thread_index + i * 256;                            \
+      loaded[i] = index < vectors ? vector_row[index] : float4(0.0f);         \
+      if (index < vectors) {                                                  \
+        for (uint j = 0; j < VectorTokens; ++j)                               \
+          if (loaded[i][j] > best)                                            \
+            best = loaded[i][j];                                              \
+      }                                                                       \
+    }                                                                         \
+    /* The 16th largest thread maximum: the minimum over the maxima that */   \
+    /* fewer than sixteen others exceed. */                                   \
+    maxima[thread_index] = best;                                              \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                          \
+    uint above = 0;                                                           \
+    for (uint other = 0; other < 256; ++other)                                \
+      above += maxima[other] > best ? 1u : 0u;                                \
+    float candidate = simd_min(above < K ? best : INFINITY);                  \
+    if (lane == 0)                                                            \
+      thresholds[simd_group] = candidate;                                     \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                          \
+    float threshold = thresholds[0];                                          \
+    for (uint other = 1; other < 8; ++other)                                  \
+      threshold = min(threshold, thresholds[other]);                          \
+                                                                              \
+    for (uint i = 0; i < ChunkVectors; ++i) {                                 \
+      uint index = chunk + thread_index + i * 256;                            \
+      if (index >= vectors)                                                   \
+        continue;                                                             \
+      uint token = vector_begin + index * VectorTokens;                       \
+      for (uint j = 0; j < VectorTokens; ++j) {                               \
+        float value = loaded[i][j];                                           \
+        if (value >= threshold &&                                             \
+            top_beats(value, token + j, values[K - 1], ids[K - 1]))           \
+          top16_insert<K>(values, ids, value, token + j);                        \
+      }                                                                       \
+    }                                                                         \
+  }                                                                           \
+                                                                              \
+  /* Sixteen rounds pop the group-wide best head; the simdgroup bests */      \
+  /* alternate between two slots so one barrier per round suffices. */        \
+  threadgroup float round_values[2][8];                                       \
+  threadgroup uint round_ids[2][8];                                           \
+  for (uint rank = 0; rank < K; ++rank) {                                     \
+    float head_value = values[0];                                             \
+    uint head_id = ids[0];                                                    \
+    float simd_value;                                                         \
+    uint simd_id;                                                             \
+    simd_best_head(head_value, head_id, simd_value, simd_id);                 \
+    uint slot = rank & 1;                                                     \
+    if (lane == 0) {                                                          \
+      round_values[slot][simd_group] = simd_value;                            \
+      round_ids[slot][simd_group] = simd_id;                                  \
+    }                                                                         \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                          \
+    float best = round_values[slot][0];                                       \
+    uint best_id = round_ids[slot][0];                                        \
+    for (uint other = 1; other < 8; ++other) {                                \
+      float value = round_values[slot][other];                                \
+      uint token = round_ids[slot][other];                                    \
+      if (top_beats(value, token, best, best_id)) {                           \
+        best = value;                                                         \
+        best_id = token;                                                      \
+      }                                                                       \
+    }                                                                         \
+    if (thread_index == rank) {                                               \
+      partial_ids[group * K + rank] = best_id;                                \
+      partial_values[group * K + rank] = best;                                \
+    }                                                                         \
+    if (head_value == best && head_id == best_id)                             \
+      top_pop<K>(values, ids);                                                \
+  }                                                                           \
 }
 
 // Merges the eight shard partials of one row into the simdgroup's lanes: each
 // lane holds four consecutive entries of one shard's sorted list and sixteen
 // rounds pop the simdgroup-wide best into rank order, lane `rank` keeping it.
+template <uint K>
 inline void top16_merge_shards(device const uint *partial_ids,
                                device const float *partial_values,
                                uint row, uint lane, thread float &value,
                                thread uint &token) {
-  constexpr uint K = SPLASH_DRAFT_CANDIDATES;
   constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
   constexpr uint Entries = Shards * K / 32;
   uint origin = row * Shards * K + lane * Entries;
@@ -1224,90 +1237,93 @@ inline void top16_merge_shards(device const uint *partial_ids,
 // remaining simdgroups score the 16 x 16 predecessor/candidate edge table in
 // fixed per-lane reduction order. The table follows the shard partials in
 // partial-values scratch.
-kernel void draft_select_edges(
-    device const uint *partial_ids [[buffer(0)]],
-    device float *partial_values [[buffer(1)]],
-    device uint *candidates [[buffer(2)]],
-    device float *unary [[buffer(3)]],
-    device const bfloat *hidden [[buffer(4)]],
-    device const bfloat *predecessor_codebook [[buffer(5)]],
-    device const bfloat *successor_codebook [[buffer(6)]],
-    constant SelectorBatchParams &params [[buffer(7)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint threads [[threads_per_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
-  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
-  constexpr uint Candidates = SPLASH_DRAFT_CANDIDATES;
-  constexpr uint Rank = SPLASH_DRAFT_SELECTOR_RANK;
-  uint batch = row / Positions;
-  uint position = row % Positions;
-  threadgroup uint successors[Candidates];
-  threadgroup uint predecessors[Candidates];
-  if (simd_group == 0) {
-    float value;
-    uint token;
-    top16_merge_shards(partial_ids, partial_values, row, lane, value, token);
-    if (lane < Candidates) {
-      candidates[row * Candidates + lane] = token;
-      unary[row * Candidates + lane] = value;
-      successors[lane] = token;
-    }
-  } else if (simd_group == 1) {
-    uint token = params.anchor[batch];
-    if (position > 0) {
-      float value;
-      top16_merge_shards(partial_ids, partial_values, row - 1, lane, value,
-                         token);
-    }
-    if (lane < Candidates)
-      predecessors[lane] = token;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  // One task is one predecessor and eight of the sixteen candidates, so a
-  // simdgroup issues all its codebook loads at once instead of one cold row
-  // per edge.
-  constexpr uint TaskCandidates = 8, Dims = Rank / 32;
-  uint tasks = (position > 0 ? Candidates : 1) * (Candidates / TaskCandidates);
-  device float *table = partial_values +
-                        ulong(params.lanes) * Positions * Shards * Candidates +
-                        ulong(row) * Candidates * Candidates;
-  device const bfloat *row_hidden =
-      hidden + (ulong(batch) * Rows + position + 1) * Rank;
-  for (uint task = simd_group; task < tasks; task += threads / 32) {
-    uint predecessor_index = task / (Candidates / TaskCandidates);
-    uint first_candidate =
-        task % (Candidates / TaskCandidates) * TaskCandidates;
-    // Ids are produced by the top-k selection and are always in range; the
-    // clamp only keeps a corrupted id inside the codebooks.
-    uint safe_predecessor =
-        min(predecessors[predecessor_index], params.vocabulary - 1u);
-    float context[Dims];
-    float successor[TaskCandidates][Dims];
-    for (uint i = 0; i < Dims; ++i) {
-      uint dim = lane + i * 32;
-      context[i] = float(predecessor_codebook[safe_predecessor * Rank + dim]) *
-                   float(row_hidden[dim]);
-    }
-    for (uint j = 0; j < TaskCandidates; ++j) {
-      uint safe_candidate =
-          min(successors[first_candidate + j], params.vocabulary - 1u);
-      for (uint i = 0; i < Dims; ++i)
-        successor[j][i] =
-            float(successor_codebook[safe_candidate * Rank + lane + i * 32]);
-    }
-    for (uint j = 0; j < TaskCandidates; ++j) {
-      float score = 0.0f;
-      for (uint i = 0; i < Dims; ++i)
-        score += context[i] * successor[j][i];
-      score = simd_sum(score);
-      if (lane == 0)
-        table[predecessor_index * Candidates + first_candidate + j] = score;
-    }
-  }
+#define DRAFT_SELECT_EDGES_KERNEL(name, candidate_count) \
+  kernel void name( \
+      device const uint *partial_ids [[buffer(0)]],                           \
+    device float *partial_values [[buffer(1)]],                               \
+    device uint *candidates [[buffer(2)]],                                    \
+    device float *unary [[buffer(3)]],                                        \
+    device const bfloat *hidden [[buffer(4)]],                                \
+    device const bfloat *predecessor_codebook [[buffer(5)]],                  \
+    device const bfloat *successor_codebook [[buffer(6)]],                    \
+    constant SelectorBatchParams &params [[buffer(7)]],                       \
+    uint row [[threadgroup_position_in_grid]],                                \
+    uint threads [[threads_per_threadgroup]],                                 \
+    uint lane [[thread_index_in_simdgroup]],                                  \
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {                     \
+  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;                              \
+  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;                    \
+  constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;                       \
+  constexpr uint Candidates = candidate_count;                                     \
+  constexpr uint Rank = SPLASH_DRAFT_SELECTOR_RANK;                           \
+  uint batch = row / Positions;                                               \
+  uint position = row % Positions;                                            \
+  threadgroup uint successors[Candidates];                                    \
+  threadgroup uint predecessors[Candidates];                                  \
+  if (simd_group == 0) {                                                      \
+    float value;                                                              \
+    uint token;                                                               \
+    top16_merge_shards<Candidates>(partial_ids, partial_values, row, lane, value, \
+                                   token);                                    \
+    if (lane < Candidates) {                                                  \
+      candidates[row * Candidates + lane] = token;                            \
+      unary[row * Candidates + lane] = value;                                 \
+      successors[lane] = token;                                               \
+    }                                                                         \
+  } else if (simd_group == 1) {                                               \
+    uint token = params.anchor[batch];                                        \
+    if (position > 0) {                                                       \
+      float value;                                                            \
+      top16_merge_shards<Candidates>(partial_ids, partial_values, row - 1, lane, \
+                                   value,                                     \
+                         token);                                              \
+    }                                                                         \
+    if (lane < Candidates)                                                    \
+      predecessors[lane] = token;                                             \
+  }                                                                           \
+  threadgroup_barrier(mem_flags::mem_threadgroup);                            \
+                                                                              \
+  /* One task is one predecessor and eight of the sixteen candidates, so a */ \
+  /* simdgroup issues all its codebook loads at once instead of one cold row */ \
+  /* per edge. */                                                             \
+  constexpr uint TaskCandidates = 8, Dims = Rank / 32;                        \
+  uint tasks = (position > 0 ? Candidates : 1) * (Candidates / TaskCandidates); \
+  device float *table = partial_values +                                      \
+                        ulong(params.lanes) * Positions * Shards * Candidates + \
+                        ulong(row) * Candidates * Candidates;                 \
+  device const bfloat *row_hidden =                                           \
+      hidden + (ulong(batch) * Rows + position + 1) * Rank;                   \
+  for (uint task = simd_group; task < tasks; task += threads / 32) {          \
+    uint predecessor_index = task / (Candidates / TaskCandidates);            \
+    uint first_candidate =                                                    \
+        task % (Candidates / TaskCandidates) * TaskCandidates;                \
+    /* Ids are produced by the top-k selection and are always in range; the */ \
+    /* clamp only keeps a corrupted id inside the codebooks. */               \
+    uint safe_predecessor =                                                   \
+        min(predecessors[predecessor_index], params.vocabulary - 1u);         \
+    float context[Dims];                                                      \
+    float successor[TaskCandidates][Dims];                                    \
+    for (uint i = 0; i < Dims; ++i) {                                         \
+      uint dim = lane + i * 32;                                               \
+      context[i] = float(predecessor_codebook[safe_predecessor * Rank + dim]) * \
+                   float(row_hidden[dim]);                                    \
+    }                                                                         \
+    for (uint j = 0; j < TaskCandidates; ++j) {                               \
+      uint safe_candidate =                                                   \
+          min(successors[first_candidate + j], params.vocabulary - 1u);       \
+      for (uint i = 0; i < Dims; ++i)                                         \
+        successor[j][i] =                                                     \
+            float(successor_codebook[safe_candidate * Rank + lane + i * 32]); \
+    }                                                                         \
+    for (uint j = 0; j < TaskCandidates; ++j) {                               \
+      float score = 0.0f;                                                     \
+      for (uint i = 0; i < Dims; ++i)                                         \
+        score += context[i] * successor[j][i];                                \
+      score = simd_sum(score);                                                \
+      if (lane == 0)                                                          \
+        table[predecessor_index * Candidates + first_candidate + j] = score;  \
+    }                                                                         \
+  }                                                                           \
 }
 
 // One thread per lane walks the seven positions: the score of a candidate is
@@ -1315,77 +1331,78 @@ kernel void draft_select_edges(
 // from the table draft_select_edges left in the partial-values scratch. It
 // writes the lane's confidence at each position (VerifyRowsParams) as it
 // walks.
-kernel void draft_select_dflash(
-    device const uint *candidates [[buffer(0)]],
-    device const float *unary [[buffer(1)]],
-    device const float *partial_values [[buffer(2)]],
-    device const float *uniforms [[buffer(3)]],
-    device uint *tokens [[buffer(4)]], device float *q_probs [[buffer(5)]],
-    device float *confidence [[buffer(6)]],
-    constant SelectorBatchParams &params [[buffer(7)]],
-    uint batch [[thread_position_in_grid]]) {
-  constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  constexpr ulong Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
-  constexpr ulong Candidates = SPLASH_DRAFT_CANDIDATES;
-  candidates += batch * Positions * Candidates;
-  unary += batch * Positions * Candidates;
-  device const float *tables = partial_values +
-                               params.lanes * Positions * Shards * Candidates +
-                               batch * Positions * Candidates * Candidates;
-  uniforms += batch * SPLASH_SAMPLING_UNIFORMS;
-  tokens += batch * Positions;
-  q_probs += batch * Positions * Candidates;
-  confidence += batch * Positions;
-
-  const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
-  uint predecessor_index = 0;
-  for (uint position = 0; position < Positions; ++position) {
-    device const float *edges =
-        tables + (position * Candidates + predecessor_index) * Candidates;
-    float scores[Candidates];
-    for (uint i = 0; i < Candidates; ++i)
-      scores[i] = unary[position * Candidates + i] + edges[i];
-    // The largest of the position's candidate probabilities at temperature
-    // 1, before the lane chooses among them.
-    float best = scores[0];
-    for (uint i = 1; i < Candidates; ++i)
-      best = max(best, scores[i]);
-    float mass = 0.0f;
-    for (uint i = 0; i < Candidates; ++i)
-      mass += exp(scores[i] - best);
-    confidence[position] = 1.0f / mass;
-    uint selected = 0;
-    if (sampling) {
-      float maximum = scores[0];
-      for (uint i = 1; i < Candidates; ++i)
-        maximum = max(maximum, scores[i]);
-      float sum = 0.0f;
-      for (uint i = 0; i < Candidates; ++i) {
-        float probability =
-            exp((scores[i] - maximum) / params.temperature[batch]);
-        q_probs[position * Candidates + i] = probability;
-        sum += probability;
-      }
-      float cumulative = 0.0f;
-      selected = Candidates - 1;
-      for (uint i = 0; i < Candidates; ++i) {
-        float probability = q_probs[position * Candidates + i] / sum;
-        q_probs[position * Candidates + i] = probability;
-        cumulative += probability;
-        if (selected == Candidates - 1 &&
-            cumulative > uniforms[SPLASH_UNIFORM_PROPOSALS + position]) {
-          selected = i;
-        }
-      }
-    } else {
-      for (uint i = 1; i < Candidates; ++i) {
-        if (scores[i] > scores[selected])
-          selected = i;
-      }
-    }
-    predecessor_index = selected;
-    tokens[position] = candidates[position * Candidates + selected];
-  }
+#define DRAFT_SELECT_DFLASH_KERNEL(name, candidate_count) \
+  kernel void name( \
+      device const uint *candidates [[buffer(0)]],                            \
+    device const float *unary [[buffer(1)]],                                  \
+    device const float *partial_values [[buffer(2)]],                         \
+    device const float *uniforms [[buffer(3)]],                               \
+    device uint *tokens [[buffer(4)]], device float *q_probs [[buffer(5)]],   \
+    device float *confidence [[buffer(6)]],                                   \
+    constant SelectorBatchParams &params [[buffer(7)]],                       \
+    uint batch [[thread_position_in_grid]]) {                                 \
+  constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;                   \
+  constexpr ulong Shards = SPLASH_DRAFT_SAMPLING_SHARDS;                      \
+  constexpr ulong Candidates = candidate_count;                                    \
+  candidates += batch * Positions * Candidates;                               \
+  unary += batch * Positions * Candidates;                                    \
+  device const float *tables = partial_values +                               \
+                               params.lanes * Positions * Shards * Candidates + \
+                               batch * Positions * Candidates * Candidates;   \
+  uniforms += batch * SPLASH_SAMPLING_UNIFORMS;                               \
+  tokens += batch * Positions;                                                \
+  q_probs += batch * Positions * Candidates;                                  \
+  confidence += batch * Positions;                                            \
+                                                                              \
+  const bool sampling = (params.sampling_mask & (1u << batch)) != 0;          \
+  uint predecessor_index = 0;                                                 \
+  for (uint position = 0; position < Positions; ++position) {                 \
+    device const float *edges =                                               \
+        tables + (position * Candidates + predecessor_index) * Candidates;    \
+    float scores[Candidates];                                                 \
+    for (uint i = 0; i < Candidates; ++i)                                     \
+      scores[i] = unary[position * Candidates + i] + edges[i];                \
+    /* The largest of the position's candidate probabilities at temperature */ \
+    /* 1, before the lane chooses among them. */                              \
+    float best = scores[0];                                                   \
+    for (uint i = 1; i < Candidates; ++i)                                     \
+      best = max(best, scores[i]);                                            \
+    float mass = 0.0f;                                                        \
+    for (uint i = 0; i < Candidates; ++i)                                     \
+      mass += exp(scores[i] - best);                                          \
+    confidence[position] = 1.0f / mass;                                       \
+    uint selected = 0;                                                        \
+    if (sampling) {                                                           \
+      float maximum = scores[0];                                              \
+      for (uint i = 1; i < Candidates; ++i)                                   \
+        maximum = max(maximum, scores[i]);                                    \
+      float sum = 0.0f;                                                       \
+      for (uint i = 0; i < Candidates; ++i) {                                 \
+        float probability =                                                   \
+            exp((scores[i] - maximum) / params.temperature[batch]);           \
+        q_probs[position * Candidates + i] = probability;                     \
+        sum += probability;                                                   \
+      }                                                                       \
+      float cumulative = 0.0f;                                                \
+      selected = Candidates - 1;                                              \
+      for (uint i = 0; i < Candidates; ++i) {                                 \
+        float probability = q_probs[position * Candidates + i] / sum;         \
+        q_probs[position * Candidates + i] = probability;                     \
+        cumulative += probability;                                            \
+        if (selected == Candidates - 1 &&                                     \
+            cumulative > uniforms[SPLASH_UNIFORM_PROPOSALS + position]) {     \
+          selected = i;                                                       \
+        }                                                                     \
+      }                                                                       \
+    } else {                                                                  \
+      for (uint i = 1; i < Candidates; ++i) {                                 \
+        if (scores[i] > scores[selected])                                     \
+          selected = i;                                                       \
+      }                                                                       \
+    }                                                                         \
+    predecessor_index = selected;                                             \
+    tokens[position] = candidates[position * Candidates + selected];          \
+  }                                                                           \
 }
 
 // One thread chooses every lane's verify rows (VerifyRowsParams): it ranks
@@ -1393,6 +1410,15 @@ kernel void draft_select_dflash(
 // position first among equal ones, so that a lane's chosen rows are always the
 // first of its block, and takes as many as maximize the expected tokens over
 // the cost of the rows verified in all.
+
+// The shipped drafts' selector kernels; Ripple's draft keeps 32 candidates.
+DRAFT_SELECT_TOP_KERNEL(draft_select_top16_sharded, SPLASH_DRAFT_CANDIDATES)
+DRAFT_SELECT_EDGES_KERNEL(draft_select_edges, SPLASH_DRAFT_CANDIDATES)
+DRAFT_SELECT_DFLASH_KERNEL(draft_select_dflash, SPLASH_DRAFT_CANDIDATES)
+DRAFT_SELECT_TOP_KERNEL(draft_select_top32_sharded, 32)
+DRAFT_SELECT_EDGES_KERNEL(draft_select_edges_k32, 32)
+DRAFT_SELECT_DFLASH_KERNEL(draft_select_dflash_k32, 32)
+
 kernel void draft_verify_rows(device const float *confidence [[buffer(0)]],
                               device uint *verify_rows [[buffer(1)]],
                               constant VerifyRowsParams &params [[buffer(2)]],
@@ -1484,6 +1510,7 @@ inline void finish_acceptance(device const uint *tokens, uint accepted,
 // the correction a rejection takes or, for the last row, the bonus token.
 // Acceptance overwrites the accepted rows with the draft tokens, so row
 // accepted keeps its draw.
+template <uint Candidates>
 inline void accept_sampled_lane(device const uint *draft_tokens,
                                 device const uint *draft_ids,
                                 device const float *draft_probs,
@@ -1496,9 +1523,9 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
   uint accepted = 0;
   while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS) {
     uint token = draft_tokens[accepted];
-    float q = sparse_lookup(draft_ids + accepted * kDraftCandidates,
-                            draft_probs + accepted * kDraftCandidates,
-                            kDraftCandidates, token);
+    float q = sparse_lookup(draft_ids + accepted * Candidates,
+                            draft_probs + accepted * Candidates,
+                            Candidates, token);
     float p = target_rows[accepted].draft_probability;
     if (!(uniforms[SPLASH_UNIFORM_ACCEPTANCE + accepted] * q < p))
       break;
@@ -1674,36 +1701,40 @@ inline void accept_greedy_lane(device const uint *draft_tokens,
                     accepted_count);
 }
 
-kernel void decode_accept_dflash(
-    device const uint *draft_tokens [[buffer(0)]],
-    device const uint *draft_ids [[buffer(1)]],
-    device const float *draft_probs [[buffer(2)]],
-    device const TargetVocabularyRow *target_rows [[buffer(3)]],
-    device const float *uniforms [[buffer(4)]],
-    device uint *target_tokens [[buffer(5)]],
-    device uint *retained [[buffer(6)]],
-    device uint *accepted_count [[buffer(7)]],
-    device const uint *verify_rows [[buffer(8)]],
-    constant AcceptBatchParams &params [[buffer(9)]],
-    uint batch [[threadgroup_position_in_grid]]) {
-  // A lane retains at most the rows its verify verified (the selector's
-  // verify rows, SelectorBatchParams).
-  uint remaining = min(params.remaining[batch], verify_rows[batch]);
-  AcceptParams lane_params{remaining, params.stop_tokens};
-  device const uint *lane_draft =
-      draft_tokens + batch * SPLASH_DRAFT_PROPOSAL_TOKENS;
-  device uint *lane_target =
-      target_tokens + batch * SPLASH_TARGET_VERIFY_ROWS;
-  if (params.sampling_mask & (1u << batch)) {
-    accept_sampled_lane(
-        lane_draft,
-        draft_ids + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
-        draft_probs + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
-        target_rows + batch * SPLASH_TARGET_VERIFY_ROWS,
-        uniforms + batch * SPLASH_SAMPLING_UNIFORMS, lane_target,
-        retained[batch], accepted_count[batch], lane_params);
-  } else {
-    accept_greedy_lane(lane_draft, lane_target, retained[batch],
-                       accepted_count[batch], lane_params);
-  }
+// The shipped drafts' acceptance kernel; Ripple's draft keeps 32 candidates.
+#define DECODE_ACCEPT_DFLASH_KERNEL(name, Candidates) \
+  kernel void name(                                                           \
+    device const uint *draft_tokens [[buffer(0)]],                            \
+    device const uint *draft_ids [[buffer(1)]],                               \
+    device const float *draft_probs [[buffer(2)]],                            \
+    device const TargetVocabularyRow *target_rows [[buffer(3)]],              \
+    device const float *uniforms [[buffer(4)]],                               \
+    device uint *target_tokens [[buffer(5)]],                                 \
+    device uint *retained [[buffer(6)]],                                      \
+    device uint *accepted_count [[buffer(7)]],                                \
+    device const uint *verify_rows [[buffer(8)]],                             \
+    constant AcceptBatchParams &params [[buffer(9)]],                         \
+    uint batch [[threadgroup_position_in_grid]]) {                            \
+  /* A lane retains at most the rows its verify verified (the selector's */   \
+  /* verify rows, SelectorBatchParams). */                                    \
+  uint remaining = min(params.remaining[batch], verify_rows[batch]);          \
+  AcceptParams lane_params{remaining, params.stop_tokens};                    \
+  device const uint *lane_draft =                                             \
+      draft_tokens + batch * SPLASH_DRAFT_PROPOSAL_TOKENS;                    \
+  device uint *lane_target =                                                  \
+      target_tokens + batch * SPLASH_TARGET_VERIFY_ROWS;                      \
+  if (params.sampling_mask & (1u << batch)) {                                 \
+    accept_sampled_lane<Candidates>(                                     \
+        lane_draft,                                                           \
+        draft_ids + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * Candidates,        \
+        draft_probs + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * Candidates,      \
+        target_rows + batch * SPLASH_TARGET_VERIFY_ROWS,                      \
+        uniforms + batch * SPLASH_SAMPLING_UNIFORMS, lane_target,             \
+        retained[batch], accepted_count[batch], lane_params);                 \
+  } else {                                                                    \
+    accept_greedy_lane(lane_draft, lane_target, retained[batch],              \
+                       accepted_count[batch], lane_params);                   \
+  }                                                                           \
 }
+DECODE_ACCEPT_DFLASH_KERNEL(decode_accept_dflash, SPLASH_DRAFT_CANDIDATES)
+DECODE_ACCEPT_DFLASH_KERNEL(decode_accept_dflash_k32, 32)

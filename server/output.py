@@ -113,10 +113,12 @@ class ReasoningSplitter:
         self.reasoning = thinking
         # Whether the output may yet open its reasoning: until it shows
         # whether it starts with THINK_START.
+        # The opener the model writes itself: a token (Flint's) or, where the
+        # tags are text, the opener's text arriving over pieces.
         self.opening = (
             not thinking
             and chat_format is not None
-            and chat_format.think_start_id is not None
+            and (chat_format.think_start_id is not None or chat_format.tags_are_text)
         )
         self.pending = ""
         # Whether the newlines after </think>, which set the answer apart in

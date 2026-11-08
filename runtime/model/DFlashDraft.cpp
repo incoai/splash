@@ -25,6 +25,14 @@ void requireLayout(const DFlashDraftLayout &layout) {
     throw WeightStoreError("draft selector kernels are compiled for rank " +
                            std::to_string(SPLASH_DRAFT_SELECTOR_RANK));
   }
+  // The proposal the variant's kernels run: the block's rows and the kept
+  // candidates, which the variant's kernels are instantiated with.
+  if (layout.rows != SPLASH_DRAFT_QUERY_ROWS && layout.rows != 16)
+    throw WeightStoreError("draft proposal kernels are compiled for 8 or 16 rows, not " +
+                           std::to_string(layout.rows));
+  if (layout.candidates != SPLASH_DRAFT_CANDIDATES && layout.candidates != 32)
+    throw WeightStoreError("draft selector kernels are compiled for 16 or 32 candidates, not " +
+                           std::to_string(layout.candidates));
 }
 
 // The key and value rows of each layer's fused QKV projection, without a
@@ -89,6 +97,8 @@ DFlashDraftLayout draftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint
   layout.queryHeads = variant.query_heads;
   layout.window = variant.window;
   layout.convolutionTaps = variant.convolution_taps;
+  layout.rows = variant.rows;
+  layout.candidates = variant.candidates;
   requireLayout(layout);
   return layout;
 }
@@ -145,7 +155,8 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
                          metal::MetalBackend &backend,
                          const ops::ExecutionPlans &operators)
     : weights_(weights), backend_(backend), operators_(operators),
-      selector_(weights.layout.vocabularySize),
+      selector_(weights.layout.vocabularySize,
+                weights.layout.candidates),
       contextKvProjections_(contextKvRows(backend, weights)) {}
 
 void DFlashDraft::addSelection(
@@ -154,7 +165,7 @@ void DFlashDraft::addSelection(
     std::span<const ops::SamplingPolicy> policies) const {
   selector_.add(graph, buffers,
                 {weights_.predecessorCodebook, weights_.successorCodebook},
-                anchors, policies);
+                weights_.layout.candidates, anchors, policies);
 }
 
 void DFlashDraft::addContextPrefill(

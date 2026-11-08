@@ -58,6 +58,11 @@ struct SplashDraftVariant {
   uint32_t convolution_taps;
   uint32_t splits;
   uint32_t head_groups;
+  // The proposal the draft was trained for: the block's rows a cycle drafts
+  // (the target verifies as many) and the selector's kept candidates, which
+  // the variant's kernels are instantiated with.
+  uint32_t rows;
+  uint32_t candidates;
   const char *suffix;
 };
 inline constexpr SplashDraftVariant SPLASH_DRAFT_VARIANTS[] = {
@@ -66,12 +71,13 @@ inline constexpr SplashDraftVariant SPLASH_DRAFT_VARIANTS[] = {
     // head group per KV head.
     {SPLASH_DRAFT_QUERY_HEADS, SPLASH_DRAFT_KV_HEADS, SPLASH_DRAFT_HEAD_DIMENSION,
      SPLASH_DRAFT_SLIDING_WINDOW, SPLASH_DRAFT_CONVOLUTION_TAPS,
-     SPLASH_DRAFT_ATTENTION_SPLITS, 1, ""},
+     SPLASH_DRAFT_ATTENTION_SPLITS, 1, SPLASH_DRAFT_QUERY_ROWS,
+     SPLASH_DRAFT_CANDIDATES, ""},
     // Ripple's draft: 80 query heads over the 8 KV heads, a 4096-slot ring,
-    // four-tap convolutions, head groups of five query heads (two 40-row
-    // threadgroups per KV head, the device's 32 KB threadgroup memory
-    // measured to refuse one 80-row group), eight split threadgroups.
-    {80, 8, 128, 4096, 4, 8, 2, "_kv8_h5_d128_w4096_s8"},
+    // four-tap convolutions, 16-row proposals of 32 candidates (the draft
+    // was trained so), head groups of two query heads (five 32-row
+    // threadgroups per KV head), eight split threadgroups.
+    {80, 8, 128, 4096, 4, 8, 5, 16, 32, "_kv8_h2_d128_w4096_s8"},
 };
 #endif
 

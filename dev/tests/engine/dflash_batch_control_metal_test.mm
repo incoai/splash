@@ -33,6 +33,7 @@ using splash::ops::RowRegion;
 using splash::ops::StopTokens;
 
 constexpr uint32_t kRows = splash::model::ExecutionLimits::targetVerifyRows;
+constexpr uint32_t kCandidates = SPLASH_DRAFT_CANDIDATES;
 constexpr uint32_t kProposals =
     splash::model::ExecutionLimits::draftProposalTokens;
 constexpr uint32_t kLanes =
@@ -122,7 +123,8 @@ void runWidth(MetalBackend &backend, uint32_t width,
             std::begin(params.remaining));
   std::ranges::copy(stops.ids, params.stop_tokens);
   ComputeDispatch dispatch;
-  dispatch.pipelineName = "decode_accept_dflash";
+  dispatch.pipelineName =
+      kCandidates == 32 ? "decode_accept_dflash_k32" : "decode_accept_dflash";
   dispatch.buffers = {{0, draft},
                       {1, draftIds},
                       {2, draftProbabilities},

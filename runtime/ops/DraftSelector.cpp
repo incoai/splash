@@ -19,27 +19,35 @@ constexpr uint32_t kEdgeThreads = 256;
 
 } // namespace
 
-DraftSelector::DraftSelector(uint32_t vocabulary) : vocabulary_(vocabulary) {
+DraftSelector::DraftSelector(uint32_t vocabulary, uint32_t candidates)
+    : vocabulary_(vocabulary), candidates_(candidates) {
   if (!vocabulary)
     throw std::invalid_argument("invalid draft selector vocabulary");
+  if (candidates_ != SPLASH_DRAFT_CANDIDATES && candidates_ != 32)
+    throw std::invalid_argument("invalid draft selector candidate count");
 }
 
-DraftSelectorWorkspace DraftSelector::workspace(uint32_t positions) {
+DraftSelectorWorkspace DraftSelector::workspace(uint32_t positions,
+                                                uint32_t candidates) {
   if (!positions)
     throw std::invalid_argument("invalid draft selector workspace position count");
-  const uint64_t candidates = uint64_t{positions} * SPLASH_DRAFT_CANDIDATES;
-  // The partial values are followed by each position's 16 x 16 edge table.
-  return {candidates * kShards * sizeof(uint32_t),
-          candidates * (kShards + SPLASH_DRAFT_CANDIDATES) * sizeof(float),
-          candidates * sizeof(uint32_t), candidates * sizeof(float),
-          candidates * sizeof(float)};
+  if (candidates != SPLASH_DRAFT_CANDIDATES && candidates != 32)
+    throw std::invalid_argument("invalid draft selector candidate count");
+  const uint64_t kept = uint64_t{positions} * candidates;
+  // The partial values are followed by each position's candidate-count
+  // squared edge table.
+  return {kept * kShards * sizeof(uint32_t),
+          kept * (kShards + candidates) * sizeof(float),
+          kept * sizeof(uint32_t), kept * sizeof(float), kept * sizeof(float)};
 }
 
 void DraftSelector::add(metal::CommandGraph &graph,
                         const DraftSelectorBuffers &buffers,
-                        const DraftCodebooks &codebooks,
+                        const DraftCodebooks &codebooks, uint32_t candidates,
                         std::span<const uint32_t> anchors,
                         std::span<const SamplingPolicy> policies) const {
+  if (candidates != candidates_)
+    throw std::invalid_argument("draft selector candidate mismatch");
   if (anchors.empty() || anchors.size() != policies.size() ||
       anchors.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
@@ -56,7 +64,8 @@ void DraftSelector::add(metal::CommandGraph &graph,
   // A lane's proposal positions take rows 1-7 of its eight query rows of the
   // logits and the selector hidden rows; a sampling lane draws its proposals
   // with its proposal uniforms and writes their candidates' probabilities.
-  const DraftSelectorWorkspace workspace = DraftSelector::workspace(lanes * kPositions);
+  const DraftSelectorWorkspace workspace =
+      DraftSelector::workspace(lanes * kPositions, candidates_);
   const uint64_t rows = uint64_t{lanes} * SPLASH_DRAFT_QUERY_ROWS;
   const uint64_t codebook = uint64_t{vocabulary_} * SPLASH_DRAFT_SELECTOR_RANK * 2;
   requireBytes(buffers.logits, rows * vocabulary_ * sizeof(float), "draft logits");
@@ -73,19 +82,20 @@ void DraftSelector::add(metal::CommandGraph &graph,
     requireBytes(buffers.uniforms,
                  ((sampledLanes - 1) * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_PROPOSALS + kPositions) * sizeof(float),
                  "proposal uniform");
-    requireBytes(buffers.proposalProbabilities, sampledLanes * kPositions * SPLASH_DRAFT_CANDIDATES * sizeof(float),
+    requireBytes(buffers.proposalProbabilities, sampledLanes * kPositions * candidates_ * sizeof(float),
                  "proposal probability");
   }
-  graph.add("draft_select_top16_sharded",
+  const uint32_t suffix = candidates_ == 32 ? 32 : 0;
+  graph.add(suffix ? "draft_select_top32_sharded" : "draft_select_top16_sharded",
             {buffers.logits, buffers.partialIds, buffers.partialValues},
             vocabulary_, {uint64_t{lanes} * kPositions * kShards, 1, 1});
-  graph.add("draft_select_edges",
+  graph.add(suffix ? "draft_select_edges_k32" : "draft_select_edges",
             {buffers.partialIds, buffers.partialValues, buffers.candidates,
              buffers.unary, buffers.selectorHidden, codebooks.predecessor,
              codebooks.successor},
             params, {uint64_t{lanes} * kPositions, 1, 1},
             {kEdgeThreads, 1, 1});
-  graph.add("draft_select_dflash",
+  graph.add(suffix ? "draft_select_dflash_k32" : "draft_select_dflash",
             {buffers.candidates, buffers.unary, buffers.partialValues,
              buffers.uniforms, buffers.proposedTokens,
              buffers.proposalProbabilities, buffers.confidence},

@@ -128,10 +128,13 @@ void Sampling::countPenaltyTokens(std::span<uint32_t> words,
     ++words[token];
 }
 
-Sampling::Sampling(uint32_t vocabulary)
-    : vocabulary_(vocabulary), maskWords_((vocabulary + 31) / 32) {
+Sampling::Sampling(uint32_t vocabulary, uint32_t draftCandidates)
+    : vocabulary_(vocabulary), draftCandidates_(draftCandidates),
+      maskWords_((vocabulary + 31) / 32) {
   if (!vocabulary)
     throw std::invalid_argument("invalid sampling geometry");
+  if (draftCandidates_ != SPLASH_DRAFT_CANDIDATES && draftCandidates_ != 32)
+    throw std::invalid_argument("invalid draft candidate count");
 }
 
 void Sampling::addPenalties(metal::CommandGraph &graph,
@@ -273,7 +276,8 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
     // its proposal position's candidates.
     if (drafted) {
       requireBytes(buffers.inputTokens, (last * rows.rows + drafted + 1) * sizeof(uint32_t), "verify input token");
-      const uint64_t candidates = (last * SPLASH_DRAFT_PROPOSAL_TOKENS + drafted) * SPLASH_DRAFT_CANDIDATES;
+      const uint64_t candidates =
+          (last * SPLASH_DRAFT_PROPOSAL_TOKENS + drafted) * draftCandidates_;
       requireBytes(buffers.draftCandidates, candidates * sizeof(uint32_t), "draft candidate");
       requireBytes(buffers.draftProbabilities, candidates * sizeof(float), "draft probability");
     }
@@ -305,7 +309,8 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
               {buffers.logits, buffers.constraintMasks, buffers.partialMasses,
                buffers.vocabularyRows},
               params, {selected, 1, 1}, {kVocabularyThreads, 1, 1});
-    graph.add("decode_sample_vocabulary_draw",
+    graph.add(draftCandidates_ == 32 ? "decode_sample_vocabulary_draw_k32"
+                                     : "decode_sample_vocabulary_draw",
               {buffers.logits, buffers.constraintMasks, buffers.vocabularyRows,
                buffers.inputTokens, buffers.draftCandidates,
                buffers.draftProbabilities, buffers.uniforms,
@@ -380,7 +385,7 @@ void Sampling::addAcceptance(
   requireBytes(buffers.acceptedCounts, lanes * sizeof(uint32_t), "accepted count");
   requireBytes(buffers.verifyRows, lanes * sizeof(uint32_t), "verify rows");
   if (const uint64_t sampledLanes = std::bit_width(params.sampling_mask)) {
-    const uint64_t candidates = sampledLanes * kProposals * SPLASH_DRAFT_CANDIDATES;
+    const uint64_t candidates = sampledLanes * kProposals * draftCandidates_;
     requireBytes(buffers.candidates, candidates * sizeof(uint32_t), "draft candidate");
     requireBytes(buffers.proposalProbabilities, candidates * sizeof(float), "draft probability");
     requireBytes(buffers.targetVocabularyRows,
@@ -391,7 +396,8 @@ void Sampling::addAcceptance(
                      sizeof(float),
                  "acceptance uniform");
   }
-  graph.add("decode_accept_dflash",
+  graph.add(draftCandidates_ == 32 ? "decode_accept_dflash_k32"
+                                   : "decode_accept_dflash",
             {buffers.proposedTokens, buffers.candidates,
              buffers.proposalProbabilities, buffers.targetVocabularyRows,
              buffers.uniforms, buffers.outputTokens, buffers.retainedCounts,

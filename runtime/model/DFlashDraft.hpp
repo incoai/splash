@@ -86,10 +86,15 @@ struct DFlashDraftLayout final {
   float rotaryTheta = 0.0F;
   uint32_t selectorRank = 0;
   uint32_t kvHeads = 0;
-  // The variant's query heads, ring length and convolution taps.
+  // The variant's query heads, ring length, convolution taps, and the
+  // proposal it was trained for: the block's rows a cycle drafts (the target
+  // verifies as many) and the selector's kept candidates, which the variant's
+  // kernels are instantiated with.
   uint32_t queryHeads = SPLASH_DRAFT_QUERY_HEADS;
   uint32_t window = SPLASH_DRAFT_SLIDING_WINDOW;
   uint32_t convolutionTaps = SPLASH_DRAFT_CONVOLUTION_TAPS;
+  uint32_t rows = SPLASH_DRAFT_QUERY_ROWS;
+  uint32_t candidates = SPLASH_DRAFT_CANDIDATES;
   // The target layers whose output rows the draft reads, ascending: the
   // first targetLayerCount of targetLayers, targetHiddenSize() values a row.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};

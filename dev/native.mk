@@ -1019,4 +1019,3 @@ $(TEST_RIPPLE_LOAD): dev/tests/engine/ripple_load_test.mm \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
 		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
 
- bbc660bf
