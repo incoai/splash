@@ -177,6 +177,11 @@ private:
 // hook sees none), and its target (Ripple.cpp, whose making is to land).
 void includeFamilyProjections(QwenTargetGeometry &geometry, const RippleWeights &weights);
 [[nodiscard]] const ops::BlockMoeWeights *qwenMoeBlock(const RippleLayerWeights &layer) noexcept;
+// The family's prefill scratch: the scaled embedding rows the blocks mix
+// back in (RippleTarget's embed rows), which the target allocates itself.
+[[nodiscard]] QwenTargetScratchBytes qwenTargetScratchBytes(const RippleWeights &weights,
+                                                            const QwenTargetGeometry &geometry, uint32_t,
+                                                            uint64_t);
 [[nodiscard]] std::unique_ptr<QwenTarget> makeQwenTarget(const RippleWeights &weights,
                                                          const QwenTargetGeometry &geometry,
                                                          metal::MetalBackend &backend,

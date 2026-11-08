@@ -27,6 +27,10 @@ constexpr uint64_t kMostPages = (uint64_t{kv::kMaximumPhysicalTokens} + kv::kPag
 // extent.
 kv::Layout oneLayer(kv::Layout layout) {
   layout.attentionLayers = 1;
+  // The staging page holds one layer's K/V, whose region the one-layer
+  // layout orders first, whatever the real layout's windowed pattern makes
+  // the layer's region there.
+  layout.windowedLayers = {};
   layout.indexDimension = 0;
   return layout;
 }

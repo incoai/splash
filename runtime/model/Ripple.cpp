@@ -306,6 +306,13 @@ void RippleTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer h
                     lanes, scratch);
 }
 
+QwenTargetScratchBytes qwenTargetScratchBytes(const RippleWeights &, const QwenTargetGeometry &geometry,
+                                              uint32_t, uint64_t) {
+  // The target's own scratch in the prefill path: the scaled embedding rows
+  // the blocks mix back in (RippleTarget's embed rows).
+  return {uint64_t{ExecutionLimits::prefillTokenBudget} * geometry.hiddenSize * 2, 0};
+}
+
 std::unique_ptr<QwenTarget> makeQwenTarget(const RippleWeights &weights, const QwenTargetGeometry &geometry,
                                            metal::MetalBackend &backend, const ops::ExecutionPlans &operators,
                                            uint32_t) {

@@ -221,7 +221,10 @@ std::array<std::span<std::byte>, 4> PageStorage::layerSpans(uint32_t page, uint3
     if (layer >= layout_.attentionLayers)
         throw std::out_of_range("KV layer is outside the layout");
     if (layout_.region(layer) >= layout_.regions(extent.form))
-        throw std::logic_error("KV page " + std::to_string(page) + " holds no windowed layer's K/V");
+        throw std::logic_error("KV page " + std::to_string(page) + " of form " +
+                               std::to_string(static_cast<uint32_t>(extent.form)) +
+                               " holds no windowed layer's K/V for layer " + std::to_string(layer) +
+                               " at region " + std::to_string(layout_.region(layer)));
     auto *contents = static_cast<std::byte *>(extent.buffer.contents());
     const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
     const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());

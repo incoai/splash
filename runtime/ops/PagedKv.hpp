@@ -166,11 +166,17 @@ struct LayerMask final {
   }
   // The mask's bits before `layer`.
   [[nodiscard]] constexpr uint32_t countBelow(uint32_t layer) const noexcept {
-    if (layer <= 64)
-      return static_cast<uint32_t>(
-          std::popcount(words[0] & (layer ? (uint64_t{1} << layer) - 1 : 0)));
-    return count() - static_cast<uint32_t>(std::popcount(
-               words[1] & ((layer < 128 ? uint64_t{1} << (layer - 64) : 0) - 1)));
+    // Whole words below the layer's, then its word's bits below its bit.
+    // A layer past the first word's bits was counted with the words above
+    // it (count() minus its suffix), which only holds when no windowed
+    // layer sits at or above it: Ripple's window runs past bit 64.
+    uint32_t below = 0;
+    for (uint32_t word = 0; word * 64 < layer && word < 2; ++word) {
+      const uint32_t bits = layer - word * 64 < 64 ? layer - word * 64 : 64;
+      below += static_cast<uint32_t>(
+          std::popcount(words[word] & (bits == 64 ? ~uint64_t{0} : (uint64_t{1} << bits) - 1)));
+    }
+    return below;
   }
   // Whether the mask holds no bit at or above `layers`.
   [[nodiscard]] constexpr bool above(uint32_t layers) const noexcept {
