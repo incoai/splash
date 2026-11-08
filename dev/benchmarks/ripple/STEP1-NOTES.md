@@ -412,3 +412,31 @@ confidence early-stop the truncated candidate list makes fire early) and
 candidates would propose and accept more per cycle at the same 42.8 GB
 pass. That, with the last 15% of bandwidth, is the decode headroom the
 refactor buys.
+
+## The apples-to-apples acceptance (the same prompt, greedy, both families)
+
+The same reasoning prompt through both benches, greedy:
+
+- Qwen3.8-27B: 24 cycles, 7 proposed a cycle, 100% accepted, 0.0405 s a
+  cycle — 363 GB/s effective.
+- Ripple-65B: 25 cycles, 7 proposed a cycle, 94.9% accepted, 0.0959 s a
+  cycle — 446 GB/s effective.
+
+The proposal machinery performs identically: both draft 7 rows a cycle of
+their 8-row block. Ripple's kernels move MORE bytes per second than the
+shipped path's on the same machine. The served rate differs where the
+models differ — 2.9x the weights a pass, and the draft's per-row accuracy
+on the task (94.9% against 100%).
+
+This sharpens the earlier read: under greedy, the candidate subset costs
+nothing (the kept 16 hold the target's argmax), and the proposal's length
+is the draft's own confidence, not the kernels' cap. The 32-candidate and
+16-row ABI work pays under SAMPLED serving, where the truncated proposal
+distorts the sampling distribution; it is not the greedy lever.
+
+The decode levers that remain, by measured size: the draft's own bytes —
+its FFN is 6.3 GB of the 8.1 GB a cycle re-reads, and a draft ships in
+BF16 only by convention; a Q8/Q4 draft FFN would take 3-5 GB off the
+cycle (+8-12% at the same acceptance), its accuracy to be measured. The
+bandwidth's last 18% (446 of 546). The proposal-length refactor for
+sampled serving.
