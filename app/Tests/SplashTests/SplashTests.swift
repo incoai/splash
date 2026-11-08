@@ -1103,10 +1103,55 @@ struct ChatTests {
         let reloaded = ChatStore(folder: folder)
         #expect(reloaded.conversations.map(\.title) == ["Greeting"])
         #expect(reloaded.conversations[0].messages == store.conversations[0].messages)
-        store.delete(store.conversations[0].id)
+        store.delete([store.conversations[0].id])
         #expect(store.conversations.isEmpty && store.selection == nil)
         store.flush()
         #expect(ChatStore(folder: folder).conversations.isEmpty)
+    }
+
+    /// The question to delete chats names one by its title, and else how many.
+    @MainActor @Test func theQuestionToDeleteChatsNamesOneByItsTitleElseHowMany() {
+        let one = ChatDeletion([Conversation(title: "Greeting")])
+        #expect(one.title == "Delete this chat?" && one.message == "“Greeting” will be deleted from this Mac.")
+        let three = ChatDeletion([Conversation(), Conversation(), Conversation()])
+        #expect(three.ids.count == 3 && three.title == "Delete 3 chats?" && three.message == "They will be deleted from this Mac.")
+    }
+
+    /// Deleting chats deletes each with its file and stops the reply that streams in one, and the
+    /// open one deleted, a new chat opens; a file in the folder that is no chat stays, even under
+    /// the name of an id asked for.
+    @MainActor @Test func deletingChatsDeletesThemWithTheirFiles() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let kept = Conversation(title: "Kept"), gone = Conversation(title: "Gone")
+        for conversation in [kept, gone] {
+            try JSONEncoder().encode(conversation).write(to: folder.appending(path: "\(conversation.id.uuidString).json"))
+        }
+        let unread = UUID()
+        let stray = folder.appending(path: "\(unread.uuidString).json")
+        try Data("not a chat".utf8).write(to: stray)
+        // A reply without end: only the stop ends it.
+        let server = Process()
+        server.executableURL = URL(filePath: "/usr/bin/python3")
+        server.arguments = [try #require(Bundle.module.path(forResource: "streaming_server", ofType: "py", inDirectory: "Fakes")), "--endless"]
+        let output = Pipe()
+        server.standardOutput = output
+        try server.run()
+        defer { server.terminate() }
+        let port = try #require(String(data: output.fileHandleForReading.availableData, encoding: .utf8)
+            .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+        let store = ChatStore(folder: folder)
+        store.send("Hi", images: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        let streaming = try #require(store.streaming)
+        #expect(store.selection == streaming)
+        store.delete([streaming, gone.id, unread])
+        #expect(store.conversations.map(\.id) == [kept.id] && store.selection == nil)
+        try await waitFor(store.streaming == nil, "the reply to stop")
+        #expect(store.conversations.map(\.id) == [kept.id])
+        store.flush()
+        #expect(ChatStore(folder: folder).conversations.map(\.id) == [kept.id])
+        #expect(FileManager.default.fileExists(atPath: stray.path))
     }
 
     @MainActor @Test func aReplyStreamsApartFromTheConversationsUntilItEnds() async throws {

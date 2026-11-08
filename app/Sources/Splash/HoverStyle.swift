@@ -8,9 +8,12 @@ struct HoverStyle: ButtonStyle {
     var padding = EdgeInsets(top: 3, leading: 6, bottom: 3, trailing: 6)
     var shape = AnyShape(.rect(cornerRadius: 7))
     var held = false
+    /// Whether the pointer is over what the button is part of, for a row with a button of its own
+    /// laid over it, which takes the pointer from the label; nil for the label's own hover.
+    var hovered: Bool?
 
     func makeBody(configuration: Configuration) -> some View {
-        Highlight(configuration: configuration, padding: padding, shape: shape, held: held)
+        Highlight(configuration: configuration, padding: padding, shape: shape, held: held, hovered: hovered)
     }
 
     private struct Highlight: View {
@@ -18,6 +21,7 @@ struct HoverStyle: ButtonStyle {
         let padding: EdgeInsets
         let shape: AnyShape
         let held: Bool
+        let hovered: Bool?
         @State private var hovering = false
         @Environment(\.isEnabled) private var enabled
 
@@ -25,7 +29,7 @@ struct HoverStyle: ButtonStyle {
             configuration.label
                 .opacity(enabled ? 1 : 0.4)
                 .padding(padding)
-                .background(.quaternary.opacity(!enabled ? 0 : configuration.isPressed || held ? 1 : hovering ? 0.75 : 0), in: shape)
+                .background(.quaternary.opacity(!enabled ? 0 : configuration.isPressed || held ? 1 : (hovered ?? hovering) ? 0.75 : 0), in: shape)
                 .contentShape(shape)
                 // At once, as AppKit's own controls light up: a fade would redraw the window in
                 // each of its frames as the pointer crosses one row after another.

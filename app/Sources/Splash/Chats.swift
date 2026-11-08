@@ -107,12 +107,14 @@ final class ChatStore {
         selection = nil
     }
 
-    func delete(_ id: UUID) {
-        if streaming == id { stop() }
-        conversations.removeAll { $0.id == id }
-        let file = file(id)
-        files.async { try? FileManager.default.removeItem(at: file) }
-        if selection == id { selection = nil }
+    /// Deletes the conversations of `ids` it holds, and their files, stopping a reply that streams
+    /// in one; the open one deleted, a new chat opens.
+    func delete(_ ids: Set<UUID>) {
+        if let streaming, ids.contains(streaming) { stop() }
+        let removed = conversations.filter { ids.contains($0.id) }.map { file($0.id) }
+        conversations.removeAll { ids.contains($0.id) }
+        files.async { removed.forEach { try? FileManager.default.removeItem(at: $0) } }
+        if let selection, ids.contains(selection) { self.selection = nil }
     }
 
     func rename(_ id: UUID, to title: String) {

@@ -20,12 +20,34 @@ struct ChatScreen: View {
     }
 }
 
+/// A question to delete chats: which, and what it says of them, as it was asked.
+struct ChatDeletion {
+    let ids: Set<UUID>
+    let title: String
+    let message: String
+
+    init(_ chats: [Conversation]) {
+        ids = Set(chats.map(\.id))
+        if chats.count == 1 {
+            title = "Delete this chat?"
+            message = "“\(chats[0].title)” will be deleted from this Mac."
+        } else {
+            title = "Delete \(chats.count) chats?"
+            message = "They will be deleted from this Mac."
+        }
+    }
+}
+
+/// The conversations, searched, each with its menu; Select there picks chats to delete at once.
 private struct ChatList: View {
     @Environment(AppState.self) private var state
     @State private var query = ""
-    @State private var deleting: Conversation?
     @State private var renaming: Conversation?
     @State private var title = ""
+    /// The chats picked to delete while the list picks them, from a chat's Select; nil otherwise.
+    @State private var picked: Set<UUID>?
+    /// The question to delete chats, while it asks, as it was asked.
+    @State private var deletion: ChatDeletion?
 
     var body: some View {
         @Bindable var chats = state.chats
@@ -45,16 +67,12 @@ private struct ChatList: View {
             .padding(.horizontal, 10)
             .padding(.top, 10)
             .padding(.bottom, 4)
+            if let picked {
+                picking(picked, shown: shown)
+            }
             list(shown)
         }
         .background(.background.secondary)
-        .confirmationDialog("Delete this chat?", isPresented: Binding(
-            get: { deleting != nil }, set: { if !$0 { deleting = nil } }
-        ), presenting: deleting) { conversation in
-            Button("Delete", role: .destructive) { chats.delete(conversation.id) }
-        } message: { conversation in
-            Text("“\(conversation.title)” will be deleted from this Mac.")
-        }
         .alert("Rename Chat", isPresented: Binding(
             get: { renaming != nil }, set: { if !$0 { renaming = nil } }
         ), presenting: renaming) { conversation in
@@ -62,6 +80,32 @@ private struct ChatList: View {
             Button("Rename") { chats.rename(conversation.id, to: title) }
             Button("Cancel", role: .cancel) {}
         }
+        .confirmationDialog(deletion?.title ?? "", isPresented: Binding(
+            get: { deletion != nil }, set: { if !$0 { deletion = nil } }
+        ), presenting: deletion) { deletion in
+            Button("Delete", role: .destructive) {
+                chats.delete(deletion.ids)
+                picked = nil
+            }
+        } message: { deletion in
+            Text(deletion.message)
+        }
+    }
+
+    /// While the list picks chats to delete, under the search field: picking every chat shown, or
+    /// none again; deleting those picked, which asks first; and Done, which ends the picking.
+    private func picking(_ picked: Set<UUID>, shown: [Conversation]) -> some View {
+        let all = !shown.isEmpty && shown.allSatisfy { picked.contains($0.id) }
+        return HStack(spacing: 2) {
+            Button(all ? "Deselect All" : "Select All") { self.picked = all ? [] : Set(shown.map(\.id)) }
+            Spacer()
+            Button("Delete") { deletion = ChatDeletion(state.chats.conversations.filter { picked.contains($0.id) }) }
+                .disabled(picked.isEmpty)
+            Button("Done") { self.picked = nil }
+        }
+        .buttonStyle(.hover)
+        .padding(.horizontal, 12)
+        .padding(.bottom, 4)
     }
 
     /// The conversations, the latest first, the open one held highlighted; a conversation that
@@ -72,15 +116,11 @@ private struct ChatList: View {
         return ScrollView {
             LazyVStack(spacing: 2) {
                 ForEach(shown) { conversation in
-                    ChatRow(conversation: conversation, open: chats.selection == conversation.id) {
-                        chats.selection = conversation.id
-                    }
-                    .contextMenu {
-                        Button("Rename…") {
-                            title = conversation.title
-                            renaming = conversation
-                        }
-                        Button("Delete…", role: .destructive) { deleting = conversation }
+                    let id = conversation.id
+                    ChatRow(conversation: conversation, open: chats.selection == id, picked: picked.map { $0.contains(id) }) {
+                        if picked == nil { chats.selection = id } else { picked?.formSymmetricDifference([id]) }
+                    } actions: {
+                        actions(for: conversation)
                     }
                 }
             }
@@ -89,24 +129,71 @@ private struct ChatList: View {
         }
         .animation(Motion.settle, value: shown.map(\.id))
     }
+
+    /// What can be done with a chat, as its row's menu and a right click on it give it: rename it,
+    /// delete it, or start picking chats to delete with it.
+    @ViewBuilder private func actions(for conversation: Conversation) -> some View {
+        Button("Rename…") {
+            title = conversation.title
+            renaming = conversation
+        }
+        Button("Delete…", role: .destructive) { deletion = ChatDeletion([conversation]) }
+        if picked == nil {
+            Divider()
+            Button("Select") { picked = [conversation.id] }
+        }
+    }
 }
 
 /// A conversation in the list: its title, highlighted as the app's buttons are, held while open;
-/// the highlight in line with the search field.
-private struct ChatRow: View {
+/// the highlight in line with the search field. Under the pointer, a button at its end opens its
+/// menu, as a right click does; while the list picks chats to delete, a check before the title
+/// says whether it is picked, and a click picks it or not.
+private struct ChatRow<Actions: View>: View {
     let conversation: Conversation
     let open: Bool
-    let select: () -> Void
+    /// Whether it is picked, while the list picks chats to delete; nil otherwise.
+    let picked: Bool?
+    let choose: () -> Void
+    @ViewBuilder let actions: () -> Actions
+    @State private var hovering = false
 
     var body: some View {
-        Button(action: select) {
-            Text(conversation.title.isEmpty ? "New Chat" : conversation.title)
-                .lineLimit(1)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(.rect)
+        let more = picked == nil && hovering
+        Button(action: choose) {
+            HStack(spacing: 6) {
+                if let picked {
+                    Image(systemName: picked ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(picked ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                }
+                Text(conversation.title.isEmpty ? "New Chat" : conversation.title)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .contentShape(.rect)
         }
-        .buttonStyle(HoverStyle(padding: EdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8), held: open))
-        .accessibilityAddTraits(open ? .isSelected : [])
+        // Room at the end for the menu's button while it shows, and the highlight kept while the
+        // pointer is on that button.
+        .buttonStyle(HoverStyle(padding: EdgeInsets(top: 6, leading: 8, bottom: 6, trailing: more ? 30 : 8), held: open && picked == nil,
+                                hovered: hovering))
+        .overlay(alignment: .trailing) {
+            if more {
+                // A square button, as the menu buttons of a sidebar's rows are.
+                Menu(content: actions) {
+                    Image(systemName: "ellipsis").foregroundStyle(.secondary).frame(width: 24, height: 24)
+                }
+                .menuStyle(.button)
+                .buttonStyle(HoverStyle(padding: EdgeInsets(), shape: AnyShape(.rect(cornerRadius: 6))))
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .padding(.trailing, 3)
+                .help("More")
+                .accessibilityLabel("More")
+            }
+        }
+        .onHover { hovering = $0 }
+        .contextMenu(menuItems: actions)
+        .accessibilityAddTraits(open || picked == true ? .isSelected : [])
     }
 }
 
