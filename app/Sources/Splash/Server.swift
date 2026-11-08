@@ -170,10 +170,10 @@ final class Server {
         child.stop(SIGINT, killAfter: killAfter)
     }
 
-    /// Clears a failure the user has read, stopping a server that still runs but serves nothing.
+    /// Clears a failure the user has read.
     func dismissFailure() {
         guard case .failed = phase else { return }
-        if child != nil { stop() } else { phase = .stopped }
+        phase = .stopped
     }
 
     /// Stops the server an app started before it quit or crashed, if it still runs, and waits
@@ -247,19 +247,20 @@ final class Server {
             launch(queued.model, settings: queued.settings)
         } else if stopRequested {
             phase = .stopped
-        } else if phase == .starting, let pid {
-            phase = .failed(Self.startProblem(record: runtime.serveRecord(port: settings.port), pid: pid,
-                                              port: settings.port, holder: runtime.serveLockHolder(port: settings.port)))
+        } else if let pid {
+            phase = .failed(Self.exitProblem(record: runtime.serveRecord(port: settings.port), pid: pid,
+                                             port: settings.port, holder: runtime.serveLockHolder(port: settings.port)))
         } else {
             phase = .failed("It stopped unexpectedly. The log has the details.")
         }
     }
 
-    /// Why a start by process `pid` on `port` failed, as this start's serve record says; that another
-    /// Splash server serves the port, where `holder`, the process holding the port's lock, is not
-    /// this start's: the launcher refuses it and leaves that server's record; else that it stopped,
-    /// where it recorded nothing: it crashed or was killed.
-    nonisolated static func startProblem(record: ServeRecord?, pid: pid_t, port: Int, holder: pid_t?) -> String {
+    /// Why process `pid` serving `port` ended unasked, as its serve record says: the failure it
+    /// recorded, at its start or once ready; that another Splash server serves the
+    /// port, where `holder`, the process holding the port's lock, is not this one: the launcher
+    /// refuses it and leaves that server's record; else that it stopped, where it recorded
+    /// nothing: it crashed or was killed.
+    nonisolated static func exitProblem(record: ServeRecord?, pid: pid_t, port: Int, holder: pid_t?) -> String {
         if let record, record.pid == pid, let failure = record.failure {
             return problem(failure, port: port)
         }
@@ -274,7 +275,7 @@ final class Server {
         "Port \(port) is in use by another app. Quit that app, or choose another port in Launch Options › Advanced."
     }
 
-    /// A start failure on `port` in the words of the launch options: the model, with its reserves,
+    /// A failure on `port` in the words of the launch options: the model, with its reserves,
     /// needs more memory than the limit set or this Mac gives; the context length set is more than
     /// the memory left, or the SSD cache, holds; other apps hold the memory, GPU memory or port it
     /// needs; an update holds Splash; its files could not be prepared, or Splash cannot serve them;
@@ -310,7 +311,7 @@ final class Server {
         case ("model", _):
             return "Splash can’t serve this model: \(failure.message)"
         case ("internal", _):
-            return "It stopped while starting: \(failure.message). The log has the details."
+            return "It stopped: \(failure.message). The log has the details."
         default:
             return failure.message
         }
@@ -345,20 +346,17 @@ final class Server {
                 activity = report.activity
                 // A relaunched engine may serve less context than the first did.
                 if let served = report.context { context = served }
-                if let stopped = report.stopped { phase = .failed(stopped) }
             }
             try? await Task.sleep(for: .seconds(2))
         }
     }
 
     /// What the server's status says: the work it has done, whether it has given the weights back
-    /// while idle, whether it is starting a failed engine again, and, once it serves nothing more,
-    /// why.
+    /// while idle, and whether it is starting a failed engine again.
     struct Report: Equatable {
         var activity: Activity
         var asleep: Bool
         var recovering = false
-        var stopped: String?
         /// The tokens of context the server serves now.
         var context: Int?
     }
@@ -381,9 +379,6 @@ final class Server {
             ),
             asleep: status.weights?.released ?? false,
             recovering: status.transport?.recovering ?? false,
-            // The engine failed in a way restarting cannot help; the server stays up but serves
-            // nothing.
-            stopped: status.transport?.stopped == true ? status.transport?.error ?? "Its engine stopped." : nil,
             context: status.capabilities?.max_context_tokens
         )
     }
@@ -391,7 +386,7 @@ final class Server {
     private struct Status: Decodable {
         struct Capabilities: Decodable { let max_context_tokens: Int? }
         struct Weights: Decodable { let released: Bool? }
-        struct Transport: Decodable { let recovering: Bool?; let stopped: Bool?; let error: String? }
+        struct Transport: Decodable { let recovering: Bool? }
         struct Requests: Decodable { let completed: Int? }
         struct Request: Decodable {}
         struct Metrics: Decodable {

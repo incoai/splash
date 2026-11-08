@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,11 +16,14 @@ from unittest import mock
 from dev.tests.installer_fixtures import DENSE, MODEL, family_config
 from dev.tests.server_fixtures import (
     NO_THINKING_END,
+    FakeRuntime,
     engine_ready,
+    keep_stop_signals,
     main_args,
     unprepared_hold,
 )
 from install import families
+from server import backend as backend_api
 from server import diagnostics
 from server import protocol as native_wire
 from server import server as api
@@ -484,6 +488,77 @@ class ServerMainTests(unittest.TestCase):
             )
             api.main()
         self.assertEqual(phases, [(True, {"pid": 4242, "phase": "ready"})])
+
+    def test_a_server_that_stops_restarting_its_engine_exits_saying_why(self):
+        """A server whose engine fails past restarting stops as SIGTERM stops
+        it, its engine closed, and exits with status 69 (EX_UNAVAILABLE), its
+        record naming why as the app reads it (serve_record_stopped_golden.json),
+        so that what supervises it, launchd's KeepAlive or the app, sees it end
+        (it went on answering /health, every request refused, until someone
+        restarted it)."""
+        keep_stop_signals(self)
+        record = Path(self.enterContext(tempfile.TemporaryDirectory())) / "s.json"
+        runtime = FakeRuntime()
+        refused = native_wire.StartFailedEvent(
+            native_wire.StartFailureKind.CONFIGURATION,
+            native_wire.ShortfallBound.DEVICE_MEMORY,
+            0,
+            0,
+            0,
+            b"--kv-format bf16 is refused",
+        )
+        # The first engine is ready; its relaunch is refused, which every
+        # relaunch would be.
+        runtime.wait_ready = mock.Mock(
+            side_effect=[True, api.engine_runtime.EngineStartFailed(refused)]
+        )
+        server = mock.Mock(server_port=8000)
+
+        def serve():
+            runtime.ready = False
+            runtime.on_engine_failure(
+                api.engine_runtime.EngineUnhealthy("native protocol reached EOF"),
+                1.0,
+                frozenset(),
+                lambda: None,
+            )
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.fail("still serving after its engine stopped")
+
+        server.serve_forever.side_effect = serve
+        with (
+            mock.patch.object(
+                api, "parse_args", return_value=main_args(serve_record=record)
+            ),
+            unprepared_hold(),
+            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(api.AutoTokenizer, "from_pretrained"),
+            mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
+            mock.patch.object(
+                api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+            ),
+            mock.patch.object(api, "check_capabilities"),
+            mock.patch.object(api, "ConstraintFactory"),
+            mock.patch.object(api, "Frontend"),
+            mock.patch.object(api, "FrontendServer", return_value=server),
+            mock.patch.object(api, "print_status"),
+            mock.patch.object(backend_api, "print_status") as console,
+            self.assertRaises(SystemExit) as ended,
+        ):
+            api.main()
+        self.assertEqual(ended.exception.code, os.EX_UNAVAILABLE)
+        golden = json.loads((GOLDEN / "serve_record_stopped_golden.json").read_text())
+        self.assertEqual(
+            console.call_args_list[-1].args[0],
+            f"Engine stopped · {golden['failure']['message']}",
+        )
+        self.assertTrue(runtime.closed)
+        server.socket.close.assert_called_once_with()
+        server.server_close.assert_called_once_with()
+        self.assertEqual(json.loads(record.read_text()), golden | {"pid": os.getpid()})
 
     def test_a_failed_start_whose_record_cannot_be_written_ends_as_it_would(self):
         """With the record's directory gone, a start the server refuses still

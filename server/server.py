@@ -87,6 +87,11 @@ ANSWERED_LINGER_SECONDS = 2.0
 # lingering after a burst and the engine's pipes and files can need. 10240 is
 # macOS's OPEN_MAX.
 DESCRIPTOR_LIMIT = 10240
+# The status of a server that stopped restarting its engine, apart from a
+# stop's 0 and a failed start's 1: what supervises the server, as launchd's
+# KeepAlive does, decides whether to start it again. 69 is sysexits'
+# EX_UNAVAILABLE.
+ENGINE_STOPPED_STATUS = os.EX_UNAVAILABLE
 SSE_KEEPALIVE_SECONDS = 2.0
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
@@ -1219,6 +1224,14 @@ def main():
     server = None
     runtime = None
     backend = None
+    # Why the backend stopped restarting the engine, once it has.
+    stopped = None
+
+    def stop_serving(reason):
+        nonlocal stopped
+        stopped = reason
+        os.kill(os.getpid(), signal.SIGTERM)
+
     # A server started in the background from a non-interactive shell inherits
     # SIGINT as ignored and Python then leaves it alone; install both stop
     # signals explicitly so scripts and supervisors can interrupt it.
@@ -1310,6 +1323,9 @@ def main():
             request_logger=print_request,
             thinking_end=thinking_end,
         )
+        # A server that serves nothing more stops as on SIGTERM and exits
+        # ENGINE_STOPPED_STATUS below.
+        backend.on_stopped = stop_serving
         if not runtime.wait_ready():
             raise engine_runtime.EngineUnhealthy("native runtime did not become ready")
         # The engine is authoritative for what it serves: it refuses a
@@ -1403,6 +1419,11 @@ def main():
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             if server is not None:
                 server.server_close()
+    if stopped is not None:
+        serve_record.failed(
+            args.serve_record, serve_record.failure(serve_record.STOPPED, stopped)
+        )
+        raise SystemExit(ENGINE_STOPPED_STATUS)
 
 
 if __name__ == "__main__":

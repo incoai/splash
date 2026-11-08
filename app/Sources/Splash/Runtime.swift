@@ -185,8 +185,9 @@ struct Runtime: Sendable {
 }
 
 /// What a launcher writes of its start, as itself or as the server it runs as: the process, the
-/// phase of its start, and, for a start that failed, why: the class of the failure, with what it
-/// needed against what it had for a shortfall, and its message.
+/// phase of its start, and, for a server that ended on a failure, at its start or once ready,
+/// why: the class of the failure, with what it needed against what it had for a shortfall, and
+/// its message.
 struct ServeRecord: Decodable, Equatable {
     /// Starting; loading the model's weights; running the model once (warming); answering; or
     /// failed.
@@ -196,8 +197,8 @@ struct ServeRecord: Decodable, Equatable {
 
     struct Failure: Decodable, Equatable {
         /// The class of the failure: a `StartFailureKind` name, lowercased, which the engine, the
-        /// launcher or the server writes, or the frontend's own "port", "upgrade" or "install"
-        /// (`server/serve_record.py`).
+        /// launcher or the server writes, or the frontend's own "port", "upgrade", "install" or
+        /// "stopped" (`server/serve_record.py`).
         let kind: String
         let message: String
         /// What bounds a memory or context shortfall: "device_memory", "max_memory" or "disk".

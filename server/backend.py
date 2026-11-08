@@ -6,6 +6,7 @@ import math
 import queue
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 from tokenizers.decoders import DecodeStream
@@ -365,6 +366,9 @@ class NativeBackend:
         self.failure_to_count = None
         # Set by close() to cut a relaunch's backoff short.
         self.wakeup = threading.Event()
+        # Called once relaunching has stopped for good, with stop_reason,
+        # without the lock: the server then exits (server.main).
+        self.on_stopped: Callable[[str], None] | None = None
         # Why the engine cannot serve: its failure, the last failed restart or
         # why restarts stopped.
         self.engine_error = None
@@ -414,6 +418,8 @@ class NativeBackend:
         print_status(f"{event} · {failure.message}", error=True)
         if stopped is not None:
             print_status(f"Engine stopped · {stopped}", error=True)
+            if self.on_stopped is not None:
+                self.on_stopped(stopped)
 
     def _stop_message(self, failure):
         """Why relaunching stopped after `failure`, and what to do."""
@@ -422,13 +428,13 @@ class NativeBackend:
             return (
                 "the engine's start ran out of GPU memory another process holds "
                 "(another Splash server?); Splash stopped restarting it. Quit that "
-                "process, then restart the Splash server."
+                "process, then start the Splash server again."
             )
         if kind is wire.StartFailureKind.MODEL:
             return (
                 f"the model's files can no longer be served ({failure.message}); "
                 "Splash stopped restarting the engine. Restore or reinstall the "
-                "model, then restart the Splash server."
+                "model, then start the Splash server again."
             )
         cause = (
             failure.message
@@ -447,12 +453,12 @@ class NativeBackend:
                 if trace
                 else "Set SPLASH_CRASH_TRACE=1 to record a crash trace. "
             )
-            + "Restart the Splash server after fixing the cause."
+            + "Start the Splash server again after fixing the cause."
         )
 
     def _stop_restarting_locked(self, message):
-        """Stop relaunching for good; there is no way back but a server
-        restart."""
+        """Stop relaunching for good: the server exits once _failed has said
+        why (on_stopped)."""
         self.restart_due = None
         self.stop_reason = message
         self.engine_error = message

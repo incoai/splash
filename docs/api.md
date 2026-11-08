@@ -699,7 +699,7 @@ fields; additional fields may be added:
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` for a model serving without vision |
 | `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
-| `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after a failure a restart would meet again, or after 6 failures in a row ([engine restarts](server.md#engine-restarts-and-sleep)); `error` names its failure, the last failed restart, or why restarts stopped |
+| `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after a failure a restart would meet again, or after 6 failures in a row, and the server is exiting ([engine restarts](server.md#engine-restarts-and-sleep)); `error` names its failure, the last failed restart, or why restarts stopped |
 | `capabilities.max_context_tokens` | The context the server serves now: the latest engine's, which a restart whose plan holds less may lower until a later one regains it |
 
 `GET /ready` is 200 while the engine's own `ready` is true. While the engine
@@ -799,7 +799,7 @@ its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 | 408 | `request_timeout` | The upload stalled or ran past its time. |
 | 413 | `request_too_large` | The body exceeds `--max-request-size`. |
 | 415 | `invalid_request_error` | The body is not `application/json`, or is compressed. |
-| 500 | `engine_failed` | The engine failed in a way a restart would meet again, or failed 6 times in a row, and Splash stopped restarting it ([engine restarts](server.md#engine-restarts-and-sleep)). |
+| 500 | `engine_failed` | The engine failed in a way a restart would meet again, or failed 6 times in a row, and Splash stopped restarting it; the server exits with status 69 ([engine restarts](server.md#engine-restarts-and-sleep)). |
 | 500 | `model_result_invalid` | The model produced a non-finite result for this request; others continue ([failures](internals.md#failures-and-crash-traces)). |
 | 500 | `internal_server_error` | A fault in the server, not in the request; the console names the error's type and the server line it arose at. |
 | 501 | `not_implemented` | The request's method is not one the server has. |

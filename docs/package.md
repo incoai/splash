@@ -70,7 +70,9 @@ job, with its output appended to a log in `~/Library/Logs/Splash`:
 `splash serve --model ID --port PORT --offline` serves an installed one, with
 the launch options picked in the app that differ from the server's defaults,
 ready once the port's lock names that process and `/health` answers; stopping
-is Ctrl+C's SIGINT to the group. Switching models stops one server and starts
+is Ctrl+C's SIGINT to the group. When a server ends unasked, as a start that
+fails or a server that stops restarting its engine does, the app shows the
+failure its serve record names. Switching models stops one server and starts
 the next. The app starts nothing by itself: its window opens on the Server,
 where models download, start and switch, beside the Chat. The toolbar's switch
 opens the Chat, whose sidebar of conversations ⌘B hides, and the Server's

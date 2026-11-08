@@ -40,11 +40,14 @@ executable, or a start whose GPU commands another process's memory starved
 restart that failed for want of memory the Mac refused is retried, at most 60 s
 apart, for as long as it fails, and neither counts toward the six below nor
 starts them anew. For any other cause it stops after the sixth failure in a
-row, each within 60 s of starting. Once it stops, requests get 500
-`engine_failed` until the server is restarted; its message names the crash
-trace when
-`SPLASH_CRASH_TRACE=1` recorded one
-([crash traces](internals.md#failures-and-crash-traces)). Meanwhile generation requests get
+row, each within 60 s of starting. Once it stops, the server logs why
+(`Engine stopped · …`), naming the crash trace when `SPLASH_CRASH_TRACE=1`
+recorded one ([crash traces](internals.md#failures-and-crash-traces)), and
+exits with status 69 (`EX_UNAVAILABLE`), where a stop exits 0 and a failed
+start 1; until then requests get 500 `engine_failed` in the same words. What
+runs the server, such as launchd with `KeepAlive`, decides whether to start it
+again, and a new server counts failures from none; the app shows why it
+stopped. While the engine restarts, generation requests get
 503 `engine_recovering`, whose message names the last failure and whose
 `Retry-After` the time until the next bound on the restart's start: when it
 should be ready, as long after its spawn as the start before took, then up to
