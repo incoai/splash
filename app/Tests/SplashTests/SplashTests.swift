@@ -1109,6 +1109,44 @@ struct ChatTests {
         #expect(ChatStore(folder: folder).conversations.isEmpty)
     }
 
+    /// The list's groups: the pinned chats, whenever they changed, the last pinned first; then today,
+    /// yesterday, the week before, the month before and older, by the day each changed last, each
+    /// in its chats' order; a group with no chat is left out.
+    @Test func theChatListGroupsThePinnedChatsThenTheOthersByDay() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        func chat(_ title: String, _ daysAgo: Double, pinnedDaysAgo: Double? = nil) -> Conversation {
+            Conversation(title: title, updated: now.addingTimeInterval(-daysAgo * 86_400),
+                         pinned: pinnedDaysAgo.map { now.addingTimeInterval(-$0 * 86_400) })
+        }
+        let chats = [chat("a", 0), chat("p", 0, pinnedDaysAgo: 5), chat("b", 1), chat("c", 3), chat("d", 20), chat("e", 60),
+                     chat("f", 60, pinnedDaysAgo: 1), chat("g", 0)]
+        let sections = ChatSection.of(chats, now: now, calendar: calendar)
+        #expect(sections.map(\.group) == [.pinned, .today, .yesterday, .week, .month, .older])
+        #expect(sections.map { $0.chats.map(\.title) } == [["f", "p"], ["a", "g"], ["b"], ["c"], ["d"], ["e"]])
+        #expect(ChatSection.of([chat("b", 1)], now: now, calendar: calendar).map(\.group) == [.yesterday])
+    }
+
+    /// A pinned chat stays pinned on disk, and one unpinned stays so; a file from before pinning
+    /// reads as not pinned.
+    @MainActor @Test func aChatPinnedStaysPinned() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let old = Conversation(title: "Old")
+        try JSONEncoder().encode(old).write(to: folder.appending(path: "\(old.id.uuidString).json"))
+        #expect(try !String(contentsOf: folder.appending(path: "\(old.id.uuidString).json"), encoding: .utf8).contains("pinned"))
+        let store = ChatStore(folder: folder)
+        #expect(store.conversations.map(\.pinned) == [nil])
+        store.pin(old.id, true)
+        store.flush()
+        #expect(ChatStore(folder: folder).conversations.first?.pinned != nil)
+        store.pin(old.id, false)
+        store.flush()
+        #expect(ChatStore(folder: folder).conversations.first?.pinned == nil)
+    }
+
     /// The question to delete chats names one by its title, and else how many.
     @MainActor @Test func theQuestionToDeleteChatsNamesOneByItsTitleElseHowMany() {
         let one = ChatDeletion([Conversation(title: "Greeting")])

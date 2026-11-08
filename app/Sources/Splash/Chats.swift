@@ -32,6 +32,8 @@ struct Conversation: Codable, Identifiable, Equatable {
     var title = ""
     var updated = Date.now
     var messages: [ChatMessage] = []
+    /// When it was pinned to the top of the list; nil where it is not.
+    var pinned: Date?
 }
 
 /// The model a message goes to: the server's address, the model it serves and whether it sees
@@ -120,6 +122,13 @@ final class ChatStore {
     func rename(_ id: UUID, to title: String) {
         guard let index = conversations.firstIndex(where: { $0.id == id }) else { return }
         conversations[index].title = title
+        write(conversations[index])
+    }
+
+    /// Pins conversation `id` to the top of the list, or takes it off there.
+    func pin(_ id: UUID, _ pinned: Bool) {
+        guard let index = conversations.firstIndex(where: { $0.id == id }) else { return }
+        conversations[index].pinned = pinned ? .now : nil
         write(conversations[index])
     }
 

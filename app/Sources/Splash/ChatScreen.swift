@@ -6,17 +6,53 @@ private let column: CGFloat = 680
 
 /// The conversations at the side of the open one, in a sidebar that hides (`WithSidebar`). The
 /// window's toolbar is the Server's too, so that the switch and the Server's button stay where
-/// they are.
+/// they are. The questions the list asks, to rename and to delete chats, show here.
 struct ChatScreen: View {
     @Environment(AppState.self) private var state
+    /// The chat asked a new name for, and the name typed.
+    @State private var renaming: Conversation?
+    @State private var name = ""
+    /// The question to delete chats, while it asks, as it was asked.
+    @State private var deletion: ChatDeletion?
+    /// The chats picked to delete while the list picks them, from a chat's Select; nil otherwise.
+    @State private var picked: Set<UUID>?
 
     var body: some View {
         WithSidebar {
-            ChatList()
+            ChatList(picked: $picked, deletion: $deletion, actions: actions)
         } content: {
             ConversationView()
         }
         .onAppear { state.draft.focus() }
+        .alert("Rename Chat", isPresented: Binding(
+            get: { renaming != nil }, set: { if !$0 { renaming = nil } }
+        ), presenting: renaming) { conversation in
+            TextField("Name", text: $name)
+            Button("Rename") { state.chats.rename(conversation.id, to: name) }
+            Button("Cancel", role: .cancel) {}
+        }
+        .confirmationDialog(deletion?.title ?? "", isPresented: Binding(
+            get: { deletion != nil }, set: { if !$0 { deletion = nil } }
+        ), presenting: deletion) { deletion in
+            Button("Delete", role: .destructive) {
+                state.chats.delete(deletion.ids)
+                // Those picked, deleted, end the picking; another chat deleted leaves the rest.
+                if picked == deletion.ids { picked = nil } else { picked?.subtract(deletion.ids) }
+            }
+        } message: { deletion in
+            Text(deletion.message)
+        }
+    }
+
+    /// What can be done with a chat, as its row's menu and a right click on its row give it: pin it
+    /// to the list's top, or take it off there; rename it; delete it.
+    @ViewBuilder private func actions(for conversation: Conversation) -> some View {
+        Button(conversation.pinned == nil ? "Pin" : "Unpin") { state.chats.pin(conversation.id, conversation.pinned == nil) }
+        Button("Rename…") {
+            name = conversation.title
+            renaming = conversation
+        }
+        Button("Delete…", role: .destructive) { deletion = ChatDeletion([conversation]) }
     }
 }
 
@@ -38,19 +74,64 @@ struct ChatDeletion {
     }
 }
 
-/// The conversations, searched, each with its menu; Select there picks chats to delete at once.
-private struct ChatList: View {
+/// A group of the chat list: the pinned chats, then the others by how long ago they changed.
+struct ChatSection: Identifiable {
+    enum Group: CaseIterable {
+        case pinned, today, yesterday, week, month, older
+
+        var title: String {
+            switch self {
+            case .pinned: "Pinned"
+            case .today: "Today"
+            case .yesterday: "Yesterday"
+            case .week: "Previous 7 Days"
+            case .month: "Previous 30 Days"
+            case .older: "Older"
+            }
+        }
+    }
+
+    let group: Group
+    let chats: [Conversation]
+    var id: Group { group }
+
+    /// The groups of `conversations`: those pinned, the last pinned first, so that they keep their
+    /// places as they change; then the others in their order by the day each changed last, in
+    /// `calendar`, as of `now`; a group that holds no chat left out.
+    static func of(_ conversations: [Conversation], now: Date, calendar: Calendar = .current) -> [ChatSection] {
+        let today = calendar.startOfDay(for: now)
+        let grouped = Dictionary(grouping: conversations) { conversation -> Group in
+            guard conversation.pinned == nil else { return .pinned }
+            let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: conversation.updated), to: today).day ?? 0
+            return switch days {
+            case ...0: .today
+            case 1: .yesterday
+            case 2...7: .week
+            case 8...30: .month
+            default: .older
+            }
+        }
+        return Group.allCases.compactMap { group in
+            grouped[group].map { chats in
+                ChatSection(group: group, chats: group == .pinned ? chats.sorted { $0.pinned ?? .distantPast > $1.pinned ?? .distantPast } : chats)
+            }
+        }
+    }
+}
+
+/// The conversations, the pinned first, then the others by how recent they are, under a new
+/// chat and the search; each has its menu, whose Select starts picking chats to delete at once.
+private struct ChatList<Actions: View>: View {
     @Environment(AppState.self) private var state
+    @Binding var picked: Set<UUID>?
+    @Binding var deletion: ChatDeletion?
+    @ViewBuilder let actions: (Conversation) -> Actions
     @State private var query = ""
-    @State private var renaming: Conversation?
-    @State private var title = ""
-    /// The chats picked to delete while the list picks them, from a chat's Select; nil otherwise.
-    @State private var picked: Set<UUID>?
-    /// The question to delete chats, while it asks, as it was asked.
-    @State private var deletion: ChatDeletion?
+    /// When the day groups were made; a new day makes them again, the app open past midnight.
+    @State private var today = Date.now
 
     var body: some View {
-        @Bindable var chats = state.chats
+        let chats = state.chats
         let shown = query.isEmpty ? chats.conversations : chats.conversations.filter { conversation in
             conversation.title.localizedStandardContains(query)
                 || conversation.messages.contains { $0.text.localizedStandardContains(query) }
@@ -86,23 +167,7 @@ private struct ChatList: View {
             list(shown)
         }
         .background(.background.secondary)
-        .alert("Rename Chat", isPresented: Binding(
-            get: { renaming != nil }, set: { if !$0 { renaming = nil } }
-        ), presenting: renaming) { conversation in
-            TextField("Name", text: $title)
-            Button("Rename") { chats.rename(conversation.id, to: title) }
-            Button("Cancel", role: .cancel) {}
-        }
-        .confirmationDialog(deletion?.title ?? "", isPresented: Binding(
-            get: { deletion != nil }, set: { if !$0 { deletion = nil } }
-        ), presenting: deletion) { deletion in
-            Button("Delete", role: .destructive) {
-                chats.delete(deletion.ids)
-                picked = nil
-            }
-        } message: { deletion in
-            Text(deletion.message)
-        }
+        .onReceive(NotificationCenter.default.publisher(for: .NSCalendarDayChanged)) { _ in today = .now }
     }
 
     /// While the list picks chats to delete, under the search field: picking every chat shown, or
@@ -121,40 +186,41 @@ private struct ChatList: View {
         .padding(.bottom, 4)
     }
 
-    /// The conversations, the latest first, the open one held highlighted; a conversation that
-    /// gets a message moves to the top, and one deleted closes its gap.
+    /// The conversations in their groups, the latest first in each, the open one held highlighted;
+    /// a conversation that gets a message moves to the top of its group, and one deleted closes its
+    /// gap.
     private func list(_ shown: [Conversation]) -> some View {
         let chats = state.chats
+        let sections = ChatSection.of(shown, now: today)
         // A stack, not a sidebar list, whose source-list rows AppKit insets further.
         return ScrollView {
-            LazyVStack(spacing: 2) {
-                ForEach(shown) { conversation in
-                    let id = conversation.id
-                    ChatRow(conversation: conversation, open: chats.selection == id, picked: picked.map { $0.contains(id) }) {
-                        if picked == nil { chats.selection = id } else { picked?.formSymmetricDifference([id]) }
-                    } actions: {
-                        actions(for: conversation)
+            LazyVStack(alignment: .leading, spacing: 2) {
+                ForEach(sections) { section in
+                    Text(section.group.title)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.top, section.id == sections.first?.id ? 6 : 14)
+                        .padding(.bottom, 2)
+                        .accessibilityAddTraits(.isHeader)
+                    ForEach(section.chats) { conversation in
+                        let id = conversation.id
+                        ChatRow(conversation: conversation, open: chats.selection == id, picked: picked.map { $0.contains(id) }) {
+                            if picked == nil { chats.selection = id } else { picked?.formSymmetricDifference([id]) }
+                        } actions: {
+                            actions(conversation)
+                            if picked == nil {
+                                Divider()
+                                Button("Select") { picked = [id] }
+                            }
+                        }
                     }
                 }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 4)
         }
-        .animation(Motion.settle, value: shown.map(\.id))
-    }
-
-    /// What can be done with a chat, as its row's menu and a right click on it give it: rename it,
-    /// delete it, or start picking chats to delete with it.
-    @ViewBuilder private func actions(for conversation: Conversation) -> some View {
-        Button("Rename…") {
-            title = conversation.title
-            renaming = conversation
-        }
-        Button("Delete…", role: .destructive) { deletion = ChatDeletion([conversation]) }
-        if picked == nil {
-            Divider()
-            Button("Select") { picked = [conversation.id] }
-        }
+        .animation(Motion.settle, value: sections.map { $0.chats.map(\.id) })
     }
 }
 
