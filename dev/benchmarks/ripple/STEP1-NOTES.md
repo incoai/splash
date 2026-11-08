@@ -280,3 +280,33 @@ The model's own format serves: at 'What is 2+2?' it opens its reasoning
 block, reasons briefly, closes it and answers 4 - the tags it writes are
 the text ones the server's detection has to read (chat_format's gap, which
 still gates families.py).
+
+## The server reads the tags as text
+
+families.py carries the family, whose chat format holds the think and call
+tags as text (the token-id fields None). The server's machinery reads them
+where the format says the tags are text:
+
+- startup checks each tag by encoding it and decoding it back unchanged;
+- the reasoning's tokens count through the decoded stream, from the opener's
+  text to the close's first character (or a call's opening where one ends
+  the reasoning);
+- a thinking budget has no engine cutoff token: the reasoning runs to the
+  model's own close;
+- a tool grammar's thinking block is a suffix rule, whose lexeme runs to
+  the close's first spelling and ends with it. The shipped shape, a TEXT
+  terminal and a close literal, fails with multi-token tags: the lexer
+  commits the close's earlier tokens to the TEXT, and the close's last
+  token satisfies nothing. And a TEXT exclusion of the tags' bytes cannot
+  stand beside the suffix rule: its forbidden path prunes the shared
+  lexer's path through the close, which the suffix's completion needs. The
+  TEXT rule of a text-tags format excludes nothing; the lexer prefers the
+  structural literals over TEXT regardless;
+- the calls' arguments are one JSON value (the syntax carries
+  json_arguments): a strict tool's grammar generates its schema's JSON, a
+  loose one's any JSON, and the projector streams the value as it is
+  written, framed by the name's close and the call's close tag.
+
+The tool responses render through the model's own template, which the
+installer carries from the GGUF; nothing on the prompt side needs the
+format's tags.
