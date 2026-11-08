@@ -971,3 +971,52 @@ test-sanitizers-metal:
 	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/expert-store $(METAL_TSAN_BUILD)/splash.metallib
 	$(METAL_TSAN_TEST_ENV) $(METAL_TSAN_BUILD)/engine-tests/metal-backend \
 		$(METAL_TSAN_BUILD)/engine-tests/metal-backend.metallib --filter behaviour/
+
+# The Ripple family's engine tests: the tiny model's load and parity gates,
+# the draft kernels' batch control, and the real model's opt-in harnesses
+# (which take the model root and a prompt's tokens as arguments).
+TEST_RIPPLE_VALUE_MIX := $(ENGINE_TEST_BUILD)/ripple-value-mix
+TEST_RIPPLE_LOAD := $(ENGINE_TEST_BUILD)/ripple-load
+TEST_RIPPLE_CHAIN := $(ENGINE_TEST_BUILD)/ripple-chain
+TEST_RIPPLE_PARITY := $(ENGINE_TEST_BUILD)/ripple-parity
+TEST_RIPPLE_REAL := $(ENGINE_TEST_BUILD)/ripple-real
+TEST_RIPPLE_SERVE := $(ENGINE_TEST_BUILD)/ripple-serve
+
+$(TEST_RIPPLE_VALUE_MIX): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(TEST_RIPPLE_LOAD): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(TEST_RIPPLE_CHAIN): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(TEST_RIPPLE_PARITY): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(TEST_RIPPLE_REAL): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+$(TEST_RIPPLE_SERVE): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
+
+$(TEST_RIPPLE_VALUE_MIX): dev/tests/engine/ripple_value_mix_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_RIPPLE_SERVE): dev/tests/engine/ripple_serve_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_RIPPLE_REAL): dev/tests/engine/ripple_real_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_RIPPLE_PARITY): dev/tests/engine/ripple_parity_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_RIPPLE_CHAIN): dev/tests/engine/ripple_chain_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_RIPPLE_LOAD): dev/tests/engine/ripple_load_test.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) -o $@
+
+ bbc660bf

@@ -30,7 +30,18 @@ from server import constraints, tool_schema
 from server import output as model_output
 from server import protocol as wire
 from server import server as api
-from server.chat_format import FLINT, GLM_ARGS, QWEN, QWEN_XML, ToolCallSyntax
+from server.chat_format import (
+    FLINT,
+    GLM_ARGS,
+    QWEN,
+    QWEN_XML,
+    RIPPLE,
+    THINK_END,
+    THINK_START,
+    TOOL_CALL_CLOSE,
+    TOOL_CALL_OPEN,
+    ToolCallSyntax,
+)
 from server.chat_templates import NATIVE, ChatTemplates
 from server.dialects import scoring
 from server.errors import APIError
@@ -102,6 +113,59 @@ def flint_tokenizer():
     )
     tokenizer.chat_template = TEMPLATE
     return tokenizer
+
+
+# Ripple's control tokens, the special ones. Its think and call tags are
+# not tokens: they are text the tokenizer splits.
+RIPPLE_SPECIAL = (
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|endoftext|>",
+    "<|endofprompt|>",
+    "<|pad|>",
+)
+
+
+def ripple_tokenizer():
+    """A byte-level BPE tokenizer of the standard tags as text, which encodes
+    and decodes each of them unchanged, and Ripple's specials as tokens."""
+    backend = Tokenizer(models.BPE())
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    backend.train_from_iterator(
+        [
+            " ansvar\nWe need the number. Final 4.\n ansvar\n4",
+            THINK_START + "\nWe need the number. Final 4.\n" + THINK_END + "\n4",
+            TOOL_CALL_OPEN
+            + '\n{"name": "time", "arguments": {}}\n'
+            + TOOL_CALL_CLOSE
+            + ",",
+        ],
+        trainers.BpeTrainer(
+            vocab_size=500,
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+            show_progress=False,
+        ),
+    )
+    backend.add_special_tokens(
+        [AddedToken(text, normalized=False) for text in RIPPLE_SPECIAL]
+    )
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, eos_token="<|im_end|>"
+    )
+    return tokenizer
+
+
+def ripple_format(tokenizer):
+    """Ripple's chat format over `tokenizer`'s token IDs."""
+    return replace(
+        RIPPLE,
+        vocabulary=len(tokenizer),
+        stop_tokens=(
+            ("<|im_end|>", tokenizer.convert_tokens_to_ids("<|im_end|>")),
+            ("<|endoftext|>", tokenizer.convert_tokens_to_ids("<|endoftext|>")),
+        ),
+    )
 
 
 def flint_format(tokenizer):
@@ -607,6 +671,203 @@ class FlintTokenizerContractTests(unittest.TestCase):
         self.assertEqual((FLINT.call_open_id, FLINT.call_syntax), (150010, GLM_ARGS))
         self.assertFalse(FLINT.calls_end_reasoning)
         self.assertTrue(QWEN.calls_end_reasoning)
+
+
+class RippleFormatTests(unittest.TestCase):
+    """Ripple's chat format: its think and call tags are text the tokenizer
+    splits, which startup checks by encoding and decoding each one back, and
+    the output's reasoning counts through the decoded stream."""
+
+    def test_a_tokenizer_that_round_trips_the_tags_is_accepted(self):
+        tokenizer = ripple_tokenizer()
+        constraints.validate_tokenizer(tokenizer, ripple_format(tokenizer))
+        for text in (THINK_END, TOOL_CALL_CLOSE):
+            encoded = tokenizer.encode(text, add_special_tokens=False)
+            self.assertTrue(encoded, text)
+            self.assertEqual(
+                tokenizer.decode(encoded, skip_special_tokens=True), text
+            )
+
+    def test_a_tokenizer_that_holds_a_tag_is_refused(self):
+        # A tag held as a special token decodes to nothing with the special
+        # tokens skipped, so a match in the decoded stream would not be the
+        # tag the template wrote.
+        backend = ripple_tokenizer().backend_tokenizer
+        backend.add_tokens([AddedToken(THINK_END, normalized=False, special=True)])
+        tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, eos_token="<|im_end|>")
+        with self.assertRaisesRegex(
+            fixtures.engine_runtime.EngineUnhealthy,
+            f"tokenizer must encode '{THINK_END}' and decode it back as text",
+        ):
+            constraints.validate_tokenizer(tokenizer, ripple_format(tokenizer))
+
+    def test_the_real_format_is_ripple_s(self):
+        self.assertEqual(
+            RIPPLE.vocabulary, 100352,
+            "the family's vocabulary is its engine layout's",
+        )
+        self.assertEqual(RIPPLE.stop_ids, (100265, 100257))
+        self.assertIsNone(RIPPLE.think_end_id)
+        self.assertIsNone(RIPPLE.think_start_id)
+        self.assertIsNone(RIPPLE.call_open_id)
+        self.assertTrue(RIPPLE.tags_are_text)
+        self.assertTrue(RIPPLE.reasoning_switch)
+        self.assertTrue(RIPPLE.calls_end_reasoning)
+        self.assertTrue(RIPPLE.call_syntax.json_arguments)
+
+    def test_reasoning_tokens_count_through_the_decoded_stream(self):
+        tokenizer = ripple_tokenizer()
+        chat_format = ripple_format(tokenizer)
+        ids_of = lambda text: tokenizer.encode(text, add_special_tokens=False)
+        open_ = ids_of(THINK_START + "\n")
+        close = ids_of("\n" + THINK_END + "\n")
+        body = ids_of("We need the number. Final 4.")
+        call = ids_of(TOOL_CALL_OPEN + "\n")
+        # The template's layout newlines, which the splitter's reasoning
+        # holds: one after the opener, one before the close.
+        cases = (
+            (open_ + body + close, 1 + len(body) + 1, "the body's tokens and the layout's"),
+            (open_ + body, 1 + len(body), "an unclosed block is all reasoning"),
+            (body, 0, "no opener, no reasoning"),
+            (open_ + body + close + body, 1 + len(body) + 1, "the close ends it"),
+            # A call's opening ends the reasoning at the opening's start, as
+            # the splitter's holds it: the opening's text is the tag and the
+            # call's name's prefix together.
+            (
+                open_
+                + ids_of("call ")
+                + ids_of(TOOL_CALL_OPEN + chat_format.call_syntax.name_open),
+                1 + len(ids_of("call ")),
+                "a call's opening ends it",
+            ),
+            (open_[:2], 0, "a cut opener is not reasoning yet"),
+        )
+        for token_ids, expected, what in cases:
+            with self.subTest(what=what):
+                streamer = backend_api.CallbackStreamer(tokenizer, lambda *_: None)
+                streamer.token_ids = token_ids
+                self.assertEqual(
+                    streamer.count_reasoning_tokens(chat_format, False, True),
+                    expected,
+                )
+
+    def test_a_prompt_opened_block_counts_from_its_start(self):
+        tokenizer = ripple_tokenizer()
+        chat_format = ripple_format(tokenizer)
+        ids_of = lambda text: tokenizer.encode(text, add_special_tokens=False)
+        body = ids_of("We need the number. Final 4.")
+        close = ids_of("\n" + THINK_END + "\n")
+        streamer = backend_api.CallbackStreamer(tokenizer, lambda *_: None)
+        streamer.token_ids = body + close
+        self.assertEqual(
+            streamer.count_reasoning_tokens(chat_format, True, False),
+            len(body) + 1,
+        )
+
+
+class RippleToolOutputTests(unittest.TestCase):
+    """Ripple's calls, read and constrained: one JSON object of the call's
+    name and arguments between the call tags as text, streamed whole and in
+    pieces, and a grammar that generates them."""
+
+    def policy(self, strict=False, choice="auto"):
+        schemas = {
+            "time": {"type": "object", "properties": {}},
+            "weather": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": name, "parameters": schema, "strict": strict},
+            }
+            for name, schema in schemas.items()
+        ]
+        return tool_schema.normalize_tools(tools, choice, True)[1]
+
+    def call_text(self, name, arguments):
+        return (
+            TOOL_CALL_OPEN
+            + '\n{"name": "'
+            + name
+            + '", "arguments": '
+            + json.dumps(arguments)
+            + "}\n"
+            + TOOL_CALL_CLOSE
+        )
+
+    def test_a_call_is_read_whole_and_in_pieces(self):
+        policy = self.policy()
+        text = self.call_text("time", {})
+        for size in (None, 3, 40):
+            with self.subTest(size=size):
+                content, calls, _ = project(text, policy, syntax=RIPPLE.call_syntax, size=size)
+                self.assertEqual(content, "")
+                self.assertEqual(
+                    calls,
+                    [
+                        {
+                            "id": calls[0]["id"],
+                            "type": "function",
+                            "function": {"name": "time", "arguments": "{}"},
+                        }
+                    ],
+                )
+
+    def test_an_argument_streams_as_it_is_written(self):
+        policy = self.policy()
+        text = self.call_text("weather", {"city": "Paris"})
+        _, _, events = project(text, policy, syntax=RIPPLE.call_syntax, size=5)
+        arguments = "".join(
+            event["function"].get("arguments", "")
+            for kind, event in events
+            if kind == "tool" and "function" in event
+        )
+        self.assertEqual(json.loads(arguments), {"city": "Paris"})
+
+    def test_a_cut_call_keeps_its_arguments(self):
+        policy = self.policy()
+        text = self.call_text("weather", {"city": "Paris"})
+        # Cut after the arguments' JSON value and its close, before the call's.
+        cut = text[: text.index("}") + 2]
+        content, calls, _ = project(cut, policy, syntax=RIPPLE.call_syntax, incomplete=True)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"city": "Paris"})
+
+    def test_the_grammar_generates_a_call(self):
+        tokenizer = ripple_tokenizer()
+        factory = constraints.ConstraintFactory(tokenizer, ripple_format(tokenizer))
+        grammar = tool_schema.tool_grammar(
+            self.policy(strict=True, choice="required"),
+            False,
+            chat_format=ripple_format(tokenizer),
+        )
+        matcher = factory.create(grammar).matcher
+        text = self.call_text("weather", {"city": "Paris"})
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        self.assertTrue(matcher.consume_tokens(tokens), matcher.get_error())
+        self.assertTrue(matcher.is_accepting())
+
+    def test_the_grammar_takes_the_reasoning_first(self):
+        tokenizer = ripple_tokenizer()
+        chat_format = ripple_format(tokenizer)
+        factory = constraints.ConstraintFactory(tokenizer, chat_format)
+        grammar = tool_schema.tool_grammar(
+            self.policy(choice="auto"), False, chat_format=chat_format
+        )
+        matcher = factory.create(grammar).matcher
+        text = (
+            THINK_START
+            + "\nWe need the time.\n"
+            + THINK_END
+            + "\n"
+            + self.call_text("time", {})
+        )
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        self.assertTrue(matcher.consume_tokens(tokens), matcher.get_error())
+        self.assertTrue(matcher.is_accepting())
 
 
 class FlintPromptTests(unittest.TestCase):

@@ -26,7 +26,7 @@ if __name__ == "__main__" and not __package__:
     __package__ = "install"
 
 from server import serve_options
-from server.chat_format import FLINT, QWEN, ChatFormat
+from server.chat_format import FLINT, QWEN, RIPPLE, ChatFormat
 
 from . import models
 
@@ -86,6 +86,11 @@ FAMILIES = (
     ),
     # It has no vision tower.
     ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, FLINT_SAMPLING, vision=False),
+    # Its draft reads five of its blocks, and its think and call tags are
+    # text (server/chat_format.py's RIPPLE).
+    ModelFamily(
+        "Ripple-65B", "ricursiveAI/Ripple-65B-Preview-DFlash2", RIPPLE, vision=False
+    ),
 )
 
 

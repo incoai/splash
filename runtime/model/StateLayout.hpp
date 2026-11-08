@@ -81,14 +81,16 @@ struct DraftStateLayout final {
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
   uint32_t contextWidth = 0;
+  // The ring slots the draft's geometry keeps (the compiled draft variant's
+  // window, the shipped drafts' unless another's config states one).
+  uint32_t window = SPLASH_DRAFT_SLIDING_WINDOW;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return layers && kvHeads && headDimension && contextWidth &&
+    return layers && kvHeads && headDimension && contextWidth && window &&
            contextWidth % SPLASH_DRAFT_CONTEXT_GROUP == 0;
   }
   [[nodiscard]] constexpr uint64_t tensorBytes() const noexcept {
-    return uint64_t{kvHeads} * SPLASH_DRAFT_SLIDING_WINDOW * headDimension *
-           bfloat16Bytes;
+    return uint64_t{kvHeads} * window * headDimension * bfloat16Bytes;
   }
   [[nodiscard]] constexpr uint64_t ringBytes() const noexcept {
     return uint64_t{layers} * 2 * tensorBytes();

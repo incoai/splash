@@ -113,7 +113,8 @@ std::vector<std::span<const std::byte>> SlotFormat::recordOrder(std::span<const 
   if (index.size() != layout_.attentionLayers || layers.size() != layout_.attentionLayers)
     throw std::invalid_argument("a KV page's spans do not hold its layout");
   for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
-    if (index[layer].size() != layout_.indexBytesPerLayerPage() || !holdsLayer(layout_, layers[layer]))
+    if (index[layer].size() != layout_.indexBytesPerLayerPage() ||
+        (!layers[layer].empty() && !holdsLayer(layout_, layers[layer])))
       throw std::invalid_argument("a KV page's spans do not hold its layout");
   std::vector<std::span<const std::byte>> result;
   result.reserve(index.size() + 1 + layers.size() * kBlocksPerPage * (4 * layout_.kvHeads + 1));
@@ -126,6 +127,12 @@ std::vector<std::span<const std::byte>> SlotFormat::recordOrder(std::span<const 
   for (const LayerSpans &layer : layers) {
     for (uint32_t place = 0; place < kBlocksPerPage; ++place) {
       if (!std::exchange(first, false)) pad(recordPitch_ - recordBytes_);
+      if (layer.empty()) {
+        // A lesser form's page holds none of this windowed layer: its
+        // records hold zeros (a Slim page's windowed K/V was trimmed).
+        pad(recordBytes_);
+        continue;
+      }
       visitRecord(layout_, layer, place, [&](std::span<std::byte> piece) { result.emplace_back(piece); });
     }
   }

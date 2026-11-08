@@ -60,7 +60,8 @@ std::vector<ops::Projection> contextKvRows(metal::MetalBackend &backend,
 } // namespace
 
 DFlashDraftLayout draftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint32_t layers,
-                              uint32_t intermediateSize, float rotaryTheta, std::span<const uint32_t> targetLayers) {
+                              uint32_t intermediateSize, float rotaryTheta, std::span<const uint32_t> targetLayers,
+                              const SplashDraftVariant &variant) {
   constexpr uint32_t most = ExecutionLimits::maximumDraftTargetLayers;
   if (targetLayers.empty() || targetLayers.size() > most ||
       std::ranges::adjacent_find(targetLayers, std::ranges::greater_equal{}) != targetLayers.end())
@@ -74,16 +75,20 @@ DFlashDraftLayout draftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint
   DFlashDraftLayout layout{.layers = layers,
                            .hiddenSize = hiddenSize,
                            .vocabularySize = vocabularySize,
-                           .dynamicSize = draft_dynamic_width(hiddenSize),
-                           .qkvSize = SPLASH_DRAFT_QKV_WIDTH,
-                           .attentionSize = SPLASH_DRAFT_ATTENTION_WIDTH,
+                           .dynamicSize = draft_dynamic_width(hiddenSize, variant.convolution_taps),
+                           .qkvSize = variant.kv_heads * variant.head_dimension * 2 +
+                                      variant.query_heads * variant.head_dimension,
+                           .attentionSize = variant.query_heads * variant.head_dimension,
                            .intermediateSize = intermediateSize,
-                           .attentionHeadDimension = SPLASH_DRAFT_HEAD_DIMENSION,
+                           .attentionHeadDimension = variant.head_dimension,
                            .rotaryTheta = rotaryTheta,
                            .selectorRank = SPLASH_DRAFT_SELECTOR_RANK,
-                           .kvHeads = SPLASH_DRAFT_KV_HEADS,
+                           .kvHeads = variant.kv_heads,
                            .targetLayerCount = static_cast<uint32_t>(targetLayers.size())};
   std::ranges::copy(targetLayers, layout.targetLayers.begin());
+  layout.queryHeads = variant.query_heads;
+  layout.window = variant.window;
+  layout.convolutionTaps = variant.convolution_taps;
   requireLayout(layout);
   return layout;
 }
@@ -172,7 +177,8 @@ void DFlashDraft::addContextPrefill(
                          const metal::MetalBuffer &window) {
     ops::DraftAttention::addWindowStore(graph,
                                         backend_.view(buffers.hidden, compactRow * rowBytes, count * rowBytes),
-                                        window, count, startPosition, layout.hiddenSize);
+                                        window, count, startPosition, layout.hiddenSize,
+                                        ops::draftVariant(layout.attentionShape()));
   };
   for (const DFlashPrefillSpan &span : spans)
     store(span.compactRow, span.rows, span.startPosition, span.window);
@@ -187,15 +193,20 @@ void DFlashDraft::addContextRebuild(metal::CommandGraph &graph,
                                     const metal::MetalBuffer &window,
                                     std::span<const DFlashDraftRingLayer> ring,
                                     uint32_t rows, uint32_t startPosition) const {
-  static_assert(ExecutionLimits::draftContextTokens <= ExecutionLimits::prefillTokenBudget,
-                "a whole draft window passes through buffers of one prefill chunk's rows");
   const DFlashDraftLayout &layout = weights_.layout;
-  if (!rows || rows > ExecutionLimits::draftContextTokens || ring.size() != layout.layers)
+  if (!rows || rows > layout.window || ring.size() != layout.layers)
     throw std::invalid_argument("invalid draft context rebuild");
-  ops::DraftAttention::addWindowLoad(graph, window, buffers.hidden, rows, startPosition,
-                                     layout.hiddenSize);
-  const DFlashPrefillSpan span{0, rows, startPosition, ring, window};
-  addContextKv(graph, buffers, rows, {&span, 1});
+  // A window longer than a prefill chunk's rows passes through them in
+  // chunks, each loading its rows and computing their keys and values into
+  // the slots their positions name.
+  const SplashDraftVariant &variant = ops::draftVariant(layout.attentionShape());
+  for (uint32_t begin = 0; begin < rows; begin += ExecutionLimits::prefillTokenBudget) {
+    const uint32_t count = std::min(ExecutionLimits::prefillTokenBudget, rows - begin);
+    ops::DraftAttention::addWindowLoad(graph, window, buffers.hidden, count, startPosition + begin,
+                                       layout.hiddenSize, variant);
+    const DFlashPrefillSpan span{0, count, startPosition + begin, ring, window};
+    addContextKv(graph, buffers, count, {&span, 1});
+  }
 }
 
 void DFlashDraft::addContextKv(metal::CommandGraph &graph,
@@ -397,7 +408,7 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
   result.layout = layout;
   result.layers.reserve(layout.layers);
   const uint64_t convolutionBytes = checkedMultiply<WeightStoreError>(
-      checkedMultiply<WeightStoreError>(SPLASH_DRAFT_CONVOLUTION_STAGES * SPLASH_DRAFT_CONVOLUTION_TAPS,
+      checkedMultiply<WeightStoreError>(SPLASH_DRAFT_CONVOLUTION_STAGES * layout.convolutionTaps,
                                         layout.hiddenSize, "draft convolution elements"),
       kBFloat16Bytes, "draft convolution bytes");
   const uint64_t headNormBytes = checkedMultiply<WeightStoreError>(

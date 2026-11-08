@@ -286,7 +286,7 @@ void testOneRulePerValue(const std::filesystem::path &fixtures) {
            {&SourceModel::draft, R"("num_attention_heads": 32)", R"("num_attention_heads": 16)",
             "draft config num_attention_heads mismatch: checkpoint 16, runtime 32"},
            {&SourceModel::draft, R"("selector_top_k": 16)", R"("selector_top_k": 8)",
-            "draft config dflash_config selector_top_k mismatch"},
+            "draft config dflash_config selector_top_k is below the 16 candidates the kernels keep"},
            {&SourceModel::draft, R"("selector_top_k": 16)",
             R"("selector_top_k": 16, "target_hidden_reduction": "stream_mean")",
             "draft config dflash_config target_hidden_reduction mismatch: checkpoint stream_mean, runtime none"},
@@ -991,7 +991,7 @@ void testFlint(const std::filesystem::path &fixtures) {
   // Its 35 sliding layers read a window of the 512 keys before a row's, its
   // 14 others every key, the 49 attention layers' K/V in one page.
   require(descriptor.targetKvLayout.attentionLayers == 49 && descriptor.targetKvLayout.windowTokens == 512 &&
-              std::popcount(descriptor.targetKvLayout.windowedLayers) == 35 && !descriptor.stateLayout.target.layers,
+              descriptor.targetKvLayout.windowedLayers.count() == 35 && !descriptor.stateLayout.target.layers,
           "Flint's KV and state layouts are not its layers'");
   const auto masked = [&](uint32_t token) {
     return flint.with(&SourceModel::draft, R"("mask_token_id": 150019)",
@@ -1036,6 +1036,95 @@ void testFlint(const std::filesystem::path &fixtures) {
           "a Flint config under text_config was accepted");
 }
 
+// Ripple's, from its release's flat config and the metadata its GGUF header
+// holds: the family serves its native window, and the two million tokens its
+// config claims are the config's, not the family's served one. A GGUF's
+// config is held to the sizes every family's holds and its metadata to the
+// family's keys; its draft's selector keeps more candidates than the kernels
+// do, which refuse it until they serve them, and the family names itself
+// without the draft.
+void testRipple(const std::filesystem::path &fixtures) {
+  const std::string config = text(fixtures / "ripple-65b" / "config.json");
+  const std::string metadata = text(fixtures / "ripple-65b" / "gguf-metadata.json");
+  const std::string draft = text(fixtures / "ripple-65b" / "draft" / "config.json");
+  const auto check = [&](std::string configText, std::string metadataText,
+                         std::optional<std::string> draftText) {
+    const test::TemporaryDirectory directory("splash-ripple-check");
+    test::writeFile(directory.path() / "config.json", configText);
+    test::writeFile(directory.path() / "gguf-metadata.json", metadataText);
+    std::optional<std::filesystem::path> draftFile;
+    if (draftText) test::writeFile(draftFile.emplace(directory.path() / "draft.json"), *draftText);
+    return std::string(model::inspectSourceConfiguration("gguf", "none", directory.path() / "config.json",
+                                                         directory.path() / "gguf-metadata.json", draftFile));
+  };
+  require(check(config, metadata, std::nullopt) == "Ripple-65B",
+          "Ripple's configuration was not found to be its family");
+  // The trained selector keeps more candidates than the kernels do, whose
+  // subset the proposal serves exactly; fewer than the kernels keep cannot
+  // select their list.
+  const test::TemporaryDirectory rippleRoot("splash-ripple-model");
+  test::writeFile(rippleRoot.path() / "model.json",
+                  R"({"version":1,"model":"community/fine-tune","target_format":"gguf","vision_format":"none"})");
+  test::writeFile(rippleRoot.path() / "config.json", config);
+  test::writeFile(rippleRoot.path() / "gguf-metadata.json", metadata);
+  std::filesystem::create_directory(rippleRoot.path() / "draft");
+  test::writeFile(rippleRoot.path() / "draft" / "config.json", draft);
+  const model::ModelDescriptor rippleDescriptor = model::inspectModelRoot(rippleRoot.path());
+  require(rippleDescriptor.valid() && rippleDescriptor.family() == "Ripple-65B" &&
+              rippleDescriptor.draft.targetLayerCount == 5 &&
+              rippleDescriptor.draft.targetLayers[0] == 1 &&
+              rippleDescriptor.draft.window == 4096 &&
+              rippleDescriptor.draft.queryHeads == 80,
+          "a Ripple model made another descriptor");
+  for (const uint32_t topK : {8u, 15u}) {
+    std::string truncated = draft;
+    const std::string from = R"("selector_top_k": 32)";
+    truncated.replace(truncated.find(from), from.size(),
+                      R"("selector_top_k": )" + std::to_string(topK));
+    rejects([&] { static_cast<void>(check(config, metadata, truncated)); },
+            "is below the 16 candidates the kernels keep",
+            "a Ripple draft of " + std::to_string(topK) + " candidates was accepted");
+  }
+  const SourceModel ripple =
+      SourceModel{R"({"version":1,"model":"community/fine-tune","target_format":"gguf","vision_format":"none"})",
+                  config, draft};
+  // Each size every family's config holds is Ripple's, and the keys its
+  // metadata holds are its values'.
+  struct Refused final {
+    std::string_view from, to, error;
+  };
+  for (const Refused &refused : std::initializer_list<Refused>{
+           {R"("num_attention_heads": 80)", R"("num_attention_heads": 64)", "text config num_attention_heads: GGUF 64, Ripple-65B 80"},
+           {R"("num_key_value_heads": 8)", R"("num_key_value_heads": 4)", "text config num_key_value_heads: GGUF 4, Ripple-65B 8"},
+           {R"("hidden_size": 5120)", R"("hidden_size": 3072)", "text config hidden_size: GGUF 3072, Ripple-65B 5120"},
+           {R"("num_hidden_layers": 80)", R"("num_hidden_layers": 61)", "text config num_hidden_layers: GGUF 61, Ripple-65B 80"},
+           {R"("vocab_size": 100352)", R"("vocab_size": 151936)", "text config vocab_size: GGUF 151936, Ripple-65B 100352"},
+           {R"("head_dim": 128)", R"("head_dim": 256)", "text config head_dim: GGUF 256, Ripple-65B 128"},
+           {R"("max_position_embeddings": 2097152)", R"("max_position_embeddings": 262144)",
+            "text config max_position_embeddings: GGUF 262144, Ripple-65B 2097152"},
+           {R"("model_type": "ricursive")", R"("model_type": "qwen3_5_text")", "no supported model has this architecture"}})
+    refuses(ripple.with(&SourceModel::config, refused.from, refused.to), refused.error,
+            "a Ripple config with " + std::string(refused.to) + " was accepted");
+  for (const Refused &refused : std::initializer_list<Refused>{
+           {R"("ricursive.attention.sliding_window": 1024)", R"("ricursive.attention.sliding_window": 512)",
+            "GGUF metadata does not match the target: attention.sliding_window"},
+           {R"("ricursive.embedding_scale": 71.5541763305664)", R"("ricursive.embedding_scale": 1.0)",
+            "GGUF metadata does not match the target: embedding_scale"},
+           {R"("ricursive.swiglu_clamp": 20.0)", R"("ricursive.swiglu_clamp": 6.0)",
+            "GGUF metadata does not match the target: swiglu_clamp"},
+           {R"("ricursive.attention.head_count": 80)", R"("ricursive.attention.head_count": 64)",
+            "GGUF metadata does not match the target: attention.head_count"},
+           {R"("ricursive.block_count": 80)", R"("ricursive.block_count": 61)",
+            "GGUF metadata does not match the target: block_count"}}) {
+    std::string metadataText(metadata);
+    const size_t at = metadataText.find(refused.from);
+    require(at != std::string::npos, std::string("the Ripple metadata has no ") + std::string(refused.from));
+    metadataText.replace(at, refused.from.size(), refused.to);
+    rejects([&] { static_cast<void>(check(config, metadataText, std::nullopt)); }, refused.error,
+            "a Ripple GGUF with " + std::string(refused.to) + " was accepted");
+  }
+}
+
 int main(int argc, char **argv) {
   try {
     if (argc != 2) throw std::invalid_argument("usage: model-configuration FIXTURES");
@@ -1048,6 +1137,7 @@ int main(int argc, char **argv) {
     testConfigurationCheck(argv[1]);
     testYarn(argv[1]);
     testFlint(argv[1]);
+    testRipple(argv[1]);
     std::cout << "model configuration: every family, sources, one rule per value, quantization, vision, pruned "
                  "experts, the installer's check, YaRN, Flint PASS\n";
   } catch (const std::exception &error) {

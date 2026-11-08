@@ -30,7 +30,7 @@ class QwenStateStorage;
 class SsdReaders;
 class VisionLoader;
 
-using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights, FlintWeights>;
+using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights, FlintWeights, RippleWeights>;
 
 // How a model loads beside its descriptor: with streamedTableBytes, the rows
 // of a table the target's GGUF holds (model/ModelSizing.hpp) stream from its
@@ -147,6 +147,7 @@ void requireCompatibleModel(const LoadedModel &model);
 [[nodiscard]] SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &layout);
 [[nodiscard]] SparseRowStoreOptions streamedTableRows(const Qwen3_6MoeLayout &layout);
 [[nodiscard]] SparseRowStoreOptions streamedTableRows(const FlintLayout &layout);
+[[nodiscard]] SparseRowStoreOptions streamedTableRows(const RippleLayout &layout);
 
 // The vision role's source, planned; null for a model without vision.
 [[nodiscard]] std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root,
@@ -172,7 +173,7 @@ loadModel(metal::MetalBackend &backend,
 // buffers of a full chunk and the hidden rows layers alternate between.
 void withPrefillArena(
     metal::MetalBackend &backend, const LoadedModel &model, const ops::ExecutionPlans &operators, kv::Format format,
-    const std::function<void(const ops::PrefillFfnBuffers &, const std::array<metal::MetalBuffer, 2> &)> &use);
+    const std::function<void(const QwenTargetPrefillBuffers &)> &use);
 // What of a model streams from the SSD, which its arenas rest on: a target
 // whose routed experts stream runs its prefill commands as groups
 // (RuntimeGeometry::prefillChunks), the step of one whose table streams

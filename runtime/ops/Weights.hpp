@@ -164,6 +164,21 @@ public:
     }
   }
 
+  // A projection of `source`'s segments writing at `columnOffset` of a
+  // destination row of `destinationColumns` columns: a split mixer's value
+  // projection, whose rows land in the packed row's value columns the fused
+  // projection left unwritten. The decode dispatch writes
+  // out[row * destinationColumns + columnOffset + column], so the segment's
+  // offsets shift by `columnOffset` and the declared output is the
+  // destination's.
+  [[nodiscard]] static Projection placed(uint32_t destinationColumns, uint32_t columnOffset, Projection source) {
+    if (!destinationColumns || columnOffset + source.outputSize > destinationColumns)
+      throw std::invalid_argument("a placed projection's columns do not fit its destination");
+    for (QuantizedSegment &s : source.weights_.segments) s.columnOffset += columnOffset;
+    source.outputSize = destinationColumns;
+    return source;
+  }
+
   [[nodiscard]] const BlockWeights &blocks() const noexcept { return weights_; }
   [[nodiscard]] ProjectionShape shape() const noexcept {
     bool registerFormats = true;

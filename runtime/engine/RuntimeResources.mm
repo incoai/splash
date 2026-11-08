@@ -558,8 +558,11 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
   // A sliding window (kv::Layout::windowTokens), which also orders a page's
   // regions in its slot (kv::Layout::region) and labels a slot with its
   // page's form (KvSlotLabel). A layout without one keeps the line it had.
-  if (kv.windowedLayers)
-    canonical << " window " << kv.windowTokens << " layers 0x" << std::hex << kv.windowedLayers << std::dec;
+  if (!kv.windowedLayers.empty()) {
+    canonical << " window " << kv.windowTokens << " layers 0x" << std::hex << kv.windowedLayers.words[0];
+    if (kv.windowedLayers.words[1]) canonical << "/" << kv.windowedLayers.words[1];
+    canonical << std::dec;
+  }
   // How a slot holds a page; nothing for the spans' order, so the caches
   // written before slots had another order stay valid.
   canonical << KvPageTier::slotFormatToken(kv) << '\n'
@@ -1216,7 +1219,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // A windowed layout's pages give up their windowed layers' K/V where
     // they can (kv::Layout::slimmable), unless --kv-window-trim off.
     std::optional<CacheWindowPolicy> windowPolicy;
-    if (kvLayout.windowedLayers)
+    if (!kvLayout.windowedLayers.empty())
       windowPolicy = CacheWindowPolicy{.windowPages = kvLayout.windowPages(),
                                        .trim = kvLayout.slimmable() && config.kvWindowTrim};
     auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), disk.budget, spillPolicy, windowPolicy);
@@ -1509,19 +1512,19 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
   };
   model.time = [&backend, layers, cancelled, onArena] {
     ops::ane_ffn::Timings timings;
-    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      timings = ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).time();
+    onArena([&](const model::QwenTargetPrefillBuffers &buffers) {
+      timings = ops::ane_ffn::Measurement(backend, *layers, buffers.ffn(), buffers.hidden, cancelled).time();
     });
     return timings;
   };
   model.prepare = [&backend, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
     AneFfnPrepared prepared;
-    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+    onArena([&](const model::QwenTargetPrefillBuffers &buffers) {
       prepared.split = std::make_unique<ops::AneFfn>(backend, *layers, aneUnits, cancelled);
-      prepared.error = prepared.split->verify(*layers, ffn, hidden);
+      prepared.error = prepared.split->verify(*layers, buffers.ffn(), buffers.hidden);
       if (timeChunks)
         prepared.chunks =
-            ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).chunks(*prepared.split);
+            ops::ane_ffn::Measurement(backend, *layers, buffers.ffn(), buffers.hidden, cancelled).chunks(*prepared.split);
     });
     return prepared;
   };

@@ -23,7 +23,7 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 constexpr double kMaskWaitMilliseconds = double(supervision::kMaskWait.count());
 // A junction costs a cached state, its capture and up to a draft window of
 // draft-context rows; a later request must save at least that much prefill.
-constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftContextTokens;
+constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftWindowLimit;
 
 constexpr std::string_view kKvUnreadableMessage =
     "KV of an earlier part of the conversation could not be read from the SSD cache";
@@ -1242,7 +1242,7 @@ bool Engine::addStateBoundary(Request &active, uint32_t after, uint32_t tokens,
   // boundary before it, from `after` when the lane's draft state is
   // complete there, or whole past `after` (planDraftContext).
   if (!completeAfter && found == remaining &&
-      tokens - after < model::ExecutionLimits::draftContextTokens)
+      tokens - after < model::ExecutionLimits::draftWindowLimit)
     return false;
   active.stateBoundaries.insert(found, {tokens, disposable});
   return true;
@@ -1270,7 +1270,7 @@ DraftContextPlan Engine::pendingDraftStatePlan(const Request &active,
   boundaries.reserve(active.stateBoundaries.size() - active.stateBoundaryCursor);
   for (size_t i = active.stateBoundaryCursor; i < active.stateBoundaries.size(); ++i)
     boundaries.push_back(active.stateBoundaries[i].tokens);
-  return planDraftContext(stateBoundary, active.replayTokens, boundaries);
+  return planDraftContext(stateBoundary, active.replayTokens, boundaries, model_.draftWindow());
 }
 
 void Engine::discardPendingStateBoundaries(Request &active) noexcept {

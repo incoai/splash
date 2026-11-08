@@ -67,7 +67,19 @@ struct LinearMatrix final {
 void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what, uint32_t planeInputs = 0);
 
 enum class LinearPhase : uint8_t { Prefill, Decode };
-enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
+enum class LinearEpilogue : uint8_t {
+  None,
+  Residual,
+  GateUp,
+  UpWithGate,
+  // The gated product with both activations clamped at the dispatch's
+  // clamp (a family whose SwiGLU clamps): the decode pair's up pass and
+  // the prefill up pass read the unclamped gate scratch and clamp as they
+  // apply it. The one-pass gate/up pair does not run clamped: its two-pass
+  // fallback's scratch costs a gated intermediate's round trip.
+  ClampedGateUp,
+  ClampedUpWithGate
+};
 // The tiles run 64 columns per threadgroup; a one-pass gate/up
 // (LinearConfig::oneGateUpPass) runs 32 columns of both tensors per
 // threadgroup of one simdgroup. The staged tiles, GgufStaged and GgufPrefill,
@@ -228,6 +240,9 @@ struct LinearBuffers final {
   // What the scratch table holds (for example after fused RMSNorm). A plan
   // that reads a table prepares one unless this describes its input.
   PreparedInput prepared{};
+  // The clamped epilogues' threshold, which their params carry to the
+  // kernels; infinity clamps nothing.
+  float clamp = std::numeric_limits<float>::infinity();
 };
 
 // Owns projection pipeline selection and dispatch. Plans follow the device's

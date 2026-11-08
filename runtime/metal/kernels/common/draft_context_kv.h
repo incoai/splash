@@ -5,7 +5,10 @@
 
 // One KV head of one context row: a row of context_kv holds the row's keys,
 // then its values (KWidth each). The keys are normalized and rotated into
-// the ring slot of the row's position; the values are copied there.
+// the ring slot of the row's position; the values are copied there. The
+// Window is the ring length of the draft's geometry, which every draft keeps
+// to a compiled variant's (2048 for the shipped drafts, 4096 for Ripple's).
+template <uint Window = SPLASH_DRAFT_SLIDING_WINDOW>
 inline void draft_context_kv_phase(
     device const bfloat *context_kv, device const bfloat *k_norm,
     device const float *rope_cos, device const float *rope_sin,
@@ -13,8 +16,7 @@ inline void draft_context_kv_phase(
     uint active_tokens, uint task,
     uint thread_index, uint lane, uint simd_group,
     threadgroup float *reductions, threadgroup bfloat *normalized) {
-  constexpr uint KVHeads = SPLASH_DRAFT_KV_HEADS, HeadDim = SPLASH_DRAFT_HEAD_DIMENSION,
-                 Window = SPLASH_DRAFT_SLIDING_WINDOW;
+  constexpr uint KVHeads = SPLASH_DRAFT_KV_HEADS, HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
   constexpr uint KWidth = KVHeads * HeadDim, RowWidth = 2 * KWidth;
   uint row = task / KVHeads;
   if (row >= active_tokens)

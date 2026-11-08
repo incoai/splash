@@ -56,8 +56,11 @@ struct GgufPrefillParams {
   uint32_t rows;        // rows of the chunk
   uint32_t out_stride;  // columns of a destination row
   uint32_t out_offset;  // first destination column of this segment
+  // The clamped epilogue's threshold, infinity for an unclamped one (which
+  // never reads it).
+  float clamp;
 };
-static_assert(sizeof(GgufPrefillParams) == 16, "GGUF prefill parameters are 16 bytes on both sides");
+static_assert(sizeof(GgufPrefillParams) == 20, "GGUF prefill parameters are 20 bytes on both sides");
 // The residual prefill kernels over a view of the leading inputs of wider weight rows
 // (gguf_prefill_<format>_r_leading_inputs): each row of the planes holds plane_input_size inputs, of which the
 // projection reads the first prefill.input_size.
@@ -65,7 +68,7 @@ struct GgufPrefillLeadingParams {
   GgufPrefillParams prefill;
   uint32_t plane_input_size;
 };
-static_assert(sizeof(GgufPrefillLeadingParams) == 20,
+static_assert(sizeof(GgufPrefillLeadingParams) == 24,
               "GGUF leading-input prefill parameters are 20 bytes on both sides");
 // The plain prefill kernels (gguf_prefill_<format>_a): up to three column segments of the kernel's format in one
 // dispatch, tiles in segment order, as a fused decode dispatch takes them; a single tensor is one segment.
@@ -81,7 +84,7 @@ static_assert(sizeof(GgufPrefillSegmentsParams) == 36, "GGUF segmented prefill p
 // Decode tiles: the register tile, which Apple9 runs but for the projections
 // it stages (ops/LinearGguf.cpp, apple9Stages), and the staged tile, which
 // runs every other decode and prefill chunks of up to 32 rows (64 on
-// Apple10 and on Apple9 GPUs of 10 cores or fewer). One tensor per
+// Apple10). One tensor per
 // dispatch, over the dispatch's tiles (grid.x) and K partitions (grid.y).
 struct GgufDecodeParams {
   uint32_t input_size;  // K
@@ -89,8 +92,10 @@ struct GgufDecodeParams {
   uint32_t out_stride;  // columns of a destination row
   uint32_t out_offset;  // first destination column of the tensor
   uint32_t spread;      // staged tile: 1 = each column tile starts its K walk at its own step, 0 = lockstep
+  // The clamped epilogue's threshold, infinity for an unclamped one.
+  float clamp;
 };
-static_assert(sizeof(GgufDecodeParams) == 20, "GGUF decode parameters are 20 bytes on both sides");
+static_assert(sizeof(GgufDecodeParams) == 24, "GGUF decode parameters are 24 bytes on both sides");
 
 // Decode of a fused projection: up to three column segments of any formats in
 // one dispatch, tiles in segment order.
@@ -109,8 +114,17 @@ struct GgufEmbedParams {
   uint32_t rows;
   uint32_t vocabulary;
   uint32_t hidden;
+  // What a gathered row is multiplied by as it is written: a family whose
+  // embeddings the square root of the hidden size scales (Ripple's) gathers
+  // them scaled, and every gather of its table does.
+  float scale;
 };
-static_assert(sizeof(GgufEmbedParams) == 12, "GGUF embedding parameters are 12 bytes on both sides");
+static_assert(sizeof(GgufEmbedParams) == 16, "GGUF embedding parameters are 16 bytes on both sides");
+// The formats whose native rows the embedding kernels gather, in bf16 as token
+// tables and in fp32 as the F32 values load-time widening writes
+// (kernels/shared/embedding.metal, gguf_embed_<kQuantFormats name> and
+// gguf_embed_f32_<name>): every format.
+inline constexpr bool gguf_embedding_format(uint32_t format) { return format < GGUF_FMT_COUNT; }
 
 // Prism ML's input rotation (kernels/shared/gguf_rotation.metal): weights
 // stored for rotated inputs multiply H (D x), H the normalized Walsh-Hadamard

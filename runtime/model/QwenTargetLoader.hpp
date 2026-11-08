@@ -111,9 +111,12 @@ void readQwenTargetHead(Weights &result, const Layout &layout, Files &&files, co
 // with the file, the layer's weights, the format and the layer's index),
 // then the head and the token embedding. Weights is the architecture's
 // weight struct.
-template <class Weights, class Layout, class Files, class ReadFfn>
+template <class Weights, class Layout, class Files, class ReadFfn,
+          class ReadMixer = QwenMixerWeights (*)(WeightFile &, const BlockTargetFormat &,
+                                                 const QwenTargetDimensions &, bool)>
 [[nodiscard]] Weights
-readQwenTargetWeights(const Layout &layout, Files &&files, const BlockTargetFormat &format, ReadFfn readFfn) {
+readQwenTargetWeights(const Layout &layout, Files &&files, const BlockTargetFormat &format, ReadFfn readFfn,
+                      ReadMixer readMixer = readQwenMixer) {
   Weights result;
   result.layout = layout;
   result.layers.reserve(layout.layers);
@@ -123,7 +126,7 @@ readQwenTargetWeights(const Layout &layout, Files &&files, const BlockTargetForm
     WeightFile file = files.layer(layerIndex);
     auto &layer = result.layers.emplace_back();
     layer.inputNorm = format.norm(file, layout.hiddenSize, "input-norm");
-    layer.mixer = readQwenMixer(file, format, layout, fullAttention);
+    layer.mixer = readMixer(file, format, layout, fullAttention);
     layer.postAttentionNorm = format.norm(file, layout.hiddenSize, "post-attention-norm");
     readFfn(file, layer, format, layerIndex);
     file.finish();
@@ -159,8 +162,8 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
            layout.attentionHeadDimension, layout.rotaryPairs, layout.fullAttentionPeriod))
     throw WeightStoreError("Qwen target layout contains a zero dimension");
   const uint32_t kvWidth = 2 * layout.attentionKvHeads * layout.attentionHeadDimension;
-  const auto attentionMask = [&](uint64_t mask) {
-    return layout.attentionLayerCount() >= 64 || !(mask >> layout.attentionLayerCount());
+  const auto attentionMask = [&](const kv::LayerMask &mask) {
+    return mask.above(layout.attentionLayerCount());
   };
   if (routingInconsistent ||
       (gdn ? layout.gdnValueHeads % layout.gdnKeyHeads ||

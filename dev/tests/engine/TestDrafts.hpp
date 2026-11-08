@@ -5,6 +5,7 @@
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/Qwen4Exp.hpp"
+#include "model/Ripple.hpp"
 #include "ops/Vision.hpp"
 
 #include <array>
@@ -37,6 +38,13 @@ namespace splash::test {
   constexpr model::Qwen4ExpLayout target;
   constexpr std::array<uint32_t, 4> targetLayers{3, 17, 31, 47};
   return model::draftLayout(target.hiddenSize, target.vocabularySize, 3, 5120, 1'000'000.0F, targetLayers);
+}
+
+[[nodiscard]] inline model::DFlashDraftLayout rippleDraft() {
+  constexpr model::RippleLayout target;
+  constexpr std::array<uint32_t, 5> targetLayers{1, 20, 39, 58, 77};
+  return model::draftLayout(target.hiddenSize, target.vocabularySize, 5, 40'960, 10'000.0F, targetLayers,
+                            SPLASH_DRAFT_VARIANTS[1]);
 }
 
 [[nodiscard]] inline model::DFlashDraftLayout flintDraft() {

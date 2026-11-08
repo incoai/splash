@@ -50,12 +50,22 @@ struct QwenGdnWeights final {
 
 struct QwenAttentionWeights final {
   ops::Projection inputProjection;
+  // A mixer whose value projection reads its own mixed input (Ripple's value
+  // residual): the fused projection carries the queries, their gate and the
+  // keys alone, and this carries the value rows, which the mixed input
+  // projects through. Empty for a mixer whose fused projection carries the
+  // value rows with the queries'.
+  ops::Projection valueProjection;
   ops::NormWeights queryNorm;
   ops::NormWeights keyNorm;
   ops::Projection outputProjection;
   // The layer's learned sinks, an F32 per query head, of a geometry whose
   // attention adds them (ops::PrefillAttentionPlan::sinks); none otherwise.
   metal::MetalBuffer sinks{};
+
+  [[nodiscard]] bool splitsValue() const noexcept {
+    return valueProjection.outputSize != 0;
+  }
 };
 
 using QwenMixerWeights = std::variant<QwenGdnWeights, QwenAttentionWeights>;
@@ -138,7 +148,7 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // the RoPE of the target's pairs unless unrotatedLayers names it, and over
   // the window of kvLayout where that names it.
   [[nodiscard]] constexpr ops::AttentionVariant attentionVariant(uint32_t attention) const noexcept {
-    return {.rotated = attention >= 64 || !(unrotatedLayers >> attention & 1),
+    return {.rotated = !unrotatedLayers.test(attention),
             .windowTokens = kvLayout.windowed(attention) ? kvLayout.windowTokens : 0};
   }
   [[nodiscard]] constexpr std::span<const uint32_t>
@@ -494,8 +504,8 @@ public:
   virtual void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                               metal::MetalBuffer proposals,
                               metal::MetalBuffer verifyInput, uint32_t lanes) const;
-  void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
-                    metal::MetalBuffer hidden, uint32_t rows) const;
+  virtual void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
+                            metal::MetalBuffer hidden, uint32_t rows) const;
   // The commit after acceptance of a verify of `lanes` lanes: in the
   // verify's command after it (addVerify), or for constrained decoding in
   // the next command, before any other decode step reuses the verify's

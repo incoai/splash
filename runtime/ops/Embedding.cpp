@@ -18,7 +18,7 @@ const QuantFormat &StoredRows::format() const noexcept { return kQuantFormats[fo
 
 void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     const EmbeddingWeights &table, metal::MetalBuffer output,
-                    uint32_t rows) {
+                    uint32_t rows, float scale) {
   if (!rows || !table.outputSize || !table.inputSize)
     throw std::invalid_argument("invalid embedding shape");
   // Every gather reads `rows` token ids and writes `rows` bf16 rows of the table's width.
@@ -30,7 +30,7 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
   const uint64_t rowBytes = quant_stored_row_bytes(stored.formatId, table.inputSize);
   if (!rowBytes) throw std::invalid_argument("token rows take whole blocks of their format");
   requireBytes(stored.rows, uint64_t{table.outputSize} * rowBytes, "token table");
-  const GgufEmbedParams params{rows, table.outputSize, table.inputSize};
+  const GgufEmbedParams params{rows, table.outputSize, table.inputSize, scale};
   if (table.rotation) {
     // One threadgroup per rotation block of a row, which gathers the block
     // and inverts its rotation in fp32 (kernels/shared/gguf_rotation.metal).

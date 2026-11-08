@@ -1,0 +1,65 @@
+{
+  "architectures": [
+    "DFlash2DraftModel"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "bos_token_id": 100257,
+  "dflash_config": {
+    "block_size": 16,
+    "conv_group_size": 16,
+    "conv_kernel_size": 4,
+    "mask_token_id": 100278,
+    "selector_rank": 256,
+    "selector_top_k": 32,
+    "target_layer_ids": [
+      1,
+      20,
+      39,
+      58,
+      77
+    ]
+  },
+  "draft_vocab_size": 100352,
+  "dtype": "bfloat16",
+  "eos_token_id": [
+    100265,
+    100257
+  ],
+  "head_dim": 128,
+  "hidden_act": "silu",
+  "hidden_size": 5120,
+  "initializer_range": 0.02,
+  "intermediate_size": 40960,
+  "is_causal": false,
+  "layer_types": [
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention"
+  ],
+  "max_position_embeddings": 131072,
+  "max_window_layers": 5,
+  "model_type": "qwen3",
+  "no_rope_layers": [
+    4
+  ],
+  "num_attention_heads": 80,
+  "num_hidden_layers": 5,
+  "num_key_value_heads": 8,
+  "num_target_layers": 80,
+  "pad_token_id": 100277,
+  "rms_norm_eps": 1e-06,
+  "rope_parameters": {
+    "rope_theta": 10000.0,
+    "rope_type": "default"
+  },
+  "rope_theta": 10000.0,
+  "sliding_window": 4096,
+  "tie_word_embeddings": false,
+  "transformers_version": "5.12.1",
+  "use_cache": true,
+  "use_sliding_window": true,
+  "vocab_size": 100352
+}

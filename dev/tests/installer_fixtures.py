@@ -27,8 +27,9 @@ DENSE = families.named("Qwen3.8-27B")
 MOE = families.named("Qwen3.6-35B-A3B")
 FLASH_NEXT = families.named("Qwen3.8-Flash-Next")
 FLINT = families.named("Flint")
+RIPPLE = families.named("Ripple-65B")
 # The families whose targets the engine loads from a GGUF only.
-GGUF_ONLY = (FLASH_NEXT, FLINT)
+GGUF_ONLY = (FLASH_NEXT, FLINT, RIPPLE)
 MODEL = "mlx-community/Qwen3.8-27B-4bit"
 # An MLX config.json (of a GGUF_ONLY family, the one the installer derives
 # from its GGUF), a DFlash2 draft config and, of Qwen3.6-35B-A3B and the
