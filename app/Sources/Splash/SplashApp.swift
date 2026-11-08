@@ -130,8 +130,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         termination?.resume()
         statusMenu = StatusMenu(state: state)
+        followWindows()
         updates.start()
         Task { await state.launch() }
+    }
+
+    /// The notifications that tell the app a window has come or gone, kept for the app's life.
+    private var windowObservers: [NSObjectProtocol] = []
+
+    /// The app is in the Dock and the menu bar from the moment a window of its own is on screen
+    /// until the last one closes: hiding the app and minimizing the window leave it there, as they
+    /// do any app. A closed window leaves the menu bar item alone, with no menus and no Dock icon.
+    private func followWindows() {
+        let center = NotificationCenter.default
+        // A window comes on screen and takes the keyboard, as the app opened again, or a second
+        // launch, brings its window back.
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didBecomeMainNotification] {
+            windowObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.scheduleActivationPolicyUpdate(leaving: false) }
+            })
+        }
+        windowObservers.append(center.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.scheduleActivationPolicyUpdate(leaving: true) }
+        })
+        // Once the run loop turns: on a launch that restores no window, the app leaves the Dock
+        // even though it starts out in it.
+        scheduleActivationPolicyUpdate(leaving: true)
+    }
+
+    /// Reads the windows once the window that sent the notification has finished coming or going.
+    /// Only a close, or the launch, takes the app out of the Dock: a window hidden with the app
+    /// is not visible, and is not closed.
+    private func scheduleActivationPolicyUpdate(leaving: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated { self?.updateActivationPolicy(leaving: leaving) }
+        }
+    }
+
+    /// Sets the policy the windows call for: into the Dock whenever one is open, out of it only
+    /// when `leaving`.
+    private func updateActivationPolicy(leaving: Bool) {
+        let policy = AppDelegate.activationPolicy(for: NSApp.windows)
+        guard NSApp.activationPolicy() != policy, policy == .regular || leaving else { return }
+        NSApp.setActivationPolicy(policy)
+    }
+
+    /// The app's policy for `windows`: a regular app while one of its own is open, an accessory
+    /// app with no menus and no Dock icon when none is.
+    static func activationPolicy(for windows: [NSWindow]) -> NSApplication.ActivationPolicy {
+        windows.contains(where: isOpen) ? .regular : .accessory
+    }
+
+    /// Whether `window` is one to keep the app in the Dock and the menu bar for: a window of its
+    /// own, on screen or minimized. Not a panel — a popup's, the quit question's — which comes and
+    /// goes with the window it belongs to, nor one that cannot take the keyboard, as the menu bar
+    /// item's cannot.
+    private static func isOpen(_ window: NSWindow) -> Bool {
+        window.canBecomeKey && !(window is NSPanel) && (window.isVisible || window.isMiniaturized)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

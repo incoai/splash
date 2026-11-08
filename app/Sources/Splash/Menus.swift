@@ -111,10 +111,11 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     }
 
     /// Shows the window, which may have closed: the app opened again brings it back, as a second
-    /// launch does.
+    /// launch does, and the window in turn brings back the Dock and the menu bar.
     private static func show(_ section: AppState.Section, in state: AppState) {
         state.section = section
         NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: NSWorkspace.OpenConfiguration())
+        NSApp.activate()
     }
 }
 
