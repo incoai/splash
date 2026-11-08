@@ -655,8 +655,8 @@ class ServerRecoveryTests(HarnessTestCase):
 
     def test_a_request_started_at_two_engine_failures_in_a_row_is_refused(self):
         """A request in flight at two engine failures in a row is refused
-        until the server restarts, without reaching the engine; another,
-        started only after the first relaunch, is served."""
+        for an hour, without reaching the engine; another, started only
+        after the first relaunch, is served."""
         poison = (1, 2, 3)
         crash = self.crash(b"engine_execution_failed")
         factory, runtime, backend = self.quarantine_server(
