@@ -925,9 +925,16 @@ bool Engine::admit(Request &active, double now) {
     }
     active.kvMode = *active.placement;
   }
+  // A request is in service when no other lane is resident
+  // (anotherResident): the host exempts it once nothing in place meets it,
+  // and it takes up to what is in use. Beside a resident lane it is a start,
+  // which takes only the cache nothing in use holds, the model's caches it
+  // rebuilds on use among them, and waits for that lane.
+  ClaimSpec spec = claimFor(active, anotherResident(active.request.id) ? ClaimClass::Start : ClaimClass::InService);
+  spec.supersedes = supersedes;
   bool commits = false;
   if (active.kvMode == KvMode::Spill) {
-    switch (admitSpill(active, resuming, chainEnd(lookup), now)) {
+    switch (admitSpill(active, resuming, chainEnd(lookup), spec, now)) {
     case SpillAdmission::Commit:
       commits = true;
       break;
@@ -940,13 +947,6 @@ bool Engine::admit(Request &active, double now) {
     }
   }
   modelRequest.maxNewTokens = active.outputLimit;
-  // A request is in service when no other lane is resident
-  // (anotherResident): the host exempts it once nothing in place meets it,
-  // and it takes up to what is in use. Beside a resident lane it is a start,
-  // which takes only the cache nothing in use holds, the model's caches it
-  // rebuilds on use among them, and waits for that lane.
-  ClaimSpec spec = claimFor(active, anotherResident(active.request.id) ? ClaimClass::Start : ClaimClass::InService);
-  spec.supersedes = supersedes;
   const auto begin = [&] {
     modelRequest.restoredTokens = lookup.resumeBoundary();
     return resuming ? model_.resume(modelRequest) : model_.begin(modelRequest);
@@ -967,20 +967,17 @@ bool Engine::admit(Request &active, double now) {
   if (!state.admission.granted()) {
     // Without a free lane the request waits for one; only memory it could
     // not get may fail it.
-    if (state.admission.failure == StateFailure::MemoryPressure &&
-        judge(state.denial, active.request.id) == Verdict::Fail) {
-      settle(active, capacityExhausted(active, "request state",
-                                       state.admission.allocationFailure));
-      return true;
+    if (state.admission.failure == StateFailure::MemoryPressure) {
+      if (judge(state.denial, active.request.id) == Verdict::Fail) {
+        settle(active, capacityExhausted(active, "request state",
+                                         state.admission.allocationFailure));
+        return true;
+      }
+      waitForMemory(active, now, state.denial);
+      return false;
     }
-    active.refusedResources = state.admission.failure == StateFailure::MemoryPressure;
     scheduler_.waitForResources(active.request.id);
     deferResourceRetry(active, now, state.denial, state.admission.failure);
-    // A start refused memory takes it from a resident of a lower priority,
-    // whose suspension makes it retry at the next pass. Memory on its way
-    // back makes no lane yield: the start waits for it.
-    if (active.refusedResources && !resuming && !state.denial.pending)
-      static_cast<void>(preemptBelow(active.request.priority, now));
     return false;
   }
   const uint64_t requestId = active.request.id;
@@ -1042,12 +1039,7 @@ bool Engine::admit(Request &active, double now) {
       active.skipCache = true;
       active.admissionProbe.reset();
     }
-    active.refusedResources = true;
-    scheduler_.waitForResources(requestId);
-    deferResourceRetry(active, now, kv.denial);
-    // As for a refused state.
-    if (!resuming && !kv.denial.pending)
-      static_cast<void>(preemptBelow(active.request.priority, now));
+    waitForMemory(active, now, kv.denial);
     return false;
   }
   // Admitted, it waits for nothing.

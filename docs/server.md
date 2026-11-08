@@ -801,10 +801,17 @@ what memory holds, as a dense target's is.
   with what a start may take (the cached prefixes nothing in use holds and
   the caches the model rebuilds, never the
   [expert store](#streamed-experts)'s chunks), counted in whole extents with
-  the states its prefill holds; any other spills. A request
-  that cannot spill, the SSD cache closed or its quota short, or whose KV
-  fits in the pages a spilling request keeps whole anyway, keeps its KV in
-  memory.
+  the states its prefill holds; any other spills. A request whose KV fits
+  in the pages a spilling request keeps whole anyway keeps its KV in memory.
+  So does one that cannot spill, the SSD cache closed or its quota short,
+  where it fits the context memory holds of one request and memory holds its
+  KV now: beside other requests in service, with what a start may take, as
+  above; alone, with what a request in service may take, the buffers the
+  next request starts from among it. Where memory does not hold it, it waits
+  for the other requests in service; alone, it takes the SSD cache's bound
+  on its output or waits for its quota as a spilling request does, and is
+  otherwise refused at its start, naming what memory and the SSD cache have
+  for it, rather than fail partway through its prefill.
 - A decoding request in memory whose KV cannot grow spills from then on
   rather than yield its lane or fail, where that covers what it lacks: what
   spilling the pages only it holds frees, past its first 2,048 tokens and
@@ -866,17 +873,19 @@ what memory holds, as a dense target's is.
   `model_context_window_exceeded`. A request that cannot spill, the cache
   short of room, its file closed or its write budget spent, keeps its KV in
   memory where it fits the context memory holds of one request
-  (`context_bounds.resident`). Past what it committed, as when its output
-  outgrows the 4,096 tokens admission counted, a request commits each
-  page's slot as it writes it, while the room lasts; its pages stay in
-  memory beyond it, and the other requests' committed pages are still
-  written.
+  (`context_bounds.resident`) and memory holds it now (above). Past what it
+  committed, as when its output outgrows the 4,096 tokens admission
+  counted, a request commits each page's slot as it writes it, while the
+  room lasts; its pages stay in memory beyond it, and the other requests'
+  committed pages are still written.
 - The KV a spilling request writes is in use and always written, so one long
   request may overdraw `--max-cache-disk-writes` once. Until the budget
   covers what spilling requests were promised, a new request that would
-  spill keeps its KV in memory where it fits and is refused otherwise
-  (`kv_write_budget`, 503 with a `Retry-After` of the seconds until the
-  budget covers them again as it refills).
+  spill keeps its KV in memory where it fits the context memory holds of
+  one request and memory holds it now (above), waits for the other requests
+  in service where memory does not hold it beside them, and is refused
+  otherwise (`kv_write_budget`, 503 with a `Retry-After` of the seconds
+  until the budget covers them again as it refills).
 - A block that cannot be read back fails only the requests that read it, as
   `kv_unreadable`, which they may retry; the copy is dropped.
 

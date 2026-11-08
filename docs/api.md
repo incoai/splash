@@ -791,7 +791,7 @@ its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 | 400 | `context_length_exceeded` | The prompt exceeds the context limit, or leaves no room in it for output. |
 | 400 | `capacity_exhausted` | The request cannot fit in memory even alone; retrying fails the same way. |
 | 400 | `request_quarantined` | The engine had started this request at each of two engine failures in a row; Splash refuses it until the server restarts, and retrying fails the same way ([engine restarts](server.md#engine-restarts-and-sleep)). |
-| 400 | `kv_disk_quota` | The request's KV does not fit in memory, and the SSD cache may not hold even its prompt's (`--max-cache-disk`, and the volume's free space); retrying fails the same way. |
+| 400 | `kv_disk_quota` | The request's KV does not fit in memory now, and the SSD cache may not hold even its prompt's (`--max-cache-disk`, and the volume's free space); retrying fails the same way while memory and the quota stay as they are. |
 | 401 | `authentication_error` | The API key is missing or wrong. |
 | 403 | `forbidden` | A Host or Origin the server does not serve; the message names the flag that admits it. |
 | 404 | `model_not_found` | `model` is neither the served ID nor an alias. |

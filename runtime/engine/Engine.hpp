@@ -602,6 +602,15 @@ private:
   // for every request under --kv-spill
   // always; Resident otherwise. Correctness never depends on it.
   [[nodiscard]] KvMode placement(const Request &request) const;
+  // What a start's Resident KV needs now beside every lane's projected
+  // growth, as placement prices it, and how much of it what `spec` may take
+  // gives, keeping the chain the start restores.
+  struct ResidentRoom final {
+    uint64_t needed = 0;
+    uint64_t available = 0;
+    [[nodiscard]] bool holds() const noexcept { return available >= needed; }
+  };
+  [[nodiscard]] ResidentRoom residentRoom(const Request &request, const ClaimSpec &spec) const;
   // Places every candidate whose placement is older than the memory's state
   // now (ledgerChanges_), once per candidate and state.
   void placeCandidates(std::span<const PrefillAdmission> candidates);
@@ -632,18 +641,20 @@ private:
   // writes no more. Each of its other pages is written once.
   [[nodiscard]] uint32_t spillPages(const Request &request, uint32_t copied) const;
   // What becomes of a start (or a resume, which keeps its mode) in Spill
-  // mode that restores the chain ending at `chainEnd`. A fresh start needs
-  // a tier that takes writes and a write budget for what Spill requests
-  // committed (Cache::spillGate); refused either, it starts Resident if it
-  // fits in memory alone and is refused otherwise. Then the SSD cache's
-  // quota of active KV (Cache::spillRoom) must hold the pages it publishes
-  // up to its projection. Short of that, a start that fits alone starts
-  // Resident, unless every request spills; otherwise the quota bounds its
-  // output to what it holds, if that leaves a token of it past what the
-  // request holds, the anchor of a resume that holds one included; it
-  // waits while other requests' active KV (the copies of the blocks they
-  // hold, and their commitments) holds what it lacks; and otherwise a start
-  // is refused, and a resume ends at its length.
+  // mode that restores the chain ending at `chainEnd`, `spec` the claim its
+  // admission makes. A fresh start needs a tier that takes writes and a
+  // write budget for what Spill requests committed (Cache::spillGate);
+  // refused either, it goes on in memory where memory allows (inMemory), and
+  // is refused otherwise. Then the SSD cache's quota of active KV
+  // (Cache::spillRoom) must hold the pages it publishes up to its
+  // projection. Short of that, unless every request spills, a start goes on
+  // in memory where memory allows; otherwise the quota bounds its output to
+  // what it holds, if that leaves a token of it past what the request holds,
+  // the anchor of a resume that holds one included; it waits while other
+  // requests' active KV (the copies of the blocks they hold, and their
+  // commitments) holds what it lacks; and otherwise a start is refused,
+  // naming what memory and the SSD cache have for it, and a resume ends at
+  // its length.
   enum class SpillAdmission : uint8_t {
     // The quota holds what it publishes: commit it once the lane is taken.
     Commit,
@@ -651,11 +662,29 @@ private:
     Resident,
     // It ended: refused, or a resume at its length.
     Settled,
-    // It waits for the quota other requests' active KV holds.
+    // It waits for the quota other requests' active KV holds, or for the
+    // memory the lanes in service hold.
     Waiting,
   };
-  [[nodiscard]] SpillAdmission admitSpill(Request &request, bool resuming, uint64_t chainEnd,
+  [[nodiscard]] SpillAdmission admitSpill(Request &request, bool resuming, uint64_t chainEnd, const ClaimSpec &spec,
                                           double nowMilliseconds);
+  // What memory does for a start the SSD cache cannot take whose projection
+  // fits in memory alone (fitsResidentAlone): it starts Resident where the
+  // claim its admission makes holds its Resident KV now beside the lanes'
+  // projected growth (residentRoom), since a lane started where memory does
+  // not hold it fails at a wall the engine already sees. Beside other lanes
+  // that claim is a start's, whose test placed it Spill unless every request
+  // spills: short of it, it waits for them (Waiting). Alone it is in
+  // service, as its lane's growth is, which takes the pooled buffers the
+  // next lane starts from too: short of it, it goes on as a Spill start,
+  // `room` naming what its Resident KV needs and what memory has for it.
+  struct InMemory final {
+    std::optional<SpillAdmission> admission;
+    std::optional<ResidentRoom> room;
+    // What memory has for a start refused, where it was asked.
+    [[nodiscard]] std::string detail() const;
+  };
+  [[nodiscard]] InMemory inMemory(const Request &request, const ClaimSpec &spec) const;
   // A start the SSD cache's quota of active KV refused while other requests'
   // active KV holds what it lacks: it waits for them to end, and holds back
   // the starts the scheduler wants after it that compete for the quota
@@ -1043,6 +1072,11 @@ private:
   void deferResourceRetry(Request &request, double nowMilliseconds,
                           const Denial &denial,
                           StateFailure reason = StateFailure::MemoryPressure) noexcept;
+  // A start or resume refused memory (`denial`) waits for it
+  // (Request::refusedResources), and a start takes it from a lane of a lower
+  // priority (preemptBelow), whose suspension makes it retry at the next
+  // pass. Memory on its way back makes no lane yield: it waits for that.
+  void waitForMemory(Request &request, double nowMilliseconds, const Denial &denial);
   // The latest refusal of the request's memory, as a wait or beside lanes
   // that run: what refused it, whether memory is on its way back, and when
   // memory on its way back was first awaited, which bounds how long its
