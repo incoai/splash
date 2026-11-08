@@ -82,13 +82,15 @@ RuntimeResourcesConfig budgetConfig(const char *metallibPath, const std::filesys
 // What a start sized: its context, the least memory its plan needs, its
 // arenas, the budget of states and KV, its streamed table's row cache and
 // what the host held back of the streamed stores, its routed experts' store,
-// whether its SSD cache started, its backend's memory, its log and how many
-// times it loaded the weights.
+// whether its SSD cache started and what that cache measured free on its
+// volume, its backend's memory, its log and how many times it loaded the
+// weights.
 struct StreamedStart final {
   uint32_t context = 0;
   uint64_t minimumRequired = 0, arenaBytes = 0, dynamicBudget = 0, table = 0, heldBack = 0;
   std::optional<model::ExpertStoreStats> experts;
   bool tier = false;
+  uint64_t volumeAvailable = 0;
   metal::MetalMemoryStats memory;
   std::string log;
   size_t loads = 0;
@@ -115,7 +117,9 @@ StreamedStart startStreamed(const RuntimeResourcesConfig &config, uint32_t reque
     started.table = budget.streamedTableBytes;
     started.heldBack = budget.hostHeldBackBytes;
     started.experts = resources->streamedExpertStats();
-    started.tier = resources->cache().snapshot().kvTier.capacityBytes != 0;
+    const KvTierSnapshot tier = resources->cache().snapshot().kvTier;
+    started.tier = tier.capacityBytes != 0;
+    started.volumeAvailable = tier.volumeAvailableBytes;
     started.memory = resources->backend().refreshMemoryStats();
   });
   started.loads = occurrences(started.log, "Weights loaded");
@@ -1173,6 +1177,7 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
 // context whatever room the volume has left since, that of a server started
 // with --max-context, which asks for it again, as well: its spilling plan
 // opens the cache's temporary files however little room their volume has.
+// Once its files open, the cache measures the volume the start read for them.
 void testRelaunchKeepsTheSpilledContext(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-relaunch");
   RuntimeResourcesConfig config = flashNextConfig(metallibPath, root.path());
@@ -1181,6 +1186,8 @@ void testRelaunchKeepsTheSpilledContext(const char *metallibPath) {
   // A budget whose memory holds less of the window than spilling does.
   config.maximumMemoryBytes = startStreamed(config).minimumRequired + 512 * kMiB;
   const StreamedStart first = startStreamed(config);
+  require(first.volumeAvailable == 500 * kGiB,
+          "an SSD cache whose files opened did not read the volume its start read to open them");
   require(startStreamed(config, first.context).context >= first.context,
           "a --max-context of the context a start spills for was not held");
   config.diskVolume = reading(localVolume(11 * kGiB));

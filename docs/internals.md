@@ -2018,8 +2018,10 @@ on the tier, and each request's commitment checks the room
 
 The volume sizes the tier only once its files are open, before a persistent
 tier takes anything back, and again at every control pass and whenever a write
-finds the volume full. `DiskSpace` reads the volume with `fstatfs` on the first
-file's descriptor, which names the right volume however the file was made, and
+finds the volume full. `DiskSpace` reads it through the reader the start gives
+it, `RuntimeResourcesConfig::diskVolume` for the place the files opened in, a
+persistent tier's root, else the temporary files' directory, as the start read
+that place to open them, so the two readings of the volume agree. It
 sets the budget's limit to min(quota, max(0, available + held - floor) / 4) for
 the automatic quota and to min(quota, max(0, available + held - floor)) for a
 size, held being the blocks the tier's files take (`st_blocks`). The KV of

@@ -299,18 +299,23 @@ DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &c
       throw;
     logLine("SSD cache KV storage disabled; state storage remains enabled (", error.what(), ").");
   }
-  // The volume sizes the tier before it takes anything back. A persistent
-  // tier's root holds the other caches nobody holds too.
+  // The volume sizes the tier before it takes anything back, read as the
+  // start read it to open the files, so the two agree: a persistent tier's
+  // root, which holds the other caches nobody holds too, else the temporary
+  // files' directory.
   std::vector<std::shared_ptr<model::SlotFile>> files{tier.states};
   if (tier.kv)
     files.push_back(tier.kv);
+  const std::filesystem::path directory =
+      tier.persistent.directory ? config.cacheRoot : std::filesystem::temp_directory_path();
   tier.space = std::make_unique<DiskSpace>(
       tier.budget, config.cacheDisk.automatic, std::move(files),
+      [diskVolume = config.diskVolume, directory] { return diskVolume(directory); },
       tier.persistent.directory ? std::move(otherCaches) : std::vector<CacheDirectory::Idle>{});
   reportDiskTier(*tier.space, *tier.budget, config.cacheDiskWritesPerDay,
                  tier.persistent.directory
                      ? "persistent files in " + tier.persistent.directory->path().string()
-                     : "temporary files in " + std::filesystem::temp_directory_path().string(),
+                     : "temporary files in " + directory.string(),
                  tier.kv ? kvSlotBytes : 0, stateBytes);
   return tier;
 }

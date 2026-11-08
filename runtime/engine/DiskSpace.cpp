@@ -90,18 +90,17 @@ std::string gibibytes(uint64_t bytes) {
 
 DiskSpace::DiskSpace(std::shared_ptr<model::DiskBudget> budget, bool automatic,
                      std::vector<std::shared_ptr<model::SlotFile>> files,
+                     std::function<std::optional<DiskVolume>()> readVolume,
                      std::vector<CacheDirectory::Idle> others)
     : budget_(std::move(budget)), automatic_(automatic), files_(std::move(files)),
+      readVolume_(std::move(readVolume)),
       others_(std::make_move_iterator(others.begin()), std::make_move_iterator(others.end())) {
-  if (!budget_ || files_.empty())
-    throw std::invalid_argument("a disk tier's space needs its budget and a file");
+  if (!budget_ || files_.empty() || !readVolume_)
+    throw std::invalid_argument("a disk tier's space needs its budget, a file and its volume's reader");
   measure();
 }
 
-void DiskSpace::measure() {
-  const std::optional<struct statfs> status = files_.front()->volume();
-  measure(status ? std::optional(DiskVolume::of(*status)) : std::nullopt);
-}
+void DiskSpace::measure() { measure(readVolume_()); }
 
 void DiskSpace::measure(std::optional<DiskVolume> volume) {
   const bool full = budget_->takeFullReport();

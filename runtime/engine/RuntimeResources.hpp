@@ -122,7 +122,8 @@ struct RuntimeResourcesConfig {
   // process.
   bool persistentCache = false;
   // The volume a directory lives on (volumeOf), which the automatic quota
-  // reads for each place the tier may keep its files before it opens them.
+  // reads for each place the tier may keep its files before it opens them,
+  // and the tier at each measure for the place they opened in (DiskSpace).
   std::function<std::optional<DiskVolume>(const std::filesystem::path &directory)> diskVolume =
       volumeOf;
   // Patches per image, from --max-image-patches: the engine admits images up

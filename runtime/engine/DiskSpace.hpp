@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -88,9 +89,8 @@ automaticDiskRefusal(const std::optional<DiskVolume> &volume, uint64_t heldBytes
 [[nodiscard]] std::string gibibytes(uint64_t bytes);
 
 // Keeps a disk tier within what its volume leaves it. Each measure, at every
-// control pass and when a write found the volume full, reads the volume
-// through the first file's descriptor, which names the right volume however
-// the file was made, adds the blocks the tier's files hold, and sets the
+// control pass and when a write found the volume full, reads the volume its
+// files live on, adds the blocks the tier's files hold, and sets the
 // budget's active limit (diskActiveLimitBytes) and limit, the active one for
 // a size and a quarter of the room for the automatic quota (diskLimitBytes);
 // off a local volume the quota is both. In a persistent cache's root one
@@ -109,17 +109,18 @@ automaticDiskRefusal(const std::optional<DiskVolume> &volume, uint64_t heldBytes
 class DiskSpace final {
 public:
   // The budget's quota is the automatic one (--max-cache-disk auto) or, not
-  // `automatic`, a size. The files live on one volume; `others` are the
-  // root's namespaces nobody holds (CacheDirectory::idle), oldest first, none
-  // for temporary files. Measures the volume.
+  // `automatic`, a size. The files live on one volume, which `readVolume`
+  // reads, empty when it cannot be measured; `others` are the root's
+  // namespaces nobody holds (CacheDirectory::idle), oldest first, none for
+  // temporary files. Measures the volume.
   DiskSpace(std::shared_ptr<model::DiskBudget> budget, bool automatic,
             std::vector<std::shared_ptr<model::SlotFile>> files,
+            std::function<std::optional<DiskVolume>()> readVolume,
             std::vector<CacheDirectory::Idle> others = {});
   DiskSpace(const DiskSpace &) = delete;
   DiskSpace &operator=(const DiskSpace &) = delete;
 
-  // Reads the volume through the first file and sets the limit from it.
-  // Engine thread.
+  // Reads the volume and sets the limit from it. Engine thread.
   void measure();
   // The same with a reading of the volume the caller made.
   void measure(std::optional<DiskVolume> volume);
@@ -138,6 +139,7 @@ private:
   std::shared_ptr<model::DiskBudget> budget_;
   bool automatic_;
   std::vector<std::shared_ptr<model::SlotFile>> files_;
+  std::function<std::optional<DiskVolume>()> readVolume_;
   std::deque<CacheDirectory::Idle> others_;
   uint64_t othersBytes_ = 0;
   std::optional<DiskVolume> volume_;
