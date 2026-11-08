@@ -113,6 +113,24 @@ struct DrawerTests {
         #expect(try String(contentsOf: typed, encoding: .utf8) == "|\n")
     }
 
+    /// A terminal runs a program while one other than its shell has it, not at its prompt, and one
+    /// closed runs nothing; the drawer counts them for what a quit would cut off.
+    @Test func aTerminalRunsAProgramWhileOneHasIt() async throws {
+        let (state, folder) = AppState.forTests()
+        defer { state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        state.newTerminal()
+        state.newTerminal()
+        let busy = try #require(state.drawer.terminals.first)
+        let idle = try #require(state.drawer.terminals.last)
+        #expect(state.drawer.runningPrograms == 0 && state.quitCost.message == nil)
+        _ = try await Self.run("sleep 1000", in: busy)
+        try await waitFor(busy.runsProgram, "the program to have the terminal")
+        #expect(!idle.runsProgram && state.drawer.runningPrograms == 1)
+        #expect(state.quitCost.message == "A terminal is running a program.")
+        state.drawer.close(busy.id)
+        #expect(!busy.runsProgram && state.drawer.runningPrograms == 0)
+    }
+
     /// Quitting ends every shell.
     @Test func quittingEndsEveryShell() async throws {
         let (state, folder) = AppState.forTests()

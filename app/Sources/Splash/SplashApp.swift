@@ -73,12 +73,15 @@ struct SplashApp: App {
 }
 
 /// Owns the app's state and its updates, starts them on launch, and stops the model and the
-/// downloads before the app quits, for the Quit command, the system, `kill` and an update alike.
-/// The drawer's shells end as the app does, which hangs them up (`TerminalSession`).
+/// downloads before the app quits, for the Quit command, the system, `kill` and an update alike;
+/// a quit of the user's asks first where it would cut off work (`AppState.QuitCost`). The
+/// drawer's shells end as the app does, which hangs them up (`TerminalSession`).
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let state: AppState
     let updates = Updates()
+    /// The question a quit of the user's asks.
+    private let question = QuitQuestion()
 
     override convenience init() {
         guard let runtime = Runtime.locate() else {
@@ -99,7 +102,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Quits as the Quit command does when the system or `kill` asks the app to end, without
     /// asking first.
     private var termination: DispatchSourceSignal?
-    private var signalled = false
+    /// Whether the quit under way goes ahead without asking: SIGTERM asked for it, or the user
+    /// answered the question with Quit.
+    private var quitsAtOnce = false
 
     /// SIGTERM caught by a handler that does nothing, for `termination` alone to act on. Not
     /// ignored: a program the app starts keeps a signal ignored, but not one caught, so that what
@@ -127,7 +132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Self.catchTerminate()
         termination = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         termination?.setEventHandler { [weak self] in
-            self?.signalled = true
+            self?.quitsAtOnce = true
             // From the run loop, not this main-queue block: terminating waits for the model to stop,
             // which is reported on the main queue.
             NSApp.perform(#selector(NSApplication.terminate(_:)), with: nil, afterDelay: 0)
@@ -148,15 +153,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let state = state
-        guard state.busy else { return .terminateNow }
-        if let model = state.installer.model, !signalled {
-            let alert = NSAlert()
-            alert.messageText = "Quit Splash?"
-            alert.informativeText = "\(state.displayName(of: model)) is still downloading. If you quit, the download starts over next time."
-            alert.addButton(withTitle: "Quit")
-            alert.addButton(withTitle: "Cancel")
-            guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        if asksFirst, let message = state.quitCost.message {
+            question.ask(message) { [weak self] in
+                self?.quitsAtOnce = true
+                NSApp.terminate(nil)
+            }
+            return .terminateCancel
         }
+        // A quit that goes ahead takes away a question still asking.
+        question.close()
+        guard state.busy else { return .terminateNow }
         state.quit()
         Task {
             while state.busy {
@@ -165,6 +171,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
+    }
+
+    /// Whether this quit asks first: one of the user's (`isUserQuit`) that is not to go ahead at
+    /// once (`quitsAtOnce`).
+    private var asksFirst: Bool {
+        !quitsAtOnce && Self.isUserQuit(NSAppleEventManager.shared().currentAppleEvent)
+    }
+
+    /// Whether a quit that came as `event` is the user's: one of the app's own menus and ⌘Q, which
+    /// come as no quit event, or the Dock's; not the quit event of a script, of the system as it
+    /// logs out, of an update's installer, or of a sender that cannot be told.
+    static func isUserQuit(_ event: NSAppleEventDescriptor?) -> Bool {
+        guard let event else { return true }
+        return isDock(event.attributeDescriptor(forKeyword: AEKeyword(keySenderPIDAttr))?.int32Value)
+    }
+
+    /// Whether process `pid` is the Dock.
+    static func isDock(_ pid: pid_t?) -> Bool {
+        pid.flatMap(NSRunningApplication.init(processIdentifier:))?.bundleIdentifier == "com.apple.dock"
+    }
+}
+
+/// Asks whether to quit, and quits on Quit: as a sheet of the main window where it shows, else as
+/// an alert of its own. Neither holds the app modal, as `runModal` would, which refuses the quit
+/// event of a script, and of the system as it logs out. A second quit while it asks brings it
+/// forward.
+@MainActor
+private final class QuitQuestion: NSObject {
+    private var alert: NSAlert?
+    private var quit: (() -> Void)?
+
+    func ask(_ message: String, quit: @escaping () -> Void) {
+        // The system decides whether the app comes forward: in the background, as an app the Dock
+        // quits can be, it may stay behind, and its icon bounces until it does.
+        NSApp.activate()
+        NSApp.requestUserAttention(.criticalRequest)
+        if let alert {
+            (alert.window.sheetParent ?? alert.window).makeKeyAndOrderFront(nil)
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Quit Splash?"
+        alert.informativeText = message
+        // Return chooses the first, Escape Cancel, as AppKit gives an alert's buttons.
+        for (title, action) in [("Quit", #selector(quitChosen)), ("Cancel", #selector(cancelChosen))] {
+            let button = alert.addButton(withTitle: title)
+            button.target = self
+            button.action = action
+        }
+        alert.layout()
+        self.alert = alert
+        self.quit = quit
+        if let window = NSApp.mainWindow, window.isVisible, window.attachedSheet == nil {
+            window.beginSheet(alert.window)
+        } else {
+            alert.window.center()
+            alert.window.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    @objc private func quitChosen() {
+        let quit = quit
+        close()
+        quit?()
+    }
+
+    @objc private func cancelChosen() {
+        close()
+    }
+
+    func close() {
+        guard let window = alert?.window else { return }
+        if let parent = window.sheetParent { parent.endSheet(window) } else { window.orderOut(nil) }
+        alert = nil
+        quit = nil
     }
 }
 

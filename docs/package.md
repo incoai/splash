@@ -112,8 +112,11 @@ of the server's log, folded. Its chat is its own, not the chat page: it streams
 `~/Library/Application Support/Splash/Chats`, so a conversation outlives a
 switch of models. The window's drawer, ⌘J or the toolbar's terminal button,
 holds terminals, each the user's login shell in the home folder, through
-SwiftTerm, and the server's and the downloads' logs as they are written. Its
-icon is `app/AppIcon.icon`, an Icon Composer document
+SwiftTerm, and the server's and the downloads' logs as they are written.
+Quitting stops what runs. A quit from ⌘Q, the menus or the Dock asks first
+where it would cut off requests the model is answering, a download or a program
+a terminal runs; one from a script, the system as it logs out, a signal or an
+update quits at once. Its icon is `app/AppIcon.icon`, an Icon Composer document
 `actool` compiles, which needs the full Xcode; its mark, three arcs of water
 springing from a rippled surface, is the menu bar's too (`SplashMark`), and the
 chat page's (`server/favicon.svg`). `swift test --package-path app` runs its
@@ -132,7 +135,7 @@ the release key, an EdDSA key whose public half is `SPARKLE_PUBLIC_KEY` there,
 or, to replace a lost release key, the app's Developer ID. An app built while
 `SPARKLE_PUBLIC_KEY` is empty checks for nothing. Sparkle asks on the second
 launch whether to check by itself, once a day, and installs an update by
-quitting the app as its Quit command does, which stops what runs first.
+quitting the app, which stops what runs first, without asking.
 `package_app.py` puts `Sparkle.framework` in `Contents/Frameworks` without its
 XPC services, which only a sandboxed app needs, and signs its installer, its
 progress app and the framework before the app.

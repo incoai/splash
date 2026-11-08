@@ -293,6 +293,39 @@ final class AppState {
         installer.install(model)
     }
 
+    /// What quitting now would cut off: the requests the model answers, as its last status said
+    /// (`Server.Activity.running`), or the Chat's reply as it streams; a download, which starts
+    /// over next time; and the programs the drawer's terminals run. A model that idles, sleeps,
+    /// starts or switches is no loss: quitting stops it, as it always does.
+    struct QuitCost {
+        var model: String?
+        var requests = 0
+        var download: String?
+        var programs = 0
+
+        /// A line for each loss, for the question a quit asks; nil where there is none, and the
+        /// app quits at once.
+        var message: String? {
+            var lines: [String] = []
+            if requests > 0, let model {
+                lines.append("\(model) is answering \(requests == 1 ? "a request" : "\(requests) requests").")
+            }
+            if let download {
+                lines.append("\(download) is still downloading. If you quit, the download starts over next time.")
+            }
+            if programs > 0 {
+                lines.append(programs == 1 ? "A terminal is running a program." : "\(programs) terminals are running programs.")
+            }
+            return lines.isEmpty ? nil : lines.joined(separator: "\n\n")
+        }
+    }
+
+    var quitCost: QuitCost {
+        let requests = server.phase == .ready ? max(server.activity.running, chats.streaming == nil ? 0 : 1) : 0
+        return QuitCost(model: server.model.map(displayName(of:)), requests: requests,
+                        download: installer.model.map(displayName(of:)), programs: drawer.runningPrograms)
+    }
+
     /// Stops the download, the model and the installer of cached models, which the app waits for
     /// as it quits, and the drawer's terminals, and starts nothing after. The installer of cached
     /// models gets SIGINT, as Ctrl+C sends, and SIGKILL 5 s later.

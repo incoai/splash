@@ -38,6 +38,11 @@ final class Drawer {
     func endAll() {
         terminals.forEach { $0.end() }
     }
+
+    /// How many terminals run a program besides their shell, which a quit ends (`AppState.QuitCost`).
+    var runningPrograms: Int {
+        terminals.count { $0.runsProgram }
+    }
 }
 
 extension Array {
@@ -110,6 +115,15 @@ final class TerminalSession: Identifiable {
             view.nativeBackgroundColor = NSColor.textBackgroundColor.usingColorSpace(.sRGB) ?? .textBackgroundColor
             view.caretColor = NSColor.controlAccentColor
         }
+    }
+
+    /// Whether a program other than the shell has the terminal, as a coding agent has it while it
+    /// runs: the terminal's foreground process group is not the shell's, which a shell at its
+    /// prompt holds itself.
+    var runsProgram: Bool {
+        guard !ended, view.process.shellPid != 0 else { return false }
+        let group = tcgetpgrp(view.process.childfd)
+        return group > 0 && group != view.process.shellPid
     }
 
     /// Hangs the shell up, as closing a terminal window does, which ends it and its jobs, and
