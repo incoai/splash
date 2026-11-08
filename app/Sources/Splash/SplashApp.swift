@@ -55,10 +55,6 @@ struct SplashApp: App {
                     .keyboardShortcut("2")
                     .disabled(!state.available)
             }
-            CommandMenu("Server") {
-                ServerMenuItems()
-                    .environment(state)
-            }
             CommandGroup(replacing: .help) {
                 Button("Show Server Log") { NSWorkspace.shared.open(state.server.log) }
                 Button("Show Download Log") { NSWorkspace.shared.open(state.installer.log) }

@@ -6,7 +6,8 @@ private let column: CGFloat = 640
 
 /// The Server screen, where the window opens: the models on this Mac to pick from, how they
 /// start, the suggested ones this Mac can run to download, and, under them all, what runs with
-/// Start, Stop and Switch. Models start and change only here.
+/// Start, Stop and Switch. Models start and change here and from the menu bar's panel
+/// (`MenuBarPanel`), with the same launch options and by the same rule (`AppState.canStart`).
 struct ServerView: View {
     @Environment(AppState.self) private var state
     @State private var customModel = false
@@ -244,7 +245,7 @@ private struct ControlBar: View {
                 if let model = state.selection { state.start(model) }
             }
             .buttonStyle(.borderedProminent)
-            .disabled(state.selection == nil || !state.ready || state.keyProblem != nil)
+            .disabled(state.selection == nil || !state.canStart)
         case .starting:
             Button("Cancel") { state.stop() }
         case .stopping:
@@ -254,14 +255,14 @@ private struct ControlBar: View {
                 Button("Stop") { state.stop() }
                 Button("Switch to \(state.displayName(of: selection))") { state.start(selection) }
                     .buttonStyle(.borderedProminent)
-                    .disabled(state.keyProblem != nil)
+                    .disabled(!state.canStart)
             } else {
                 AgentsPopup()
                 Button("Stop") { state.stop() }
                 if state.optionsChanged, let model = server.model {
                     Button("Restart to Apply") { state.start(model) }
                         .buttonStyle(.borderedProminent)
-                        .disabled(state.keyProblem != nil)
+                        .disabled(!state.canStart)
                 } else {
                     Button("Open Chat") { state.section = .chat }.buttonStyle(.borderedProminent)
                 }

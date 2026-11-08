@@ -114,8 +114,13 @@ final class AppState {
     /// and the Chat.
     var available: Bool { launched && blocker == nil }
 
-    /// Whether models can start and download.
+    /// Whether models can download, and start where the Keychain gives the API key (`canStart`).
     var ready: Bool { available && !quitting }
+
+    /// Whether a model can start, or the one that runs give way to another, now: the app is ready
+    /// and the Keychain gives the API key (`keyProblem`). The Server's buttons and the menu bar's
+    /// panel ask it.
+    var canStart: Bool { ready && keyProblem == nil }
 
     /// Whether the app runs something it must stop or wait for before it quits.
     var busy: Bool { server.running || installer.running || cachedInstaller != nil }
@@ -251,7 +256,7 @@ final class AppState {
 
     /// Starts `model` with the launch options, stopping the one that runs first.
     func start(_ model: String) {
-        guard ready, keyProblem == nil else { return }
+        guard canStart else { return }
         selection = model
         chats.stop()
         server.start(model, settings: options.usable(by: family(of: model)))
@@ -267,6 +272,20 @@ final class AppState {
     var stopItem: (model: String, enabled: Bool)? {
         guard server.running, let model = server.next ?? server.model else { return nil }
         return (model, !(server.phase == .stopping && server.next == nil))
+    }
+
+    /// The model the menu bar's panel checks: the one a switch goes to, else the one that starts or
+    /// serves; none while it stops or once it failed, so that choosing it starts it again.
+    var checkedModel: String? {
+        if let next = server.next { return next }
+        return server.phase == .starting || server.phase == .ready ? server.model : nil
+    }
+
+    /// What choosing `model` in the menu bar's panel does: starts it, or switches to it from the one
+    /// that runs; the one checked goes on as it is.
+    func choose(_ model: String) {
+        guard model != checkedModel else { return }
+        start(model)
     }
 
     func download(_ model: String) {

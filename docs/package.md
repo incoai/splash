@@ -72,7 +72,8 @@ the launch options picked in the app that differ from the server's defaults,
 ready once the port's lock names that process and `/health` answers; stopping
 is Ctrl+C's SIGINT to the group. Switching models stops one server and starts
 the next. The app starts nothing by itself: its window opens on the Server,
-where models download, start and switch, beside the Chat. The toolbar's switch
+where models download, start and switch, beside the Chat; the menu bar's panel
+starts and switches them too. The toolbar's switch
 opens the Chat, whose sidebar of conversations ⌘B hides, and the Server's
 button at its end the Server: it shows the model that runs, a spinner while
 one starts and a ring for a download's progress. Models, locks and

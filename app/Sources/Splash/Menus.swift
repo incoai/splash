@@ -1,39 +1,14 @@
 import SwiftUI
 
-/// Stopping the model that runs, and the coding agents on it; models start on the Server screen.
-struct ServerMenuItems: View {
-    @Environment(AppState.self) private var state
-
-    var body: some View {
-        if let stop = state.stopItem {
-            Button("Stop \(state.displayName(of: stop.model))") { state.stop() }
-                .disabled(!stop.enabled)
-        }
-        Menu("Coding Agents") { AgentMenuItems() }
-    }
-}
-
-/// The coding agents, and the address other apps reach the model at.
-struct AgentMenuItems: View {
-    @Environment(AppState.self) private var state
-
-    var body: some View {
-        Section("Open in Terminal") {
-            ForEach(Agent.allCases) { agent in
-                Button("\(agent.title)…") { state.open(agent) }
-                    .disabled(state.server.phase != .ready)
-            }
-        }
-        Divider()
-        Button("Copy API Address") { state.copyAPIAddress() }
-    }
-}
-
 /// The menu bar item's panel, in Splash's own style: what runs, with its totals while it serves,
-/// any download, then the window's two parts, stopping the model, its coding agents, and quitting.
+/// any download, then the window's two parts, the models on this Mac to run, stopping the model,
+/// its coding agents, and quitting.
 struct MenuBarPanel: View {
     @Environment(AppState.self) private var state
     @Environment(\.openWindow) private var openWindow
+    @State private var models = false
+    /// The height of the Model rows, all of them, which the panel shows up to its limit.
+    @State private var modelRows: CGFloat = 0
     @State private var agents = false
 
     var body: some View {
@@ -61,6 +36,28 @@ struct MenuBarPanel: View {
             PanelRow(title: "Open Server") { show(.server) }
             PanelRow(title: "Open Chat") { show(.chat) }
             Divider().padding(.horizontal, 8).padding(.vertical, 4)
+            if !state.installed.isEmpty {
+                PanelRow(title: "Model", open: models) { withAnimation(Motion.settle) { models.toggle() } }
+                if models {
+                    let checked = state.checkedModel
+                    // As high as the rows up to some ten of them, then scrolling, so that a long
+                    // list of models keeps the panel on the screen. A scroll view asks for no
+                    // height of its own, so the rows' is measured.
+                    ScrollView {
+                        VStack(spacing: 1) {
+                            ForEach(state.installed) { model in
+                                PanelRow(title: state.displayName(of: model.id), indent: true, check: model.id == checked) {
+                                    state.choose(model.id)
+                                }
+                                .disabled(!state.canStart)
+                            }
+                        }
+                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { modelRows = $0 }
+                    }
+                    .frame(height: min(modelRows, 280))
+                    .scrollBounceBehavior(.basedOnSize)
+                }
+            }
             if let stop = state.stopItem {
                 PanelRow(title: "Stop \(state.displayName(of: stop.model))") { state.stop() }
                     .disabled(!stop.enabled)
@@ -75,7 +72,7 @@ struct MenuBarPanel: View {
                         .buttonStyle(.hoverFlush)
                 }
             }
-            if server.running {
+            if server.running || !state.installed.isEmpty {
                 Divider().padding(.horizontal, 8).padding(.vertical, 4)
             }
             PanelRow(title: "Quit Splash", shortcut: "⌘Q") { NSApp.terminate(nil) }
@@ -113,20 +110,22 @@ struct MenuBarPanel: View {
 }
 
 /// A row of the menu bar's panel, highlighted under the pointer as the app's popups are; one that
-/// opens rows under it shows a chevron.
+/// opens rows under it shows a chevron, the one chosen of the rows under it a check.
 private struct PanelRow: View {
     let title: String
     var shortcut: String?
     var open: Bool?
     var indent = false
+    var check = false
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            PanelLabel(title: title, shortcut: shortcut, open: open, indent: indent)
+            PanelLabel(title: title, shortcut: shortcut, open: open, indent: indent, check: check)
         }
         .buttonStyle(.hoverFlush)
         .accessibilityValue(open.map { $0 ? "Expanded" : "Collapsed" } ?? "")
+        .accessibilityAddTraits(check ? .isSelected : [])
     }
 }
 

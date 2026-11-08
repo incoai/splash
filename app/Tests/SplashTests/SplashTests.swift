@@ -401,6 +401,61 @@ struct AppStateTests {
         #expect(state.installed.map(\.id) == ["owner/repo:IQ3_S", "owner/repo:Q2_0"])
         #expect(state.selection == "owner/repo:Q2_0")
     }
+
+    /// Nothing starts before the app is ready or once it quits (`canStart`). The menu bar's panel
+    /// checks the model that starts or runs, then the one a switch goes to, and none once it
+    /// failed, whether its server ended or runs on, or while it stops; choosing another starts or
+    /// switches to it, choosing the failed one starts it again, and the one checked goes on as it is.
+    @Test func thePanelStartsTheModelChosen() async throws {
+        let fake = try FakeRuntime("splash-menus", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let first = "a/First-GGUF:Q4", second = "a/Second-GGUF:Q4"
+        try fake.install(first)
+        try fake.install(second)
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        func step(_ name: String) { FileManager.default.createFile(atPath: fake.root.appending(path: name).path, contents: nil) }
+        #expect(!state.canStart)
+        state.choose(first)
+        #expect(!state.server.running)
+        await state.launch()
+        #expect(state.canStart && state.checkedModel == nil)
+        state.options["--port"] = String(fake.port)
+        // Refused by the engine, the start fails and stops: nothing is checked, and choosing the
+        // model again starts it again.
+        step("refused")
+        step("loaded")
+        state.choose(first)
+        try await waitFor(state.serverStatus.look == .failed && !state.server.running, "the refusal")
+        #expect(state.checkedModel == nil)
+        try FileManager.default.removeItem(at: fake.root.appending(path: "refused"))
+        step("warm")
+        state.choose(first)
+        #expect(state.checkedModel == first && state.selection == first)
+        try await waitFor(state.server.phase == .ready, "\(first) ready")
+        let since = state.server.since
+        state.choose(first)
+        #expect(state.server.phase == .ready && state.server.since == since)
+        state.choose(second)
+        #expect(state.checkedModel == second && state.selection == second)
+        try await waitFor(state.server.model == second && state.server.phase == .ready, "\(second) ready")
+        #expect(state.server.since > since)
+        // Its engine stopped while its server runs on, nothing is checked, and choosing the model
+        // starts it again.
+        step("broken")
+        try await waitFor(state.serverStatus.look == .failed && state.server.running, "the engine's stop")
+        #expect(state.checkedModel == nil)
+        try FileManager.default.removeItem(at: fake.root.appending(path: "broken"))
+        let broken = state.server.since
+        state.choose(second)
+        try await waitFor(state.server.phase == .ready && state.server.since > broken, "\(second) ready again")
+        state.stop()
+        #expect(state.checkedModel == nil)
+        state.quit()
+        #expect(!state.canStart)
+        state.choose(first)
+        #expect(state.server.next == nil)
+    }
 }
 
 struct ServerTests {
@@ -855,12 +910,8 @@ struct ModelFamilyTests {
         try #"print('{"Flint": {"unusable": ["--state-format"], "context_tokens": 262144, "max_context_tokens": 262144}}')"#
             .write(to: runtime.root.appending(path: "install/families.py"), atomically: true, encoding: .utf8)
         let flint = "a/Flint-GGUF:Q4", other = "a/Other-GGUF:Q4"
-        for (model, family) in [(flint, "Flint"), (other, "Other")] {
-            let link = runtime.models.appending(path: model)
-            try FileManager.default.createDirectory(at: link, withIntermediateDirectories: true)
-            try #"{"model": "\#(model)", "family": "\#(family)", "files": {}}"#
-                .write(to: link.appending(path: "model.json"), atomically: true, encoding: .utf8)
-        }
+        try fake.install(flint, family: "Flint")
+        try fake.install(other, family: "Other")
         let state = fake.state(keychain: Keychain(service: "Splash Tests"))
         defer { state.quit() }
         #expect(state.family(of: flint) == .unknown)
