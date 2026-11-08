@@ -716,6 +716,111 @@ class RippleFormatTests(unittest.TestCase):
         )
 
 
+class RippleToolOutputTests(unittest.TestCase):
+    """Ripple's calls, read and constrained: one JSON object of the call's
+    name and arguments between the call tags as text, streamed whole and in
+    pieces, and a grammar that generates them."""
+
+    def policy(self, strict=False, choice="auto"):
+        schemas = {
+            "time": {"type": "object", "properties": {}},
+            "weather": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": name, "parameters": schema, "strict": strict},
+            }
+            for name, schema in schemas.items()
+        ]
+        return tool_schema.normalize_tools(tools, choice, True)[1]
+
+    def call_text(self, name, arguments):
+        return (
+            TOOL_CALL_OPEN
+            + '\n{"name": "'
+            + name
+            + '", "arguments": '
+            + json.dumps(arguments)
+            + "}\n"
+            + TOOL_CALL_CLOSE
+        )
+
+    def test_a_call_is_read_whole_and_in_pieces(self):
+        policy = self.policy()
+        text = self.call_text("time", {})
+        for size in (None, 3, 40):
+            with self.subTest(size=size):
+                content, calls, _ = project(text, policy, syntax=RIPPLE.call_syntax, size=size)
+                self.assertEqual(content, "")
+                self.assertEqual(
+                    calls,
+                    [
+                        {
+                            "id": calls[0]["id"],
+                            "type": "function",
+                            "function": {"name": "time", "arguments": "{}"},
+                        }
+                    ],
+                )
+
+    def test_an_argument_streams_as_it_is_written(self):
+        policy = self.policy()
+        text = self.call_text("weather", {"city": "Paris"})
+        _, _, events = project(text, policy, syntax=RIPPLE.call_syntax, size=5)
+        arguments = "".join(
+            event["function"].get("arguments", "")
+            for kind, event in events
+            if kind == "tool" and "function" in event
+        )
+        self.assertEqual(json.loads(arguments), {"city": "Paris"})
+
+    def test_a_cut_call_keeps_its_arguments(self):
+        policy = self.policy()
+        text = self.call_text("weather", {"city": "Paris"})
+        # Cut after the arguments' JSON value and its close, before the call's.
+        cut = text[: text.index("}") + 2]
+        content, calls, _ = project(cut, policy, syntax=RIPPLE.call_syntax, incomplete=True)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"city": "Paris"})
+
+    def test_the_grammar_generates_a_call(self):
+        tokenizer = ripple_tokenizer()
+        factory = constraints.ConstraintFactory(tokenizer, ripple_format(tokenizer))
+        grammar = tool_schema.tool_grammar(
+            self.policy(strict=True, choice="required"),
+            False,
+            chat_format=ripple_format(tokenizer),
+        )
+        matcher = factory.create(grammar).matcher
+        text = self.call_text("weather", {"city": "Paris"})
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        self.assertTrue(matcher.consume_tokens(tokens), matcher.get_error())
+        self.assertTrue(matcher.is_accepting())
+
+    def test_the_grammar_takes_the_reasoning_first(self):
+        tokenizer = ripple_tokenizer()
+        chat_format = ripple_format(tokenizer)
+        factory = constraints.ConstraintFactory(tokenizer, chat_format)
+        grammar = tool_schema.tool_grammar(
+            self.policy(choice="auto"), False, chat_format=chat_format
+        )
+        matcher = factory.create(grammar).matcher
+        text = (
+            THINK_START
+            + "\nWe need the time.\n"
+            + THINK_END
+            + "\n"
+            + self.call_text("time", {})
+        )
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        self.assertTrue(matcher.consume_tokens(tokens), matcher.get_error())
+        self.assertTrue(matcher.is_accepting())
+
+
 class FlintPromptTests(unittest.TestCase):
     """Flint's template renders as shipped: its roles, its tools block, the
     reasoning and calls of a history, and a generation prompt that leaves

@@ -214,7 +214,7 @@ RIPPLE = ChatFormat(
         key_close="",
         value_open="",
         value_close="",
-        arguments_close="}\n" + TOOL_CALL_CLOSE,
+        arguments_close="}\n",
         tags_are_tokens=False,
         json_arguments=True,
     ),
