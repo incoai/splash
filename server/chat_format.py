@@ -203,7 +203,7 @@ FLINT = ChatFormat(
 # JSON value.
 RIPPLE = ChatFormat(
     vocabulary=100352,
-    stop_tokens=(("<|im_end|>", 100265), ("<|endoftext|>", 100257)),
+    stop_tokens=(("<|im_end|>", 100265), ("<|endofprompt|>", 100257)),
     think_end_id=None,
     think_start_id=None,
     call_open_id=None,
