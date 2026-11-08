@@ -1622,6 +1622,19 @@ waits while what it reached or started lands, and is `Short` otherwise. A
 refusal of KV counts the free pages of its form as its own: the ledger never
 releases their extent for it, which it would only allocate again.
 
+The log has a line for each decision of a request's claim
+(`Memory: <class> claim of request N needs ...`) that waits, is short, is
+met past the host or takes a unit from step 5 of the
+[take order](#memory-rules) on, with what it took, once for each kind of need
+until an allocation of the claim is granted; a claim of no request logs each
+take. A request's claim met by the room or by steps 1 to 4 alone, the met
+that does not hold a pool's regrowth back ([above](#memory-rules)), logs
+only once the claim logged since that grant, so that a wait the log shows
+ends there: a decode taking each next page from the cache logged such a met
+1-2 times a second through a long reply. `/status` shows the cache's pages
+(`kv.pages_cache`), its evicted states (`state.evictions`) and the pools'
+shrinks (`memory_governor.accounts`).
+
 A claim for memory nothing needs yet, such as the Index runway's refill with
 no Spill lane in service, takes only what costs nothing. Pages whose copies
 landed leave memory at every point between commands where memory is judged,

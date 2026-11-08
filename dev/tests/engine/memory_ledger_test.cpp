@@ -2056,22 +2056,54 @@ void testPoolFloorBoundsEveryTake() {
   }
 }
 
-// Each decision logs one line; a retry that decides the same again logs nothing.
+// A logged decision logs one line, a met one with what it took; a retry that decides the same again logs nothing.
 void testEachDecisionLogsOneLine() {
+  FakeMemory memory({});
+  FakeElasticPool experts("experts", memory, kGiB, 0, 1, 1, 1);
   MemoryLedger ledger;
   std::vector<std::string> lines;
   ledger.setDecisionLog([&](std::string_view line) { lines.emplace_back(line); });
-  TestSource cache("cache");
-  cache.units = {unit(1, kGiB)};
-  ledger.addSource(cache);
+  ledger.addPool(experts);
   const ClaimId claim = ledger.open(request(4, RequestPriority::Normal));
   static_cast<void>(ledger.free(claim, {.bytes = kGiB}, 0, false));
   static_cast<void>(ledger.free(claim, {.bytes = kGiB}, 0, false));
   static_cast<void>(ledger.free(claim, {.bytes = kGiB}, 0, false));
   require(lines.size() == 2 && lines[0].find("request 4") != std::string::npos &&
-              lines[0].find(": met, took cache") != std::string::npos &&
+              lines[0].find(": met, took experts unit") != std::string::npos &&
               lines[1].find(": short") != std::string::npos,
           "the decisions were not logged once each: " + (lines.empty() ? std::string() : lines[0]));
+}
+
+// A request's claim met from cache logs nothing while it logged nothing since its last grant: a decode that took
+// each next page from the cache, a cached page of a kept extent, logged a line a page, 1-2 a second through a whole
+// reply. Such a met marks no outcome logged, so the same need met next by a store chunk, which costs work later,
+// logs its take.
+void testARequestMetFromCacheLogsNothing() {
+  FakeMemory memory({});
+  FakeElasticPool experts("experts", memory, kGiB, 0, 1, 1, 1);
+  MemoryLedger ledger;
+  std::vector<std::string> lines;
+  ledger.setDecisionLog([&](std::string_view line) { lines.emplace_back(line); });
+  TestSource cache("cache");
+  for (uint64_t key = 1; key <= 8; ++key)
+    cache.units.push_back({.key = key, .pages = 1});
+  ledger.addSource(cache);
+  ledger.addPool(experts);
+  const ClaimId claim = ledger.open(request(17, RequestPriority::Normal));
+  const Need page{.bytes = 130 * kMiB, .pages = 1};
+  for (int taken = 0; taken < 8; ++taken) {
+    if (taken)
+      ledger.granted(claim);
+    require(ledger.free(claim, page, 0, false).outcome == FreeOutcome::Met,
+            "a page the cache holds did not meet the decode's next page");
+  }
+  require(cache.taken.size() == 8 && lines.empty(),
+          "a request's claim met from cache logged " + std::to_string(lines.size()) +
+              " lines: " + (lines.empty() ? std::string() : lines[0]));
+  require(ledger.free(claim, page, 0, false).outcome == FreeOutcome::Met && lines.size() == 1 &&
+              lines[0].find(": met, took experts unit") != std::string::npos,
+          "a met from cache hid the store chunk the same need took next: " +
+              (lines.empty() ? std::string() : lines[0]));
 }
 
 // A claim that flips between waiting for what lands and short of it as
@@ -2105,21 +2137,18 @@ void testARetryBackToALoggedOutcomeLogsNothing() {
 }
 
 // A need the host refused that nothing in place meets is met past the host
-// (the host exemption) and its line says so, once, after a need of the
-// claim met before: logged short, or not at all, a prefill the host refused
-// every extent of read as short for 67 s while it ran.
+// (the host exemption) and its line says so, once across its retries:
+// logged short, a prefill the host refused every extent of read as short
+// for 67 s while it ran.
 void testAHostExemptionLogsMetPastTheHost() {
   Fixture fixture(host(32 * kGiB), 16 * kGiB);
   std::vector<std::string> lines;
   fixture.ledger().setDecisionLog([&](std::string_view line) { lines.emplace_back(line); });
   const ClaimId claim = fixture.ledger().open(request(4, RequestPriority::Normal));
-  require(fixture.governor->free(claim, {.bytes = 128 * kMiB}).outcome == FreeOutcome::Met,
-          "a need the room holds was not met");
   for (int retry = 0; retry < 3; ++retry)
     require(fixture.governor->free(claim, {.bytes = 128 * kMiB, .hostRefused = true}).outcome == FreeOutcome::Met,
             "a refused need of work in service was not met past the host");
-  require(lines.size() == 2 && lines[0].find(": met") != std::string::npos &&
-              lines[1].find(": met past the host") != std::string::npos,
+  require(lines.size() == 1 && lines[0].find(": met past the host") != std::string::npos,
           "the host exemption did not log one met line: " + (lines.empty() ? std::string() : lines.back()));
 }
 
@@ -2285,7 +2314,7 @@ void testWarningRegrowsAUnitTheCacheFundsBeyondTheLack() {
 }
 
 // A bytes need beside buffers no state can give is met by the bytes of the states it evicts, which leave the
-// model's pool; its decision says it lacks such a buffer, not a count of them.
+// model's pool; its retry's decision, short once they went, says it lacks such a buffer, not a count of them.
 void testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes() {
   MemoryLedger ledger;
   std::vector<std::string> lines;
@@ -2301,9 +2330,11 @@ void testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes() {
   require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 64 * kMiB &&
               cache.taken == std::vector<uint64_t>{1} && !pool.idle,
           "the evicted state's buffers stayed in the pool for a need no state meets in place");
+  require(ledger.free(claim, {.bytes = 48 * kMiB, .unheldStateBuffer = true}, 0, false).outcome == FreeOutcome::Short,
+          "a need with no state left to evict was not short");
   require(lines.size() == 1 && lines[0].find(", a state buffer no cached state holds") != std::string::npos &&
               lines[0].find("4294967295") == std::string::npos,
-          "the decision did not say the need lacks a buffer no cached state holds: " +
+          "the need did not log its short alone, saying it lacks a buffer no cached state holds: " +
               (lines.empty() ? std::string() : lines[0]));
 }
 
@@ -2409,6 +2440,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testALaggingHostReadingTakesNoSecondRelease", testALaggingHostReadingTakesNoSecondRelease},
       {"testPoolFloorBoundsEveryTake", testPoolFloorBoundsEveryTake},
       {"testEachDecisionLogsOneLine", testEachDecisionLogsOneLine},
+      {"testARequestMetFromCacheLogsNothing", testARequestMetFromCacheLogsNothing},
       {"testARetryBackToALoggedOutcomeLogsNothing", testARetryBackToALoggedOutcomeLogsNothing},
       {"testAHostExemptionLogsMetPastTheHost", testAHostExemptionLogsMetPastTheHost},
       {"testTheOrderTakesCacheThenRebuiltPoolsThenConversionsThenTheStore",

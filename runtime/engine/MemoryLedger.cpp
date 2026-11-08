@@ -688,7 +688,8 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
   // restarts the pools' wait to regrow: a unit regrown now would go back to
   // its next claim. One met from cache does not, or requests arriving every
   // few seconds would keep the pools from ever regrowing.
-  if (spec.requestId && (result.outcome != FreeOutcome::Met || (run && run->costly)))
+  const bool metFromCache = result.outcome == FreeOutcome::Met && !(run && run->costly);
+  if (spec.requestId && !metFromCache)
     quietSinceSeconds_ = nowSeconds_;
   // Met past the host on its retry, the line says so: logged short, a
   // prefill whose every extent the host refused read as short for 67 s
@@ -698,16 +699,19 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
     claim.hostExempt = true;
     result.outcome = FreeOutcome::Met;
   }
-  // One line per decision of a request's claim, with what its units took:
-  // an outcome, or a need met past the host, once for each kind of need
-  // since the claim's last grant. A retry back to a decision logged since
-  // then logs nothing, whatever it took and however much the need still
-  // lacks: a claim that flips between short and pending as copies land
-  // logged 669 lines in one second, and one whose pages came a page at a
-  // time a pair of lines a page (5,216 of a run's 5,812). A claim of no
-  // request logs each take.
-  bool logs = run.has_value();
-  if (spec.requestId) {
+  // A request's claim logs its decisions, with what their units took: an
+  // outcome, or a need met past the host, once for each kind of need since
+  // the claim's last grant. A retry back to a decision logged since then
+  // logs nothing, whatever it took and however much the need still lacks: a
+  // claim that flips between short and pending as copies land logged 669
+  // lines in one second, and one whose pages came a page at a time a pair
+  // of lines a page (5,216 of a run's 5,812). Nor does a met from cache
+  // unless the claim logged since that grant, so that a wait the log shows
+  // ends there: a decode that took each next page from the cache logged a
+  // line a page, 1-2 a second through a whole reply. A claim of no request
+  // logs each take.
+  bool logs = spec.requestId ? !metFromCache || !claim.logged.empty() : run.has_value();
+  if (spec.requestId && logs) {
     const auto bit = static_cast<uint8_t>(1U << (exempted ? 3U : static_cast<unsigned>(result.outcome)));
     const ClaimState::Logged::Lack lack{.bytes = need.bytes != 0,
                                         .hostRefused = need.hostRefused,
