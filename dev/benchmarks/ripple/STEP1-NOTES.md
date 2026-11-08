@@ -332,3 +332,24 @@ layout drops its windowed mask (a one-region page cannot hold a windowed
 layer's region), and the engine's memory plan carries the family's own
 prefill scratch, which the audit counted against the plan it did not
 know.
+
+## The runtime's own numbers (SPLASH_SERVE_BENCH, M5 Max)
+
+The served path's costs, measured black-box through the model runtime (the
+draft proposes, the target verifies; the AD-Q4_K_M target and the DFlash2
+draft, 42.8 GB of weights together):
+
+- prefill 32 tokens: 0.127 s (253 tok/s); 128: 0.40 s (317); 512: 1.20 s
+  (428); 2048: 4.88 s (420). Long prefill is compute-bound at about 55
+  effective TFLOPS (65B × 2 FLOPs per token); the short chunk's 0.127 s
+  sits about 1.7× over the memory floor of one pass over the weights
+  (42.8 GB at the machine's 546 GB/s is 78 ms).
+- decode: mean cycle 0.111 s at a 96-token budget (57.5 tok/s, 4.2 tokens
+  a cycle, 78% accepted), 0.097 s at a 192-token one (73.2 tok/s, 4.9 a
+  cycle, 87.8% accepted over 27 cycles). One cycle reads the whole 42.8 GB
+  once: 386-441 GB/s effective, 70-80% of the machine's bandwidth — the
+  headroom is real but bounded, and the acceptance is the bigger lever
+  (each accepted row is bandwidth the target did not spend).
+
+Earlier "12x off the ceiling" figures from the server's TTFT were the
+HTTP path's own overheads, not the runtime's.
