@@ -394,6 +394,23 @@ planes, 4 bits in groups of 64 as MLX's affine quantization rounds them, and
 copies every other tensor as stored. The draft runs on the block kernels its
 target's projections run on.
 
+### Tree verify
+
+`--verify-tree on` (default `off`) lets a single-request decode cycle of the
+dense target with a hidden size of 5120 (Qwen3.8-27B) verify sixteen rows instead of eight:
+the draft's chain plus the likeliest alternatives its selector ranks, as a tree
+of at most four leaves. A greedy request commits the longest path whose tokens
+are the target's own argmax at each node. A sampled request draws a token at
+each node from the target's distribution, with one uniform per node, and
+follows the child that matches: each committed token is a fresh draw from its
+conditional distribution, so the output keeps the distribution of the chain
+verify (a greedy request's output matches it but for the rounding of the
+wider kernels). The cycle costs 1-6% more GPU time and commits about 12% more
+tokens on code and prose, so decoding runs 5-10% faster there, and a cycle
+whose recent average already keeps 6.5 or more rows takes the eight-row path.
+Requests that penalize, constrain, think under a budget or carry images, and
+cycles beside other requests, take the chain path.
+
 ## Vision
 
 Vision comes from the target repository: MLX's `vision_tower.*` tensors (or

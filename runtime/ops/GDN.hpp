@@ -144,6 +144,7 @@ public:
   // Also writes the out-projection's `input` table into
   // buffers.linearScratch when it is not Plain, and throws when the scratch
   // cannot hold it.
+  static void addResearchWideDecode(metal::CommandGraph &graph,GdnDecodeBuffers buffers,GdnShape shape,uint32_t layer,GdnStateStrides state,GdnHeadOrder order,metal::MetalBuffer tree,metal::MetalBuffer wideTape);
   static PreparedInput addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                                  GdnShape shape, uint32_t lanes, uint32_t layer,
                                  GdnStateStrides state,

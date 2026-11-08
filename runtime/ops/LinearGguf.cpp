@@ -165,14 +165,24 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
       : LinearScratchSize{};
 }
 
-LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerFormats) const {
+LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerFormats, uint32_t researchPhysicalRows) const {
+  // Research wide tree: the one-lane plan and configuration, sixteen physical rows.
+  const auto scratch = [&](LinearConfig c) {
+    auto physical = w;
+    if (researchPhysicalRows) {
+      physical.rows = researchPhysicalRows;
+      physical.researchFloatMathRows = w.rows;
+      c.sixteenRows = false;
+    }
+    return LinearPlan(physical, c).scratchSize();
+  };
   // Every format the register tile takes K inputs in has one register plan,
   // whose partitions keep whole coefficient units of each (kRegisterTiers);
   // a projection of segments the tile does not take has none. One lane on the
   // 16-row tile runs unsplit, without partials.
   LinearScratchSize size;
   for (const LinearConfig &config : decodeConfigurations(calibration_, w, registerFormats))
-    size.include(LinearPlan(w, config).scratchSize());
+    size.include(scratch(config));
   return size;
 }
 
@@ -410,7 +420,7 @@ void Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffer
   for (const QuantizedSegment &s : p.blocks().segments)
     if (s.isFloat())
       addGgufFloat(graph, b.input, s, b.output, w.rows, w.matrix.outputSize, s.columnOffset, plan.destination(),
-                   ggufFloatTile(w.rows, s.outputSize, s.formatId));
+                   ggufFloatTile(w.researchFloatMathRows?w.researchFloatMathRows:w.rows, s.outputSize, s.formatId));
 }
 
 FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize, uint32_t formatId) const noexcept {

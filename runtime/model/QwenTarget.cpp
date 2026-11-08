@@ -187,6 +187,7 @@ QwenTarget::VerifyStep QwenTarget::verifyStep(metal::CommandGraph &graph, const 
                                                               {.windowTokens = window}));
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
     step.moe = operators_.moeDecode(geometry_.moeBlockShape(), geometry_.moeFormats, lanes);
+  if(buffers.researchWideTree){if(lanes!=1)throw std::logic_error("wideB1only");step.rows=16;}
   return step;
 }
 
@@ -291,18 +292,15 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
                    b.linearScratch, std::move(output.rows), std::move(output.residual));
 }
 
-ops::LinearInput QwenTarget::decodeInput(const ops::Projection &projection, uint32_t lanes) const {
-  return operators_.linear().decodePlan(projection, lanes).input();
+ops::LinearPlan QwenTarget::projectionPlan(const ops::Projection &p,uint32_t lanes,ops::LinearEpilogue epilogue,const ops::Projection *gate,bool wide) const {
+ const auto &linear=operators_.linear();if(!wide)return linear.decodePlan(p,lanes,epilogue,gate);
+ if(lanes!=1||p.rotation||(gate&&gate->rotation))throw std::logic_error("unsupportedwideprojection");
+ const auto original=linear.decodePlan(p,1,epilogue,gate);auto w=original.workload();w.rows=16;w.researchFloatMathRows=8;auto c=original.configuration();c.sixteenRows=false;
+ return ops::Linear::plan(w,c,original.destination());
 }
-
-void QwenTarget::addDecodeProjection(metal::CommandGraph &graph, metal::MetalBuffer input,
-                                     const ops::Projection &projection, metal::MetalBuffer output, uint32_t lanes,
-                                     ops::LinearScratch scratch, ops::PreparedInput prepared) const {
-  const ops::Linear &linear = operators_.linear();
-  linear.add(graph,
-             {.input = std::move(input), .output = std::move(output), .scratch = scratch,
-              .prepared = std::move(prepared)},
-             projection, linear.decodePlan(projection, lanes));
+ops::LinearInput QwenTarget::decodeInput(const ops::Projection &p,uint32_t lanes,bool wide) const {return projectionPlan(p,lanes,ops::LinearEpilogue::None,nullptr,wide).input();}
+void QwenTarget::addDecodeProjection(metal::CommandGraph &graph,metal::MetalBuffer input,const ops::Projection &p,metal::MetalBuffer output,uint32_t lanes,ops::LinearScratch scratch,ops::PreparedInput prepared,bool wide) const {
+ operators_.linear().add(graph,{.input=std::move(input),.output=std::move(output),.scratch=scratch,.prepared=std::move(prepared)},p,projectionPlan(p,lanes,ops::LinearEpilogue::None,nullptr,wide));
 }
 
 // Each producer emits the table (if any) its consumer's plan reads.
@@ -312,16 +310,12 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, o
   const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.gdnLayer++;
   addDecodeProjection(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, step.lanes, b.linearScratch,
-                      std::move(normalized));
-  const ops::LinearPlan outputPlan = linear.decodePlan(
-      mixer.outputProjection, step.lanes, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
-  const ops::PreparedInput hidden = ops::GDN::addDecode(
-      step.graph,
-      {b.gdnPacked, mixer.convolutionWeights, b.currentGdnStates, b.nextGdnStates, b.gdnTape,
-       std::span(b.gdnTapeLanes).first(step.lanes), mixer.decay, mixer.timeBias, mixer.mixerNorm, b.gdnHidden,
-       b.linearScratch},
-      geometry_.gdnShape(), step.lanes, layer, geometry_.stateLayout.strides(),
-      mixer.outputHeadOrder, outputPlan.input());
+                      std::move(normalized),bool(b.researchWideTree));
+  const ops::LinearPlan outputPlan = projectionPlan(mixer.outputProjection,step.lanes,output.residual?ops::LinearEpilogue::Residual:ops::LinearEpilogue::None,nullptr,bool(b.researchWideTree));
+  ops::GdnDecodeBuffers mixerBuffers{b.gdnPacked,mixer.convolutionWeights,b.currentGdnStates,b.nextGdnStates,b.gdnTape,std::span(b.gdnTapeLanes).first(step.lanes),mixer.decay,mixer.timeBias,mixer.mixerNorm,b.gdnHidden,b.linearScratch};
+  ops::PreparedInput hidden;
+  if(b.researchWideTree)ops::GDN::addResearchWideDecode(step.graph,std::move(mixerBuffers),geometry_.gdnShape(),layer,geometry_.stateLayout.strides(),mixer.outputHeadOrder,b.researchWideTree,b.researchWideGdnTape);
+  else hidden=ops::GDN::addDecode(step.graph,std::move(mixerBuffers),geometry_.gdnShape(),step.lanes,layer,geometry_.stateLayout.strides(),mixer.outputHeadOrder,outputPlan.input());
   linear.add(step.graph,
              {.input = b.gdnHidden, .output = std::move(output.rows), .residual = std::move(output.residual),
               .scratch = b.linearScratch, .prepared = hidden},
@@ -339,7 +333,9 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
   const uint32_t layer = step.attentionLayer++;
   const ops::AttentionVariant variant = geometry_.attentionVariant(layer);
   addDecodeProjection(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.lanes, b.linearScratch,
-                      std::move(normalized));
+                      std::move(normalized),bool(b.researchWideTree));
+  if(b.researchWideTree)ops::PagedAttention::addPrefillProjection(step.graph,b.fullPacked,mixer.queryNorm,mixer.keyNorm,b.ropeCos,b.ropeSin,b.fullQueries,b.chunkKeys[layer],b.chunkValues[layer],16,32,geometry_.attentionQueryHeads,geometry_.kvLayout,variant);
+  else
   ops::PagedAttention::addVerifyProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos,
                                            b.ropeSin, b.fullQueries, b.chunkKeys[layer], b.chunkValues[layer],
                                            geometry_.attentionQueryHeads, geometry_.kvLayout, step.lanes, variant);
@@ -350,12 +346,13 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
   }
   ops::PagedAttention::addVerify(step.graph, step.kvLayers[layer],
                                  {b.chunkKeys[layer], b.chunkValues[layer], b.fullQueries, b.attentionPartials,
-                                  b.attentionStatistics, b.fullAttention, b.pageTables, mixer.sinks},
+                                  b.attentionStatistics, b.fullAttention, b.pageTables, mixer.sinks, b.researchTreeScratch,b.researchWideTree},
                                  step.chunks, variant.windowTokens ? *step.windowedAttention : step.attention,
                                  attended);
-  const ops::LinearPlan outputPlan = linear.decodePlan(
-      mixer.outputProjection, step.lanes, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
-  const ops::PreparedInput hidden = ops::PagedAttention::addVerifyGate(
+  const ops::LinearPlan outputPlan = projectionPlan(mixer.outputProjection,step.lanes,output.residual?ops::LinearEpilogue::Residual:ops::LinearEpilogue::None,nullptr,bool(b.researchWideTree));
+  ops::PreparedInput hidden;
+  if(b.researchWideTree)ops::PagedAttention::addPrefillGate(step.graph,b.fullPacked,b.fullAttention,b.attentionHidden,16,32,geometry_.attentionQueryHeads,geometry_.kvLayout);
+  else hidden= ops::PagedAttention::addVerifyGate(
       step.graph, b.fullPacked, b.fullAttention, b.attentionHidden, geometry_.attentionQueryHeads,
       geometry_.kvLayout, step.lanes, b.linearScratch, outputPlan.input());
   linear.add(step.graph,
@@ -390,7 +387,7 @@ void QwenTarget::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &nor
   const QwenTargetVerifyBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
   const ops::LinearPlan gateUpPlan =
-      linear.decodePlan(*ffn.up, step.lanes, ops::LinearEpilogue::GateUp, ffn.gate);
+      projectionPlan(*ffn.up,step.lanes,ops::LinearEpilogue::GateUp,ffn.gate,bool(b.researchWideTree));
   const ops::PreparedInput normalized =
       ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, step.rows,
                                  b.linearScratch, gateUpPlan.input());
@@ -401,7 +398,7 @@ void QwenTarget::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &nor
   linear.add(step.graph,
              {.input = b.denseIntermediate, .output = std::move(output), .residual = std::move(residual),
               .scratch = b.linearScratch},
-             *ffn.down, linear.decodePlan(*ffn.down, step.lanes, ops::LinearEpilogue::Residual));
+             *ffn.down, projectionPlan(*ffn.down,step.lanes,ops::LinearEpilogue::Residual,nullptr,bool(b.researchWideTree)));
 }
 
 void QwenTarget::addVerifyMoe(VerifyStep &step, const ops::NormWeights &norm, const ops::BlockMoeWeights &ffn,
@@ -414,12 +411,12 @@ void QwenTarget::addVerifyMoe(VerifyStep &step, const ops::NormWeights &norm, co
 
 void QwenTarget::addNormalizedHead(metal::CommandGraph &graph, const ops::NormWeights &finalNorm,
                                    metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
-                                   metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const {
+                                   metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch,bool wide) const {
   const ops::PreparedInput normalized =
       ops::Normalization::addRms(graph, std::move(hidden), finalNorm, finalHidden, geometry_.hiddenSize,
-                                 lanes * kVerifyRows, scratch, decodeInput(vocabularyProjection(), lanes));
+                                 (wide?16:lanes*kVerifyRows), scratch, decodeInput(vocabularyProjection(),lanes,wide));
   addDecodeProjection(graph, std::move(finalHidden), vocabularyProjection(), std::move(logits), lanes, scratch,
-                      normalized);
+                      normalized,wide);
 }
 
 void QwenTarget::addCapture(metal::CommandGraph &graph, uint32_t slot, metal::MetalBuffer output,
@@ -477,7 +474,7 @@ public:
           [&](const auto &mixer) {
             const ops::PreparedInput normalized = ops::Normalization::addRms(
                 step.graph, input, layer.inputNorm, buffers.normalized, geometry_.hiddenSize, step.rows,
-                buffers.linearScratch, decodeInput(mixer.inputProjection, step.lanes));
+                buffers.linearScratch, decodeInput(mixer.inputProjection,step.lanes,bool(buffers.researchWideTree)));
             const BlockOutput block{mixerOutput(buffers, mixer), input};
             addVerifyMixer(step, mixer, normalized, block);
             return block.rows;
@@ -488,6 +485,8 @@ public:
         addCapture(step.graph, *slot, output, 0, buffers.capturedTargetHidden, 0, step.rows);
     }
     requireLayerPartition(step.gdnLayer, step.attentionLayer);
+    if(buffers.researchWideTree)addNormalizedHead(step.graph,weights_.finalNorm,buffers.hidden[geometry_.layers&1],buffers.finalHidden,buffers.logits,step.lanes,buffers.linearScratch,true);
+    else
     addHeadBatch(step.graph, buffers.hidden[geometry_.layers & 1], buffers.finalHidden, buffers.logits, step.lanes,
                  buffers.linearScratch);
   }

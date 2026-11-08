@@ -198,16 +198,21 @@ void Sampling::addInitial(metal::CommandGraph &graph,
 void Sampling::addVerify(metal::CommandGraph &graph,
                          std::span<const SamplingPolicy> policies,
                          SamplingBuffers buffers, const StopTokens &stopTokens,
-                         const PenaltyTable &penalties) const {
+                         const PenaltyTable &penalties, bool treeRows) const {
   if (policies.empty() || policies.size() > kMaximumLanes)
     throw std::invalid_argument("invalid sampling batch width");
-  // Verify row r of a lane reads mask row r + 1 and, below the last row,
+  // A tree's rows are independent nodes: each draws its own sampled token from
+  // its distribution with its own uniform (ACCEPTANCE + row) and follows no
+  // draft token; acceptance matches the draws to the tree's children.
+  // Otherwise verify row r of a lane reads mask row r + 1 and, below the last row,
   // follows draft token r; every row draws with the lane's correction
   // uniform.
   const TargetSamplingParams params =
-      selection(policies, buffers,
-                {SPLASH_TARGET_VERIFY_ROWS, 0, 1, SPLASH_UNIFORM_CORRECTION, SPLASH_DRAFT_PROPOSAL_TOKENS},
-                stopTokens);
+      treeRows ? selection(policies, buffers, {SPLASH_TARGET_VERIFY_ROWS, 0, 1, SPLASH_UNIFORM_ACCEPTANCE, 0, 1},
+                           stopTokens)
+               : selection(policies, buffers,
+                           {SPLASH_TARGET_VERIFY_ROWS, 0, 1, SPLASH_UNIFORM_CORRECTION, SPLASH_DRAFT_PROPOSAL_TOKENS},
+                           stopTokens);
   addPenalties(graph, policies, buffers, penalties, 0, true);
   addSelection(graph, params, policies, buffers);
 }
@@ -223,6 +228,7 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
   params.mask_row = rows.maskRow;
   params.uniform = rows.uniform;
   params.drafted_rows = rows.draftedRows;
+  params.uniform_stride = rows.uniformStride;
   std::ranges::copy(stopTokens.ids, params.stop_tokens);
   for (uint32_t lane = 0; lane < policies.size(); ++lane) {
     const SamplingPolicy &policy = policies[lane];
@@ -267,7 +273,7 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
   requireBytes(buffers.vocabularyArrivals, sampled.vocabularyArrivalsBytes, "sampling arrival");
   if (sampledLanes) {
     const uint64_t last = sampledLanes - 1, drafted = std::min(rows.rows, rows.draftedRows);
-    requireBytes(buffers.uniforms, (last * SPLASH_SAMPLING_UNIFORMS + rows.uniform + 1) * sizeof(float),
+    requireBytes(buffers.uniforms, (last * SPLASH_SAMPLING_UNIFORMS + rows.uniform + (rows.rows - 1) * rows.uniformStride + 1) * sizeof(float),
                  "sampling uniform");
     // A drafted row reads its draft token, the next verify input row, and
     // its proposal position's candidates.

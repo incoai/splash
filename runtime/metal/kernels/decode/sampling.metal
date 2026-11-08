@@ -916,7 +916,8 @@ kernel void decode_sample_vocabulary_draw(
           drafted ? input_tokens[s + 1] : 0u,
           draft_ids + position * kDraftCandidates,
           draft_probabilities + position * kDraftCandidates,
-          uniforms[ulong(batch) * SPLASH_SAMPLING_UNIFORMS + params.uniform],
+          uniforms[ulong(batch) * SPLASH_SAMPLING_UNIFORMS + params.uniform +
+                   index * params.uniform_stride],
           ranges + ulong(s) * kVocabularyRanges, arrivals + s,
           group % kVocabularyGroups, scratch, thread_index, lane, simd_group,
           token, draft_probability) &&

@@ -2,6 +2,7 @@
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/PagedKv.hpp"
+#include "ops/ResearchWideTree.hpp"
 #include "ops/Vision.hpp"
 #include "model/CommandCost.hpp"
 #include "model/ElasticPool.hpp"
@@ -925,6 +926,21 @@ public:
   [[nodiscard]] virtual ModelMemoryActual actualRuntimeMemory() const = 0;
   [[nodiscard]] virtual ModelTelemetry telemetry() const noexcept = 0;
 };
+
+// Whether a request may use the tree verify (--verify-tree): its sampling has
+// no penalties (temperature, top-p, top-k and min-p are exact in the tree),
+// no constraint, no thinking budget and no flags, a budget of at least one
+// verify block, and a prompt whose every decode start splits the verify
+// attention's pages the same way. The cache keeps the pages such a request
+// computes (engine::Cache::setResearchKeepWriter), and the decision is fixed
+// at admission, cache hits included.
+[[nodiscard]] inline bool researchTreeRequestEligible(uint32_t prompt, uint32_t cap, const SamplingParameters &sampling,
+                                                      ConstraintMode constraint, bool initialThinking,
+                                                      uint32_t flags) noexcept {
+  return cap >= 8 && sampling.presencePenalty == 0 && sampling.frequencyPenalty == 0 &&
+         sampling.repetitionPenalty == 1 && constraint == ConstraintMode::None && !initialThinking && !flags &&
+         ops::ResearchWideTree::stablePagePartition(prompt, cap);
+}
 
 } // namespace model
 } // namespace splash

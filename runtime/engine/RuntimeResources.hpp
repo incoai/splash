@@ -163,6 +163,9 @@ struct RuntimeResourcesConfig {
   // (model::budgetsVerifyRows); a benchmark round verifies every row so that
   // rounds repeat one another.
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --verify-tree: a dense target verifies a tree of sixteen rows
+  // (model::VerifyTree).
+  model::VerifyTree verifyTree = model::VerifyTree::Off;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
@@ -365,7 +368,7 @@ private:
                    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
                    std::unique_ptr<model::KvBlockCache> blockCache,
                    std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
-                   model::VerifyRows verifyRows);
+                   model::VerifyRows verifyRows, model::VerifyTree verifyTree);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
   void adoptPersistentCache();
@@ -403,6 +406,8 @@ private:
   bool spillAlways_ = false;
   // --verify-rows, which modelContext() passes on.
   model::VerifyRows verifyRows_ = model::VerifyRows::Auto;
+  // --verify-tree, which modelContext() passes on.
+  model::VerifyTree verifyTree_ = model::VerifyTree::Off;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
   std::mutex probationMutex_;

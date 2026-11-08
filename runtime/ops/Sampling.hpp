@@ -190,7 +190,7 @@ public:
   void addVerify(metal::CommandGraph &graph,
                  std::span<const SamplingPolicy> policies,
                  SamplingBuffers buffers, const StopTokens &stopTokens,
-                 const PenaltyTable &penalties) const;
+                 const PenaltyTable &penalties, bool treeRows = false) const;
   void addAcceptance(
       metal::CommandGraph &graph, AcceptanceBuffers buffers,
       std::span<const uint32_t> maximumRetained,
@@ -214,6 +214,7 @@ private:
     uint32_t maskRow = 0;
     uint32_t uniform = 0;
     uint32_t draftedRows = 0;
+    uint32_t uniformStride = 0;
   };
 
   // Penalizes the row at rowOffset of each penalized lane or, for verify,

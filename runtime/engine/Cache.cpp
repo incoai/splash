@@ -183,7 +183,7 @@ CacheAdoption Cache::adopt(std::vector<PersistedKv> blocks, std::vector<Persiste
   return result;
 }
 
-void Cache::beginRequest(uint64_t requestId, KvMode mode) {
+void Cache::beginRequest(uint64_t requestId, KvMode mode,bool retainComputedPages) {
   if (!requestId)
     throw std::invalid_argument("invalid request id");
   if (mode == KvMode::Spill && !spill_)
@@ -192,6 +192,7 @@ void Cache::beginRequest(uint64_t requestId, KvMode mode) {
   if (!inserted)
     throw std::invalid_argument("duplicate request id");
   entry->second.mode = mode;
+  entry->second.retainComputedPages=researchKeepWriter_&&retainComputedPages;
   if (mode == KvMode::Spill)
     entry->second.spillOrder = ++spillSequence_;
 }
@@ -433,7 +434,8 @@ uint32_t Cache::publishCommittedBlocks(uint64_t requestId,
                    active.pages[logical],
                    blockIdentity(begin, KvCache::pageTokens, identity.images, identity.salt));
     const uint32_t writerPage = active.pages[logical];
-    const bool replacePage = inserted.physicalPage != writerPage;
+    const bool keepWriter=active.retainComputedPages&&active.mode==KvMode::Resident&&!window_&&!spill_&&pool_.form(writerPage)==kv::PageForm::Full&&pool_.form(inserted.physicalPage)==kv::PageForm::Full;
+    const bool replacePage = inserted.physicalPage != writerPage&&!keepWriter;
     // A writer that keeps its page beside the block, while a restore fills
     // the block's or a write reads it, trims it on its own; so does each
     // other request that holds the page the block left for the writer's.

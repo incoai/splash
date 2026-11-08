@@ -394,6 +394,22 @@ void testARelaunchKeepsItsFirstEnginesMaxContext() {
           "a relaunch of a --max-context within the native window lost it, or was served with YaRN");
 }
 
+// The tree verify is off unless --verify-tree on turns it on, and refuses other values.
+void testVerifyTree() {
+  const ModelDirectory model;
+  require(parse(model, {"auto", "auto"}).verifyTree == model::VerifyTree::Off &&
+              parse(model, {"auto", "auto", "--verify-tree", "off"}).verifyTree == model::VerifyTree::Off &&
+              parse(model, {"auto", "auto", "--verify-tree", "on"}).verifyTree == model::VerifyTree::On,
+          "--verify-tree did not reach the arguments as given");
+  bool refused = false;
+  try {
+    static_cast<void>(parse(model, {"auto", "auto", "--verify-tree", "maybe"}));
+  } catch (const engine::UsageError &) {
+    refused = true;
+  }
+  require(refused, "--verify-tree accepted a value other than on or off");
+}
+
 int main(int argc, char **argv) {
   if (argc != 3) {
     std::cerr << "usage: " << argv[0] << " native_command_golden.txt MODEL_CONFIGS\n";
@@ -403,6 +419,7 @@ int main(int argc, char **argv) {
   try {
     testServerCommandLines(argv[1]);
     testNeuralEngine();
+    testVerifyTree();
     testVerifyRows();
     testStreamedMemoryAndSpill();
     testWindowTrim();

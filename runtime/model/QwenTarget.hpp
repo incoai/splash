@@ -307,6 +307,8 @@ struct QwenPrefillLayers final {
 };
 
 struct QwenTargetVerifyBuffers final {
+  metal::MetalBuffer researchTreeScratch{};
+  metal::MetalBuffer researchWideTree{},researchWideGdnTape{};
   ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;
@@ -644,12 +646,13 @@ protected:
                       BlockOutput output, const ops::AttentionBlocks &blocks = {}) const;
   // The input the decode plan of `projection` over `lanes` lanes reads, a
   // table its producer writes or plain rows.
-  [[nodiscard]] ops::LinearInput decodeInput(const ops::Projection &projection, uint32_t lanes) const;
+  [[nodiscard]] ops::LinearInput decodeInput(const ops::Projection &projection, uint32_t lanes,bool wide=false) const;
+  [[nodiscard]] ops::LinearPlan projectionPlan(const ops::Projection &projection,uint32_t lanes,ops::LinearEpilogue epilogue=ops::LinearEpilogue::None,const ops::Projection *gate=nullptr,bool wide=false) const;
   // A decode projection over `lanes` lanes through its own plan; `prepared`
   // describes the table its producer wrote for the plan's input.
   void addDecodeProjection(metal::CommandGraph &graph, metal::MetalBuffer input, const ops::Projection &projection,
                            metal::MetalBuffer output, uint32_t lanes, ops::LinearScratch scratch,
-                           ops::PreparedInput prepared = {}) const;
+                           ops::PreparedInput prepared = {},bool wide=false) const;
   // The FFNs of a layer whose residual is one row of hiddenSize values: each
   // reads the RMS norm `norm` of the mixer's `residual` rows and adds its
   // output to them into `output`. A dense SwiGLU, in a prefill on the
@@ -669,7 +672,7 @@ protected:
   // `finalNorm`, into `finalHidden`, as addHeadBatch takes them.
   void addNormalizedHead(metal::CommandGraph &graph, const ops::NormWeights &finalNorm, metal::MetalBuffer hidden,
                          metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t lanes,
-                         ops::LinearScratch scratch) const;
+                         ops::LinearScratch scratch,bool wide=false) const;
   // Copies `rows` rows of a layer's output rows, from row `sourceRow` of
   // `output`, into capture slot `slot` of the captured hidden rows from row
   // `destinationRow`: the draft's capture of a layer whose output is one row

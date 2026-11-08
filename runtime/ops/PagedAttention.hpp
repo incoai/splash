@@ -244,6 +244,8 @@ struct PagedVerifyBuffers final {
   // The layer's learned sinks, an F32 per query head, for a plan whose
   // reduce adds them (VerifyAttentionPlan::sinks); none otherwise.
   metal::MetalBuffer sinks{};
+  metal::MetalBuffer researchTreeScratch{};
+  metal::MetalBuffer researchWideTree{};
 };
 
 // Target attention over paged INT8 or BF16 history. Prefill and verify read

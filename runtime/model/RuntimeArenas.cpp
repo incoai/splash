@@ -336,7 +336,7 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   const auto &d = geometry.draft;
   ops::LinearScratchSize result;
   // Includes the vocabulary head shared with the draft.
-  for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p));
+  for(const auto &p:geometry.target.decodeProjections){result.include(operators.linear().decodeScratchSize(p));if(geometry.target.hiddenSize==5120)result.include(operators.linear().researchWideScratchSize(p));}
   for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
        {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
        {d.hiddenSize, d.attentionSize},

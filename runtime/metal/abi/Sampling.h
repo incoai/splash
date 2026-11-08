@@ -48,6 +48,8 @@ struct TargetSamplingParams {
   uint32_t mask_row;
   uint32_t uniform;
   uint32_t drafted_rows;
+  // Row r of a lane draws uniform + r * uniform_stride (0: every row shares it).
+  uint32_t uniform_stride;
   uint32_t top_k[SPLASH_MAXIMUM_BATCH_WIDTH];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
   float top_p[SPLASH_MAXIMUM_BATCH_WIDTH];
@@ -60,8 +62,8 @@ struct TargetSamplingParams {
   uint32_t stop_tokens[SPLASH_STOP_TOKENS];
 };
 
-static_assert(sizeof(TargetSamplingParams) == 120,
-              "Target sampling parameters are 120 bytes on both sides");
+static_assert(sizeof(TargetSamplingParams) == 124,
+              "Target sampling parameters are 124 bytes on both sides");
 
 // One shard's share of a sampled row's softmax denominator: the largest
 // logit it admits, the sum of exp((logit - maximum) / temperature) over its

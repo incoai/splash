@@ -984,7 +984,7 @@ bool Engine::admit(Request &active, double now) {
     return false;
   }
   const uint64_t requestId = active.request.id;
-  cache_.beginRequest(requestId, active.kvMode);
+  cache_.beginRequest(requestId, active.kvMode,model::researchTreeRequestEligible(static_cast<uint32_t>(active.request.prompt.size()),active.request.maxNewTokens,active.request.sampling,active.request.constraint,active.request.thinkingBudget.has_value(),active.request.flags));
   active.lane = *state.admission.lane;
   active.admission = ++admissions_;
   // Its projected growth is the lanes' now (laneDemandBytes).

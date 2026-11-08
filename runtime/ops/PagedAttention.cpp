@@ -585,6 +585,17 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
                        plan.laneSplits[lane], plan.splits, blocks.stride,
                        blocks.list + lane};
   }
+  if(buffers.researchWideTree){
+    if(plan.lanes!=1||plan.sparse||plan.sinks||plan.queryHeads!=24||plan.layout.kvHeads!=4||headDimension!=256||plan.layout.format!=kv::Format::Int8)throw std::logic_error("unsupported researchwide attention plan");
+    requireBytes(buffers.partials,2*plan.workspace.partialsBytes,"wide attention partials");requireBytes(buffers.statistics,2*plan.workspace.statisticsBytes,"wide attention statistics");requireBytes(buffers.researchTreeScratch,532480,"wide canonical scratch");
+    auto store=stores[0];store.chunk_tokens=16;
+    addPrefillStore(graph,layer,buffers.chunkKeys,buffers.chunkValues,buffers.pageTables[0],store,plan.layout);
+    const std::vector<metal::MetalBuffer> split{buffers.queries,buffers.partials,buffers.statistics,buffers.pageTables[0],buffers.researchWideTree};
+    graph.add("verify_attention_research_wide_split",split,attention,{4,plan.splits,2});
+    graph.add("research_wide_prepare_pages",{buffers.pageTables[0],buffers.researchWideTree,buffers.researchTreeScratch},attention,{4,4,2},{256,1,1});
+    auto tail=split;tail.push_back(buffers.researchTreeScratch);graph.add("verify_attention_research_wide_tail",std::move(tail),attention,{4,plan.splits,2});
+    graph.add("verify_attention_research_wide_reduce",{buffers.partials,buffers.statistics,buffers.output},attention,{4,96,1},{256,1,1});return;
+  }
   const auto tables = laneBindings(buffers.pageTables.first(plan.lanes));
   std::vector<metal::MetalBuffer> store{buffers.chunkKeys, buffers.chunkValues};
   store.insert(store.end(), tables.begin(), tables.end());

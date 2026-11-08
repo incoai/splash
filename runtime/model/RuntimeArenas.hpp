@@ -574,6 +574,10 @@ public:
   }
 
   [[nodiscard]] ops::LinearScratch linearScratch() const { return linearScratch_; }
+  // Both parity slots of an explicitly UNASSIGNED state lane. Callers must
+  // exclude live/pending state, even when only one batch lane decodes.
+  [[nodiscard]] metal::MetalBuffer researchWideTape(uint32_t unassignedStateLane) const { return get(unassignedStateLane,DecodeTensor::GdnTape); }
+  [[nodiscard]] static uint64_t researchWideTapeBytes(const RuntimeGeometry &g) noexcept {return g.target.hiddenSize==5120?2*ops::gdnTapeLayerBytes(g.target.gdnShape())*g.target.stateLayout.layers:0;}
   static ops::LinearScratchSize linearScratchSize(const RuntimeGeometry &geometry,
                                                  const ops::ExecutionPlans &operators);
 

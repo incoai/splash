@@ -273,6 +273,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/PageStorage.cpp \
 	runtime/ops/KvSlotFormat.cpp \
 	runtime/ops/RoPE.cpp \
+	runtime/ops/ResearchWideTree.cpp \
 	runtime/ops/RowCopy.cpp \
 	runtime/ops/Sampling.cpp \
 	runtime/ops/Vision.cpp \

@@ -188,6 +188,16 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
             {128, 1, 1});
 }
 
+void GDN::addResearchWideDecode(metal::CommandGraph &graph,GdnDecodeBuffers b,GdnShape shape,uint32_t layer,GdnStateStrides state,GdnHeadOrder order,metal::MetalBuffer tree,metal::MetalBuffer wideTape){
+ if(shape.keyHeads!=16||shape.valueHeads!=48||shape.headDimension!=128||shape.convolutionDimension!=10240||shape.packedWidth!=16640||shape.sigmoidGate||state.format!=GdnStateFormat::Float32||b.mixerNorm.float32||b.tapeLanes.size()!=1)throw std::logic_error("unsupported researchwide GDN geometry");
+ requireBytes(b.packed,16ull*shape.packedWidth*2,"wide GDN packed");requireBytes(b.hidden,16ull*shape.valueHeads*128*2,"wide GDN hidden");requireMixerWeights(shape,b.convolutionWeights,b.decayWeights,b.timeBias);requireStates(shape,state,layer,1,b.currentStates,b.nextStates);
+ const uint64_t oldLayer=gdnTapeLayerBytes(shape),newLayer=2*oldLayer;const auto&t=b.tapeLanes[0];if(t.pendingRows>8||t.pendingSlot%16||t.stepSlot%16)throw std::logic_error("wide pending tape contract");
+ requireBytes(b.tape,std::max(t.pendingSlot,t.stepSlot)+(layer+1)*oldLayer,"wide pending tape");requireBytes(wideTape,(layer+1)*newLayer,"wide next tape");requireBytes(tree,328,"wide tree");
+ GDNDecodeBatchParams p{headFlags(shape,order),layer,state.convolutionLayerBytes,state.recurrentLayerBytes,state.convolutionStateBytes,{},{},{}};p.pending_tape[0]=t.pendingSlot+layer*oldLayer;p.step_tape[0]=t.stepSlot+layer*oldLayer;p.pending_rows[0]=t.pendingRows;
+ std::vector<metal::MetalBuffer>bindings{b.packed,b.convolutionWeights};appendLaneBindings(bindings,b.currentStates,b.nextStates);bindings.insert(bindings.end(),{b.tape,b.decayWeights,b.timeBias,b.mixerNorm.buffer,b.hidden,wideTape,tree});
+ struct Params{GDNDecodeBatchParams gdn;uint64_t wide_step_offset;};graph.add("verify_gdn_research_wide",std::move(bindings),Params{p,layer*newLayer},{48,1,1},{512,1,1});
+}
+
 PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                              GdnShape shape, uint32_t lanes, uint32_t layer,
                              GdnStateStrides state, GdnHeadOrder order, LinearInput input) {

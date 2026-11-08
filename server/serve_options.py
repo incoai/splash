@@ -780,6 +780,20 @@ SERVE_OPTIONS = (
         needs="experts",
     ),
     ServeOption(
+        "--verify-tree",
+        "requests",
+        dict(
+            choices=("on", "off"),
+            default="off",
+            help="verify a tree of sixteen candidate rows per decode cycle on "
+            "the dense 27B target, so a cycle commits more tokens: a greedy "
+            "request commits the target's own argmax at each node and a "
+            "sampled one keeps its distribution (default: off)",
+        ),
+        engine=EngineArgument("--verify-tree"),
+        needs="dense_ffn",
+    ),
+    ServeOption(
         "--allow-idle-sleep",
         "requests",
         dict(

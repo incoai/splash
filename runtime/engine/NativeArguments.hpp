@@ -87,6 +87,9 @@ struct NativeArguments final {
   // --verify-rows auto|all: the rows of the draft's block a decode
   // cycle verifies (RuntimeResourcesConfig::verifyRows).
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --verify-tree on|off: a dense target verifies a tree of candidate rows
+  // (RuntimeResourcesConfig::verifyTree).
+  model::VerifyTree verifyTree = model::VerifyTree::Off;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto
