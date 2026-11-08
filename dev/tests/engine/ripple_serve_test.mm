@@ -39,43 +39,6 @@ using splash::test::require;
 
 namespace {
 
-constexpr uint32_t kLayers = 80;
-constexpr uint32_t kHidden = 5120;
-constexpr uint32_t kVocab = 100352;
-constexpr float kEmbedScale = 71.5541763305664F;
-constexpr uint32_t kBos = 100257;
-
-splash::model::RippleLayout servedLayout() {
-  splash::model::RippleLayout layout;
-  layout.nativeContextTokens = 262144;
-  layout.layers = kLayers;
-  layout.hiddenSize = kHidden;
-  layout.vocabularySize = kVocab;
-  layout.attentionWidth = 80 * 128;
-  layout.attentionQueryHeads = 80;
-  layout.attentionKvHeads = 8;
-  layout.attentionHeadDimension = 128;
-  layout.rotaryPairs = 64;
-  layout.rotaryTheta = 10000.0F;
-  layout.intermediateSize = 40960;
-  layout.embeddingScale = kEmbedScale;
-  layout.swigluClamp = 20.0F;
-  layout.valueResidual = true;
-  layout.postFfnNorm = true;
-  layout.maskToken = 100278;
-  layout.stopTokens = {100265, kBos};
-  uint64_t sliding[2] = {}, full[2] = {};
-  for (uint32_t layer = 0; layer < kLayers; ++layer)
-    (layer % 5 == 4 ? full : sliding)[layer / 64] |= 1ULL << (layer % 64);
-  layout.slidingLayers = {sliding[0], sliding[1]};
-  layout.unrotatedLayers = {full[0], full[1]};
-  layout.fullAttentionPeriod = 1;
-  layout.slidingWindow = 1024;
-  layout.ffnKind = splash::model::QwenFfnKind::Dense;
-  layout.packedFullWidth = 2 * (80 * 128) + 2 * (8 * 128);
-  return layout;
-}
-
 void runBench(splash::metal::MetalBackend &backend, LoadedModel &model, const splash::ops::ExecutionPlans &operators,
               kv::PageStorage &kv, splash::model::QwenStateStorage &states,
               const std::vector<uint32_t> &tokens, const std::vector<uint32_t> &pageTable,
@@ -88,14 +51,16 @@ void runBench(splash::metal::MetalBackend &backend, LoadedModel &model, const sp
   // Prefill chunks of rising length, each its own request and lane, ended
   // after its one chunk.
   uint32_t lane = 1;
-      for (const uint32_t count : {32u, 128u, 512u, 2048u}) {
+  const uint32_t fill = std::visit([](const auto &layout) { return layout.stopTokens.ids[0]; },
+                                   model.descriptor.target);
+  for (const uint32_t count : {32u, 128u, 512u, 2048u}) {
     const uint64_t id = 100 + count;
     engine::EngineRequest warm;
     warm.id = id;
-    warm.prompt.assign(count, kBos);
+    warm.prompt.assign(count, fill);
     warm.maxNewTokens = 1;
         runtime.beginColdRequest(warm.modelView(), 1 + (lane++ % 3));
-    std::vector<uint32_t> warmTokens(count, kBos);
+    std::vector<uint32_t> warmTokens(count, fill);
     const auto began = std::chrono::steady_clock::now();
     BatchPlan plan{.kind = WorkKind::Prefill, .items = {{id, count, 0}}, .decodeStage = DecodeStage::Regular};
     ModelBatchItem item{id, 0, count, pageTable};
@@ -164,7 +129,7 @@ int main(int argc, char **argv) {
     if (argc != 5) throw std::invalid_argument("usage: ripple-serve-test METALLIB MODEL_ROOT TOKENS_FILE NEW_TOKENS");
     MetalBackend backend(argv[1]);
     const std::filesystem::path root(argv[2]);
-    std::vector<uint32_t> tokens{kBos};
+    std::vector<uint32_t> tokens;
     {
       std::ifstream in(argv[3]);
       uint32_t id = 0;
@@ -172,13 +137,9 @@ int main(int argc, char **argv) {
     }
     const uint32_t budget = static_cast<uint32_t>(std::stoul(argv[4]));
 
-    const splash::model::RippleLayout layout = servedLayout();
-    const std::vector<uint32_t> draftLayers{1, 20, 39, 58, 77};
-    const splash::model::DFlashDraftLayout draft = splash::model::draftLayout(
-        kHidden, kVocab, 5, 40960, 10000.0F, draftLayers, SPLASH_DRAFT_VARIANTS[1]);
-    const splash::model::ModelDescriptor descriptor = splash::model::makeModelDescriptor(
-        "ripple-65b-real", layout, draft, {.outputHiddenSize = kHidden},
-        splash::model::TargetSource::Gguf, splash::model::VisionSource::None);
+    // The descriptor from the model root, as the engine's own start reads
+    // it: the bench serves whichever family the root names.
+    const splash::model::ModelDescriptor descriptor = splash::model::inspectModelRoot(root);
     require(descriptor.valid(), "the served model's descriptor is not valid");
 
     const auto loadBegan = std::chrono::steady_clock::now();
@@ -261,7 +222,9 @@ int main(int argc, char **argv) {
       drafted += result[0].draftedTokens;
       accepted += result[0].acceptedDraftTokens;
       if (result[0].finished) break;
-      if (!output.empty() && (output.back() == 100265 || output.back() == kBos)) break;
+      const uint32_t turnEnd = std::visit([](const auto &layout) { return layout.stopTokens.ids[0]; },
+                                        model.descriptor.target);
+    if (!output.empty() && output.back() == turnEnd) break;
     }
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
     std::cout << "generated " << generated << " tokens in " << decodeSeconds << " s of decode ("

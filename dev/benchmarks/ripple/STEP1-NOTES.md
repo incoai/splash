@@ -353,3 +353,27 @@ draft, 42.8 GB of weights together):
 
 Earlier "12x off the ceiling" figures from the server's TTFT were the
 HTTP path's own overheads, not the runtime's.
+
+## The same harness on the shipped family (Qwen3.8-27B, UD-Q3_K_XL GGUF)
+
+The bench is family-agnostic now (the descriptor comes from the model
+root, inspectModelRoot), so the shipped DFlash2 path runs the same
+protocol on this machine:
+
+- prefill 2048 tokens: 1.85 s (1106 tok/s) — 27B × 2 FLOPs per token is
+  about 60 effective TFLOPS, the same kernel efficiency as Ripple's;
+- decode: 24 cycles, mean 0.0400 s, tight (best 0.0398, worst 0.0415),
+  200 tok/s, 8 tokens a cycle, every proposal accepted (greedy, a
+  deterministic prompt). 14.7 GB a cycle is 368 GB/s effective.
+
+So the per-byte kernel efficiency is the same implementation's — both
+families run 368-466 GB/s effective per cycle. The decode rate differs
+where the models differ: Ripple's weights are 2.9x the bytes per pass,
+its draft is 8.1 GB (5 layers of the target's FFN size) against Qwen's
+2.2 GB, and its block proposes 16 candidates against Qwen's 8 — whose
+greedy acceptance is 100% where Ripple's subset-proposed 16 reach 78-88%.
+
+The decode levers, in the order the numbers put them: the trained
+selector's 32-candidate kernels (the subset proposal caps acceptance),
+the acceptance itself on real workloads, and the last 15-30% of
+bandwidth.
