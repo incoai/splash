@@ -331,11 +331,15 @@ void DFlashDraft::addDecode(
 
   // The final norm feeds the shared vocabulary head and then the selector;
   // the selector reuses whatever table the head leaves when the layouts match.
-  const ops::LinearPlan headPlan = linear.decodePlan(vocabularyProjection, lanes);
+  // The head is the target's weights, so it runs on the target's plans, as
+  // its scratch is sized (DecodeArena::linearScratchSize): only the draft's
+  // own projections keep bf16 activations.
+  const ops::Linear &target = operators_.linear();
+  const ops::LinearPlan headPlan = target.decodePlan(vocabularyProjection, lanes);
   const ops::PreparedInput finalHidden = ops::Normalization::addRms(
       graph, buffers.hidden[weights_.layout.layers & 1], weights_.finalNorm,
       buffers.finalHidden, layout.hiddenSize, rows, scratch, headPlan.input());
-  const ops::PreparedInput afterHead = linear.add(
+  const ops::PreparedInput afterHead = target.add(
       graph, {.input = buffers.finalHidden, .output = buffers.logits, .scratch = scratch, .prepared = finalHidden},
       vocabularyProjection, headPlan);
   linear.add(graph,
