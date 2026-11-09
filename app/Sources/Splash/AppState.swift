@@ -211,6 +211,8 @@ final class AppState {
     /// Face cache holds; meanwhile it reads what each model family makes of the launch options.
     func launch() async {
         defer { launched = true }
+        // The shell's Hugging Face settings, read beside the checks, for all the app runs after them.
+        let shellSettings = Task { await Runtime.readShellSettings(drawer.shell()) }
         if let reason = await runtime.unsupportedReason() {
             blocker = Blocker(title: "This Mac Can’t Run Splash", symbol: "exclamationmark.triangle", message: reason)
             return
@@ -220,6 +222,7 @@ final class AppState {
                               message: "Splash can’t run from the disk image. Drag it to your Applications folder, then open it from there.")
             return
         }
+        runtime.shellSettings.set(await shellSettings.value)
         await listed()
         Task { families = await runtime.families() }
         await installer.stopLeftover { self.launchWait = "Stopping the download Splash left running…" }
