@@ -59,14 +59,16 @@ struct SplitChoice final {
 // rotation blocks, and whole 128-input PQ2_0 blocks per partition.
 [[nodiscard]] bool decodeInt8TakesSplits(uint32_t k, uint32_t splits) noexcept;
 // A dense GGUF projection's configuration: the tile, its splits, spread, one
-// pass, sixteen rows and int8 activations. A gate/up decode's `pairTensors`
-// are its up's and gate's own formats, whose plans decide its 16-row tile;
-// none, it runs none.
-[[nodiscard]] LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorkload workload,
-                                            const UnitFormats &unit, std::span<const UnitFormats> pairTensors = {});
+// pass and sixteen rows, then, with `int8Activations` on, whether it runs in
+// int8 activations. A gate/up decode's `pairTensors` are its up's and gate's
+// own formats, whose plans decide its 16-row tile; none, it runs none.
+[[nodiscard]] LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activations int8Activations,
+                                            LinearWorkload workload, const UnitFormats &unit,
+                                            std::span<const UnitFormats> pairTensors = {});
 // Every configuration a decode plan of the workload may take on the device
 // when only whether the register tile takes its formats is known (arena
-// bounds).
+// bounds). Int8 activations keep a plan's tile, rows and splits, and with them
+// its scratch.
 [[nodiscard]] std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibration,
                                                              LinearWorkload workload, bool registerTakes);
 
@@ -75,16 +77,13 @@ struct SplitChoice final {
 [[nodiscard]] FloatTile selectFloatTile(const KernelCalibration &calibration, uint32_t rows, uint32_t outputSize,
                                         uint32_t formatId) noexcept;
 
-// The formats a MoE target's plans follow. One plan per step serves every
-// block (QwenTarget.cpp): the router is the format of most routers' rows, F32
-// for none.
-struct MoeFormats final {
-  uint32_t router = QuantizedSegment::kFloat32;
-  bool operator==(const MoeFormats &) const = default;
-};
-[[nodiscard]] MoeFormats moeFormats(std::span<const BlockMoeWeights *const> blocks) noexcept;
-// A MoE plan's configuration of `rows` rows in `phase`.
+// The router format a MoE target's plans follow: one plan per step serves
+// every block (QwenTarget.cpp), at the format of most routers' rows, F32 for
+// none.
+[[nodiscard]] uint32_t moeRouterFormat(std::span<const BlockMoeWeights *const> blocks) noexcept;
+// A MoE plan's configuration of `rows` rows in `phase`, its routers in
+// `routerFormat`.
 [[nodiscard]] MoeConfig selectMoe(const KernelCalibration &calibration, const MoeShape &shape,
-                                  const MoeFormats &formats, uint32_t rows, MoePhase phase) noexcept;
+                                  uint32_t routerFormat, uint32_t rows, MoePhase phase) noexcept;
 
 } // namespace splash::ops

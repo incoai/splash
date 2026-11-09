@@ -148,6 +148,9 @@ bool multiplyOverflows(uint64_t left, uint64_t right) {
 
 // Entries of a kernel's buffer argument table on every Apple GPU family.
 constexpr uint32_t kBufferArgumentEntries = 31;
+// The GPU's cache line, which a host step's beside dispatches share with no
+// buffer its work writes (EventStep::beside).
+constexpr uint64_t kCacheLineBytes = 128;
 // The most bytes setBytes passes, which bounds an address table
 // (AddressTable) to 512 addresses.
 constexpr uint64_t kBytesArgumentLimit = 4096;
@@ -212,8 +215,10 @@ NSUInteger checkEvents(std::span<const EventStep> events, size_t dispatches) {
                                         : "event step needs an event and a nonzero value");
         if (step.gpu == HostStepGpu::Awake && step.kind != EventStep::Kind::Host)
             throw MetalBackendError("only a host step keeps the GPU awake");
-        if (step.beside && step.kind != EventStep::Kind::Host)
-            throw MetalBackendError("only a host step has beside dispatches");
+        if ((step.beside || !step.writes.empty()) && step.kind != EventStep::Kind::Host)
+            throw MetalBackendError("only a host step has beside dispatches and writes buffers");
+        if (std::ranges::any_of(step.writes, [](const MetalBuffer &buffer) { return !buffer; }))
+            throw MetalBackendError("a host step writes an empty buffer");
         if (step.before < before)
             throw MetalBackendError("event steps are out of dispatch order");
         if (step.before < joined)
@@ -558,23 +563,26 @@ struct BackendAsyncState {
 // and a GPU signal can land after a later value the CPU wrote to the same
 // event (M5 Max, macOS 27: about once in a million steps), which puts it back
 // and holds the work waiting for the CPU's value until Metal fails it after
-// supervision::kGpuWaitLimit ("Caused GPU Timeout Error"). The exception is
-// an awake step's spin, which waits for readyEvent: a failed buffer may never
+// supervision::kGpuWaitLimit ("Caused GPU Timeout Error"). The exception is an
+// awake step's spin, which waits for readyEvent: a failed buffer may never
 // raise it and one still running when the runner gives the step up raises it
 // late, so for an awake step it gives up or that follows a failed buffer the
-// runner raises readyEvent to i + 1 itself, before ranEvent, which every
-// later GPU signal of readyEvent follows; the buffer's own signal carries the
-// same value. Past ranEvent of an awake step the runner raises the backend's
-// release counter to the step's value, which ends the GPU's spin through it
-// (host_step_wait), and then runs the step's `then` once its work returned.
-// Each step runs unless the command buffer before it failed, or the buffer of
-// an earlier step's beside dispatches failed by then, or an earlier step of
-// its command did not run or threw (halted); the first step that throws names
-// the command's failure, and a `then` that throws marks the backend unhealthy
-// (EventStep). The runner notes when it took each step up and when its work
-// returned, which the command's completion reports (timed) against the GPU
-// times of the buffers before and after the step, and each is the command's
-// progress for the watchdog (CommandWatchdog).
+// runner raises readyEvent to i + 1 itself, before ranEvent, which the GPU
+// signals of later steps follow; the buffer's own signal carries the same
+// value. An earlier step's buffer whose signal lands after the runner gave up
+// a later awake step can put readyEvent back below that step's value, whose
+// spin then waits for its own buffer's signal, or, where that buffer failed
+// too, for Metal's limit: two faults. Past ranEvent of an awake step the
+// runner raises the backend's release counter to the step's value, which ends
+// the GPU's spin through it (host_step_wait), and then runs the step's `then`
+// once its work returned. Each step runs unless the command buffer before it
+// failed, or the buffer of an earlier step's beside dispatches failed by then,
+// or an earlier step of its command did not run or threw (halted); the first
+// step that throws names the command's failure, and a `then` that throws marks
+// the backend unhealthy (EventStep). The runner notes when it took each step
+// up and when its work returned, which the command's completion reports
+// (timed) against the GPU times of the buffers before and after the step, and
+// each is the command's progress for the watchdog (CommandWatchdog).
 struct HostSteps {
     struct Step {
         uint64_t ready = 0;
@@ -1248,7 +1256,30 @@ struct MetalBackend::Impl {
         return result;
     }
 
-    PreparedCommand prepare(std::span<const ComputeDispatch> dispatches) {
+    // Whether two views share a 128-byte line of one allocation, whose start
+    // is on a line (a page).
+    static bool shareLine(const MetalBuffer::Impl &a, const MetalBuffer::Impl &b) noexcept {
+        return a.allocation == b.allocation && a.lengthBytes && b.lengthBytes &&
+               a.offsetBytes / kCacheLineBytes <= (b.offsetBytes + b.lengthBytes - 1) / kCacheLineBytes &&
+               b.offsetBytes / kCacheLineBytes <= (a.offsetBytes + a.lengthBytes - 1) / kCacheLineBytes;
+    }
+
+    // Refuses `buffer`, which a host step's beside dispatch `dispatch` uses,
+    // where it shares a line with one of `writes`, the buffers the step's work
+    // writes (EventStep::beside).
+    static void requireApart(const MetalBuffer::Impl &buffer, const std::vector<MetalBuffer> &writes,
+                             const ComputeDispatch &dispatch) {
+        for (const MetalBuffer &written : writes)
+            if (shareLine(buffer, *written.impl_))
+                throw MetalBackendError("host step's beside dispatch '" + dispatch.pipelineName +
+                                        "' uses a 128-byte line of a buffer its work writes");
+    }
+
+    // Validates `dispatches` and resolves them to their pipelines and address
+    // tables. The beside dispatches of `events`' host steps use no line of the
+    // buffers the step's work writes (EventStep::beside); events are in
+    // dispatch order (checkEvents).
+    PreparedCommand prepare(std::span<const ComputeDispatch> dispatches, std::span<const EventStep> events = {}) {
         if (dispatches.empty()) {
             throw MetalBackendError("Metal command must contain a dispatch");
         }
@@ -1258,7 +1289,13 @@ struct MetalBackend::Impl {
         // the tables are allocated once.
         command.tables.reserve(dispatches.size());
         size_t bindings = 0;
-        for (const ComputeDispatch &dispatch : dispatches) {
+        auto step = events.begin();
+        for (size_t index = 0; index < dispatches.size(); ++index) {
+            const ComputeDispatch &dispatch = dispatches[index];
+            // The buffers the step whose beside dispatches hold this one writes.
+            while (step != events.end() && step->before + step->beside <= index) ++step;
+            const std::vector<MetalBuffer> *writes =
+                step != events.end() && step->before <= index ? &step->writes : nullptr;
             PreparedDispatch item;
             item.source = &dispatch;
             item.groups = metalSize(dispatch.threadgroups, "threadgroups");
@@ -1309,6 +1346,7 @@ struct MetalBackend::Impl {
                 }
                 claim(binding.index);
                 item.bufferIndices |= uint32_t{1} << binding.index;
+                if (writes) requireApart(*binding.buffer.impl_, *writes, dispatch);
             }
             for (const BytesBinding &binding : dispatch.bytes) {
                 if (!binding.data || !binding.sizeBytes) {
@@ -1357,6 +1395,14 @@ struct MetalBackend::Impl {
                     bindings += source->size();
                 }
                 claim(dispatch.addresses.index);
+                // The table's buffers in an allocation the step writes.
+                const PreparedTable &table = command.tables[item.table];
+                if (writes)
+                    for (const MetalBuffer &written : *writes)
+                        if (std::ranges::find(table.allocations, written.impl_->allocation.get()) !=
+                            table.allocations.end())
+                            for (const MetalBuffer &buffer : *table.source)
+                                requireApart(*buffer.impl_, *writes, dispatch);
             }
             // Metal reads an indirect grid's three counts at a multiple of 4
             // bytes, counted from the allocation's start, not the view's.
@@ -1374,6 +1420,7 @@ struct MetalBackend::Impl {
                         "compute dispatch '" + dispatch.pipelineName +
                         "' reads its grid outside a buffer of this backend");
                 }
+                if (writes) requireApart(arguments, *writes, dispatch);
                 ++bindings;
             }
             bindings += dispatch.buffers.size();
@@ -1443,11 +1490,10 @@ struct MetalBackend::Impl {
     // waits for ranEvent, and only a buffer's start makes what the CPU wrote
     // visible (a wait inside a buffer that the GPU reaches after the signal
     // leaves stale lines); a runner done before the spin is committed still
-    // ends it. A spin that ran ahead of the work before its step, while that
-    // work waited for the beside dispatches before it, at times held that work
-    // till its bound (M5 Pro, Flash-Next decode: 1 step in about 1000 held
-    // 100 ms). An awake step spins only once the spin was seen to end at its
-    // release (checkHostStepSpin).
+    // ends it. The spin starts at the step's signal: one that ran ahead of the
+    // work before its step, while that work waited for earlier beside
+    // dispatches, held it up to its bound (100 ms). An awake step spins only
+    // once the spin was seen to end at its release (checkHostStepSpin).
     template <class Fail>
     id<MTLCommandBuffer> encodeHostStep(id<MTLCommandBuffer> command, std::vector<id<MTLCommandBuffer>> &leading,
                                         std::shared_ptr<HostSteps> &steps, uint64_t sequence, const EventStep &step,
@@ -1827,7 +1873,7 @@ struct MetalBackend::Impl {
                                  CommandCompletion completion) {
         if (std::ranges::any_of(events, [](const EventStep &step) { return step.kind != EventStep::Kind::Host; }))
             throw MetalBackendError("dispatch profiling does not replay event steps");
-        const PreparedCommand command = prepare(dispatches);
+        const PreparedCommand command = prepare(dispatches, events);
         CommandTiming total;
         auto step = events.begin();
         const auto runSteps = [&](size_t before) {
@@ -2270,7 +2316,7 @@ CommandTicket MetalBackend::submitCommandAsync(const Command &command,
     if (impl_->dispatchProfiling)
         return impl_->submitProfiled(command.dispatches, command.events, std::move(completion));
 #endif
-    Impl::PreparedCommand prepared = impl_->prepare(command.dispatches);
+    Impl::PreparedCommand prepared = impl_->prepare(command.dispatches, command.events);
     return impl_->commit(prepared.dispatches, prepared.tables, command.events,
                          std::move(prepared.retainedAllocations),
                          std::move(completion));

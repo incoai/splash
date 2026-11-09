@@ -179,17 +179,6 @@ void reportDiskTier(const DiskSpace &space, const model::DiskBudget &budget, uin
   logLine(line.str());
 }
 
-// The layers' part of what ane::recall() keeps a calibration under: their
-// shapes and formats.
-std::string calibrationKey(std::span<const ops::SwiGluProjections> layers) {
-  std::string key = "ane-ffn calibration";
-  for (const ops::SwiGluProjections &layer : layers)
-    for (const ops::Projection *projection : {layer.gate, layer.up, layer.down})
-      key += " " + std::to_string(projection->outputSize) + "x" + std::to_string(projection->inputSize) + ":g" +
-             std::to_string(projection->blocks().segments.front().formatId);
-  return key;
-}
-
 // The split's part of what the engine gives back while idle, if it runs one.
 std::optional<ReleasableMemory::Split> idleSplit(ops::AneFfn *split) {
   if (!split)
@@ -892,7 +881,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
 
   // One plan owner is used both before allocation and during encoding. The
   // engine lends it to model execution without inspecting its plans.
-  ops::ExecutionPlans operators(device, config.prefillInt8);
+  ops::ExecutionPlans operators(device, config.int8Activations);
   model::LoadedModel loaded;
   // The runtime's lane state and arenas as the model loaded, with its K/V in
   // memory and where it spills.
@@ -1531,10 +1520,10 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
     });
     return prepared;
   };
-  const std::string key = calibrationKey(*layers) + " device " + backend.capabilities().deviceName + " macos " +
+  const std::string key = ops::AneFfn::calibrationKey(*layers, linear) + " device " +
+                          backend.capabilities().deviceName + " macos " +
                           [[NSProcessInfo processInfo] operatingSystemVersionString].UTF8String + " build " +
-                          std::string(buildId) + " prefill-int8 " +
-                          (operators.calibration().projection.prefillInt8 ? "on" : "off") + " most ";
+                          std::string(buildId) + " most ";
   model.recall = [key](uint32_t maxAneUnits) -> std::optional<ops::ane_ffn::Calibration> {
     const std::optional<std::string> line = ane::recall(key + std::to_string(maxAneUnits));
     return line ? ops::ane_ffn::Calibration::parse(*line) : std::nullopt;

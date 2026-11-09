@@ -109,6 +109,16 @@ uint32_t AneFfn::units(std::span<const SwiGluProjections> layers) {
   return layers.front().gate->outputSize / kChannelUnit;
 }
 
+std::string AneFfn::calibrationKey(std::span<const SwiGluProjections> layers, const Linear &linear) {
+  if (const char *reason = unsupported(layers)) throw std::invalid_argument(reason);
+  std::string key = "ane-ffn calibration";
+  for (const SwiGluProjections &layer : layers)
+    for (const Projection *projection : {layer.gate, layer.up, layer.down})
+      key += " " + std::to_string(projection->outputSize) + "x" + std::to_string(projection->inputSize) + ":g" +
+             std::to_string(projection->blocks().segments.front().formatId);
+  return key + " int8-activations " + (linear.int8Activations() == Int8Activations::On ? "on" : "off");
+}
+
 namespace {
 
 // The rotation a weight kernel applies: over gate's and up's hidden inputs,

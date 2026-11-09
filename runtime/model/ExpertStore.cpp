@@ -456,7 +456,7 @@ void ExpertStore::Impl::route(uint32_t index, std::span<const std::span<const Mo
   uint32_t *loadTable = static_cast<uint32_t *>(loadTables.contents()) + uint64_t{index} * shape.experts;
   for (std::span<const MoeTileDescriptor> tiles : parts)
     for (const MoeTileDescriptor &tile : tiles) {
-      // Past the routed experts' tiles come the shared expert's (id experts).
+      // The shared expert's tiles (ids experts on) route nothing.
       const uint32_t expert = tile.expert;
       if (expert >= shape.experts || routedIn[expert] == serial) continue;
       routedIn[expert] = serial;
@@ -988,10 +988,10 @@ void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows,
   ExpertStoreStats::Use &use = counters.uses[static_cast<size_t>(phase)];
   try {
     if (round == 0) {
-      // A load whose later rounds did not run (its command failed) frees the
-      // slots of the experts it had not staged; one that fails before it
-      // routes frees none of the last load's (abandon).
-      abandon();
+      // A load whose later rounds did not run (its command failed, which ends
+      // the engine) left routed experts in slots the slot table names but no
+      // repack wrote, which the grouping before this load took as resident.
+      if (!pending.empty()) throw std::logic_error("an expert load follows one whose later rounds did not run");
       partTiles.clear();
       for (const PartTiles &part : parts) {
         const auto *counted = static_cast<const MoeTileCount *>(part.count.contents());
@@ -1280,13 +1280,14 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
   // The first round's step runs beside the passes over the experts resident
   // before it, whose slots route() leaves as they are (it touches every routed
   // resident slot before it claims any): they read the grouping's copy of the
-  // slot table, no line of the tables it writes.
+  // slot table, no line of what a load's step writes.
   for (uint32_t round = 0; round < rounds; ++round) {
     graph.host(
         [impl = impl_, block, phase, rows, predicted, tiles, round, rounds, verifyRows] {
           impl->load(block, phase, rows, predicted, tiles, round, rounds, verifyRows);
         },
-        timed, gpu, startAhead, round ? std::function<void()>{} : beside);
+        timed, gpu, startAhead, round ? std::function<void()>{} : beside,
+        {impl.tables, impl.loadTables, impl.staging, impl.jobs, impl.sources, impl.grid});
     ops::MoE::addExpertLoad(graph, impl.staging, size.chunks, impl.jobs, impl.sources, size.load,
                             static_cast<uint32_t>(std::min<uint64_t>(routable, impl.places.count)),
                             metal::IndirectGrid{impl.grid, 0});

@@ -66,6 +66,12 @@ public:
   [[nodiscard]] static uint32_t units(std::span<const SwiGluProjections> layers);
   // The Metal memory of the split of `layers` with the ANE taking `aneUnits`.
   [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
+  // What tells this Mac's calibrations of a split of `layers` apart for one
+  // macOS version, engine build and most units its plan holds: the layers'
+  // shapes and formats, and the Int8Activations of `linear`, whose plans run
+  // the GPU's part and so move the units the split takes (Qwen3.8-27B MLX
+  // 4-bit's takes 10 of 34 with them on, 15 off, on a 20-core M5 Pro).
+  [[nodiscard]] static std::string calibrationKey(std::span<const SwiGluProjections> layers, const Linear &linear);
 
   // The fraction of intermediate channels the ANE takes.
   [[nodiscard]] double share() const noexcept;

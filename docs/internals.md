@@ -387,12 +387,14 @@ read row attends as a chunk of its own on the chunk's split count
 (`PagedAttention::prefillTail`), and its gate, o-projection, norm and FFN run
 on the read rows compacted, on the chunk's projection tile kinds and K splits
 (`Linear::prefillPlan` of a chunk's rows), so a dense target's read rows keep
-their bits. A MoE block runs the plan of the read rows, whose routes then see
+their bits where the GPU runs the layer. A MoE block runs the plan of the read
+rows, whose routes then see
 fewer rows of their experts and sum in another order (abi/MoE.h), so a MoE
 target's read rows are not bitwise the whole chunk's: their next-token KL is
 about 1e-8, against about 1e-3 between the same prompts at other batch widths.
-The Neural Engine split, which takes whole chunks, leaves them to the GPU. On
-a 16-core M5 Pro this takes about 2% off the 35B's prefill of 8K tokens.
+The Neural Engine split, which takes whole chunks, leaves the read rows to the
+GPU, so in a chunk it takes their last FFN rounds as the GPU's alone. On a
+16-core M5 Pro this takes about 2% off the 35B's prefill of 8K tokens.
 
 ### Kernel selection
 
@@ -418,17 +420,32 @@ engine or the models branches on the GPU:
   blocks. `Linear` and `ExecutionPlans` hold the device's calibration and plan
   through them.
 
+One setting sits beside the measured row: `Int8Activations`
+(`runtime/ops/Linear.hpp`; `splash serve --int8-activations`, on by default),
+whether a plan may round activations to int8 where an int8-activation path of
+rules 1, 2 and 5 takes them. The engine decides it once for `ExecutionPlans`,
+whose `Linear` holds it beside the calibration for `selectProjection` and
+whose attention plans read it too. Off, every plan is its plan with it on in
+bf16 activations and nothing else of it changes: no chunk runs the int8
+prefill tile, no decode plan the int8 decode tiles and no attention split INT8
+queries, so every activation stays bf16 (`kernel-selection` checks this for
+every plan on every device). The KV cache keeps `--kv-format` either way.
+
 The rules:
 
 1. *Projection, prefill.* A chunk of up to `stagedPrefillRows` rows (64 on
    Apple10 and on Apple9 GPUs of 10 cores or fewer, 32 on larger Apple9 GPUs)
    runs the staged tile at its rows' height (8, 16, 32 or 64) with
-   `stagedSplits`; a longer one runs the 128-row prefill tile, unsplit, or on
-   a row with `prefillInt8` (Apple10 and Apple11, with `--prefill-int8` on)
+   `stagedSplits`; a longer one runs the 128-row prefill tile, unsplit, or,
+   with int8 activations on, on a row with `prefillInt8` (Apple10 and Apple11)
    the [int8-activation tile](#int8-activation-prefill) where it takes every
-   quantized segment. A staged chunk of a projection of several segments and
-   no epilogue runs them in one dispatch, in prefill as in decode: a tile
-   choice never adds dispatches to a fused projection.
+   quantized segment. A projection of several segments and no epilogue runs
+   them in one dispatch on the staged tile, in prefill as in decode, and those
+   of each format in one on the 128-row prefill tile; the int8 tile runs a
+   GEMM dispatch per segment beside the quantization of its input, which a
+   SwiGLU's gate and up share. (The segments of a format in one dispatch
+   took the 27B's fused inputs 6-11% less time at 65-128 rows but 1-3% more
+   at 512-2048, 12-core M6.)
 2. *Projection, decode.* The register tile runs where it takes every quantized
    segment and the unit's `FormatClass` (`GridLookup`: IQ3_XXS, the IQ2 formats
    and IQ1; `GridLookupOrQ2K`; `UnderFourBits`; `FourBitsOrMore`) is below its
@@ -442,29 +459,29 @@ The rules:
    under the wave law where its grid runs in as many waves of that tile as of
    the 8-row tile, `sixteenRowWaves` at most; a pair's only where both its
    tensors' own plans take it. A unit stages only where every quantized
-   segment's class does: dense measurements were taken per projection. A
-   unit whose quantized segments are all rotated in a format the int8 decode
-   tiles take (`UnitFormats::decodeInt8Takes`: PQ2_0) runs a staged plan of
-   at least `decodeInt8FromRows` rows (16 on Apple10 and Apple11, one lane's
-   16-row plan among them; never on Apple9) whose K splits keep whole PQ2_0
-   blocks on those tiles, at the plan's splits and passes.
+   segment's class does: dense measurements were taken per projection. With
+   int8 activations on, a unit whose quantized segments are all rotated in a
+   format the int8 decode tiles take (`UnitFormats::decodeInt8Takes`: PQ2_0)
+   runs a staged plan of at least `decodeInt8FromRows` rows (16 on Apple10 and
+   Apple11, one lane's 16-row plan among them; never on Apple9) whose K splits
+   keep whole PQ2_0 blocks on those tiles, at the plan's splits and passes.
 3. *Float projection.* The accelerator tile runs where the device has one,
    from `minimumRows` rows and a grid of its tiles of at least half the class's
    half tiles per core for BF16 values, F32 values or a quantized format's rows.
 4. *MoE.* Every GPU runs the experts on the staged tile, on 8-row tiles
    while a prefill chunk's routes average at most one row per expert and
    32-row tiles beyond. One plan per step serves every block, so its router
-   follows rule 3 in the format of most blocks' routers (`ops::moeFormats`).
+   follows rule 3 in the format of most blocks' routers (`ops::moeRouterFormat`).
 5. *Attention.* The kernels follow how a layout reads its pages
    (`kv::Layout::reads`, below). A dense prefill tile takes one history split
    per `AttentionCalibration::prefillPagesPerSplit` pages its rows read (32,
    and 64 on Apple9 GPUs of 10 cores or fewer, where 32 made one measured case
    slower than the shared splits), between the splits shared out over the
    chunk's tiles and the longest chunk's tiles' ceiling (`PagedAttention.cpp`);
-   a sparse tile reads its list's blocks and keeps the shared splits. Over
-   INT8 pages a dense split scores INT8 queries (`q8q`) from
-   `AttentionCalibration::int8QueriesFromPages` pages a split of the
-   longest tile or lane reads (8 on Apple10; never on Apple9, whose matrix
+   a sparse tile reads its list's blocks and keeps the shared splits. With
+   int8 activations on, over INT8 pages a dense split scores INT8 queries
+   (`q8q`) from `AttentionCalibration::int8QueriesFromPages` pages a split of
+   the longest tile or lane reads (8 on Apple10; never on Apple9, whose matrix
    operations share the FP32 pipe); a verify's lanes share the choice.
 
 The register-against-staged boundaries are measured table entries, not a
@@ -472,10 +489,11 @@ cost model: the wave law, which describes the Apple10 staged tiles, does not
 describe the register tile (`KernelCalibration.hpp`). `kernel-selection`
 (`dev/tests/engine/kernel_selection_test.cc`) pins every plan of every
 family's projections (a rotated PQ2_0 unit's with its int8 activations), float
-tiles, MoE blocks and attention on fifteen device classes and core counts as a
-golden of one FNV-1a-64 per device, section and group, and `--dump <dir>`
-writes the plan lines; a change of a rule or an entry shows as the groups it
-changes. Kernels and their instances do not depend on any of this.
+tiles, MoE blocks and attention on fifteen device classes and core counts, with
+int8 activations on, as a golden of one FNV-1a-64 per device, section and
+group, and `--dump <dir>` writes the plan lines; a change of a rule or an entry
+shows as the groups it changes. Kernels and their instances do not depend on
+any of this.
 
 ### GGUF tiles
 
@@ -664,7 +682,7 @@ slices in the grouped passes: the planner keeps its gate and up rows and lays it
 out as column windows (`gguf::TensorRows::windows`), so slice s's rows of each projection follow
 slice s - 1's (`moe_gguf_segment`). The select kernel names the routing's select suffix
 (`moe_route_select_f32_sigmoid_s2`), the grouping and expert passes its slices suffix
-(`moe_group_routes_s2`, `moe_expert_gguf_m8_a_s2`); the softmax router's one gated slice is the
+(`moe_group_routes_s2`, `moe_expert_gguf_m8_down_s2`); the softmax router's one gated slice is the
 unsuffixed instances. The expert passes launch the live tiles alone: the grouping kernel writes each
 pass's grid with the tile count, and the pass reads it as an indirect dispatch
 (`ComputeDispatch::indirectThreadgroups`). They find a routed expert through the block's slot table
@@ -727,25 +745,35 @@ producer writes plain rows. The token table gathers each row through the inverse
 (`gguf_embed_rotated_pq20`).
 
 In int8 activations (`LinearConfig::decodeInt8`, rule 2) the rotation
-writes int8 rows instead (`gguf_rotate_int8`), one fp32 scale max |x| / 127
-per row and rotation block, whose values the rotation spreads evenly, and the
-staged plan runs the int8 tiles `gguf_decode_int8_pq20_m<rows>_<e>` (and
-`_gate_up`) at 16 or 32 rows: PQ2_0's ternary codes are int8 exactly, staged
-at a byte per weight, and the neural accelerator multiplies int8 at twice its
-bf16 rate. The 27B Bonsai's projections take 9-31% less time there than on
+writes int8 rows instead (`gguf_rotate_int8`), one fp32 scale per row and
+rotation block, whose values the rotation spreads evenly, and the staged plan
+runs the int8 tiles, the staged tiles' dispatches on int8 stages
+(`gguf_decode_int8_pq20_m<rows>_<e>`, `_gate_up` and
+`gguf_decode_int8_pq20_fused_m<rows>`), at 16 or 32 rows: PQ2_0's two-bit
+codes q stand for q - 1, exact in int8, staged at a byte per weight, and the
+neural accelerator multiplies int8 at twice its bf16 rate. The 27B Bonsai's projections take 9-31% less time there than on
 the bf16 tiles at the policy's plans (20-core M5 Pro; 10-25% on a 12-core M6);
 the 8-row int8 matmul takes twice the 16-row one's time, so one lane's split
-plans, of 8 rows, keep bf16. A block holding an infinity or a NaN, which its
-codes alone would round to finite values, takes a NaN scale, so that its row's
-outputs are not finite, as the bf16 tiles' are.
+plans, of 8 rows, keep bf16.
+
+Every int8-activation path (these rows, the [int8-activation prefill
+tile](#int8-activation-prefill)'s groups and the attention tiles' INT8
+queries) quantizes by one rule, `kernels/common/int8_activations.h`: a block
+whose largest magnitude is m codes x as clamp(rint(x * (127 / m)), -127, 127),
+ties to even, with scale m / 127, both quotients correctly rounded so that the
+tests' references compute the same codes; a block whose m is 2^-100 or less
+codes as zeros; and a block holding an infinity or a NaN, which its codes
+alone would round to finite values, takes a NaN scale, so that its row goes
+on in NaN as it would in bf16: a projection's outputs are not finite, and an
+attention row's softmax statistics are NaN, which the reduce writes as zeros.
 
 A GGUF kernel of one quantized tensor names its epilogue last: `a` none, `r` residual, `g` the
 up pass with the silu gate. The staged ones are `gguf_decode_<format>_m<rows>_<e>`, with gate and
 up in one pass `gguf_decode_<format>_m<rows>_gate_up`, and
 `gguf_prefill_<format>_<e>` (and `gguf_prefill_<format>_r_leading_inputs` over a view of the
 leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lanes>_<e>`, and the
-experts `moe_expert_gguf_m<rows>_<e>`, with gate and up in one pass
-`moe_expert_gguf_m<rows>_gate_up`; the fused projections run
+experts' gate and up in one pass `moe_expert_gguf_m<rows>_gate_up` and their down pass
+`moe_expert_gguf_m<rows>_down`; the fused projections run
 `gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode and, on Apple10 and on
 Apple9 GPUs of 10 cores or fewer, in prefill chunks of 33 to 64 rows (`gguf_decode_fused_m64`),
 and in longer prefill chunks one `gguf_prefill_<format>_a` per format over that format's
@@ -774,16 +802,17 @@ also as column windows, the alpha/beta, norm, convolution and router bytes they 
 golden images; then `gguf-dequant`, the staged tile's dequantizer, built with the production Metal
 flags, against the half rounding of every reference weight; `gguf-rotation`, `gguf_rotate` and the
 rotated PQ2_0 token gather bitwise against the fp32 butterflies and within one bf16 step of fp64,
-and `gguf_rotate_int8`'s per-block scales, with NaN bits where a block holds a NaN or an infinity;
+and `gguf_rotate_int8`'s codes at their stage positions and per-block scales bit for bit against
+the int8-activation rule, NaN bits where a block holds a NaN or an infinity;
 `gguf-projection`, every GGUF projection through `ops::Linear` with each tile forced, so both
 decode tiles run on every GPU, each in every format it takes (the register tile all but F16), at
 one to four lanes, every K split and epilogue, fused segments, every format's gate with the next
 format's up and the prefill tiles, each output inside the fp64 bound of
 `GgufFormatReference.hpp`, the one-pass gate/up bitwise against the two passes at the same K
 split, one lane on the staged 16-row tile bitwise against the 8-row tile, and, where the device
-row takes int8 activations, rotated PQ2_0 on the int8 tiles within that bound plus the int8
-quantization's term, lanes and pass modes bitwise, and a non-finite input's row alone not finite,
-with the production plans' int8 choice checked on every GPU; and
+row takes int8 activations, rotated PQ2_0 on the int8 tiles within the fp32 rounding of the exact
+products of their codes, lanes and pass modes bitwise, and a non-finite input's row alone not
+finite; and
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
 plan, the staged 8- and 32-row tiles, in every format as each routed and shared expert tensor,
 against fp64, bitwise against the full grids and two gate/up passes, and with the experts in
@@ -810,7 +839,8 @@ the walks spread also in one, `pair` and `pair16`) and every K split, and marks 
 pick; widths emulate core counts, since the policy counts threadgroups per core. Or, with a trailing
 `prefill=R[,R...]` after the epilogue and the round count, one format's 128-row prefill tile at each
 chunk of `R` rows (more than 32), for `R` up to 64 the staged 64-row tile at every K split, and for
-`af4g64` and `af5g64` the int8-activation tile (`prefill int8`); the formats `float-bf16` and
+`af4g64` and `af5g64` the int8-activation tile (`prefill int8`) and its GEMM alone on codes the
+scratch holds (`int8 codes`, as a SwiGLU's up runs on its gate's); the formats `float-bf16` and
 `float-f32`, and `float-<format>` for a quantized format's native rows (such as `float-af8g64`),
 time the float projection (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles
 instead, marking `selectFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B
@@ -830,7 +860,8 @@ windowed split and reduce start at the page of their tile's first row's window s
 lane's or prefill tile's splits stop at the 18 pages such a window reads
 (`kv::windowAttentionPages`). Over INT8 pages each dense split kernel (`…q8_split…`) also has a
 `…q8q_split…` entry, `q8q` for INT8 queries: it quantizes its tile's queries once (absmax / 127
-per row) and scores them against the INT8 keys (kernel selection, rule 5). A geometry
+per row, by the int8-activation rule) and scores them against the INT8 keys (kernel selection,
+rule 5). A geometry
 with learned sinks (`reduce…_sinks`) binds the layer's, an F32 per query head, to the reduce,
 which adds each to its row's softmax after the splits, in their order, as a key with no value;
 one without an output gate (`gather`) gives the out-projection its attention rows as they are.
@@ -847,12 +878,14 @@ On Apple10 and Apple11, which multiply int8 at twice their bf16 rate, a prefill 
 staged tile (more than 64 rows) of a projection whose quantized segments are all MLX affine 4- or
 5-bit in groups of 64 (`af4g64`, `af5g64`) runs `LinearTile::GgufPrefillInt8`
 (`kernels/prefill/gguf_prefill_int8.metal`) instead of the bf16 tile
-(`ProjectionCalibration::prefillInt8`; Apple9, whose int8 matmul runs at 0.9x its bf16 rate, never).
-`splash serve --prefill-int8 off` turns it off (`ExecutionPlans`' `prefillInt8`): every chunk then
-runs the bf16 tiles and the prefill arena holds no codes, so prefill is what it was before the tile,
-bit for bit. `gguf_prefill_int8_quantize` writes each 64-input group of each row as int8 codes with
-its own scale; the GEMM (`gguf_prefill_int8_<format>_<e>`, one dispatch per segment) feeds the
-weights' 4- or 5-bit codes straight from the planes into int8 `matmul2d` fragments and folds each
+(`ProjectionCalibration::prefillInt8`; Apple9, whose int8 matmul runs at 0.9x its bf16 rate, never),
+with int8 activations on. With them off (`--int8-activations off`) every chunk runs the bf16 tiles,
+bit for bit, and the prefill arena holds no codes. `gguf_prefill_int8_quantize` writes each 64-input
+group of each row as int8 codes with its own scale, by the int8-activation rule
+(`kernels/common/int8_activations.h`), which a SwiGLU's up takes from its gate's plan
+(`LinearInput::PrefillInt8`) rather than quantizing the same rows again; the GEMM
+(`gguf_prefill_int8_<format>_<e>`, one dispatch per segment) feeds the weights' 4- or 5-bit codes
+straight from the planes into int8 `matmul2d` fragments and folds each
 group's affine correction, `(sa s) sum(qa q) + z (sa sum(qa))`, once in fp32. The weights stay
 exact; only the activations round, per row and group, so an outlier channel costs only its own 64
 inputs. A group holding an infinity or a NaN, which its codes alone would round to finite values,
@@ -863,10 +896,15 @@ values: a prefill's last layer runs its read rows alone on the chunk's tile and 
 tile is two simdgroups of 32 rows by 32 columns for both formats, and threadgroups take 16 row tiles
 down each column tile before the next (`GGUF_PREFILL_INT8_WALK`), so a column tile's weights stream
 once per 16 row tiles: walking every column tile of a row tile first left the M6's 2048-row down
-projections at 0.95-1.12x the bf16 tile's speed. Over the 27B's projection shapes in `af4g64` and
+projections at 0.95-1.12x the bf16 tile's speed. The GEMM's grid is 16 threadgroups wide and takes
+the walk's tiles in order, so each run of 16 along x is one column tile's row tiles of a block
+whatever the segment's column count; a grid of column tiles by row tiles kept that only where the
+column tiles were a multiple of 16 (M6, 2048 rows: 260 column tiles took 29% longer than 256, on the
+16-wide grid 1.7%, as their columns). Over the 27B's projection shapes in `af4g64` and
 `af5g64` at 65-2048 rows the tile takes 1.13-2.4x less time than the bf16 tile on a 32-core M5 Max,
-a 16-core M5 Pro and a 12-core M6. The fragment schedule is adapted from oMLX's oQ A8 kernel, whose
-Apache-2.0 notice is in `THIRD_PARTY_NOTICES`. The codes and scales are the prefill arena's
+a 16-core M5 Pro and a 12-core M6. The quantizer stores each 32-input group's codes in the GEMM's
+fragment order (`prefill_int8_position`): the four inputs a lane takes in a fragment step, in the
+planes' slot order, are one word. The codes and scales are the prefill arena's
 `LinearTable` and `LinearSums`, sized for a full chunk of the target's widest projection whose
 formats the tile takes (`ProjectionShape::prefillInt8Formats`; 40 MB on Qwen3.8-27B MLX 4-bit, its
 down projection) wherever the family runs the tile; a GGUF target's arena holds none. The tile also
@@ -883,8 +921,9 @@ its own 15 units; both change the most likely token at the same one prefix of 24
 token falls by a quarter at 2K and 10K tokens on the 27B (20-core M5 Pro) and by 12-13% on the 35B
 (16-core M5 Pro). `gguf-projection` checks that the tile computes the products of the inputs so
 rounded within the bf16 tile's error, also with an outlier input per row, and bounds the RMS error
-it adds over the bf16 tile on dense inputs at 1%; `gguf-projection-benchmark` times it as
-`prefill int8`.
+it adds over the bf16 tile on dense inputs at 1%, that a fused projection quantizes once and runs a
+GEMM per segment, and an up on its gate's codes bitwise its own run; `gguf-projection-benchmark`
+times it as `prefill int8`.
 
 ## Sparse attention
 
@@ -1067,13 +1106,13 @@ put T's least a unit off: a unit past where the ANE's part takes the longer
 costs the ANE's time per unit, a unit short of it the GPU's, and on an M5 Max
 and an M5 Pro the ANE's is the longer (1.7 ms a unit of the full-chunk layer
 against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms), all with
-`--prefill-int8 off`. On Qwen3.8-27B that takes 8 of the 34 units on an M5
-Max, 14-15 on an M5 Pro and 25-26 on an M6 with `--prefill-int8 off`, the best
+`--int8-activations off`. On Qwen3.8-27B that takes 8 of the 34 units on an M5
+Max, 14-15 on an M5 Pro and 25-26 on an M6 with `--int8-activations off`, the best
 each Mac's sweeps measured. By default the int8-activation tile makes the
 GPU's part faster, so the split takes fewer: 10 on a 20-core M5 Pro (the M5
 Max and M6 unmeasured). The split runs if T there gains 5% on the GPU alone. A
 start calibrates the split once for a Mac, a model, a macOS version, an engine
-build, `--prefill-int8` and the most units its memory plan holds, and remembers
+build, `--int8-activations` and the most units its memory plan holds, and remembers
 what it found (`remembered-*` in the cache directory below): the units, the
 least chunk and the GPU alone's layer at 512 and 2048 rows, or that no split
 gains enough. Later starts take it untimed: they build the split, check it as
@@ -1193,10 +1232,14 @@ threw, and must not throw: the command may have completed by then, so a
 those right after it (`EventStep::beside`), run while its work runs, in a
 buffer of their own after its signal, and the work after them waits for the
 step (a streamed MoE layer's passes over its resident experts beside its
-load). They write nothing the work reads and read no 128-byte cache line it
-writes: a line the GPU read before the work wrote it is unproven fresh after
-the step, so those MoE passes read the grouping's copy of the slot table, and
-the passes after the load a table of their own. A step's work may run after
+load). They write nothing the work reads and use no 128-byte line, the GPU's
+cache line, of the buffers the step names as its work's writes, which the
+backend checks as the command is submitted: a line the GPU read while the step
+ran is unproven fresh after it. So those MoE passes read the grouping's copy of
+the slot table, and the passes after the load a table of their own. Only
+Metal's tracking of the buffers they use orders the work after the step, and
+the command's end, after them, so that work reads what they write (the MoE
+combine reads those passes' outputs). A step's work may run after
 submitCommandAsync or wait() threw (its encoding failed after its first
 buffers were committed, or the watchdog or a shutdown gave the command up),
 so the work owns what it touches.
