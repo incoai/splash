@@ -495,6 +495,25 @@ group, and `--dump <dir>` writes the plan lines; a change of a rule or an entry
 shows as the groups it changes. Kernels and their instances do not depend on
 any of this.
 
+### Warmup and pipelines
+
+Metal creates a kernel's pipeline, one for each set of its function constants
+(a fused projection's formats), the first time a dispatch names it, on the
+thread that submits the command, which is the serving loop's: a request whose
+command names a kernel no earlier command did waits while its pipeline is
+created, and so does every status request behind it. With a warm shader cache
+that is a load of milliseconds; cold, after an install or a macOS update, it
+is a compile, and the 27B's first 17-row chunk waited 19 s for its kernels on
+an M5 Max planned as a 16-core Apple9 GPU. So before Ready the start runs a
+command of each kind serving runs (`ServingRuntime::requireWarmup`): a prefill
+of the most rows, 2048, a decode of each width the memory plan holds and a
+state restore; and it prepares the sampling kernels' dispatches without
+running them (`MetalBackend::preparePipelines`). What memory keeps from running
+(`warmup.memory_limited_steps` in `/status`) stays cold, as do the paths no
+warmup takes. From Ready on the backend counts each pipeline it creates
+(`metal.pipelines_created_while_serving`) and logs it once, with its name, its
+function constants and how long it took.
+
 ### GGUF tiles
 
 Decode runs one of two kernel families, chosen by the device's calibration row

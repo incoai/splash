@@ -425,8 +425,9 @@ void testCleanRuntimeStatus(const char *goldenPath) {
 // steps memory-limited. A resident target with windows: the plan's kv_window,
 // no kv_spill or kv.window, no host telemetry, the idle release off, the
 // split off, the streamed stores absent, SSD writes open, Metal failed with a
-// reason that needs escaping, YaRN, BF16 token-major KV, no requests, no
-// ledger accounts and one warmup step memory-limited.
+// reason that needs escaping after it created two pipelines while serving,
+// YaRN, BF16 token-major KV, no requests, no ledger accounts and one warmup
+// step memory-limited.
 std::vector<std::pair<const char *, StatusInputs>> statusVariants() {
   const StatusInputs representative = representativeStatus();
 
@@ -478,6 +479,7 @@ std::vector<std::pair<const char *, StatusInputs>> statusVariants() {
   resident.sample.engine.resources.kvTier.writesGated = engine::DiskWritesGate::No;
   resident.sample.metalHealthy = false;
   resident.sample.metalFailureReason = "command buffer \"decode\" failed:\n\tGPU timeout";
+  resident.sample.pipelinesCreatedWhileServing = 2;
   resident.identity.ropeScaling = {3.814697265625, 262144};
   resident.identity.kvLayout = kv::Layout{16, 4, 256, kv::Format::BFloat16};
   resident.identity.kvLayout.valuesTokenMajor = true;

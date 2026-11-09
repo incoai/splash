@@ -1198,6 +1198,9 @@ struct MetalBackend::Impl {
     std::unordered_map<PipelineKey, id<MTLComputePipelineState>,
                        PipelineKeyHash, PipelineKeyEqual>
         pipelines;
+    // From Ready on (MetalBackend::beginServing), the pipelines created since.
+    std::atomic<bool> serving{false};
+    std::atomic<uint64_t> pipelinesWhileServing{0};
 
     DeviceCapabilities capabilities;
     std::shared_ptr<AllocationAccounting> accounting =
@@ -1260,6 +1263,7 @@ struct MetalBackend::Impl {
 
     id<MTLComputePipelineState> newPipeline(id<MTLLibrary> source, std::string_view name,
                                             std::span<const uint32_t> constants = {}) {
+        const auto started = AwakeClock::now();
         NSString *key = checkedNSString(name, "pipeline name");
         NSError *error = nil;
         id<MTLFunction> function = nil;
@@ -1282,6 +1286,16 @@ struct MetalBackend::Impl {
             throw MetalBackendError(
                 "unable to create Metal pipeline " + std::string(name) +
                 ": " + errorDescription(error));
+        }
+        if (serving.load(std::memory_order_relaxed)) {
+            pipelinesWhileServing.fetch_add(1, std::memory_order_relaxed);
+            std::string values;
+            for (const uint32_t value : constants)
+                values += (values.empty() ? "(" : ",") + std::to_string(value);
+            if (!values.empty()) values += ')';
+            logWarning("Metal created pipeline ", name, values, " while serving, in ",
+                       std::chrono::duration<double, std::milli>(AwakeClock::now() - started).count(),
+                       " ms: no warmup of the start created it");
         }
         return result;
     }
@@ -1679,10 +1693,12 @@ struct MetalBackend::Impl {
     }
 
     // The spin of awake host steps, from host_step_wait of the library beside
-    // the backend's, with a release buffer whose counter starts at zero.
+    // the backend's, created once and reused by every check, with a release
+    // buffer whose counter starts at zero.
     HostStepSpin newHostStepSpin() {
+        if (!hostStepWait) hostStepWait = newPipeline(loadLibrary(device, hostStepLibraryPath), "host_step_wait");
         HostStepSpin spin;
-        spin.pipeline = newPipeline(loadLibrary(device, hostStepLibraryPath), "host_step_wait");
+        spin.pipeline = hostStepWait;
         spin.releases = newBuffer(kHostStepSeenOffset + 2 * sizeof(uint32_t), BufferStorage::Shared,
                                   @"host-step releases");
         std::memset(spin.releases.contents, 0, spin.releases.length);
@@ -1936,6 +1952,8 @@ struct MetalBackend::Impl {
 
     // host-step.metallib beside the backend's library (kHostStepLibrary).
     std::string hostStepLibraryPath;
+    // Its host_step_wait, created by the first spin check (newHostStepSpin).
+    __strong id<MTLComputePipelineState> hostStepWait = nil;
     // The spin of awake host steps, once checked (checkHostStepSpin); until
     // then they run as plain ones.
     std::optional<HostStepSpin> hostStepSpin;
@@ -2356,6 +2374,14 @@ void MetalBackend::preparePipelines(
     std::span<const ComputeDispatch> dispatches) {
     checkOperation();
     static_cast<void>(impl_->prepare(dispatches));
+}
+
+void MetalBackend::beginServing() noexcept {
+    impl_->serving.store(true, std::memory_order_relaxed);
+}
+
+uint64_t MetalBackend::pipelinesCreatedWhileServing() const noexcept {
+    return impl_->pipelinesWhileServing.load(std::memory_order_relaxed);
 }
 
 MetalMemoryStats MetalBackend::memoryStats() const noexcept {

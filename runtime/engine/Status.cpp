@@ -821,7 +821,9 @@ std::string runtimeStatusJson(const StatusStart &start, const StatusSample &samp
     w.key("warmup");
     writeWarmup(w, start.warmup);
     w.object("metal", [&] {
-      w.field("healthy", sample.metalHealthy).field("failure_reason", sample.metalFailureReason);
+      w.field("healthy", sample.metalHealthy)
+          .field("failure_reason", sample.metalFailureReason)
+          .field("pipelines_created_while_serving", sample.pipelinesCreatedWhileServing);
     });
   });
   return w.str();

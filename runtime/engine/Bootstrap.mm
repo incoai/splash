@@ -196,8 +196,10 @@ ServingRuntime::~ServingRuntime() {
 
 void ServingRuntime::announceReady() {
   // The per-operation guard RuntimeResources installed is only for startup:
-  // once Ready, the engine meets memory pressure between its ticks.
+  // once Ready, the engine meets memory pressure between its ticks, and the
+  // backend counts each pipeline the warmups did not create.
   resources_->backend().setOperationGuard({});
+  resources_->backend().beginServing();
   nativeLoop_->announceReady(ready_);
   resources_->beginServing();
 }
@@ -215,6 +217,7 @@ std::string ServingRuntime::statusJson() {
                       .metalMemory = backend.memoryStats(),
                       .metalHealthy = healthy,
                       .metalFailureReason = healthy ? std::string{} : backend.unhealthyReason(),
+                      .pipelinesCreatedWhileServing = backend.pipelinesCreatedWhileServing(),
                       .memoryGovernor = resources_->memoryGovernor().snapshot(),
                       .aneFfn = resources_->aneFfnSnapshot(),
                       .thermalState = thermalState_.state(),

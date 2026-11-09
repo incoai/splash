@@ -2187,6 +2187,46 @@ void hostStepSpinEndedEarlyDecidesNothing(const std::string &metallibPath) {
     std::cout << "PASS a spin check whose spins all ended before their release decides nothing\n";
 }
 
+// Once serving began, each pipeline the backend creates is one a request
+// waited for: counted, and logged once with its name and function constants.
+// One created before, or cached, is not, but its function at other constants
+// is; nor is the awake steps' spin again when a check that decided nothing
+// runs once more.
+void pipelinesCreatedWhileServingAreCounted(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
+    const uint32_t count = 1, one = 1;
+    ComputeDispatch specialized{"test_add_constant_u32", {{0, buffer}}, {}, {1, 1, 1}, {1, 1, 1}};
+    specialized.constants = {3};
+    const ComputeDispatch prepared[] = {addition(buffer, count, one), specialized};
+    backend.preparePipelines(prepared);
+    backend.beginServing();
+    for (const ComputeDispatch &dispatch : prepared) (void)backend.submit(dispatch);
+    require(backend.pipelinesCreatedWhileServing() == 0, "a pipeline created before serving began was counted");
+    const ComputeDispatch copy{"test_copy_u32", {{0, buffer}, {1, sharedBuffer(backend, sizeof(uint32_t))}},
+                               {{2, &count, sizeof(count)}}, {1, 1, 1}, {1, 1, 1}};
+    specialized.constants = {5};
+    const std::string log = capturedStderr([&] {
+        (void)backend.submit(copy);
+        (void)backend.submit(copy);
+        (void)backend.submit(specialized);
+    });
+    const size_t logged = log.find("Metal created pipeline test_copy_u32 while serving");
+    require(backend.pipelinesCreatedWhileServing() == 2 && logged != std::string::npos &&
+                log.find("Metal created pipeline test_copy_u32", logged + 1) == std::string::npos &&
+                log.find("Metal created pipeline test_add_constant_u32(5) while serving") != std::string::npos,
+            "a pipeline created while serving was not counted and logged once: " + log);
+    {
+        id<MTLCommandBuffer> command = [[MTLCreateSystemDefaultDevice() newCommandQueue] commandBuffer];
+        MethodReplacement late(command, @selector(GPUStartTime), reinterpret_cast<IMP>(startedLate));
+        (void)capturedStderr([&] { (void)BackendInstrumentation::awakeHostStepsSpin(backend); });
+    }
+    (void)capturedStderr([&] { (void)spinCheck(backend, "a check after one that decided nothing"); });
+    require(backend.pipelinesCreatedWhileServing() == 3,
+            "a spin check after one that decided nothing created the spin's pipeline again");
+    std::cout << "PASS pipelines created while serving are counted\n";
+}
+
 // The fastest load host_step_wait makes: 0.23 us on the M5 Max, 0.226 us on
 // the 20-core M5 Pro, at the high clocks of a GPU busy with other work.
 constexpr double kFastestSpinLoadSeconds = 0.22e-6;
@@ -3222,6 +3262,7 @@ std::span<const splash::test::TestCase> behaviourTests() {
         {"hostSteps", [] { (void)hostSteps(metallib); }},
         {"hostStepSpinFallsBack", [] { hostStepSpinFallsBack(metallib); }},
         {"hostStepSpinEndedEarlyDecidesNothing", [] { hostStepSpinEndedEarlyDecidesNothing(metallib); }},
+        {"pipelinesCreatedWhileServingAreCounted", [] { pipelinesCreatedWhileServingAreCounted(metallib); }},
         {"hostStepCheckSpinsOutlastTheirRelease", [] { hostStepCheckSpinsOutlastTheirRelease(metallib); }},
         {"earlyBuffersRunWhileTheRestEncodes", [] { earlyBuffersRunWhileTheRestEncodes(metallib); }},
         {"encodingFailureAfterACommit", [] { encodingFailureAfterACommit(metallib); }},

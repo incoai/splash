@@ -61,6 +61,8 @@ struct StatusSample final {
   bool metalHealthy = true;
   // Why Metal failed; empty while it is healthy.
   std::string metalFailureReason;
+  // metal::MetalBackend::pipelinesCreatedWhileServing.
+  uint64_t pipelinesCreatedWhileServing = 0;
   MemoryGovernorSnapshot memoryGovernor;
   AneFfnSnapshot aneFfn;
   ThermalState thermalState = ThermalState::Nominal;
