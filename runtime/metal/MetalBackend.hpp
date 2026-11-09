@@ -163,6 +163,9 @@ struct ComputeDispatch {
   DispatchSize threadsPerThreadgroup;
   IndirectGrid indirectThreadgroups = {};
   AddressTable addresses = {};
+  // The values of the function's uint function constants at indices 0 up,
+  // which specialize its pipeline: a pipeline per name and values.
+  std::vector<uint32_t> constants = {};
 };
 
 // A host step's round trip on the host clock (AwakeClock, the time base of

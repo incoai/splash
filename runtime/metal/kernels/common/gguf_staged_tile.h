@@ -222,13 +222,18 @@ inline void gguf_staged_pair_steps(device bfloat *input, device uchar *gw0, devi
   gguf_staged_walk(step_begin, step_end, step_first, run_step);
 }
 
+// Any format's switch (quant_format_switch), the one staged_accumulate_any takes unless given another.
+struct any_quant_format {
+  template <class Body> void operator()(uint format, Body body) const { quant_format_switch(format, body); }
+};
+
 // runtime dequantizer selection (uniform per threadgroup): the format's pair table, which every thread of the
-// threadgroup fills, then its tile loop
-template <ushort Rows, ushort Cols, ushort KS, class Acc>
+// threadgroup fills, then its tile loop, for each format `formats` switches to
+template <ushort Rows, ushort Cols, ushort KS, class Acc, class Formats = any_quant_format>
 inline void staged_accumulate_any(uint fmt, device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint origin,
                            threadgroup half *stage, threadgroup half2 *tl, uint thread_index, uint simd_lane, uint sb, uint se,
-                           uint sf, thread Acc &acc) {
-  quant_format_switch(fmt, [&](auto format) {
+                           uint sf, thread Acc &acc, Formats formats = Formats()) {
+  formats(fmt, [&](auto format) {
     typedef decltype(format) F;
     quant_pair_table<F>(tl, thread_index, GGUF_STAGED_THREADS);
     staged_accumulate<F, Rows, Cols, KS>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, sf, acc);

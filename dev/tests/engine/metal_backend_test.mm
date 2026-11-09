@@ -733,6 +733,23 @@ void preparedPipelinesCompileAhead(const std::string &metallibPath) {
     std::cout << "PASS prepared pipelines compile ahead\n";
 }
 
+// A dispatch's function constants specialize its pipeline: a pipeline per
+// name and values, each running with its values.
+void functionConstantsSpecializePipelines(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
+    auto *value = static_cast<uint32_t *>(buffer.contents());
+    *value = 0;
+    ComputeDispatch dispatch{"test_add_constant_u32", {{0, buffer}}, {}, {1, 1, 1}, {1, 1, 1}};
+    for (const uint32_t increment : {3u, 5u, 3u}) {
+        dispatch.constants = {increment};
+        (void)backend.submit(dispatch);
+    }
+    require(*value == 11 && BackendInstrumentation::cachedPipelines(backend) == 2,
+            "function constants did not specialize a pipeline per value");
+    std::cout << "PASS function constants specialize pipelines\n";
+}
+
 std::atomic<unsigned> blitEncoders{0};
 std::atomic<unsigned> computeEncoders{0};
 IMP originalBlitEncoder = nullptr;
@@ -3190,6 +3207,7 @@ std::span<const splash::test::TestCase> behaviourTests() {
         {"shutdownSparesACommandThatCompletes", [] { shutdownSparesACommandThatCompletes(metallib); }},
         {"dispatchProfilingCoversEveryCommand", [] { dispatchProfilingCoversEveryCommand(metallib); }},
         {"preparedPipelinesCompileAhead", [] { preparedPipelinesCompileAhead(metallib); }},
+        {"functionConstantsSpecializePipelines", [] { functionConstantsSpecializePipelines(metallib); }},
         {"buffersStayResident", [] { buffersStayResident(metallib); }},
         {"infiniteKeepAliveHoldsResidency", [] { infiniteKeepAliveHoldsResidency(metallib); }},
         {"releasedMemory", [] { releasedMemory(metallib); }},

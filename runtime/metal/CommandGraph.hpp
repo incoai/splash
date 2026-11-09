@@ -74,6 +74,13 @@ public:
                           writes};
   }
 
+  // Specializes the last dispatch's pipeline with the values of its uint
+  // function constants at indices 0 up (ComputeDispatch::constants).
+  void specialize(std::span<const uint32_t> constants) {
+    if (dispatches_.empty()) throw std::logic_error("function constants need a dispatch");
+    dispatches_.back().constants.assign(constants.begin(), constants.end());
+  }
+
   // Event steps after the dispatches added so far (EventStep): signal once
   // all earlier work has completed, or hold all later work until the event
   // reaches value.

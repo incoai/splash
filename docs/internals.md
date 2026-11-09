@@ -778,11 +778,14 @@ experts' gate and up in one pass `moe_expert_gguf_m<rows>_gate_up` and their dow
 Apple9 GPUs of 10 cores or fewer, in prefill chunks of 33 to 64 rows (`gguf_decode_fused_m64`),
 and in longer prefill chunks one `gguf_prefill_<format>_a` per format over that format's
 segments (or, on the int8-activation tile, `gguf_prefill_int8_quantize` and one
-`gguf_prefill_int8_<format>_a` per segment). The norm, GDN, attention-gate and attention-gather
-variants that also write the register kernels' input table carry `table16` in their names. The
-epilogue kinds of both GGUF families are in `kernels/common/gguf_tile.h`, the SiLU and sigmoid
-every kernel shares in `kernels/common/activation.h`, and the MMA helpers every register kernel
-uses, GGUF or fp32, in `kernels/common/sgmatrix.h`.
+`gguf_prefill_int8_<format>_a` per segment). A `gguf_decode_fused_m<rows>` pipeline decodes
+its segments' formats alone, which specialize it as Metal function constants
+(`ComputeDispatch::constants`, a pipeline per name and values), so its first use compiles a
+staged loop for each of those formats rather than for all 44. The norm, GDN, attention-gate and
+attention-gather variants that also write the register kernels' input table carry `table16` in
+their names. The epilogue kinds of both GGUF families are in `kernels/common/gguf_tile.h`, the
+SiLU and sigmoid every kernel shares in `kernels/common/activation.h`, and the MMA helpers every
+register kernel uses, GGUF or fp32, in `kernels/common/sgmatrix.h`.
 
 The ABIs are in `runtime/metal/abi/Gguf.h`, which also defines the tile geometry the kernels
 and `LinearGguf.cpp` share, and `MoE.h`; the image formats in
