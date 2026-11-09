@@ -605,8 +605,10 @@ private struct ModelRow: View {
     var body: some View {
         let selected = state.selection == model.id
         let files = state.modelFiles[model.id]
-        let detail = ([model.id, model.missing ? "Not found" : model.bytes.map(Format.size),
-                       files?.projector.map { _ in "with projector" }, files?.draft.map { _ in "with draft" }] as [String?])
+        // A projector, which Text only leaves out of the start, says so.
+        let projector = files?.projector.map { _ in state.settings(for: model.id).textOnly ? "projector off (Text only)" : "with projector" }
+        let detail = ([model.id, model.missing ? "Not found" : model.bytes.map(Format.size), projector,
+                       files?.draft.map { _ in "with draft" }] as [String?])
             .compactMap { $0 }.joined(separator: " · ")
         Button { state.selection = model.id } label: {
             HStack(spacing: 8) {

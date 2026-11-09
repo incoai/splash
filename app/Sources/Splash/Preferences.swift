@@ -37,9 +37,14 @@ struct ServeSettings: Equatable {
     var values: [String: String] = [:]
     var apiKey: String?
     /// The files of model files on this Mac that only their own start passes: a GGUF's vision
-    /// projector (`--mmproj`) and a draft in place of its family's (`--draft-model`).
+    /// projector (`--mmproj`), which Text only leaves out (`textOnly`), and a draft in place of its
+    /// family's (`--draft-model`).
     var projector: String?
     var draft: String?
+
+    /// Whether the model starts without its vision, as Text only has it (`--language-only`), which
+    /// `splash serve` refuses beside a vision projector.
+    var textOnly: Bool { values["--language-only"] == "true" }
 
     subscript(flag: String) -> String? {
         get { values[flag] }
@@ -63,7 +68,7 @@ struct ServeSettings: Equatable {
     /// this Mac, with these options.
     func serveArguments(model: String, localName: String? = Self.localName) -> [String] {
         let source = model.hasPrefix("/")
-            ? ["--model", Self.localID(model), "--model-dir", model] + (projector.map { ["--mmproj", $0] } ?? [])
+            ? ["--model", Self.localID(model), "--model-dir", model] + (projector.flatMap { textOnly ? nil : ["--mmproj", $0] } ?? [])
                 + (draft.map { ["--draft-model", $0] } ?? [])
             : ["--model", model]
         var arguments = ["serve"] + source + ["--port", String(port), "--offline"]
@@ -473,7 +478,7 @@ extension LaunchOption {
             section: .requests,
             kind: .choice(standard: "4,194,304", choices: [], custom: Value(prompt: "1048576", message: "Pixels, 65,536 to 4,194,304.",
                                                                            parse: whole)),
-            requires: [Requirement("Needs the model’s vision (Text only off).") { $0["--language-only"] != "true" }]),
+            requires: [Requirement("Needs the model’s vision (Text only off).") { !$0.textOnly }]),
         LaunchOption(
             flag: "--decode-share", title: "Decode share",
             help: "Seconds of answering for each second spent reading a new prompt: more keeps answers flowing, less starts the new one sooner; 0 takes turns step by step.",

@@ -107,6 +107,11 @@ struct ServeSettingsTests {
         var other = settings
         other.projector = nil
         #expect(settings.differs(from: other, model: "/models/q.gguf", family: .unknown))
+        // Under Text only, which `splash serve` refuses beside a projector, the projector stays out.
+        settings["--language-only"] = "true"
+        #expect(settings.textOnly && settings.serveArguments(model: "/models/q.gguf", localName: nil)
+            == ["serve", "--model", "local/q", "--model-dir", "/models/q.gguf", "--draft-model", "/models/draft",
+                "--port", "8100", "--offline", "--language-only"])
     }
 
     /// Listening on every network, the server accepts this Mac's .local name, once, which the API
