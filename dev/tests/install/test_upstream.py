@@ -1812,6 +1812,34 @@ class UpstreamTest(unittest.TestCase):
             f"{MODEL} is not installed in {(self.root / 'models').resolve()}",
         )
 
+    def test_prepare_reports_what_it_did_last(self):
+        # The app words a check for updates by it: installed or updated, up
+        # to date, unable to check (the Hub unreachable, or not asked), or
+        # unable to install what moved on and keeping the installed one.
+        fake = fake_hub(self, self.cache)
+
+        def outcome():
+            status, events, _ = self.run_installer("prepare", "--json-progress")
+            self.assertEqual(status, 0)
+            self.assertEqual(events[-1]["event"], "prepared")
+            return events[-1]["outcome"]
+
+        self.assertEqual(outcome(), "updated")
+        self.assertEqual(outcome(), "up_to_date")
+        fake.failure = httpx.ConnectError("[Errno 8] nodename nor servname provided")
+        self.assertEqual(outcome(), "unreachable")
+        fake.failure = None
+        with mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", True):
+            self.assertEqual(outcome(), "unreachable")
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        fake.download_failure = httpx.ReadTimeout("timed out")
+        self.assertEqual(outcome(), "kept")
+        fake.download_failure = None
+        self.assertEqual(outcome(), "updated")
+        # Without JSON progress, none.
+        status, events, _ = self.run_installer("prepare")
+        self.assertEqual((status, events), (0, []))
+
     def test_pins_are_required_before_publishing(self):
         fake_hub(self, self.cache)
         chosen = selection(self.root)

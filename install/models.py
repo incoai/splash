@@ -419,7 +419,10 @@ def main(argv=None):
         if args.command == "prepare":
             if args.json_progress:
                 hub.report_json_progress()
-            upstream.prepare(selection)
+            outcome = upstream.prepare(selection)
+            if args.json_progress:
+                # What it did, last, which the app words.
+                print(json.dumps({"event": "prepared", "outcome": outcome}), flush=True)
         elif args.command == "remove":
             freed = upstream.remove(selection)
             print(json.dumps({"event": "removed", "bytes": freed}), flush=True)

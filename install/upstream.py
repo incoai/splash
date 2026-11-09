@@ -19,7 +19,7 @@ import json
 import os
 import re
 import tempfile
-from contextlib import contextmanager, suppress
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,6 +46,13 @@ PROCESSOR_FILES = ("preprocessor_config.json", "processor_config.json")
 # which its draft reads in place of the target's token table row
 # (DraftCheckpoint.hpp kDraftMaskEmbedding; docs/models.md, Drafts).
 DRAFT_MASK_EMBEDDING = "mask_embedding.safetensors"
+# What a prepare did with the model, which `prepare --json-progress` reports
+# last for the app to word (models.main): published a new installation of it;
+# found the Hub to have nothing newer; could not check, the Hub not answering
+# for the target or its draft, or not asked (HF_HUB_OFFLINE, or a commit
+# revision, whose draft is not asked either); or could not install what moved
+# on and kept the installed one.
+UPDATED, UP_TO_DATE, UNREACHABLE, KEPT = "updated", "up_to_date", "unreachable", "kept"
 
 
 @dataclass(frozen=True)
@@ -556,8 +563,8 @@ def prepare(selection):
     """Start selection's model, installing what it needs: the installed
     assembly of the resolved commits, or a new commit installed and published
     atomically, or the verified installation when the Hub cannot answer or the
-    new commit cannot be installed. A Splash package is refused
-    (models.refuse_package)."""
+    new commit cannot be installed; and return what it did (UPDATED and the
+    other outcomes). A Splash package is refused (models.refuse_package)."""
     kind = models.installation_kind(selection.link)
     if kind == models.PACKAGE:
         models.refuse_package(
@@ -583,9 +590,8 @@ def prepare(selection):
             manifest = models.read_json(target.file("manifest.json"))
         models.refuse_package(selection.model, manifest)
     if installed is not None and target.revision == installed_commit:
-        _start_installed(selection, target, installed)
-    else:
-        _install_commit(selection, target, installed)
+        return _start_installed(selection, target, installed)
+    return _install_commit(selection, target, installed)
 
 
 def remove(selection):
@@ -639,23 +645,30 @@ def _start_installed(selection, target, installed):
             f"using the installed draft {_at(draft)}.",
             flush=True,
         )
+    answered = _answered(target) and not (draft and draft.unreachable_reason)
     if changes := _changes(installed, family, draft):
         print(f"Updating {selection.model}: {'; '.join(changes)}.", flush=True)
-        with _keeping_installation(
-            selection, installed, f"update it ({'; '.join(changes)})"
+        if not _keeping_installation(
+            selection,
+            installed,
+            f"update it ({'; '.join(changes)})",
+            lambda: _install(
+                selection, assembly.source(installed, "target"), installed, draft
+            ),
         ):
-            _install(selection, assembly.source(installed, "target"), installed, draft)
-        return
+            return KEPT
+        return UPDATED if answered else UNREACHABLE
     if (replaced := _retain_installed(selection)) is None:
         print(
             f"Splash model {selection.model} is already installed in {selection.link}",
             flush=True,
         )
-        return
+        return UP_TO_DATE if answered else UNREACHABLE
     # A concurrent installation replaced or damaged the assembly after it was
     # verified: no verified installation is left to keep.
     print(f"Reinstalling {selection.model}: {replaced}", flush=True)
     _install(selection, assembly.source(installed, "target"), installed, draft)
+    return UPDATED if answered else UNREACHABLE
 
 
 def _install_commit(selection, target, installed):
@@ -676,19 +689,22 @@ def _install_commit(selection, target, installed):
         )
     if installed is None:
         _install(selection, target, None)
-        return
-    with _keeping_installation(
-        selection, installed, f"install {selection.repo_id}@{target.revision}"
+    elif not _keeping_installation(
+        selection,
+        installed,
+        f"install {selection.repo_id}@{target.revision}",
+        lambda: _install(selection, target, installed),
     ):
-        _install(selection, target, installed)
+        return KEPT
+    return UPDATED if _answered(target) else UNREACHABLE
 
 
-@contextmanager
-def _keeping_installation(selection, installed, attempt):
-    """Run the block; if it fails, start the verified installation instead,
-    with a warning naming the attempt that failed."""
+def _keeping_installation(selection, installed, attempt, install):
+    """Run install(), and return whether it succeeded; if it fails, start
+    the verified installation instead, with a warning naming the attempt
+    that failed."""
     try:
-        yield
+        install()
     except (models.ModelError, OSError) as error:
         commit = installed["sources"]["target"]["revision"]
         models.warn(
@@ -697,6 +713,8 @@ def _keeping_installation(selection, installed, attempt):
         )
         if _retain_installed(selection) is not None:
             raise
+        return False
+    return True
 
 
 def _retain_installed(selection):
