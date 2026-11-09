@@ -376,13 +376,26 @@
     catch { /* Chat still works if browser storage is full or disabled. */ return false; }
   }
 
+  // What a message says in place of an image or a PDF that isn't kept.
+  function notSaved(part) {
+    return {type: 'text', text: part.type === 'image_url' ? '[Image not saved]' : `[${part.file?.filename || 'PDF'} not saved]`};
+  }
+
+  // A saved question's text, images and PDFs; an image or a PDF that can't be
+  // read back says so in its place, so the question stays with its answer.
   function cleanUserContent(content) {
     if (typeof content === 'string') return content;
     if (!Array.isArray(content)) return null;
     const clean = content.flatMap(part => {
       if (part?.type === 'text' && typeof part.text === 'string') return [{type: 'text', text: part.text}];
       const url = part?.type === 'image_url' ? part.image_url?.url : null;
-      return typeof url === 'string' && url.startsWith('data:image/') ? [{type: 'image_url', image_url: {url}}] : [];
+      if (typeof url === 'string' && url.startsWith('data:image/')) return [{type: 'image_url', image_url: {url}}];
+      const file = part?.type === 'file' ? part.file : null;
+      if (typeof file?.file_data === 'string' && file.file_data.startsWith('data:application/pdf;base64,')) {
+        const filename = typeof file.filename === 'string' ? file.filename : 'PDF';
+        return [{type: 'file', file: {filename, file_data: file.file_data}}];
+      }
+      return part?.type === 'image_url' || part?.type === 'file' ? [notSaved(part)] : [];
     });
     return clean.length ? clean : null;
   }
@@ -406,7 +419,11 @@
         if (!conversation || typeof conversation.id !== 'string' || seen.has(conversation.id) ||
             typeof conversation.title !== 'string' || !Number.isFinite(conversation.updated) ||
             !Array.isArray(conversation.messages)) return [];
-        const messages = conversation.messages.map(cleanMessage).filter(Boolean);
+        // A question and its answer go together where either can't be read, so
+        // the turns still alternate, as a model's chat template needs them to.
+        const read = conversation.messages.map(cleanMessage);
+        const messages = read.filter((message, index) => message &&
+          (message.role === 'user' ? read[index + 1] !== null : read[index - 1]?.role === 'user'));
         if (!messages.length) return [];
         seen.add(conversation.id);
         return [{id: conversation.id, title: conversation.title, updated: conversation.updated, messages}];
@@ -420,10 +437,9 @@
   }
 
   function withoutAttachments(conversation) {
-    const notSaved = part => part.type === 'image_url' ? {type: 'text', text: '[Image not saved]'}
-      : part.type === 'file' ? {type: 'text', text: `[${part.file.filename || 'PDF'} not saved]`} : part;
     const messages = conversation.messages.map(message => Array.isArray(message.content)
-      ? {...message, content: message.content.map(notSaved)} : message);
+      ? {...message, content: message.content.map(part => part.type === 'image_url' || part.type === 'file' ? notSaved(part) : part)}
+      : message);
     return {...conversation, messages};
   }
 

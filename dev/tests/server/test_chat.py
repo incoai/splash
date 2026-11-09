@@ -363,6 +363,74 @@ assert.equal(fresh.requests[0].headers.Authorization, undefined);
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """)
 
+    def test_a_reload_keeps_pdfs_and_each_question_with_its_answer(self):
+        # A chat saved with its PDFs has them again once the page reloads. A
+        # question never goes alone, which would leave two answers in a row: an
+        # attachment that can't be kept says so in its place, as one too large
+        # to store does, and an exchange that can't be read goes whole.
+        self.run_chat(r"""
+(async () => {
+  class Storage extends Map {
+    set(key, value) {
+      if (value.length > this.quota) throw Object.assign(new Error('Quota exceeded'), {name: 'QuotaExceededError'});
+      return super.set(key, value);
+    }
+  }
+  const pdfs = () => served(['text', 'image', 'pdf']);
+  async function send(chat, text, ...files) {
+    setText(chat, text);
+    selectFiles(chat, ...files).forEach(reading => reading.onload());
+    await flush();
+    submit(chat);
+    succeed(chat.requests.at(-1));
+    await flush();
+  }
+  async function reload(storage) {
+    const chat = createChat(storage, true, pdfs);
+    await flush();
+    chat.elements.recents.children[0].querySelector('.recent-open').handlers.click();
+    setText(chat, 'next');
+    submit(chat);
+    return chat.requests[0].body.messages;
+  }
+  const roles = messages => messages.map(message => message.role).join(' ');
+  for (const [quota, data, kept] of [
+    [Infinity, 'UERG', {type: 'file', file: {filename: 'plan.pdf', file_data: 'data:application/pdf;base64,UERG'}}],
+    // Storage too small for the PDF keeps the chat without it.
+    [1000, 'P'.repeat(2000), {type: 'text', text: '[plan.pdf not saved]'}],
+  ]) {
+    const storage = new Storage();
+    storage.quota = quota;
+    const chat = createChat(storage, true, pdfs);
+    await flush();
+    await send(chat, 'Hello');
+    // A PDF alone, without a word.
+    await send(chat, '', {type: 'application/pdf', name: 'plan.pdf', size: data.length, data});
+    const messages = await reload(storage);
+    assert.equal(roles(messages), 'user assistant user assistant user', `quota ${quota}`);
+    assert.deepEqual(messages[2].content, [kept], `quota ${quota}`);
+  }
+  // Saved with what this page can't read.
+  const storage = new Map([['splash-chats', JSON.stringify([{id: 'saved', title: 'Saved', updated: 1, messages: [
+    {role: 'user', content: [{type: 'file', file: {filename: 'notes.txt', file_data: 'data:text/plain;base64,TQ=='}}]},
+    {role: 'assistant', content: 'first answer'},
+    {role: 'user', content: []},
+    {role: 'assistant', content: 'second answer'},
+    {role: 'user', content: 'third question'},
+    {role: 'assistant', content: {}},
+    {role: 'user', content: [{type: 'image_url', image_url: {url: 'https://example.com/a.png'}}, {type: 'file', file: {}}]},
+    {role: 'assistant', content: 'last answer'},
+  ]}])]]);
+  assert.deepEqual(await reload(storage), [
+    {role: 'user', content: [{type: 'text', text: '[notes.txt not saved]'}]},
+    {role: 'assistant', content: 'first answer'},
+    {role: 'user', content: [{type: 'text', text: '[Image not saved]'}, {type: 'text', text: '[PDF not saved]'}]},
+    {role: 'assistant', content: 'last answer'},
+    {role: 'user', content: 'next'},
+  ]);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
     def test_restores_saved_chats_and_effort_with_read_only_storage(self):
         self.run_chat(r"""
 (async () => {
