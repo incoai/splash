@@ -319,7 +319,7 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
   // sets one, or waiting for the lanes in service.
   const auto goInMemory = [&](const InMemory &memory) {
     if (*memory.admission == SpillAdmission::Waiting) {
-      waitForMemory(active, now, {.projection = true});
+      waitForResources(active, now, {.projection = true});
     } else {
       active.kvMode = KvMode::Resident;
       if (memory.tokens)
@@ -392,7 +392,7 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
   // room left for output ends.
   const uint64_t activeLimitBytes = cache_.spillLimit();
   if (activeLimitBytes / geometry.slotBytes >= needed) {
-    waitForDiskQuota(active, now);
+    waitForResources(active, now, {.diskQuota = true});
     return SpillAdmission::Waiting;
   }
   if (resuming) {
@@ -409,18 +409,12 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
   return SpillAdmission::Settled;
 }
 
-void Engine::waitForDiskQuota(Request &active, double now) {
-  active.refusedResources = true;
-  scheduler_.waitForResources(active.request.id);
-  deferResourceRetry(active, now, {.diskQuota = true});
-}
-
-void Engine::waitForMemory(Request &active, double now, const Denial &denial) {
+void Engine::waitForResources(Request &active, double now, const Denial &denial) {
   active.refusedResources = true;
   scheduler_.waitForResources(active.request.id);
   deferResourceRetry(active, now, denial);
   const std::optional<RequestPriority> highest = highestLanePriority();
-  if (!scheduler_.suspended(active.request.id) && !denial.pending &&
+  if (!scheduler_.suspended(active.request.id) && !denial.pending && !denial.diskQuota &&
       (!denial.projection || (highest && *highest > active.request.priority)))
     static_cast<void>(preemptBelow(active.request.priority, now));
 }

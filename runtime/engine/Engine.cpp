@@ -974,7 +974,7 @@ bool Engine::admit(Request &active, double now) {
                                          state.admission.allocationFailure));
         return true;
       }
-      waitForMemory(active, now, state.denial);
+      waitForResources(active, now, state.denial);
       return false;
     }
     scheduler_.waitForResources(active.request.id);
@@ -996,7 +996,7 @@ bool Engine::admit(Request &active, double now) {
   const Cache::ChainCopies copies = commits ? cache_.chainCopies(chainEnd(lookup)) : Cache::ChainCopies{};
   if (commits && !cache_.commitSpill(requestId, spillPages(active, copies.copied), copies)) {
     vacateLane(active, resuming);
-    waitForDiskQuota(active, now);
+    waitForResources(active, now, {.diskQuota = true});
     return false;
   }
   const uint32_t resumeBoundary = lookup.resumeBoundary();
@@ -1040,7 +1040,7 @@ bool Engine::admit(Request &active, double now) {
       active.skipCache = true;
       active.admissionProbe.reset();
     }
-    waitForMemory(active, now, kv.denial);
+    waitForResources(active, now, kv.denial);
     return false;
   }
   // Admitted, it waits for nothing.

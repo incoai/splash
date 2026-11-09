@@ -694,11 +694,6 @@ private:
     std::optional<ResidentRoom> room;
   };
   [[nodiscard]] InMemory inMemory(const Request &request, const ClaimSpec &spec) const;
-  // A start the SSD cache's quota of active KV refused while other requests'
-  // active KV holds what it lacks: it waits for them to end, and holds back
-  // the starts the scheduler wants after it that compete for the quota
-  // (competesForQuota, Request::refusedResources).
-  void waitForDiskQuota(Request &request, double nowMilliseconds);
   // Whether the lane's history may gain Index pages between a command's
   // passes: under --kv-spill always, in Spill mode, a prompt `processed`
   // rows in reaches past its dense history and tail window, where its pages
@@ -1129,8 +1124,12 @@ private:
   // (Denial::projection) while one of its priority or above is in service:
   // it waits for that lane, which it cannot make yield, and a lower lane
   // suspended would wait behind it as long; with every lane lower, each
-  // suspension brings it closer to alone, where it is decided (inMemory).
-  void waitForMemory(Request &request, double nowMilliseconds, const Denial &denial);
+  // suspension brings it closer to alone, where it is decided (inMemory). A
+  // start the SSD cache's quota of active KV refused (Denial::diskQuota) waits
+  // for the requests whose active KV holds what it lacks to end, no lane
+  // yielding, and holds back the starts the scheduler wants after it that
+  // compete for the quota (competesForQuota, Request::refusedResources).
+  void waitForResources(Request &request, double nowMilliseconds, const Denial &denial);
   // The latest refusal of the request's memory, as a wait or beside lanes
   // that run: what refused it, whether memory is on its way back, and when
   // memory on its way back was first awaited, which bounds how long its
