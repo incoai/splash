@@ -132,7 +132,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](internals.md#neural-engine-prefill). |
-| `--prefill-int8` | `on` | On M5 and later Macs, whose GPUs multiply int8 at twice their bf16 rate, prefill chunks of more than 64 rows through a target's MLX 4- and 5-bit weights in groups of 64 (mlx_lm's default; not a MoE model's routed experts) in int8 activations, rounded per row and 64 inputs: about a quarter less time to the first token on Qwen3.8-27B MLX 4-bit. `off` runs those projections on the bf16 tiles (attention's INT8 queries follow `--kv-format`). See [int8-activation prefill](internals.md#int8-activation-prefill). |
+| `--int8-activations` | `on` | On M5 and later Macs, whose GPUs multiply int8 at twice their bf16 rate, round activations to int8 where that is faster: prefill chunks of more than 64 rows through a target's MLX 4- and 5-bit weights in groups of 64 (not a MoE model's routed experts), rounded per row and 64 inputs, about a quarter less time to the first token on Qwen3.8-27B MLX 4-bit; a Ternary-Bonsai (rotated PQ2_0) model's decode, 13-16% less time a cycle on a 20-core M5 Pro; and attention over the INT8 KV cache where a split reads 8 pages or more, 4-7% sooner first tokens at 32K-64K (see [KV cache precision](#kv-cache-precision)). `off` is a precision opt-out for evaluations and bf16 parity: every activation stays bf16. What `on` costs, as next-token KL against bf16: about 2.2e-3 for Qwen3.8-27B MLX 4-bit's prefill on the GPU alone, 2.8e-4 for Bonsai's decode, and with INT8 queries 1.37x the KL the INT8 KV cache alone gives Qwen3.8-27B. The Neural Engine split, which multiplies its part in int8 whatever this option, has its own switch, `--disable-ane`. See [kernel selection](internals.md#kernel-selection). |
 | `--verify-rows` | `auto` | The rows of each draft block decode cycles verify: `auto` lets the verify budget choose a MoE target's rows, which is faster but makes its greedy and seeded outputs vary from run to run, and verifies every row of a dense target; `all` verifies every row the output limit leaves on every target, so those outputs repeat when a request runs alone with the same cached prefixes. See [drafts](models.md#drafts) and [sampling](api.md#sampling). |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
@@ -434,11 +434,11 @@ off` loads every expert, as a SIZE that holds them all does.
   experts go first), and reads them from their
   files into a staging of a decode cycle's experts on the engine's SSD
   readers, and a repack kernel writes them into their slots before the expert
-  passes run. A decode step's load is one such round; a prefill command's
-  loads take as many rounds as its rows may route experts, each staging half
-  of the staging while the other half is read ahead. The kernels read every
-  routed expert through the layer's slot table and the chunks that hold its
-  slots, so resident experts, one chunk of every expert, and streamed
+  passes over them run. A decode step's load is one such round; a prefill
+  command's loads take as many rounds as its rows may route experts, each
+  staging half of the staging while the other half is read ahead. The kernels
+  find every routed expert through a table of its slot and the chunks that
+  hold its slots, so resident experts, one chunk of every expert, and streamed
   experts run the same kernels.
 - The grouping puts the tiles of the experts already resident first and those
   a load brings last (their slot-table entry is marked absent). A decode
@@ -576,7 +576,8 @@ On M5 and later Macs, whose GPUs multiply int8 at twice their bf16 rate, INT8 KV
 also quantizes the attention queries to INT8 where each split of dense attention
 reads at least 8 pages of 32 tokens. Prefill chunks of about 225 tokens or more
 take INT8 queries even with no history, and verify takes them from about 7K
-tokens of history.
+tokens of history. `--int8-activations off` keeps the queries bf16 with either
+KV format.
 
 ### State precision
 

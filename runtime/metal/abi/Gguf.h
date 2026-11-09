@@ -117,8 +117,9 @@ struct GgufPrefillInt8Params {
   uint32_t out_stride;        // columns of a destination row
   uint32_t out_offset;        // first destination column of the segment
   uint32_t plane_input_size;  // inputs a row of the planes holds (Projection::leadingInputs), K for none
+  uint32_t column_tiles;      // the segment's tiles of GGUF_TILE_COLUMNS columns
 };
-static_assert(sizeof(GgufPrefillInt8Params) == 24, "int8 prefill parameters are 24 bytes on both sides");
+static_assert(sizeof(GgufPrefillInt8Params) == 28, "int8 prefill parameters are 28 bytes on both sides");
 // Scratch of `storage` rows of K inputs: the int8 codes in the table, and in
 // the sums buffer float2 [K / 64][storage].
 inline constexpr uint64_t gguf_prefill_int8_table_bytes(uint32_t k, uint64_t storage) {
@@ -193,21 +194,17 @@ static_assert(sizeof(GgufFloatParams) == 32, "GGUF float parameters are 32 bytes
 // (kernels/shared/gguf_rotation.metal) writes the rotated input as int8 rows [rows][width], each group of 32 inputs
 // in the tile's stage order (gguf_decode_int8_position), then fp32 scales [rows][width / GGUF_ROTATION_BLOCK]:
 // input k of row r is int8 * scale[r][k / GGUF_ROTATION_BLOCK]. The tiles (kernels/shared/gguf_linear.metal
-// gguf_decode_int8_*) multiply them with the PQ2_0 codes in int8.
+// gguf_decode_int8_*) multiply them with the PQ2_0 codes in int8, taking the staged decode kernels' parameters
+// (GgufDecodeParams, GgufDecodeFusedParams), each K partition of whole PQ2_0 blocks.
 struct GgufRotationInt8Params {
   uint32_t width;  // K, the row stride of the input and of the int8 rows
   uint32_t rows;   // rows of int8 storage (the tile's height): the scales start at byte rows * K
 };
 static_assert(sizeof(GgufRotationInt8Params) == 8, "GGUF int8 rotation parameters are 8 bytes on both sides");
-struct GgufDecodeInt8Params {
-  uint32_t input_size;  // K
-  uint32_t splits;      // K partitions, each of whole 128-input PQ2_0 blocks
-  uint32_t out_stride;  // columns of a destination row
-  uint32_t cols[3];     // columns per segment; 0 past the last
-  uint32_t offset[3];   // first destination column per segment
-  uint32_t spread;      // as GgufDecodeParams'
-};
-static_assert(sizeof(GgufDecodeInt8Params) == 40, "GGUF int8 decode parameters are 40 bytes on both sides");
+// The bytes of `rows` rows of int8 storage of `width` inputs: the int8 rows, then their scales.
+inline constexpr uint64_t gguf_rotation_int8_bytes(uint32_t width, uint64_t rows) {
+  return uint64_t(width) * rows + uint64_t(width / GGUF_ROTATION_BLOCK) * rows * 4u;
+}
 // The stage position, within its group of 32, of input t of the group: the PQ2_0 tile stages the codes of chunk
 // word w (chunks 2w, 2w + 1) as four words (w >> 2e) & 0x03030303 (e = 0..3), so byte 16 w + 4 e + k holds code e
 // of byte k of the word, which is input 16 (k & 1) + 4 (2 w + (k >> 1)) + e.

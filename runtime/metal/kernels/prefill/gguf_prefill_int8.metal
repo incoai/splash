@@ -28,8 +28,9 @@ inline uint prefill_int8_position(uint slot) {
 }
 
 // grid (groups / GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS, rows): simdgroup s of threadgroup (b, row) quantizes group
-// b * GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS + s of the row, lane l its inputs l and 32 + l; a group holding an
-// infinity or a NaN takes NaN scales (kernels/common/int8_activations.h).
+// b * GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS + s of the row by the int8-activation rule
+// (kernels/common/int8_activations.h), lane l its inputs l and 32 + l, and stores the group's scale and the scale
+// times its codes' sum.
 kernel void gguf_prefill_int8_quantize(device const bfloat *input [[buffer(0)]], device char *codes [[buffer(1)]],
                                        device float2 *scales [[buffer(2)]],
                                        constant GgufPrefillInt8QuantizeParams &p [[buffer(3)]],
@@ -41,18 +42,16 @@ kernel void gguf_prefill_int8_quantize(device const bfloat *input [[buffer(0)]],
   const ulong at = ulong(row) * p.input_size + g * GGUF_PREFILL_INT8_GROUP;
   const bfloat b0 = input[at + lane], b1 = input[at + 32 + lane];
   const float x0 = float(b0), x1 = float(b1);
-  const float amax = simd_max(max(fabs(x0), fabs(x1)));
-  const float inv = amax > 0.0f ? 127.0f / amax : 0.0f, scale = amax > 0.0f ? amax / 127.0f : 0.0f;
-  const int q0 = int(clamp(rint(x0 * inv), -127.0f, 127.0f)), q1 = int(clamp(rint(x1 * inv), -127.0f, 127.0f));
+  const Int8Block block = int8_activation_block(simd_max(max(fabs(x0), fabs(x1))));
+  const int q0 = int8_activation_code(x0, block.inverse), q1 = int8_activation_code(x1, block.inverse);
   const uint position = prefill_int8_position(quant_slot(lane));
   codes[at + position] = char(q0);
   codes[at + 32 + position] = char(q1);
   const int sum = simd_sum(q0 + q1);
   const bool finite = simd_all(!int8_activation_not_finite(b0) && !int8_activation_not_finite(b1));
   if (lane != 0) return;
-  const ulong s = ulong(g) * p.storage_rows + row;
-  if (finite) scales[s] = float2(scale, scale * float(sum));
-  else ((device uint2 *)scales)[s] = uint2(0x7fc00000u);
+  ((device uint2 *)scales)[ulong(g) * p.storage_rows + row] =
+      uint2(int8_activation_bits(block.scale, finite), int8_activation_bits(block.scale * float(sum), finite));
 }
 
 constant constexpr int kInt8FragM = 16, kInt8FragN = 32, kInt8FragK = 16, kInt8RowFrags = 2, kInt8Elements = 16;
@@ -71,13 +70,12 @@ inline uint prefill_int8_fifth(uint b) {
   return ((b & 1u) | ((b & 0x10u) << 4) | ((b & 2u) << 15) | ((b & 0x20u) << 19)) << 4;
 }
 
-// The (column tile, row tile) of the threadgroup at launch position tid.y C + tid.x of a grid of C column tiles by R
-// row tiles: GGUF_PREFILL_INT8_WALK row tiles take each column tile in turn before the next column tile, the last
-// block of row tiles its remainder.
-inline uint2 prefill_int8_walk(uint2 tid, uint2 grid) {
+// The (column tile, row tile) of tile index `at` of grid.x column tiles by grid.y row tiles:
+// GGUF_PREFILL_INT8_WALK row tiles take each column tile in turn before the next column tile, the last block of row
+// tiles its remainder.
+inline uint2 prefill_int8_walk(uint at, uint2 grid) {
   constexpr uint S = GGUF_PREFILL_INT8_WALK;
-  const uint at = tid.y * grid.x + tid.x, block = at / (S * grid.x), height = min(S, grid.y - block * S),
-             i = at - block * S * grid.x;
+  const uint block = at / (S * grid.x), height = min(S, grid.y - block * S), i = at - block * S * grid.x;
   return uint2(i / height, block * S + i % height);
 }
 
@@ -191,18 +189,25 @@ inline void prefill_int8_tile(device const char *codes, device const float2 *sca
     }
 }
 
-// grid (column tiles, row tiles of GGUF_PREFILL_INT8_ROWS), GGUF_PREFILL_INT8_THREADS threads, walked by
-// prefill_int8_walk; aux (buffer 6) is the residual or the gate, the output for the plain epilogue, which reads none.
+// grid (GGUF_PREFILL_INT8_WALK, its tiles / GGUF_PREFILL_INT8_WALK rounded up), GGUF_PREFILL_INT8_THREADS threads:
+// threadgroup (x, y) takes tile index y GGUF_PREFILL_INT8_WALK + x of the segment's column tiles by the chunk's row
+// tiles of GGUF_PREFILL_INT8_ROWS (prefill_int8_walk), and those past the tiles none. A run of 16 threadgroups along
+// x is so one column tile's row tiles of a block, whatever the column count; a grid of (column tiles, row tiles)
+// kept them together only where the column tiles were a multiple of 16 (M6: 260 column tiles took 29% longer than
+// 256 at 2048 rows). aux (buffer 6) is the residual or the gate, the output for the plain epilogue, which reads none.
 #define GGUF_PREFILL_INT8_KERNEL(B, f, ep, Ep)                                                                         \
   kernel void gguf_prefill_int8_##f##_##ep(                                                                            \
       device const char *codes [[buffer(0)]], device const float2 *scales [[buffer(1)]],                               \
       device const uchar *w0 [[buffer(2)]], device const uchar *w1 [[buffer(3)]],                                      \
       device const uchar *meta [[buffer(4)]], device bfloat *output [[buffer(5)]],                                     \
       device const bfloat *aux [[buffer(6)]], constant GgufPrefillInt8Params &p [[buffer(7)]],                         \
-      uint2 tid [[threadgroup_position_in_grid]], uint2 grid [[threadgroups_per_grid]],                                \
-      ushort lane [[thread_index_in_simdgroup]], ushort simd_group [[simdgroup_index_in_threadgroup]]) {               \
-    prefill_int8_tile<B, Ep>(codes, scales, w0, w1, meta, output, aux, p, prefill_int8_walk(tid, grid), lane,          \
-                             simd_group);                                                                              \
+      uint2 tid [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]],                           \
+      ushort simd_group [[simdgroup_index_in_threadgroup]]) {                                                          \
+    const uint rows = (p.rows + GGUF_PREFILL_INT8_ROWS - 1) / GGUF_PREFILL_INT8_ROWS,                                  \
+               at = tid.y * GGUF_PREFILL_INT8_WALK + tid.x;                                                            \
+    if (at >= p.column_tiles * rows) return;                                                                           \
+    prefill_int8_tile<B, Ep>(codes, scales, w0, w1, meta, output, aux, p,                                              \
+                             prefill_int8_walk(at, uint2(p.column_tiles, rows)), lane, simd_group);                    \
   }
 #define GGUF_PREFILL_INT8_FORMAT(B, f)                                                                                 \
   GGUF_PREFILL_INT8_KERNEL(B, f, a, EpNone) GGUF_PREFILL_INT8_KERNEL(B, f, r, EpResidual)                              \
