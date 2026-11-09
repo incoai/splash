@@ -247,7 +247,13 @@ extension AppState {
     /// start and a download's progress; the button's help says the step and the percentage, the
     /// Server and the menu bar's panel the speed.
     var serverTitle: String {
-        if installer.running { return "Downloading…" }
+        if installer.running {
+            return switch installer.work {
+            case .removal: "Deleting…"
+            case .check where installer.progress == nil: "Checking…"
+            default: "Downloading…"
+            }
+        }
         guard let name = server.model.map(catalog.name(of:)) else { return "Server" }
         switch server.phase {
         case .starting, .ready, .stopping: return name

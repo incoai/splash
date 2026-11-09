@@ -19,7 +19,9 @@ struct ServerView: View {
     var body: some View {
         let suggestions = state.catalog.suggestions(memory: Catalog.memory)
         let installedNames = Set(state.installed.map { state.catalog.name(of: $0.id) })
-        let available = suggestions.filter { !installedNames.contains($0.name) && $0.id != state.installer.model }
+        let available = suggestions.filter {
+            !installedNames.contains($0.name) && $0.id != state.installer.model && $0.id != state.arriving
+        }
         let first = state.installed.isEmpty
         let failed = if case .failed = state.server.phase { true } else { false }
         Form {
@@ -32,16 +34,14 @@ struct ServerView: View {
                     if let problem = state.keyProblem {
                         ProblemRow(title: "Splash can’t use its API key",
                                    message: "The Keychain says: \(problem) Allow Splash to use it, then try again.",
-                                   action: ("Try Again", state.readKey))
+                                   action: ("Try Again", state.retryKey))
                     }
                     if case .failed(let message) = state.server.phase, let model = state.server.model {
+                        // What its failure says would help: a start that would fit, or, for files on
+                        // this Mac Splash can't serve, taking them off the list.
                         ProblemRow(title: "\(state.displayName(of: model)) ran into a problem", message: message,
                                    log: .server, dismiss: state.server.dismissFailure,
-                                   // The start its failure says would fit; files on this Mac that can't
-                                   // serve won't serve on a second try.
-                                   action: state.server.remedy.map { remedy in (remedy.title, { state.retry(model, with: remedy) }) }
-                                       ?? (model.hasPrefix("/") && !state.server.running
-                                           ? ("Remove from List", { state.server.dismissFailure(); state.removeLocal(model) }) : nil))
+                                   action: state.server.remedy.map { remedy in (remedy.title, { state.retry(model, with: remedy) }) })
                     }
                     if let failure = state.installer.failure {
                         let name = state.displayName(of: failure.model)
@@ -243,7 +243,7 @@ private struct ControlBar: View {
                     .help(server.asleep ? "It freed its memory while idle and loads again with the next message." : "")
                 CopyButton(copy: state.copyAPIAddress)
                     .buttonStyle(.hover)
-                    .help("Copy API Address: \(server.settings.url.appending(path: "v1").absoluteString)")
+                    .help("Copy API Address: \(state.apiAddress)")
                     .accessibilityLabel("Copy API Address")
             }
         case .failed where othersFailure:
@@ -257,21 +257,26 @@ private struct ControlBar: View {
         let server = state.server
         switch server.phase {
         case .stopped, .failed:
-            // A server that runs but serves nothing gives way to the model picked.
+            // A server that runs but serves nothing can be stopped, and gives way to the model
+            // picked.
+            if server.running { Button("Stop") { state.stop() } }
             let switching = server.running && state.selection != server.model
-            Button(failedPicked ? "Try Again" : switching ? "Switch to \(state.selection.map(state.displayName(of:)) ?? "")" : "Start") {
-                if let model = state.selection { state.start(model) }
+            Button { if let model = state.selection { state.start(model) } } label: {
+                Text(failedPicked ? "Try Again" : switching ? "Switch to \(state.selection.map(state.displayName(of:)) ?? "")" : "Start")
+                    .frame(maxWidth: 240)
             }
             .buttonStyle(.borderedProminent)
             .disabled(state.selection == nil || !state.canStart)
         case .starting:
-            Button("Cancel") { state.stop() }
+            LateButton(title: "Cancel") { state.stop() }
         case .stopping:
-            if server.next != nil { Button("Cancel") { state.stop() } }
+            if server.next != nil { LateButton(title: "Cancel") { state.stop() } }
         case .ready:
             if let selection = state.selection, selection != server.model {
                 Button("Stop") { state.stop() }
-                Button("Switch to \(state.displayName(of: selection))") { state.start(selection) }
+                Button { state.start(selection) } label: {
+                    Text("Switch to \(state.displayName(of: selection))").frame(maxWidth: 240)
+                }
                     .buttonStyle(.borderedProminent)
                     .disabled(!state.canStart)
             } else {
@@ -289,6 +294,22 @@ private struct ControlBar: View {
     }
 }
 
+/// A button that takes clicks half a second after it shows: one that takes the place of the button
+/// just clicked would take the second click of a double click.
+private struct LateButton: View {
+    let title: String
+    let action: () -> Void
+    @State private var armed = false
+
+    var body: some View {
+        Button(title) { if armed { action() } }
+            .task {
+                try? await Task.sleep(for: .milliseconds(500))
+                armed = true
+            }
+    }
+}
+
 /// What the model that runs has done: its figures and its requests. It reads them itself, so that a
 /// poll or a request finishing redraws this section alone, not the whole screen.
 private struct ActivitySection: View {
@@ -298,8 +319,7 @@ private struct ActivitySection: View {
     var body: some View {
         Section {
             ActivityFigures(activity: state.server.activity, context: state.server.context)
-            RequestLog(requests: state.server.requests,
-                       totals: RequestLog.totals(state.server.activity, running: state.server.requests.count { $0.end == nil }),
+            RequestLog(requests: state.server.requests, totals: RequestLog.totals(state.server.activity, requests: state.server.requests),
                        open: advanced)
         } header: {
             SectionTitle(text: "Activity")
@@ -360,11 +380,12 @@ private struct RequestLog: View {
         }
     }
 
-    /// How many requests, the tokens they wrote and read, those taken from the cache, and those
-    /// `running` as the rows show them; none before the first.
-    static func totals(_ activity: Server.Activity, running: Int) -> String? {
-        guard activity.served > 0 || running > 0 else { return nil }
-        var parts = [activity.served.formatted(), "\(Format.count(activity.generated)) tokens out", "\(Format.count(activity.read)) in"]
+    /// How many `requests`, as the rows count them, the tokens they wrote and read, those taken from
+    /// the cache, and those running; none before the first.
+    static func totals(_ activity: Server.Activity, requests: [ServedRequest]) -> String? {
+        guard !requests.isEmpty else { return nil }
+        let running = requests.count { $0.end == nil }
+        var parts = [requests.count.formatted(), "\(Format.count(activity.generated)) tokens out", "\(Format.count(activity.read)) in"]
         if activity.cached > 0 { parts.append("\(Format.count(activity.cached)) cached") }
         if running > 0 { parts.append("\(running) running") }
         return parts.joined(separator: " · ")
@@ -525,8 +546,7 @@ private struct DownloadRow: View {
             HStack {
                 let name = installer.model.map(state.displayName(of:)) ?? ""
                 // A check says so until it finds something to download.
-                Text(installer.work == .removal ? "Deleting \(name)"
-                     : installer.work == .check && installer.progress == nil ? "Checking \(name) for updates" : "Downloading \(name)")
+                Text(installer.work.phrase(name, downloading: installer.progress != nil))
                     .font(.headline)
                 Spacer()
                 // A deletion is quick, and cut short it would leave files no one uses.
@@ -653,7 +673,7 @@ private struct ModelRow: View {
             Button("Remove from List") { state.removeLocal(model.id) }
         } else {
             // One download at a time; the model that runs is checked or deleted once stopped.
-            let busy = !state.ready || state.installer.running || (state.server.running && state.server.model == model.id)
+            let busy = !state.ready || state.installer.running || state.serving(model.id)
             Button("Check for Updates") { state.checkForUpdates(model.id) }
                 .disabled(busy)
             CopyModelID(id: model.id)
@@ -669,7 +689,7 @@ private struct ModelRow: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowedContentTypes = UTType(filenameExtension: "gguf").map { [$0] } ?? []
-        panel.directoryURL = URL(filePath: model.id).deletingLastPathComponent()
+        panel.directoryURL = model.id.hasSuffix(".gguf") ? URL(filePath: model.id).deletingLastPathComponent() : URL(filePath: model.id)
         panel.prompt = "Choose"
         panel.message = "Choose the GGUF vision projector of this model, such as mmproj-BF16.gguf."
         guard panel.runModal() == .OK, let url = panel.url else { return }
@@ -708,7 +728,7 @@ private struct SuggestedRow: View {
         LabeledContent {
             Button("Download") { state.download(variant.id) }
                 .disabled(state.installer.running || !state.ready)
-                .help(state.installer.running ? "One download at a time" : "")
+                .help(state.downloadStatus.map { "One at a time: \($0)" } ?? "")
                 .prominent(lead)
         } label: {
             // The anatomy of a model row.
@@ -812,6 +832,7 @@ private struct CustomModelSheet: View {
 extension View {
     /// The screen's one prominent button, which Return presses.
     @ViewBuilder func prominent(_ on: Bool) -> some View {
-        if on { buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction) } else { self }
+        // No Return for it: a key pressed in a drawer's terminal or a field must not start a download.
+        if on { buttonStyle(.borderedProminent) } else { self }
     }
 }

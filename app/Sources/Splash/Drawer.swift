@@ -176,28 +176,38 @@ struct WithDrawer<Content: View>: View {
     @Environment(AppState.self) private var state
     @FocusState private var focused: Bool
     @ViewBuilder let content: Content
+    /// The room the content and the drawer share.
+    @State private var room: CGFloat = 0
+
+    /// The tallest the drawer is: 640 points, leaving the content 240 at least, once the room is
+    /// measured.
+    private var tallest: CGFloat { room == 0 ? 640 : max(120, min(640, room - 240)) }
 
     var body: some View {
         let shown = state.showsDrawer
+        let height = min(state.drawerHeight, tallest)
         VStack(spacing: 0) {
             content
             // Closed, it keeps its place and its height, clipped to none, its terminals and their
             // views with it; the keyboard leaves it. Its tabs keep to its top edge, with no
             // terminal under them too.
-            DrawerView()
-                .frame(height: state.drawerHeight, alignment: .top)
+            DrawerView(tallest: tallest)
+                .frame(height: height, alignment: .top)
                 .focused($focused)
-                .frame(height: shown ? state.drawerHeight : 0, alignment: .top)
+                .frame(height: shown ? height : 0, alignment: .top)
                 .clipped()
                 .allowsHitTesting(shown)
                 .accessibilityHidden(!shown)
         }
         .onChange(of: shown) { if !shown { focused = false } }
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { room = $0 }
     }
 }
 
 private struct DrawerView: View {
     @Environment(AppState.self) private var state
+    /// The tallest the drawer is in the window it is in.
+    let tallest: CGFloat
     @State private var dragged: CGFloat?
     /// The terminal with the keyboard: the one shown, picked in the drawer shown; none otherwise.
     /// One value for them all moves the keyboard from the terminal hidden to the one shown in one
@@ -217,9 +227,9 @@ private struct DrawerView: View {
                         .pointerStyle(.frameResize(position: .top))
                         .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
                             .onChanged { value in
-                                let start = dragged ?? state.drawerHeight
+                                let start = dragged ?? min(state.drawerHeight, tallest)
                                 if dragged == nil { dragged = start }
-                                state.drawerHeight = min(max(start - value.translation.height, 120), 640)
+                                state.drawerHeight = min(max(start - value.translation.height, 120), tallest)
                             }
                             .onEnded { _ in dragged = nil })
                 }

@@ -17,13 +17,16 @@ final class Server {
         case memoryLimit(String?)
         /// The context length on Auto.
         case autoContext
+        /// Model files on this Mac Splash can't prepare or serve, which no start would: off the list.
+        case removeFromList
 
-        /// Its button: the start with it.
+        /// Its button: the start with it, or taking the files off the list.
         var title: String {
             switch self {
             case .memoryLimit(let limit?): "Start with \(limit.dropLast()) GB"
             case .memoryLimit(nil): "Start Without a Limit"
             case .autoContext: "Start with Auto Context"
+            case .removeFromList: "Remove from List"
             }
         }
     }
@@ -296,7 +299,7 @@ final class Server {
             phase = .failed(Self.startProblem(record: record, pid: pid, port: settings.port,
                                               holder: runtime.serveLockHolder(port: settings.port)))
             remedy = record.flatMap { $0.pid == pid ? $0.failure : nil }
-                .flatMap { Self.remedy(for: $0, settings: settings, memory: Catalog.memory) }
+                .flatMap { Self.remedy(for: $0, settings: settings, memory: Catalog.memory, local: model?.hasPrefix("/") == true) }
         } else {
             phase = .failed("It stopped unexpectedly. The log has the details.")
         }
@@ -319,9 +322,13 @@ final class Server {
     /// What the launch options would need for a start that failed with `settings` on a Mac with
     /// `memory` GB to start: a memory limit that holds what the model needs, the least one the
     /// options offer, or none where none does; the context length on Auto, which the server fits to
-    /// the memory, where one was set that doesn't fit. Other failures it can't tell a change for.
-    nonisolated static func remedy(for failure: ServeRecord.Failure, settings: ServeSettings, memory: Int) -> Remedy? {
+    /// the memory, where one was set that doesn't fit; for `local` model files Splash couldn't
+    /// prepare or can't serve, taking them off the list. Other failures it can't tell a change for.
+    nonisolated static func remedy(for failure: ServeRecord.Failure, settings: ServeSettings, memory: Int,
+                                   local: Bool = false) -> Remedy? {
         switch (failure.kind, failure.bound) {
+        case (let kind, _) where local && (kind == "model" || kind == "install"):
+            return .removeFromList
         case ("memory_budget", "max_memory"):
             guard let needed = failure.required_bytes else { return nil }
             let limit = ServeSettings.memoryLimits(memory: memory).first { Int64($0) << 30 >= needed }

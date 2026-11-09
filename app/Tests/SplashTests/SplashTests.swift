@@ -49,8 +49,9 @@ struct CatalogTests {
         try FileManager.default.createDirectory(at: folder.appending(path: "Q4"), withIntermediateDirectories: true)
         try Data(count: 12_345).write(to: folder.appending(path: "m.gguf"))
         try Data(count: 1000).write(to: folder.appending(path: "Q4/m-00001-of-00002.gguf"))
-        #expect(InstalledModel.local(folder.appending(path: "m.gguf").path) == InstalledModel(id: folder.appending(path: "m.gguf").path, bytes: 12_345))
-        #expect(InstalledModel.local(folder.path).bytes == 13_345)
+        #expect(InstalledModel.local(folder.appending(path: "m.gguf").path)
+            == InstalledModel(id: folder.appending(path: "m.gguf").path, bytes: 12_345, holdsGGUF: true))
+        #expect(InstalledModel.local(folder.path).bytes == 13_345 && InstalledModel.local(folder.path).gguf)
         #expect(InstalledModel.local(folder.appending(path: "gone").path).missing)
     }
 }
@@ -1103,7 +1104,7 @@ struct ModelFamilyTests {
         try Data(count: 1000).write(to: file)
         state.addLocal(file)
         await state.listed()
-        #expect(state.installed.last == InstalledModel(id: file.path, bytes: 1000) && state.selection == file.path)
+        #expect(state.installed.last == InstalledModel(id: file.path, bytes: 1000, holdsGGUF: true) && state.selection == file.path)
         #expect(state.family(of: file.path) == .unknown)
         state.options["--port"] = String(fake.port)
         state.start(file.path)

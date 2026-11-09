@@ -77,15 +77,29 @@ final class Installer {
     private(set) var failure: (model: String, message: String)?
     /// What the installer does with a model: downloads it, checks an installed one for updates,
     /// which downloads only what has moved on, if anything, or removes an installed one.
-    enum Work { case download, check, removal }
+    enum Work {
+        case download, check, removal
+
+        /// What it does to the model `name`: a check, once it finds something to download,
+        /// downloads it.
+        func phrase(_ name: String, downloading: Bool) -> String {
+            switch self {
+            case .download: "Downloading \(name)"
+            case .check: downloading ? "Downloading \(name)" : "Checking \(name) for updates"
+            case .removal: "Deleting \(name)"
+            }
+        }
+    }
     /// What the installation running does, or else what the last one did.
     private(set) var work = Work.download
     /// The last check for updates that ended: its model, and whether it downloaded what had moved
     /// on rather than finding it all there.
     private(set) var checked: (model: String, updated: Bool)?
 
-    /// Gets each model once it is installed.
+    /// Gets each model once it is downloaded.
     @ObservationIgnored var installed: (String) -> Void = { _ in }
+    /// Gets each model once a check or a deletion of it has changed its files.
+    @ObservationIgnored var changed: (String) -> Void = { _ in }
     /// Gets each model once it is removed.
     @ObservationIgnored var removed: (String) -> Void = { _ in }
 
@@ -207,8 +221,13 @@ final class Installer {
         self.model = nil
         progress = nil
         if status == 0 {
-            if work == .check { checked = (model, downloaded) }
-            if work == .removal { removed(model) } else { installed(model) }
+            switch work {
+            case .download: installed(model)
+            case .check:
+                checked = (model, downloaded)
+                changed(model)
+            case .removal: changed(model)
+            }
         } else if !cancelled {
             failure = (model, reported.map { Self.problem($0, model: model) }
                 ?? "It stopped unexpectedly. The log has the details.")

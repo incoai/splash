@@ -78,6 +78,8 @@ final class AppState {
     /// Why the Keychain didn't give or keep the API key; nothing starts until it does, so that a
     /// model never serves without the key it is meant to ask for.
     private(set) var keyProblem: String?
+    /// A model downloaded that the listing hasn't found yet, whose suggestion stays away meanwhile.
+    private(set) var arriving: String?
     /// Set once the app quits: nothing starts any more.
     private(set) var quitting = false
     /// The installer of the models the Hugging Face cache holds, while it runs (`launch`).
@@ -96,6 +98,7 @@ final class AppState {
         self.defaults = defaults
         showsSidebar = defaults.object(forKey: Preference.sidebar) as? Bool ?? true
         options = ServeSettings.current(defaults)
+        modelFiles = Self.keptModelFiles(defaults)
         drawer = Drawer(shell: shell)
         chats = ChatStore(folder: folders.chats)
         draft = Draft(files: chats.attachments)
@@ -104,7 +107,7 @@ final class AppState {
         catalog = Catalog(contentsOf: runtime.suggestedModels)
         transcript = Transcript(runtime: runtime, attachments: chats.attachments)
         installer.installed = { [weak self] in self?.didInstall($0) }
-        installer.removed = { [weak self] _ in self?.refresh() }
+        installer.changed = { [weak self] _ in self?.refresh() }
         // A start prepares model files on this Mac, which then have a family, and the model that
         // runs stays listed only while it runs.
         server.phaseChanged = { [weak self] in self?.refresh() }
@@ -127,7 +130,18 @@ final class AppState {
     /// Whether a model can start, or the one that runs give way to another, now: the app is ready
     /// and the Keychain gives the API key (`keyProblem`). The Server's buttons, the menu bar's
     /// panel and the composer's model menu ask it.
-    var canStart: Bool { ready && keyProblem == nil }
+    var canStart: Bool { ready && keyProblem == nil && !removing(selection) }
+
+    /// Whether `model` is being deleted.
+    func removing(_ model: String?) -> Bool {
+        installer.running && installer.work == .removal && installer.model == model
+    }
+
+    /// Whether `model` is the one the server runs or a switch starts, which is checked or deleted
+    /// once stopped.
+    func serving(_ model: String) -> Bool {
+        server.running && (server.model == model || server.next == model)
+    }
 
     /// Whether the app runs something it must stop or wait for before it quits.
     var busy: Bool { server.running || installer.running || cachedInstaller != nil }
@@ -170,12 +184,12 @@ final class AppState {
         return "\(displayName(of: model)) · \(serverStatus.phrase)"
     }
 
-    /// The download under way, in the words the menus use.
+    /// What the installer does, a download, a check or a deletion, in the words the menus use.
     var downloadStatus: String? {
         guard let model = installer.model else { return nil }
         let name = displayName(of: model)
-        guard let progress = installer.progress else { return "Downloading \(name)…" }
-        return "Downloading \(name) · \(progress.fraction.formatted(.percent.precision(.fractionLength(0))))"
+        guard let progress = installer.progress else { return "\(installer.work.phrase(name, downloading: false))…" }
+        return "\(installer.work.phrase(name, downloading: true)) · \(progress.fraction.formatted(.percent.precision(.fractionLength(0))))"
     }
 
     /// The model picked on the Server screen: the last one picked while it is listed, else the
@@ -261,6 +275,12 @@ final class AppState {
         if options.apiKey != keptKey { keep(options.apiKey) }
     }
 
+    /// Tries again what the Keychain refused: keeping the key typed, where it differs from the one
+    /// kept, or else reading the key kept.
+    func retryKey() {
+        if options.apiKey != keptKey { keep(options.apiKey) } else { readKey() }
+    }
+
     private func keep(_ key: String?) {
         do {
             try keychain.write(key)
@@ -291,6 +311,9 @@ final class AppState {
         switch remedy {
         case .memoryLimit(let limit): options["--max-memory"] = limit
         case .autoContext: options["--max-context"] = nil
+        case .removeFromList:
+            server.dismissFailure()
+            return removeLocal(model)
         }
         start(model)
     }
@@ -351,8 +374,11 @@ final class AppState {
 
     var quitCost: QuitCost {
         let requests = server.phase == .ready ? max(server.activity.running, chats.streaming == nil ? 0 : 1) : 0
+        // A download, or a check's update, starts over; a check that has found nothing loses nothing,
+        // and a deletion, quick, ends first.
+        let downloading = installer.running && (installer.work == .download || installer.progress != nil)
         return QuitCost(model: server.model.map(displayName(of:)), requests: requests,
-                        download: installer.model.map(displayName(of:)), programs: drawer.runningPrograms)
+                        download: downloading ? installer.model.map(displayName(of:)) : nil, programs: drawer.runningPrograms)
     }
 
     /// Stops the download, the model and the installer of cached models, which the app waits for
@@ -362,7 +388,8 @@ final class AppState {
         quitting = true
         chats.stop()
         drawer.endAll()
-        installer.cancel()
+        // A deletion cut short would leave files no one uses: the quit waits for it.
+        if installer.work != .removal { installer.cancel() }
         server.stop()
         cachedInstaller?.stop(SIGINT, killAfter: .seconds(5))
     }
@@ -513,8 +540,13 @@ final class AppState {
     }
 
     func copyAPIAddress() {
+        NSPasteboard.put(apiAddress)
+    }
+
+    /// The model's API address, as Copy API Address gives it.
+    var apiAddress: String {
         let settings = server.running ? server.settings : options
-        NSPasteboard.put(settings.address().appending(path: "v1").absoluteString)
+        return settings.address().appending(path: "v1").absoluteString
     }
 
     /// Lists the models installed here, the suggested ones first in the list's order, then the model
@@ -548,6 +580,7 @@ final class AppState {
             let listed = all.filter { !$0.local }.sorted { (rank($0.id), $0.id) < (rank($1.id), $1.id) }
                 + all.filter(\.local)
             if listed != installed { installed = listed }
+            if let arriving, listed.contains(where: { $0.id == arriving }) { self.arriving = nil }
             if let picked = picking {
                 picking = nil
                 selection = picked
@@ -592,20 +625,19 @@ final class AppState {
     }
 
     /// What each of the model files on this Mac starts with besides, by its path, kept as they
-    /// are set.
-    var modelFiles: [String: ModelFiles] {
-        get {
-            access(keyPath: \.modelFiles)
-            let kept = defaults.dictionary(forKey: Preference.localModelFiles) as? [String: [String: String]] ?? [:]
-            return kept.mapValues { ModelFiles(projector: $0["projector"], draft: $0["draft"]) }
+    /// are set; read once, as the rows that show them render often.
+    var modelFiles: [String: ModelFiles] = [:] {
+        didSet {
+            let kept = modelFiles.filter { $0.value != ModelFiles() }
+                .mapValues { ["projector": $0.projector, "draft": $0.draft].compactMapValues { $0 } }
+            defaults.set(kept, forKey: Preference.localModelFiles)
         }
-        set {
-            withMutation(keyPath: \.modelFiles) {
-                let kept = newValue.filter { $0.value != ModelFiles() }
-                    .mapValues { ["projector": $0.projector, "draft": $0.draft].compactMapValues { $0 } }
-                defaults.set(kept, forKey: Preference.localModelFiles)
-            }
-        }
+    }
+
+    /// The model files' projector and draft `defaults` keep.
+    private static func keptModelFiles(_ defaults: UserDefaults) -> [String: ModelFiles] {
+        let kept = defaults.dictionary(forKey: Preference.localModelFiles) as? [String: [String: String]] ?? [:]
+        return kept.mapValues { ModelFiles(projector: $0["projector"], draft: $0["draft"]) }
     }
 
     /// The settings `model` starts with: the launch options it takes, and, for model files on this
@@ -621,14 +653,14 @@ final class AppState {
     /// Deletes `model`, a model Splash installed, with the files of it nothing else uses; the
     /// model that runs is deleted once it is stopped.
     func delete(_ model: String) {
-        guard ready, !(server.running && server.model == model) else { return }
+        guard ready, !serving(model) else { return }
         installer.remove(model)
     }
 
     /// Asks the Hub whether `model` or its draft has moved on, and installs what has, as its
     /// download did: the starts skip that question (`--offline`).
     func checkForUpdates(_ model: String) {
-        guard ready else { return }
+        guard ready, !serving(model) else { return }
         installer.install(model, .check)
     }
 
@@ -636,8 +668,9 @@ final class AppState {
         installed.contains { $0.id == model }
     }
 
-    /// Picks the model downloaded, for the user to start.
+    /// Picks the model downloaded, for the user to start, its suggestion away until it is listed.
     private func didInstall(_ model: String) {
+        arriving = model
         refresh(picking: model)
         if NSApp?.isActive == false { NSApp.requestUserAttention(.informationalRequest) }
     }
