@@ -131,7 +131,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   put(PrefillTensor::LinearRotated, linear.rotated);
   if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
-        operators.moePrefillWorkspace(geometry.target.moeBlockShape(), geometry.target.moeFormats, kPrefillRows);
+        operators.moePrefillWorkspace(geometry.target.moeBlockShape(), geometry.target.moeRouterFormat, kPrefillRows);
     for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
       put(moeScratchTensor<PrefillTensor>(field),
           workspace.*ops::kMoeScratchFields[field].bytes);
@@ -315,7 +315,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
           decodeChunkLayerBytes(geometry));
   if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
-        operators.moeDecodeWorkspacePerLane(geometry.target.moeBlockShape(), geometry.target.moeFormats);
+        operators.moeDecodeWorkspacePerLane(geometry.target.moeBlockShape(), geometry.target.moeRouterFormat);
     for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
       put(moeScratchTensor<DecodeTensor>(field),
           workspace.*ops::kMoeScratchFields[field].bytes);

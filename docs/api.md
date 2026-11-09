@@ -25,7 +25,7 @@ Messages requires it.
 | `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit and what reasoning efforts do ([default reasoning effort](server.md#default-reasoning-effort)) |
 | `POST /tokenize`, `/apply-template` | A text's tokens, or a conversation's rendered prompt, without inference |
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
-| `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](internals.md#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, `409 engine_busy` while the engine serves a request or restores its weights, `503 engine_busy` when the engine does not answer within 5 s, and `503 engine_recovering` or `server_shutdown` while the engine restarts or the server stops |
+| `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](internals.md#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, `409 engine_busy` while the engine serves a request or restores its weights, `503 engine_busy` when the engine does not answer within 5 s, `503 engine_recovering` or `server_shutdown` while the engine restarts or the server stops, and `500 engine_failed` once the engine has stopped for good, before the server exits |
 | `GET /status`, `/metrics` | JSON status and Prometheus metrics ([status](#status-readiness-and-metrics)) |
 | `GET /health` | 200 while the server answers; public |
 | `GET /ready` | 200 while the engine is ready, else 503; public |
@@ -256,11 +256,13 @@ A lane's arithmetic can depend on the batch it decodes in and on how its prompt
 is chunked. On a GGUF MoE target, an expert that a step routes at most two rows
 to runs them on the column tile, which sums in another order than the staged
 matmul, so a row's result also depends on the rows decoded or prefilled beside
-it. With INT8 KV on M5 and later Macs, attention scores INT8 queries where its
-splits read 8 pages or more, which follows the chunk's rows and history and, in
-verify, the batch's longest lane. On M5 and later Macs with `--prefill-int8` on,
-a target's MLX 4- or 5-bit projection rounds its rows to int8 when their chunk,
-with the rows prefilled beside them, has more than 64 rows. Concurrent requests
+it. On M5 and later Macs with `--int8-activations` on, the default, attention
+over INT8 KV scores INT8 queries where its splits read 8 pages or more, which
+follows the chunk's rows and history and, in verify, the batch's longest lane;
+a target's MLX 4- or 5-bit projection rounds its prefill rows to int8 when their
+chunk, with the rows prefilled beside them, has more than 64 rows; and a rotated
+PQ2_0 projection decodes in int8 activations on plans of 16 rows or more, though
+not on a lone lane's split plans of 8 rows, which keep bf16. Concurrent requests
 change the batch and the chunking, and chunk boundaries also come from the
 cached boundary a request resumes from, from a boundary another request waits to
 resume from, and from one whose state, or the KV past it, memory could not hold.

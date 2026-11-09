@@ -230,8 +230,8 @@ inline constexpr bool quant_loader_format(uint32_t format) {
 // every format's but F16's, whose 11-bit significands bf16 does not hold.
 inline constexpr bool quant_register_format(uint32_t format) { return format != GGUF_FMT_F16; }
 // Whether the int8 decode tiles (kernels/shared/gguf_linear.metal
-// gguf_decode_int8_*) take a format: PQ2_0, whose ternary codes are int8
-// exactly, with one d per 128-input block.
+// gguf_decode_int8_*) take a format: PQ2_0, whose two-bit codes q stand for
+// q - 1, exact in int8, with one d per 128-input block.
 inline constexpr bool quant_decode_int8_format(uint32_t format) { return format == GGUF_FMT_PQ20; }
 // Whether the int8 prefill tile (kernels/prefill/gguf_prefill_int8.metal
 // gguf_prefill_int8_*) takes a format: MLX affine 4 and 5 bits in groups of

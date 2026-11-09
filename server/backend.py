@@ -434,6 +434,10 @@ class NativeBackend:
                 "Splash stopped restarting the engine. Restore or reinstall the "
                 "model, then start the Splash server again."
             )
+        if failure.launch:
+            # A missing executable stays missing: no crash trace or restart
+            # helps, only the current installation, which its message names.
+            return f"Splash stopped restarting the engine: {failure.message}."
         cause = (
             failure.message
             if supervision.permanent(failure)

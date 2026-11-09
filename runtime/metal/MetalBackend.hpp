@@ -204,13 +204,13 @@ enum class HostStepGpu : uint8_t {
 // the other (the step's event and value are unused). The exception: the runner
 // also raises the GPU's event, before its own, for an awake step it gives up
 // or that follows a failed buffer, as the step's spin waits for it and the
-// buffer may raise it late or never; every later GPU signal follows the
-// runner's event. The work reads what the GPU wrote before it and writes
-// Shared buffers the GPU reads after it. With HostStepGpu::Awake, one GPU
-// thread spins from the end of the work before the step until the step
-// returned, so the GPU stays awake and starts the work after it at once and at
-// full clocks: for steps about as short as the GPU's wake-up (a streamed
-// decode load), not for long ones, where the spin saves little. The spin,
+// buffer may raise it late or never; every later step's GPU signal follows the
+// runner's. The work reads what the GPU wrote before it and writes Shared
+// buffers the GPU reads after it. With HostStepGpu::Awake, one GPU thread
+// spins from the end of the work before the step until the step returned, so
+// the GPU stays awake and starts the work after it at once and at full clocks:
+// for steps about as short as the GPU's wake-up (a streamed decode load), not
+// for long ones, where the spin saves little. The spin,
 // host_step_wait of host-step.metallib beside the backend's metallib, sees the
 // CPU end it through a memory scope Metal's public headers leave out, so the
 // backend checks, before the first command with an awake step, that it does;
@@ -228,12 +228,15 @@ enum class HostStepGpu : uint8_t {
 // A host step's `beside` dispatches, those right after it, run while its
 // work runs, in a buffer of their own after the step's signal, which waits for
 // nothing; the work after them waits for the step. They write nothing the
-// work reads and read no 128-byte cache line it writes: a line the GPU read
-// before the work wrote it is unproven fresh in the buffer after the step (a
-// streamed MoE decode whose later passes read slot-table lines the GPU read
-// beside its load diverged on an M4; hostStepBesideLines saw none of 2432
-// such reads stale on M5 Pros). A step after a buffer of them that failed by
-// its turn is skipped too. No other event step comes among them.
+// work reads, and use no 128-byte line, the GPU's cache line, of `writes`,
+// the buffers the work writes, which submission checks: a line the GPU read
+// while the step ran is unproven fresh in the buffer after the step, where
+// only the buffer's start makes what the CPU wrote visible. Nothing but
+// Metal's tracking of the buffers they use orders the work after the step,
+// the command's completion and its failure report after them: the work after
+// the step uses what they write (a MoE step's combine reads the outputs of its
+// passes beside the load). A step after a buffer of them that failed by its
+// turn is skipped too. No other event step comes among them.
 // The GPU work after a skipped step still runs, on what its buffers held, as
 // all work after a failed buffer runs on what it left, and the command fails
 // with the first failure; a step whose work threw names it (its ticket's
@@ -261,8 +264,10 @@ struct EventStep {
   std::function<void(const HostStepTiming &)> timed{};
   HostStepGpu gpu = HostStepGpu::Idle;
   std::function<void()> then{};
-  // A host step's dispatches from `before` on that run beside its work.
+  // A host step's dispatches from `before` on that run beside its work, and
+  // the buffers its work writes, of which they use no 128-byte line.
   size_t beside = 0;
+  std::vector<MetalBuffer> writes{};
 };
 
 // What one submission encodes: its dispatches in order, and the event steps
