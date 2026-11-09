@@ -264,6 +264,9 @@ StatusInputs representativeStatus() {
                         .shrinks = 2}};
   governor.owed = {.transfers = 2, .bytes = 64 * 4096ULL, .toClaimsBytes = 32 * 4096ULL, .oldestMilliseconds = 12.5};
   governor.claims = {.waiting = 2, .bytes = 32 * 4096ULL, .oldestMilliseconds = 1250.0};
+  // Of 40 takes on a count that covered what their claim lacked, one freed
+  // less; two releases taken first freed less than they counted.
+  governor.countChecks = {.coveredRuns = 40, .overcountedRuns = 1, .shortReleases = 2};
 
   // A streamed table, the experts' store and KV on the SSD cache with its
   // readers.
@@ -803,6 +806,8 @@ void testKvSpillStatus() {
                  .writeThroughBytes = 13'312'000'000,
                  .writeThroughInFlight = 3,
                  .spillMoves = 31'250,
+                 .releases = 3,
+                 .releasedPages = 1'536,
                  .indexRestores = 12,
                  .wholeRestores = 2,
                  .restore = {.count = 2, .totalMilliseconds = 1.5, .maximumMilliseconds = 1, .p50Milliseconds = 0.5,
@@ -852,9 +857,10 @@ void testKvSpillStatus() {
       "\"closed\":0},\"waiting_quota\":1},\"pages\":{\"index\":31250,"
       "\"index_bytes\":768000000,\"spilled\":31250,\"spilled_bytes\":13312000000},\"write_through\":{\"pages\":31250,"
       "\"bytes\":13312000000,\"in_flight\":3,\"failures\":0,\"paused\":false},\"spill_moves\":31250,\"unspills\":0,"
-      "\"rewrites\":0,\"restores\":{\"index_pages\":12,\"whole_pages\":2,\"ms\":{\"p50\":0.5,\"p95\":1,\"p99\":1,"
-      "\"max\":1,\"total\":1.5,\"samples\":2}},\"quota\":{\"active_limit_bytes\":34359738368,\"held_bytes\":"
-      "13312000000,\"committed_bytes\":55000000,\"revoked\":0},\"index_runway_bytes\":6291456,\"block_cache\":"
+      "\"releases\":3,\"released_pages\":1536,\"rewrites\":0,\"restores\":{\"index_pages\":12,\"whole_pages\":2,"
+      "\"ms\":{\"p50\":0.5,\"p95\":1,\"p99\":1,\"max\":1,\"total\":1.5,\"samples\":2}},\"quota\":"
+      "{\"active_limit_bytes\":34359738368,\"held_bytes\":13312000000,\"committed_bytes\":55000000,"
+      "\"revoked\":0},\"index_runway_bytes\":6291456,\"block_cache\":"
       "{\"bytes\":408944640,\"target_bytes\":408944640,\"floor_bytes\":408944640,\"slots_per_layer\":8192,\"lanes\":1,"
       "\"resolves\":24,\"entries\":98304,\"paged\":1024,\"hits\":60000,\"read\":37280,\"hit_rate\":0.6167763158,"
       "\"ghost_hits\":512,\"read_bytes\":310000000,\"read_failures\":0,\"resolve_ms\":" +

@@ -225,7 +225,10 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   const ClaimState &claim = ledger_.claim(scope_);
   const bool fits = engineFits && ledger_.heldBytes(scope_) <= limitBytes_ - observed - requested;
   const ClaimClass cls = hostClass(claim.spec);
-  const bool hostAdmits = hostRule_.admits(cls, hostBytes(cls, bytes), claim.hostExempt);
+  // What the scope's work released pays for it, under critical pressure
+  // too: the host gets back at least what it gives (fund).
+  const bool funded = bytes <= fundedBytes_;
+  const bool hostAdmits = funded || hostRule_.admits(cls, hostBytes(cls, bytes), claim.hostExempt);
   if (!fits || !hostAdmits) {
     // The host's refusal lifts with its pressure, the limit's only once
     // memory is freed: a refusal they share is the host's.
@@ -243,6 +246,8 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
     unseenGrowthHeadroom_ = hostHeadroomBytes(host, 0);
     unseenGrowthUntilMilliseconds_ = clockMilliseconds_ + kHostSettleMilliseconds;
   }
+  if (funded)
+    fundedBytes_ -= bytes;
   reservedBytes_ = requested;
   return Reservation(this, bytes);
 }
@@ -285,6 +290,11 @@ MemoryGovernorSnapshot MemoryGovernor::evaluate() noexcept {
   return snapshot(host, hostRule_);
 }
 
+uint64_t MemoryGovernor::untrackedBytes() const noexcept {
+  const metal::MetalMemoryStats memory = backend_.memoryStats();
+  return saturatingSubtract(memory.deviceCurrentAllocatedBytes, memory.allocatedBytes);
+}
+
 MemoryGovernorSnapshot
 MemoryGovernor::snapshot(const std::optional<HostMemory> &hostMemory,
                          const HostRule &rule) const noexcept {
@@ -317,9 +327,19 @@ MemoryGovernor::snapshot(const std::optional<HostMemory> &hostMemory,
 void MemoryGovernor::release(uint64_t bytes) noexcept { reservedBytes_ = saturatingSubtract(reservedBytes_, bytes); }
 
 MemoryGovernor::Scope::Scope(MemoryGovernor &governor, ClaimId claim) noexcept
-    : governor_(governor), previousClaim_(std::exchange(governor.scope_, claim)) {}
+    : governor_(governor), previousClaim_(std::exchange(governor.scope_, claim)),
+      previousFunded_(std::exchange(governor.fundedBytes_, 0)) {}
 
-MemoryGovernor::Scope::~Scope() { governor_.scope_ = previousClaim_; }
+MemoryGovernor::Scope::~Scope() {
+  governor_.scope_ = previousClaim_;
+  governor_.fundedBytes_ = previousFunded_;
+}
+
+void MemoryGovernor::fund(uint64_t bytes) {
+  if (!scope_)
+    throw std::logic_error("memory was released for an allocation outside a claim's scope");
+  fundedBytes_ = saturatingAdd(fundedBytes_, bytes);
+}
 
 void MemoryGovernor::HostRule::sample(const std::optional<HostMemory> &host, uint64_t spareReserve, uint64_t inFlight,
                                       MemoryPressure system, uint64_t hysteresisBytes, uint64_t refusedWaitingBytes,
@@ -384,6 +404,7 @@ std::array<uint32_t, 3> MemoryGovernor::heldPages(ClaimId claim) const {
 }
 
 FreeResult MemoryGovernor::free(ClaimId claim, const Need &need) {
+  const Scope scope(*this, claim);
   return ledger_.free(claim, need, roomBytes(), hostRule_.level() == MemoryPressure::Critical,
                       hostClass(ledger_.claim(claim).spec) == ClaimClass::InService);
 }
@@ -398,21 +419,25 @@ bool MemoryGovernor::copyDemand() const noexcept { return ledger_.copyDemand(); 
 
 bool MemoryGovernor::claimWaiting() const noexcept { return ledger_.claimWaiting(); }
 
-// The host's claim of what the pass finds, up to `target`, taken at once:
-// the target is net of what lands already (HostRule::deficitBytes). What it
-// may take its rights say (takeRights): under macOS's critical pressure
-// units in use too, otherwise units that free later. It asks with no room,
-// which returns nothing to the host. free() gives back the units that cost
-// nothing and are sized only when taken (the idle state buffers) first
-// either way. A pass that freed nothing now or later waits (Pending) while
-// memory lands if its rights wait for writes, else is Short: it found
-// nothing to take.
+// The host's claim of what the pass finds, up to `target`, taken at once in
+// its scope: the target is net of what lands already (HostRule::deficitBytes).
+// What it may take its rights say (takeRights): under macOS's critical
+// pressure units in use and lanes' pages too, otherwise units that free
+// later. It asks with no room, which returns nothing to the host. free()
+// gives back the units that cost nothing and are sized only when taken (the
+// idle state buffers) first either way. A pass that freed nothing now or
+// later waits (Pending) while memory lands if its rights wait for writes,
+// else is Short: it found nothing to take.
 FreeResult MemoryGovernor::hostPass(uint64_t target, bool critical) {
   const ClaimSpec spec{.cls = ClaimClass::Host};
   const Need need{.bytes = target};
   const uint64_t found = ledger_.available(spec, need, 0, critical);
   const ClaimId claim = ledger_.open(spec);
-  FreeResult result = ledger_.free(claim, {.bytes = std::min(target, found)}, 0, critical);
+  FreeResult result;
+  {
+    const Scope scope(*this, claim);
+    result = ledger_.free(claim, {.bytes = std::min(target, found)}, 0, critical);
+  }
   ledger_.close(claim);
   const bool waits = takeRights(spec, need, critical, std::nullopt).waitsForWrites;
   if (result.outcome == FreeOutcome::Met && !result.nowBytes && !result.laterBytes)
@@ -432,8 +457,9 @@ GrowthHost MemoryGovernor::growthHost(bool paced) {
               [this](uint64_t bytes, uint64_t funded) {
                 sampleHostRule(sampleHost());
                 // A unit the cache funds whole changes the host by nothing:
-                // it needs only no critical pressure and no deficit, under
-                // macOS's warning too. The rest is judged as growth.
+                // it needs only no critical pressure and no deficit, when
+                // the host takes those cache units itself, under macOS's
+                // warning too. The rest is judged as growth.
                 if (funded >= bytes)
                   return hostRule_.level() != MemoryPressure::Critical &&
                          !hostRule_.deficitBytes(ledger_.hostRefusedWaitingBytes(), ledger_.returning().landingBytes);

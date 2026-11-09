@@ -272,6 +272,7 @@ public:
     entry.resident = false;
     entry.position = 0;
     ++suspensions;
+    suspendedIds.push_back(id);
     if (laneReleased)
       laneReleased();
     if (kvGrowthBlocked && unblockGrowthOnSuspend)
@@ -852,6 +853,8 @@ public:
   // Begins the budget refuses, and resumes the host refuses.
   uint32_t deniedBegins = 0;
   uint32_t suspensions = 0;
+  // The request of each suspension, in order.
+  std::vector<uint64_t> suspendedIds;
   uint32_t resumptions = 0;
   uint32_t resumeAttempts = 0;
   // Requests the engine ended (end()).

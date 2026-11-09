@@ -28,12 +28,12 @@ inline constexpr uint64_t kHostMarginBytes = 1ULL << 30;
 // How long the host's counters take to show what a pass returned.
 inline constexpr double kHostSettleMilliseconds = 1000.0;
 // How long a pool waits to regrow after a request's claim last went unmet or
-// took what costs work later (a store chunk, a pass, a conversion, a unit in
-// use), while a claim waits, and after the pool last grew or tried to: a
-// chunk regrown sooner goes back to the next claim, and each cycle costs a
-// refill and a compaction. 30 s covers the 1-29 s between a regrow and its
-// retake under churn. Under a macOS warning only a unit the cache funds
-// whole regrows.
+// took what costs work later (a store chunk, a pass, a conversion, a
+// release, a unit in use), while a claim waits, and after the pool last grew
+// or tried to: a chunk regrown sooner goes back to the next claim, and each
+// cycle costs a refill and a compaction. 30 s covers the 1-29 s between a
+// regrow and its retake under churn. Under a macOS warning only a unit the
+// cache funds whole regrows.
 inline constexpr double kRegrowQuietSeconds = 30.0;
 // How long a cached unit reached that frees memory only once its copy lands
 // keeps a temporary tier copying ahead: claims at the engine's limit come
@@ -110,8 +110,11 @@ struct ClaimId final {
 // one no cached state holds (unheldStateBuffer), which their states meet only
 // by the bytes their buffers free. afterStart: a need that counts a lane's
 // start and the state it captures, which take their buffers from the model's
-// pool before any unit's return to it (Model::startStateBytes). kv: a need
-// of KV pages (a TokenAdmission's), whatever measure lacks them.
+// pool before any unit's return to it (Model::startStateBytes); a buffer a
+// unit returns that they then take, not allocate, gives the need its bytes
+// as one the pool releases does, and a pooled one released that they would
+// have taken gives it none. kv: a need of KV pages (a TokenAdmission's),
+// whatever measure lacks them.
 struct Need final {
   uint64_t bytes = 0;
   bool hostRefused = false;
@@ -145,13 +148,15 @@ struct FreeResult final {
 
 // What taking a unit gives up besides its bytes, which the claim's take
 // rights decide whether it may: memory nothing needs now (a cached unit, a
-// buffer), a Resident lane's KV in memory (its conversion to Spill), the
-// command between its passes, or the pooled state buffers the next lane
-// starts from (Model::releaseIdleBuffer without keeping a lane), which its
-// start then allocates again. Those count no bytes of their own: what the
-// model's pool releases without keeping them is counted through the pool
+// buffer), a Resident lane's KV in memory (its conversion to Spill), a Spill
+// lane's KV in memory whose copies landed (its release to the index form,
+// whose blocks its reads then miss), the command between its passes, or
+// the pooled state buffers the next lane starts from
+// (Model::releaseIdleBuffer without keeping a lane), which its start then
+// allocates again. Those count no bytes of their own: what the model's pool
+// releases without keeping them is counted through the pool
 // (setBufferBytes), with the buffers of the states taken before them.
-enum class VictimKind : uint8_t { Memory, Conversion, PassCommand, LaneStart };
+enum class VictimKind : uint8_t { Memory, Conversion, Release, PassCommand, LaneStart };
 
 // One unit a source would give up, in the source's own order.
 struct Victim final {
@@ -162,12 +167,12 @@ struct Victim final {
   uint32_t stateBuffers = 0;    // pooled state buffers it frees (in-place needs; bytes, setBufferBytes)
   // It frees through a write: one its take starts (a state's, which the
   // idle staging buffer frees at once; a demotion; a conversion's copies)
-  // or one in flight it waits for. The order's stage of cache that needs a
-  // write.
+  // or one in flight it waits for (a release of pages whose copies land).
+  // The order's stage of cache that needs a write.
   bool write = false;
   // It frees only once that write lands (a demotion, the state write in
-  // flight, a conversion's copies): a claim that does not wait for writes
-  // passes over it.
+  // flight, a conversion's copies, a release of pages whose copies land): a
+  // claim that does not wait for writes passes over it.
   bool later = false;
   // false: a unit that costs nothing, taken before any count, whose
   // bytes are at least what peek gives (available() counts them)
@@ -184,12 +189,18 @@ struct TakeRights final {
   // The units of certain reuse: none, the newest resume point, or that and
   // the chains queued requests restore.
   enum class CertainReuse : uint8_t { None, ResumePoint, All };
-  // The reserves kept for the work to come it may take: none, the empty
-  // extent the next request takes, or also the Index runway.
-  enum class Reserves : uint8_t { None, NextExtent, All };
+  // The reserves kept for the work to come it may take: none, or the empty
+  // extent the next request takes. No claim takes the Index runway: the
+  // pages a spill moves land there without an allocation, under critical
+  // pressure too (Cache::spillWritten).
+  enum class Reserves : uint8_t { None, NextExtent };
   // The pooled state buffers the next lane starts from: kept, taken last of
   // all (VictimKind::LaneStart), or taken first with the idle buffers.
   enum class LaneStart : uint8_t { Kept, Last, First };
+  // The Spill lanes whose pages it releases (VictimKind::Release): none, its
+  // own, its own and those of its priority or a lower one, or every lane
+  // (VictimQuery::reaches).
+  enum class Lanes : uint8_t { None, Own, AtOrBelow, All };
   bool units = false;             // the sources' and pools' units at all: those that free now, and more below
   bool waitsForWrites = false;    // takes cache that frees only once its write lands
   bool waitsForLandings = false;  // waits for memory transfers return: the engine's limit refused it
@@ -200,36 +211,42 @@ struct TakeRights final {
   bool storeAboveFloor = false;   // the other pools' units above their floors
   bool passCommand = false;       // the command between passes its work supersedes
   uint64_t convertLane = 0;       // the request whose own lane may convert to Spill; 0: none
+  Lanes lanes = Lanes::None;
   LaneStart laneStart = LaneStart::Kept;
 
   friend bool operator==(const TakeRights &, const TakeRights &) = default;
 };
 
-// The one table of what each claim may take. A need the host refused, and
-// an Immediate claim, take only what frees now: no write whose memory frees
+// The one table of what each claim may take. A need the host refused, and an
+// Immediate claim, take only what frees now: no write whose memory frees
 // only when it lands (a state the idle staging buffer writes frees at once,
 // and they take it), store chunk, pass, conversion or unit in use. What
 // costs a lane work later (a store chunk's reads, the pass, the claim's own
 // conversion) goes only to in-service work that can wait; units in use also
-// need its reach. Certain reuse, which a request rebuilds at its whole
-// prefill, goes to in-service work; a start and optional work take the
-// resume point but never a queued chain, since a running lane beats a
-// queued one and a new request does not. The host waits for writes short of
-// critical pressure and never for landings, which its pass's target is net
-// of; at critical pressure it is Immediate but takes the store, certain
-// reuse and units in use. No pool unit for a claim below a lane in service,
-// since the pools serve every lane, and none for a pool's growth. The pooled
-// buffers the next lane starts from go to in-service KV that can wait, last
-// of all: the memory plan sizes the context for one lane beside its own
-// state, not beside a next lane's buffers, so a lane alone reaches it, and a
-// lone restore takes its whole chain. Every other need keeps them: a need of
-// state buffers (a lane's start among them), which their release would only
-// make allocate again, and the model's other memory. At critical pressure
-// every claim takes them first, with every reserve. A Floor
-// claim takes nothing (logic_error). The engine's own optional work, an
-// Optional claim of no request (the Index runway's refill with no Spill lane
-// in service, trims with no lane in service), takes no unit: its rights are
-// the narrowest, TakeRights{}, for memory it can go without.
+// need its reach. A Spill lane's pages whose copies landed cost it the reads
+// of their blocks: work that can wait, in service or a start, releases them
+// from its own lane and those of its priority or a lower one, never a higher
+// one's; a need the host refused from its own lane, in place; the host under
+// critical pressure from every lane; no other claim. Certain reuse, which a
+// request rebuilds at its whole prefill, goes to in-service work; a start
+// and optional work take the resume point but never a queued chain, since a
+// running lane beats a queued one and a new request does not. The host waits
+// for writes short of critical pressure and never for landings, which its
+// pass's target is net of; at critical pressure it is Immediate but takes
+// the store, certain reuse and units in use. No pool unit for a claim below
+// a lane in service, since the pools serve every lane, and none for a pool's
+// growth. The pooled buffers the next lane starts from go to in-service KV
+// that can wait, last of all: the memory plan sizes the context for one lane
+// beside its own state, not beside a next lane's buffers, so a lane alone
+// reaches it, and a lone restore takes its whole chain. Every other need
+// keeps them: a need of state buffers (a lane's start among them), which
+// their release would only make allocate again, and the model's other
+// memory. At critical pressure every claim takes them first, and the next
+// extent. A Floor claim takes nothing (logic_error). The engine's own
+// optional work, an Optional claim of no request (the Index runway's refill
+// with no Spill lane in service, trims with no lane in service), takes no
+// unit: its rights are the narrowest, TakeRights{}, for memory it can go
+// without.
 [[nodiscard]] TakeRights takeRights(const ClaimSpec &spec, const Need &need, bool critical,
                                     std::optional<RequestPriority> highestLane);
 
@@ -237,8 +254,24 @@ struct VictimQuery final {
   TakeRights rights;
   Need need;
   // Chains every walk keeps: the one a start restores, which its placement
-  // leaves out of the need it asks about (Engine::placement).
+  // leaves out of the need it asks about (Engine::placement). A count that
+  // keeps a chain is the claimant's as Resident (Engine::residentRoom), whose
+  // releases keep its admission probe's chain as well
+  // (EngineVictims::releaseRule).
   const RestoredChains *kept = nullptr;
+  // The claimant: its request (0 for none) and priority, which the lanes it
+  // releases follow (TakeRights::lanes).
+  uint64_t requestId = 0;
+  RequestPriority priority = RequestPriority::Foreground;
+  // What the claim lacks still as take() reaches a unit, past what the units
+  // taken before it freed: bytes, and pages of the need's form. A source
+  // that frees a unit in part, a lane's release, frees that much.
+  uint64_t lackingBytes = 0;
+  uint32_t lackingPages = 0;
+
+  // Whether the claim's rights reach the lane of request `lane`, of
+  // `lanePriority`, whose pages it may release.
+  [[nodiscard]] bool reaches(uint64_t lane, RequestPriority lanePriority) const noexcept;
 };
 
 // A source of the units free() takes, on the engine thread between commands.
@@ -250,7 +283,11 @@ struct VictimQuery final {
 // in flight holds part of the unit, a reclaim empties fewer extents than
 // counted). The bound is that running total, not the unit's own count: a
 // take may first free what a unit before it counts (the cache's reclaims
-// free the free pages, and the extents they fill, first).
+// free the free pages, and the extents they fill, first). No two units of a
+// source count the same memory (a page lanes share, a buffer, a chunk), so
+// that, but for a transfer in flight or an allocation the host refuses,
+// their takes in turn free what their counts add up to as far as the claim
+// lacks it: a count that covers it is met (MemoryLedger::CountChecks).
 // This is the one peek contract: free() counts with it (bound) and takes
 // nothing unless the count covers the need, the claim's retries taking what
 // a take fell short by, and every reader of peek relies on it alone (the
@@ -262,14 +299,16 @@ struct VictimQuery final {
 // Short when nothing of it is left. A later unit's bytes include what goes
 // only once another of its transfers lands: take starts what can start now,
 // and the waiting claim takes the rest on its retries. A key may name its
-// unit only by its place in the source's order; a conversion's key is its
-// lane's request id. Taking a unit leaves the units before it in place and
-// those after it in order: free() peeks again from the unit before it. Units
-// that cost nothing and are sized only when taken come first in a source's
-// order. A source gives only the units its query's rights take: units in
-// use, certain reuse, the pass command and the claimant's own conversion it
-// leaves out itself; the ledger passes over those that land later for a
-// claim that does not wait for writes.
+// unit only by its place in the source's order; a conversion's and a
+// release's key is its lane's request id. Taking a unit leaves the units
+// before it in place and those after it in order: free() peeks again from
+// the unit before it. Units that cost nothing and are sized only when taken
+// come first in a source's order. A source gives only the units its query's
+// rights take: units in use, certain reuse, the pass command, the
+// claimant's own conversion and the lanes it releases it leaves out itself;
+// the ledger passes over those that land later for a claim that does not
+// wait for writes. take reads what the claim lacks still in its query
+// (VictimQuery::lackingBytes), every other field as peek did.
 class VictimSource {
 public:
   virtual ~VictimSource() = default;
@@ -279,11 +318,12 @@ public:
 };
 
 // What transfers free when they land (Cache::returning). Landing: in flight
-// now. Owed: copies Spill requests owe and have not started. Restores free
-// nothing and are not here.
+// now. Owed: copies Spill requests owe and have not started, whose pages
+// spill once copied only under --kv-spill always (a release takes the
+// others, VictimKind::Release). Restores free nothing and are not here.
 struct Returning final {
-  // By kv::PageForm: demotions, and Spill landings as far as free Index
-  // pages take them.
+  // By kv::PageForm: demotions, and under --kv-spill always Spill landings
+  // as far as free Index pages take them.
   std::array<uint32_t, 3> landingPages{};
   // Full: owed copies of pages that spill once copied, all of them (the
   // Full extents they empty fund their Index pages).
@@ -419,6 +459,21 @@ public:
   [[nodiscard]] uint64_t hostRefusedWaitingBytes() const noexcept;
   // The units the pools gave back since the engine started.
   [[nodiscard]] uint64_t poolReleases() const noexcept;
+  // How free()'s takes kept to its counts since the engine started, which
+  // /status reports (memory_governor.count_checks): the runs whose count
+  // (bound) covered what the claim lacked; of those, the takes that covered
+  // less though no unit they reached waited for a transfer and the host
+  // refused no allocation in the claim's scope (overcounted: a source
+  // counted memory its takes did not free, against the peek contract); and
+  // the units that release a lane's pages (VictimKind::Release) taken first
+  // in a run that freed less than the lesser of their count and what the
+  // claim lacked, though the host refused nothing (short). Two lanes on one
+  // conversation counting their shared pages each overcount by those pages.
+  struct CountChecks final {
+    uint64_t coveredRuns = 0;
+    uint64_t overcountedRuns = 0;
+    uint64_t shortReleases = 0;
+  };
   // The largest unit a pool grows by next: the host's band reaches past its
   // margin by it.
   [[nodiscard]] uint64_t largestGrowthUnit() const;
@@ -448,7 +503,7 @@ public:
   // One growth pass. True when a pool grew.
   bool grow(uint64_t freeBytes, const GrowthHost &host);
 
-  // The accounts, owed bytes and claims.
+  // The accounts, owed bytes, claims and count checks.
   void fill(MemoryGovernorSnapshot &snapshot, uint64_t chargedBytes) const;
 
 private:
@@ -472,6 +527,11 @@ private:
   // to what it released before the run.
   [[nodiscard]] uint64_t pooledBytes(const VictimQuery &query, const Lacking &lack, uint32_t states,
                                      bool keepLane = true) const;
+  // What a lane's start and the state it captures take from the model's
+  // pool, for a need afterStart: what the pool releases without keeping a
+  // lane, less what it releases once they took theirs. What they lack of it
+  // they allocate (Model::startStateBytes).
+  [[nodiscard]] uint64_t startPooledBytes(const VictimQuery &query) const;
   // The most the units the claim's rights take give it, counted in the
   // one order without taking any, up to the lack.
   [[nodiscard]] Run bound(const VictimQuery &query, const Lacking &lack) const;
@@ -479,7 +539,9 @@ private:
   // now and later covers the lack, or none is left.
   [[nodiscard]] Run take(const VictimQuery &query, const Lacking &lack);
   // Takes each source's units that cost nothing and are sized only when
-  // taken, until one frees nothing; the bytes they freed.
+  // taken, until one frees nothing; the bytes they freed, for a need
+  // afterStart less the pooled buffers among them its start would have
+  // taken, which it then allocates (startPooledBytes).
   uint64_t takeUnsized(const VictimQuery &query);
 
   void log(const ClaimSpec &spec, const Need &need, const Run *run, const FreeResult &result,
@@ -502,6 +564,9 @@ private:
   // and no pool grew or tried to (grow).
   double quietSinceSeconds_ = 0.0;
   uint64_t growthLackBytes_ = 0;
+  CountChecks checks_;
+  // The allocations the host refused in any claim's scope (refused).
+  uint64_t hostRefusals_ = 0;
 };
 
 } // namespace splash::engine

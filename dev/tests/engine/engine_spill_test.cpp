@@ -16,10 +16,12 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 using namespace splash;
 using namespace splash::engine;
@@ -129,7 +131,8 @@ void testSpillCommitmentCoversTheChainWithoutCopies() {
 }
 
 // A Resident lane at the wall converts where the quota holds its whole history, waits for its
-// copies and grows into the freed pages; a quota short of the history refuses it, and it fails.
+// copies and grows into the freed pages; a quota short of the history refuses it, and it fails,
+// naming its lane Resident in decode: none of its KV went to the SSD cache.
 void testConversionCommitsTheHistoryWithoutCopies() {
   for (const uint32_t slots : {5U, 8U}) {
     Spilling spill(slots, false);
@@ -142,10 +145,13 @@ void testConversionCommitsTheHistoryWithoutCopies() {
     const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
     if (slots == 5) {
       require(counts.converted == 0 && spill.tier.writes.empty() &&
-                  spill.events.failures == std::vector<std::string>{"capacity_exhausted"} &&
-                  spill.events.failureDetails.front().first.find("SSD cache") !=
-                      std::string::npos,
+                  spill.events.failures == std::vector<std::string>{"capacity_exhausted"},
               "a conversion the quota could not hold with the history went ahead");
+      const std::string &message = spill.events.failureDetails.front().first;
+      require(message.find(" for a Resident lane of ") != std::string::npos &&
+                  message.find(" tokens in decode: ") != std::string::npos &&
+                  message.find("SSD cache") == std::string::npos,
+              "the lane the quota refused did not fail naming its mode and phase alone: " + message);
     } else {
       require(counts.converted == 1 && counts.resident == 1 &&
                   spill.events.completedCount == 1 && spill.events.usage.at(1).second == 40 &&
@@ -264,31 +270,67 @@ void testAConvertedLanesMovesReleaseTheExtentsTheyEmpty() {
           "the converted lane failed or yielded");
 }
 
+// The KV mode of the request's lane, Resident before it has one.
+KvMode kvMode(const Spilling &spill, uint64_t id) {
+  for (const ActiveRequestSnapshot &active : spill.engine.snapshot().activeRequests)
+    if (active.id == id)
+      return active.kvMode;
+  return KvMode::Resident;
+}
+
 // Flash-Next's proportions: 256-page extents, 423,936 B Full and 24,576 B Index pages, a 390 MiB hot
-// block floor, and a dense history and tail window of a page each.
+// block floor, and a dense history and tail window of a page each. Its page ids hold every extent the
+// lanes reach, so memory limits the pool and never the ids, as production's hold every extent the limit
+// could hold of Index pages: 8,192 held 32 extents, and the runway's refill failed for ids.
 struct FlashNextLanes {
-  static constexpr Spilling::Pages kPages{.count = 8192, .fullBytes = 423'936, .indexBytes = 24'576};
+  static constexpr Spilling::Pages kPages{.count = 65'536, .fullBytes = 423'936, .indexBytes = 24'576};
   Spilling spill{16'384, false, 0, 200'000, Spilling::Extent{256}, {}, {}, false, kPages};
   FlashNextLanes() { spill.model.spilledReadFloorBytes = 390ULL << 20; }
   // No Full extent more: the bytes held, in whole Full pages.
   void wall() { spill.storage.budgetPages = static_cast<uint32_t>(spill.storage.allocatedBytes() / kPages.fullBytes); }
-  [[nodiscard]] KvMode mode(uint64_t id) const {
-    for (const ActiveRequestSnapshot &active : spill.engine.snapshot().activeRequests)
-      if (active.id == id)
-        return active.kvMode;
-    return KvMode::Resident;
-  }
 };
 
-// A lone 64K Resident lane at the wall converts itself, its pages freeing more than the hot block
-// floor, and decodes its whole output.
+// Flash-Next's proportions (FlashNextLanes) under the governor's 40 GiB limit, with a prefill's history staging of
+// 36,864 B a page: a request spills where placement says, its pages written through and kept Full until a claim
+// releases them.
+struct FlashNextGoverned {
+  // The room a Spill start finds: its first command's extent and state, not its Resident KV's extents.
+  static constexpr uint64_t kStartRoomBytes = 300ULL << 20;
+  explicit FlashNextGoverned(const std::function<void(Executor &)> &shape = {})
+      : spill{16'384, false, 0, 200'000, Spilling::Extent{256}, shape, {}, true, FlashNextLanes::kPages} {
+    spill.model.spilledReadFloorBytes = 390ULL << 20;
+    spill.model.stagingPageBytes = 36'864;
+  }
+  // Starts `request` Spill (Engine::placement): the room it finds holds its first command but not its Resident KV,
+  // and the limit leaves the engine ample room again once it has its lane.
+  void startSpill(EngineRequest request) {
+    const uint64_t id = request.id;
+    spill.host.leaveRoom(kStartRoomBytes);
+    spill.engine.submit(std::move(request));
+    spill.runUntil([&] { return std::ranges::count(spill.events.startIds, id) != 0; }, "the start did not start");
+    spill.host.leaveRoom(std::nullopt);
+    require(kvMode(spill, id) == KvMode::Spill, "the start was not placed Spill");
+  }
+  // The memory wall: the engine holds what it does now and no more (GovernedHost::leaveRoom).
+  void wall() { spill.host.leaveRoom(0); }
+  // Ticks until the lane has decoded `tokens` tokens, between commands.
+  void decode(uint64_t id, size_t tokens) {
+    spill.runUntil([&] { return spill.events.outputs[id].size() >= tokens && !spill.engine.commandInFlight(); },
+                   "the lane did not decode");
+  }
+
+  Spilling spill;
+};
+
+// A lone 64K Resident lane at the engine's limit converts itself, its pages freeing more than the hot
+// block floor, and decodes its whole output.
 void testALongDecodingLaneConvertsItselfAtTheWall() {
-  FlashNextLanes lanes;
+  FlashNextGoverned lanes;
   Spilling &spill = lanes.spill;
   // 2,047 pages: one page's room left in its eighth extent.
   spill.engine.submit(Spilling::prompt(1, 1, 2'046, 200));
   spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the lane did not decode");
-  require(lanes.mode(1) == KvMode::Resident, "the lane did not start Resident");
+  require(kvMode(spill, 1) == KvMode::Resident, "the lane did not start Resident");
   lanes.wall();
   spill.runUntilIdle();
   const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
@@ -297,6 +339,46 @@ void testALongDecodingLaneConvertsItselfAtTheWall() {
           "the lane did not decode its whole output");
   require(counts.converted == 1 && spill.cache.spillSnapshot().spilledPages > 0,
           "the lane did not convert itself at the wall");
+}
+
+// A lone 64K prompt that starts Resident and meets the engine's limit at 56K tokens, its pages there
+// freeing more than the hot block floor and its growth, converts itself between its prefill commands,
+// prefills on as a Spill lane and decodes the output it decodes without the limit.
+void testAPrefillingLaneConvertsItselfAtTheWall() {
+  struct Run final {
+    uint64_t converted = 0, spilledPages = 0;
+    std::vector<std::string> failures;
+    std::vector<uint32_t> output;
+  };
+  const auto run = [](bool walled) {
+    FlashNextGoverned lanes;
+    Spilling &spill = lanes.spill;
+    spill.engine.submit(Spilling::prompt(1, 1, 2'046, 200));
+    // 1,792 pages: seven whole extents.
+    spill.runUntil(
+        [&] {
+          return spill.model.prefillChunks[1] != 0 && spill.cache.pageTable(1).pages.size() >= 1'792 &&
+                 !spill.engine.commandInFlight();
+        },
+        "the prompt did not prefill 56K tokens");
+    require(kvMode(spill, 1) == KvMode::Resident, "the prompt did not start Resident");
+    if (walled) {
+      lanes.wall();
+      spill.runUntil([&] { return kvMode(spill, 1) == KvMode::Spill; }, "the prompt did not convert itself");
+      require(!spill.events.outputs.contains(1), "the prompt converted only once it decoded");
+    }
+    spill.runUntilIdle();
+    return Run{.converted = spill.engine.snapshot().spill.converted,
+               .spilledPages = spill.cache.spillSnapshot().spilledPages,
+               .failures = spill.events.failures,
+               .output = spill.events.outputs[1]};
+  };
+  const Run roomy = run(false), walled = run(true);
+  require(roomy.converted == 0 && roomy.failures.empty() && roomy.output.size() == 200,
+          "the prompt without the limit did not decode its output Resident");
+  require(walled.converted == 1 && walled.spilledPages > 0 && walled.failures.empty(),
+          "a prefilling lane at the limit did not convert itself and complete");
+  require(walled.output == roomy.output, "the converted lane decoded another output");
 }
 
 // With no free Index page to land its copies in, the 64K lane does not convert and writes nothing.
@@ -345,10 +427,11 @@ void testALongLaneConvertsItselfBesideAnother() {
                !needsPage(2, 1);
       },
       "the long lane did not come to need a page alone");
-  require(lanes.mode(1) == KvMode::Resident && lanes.mode(2) == KvMode::Resident, "the lanes did not start Resident");
+  require(kvMode(spill, 1) == KvMode::Resident && kvMode(spill, 2) == KvMode::Resident,
+          "the lanes did not start Resident");
   lanes.wall();
   const KvPageAcquisition held = spill.pool.acquirePages(spill.pool.freePageCount());
-  spill.runUntil([&] { return lanes.mode(1) == KvMode::Spill; }, "the long lane did not convert itself");
+  spill.runUntil([&] { return kvMode(spill, 1) == KvMode::Spill; }, "the long lane did not convert itself");
   for (const uint32_t page : held.pages)
     spill.pool.releasePage(page, false);
   spill.runUntilIdle();
@@ -383,15 +466,15 @@ void testASharedPrefixCountsForNoConversion() {
                  !needsPage(2, shared);
         },
         "the long lane did not come to need a page alone");
-    require(lanes.mode(1) == KvMode::Resident && spill.cache.pageTable(1).pages.front() ==
-                                                     spill.cache.pageTable(2).pages.front(),
+    require(kvMode(spill, 1) == KvMode::Resident &&
+                spill.cache.pageTable(1).pages.front() == spill.cache.pageTable(2).pages.front(),
             "the lanes did not share their prefix's pages, the long lane Resident");
     lanes.wall();
     const KvPageAcquisition held = spill.pool.acquirePages(spill.pool.freePageCount());
     static_cast<void>(spill.engine.tick(spill.now++));
     spill.tier.complete();
     const bool converts = shared == 125;
-    require(held.granted() && (lanes.mode(1) == KvMode::Spill) == converts &&
+    require(held.granted() && (kvMode(spill, 1) == KvMode::Spill) == converts &&
                 spill.engine.snapshot().spill.converted == (converts ? 1U : 0U),
             converts ? "a lane whose own suffix passes the gate did not convert"
                      : "a lane converted on pages a Resident lane shares");
@@ -403,16 +486,16 @@ void testASharedPrefixCountsForNoConversion() {
   }
 }
 
-// A 32K lane, which frees less than the hot block floor, and a prefilling lane never convert;
-// alone at the wall each fails as on a target that cannot spill.
-void testAShortOrPrefillingLaneDoesNotConvert() {
+// A lane of 32K tokens at most, whose pages free less than the hot block floor, does not convert,
+// decoding or prefilling; alone at the wall it fails as on a target that cannot spill, naming its
+// lane Resident in its phase and not the SSD cache, which holds none of its KV.
+void testAShortLaneDoesNotConvert() {
   for (const bool prefilling : {true, false}) {
     FlashNextLanes lanes;
     Spilling &spill = lanes.spill;
     if (prefilling) {
-      spill.model.spilledReadFloorBytes = 0;
       // A 64K prompt that starts Resident, as while the SSD cache takes no
-      // writes, and whose prefill meets the wall halfway.
+      // writes, and whose prefill meets the wall before 32K tokens.
       spill.tier.writableFile = false;
       spill.storage.budgetPages = 1'024;
       spill.engine.submit(Spilling::prompt(1, 1, 2'046, 200));
@@ -426,10 +509,41 @@ void testAShortOrPrefillingLaneDoesNotConvert() {
     }
     spill.runUntilIdle();
     require(spill.engine.snapshot().spill.converted == 0 && spill.cache.spillSnapshot().spilledPages == 0,
-            std::string("a ") + (prefilling ? "prefilling" : "short") + " lane converted to Spill");
+            std::string("a short ") + (prefilling ? "prefilling" : "decoding") + " lane converted to Spill");
     require(spill.events.failures == std::vector<std::string>{"capacity_exhausted"},
             "the lone lane did not fail at the wall");
+    const std::string &message = spill.events.failureDetails.front().first;
+    require(message.find(" for a Resident lane of ") != std::string::npos &&
+                message.find(prefilling ? " tokens in prefill: " : " tokens in decode: ") != std::string::npos &&
+                message.find("SSD cache") == std::string::npos,
+            "the lone lane's failure did not name its mode and phase alone: " + message);
   }
+}
+
+// A lone Resident prefill at the engine's limit, Metal memory outside the engine's buffers taking
+// the room its KV would grow into, fails naming its lane's mode, phase and tokens and those bytes,
+// and not the SSD cache, which holds none of its KV.
+void testALoneResidentWallNamesItsModeAndPhase() {
+  const test::GovernorLimits limits;
+  Spilling spill{16'384, false, 0, 200'000, Spilling::Extent{256}, {}, limits, true, FlashNextLanes::kPages};
+  // A 64K prompt that starts Resident, as while the SSD cache takes no writes.
+  spill.tier.writableFile = false;
+  spill.engine.submit(Spilling::prompt(1, 1, 2'046, 200));
+  spill.runUntil([&] { return spill.model.prefillChunks[1] >= 1; }, "the prompt did not start");
+  spill.tier.writableFile = true;
+  // Memory outside the engine's buffers takes the room the limit leaves.
+  const uint64_t untracked = limits.limitBytes - std::min(limits.limitBytes, spill.host.memory.total());
+  spill.host.memory.holdUntracked(untracked);
+  spill.runUntilIdle();
+  require(spill.events.failures == std::vector<std::string>{"capacity_exhausted"},
+          "the lone prefill did not fail at the limit");
+  const std::string &message = spill.events.failureDetails.front().first;
+  require(message.find(" for a Resident lane of 65473 tokens in prefill: ") != std::string::npos &&
+              message.find("; beside device_untracked_bytes=" + std::to_string(untracked) + " of Metal memory") !=
+                  std::string::npos &&
+              message.find("SSD cache") == std::string::npos,
+          "the lone prefill's failure did not name its lane and the memory outside the engine's buffers alone: " +
+              message);
 }
 
 // A lane's growth converts no other lane: a short lane refused at the wall leaves a 64K neighbour
@@ -452,12 +566,13 @@ void testALanesGrowthConvertsNoOtherLane() {
                !needsPage(1, 2'046);
       },
       "the short lane did not come to need a page alone");
-  require(lanes.mode(1) == KvMode::Resident && lanes.mode(2) == KvMode::Resident, "the lanes did not start Resident");
+  require(kvMode(spill, 1) == KvMode::Resident && kvMode(spill, 2) == KvMode::Resident,
+          "the lanes did not start Resident");
   // At the wall: no free Full page, and no extent more.
   lanes.wall();
   const KvPageAcquisition held = spill.pool.acquirePages(spill.pool.freePageCount());
   static_cast<void>(spill.engine.tick(spill.now++));
-  require(held.granted() && lanes.mode(1) == KvMode::Resident, "a lane's growth converted another lane");
+  require(held.granted() && kvMode(spill, 1) == KvMode::Resident, "a lane's growth converted another lane");
   for (const uint32_t page : held.pages)
     spill.pool.releasePage(page, false);
   spill.storage.budgetPages = FlashNextLanes::kPages.count;
@@ -483,6 +598,125 @@ void testALaneFreeingLessThanItsNeedDoesNotConvert() {
           "a lane whose spill freed less than the floor and its need converted");
   require(spill.events.completedCount == 1 && spill.events.failures.empty() && spill.events.usage.at(1).second == 200,
           "the lane did not decode its whole output");
+}
+
+// The pooled buffers the next lane starts from (Executor::pooledLaneBytes), `bytes` of them, which
+// only KV in service takes: a lane's start takes none of them.
+void poolTheNextLanesBuffers(Spilling &spill, uint64_t bytes) {
+  spill.host.memory.hold("states", bytes);
+  spill.model.heldStateBytes += bytes;
+  spill.model.pooledLaneBytes += bytes;
+}
+
+// Memory beside a Flash-Next prompt of 2,046 pages and its 828 MiB of Resident KV, on a run whose SSD
+// cache holds `slots` pages: the engine's limit leaves `room` past what memory holds, `pooled` bytes
+// of it held as the next lane's pooled buffers.
+struct ShortOfBoth {
+  explicit ShortOfBoth(uint64_t room, uint64_t pooled = 0, uint32_t slots = 1'000)
+      : spill{slots, false, 0, 200'000, Spilling::Extent{256}, {}, {}, true, FlashNextLanes::kPages} {
+    if (pooled)
+      poolTheNextLanesBuffers(spill, pooled);
+    const uint64_t limit = test::GovernorLimits{}.limitBytes;
+    spill.host.memory.hold("limit", limit - std::min(limit, spill.host.memory.total() + room));
+  }
+  Spilling spill;
+};
+
+// A start alone that cannot spill, the SSD cache's room short of its projection or the tier closed,
+// and whose Resident KV memory does not hold now is refused at its start, naming what memory and the
+// SSD cache have for it, rather than start Resident and fail partway through its prefill.
+void testALoneStartMemoryCannotHoldIsRefusedAtItsStart() {
+  for (const bool closed : {false, true}) {
+    ShortOfBoth both(400ULL << 20);
+    Spilling &spill = both.spill;
+    spill.tier.writableFile = !closed;
+    spill.engine.submit(Spilling::prompt(1, 1, 2'046, 200));
+    spill.runUntilIdle();
+    const std::string message = spill.events.failureDetails.empty() ? "" : spill.events.failureDetails.front().first;
+    require(spill.events.failures == std::vector<std::string>{closed ? "capacity_exhausted" : "kv_disk_quota"} &&
+                spill.model.prefillChunks[1] == 0 && message.find("resident_bytes=") != std::string::npos &&
+                message.find("memory_bytes=") != std::string::npos,
+            std::string("a start alone that neither memory nor the SSD cache holds was not refused at its start "
+                        "naming both") +
+                (closed ? " while the tier took no writes: " : " for a short quota: ") + message);
+  }
+}
+
+// A guard: the same start beside the next lane's pooled buffers, which cover what memory lacks,
+// starts Resident and decodes its output. The claim it makes in service takes them, as its growth
+// does; a start's would keep them, and it would not start.
+void testALoneStartCountsTheNextLanesBuffers() {
+  ShortOfBoth both(400ULL << 20, 768ULL << 20);
+  Spilling &spill = both.spill;
+  spill.engine.submit(Spilling::prompt(1, 1, 2'046, 200));
+  spill.runUntilIdle();
+  require(spill.events.completedCount == 1 && spill.events.failures.empty() &&
+              spill.events.usage.at(1).second == 200 && spill.model.pooledLaneBytes == 0,
+          "a start alone that the next lane's buffers hold did not take them and decode: " +
+              (spill.events.failureDetails.empty() ? std::string() : spill.events.failureDetails.front().first));
+}
+
+// A start alone that cannot spill and whose Resident KV memory does not hold now, but whose SSD
+// cache holds its prompt and some of its output, takes the quota's bound on its output and starts
+// Spill, as a Spill start short of its projection does: 2,050 slots hold the 64K prompt's 2,047 pages
+// and 127 tokens of its 300.
+void testALoneStartMemoryCannotHoldTakesTheQuotasBound() {
+  ShortOfBoth both(400ULL << 20, 0, 2'050);
+  Spilling &spill = both.spill;
+  spill.engine.submit(Spilling::prompt(1, 1, 2'046, 300));
+  spill.runUntilIdle();
+  const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+  require(spill.events.completedCount == 1 && spill.events.failures.empty() && counts.spill == 1 &&
+              counts.resident == 0 && spill.model.outputLimits.at(1) == 127 &&
+              spill.events.usage.at(1).second == 127 && spill.events.boundedIds == std::vector<uint64_t>{1},
+          "a start alone that memory does not hold did not start Spill under the quota's bound: " +
+              (spill.events.failureDetails.empty() ? std::string() : spill.events.failureDetails.front().first));
+}
+
+// Beside a lane in service, a start that cannot spill and whose Resident KV that lane keeps memory
+// from holding waits for it to end, then starts and decodes: it never prefills beside it.
+void testAStartMemoryCannotHoldBesideALaneWaitsForIt() {
+  ShortOfBoth both(1'200ULL << 20);
+  Spilling &spill = both.spill;
+  spill.engine.submit(Spilling::prompt(1, 1, 1'000, 100));
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the first lane did not decode");
+  spill.engine.submit(Spilling::prompt(2, 2, 2'046, 50));
+  bool beside = false;
+  spill.runUntil(
+      [&] {
+        beside = beside || (spill.events.completedCount == 0 && spill.model.prefillChunks[2] > 0);
+        return idle(spill.engine);
+      },
+      "the requests did not end");
+  require(!beside && spill.events.completedCount == 2 && spill.events.failures.empty() &&
+              spill.events.usage.at(2).second == 50,
+          "a start memory could not hold beside a lane prefilled beside it, or did not decode after it");
+}
+
+// Beside a lane of a lower priority, the same start makes that lane yield, as a start refused memory
+// does, and prefills only once it has; it decodes, and the lane decodes its output once it resumes.
+void testAStartMemoryCannotHoldBesideALowerLaneMakesItYield() {
+  ShortOfBoth both(1'200ULL << 20);
+  Spilling &spill = both.spill;
+  EngineRequest background = Spilling::prompt(1, 1, 1'000, 100);
+  background.priority = RequestPriority::Background;
+  spill.engine.submit(std::move(background));
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the Background lane did not decode");
+  EngineRequest foreground = Spilling::prompt(2, 2, 2'046, 50);
+  foreground.priority = RequestPriority::Foreground;
+  spill.engine.submit(std::move(foreground));
+  bool beside = false;
+  spill.runUntil(
+      [&] {
+        beside = beside || (spill.engine.snapshot().prioritySuspensions == 0 && spill.model.prefillChunks[2] > 0);
+        return idle(spill.engine);
+      },
+      "the requests did not end");
+  require(!beside && spill.engine.snapshot().prioritySuspensions == 1 && spill.events.completedCount == 2 &&
+              spill.events.failures.empty() && spill.events.usage.at(2).second == 50 &&
+              spill.events.usage.at(1).second == 100,
+          "a start memory could not hold prefilled beside a lower priority's lane before that lane yielded to "
+          "it, or the two did not decode");
 }
 
 // Lane demand counts the hot block floor a prefilling Spill lane waits for, and none once it holds
@@ -987,24 +1221,37 @@ void testAQuotaRefusalReadsOnlyTheChainAStartKeeps() {
   require(spill.committedSlots() == 0, "the quota was not returned");
 }
 
-// A start that cannot spill, the tier closed or the quota short, starts Resident where its
-// projection fits the resident context alone.
-void testAStartThatCannotSpillStartsResidentWithinTheResidentContext() {
-  for (const bool closed : {true, false}) {
-    // The room beside the lanes holds 20 pages, so placement spills; the resident context is 50.
-    Spilling spill(8, false, 0, 50 * KvCache::pageTokens, {4}, {}, {.limitBytes = 20 * 100});
-    spill.tier.writableFile = !closed;
-    // 40 pages of prompt and 64 tokens of output project 43 pages; the 8
-    // slots of the quota cannot hold them.
-    spill.engine.submit(Spilling::prompt(1, 1, 40, 64));
-    spill.runUntilIdle();
-    const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
-    require(spill.events.completedCount == 1 && spill.events.usage.at(1).second == 64 &&
-                counts.resident == 1 && counts.spill == 0 && counts.refusedClosed == 0 &&
-                counts.refusedQuota == 0 && spill.tier.writes.empty(),
-            closed ? "a start that fits the resident context was refused while the tier took no writes"
-                   : "a start that fits the resident context was refused for a short quota");
-  }
+// A start alone that cannot spill, the tier closed or the quota short, and whose projection fits
+// the resident context starts Resident where memory holds it now, the next lane's pooled buffers
+// among it, and is refused at its start where it does not.
+void testAStartThatCannotSpillStartsResidentWhereMemoryHoldsIt() {
+  for (const bool closed : {true, false})
+    for (const bool buffers : {true, false}) {
+      Spilling spill(8, false, 0, 50 * KvCache::pageTokens, {4}, {}, {.limitBytes = Spilling::kGovernedLimitBytes},
+                     true);
+      spill.tier.writableFile = !closed;
+      // The room holds 20 pages, so placement spills; the resident context is 50, and the next lane's
+      // pooled buffers, where it has them, hold 60 more.
+      if (buffers)
+        poolTheNextLanesBuffers(spill, 60 * 100);
+      spill.limit(spill.held() + 20 * 100);
+      // 40 pages of prompt and 64 tokens of output project 43 pages; the 8
+      // slots of the quota cannot hold them.
+      spill.engine.submit(Spilling::prompt(1, 1, 40, 64));
+      spill.runUntilIdle();
+      const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+      const std::string when = std::string(closed ? " while the tier took no writes" : " for a short quota");
+      if (buffers)
+        require(spill.events.completedCount == 1 && spill.events.usage.at(1).second == 64 && counts.resident == 1 &&
+                    counts.spill == 0 && counts.refusedClosed == 0 && counts.refusedQuota == 0 &&
+                    spill.model.pooledLaneBytes == 0,
+                "a start the next lane's buffers hold was refused, or did not take them," + when);
+      else
+        require(spill.events.failures ==
+                        std::vector<std::string>{closed ? "capacity_exhausted" : "kv_disk_quota"} &&
+                    (closed ? counts.refusedClosed : counts.refusedQuota) == 1 && spill.model.prefillChunks[1] == 0,
+                "a start memory did not hold started" + when);
+    }
 }
 
 // A Spill start the write budget cannot cover is refused (kv_write_budget) with a Retry-After of
@@ -1133,6 +1380,30 @@ void testSpillMovesThroughTheHostPause() {
   require(spill.events.failedCount == 0 && spill.events.completedCount == 1 &&
               spill.events.usage.at(1).second == 8,
           "a Spill prompt kept its landed pages Full under the host's pause until the engine's limit");
+}
+
+// Under critical pressure, which refuses every allocation the host's rule judges, a Spill lane's landed pages
+// still move past the Index runway: the Full extents each runway's moves empty leave and pay for the next Index
+// extent (MemoryGovernor::fund).
+void testLandedPagesSpillAtCriticalPressure() {
+  Spilling spill{4'096, true, 100'000, 0, Spilling::Extent{256}, {}, {}, true, FlashNextLanes::kPages};
+  const auto fullBytes = [&] {
+    const KvPoolSnapshot pool = spill.pool.snapshot();
+    return pool.allocatedBytes - pool.index.allocatedBytes;
+  };
+  // Three extents of pages past the dense history and the window, with no
+  // copies until the lane decodes.
+  spill.allowSpillWrites(false);
+  spill.engine.submit(Spilling::prompt(1, 1, 3 * 256 + 2, 4'096));
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the lane did not decode");
+  const uint64_t full = fullBytes();
+  spill.host.setPressure(MemoryPressure::Critical);
+  spill.allowSpillWrites(true);
+  spill.runUntil([&] { return spill.cache.spillSnapshot().spilledPages >= 3 * 256; },
+                 "under critical pressure the landed pages stayed Full once the Index runway was used");
+  require(fullBytes() + 3 * 256 * FlashNextLanes::kPages.fullBytes <= full && spill.events.failures.empty() &&
+              spill.engine.snapshot().resourceSuspensions == 0,
+          "the moves kept the Full extents they emptied, or the lane failed or yielded");
 }
 
 // A suspended Spill request returns its commitment and commits again on resume; a short quota
@@ -2120,57 +2391,682 @@ void testAPageWaitingForItsCopyHoldsBackNoneAfterIt() {
   require(idle(spill.engine), "the lane did not end");
 }
 
-// A conversion that spills pages a Spill lane shares replans the command, so both lanes read them
-// through their floors.
-void testAConversionLeavesNoLaneWithoutItsFloor() {
-  Spilling spill(1024);
-  // The Spill lane writes its copies only once the Resident lane holds them.
-  spill.allowSpillWrites(false);
-  spill.engine.submit(Spilling::prompt(1, 1, 4, 200));
-  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the Spill lane did not decode");
-  // The Resident lane starts while the SSD cache takes no writes.
-  spill.tier.writableFile = false;
-  spill.engine.submit(Spilling::prompt(2, 1, 4, 200));
-  spill.runUntil([&] { return spill.events.outputs.contains(2); }, "the Resident lane did not decode");
-  spill.tier.writableFile = true;
-  spill.allowSpillWrites(true);
-  // Lane 2's next command needs a page that lane 1's does not.
-  const auto needsPage = [&](uint64_t id) {
-    const uint64_t tokens = 4 * KvCache::pageTokens + 1 + spill.events.outputs[id].size() +
-                            model::ExecutionLimits::targetVerifyRows;
-    return tokens > uint64_t{spill.cache.pageTable(id).pages.size()} * KvCache::pageTokens;
-  };
+// A Spill lane keeps the pages whose copies landed Full while memory lasts: it writes every page through, yet holds
+// no Index page and reads nothing back, taking neither history staging nor a hot block floor.
+void testASpillLaneKeepsLandedPagesWhileMemoryLasts() {
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  lanes.startSpill(Spilling::prompt(1, 1, 2'046, 200));
+  uint32_t index = 0;
+  bool reads = false;
   spill.runUntil(
       [&] {
-        return !spill.engine.commandInFlight() &&
-               spill.cache.chainCopies(spill.cache.blockAt(1, 4 * KvCache::pageTokens)).copied == 4 &&
-               needsPage(2) && !needsPage(1);
+        if (spill.events.usage.contains(1))
+          return true;
+        index = std::max(index, spill.cache.indexPages(1));
+        reads = reads || spill.model.spilledReadFloors.contains(1) || spill.model.historyStaging.contains(1);
+        return false;
       },
-      "lane 2 did not come to need a page that lane 1 does not");
-  require(spill.engine.snapshot().spill.spill == 1 && spill.engine.snapshot().spill.resident == 1 &&
-              !spill.cache.holdsIndexPages(1) &&
-              spill.cache.pageTable(1).pages.front() == spill.cache.pageTable(2).pages.front(),
-          "the lanes did not share the prompt, its pages Full beside their copies");
-  // At the wall: no free Full page, and no growth.
-  spill.storage.growthBlocked = true;
+      "the lane did not end");
+  require(spill.events.failures.empty() && spill.events.usage.at(1).second == 200 &&
+              spill.cache.spillSnapshot().writeThroughPages >= 2'046,
+          "the Spill lane did not write its pages through and decode its whole output");
+  require(index == 0 && !reads, "a Spill lane with memory to spare moved " + std::to_string(index) +
+                                    " pages to the index form, or took memory to read them back");
+}
+
+// A Spill lane in prefill at the memory wall releases at once only what it lacks: its oldest pages whose copies
+// landed, in the whole extents that hold its growth's extent and its history's staging through its next command,
+// 512 pages for 108.5 MB and 40.1 MB on Qwen3.8-Flash-Next, the staging held by the same command. No claim waits.
+void testASpillLaneAtTheWallReleasesOnlyWhatItLacks() {
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  lanes.startSpill(Spilling::prompt(1, 1, 2'046, 8));
+  spill.runUntil([&] { return spill.cache.pageTable(1).pages.size() >= 1'024 && !spill.engine.commandInFlight(); },
+                 "the prompt did not reach its 1,024th page");
+  lanes.wall();
+  uint32_t released = 0;
+  bool waited = false;
+  spill.runUntil(
+      [&] {
+        waited = waited || spill.host.governor.snapshot().claims.waiting != 0;
+        released = spill.cache.indexPages(1);
+        return released && !spill.engine.commandInFlight();
+      },
+      "the lane at the wall released none of its pages");
+  require(released == 512 && !waited && spill.model.historyStaging.contains(1),
+          "the lane at the wall released " + std::to_string(released) + " pages, not the 512 of the two extents its "
+              "growth and staging lack, waited, or read without its staging");
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.usage.at(1).second == 8, "the lane did not complete");
+}
+
+// A decoding Spill lane takes its hot block floor only at its first release, which frees the floor beside what its
+// growth lacks, and the same prepare reserves it: the command after the release reads with it. A Background start
+// refused at the same wall, which releases no Normal lane, takes none of it.
+void testTheFirstReleaseFundsTheLanesReads() {
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  // 2,047 pages: one page's room left in its eighth extent.
+  lanes.startSpill(Spilling::prompt(1, 1, 2'046, 400));
+  lanes.decode(1, 10);
+  require(!spill.cache.holdsIndexPages(1) && !spill.model.spilledReadFloors.contains(1),
+          "a decoding Spill lane held Index pages or its hot block floor before any release");
+  lanes.wall();
+  EngineRequest background = Spilling::prompt(2, 2, 1, 4);
+  background.priority = RequestPriority::Background;
+  spill.engine.submit(std::move(background));
+  bool floor = false;
+  spill.runUntil(
+      [&] {
+        if (!spill.cache.holdsIndexPages(1))
+          return false;
+        floor = spill.model.spilledReadFloors.contains(1);
+        return true;
+      },
+      "the decoding lane released none of its pages");
+  require(floor && !spill.events.startIds.empty() && std::ranges::count(spill.events.startIds, 2) == 0,
+          "the release's prepare did not reserve the lane's floor, or the Background start took memory it freed");
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.usage.at(1).second == 400 &&
+              spill.engine.snapshot().resourceSuspensions == 0,
+          "the lanes did not complete, or one yielded");
+}
+
+// A start at the memory wall releases the landed pages of a lane of its own priority rather than wait for it to end:
+// a 2K Normal prompt starts beside a Normal Spill lane in decode, which yields nothing and decodes on.
+void testAStartReleasesALaneOfItsPriority() {
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  // 2,047 pages: one page's room left in its eighth extent, the 16 tokens of output within it.
+  lanes.startSpill(Spilling::prompt(1, 1, 2'046, 16));
+  lanes.decode(1, 4);
+  require(!spill.cache.holdsIndexPages(1), "the decoding lane held Index pages before the wall");
+  lanes.wall();
+  spill.engine.submit(Spilling::prompt(2, 2, 64, 4));
+  spill.runUntil([&] { return std::ranges::count(spill.events.startIds, 2) != 0; }, "the start did not start");
+  require(spill.cache.holdsIndexPages(1) && !spill.events.usage.contains(1) &&
+              spill.engine.snapshot().resourceSuspensions == 0,
+          "the start did not release the lane's pages, waited for the lane of its priority to end, or the lane "
+          "yielded");
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.completedCount == 2, "the requests did not complete");
+}
+
+// A start never releases the pages of a lane of a higher priority: a Normal prompt at the wall waits for a
+// Foreground Spill lane to end, the lane's pages left Full.
+void testAStartNeverReleasesAHigherPriorityLane() {
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  // 2,047 pages: one page's room left in its eighth extent, the 16 tokens of output within it.
+  EngineRequest foreground = Spilling::prompt(1, 1, 2'046, 16);
+  foreground.priority = RequestPriority::Foreground;
+  lanes.startSpill(std::move(foreground));
+  lanes.decode(1, 4);
+  lanes.wall();
+  spill.engine.submit(Spilling::prompt(2, 2, 64, 4));
+  bool released = false;
+  spill.runUntil(
+      [&] {
+        if (spill.events.usage.contains(1))
+          return true;
+        released = released || spill.cache.holdsIndexPages(1);
+        return false;
+      },
+      "the Foreground lane did not end");
+  require(!released && std::ranges::count(spill.events.startIds, 2) == 0,
+          "the Foreground lane's pages left memory before it ended, or the Normal start started first");
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.completedCount == 2, "the requests did not complete");
+}
+
+// A decoding Spill lane of 3,070 pages under macOS's critical pressure, which refuses every allocation, beside an
+// expert store of `chunks` 1 GiB chunks over a floor of two: a release at an earlier wall left it Index pages, its hot
+// block floor and five extents of pages whose copies landed.
+struct CriticalLane {
+  explicit CriticalLane(uint32_t chunks = 2)
+      : experts{"experts", spill.host.memory, 1ULL << 30, 2, chunks, chunks, chunks} {
+    static_cast<void>(spill.host.governor.ledger().addPool(experts));
+    lanes.startSpill(Spilling::prompt(1, 1, 3'070, 1'000));
+    lanes.decode(1, 10);
+    lanes.wall();
+    spill.runUntil(
+        [&] {
+          return spill.cache.holdsIndexPages(1) && spill.model.spilledReadFloors.contains(1) &&
+                 !spill.engine.commandInFlight();
+        },
+        "the lane did not release its pages at the wall");
+    spill.host.setPressure(MemoryPressure::Critical);
+  }
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  test::FakeElasticPool experts;
+};
+
+// Under critical pressure the host's pass releases a lane's pages whose copies landed before any lane yields and
+// before the expert store: with a chunk above its floor, the store gives nothing to a pass of two extents' pages,
+// 204 MB on Qwen3.8-Flash-Next, which the lane's release covers.
+void testCriticalReleasesCleanPagesBeforeAnyLaneYields() {
+  CriticalLane critical(3);
+  Spilling &spill = critical.spill;
+  const uint32_t before = spill.cache.indexPages(1);
+  const uint64_t extents = 2 * 256 * (FlashNextLanes::kPages.fullBytes - FlashNextLanes::kPages.indexBytes);
+  const FreeResult freed = test::hostPass(spill.host.governor, extents, true);
+  require(freed.nowBytes >= extents && spill.cache.indexPages(1) > before && critical.experts.shrinks == 0,
+          "the host's pass under critical pressure freed " + std::to_string(freed.nowBytes) + " B, released " +
+              std::to_string(spill.cache.indexPages(1) - before) + " of the lane's pages and took " +
+              std::to_string(critical.experts.shrinks) + " store chunks");
+  critical.lanes.decode(1, spill.events.outputs[1].size() + 64);
+  require(spill.engine.snapshot().resourceSuspensions == 0, "the lane yielded under critical pressure");
+  spill.host.setPressure(MemoryPressure::Normal);
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.usage.at(1).second == 1'000, "the lane did not complete");
+}
+
+// Under critical pressure a lane's growth the host refuses releases its own lane's pages whose copies landed, in
+// place: into free Index pages, the Full pages they free taken by the growth, so the lane decodes on rather than
+// yield.
+void testAHostRefusedGrowthReleasesItsOwnLane() {
+  CriticalLane critical;
+  Spilling &spill = critical.spill;
+  // No free Full page: the growth asks for an extent.
   const KvPageAcquisition held = spill.pool.acquirePages(spill.pool.freePageCount());
-  const uint64_t replans = spill.engine.snapshot().replans;
-  static_cast<void>(spill.engine.tick(spill.now++));
-  require(held.granted() && spill.engine.commandInFlight() && spill.engine.snapshot().replans > replans &&
-              spill.engine.snapshot().spill.converted == 1 && spill.cache.holdsIndexPages(1) &&
-              spill.model.spilledReadFloors.contains(1) && spill.model.spilledReadFloors.contains(2),
-          "a lane whose pages a later lane's conversion spilled read them without its floor");
+  const uint32_t before = spill.cache.indexPages(1);
+  critical.lanes.decode(1, spill.events.outputs[1].size() + 64);
+  require(held.granted() && spill.engine.snapshot().resourceSuspensions == 0 && spill.cache.indexPages(1) > before,
+          "a growth the host refused under critical pressure did not release its own lane's pages, or the lane "
+          "yielded");
   for (const uint32_t page : held.pages)
     spill.pool.releasePage(page, false);
-  spill.storage.growthBlocked = false;
-  spill.model.decodeFinishes = true;
+  spill.host.setPressure(MemoryPressure::Normal);
+  spill.host.leaveRoom(std::nullopt);
   spill.runUntilIdle();
-  require(spill.events.completedCount == 2 && spill.events.failedCount == 0,
-          "the lanes did not complete after the conversion");
+  require(spill.events.failures.empty() && spill.events.usage.at(1).second == 1'000, "the lane did not complete");
+}
+
+// A release in place keeps the Index runway, which under critical pressure only the bytes a release frees refill: a
+// growth the host refuses with no free Full page releases an extent of its lane's pages more than it takes, whose
+// emptied Full extent refills the runway. The host's next pass then still releases two extents of the lane's pages,
+// 204 MB on Qwen3.8-Flash-Next, with the expert store at its floor, and leaves an extent of free Index pages.
+void testAReleaseInPlaceKeepsTheIndexRunway() {
+  CriticalLane critical;
+  Spilling &spill = critical.spill;
+  // No free Full page: the growth asks for an extent.
+  const KvPageAcquisition held = spill.pool.acquirePages(spill.pool.freePageCount());
+  critical.lanes.decode(1, spill.events.outputs[1].size() + 64);
+  const uint32_t before = spill.cache.indexPages(1);
+  const uint64_t extents = 2 * 256 * (FlashNextLanes::kPages.fullBytes - FlashNextLanes::kPages.indexBytes);
+  const FreeResult freed = test::hostPass(spill.host.governor, extents, true);
+  const uint32_t runway = spill.pool.freePageCount(kv::PageForm::Index);
+  require(held.granted() && spill.engine.snapshot().resourceSuspensions == 0 && freed.nowBytes >= extents &&
+              spill.cache.indexPages(1) >= before + 512 && runway >= spill.pool.extentPages() &&
+              critical.experts.shrinks == 0,
+          "after a release in place under critical pressure the host's pass freed " + std::to_string(freed.nowBytes) +
+              " B, released " + std::to_string(spill.cache.indexPages(1) - before) + " of the lane's pages, took " +
+              std::to_string(critical.experts.shrinks) + " store chunks and left " + std::to_string(runway) +
+              " free Index pages");
+  for (const uint32_t page : held.pages)
+    spill.pool.releasePage(page, false);
+  spill.host.setPressure(MemoryPressure::Normal);
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.usage.at(1).second == 1'000, "the lane did not complete");
+}
+
+// A release in place keeps the Index runway at every pressure level, since the room may hold no Index extent to refill
+// it, 6.3 MB on Qwen3.8-Flash-Next. A first wall's release leaves a Background lane 162 pages whose copies landed, too
+// few for an extent more: at a second wall, with no free Full page and no room, a Normal lane's growth takes none of
+// them in place but releases its own lane's pages. The host's pass under critical pressure then still releases two
+// extents of the Normal lane's pages.
+void testAReleaseInPlaceKeepsTheRunwayTheRoomCannotRefill() {
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  EngineRequest background = Spilling::prompt(3, 3, 1'700, 400);
+  background.priority = RequestPriority::Background;
+  lanes.startSpill(std::move(background));
+  lanes.decode(3, 4);
+  lanes.startSpill(Spilling::prompt(1, 1, 3'070, 600));
+  lanes.decode(1, 64);
+  require(!spill.cache.holdsIndexPages(1) && !spill.cache.holdsIndexPages(3),
+          "a lane held Index pages before the wall");
+  // At each wall no Full page is free: the first releases the Background lane's pages for the Normal lane's growth.
+  lanes.wall();
+  const KvPageAcquisition first = spill.pool.acquirePages(spill.pool.freePageCount());
+  spill.runUntil([&] { return spill.cache.holdsIndexPages(3) && !spill.engine.commandInFlight(); },
+                 "the Background lane released none of its pages at the first wall");
+  lanes.wall();
+  const KvPageAcquisition second = spill.pool.acquirePages(spill.pool.freePageCount());
+  const uint32_t backgroundIndex = spill.cache.indexPages(3), normalIndex = spill.cache.indexPages(1);
+  lanes.decode(1, spill.events.outputs[1].size() + 64);
+  require(spill.cache.indexPages(3) == backgroundIndex && spill.cache.indexPages(1) > normalIndex,
+          "at the second wall the Normal lane's growth moved " +
+              std::to_string(spill.cache.indexPages(3) - backgroundIndex) + " of the Background lane's pages and " +
+              std::to_string(spill.cache.indexPages(1) - normalIndex) + " of its own");
+  const uint32_t runway = spill.pool.freePageCount(kv::PageForm::Index);
+  spill.host.setPressure(MemoryPressure::Critical);
+  const uint32_t before = spill.cache.indexPages(1);
+  const uint64_t extents = 2 * 256 * (FlashNextLanes::kPages.fullBytes - FlashNextLanes::kPages.indexBytes);
+  const FreeResult freed = test::hostPass(spill.host.governor, extents, true);
+  require(first.granted() && second.granted() && runway >= spill.pool.extentPages() && freed.nowBytes >= extents &&
+              spill.cache.indexPages(1) >= before + 512,
+          "after growths at a wall with no room the runway held " + std::to_string(runway) +
+              " free Index pages, and the host's pass under critical pressure freed " +
+              std::to_string(freed.nowBytes) + " B and released " +
+              std::to_string(spill.cache.indexPages(1) - before) + " of the Normal lane's pages");
+  for (const KvPageAcquisition *held : {&first, &second})
+    for (const uint32_t page : held->pages)
+      spill.pool.releasePage(page, false);
+  spill.host.setPressure(MemoryPressure::Normal);
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.completedCount == 2, "the lanes did not complete");
+}
+
+// A growth takes its page in place before a release for bytes, which moves more pages and may still leave it short:
+// at a wall with no free Full page and no room, a lone decoding lane whose first release left it fewer than two
+// extents of pages whose copies landed moves its page and an extent more in place, where a release of one extent for
+// bytes would free 102 MB of the 108.5 MB its Full extent lacks and leave too few pages to move in place.
+void testAGrowthTakesItsPageInPlaceBeforeAReleaseForBytes() {
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  lanes.startSpill(Spilling::prompt(1, 1, 2'000, 600));
+  lanes.decode(1, 64);
+  require(!spill.cache.holdsIndexPages(1), "the lane held Index pages before the wall");
+  // At each wall no Full page is free: the first releases the lane's pages for its growth and floor.
+  lanes.wall();
+  const KvPageAcquisition first = spill.pool.acquirePages(spill.pool.freePageCount());
+  spill.runUntil([&] { return spill.cache.holdsIndexPages(1) && !spill.engine.commandInFlight(); },
+                 "the lane released none of its pages at the first wall");
+  lanes.wall();
+  const KvPageAcquisition second = spill.pool.acquirePages(spill.pool.freePageCount());
+  const uint32_t before = spill.cache.indexPages(1);
+  const size_t decoded = spill.events.outputs[1].size() + 64;
+  uint32_t released = 0;
+  spill.runUntil(
+      [&] {
+        if (spill.events.usage.contains(1))
+          return true;
+        released = spill.cache.indexPages(1) - before;
+        return spill.events.outputs[1].size() >= decoded && !spill.engine.commandInFlight();
+      },
+      "the lane neither decoded nor ended");
+  require(first.granted() && second.granted() && !spill.events.usage.contains(1) && released < 512,
+          "the lane at the second wall released " + std::to_string(released) + " pages, or ended after " +
+              std::to_string(spill.events.outputs[1].size()) + " tokens");
+  for (const KvPageAcquisition *held : {&first, &second})
+    for (const uint32_t page : held->pages)
+      spill.pool.releasePage(page, false);
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.usage.at(1).second == 600, "the lane did not complete");
+}
+
+// A lane whose command is between its passes reads its history as the command's first pass cut it, so it gains no
+// Index page there: no claim releases it, and its pages do not move as their copies land. A start of its priority at
+// the wall leaves its pages Full until the command's last pass.
+void testNoReleaseOfALaneBetweenItsPasses() {
+  FlashNextGoverned lanes(test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6, true));
+  Spilling &spill = lanes.spill;
+  std::vector<std::pair<uint32_t, uint32_t>> passes;
+  spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
+    if (plan.kind == WorkKind::Prefill)
+      passes.emplace_back(plan.pass, plan.passes);
+    return test::CommandTimes{};
+  };
+  const auto between = [&] { return !passes.empty() && passes.back().first + 1 < passes.back().second; };
+  lanes.startSpill(Spilling::prompt(1, 1, 2'046, 8));
+  spill.runUntil(
+      [&] { return spill.cache.pageTable(1).pages.size() >= 1'024 && between() && !spill.engine.commandInFlight(); },
+      "the prompt did not reach its 1,024th page between a command's passes");
+  lanes.wall();
+  spill.engine.submit(Spilling::prompt(2, 2, 64, 4));
+  bool released = false;
+  spill.runUntil(
+      [&] {
+        released = released || (between() && spill.cache.holdsIndexPages(1));
+        return !between();
+      },
+      "the command did not reach its last pass");
+  require(!released, "a lane gained Index pages between its command's passes");
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.completedCount == 2, "the requests did not complete");
+}
+
+// Requests on one prefix share its pages, so a release moves a page only where its claim may take it from every lane
+// that holds it: neither a decoding Spill lane's growth at the wall nor a start of its priority releases the lane's
+// conversation while a longer prompt on it, which holds those pages, is between its command's passes, and all three
+// requests complete.
+void testNoReleaseOfAPageALaneBetweenItsPassesHolds() {
+  FlashNextGoverned lanes(test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6, true));
+  Spilling &spill = lanes.spill;
+  std::vector<std::pair<uint32_t, uint32_t>> passes;
+  spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
+    if (plan.kind == WorkKind::Prefill)
+      passes.emplace_back(plan.pass, plan.passes);
+    return test::CommandTimes{};
+  };
+  const auto between = [&] { return !passes.empty() && passes.back().first + 1 < passes.back().second; };
+  lanes.startSpill(Spilling::prompt(1, 1, 2'046, 4'096));
+  lanes.decode(1, 4);
+  // Lane 2's prompt is lane 1's and 2,048 pages more: it holds lane 1's pages and prefills the rest in passes. Lane 1
+  // then decodes eight tokens a step, its verify rows', so its growth meets the wall within four steps.
+  lanes.startSpill(Spilling::prompt(2, 1, 4'094, 8));
+  spill.model.decodeTokens = model::ExecutionLimits::targetVerifyRows;
+  spill.runUntil([&] { return between() && !spill.engine.commandInFlight(); },
+                 "lane 2's prompt did not come between a command's passes");
+  require(!spill.cache.holdsIndexPages(1) && !spill.cache.holdsIndexPages(2),
+          "a lane held Index pages before the wall");
+  lanes.wall();
+  const KvPageAcquisition held = spill.pool.acquirePages(spill.pool.freePageCount());
+  spill.engine.submit(Spilling::prompt(3, 3, 64, 8));
+  // The command goes on to its last pass, or lane 2 yields, which gives it up.
+  const auto inCommand = [&] { return between() && spill.model.requests.at(2).resident; };
+  bool released = false;
+  spill.runUntil(
+      [&] {
+        released = released || (inCommand() && spill.cache.holdsIndexPages(2));
+        return !inCommand();
+      },
+      "the command did not reach its last pass");
+  require(held.granted() && !released, "a page a lane between its command's passes holds left memory");
+  for (const uint32_t page : held.pages)
+    spill.pool.releasePage(page, false);
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.completedCount == 3, "the requests did not complete");
+}
+
+// Guard: a lone decoding Spill lane at the engine's limit takes no Index page whose hot block floor (390 MiB) its
+// release cannot free beside its growth: each page frees its Full bytes less its Index page's, so even four extents of
+// pages whose copies landed free the floor alone. With 1,021 such pages it releases none and ends with Length at the
+// wall, rather than fail for its reads.
+void testALoneLaneWhoseReleaseCannotPayItsReadsEndsAtItsLength() {
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  // 1,023 pages and a token: 1,021 pages past the dense history and window, under four extents.
+  lanes.startSpill(Spilling::prompt(1, 1, 1'023, 4'096));
+  lanes.decode(1, 64);
+  lanes.wall();
+  // No free Full page: the growth asks for an extent.
+  const KvPageAcquisition held = spill.pool.acquirePages(spill.pool.freePageCount());
+  spill.runUntil([&] { return idle(spill.engine); }, "the lane did not end at the wall");
+  require(held.granted() && spill.events.failures.empty() && spill.events.usage.contains(1) &&
+              spill.engine.snapshot().spill.lengthEnds == 1,
+          "a lone Spill lane whose release could not pay for its reads did not end with Length at the wall: " +
+              (spill.events.failures.empty() ? std::string("no failure") : spill.events.failureDetails.front().first) +
+              ", " + std::to_string(spill.engine.snapshot().spill.lengthEnds) + " length ends");
+  for (const uint32_t page : held.pages)
+    spill.pool.releasePage(page, false);
+}
+
+// Guard: a lone Spill lane at the wall whose copies are still being written waits for them, then releases them, and
+// prefills on with no resource_timeout and no failure.
+void testALoneLaneWaitsForItsLastWritesThenReleasesThem() {
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  spill.allowSpillWrites(false);
+  lanes.startSpill(Spilling::prompt(1, 1, 2'046, 8));
+  spill.runUntil([&] { return spill.cache.pageTable(1).pages.size() >= 1'024 && !spill.engine.commandInFlight(); },
+                 "the prompt did not reach its 1,024th page");
+  lanes.wall();
+  spill.allowSpillWrites(true);
+  bool waited = false;
+  spill.runUntil(
+      [&] {
+        waited = waited || spill.host.governor.snapshot().claims.waiting != 0;
+        return spill.cache.holdsIndexPages(1);
+      },
+      "the lane released none of its pages once their copies landed");
+  require(waited, "the lane at the wall did not wait for its copies in flight");
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.usage.at(1).second == 8,
+          "the lone lane failed at the wall while its copies were landing");
+}
+
+// A decoding lane whose pages another lane's claim released reads them with its hot block floor from its next
+// command: the release frees the floor beside what the claim lacks, and the lane's next prepare reserves it. Until
+// then it decodes on its pages in memory, with no floor.
+void testAReleaseLeavesNoLaneWithoutItsFloor() {
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  // 2,047 pages: one page's room left in its eighth extent, the 16 tokens of output within it.
+  EngineRequest background = Spilling::prompt(1, 1, 2'046, 16);
+  background.priority = RequestPriority::Background;
+  lanes.startSpill(std::move(background));
+  lanes.decode(1, 4);
+  require(!spill.cache.holdsIndexPages(1) && !spill.model.spilledReadFloors.contains(1),
+          "a decoding Spill lane no claim released held Index pages or a hot block floor");
+  // A Normal start at the wall releases the lane's pages.
+  lanes.wall();
+  spill.engine.submit(Spilling::prompt(2, 2, 64, 600));
+  spill.runUntil([&] { return spill.cache.holdsIndexPages(1); }, "no claim released the Spill lane's pages");
+  const size_t decoded = spill.events.outputs[1].size();
+  lanes.decode(1, decoded + 1);
+  require(spill.model.spilledReadFloors.contains(1), "a lane whose pages a release took decoded without its floor");
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.completedCount == 2 &&
+              spill.engine.snapshot().resourceSuspensions == 0,
+          "the lanes did not complete after the release, or one yielded");
+}
+
+// Two Spill lanes that hold no Index page read no spilled history: they prefill together as Resident lanes do, the
+// longer one's 193 rows past its whole commands beside the shorter.
+void testTwoSpillLanesWithoutIndexPagesPrefillTogether() {
+  // Flash-Next's pages, and an engine's limit short of one extent: every start spills.
+  Spilling spill{16'384, false, 0, 200'000, Spilling::Extent{256}, {}, {.limitBytes = 50ULL << 20}, false,
+                 FlashNextLanes::kPages};
+  std::vector<std::vector<uint64_t>> prefills;
+  spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
+    if (plan.kind == WorkKind::Prefill) {
+      std::vector<uint64_t> lanes;
+      for (const BatchItem &item : plan.items)
+        lanes.push_back(item.requestId);
+      prefills.push_back(std::move(lanes));
+    }
+    return test::CommandTimes{};
+  };
+  spill.engine.submit(Spilling::prompt(1, 1, 15, 4));
+  spill.engine.submit(Spilling::prompt(2, 2, 70, 4));
+  spill.runUntilIdle();
+  require(spill.events.completedCount == 2 && spill.engine.snapshot().spill.spill == 2 &&
+              std::ranges::any_of(prefills, [](const std::vector<uint64_t> &lanes) { return lanes.size() == 2; }),
+          "two Spill lanes that hold no Index page prefilled apart");
+}
+
+// Guard: a start on a decoding Spill lane's conversation counts the pages of the chain it restores once, as its own
+// in place, and not again as the lane's to release, since the start then holds them: with 200 MB of room its 1,001
+// pages past the chain lack four extents (434 MB) memory does not hold, so it starts Spill, and both complete with no
+// yield.
+void testAStartOnALanesConversationCountsItsChainOnce() {
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  lanes.startSpill(Spilling::prompt(1, 1, 2'046, 400));
+  lanes.decode(1, 4);
+  spill.host.leaveRoom(200'000'000);
+  spill.engine.submit(Spilling::prompt(2, 1, 3'046, 8));
+  spill.runUntil([&] { return std::ranges::count(spill.events.startIds, 2) != 0; }, "the start did not start");
+  require(kvMode(spill, 2) == KvMode::Spill,
+          "a start counted the chain it restores as its own and as the lane's to release, and started Resident");
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.completedCount == 2 &&
+              spill.engine.snapshot().resourceSuspensions == 0,
+          "the requests did not complete, or one yielded");
+}
+
+// A Resident lane reads its history Full, and a Resident start's count holds the chain it restores in place as its
+// own: a start on the first 1,500 pages of a decoding Spill lane's conversation, placed Resident at the wall for the
+// lane's other pages its claims release, releases none of that chain in its own claims, and restores it with no Index
+// page.
+void testAResidentStartOnALanesPrefixRestoresItWhole() {
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  // A lane's start allocates 200 MB of state buffers beside those the pool keeps.
+  spill.model.laneFootprintBytes = 200'000'000;
+  // Request 10 leaves a 1,500-page chain cached; lane 1 restores it and prefills 3,500 pages more.
+  spill.engine.submit(Spilling::prompt(10, 1, 1'500, 1));
+  spill.runUntilIdle();
+  lanes.startSpill(Spilling::prompt(1, 1, 5'000, 400));
+  lanes.decode(1, 4);
+  require(!spill.cache.holdsIndexPages(1), "the decoding lane held Index pages before the wall");
+  lanes.wall();
+  // Request 10's prompt again: its chain is lane 1's first 1,500 pages.
+  spill.engine.submit(Spilling::prompt(2, 1, 1'500, 8));
+  spill.runUntil([&] { return std::ranges::count(spill.events.startIds, 2) != 0; }, "the start did not start");
+  require(kvMode(spill, 2) == KvMode::Resident && spill.cache.holdsIndexPages(1),
+          "the start was not placed Resident, or released none of the lane's pages");
+  require(!spill.cache.holdsIndexPages(2),
+          "a Resident start's claims released the chain its count held, which it restored with " +
+              std::to_string(spill.cache.indexPages(2)) + " Index pages");
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.completedCount == 3 &&
+              spill.engine.snapshot().resourceSuspensions == 0,
+          "the requests did not complete, or one yielded");
+}
+
+// A release of pages several lanes share gives each of them Index pages, so it frees the first reads of every one
+// that holds none yet beside what its claim lacks: a start on a decoding Spill lane's conversation, its 1,001 pages
+// past the chain at 50 MB of room, releases their shared prefix for its growth and staging and for the decoding
+// lane's 390 MiB hot block floor, which memory then holds for that lane's next token.
+void testAReleaseOfASharedPrefixFundsEveryLanesReads() {
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  lanes.startSpill(Spilling::prompt(1, 1, 2'046, 400));
+  lanes.decode(1, 4);
+  require(!spill.cache.holdsIndexPages(1), "the decoding lane held Index pages before any release");
+  spill.host.leaveRoom(50'000'000);
+  spill.engine.submit(Spilling::prompt(2, 1, 3'046, 8));
+  spill.runUntil([&] { return spill.cache.holdsIndexPages(1) && !spill.engine.commandInFlight(); },
+                 "no release gave the decoding lane Index pages");
+  const uint64_t headroom = spill.host.governor.snapshot().headroomBytes;
+  require(spill.model.spilledReadFloors.contains(1) || headroom >= spill.model.spilledReadFloorBytes,
+          "a release of a shared prefix left the decoding lane " + std::to_string(headroom) +
+              " B for its 390 MiB hot block floor");
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.completedCount == 2 &&
+              spill.engine.snapshot().resourceSuspensions == 0,
+          "the requests did not complete, or one yielded");
+}
+
+// The first take that moves a page several lanes share frees it, so a count of their releases counts it once: two
+// Normal Spill lanes on one conversation, of 3,000 pages and of those and 1,000 more, give a start at the wall what
+// the longer one's release frees, 715.7 MB on Qwen3.8-Flash-Next. A Normal start of 2,300 pages that cannot spill,
+// the SSD cache closed, so waits for the shorter lane to end, rather than start beside both, release every page they
+// hold and yield.
+void testACountOfReleasesCountsASharedPageOnce() {
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  lanes.startSpill(Spilling::prompt(1, 1, 3'000, 400));
+  lanes.decode(1, 4);
+  lanes.startSpill(Spilling::prompt(2, 1, 4'000, 400));
+  lanes.decode(2, 4);
+  require(!spill.cache.holdsIndexPages(1) && !spill.cache.holdsIndexPages(2),
+          "a lane held Index pages before the wall");
+  spill.tier.writableFile = false;
+  lanes.wall();
+  spill.engine.submit(Spilling::prompt(3, 3, 2'300, 8));
+  bool beside = false;
+  spill.runUntil(
+      [&] {
+        beside = beside || (std::ranges::count(spill.events.startIds, 3) != 0 && !spill.events.usage.contains(1));
+        return idle(spill.engine);
+      },
+      "the requests did not end");
+  require(!beside && spill.events.failures.empty() && spill.events.completedCount == 3 &&
+              spill.engine.snapshot().resourceSuspensions == 0,
+          "a start that cannot spill started beside two lanes on one conversation, or a request failed or yielded (" +
+              std::to_string(spill.engine.snapshot().resourceSuspensions) + " yields)");
+}
+
+// A count of releases holds for the takes made as the copies stand; copies that land before them can lower it, as a
+// lane's landed pages then join, in its whole extents, shared pages a later lane's unit counted. Two Normal Spill
+// lanes on a 2,433-page prefix, of 769 and 897 pages more, count at most an extent of pages, 102 MB on
+// Qwen3.8-Flash-Next, less once the shorter one's copies have landed, with nothing taken.
+void testACountOfReleasesFallsByAtMostAnExtentAsCopiesLand() {
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  // Request 10 leaves the prefix cached; each lane restores it and prefills pages of its own.
+  spill.engine.submit(Spilling::prompt(10, 1, 2'433, 1));
+  spill.runUntilIdle();
+  const auto branch = [](uint64_t id, uint32_t pages) {
+    EngineRequest result = Spilling::prompt(id, 1, 2'433, 4'000);
+    result.prompt.insert(result.prompt.end(), pages * KvCache::pageTokens, static_cast<uint32_t>(id + 1));
+    return result;
+  };
+  lanes.startSpill(branch(2, 897));
+  spill.runUntil(
+      [&] {
+        return spill.events.outputs[2].size() >= 4 && !spill.cache.owesCopies(2) && spill.tier.inFlight() == 0 &&
+               !spill.engine.commandInFlight();
+      },
+      "the longer lane's copies did not land");
+  require(!spill.cache.holdsIndexPages(2), "the longer lane held Index pages before any release");
+  lanes.startSpill(branch(1, 769));
+  // The shorter lane prefills its own pages, none of their copies landing.
+  for (uint32_t step = 0; step < 4'000 && (spill.events.outputs[1].empty() || spill.engine.commandInFlight()); ++step)
+    static_cast<void>(spill.engine.tick(spill.now++));
+  require(!spill.cache.holdsIndexPages(1) && spill.tier.inFlight() != 0,
+          "the shorter lane held Index pages, or its copies landed, before the wall");
+  const ClaimSpec start{.cls = ClaimClass::Start, .priority = RequestPriority::Normal};
+  lanes.wall();
+  const uint64_t landing = spill.host.governor.available(start, {.bytes = 20ULL << 30});
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntil(
+      [&] { return !spill.cache.owesCopies(1) && spill.tier.inFlight() == 0 && !spill.engine.commandInFlight(); },
+      "the shorter lane's copies did not land");
+  lanes.wall();
+  const uint64_t landed = spill.host.governor.available(start, {.bytes = 20ULL << 30});
+  const uint64_t extent =
+      uint64_t{spill.pool.extentPages()} * (FlashNextLanes::kPages.fullBytes - FlashNextLanes::kPages.indexBytes);
+  require(spill.cache.spillSnapshot().releases == 0 && landed + extent >= landing,
+          "the count of releases fell from " + std::to_string(landing) + " B to " + std::to_string(landed) +
+              " B as copies landed, by more than an extent of pages, or a claim took some");
+}
+
+// A lone Spill prefill at the engine's limit, Metal memory outside the engine's buffers taking the room and 1 GiB
+// more, names why its KV gives no more memory back: where the SSD cache took no copy of its pages, as while the tier
+// writes none of them, the SSD cache; where it took them all, that even a release down to its floor does not cover
+// what it lacks, and not the SSD cache, which holds its KV.
+void testALoneSpillWallNamesWhyItsKvGaveNoMoreMemory() {
+  for (const bool written : {true, false}) {
+    FlashNextGoverned lanes;
+    Spilling &spill = lanes.spill;
+    spill.allowSpillWrites(written);
+    lanes.startSpill(Spilling::prompt(1, 1, 2'046, 8));
+    spill.runUntil([&] { return spill.cache.pageTable(1).pages.size() >= 1'024 && !spill.engine.commandInFlight(); },
+                   "the prompt did not reach its 1,024th page");
+    const uint64_t untracked = spill.host.governor.snapshot().headroomBytes + (1ULL << 30);
+    spill.host.memory.holdUntracked(untracked);
+    spill.runUntilIdle();
+    require(spill.events.failures == std::vector<std::string>{"capacity_exhausted"},
+            "the lone Spill prefill did not fail at the limit");
+    const std::string &message = spill.events.failureDetails.front().first;
+    const std::string_view named = written ? "even with its KV released down to its floor"
+                                           : "the SSD cache took no more of its KV";
+    const std::string_view other = written ? "SSD cache" : "down to its floor";
+    require(message.find(" for a Spill lane of ") != std::string::npos &&
+                message.find(" tokens in prefill: ") != std::string::npos &&
+                message.find(named) != std::string::npos && message.find(other) == std::string::npos &&
+                message.find("device_untracked_bytes=" + std::to_string(untracked)) != std::string::npos,
+            std::string("a lone Spill prefill whose copies ") + (written ? "landed" : "the tier did not take") +
+                " did not fail naming its lane, \"" + std::string(named) + "\" alone and the memory outside the "
+                "engine's buffers: " + message);
+  }
 }
 
 // A lone Spill lane the tier takes no more pages of: decoding, it ends with Length at its bound;
-// prefilling, it fails naming the SSD cache.
+// prefilling, its first command's ten pages, more than the eight memory holds, fail naming its lane
+// Spill in prefill and that even a release down to its floor does not cover them: it published no
+// page whose copy the SSD cache did not take.
 void testLoneSpillLaneEndsAtTheWall() {
   for (const bool decoding : {true, false}) {
     Spilling spill(64);
@@ -2188,10 +3084,12 @@ void testLoneSpillLaneEndsAtTheWall() {
                   spill.events.boundedIds == std::vector<uint64_t>{1},
               "a lone Spill lane at the wall did not end with Length at its bound");
     } else {
-      require(spill.events.failures == std::vector<std::string>{"capacity_exhausted"} &&
-                  spill.events.failureDetails.front().first.find("SSD cache") !=
-                      std::string::npos,
-              "a lone Spill prefill at the wall did not fail naming the SSD cache");
+      require(spill.events.failures == std::vector<std::string>{"capacity_exhausted"},
+              "a lone Spill prefill at the wall did not fail");
+      const std::string &message = spill.events.failureDetails.front().first;
+      require(message.find(" for a Spill lane of 321 tokens in prefill: ") != std::string::npos &&
+                  message.find("; even with its KV released down to its floor") != std::string::npos,
+              "a lone Spill prefill at the wall did not fail naming its lane and its floor: " + message);
     }
     require(spill.committedSlots() == 0, "the lane kept its commitment");
   }
@@ -2277,12 +3175,13 @@ void testFailedRestoreReturnsTheCommitment() {
           "the start did not run from the prefix that remained");
 }
 
-// A KV need takes cached pages of its form in place, with no extent emptied. A Spill lane's landed
-// copies free pages in its extents, which a short Resident prompt beside it takes; the prompt
-// yields or ends, and the lane's next page comes from the prompt's cached pages: it runs to its end.
+// A KV need takes cached pages of its form in place, with no extent emptied. Under --kv-spill always,
+// since its premise is pages that move as their copies land, a Spill lane's landed copies free pages
+// in its extents, which a short prompt beside it, spilling too, takes; the prompt yields or ends,
+// and the lane's next page comes from the prompt's cached pages: it runs to its end.
 void testALaneTakesCachedPagesInPlace() {
   for (const uint64_t room : {0, 50, 100}) {
-    Spilling spill(Spilling::Governed{}, 1024, false, Spilling::Extent{4}, test::commandShape(KvCache::pageTokens));
+    Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{4}, test::commandShape(KvCache::pageTokens));
     spill.limit(spill.held() + 1'100);
     EngineRequest lane = Spilling::prompt(2, 2, 12, 200);
     lane.deadlineMilliseconds = 1e9;
@@ -2723,12 +3622,20 @@ std::span<const test::TestCase> spillTests() {
       {"testAConvertedLaneResumesUnderTheSpillRules", testAConvertedLaneResumesUnderTheSpillRules},
       {"testAConvertedLanesMovesReleaseTheExtentsTheyEmpty", testAConvertedLanesMovesReleaseTheExtentsTheyEmpty},
       {"testALongDecodingLaneConvertsItselfAtTheWall", testALongDecodingLaneConvertsItselfAtTheWall},
+      {"testAPrefillingLaneConvertsItselfAtTheWall", testAPrefillingLaneConvertsItselfAtTheWall},
       {"testALaneConvertsOnlyWithAnIndexRunway", testALaneConvertsOnlyWithAnIndexRunway},
       {"testAGrowthTheHostRefusesDoesNotConvert", testAGrowthTheHostRefusesDoesNotConvert},
       {"testALaneFreeingLessThanItsNeedDoesNotConvert", testALaneFreeingLessThanItsNeedDoesNotConvert},
       {"testALongLaneConvertsItselfBesideAnother", testALongLaneConvertsItselfBesideAnother},
       {"testASharedPrefixCountsForNoConversion", testASharedPrefixCountsForNoConversion},
-      {"testAShortOrPrefillingLaneDoesNotConvert", testAShortOrPrefillingLaneDoesNotConvert},
+      {"testAShortLaneDoesNotConvert", testAShortLaneDoesNotConvert},
+      {"testALoneResidentWallNamesItsModeAndPhase", testALoneResidentWallNamesItsModeAndPhase},
+      {"testALoneStartMemoryCannotHoldIsRefusedAtItsStart", testALoneStartMemoryCannotHoldIsRefusedAtItsStart},
+      {"testALoneStartCountsTheNextLanesBuffers", testALoneStartCountsTheNextLanesBuffers},
+      {"testALoneStartMemoryCannotHoldTakesTheQuotasBound", testALoneStartMemoryCannotHoldTakesTheQuotasBound},
+      {"testAStartMemoryCannotHoldBesideALaneWaitsForIt", testAStartMemoryCannotHoldBesideALaneWaitsForIt},
+      {"testAStartMemoryCannotHoldBesideALowerLaneMakesItYield",
+       testAStartMemoryCannotHoldBesideALowerLaneMakesItYield},
       {"testALanesGrowthConvertsNoOtherLane", testALanesGrowthConvertsNoOtherLane},
       {"testLaneDemandCountsTheHotFloorALaneWaitsFor", testLaneDemandCountsTheHotFloorALaneWaitsFor},
       {"testAStartRefusedMemoryCountsNoConversion", testAStartRefusedMemoryCountsNoConversion},
@@ -2743,14 +3650,15 @@ std::span<const test::TestCase> spillTests() {
       {"testAStartRestoringHeldCopiesStartsBesideAQuotaRefusal",
        testAStartRestoringHeldCopiesStartsBesideAQuotaRefusal},
       {"testASpillStartCountsTheCopiesItRestores", testASpillStartCountsTheCopiesItRestores},
-      {"testAStartThatCannotSpillStartsResidentWithinTheResidentContext",
-       testAStartThatCannotSpillStartsResidentWithinTheResidentContext},
+      {"testAStartThatCannotSpillStartsResidentWhereMemoryHoldsIt",
+       testAStartThatCannotSpillStartsResidentWhereMemoryHoldsIt},
       {"testWriteBudgetRefusalSaysWhenToRetry", testWriteBudgetRefusalSaysWhenToRetry},
       {"testPrefillGroupsFollowIndexPages", testPrefillGroupsFollowIndexPages},
       {"testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups",
        testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups},
       {"testSpilledFullExtentsLeaveOnceNoPromptGrows", testSpilledFullExtentsLeaveOnceNoPromptGrows},
       {"testSpillMovesThroughTheHostPause", testSpillMovesThroughTheHostPause},
+      {"testLandedPagesSpillAtCriticalPressure", testLandedPagesSpillAtCriticalPressure},
       {"testSpillResumeCommitsAgain", testSpillResumeCommitsAgain},
       {"testABoundAtStartAndResumeCountsOnce", testABoundAtStartAndResumeCountsOnce},
       {"testSpillResumeOnAClosedTier", testSpillResumeOnAClosedTier},
@@ -2771,7 +3679,29 @@ std::span<const test::TestCase> spillTests() {
       {"testALoneSpillLaneWaitsForItsOwnCopies", testALoneSpillLaneWaitsForItsOwnCopies},
       {"testALaneRefusedBeforeItsFirstCommandWritesItsChain", testALaneRefusedBeforeItsFirstCommandWritesItsChain},
       {"testAPageWaitingForItsCopyHoldsBackNoneAfterIt", testAPageWaitingForItsCopyHoldsBackNoneAfterIt},
-      {"testAConversionLeavesNoLaneWithoutItsFloor", testAConversionLeavesNoLaneWithoutItsFloor},
+      {"testASpillLaneKeepsLandedPagesWhileMemoryLasts", testASpillLaneKeepsLandedPagesWhileMemoryLasts},
+      {"testASpillLaneAtTheWallReleasesOnlyWhatItLacks", testASpillLaneAtTheWallReleasesOnlyWhatItLacks},
+      {"testTheFirstReleaseFundsTheLanesReads", testTheFirstReleaseFundsTheLanesReads},
+      {"testAStartReleasesALaneOfItsPriority", testAStartReleasesALaneOfItsPriority},
+      {"testAStartNeverReleasesAHigherPriorityLane", testAStartNeverReleasesAHigherPriorityLane},
+      {"testCriticalReleasesCleanPagesBeforeAnyLaneYields", testCriticalReleasesCleanPagesBeforeAnyLaneYields},
+      {"testAHostRefusedGrowthReleasesItsOwnLane", testAHostRefusedGrowthReleasesItsOwnLane},
+      {"testAReleaseInPlaceKeepsTheIndexRunway", testAReleaseInPlaceKeepsTheIndexRunway},
+      {"testAReleaseInPlaceKeepsTheRunwayTheRoomCannotRefill", testAReleaseInPlaceKeepsTheRunwayTheRoomCannotRefill},
+      {"testAGrowthTakesItsPageInPlaceBeforeAReleaseForBytes", testAGrowthTakesItsPageInPlaceBeforeAReleaseForBytes},
+      {"testNoReleaseOfALaneBetweenItsPasses", testNoReleaseOfALaneBetweenItsPasses},
+      {"testNoReleaseOfAPageALaneBetweenItsPassesHolds", testNoReleaseOfAPageALaneBetweenItsPassesHolds},
+      {"testALoneLaneWhoseReleaseCannotPayItsReadsEndsAtItsLength",
+       testALoneLaneWhoseReleaseCannotPayItsReadsEndsAtItsLength},
+      {"testALoneLaneWaitsForItsLastWritesThenReleasesThem", testALoneLaneWaitsForItsLastWritesThenReleasesThem},
+      {"testAReleaseLeavesNoLaneWithoutItsFloor", testAReleaseLeavesNoLaneWithoutItsFloor},
+      {"testTwoSpillLanesWithoutIndexPagesPrefillTogether", testTwoSpillLanesWithoutIndexPagesPrefillTogether},
+      {"testAStartOnALanesConversationCountsItsChainOnce", testAStartOnALanesConversationCountsItsChainOnce},
+      {"testAResidentStartOnALanesPrefixRestoresItWhole", testAResidentStartOnALanesPrefixRestoresItWhole},
+      {"testAReleaseOfASharedPrefixFundsEveryLanesReads", testAReleaseOfASharedPrefixFundsEveryLanesReads},
+      {"testACountOfReleasesCountsASharedPageOnce", testACountOfReleasesCountsASharedPageOnce},
+      {"testACountOfReleasesFallsByAtMostAnExtentAsCopiesLand", testACountOfReleasesFallsByAtMostAnExtentAsCopiesLand},
+      {"testALoneSpillWallNamesWhyItsKvGaveNoMoreMemory", testALoneSpillWallNamesWhyItsKvGaveNoMoreMemory},
       {"testLoneSpillLaneEndsAtTheWall", testLoneSpillLaneEndsAtTheWall},
       {"testLaneDecodesThroughHostRefusedHotFloor", testLaneDecodesThroughHostRefusedHotFloor},
       {"testUnreadableKvEndsOnlyItsLane", testUnreadableKvEndsOnlyItsLane},

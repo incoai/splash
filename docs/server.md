@@ -349,6 +349,18 @@ aliases. Clients can impose a smaller limit. This is a capacity limit, not a
 guarantee of a fast first token for a long uncached prompt. If the model cannot
 fit, startup prints a memory budget breakdown and stops.
 
+A request that cannot fit even alone, after every cached prefix was evicted
+and the expert store shrank to its floor, fails with `capacity_exhausted`. Its
+message names what it could not allocate, its lane's KV mode (`Resident`, its
+KV in memory, or `Spill`, its KV partly [on the SSD](#kv-on-the-ssd)), its
+phase and its tokens, and the Metal memory outside the server's buffers then
+(`device_untracked_bytes`, as `/status` reports it under `memory_audit` at
+startup: 17 MB on a 64 GB M5 Pro serving Flash-Next), which the budget charges
+past the runtime reserves. Only a `Spill` lane's, the one whose KV goes there,
+says why its KV gave no more memory back: the SSD cache took no more of it,
+where its writes stopped for the quota, the write budget or a closed cache, or
+otherwise the request does not fit even with its KV released down to its floor.
+
 ### PLE table streaming
 
 Qwen3.8-Flash-Next's PLE n-gram table (`per_layer_token_embd.weight`, 320M rows
@@ -532,9 +544,10 @@ off` loads every expert, as a SIZE that holds them all does.
   cached prefixes nothing in use holds that leave memory at once, by the
   cache's order; the caches the model rebuilds; the cached prefixes that
   first need a copy on the SSD cache, whose writes it waits for rather than
-  take what follows; on a target whose KV can stay on the SSD cache, that
-  request's own [spill](#kv-on-the-ssd); then the store's last chunk, one at
-  a time; and only then anything in use. A start, optional work and memory
+  take what follows; on a target whose KV can stay on the SSD cache, the
+  memory of [spilling requests](#kv-on-the-ssd)' pages of its priority or a
+  lower one, then that request's own spill; then the store's last chunk, one
+  at a time; and only then anything in use. A start, optional work and memory
   the host refused never take a chunk. When the host runs short of its 1 GiB
   margin, the engine gives it cached prefixes and the caches the model rebuilds,
   never a chunk; macOS's warning alone takes nothing. A chunk given back keeps
@@ -542,26 +555,26 @@ off` loads every expert, as a SIZE that holds them all does.
   slots' recycling would recycle first evicted to make room, and later steps
   read the evicted ones from the SSD again. Under macOS's critical pressure the
   engine gives the Mac, each second, the 1 GiB margin and what requests the host
-  refused wait for, in the same order, store chunks above the floor among them,
-  never the store below its floor.
+  refused wait for, in the same order, every spilling request's pages and store
+  chunks above the floor among them, never the store below its floor.
 - The store's cap is a reservation the engine repays: between commands, the
   store tries to take one chunk back, one it gave back or started without,
   its slots empty, once 30 s have passed since its last try and since a
   request's claim last went unmet or took a chunk, a prefill between its
-  passes, its own spill or something in use (a request the cache served does
-  not count), as long as no request waits for memory and the weights are not
-  released. The chunk takes memory `--max-memory` leaves free, which needs
-  normal pressure and 1 GiB to spare beyond the chunk; for what that lacks
-  the engine evicts cached prefixes that leave memory at once, only when they
-  cover it, never one in use, the prefix the newest conversation resumes from or
-  those that requests waiting to start would resume from. A chunk such prefixes
-  pay for whole comes back under macOS's warning too while the host keeps its
-  margin. A prefix that would first need a copy on the SSD cache stays; the
-  engine copies such prefixes ahead for what the chunk lacked, so a later try
-  finds them free to go. A store a burst shrank thus comes back a chunk per 30 s
-  once requests stop going short, even when the burst's KV, cached, fills the
-  room. Each chunk given back or taken back logs a line
-  (`Expert store gave back`, `Expert store took back`). Elasticity serves
+  passes, a spilling request's pages, its own spill or something in use (a
+  request the cache served does not count), as long as no request waits for
+  memory and the weights are not released. The chunk takes memory `--max-memory`
+  leaves free, which needs normal pressure and 1 GiB to spare beyond the chunk;
+  for what that lacks the engine evicts cached prefixes that leave memory at
+  once, only when they cover it, never one in use, the prefix the newest
+  conversation resumes from or those that requests waiting to start would resume
+  from. A chunk such prefixes pay for whole comes back under macOS's warning too
+  while the host keeps its margin. A prefix that would first need a copy on the
+  SSD cache stays; the engine copies such prefixes ahead for what the chunk
+  lacked, so a later try finds them free to go. A store a burst shrank thus
+  comes back a chunk per 30 s once requests stop going short, even when the
+  burst's KV, cached, fills the room. Each chunk given back or taken back logs a
+  line (`Expert store gave back`, `Expert store took back`). Elasticity serves
   concurrency, the prefix cache and the rest of the Mac; the advertised context
   is planned with the store at the cap the engine's limit gives it and does not
   change.
@@ -813,48 +826,76 @@ what memory holds, as a dense target's is.
   tokens or fewer, or takes no more in memory than spilling it would at its
   peak, keeps its KV in memory, and so does one whose KV, beside what the
   requests in service are projected to grow into, fits the memory free now
-  with what a start may take (the cached prefixes nothing in use holds and
-  the caches the model rebuilds, never the
-  [expert store](#streamed-experts)'s chunks), counted in whole extents with
-  the states its prefill holds; any other spills. A request
-  that cannot spill, the SSD cache closed or its quota short, or whose KV
-  fits in the pages a spilling request keeps whole anyway, keeps its KV in
-  memory.
-- A decoding request in memory whose KV cannot grow spills from then on
-  rather than yield its lane or fail, where that covers what it lacks: what
-  spilling the pages only it holds frees, past its first 2,048 tokens and
-  its last 64 pages, less the hot block cache's floor its reads need
-  (390 MiB), which takes a request of about 46K tokens or more. Its pages whose copies landed before,
-  as a prefix restored from the SSD cache has them, spill at once, and it
-  waits while the others' copies land. From then on it is a spilling request
-  like any other. No other request and no shortage of the host's makes a
-  request spill, and a request in prefill does not. When other memory is
-  short, a state, a spilling request's reads, or the host's, what can go
-  goes in a fixed order: a cached prefix, the caches the model rebuilds,
+  with what a start may take (the cached prefixes nothing in use holds, the
+  caches the model rebuilds and the memory spilling requests of its priority
+  or a lower one give back, below, never the pages of a prefix it reuses nor
+  the [expert store](#streamed-experts)'s chunks), counted in whole extents with
+  the states its prefill holds; any other spills. A request whose KV fits
+  in the pages a spilling request keeps whole anyway keeps its KV in memory.
+  So does one that cannot spill, the SSD cache closed or its quota short,
+  where it fits the context memory holds of one request and memory holds its
+  KV now: beside other requests in service, with what a start may take, as
+  above; alone, with what a request in service may take, the buffers the
+  next request starts from among it. Where memory does not hold it, it waits
+  for the other requests in service; alone, it takes the SSD cache's bound
+  on its output or waits for its quota as a spilling request does, and is
+  otherwise refused at its start, naming what memory and the SSD cache have
+  for it, rather than fail partway through its prefill.
+- A request in memory whose KV cannot grow, in decode or in prefill, spills
+  from then on rather than yield its lane or fail, where that covers what it
+  lacks: what spilling the pages only it holds frees, past its first 2,048
+  tokens and its last 64 pages, less the hot block cache's floor its
+  decode's reads need (390 MiB), which takes a request of about 46K tokens
+  or more. It waits while its pages' copies land, and its growth then gives
+  back the memory of those it lacks, as below; a prefix restored from the
+  SSD cache has its copies already. From then on it is a spilling request
+  like any other, a prefill going on as one's. No other request and no
+  shortage of the host's makes a request spill. When other memory is short,
+  a state, a spilling request's reads, or the host's, what can go goes in a
+  fixed order: a cached prefix, the caches the model rebuilds, the pages of
+  spilling requests (below; for the host only under critical pressure),
   then, for a request in service, a chunk of the store above its floor, of
   which a target that can spill has none.
-- A spilling request writes each committed page once to the SSD cache. Once
-  the copy has landed, the page keeps only its index, 24 KiB of the int8
-  page's 414 KiB. Alone at the memory wall, it waits while its writes land
-  rather than fail. Its first 2,048 tokens, which rows with less history read
-  whole, its last 64 pages and up to two prefill groups' pages still being
-  written stay whole. The memory the pages free leaves with the extents they
-  empty, all of them once every spilling request decodes, but one while a
-  spilling prompt still grows into it or the host holds growth back.
+- A spilling request writes each committed page once to the SSD cache and
+  keeps the page in memory while memory lasts: it decodes on its pages in
+  memory and reads nothing back. Once memory is short, a page whose copy has
+  landed gives its memory back, the oldest first, and keeps only its index,
+  24 KiB of the int8 page's 414 KiB: as much as a request lacks, in whole
+  extents, for the request's own growth or reads, for a request in service or
+  a start of its priority or a higher one, and under macOS's critical pressure
+  for the host, which takes every request's. Where every request holding them
+  reads pages back already, a request's growth, one the host refuses among
+  them, first takes the pages it lacks in place. Where those would leave too
+  few index pages free for the next, an extent more gives its memory back
+  with them and refills them; without that extent pages give back nothing in
+  place, since the memory left may hold no new index pages. A prefix's page
+  that several requests share gives its memory back only where the one
+  asking may take it from each of them, and beside it the memory each of
+  them then needs for its reads, and never while a request that starts with
+  its KV in memory restores it; it does so once, and counts once in what a
+  start may take. A request's reads then miss only the blocks of the pages
+  given back. Alone at the memory wall, a spilling request waits while its
+  writes land rather than fail. Its first 2,048 tokens, which rows with less
+  history read whole, its last 64 pages and the pages still being written
+  stay whole. The memory a page gives back leaves with the extents it empties
+  and pays for the index pages it moves into, so pages keep giving memory
+  back under critical pressure too. With `--kv-spill always`, for
+  validation, each page keeps only its index as soon as its copy lands.
 - A decode step reads, after each attention layer selects its blocks, the
   selected blocks not in memory into one hot block cache that all requests
   share, a page's in one read from its first missed block to its last on the
   32 SSD readers, and attends them there.
   The cache holds at least, for n decoding requests, n + 1 times the blocks a
   request's 8 rows select, 8,192 blocks a layer (390 MiB) for one, taken
-  whole as a spilling request starts decoding; `--sparse-kv-memory` raises
-  its target, toward which it grows only while a request holds a floor. A
-  decoding request's floor goes only with the request. While no request
-  reads above the floor, the cache's memory, up to 975 MiB after the last
-  spilling request ends, is among the first to go when memory is short, as
-  a cache the model rebuilds. It shares the readers' memory
-  with the history staging below, which the plan sets aside the larger of,
-  so a target within the staging takes nothing from the expert store.
+  whole as a request some of whose pages gave their memory back starts decoding,
+  by the same release as its first pages give memory back, whichever request's
+  claim it was for; `--sparse-kv-memory` raises its target, toward which it
+  grows only while a request holds a floor. A decoding request's floor goes only
+  with the request. While no request reads above the floor, the cache's memory,
+  up to 975 MiB after the last spilling request ends, is among the first to go
+  when memory is short, as a cache the model rebuilds. It shares the readers'
+  memory with the history staging below, which the plan sets aside the larger
+  of, so a target within the staging takes nothing from the expert store.
 - A prefill streams each attention layer's history from the SSD cache into
   staging, a layer's pages read whole (36 KiB each) while the previous layer
   runs. A second buffer, which lets the next layer's reads overlap this
@@ -862,6 +903,8 @@ what memory holds, as a dense target's is.
   or where what the streamed stores and the first 64K tokens of KV leave
   holds it: where a store binds that is nothing, and the store keeps the
   room; otherwise the buffer takes it from the KV kept resident beyond them.
+  A request reads nothing back, and takes neither the staging nor the hot
+  block cache, until its first pages give memory back.
   A prefill whose history is on the SSD runs alone, and with others waiting
   it takes the fewest rows whose work covers its reads. The staging holds
   nothing between prompts: a decoding request's floor of the hot block cache
@@ -881,17 +924,19 @@ what memory holds, as a dense target's is.
   `model_context_window_exceeded`. A request that cannot spill, the cache
   short of room, its file closed or its write budget spent, keeps its KV in
   memory where it fits the context memory holds of one request
-  (`context_bounds.resident`). Past what it committed, as when its output
-  outgrows the 4,096 tokens admission counted, a request commits each
-  page's slot as it writes it, while the room lasts; its pages stay in
-  memory beyond it, and the other requests' committed pages are still
-  written.
+  (`context_bounds.resident`) and memory holds it now (above). Past what it
+  committed, as when its output outgrows the 4,096 tokens admission
+  counted, a request commits each page's slot as it writes it, while the
+  room lasts; its pages stay in memory beyond it, and the other requests'
+  committed pages are still written.
 - The KV a spilling request writes is in use and always written, so one long
   request may overdraw `--max-cache-disk-writes` once. Until the budget
   covers what spilling requests were promised, a new request that would
-  spill keeps its KV in memory where it fits and is refused otherwise
-  (`kv_write_budget`, 503 with a `Retry-After` of the seconds until the
-  budget covers them again as it refills).
+  spill keeps its KV in memory where it fits the context memory holds of
+  one request and memory holds it now (above), waits for the other requests
+  in service where memory does not hold it beside them, and is refused
+  otherwise (`kv_write_budget`, 503 with a `Retry-After` of the seconds
+  until the budget covers them again as it refills).
 - A block that cannot be read back fails only the requests that read it, as
   `kv_unreadable`, which they may retry; the copy is dropped.
 

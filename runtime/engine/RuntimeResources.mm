@@ -1212,7 +1212,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       kvTier = std::make_unique<KvPageTier>(*kvPages, kvFormat, disk.kv, readers);
     std::optional<CacheSpillPolicy> spillPolicy;
     if (spill.enabled)
-      spillPolicy = CacheSpillPolicy{.densePages = spill.densePages, .windowPages = spill.windowPages};
+      spillPolicy = CacheSpillPolicy{
+          .densePages = spill.densePages, .windowPages = spill.windowPages, .always = config.kvSpillAlways};
     // A windowed layout's pages give up their windowed layers' K/V where
     // they can (kv::Layout::slimmable), unless --kv-window-trim off.
     std::optional<CacheWindowPolicy> windowPolicy;
@@ -1225,8 +1226,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // A target that can spill holds one empty Index extent from the start
     // (the plan's indexRunwayBytes, one extent): a lane's first conversion
     // lands its pages there at the memory wall, where no allocation is
-    // granted. It stays through an idle release of the weights; a walk under
-    // critical pressure may take it, and the next control pass refills it.
+    // granted. It stays through an idle release of the weights, and no claim
+    // takes it, under critical pressure either (TakeRights::Reserves).
     if (spill.enabled)
       if (const metal::AllocationResult runway = kvPool->fillRunway(kv::PageForm::Index); !runway)
         throw metal::MetalAllocationError("the KV pool's Index runway was refused", runway.failure);

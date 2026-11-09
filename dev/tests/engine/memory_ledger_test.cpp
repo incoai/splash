@@ -49,8 +49,9 @@ public:
 
   [[nodiscard]] std::string_view name() const noexcept override { return name_; }
   // Only the units the query's rights take (VictimSource): units in use,
-  // the pass command, the buffers a lane starts from and a conversion of the
-  // claimant's own lane (its key) only for a claim whose rights take them.
+  // the pass command, the buffers a lane starts from, a conversion of the
+  // claimant's own lane (its key) and a release of a lane (its key) of the
+  // claimant's priority only for a claim whose rights take them.
   [[nodiscard]] std::optional<Victim> peek(const VictimQuery &query, const Victim *after) const override {
     ++peeks;
     peeked.push_back(after ? after->key : 0);
@@ -58,6 +59,7 @@ public:
       switch (unit.kind) {
       case VictimKind::Memory: return unit.cls != ReclaimClass::InUse || query.rights.inUse;
       case VictimKind::Conversion: return unit.key == query.rights.convertLane;
+      case VictimKind::Release: return query.reaches(unit.key, query.priority);
       case VictimKind::PassCommand: return query.rights.passCommand;
       case VictimKind::LaneStart: return query.rights.laneStart == TakeRights::LaneStart::Last;
       }
@@ -784,6 +786,7 @@ void testTakeRightsTable() {
   using Reuse = TakeRights::CertainReuse;
   using Reserves = TakeRights::Reserves;
   using LaneStart = TakeRights::LaneStart;
+  using Lanes = TakeRights::Lanes;
   const auto rights = [](const ClaimSpec &spec, const Need &need = {.bytes = kMiB}, bool critical = false,
                          std::optional<RequestPriority> highest = std::nullopt) {
     return takeRights(spec, need, critical, highest);
@@ -807,23 +810,23 @@ void testTakeRightsTable() {
       {"in service, can wait", rights(everything),
        {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = true,
-        .convertLane = 7}},
+        .convertLane = 7, .lanes = Lanes::AtOrBelow}},
       {"in service, can wait, for KV", rights(everything, {.bytes = kMiB, .kv = true}),
        {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = true,
-        .convertLane = 7, .laneStart = LaneStart::Last}},
+        .convertLane = 7, .lanes = Lanes::AtOrBelow, .laneStart = LaneStart::Last}},
       {"in service, can wait, for a state's buffers", rights(everything, {.bytes = kMiB, .stateBuffers = 1}),
        {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = true,
-        .convertLane = 7}},
+        .convertLane = 7, .lanes = Lanes::AtOrBelow}},
       {"in service, can wait, ordinary reach", rights({.cls = ClaimClass::InService}),
        {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = false, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = false,
-        .convertLane = 0}},
+        .convertLane = 0, .lanes = Lanes::AtOrBelow}},
       {"in service, can wait, ordinary reach, for KV", rights({.cls = ClaimClass::InService}, {.pages = 1, .kv = true}),
        {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = false, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = false,
-        .convertLane = 0, .laneStart = LaneStart::Last}},
+        .convertLane = 0, .lanes = Lanes::AtOrBelow, .laneStart = LaneStart::Last}},
       {"in service, Immediate", rights(immediate, {.bytes = kMiB, .kv = true}),
        {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
@@ -831,7 +834,7 @@ void testTakeRightsTable() {
       {"start", rights(start, {.bytes = kMiB, .kv = true}),
        {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = false, .certainReuse = Reuse::ResumePoint,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
-        .convertLane = 0}},
+        .convertLane = 0, .lanes = Lanes::AtOrBelow}},
       {"optional", rights(optional, {.bytes = kMiB, .kv = true}),
        {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::ResumePoint,
         .reserves = Reserves::None, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
@@ -844,24 +847,24 @@ void testTakeRightsTable() {
         .convertLane = 0}},
       {"the host at critical pressure", rights({.cls = ClaimClass::Host}, {.bytes = kMiB}, true),
        {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = true, .certainReuse = Reuse::All,
-        .reserves = Reserves::All, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = false,
-        .convertLane = 0, .laneStart = LaneStart::First}},
+        .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = false,
+        .convertLane = 0, .lanes = Lanes::All, .laneStart = LaneStart::First}},
       {"a need the host refused in service", rights(everything, {.bytes = kMiB, .hostRefused = true, .kv = true}),
        {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
-        .convertLane = 0}},
+        .convertLane = 0, .lanes = Lanes::Own}},
       {"a need the host refused a start", rights(start, {.bytes = kMiB, .hostRefused = true}),
        {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::ResumePoint,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
-        .convertLane = 0}},
+        .convertLane = 0, .lanes = Lanes::Own}},
       {"in service below a lane", rights(below, {.bytes = kMiB, .kv = true}, false, RequestPriority::Foreground),
        {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = false, .storeAboveFloor = false, .passCommand = true,
-        .convertLane = 7, .laneStart = LaneStart::Last}},
+        .convertLane = 7, .lanes = Lanes::AtOrBelow, .laneStart = LaneStart::Last}},
       {"in service at critical pressure", rights(everything, {.bytes = kMiB}, true),
        {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
-        .reserves = Reserves::All, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = true,
-        .convertLane = 7, .laneStart = LaneStart::First}},
+        .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = true,
+        .convertLane = 7, .lanes = Lanes::AtOrBelow, .laneStart = LaneStart::First}},
   };
   for (const Row &row : rows)
     require(row.actual == row.expected, row.name + ": the take rights differ from the table");
@@ -2123,18 +2126,19 @@ void testAHostExemptionLogsMetPastTheHost() {
           "the host exemption did not log one met line: " + (lines.empty() ? std::string() : lines.back()));
 }
 
-// The fixed take order: cache, rebuild-only pools, the lane's conversion, then the store, each only for what the
-// ones before leave.
-void testTheOrderTakesCacheThenRebuiltPoolsThenConversionsThenTheStore() {
+// The fixed take order: cache, rebuild-only pools, a lane's release, then the store, each only for what the ones
+// before leave.
+void testTheOrderTakesCacheThenRebuiltPoolsThenReleasesThenTheStore() {
   FakeMemory memory({});
   FakeElasticPool experts("experts", memory, kGiB, 2, 6, 7, 6);
   FakeElasticPool vision("vision", memory, 256 * kMiB, 0, 1, 1, 1);
   vision.rebuildOnly = true;
   MemoryLedger ledger;
   TestSource engine("engine"), cache("cache");
-  // The lane of request 3, which its own growth converts.
-  Victim lane = unit(3, kGiB, true);
-  lane.kind = VictimKind::Conversion;
+  // The landed pages of the lane of request 3, which another lane's growth
+  // releases.
+  Victim lane = unit(3, kGiB);
+  lane.kind = VictimKind::Release;
   engine.units = {lane};
   cache.units = {unit(1, 256 * kMiB)};
   ledger.addPool(experts);
@@ -2152,12 +2156,124 @@ void testTheOrderTakesCacheThenRebuiltPoolsThenConversionsThenTheStore() {
           "the cache did not go first");
   lacks(2, 256 * kMiB);
   require(vision.units() == 0 && engine.taken.empty() && experts.units() == 6,
-          "the pool that costs only its rebuild did not go before conversions and the store");
-  lacks(3, kGiB);
-  require(engine.taken == std::vector<uint64_t>{3} && experts.units() == 6,
-          "the lane's conversion did not go before the store");
+          "the pool that costs only its rebuild did not go before releases and the store");
   lacks(4, kGiB);
+  require(engine.taken == std::vector<uint64_t>{3} && experts.units() == 6,
+          "the lane's release did not go before the store");
+  lacks(5, kGiB);
   require(experts.units() == 5, "the store did not give a unit once nothing else was left");
+}
+
+// The releases of two lanes on one conversation, each lane's own pages beside the pages both hold, which the first
+// take of either frees. With `twice`, each lane's unit counts the shared pages, as each lane alone holds them;
+// otherwise the second counts its own pages alone.
+class SharedPages final : public VictimSource {
+public:
+  SharedPages(uint64_t shared, uint64_t own, bool twice) : shared_(shared), own_(own), twice_(twice) {}
+
+  [[nodiscard]] std::string_view name() const noexcept override { return "lanes"; }
+  [[nodiscard]] std::optional<Victim> peek(const VictimQuery &, const Victim *after) const override {
+    uint64_t lane = after ? after->key + 1 : 1;
+    while (std::ranges::count(taken, lane))
+      ++lane;
+    if (lane > 2)
+      return std::nullopt;
+    const bool counts = !sharedFreed_ && (lane == 1 || twice_);
+    return Victim{.key = lane, .bytes = own_ + (counts ? shared_ : 0), .kind = VictimKind::Release};
+  }
+  FreeResult take(const VictimQuery &, const Victim &victim) override {
+    const uint64_t freed = own_ + (sharedFreed_ ? 0 : shared_);
+    sharedFreed_ = true;
+    taken.push_back(victim.key);
+    return {FreeOutcome::Met, freed};
+  }
+
+  std::vector<uint64_t> taken;
+
+private:
+  uint64_t shared_, own_;
+  bool twice_;
+  bool sharedFreed_ = false;
+};
+
+// The peek contract's units count disjoint memory (VictimSource): a source whose units count the pages two lanes
+// share each overcounts, and free() then takes them on a count that covers a need its takes do not meet, which the
+// status snapshot counts as an overcounted run (memory_governor.count_checks), the first release having freed what it
+// counted; counted once, the count falls short and nothing is taken.
+void testUnitsThatCountOnePageTwiceOvercount() {
+  for (const bool twice : {true, false}) {
+    Fixture fixture(host(32 * kGiB));
+    MemoryLedger &ledger = fixture.ledger();
+    SharedPages lanes(kGiB, 256 * kMiB, twice);
+    ledger.addSource(lanes);
+    const ClaimId claim = ledger.open(request(3, RequestPriority::Normal));
+    const FreeResult freed = ledger.free(claim, {.bytes = 2 * kGiB}, 0, false);
+    const MemoryLedger::CountChecks checks = fixture.governor->snapshot().countChecks;
+    if (twice)
+      require(freed.outcome == FreeOutcome::Short && lanes.taken == std::vector<uint64_t>{1, 2} &&
+                  checks.coveredRuns == 1 && checks.overcountedRuns == 1 && checks.shortReleases == 0,
+              "units that count the shared pages each were not taken on their count and reported overcounted");
+    else
+      require(freed.outcome == FreeOutcome::Short && lanes.taken.empty() && checks.coveredRuns == 0 &&
+                  checks.overcountedRuns == 0,
+              "units that count the shared pages once covered a need their takes do not meet, or were taken");
+    ledger.close(claim);
+  }
+}
+
+// A start's count (Need::afterStart) credits the buffers a cached state returns to the pool the start leaves, those
+// the start then takes from it in place of an allocation among them, and its take credits them alike. Of a pool that
+// holds no buffer for the start, a state of one buffer meets a start that lacks that buffer's bytes, and the buffer
+// stays pooled for it. Read only as what the pool releases, the take credited none, and the run was overcounted.
+void testAStartsCountOfAStateWhoseBufferItTakesIsMet() {
+  Fixture fixture(host(32 * kGiB));
+  MemoryLedger &ledger = fixture.ledger();
+  BufferPool pool(64);
+  CachedStates cache(pool);
+  cache.units = {{.key = 1, .stateBuffers = 1}};
+  ledger.addSource(cache);
+  // A start takes a buffer from the pool first.
+  ledger.setBufferBytes([&pool](uint32_t states, bool afterStart, bool) {
+    const uint32_t pooled = afterStart ? pool.idle - std::min(pool.idle, 1U) : pool.idle;
+    return uint64_t{pooled + states} * 64;
+  });
+  const ClaimId claim = ledger.open(request(1, RequestPriority::Normal, ClaimClass::Start));
+  const FreeResult freed = ledger.free(claim, {.bytes = 64, .afterStart = true}, 0, false);
+  ledger.close(claim);
+  const MemoryLedger::CountChecks checks = fixture.governor->snapshot().countChecks;
+  require(freed.outcome == FreeOutcome::Met && cache.taken == std::vector<uint64_t>{1} && pool.idle == 1 &&
+              checks.coveredRuns == 1 && !checks.overcountedRuns,
+          "a start's count of a state whose buffer it takes was not met: outcome " +
+              std::to_string(static_cast<int>(freed.outcome)) + ", " + std::to_string(cache.taken.size()) +
+              " states taken, " + std::to_string(pool.idle) + " buffers pooled, " +
+              std::to_string(checks.overcountedRuns) + " runs overcounted");
+}
+
+// A start's take of the buffers that cost nothing (MemoryLedger::takeUnsized) credits none it releases that the start
+// would have taken from the pool, which the start then allocates. Of a pool whose one buffer the start takes, its
+// release leaves the start lacking that buffer's bytes still, and a cached state's bytes meet them. Credited as the
+// pool's release, the buffer met the start, which then allocated it again, and the state stayed.
+void testAStartsTakeOfABufferItWouldTakeCreditsNothing() {
+  Fixture fixture(host(32 * kGiB));
+  MemoryLedger &ledger = fixture.ledger();
+  BufferPool pool(64);
+  pool.idle = 1;
+  CachedStates cache(pool);
+  cache.units = {{.key = 1, .bytes = 64}};
+  ledger.addSource(pool);
+  ledger.addSource(cache);
+  // A start takes a buffer from the pool first.
+  ledger.setBufferBytes([&pool](uint32_t states, bool afterStart, bool) {
+    const uint32_t pooled = afterStart ? pool.idle - std::min(pool.idle, 1U) : pool.idle;
+    return uint64_t{pooled + states} * 64;
+  });
+  const ClaimId claim = ledger.open(request(1, RequestPriority::Normal, ClaimClass::Start));
+  const FreeResult freed = ledger.free(claim, {.bytes = 64, .afterStart = true}, 0, false);
+  ledger.close(claim);
+  require(freed.outcome == FreeOutcome::Met && cache.taken == std::vector<uint64_t>{1},
+          "a start's release of a pooled buffer it would take met it: outcome " +
+              std::to_string(static_cast<int>(freed.outcome)) + ", " + std::to_string(freed.nowBytes) +
+              " B now, " + std::to_string(cache.taken.size()) + " states taken");
 }
 
 // Growth counts what the host's reading does not show yet, so a lagging reading grows no unit that later goes back.
@@ -2411,8 +2527,11 @@ std::span<const test::TestCase> ledgerTests() {
       {"testEachDecisionLogsOneLine", testEachDecisionLogsOneLine},
       {"testARetryBackToALoggedOutcomeLogsNothing", testARetryBackToALoggedOutcomeLogsNothing},
       {"testAHostExemptionLogsMetPastTheHost", testAHostExemptionLogsMetPastTheHost},
-      {"testTheOrderTakesCacheThenRebuiltPoolsThenConversionsThenTheStore",
-       testTheOrderTakesCacheThenRebuiltPoolsThenConversionsThenTheStore},
+      {"testTheOrderTakesCacheThenRebuiltPoolsThenReleasesThenTheStore",
+       testTheOrderTakesCacheThenRebuiltPoolsThenReleasesThenTheStore},
+      {"testUnitsThatCountOnePageTwiceOvercount", testUnitsThatCountOnePageTwiceOvercount},
+      {"testAStartsCountOfAStateWhoseBufferItTakesIsMet", testAStartsCountOfAStateWhoseBufferItTakesIsMet},
+      {"testAStartsTakeOfABufferItWouldTakeCreditsNothing", testAStartsTakeOfABufferItWouldTakeCreditsNothing},
       {"testGrowthCountsWhatTheHostDoesNotShowYet", testGrowthCountsWhatTheHostDoesNotShowYet},
       {"testGrowthLeavesTheHostWhatTheLanesGrowInto", testGrowthLeavesTheHostWhatTheLanesGrowInto},
       {"testRequestsMetFromCacheLeaveRegrowthQuiet", testRequestsMetFromCacheLeaveRegrowthQuiet},

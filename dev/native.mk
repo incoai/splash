@@ -834,7 +834,7 @@ $(TEST_ENGINE_TEST) $(TEST_ENGINE_ASAN) $(TEST_ENGINE_TSAN): \
 		dev/tests/engine/engine_requests_test.cpp dev/tests/engine/engine_checkpoints_test.cpp \
 		dev/tests/engine/engine_commands_test.cpp dev/tests/engine/engine_memory_test.cpp \
 		dev/tests/engine/engine_spill_test.cpp dev/tests/engine/engine_disk_test.cpp \
-		dev/tests/engine/engine_memory_rules_test.cpp \
+		dev/tests/engine/engine_memory_rules_test.cpp dev/tests/engine/engine_release_property_test.cpp \
 		dev/tests/engine/TimingProfile.cpp dev/tests/engine/engine_test_main.cpp
 $(TEST_RAGGED_SCHEDULER_TEST) $(TEST_RAGGED_SCHEDULER_ASAN) $(TEST_RAGGED_SCHEDULER_TSAN): \
 		runtime/engine/Scheduler.cpp \

@@ -189,8 +189,10 @@ struct SpillPages final {
 // bytes and Index pages of 10 unless `pages` says, four to an extent unless
 // `extent` says, the Index runway allocated; a tier of 100-byte slots whose
 // quota, active KV's limit included, holds `slots`; a dense history and a
-// window of a page each. With `always` every request spills; otherwise
-// placement decides, a request that cannot spill starting Resident within
+// window of a page each. With `always` every request spills, its pages
+// moving to the index form as their copies land; otherwise placement
+// decides, a Spill request's pages staying Full until a claim releases them,
+// and a request that cannot spill starting Resident within
 // `residentTokens` (by default those of `residentKvBytes`). Decode runs to
 // each request's output limit. A governed fixture's KV extents and the
 // model's state buffers allocate through its GovernedHost, whose limit
@@ -209,7 +211,7 @@ struct Spilling {
                     const GovernorLimits &limits = {}, bool governed = false, Pages pages = {})
       : storage(pages.count, pages.fullBytes, extent.pages, pages.indexBytes),
         budget(std::make_shared<model::DiskBudget>(uint64_t{slots} * 100, [this] { return now; })),
-        cache(pool, &tier, budget, engine::CacheSpillPolicy{1, 1}),
+        cache(pool, &tier, budget, engine::CacheSpillPolicy{1, 1, always}),
         host(limits),
         engine((shape ? shape(model) : void(),
                 config(always,
@@ -244,14 +246,17 @@ struct Spilling {
     result.spill = {.capable = true,
                     .always = always,
                     .denseTokens = engine::KvCache::pageTokens,
-                    .geometry = {.fullPageBytes = pages.fullBytes,
-                                 .indexPageBytes = pages.indexBytes,
-                                 .slotBytes = 100,
-                                 .residentTokens = residentTokens,
-                                 .densePages = 1,
-                                 .windowPages = 1,
-                                 .groupPages = 4}};
+                    .geometry = geometry(residentTokens, pages)};
     return result;
+  }
+  static engine::SpillGeometry geometry(uint32_t residentTokens, Pages pages = {}) {
+    return {.fullPageBytes = pages.fullBytes,
+            .indexPageBytes = pages.indexBytes,
+            .slotBytes = 100,
+            .residentTokens = residentTokens,
+            .densePages = 1,
+            .windowPages = 1,
+            .groupPages = 4};
   }
   // A request whose prompt is `pages` whole pages of `token` and one token
   // more, which may generate `output` tokens.
@@ -271,6 +276,16 @@ struct Spilling {
   }
   void runUntilIdle() {
     runUntil([&] { return idle(engine); }, "the requests did not end");
+  }
+  // An ungoverned fixture's Spill lane, whose reads take no memory, grows at
+  // the memory wall, the pool holding no more Full extents than it does now,
+  // until its growth has released some of its pages whose copies landed in
+  // place: it then holds Index pages, and the wall goes.
+  void releaseAtTheWall(uint64_t id) {
+    const auto wall = static_cast<uint32_t>(storage.allocatedBytes() / storage.bytesPerPage(kv::PageForm::Full));
+    const uint32_t budget = std::exchange(storage.budgetPages, wall);
+    runUntil([&] { return cache.holdsIndexPages(id); }, "the lane released none of its pages at the wall");
+    storage.budgetPages = budget;
   }
   // A governed fixture's engine may hold `bytes` in all: other memory
   // (FakeMemory's holder "limit") takes the rest of its governor's limit.
