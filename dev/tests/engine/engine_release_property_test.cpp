@@ -550,17 +550,20 @@ private:
         ++totals_.residentStarts;
       }
     }
-    // A start placed Resident yields (but to a start of a higher priority) or goes short in its own prefill only where
-  // the host or the wall moved since.
+    // A start placed Resident yields (but to a start of a higher priority), goes short or converts itself to Spill in
+    // its own prefill only where the host or the wall moved since. Only its own growth converts it, never the test's
+    // claims (Engine::EngineVictims::conversions).
     for (auto entry = placed_.begin(); entry != placed_.end();) {
       const auto [id, epoch] = *entry;
       const std::optional<Phase> phase = lanes_.phase(id);
       const bool suspended = std::ranges::count(spill.model.suspendedIds, id) != 0 && !preempted_.contains(id);
-      if ((suspended || shortClaims_.contains(id)) && epoch == epoch_)
+      const bool converted = lanes_.kvMode(id) == KvMode::Spill;
+      const bool refused = suspended || converted || shortClaims_.contains(id);
+      if (refused && epoch == epoch_)
         totals_.placement.add(where() + ": request " + std::to_string(id) + " placed Resident " +
-                              (suspended ? "yielded" : "went short") + " in its prefill; " + lanes_.pool() + "; " +
-                              lastLog());
-      if (suspended || shortClaims_.contains(id) || !phase || *phase != Phase::Prefill)
+                              (suspended ? "yielded" : converted ? "converted" : "went short") + " in its prefill; " +
+                              lanes_.pool() + "; " + lastLog());
+      if (refused || !phase || *phase != Phase::Prefill)
         entry = placed_.erase(entry);
       else
         ++entry;
@@ -772,9 +775,9 @@ void report(std::string_view name, const Violations &violations, std::string &fa
 // decisions): with no transfer in flight, a claim's count that covered its need is met by its takes, the ledger's
 // own runs in the engine's ticks too, and what a met claim keeps of the room beside the first reads its releases
 // created holds its need; a release taken first frees what it counted; between commands at normal pressure the Index
-// runway holds an extent where the room does; a start placed Resident beside the lanes prefills with no yield and no
-// short claim while the host and the wall stay. With transfers in flight they are counted apart, as are the engine's
-// runs for a need of bytes and pages together (PropertyTotals).
+// runway holds an extent where the room does; a start placed Resident beside the lanes prefills with no yield, no
+// short claim and no conversion while the host and the wall stay. With transfers in flight they are counted apart, as
+// are the engine's runs for a need of bytes and pages together (PropertyTotals).
 void testRandomConversationTreesKeepTheReleaseCounts() {
   const char *seeds = std::getenv("SPLASH_RELEASE_SEEDS");
   const char *one = std::getenv("SPLASH_RELEASE_SEED");
@@ -800,7 +803,7 @@ void testRandomConversationTreesKeepTheReleaseCounts() {
   report("invariant 2, the engine's own runs in ticks with no transfer", totals.engineOvercounted, failures);
   report("invariant 5, a release taken first freed less than it counted", totals.shortUnits, failures);
   report("invariant 4, the Index runway short of an extent between commands", totals.runway, failures);
-  report("invariant 3, a start placed Resident yielded or went short", totals.placement, failures);
+  report("invariant 3, a start placed Resident yielded, went short or converted", totals.placement, failures);
   std::string apart;
   report("a count not met, transfers in flight", totals.blockedByTransfers, apart);
   report("a count not met, the cache's walk in place for a need of bytes and pages", totals.bytesAndPagesOvercounted,

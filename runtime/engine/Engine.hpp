@@ -860,10 +860,10 @@ private:
   // the chain a Resident start restores, then for a claim that waits for
   // writes those whose copies land, which it releases once they have
   // (releases); the lane's conversion to Spill (TakeRights::convertLane)
-  // while it decodes Resident, not ended and not between passes, on a target
-  // that can spill with the tier open and its quota holding the lane's
-  // pages, and only where the pages it would spill free, net of the first
-  // lane's hot block floor its decode then reads through, cover what the
+  // while it is Resident, decoding or prefilling, not ended and not between
+  // passes, on a target that can spill with the tier open and its quota
+  // holding the lane's pages, and only where the pages it would spill free,
+  // net of the first lane's hot block floor its decode reads, cover what the
   // claim lacks; its claim's retries release its pages as their copies land.
   // The command between its passes gives back the buffers of the states it
   // would capture, which the model's pool releases at once; its lanes that

@@ -341,6 +341,46 @@ void testALongDecodingLaneConvertsItselfAtTheWall() {
           "the lane did not convert itself at the wall");
 }
 
+// A lone 64K prompt that starts Resident and meets the engine's limit at 56K tokens, its pages there
+// freeing more than the hot block floor and its growth, converts itself between its prefill commands,
+// prefills on as a Spill lane and decodes the output it decodes without the limit.
+void testAPrefillingLaneConvertsItselfAtTheWall() {
+  struct Run final {
+    uint64_t converted = 0, spilledPages = 0;
+    std::vector<std::string> failures;
+    std::vector<uint32_t> output;
+  };
+  const auto run = [](bool walled) {
+    FlashNextGoverned lanes;
+    Spilling &spill = lanes.spill;
+    spill.engine.submit(Spilling::prompt(1, 1, 2'046, 200));
+    // 1,792 pages: seven whole extents.
+    spill.runUntil(
+        [&] {
+          return spill.model.prefillChunks[1] != 0 && spill.cache.pageTable(1).pages.size() >= 1'792 &&
+                 !spill.engine.commandInFlight();
+        },
+        "the prompt did not prefill 56K tokens");
+    require(kvMode(spill, 1) == KvMode::Resident, "the prompt did not start Resident");
+    if (walled) {
+      lanes.wall();
+      spill.runUntil([&] { return kvMode(spill, 1) == KvMode::Spill; }, "the prompt did not convert itself");
+      require(!spill.events.outputs.contains(1), "the prompt converted only once it decoded");
+    }
+    spill.runUntilIdle();
+    return Run{.converted = spill.engine.snapshot().spill.converted,
+               .spilledPages = spill.cache.spillSnapshot().spilledPages,
+               .failures = spill.events.failures,
+               .output = spill.events.outputs[1]};
+  };
+  const Run roomy = run(false), walled = run(true);
+  require(roomy.converted == 0 && roomy.failures.empty() && roomy.output.size() == 200,
+          "the prompt without the limit did not decode its output Resident");
+  require(walled.converted == 1 && walled.spilledPages > 0 && walled.failures.empty(),
+          "a prefilling lane at the limit did not convert itself and complete");
+  require(walled.output == roomy.output, "the converted lane decoded another output");
+}
+
 // With no free Index page to land its copies in, the 64K lane does not convert and writes nothing.
 void testALaneConvertsOnlyWithAnIndexRunway() {
   FlashNextLanes lanes;
@@ -446,17 +486,16 @@ void testASharedPrefixCountsForNoConversion() {
   }
 }
 
-// A 32K lane, which frees less than the hot block floor, and a prefilling lane never convert;
-// alone at the wall each fails as on a target that cannot spill, naming its lane Resident in its
-// phase and not the SSD cache, which holds none of its KV.
-void testAShortOrPrefillingLaneDoesNotConvert() {
+// A lane of 32K tokens at most, whose pages free less than the hot block floor, does not convert,
+// decoding or prefilling; alone at the wall it fails as on a target that cannot spill, naming its
+// lane Resident in its phase and not the SSD cache, which holds none of its KV.
+void testAShortLaneDoesNotConvert() {
   for (const bool prefilling : {true, false}) {
     FlashNextLanes lanes;
     Spilling &spill = lanes.spill;
     if (prefilling) {
-      spill.model.spilledReadFloorBytes = 0;
       // A 64K prompt that starts Resident, as while the SSD cache takes no
-      // writes, and whose prefill meets the wall halfway.
+      // writes, and whose prefill meets the wall before 32K tokens.
       spill.tier.writableFile = false;
       spill.storage.budgetPages = 1'024;
       spill.engine.submit(Spilling::prompt(1, 1, 2'046, 200));
@@ -470,7 +509,7 @@ void testAShortOrPrefillingLaneDoesNotConvert() {
     }
     spill.runUntilIdle();
     require(spill.engine.snapshot().spill.converted == 0 && spill.cache.spillSnapshot().spilledPages == 0,
-            std::string("a ") + (prefilling ? "prefilling" : "short") + " lane converted to Spill");
+            std::string("a short ") + (prefilling ? "prefilling" : "decoding") + " lane converted to Spill");
     require(spill.events.failures == std::vector<std::string>{"capacity_exhausted"},
             "the lone lane did not fail at the wall");
     const std::string &message = spill.events.failureDetails.front().first;
@@ -3583,12 +3622,13 @@ std::span<const test::TestCase> spillTests() {
       {"testAConvertedLaneResumesUnderTheSpillRules", testAConvertedLaneResumesUnderTheSpillRules},
       {"testAConvertedLanesMovesReleaseTheExtentsTheyEmpty", testAConvertedLanesMovesReleaseTheExtentsTheyEmpty},
       {"testALongDecodingLaneConvertsItselfAtTheWall", testALongDecodingLaneConvertsItselfAtTheWall},
+      {"testAPrefillingLaneConvertsItselfAtTheWall", testAPrefillingLaneConvertsItselfAtTheWall},
       {"testALaneConvertsOnlyWithAnIndexRunway", testALaneConvertsOnlyWithAnIndexRunway},
       {"testAGrowthTheHostRefusesDoesNotConvert", testAGrowthTheHostRefusesDoesNotConvert},
       {"testALaneFreeingLessThanItsNeedDoesNotConvert", testALaneFreeingLessThanItsNeedDoesNotConvert},
       {"testALongLaneConvertsItselfBesideAnother", testALongLaneConvertsItselfBesideAnother},
       {"testASharedPrefixCountsForNoConversion", testASharedPrefixCountsForNoConversion},
-      {"testAShortOrPrefillingLaneDoesNotConvert", testAShortOrPrefillingLaneDoesNotConvert},
+      {"testAShortLaneDoesNotConvert", testAShortLaneDoesNotConvert},
       {"testALoneResidentWallNamesItsModeAndPhase", testALoneResidentWallNamesItsModeAndPhase},
       {"testALoneStartMemoryCannotHoldIsRefusedAtItsStart", testALoneStartMemoryCannotHoldIsRefusedAtItsStart},
       {"testALoneStartCountsTheNextLanesBuffers", testALoneStartCountsTheNextLanesBuffers},

@@ -1011,15 +1011,15 @@ std::vector<Victim> Engine::EngineVictims::conversions(const VictimQuery &query)
   if (!id || !engine.config_.spill.capable || engine.cache_.spillGate() != SpillGate::Open ||
       !engine.cache_.freePages(kv::PageForm::Index))
     return units;
-  // Resident and decoding: its history is whole and its next growth is what
-  // it lacks.
+  // Resident, decoding or prefilling, between its commands and not between a
+  // command's passes: its history is whole and its next growth is what it
+  // lacks. A prefill goes on as a Spill lane's.
   const auto found = engine.requests_.find(id);
   if (found == engine.requests_.end())
     return units;
   const Request &active = found->second;
   if (!active.lane || active.restore || active.finalized || active.pendingEnd ||
-      active.kvMode != KvMode::Resident || engine.scheduler_.phase(id) != Phase::Decode ||
-      engine.passCommand_.holds(id))
+      active.kvMode != KvMode::Resident || engine.passCommand_.holds(id))
     return units;
   const SpillGeometry &geometry = engine.config_.spill.geometry;
   if (!geometry.slotBytes ||

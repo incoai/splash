@@ -1557,16 +1557,17 @@ lanes, in whole extents, and extents no lane reads above the floors are a
 rebuilt cache, not a lane's floor.
 
 **Self-conversion** (`Engine::EngineVictims::conversions`). On a target whose
-run can spill, a Resident lane in decode whose own KV growth the engine's
-limit refuses converts itself to Spill when its eligible pages
-(`Cache::convertiblePages`) times a Full page less an Index page, less the
-first lane's hot block floor (`Model::hotFloorBytes`), cover the missing
-bytes: about 46K tokens on Qwen3.8-Flash-Next. It needs the SSD cache's quota
-for its pages and a free page in the Index runway, an extent kept while
-spilling is possible (`Engine::spillLanded`). Its claim then waits for its
-copies and releases its pages as they land (below), and it follows the
-Spill rules ([KV on the SSD](server.md#kv-on-the-ssd)). No other claim
-converts a lane, and a prefill lane does not convert.
+run can spill, a Resident lane, decoding or between the commands of its
+prefill, whose own KV growth the engine's limit refuses converts itself to
+Spill when its eligible pages (`Cache::convertiblePages`) times a Full page
+less an Index page, less the first lane's hot block floor
+(`Model::hotFloorBytes`), cover the missing bytes: about 46K tokens on
+Qwen3.8-Flash-Next. It needs the SSD cache's quota for its pages and a free
+page in the Index runway, an extent kept while spilling is possible
+(`Engine::spillLanded`). Its claim then waits for its copies and releases its
+pages as they land (below), and it follows the Spill rules ([KV on the
+SSD](server.md#kv-on-the-ssd)): a prefill goes on as a Spill lane's, its
+later commands planned in that shape. No other claim converts a lane.
 
 **Releases** (`Engine::EngineVictims::releases`, `Cache::releasePages`). A Spill
 lane writes each committed page to the SSD cache and keeps it Full, so it
