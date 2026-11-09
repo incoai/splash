@@ -607,7 +607,7 @@ extension LiveRequest.Stage {
 /// started it or the status that had it first, which goes on as each status taken since says, back
 /// too, until the line that ends it ends it in its place, or a status taken since no longer has
 /// it; and one for each line that names no request, as a request refused before the engine took
-/// it, or an earlier server's line.
+/// it.
 struct ServedRequest: Equatable, Identifiable {
     /// The engine's id of the request, as its lines and the status name it; below zero for a line
     /// that names none.
@@ -637,7 +637,7 @@ struct ServedRequest: Equatable, Identifiable {
     /// `requests` with `line` taken, as it came `now`: a request's start adds its row, unless the
     /// status had it first, which it moves on to reading where the status had it no further; its
     /// end ends its row, or adds one ended where it was never seen; a line that names no request
-    /// adds a row of its own, an earlier server's start none, as nothing could end it.
+    /// adds a row of its own.
     static func taking(_ line: RequestEntry, at now: Date, into requests: [ServedRequest]) -> [ServedRequest] {
         var requests = requests
         let index = line.request.flatMap { id in requests.firstIndex { $0.id == id } }
@@ -704,8 +704,7 @@ struct RequestEntry: Equatable {
     let outcome: Outcome
     /// The line itself.
     let raw: String
-    /// The engine's id of the request; nil for one refused before the engine took it, or an
-    /// earlier server's line, which names none.
+    /// The engine's id of the request; nil for one refused before the engine took it.
     var request: Int?
     var input: Int?
     var cached: Int?

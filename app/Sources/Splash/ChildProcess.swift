@@ -356,9 +356,10 @@ func resetLog(_ url: URL) {
 
 /// Begins a run in `url`'s log, after the runs before it and a blank line, with `heading`, a line
 /// that names the run, and returns where the run's own lines start. The log keeps its last `kept`
-/// bytes, from the start of a line; it is made, with its folder, where there is none. Only its
-/// end is read, however long a run grew it: a log past `kept` is written again from its last
-/// `kept` bytes, and one within it has the heading added.
+/// bytes, from the start of a line: 8 MiB, 16 times what the drawer shows at first, keeps earlier
+/// starts' failures and is written again in a moment. It is made, with its folder, where there is
+/// none. Only its end is read, however long a run grew it: a log past `kept` is written again from
+/// its last `kept` bytes, and one within it has the heading added.
 @discardableResult
 func beginLog(_ url: URL, heading: String, kept: Int = 8 << 20) -> UInt64 {
     try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)

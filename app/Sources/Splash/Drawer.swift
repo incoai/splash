@@ -205,7 +205,8 @@ final class TerminalSession: Identifiable {
 /// A terminal view that types a line into its shell as the shell first reads one: once its line
 /// editor takes the terminal (no canonical input), as zsh, bash and fish do to show their prompt,
 /// so that the line shows once, at the prompt, rather than echoed ahead of what the shell prints
-/// as it starts too; or after a few seconds, for a shell without one.
+/// as it starts too; or after 5 s, for a shell without one, where a shell whose start outlasts
+/// them only has the line echoed ahead of what it prints.
 final class TypingTerminalView: LocalProcessTerminalView {
     private var typing: String?
     /// Whether it takes the keyboard as it moves into a window, once.
@@ -241,7 +242,7 @@ final class TypingTerminalView: LocalProcessTerminalView {
     }
 }
 
-/// A log the drawer shows: the server's, which each start begins again, and the downloads'.
+/// A log the drawer shows: the server's and the downloads', which each download begins again.
 enum LogSource: String, CaseIterable {
     case server = "Server", downloads = "Downloads"
 
@@ -479,7 +480,7 @@ private struct TerminalPane: View {
 /// A log file, read only, as it grows: the lines that start in its last `limit` bytes at first,
 /// then what is written to it, the line being written as far as it is, the oldest lines going an
 /// eighth of `limit` at a time past it; ⌘F finds in it. It keeps its place as it changes (`LogScrollView`). A file written
-/// again from its start, as the server's log is at each start, is read again from there.
+/// again from its start, as the downloads' log is at each download, is read again from there.
 struct LogText: NSViewRepresentable {
     let url: URL
     /// Given its text view as it shows, which then takes the keyboard.

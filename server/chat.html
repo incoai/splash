@@ -764,7 +764,7 @@
       const status = attachment.error ? 'Read failed' : limit ? 'Too large' : null;
       let preview;
       if (pdf) {
-        preview = fileChip('attachment-file', name, status ?? (attachment.bytes >= 0 ? size(attachment.bytes) : 'PDF'), Boolean(status));
+        preview = fileChip('attachment-file', name, status ?? size(attachment.bytes), Boolean(status));
       } else if (attachment.url && !status) {
         preview = document.createElement('img');
         preview.src = attachment.url;

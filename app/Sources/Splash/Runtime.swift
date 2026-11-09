@@ -103,7 +103,8 @@ struct Runtime: Sendable {
     /// has them started as a terminal starts it, interactive: the variables `takesShellSetting`
     /// names, such as where the cache is and the token. They come through a pipe, never a file,
     /// and the shell gives those alone (`shellSettingsCommand`), so that no other variable, a
-    /// secret among them, leaves it. None where it gives none within `limit`, which then stops it.
+    /// secret among them, leaves it. None where it gives none within `limit`, which then stops it:
+    /// the launch waits for this, and 5 s outlasts an rc file that loads a version manager.
     @MainActor
     static func readShellSettings(_ shell: Shell, environment: [String: String] = ProcessInfo.processInfo.environment,
                                   limit: Duration = .seconds(5)) async -> [String: String] {
