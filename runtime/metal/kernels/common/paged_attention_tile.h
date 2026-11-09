@@ -295,8 +295,9 @@ inline float splash_attention_query_codes(device const bfloat *queries, device i
   }
   maximum = max(maximum, simd_shuffle_xor(maximum, 1));
   maximum = max(maximum, simd_shuffle_xor(maximum, 2));
-  // A row below 2^-100 (inactive or stale) codes as zeros: 127 / maximum
-  // would overflow.
+  // A row whose largest magnitude is 2^-100 or less (zero among them) codes
+  // as zeros: its scores are 0 to fp32's precision in its softmax anyway, and
+  // 127 / maximum stays finite (it overflows below 2^-121).
   const float inverse = maximum > 0x1p-100f ? 127.0f / maximum : 0.0f;
   device char4 *target = reinterpret_cast<device char4 *>(codes + first);
 #pragma unroll

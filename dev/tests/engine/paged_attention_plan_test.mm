@@ -30,14 +30,12 @@
 
 namespace {
 
-// The attention row these plans take: the Apple10 row (KernelCalibration.hpp),
-// and its pages per prefill split with bf16 queries.
+// The attention row these plans take: the Apple10 row (KernelCalibration.hpp).
 constexpr splash::ops::AttentionCalibration kApple10Row = splash::ops::kApple10Attention;
-constexpr splash::ops::AttentionCalibration kBf16Queries{.prefillPagesPerSplit = kApple10Row.prefillPagesPerSplit,
-                                                         .int8QueriesFromPages = splash::ops::kNever};
 
 using namespace splash;
 using test::HostKvExtents;
+using test::attentionRow;
 using test::bf16ToFloat;
 using test::floatToBf16;
 using test::moveBlock;
@@ -108,7 +106,7 @@ void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Layout layout) {
   // split.
   for (const auto [rows, history] : {std::pair{17U, 0U}, std::pair{257U, 0U}, std::pair{257U, 65536U},
                                      std::pair{2048U, 131072U}}) {
-    const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, kBf16Queries);
+    const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, attentionRow());
     const uint32_t tiles = (rows + 7) / 8;
     require(plan.splitGroups.x == headParts &&
                 plan.splitGroups.y == tiles && plan.splitGroups.z == plan.splits,
@@ -153,12 +151,12 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
         std::array{256U, 4096U, 4U}, std::array{64U, 8192U, 8U}, std::array{256U, 16384U, 8U},
         std::array{64U, 65536U, 32U}, std::array{256U, 131072U, 8U}, std::array{512U, 65536U, 4U},
         std::array{300U, 65536U, 6U}, std::array{2048U, 131072U, 1U}})
-    require(ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, kBf16Queries).splits ==
+    require(ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, attentionRow()).splits ==
                 (selectsBlocks(layout) ? std::clamp(32U / ((rows + 7) / 8), 1U, 32U) : splits),
             "prefill split count does not follow its rows and history");
   for (uint32_t rows = 1; rows <= 2048; ++rows)
     for (const uint32_t history : {0U, 4000U, 8192U, 32768U, 131072U, 1'000'000U}) {
-      const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, kBf16Queries);
+      const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, attentionRow());
       const uint32_t tiles = (rows + 7) / 8;
       const uint32_t splits = prefillSplits(rows, history, selectsBlocks(layout));
       require(plan.rows == rows && plan.splits == splits, "prefill plan lost actual rows");
@@ -184,7 +182,7 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     const std::array<uint32_t, 4> histories{0, 31, 16384, 131072};
     const auto plan = ops::PagedAttention::verifyPlan(lanes, queryHeads, layout,
-                                                      std::span(histories).first(lanes), kBf16Queries);
+                                                      std::span(histories).first(lanes), attentionRow());
     require(plan.splitPipeline == verifySplit && plan.reducePipeline == verifyReduce,
             "verify plan runs the wrong pipelines");
     uint32_t maximum = 0;
@@ -223,8 +221,7 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
     if (layout.format == kv::Format::Int8 && !selectsBlocks(layout)) name.replace(name.find("q8_"), 3, "q8q_");
     return name;
   };
-  constexpr ops::AttentionCalibration fromEight{.prefillPagesPerSplit = kApple10Row.prefillPagesPerSplit,
-                                                .int8QueriesFromPages = 8};
+  constexpr ops::AttentionCalibration fromEight = attentionRow(8);
   const auto verifyAfter = [&](const std::vector<uint32_t> &histories) {
     return ops::PagedAttention::verifyPlan(uint32_t(histories.size()), queryHeads, layout, histories, fromEight)
         .splitPipeline;
@@ -236,32 +233,32 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
               prefillAfter(832) == prefillSplit && prefillAfter(833) == int8QueriesSplit(prefillSplit),
           "INT8 queries do not follow the pages the longest split reads");
   for (const uint32_t rows : {0U, 2049U})
-    rejects([&] { (void)ops::PagedAttention::prefillPlan(rows, 0, queryHeads, layout, kBf16Queries); },
+    rejects([&] { (void)ops::PagedAttention::prefillPlan(rows, 0, queryHeads, layout, attentionRow()); },
             "invalid attention workspace rows", "a prefill plan of no rows or past the budget was accepted");
   for (const uint32_t lanes : {0U, 5U})
-    rejects([&] { (void)ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, zeroHistory, kBf16Queries); },
+    rejects([&] { (void)ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, zeroHistory, attentionRow()); },
             "invalid attention workspace batch width",
             "a verify plan of no lanes or more than a batch was accepted");
   rejects(
       [&] {
         const std::array<uint32_t, 2> two{};
-        (void)ops::PagedAttention::verifyPlan(3, queryHeads, layout, two, kBf16Queries);
+        (void)ops::PagedAttention::verifyPlan(3, queryHeads, layout, two, attentionRow());
       },
       "invalid verify attention history vector", "a verify plan took fewer histories than lanes");
   rejects(
       [&] {
         const std::array<uint32_t, 4> padded{};
-        (void)ops::PagedAttention::verifyPlan(3, queryHeads, layout, padded, kBf16Queries);
+        (void)ops::PagedAttention::verifyPlan(3, queryHeads, layout, padded, attentionRow());
       },
       "invalid verify attention history vector", "a verify plan took more histories than lanes");
   rejects(
       [&] {
         const std::array<uint32_t, 1> beyond{kv::kMaximumPhysicalTokens};
-        (void)ops::PagedAttention::verifyPlan(1, queryHeads, layout, beyond, kBf16Queries);
+        (void)ops::PagedAttention::verifyPlan(1, queryHeads, layout, beyond, attentionRow());
       },
       "verify attention history exceeds physical context",
       "verify rows past the physical context were accepted");
-  rejects([&] { (void)ops::PagedAttention::verifyPlan(1, queryHeads + 1, layout, zeroHistory, kBf16Queries); },
+  rejects([&] { (void)ops::PagedAttention::verifyPlan(1, queryHeads + 1, layout, zeroHistory, attentionRow()); },
           selectsBlocks(layout) ? "no sparse attention kernel for layout" : "no paged-attention kernel for layout",
           "a query head count without a kernel was accepted");
 }
@@ -1170,7 +1167,7 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
                        [&](metal::CommandGraph &graph, const Buffers &b) {
                          ops::PagedAttention::addPrefillStore(graph, {}, b[0], b[1], b[2], chunk, layout);
                        });
-  const auto prefill = ops::PagedAttention::prefillPlan(tokens, committed, queryHeads, layout, kBf16Queries);
+  const auto prefill = ops::PagedAttention::prefillPlan(tokens, committed, queryHeads, layout, attentionRow());
   const uint64_t tileRows = kv::prefillAttentionTiles(tokens) * kv::kPrefillAttentionTileRows;
   test::requireExtents(backend,
                        Extents{{0, staged(kvHeads, stride, tileRows, queryWidth), 2, "attention query"},
@@ -1185,7 +1182,7 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
   std::array<kv::ChunkedPrefillParams, lanes> chunks{};
   for (uint32_t lane = 0; lane < lanes; ++lane)
     chunks[lane] = ops::PagedAttention::verifyParams(histories[lane], 64);
-  const auto verify = ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, histories, kBf16Queries);
+  const auto verify = ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, histories, attentionRow());
   std::vector<test::BufferExtent> extents{
       {0, verifyStaged(dimension), 2, "attention key"},
       {1, stagedValues(verifyHeads, kv::kVerifyChunkStride, kv::kVerifyRows), 2, "attention value"},
@@ -1287,9 +1284,9 @@ void attentionBlocks(metal::MetalBackend &backend) {
   tokenMajor.valuesTokenMajor = true;
   tokenMajor.reads = kv::Reads::SelectedBlocks;
   const std::array<uint32_t, lanes> histories{100, 2000, 0};
-  rejects([&] { (void)ops::PagedAttention::prefillPlan(tokens, 100, 24, dense, kBf16Queries); },
+  rejects([&] { (void)ops::PagedAttention::prefillPlan(tokens, 100, 24, dense, attentionRow()); },
           "no paged-attention kernel for layout", "the sparse kernels took dimension-major values");
-  rejects([&] { (void)ops::PagedAttention::verifyPlan(lanes, 16, tokenMajor, histories, kBf16Queries); },
+  rejects([&] { (void)ops::PagedAttention::verifyPlan(lanes, 16, tokenMajor, histories, attentionRow()); },
           "no sparse attention kernel for layout", "the page loop took token-major values");
   const auto chunk = ops::PagedAttention::prefillParams(100, tokens, stride, 8);
   std::array<kv::ChunkedPrefillParams, lanes> chunks{};
@@ -1306,8 +1303,8 @@ void attentionBlocks(metal::MetalBackend &backend) {
   for (const uint32_t queryHeads : {16U, 24U}) {
     const bool sparse = queryHeads == 24;
     const kv::Layout layout = sparse ? tokenMajor : dense;
-    const auto prefill = ops::PagedAttention::prefillPlan(tokens, 100, queryHeads, layout, kBf16Queries);
-    const auto verify = ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, histories, kBf16Queries);
+    const auto prefill = ops::PagedAttention::prefillPlan(tokens, 100, queryHeads, layout, attentionRow());
+    const auto verify = ops::PagedAttention::verifyPlan(lanes, queryHeads, layout, histories, attentionRow());
     require(prefill.sparse == sparse && verify.sparse == sparse,
             "a plan's kernels do not take block lists as its group size states");
     const metal::MetalBuffer partials =

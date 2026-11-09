@@ -68,11 +68,9 @@ struct Shape {
   }
 
 private:
-  // The plans' attention row: the Apple10 row's pages per prefill split
-  // (KernelCalibration.hpp), and INT8 queries in every split or none.
+  // The plans' attention row: INT8 queries in every split, or none.
   splash::ops::AttentionCalibration attention() const {
-    return {.prefillPagesPerSplit = splash::ops::kApple10Attention.prefillPagesPerSplit,
-            .int8QueriesFromPages = int8Queries ? 1U : splash::ops::kNever};
+    return splash::test::attentionRow(int8Queries ? 1U : splash::ops::kNever);
   }
   splash::ops::PrefillAttentionPlan prefillPlan() const {
     return splash::ops::PagedAttention::prefillPlan(kRows, 0, queryHeads(), layout(), attention());
@@ -511,8 +509,9 @@ Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
 }
 
 // The split, reduce and every scratch buffer of one production-sized
-// dispatch: partials and statistics exactly cover [lane][KV head][split]
-// (verify) or [tile][KV head][split] (prefill, one tile).
+// dispatch: partials and statistics are the workspace production allocates,
+// which holds [lane][KV head][split] (verify) or [tile][KV head][split]
+// (prefill, one tile) at every split count.
 struct Dispatch {
   std::vector<uint8_t> output;
   std::vector<uint8_t> partials;
@@ -535,11 +534,12 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const uint64_t laneBytes = data.queries.length;
   id<MTLBuffer> queries = makeBuffer(device, width * laneBytes);
   id<MTLBuffer> output = makeBuffer(device, width * laneBytes);
-  const uint64_t slots = uint64_t{width} * shape.kvHeads * splits;
-  id<MTLBuffer> partials = makeBuffer(
-      device, slots * shape.fusedRows() * kHeadDimension * sizeof(float));
-  id<MTLBuffer> statistics =
-      makeBuffer(device, slots * shape.fusedRows() * 2 * sizeof(float));
+  // The workspace production allocates for `width` lanes, which holds every
+  // split count's slots.
+  const splash::ops::AttentionWorkspace workspace =
+      splash::ops::PagedAttention::verifyWorkspace(width, shape.queryHeads(), shape.layout());
+  id<MTLBuffer> partials = makeBuffer(device, workspace.partialsBytes);
+  id<MTLBuffer> statistics = makeBuffer(device, workspace.statisticsBytes);
   for (uint32_t lane = 0; lane < width; ++lane) {
     std::memcpy(static_cast<uint8_t *>(queries.contents) + lane * laneBytes,
                 data.queries.contents, laneBytes);
@@ -600,11 +600,12 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const Shape shape = data.shape;
   const uint32_t splits = data.params.split_count;
   id<MTLBuffer> output = makeBuffer(device, data.queries.length);
-  const uint64_t slots = uint64_t{shape.kvHeads} * splits;
-  id<MTLBuffer> partials = makeBuffer(
-      device, slots * shape.fusedRows() * kHeadDimension * sizeof(float));
-  id<MTLBuffer> statistics =
-      makeBuffer(device, slots * shape.fusedRows() * 2 * sizeof(float));
+  // The workspace production allocates for chunks of the tile's rows, which
+  // holds every split count's slots.
+  const splash::ops::AttentionWorkspace workspace =
+      splash::ops::PagedAttention::prefillWorkspace(kRows, shape.queryHeads(), shape.layout());
+  id<MTLBuffer> partials = makeBuffer(device, workspace.partialsBytes);
+  id<MTLBuffer> statistics = makeBuffer(device, workspace.statisticsBytes);
   // With QSA masks the tile attends through list kQsaJunkLists.
   const BlockLists blocks = data.maskWords ? qsaBlockLists(device, data, 1) : BlockLists{partials, partials, 0};
   PrefillAttentionParams params = data.params;

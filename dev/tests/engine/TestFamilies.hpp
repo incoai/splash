@@ -3,6 +3,7 @@
 #include "model/ModelDescriptor.hpp"
 #include "metal/abi/KvExtent.h"
 #include "ops/GDN.hpp"
+#include "ops/KernelCalibration.hpp"
 #include "ops/PagedKv.hpp"
 
 #include <algorithm>
@@ -47,6 +48,16 @@ struct AttentionGeometry final {
   }
   bool operator==(const AttentionGeometry &) const = default;
 };
+// The attention row the attention tests plan with: the Apple10 row
+// (KernelCalibration.hpp), its dense splits scoring INT8 queries over INT8
+// pages from int8QueriesFromPages pages a split reads: kNever keeps bf16
+// queries, 1 takes INT8 queries in every split.
+[[nodiscard]] constexpr ops::AttentionCalibration attentionRow(uint32_t int8QueriesFromPages = ops::kNever) noexcept {
+  ops::AttentionCalibration row = ops::kApple10Attention;
+  row.int8QueriesFromPages = int8QueriesFromPages;
+  return row;
+}
+
 // A family's attention geometry.
 template <class Family> [[nodiscard]] AttentionGeometry attentionGeometry(const Family &family) {
   const kv::Layout layout = family.kvLayout();

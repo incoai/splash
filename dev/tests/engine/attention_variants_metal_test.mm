@@ -35,12 +35,6 @@
 
 namespace {
 
-// The attention row these plans take: the Apple10 row's pages per prefill
-// split (KernelCalibration.hpp), with bf16 queries.
-constexpr splash::ops::AttentionCalibration kBf16Queries{
-    .prefillPagesPerSplit = splash::ops::kApple10Attention.prefillPagesPerSplit,
-    .int8QueriesFromPages = splash::ops::kNever};
-
 using namespace splash;
 using test::HostKvExtents;
 using test::bf16ToFloat;
@@ -128,9 +122,7 @@ struct Case final {
   [[nodiscard]] uint32_t page(uint32_t lane, uint32_t token) const { return pages[lane][token / kPageTokens]; }
   // The plans' attention row: INT8 queries in every split, or none.
   [[nodiscard]] ops::AttentionCalibration attention() const {
-    ops::AttentionCalibration row = kBf16Queries;
-    if (int8Queries) row.int8QueriesFromPages = 1;
-    return row;
+    return test::attentionRow(int8Queries ? 1U : ops::kNever);
   }
 
   // The stored K/V of a lane's token, which the reference attends.
@@ -577,9 +569,14 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format, bool int8
   const auto tilePlan =
       ops::PagedAttention::prefillPlan(8, 4103, kQueryHeads, tile.layout, tile.attention(), kWindowed);
   run(backend, tile, tileStaging, tilePlan);
+  // The workspace production allocates for chunks of up to 8 rows, which
+  // holds every split count's slots, poisoned again before each.
+  const ops::AttentionWorkspace workspace = ops::PagedAttention::prefillWorkspace(8, kQueryHeads, tile.layout);
+  const metal::MetalBuffer partials = poisoned(backend, workspace.partialsBytes);
+  const metal::MetalBuffer statistics = poisoned(backend, workspace.statisticsBytes);
   for (uint32_t splits = 1; splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS; ++splits) {
-    const metal::MetalBuffer partials = poisoned(backend, uint64_t{splits} * kKvHeads * 64 * kHeadDimension * 4);
-    const metal::MetalBuffer statistics = poisoned(backend, uint64_t{splits} * kKvHeads * 64 * 2 * 4);
+    std::memset(partials.contents(), 0xff, partials.sizeBytes());
+    std::memset(statistics.contents(), 0xff, statistics.sizeBytes());
     std::memset(tileStaging.output.contents(), 0xff, tileStaging.output.sizeBytes());
     const kv::PrefillAttentionParams params{4103, 8, kPageTokens, uint32_t(tile.pages[0].size()), tile.layer,
                                             splits, 0, 0};
@@ -637,26 +634,26 @@ void checkPlans(metal::MetalBackend &backend) {
   // windowed chunk keeps its splits as the history grows; a whole layer's
   // chunk takes more.
   const auto splitsAfter = [&](uint32_t history, ops::AttentionVariant variant) {
-    return ops::PagedAttention::prefillPlan(64, history, kQueryHeads, layout, kBf16Queries, variant).splits;
+    return ops::PagedAttention::prefillPlan(64, history, kQueryHeads, layout, test::attentionRow(), variant).splits;
   };
   require(splitsAfter(1024, kWindowed) == splitsAfter(65536, kWindowed) &&
               splitsAfter(1024, kWhole) < splitsAfter(65536, kWhole),
           "a windowed chunk's splits follow its history, or a whole chunk's do not");
   for (const ops::AttentionVariant variant : {ops::AttentionVariant{.rotated = true, .windowTokens = 256},
                                               ops::AttentionVariant{.rotated = false, .windowTokens = 1024}})
-    rejects([&] { (void)ops::PagedAttention::prefillPlan(8, 0, kQueryHeads, layout, kBf16Queries, variant); },
+    rejects([&] { (void)ops::PagedAttention::prefillPlan(8, 0, kQueryHeads, layout, test::attentionRow(), variant); },
             "no attention kernel for the layer's variant", "a window the geometry has no kernels for was accepted");
   for (const ops::AttentionVariant variant : {kWindowed, kWhole})
-    rejects([&] { (void)ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kBf16Queries, variant); },
+    rejects([&] { (void)ops::PagedAttention::prefillPlan(8, 0, 24, qwen, test::attentionRow(), variant); },
             "no attention kernel for the layer's variant", "a variant of a geometry without it was accepted");
-  require(!ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kBf16Queries).sinks &&
-              ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kBf16Queries).reducePipeline ==
+  require(!ops::PagedAttention::prefillPlan(8, 0, 24, qwen, test::attentionRow()).sinks &&
+              ops::PagedAttention::prefillPlan(8, 0, 24, qwen, test::attentionRow()).reducePipeline ==
                   "prefill_attention_reduce",
           "a geometry without sinks takes none");
   const metal::MetalBuffer buffer = zeroed(backend, 1 << 23), sinks = zeroed(backend, kQueryHeads * 4);
   const metal::MetalBuffer fewSinks = zeroed(backend, kQueryHeads * 4 - 4);
   const kv::ChunkedPrefillParams chunk = ops::PagedAttention::prefillParams(0, 8, 32, 1);
-  const auto plan = ops::PagedAttention::prefillPlan(8, 0, kQueryHeads, layout, kBf16Queries, kWindowed);
+  const auto plan = ops::PagedAttention::prefillPlan(8, 0, kQueryHeads, layout, test::attentionRow(), kWindowed);
   metal::CommandGraph graph;
   rejects([&] { ops::PagedAttention::addPrefill(graph, {1, 0}, buffer, buffer, buffer, buffer, buffer, chunk, plan); },
           "attention sinks buffer holds", "a plan with sinks encoded without them");
@@ -665,7 +662,7 @@ void checkPlans(metal::MetalBackend &backend) {
   }, "attention sinks buffer holds", "a plan with sinks encoded with too few");
   rejects([&] {
     ops::PagedAttention::addPrefill(graph, {1, 0}, buffer, buffer, buffer, buffer, buffer, chunk,
-                                    ops::PagedAttention::prefillPlan(8, 0, 24, qwen, kBf16Queries), {}, sinks);
+                                    ops::PagedAttention::prefillPlan(8, 0, 24, qwen, test::attentionRow()), {}, sinks);
   }, "the attention kernels take no sinks", "a plan without sinks encoded with some");
   require(graph.empty(), "a refused attention encoded a dispatch");
   std::cout << "variant plans PASS\n";
