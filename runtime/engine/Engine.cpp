@@ -916,9 +916,11 @@ bool Engine::admit(Request &active, double now) {
   active.refusedResources = false;
   // Each attempt to start a request decides where its KV lives, and a resume
   // keeps it; each bounds its output afresh, so a bound an attempt that did
-  // not start set does not outlive it. A Spill request commits the SSD
-  // cache's quota for the pages it publishes once it holds its lane.
-  active.outputLimit = active.request.maxNewTokens;
+  // not start set does not outlive it. A Resident resume meets no bound
+  // again, and keeps the one memory set at its start. A Spill request commits
+  // the SSD cache's quota for the pages it publishes once it holds its lane.
+  if (!resuming || active.kvMode == KvMode::Spill)
+    active.outputLimit = active.request.maxNewTokens;
   if (!resuming) {
     if (!active.placement || active.placementState != ledgerChanges_) {
       active.placement = placement(active);
