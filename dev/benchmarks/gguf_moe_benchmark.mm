@@ -156,7 +156,7 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
     }
     return 100.0 * column / tiles;
   };
-  const splash::ops::ExecutionPlans plans(backend.capabilities());
+  const splash::ops::ExecutionPlans plans(backend.capabilities(), splash::ops::Int8Activations::On);
   printf("%s, GPU family %u, %u cores: MoE %ux%u, %u experts, top %u, %s router, %u shared slice(s)%s, %s/%s/%s, "
          "median GPU ms per layer of %u rounds\n",
          backend.capabilities().deviceName.c_str(), backend.capabilities().appleGpuFamily,

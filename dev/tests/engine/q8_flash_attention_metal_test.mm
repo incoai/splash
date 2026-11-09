@@ -73,11 +73,13 @@ private:
     return splash::test::attentionRow(int8Queries ? 1U : splash::ops::kNever);
   }
   splash::ops::PrefillAttentionPlan prefillPlan() const {
-    return splash::ops::PagedAttention::prefillPlan(kRows, 0, queryHeads(), layout(), attention());
+    return splash::ops::PagedAttention::prefillPlan(kRows, 0, queryHeads(), layout(), attention(),
+                                                    splash::ops::Int8Activations::On);
   }
   splash::ops::VerifyAttentionPlan verifyPlan() const {
     const std::array<uint32_t, 1> history{0};
-    return splash::ops::PagedAttention::verifyPlan(1, queryHeads(), layout(), history, attention());
+    return splash::ops::PagedAttention::verifyPlan(1, queryHeads(), layout(), history, attention(),
+                                                   splash::ops::Int8Activations::On);
   }
 };
 const std::vector<Shape> kShapes = [] {

@@ -160,7 +160,7 @@ void testStreamableWeightsAreWhatLoads(const RuntimeResourcesConfig &config) {
            loaded.vision.actualAllocatedBytes;
   };
   metal::MetalBackend backend(config.metallibPath.string());
-  const ops::ExecutionPlans operators(backend.capabilities());
+  const ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
   const auto arenas = [&](const model::LoadedModel &loaded, model::StreamedParts parts) {
     const model::ModelMemoryPlan plan =
         model::plannedRuntimeMemory(loaded, operators, kv::Format::Int8, ops::GdnStateFormat::Float32, parts);

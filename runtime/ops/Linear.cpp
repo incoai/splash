@@ -142,10 +142,8 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   requireConfiguration();
 }
 
-Linear::Linear(const DeviceCapabilities &device, bool prefillInt8) noexcept
-    : calibration_(KernelCalibration::of(device)) {
-  calibration_.projection.prefillInt8 &= prefillInt8;
-}
+Linear::Linear(const DeviceCapabilities &device, Int8Activations int8Activations) noexcept
+    : calibration_(KernelCalibration::of(device)), int8Activations_(int8Activations) {}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
   // The None and Residual plans share a tile; a gate/up pair of one format
@@ -156,14 +154,14 @@ uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
     const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, epilogue};
     validate(w);
     unit.oneFormat = epilogue == LinearEpilogue::GateUp;
-    storage = std::max(storage, LinearPlan(w, selectProjection(calibration_, w, unit)).storageRows());
+    storage = std::max(storage, LinearPlan(w, selectProjection(calibration_, int8Activations_, w, unit)).storageRows());
   }
   return storage;
 }
 
 LinearPlan Linear::plan(LinearWorkload workload) const {
   validate(workload);
-  return LinearPlan(workload, selectProjection(calibration_, workload, {}));
+  return LinearPlan(workload, selectProjection(calibration_, int8Activations_, workload, {}));
 }
 LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config, FloatOutput destination) {
   return LinearPlan(workload, config, destination);
@@ -176,7 +174,7 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
   const bool pair = w.epilogue == LinearEpilogue::GateUp && gate;
   if (pair) tensors = {unitFormats(std::span(&projections[0], 1)), unitFormats(std::span(&projections[1], 1))};
   LinearPlan plan(w,
-                  selectProjection(calibration_, w, unitFormats(projections),
+                  selectProjection(calibration_, int8Activations_, w, unitFormats(projections),
                                    pair ? std::span<const UnitFormats>(tensors) : std::span<const UnitFormats>{}),
                   p.destination);
   plan.rotated_ = static_cast<bool>(p.rotation);
@@ -224,7 +222,8 @@ LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
   const LinearWorkload chunk{
       {shape.outputSize, shape.inputSize}, SPLASH_PREFILL_TOKEN_BUDGET, LinearPhase::Prefill, LinearEpilogue::None};
   validate(chunk);
-  bound.include(LinearPlan(chunk, selectProjection(calibration_, chunk, unitFormats(shape))).scratchSize());
+  bound.include(
+      LinearPlan(chunk, selectProjection(calibration_, int8Activations_, chunk, unitFormats(shape))).scratchSize());
   return bound;
 }
 

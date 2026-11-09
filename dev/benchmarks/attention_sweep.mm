@@ -665,7 +665,7 @@ int main(int argc, const char *argv[]) {
                                     " " + std::string(kv::formatName(format)));
     }
     metal::MetalBackend backend(argv[1]);
-    const ExecutionPlans plans(backend.capabilities());
+    const ExecutionPlans plans(backend.capabilities(), Int8Activations::On);
     std::unique_ptr<metal::MetalBackend> comparison;
     std::vector<metal::MetalBackend *> backends{&backend};
     if (!comparisonLibrary.empty()) {

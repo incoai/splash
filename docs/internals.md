@@ -420,13 +420,24 @@ engine or the models branches on the GPU:
   blocks. `Linear` and `ExecutionPlans` hold the device's calibration and plan
   through them.
 
+One setting sits beside the measured row: `Int8Activations`
+(`runtime/ops/Linear.hpp`; `splash serve --int8-activations`, on by default),
+whether a plan may round activations to int8 where an int8-activation path of
+rules 1, 2 and 5 takes them. The engine decides it once for `ExecutionPlans`,
+whose `Linear` holds it beside the calibration for `selectProjection` and
+whose attention plans read it too. Off, every plan is its plan with it on in
+bf16 activations and nothing else of it changes: no chunk runs the int8
+prefill tile, no decode plan the int8 decode tiles and no attention split INT8
+queries, so every activation stays bf16 (`kernel-selection` checks this for
+every plan on every device). The KV cache keeps `--kv-format` either way.
+
 The rules:
 
 1. *Projection, prefill.* A chunk of up to `stagedPrefillRows` rows (64 on
    Apple10 and on Apple9 GPUs of 10 cores or fewer, 32 on larger Apple9 GPUs)
    runs the staged tile at its rows' height (8, 16, 32 or 64) with
-   `stagedSplits`; a longer one runs the 128-row prefill tile, unsplit, or on
-   a row with `prefillInt8` (Apple10 and Apple11, with `--prefill-int8` on)
+   `stagedSplits`; a longer one runs the 128-row prefill tile, unsplit, or,
+   with int8 activations on, on a row with `prefillInt8` (Apple10 and Apple11)
    the [int8-activation tile](#int8-activation-prefill) where it takes every
    quantized segment. A projection of several segments and no epilogue runs
    them in one dispatch on the staged tile, in prefill as in decode, and those
@@ -448,12 +459,12 @@ The rules:
    under the wave law where its grid runs in as many waves of that tile as of
    the 8-row tile, `sixteenRowWaves` at most; a pair's only where both its
    tensors' own plans take it. A unit stages only where every quantized
-   segment's class does: dense measurements were taken per projection. A
-   unit whose quantized segments are all rotated in a format the int8 decode
-   tiles take (`UnitFormats::decodeInt8Takes`: PQ2_0) runs a staged plan of
-   at least `decodeInt8FromRows` rows (16 on Apple10 and Apple11, one lane's
-   16-row plan among them; never on Apple9) whose K splits keep whole PQ2_0
-   blocks on those tiles, at the plan's splits and passes.
+   segment's class does: dense measurements were taken per projection. With
+   int8 activations on, a unit whose quantized segments are all rotated in a
+   format the int8 decode tiles take (`UnitFormats::decodeInt8Takes`: PQ2_0)
+   runs a staged plan of at least `decodeInt8FromRows` rows (16 on Apple10 and
+   Apple11, one lane's 16-row plan among them; never on Apple9) whose K splits
+   keep whole PQ2_0 blocks on those tiles, at the plan's splits and passes.
 3. *Float projection.* The accelerator tile runs where the device has one,
    from `minimumRows` rows and a grid of its tiles of at least half the class's
    half tiles per core for BF16 values, F32 values or a quantized format's rows.
@@ -467,10 +478,10 @@ The rules:
    and 64 on Apple9 GPUs of 10 cores or fewer, where 32 made one measured case
    slower than the shared splits), between the splits shared out over the
    chunk's tiles and the longest chunk's tiles' ceiling (`PagedAttention.cpp`);
-   a sparse tile reads its list's blocks and keeps the shared splits. Over
-   INT8 pages a dense split scores INT8 queries (`q8q`) from
-   `AttentionCalibration::int8QueriesFromPages` pages a split of the
-   longest tile or lane reads (8 on Apple10; never on Apple9, whose matrix
+   a sparse tile reads its list's blocks and keeps the shared splits. With
+   int8 activations on, over INT8 pages a dense split scores INT8 queries
+   (`q8q`) from `AttentionCalibration::int8QueriesFromPages` pages a split of
+   the longest tile or lane reads (8 on Apple10; never on Apple9, whose matrix
    operations share the FP32 pipe); a verify's lanes share the choice.
 
 The register-against-staged boundaries are measured table entries, not a
@@ -478,10 +489,11 @@ cost model: the wave law, which describes the Apple10 staged tiles, does not
 describe the register tile (`KernelCalibration.hpp`). `kernel-selection`
 (`dev/tests/engine/kernel_selection_test.cc`) pins every plan of every
 family's projections (a rotated PQ2_0 unit's with its int8 activations), float
-tiles, MoE blocks and attention on fifteen device classes and core counts as a
-golden of one FNV-1a-64 per device, section and group, and `--dump <dir>`
-writes the plan lines; a change of a rule or an entry shows as the groups it
-changes. Kernels and their instances do not depend on any of this.
+tiles, MoE blocks and attention on fifteen device classes and core counts, with
+int8 activations on, as a golden of one FNV-1a-64 per device, section and
+group, and `--dump <dir>` writes the plan lines; a change of a rule or an entry
+shows as the groups it changes. Kernels and their instances do not depend on
+any of this.
 
 ### GGUF tiles
 
@@ -866,14 +878,14 @@ On Apple10 and Apple11, which multiply int8 at twice their bf16 rate, a prefill 
 staged tile (more than 64 rows) of a projection whose quantized segments are all MLX affine 4- or
 5-bit in groups of 64 (`af4g64`, `af5g64`) runs `LinearTile::GgufPrefillInt8`
 (`kernels/prefill/gguf_prefill_int8.metal`) instead of the bf16 tile
-(`ProjectionCalibration::prefillInt8`; Apple9, whose int8 matmul runs at 0.9x its bf16 rate, never).
-`splash serve --prefill-int8 off` turns it off (`ExecutionPlans`' `prefillInt8`): every chunk then
-runs the bf16 tiles and the prefill arena holds no codes, so prefill is what it was before the tile,
-bit for bit. `gguf_prefill_int8_quantize` writes each 64-input group of each row as int8 codes with
-its own scale, by the int8-activation rule (`kernels/common/int8_activations.h`), which a SwiGLU's
-up takes from its gate's plan (`LinearInput::PrefillInt8`) rather than quantizing the same rows
-again; the GEMM (`gguf_prefill_int8_<format>_<e>`, one dispatch per segment) feeds the weights' 4-
-or 5-bit codes straight from the planes into int8 `matmul2d` fragments and folds each
+(`ProjectionCalibration::prefillInt8`; Apple9, whose int8 matmul runs at 0.9x its bf16 rate, never),
+with int8 activations on. With them off (`--int8-activations off`) every chunk runs the bf16 tiles,
+bit for bit, and the prefill arena holds no codes. `gguf_prefill_int8_quantize` writes each 64-input
+group of each row as int8 codes with its own scale, by the int8-activation rule
+(`kernels/common/int8_activations.h`), which a SwiGLU's up takes from its gate's plan
+(`LinearInput::PrefillInt8`) rather than quantizing the same rows again; the GEMM
+(`gguf_prefill_int8_<format>_<e>`, one dispatch per segment) feeds the weights' 4- or 5-bit codes
+straight from the planes into int8 `matmul2d` fragments and folds each
 group's affine correction, `(sa s) sum(qa q) + z (sa sum(qa))`, once in fp32. The weights stay
 exact; only the activations round, per row and group, so an outlier channel costs only its own 64
 inputs. A group holding an infinity or a NaN, which its codes alone would round to finite values,
@@ -1094,13 +1106,13 @@ put T's least a unit off: a unit past where the ANE's part takes the longer
 costs the ANE's time per unit, a unit short of it the GPU's, and on an M5 Max
 and an M5 Pro the ANE's is the longer (1.7 ms a unit of the full-chunk layer
 against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms), all with
-`--prefill-int8 off`. On Qwen3.8-27B that takes 8 of the 34 units on an M5
-Max, 14-15 on an M5 Pro and 25-26 on an M6 with `--prefill-int8 off`, the best
+`--int8-activations off`. On Qwen3.8-27B that takes 8 of the 34 units on an M5
+Max, 14-15 on an M5 Pro and 25-26 on an M6 with `--int8-activations off`, the best
 each Mac's sweeps measured. By default the int8-activation tile makes the
 GPU's part faster, so the split takes fewer: 10 on a 20-core M5 Pro (the M5
 Max and M6 unmeasured). The split runs if T there gains 5% on the GPU alone. A
 start calibrates the split once for a Mac, a model, a macOS version, an engine
-build, `--prefill-int8` and the most units its memory plan holds, and remembers
+build, `--int8-activations` and the most units its memory plan holds, and remembers
 what it found (`remembered-*` in the cache directory below): the units, the
 least chunk and the GPU alone's layer at 512 and 2048 rows, or that no split
 gains enough. Later starts take it untimed: they build the split, check it as

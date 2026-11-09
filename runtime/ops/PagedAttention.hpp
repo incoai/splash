@@ -285,13 +285,14 @@ public:
   // its tiles read of the historyTokens committed before them (with a
   // window, no more than its window's), a split per the device's
   // `prefillPagesPerSplit` (AttentionCalibration).
-  // INT8 pages score against INT8 queries (the dense split kernels' q8q
-  // entries) where the longest tile's or lane's splits read at least the
-  // device's `int8QueriesFromPages` pages each: a verify's lanes share the
-  // choice.
+  // With `int8Activations` on, INT8 pages score against INT8 queries (the
+  // dense split kernels' q8q entries) where the longest tile's or lane's
+  // splits read at least the device's `int8QueriesFromPages` pages each: a
+  // verify's lanes share the choice.
   [[nodiscard]] static PrefillAttentionPlan
   prefillPlan(uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
-              const AttentionCalibration &calibration, AttentionVariant variant = {});
+              const AttentionCalibration &calibration, Int8Activations int8Activations,
+              AttentionVariant variant = {});
   // `chunk`'s rows from the first of the tile that holds `row`: the chunk's
   // kernels and splits, so each of their tiles computes what it does in the
   // chunk.
@@ -301,7 +302,7 @@ public:
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
              std::span<const uint32_t> historyTokens, const AttentionCalibration &calibration,
-             AttentionVariant variant = {});
+             Int8Activations int8Activations, AttentionVariant variant = {});
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences

@@ -514,7 +514,7 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
     DeviceCapabilities device = backend.capabilities();
     device.appleGpuFamily = family;
     if (cores) device.gpuCoreCount = cores;
-    const Linear linear(device);
+    const Linear linear(device, splash::ops::Int8Activations::On);
     const auto check = [&](uint32_t rows, uint32_t storage, const std::string &label,
                            const std::function<void(CommandGraph &, MetalBuffer, const Projection &, MetalBuffer)> &add) {
       const std::vector<float> x = activations(uint64_t{storage} * K);
@@ -592,7 +592,7 @@ int floatOnlyChain(MetalBackend &backend) {
   const Projection blocks(N, K, splash::ops::BlockWeights{{q4k.segment}});
   DeviceCapabilities device = backend.capabilities();
   device.appleGpuFamily = 9;
-  const Linear linear(device);
+  const Linear linear(device, splash::ops::Int8Activations::On);
   int failures = 0;
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     const uint64_t rows = lanes * 8, bytes = rows * N * 2;

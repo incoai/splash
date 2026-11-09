@@ -288,6 +288,12 @@ PQ2_0 token table, and GDN value heads in grouped order (`GgufFile` checks the
 parameters and the planner the rest, both before any download through the
 engine's model check).
 
+On M5 and later Macs, whose GPUs multiply int8 at twice their bf16 rate, such a
+model decodes in int8 activations, one scale per row and block of 1024 rotated
+inputs (next-token KL 2.8e-4 against bf16, 13-16% less time a decode cycle on a
+20-core M5 Pro), which `--int8-activations off` turns off
+([server options](server.md#server-options)).
+
 ## Drafts
 
 Every model decodes with a DFlash2 draft. Each family names the repository

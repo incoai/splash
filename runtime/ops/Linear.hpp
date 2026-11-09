@@ -249,13 +249,22 @@ struct LinearBuffers final {
   PreparedInput prepared{};
 };
 
+// Whether plans may round activations to int8 where an int8-activation path
+// takes them, a precision choice made once per runtime (ExecutionPlans) beside
+// the device's measured KernelCalibration: the int8 prefill and decode tiles
+// (selectProjection) and INT8 attention queries (PagedAttention). Off keeps
+// every activation bf16; on, the GPU's int8 matmul, twice its bf16 rate, takes
+// about a quarter off Qwen3.8-27B MLX 4-bit prefill.
+enum class Int8Activations : uint8_t { Off, On };
+
 // Owns projection pipeline selection and dispatch. Plans follow the device's
-// KernelCalibration (KernelSelection.cpp); without prefillInt8 (serve's
-// --prefill-int8 off) no prefill chunk runs the int8 prefill tile.
+// KernelCalibration and the runtime's Int8Activations (KernelSelection.cpp),
+// which ExecutionPlans also gives its attention plans.
 class Linear final {
 public:
-  explicit Linear(const DeviceCapabilities &device, bool prefillInt8 = true) noexcept;
+  explicit Linear(const DeviceCapabilities &device, Int8Activations int8Activations) noexcept;
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return calibration_; }
+  [[nodiscard]] Int8Activations int8Activations() const noexcept { return int8Activations_; }
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
   // The plan of `workload` for the projection, into its destination type; a gate/up plan also runs `gate`.
@@ -339,6 +348,7 @@ private:
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
   KernelCalibration calibration_;
+  Int8Activations int8Activations_;
 };
 
 } // namespace splash::ops

@@ -579,7 +579,8 @@ template <typename T> void attendsThroughLocations(MetalBackend &backend, kv::Fo
   test::AttentionFixture fixture(backend, plan, "kv-block-cache-test");
   fixture.fill();
   const ops::VerifyAttentionPlan verify = ops::PagedAttention::verifyPlan(
-      lanes, kQueryHeads, plan.layout(), std::span(histories).first(lanes), ops::kApple10Attention);
+      lanes, kQueryHeads, plan.layout(), std::span(histories).first(lanes), ops::kApple10Attention,
+      ops::Int8Activations::On);
   // Each row of lane 0 selects every other block of its history besides its
   // own, as QSA's lists do (masks of each lane's rows, a bit a block); lane
   // 1's rows select blocks 1, 2 and 5 of each page, so that a page's read

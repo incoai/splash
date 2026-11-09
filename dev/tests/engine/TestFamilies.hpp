@@ -48,11 +48,12 @@ struct AttentionGeometry final {
   }
   bool operator==(const AttentionGeometry &) const = default;
 };
-// The attention row the attention tests plan with: the Apple10 row
-// (KernelCalibration.hpp), its dense splits scoring INT8 queries over INT8
-// pages from int8QueriesFromPages pages a split reads: kNever keeps bf16
-// queries, 1 takes INT8 queries in every split.
-[[nodiscard]] constexpr ops::AttentionCalibration attentionRow(uint32_t int8QueriesFromPages = ops::kNever) noexcept {
+// The Apple10 attention row (KernelCalibration.hpp) whose dense splits score
+// INT8 queries over INT8 pages from int8QueriesFromPages pages a split reads,
+// for tests that choose the queries by the row, with int8 activations on:
+// kNever keeps bf16 queries, 1 takes INT8 queries in every split. A plan with
+// int8 activations off scores bf16 queries whatever its row.
+[[nodiscard]] constexpr ops::AttentionCalibration attentionRow(uint32_t int8QueriesFromPages) noexcept {
   ops::AttentionCalibration row = ops::kApple10Attention;
   row.int8QueriesFromPages = int8QueriesFromPages;
   return row;

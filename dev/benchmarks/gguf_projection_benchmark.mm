@@ -167,7 +167,7 @@ void floatProjections(MetalBackend &backend, const char *formatList, const char 
       segments.push_back(QuantizedSegment::rows(type, sizes[i], K, upload(backend, tensors[i])));
       segments.back().columnOffset = offset;
     }
-  const Linear linear(backend.capabilities());
+  const Linear linear(backend.capabilities(), Int8Activations::On);
   std::vector<FloatCase> cases;
   std::vector<uint32_t> lines = prefillRows;
   if (lines.empty())
@@ -281,7 +281,7 @@ int main(int argc, char **argv) {
         ring.emplace_back(N, K, std::move(weights));
         ring.back().rotation.signs = signs;
       }
-      const Linear linear(backend.capabilities());
+      const Linear linear(backend.capabilities(), Int8Activations::On);
       std::vector<Case> cases;
       for (const uint32_t rows : prefillRows) {
         const LinearWorkload w{{N, K}, rows, LinearPhase::Prefill, epilogue};

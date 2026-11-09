@@ -163,9 +163,10 @@ struct RuntimeResourcesConfig {
   // (model::budgetsVerifyRows); a benchmark round verifies every row so that
   // rounds repeat one another.
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
-  // --prefill-int8 off: no prefill chunk runs the int8 prefill tile, so
-  // every projection prefills on the bf16 tiles (ops::ExecutionPlans).
-  bool prefillInt8 = true;
+  // --int8-activations: whether the plans may round activations to int8
+  // where an int8-activation path takes them, or keep every activation bf16
+  // (ops::Int8Activations), for the life of the engine (ops::ExecutionPlans).
+  ops::Int8Activations int8Activations = ops::Int8Activations::On;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
@@ -418,9 +419,9 @@ private:
 // run on a prefill arena of their own, its programs wait for the ANE's
 // service until `cancelled` returns true, and its calibrations are
 // remembered beside the programs (ane::recall) under its layers' shapes and
-// formats, the device, the macOS version, the engine's `buildId`, whether
-// the GPU's part prefills in int8 (--prefill-int8) and the most units the
-// plan holds.
+// formats and the Int8Activations its GPU part plans with
+// (ops::AneFfn::calibrationKey), the device, the macOS version, the engine's
+// `buildId` and the most units the plan holds.
 [[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                                       const ops::ExecutionPlans &operators, kv::Format format,
                                       std::string_view buildId, std::function<bool()> cancelled);
