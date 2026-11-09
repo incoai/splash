@@ -294,7 +294,7 @@ StoredKv stored(const Case &data, uint32_t lane, uint32_t first, uint32_t end) {
 // history, and the head's sink: a key with no value. `mass` is the sum of
 // each key's weight times its value's magnitude, which bounds the error of
 // the kernels' bf16 probabilities. With INT8 queries the reference's queries
-// are the kernel's codes: the row's absmax / 127 steps, rounded to nearest.
+// are the kernel's codes times their row's scale (test::int8Block).
 struct Reference final {
   std::array<double, kHeadDimension> output{};
   std::array<double, kHeadDimension> mass{};
@@ -308,10 +308,10 @@ Reference reference(const Case &data, const StoredKv &kv, uint32_t lane, uint32_
   for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension)
     queries[dimension] = query(lane, head, row, dimension);
   if (data.int8Queries) {
-    float absmax = 0;
-    for (const double value : queries) absmax = std::max(absmax, float(std::fabs(value)));
-    const float inverse = absmax > 0x1p-100f ? 127.0f / absmax : 0.0f;
-    for (double &value : queries) value = double(std::rint(float(value) * inverse)) * double(absmax / 127.0f);
+    float largest = 0;
+    for (const double value : queries) largest = std::max(largest, float(std::fabs(value)));
+    const test::Int8Block block = test::int8Block(largest);
+    for (double &value : queries) value = double(test::int8Code(float(value), block)) * block.scale;
   }
   std::vector<double> scores(position + 1 - start);
   double maximum = sink;
@@ -621,6 +621,49 @@ void checkWindowWithinHistory(metal::MetalBackend &backend, kv::Format format, b
             << " bit for bit the whole history's PASS\n";
 }
 
+// A NaN in one row's query of a head and an infinity in another's turn those
+// rows' scores NaN, with INT8 queries (the row's scale is NaN:
+// kernels/common/int8_activations.h) as with bf16 queries: their softmax
+// statistics are NaN, which the reduce writes as a row of zeros, as it writes
+// a row without keys. Every other output stays as it was, bit for bit.
+void checkNonFiniteQueries(metal::MetalBackend &backend, bool int8Queries) {
+  constexpr uint32_t kRows = 24, kHistory = 300;
+  const Case data = makeCase(backend, kv::Format::Int8, int8Queries, kWhole, 1, kRows, {kHistory, 0, 0, 0});
+  const Staging staging = stage(backend, data, 0, kRows, kPageTokens);
+  const auto plan =
+      ops::PagedAttention::prefillPlan(kRows, kHistory, kQueryHeads, data.layout, data.attention(), kWhole);
+  const auto outputs = [&] {
+    run(backend, data, staging, plan);
+    const auto *begin = contents<uint16_t>(staging.output);
+    return std::vector<uint16_t>(begin, begin + staging.output.sizeBytes() / 2);
+  };
+  const std::vector<uint16_t> clean = outputs();
+  struct Poison final {
+    uint32_t row, head, dimension;
+    uint16_t bits;
+  };
+  constexpr std::array<Poison, 2> kPoisons{{{3, 5, 17, 0x7FC0}, {17, 26, 100, 0x7F80}}};
+  for (const Poison &poison : kPoisons)
+    contents<uint16_t>(staging.queries)[staging.queryIndex(0, poison.head, poison.row, poison.dimension)] =
+        poison.bits;
+  const std::vector<uint16_t> poisoned = outputs();
+  for (uint32_t row = 0; row < kRows; ++row)
+    for (uint32_t head = 0; head < kQueryHeads; ++head) {
+      const bool hit = std::any_of(kPoisons.begin(), kPoisons.end(), [&](const Poison &poison) {
+        return poison.row == row && poison.head == head;
+      });
+      for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
+        const uint64_t at = staging.queryIndex(0, head, row, dimension);
+        require(hit ? bf16ToFloat(poisoned[at]) == 0.0f : poisoned[at] == clean[at],
+                formatLabel(kv::Format::Int8, int8Queries) + ": row " + std::to_string(row) + " head " +
+                    std::to_string(head) + " output " + std::to_string(bf16ToFloat(poisoned[at])) +
+                    (hit ? " beside a non-finite query, not 0" : " changed beside another row's non-finite query"));
+      }
+    }
+  std::cout << "non-finite queries: " << formatLabel(kv::Format::Int8, int8Queries)
+            << " write their rows alone as zeros PASS\n";
+}
+
 // The plans of the variants, and what each refuses: a variant the geometry
 // is not compiled for, and a reduce's sinks where the plan has none or the
 // layer gives too few.
@@ -892,6 +935,7 @@ int main(int argc, char **argv) {
       checkSplitCounts(backend, format, int8Queries);
       checkWindowWithinHistory(backend, format, int8Queries);
     }
+    for (const bool int8Queries : {false, true}) checkNonFiniteQueries(backend, int8Queries);
     std::cout << "attention variants: PASS\n";
   } catch (const std::exception &error) {
     std::cerr << "attention variants: FAIL: " << error.what() << '\n';

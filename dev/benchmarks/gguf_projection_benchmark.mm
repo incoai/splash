@@ -367,8 +367,12 @@ int main(int argc, char **argv) {
         auto *x = static_cast<__bf16 *>(input.contents());
         for (uint64_t i = 0; i < rows * K; ++i) x[i] = __bf16(unit(rng));
       }
-      const LinearScratch scratch{zeros(size.input), zeros(size.sums), zeros(size.partials), zeros(size.counters),
-                                  rotated ? zeros(rows * K * 2) : MetalBuffer{}};
+      // A rotated projection's rotated rows, as production sizes them.
+      const ProjectionShape shape = ring.front().shape();
+      const LinearScratch scratch{
+          zeros(size.input), zeros(size.sums), zeros(size.partials), zeros(size.counters),
+          rotated ? zeros(prefill ? linear.prefillScratchSize(shape).rotated : linear.decodeScratchSize(shape).rotated)
+                  : MetalBuffer{}};
       // The register tile's table, prepared by its widest plan, whose plans of fewer rows read its leading tiles.
       PreparedInput table;
       const Case *widest = nullptr;

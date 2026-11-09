@@ -337,8 +337,6 @@ private:
                        const Projection *gate) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
-  void addGgufDecodeInt8(metal::CommandGraph &graph, const LinearBuffers &buffers, const Projection &projection,
-                         const LinearPlan &plan, const Projection *gate) const;
   KernelCalibration calibration_;
 };
 

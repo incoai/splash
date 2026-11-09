@@ -318,55 +318,44 @@ QUANT_FORMATS(GGUF_PREFILL_LEADING_INPUTS)
 #undef GGUF_PREFILL_TABLES
 #undef GGUF_PREFILL_THREAD
 #undef GGUF_PREFILL_BUFFERS
-#undef GGUF_SEGMENTS
-#undef GGUF_SEGMENT
 
-// ---------------- int8-activation decode of rotated PQ2_0 projections (ops::Linear, LinearConfig::decodeInt8).
-// gguf_rotate_int8 writes the rotated input as int8 rows with one scale s per row and rotation block
-// (metal/abi/Gguf.h). Per step each lane stages its column's 32 codes as int8 q - 1 in {-1, 0, 1}
-// (((w >> 2e) & 0x03030303) + 0x7F7F7F7F, then ^ 0x80808080: bytes 0x7F..0x82, no carries) in the order of the int8
-// rows (gguf_decode_int8_position), and one int8 matmul2d accumulates in int32 over a PQ2_0 block's four steps
-// (|acc| <= 128 * 127, exact); the block's last step folds it into the fp32 sums as acc * d * s. K splits, spread walks
-// (from a block's first step), the split reduction (gguf_store_sums, gguf_store_gate_up), pass modes and epilogues are
-// the staged tile's; the tiles hold 16 or 32 rows (one lane on the 16-row tile), the 8-row int8 matmul taking longer
-// than the 16-row one.
+// ---------------- int8-activation decode of rotated projections (ops::Linear, LinearConfig::decodeInt8) in a format
+// whose codes are int8 exactly (quant_decode_int8_format: PQ2_0). gguf_rotate_int8 writes the rotated input as int8
+// rows with one scale s per row and rotation block (metal/abi/Gguf.h). The tiles are the staged decode tiles on int8
+// stages: their columns (StagedColumn), walks (gguf_staged_tile_walk, gguf_staged_walk), K splits, split reductions
+// (gguf_store_sums, gguf_store_gate_up), pass modes, epilogues, parameters and bindings; per step each lane stages its
+// column's 32 two-bit codes q as int8 q - 1 in {-1, 0, 1, 2} in the order of the int8 rows
+// (gguf_decode_int8_position), and one int8 matmul2d accumulates in int32 over a block's steps (|acc| <= 2 * 128 * 127
+// for PQ2_0's 128 inputs, exact); the block's last step folds it into the fp32 sums as acc * d * s, so a tile walks
+// from its block's first step. The tiles hold 16 or 32 rows (one lane on the 16-row tile), the 8-row int8 matmul
+// taking longer than the 16-row one.
 
-// One simdgroup's 32 columns of a PQ2_0 tensor: lane l stages column origin + l, holding the payload of the step it
-// stages next and the d of that step's block.
-struct Int8Column {
-  device uchar *w0, *meta;
-  uint2 packed;
-  float d;
-  void begin(device uchar *p0, device uchar *m, uint input_size, uint origin, uint lane, uint first) thread {
-    const uint groups = input_size / 32, units = groups / FmtPQ20::MetaGroups;
-    const uint plane_tile = origin / QUANT_TILE_ROWS, plane_row = origin % QUANT_TILE_ROWS + lane;
-    w0 = p0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * FmtPQ20::P0;
-    meta = m + (ulong(plane_tile) * units * QUANT_TILE_ROWS + plane_row) * FmtPQ20::MetaBytes;
-    load(first);
-  }
-  // `step`'s payload and, at a block's first step, the block's d.
-  void load(uint step) thread {
-    packed = *((device const uint2 *)(w0 + ulong(step) * QUANT_TILE_ROWS * FmtPQ20::P0));
-    if (step % FmtPQ20::MetaGroups == 0)
-      d = float(as_type<half>(
-          *((device const ushort *)(meta + ulong(step / FmtPQ20::MetaGroups) * QUANT_TILE_ROWS * FmtPQ20::MetaBytes))));
-  }
-  // `step` into the lane's 32 bytes of `stage`; at a block's last step the block's d into scales[lane] for the fold.
-  void stage(uint step, threadgroup char *stage, threadgroup float *scales, uint lane) thread {
-    threadgroup uint *dst = (threadgroup uint *)(stage + lane * GGUF_STAGED_STEP);
+// Stages `step` of `column` as int8: its 32 codes q as q - 1 ((q + 0x7F) ^ 0x80 a byte: bytes 0x7F..0x82 before the
+// xor, no carries) at the lane's 32 bytes of `stage`, and at a block's last step the block's d at d[lane], before the
+// walk's load moves the column's meta to the next block.
+template <class F>
+inline void gguf_int8_stage(thread const StagedColumn<F> &column, uint step, threadgroup char *stage,
+                            threadgroup float *d, uint lane) {
+  static_assert(F::Kind == QuantLinear && F::Zero == 1 && F::P0 == 8 && F::P1 == 0,
+                "the int8 stage takes two-bit codes of value d (q - 1)");
+  threadgroup uint *dst = (threadgroup uint *)(stage + lane * GGUF_STAGED_STEP);
 #pragma unroll
-    for (ushort e = 0; e < 4; ++e) {
-      dst[e] = (((packed.x >> (2 * e)) & 0x03030303u) + 0x7F7F7F7Fu) ^ 0x80808080u;
-      dst[4 + e] = (((packed.y >> (2 * e)) & 0x03030303u) + 0x7F7F7F7Fu) ^ 0x80808080u;
-    }
-    if (step % FmtPQ20::MetaGroups == FmtPQ20::MetaGroups - 1) scales[lane] = d;
+  for (ushort e = 0; e < 4; ++e) {
+    dst[e] = (((column.packed.a.x >> (2 * e)) & 0x03030303u) + 0x7F7F7F7Fu) ^ 0x80808080u;
+    dst[4 + e] = (((column.packed.a.y >> (2 * e)) & 0x03030303u) + 0x7F7F7F7Fu) ^ 0x80808080u;
   }
-};
+  if (step % F::MetaGroups == F::MetaGroups - 1) d[lane] = F::coef(column.hdr, 0).s.x;
+}
+// The step an int8 tile starts at: its staged_first_step, back to the first step of its block, so that each block's
+// steps run in order and fold once.
+template <class F> inline uint gguf_int8_first_step(uint tile, uint step_begin, uint step_end, uint spread) {
+  return step_begin + (staged_first_step(tile, step_begin, step_end, spread) - step_begin) / F::MetaGroups * F::MetaGroups;
+}
 // A block's int32 sums into the fp32 sums, sums += acc * d[column] * s[row][block], acc reset. The two cooperative
 // tensors are destinations of one matmul2d, element i the same (row, column) in both.
 template <class Acc, class Sums>
-inline void int8_fold(thread Acc &acc, thread Sums &sums, threadgroup const float *d, device const float *s,
-                       uint blocks, uint block) {
+inline void gguf_int8_fold(thread Acc &acc, thread Sums &sums, threadgroup const float *d, device const float *s,
+                           uint blocks, uint block) {
 #pragma unroll
   for (ushort i = 0; i < acc.get_capacity(); ++i) {
     if (acc.is_valid_element(i)) {
@@ -376,104 +365,135 @@ inline void int8_fold(thread Acc &acc, thread Sums &sums, threadgroup const floa
     acc[i] = 0;
   }
 }
-// The walk over steps [sb, se) of K from block-aligned `first`, wrapping: per step stage(step, buffer), a barrier,
-// load(next) where a step follows, run(step, buffer); the stages alternate per step walked.
-template <class Stage, class Load, class Run>
-inline void int8_walk(uint sb, uint se, uint first, Stage stage, Load load, Run run) {
-  const uint per = se - sb;
-  for (uint walked = 0; walked < per; ++walked) {
-    const uint step = first + walked < se ? first + walked : first + walked - per;
-    stage(step, walked & 1);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    if (walked + 1 < per) load(step + 1 < se ? step + 1 : sb);
-    run(step, walked & 1);
-  }
+// The int8 rows of a Rows-row tile (input [Rows][K] int8, then their scales) and a stage of 32 columns, as matmul2d
+// operands.
+template <ushort Rows> inline auto gguf_int8_rows(device char *input, uint input_size) {
+  return tensor<device int8_t, dextents<int, 2>, tensor_inline>((device int8_t *)input, dextents<int, 2>{int(input_size), Rows},
+                                                               array<int, 2>{1, int(input_size)});
 }
-// The int8 operands of a Rows-row tile, declared in the kernel (a macro: the cooperative tensors take the types of op
-// and a0): Cols, KS, the int8 rows `at`, the matmul's `descriptor` and `op`, and a0, its first input slice.
-#define INT8_OPERANDS(Rows, input, K)                                                                             \
-  constexpr ushort Cols = GGUF_STAGED_COLUMNS, KS = GGUF_STAGED_STEP;                                              \
-  auto at = tensor<device int8_t, dextents<int, 2>, tensor_inline>((device int8_t *)(input),                       \
-                                                                  dextents<int, 2>{int(K), Rows}, array<int, 2>{1, int(K)}); \
-  constexpr auto descriptor =                                                                                      \
-      matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);     \
-  matmul2d<descriptor, execution_simdgroups<1>> op;                                                                \
-  auto a0 = at.template slice<KS, Rows>(0, 0)
-// The int8 stage of 32 columns at `stage` as a matmul operand, of INT8_OPERANDS' KS and Cols (a macro: an inline
-// function changes the kernels' AIR, unmeasured).
-#define INT8_STAGE(stage)                                                                                         \
-  tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline>((threadgroup int8_t *)(stage), dextents<int, 2>{KS, Cols}, \
-                                                             array<int, 2>{1, KS})                                 \
-      .template slice<KS, Cols>(0, 0)
-template <ushort Rows, GgufEpilogue Ep, class Out>
-kernel void gguf_decode_int8(device uchar *input [[buffer(0)]], device uchar *w0a [[buffer(1)]],
-                             device uchar *ma [[buffer(2)]], device uchar *w0b [[buffer(3)]],
-                             device uchar *mb [[buffer(4)]], device uchar *w0c [[buffer(5)]],
-                             device uchar *mc [[buffer(6)]], device Out *output [[buffer(7)]],
-                             device coherent(device) float *partials [[buffer(8)]],
-                             device atomic_uint *counters [[buffer(9)]], device bfloat *aux [[buffer(10)]],
-                             constant GgufDecodeInt8Params &p [[buffer(11)]],
-                             uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
-                             uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  threadgroup char stages[GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS][2][GGUF_STAGED_COLUMNS * GGUF_STAGED_STEP];
-  threadgroup float scales[GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS][GGUF_STAGED_COLUMNS];
-  threadgroup uint arrival;
-  const uint K = p.input_size;
-  GGUF_SEGMENT_INDEX(group.x, p.cols);
-  GGUF_SEGMENT_PLANE(w0, w0);
-  GGUF_SEGMENT_PLANE(meta, m);
-  const uint origin = local * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS, column0 = p.offset[s] + origin;
-  INT8_OPERANDS(Rows, input, K);
-  auto b0 = INT8_STAGE(stages[simd_group][0]), b1 = INT8_STAGE(stages[simd_group][1]);
-  auto acc = op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), int>();
-  auto sums = op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
-  gguf_zero(sums);
+inline auto gguf_int8_operand(threadgroup char *stage) {
+  return tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline>(
+             (threadgroup int8_t *)stage, dextents<int, 2>{GGUF_STAGED_STEP, GGUF_STAGED_COLUMNS}, array<int, 2>{1, GGUF_STAGED_STEP})
+      .template slice<GGUF_STAGED_STEP, GGUF_STAGED_COLUMNS>(0, 0);
+}
+template <ushort Rows>
+using GgufInt8Matmul = matmul2d<matmul2d_descriptor(Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, false, true, false,
+                                                    matmul2d_descriptor::mode::multiply_accumulate),
+                                execution_simdgroups<1>>;
+// The destination of a Rows-row int8 tile, of int (a block's sums) or float (the folded sums), not initialized, as
+// staged_accumulator's.
+template <ushort Rows, class T> inline auto gguf_int8_destination(device char *input, uint input_size, threadgroup char *stage) {
+  GgufInt8Matmul<Rows> op;
+  auto a0 = gguf_int8_rows<Rows>(input, input_size).template slice<GGUF_STAGED_STEP, Rows>(0, 0);
+  auto b0 = gguf_int8_operand(stage);
+  return op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), T>();
+}
+
+// The int8 decode tile loop of one simdgroup without the store, as staged_accumulate's: its GGUF_STAGED_COLUMNS
+// columns from `origin` over steps [step_begin, step_end) of K from block-aligned step_first, folded into `sums`;
+// `stages` holds two stages, d a block's scale of each column.
+template <class F, ushort Rows, class Sums>
+inline void gguf_int8_accumulate(device char *input, device uchar *w0, device uchar *w1, device uchar *meta,
+                                 uint input_size, uint origin, threadgroup char *stages, threadgroup float *d,
+                                 uint lane, uint step_begin, uint step_end, uint step_first, thread Sums &sums) {
+  constexpr ushort Stage = GGUF_STAGED_COLUMNS * GGUF_STAGED_STEP;
+  auto rows = gguf_int8_rows<Rows>(input, input_size);
+  GgufInt8Matmul<Rows> op;
+  auto b0 = gguf_int8_operand(stages), b1 = gguf_int8_operand(stages + Stage);
+  auto acc = gguf_int8_destination<Rows, int>(input, input_size, stages);
 #pragma unroll
   for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0;
-  device const float *rowScales = (device const float *)(input + ulong(Rows) * K);
-  const uint per = K / KS / p.splits, sb = group.y * per, se = sb + per;
-  const uint first = sb + ((staged_first_step(local, sb, se, p.spread) - sb) & ~(FmtPQ20::MetaGroups - 1));
-  Int8Column column;
-  column.begin(w0, meta, K, origin, lane, first);
-  threadgroup float *d = scales[simd_group];
-  int8_walk(
-      sb, se, first,
-      [&](uint step, uint buffer) __attribute__((always_inline)) { column.stage(step, stages[simd_group][buffer], d, lane); },
-      [&](uint next) __attribute__((always_inline)) { column.load(next); },
-      [&](uint step, uint buffer) __attribute__((always_inline)) {
-        const auto a = at.template slice<KS, Rows>(step * KS, 0);
-        if (buffer) op.run(a, b1, acc); else op.run(a, b0, acc);
-        if (step % FmtPQ20::MetaGroups == FmtPQ20::MetaGroups - 1)
-          int8_fold(acc, sums, d, rowScales, K / GGUF_ROTATION_BLOCK, step * KS / GGUF_ROTATION_BLOCK);
-      });
-  gguf_store_sums<Rows>(sums, p.splits, group.y, partials, counters + p.offset[s] / GGUF_TILE_COLUMNS + local,
-                        p.out_stride, column0, simd_group * 32 + lane, &arrival, [&](uint row, uint col, float v) {
-    const ulong o = ulong(row) * p.out_stride + column0 + col;
+  device const float *scales = (device const float *)(input + ulong(Rows) * input_size);
+  StagedColumn<F> column;
+  column.begin(w0, w1, meta, input_size, origin, lane, step_first, step_begin < step_end);
+  const auto run_step = [&](uint step, uint next, bool more, uint buffer) __attribute__((always_inline)) {
+    gguf_int8_stage(column, step, stages + buffer * Stage, d, lane);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (more) column.load(step, next);
+    auto a = rows.template slice<GGUF_STAGED_STEP, Rows>(step * GGUF_STAGED_STEP, 0);
+    if (buffer) op.run(a, b1, acc); else op.run(a, b0, acc);
+    if (step % F::MetaGroups == F::MetaGroups - 1)
+      gguf_int8_fold(acc, sums, d, scales, input_size / GGUF_ROTATION_BLOCK, step * GGUF_STAGED_STEP / GGUF_ROTATION_BLOCK);
+  };
+  gguf_staged_tile_walk(step_begin, step_end, step_first, run_step);
+}
+// The int8 decode kernels, as gguf_decode's: grid (column tiles, K partitions), two simdgroups. Their stores take the
+// parameters they need by value: gguf_store_sums is not inlined into them, and under shader validation a load through
+// the constant parameters' address that its closure held read as 0 in 1 run of 30 (a fused plan's p.out_stride).
+template <class F, ushort Rows, GgufEpilogue Ep, class Out>
+kernel void gguf_decode_int8(device char *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], device uchar *w1 [[buffer(2)]],
+                             device uchar *meta [[buffer(3)]], device Out *output [[buffer(4)]],
+                             device coherent(device) float *partials [[buffer(5)]], device atomic_uint *counters [[buffer(6)]],
+                             device bfloat *aux [[buffer(7)]], constant GgufDecodeParams &p [[buffer(8)]],
+                             uint2 group [[threadgroup_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
+                             uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup char stages[GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS][2 * GGUF_STAGED_COLUMNS * GGUF_STAGED_STEP];
+  threadgroup float d[GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS][GGUF_STAGED_COLUMNS];
+  threadgroup uint arrival;
+  const uint per = p.input_size / GGUF_STAGED_STEP / p.splits, sb = group.y * per, se = sb + per,
+             origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS, column0 = p.out_offset + origin;
+  auto sums = gguf_int8_destination<Rows, float>(input, p.input_size, stages[simd_group]);
+  gguf_zero(sums);
+  gguf_int8_accumulate<F, Rows>(input, w0, w1, meta, p.input_size, origin, stages[simd_group], d[simd_group], simd_lane,
+                                sb, se, gguf_int8_first_step<F>(group.x, sb, se, p.spread), sums);
+  const uint stride = p.out_stride;
+  gguf_store_sums<Rows>(sums, p.splits, group.y, partials, counters + p.out_offset / GGUF_TILE_COLUMNS + group.x,
+                        stride, column0, simd_group * 32 + simd_lane, &arrival, [=](uint row, uint column, float v) {
+    const ulong o = ulong(row) * stride + column0 + column;
     output[o] = gguf_epilogue<Ep, Out>(v, aux, o);
   });
 }
-// A gate/up pair of PQ2_0 tensors in one pass, as gguf_decode_gate_up runs the bf16 pair: grid (32-column tiles, K
-// partitions), one simdgroup staging both tensors' same 32 columns; the output is bf16(up) * silu(bf16(gate)).
-template <ushort Rows>
-kernel void gguf_decode_int8_gate_up(device uchar *input [[buffer(0)]], device uchar *gw0 [[buffer(1)]],
-                                     device uchar *gmeta [[buffer(2)]], device uchar *uw0 [[buffer(3)]],
-                                     device uchar *umeta [[buffer(4)]], device bfloat *output [[buffer(5)]],
-                                     device coherent(device) float *partials [[buffer(6)]],
-                                     device atomic_uint *counters [[buffer(7)]],
-                                     constant GgufDecodeInt8Params &p [[buffer(8)]],
-                                     uint2 group [[threadgroup_position_in_grid]],
-                                     uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup char stages[2][2][GGUF_STAGED_COLUMNS * GGUF_STAGED_STEP];   // [gate, up][buffer]
-  threadgroup float scales[2][GGUF_STAGED_COLUMNS];
+// A fused projection's segments in one dispatch, as gguf_decode_fused_m<rows> runs them, each of the kernel's format:
+// the threadgroup's tile picks its segment, whose tiles walk as its projection alone would.
+template <class F, ushort Rows>
+kernel void gguf_decode_int8_fused(device char *input [[buffer(0)]], GGUF_SEGMENTS, device bfloat *output [[buffer(10)]],
+                                   device coherent(device) float *partials [[buffer(11)]],
+                                   device atomic_uint *counters [[buffer(12)]],
+                                   constant GgufDecodeFusedParams &p [[buffer(13)]],
+                                   uint2 group [[threadgroup_position_in_grid]],
+                                   uint simd_lane [[thread_index_in_simdgroup]],
+                                   uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup char stages[GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS][2 * GGUF_STAGED_COLUMNS * GGUF_STAGED_STEP];
+  threadgroup float d[GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS][GGUF_STAGED_COLUMNS];
   threadgroup uint arrival;
-  const uint K = p.input_size, origin = group.x * GGUF_STAGED_COLUMNS, column0 = p.offset[0] + origin;
-  INT8_OPERANDS(Rows, input, K);
-  auto g0 = INT8_STAGE(stages[0][0]), g1 = INT8_STAGE(stages[0][1]);
-  auto u0 = INT8_STAGE(stages[1][0]), u1 = INT8_STAGE(stages[1][1]);
-  auto gate = op.template get_destination_cooperative_tensor<decltype(a0), decltype(g0), int>();
-  auto up = op.template get_destination_cooperative_tensor<decltype(a0), decltype(g0), int>();
-  auto gateSums = op.template get_destination_cooperative_tensor<decltype(a0), decltype(g0), float>();
-  auto upSums = op.template get_destination_cooperative_tensor<decltype(a0), decltype(g0), float>();
+  GGUF_SEGMENT_OF(group.x, p.cols);
+  const uint per = p.input_size / GGUF_STAGED_STEP / p.splits, sb = group.y * per, se = sb + per,
+             origin = local * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS, column0 = p.offset[s] + origin;
+  auto sums = gguf_int8_destination<Rows, float>(input, p.input_size, stages[simd_group]);
+  gguf_zero(sums);
+  gguf_int8_accumulate<F, Rows>(input, w0, w1, meta, p.input_size, origin, stages[simd_group], d[simd_group], simd_lane,
+                                sb, se, gguf_int8_first_step<F>(local, sb, se, p.spread), sums);
+  const uint stride = p.out_stride;
+  gguf_store_sums<Rows>(sums, p.splits, group.y, partials, counters + p.offset[s] / GGUF_TILE_COLUMNS + local,
+                        stride, column0, simd_group * 32 + simd_lane, &arrival,
+                        [=](uint row, uint column, float v) { output[ulong(row) * stride + column0 + column] = bfloat(v); });
+}
+// A gate/up pair in one pass, as gguf_decode_gate_up runs the bf16 pair: grid (32-column tiles, K partitions), one
+// simdgroup staging both tensors' same 32 columns on stages of their own, two each; the output is
+// bf16(up) * silu(bf16(gate)).
+template <class F, ushort Rows>
+kernel void gguf_decode_int8_gate_up(device char *input [[buffer(0)]], device uchar *gw0 [[buffer(1)]],
+                                     device uchar *gw1 [[buffer(2)]], device uchar *gmeta [[buffer(3)]],
+                                     device uchar *uw0 [[buffer(4)]], device uchar *uw1 [[buffer(5)]],
+                                     device uchar *umeta [[buffer(6)]], device bfloat *output [[buffer(7)]],
+                                     device coherent(device) float *partials [[buffer(8)]],
+                                     device atomic_uint *counters [[buffer(9)]], constant GgufDecodeParams &p [[buffer(10)]],
+                                     uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+  constexpr ushort Stage = GGUF_STAGED_COLUMNS * GGUF_STAGED_STEP;
+  threadgroup char stages[2][2 * Stage];   // [gate, up][stage]
+  threadgroup float d[2][GGUF_STAGED_COLUMNS];
+  threadgroup uint arrival;
+  const uint per = p.input_size / GGUF_STAGED_STEP / p.splits, sb = group.y * per, se = sb + per,
+             origin = group.x * GGUF_STAGED_COLUMNS, column0 = p.out_offset + origin;
+  const uint first = gguf_int8_first_step<F>(group.x / 2, sb, se, p.spread);
+  auto rows = gguf_int8_rows<Rows>(input, p.input_size);
+  GgufInt8Matmul<Rows> op;
+  auto g0 = gguf_int8_operand(stages[0]), g1 = gguf_int8_operand(stages[0] + Stage);
+  auto u0 = gguf_int8_operand(stages[1]), u1 = gguf_int8_operand(stages[1] + Stage);
+  auto gate = gguf_int8_destination<Rows, int>(input, p.input_size, stages[0]);
+  auto up = gguf_int8_destination<Rows, int>(input, p.input_size, stages[0]);
+  auto gateSums = gguf_int8_destination<Rows, float>(input, p.input_size, stages[0]);
+  auto upSums = gguf_int8_destination<Rows, float>(input, p.input_size, stages[0]);
   gguf_zero(gateSums);
   gguf_zero(upSums);
 #pragma unroll
@@ -481,59 +501,66 @@ kernel void gguf_decode_int8_gate_up(device uchar *input [[buffer(0)]], device u
     gate[i] = 0;
     up[i] = 0;
   }
-  device const float *rowScales = (device const float *)(input + ulong(Rows) * K);
-  const uint per = K / KS / p.splits, sb = group.y * per, se = sb + per;
-  const uint first = sb + ((staged_first_step(group.x / 2, sb, se, p.spread) - sb) & ~(FmtPQ20::MetaGroups - 1));
-  Int8Column g, u;
-  g.begin(gw0, gmeta, K, origin, lane, first);
-  u.begin(uw0, umeta, K, origin, lane, first);
-  int8_walk(
-      sb, se, first,
-      [&](uint step, uint buffer) __attribute__((always_inline)) {
-        g.stage(step, stages[0][buffer], scales[0], lane);
-        u.stage(step, stages[1][buffer], scales[1], lane);
-      },
-      [&](uint next) __attribute__((always_inline)) { g.load(next); u.load(next); },
-      [&](uint step, uint buffer) __attribute__((always_inline)) {
-        const auto a = at.template slice<KS, Rows>(step * KS, 0);
-        if (buffer) {
-          op.run(a, g1, gate);
-          op.run(a, u1, up);
-        } else {
-          op.run(a, g0, gate);
-          op.run(a, u0, up);
-        }
-        if (step % FmtPQ20::MetaGroups == FmtPQ20::MetaGroups - 1) {
-          const uint blocks = K / GGUF_ROTATION_BLOCK, block = step * KS / GGUF_ROTATION_BLOCK;
-          int8_fold(gate, gateSums, scales[0], rowScales, blocks, block);
-          int8_fold(up, upSums, scales[1], rowScales, blocks, block);
-        }
-      });
+  device const float *scales = (device const float *)(input + ulong(Rows) * p.input_size);
+  StagedColumn<F> g, u;
+  g.begin(gw0, gw1, gmeta, p.input_size, origin, lane, first, sb < se);
+  u.begin(uw0, uw1, umeta, p.input_size, origin, lane, first, sb < se);
+  const auto run_step = [&](uint step, uint next, bool more, uint buffer) __attribute__((always_inline)) {
+    gguf_int8_stage(g, step, stages[0] + buffer * Stage, d[0], lane);
+    gguf_int8_stage(u, step, stages[1] + buffer * Stage, d[1], lane);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (more) {
+      g.load(step, next);
+      u.load(step, next);
+    }
+    auto a = rows.template slice<GGUF_STAGED_STEP, Rows>(step * GGUF_STAGED_STEP, 0);
+    if (buffer) {
+      op.run(a, g1, gate);
+      op.run(a, u1, up);
+    } else {
+      op.run(a, g0, gate);
+      op.run(a, u0, up);
+    }
+    if (step % F::MetaGroups == F::MetaGroups - 1) {
+      const uint blocks = p.input_size / GGUF_ROTATION_BLOCK, block = step * GGUF_STAGED_STEP / GGUF_ROTATION_BLOCK;
+      gguf_int8_fold(gate, gateSums, d[0], scales, blocks, block);
+      gguf_int8_fold(up, upSums, d[1], scales, blocks, block);
+    }
+  };
+  gguf_staged_walk(sb, se, first, run_step);
   gguf_store_gate_up<Rows>(gateSums, upSums, p.splits, group.y, partials,
-                           counters + p.offset[0] / GGUF_STAGED_COLUMNS + group.x, p.out_stride, column0, lane,
+                           counters + p.out_offset / GGUF_STAGED_COLUMNS + group.x, p.out_stride, column0, lane,
                            &arrival, output);
 }
-#undef INT8_STAGE
-#undef INT8_OPERANDS
 template <class Out>
-using GgufDecodeInt8Kernel = void(device uchar *, device uchar *, device uchar *, device uchar *, device uchar *,
-                                  device uchar *, device uchar *, device Out *, device coherent(device) float *,
-                                  device atomic_uint *, device bfloat *, constant GgufDecodeInt8Params &, uint2, uint,
-                                  uint);
-using GgufDecodeInt8GateUpKernel = void(device uchar *, device uchar *, device uchar *, device uchar *, device uchar *,
-                                        device bfloat *, device coherent(device) float *, device atomic_uint *,
-                                        constant GgufDecodeInt8Params &, uint2, uint);
-#define GGUF_DECODE_INT8(R, ep, Ep, Out)                                                                           \
-  template [[host_name("gguf_decode_int8_pq20_m" #R "_" #ep)]] kernel GgufDecodeInt8Kernel<Out>                    \
-      gguf_decode_int8<R, Ep, Out>;
-#define GGUF_DECODE_INT8_ROWS(R)                                                                                   \
-  GGUF_DECODE_INT8(R, a, EpNone, bfloat) GGUF_DECODE_INT8(R, r, EpResidual, bfloat)                                \
-  GGUF_DECODE_INT8(R, g, EpUpWithGate, bfloat) GGUF_DECODE_INT8(R, a_f32, EpNone, float)                           \
-  template [[host_name("gguf_decode_int8_pq20_m" #R "_gate_up")]] kernel GgufDecodeInt8GateUpKernel                \
-      gguf_decode_int8_gate_up<R>;
-GGUF_DECODE_INT8_ROWS(16) GGUF_DECODE_INT8_ROWS(32)
+using GgufDecodeInt8Kernel = void(device char *, device uchar *, device uchar *, device uchar *, device Out *,
+                                  device coherent(device) float *, device atomic_uint *, device bfloat *,
+                                  constant GgufDecodeParams &, uint2, uint, uint);
+using GgufDecodeInt8GateUpKernel = void(device char *, device uchar *, device uchar *, device uchar *, device uchar *,
+                                        device uchar *, device uchar *, device bfloat *, device coherent(device) float *,
+                                        device atomic_uint *, constant GgufDecodeParams &, uint2, uint);
+using GgufDecodeInt8FusedKernel = void(device char *, device uchar *, device uchar *, device uchar *, device uchar *,
+                                       device uchar *, device uchar *, device uchar *, device uchar *, device uchar *,
+                                       device bfloat *, device coherent(device) float *, device atomic_uint *,
+                                       constant GgufDecodeFusedParams &, uint2, uint, uint);
+#define GGUF_DECODE_INT8(F, f, R, ep, Ep, Out)                                                                     \
+  template [[host_name("gguf_decode_int8_" #f "_m" #R "_" #ep)]] kernel GgufDecodeInt8Kernel<Out>                  \
+      gguf_decode_int8<F, R, Ep, Out>;
+#define GGUF_DECODE_INT8_ROWS(F, f, R)                                                                             \
+  GGUF_DECODE_INT8(F, f, R, a, EpNone, bfloat) GGUF_DECODE_INT8(F, f, R, r, EpResidual, bfloat)                    \
+  GGUF_DECODE_INT8(F, f, R, g, EpUpWithGate, bfloat) GGUF_DECODE_INT8(F, f, R, a_f32, EpNone, float)               \
+  template [[host_name("gguf_decode_int8_" #f "_m" #R "_gate_up")]] kernel GgufDecodeInt8GateUpKernel              \
+      gguf_decode_int8_gate_up<F, R>;                                                                              \
+  template [[host_name("gguf_decode_int8_" #f "_fused_m" #R)]] kernel GgufDecodeInt8FusedKernel                    \
+      gguf_decode_int8_fused<F, R>;
+// The formats the int8 tiles take (quant_decode_int8_format).
+#define GGUF_DECODE_INT8_FORMAT(F, f) GGUF_DECODE_INT8_ROWS(F, f, 16) GGUF_DECODE_INT8_ROWS(F, f, 32)
+GGUF_DECODE_INT8_FORMAT(FmtPQ20, pq20)
+#undef GGUF_DECODE_INT8_FORMAT
 #undef GGUF_DECODE_INT8_ROWS
 #undef GGUF_DECODE_INT8
 #undef GGUF_SEGMENT_OF
 #undef GGUF_SEGMENT_PLANE
 #undef GGUF_SEGMENT_INDEX
+#undef GGUF_SEGMENTS
+#undef GGUF_SEGMENT

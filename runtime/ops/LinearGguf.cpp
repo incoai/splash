@@ -13,6 +13,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -24,8 +25,11 @@ namespace {
 constexpr size_t kFusedSegments = std::extent_v<decltype(GgufDecodeFusedParams::cols)>;
 static_assert(QUANT_TILE_ROWS % GGUF_TILE_COLUMNS == 0, "an int8 prefill column tile lies inside one plane tile");
 
-std::string decodeKernel(const char *format, uint32_t rows, char epilogue) {
-  return std::string("gguf_decode_") + format + "_m" + std::to_string(rows) + "_" + epilogue;
+// A staged decode kernel of a format at `rows` rows: gguf_decode_<format>_m<rows>_<suffix>, in int8 activations
+// (LinearConfig::decodeInt8) gguf_decode_int8_<format>_m<rows>_<suffix>.
+std::string decodeKernel(bool int8, const char *format, uint32_t rows, std::string_view suffix) {
+  return std::string(int8 ? "gguf_decode_int8_" : "gguf_decode_") + format + "_m" + std::to_string(rows) + "_" +
+         std::string(suffix);
 }
 std::string prefillKernel(const char *format, char epilogue) {
   return std::string("gguf_prefill_") + format + "_" + epilogue;
@@ -231,17 +235,23 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     if (k % GGUF_ROTATION_BLOCK)
       throw std::invalid_argument("a rotated projection takes whole rotation blocks");
     requireBytes(p.rotation.signs, k, "rotation sign");
-    if (plan.configuration().decodeInt8) {
-      addGgufDecodeInt8(graph, b, p, plan, gate);
-      return;
-    }
-    graph.add("gguf_rotate", {b.input, p.rotation.signs, b.scratch.rotated}, GgufRotationParams{k},
-              {k / GGUF_ROTATION_BLOCK, w.rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
     LinearBuffers rotated = b;
     rotated.input = b.scratch.rotated;
     rotated.prepared = {};
     Projection plain = p;
     plain.rotation = {};
+    if (plan.configuration().decodeInt8) {
+      // In int8 activations the rotation writes int8 rows and their scales for the plan's storage rows
+      // (gguf_rotate_int8), which the staged plan's int8 tiles read.
+      const uint32_t rows = plan.storageRows();
+      requireBytes(b.scratch.rotated, gguf_rotation_int8_bytes(k, rows), "projection int8 rows");
+      graph.add("gguf_rotate_int8", {b.input, p.rotation.signs, b.scratch.rotated}, GgufRotationInt8Params{k, rows},
+                {k / GGUF_ROTATION_BLOCK, w.rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
+      addGgufStaged(graph, rotated, plain, plan, gate);
+      return;
+    }
+    graph.add("gguf_rotate", {b.input, p.rotation.signs, b.scratch.rotated}, GgufRotationParams{k},
+              {k / GGUF_ROTATION_BLOCK, w.rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
     addGguf(graph, rotated, plain, plan, gate);
     return;
   }
@@ -260,7 +270,10 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
 // (fusedSegments), in decode as in prefill; decode runs gate/up as two passes,
 // or, where selectProjection sets LinearConfig::oneGateUpPass, as one pass over
 // 32-column threadgroups of one simdgroup each, and a prefill chunk with an
-// epilogue runs one dispatch per segment.
+// epilogue runs one dispatch per segment. In int8 activations
+// (LinearConfig::decodeInt8, decode only) the same dispatches run the int8
+// tiles of the segments' one format over the int8 rows of b.input, each K
+// split holding whole blocks of it.
 void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
                              const Projection &p, const LinearPlan &plan,
                              const Projection *gate) const {
@@ -270,9 +283,16 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
   const uint32_t rows = plan.storageRows(), splits = config.splits;
   const auto [partials, counters] = splitScratch(b, splits);
+  if (config.decodeInt8)
+    for (const Projection *q : {&p, gate})
+      if (q)
+        for (const QuantizedSegment &s : q->blocks().segments)
+          if (s.formatId != segments.front().formatId || (k / 32) % (splits * s.format().meta_groups))
+            throw std::invalid_argument("the int8 tiles take segments of one format, whole blocks of it per split");
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
-    graph.add(kernelInstance(decodeKernel(s.name(), rows, epilogue), plan.destination()),
+    graph.add(kernelInstance(decodeKernel(config.decodeInt8, s.name(), rows, std::string_view(&epilogue, 1)),
+                             plan.destination()),
               {b.input, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
               GgufDecodeParams{k, splits, n, s.columnOffset, config.spread},
               {s.outputSize / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
@@ -293,8 +313,11 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
     std::vector<metal::MetalBuffer> bindings{b.input};
     const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
     bindings.insert(bindings.end(), {b.output, partials, counters});
-    graph.add("gguf_decode_fused_m" + std::to_string(rows), std::move(bindings), params,
-              {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
+    graph.add((config.decodeInt8 ? std::string("gguf_decode_int8_") + segments.front().name() + "_fused_m"
+                                 : std::string("gguf_decode_fused_m")) +
+                  std::to_string(rows),
+              std::move(bindings), params, {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1},
+              {GGUF_STAGED_THREADS, 1, 1});
   };
   if (w.phase == LinearPhase::Prefill) {
     // A fused projection's chunk runs its segments in one dispatch, as decode
@@ -311,7 +334,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   }
   if (config.oneGateUpPass) {
     const auto [g, u] = onePassTensors(p, *gate);
-    graph.add(std::string("gguf_decode_") + u.name() + "_m" + std::to_string(rows) + "_gate_up",
+    graph.add(decodeKernel(config.decodeInt8, u.name(), rows, "gate_up"),
               {b.input, g.plane0, g.plane1Slot(), g.meta, u.plane0, u.plane1Slot(), u.meta, b.output, partials,
                counters},
               GgufDecodeParams{k, splits, n, u.columnOffset, config.spread},
@@ -450,60 +473,6 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
               GgufDecodeParams{k, config.splits, n, s.columnOffset, 0}, grid, {GGUF_REGISTER_THREADS, 1, 1});
   };
   addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
-}
-
-// The int8 tiles of a rotated PQ2_0 projection (LinearConfig::decodeInt8): gguf_rotate_int8 writes the rotated
-// input's int8 rows and scales to the rotated scratch (within rotatedBytes), for the plan's storage rows; the tiles
-// run as the staged tile's dispatches do, gate/up in one pass or two, a fused projection's segments in one dispatch.
-// Rows past the workload's are padding the tiles discard.
-void Linear::addGgufDecodeInt8(metal::CommandGraph &graph, const LinearBuffers &b, const Projection &p,
-                               const LinearPlan &plan, const Projection *gate) const {
-  const LinearWorkload w = plan.workload();
-  const LinearConfig config = plan.configuration();
-  const auto [n, k] = w.matrix;
-  const uint32_t rows = plan.storageRows();
-  const std::vector<QuantizedSegment> &segments = p.blocks().segments;
-  if (segments.size() > kFusedSegments || (segments.size() > 1 && w.epilogue != LinearEpilogue::None))
-    throw std::invalid_argument("the int8 tiles take at most three segments, one with an epilogue");
-  graph.add("gguf_rotate_int8", {b.input, p.rotation.signs, b.scratch.rotated}, GgufRotationInt8Params{k, rows},
-            {k / GGUF_ROTATION_BLOCK, w.rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
-  const uint32_t splits = config.splits;
-  const auto [partials, counters] = splitScratch(b, splits);
-  const std::string name =
-      std::string("gguf_decode_int8_") + segments.front().name() + "_m" + std::to_string(rows) + "_";
-  // One dispatch of up to three segments: slots past the last bind its planes again and take no columns.
-  const auto run = [&](std::span<const QuantizedSegment> group, char epilogue, const metal::MetalBuffer &output,
-                       const metal::MetalBuffer &aux) {
-    GgufDecodeInt8Params params{k, splits, n, {0, 0, 0}, {0, 0, 0}, config.spread};
-    std::vector<metal::MetalBuffer> bindings{b.scratch.rotated};
-    uint32_t columns = 0;
-    for (size_t i = 0; i < kFusedSegments; ++i) {
-      const QuantizedSegment &s = group[std::min(i, group.size() - 1)];
-      if (i < group.size()) {
-        params.cols[i] = s.outputSize;
-        params.offset[i] = s.columnOffset;
-        columns += s.outputSize;
-      }
-      bindings.insert(bindings.end(), {s.plane0, s.meta});
-    }
-    bindings.insert(bindings.end(), {output, partials, counters, aux});
-    graph.add(kernelInstance(name + epilogue, plan.destination()), std::move(bindings), params,
-              {columns / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
-  };
-  if (config.oneGateUpPass) {
-    const auto [g, u] = onePassTensors(p, *gate);
-    graph.add(name + "gate_up", {b.scratch.rotated, g.plane0, g.meta, u.plane0, u.meta, b.output, partials, counters},
-              GgufDecodeInt8Params{k, splits, n, {u.outputSize, 0, 0}, {u.columnOffset, 0, 0}, config.spread},
-              {u.outputSize / GGUF_STAGED_COLUMNS, splits, 1}, {GGUF_GATE_UP_THREADS, 1, 1});
-    return;
-  }
-  if (segments.size() == 1) {
-    addDecodeTensor(b, w.epilogue, segments.front(), gate,
-                    [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
-                        const metal::MetalBuffer &aux) { run(std::span(&s, 1), epilogue, output, aux); });
-    return;
-  }
-  run(segments, epilogueSuffix(LinearEpilogue::None), b.output, b.output);
 }
 
 // Float segments of a projection (QuantizedSegment::isFloat): a float projection
