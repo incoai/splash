@@ -60,12 +60,13 @@ same rules; so is one that leaves a frame unread for 30 seconds. A request the
 engine had started at each of two engine failures in a row that a request may
 cause (an execution failure, broken output, or a crash by a fault signal; not
 a kill, nor a command short of GPU memory) is refused with 400
-`request_quarantined` until the server restarts. A restarted engine is asked
-for the first engine's context, with `--max-context` as without, and serves
-what its plan holds of it ([Neural Engine prefill](internals.md#neural-engine-prefill)): one
-whose plan holds less, as once the Mac's memory budget shrank, serves less, and
-the server serves that until a later restart regains it; `/status` reports it
-as `capabilities.max_context_tokens`.
+`request_quarantined` for an hour the Mac is awake, or until the server
+restarts. A restarted engine is asked for the first engine's context, with
+`--max-context` as without, and serves what its plan holds of it
+([Neural Engine prefill](internals.md#neural-engine-prefill)): one whose plan
+holds less, as once the Mac's memory budget shrank, serves less, and the
+server serves that until a later restart regains it; `/status` reports it as
+`capabilities.max_context_tokens`.
 
 Ctrl+C or SIGTERM stops the server: it stops its engine with SIGTERM, which
 gives a persistent cache's newest restore points up to 6 s to reach the disk,

@@ -541,7 +541,7 @@ class NativeBackend:
             print_status(
                 f"Quarantine · {len(refused)} request"
                 f"{'' if len(refused) == 1 else 's'} in flight at two engine "
-                "failures in a row refused until the server restarts",
+                "failures in a row refused for an hour",
                 error=True,
             )
 
@@ -898,7 +898,7 @@ class NativeBackend:
                 )
                 return
             if self.quarantine.refuses(request.fingerprint):
-                # Retrying fails the same way, as capacity_exhausted does.
+                # Retrying fails the same way until the quarantine ends.
                 state.detach()
                 trace = self.runtime.last_crash_trace
                 job.events.put(
@@ -907,7 +907,8 @@ class NativeBackend:
                         APIError(
                             400,
                             "this request was in flight at two engine failures in "
-                            "a row; Splash refuses it until the server restarts"
+                            "a row; Splash refuses it for an hour after the "
+                            "second failure"
                             + (f" (crash trace: {trace})" if trace else ""),
                             "request_quarantined",
                         ),
