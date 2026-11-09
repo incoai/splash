@@ -80,6 +80,8 @@ public:
     if (unit == units.end())
       throw std::logic_error("took a unit the source does not hold");
     taken.push_back(unit->key);
+    if (duringTake)
+      duringTake();
     const Victim gone = *unit;
     units.erase(unit);
     FreeResult freed{.outcome = FreeOutcome::Met,
@@ -114,6 +116,8 @@ public:
   std::vector<Victim> landing;
   uint64_t unsizedBytes = 0;
   bool landsIntoExtents = false;
+  // What the take allocates as it frees, as a release refills the Index runway.
+  std::function<void()> duringTake;
   mutable uint32_t peeks = 0;
   // Each peek's key it asked after, 0 for the head.
   mutable std::vector<uint64_t> peeked;
@@ -368,6 +372,27 @@ void testShortClaimHoldsNothing() {
   const ClaimId low = fixture.ledger().open(request(2, RequestPriority::Background));
   require(!fixture.allocate(high, 2 * kGiB), "2 GiB fit in 1 GiB of room");
   require(fixture.allocate(low, 512 * kMiB), "a claim that does not wait held room");
+}
+
+// What a take allocates runs in its claim's scope: one refused says nothing of what the claim lacks, which its
+// refusal goes on saying (the control pass sizes the host's target by it).
+void testARefusalInsideATakeLeavesTheClaims() {
+  Fixture fixture(host(32 * kGiB), 10 * kGiB);
+  fixture.memory.hold("weights", 9 * kGiB);
+  MemoryLedger &ledger = fixture.ledger();
+  const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
+  require(!fixture.allocate(claim, 2 * kGiB), "2 GiB fit");
+  TestSource cache("cache");
+  cache.units = {Victim{.key = 1, .bytes = 3 * kGiB}};
+  cache.duringTake = [&] {
+    require(!fixture.memory.allocate(fixture.governor->allocationAdmission(), "index", 5 * kGiB), "5 GiB fit");
+  };
+  ledger.addSource(cache);
+  static_cast<void>(fixture.governor->free(claim, fixture.governor->need(claim)));
+  require(cache.taken == std::vector<uint64_t>{1}, "the take did not run");
+  require(ledger.claim(claim).refusal.bytes == 2 * kGiB, "a take's own refused allocation replaced the claim's refusal");
+  ledger.removeSource(cache);
+  ledger.close(claim);
 }
 
 // A scope restores the one it replaced: refusals go to the innermost claim, and with none open admission is as
@@ -2555,6 +2580,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testSnapshotRendersEveryAccount", testSnapshotRendersEveryAccount},
       {"testWaitingClaimHoldsRoomForItsRank", testWaitingClaimHoldsRoomForItsRank},
       {"testShortClaimHoldsNothing", testShortClaimHoldsNothing},
+      {"testARefusalInsideATakeLeavesTheClaims", testARefusalInsideATakeLeavesTheClaims},
       {"testNestedScopesRestore", testNestedScopesRestore},
       {"testClaimIdsNeverRepeat", testClaimIdsNeverRepeat},
       {"testHeldPagesFollowRank", testHeldPagesFollowRank},

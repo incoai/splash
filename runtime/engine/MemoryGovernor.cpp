@@ -410,8 +410,13 @@ std::array<uint32_t, 3> MemoryGovernor::heldPages(ClaimId claim) const {
 
 FreeResult MemoryGovernor::free(ClaimId claim, const Need &need) {
   const Scope scope(*this, claim);
-  return ledger_.free(claim, need, roomBytes(), hostRule_.level(),
-                      hostClass(ledger_.claim(claim).spec) == ClaimClass::InService);
+  // What the claim lacks stands: a refusal of what its takes allocate, as a
+  // release's refill of the Index runway, says nothing of it.
+  const Need refusal = ledger_.claim(claim).refusal;
+  const FreeResult result = ledger_.free(claim, need, roomBytes(), hostRule_.level(),
+                                         hostClass(ledger_.claim(claim).spec) == ClaimClass::InService);
+  ledger_.refused(claim, refusal);
+  return result;
 }
 
 uint64_t MemoryGovernor::available(const ClaimSpec &spec, const Need &need, const RestoredChains *kept) const {
