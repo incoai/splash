@@ -26,7 +26,8 @@ struct ServerView: View {
             if state.server.phase == .ready {
                 ActivitySection(advanced: advanced)
             }
-            if first || failed || state.installer.failure != nil || state.installer.running || state.keyProblem != nil {
+            if first || failed || state.installer.failure != nil || state.installer.checked != nil || state.installer.running
+                || state.keyProblem != nil {
                 Section {
                     if let problem = state.keyProblem {
                         ProblemRow(title: "Splash can’t use its API key",
@@ -43,9 +44,16 @@ struct ServerView: View {
                                            ? ("Remove from List", { state.server.dismissFailure(); state.removeLocal(model) }) : nil))
                     }
                     if let failure = state.installer.failure {
-                        ProblemRow(title: "\(state.displayName(of: failure.model)) couldn’t download",
+                        let name = state.displayName(of: failure.model)
+                        let check = state.installer.work == .check
+                        ProblemRow(title: check ? "Splash couldn’t check \(name) for updates" : "\(name) couldn’t download",
                                    message: failure.message, log: .downloads, dismiss: state.installer.dismissFailure,
-                                   action: ("Download Again", { state.download(failure.model) }))
+                                   action: check
+                                       ? ("Check Again", { state.checkForUpdates(failure.model) })
+                                       : ("Download Again", { state.download(failure.model) }))
+                    }
+                    if let checked = state.installer.checked {
+                        CheckedRow(model: checked.model, updated: checked.updated)
                     }
                     if state.installer.running { DownloadRow() }
                 } header: {
@@ -503,7 +511,10 @@ private struct DownloadRow: View {
         let installer = state.installer
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Downloading \(installer.model.map(state.displayName(of:)) ?? "")").font(.headline)
+                let name = installer.model.map(state.displayName(of:)) ?? ""
+                // A check says so until it finds something to download.
+                Text(installer.work == .check && installer.progress == nil ? "Checking \(name) for updates" : "Downloading \(name)")
+                    .font(.headline)
                 Spacer()
                 Button("Cancel") { installer.cancel() }
             }
@@ -521,7 +532,7 @@ private struct DownloadRow: View {
 
     private var caption: String {
         let installer = state.installer
-        guard let progress = installer.progress else { return "Preparing download…" }
+        guard let progress = installer.progress else { return installer.work == .check ? "Asking Hugging Face…" : "Preparing download…" }
         let amount = "\(Format.size(progress.done)) of \(Format.size(progress.total))"
         guard let remaining = installer.remaining else { return amount }
         if remaining < .seconds(60) { return "\(amount) — less than a minute left" }
@@ -536,10 +547,13 @@ private struct DownloadRow: View {
 private struct ModelRow: View {
     @Environment(AppState.self) private var state
     let model: InstalledModel
+    @State private var hovering = false
 
     var body: some View {
         let selected = state.selection == model.id
-        let detail = ([model.id, model.missing ? "Not found" : model.bytes.map(Format.size)] as [String?])
+        let files = state.modelFiles[model.id]
+        let detail = ([model.id, model.missing ? "Not found" : model.bytes.map(Format.size),
+                       files?.projector.map { _ in "with projector" }, files?.draft.map { _ in "with draft" }] as [String?])
             .compactMap { $0 }.joined(separator: " · ")
         Button { state.selection = model.id } label: {
             HStack(spacing: 8) {
@@ -553,6 +567,8 @@ private struct ModelRow: View {
                 }
                 Spacer()
                 if let phase { Text(phase).foregroundStyle(.secondary) }
+                // Room for the menu's button, which shows under the pointer, so that nothing moves.
+                Color.clear.frame(width: 24, height: 24)
                 Image(systemName: "checkmark")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.tint)
@@ -561,20 +577,82 @@ private struct ModelRow: View {
                     .animation(Motion.quick, value: selected)
             }
         }
-        .buttonStyle(.hoverRow)
+        // The highlight kept while the pointer is on the menu's button.
+        .buttonStyle(HoverStyle(padding: EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8), hovered: hovering))
+        .overlay(alignment: .trailing) {
+            if hovering {
+                // A square button, as the chat list's rows have, before the check.
+                Menu(content: { actions }) {
+                    Image(systemName: "ellipsis").foregroundStyle(.secondary).frame(width: 24, height: 24)
+                }
+                .menuStyle(.button)
+                .buttonStyle(HoverStyle(padding: EdgeInsets(), shape: AnyShape(.rect(cornerRadius: 6))))
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .padding(.trailing, 8 + 16 + 8)
+                .help("More")
+                .accessibilityLabel("More")
+            }
+        }
+        .onHover { hovering = $0 }
         .hoverRowAligned()
         .accessibilityLabel("\(state.displayName(of: model.id)), \(detail)")
         .accessibilityValue(phase ?? "")
         .accessibilityAddTraits(selected ? .isSelected : [])
         .help(state.catalog.about(of: model.id) ?? model.id)
-        .contextMenu {
-            if model.local {
-                Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: model.id)]) }
-                Button("Remove from List") { state.removeLocal(model.id) }
-            } else {
-                CopyModelID(id: model.id)
+        .contextMenu { actions }
+    }
+
+    /// What can be done with the model, as its menu's button and a right click on its row give it.
+    /// Model files on this Mac: choose a vision projector, a GGUF's alone, and a draft in place of
+    /// their family's, show them in the Finder or take them off the list. A model Splash installed:
+    /// check it for updates, which its starts don't ask the Hub for, or copy its ID.
+    @ViewBuilder private var actions: some View {
+        if model.local {
+            let files = state.modelFiles[model.id] ?? AppState.ModelFiles()
+            if model.gguf {
+                Button(files.projector == nil ? "Choose Vision Projector…" : "Change Vision Projector…") { chooseProjector() }
+                if files.projector != nil {
+                    Button("Remove Vision Projector") { state.modelFiles[model.id, default: files].projector = nil }
+                }
             }
+            Button(files.draft == nil ? "Choose Draft Model…" : "Change Draft Model…") { chooseDraft() }
+            if files.draft != nil {
+                Button("Use the Family’s Draft") { state.modelFiles[model.id, default: files].draft = nil }
+            }
+            Divider()
+            Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: model.id)]) }
+            Button("Remove from List") { state.removeLocal(model.id) }
+        } else {
+            // One download at a time; the model that runs is checked once stopped.
+            Button("Check for Updates") { state.checkForUpdates(model.id) }
+                .disabled(!state.ready || state.installer.running || (state.server.running && state.server.model == model.id))
+            CopyModelID(id: model.id)
         }
+    }
+
+    /// Asks for the GGUF vision projector the model files start with, from their folder.
+    private func chooseProjector() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = UTType(filenameExtension: "gguf").map { [$0] } ?? []
+        panel.directoryURL = URL(filePath: model.id).deletingLastPathComponent()
+        panel.prompt = "Choose"
+        panel.message = "Choose the GGUF vision projector of this model, such as mmproj-BF16.gguf."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        state.modelFiles[model.id, default: AppState.ModelFiles()].projector = url.path
+    }
+
+    /// Asks for the folder of the DFlash2 draft the model files start with.
+    private func chooseDraft() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.prompt = "Choose"
+        panel.message = "Choose the folder of a DFlash2 draft for this model."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        state.modelFiles[model.id, default: AppState.ModelFiles()].draft = url.path
     }
 
     /// What the server does with this model, if anything.
@@ -612,6 +690,34 @@ private struct SuggestedRow: View {
         }
         .help(variant.id)
         .contextMenu { CopyModelID(id: variant.id) }
+    }
+}
+
+/// What a check for updates found: the model downloaded what had moved on, which its next start
+/// uses, or had it all.
+private struct CheckedRow: View {
+    @Environment(AppState.self) private var state
+    let model: String
+    let updated: Bool
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(updated ? "\(state.displayName(of: model)) is updated" : "\(state.displayName(of: model)) is up to date")
+                    .font(.headline)
+                Text(updated ? "Its next start uses the new files." : "Hugging Face has nothing newer.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 12)
+            Button(action: state.installer.dismissChecked) { Image(systemName: "xmark") }
+                .buttonStyle(.hover)
+                .foregroundStyle(.secondary)
+                .help("Dismiss")
+                .accessibilityLabel("Dismiss")
+        }
+        .padding(.vertical, 2)
     }
 }
 

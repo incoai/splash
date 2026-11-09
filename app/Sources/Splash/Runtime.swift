@@ -289,6 +289,15 @@ struct InstalledModel: Identifiable, Hashable, Sendable {
     /// Whether it is model files on this Mac rather than a model Splash installed.
     var local: Bool { id.hasPrefix("/") }
 
+    /// Whether it is a GGUF model: one Splash installed by its variant (`OWNER/REPO:VARIANT`), or
+    /// model files on this Mac that are a GGUF file or a folder holding one besides a projector.
+    var gguf: Bool {
+        guard local else { return id.contains(":") }
+        if id.hasSuffix(".gguf") { return true }
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: id)) ?? []
+        return names.contains { $0.hasSuffix(".gguf") && !$0.localizedCaseInsensitiveContains("mmproj") }
+    }
+
     /// The model files at `path`, a GGUF file or a folder, measured.
     static func local(_ path: String) -> InstalledModel {
         let url = URL(filePath: path).resolvingSymlinksInPath()

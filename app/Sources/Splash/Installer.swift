@@ -75,6 +75,14 @@ final class Installer {
     private(set) var progress: Progress?
     /// The last installation that failed: its model and why.
     private(set) var failure: (model: String, message: String)?
+    /// What the installer does with a model: downloads it, or checks an installed one for
+    /// updates, which downloads only what has moved on, if anything.
+    enum Work { case download, check }
+    /// What the installation running does, or else what the last one did.
+    private(set) var work = Work.download
+    /// The last check for updates that ended: its model, and whether it downloaded what had moved
+    /// on rather than finding it all there.
+    private(set) var checked: (model: String, updated: Bool)?
 
     /// Gets each model once it is installed.
     @ObservationIgnored var installed: (String) -> Void = { _ in }
@@ -90,6 +98,8 @@ final class Installer {
     private var activity: NSObjectProtocol?
     /// When and at how many bytes the model's own download was first reported.
     private var began: (date: Date, done: Int64)?
+    /// Whether anything downloaded, the draft's files too.
+    private var downloaded = false
 
     init(runtime: Runtime, log: URL, defaults: UserDefaults) {
         self.runtime = runtime
@@ -107,12 +117,16 @@ final class Installer {
         return .seconds(Double(progress.total - progress.done) * elapsed / Double(progress.done - began.done))
     }
 
-    func install(_ model: String) {
+    /// Downloads `model`, or checks it for updates (`Work`).
+    func install(_ model: String, _ work: Work = .download) {
         guard child == nil else { return }
         self.model = model
+        self.work = work
         progress = nil
         began = nil
+        downloaded = false
         failure = nil
+        checked = nil
         reported = nil
         cancelled = false
         resetLog(log)
@@ -147,6 +161,11 @@ final class Installer {
         failure = nil
     }
 
+    /// Clears what a check found, once read.
+    func dismissChecked() {
+        checked = nil
+    }
+
     /// Stops the download this app started before it quit or crashed, if it still runs; its record
     /// stays until then, for the next launch should this one end first. An app before 1.6 kept its
     /// download's ID alone: the process that still runs the installer under the ID as an app
@@ -161,6 +180,7 @@ final class Installer {
             return
         }
         guard let event = Progress(line: line) else { return }
+        downloaded = true
         guard let model, event.repo == model.split(separator: ":")[0] else { return }
         if began == nil { began = (.now, event.done) }
         progress = event
@@ -174,6 +194,7 @@ final class Installer {
         self.model = nil
         progress = nil
         if status == 0 {
+            if work == .check { checked = (model, downloaded) }
             installed(model)
         } else if !cancelled {
             failure = (model, reported.map { Self.problem($0, model: model) }

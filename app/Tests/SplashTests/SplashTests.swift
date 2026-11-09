@@ -91,6 +91,23 @@ struct ServeSettingsTests {
         #expect(settings.url.absoluteString == "http://127.0.0.1:8100")
     }
 
+    /// Model files on this Mac start with their own projector and draft, which their start alone
+    /// passes, after the files; a model Splash installed passes neither. A change of either
+    /// starts the model otherwise.
+    @Test func passesTheModelFilesOwnProjectorAndDraft() {
+        var settings = ServeSettings(values: ["--port": "8100"])
+        settings.projector = "/models/mmproj-BF16.gguf"
+        settings.draft = "/models/draft"
+        #expect(settings.serveArguments(model: "/models/q.gguf", localName: nil)
+            == ["serve", "--model", "local/q", "--model-dir", "/models/q.gguf", "--mmproj", "/models/mmproj-BF16.gguf",
+                "--draft-model", "/models/draft", "--port", "8100", "--offline"])
+        #expect(settings.serveArguments(model: "a/b", localName: nil) == ["serve", "--model", "a/b", "--port", "8100", "--offline"])
+        #expect(settings.usable(by: .unknown).projector == settings.projector && settings.usable(by: .unknown).draft == settings.draft)
+        var other = settings
+        other.projector = nil
+        #expect(settings.differs(from: other, model: "/models/q.gguf", family: .unknown))
+    }
+
     /// Listening on every network, the server accepts this Mac's .local name, once, which the API
     /// address it gives other devices names; on this Mac alone, neither.
     @Test func givesOtherDevicesThisMacsLocalName() {
@@ -387,6 +404,54 @@ struct AppStateTests {
         state.options.apiKey = nil
         state.keepKey()
         #expect(try keychain.read() == nil)
+    }
+
+    /// What model files on this Mac start with besides is kept as it is set, joins the settings
+    /// their start uses, and goes with them off the list.
+    @Test func keepsWhatModelFilesStartWith() throws {
+        let fake = try FakeRuntime("splash-model-files", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        state.modelFiles["/m/q.gguf", default: AppState.ModelFiles()].projector = "/m/mmproj.gguf"
+        state.modelFiles["/m/q.gguf", default: AppState.ModelFiles()].draft = "/m/draft"
+        let again = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { again.quit() }
+        #expect(again.modelFiles["/m/q.gguf"] == AppState.ModelFiles(projector: "/m/mmproj.gguf", draft: "/m/draft"))
+        #expect(state.settings(for: "/m/q.gguf").projector == "/m/mmproj.gguf" && state.settings(for: "a/b").projector == nil)
+        state.modelFiles["/m/q.gguf"]?.projector = nil
+        #expect(state.modelFiles["/m/q.gguf"] == AppState.ModelFiles(draft: "/m/draft"))
+        state.removeLocal("/m/q.gguf")
+        #expect(state.modelFiles.isEmpty)
+    }
+
+    /// A check for updates says what it found: that the model had it all, where nothing
+    /// downloaded, or that it is updated, where something did, its draft's files too.
+    @Test func aCheckForUpdatesSaysWhatItFound() async throws {
+        let fake = try FakeRuntime("splash-check", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        await state.launch()
+        let installer = fake.root.appending(path: "install/models.py")
+        try "import sys\n".write(to: installer, atomically: true, encoding: .utf8)
+        state.checkForUpdates("a/b")
+        #expect(state.installer.running && state.installer.work == .check)
+        try await waitFor(!state.installer.running, "the check")
+        #expect(state.installer.checked?.model == "a/b" && state.installer.checked?.updated == false)
+        try "print('{\"event\": \"download\", \"repo\": \"a/b-draft\", \"done\": 1, \"total\": 2}', flush=True)\n"
+            .write(to: installer, atomically: true, encoding: .utf8)
+        state.checkForUpdates("a/b")
+        #expect(state.installer.checked == nil)
+        try await waitFor(!state.installer.running, "the check")
+        #expect(state.installer.checked?.updated == true)
+        state.installer.dismissChecked()
+        #expect(state.installer.checked == nil)
+        // A download is no check.
+        state.download("a/b")
+        #expect(state.installer.work == .download)
+        try await waitFor(!state.installer.running, "the download")
+        #expect(state.installer.checked == nil)
     }
 
     /// The server's status is asked less often while neither the window nor the menu bar's panel

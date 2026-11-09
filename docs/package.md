@@ -108,7 +108,9 @@ still runs the download command above; it leaves any other process alone and
 forgets the record. It serves model files on this Mac
 the user adds with `splash serve --model local/NAME
 --model-dir PATH`, NAME being the file's or folder's name made a repository
-name, and at launch it runs `install/cached.py`. While a model runs, the Server
+name, with the `--mmproj` and `--draft-model` their row's menu chooses, and at
+launch it runs `install/cached.py`. Since it starts models `--offline`, an
+installed model's menu checks it for updates, which `prepare` installs. While a model runs, the Server
 shows its context limit, from `/v1/models`, and its `/status`, asked every 2 s,
 or every 10 s while neither the window nor the menu bar's panel is open: requests,
 answering and prompt speed, time to first token, the tokens generated, read and

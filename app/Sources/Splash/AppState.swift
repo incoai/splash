@@ -190,7 +190,7 @@ final class AppState {
     /// Whether the model that runs would start otherwise with the options set now.
     var optionsChanged: Bool {
         guard server.phase == .ready, let model = server.model else { return false }
-        return server.settings.differs(from: options, model: model, family: family(of: model))
+        return server.settings.differs(from: settings(for: model), model: model, family: family(of: model))
     }
 
     /// What the family of `model`, a listed one, makes of the launch options; unknown for model
@@ -276,7 +276,7 @@ final class AppState {
         guard canStart else { return }
         selection = model
         chats.stop()
-        server.start(model, settings: options.usable(by: family(of: model)))
+        server.start(model, settings: settings(for: model))
     }
 
     func stop() {
@@ -507,10 +507,52 @@ final class AppState {
         refresh(picking: url.path)
     }
 
-    /// Takes model files off the list; the files stay where they are.
+    /// Takes model files off the list, and what they started with; the files stay where they are.
     func removeLocal(_ path: String) {
         localModels.removeAll { $0 == path }
+        modelFiles[path] = nil
         refresh()
+    }
+
+    /// What model files on this Mac start with besides: a GGUF's vision projector, without which
+    /// it serves text alone, and a draft in place of its family's released one.
+    struct ModelFiles: Equatable {
+        var projector: String?
+        var draft: String?
+    }
+
+    /// What each of the model files on this Mac starts with besides, by its path, kept as they
+    /// are set.
+    var modelFiles: [String: ModelFiles] {
+        get {
+            access(keyPath: \.modelFiles)
+            let kept = defaults.dictionary(forKey: Preference.localModelFiles) as? [String: [String: String]] ?? [:]
+            return kept.mapValues { ModelFiles(projector: $0["projector"], draft: $0["draft"]) }
+        }
+        set {
+            withMutation(keyPath: \.modelFiles) {
+                let kept = newValue.filter { $0.value != ModelFiles() }
+                    .mapValues { ["projector": $0.projector, "draft": $0.draft].compactMapValues { $0 } }
+                defaults.set(kept, forKey: Preference.localModelFiles)
+            }
+        }
+    }
+
+    /// The settings `model` starts with: the launch options it takes, and, for model files on this
+    /// Mac, their own projector and draft.
+    func settings(for model: String) -> ServeSettings {
+        var settings = options.usable(by: family(of: model))
+        let files = modelFiles[model]
+        settings.projector = files?.projector
+        settings.draft = files?.draft
+        return settings
+    }
+
+    /// Asks the Hub whether `model` or its draft has moved on, and installs what has, as its
+    /// download did: the starts skip that question (`--offline`).
+    func checkForUpdates(_ model: String) {
+        guard ready else { return }
+        installer.install(model, .check)
     }
 
     func isInstalled(_ model: String) -> Bool {
