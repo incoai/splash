@@ -1291,8 +1291,9 @@ private:
   // transfersInFlight() as the walk's takes wait for it: of the copies
   // ahead, those that return to the walk.
   [[nodiscard]] bool transfersInFlight(const Walk &walk) const noexcept;
-  // A copy persist() writes frees nothing as it lands: its page stays. Until
-  // then it holds its block out of every order, and every block above it.
+  // A copy persist() writes frees nothing as it lands: its page stays, as
+  // does a Spill request's once no request holds its block. Until then it
+  // holds its block out of every order, and every block above it.
   // Once it lands the block is idle, and a reclaim of the class frees it
   // through the copy after the resident blocks below it, and those above it
   // after it, where the walk's reach counts an idle page (KvCache::pageReach):

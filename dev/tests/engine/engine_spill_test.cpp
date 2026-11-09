@@ -2787,6 +2787,40 @@ void testAStartNeverReleasesAHigherPriorityLane() {
   require(spill.events.failures.empty() && spill.events.completedCount == 2, "the requests did not complete");
 }
 
+// A request alone at the wall waits for the copies a finished Spill lane left in flight, which free the lane's pages
+// as they land: refused then, it would be told to shrink its context, where a retry a moment later succeeds.
+void testALoneRequestWaitsForTheCopiesAFinishedSpillLaneLeft() {
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 32;
+  bool land = false;
+  const auto run = [&](const std::function<bool()> &done, const char *message) {
+    for (uint32_t step = 0; step < 6000 && !done(); ++step) {
+      static_cast<void>(spill.engine.tick(spill.now++));
+      if (land)
+        spill.tier.complete();
+    }
+    require(done(), message);
+  };
+  spill.host.leaveRoom(FlashNextGoverned::kStartRoomBytes);
+  spill.engine.submit(Spilling::prompt(1, 1, 3'070, 1));
+  run([&] { return std::ranges::count(spill.events.startIds, uint64_t{1}) != 0; }, "the lane did not start");
+  spill.host.leaveRoom(std::nullopt);
+  require(kvMode(spill, 1) == KvMode::Spill, "the lane was not placed Spill");
+  run([&] { return spill.events.completedCount == 1; }, "the lane did not finish");
+  require(spill.tier.inFlight() != 0, "no copy of the lane's was in flight as it finished");
+  require(spill.cache.transfersInFlight(), "the finished lane's copies in flight counted as nothing on its way back");
+  lanes.wall();
+  spill.engine.submit(Spilling::prompt(2, 2, 3'070, 4));
+  for (uint32_t step = 0; step < 300; ++step)
+    static_cast<void>(spill.engine.tick(spill.now++));
+  require(spill.events.failures.empty(), "a lone request failed while a finished lane's copies were in flight");
+  land = true;
+  spill.host.leaveRoom(std::nullopt);
+  run([&] { return spill.events.completedCount == 2 || !spill.events.failures.empty(); }, "the request did not end");
+  require(spill.events.failures.empty(), "the request failed once the copies landed");
+}
+
 // A decoding Spill lane of 3,070 pages under macOS's critical pressure, which refuses every allocation, beside an
 // expert store of `chunks` 1 GiB chunks over a floor of two: a release at an earlier wall left it Index pages, its hot
 // block floor and five extents of pages whose copies landed.
@@ -4051,6 +4085,7 @@ std::span<const test::TestCase> spillTests() {
       {"testTheFirstReleaseFundsTheLanesReads", testTheFirstReleaseFundsTheLanesReads},
       {"testAStartReleasesALaneOfItsPriority", testAStartReleasesALaneOfItsPriority},
       {"testAStartNeverReleasesAHigherPriorityLane", testAStartNeverReleasesAHigherPriorityLane},
+      {"testALoneRequestWaitsForTheCopiesAFinishedSpillLaneLeft", testALoneRequestWaitsForTheCopiesAFinishedSpillLaneLeft},
       {"testCriticalReleasesCleanPagesBeforeAnyLaneYields", testCriticalReleasesCleanPagesBeforeAnyLaneYields},
       {"testACriticalPassReleasesPastTheEnginesLimit", testACriticalPassReleasesPastTheEnginesLimit},
       {"testARefillTheDriverDeniesIsNoOvercount", testARefillTheDriverDeniesIsNoOvercount},

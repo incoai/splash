@@ -1113,8 +1113,8 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
     throw std::logic_error("a walk restores chains the cache does not count");
   const std::span<const uint64_t> reused = walk.reused ? walk.reused->states() : std::span<const uint64_t>{};
   // A write in flight frees what it holds once it lands only where a take
-  // waits for it (returns): a demotion, a copy ahead whose block a reclaim
-  // of the class then frees through it (copyAheadReturns), under --kv-spill
+  // waits for it (returns): a demotion, a copy whose block a reclaim of
+  // the class then frees through it (copyAheadReturns), under --kv-spill
   // always a write through whose page spills as it lands. Above any other,
   // no reclaim reaches a page until it has landed. The extents that hold a
   // page a transfer reads or fills, which compaction does not move, empty
@@ -1779,7 +1779,7 @@ bool Cache::copyAheadReturns(const Write &write, const Walk &walk, ReclaimClass 
   // Its block, idle once the copy lands, is in the walk's reach as
   // KvCache::pageReach counts an idle page.
   const KvCache::Keeps stays = KvCache::keepBit(KvCache::Keep::Busy) | keptChains(walk, upTo);
-  return write.write == WriteClass::Persist && !(kv_.keeps(write.block) & stays) &&
+  return write.write != WriteClass::Reclaim && !(kv_.keeps(write.block) & stays) &&
          !(walk.reused && walk.reused->holds(write.block));
 }
 
