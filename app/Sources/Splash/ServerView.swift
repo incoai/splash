@@ -87,7 +87,7 @@ private struct ServerSections: View {
                         }
                     }
                     if let checked = state.installer.checked {
-                        CheckedRow(model: checked.model, updated: checked.updated)
+                        CheckedRow(model: checked.model, result: checked.result)
                     }
                     if state.installer.running { DownloadRow() }
                 } header: {
@@ -757,24 +757,30 @@ private struct SuggestedRow: View {
     }
 }
 
-/// What a check for updates found: the model downloaded what had moved on, which its next start
-/// uses, or had it all.
+/// What a check for updates found, as the installer reported it: the model downloaded what had
+/// moved on, which its next start uses, had it all, or couldn't be checked or updated, where the
+/// log says why.
 private struct CheckedRow: View {
     @Environment(AppState.self) private var state
     let model: String
-    let updated: Bool
+    let result: Installer.Result
 
     var body: some View {
+        let words = Installer.words(result, name: state.displayName(of: model))
         HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Image(systemName: "checkmark.circle.fill").foregroundStyle(.secondary)
+            Image(systemName: words.done ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 4) {
-                Text(updated ? "\(state.displayName(of: model)) is updated" : "\(state.displayName(of: model)) is up to date")
+                Text(words.title)
                     .font(.headline)
-                Text(updated ? "Its next start uses the new files." : "Hugging Face has nothing newer.")
+                Text(words.detail)
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 12)
+            if !words.done {
+                Button("Show Log") { state.showLog(.downloads) }
+            }
             Button(action: state.installer.dismissChecked) { Image(systemName: "xmark") }
                 .buttonStyle(.hover)
                 .foregroundStyle(.secondary)

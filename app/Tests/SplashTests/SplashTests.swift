@@ -426,8 +426,9 @@ struct AppStateTests {
         #expect(state.modelFiles.isEmpty)
     }
 
-    /// A check for updates says what it found: that the model had it all, where nothing
-    /// downloaded, or that it is updated, where something did, its draft's files too.
+    /// A check for updates says what the installer reports it found last: that the model is up
+    /// to date or updated, or that it couldn't be checked or updated, whatever downloaded; nothing
+    /// where the installer reported nothing.
     @Test func aCheckForUpdatesSaysWhatItFound() async throws {
         let fake = try FakeRuntime("splash-check", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
@@ -439,13 +440,20 @@ struct AppStateTests {
         state.checkForUpdates("a/b")
         #expect(state.installer.running && state.installer.work == .check)
         try await waitFor(!state.installer.running, "the check")
-        #expect(state.installer.checked?.model == "a/b" && state.installer.checked?.updated == false)
-        try "print('{\"event\": \"download\", \"repo\": \"a/b-draft\", \"done\": 1, \"total\": 2}', flush=True)\n"
-            .write(to: installer, atomically: true, encoding: .utf8)
-        state.checkForUpdates("a/b")
         #expect(state.installer.checked == nil)
-        try await waitFor(!state.installer.running, "the check")
-        #expect(state.installer.checked?.updated == true)
+        let outcomes: [(String, Installer.Outcome)] = [
+            ("up_to_date", .upToDate), ("updated", .updated), ("unreachable", .unreachable), ("kept", .kept),
+        ]
+        for (name, outcome) in outcomes {
+            try """
+            print('{"event": "download", "repo": "a/b-draft", "done": 1, "total": 2}', flush=True)
+            print('{"event": "prepared", "outcome": "\(name)"}', flush=True)
+            """.write(to: installer, atomically: true, encoding: .utf8)
+            state.checkForUpdates("a/b")
+            #expect(state.installer.checked == nil)
+            try await waitFor(!state.installer.running, "the check")
+            #expect(state.installer.checked?.model == "a/b" && state.installer.checked?.result == .checked(outcome))
+        }
         state.installer.dismissChecked()
         #expect(state.installer.checked == nil)
         // A download is no check.
@@ -1230,6 +1238,26 @@ struct OutputTests {
         #expect(Installer.problem(unclassed, model: "a/b") == "cannot install a/b: no supported model")
         #expect(Installer.Failure(line: #"{"event": "download", "repo": "a/b", "done": 1, "total": 2}"#) == nil)
         #expect(Installer.Failure(line: "error: cannot install a/b") == nil)
+    }
+
+    /// What a check for updates found is worded as the installer reports it last
+    /// (install/models.py prepare --json-progress).
+    @Test func checkAndDeletionResultsAreWordedAsReported() throws {
+        func outcome(_ name: String) -> Installer.Outcome? {
+            Installer.Outcome(line: #"{"event": "prepared", "outcome": "\#(name)"}"#)
+        }
+        #expect(outcome("updated") == .updated && outcome("up_to_date") == .upToDate)
+        #expect(outcome("unreachable") == .unreachable && outcome("kept") == .kept)
+        #expect(outcome("later") == nil)
+        #expect(Installer.Outcome(line: #"{"event": "removed", "bytes": 1}"#) == nil)
+        func words(_ result: Installer.Result) -> String {
+            let words = Installer.words(result, name: "Q")
+            return "\(words.title) / \(words.detail)\(words.done ? "" : " !")"
+        }
+        #expect(words(.checked(.updated)) == "Q is updated / Its next start uses the new files.")
+        #expect(words(.checked(.upToDate)) == "Q is up to date / Hugging Face has nothing newer.")
+        #expect(words(.checked(.unreachable)) == "Splash couldn’t check Q for updates / Hugging Face was not reachable. !")
+        #expect(words(.checked(.kept)) == "Splash couldn’t update Q / It kept the installed version. !")
     }
 
     @Test func readsDownloadEvents() {

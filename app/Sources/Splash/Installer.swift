@@ -52,6 +52,48 @@ final class Installer {
         }
     }
 
+    /// What a check for updates found, as the installer reports it last (`prepared`,
+    /// install/upstream.py).
+    enum Outcome: String, Decodable {
+        /// It downloaded what had moved on, which the next start uses.
+        case updated
+        /// Hugging Face has nothing newer.
+        case upToDate = "up_to_date"
+        /// It couldn't check: Hugging Face didn't answer, or wasn't asked (HF_HUB_OFFLINE).
+        case unreachable
+        /// What had moved on couldn't be installed, and the installed version stays.
+        case kept
+
+        /// The outcome a line of the installer's output reports, if it is a `prepared` event.
+        init?(line: String) {
+            struct Event: Decodable {
+                let event: String
+                let outcome: Outcome
+            }
+            guard line.hasPrefix("{"),
+                  let event = try? JSONDecoder().decode(Event.self, from: Data(line.utf8)),
+                  event.event == "prepared"
+            else { return nil }
+            self = event.outcome
+        }
+    }
+
+    /// What a check for updates that ended did, which the Server shows until read.
+    enum Result: Equatable {
+        case checked(Outcome)
+    }
+
+    /// What the Server says of `result` for the model `name`: a title, the line under it, and
+    /// whether it did what was asked.
+    nonisolated static func words(_ result: Result, name: String) -> (title: String, detail: String, done: Bool) {
+        switch result {
+        case .checked(.updated): ("\(name) is updated", "Its next start uses the new files.", true)
+        case .checked(.upToDate): ("\(name) is up to date", "Hugging Face has nothing newer.", true)
+        case .checked(.unreachable): ("Splash couldn’t check \(name) for updates", "Hugging Face was not reachable.", false)
+        case .checked(.kept): ("Splash couldn’t update \(name)", "It kept the installed version.", false)
+        }
+    }
+
     /// A failure installing `model`, in words a user can act on.
     nonisolated static func problem(_ failure: Failure, model: String) -> String {
         let name = model.split(separator: ":")[0]
@@ -92,9 +134,9 @@ final class Installer {
     }
     /// What the installation running does, or else what the last one did.
     private(set) var work = Work.download
-    /// The last check for updates that ended: its model, and whether it downloaded what had moved
-    /// on rather than finding it all there.
-    private(set) var checked: (model: String, updated: Bool)?
+    /// The last check for updates that ended, as the installer reported it: its model, and what
+    /// it found.
+    private(set) var checked: (model: String, result: Result)?
 
     /// Gets each model once it is downloaded.
     @ObservationIgnored var installed: (String) -> Void = { _ in }
@@ -111,11 +153,11 @@ final class Installer {
     let record: ChildRecord
     private var cancelled = false
     private var reported: Failure?
+    /// What the check running found, as reported.
+    private var outcome: Outcome?
     private var activity: NSObjectProtocol?
     /// When and at how many bytes the model's own download was first reported.
     private var began: (date: Date, done: Int64)?
-    /// Whether anything downloaded, the draft's files too.
-    private var downloaded = false
 
     init(runtime: Runtime, log: URL, defaults: UserDefaults) {
         self.runtime = runtime
@@ -150,10 +192,10 @@ final class Installer {
         self.work = work
         progress = nil
         began = nil
-        downloaded = false
         failure = nil
         checked = nil
         reported = nil
+        outcome = nil
         cancelled = false
         resetLog(log)
         do {
@@ -206,8 +248,11 @@ final class Installer {
             self.reported = reported
             return
         }
+        if let outcome = Outcome(line: line) {
+            self.outcome = outcome
+            return
+        }
         guard let event = Progress(line: line) else { return }
-        downloaded = true
         guard let model, event.repo == model.split(separator: ":")[0] else { return }
         if began == nil { began = (.now, event.done) }
         progress = event
@@ -224,7 +269,7 @@ final class Installer {
             switch work {
             case .download: installed(model)
             case .check:
-                checked = (model, downloaded)
+                checked = outcome.map { (model, .checked($0)) }
                 changed(model)
             case .removal: changed(model)
             }
