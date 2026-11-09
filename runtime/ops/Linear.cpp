@@ -254,9 +254,10 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   if (p.rotation) requireBytes(b.scratch.rotated, rotatedBytes(k, rows), "projection rotated input");
   addGguf(graph, b, p, selected, gate);
   // A rotated projection's plan prepares its table, if any, from the rotated
-  // rows, which no other plan reads; the int8 prefill tile overwrites the
-  // table with its own codes.
-  if (p.rotation || selected.configuration().tile == LinearTile::GgufPrefillInt8) return {};
+  // rows, which no other plan reads. The int8 prefill tile leaves its codes
+  // and scales of the input in the table, for a next plan over the same rows.
+  if (p.rotation) return {};
+  if (selected.configuration().tile == LinearTile::GgufPrefillInt8) return {b.input, LinearInput::PrefillInt8};
   // Only quantized segments run the plan's tile: float segments alone leave
   // the scratch table as it was.
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
@@ -279,15 +280,13 @@ void Linear::addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer i
 void Linear::addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn,
                               const PrefillFfnBuffers &b, metal::MetalBuffer residual, metal::MetalBuffer output,
                               uint32_t rows, uint32_t chunkRows) const {
-  addPrefill(graph, b.normalized, *ffn.gate, b.gateScratch, rows, b.scratch, chunkRows);
-  addPrefillUpWithGate(graph, b.normalized, *ffn.up, b.gateScratch, b.intermediate, rows, b.scratch, chunkRows);
+  const PreparedInput normalized = add(graph, {.input = b.normalized, .output = b.gateScratch, .scratch = b.scratch},
+                                       *ffn.gate, prefillPlan(*ffn.gate, rows, LinearEpilogue::None, chunkRows));
+  add(graph,
+      {.input = b.normalized, .output = b.intermediate, .gateScratch = b.gateScratch, .scratch = b.scratch,
+       .prepared = normalized},
+      *ffn.up, prefillPlan(*ffn.up, rows, LinearEpilogue::UpWithGate, chunkRows));
   addPrefillResidual(graph, b.intermediate, *ffn.down, residual, output, rows, b.scratch, chunkRows);
-}
-void Linear::addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
-                                  metal::MetalBuffer gateScratch, metal::MetalBuffer output, uint32_t rows,
-                                  LinearScratch scratch, uint32_t chunkRows) const {
-  add(graph, {.input = input, .output = output, .gateScratch = gateScratch, .scratch = scratch}, up,
-      prefillPlan(up, rows, LinearEpilogue::UpWithGate, chunkRows));
 }
 
 } // namespace splash::ops

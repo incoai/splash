@@ -2,8 +2,9 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// The int8-activation quantizers' rule, shared by gguf_rotate_int8 (a row's rotation block) and the attention tiles'
-// INT8 queries (a fused row), each of which reduces its block's largest magnitude m itself:
+// The int8-activation quantizers' rule, shared by gguf_rotate_int8 (a row's rotation block),
+// gguf_prefill_int8_quantize (a row's 64-input group) and the attention tiles' INT8 queries (a fused row), each of
+// which reduces its block's largest magnitude m itself:
 // - an input x codes as q = clamp(rint(x * (127 / m)), -127, 127), ties to even, and stands for q * s, s = m / 127;
 //   both quotients are correctly rounded (precise::divide, where fast math's divide is within 2.5 ulp), so a host
 //   reference computes the same codes and scales bit for bit;

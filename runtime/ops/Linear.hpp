@@ -184,10 +184,13 @@ struct LinearScratchSize final {
 
 // The activation layout a decode plan reads: the producer's bf16 rows, or an
 // X^T table with fp32 row sums in LinearScratch that a producer can emit
-// alongside its ordinary output.
+// alongside its ordinary output; or the int8 prefill tile's codes, which only
+// that tile writes, for a next plan over the same rows (a SwiGLU's up after
+// its gate).
 enum class LinearInput : uint8_t {
-  Plain,    // bf16 [rows][K]
-  Table16,  // the register tile's table, sums per 16 and 32 inputs (kernels/common/gguf_sgmatrix.h)
+  Plain,        // bf16 [rows][K]
+  Table16,      // the register tile's table, sums per 16 and 32 inputs (kernels/common/gguf_sgmatrix.h)
+  PrefillInt8,  // the int8 prefill tile's codes and scales per 64 inputs (kernels/prefill/gguf_prefill_int8.metal)
 };
 // Scratch bytes a producer writes for `rows` rows of `width` inputs.
 [[nodiscard]] constexpr uint64_t tableBytes(uint32_t width, uint64_t rows) noexcept {
@@ -303,13 +306,11 @@ public:
   void addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
                   metal::MetalBuffer output, uint32_t rows, LinearScratch scratch = {},
                   uint32_t chunkRows = 0) const;
-  void addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
-                            metal::MetalBuffer gateScratch, metal::MetalBuffer output, uint32_t rows,
-                            LinearScratch scratch, uint32_t chunkRows = 0) const;
   void addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
                           metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
                           LinearScratch scratch, uint32_t chunkRows = 0) const;
-  // output = residual + down(silu(gate x) * up x) of `rows` normalized rows.
+  // output = residual + down(silu(gate x) * up x) of `rows` normalized rows;
+  // up takes what gate's plan leaves of x in the scratch table.
   void addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &buffers,
                         metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
                         uint32_t chunkRows = 0) const;

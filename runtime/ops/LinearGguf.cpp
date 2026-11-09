@@ -403,30 +403,37 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
   }
 }
 
-// The int8 prefill tile: the chunk's rows quantized once into the scratch's
-// codes and scales, then a dispatch per segment over its column tiles and the
-// chunk's row tiles; a view of leading inputs reads its planes' rows at their
-// own stride.
+// The int8 prefill tile: the chunk's rows quantized into the scratch's codes
+// and scales, unless it holds them from the plan before over the same rows
+// (b.prepared: a SwiGLU's gate for its up), then a GEMM dispatch per segment
+// over its column tiles and the chunk's row tiles, on a grid 16 threadgroups
+// wide (kernels/prefill/gguf_prefill_int8.metal); a view of leading inputs
+// reads its planes' rows at their own stride.
 void Linear::addGgufPrefillInt8(metal::CommandGraph &graph, const LinearBuffers &b, const Projection &p,
                                 const LinearPlan &plan) const {
   const LinearWorkload w = plan.workload();
   const auto [n, k] = w.matrix;
-  const uint32_t storage = plan.storageRows(), groups = k / GGUF_PREFILL_INT8_GROUP;
+  const uint32_t storage = plan.storageRows(), groups = k / GGUF_PREFILL_INT8_GROUP,
+                 rowTiles = (w.rows + GGUF_PREFILL_INT8_ROWS - 1) / GGUF_PREFILL_INT8_ROWS;
   for (const QuantizedSegment &s : p.blocks().segments)
     if (!quant_prefill_int8_format(s.formatId))
       throw std::invalid_argument(std::string("the int8 prefill tile does not take ") + s.name() + " weights");
-  graph.add("gguf_prefill_int8_quantize", {b.input, b.scratch.input, b.scratch.sums},
-            GgufPrefillInt8QuantizeParams{k, w.rows, storage},
-            {(groups + GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS - 1) / GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS, w.rows, 1},
-            {GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS * 32, 1, 1});
+  if (b.prepared.layout != LinearInput::PrefillInt8 || !b.prepared.source.sameView(b.input))
+    graph.add("gguf_prefill_int8_quantize", {b.input, b.scratch.input, b.scratch.sums},
+              GgufPrefillInt8QuantizeParams{k, w.rows, storage},
+              {(groups + GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS - 1) / GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS, w.rows, 1},
+              {GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS * 32, 1, 1});
   const std::string epilogue(1, epilogueSuffix(w.epilogue));
-  for (const QuantizedSegment &s : p.blocks().segments)
+  for (const QuantizedSegment &s : p.blocks().segments) {
+    const uint32_t columnTiles = s.outputSize / GGUF_TILE_COLUMNS;
     graph.add(std::string("gguf_prefill_int8_") + s.name() + "_" + epilogue,
               {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, b.output,
                epilogueInput(b, w.epilogue)},
-              GgufPrefillInt8Params{k, w.rows, storage, n, s.columnOffset, p.planeInputs() ? p.planeInputs() : k},
-              {s.outputSize / GGUF_TILE_COLUMNS, (w.rows + GGUF_PREFILL_INT8_ROWS - 1) / GGUF_PREFILL_INT8_ROWS, 1},
+              GgufPrefillInt8Params{k, w.rows, storage, n, s.columnOffset, p.planeInputs() ? p.planeInputs() : k,
+                                    columnTiles},
+              {GGUF_PREFILL_INT8_WALK, (columnTiles * rowTiles + GGUF_PREFILL_INT8_WALK - 1) / GGUF_PREFILL_INT8_WALK, 1},
               {GGUF_PREFILL_INT8_THREADS, 1, 1});
+  }
 }
 
 // All lanes in each threadgroup, decode only: single tensors and gate/up

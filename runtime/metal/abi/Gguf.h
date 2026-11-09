@@ -117,8 +117,9 @@ struct GgufPrefillInt8Params {
   uint32_t out_stride;        // columns of a destination row
   uint32_t out_offset;        // first destination column of the segment
   uint32_t plane_input_size;  // inputs a row of the planes holds (Projection::leadingInputs), K for none
+  uint32_t column_tiles;      // the segment's tiles of GGUF_TILE_COLUMNS columns
 };
-static_assert(sizeof(GgufPrefillInt8Params) == 24, "int8 prefill parameters are 24 bytes on both sides");
+static_assert(sizeof(GgufPrefillInt8Params) == 28, "int8 prefill parameters are 28 bytes on both sides");
 // Scratch of `storage` rows of K inputs: the int8 codes in the table, and in
 // the sums buffer float2 [K / 64][storage].
 inline constexpr uint64_t gguf_prefill_int8_table_bytes(uint32_t k, uint64_t storage) {

@@ -1110,13 +1110,16 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
 // error of the bf16 tile's on the exact inputs, on dense inputs and on dense inputs with one input of 1000 per row (a
 // model's outlier channel), which a scale per row would let zero the rest of its row. On dense inputs the RMS error
 // it adds over the bf16 tile's, relative to the outputs, stays within kBound. Outputs are finite and rows past the
-// chunk unwritten, at each epilogue, chunks of 168, 136 and 65 rows ending inside a row tile, the full budget and
-// fused segments, of one format and of both. A chunk's last 1 and 4 rows at their own height, as a prefill's last layer
-// runs the rows something reads (Linear::prefillPlan of a chunk's rows), write the chunk's bits. A view of leading
-// inputs gives its inputs repacked bit for bit. A non-finite input leaves its row's outputs not finite, as the bf16
-// tile's, and no other row's changed. Unlike the int8 decode test's per-element fp64 bound, these bounds are RMS ones
-// against the bf16 tile's own error: this tile's per-group affine folds lie outside projectionBound's model of exact
-// products accumulated in fp32.
+// chunk unwritten, at each epilogue, chunks of 168, 136 and 65 rows ending inside a row tile, one of 600 rows whose
+// walk ends on a partial block of row tiles, also over 5 column tiles, whose GEMM grid, 16 threadgroups wide, ends in
+// one past its tiles, the full budget and fused segments, of one format and of both. A
+// chunk's last 1 and 4 rows at their own height, as a prefill's last layer runs the rows something reads
+// (Linear::prefillPlan of a chunk's rows), write the chunk's bits. A fused projection quantizes its rows once and
+// runs a GEMM dispatch per segment, and a SwiGLU's up takes its gate's codes (LinearInput::PrefillInt8), bit for bit.
+// A view of leading inputs gives its inputs repacked bit for bit. A non-finite input leaves its row's outputs not
+// finite, as the bf16 tile's, and no other row's changed. Unlike the int8 decode test's exact model, these bounds are
+// RMS ones against the bf16 tile's own error: this tile's per-group affine folds lie outside projectionBound's model
+// of exact products accumulated in fp32.
 void prefillInt8(MetalBackend &backend, const Linear &linear) {
   if (!linear.calibration().projection.prefillInt8) {
     section("int8 prefill: skipped, the family does not run it");
@@ -1142,12 +1145,14 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
         ? residuals(storage, columns) : activations(Inputs::Dense, storage, columns);
     const std::vector<uint16_t> aux = storageRows(auxiliary, columns, storage, storage);
     const std::vector<Dot> dots = products(parts, columns, x, rows);
+    // The inputs as the codes of the int8-activation rule (test::int8Block) stand for them.
     std::vector<float> rounded = x;
     for (uint64_t at = 0; at < uint64_t{rows} * K; at += GGUF_PREFILL_INT8_GROUP) {
       float most = 0;
       for (uint32_t k = 0; k < GGUF_PREFILL_INT8_GROUP; ++k) most = std::max(most, std::fabs(x[at + k]));
-      for (uint32_t k = 0; most > 0 && k < GGUF_PREFILL_INT8_GROUP; ++k)
-        rounded[at + k] = std::clamp(std::rint(x[at + k] * (127.f / most)), -127.f, 127.f) * (most / 127.f);
+      const test::Int8Block block = test::int8Block(most);
+      for (uint32_t k = 0; k < GGUF_PREFILL_INT8_GROUP; ++k)
+        rounded[at + k] = float(test::int8Code(x[at + k], block)) * block.scale;
     }
     const std::vector<Dot> roundedDots = products(parts, columns, rounded, rows);
     const std::string name = what + " " + epilogueName(epilogue) + " " + std::to_string(rows) + " rows K " +
@@ -1156,6 +1161,15 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
                             covered, name);
     const Outcome base = run(backend, linear, Linear::plan(w, kTile, FloatOutput::BFloat16), p, nullptr,
                              storageRows(x, K, rows, storage), aux, kPoisonNaN, covered, name + " bf16 tile");
+    // One quantization of the chunk's rows, then a GEMM dispatch per segment.
+    const auto dispatches = [&](bool gemm) {
+      return std::count_if(out.pipelines.begin(), out.pipelines.end(), [&](const std::string &pipeline) {
+        return pipeline.starts_with("gguf_prefill_int8_") && (pipeline != "gguf_prefill_int8_quantize") == gemm;
+      });
+    };
+    if (dispatches(false) != 1 || size_t(dispatches(true)) != parts.size())
+      fail(name + ": ran " + std::to_string(dispatches(false)) + " quantizations and " +
+           std::to_string(dispatches(true)) + " GEMM dispatches for " + std::to_string(parts.size()) + " segments");
     // The output of products `d` through the epilogue.
     const auto output = [&](double d, double a) {
       if (epilogue == LinearEpilogue::Residual) return d + a;
@@ -1210,6 +1224,14 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
       for (const LinearEpilogue e : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
         for (const uint32_t rows : {168u, 136u, 65u})
           for (const bool outliers : {false, true}) chunk(p, {&t}, e, rows, outliers, fmtName(f));
+      // 600 rows: 19 row tiles, whose walk takes a block of 16 down each column tile, then one of 3.
+      static_assert(GGUF_PREFILL_INT8_WALK == 16 && GGUF_PREFILL_INT8_ROWS == 32,
+                    "600 rows end on a partial walk block");
+      chunk(p, {&t}, LinearEpilogue::Residual, 600, false, fmtName(f));
+      // 5 column tiles by 19 row tiles: 95 tiles on a grid of 6 runs of 16.
+      const Tensor narrow = tensor(backend, f, 5 * GGUF_TILE_COLUMNS, K);
+      chunk(projection({&narrow}, narrow.N), {&narrow}, LinearEpilogue::Residual, 600, false,
+            std::string(fmtName(f)) + " 5 column tiles");
       chunk(p, {&t}, LinearEpilogue::None, SPLASH_PREFILL_TOKEN_BUDGET, false, fmtName(f));
       const Tensor b = tensor(backend, f, 256, K), c = tensor(backend, f, 512, K);
       const std::vector<const Tensor *> parts{&t, &b, &c};
@@ -1252,6 +1274,43 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
       chunk(projection(parts, segmentColumns(parts) + kPadding), parts, LinearEpilogue::None, 168, outliers,
             "af4g64+af5g64 fused");
   }
+  // A SwiGLU's up after its gate over the same rows takes the codes and scales the gate's plan left in the scratch
+  // (LinearInput::PrefillInt8): it quantizes nothing itself and writes the bits of its plan run alone.
+  {
+    constexpr uint32_t N = 256, K = 1024, kRows = 168;
+    const Tensor gateTensor = tensor(backend, Fmt(GGUF_FMT_AF4G64), N, K),
+                 upTensor = tensor(backend, Fmt(GGUF_FMT_AF5G64), N, K);
+    const Projection gate = projection({&gateTensor}, N), up = projection({&upTensor}, N);
+    const LinearPlan gatePlan =
+        Linear::plan({{N, K}, kRows, LinearPhase::Prefill, LinearEpilogue::None}, kInt8, FloatOutput::BFloat16);
+    const LinearPlan upPlan =
+        Linear::plan({{N, K}, kRows, LinearPhase::Prefill, LinearEpilogue::UpWithGate}, kInt8, FloatOutput::BFloat16);
+    const uint32_t storage = gatePlan.storageRows();
+    const std::vector<uint16_t> x = storageRows(activations(Inputs::Dense, storage, K), K, kRows, storage);
+    LinearScratchSize size = gatePlan.scratchSize();
+    size.include(upPlan.scratchSize());
+    const Scratch scratch(backend, size);
+    const Guarded input = bfloats(backend, x), gateOutput(backend, uint64_t{storage} * N * 2, 0xFF),
+                  upOutput(backend, uint64_t{storage} * N * 2, 0xFF);
+    CommandGraph graph;
+    const PreparedInput codes =
+        linear.add(graph, {.input = input.view, .output = gateOutput.view, .scratch = scratch.bindings()}, gate,
+                   gatePlan);
+    const size_t gateDispatches = graph.dispatches().size();
+    static_cast<void>(linear.add(graph,
+                                 {.input = input.view, .output = upOutput.view, .gateScratch = gateOutput.view,
+                                  .scratch = scratch.bindings(), .prepared = codes},
+                                 up, upPlan));
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    if (codes.layout != LinearInput::PrefillInt8 ||
+        std::any_of(graph.dispatches().begin() + gateDispatches, graph.dispatches().end(),
+                    [](const ComputeDispatch &d) { return d.pipelineName == "gguf_prefill_int8_quantize"; }))
+      fail("int8 SwiGLU: the up projection quantized its gate's rows again");
+    const Outcome alone = run(backend, linear, upPlan, up, nullptr, x, gateOutput.halves(), kPoisonNaN, N,
+                              "int8 SwiGLU up alone");
+    if (!sameRows(upOutput.halves(), 0, alone.output, 0, kRows, N))
+      fail("int8 SwiGLU: the up projection on its gate's codes differs from its own");
+  }
   // A NaN in one row's inputs and an infinity in another's leave those rows' outputs not finite, on this tile as on
   // the bf16 tile, and every other row's as they were.
   for (const Fmt f : {Fmt(GGUF_FMT_AF4G64), Fmt(GGUF_FMT_AF5G64)}) {
@@ -1282,10 +1341,11 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
     }
   }
   section("int8 prefill: af4g64, af5g64 and both fused, K 1024 and 5120, plain/residual/up-with-gate over 168-, "
-          "136- and 65-row chunks with and without outliers and the " + std::to_string(SPLASH_PREFILL_TOKEN_BUDGET) +
-          "-row budget: worst added relative RMS " + std::to_string(worst) + ", worst error from the inputs rounded "
-          "per group " + std::to_string(worstRounded) + "x the bf16 tile's; last rows and leading inputs bitwise; a "
-          "non-finite input leaves its row alone not finite");
+          "136- and 65-row chunks with and without outliers, 600 rows and the " +
+          std::to_string(SPLASH_PREFILL_TOKEN_BUDGET) + "-row budget: worst added relative RMS " +
+          std::to_string(worst) + ", worst error from the inputs rounded per group " + std::to_string(worstRounded) +
+          "x the bf16 tile's; a fused projection quantized once and a GEMM a segment; last rows, leading inputs and "
+          "an up on its gate's codes bitwise; a non-finite input leaves its row alone not finite");
 }
 
 // ---------------------------------------------------------------- leading inputs
