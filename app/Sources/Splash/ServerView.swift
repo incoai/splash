@@ -55,11 +55,11 @@ private struct ServerSections: View {
             if state.server.phase == .ready {
                 ActivitySection(advanced: advanced)
             }
-            if first || failed || state.installer.failure != nil || state.installer.checked != nil || state.installer.running
+            if first || failed || state.installer.failure != nil || state.installer.finished != nil || state.installer.running
                 || state.keyProblem != nil {
                 GroupedSection {
                     if let problem = state.keyProblem {
-                        ProblemRow(title: "Splash can’t use its API key",
+                        NoticeRow(title: "Splash can’t use its API key",
                                    message: "The Keychain says: \(problem) Allow Splash to use it, then try again.",
                                    action: ("Try Again", state.retryKey))
                     }
@@ -67,7 +67,7 @@ private struct ServerSections: View {
                         // What its failure says would help: a start that would fit, or, for files on
                         // this Mac Splash can't serve, the start without the projector or draft
                         // chosen for them, else taking them off the list.
-                        ProblemRow(title: "\(state.displayName(of: model)) ran into a problem", message: message,
+                        NoticeRow(title: "\(state.displayName(of: model)) ran into a problem", message: message,
                                    log: .server, dismiss: state.server.dismissFailure,
                                    action: state.server.remedy.map { remedy in (remedy.title, { state.retry(model, with: remedy) }) })
                     }
@@ -75,20 +75,20 @@ private struct ServerSections: View {
                         let name = state.displayName(of: failure.model)
                         switch state.installer.work {
                         case .download:
-                            ProblemRow(title: "\(name) couldn’t download", message: failure.message, log: .downloads,
+                            NoticeRow(title: "\(name) couldn’t download", message: failure.message, log: .downloads,
                                        dismiss: state.installer.dismissFailure,
                                        action: ("Download Again", { state.download(failure.model) }))
                         case .check:
-                            ProblemRow(title: "Splash couldn’t check \(name) for updates", message: failure.message,
+                            NoticeRow(title: "Splash couldn’t check \(name) for updates", message: failure.message,
                                        log: .downloads, dismiss: state.installer.dismissFailure,
                                        action: ("Check Again", { state.checkForUpdates(failure.model) }))
                         case .removal:
-                            ProblemRow(title: "Splash couldn’t delete \(name)", message: failure.message, log: .downloads,
+                            NoticeRow(title: "Splash couldn’t delete \(name)", message: failure.message, log: .downloads,
                                        dismiss: state.installer.dismissFailure)
                         }
                     }
-                    if let checked = state.installer.checked {
-                        CheckedRow(model: checked.model, result: checked.result)
+                    if let finished = state.installer.finished {
+                        FinishedRow(model: finished.model, result: finished.result)
                     }
                     if state.installer.running { DownloadRow() }
                 } header: {
@@ -509,9 +509,12 @@ struct SectionTitle: View {
     }
 }
 
-/// Something that failed: why, in a line or three, with any log and a way out.
-private struct ProblemRow: View {
+/// Something that ended: why it failed, or how it went, in a line or three, with any log and a way
+/// out.
+private struct NoticeRow: View {
     @Environment(AppState.self) private var state
+    /// In place of the warning sign, the quieter symbol of something that only says how it went.
+    var quietSymbol: String?
     let title: String
     let message: String
     /// The log that says more, which Show Log opens in the window's drawer.
@@ -522,7 +525,11 @@ private struct ProblemRow: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
+            if let quietSymbol {
+                Image(systemName: quietSymbol).foregroundStyle(.secondary)
+            } else {
+                Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
+            }
             VStack(alignment: .leading, spacing: 4) {
                 Text(title).font(.headline)
                 Text(message)
@@ -634,21 +641,10 @@ private struct ModelRow: View {
             }
         }
         // The highlight kept while the pointer is on the menu's button.
-        .buttonStyle(HoverStyle(padding: EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8), hovered: hovering))
+        .buttonStyle(.hoverRow(hovered: hovering))
         .overlay(alignment: .trailing) {
-            if hovering {
-                // A square button, as the chat list's rows have, before the check.
-                Menu(content: { actions }) {
-                    Image(systemName: "ellipsis").foregroundStyle(.secondary).frame(width: 24, height: 24)
-                }
-                .menuStyle(.button)
-                .buttonStyle(HoverStyle(padding: EdgeInsets(), shape: AnyShape(.rect(cornerRadius: 6))))
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .padding(.trailing, 8 + 16 + 8)
-                .help("More")
-                .accessibilityLabel("More")
-            }
+            // Before the check.
+            if hovering { RowMenuButton(trailing: 8 + 16 + 8) { actions } }
         }
         .onHover { hovering = $0 }
         .hoverRowAligned()
@@ -763,34 +759,15 @@ private struct SuggestedRow: View {
 /// what had moved on, which its next start uses, had it all, couldn't be checked or updated, where
 /// the log says why, or was deleted, freeing the space its files took unless other models or tools
 /// use them.
-private struct CheckedRow: View {
+private struct FinishedRow: View {
     @Environment(AppState.self) private var state
     let model: String
     let result: Installer.Result
 
     var body: some View {
         let words = Installer.words(result, name: state.displayName(of: model))
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Image(systemName: words.done ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
-                .foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(words.title)
-                    .font(.headline)
-                Text(words.detail)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 12)
-            if !words.done {
-                Button("Show Log") { state.showLog(.downloads) }
-            }
-            Button(action: state.installer.dismissChecked) { Image(systemName: "xmark") }
-                .buttonStyle(.hover)
-                .foregroundStyle(.secondary)
-                .help("Dismiss")
-                .accessibilityLabel("Dismiss")
-        }
-        .padding(.vertical, 2)
+        NoticeRow(quietSymbol: words.done ? "checkmark.circle.fill" : "exclamationmark.circle.fill", title: words.title,
+                  message: words.detail, log: words.done ? nil : .downloads, dismiss: state.installer.dismissFinished)
     }
 }
 
@@ -851,7 +828,7 @@ private struct CustomModelSheet: View {
 }
 
 extension View {
-    /// The screen's one prominent button, which Return presses.
+    /// The screen's one prominent button.
     @ViewBuilder func prominent(_ on: Bool) -> some View {
         // No Return for it: a key pressed in a drawer's terminal or a field must not start a download.
         if on { buttonStyle(.borderedProminent) } else { self }

@@ -17,15 +17,11 @@ final class Installer {
         /// The progress a line of the installer's output reports, if it is a download event.
         init?(line: String) {
             struct Event: Decodable {
-                let event: String
                 let repo: String
                 let done: Int64
                 let total: Int64
             }
-            guard line.hasPrefix("{"),
-                  let event = try? JSONDecoder().decode(Event.self, from: Data(line.utf8)),
-                  event.event == "download"
-            else { return nil }
+            guard let event: Event = Installer.event("download", in: line) else { return nil }
             (repo, done, total) = (event.repo, event.done, event.total)
         }
     }
@@ -39,16 +35,8 @@ final class Installer {
 
         /// The failure a line of the installer's output reports, if it is an error event.
         init?(line: String) {
-            struct Event: Decodable {
-                let event: String
-                let kind: String?
-                let message: String
-            }
-            guard line.hasPrefix("{"),
-                  let event = try? JSONDecoder().decode(Event.self, from: Data(line.utf8)),
-                  event.event == "error"
-            else { return nil }
-            (kind, message) = (event.kind, event.message)
+            guard let failure: Failure = Installer.event("error", in: line) else { return nil }
+            self = failure
         }
     }
 
@@ -66,14 +54,8 @@ final class Installer {
 
         /// The outcome a line of the installer's output reports, if it is a `prepared` event.
         init?(line: String) {
-            struct Event: Decodable {
-                let event: String
-                let outcome: Outcome
-            }
-            guard line.hasPrefix("{"),
-                  let event = try? JSONDecoder().decode(Event.self, from: Data(line.utf8)),
-                  event.event == "prepared"
-            else { return nil }
+            struct Event: Decodable { let outcome: Outcome }
+            guard let event: Event = Installer.event("prepared", in: line) else { return nil }
             self = event.outcome
         }
     }
@@ -88,15 +70,18 @@ final class Installer {
     /// The bytes a line of the installer's output says a removal freed, if it is a `removed`
     /// event.
     nonisolated static func freed(line: String) -> Int64? {
-        struct Event: Decodable {
-            let event: String
-            let bytes: Int64
-        }
-        guard line.hasPrefix("{"),
-              let event = try? JSONDecoder().decode(Event.self, from: Data(line.utf8)),
-              event.event == "removed"
-        else { return nil }
-        return event.bytes
+        struct Event: Decodable { let bytes: Int64 }
+        let event: Event? = Installer.event("removed", in: line)
+        return event?.bytes
+    }
+
+    private struct Named: Decodable { let event: String }
+
+    /// What a line of the installer's output reports, if it is its JSON event `name`.
+    nonisolated private static func event<Event: Decodable>(_ name: String, in line: String) -> Event? {
+        let data = Data(line.utf8)
+        guard line.hasPrefix("{"), (try? JSONDecoder().decode(Named.self, from: data))?.event == name else { return nil }
+        return try? JSONDecoder().decode(Event.self, from: data)
     }
 
     /// What the Server says of `result` for the model `name`: a title, the line under it, and
@@ -154,13 +139,12 @@ final class Installer {
     private(set) var work = Work.download
     /// The last check for updates or deletion that ended, as the installer reported it: its model,
     /// and what it found or freed.
-    private(set) var checked: (model: String, result: Result)?
+    private(set) var finished: (model: String, result: Result)?
 
     /// Gets each model once it is downloaded.
     @ObservationIgnored var installed: (String) -> Void = { _ in }
-    /// Gets each model once a check of it ended or a deletion of it ran, which may have changed its
-    /// files.
-    @ObservationIgnored var changed: (String) -> Void = { _ in }
+    /// Called once a check ended or a deletion ran, which may have changed a model's files.
+    @ObservationIgnored var changed: () -> Void = {}
 
     /// The downloads' log, which each download begins again.
     let log: URL
@@ -211,7 +195,7 @@ final class Installer {
         progress = nil
         began = nil
         failure = nil
-        checked = nil
+        finished = nil
         reported = nil
         outcome = nil
         freed = nil
@@ -249,9 +233,9 @@ final class Installer {
         failure = nil
     }
 
-    /// Clears what a check found, once read.
-    func dismissChecked() {
-        checked = nil
+    /// Clears what a check found or a deletion freed, once read.
+    func dismissFinished() {
+        finished = nil
     }
 
     /// Stops the download this app started before it quit or crashed, if it still runs; its record
@@ -289,14 +273,14 @@ final class Installer {
         self.model = nil
         progress = nil
         // A removal that failed may have removed the model all the same: the list says.
-        if work == .removal { changed(model) }
+        if work == .removal { changed() }
         if status == 0 {
             switch work {
             case .download: installed(model)
             case .check:
-                checked = outcome.map { (model, .checked($0)) }
-                changed(model)
-            case .removal: checked = freed.map { (model, .deleted(freed: $0)) }
+                finished = outcome.map { (model, .checked($0)) }
+                changed()
+            case .removal: finished = freed.map { (model, .deleted(freed: $0)) }
             }
         } else if !cancelled {
             failure = (model, reported.map { Self.problem($0, model: model) }

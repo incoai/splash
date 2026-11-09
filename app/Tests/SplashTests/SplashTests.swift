@@ -470,7 +470,7 @@ struct AppStateTests {
         state.checkForUpdates("a/b")
         #expect(state.installer.running && state.installer.work == .check)
         try await waitFor(!state.installer.running, "the check")
-        #expect(state.installer.checked == nil)
+        #expect(state.installer.finished == nil)
         let outcomes: [(String, Installer.Outcome)] = [
             ("up_to_date", .upToDate), ("updated", .updated), ("unreachable", .unreachable), ("kept", .kept),
         ]
@@ -480,17 +480,17 @@ struct AppStateTests {
             print('{"event": "prepared", "outcome": "\(name)"}', flush=True)
             """.write(to: installer, atomically: true, encoding: .utf8)
             state.checkForUpdates("a/b")
-            #expect(state.installer.checked == nil)
+            #expect(state.installer.finished == nil)
             try await waitFor(!state.installer.running, "the check")
-            #expect(state.installer.checked?.model == "a/b" && state.installer.checked?.result == .checked(outcome))
+            #expect(state.installer.finished?.model == "a/b" && state.installer.finished?.result == .checked(outcome))
         }
-        state.installer.dismissChecked()
-        #expect(state.installer.checked == nil)
+        state.installer.dismissFinished()
+        #expect(state.installer.finished == nil)
         // A download is no check.
         state.download("a/b")
         #expect(state.installer.work == .download)
         try await waitFor(!state.installer.running, "the download")
-        #expect(state.installer.checked == nil)
+        #expect(state.installer.finished == nil)
     }
 
     /// Deleting a model runs the installer's removal, says what it freed, and lists the models
@@ -525,7 +525,7 @@ struct AppStateTests {
         try await waitFor(!state.installer.running, "the removal")
         try await waitFor(!state.isInstalled("a/b"), "the list")
         #expect(state.installer.failure == nil)
-        #expect(state.installer.checked?.model == "a/b" && state.installer.checked?.result == .deleted(freed: 1))
+        #expect(state.installer.finished?.model == "a/b" && state.installer.finished?.result == .deleted(freed: 1))
         try """
         import json, shutil
         shutil.rmtree("\(models.appending(path: "c/d").path)")
@@ -534,7 +534,7 @@ struct AppStateTests {
         """.write(to: installer, atomically: true, encoding: .utf8)
         #expect(state.isInstalled("c/d"))
         state.installer.remove("c/d")
-        #expect(state.installer.checked == nil)
+        #expect(state.installer.finished == nil)
         try await waitFor(!state.installer.running, "the refusal")
         #expect(state.installer.failure?.message == "c/d is being served: stop it, then remove it")
         try await waitFor(!state.isInstalled("c/d"), "the list")

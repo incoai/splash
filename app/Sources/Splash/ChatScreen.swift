@@ -453,19 +453,7 @@ private struct ChatRow<Actions: View>: View {
         .buttonStyle(HoverStyle(padding: EdgeInsets(top: 6, leading: 8, bottom: 6, trailing: more ? 30 : 8), held: open && picked == nil,
                                 hovered: hovering))
         .overlay(alignment: .trailing) {
-            if more {
-                // A square button, as the menu buttons of a sidebar's rows are.
-                Menu(content: actions) {
-                    Image(systemName: "ellipsis").foregroundStyle(.secondary).frame(width: 24, height: 24)
-                }
-                .menuStyle(.button)
-                .buttonStyle(HoverStyle(padding: EdgeInsets(), shape: AnyShape(.rect(cornerRadius: 6))))
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .padding(.trailing, 3)
-                .help("More")
-                .accessibilityLabel("More")
-            }
+            if more { RowMenuButton(trailing: 3, actions: actions) }
         }
         .onHover { hovering = $0 }
         .contextMenu(menuItems: actions)

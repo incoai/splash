@@ -108,7 +108,7 @@ final class AppState {
         catalog = Catalog(contentsOf: runtime.suggestedModels)
         transcript = Transcript(runtime: runtime, attachments: chats.attachments)
         installer.installed = { [weak self] in self?.didInstall($0) }
-        installer.changed = { [weak self] _ in self?.refresh() }
+        installer.changed = { [weak self] in self?.refresh() }
         // The last terminal closed, the drawer showing terminals closes too.
         drawer.emptied = { [weak self] in
             guard let self, drawer.part == .terminal else { return }

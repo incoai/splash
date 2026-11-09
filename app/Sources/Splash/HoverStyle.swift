@@ -44,12 +44,34 @@ extension ButtonStyle where Self == HoverStyle {
     static var hoverFlush: HoverStyle { HoverStyle(padding: EdgeInsets()) }
     /// The highlight across a row of a form, which keeps its text where the row's other text is.
     static var hoverRow: HoverStyle { HoverStyle(padding: EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8)) }
+    /// `hoverRow` for a row with a button of its own laid over it (`HoverStyle.hovered`).
+    static func hoverRow(hovered: Bool) -> HoverStyle { HoverStyle(padding: Self.hoverRow.padding, hovered: hovered) }
 }
 
 extension View {
     /// Undoes `hoverRow`'s room, so that the row's text stays in line with the form's.
     func hoverRowAligned() -> some View {
         padding(.horizontal, -8).padding(.vertical, -4)
+    }
+}
+
+/// The button of a row's menu, laid over the row while the pointer is on it: a square, `trailing`
+/// from the row's end.
+struct RowMenuButton<Actions: View>: View {
+    let trailing: CGFloat
+    @ViewBuilder let actions: () -> Actions
+
+    var body: some View {
+        Menu(content: actions) {
+            Image(systemName: "ellipsis").foregroundStyle(.secondary).frame(width: 24, height: 24)
+        }
+        .menuStyle(.button)
+        .buttonStyle(HoverStyle(padding: EdgeInsets(), shape: AnyShape(.rect(cornerRadius: 6))))
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .padding(.trailing, trailing)
+        .help("More")
+        .accessibilityLabel("More")
     }
 }
 
