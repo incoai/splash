@@ -176,12 +176,15 @@ the shared budget, is still received on these terms, so a client that sends its
 whole body before reading the response gets the refusal. An inference request
 ends when its client disconnects, and a client that shuts down its sending side
 after the request, as `nc` does at the end of its input, counts as disconnected
-and gets no response. A response write waits up to 30 seconds for a client that
-has stopped reading, past `--request-timeout` too, and the request counts
-against `--queue-size` until then. `/status` reports `http.request_body_bytes`
-and `http.max_request_bytes`. A body's JSON nests at most 128 levels of arrays
-and objects; deeper is refused as invalid JSON. A history tool call's arguments
-nested deeper stay text, as other arguments that are not a JSON object do.
+and gets no response. So does a client that stops answering without closing its
+connection, as a Mac asleep or off its network does: TCP keepalive drops the
+connection 60 seconds after its last data. A response write waits up to 30
+seconds for a client that has stopped reading, past `--request-timeout` too, and
+the request counts against `--queue-size` until then. `/status` reports
+`http.request_body_bytes` and `http.max_request_bytes`. A body's JSON nests at
+most 128 levels of arrays and objects; deeper is refused as invalid JSON. A
+history tool call's arguments nested deeper stay text, as other arguments that
+are not a JSON object do.
 
 The server holds at most `--queue-size` + 64 connections at once (96 by
 default), each in a connection slot. A connection waits for its request without
