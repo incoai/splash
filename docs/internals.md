@@ -1547,10 +1547,13 @@ KV now, as placement prices it. Beside another lane in service that claim
 is a `Start`'s, whose test placed it Spill unless every request spills, and
 short of it the start waits for memory. Alone it is `InService`, as its
 lane's growth is, which takes the pooled buffers the next lane starts from
-too. Otherwise one the tier refuses is refused, and one whose room is short
-takes the SSD cache's bound on its output or waits for its quota as a Spill
-start does, and is otherwise refused; refused at its start, it names what
-memory and the SSD cache have for it, rather than fail partway through its
+too, and short of the projection the KV it covers bounds the output, as the
+quota bounds a Spill start's, where it holds the prompt and a token past it
+with the 7 rows past that its decode step verifies (`Cache::growthPages`).
+Otherwise one the tier refuses is refused, and one whose room is short takes
+the SSD cache's bound on its output or waits for its quota as a Spill start
+does, and is otherwise refused; refused at its start, it names what memory
+and the SSD cache have for it, rather than fail partway through its
 prefill. The lanes' projected growth (`Engine::laneDemand`) is each lane's
 KV up to its projection and what the lanes that hold Index pages still lack
 to read it: their hot block floors, and in prefill their history's staging

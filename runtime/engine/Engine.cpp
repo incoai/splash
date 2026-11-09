@@ -1915,7 +1915,7 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
     }
     // Score requests carry maxNewTokens == 0; only the model's finished flag
     // on the final prompt chunk completes them. A request whose output the
-    // SSD cache's quota bounded ends at that bound.
+    // SSD cache's quota or memory bounded ends at that bound.
     const bool complete =
         result.finished || (!scoring && completionTokens >= active.outputLimit);
     const bool boundEnd = complete && !result.finished && active.outputLimit < active.request.maxNewTokens;
@@ -2074,7 +2074,8 @@ void Engine::finish(Request &active, EngineFinishReason reason,
   active.finalized = true;
   const uint32_t completionTokens = generatedTokens(active);
   // Only a bound of the engine's own ends a request with Length short of
-  // its output: the quota's (outputLimit) or a lone lane's at the wall.
+  // its output: the quota's or memory's (outputLimit), or a lone Spill
+  // lane's at the wall.
   const bool bounded =
       reason == EngineFinishReason::Length && completionTokens < active.request.maxNewTokens;
   events_.completed(active.request.id, reason, bounded, active.promptTokens,

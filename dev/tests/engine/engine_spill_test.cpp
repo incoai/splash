@@ -7,6 +7,7 @@
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
 #include "TestRegistry.hpp"
+#include "TestWriteBudget.hpp"
 #include "engine/Engine.hpp"
 
 #include <algorithm>
@@ -639,6 +640,50 @@ void testALoneStartMemoryCannotHoldIsRefusedAtItsStart() {
             std::string("a start alone that neither memory nor the SSD cache holds was not refused at its start "
                         "naming both") +
                 (closed ? " while the tier took no writes: " : " for a short quota: ") + message);
+  }
+}
+
+// The ways the SSD cache cannot take a start: its room short of the projection, as ShortOfBoth's 1,000
+// slots are of a 64K prompt's 2,047 pages; the tier closed; or the daily write budget spent, which a
+// write of another writer's (a state in use) overdrew until it refills in 6 hours.
+enum class Unspillable : uint8_t { Quota, Closed, WriteBudget };
+constexpr std::array kUnspillable{Unspillable::Quota, Unspillable::Closed, Unspillable::WriteBudget};
+void cannotSpill(Spilling &spill, Unspillable way) {
+  if (way == Unspillable::Closed)
+    spill.tier.writableFile = false;
+  if (way == Unspillable::WriteBudget) {
+    spill.budget->setWriteBudget(2 * kHostPageBytes);
+    test::spendWriteBudget(spill.budget);
+  }
+}
+std::string unspillable(Unspillable way) {
+  return way == Unspillable::Quota    ? " for a short quota"
+         : way == Unspillable::Closed ? " while the tier took no writes"
+                                      : " while the write budget was spent";
+}
+std::string failureDetail(const Events &events) {
+  return events.failureDetails.empty() ? std::string() : ": " + events.failureDetails.front().first;
+}
+
+// A start alone that cannot spill, whose prompt memory holds but not its projection, starts Resident
+// under the bound of the KV memory holds, as the quota bounds a Spill start's output, and ends at it with
+// Length: memory holds eight Full extents, 2,048 pages, of the 2,056 the 64K prompt and its 300 tokens of
+// output project, and so 56 tokens of output with the 7 rows past them its last decode step verifies.
+// The parent refused it at its start.
+void testALoneStartTakesMemorysBound() {
+  for (const Unspillable way : kUnspillable) {
+    ShortOfBoth both(900ULL << 20);
+    Spilling &spill = both.spill;
+    cannotSpill(spill, way);
+    spill.engine.submit(Spilling::prompt(1, 1, 2'046, 300));
+    spill.runUntilIdle();
+    const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+    require(spill.events.completedCount == 1 && spill.events.failures.empty() && counts.resident == 1 &&
+                counts.spill == 0 && counts.bounded == 1 && counts.lengthEnds == 1 &&
+                spill.model.outputLimits.at(1) == 56 && spill.events.usage.at(1).second == 56 &&
+                spill.events.boundedIds == std::vector<uint64_t>{1},
+            "a start alone whose prompt memory holds did not start Resident and end at memory's bound" +
+                unspillable(way) + failureDetail(spill.events));
   }
 }
 
@@ -3658,6 +3703,7 @@ std::span<const test::TestCase> spillTests() {
       {"testALoneResidentWallNamesItsModeAndPhase", testALoneResidentWallNamesItsModeAndPhase},
       {"testALoneStartMemoryCannotHoldIsRefusedAtItsStart", testALoneStartMemoryCannotHoldIsRefusedAtItsStart},
       {"testALoneStartCountsTheNextLanesBuffers", testALoneStartCountsTheNextLanesBuffers},
+      {"testALoneStartTakesMemorysBound", testALoneStartTakesMemorysBound},
       {"testALoneStartMemoryCannotHoldTakesTheQuotasBound", testALoneStartMemoryCannotHoldTakesTheQuotasBound},
       {"testAStartMemoryCannotHoldBesideALaneWaitsForIt", testAStartMemoryCannotHoldBesideALaneWaitsForIt},
       {"testAStartMemoryCannotHoldBesideALowerLaneMakesItYield",

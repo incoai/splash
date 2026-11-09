@@ -824,7 +824,7 @@ $(TEST_PROTOCOL_TEST) $(TEST_PROTOCOL_ASAN) $(TEST_PROTOCOL_TSAN): \
 $(TEST_ENGINE_TEST) $(TEST_ENGINE_ASAN) $(TEST_ENGINE_TSAN): \
 		$(BACKEND_CONTROL_SOURCES) \
 		runtime/engine/MemoryGovernor.cpp \
-		runtime/engine/MemoryLedger.cpp \
+		runtime/engine/MemoryLedger.cpp runtime/model/SlotFile.cpp \
 		dev/benchmarks/PrefillWork.hpp \
 		dev/tests/engine/engine_requests_test.cpp dev/tests/engine/engine_checkpoints_test.cpp \
 		dev/tests/engine/engine_commands_test.cpp dev/tests/engine/engine_memory_test.cpp \

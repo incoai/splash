@@ -142,12 +142,12 @@ struct ActiveRequestSnapshot final {
 
 // The requests of a target that can spill (EngineConfig::spill): those that
 // started in each KV mode; those that converted to Spill when memory
-// refused their growth; those whose output the SSD cache's quota bounded
-// (once per request, at its start or a resume), and those that ended at
-// that bound or once the cache could hold no more of their KV; and those
-// refused because the quota cannot hold their prompt, the daily write budget
-// is spent or the tier takes no writes. Those waiting for the quota now are
-// ResourceWaitSnapshot::diskQuota.
+// refused their growth; those whose output the SSD cache's quota, or memory
+// for a start the cache could not take, bounded (once per request, at its
+// start or a resume), and those that ended at that bound or once the cache
+// could hold no more of their KV; and those refused because the quota cannot
+// hold their prompt, the daily write budget is spent or the tier takes no
+// writes. Those waiting for the quota now are ResourceWaitSnapshot::diskQuota.
 struct SpillRequestsSnapshot final {
   uint64_t spill = 0;
   uint64_t resident = 0;
@@ -426,8 +426,8 @@ private:
     uint64_t placementState = 0;
     // The most tokens it may generate, which the model is given at each
     // start, a resume's too: maxNewTokens, or fewer when the SSD cache's
-    // quota bounds its output (admitSpill), which each attempt to start it
-    // decides anew.
+    // quota, or memory for a start the cache cannot take, bounds its output
+    // (admitSpill), which each attempt to start it decides anew.
     uint32_t outputLimit = 0;
     // SpillRequestsSnapshot counted its output bounded; it stays set when a
     // later attempt leaves the output unbounded, so the request counts once.
@@ -602,15 +602,17 @@ private:
   // for every request under --kv-spill
   // always; Resident otherwise. Correctness never depends on it.
   [[nodiscard]] KvMode placement(const Request &request) const;
-  // What a start's Resident KV needs now beside every lane's projected
-  // growth, as placement prices it, and how much of it what `spec` may take
-  // gives, keeping the chain the start restores.
+  // What `tokens` of a start's Resident KV need now beside every lane's
+  // projected growth, as placement prices it, and how much of it what `spec`
+  // may take gives, keeping the chain the start restores; short of the
+  // need, the tokens of KV that gives it.
   struct ResidentRoom final {
     uint64_t needed = 0;
     uint64_t available = 0;
+    uint64_t heldTokens = 0;
     [[nodiscard]] bool holds() const noexcept { return available >= needed; }
   };
-  [[nodiscard]] ResidentRoom residentRoom(const Request &request, const ClaimSpec &spec) const;
+  [[nodiscard]] ResidentRoom residentRoom(const Request &request, const ClaimSpec &spec, uint64_t tokens) const;
   // Places every candidate whose placement is older than the memory's state
   // now (ledgerChanges_), once per candidate and state.
   void placeCandidates(std::span<const PrefillAdmission> candidates);
@@ -658,7 +660,7 @@ private:
   enum class SpillAdmission : uint8_t {
     // The quota holds what it publishes: commit it once the lane is taken.
     Commit,
-    // It starts Resident instead.
+    // It starts Resident instead, under memory's bound where memory sets one.
     Resident,
     // It ended: refused, or a resume at its length.
     Settled,
@@ -676,10 +678,14 @@ private:
   // that claim is a start's, whose test placed it Spill unless every request
   // spills: short of it, it waits for them (Waiting). Alone it is in
   // service, as its lane's growth is, which takes the pooled buffers the
-  // next lane starts from too: short of it, it goes on as a Spill start,
-  // `room` naming what its Resident KV needs and what memory has for it.
+  // next lane starts from too: short of it, the KV memory holds bounds its
+  // output, as the quota bounds a Spill start's, where it holds the prompt
+  // and a token past it with the rows the decode step verifies (`tokens`,
+  // prompt and output); otherwise it goes on as a Spill start, `room`
+  // naming what that least start needs and what memory has for it.
   struct InMemory final {
     std::optional<SpillAdmission> admission;
+    std::optional<uint64_t> tokens;
     std::optional<ResidentRoom> room;
     // What memory has for a start refused, where it was asked.
     [[nodiscard]] std::string detail() const;

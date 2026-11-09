@@ -667,6 +667,12 @@ Need Cache::growthNeed(uint32_t pages) const {
   return need;
 }
 
+uint64_t Cache::growthPages(uint64_t bytes) const {
+  constexpr kv::PageForm full = kv::PageForm::Full;
+  const uint64_t extent = pool_.extentPages();
+  return pool_.freePageCount(full) + bytes / (extent * pool_.bytesPerPage(full)) * extent;
+}
+
 bool Cache::freesOnLanding(uint64_t block, const std::unordered_set<uint64_t> &freeing) const {
   return kv_.leafOnceChildrenLeave(block) && !states_.stateResident(block) && !pool_.pageActive(kv_.page(block)) &&
          (kv_.residentLeaf(block) || std::ranges::all_of(kv_.children(block), [&](uint64_t child) {
