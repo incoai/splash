@@ -246,14 +246,17 @@ struct Spilling {
     result.spill = {.capable = true,
                     .always = always,
                     .denseTokens = engine::KvCache::pageTokens,
-                    .geometry = {.fullPageBytes = pages.fullBytes,
-                                 .indexPageBytes = pages.indexBytes,
-                                 .slotBytes = 100,
-                                 .residentTokens = residentTokens,
-                                 .densePages = 1,
-                                 .windowPages = 1,
-                                 .groupPages = 4}};
+                    .geometry = geometry(residentTokens, pages)};
     return result;
+  }
+  static engine::SpillGeometry geometry(uint32_t residentTokens, Pages pages = {}) {
+    return {.fullPageBytes = pages.fullBytes,
+            .indexPageBytes = pages.indexBytes,
+            .slotBytes = 100,
+            .residentTokens = residentTokens,
+            .densePages = 1,
+            .windowPages = 1,
+            .groupPages = 4};
   }
   // A request whose prompt is `pages` whole pages of `token` and one token
   // more, which may generate `output` tokens.

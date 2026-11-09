@@ -21,6 +21,7 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -94,6 +95,16 @@ struct Wall final {
     const uint64_t room = spill.host.governor.snapshot().headroomBytes + allocated.value_or(0);
     const uint64_t taken = created + (allocated ? spill.model.startStateBytes() : 0);
     return room - std::min(room, taken);
+  }
+  // Whether placement starts request `id`, of `tokens` projected tokens, Resident only where a Start claim's count
+  // holds its Resident KV (Engine::residentRoom): that KV takes more than Spill's peak, its floor and the larger of its
+  // history's staging and its hot block floor (Engine::placement).
+  [[nodiscard]] bool residentOnTheCount(uint64_t id, uint64_t tokens) const {
+    const SpillGeometry geometry = Spilling::geometry(0, {.fullBytes = kFullPageBytes, .indexBytes = kIndexPageBytes});
+    const auto pages = static_cast<uint32_t>((tokens + KvCache::pageTokens - 1) / KvCache::pageTokens);
+    const uint64_t reads =
+        std::max(spill.model.stagingShortfall(id, pages), spill.model.hotFloorShortfall(std::span(&id, 1)));
+    return geometry.residentBytes(tokens) > geometry.spillFloorBytes(tokens) + reads;
   }
   // The memory wall: the engine holds what it does now and `room` more.
   void wall(uint64_t room = 0) { spill.host.leaveRoom(room); }
@@ -498,7 +509,15 @@ private:
     const size_t suspended = spill.model.suspendedIds.size();
     const uint64_t preemptions = spill.engine.snapshot().prioritySuspensions;
     const MemoryLedger::CountChecks before = spill.host.governor.snapshot().countChecks;
+    const uint32_t resumptions = spill.model.resumptions;
     static_cast<void>(spill.engine.tick(spill.now++));
+    // A suspended lane resumes, below a running priority too (Engine::admitQueued): its replay takes memory no
+    // placement counted, which counts the lanes in service alone (Engine::laneDemand), as a move of the wall does.
+    if (spill.model.resumptions != resumptions) {
+      ++epoch_;
+      if (verbose_)
+        std::cout << where() << ": a suspended lane resumed\n";
+    }
     if (spill.engine.snapshot().prioritySuspensions != preemptions)
       preempted_.insert(spill.model.suspendedIds.begin() + static_cast<std::ptrdiff_t>(suspended),
                         spill.model.suspendedIds.end());
@@ -511,8 +530,8 @@ private:
     noteStarts();
   }
 
-  // The starts placed Resident beside a lane at normal pressure, whose placement counted the lanes' releases
-  // (residentRoom), and the host's and the wall's moves at each placement.
+  // The starts placed Resident beside a lane at normal pressure only on a Start claim's count, the lanes' releases
+  // among it (Wall::residentOnTheCount), and the host's and the wall's moves at each placement.
   void noteStarts() {
     Spilling &spill = lanes_.spill;
     for (const uint64_t id : spill.events.startIds) {
@@ -525,17 +544,20 @@ private:
       const bool beside = std::ranges::any_of(spill.model.requests, [&](const auto &entry) {
         return entry.first != id && entry.second.resident;
       });
+      const Planned &planned = requests_.at(id - 1);
+      const uint64_t tokens = planned.tokens.size() + std::min<uint64_t>(planned.output, kProjectedOutputTokens);
       if (verbose_)
         std::cout << where() << ": request " << id << " started "
                   << (lanes_.kvMode(id) == KvMode::Resident ? "Resident" : "Spill") << "\n";
-      if (lanes_.kvMode(id) == KvMode::Resident && beside && host_ == Host::Normal) {
+      if (lanes_.kvMode(id) == KvMode::Resident && beside && host_ == Host::Normal &&
+          lanes_.residentOnTheCount(id, tokens)) {
         placed_[id] = epoch_;
         ++totals_.residentStarts;
       }
     }
     // A start placed Resident yields (but to a start of a higher priority), goes short or converts itself to Spill in
-    // its own prefill only where the host or the wall moved since. Only its own growth converts it, never the test's
-    // claims (Engine::EngineVictims::conversions).
+    // its own prefill only where the host or the wall moved since, or a suspended lane resumed. Only its own growth
+    // converts it, never the test's claims (Engine::EngineVictims::conversions).
     for (auto entry = placed_.begin(); entry != placed_.end();) {
       const auto [id, epoch] = *entry;
       const std::optional<Phase> phase = lanes_.phase(id);
@@ -732,7 +754,8 @@ private:
   Wall lanes_;
   std::vector<Planned> requests_;
   std::set<uint64_t> started_;
-  // The starts placed Resident beside a lane, and the host's and the wall's moves when each was placed.
+  // The starts placed Resident beside a lane on the count, and the moves of the host and the wall, a suspended lane's
+  // resume among them, when each was placed.
   std::map<uint64_t, uint64_t> placed_;
   uint64_t epoch_ = 0;
   // The wall's and the host's moves at the last check that found the runway short.
@@ -759,8 +782,9 @@ void report(std::string_view name, const Violations &violations, std::string &fa
 // decisions): with no transfer in flight, a claim's count that covered its need is met by its takes, the ledger's
 // own runs in the engine's ticks too, and what a met claim keeps of the room beside the first reads its releases
 // created holds its need; a release taken first frees what it counted; between commands at normal pressure the Index
-// runway holds an extent where the room does; a start placed Resident beside the lanes prefills with no yield, no
-// short claim and no conversion while the host and the wall stay. With transfers in flight they are counted apart.
+// runway holds an extent where the room does; a start placed Resident beside the lanes on their count prefills with
+// no yield, no short claim and no conversion while the host and the wall stay and no suspended lane resumes. With
+// transfers in flight they are counted apart.
 void testRandomConversationTreesKeepTheReleaseCounts() {
   const char *seeds = std::getenv("SPLASH_RELEASE_SEEDS");
   const char *one = std::getenv("SPLASH_RELEASE_SEED");
@@ -774,7 +798,7 @@ void testRandomConversationTreesKeepTheReleaseCounts() {
   std::cout << "release trees: " << totals.seeds << " seeds, " << totals.claims << " claims (" << totals.quietClaims
             << " with no transfer in flight, " << totals.countedClaims << " of bytes their count covered), "
             << totals.coveredRuns << " taken on their count; " << totals.releases << " releases; "
-            << totals.residentStarts << " starts placed Resident beside lanes; " << totals.engineOvercounts
+            << totals.residentStarts << " starts placed Resident beside lanes on the count; " << totals.engineOvercounts
             << " of the engine's runs overcounted; " << totals.completed << " completed, " << totals.failed
             << " failed\n";
   std::string failures;
