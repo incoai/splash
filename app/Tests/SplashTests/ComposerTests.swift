@@ -128,9 +128,18 @@ struct ComposerTests {
         #expect(state.server.phase == .ready)
         Self.update(window)
         let start = try Self.picture(row, in: window)
-        try await Task.sleep(for: .seconds(1))
-        Self.update(window)
-        let settled = try Self.picture(row, in: window)
+        // The row once it has changed and stopped changing, which a slow Mac, as a virtual one is,
+        // reaches long after the animation's length.
+        var settled = start
+        for _ in 0..<30 {
+            try await Task.sleep(for: .milliseconds(500))
+            Self.update(window)
+            let next = try Self.picture(row, in: window)
+            let whole = 0..<next.pixelsWide
+            let stopped = Self.difference(settled, next, in: whole) == 0 && Self.difference(before, next, in: whole) > 0
+            settled = next
+            if stopped { break }
+        }
 
         // The controls as they settle, each a run of columns drawn on the composer: Attach Images,
         // the mark, the model's name, its menu's chevron, Thinking and Send.
