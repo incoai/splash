@@ -390,7 +390,7 @@ private struct RequestLog: View {
     /// the cache, and those running; none before the first.
     static func totals(_ activity: Server.Activity, requests: [ServedRequest]) -> String? {
         guard !requests.isEmpty else { return nil }
-        let running = requests.count { $0.end == nil }
+        let running = requests.count(where: \.running)
         var parts = [requests.count.formatted(), "\(Format.count(activity.generated)) tokens out", "\(Format.count(activity.read)) in"]
         if activity.cached > 0 { parts.append("\(Format.count(activity.cached)) cached") }
         if running > 0 { parts.append("\(running) running") }
@@ -401,7 +401,7 @@ private struct RequestLog: View {
 /// A request as a line: when it came; while it runs, a spinner and how far it has got, reading
 /// its prompt or answering, or why it waits; once it ended, the tokens it wrote, how fast, how soon
 /// and from how much prompt, or that it was cancelled, or why it failed, the server's line a hover
-/// away.
+/// away, or that it ended, where that line never came.
 private struct RequestRow: View {
     let request: ServedRequest
 
@@ -419,6 +419,8 @@ private struct RequestRow: View {
                     Text(tokens(end.output ?? 0))
                     Text(Self.facts(end)).foregroundStyle(.secondary)
                 }
+            } else if request.gone {
+                Text("Ended").foregroundStyle(.secondary)
             } else {
                 let input = request.input ?? 0
                 ProgressView().controlSize(.mini)

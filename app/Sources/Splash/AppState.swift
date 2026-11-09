@@ -386,7 +386,7 @@ final class AppState {
     var quitCost: QuitCost {
         // The status is asked as seldom as every 10 s; the requests the server's log has started
         // and not ended count at once.
-        let live = server.requests.count { $0.end == nil }
+        let live = server.requests.count(where: \.running)
         let requests = server.phase == .ready ? max(server.activity.running, live, chats.streaming == nil ? 0 : 1) : 0
         // A download, or a check's update, starts over; a check that has found nothing loses nothing,
         // and a deletion, quick, ends first.

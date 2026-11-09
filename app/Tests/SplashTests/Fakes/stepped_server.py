@@ -45,17 +45,24 @@ class Handler(BaseHTTPRequestHandler):
             }]}
         if self.path == "/status":
             # A request answering, which this status goes on reporting once the test has
-            # finished it, as one the server answers from an earlier snapshot does; or those
-            # the test writes.
+            # finished it, from a snapshot taken before, as the server answers while its engine
+            # is busy, saying how long before; or those the test writes, from a snapshot as many
+            # milliseconds old as it writes to "stale", ten minutes where it writes none.
             running = []
+            age = None
+            if (root / "stale").exists():
+                age = float((root / "stale").read_text() or 600_000)
             if (root / "answering").exists():
                 running = [{"id": 1, "phase": "decode", "prompt_tokens": 13, "prompt_processed": 13,
                             "generated_tokens": 1, "age_ms": 400}]
+                if age is None and (root / "finished").exists():
+                    age = 600_000.0
             if (root / "running.json").exists():
                 running = json.loads((root / "running.json").read_text())
             body = {
                 "active_requests": running,
                 "metrics": {"decode_tokens_per_second": 41.6},
+                "transport": {"status_stale": age is not None, "status_age_ms": age or 0.0},
             }
         data = json.dumps(body).encode()
         self.send_response(200)

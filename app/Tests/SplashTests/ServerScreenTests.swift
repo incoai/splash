@@ -96,3 +96,58 @@ extension ServerScreenTests {
         try await waitFor(!state.installer.running, "the deletion")
     }
 }
+
+extension ServerScreenTests {
+    /// A request's row follows the engine as each status says: back to waiting for memory as the
+    /// engine suspends it, then reading its prompt again. A status the server answers from a
+    /// snapshot older than what a row shows moves it not; one from a newer one, as through a long
+    /// prefill, does. One that no longer has a request seen before it ends its row, whose line
+    /// never came, and a quit no longer counts it. Each status here has a request of its own, first
+    /// seen in it, to tell when it is taken.
+    @Test func aRequestsRowFollowsTheEngineBackAndEndsWithItsStatus() async throws {
+        let fake = try FakeRuntime("splash-request-rows", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        func signal(_ name: String, _ text: String = "") throws {
+            try text.write(to: fake.root.appending(path: name), atomically: true, encoding: .utf8)
+        }
+        func request(_ id: Int, _ phase: String, read: Int = 0, written: Int = 0) -> String {
+            #"{"id": \#(id), "phase": "\#(phase)", "prompt_tokens": 900, "prompt_processed": \#(read), "generated_tokens": \#(written), "age_ms": 100}"#
+        }
+        /// Has the status say `requests`, and `marker` first seen, and waits until a status has.
+        func status(_ requests: [String], marker: Int) async throws {
+            try signal("running.json", "[\((requests + [request(marker, "queued")]).joined(separator: ", "))]")
+            try await waitFor(state.server.requests.contains { $0.id == marker }, "the status with request \(marker)")
+        }
+        func stage(_ id: Int) -> LiveRequest.Stage? { state.server.requests.first { $0.id == id }?.stage }
+        func running() -> [Int] { state.server.requests.filter(\.running).map(\.id) }
+        state.server.start("example/Model", settings: ServeSettings(values: ["--port": String(fake.port)]))
+        try signal("loaded")
+        try signal("warm")
+        try await waitFor(state.server.phase == .ready, "ready")
+        try await status([request(1, "decode", read: 900, written: 52)], marker: 11)
+        #expect(stage(1) == .answering(52))
+        // Suspended for memory, then its prompt read again.
+        try await status([request(1, "waiting_resources", read: 900, written: 52)], marker: 12)
+        #expect(stage(1) == .waiting("Waiting for memory"))
+        try await status([request(1, "prefill", read: 300, written: 52)], marker: 13)
+        #expect(stage(1) == .reading(300))
+        // From a snapshot ten minutes old, which has it answering: each status since ended the
+        // marker before it.
+        try signal("stale")
+        try await status([request(1, "decode", read: 900, written: 60)], marker: 14)
+        #expect(stage(1) == .reading(300))
+        #expect(running() == [1, 13, 14] && state.quitCost.requests == 3)
+        // From a snapshot a moment old, newer than the rows: it moves request 1 on, and the
+        // markers it no longer has ended.
+        try signal("stale", "100")
+        try await status([request(1, "prefill", read: 600, written: 52)], marker: 15)
+        #expect(stage(1) == .reading(600) && running() == [1, 15])
+        // Taken then, without any of them but its marker: they ended, their lines never come.
+        try FileManager.default.removeItem(at: fake.root.appending(path: "stale"))
+        try await status([], marker: 16)
+        #expect(running() == [16])
+        #expect(state.server.requests.first { $0.id == 1 }?.end == nil && state.quitCost.requests == 1)
+    }
+}

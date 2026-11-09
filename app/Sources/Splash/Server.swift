@@ -283,7 +283,7 @@ final class Server {
 
     private func received(_ line: String) {
         if phase == .ready, let entry = RequestEntry(line) {
-            requests = ServedRequest.taking(entry, into: requests)
+            requests = ServedRequest.taking(entry, at: .now, into: requests)
         }
     }
 
@@ -428,7 +428,7 @@ final class Server {
         asleep = report.asleep
         recovering = report.recovering
         activity = report.activity
-        requests = ServedRequest.taking(report.live, into: requests)
+        requests = ServedRequest.taking(report.live, taken: report.taken, into: requests)
         // A relaunched engine may serve less context than the first did.
         if let served = report.context { context = served }
     }
@@ -441,14 +441,19 @@ final class Server {
         var recovering = false
         /// The tokens of context the server serves now.
         var context: Int?
-        /// The requests it works on, as they were `now`.
+        /// The requests the engine works on, as they were at `taken`.
         var live: [LiveRequest] = []
+        /// When the engine's requests were as `live` has them, at the earliest: as the status was
+        /// asked, less the age of the snapshot the server answered from, as while a long prefill
+        /// keeps the engine from answering (`transport.status_age_ms`); nil where it lists none.
+        var taken: Date?
     }
 
     /// The report of `/status`'s body, if it is one, asked `now`.
     nonisolated static func report(_ data: Data, at now: Date = .now) -> Report? {
         guard let status = try? JSONDecoder().decode(Status.self, from: data) else { return nil }
         let metrics = status.metrics
+        let taken = now.addingTimeInterval(-(status.transport?.status_age_ms ?? 0) / 1000)
         return Report(
             activity: Activity(
                 served: status.requests?.completed ?? 0,
@@ -468,19 +473,25 @@ final class Server {
             // from it.
             live: (status.active_requests ?? []).compactMap { request in
                 request.id.map { id in
-                    LiveRequest(id: id, time: LiveRequest.time(of: now.addingTimeInterval(-(request.age_ms ?? 0) / 1000)),
+                    LiveRequest(id: id, time: LiveRequest.time(of: taken.addingTimeInterval(-(request.age_ms ?? 0) / 1000)),
                                 input: request.prompt_tokens ?? 0,
                                 stage: LiveRequest.stage(phase: request.phase, read: request.prompt_processed ?? 0,
                                                          written: request.generated_tokens ?? 0))
                 }
-            }
+            },
+            taken: status.active_requests == nil ? nil : taken
         )
     }
 
     private struct Status: Decodable {
         struct Capabilities: Decodable { let max_context_tokens: Int? }
         struct Weights: Decodable { let released: Bool? }
-        struct Transport: Decodable { let recovering: Bool? }
+        struct Transport: Decodable {
+            let recovering: Bool?
+            /// How long before it answered the server took the snapshot it answered from: none
+            /// where the engine answered then.
+            let status_age_ms: Double?
+        }
         struct Requests: Decodable { let completed: Int? }
         struct Request: Decodable {
             let id: Int?
@@ -527,10 +538,11 @@ final class Server {
     }
 
     private func status() async -> Report? {
+        let asked = Date.now
         var request = settings.request("status")
         request.timeoutInterval = 2
         guard let (data, _) = try? await URLSession.shared.data(for: request) else { return nil }
-        return Self.report(data)
+        return Self.report(data, at: asked)
     }
 }
 
@@ -583,9 +595,10 @@ extension LiveRequest.Stage {
 }
 
 /// A row of the Server's request list: one for each request the engine took, from the line that
-/// started it or the status that had it first, which goes on as later statuses say, never back,
-/// until the line that ends it ends it in its place; and one for each line that names no request,
-/// as a request refused before the engine took it, or an earlier server's line.
+/// started it or the status that had it first, which goes on as each status taken since says, back
+/// too, until the line that ends it ends it in its place, or a status taken since no longer has
+/// it; and one for each line that names no request, as a request refused before the engine took
+/// it, or an earlier server's line.
 struct ServedRequest: Equatable, Identifiable {
     /// The engine's id of the request, as its lines and the status name it; below zero for a line
     /// that names none.
@@ -596,56 +609,78 @@ struct ServedRequest: Equatable, Identifiable {
     var input: Int?
     /// How far it has got while it runs.
     var stage: LiveRequest.Stage
-    /// The line that ended it; nil while it runs.
+    /// When it was so: as the line that said so came, or, at the earliest, as the snapshot of the
+    /// status that said so was taken. A status taken no later says nothing of it.
+    var seen = Date.distantPast
+    /// The line that ended it; nil while it runs, or where it ended without one (`gone`).
     var end: RequestEntry?
+    /// Whether a status taken since it was seen running no longer has it: it ended, its line not
+    /// come, as the server's console drops lines while 1024 wait. Its line, should it come later,
+    /// still ends it.
+    var gone = false
+
+    /// Whether it still runs: no line has ended it, and the statuses still have it.
+    var running: Bool { end == nil && !gone }
 
     /// The rows a list keeps, the latest.
     static let kept = 1000
 
-    /// `requests` with `line` taken: a request's start adds its row, unless the status had it
-    /// first; its end ends its row, or adds one ended where it was never seen; a line that names no
-    /// request adds a row of its own, an earlier server's start none, as nothing could end it.
-    static func taking(_ line: RequestEntry, into requests: [ServedRequest]) -> [ServedRequest] {
+    /// `requests` with `line` taken, as it came `now`: a request's start adds its row, unless the
+    /// status had it first, which it moves on to reading where the status had it no further; its
+    /// end ends its row, or adds one ended where it was never seen; a line that names no request
+    /// adds a row of its own, an earlier server's start none, as nothing could end it.
+    static func taking(_ line: RequestEntry, at now: Date, into requests: [ServedRequest]) -> [ServedRequest] {
         var requests = requests
         let index = line.request.flatMap { id in requests.firstIndex { $0.id == id } }
         switch (line.outcome, index) {
         case (.started, let index?):
             requests[index].input = line.input ?? requests[index].input
-            if requests[index].end == nil { requests[index].moveOn(to: .reading(line.cached ?? 0)) }
+            if requests[index].running { requests[index].moveOn(to: .reading(line.cached ?? 0), seen: now) }
         case (.started, nil):
             guard let id = line.request else { return requests }
-            requests.append(ServedRequest(id: id, time: line.time, input: line.input, stage: .reading(line.cached ?? 0)))
+            requests.append(ServedRequest(id: id, time: line.time, input: line.input, stage: .reading(line.cached ?? 0), seen: now))
         case (_, let index?):
             requests[index].input = line.input ?? requests[index].input
             requests[index].end = line
         case (_, nil):
             let id = line.request ?? min(-1, (requests.map(\.id).min() ?? 0) - 1)
             requests.append(ServedRequest(id: id, time: line.time, input: line.input, stage: .answering(line.output ?? 0),
-                                          end: line))
+                                          seen: now, end: line))
         }
         return Array(requests.suffix(kept))
     }
 
-    /// `requests` with the status's `live` ones taken: each running goes on as the status says,
-    /// never back, as a status answered from an earlier snapshot would take it; one ended stays as
-    /// its line left it; one not seen before is added, at the time it came.
-    static func taking(_ live: [LiveRequest], into requests: [ServedRequest]) -> [ServedRequest] {
+    /// `requests` with a status's `live` ones taken, as they were at `taken`: where each row
+    /// running that was last seen before is, back too, as the engine suspends a request for memory
+    /// and later reads its prompt again, and that one it no longer has has ended (`gone`); a
+    /// request it has first is added, at the time it came. A row seen since, as a line started it
+    /// while the status was asked, or one ended, stays as it is. A status that lists no requests
+    /// (`taken` nil) says nothing of them.
+    static func taking(_ live: [LiveRequest], taken: Date?, into requests: [ServedRequest]) -> [ServedRequest] {
+        guard let taken else { return requests }
         var requests = requests
-        for request in live {
-            if let index = requests.firstIndex(where: { $0.id == request.id }) {
-                guard requests[index].end == nil else { continue }
+        for index in requests.indices where requests[index].running && requests[index].seen < taken {
+            if let request = live.first(where: { $0.id == requests[index].id }) {
                 requests[index].input = requests[index].input ?? request.input
-                requests[index].moveOn(to: request.stage)
+                requests[index].stage = request.stage
+                requests[index].seen = taken
             } else {
-                requests.append(ServedRequest(id: request.id, time: request.time, input: request.input, stage: request.stage))
+                requests[index].gone = true
             }
         }
+        for request in live where !requests.contains(where: { $0.id == request.id }) {
+            requests.append(ServedRequest(id: request.id, time: request.time, input: request.input, stage: request.stage,
+                                          seen: taken))
+        }
         return Array(requests.suffix(kept))
     }
 
-    /// Takes `stage` where it is no further back than the row's.
-    private mutating func moveOn(to stage: LiveRequest.Stage) {
-        if stage.progress >= self.stage.progress { self.stage = stage }
+    /// Takes a start's `stage`, as its line came `now`, where the row has it no further on: a
+    /// status may have had it further on by the time its line comes.
+    private mutating func moveOn(to stage: LiveRequest.Stage, seen now: Date) {
+        guard stage.progress >= self.stage.progress else { return }
+        self.stage = stage
+        seen = now
     }
 }
 

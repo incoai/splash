@@ -644,7 +644,8 @@ struct ServerTests {
                                         asleep: false,
                                         live: [LiveRequest(id: 7, time: LiveRequest.time(of: now - 1.5005), input: 4096, stage: .reading(2048)),
                                                LiveRequest(id: 9, time: LiveRequest.time(of: now - 2.25025), input: 512,
-                                                           stage: .answering(40))]))
+                                                           stage: .answering(40))],
+                                        taken: now))
         let busy = Server.report(Data(#"{"requests": {"completed": 5}, "metrics": {"decode_tokens_per_second": 71.5, "prefill_tokens_per_second": 900, "ttft_ms": {"p50": 120}}, "weights": {"released": true}}"#.utf8))
         #expect(busy == Server.Report(activity: Server.Activity(served: 5, generation: 71.5, reading: 900, firstToken: .milliseconds(120)),
                                       asleep: true))
@@ -672,34 +673,95 @@ struct ServerTests {
         #expect(report.activity.running == 6)
     }
 
+    /// A status the server answered from an earlier snapshot, as while a long prefill keeps the
+    /// engine from answering, says how old it is: the requests in it were so, and came, that much
+    /// earlier. One that lists no requests says nothing of them.
+    @Test func readsWhenTheStatusWasTaken() throws {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let request = #"{"id": 1, "phase": "decode", "prompt_tokens": 10, "generated_tokens": 3, "age_ms": 500}"#
+        let fresh = try #require(Server.report(Data(#"""
+            {"active_requests": [\#(request)], "transport": {"status_stale": false, "status_age_ms": 0}}
+            """#.utf8), at: now))
+        #expect(fresh.taken == now && fresh.live.map(\.time) == [LiveRequest.time(of: now - 0.5)])
+        let stale = try #require(Server.report(Data(#"""
+            {"active_requests": [\#(request)], "transport": {"status_stale": true, "status_age_ms": 4000}}
+            """#.utf8), at: now))
+        #expect(stale.taken == now - 4 && stale.live.map(\.time) == [LiveRequest.time(of: now - 4.5)])
+        // As the server answers before its engine's first status.
+        let none = try #require(Server.report(Data(#"{"ready": false, "transport": {"status_stale": true, "status_age_ms": 0}}"#.utf8),
+                                              at: now))
+        #expect(none.taken == nil && none.live.isEmpty)
+        #expect(Server.report(Data(#"{"requests": {"completed": 5}}"#.utf8), at: now)?.taken == nil)
+    }
+
     /// Each request the engine took is one row, in the order they came: its start or the status
-    /// adds it, the status moves it on and never back, its end ends it in its place, and a status
-    /// from before its end leaves it ended; a line that names no request is a row of its own.
+    /// adds it, the status moves it on, its end ends it in its place, and a status from before its
+    /// end leaves it ended; a line that names no request is a row of its own.
     @Test func keepsOneRowPerRequest() throws {
         func line(_ text: String) throws -> RequestEntry { try #require(RequestEntry(text)) }
         func live(_ id: Int, _ stage: LiveRequest.Stage, input: Int) -> LiveRequest {
             LiveRequest(id: id, time: "12:00:00", input: input, stage: stage)
         }
-        var rows = ServedRequest.taking(try line("12:00:01 Started · request 1 · input 881 · cached 0"), into: [])
-        rows = ServedRequest.taking([live(1, .answering(52), input: 881), live(2, .reading(6656), input: 8193)], into: rows)
-        #expect(rows.map(\.id) == [1, 2] && rows.map(\.time) == ["12:00:01", "12:00:00"])
-        #expect(rows.map(\.stage) == [.answering(52), .reading(6656)] && rows.allSatisfy { $0.end == nil })
-        rows = ServedRequest.taking(try line("12:00:05 Done · request 1 · input 881 · cached 0 · output 65 · TTFT 1.6s · 32.7 tok/s"),
+        let start = Date(timeIntervalSince1970: 1_000)
+        func at(_ seconds: Double) -> Date { start + seconds }
+        var rows = ServedRequest.taking(try line("12:00:01 Started · request 1 · input 881 · cached 0"), at: at(1), into: [])
+        rows = ServedRequest.taking([live(1, .answering(52), input: 881), live(2, .reading(6656), input: 8193)], taken: at(2),
                                     into: rows)
-        // A status from before that end, as one the server answers from an earlier snapshot.
-        rows = ServedRequest.taking([live(1, .answering(52), input: 881), live(2, .reading(4096), input: 8193)], into: rows)
-        #expect(rows.count == 2 && rows[0].end?.output == 65 && rows[1].end == nil && rows[1].stage == .reading(6656))
+        #expect(rows.map(\.id) == [1, 2] && rows.map(\.time) == ["12:00:01", "12:00:00"])
+        #expect(rows.map(\.stage) == [.answering(52), .reading(6656)] && rows.allSatisfy(\.running))
+        rows = ServedRequest.taking(try line("12:00:05 Done · request 1 · input 881 · cached 0 · output 65 · TTFT 1.6s · 32.7 tok/s"),
+                                    at: at(5), into: rows)
+        // A status from before that end and the last one, as one the server answers from an
+        // earlier snapshot.
+        rows = ServedRequest.taking([live(1, .answering(52), input: 881), live(2, .reading(4096), input: 8193)], taken: at(1.5),
+                                    into: rows)
+        #expect(rows.count == 2 && rows[0].end?.output == 65 && rows[1].running && rows[1].stage == .reading(6656))
         // Its Started line, later than the status that had it first, moves it on no further back.
-        rows = ServedRequest.taking(try line("12:00:02 Started · request 2 · input 8,193 · cached 0"), into: rows)
+        rows = ServedRequest.taking(try line("12:00:02 Started · request 2 · input 8,193 · cached 0"), at: at(6), into: rows)
         #expect(rows.map(\.time) == ["12:00:01", "12:00:00"] && rows[1].stage == .reading(6656))
-        rows = ServedRequest.taking(try line("12:00:06 Error · not_found · HEAD /api/hello"), into: rows)
-        rows = ServedRequest.taking(try line("12:00:09 Done · request 2 · input 8,193 · cached 0 · output 33"), into: rows)
+        rows = ServedRequest.taking(try line("12:00:06 Error · not_found · HEAD /api/hello"), at: at(6), into: rows)
+        rows = ServedRequest.taking(try line("12:00:09 Done · request 2 · input 8,193 · cached 0 · output 33"), at: at(9), into: rows)
         #expect(rows.map(\.id) == [1, 2, -1] && rows.allSatisfy { $0.end != nil })
         #expect(rows[2].end?.message == "not_found · HEAD /api/hello" && rows[2].time == "12:00:06")
         // An earlier server's lines name no request: its ends are rows of their own, its starts none.
-        let earlier = ServedRequest.taking(try line("12:01:00 Started · input 5 · cached 0"), into: [])
+        let earlier = ServedRequest.taking(try line("12:01:00 Started · input 5 · cached 0"), at: at(60), into: [])
         #expect(earlier.isEmpty)
-        #expect(ServedRequest.taking(try line("12:01:02 Done · input 5 · cached 0 · output 1"), into: earlier).map(\.id) == [-1])
+        #expect(ServedRequest.taking(try line("12:01:02 Done · input 5 · cached 0 · output 1"), at: at(62), into: earlier).map(\.id) == [-1])
+    }
+
+    /// Each status says where each running request seen before its snapshot was taken is, back
+    /// too, as the engine suspends a request for memory and later reads its prompt again, and that
+    /// one it no longer has has ended, its line not come; it adds the requests it has first. One
+    /// from a snapshot older than a row says nothing of it, as a status asked while a line starts
+    /// a request; a row ended stays ended; one that lists no requests says nothing.
+    @Test func aStatusSaysWhereEachRequestSeenBeforeItIs() throws {
+        func line(_ text: String) throws -> RequestEntry { try #require(RequestEntry(text)) }
+        func live(_ id: Int, _ stage: LiveRequest.Stage) -> LiveRequest { LiveRequest(id: id, time: "12:00:00", input: 900, stage: stage) }
+        let start = Date(timeIntervalSince1970: 1_000)
+        func at(_ seconds: Double) -> Date { start + seconds }
+        var rows = ServedRequest.taking([live(1, .answering(52))], taken: at(1), into: [])
+        rows = ServedRequest.taking([live(1, .waiting("Waiting for memory"))], taken: at(3), into: rows)
+        #expect(rows.map(\.stage) == [.waiting("Waiting for memory")])
+        rows = ServedRequest.taking([live(1, .reading(300))], taken: at(5), into: rows)
+        #expect(rows.map(\.stage) == [.reading(300)])
+        // From a snapshot older than that: a request first seen is added, the other stays.
+        rows = ServedRequest.taking([live(1, .answering(52)), live(2, .waiting("Queued"))], taken: at(2), into: rows)
+        #expect(rows.map(\.id) == [1, 2] && rows.map(\.stage) == [.reading(300), .waiting("Queued")])
+        // From a snapshot newer than both, as the server answers through a long prefill.
+        rows = ServedRequest.taking([live(1, .reading(600)), live(2, .waiting("Queued"))], taken: at(6), into: rows)
+        #expect(rows.map(\.stage) == [.reading(600), .waiting("Queued")])
+        // Request 2's and request 3's starts come as a status is asked, whose snapshot is older.
+        rows = ServedRequest.taking(try line("12:00:07 Started · request 2 · input 900 · cached 0"), at: at(7.1), into: rows)
+        rows = ServedRequest.taking(try line("12:00:07 Started · request 3 · input 900 · cached 0"), at: at(7.2), into: rows)
+        rows = ServedRequest.taking([live(2, .waiting("Queued"))], taken: at(7), into: rows)
+        #expect(rows.map(\.id) == [1, 2, 3] && rows.map(\.running) == [false, true, true])
+        #expect(rows[0].gone && rows[0].end == nil && rows[1].stage == .reading(0) && rows[2].stage == .reading(0))
+        // Its line, come at last, ends it all the same; a status that has it runs it no more.
+        rows = ServedRequest.taking(try line("12:00:08 Done · request 1 · input 900 · cached 0 · output 70"), at: at(8), into: rows)
+        #expect(rows[0].end?.output == 70)
+        rows = ServedRequest.taking([live(1, .answering(70)), live(2, .reading(10)), live(3, .reading(20))], taken: at(9), into: rows)
+        #expect(rows.map(\.running) == [false, true, true] && rows.map(\.stage) == [.reading(600), .reading(10), .reading(20)])
+        #expect(ServedRequest.taking([], taken: nil, into: rows) == rows)
     }
 
     /// The request lines the server writes, as the golden the server's tests check them against
