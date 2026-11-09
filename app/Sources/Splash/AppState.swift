@@ -63,6 +63,10 @@ final class AppState {
     /// What `launch` waits for while it stops what an earlier run of the app left running, which
     /// can take some seconds; the window says it under its spinner.
     private(set) var launchWait: String?
+    /// Whether the window is open, and the menu bar's panel; while neither is, the server's status
+    /// is asked less often (`Server.unwatched`).
+    @ObservationIgnored var windowShows = true { didSet { server.unwatched = !windowShows && !panelShows } }
+    @ObservationIgnored var panelShows = false { didSet { server.unwatched = !windowShows && !panelShows } }
     var section = Section.server
     /// The launch options the next start uses; their API key reaches the Keychain once typed
     /// (`keepKey`).

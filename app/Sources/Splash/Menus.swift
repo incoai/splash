@@ -79,6 +79,8 @@ struct MenuBarPanel: View {
         }
         .padding(6)
         .frame(width: 300)
+        .onAppear { state.panelShows = true }
+        .onDisappear { state.panelShows = false }
     }
 
     /// How the model does since it started: answering speed, requests and memory; the tokens it

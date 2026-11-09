@@ -164,6 +164,10 @@ final class Server {
 
     var running: Bool { child != nil }
 
+    /// Whether neither the window nor the menu bar's panel shows the server's status: it is asked
+    /// every 10 s rather than every 2 s then, for the menu bar's icon alone.
+    @ObservationIgnored var unwatched = false
+
     /// The model to start once the one stopping has stopped: another one, or the same one again.
     var next: String? { queued?.model }
 
@@ -383,15 +387,20 @@ final class Server {
             }
             try? await Task.sleep(for: .milliseconds(500))
         }
-        // Then its status, every 2 s while it serves.
+        // Then its status while it serves: every 2 s, or every 10 s while nothing but the menu bar's
+        // icon shows it.
+        var asked = ContinuousClock.now - .seconds(10)
         while !Task.isCancelled, phase == .ready {
-            if let report = await status(), phase == .ready {
-                asleep = report.asleep
-                recovering = report.recovering
-                activity = report.activity
-                // A relaunched engine may serve less context than the first did.
-                if let served = report.context { context = served }
-                if let stopped = report.stopped { phase = .failed(stopped) }
+            if !unwatched || ContinuousClock.now - asked >= .seconds(10) {
+                asked = .now
+                if let report = await status(), phase == .ready {
+                    asleep = report.asleep
+                    recovering = report.recovering
+                    activity = report.activity
+                    // A relaunched engine may serve less context than the first did.
+                    if let served = report.context { context = served }
+                    if let stopped = report.stopped { phase = .failed(stopped) }
+                }
             }
             try? await Task.sleep(for: .seconds(2))
         }

@@ -107,7 +107,8 @@ forgets the record. It serves model files on this Mac
 the user adds with `splash serve --model local/NAME
 --model-dir PATH`, NAME being the file's or folder's name made a repository
 name, and at launch it runs `install/cached.py`. While a model runs, the Server
-shows its context limit, from `/v1/models`, and its `/status`: requests,
+shows its context limit, from `/v1/models`, and its `/status`, asked every 2 s,
+or every 10 s while neither the window nor the menu bar's panel is open: requests,
 answering and prompt speed, time to first token, the tokens generated, read and
 taken from the cache, and the Metal memory it holds, with each request's line
 of the server's log, folded. A start that fails says why, as its serve record

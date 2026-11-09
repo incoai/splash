@@ -389,6 +389,23 @@ struct AppStateTests {
         #expect(try keychain.read() == nil)
     }
 
+    /// The server's status is asked less often while neither the window nor the menu bar's panel
+    /// shows it.
+    @Test func theStatusIsAskedLessOftenWhileNothingShowsIt() throws {
+        let fake = try FakeRuntime("splash-watched", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        #expect(!state.server.unwatched)
+        state.windowShows = false
+        #expect(state.server.unwatched)
+        state.panelShows = true
+        #expect(!state.server.unwatched)
+        state.panelShows = false
+        state.windowShows = true
+        #expect(!state.server.unwatched)
+    }
+
     /// A model whose files are gone, as when its Hugging Face cache folder was deleted, is not on
     /// this Mac: it leaves the list, and the pick of it falls to the first model listed, as for a
     /// model taken off the list. Its files back, as installed again, it is listed and picked again.

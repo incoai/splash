@@ -47,8 +47,13 @@ struct MainView: View {
             .onChange(of: state.status) { _, status in
                 AccessibilityNotification.Announcement(status).post()
             }
-            // The Chat's page loads with the window, so that the Chat shows at once.
-            .onAppear { state.transcript.page.load() }
+            // The Chat's page loads with the window, so that the Chat shows at once; while the window
+            // is open, the server's status is asked often (`AppState.windowShows`).
+            .onAppear {
+                state.transcript.page.load()
+                state.windowShows = true
+            }
+            .onDisappear { state.windowShows = false }
     }
 
     @ViewBuilder private var content: some View {
