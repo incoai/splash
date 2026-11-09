@@ -446,16 +446,24 @@
   function save() {
     conversations.sort((a, b) => b.updated - a.updated);
     conversations = conversations.slice(0, 20);
+    // A text past the browser's longest string is as unsaved as a full store.
+    const saved = value => {
+      try {
+        return storageSet(storeKey, JSON.stringify(value));
+      } catch {
+        return false;
+      }
+    };
     // Browser storage holds a few MB per site, which one photo can fill. Rather
     // than fail every later save, store the newest chats that fit, each with its
     // images and PDFs if they still fit and without them otherwise, so a photo
     // too large to store does not cost older chats theirs. The open page keeps
     // its attachments.
-    if (!storageSet(storeKey, JSON.stringify(conversations))) {
+    if (!saved(conversations)) {
       const stored = [];
       for (const conversation of conversations) {
         const candidates = hasAttachments(conversation) ? [conversation, withoutAttachments(conversation)] : [conversation];
-        const fitting = candidates.find(candidate => storageSet(storeKey, JSON.stringify([...stored, candidate])));
+        const fitting = candidates.find(candidate => saved([...stored, candidate]));
         if (!fitting) break;
         stored.push(fitting);
       }
