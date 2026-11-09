@@ -60,6 +60,9 @@ final class AppState {
     private(set) var blocker: Blocker?
     /// Whether the checks of `launch` are done; nothing starts before.
     private(set) var launched = false
+    /// What `launch` waits for while it stops what an earlier run of the app left running, which
+    /// can take some seconds; the window says it under its spinner.
+    private(set) var launchWait: String?
     var section = Section.server
     /// The launch options the next start uses.
     var options: ServeSettings {
@@ -217,8 +220,9 @@ final class AppState {
         }
         await listed()
         Task { families = await runtime.families() }
-        await installer.stopLeftover()
-        await server.stopLeftover()
+        await installer.stopLeftover { self.launchWait = "Stopping the download Splash left running…" }
+        await server.stopLeftover { self.launchWait = "Stopping the model Splash left running…" }
+        launchWait = nil
         installCached()
     }
 

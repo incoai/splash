@@ -55,7 +55,13 @@ struct MainView: View {
         if let blocker = state.blocker {
             ContentUnavailableView(blocker.title, systemImage: blocker.symbol, description: Text(blocker.message))
         } else if !state.launched {
-            ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
+            VStack(spacing: 10) {
+                ProgressView().controlSize(.small)
+                if let wait = state.launchWait {
+                    Text(wait).font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             switch state.section {
             case .server: ServerView()

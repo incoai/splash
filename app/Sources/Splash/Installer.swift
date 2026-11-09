@@ -151,8 +151,8 @@ final class Installer {
     /// stays until then, for the next launch should this one end first. An app before 1.6 kept its
     /// download's ID alone: the process that still runs the installer under the ID as an app
     /// starts it is that download.
-    func stopLeftover() async {
-        await record.stopLeftover(olderApps: runtime.runsInstaller)
+    func stopLeftover(stopping: () -> Void = {}) async {
+        await record.stopLeftover(olderApps: runtime.runsInstaller, stopping: stopping)
     }
 
     private func received(_ line: String) {

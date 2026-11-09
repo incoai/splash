@@ -658,9 +658,14 @@ struct ChildRecordTests {
         let child = try ChildProcess(command: ["/bin/sleep", "60"], environment: [:], log: folder.appending(path: "child.log")) { _ in }
         #expect(child.started != nil)
         record.keep(child)
-        await record.stopLeftover(olderApps: { _ in false })
+        var stopping = 0
+        await record.stopLeftover(olderApps: { _ in false }) { stopping += 1 }
         #expect(processStart(child.pid) == nil)
         #expect(defaults.object(forKey: record.key) == nil)
+        // The launch said it waited for the stop, once; with nothing left to stop, it doesn't.
+        #expect(stopping == 1)
+        await record.stopLeftover(olderApps: { _ in false }) { stopping += 1 }
+        #expect(stopping == 1)
     }
 
     @Test func leavesAnotherProcessWithTheIDAlone() async throws {
@@ -673,8 +678,9 @@ struct ChildRecordTests {
         // Kept with another start: an earlier process that had the ID, or a record an older app
         // kept as the ID alone.
         defaults.set([Int(other.pid), try #require(other.started) - 1], forKey: record.key)
-        await record.stopLeftover(olderApps: { _ in false })
-        #expect(processStart(other.pid) != nil)
+        var stopping = false
+        await record.stopLeftover(olderApps: { _ in false }) { stopping = true }
+        #expect(processStart(other.pid) != nil && !stopping)
         #expect(defaults.object(forKey: record.key) == nil)
         defaults.set(Int(other.pid), forKey: record.key)
         await record.stopLeftover(olderApps: { _ in false })

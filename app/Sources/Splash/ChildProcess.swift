@@ -252,16 +252,22 @@ struct ChildRecord {
     /// running stays kept, for the launch after. A record of the ID alone, as an app before 1.6
     /// kept it, gives no start to tell its program from a later process given the ID: that
     /// program is stopped only where `olderApps` shows the ID is still its own, and the record is
-    /// forgotten.
-    func stopLeftover(olderApps: (pid_t) -> Bool) async {
+    /// forgotten. `stopping` runs as the stop of a program that runs begins, which can take long.
+    func stopLeftover(olderApps: (pid_t) -> Bool, stopping: () -> Void = {}) async {
         if let older = defaults.object(forKey: key) as? Int, let pid = pid_t(exactly: older) {
-            if olderApps(pid) { await stopProcessGroup(pid, with: stop, killAfter: killAfter) }
+            if olderApps(pid) {
+                stopping()
+                await stopProcessGroup(pid, with: stop, killAfter: killAfter)
+            }
             return forget()
         }
         guard let kept = defaults.array(forKey: key) as? [Int], kept.count == 2,
               let pid = pid_t(exactly: kept[0])
         else { return forget() }
-        if processStart(pid) == kept[1] { await stopProcessGroup(pid, with: stop, killAfter: killAfter) }
+        if processStart(pid) == kept[1] {
+            stopping()
+            await stopProcessGroup(pid, with: stop, killAfter: killAfter)
+        }
         if processStart(pid) != kept[1] { forget() }
     }
 }

@@ -205,9 +205,9 @@ final class Server {
     /// (`SPLASH_APP_PID`), and is left to finish; this stops one that has not yet. An app before
     /// 1.6 kept its server's ID alone, with its port: the process that still holds that port's
     /// lock under the ID is that server, which nothing stops by itself.
-    func stopLeftover() async {
+    func stopLeftover(stopping: () -> Void = {}) async {
         let port = record.defaults.integer(forKey: Preference.olderServerPort)
-        await record.stopLeftover { pid in port > 0 && runtime.serveLockHolder(port: port) == pid }
+        await record.stopLeftover(olderApps: { pid in port > 0 && runtime.serveLockHolder(port: port) == pid }, stopping: stopping)
         record.defaults.removeObject(forKey: Preference.olderServerPort)
     }
 
