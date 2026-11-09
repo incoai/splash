@@ -46,16 +46,19 @@ final class Draft {
     /// limit is about four million pixels), PNG when they have transparency and JPEG otherwise.
     /// They are encoded away from the main thread, which a photo would hold for a tenth of a second
     /// or more, and join the draft in the order they were attached.
-    func attach(_ images: [NSImage]) {
+    func attach(_ images: [NSImage], unreadable: Int = 0) {
         let sources = images.compactMap { $0.cgImage(forProposedRect: nil, context: nil, hints: nil) }
-        guard !sources.isEmpty else { return }
+        let missed = images.count - sources.count + unreadable
+        guard !sources.isEmpty else {
+            if missed > 0 { noticeUnattached(missed) }
+            return
+        }
         attaching += sources.count
         let files = files
         let encoding = Task.detached(priority: .userInitiated) {
             sources.compactMap { source in Self.encoded(source).flatMap { Self.kept($0, in: files) } }
         }
         let previous = lastAttachment
-        let missed = images.count - sources.count
         lastAttachment = Task {
             await previous?.value
             let kept = await encoding.value
@@ -65,9 +68,13 @@ final class Draft {
             }
             attaching -= sources.count
             let failed = missed + sources.count - kept.count
-            if failed > 0 { notice = Notice(text: failed == 1 ? "An image couldn’t be attached" : "\(failed) images couldn’t be attached",
-                                            conversation: conversation) }
+            if failed > 0 { noticeUnattached(failed) }
         }
+    }
+
+    private func noticeUnattached(_ failed: Int) {
+        notice = Notice(text: failed == 1 ? "An image couldn’t be attached" : "\(failed) images couldn’t be attached",
+                        conversation: conversation)
     }
 
     /// Attaches the PDFs at `urls` as they are, with their names and pages, read and kept away from
@@ -188,7 +195,7 @@ struct Composer: View {
             ComposerField(text: $draft.text, focusRequests: draft.focusRequests,
                           yields: state.terminalShows,
                           placeholder: "Message Splash", submit: state.sendDraft, cancel: stop, acceptsImages: images,
-                          attach: draft.attach, attachPDFs: { draft.attach(pdfs: $0) })
+                          attach: { draft.attach($0, unreadable: $1) }, attachPDFs: { draft.attach(pdfs: $0) })
             HStack(spacing: 6) {
                 // Only for a model that sees images and reads PDFs.
                 if images {
@@ -230,7 +237,9 @@ struct Composer: View {
         .fileImporter(isPresented: $picking, allowedContentTypes: [.image, .pdf], allowsMultipleSelection: true) { result in
             let urls = (try? result.get()) ?? []
             let pdfs = urls.filter { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .pdf) == true }
-            draft.attach(urls.filter { !pdfs.contains($0) }.compactMap(NSImage.init(contentsOf:)))
+            let files = urls.filter { !pdfs.contains($0) }
+            let images = files.compactMap(NSImage.init(contentsOf:))
+            draft.attach(images, unreadable: files.count - images.count)
             draft.attach(pdfs: pdfs)
         }
         // The ring counts the next prompt as it is written.
@@ -509,7 +518,8 @@ private struct ComposerField: NSViewRepresentable {
     let cancel: () -> Bool
     /// Whether the model takes images and PDFs.
     let acceptsImages: Bool
-    let attach: ([NSImage]) -> Void
+    /// Takes images, and how many of those chosen could not be read.
+    let attach: ([NSImage], Int) -> Void
     let attachPDFs: ([URL]) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -682,11 +692,13 @@ private final class MessageTextView: NSTextView {
         guard holdsAttachments(pasteboard) else { return false }
         let pdfs = (pasteboard.readObjects(forClasses: [NSURL.self], options: Self.pdfFiles) as? [URL]) ?? []
         // A file comes with a picture of itself, which is no image to attach.
-        let images = pasteboard.canReadObject(forClasses: [NSURL.self], options: Self.files)
-            ? ((pasteboard.readObjects(forClasses: [NSURL.self], options: Self.imageFiles) as? [URL]) ?? []).compactMap(NSImage.init(contentsOf:))
-            : (pasteboard.readObjects(forClasses: [NSImage.self]) as? [NSImage]) ?? []
-        guard !images.isEmpty || !pdfs.isEmpty else { return false }
-        if !images.isEmpty { coordinator?.field.attach(images) }
+        let files = pasteboard.canReadObject(forClasses: [NSURL.self], options: Self.files)
+            ? (pasteboard.readObjects(forClasses: [NSURL.self], options: Self.imageFiles) as? [URL]) ?? []
+            : nil
+        let images = files?.compactMap(NSImage.init(contentsOf:)) ?? (pasteboard.readObjects(forClasses: [NSImage.self]) as? [NSImage]) ?? []
+        let unreadable = (files?.count ?? images.count) - images.count
+        guard !images.isEmpty || !pdfs.isEmpty || unreadable > 0 else { return false }
+        if !images.isEmpty || unreadable > 0 { coordinator?.field.attach(images, unreadable) }
         if !pdfs.isEmpty { coordinator?.field.attachPDFs(pdfs) }
         return true
     }
