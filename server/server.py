@@ -234,6 +234,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # passed validate_headers.
         self._allow_origin = None
         self._unread_body = 0
+        # The native job submitted last, which a failure cancels.
+        self._submitted = None
         self._last_sse_write = time.monotonic()
         try:
             for level, option, value in TCP_KEEPALIVE_OPTIONS:
@@ -390,7 +392,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         path = "".join(char if char.isprintable() else "?" for char in self.route)
         # A request the engine took is named as the backend's lines name it,
         # so that the app joins them.
-        job = getattr(self, "_submitted", None)
+        job = self._submitted
         engine_id = job.engine_request_id if job is not None else None
         request = "" if engine_id is None else f"request {engine_id} · "
         print_status(
@@ -631,8 +633,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
             return
         self._body_reservation = None
-        # The native job submitted last, which a failure cancels.
-        self._submitted = None
         try:
             generation = self._serve(route, started_at)
             if generation is not None:
