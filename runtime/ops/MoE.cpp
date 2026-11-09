@@ -103,7 +103,8 @@ std::string routingKernel(std::string name, MoeShape shape, std::string_view Com
 // the slots `slots` names: gate and up in one pass
 // (moe_expert_gguf_m<rows>_gate_up[_mixed], whose simdgroups each decode
 // their own pass's formats) from the grouped rows the gather writes into
-// groupedInput to expertIntermediate, then down to expertOutput.
+// groupedInput to expertIntermediate, then down to expertOutput
+// (moe_expert_gguf_m<rows>_down).
 void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const BlockMoeWeights &weights,
                 const metal::MetalBuffer &slots, const MoePlan &plan, const MoeGroupParams &group, uint32_t range) {
   const MoeShape shape = plan.shape();
@@ -134,13 +135,12 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
                                 up.routed.formatId, up.shared.formatId, floorSlots, chunkSlots, range},
             {group.gate_up_columns, tiles, 1}, gateUpGrid, {GGUF_STAGED_THREADS, 1, 1});
   graph.addresses(weights.chunks.planes());
-  // Down, projection 2 of the routed experts, which it reaches in the chunks;
-  // its aux, expertOutput again, goes unread.
-  graph.add(kernel + "_a" + slices,
+  // Down, projection 2 of the routed experts, which it reaches in the chunks.
+  graph.add(kernel + "_down" + slices,
             {scratch.expertIntermediate, scratch.tileDescriptors, scratch.tileCount, down.shared.plane0,
-             down.shared.plane1Slot(), down.shared.meta, scratch.expertOutput, scratch.expertOutput, slots},
+             down.shared.plane1Slot(), down.shared.meta, scratch.expertOutput, slots},
             MoeGgufExpertParams{intermediate, hidden, shape.experts, down.routed.formatId, down.shared.formatId,
-                                floorSlots, chunkSlots, 2, range},
+                                floorSlots, chunkSlots, range},
             {group.down_columns, tiles, 1}, downGrid, {GGUF_STAGED_THREADS, 1, 1});
   graph.addresses(weights.chunks.planes());
 }

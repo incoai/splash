@@ -740,10 +740,11 @@ uint32_t parseMaxContext(std::string_view value) {
   return tokens;
 }
 
-// --prefill-int8, as serve's: whether prefill may run the int8 prefill tile.
-bool parsePrefillInt8(std::string_view value) {
-  if (value != "on" && value != "off") throw std::invalid_argument("--prefill-int8 requires on or off");
-  return value == "on";
+// --int8-activations, as serve's: whether activations may round to int8
+// where an int8-activation path takes them.
+ops::Int8Activations parseInt8Activations(std::string_view value) {
+  if (value != "on" && value != "off") throw std::invalid_argument("--int8-activations requires on or off");
+  return value == "on" ? ops::Int8Activations::On : ops::Int8Activations::Off;
 }
 
 // --ane-ffn-minimum-rows: the least rows of a chunk the prefill FFN's Neural
@@ -901,7 +902,7 @@ int main(int argc, char **argv) {
                    "[--samples COUNT] [--progress PATH] "
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
                    "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
-                   "[--prefill-int8 on|off] "
+                   "[--int8-activations on|off] "
                    "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
                    "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
                    "(default: decode,partial,context)\n"
@@ -912,7 +913,7 @@ int main(int argc, char **argv) {
                    "  TOKENS: the context the engine serves, as serve's "
                    "--max-context, with YaRN past the model's native window "
                    "(default: what memory holds)\n"
-                   "  --prefill-int8: as serve's (default: on)\n"
+                   "  --int8-activations: as serve's (default: on)\n"
                    "  DIR: the logits scenario's dump, and the earlier dump whose "
                    "prefixes it scores (default: its own greedy transcripts')\n"
                    "  LANES: the score requests the logits scenario runs at once "
@@ -925,7 +926,7 @@ int main(int argc, char **argv) {
     std::optional<double> aneFfnShare;
     std::optional<uint32_t> aneFfnMinimumRows;
     uint32_t maxContext = 0;
-    bool prefillInt8 = true;
+    ops::Int8Activations int8Activations = ops::Int8Activations::On;
     std::optional<std::filesystem::path> logitsDirectory, logitsFrom;
     uint32_t logitsWidth = 1;
     bool logitsOptions = false;
@@ -945,8 +946,8 @@ int main(int argc, char **argv) {
         aneFfnMinimumRows = parseAneFfnMinimumRows(argv[index + 1]);
       } else if (option == "--max-context") {
         maxContext = parseMaxContext(argv[index + 1]);
-      } else if (option == "--prefill-int8") {
-        prefillInt8 = parsePrefillInt8(argv[index + 1]);
+      } else if (option == "--int8-activations") {
+        int8Activations = parseInt8Activations(argv[index + 1]);
       } else if (option == "--logits") {
         logitsDirectory = std::filesystem::path(argv[index + 1]);
       } else if (option == "--logits-from") {
@@ -975,7 +976,7 @@ int main(int argc, char **argv) {
     config.model = model::servedFor(model::inspectModelRoot(config.modelRoot), maxContext);
     config.buildId = SPLASH_BUILD_ID;
     config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
-    config.prefillInt8 = prefillInt8;
+    config.int8Activations = int8Activations;
     // The verify budget's rows follow the wall times and acceptance of the
     // cycles before them, so a MoE target's outputs would not repeat from
     // round to round: every cycle verifies every row (--verify-rows all), and

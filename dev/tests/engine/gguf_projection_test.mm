@@ -16,9 +16,9 @@
 //   (LinearConfig::oneGateUpPass) bitwise the two passes at the same K split, one lane on the 16-row tile too;
 // - prefill: 128-row tiles with each epilogue, whose simdgroups past the chunk write nothing, and chunks of up to 64
 //   rows on the decode tiles equal to them bitwise; fused segments at their column offsets;
-// - int8 decode: rotated PQ2_0 projections on the int8 decode tiles (LinearConfig::decodeInt8) within fp64 plus the
-//   int8 quantization's term, at every lane count, split, walk and pass mode, the production plans' choice, and a
-//   non-finite input's row alone not finite;
+// - int8 decode: rotated PQ2_0 projections on the int8 decode tiles (LinearConfig::decodeInt8) within the fp32
+//   rounding of the exact products of their int8 codes, at every lane count, split, walk and pass mode, the
+//   production plans in int8 activations, and a non-finite input's row alone not finite;
 // - int8 prefill (af4g64, af5g64, where the family runs it): the products of the inputs rounded per row and 64-input
 //   group, also with an outlier input per row, within a bound of the bf16 tile's error, a chunk's last rows at their
 //   own height and a view of leading inputs bitwise, and a non-finite input's row alone not finite;
@@ -296,12 +296,13 @@ std::vector<uint16_t> storageRows(const std::vector<float> &x, uint32_t width, u
 }
 
 // A plan's split scratch, as LinearPlan::scratchSize sizes it (the largest of several plans that share it), and a
-// rotated projection's rotated rows.
+// rotated projection's rotated rows, which start NaN (bytes 0xFF: NaN bf16 values, int8 codes -1 and NaN scales),
+// as the padding rows of a plan's storage that no rotation writes are read.
 struct Scratch {
   Guarded table, sums, partials, counters, rotated;
   Scratch(MetalBackend &backend, LinearScratchSize size)
       : table(backend, size.input, 0), sums(backend, size.sums, 0), partials(backend, size.partials, 0),
-        counters(backend, size.counters, 0), rotated(backend, size.rotated, 0) {}
+        counters(backend, size.counters, 0), rotated(backend, size.rotated, 0xFF) {}
   [[nodiscard]] LinearScratch bindings() const {
     return {table.view, sums.view, partials.view, counters.view, rotated.view};
   }
@@ -366,8 +367,6 @@ Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan,
         spread = static_cast<const GgufDecodeParams *>(params.data)->spread;
       else if (params.sizeBytes == sizeof(GgufDecodeFusedParams))
         spread = static_cast<const GgufDecodeFusedParams *>(params.data)->spread;
-      else if (params.sizeBytes == sizeof(GgufDecodeInt8Params))
-        spread = static_cast<const GgufDecodeInt8Params *>(params.data)->spread;
       if (spread != 1) fail(label + ": " + dispatch.pipelineName + " walks K in lockstep");
     }
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
@@ -818,17 +817,20 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
 
 // ---------------------------------------------------------------- int8 decode
 // Rotated PQ2_0 projections in int8 activations (LinearConfig::decodeInt8, which selection takes on plans of
-// ProjectionCalibration::decodeInt8FromRows rows or more):
-// gguf_rotate_int8 quantizes the rotated input to int8, one fp32 scale s = max |x| / 127 per row and rotation block,
-// and the int8 tiles (gguf_decode_int8_*) multiply it with the codes. Each int8 value stands for its input within
-// s / 2, so every output lies within the staged tile's bound of the fp64 product of the bf16 rotated rows widened by
-// the int8 term, the sum over the row's blocks of s / 2 times the block's sum |w| (int8Bound), through each epilogue
-// and the fp32 destination, which rounds to the bf16 run bit for bit. Single tensors at one to four lanes (one on the
-// 16-row tile: the int8 tiles hold 16 or 32 rows), every K split that keeps whole PQ2_0 blocks, both walks; the first
-// lane's rows equal a one-lane projection of them bitwise, and a gate/up pair in one pass the two passes; three fused
-// segments; the production plans on [8192, 5120] and [5120, 17408]. A NaN or an infinity in a row's inputs leaves
-// that row's outputs alone not finite, on the int8 tiles as on the bf16 tiles. The int8 plans run where the device's
-// row takes int8 activations; the production plans' choice is checked on every GPU.
+// ProjectionCalibration::decodeInt8FromRows rows or more): gguf_rotate_int8 codes each rotation block of the rotated
+// input by the int8-activation rule (kernels/common/int8_activations.h; LinearNumerics.hpp's int8Block), and the int8
+// tiles (gguf_decode_int8_*) multiply the codes by the weights' codes exactly and fold each PQ2_0 block's int32 sum
+// into fp32 as acc * d * s. Every output lies within the rounding of that fold's fp32 arithmetic of the exact sum
+// (int8Products, int8Bound), through each epilogue, and the fp32 destination, which rounds to the bf16 run bit for
+// bit, takes a code, a scale or a block that is another's, or rounded another way, past it. The inputs' rotation
+// blocks take maxima of 2^-3 to 2^3 by row and block, a block of every third row codes two halves by rounding them to
+// even (int8Inputs), and the rotated scratch starts NaN, as the padding rows the rotation leaves are then read.
+// Single tensors at one to four lanes (one on the 16-row tile: the int8 tiles hold 16 or 32 rows), every K split that
+// keeps whole PQ2_0 blocks, both walks; the first lane's rows equal a one-lane projection of them bitwise, and a
+// gate/up pair in one pass the two passes; three fused segments; the production plans on [8192, 5120] and
+// [5120, 17408] where they take int8 activations, which they never take over unrotated weights. A NaN or an infinity
+// in a later block of a row's inputs leaves that row's outputs alone not finite, on the int8 tiles as on the bf16
+// tiles. The int8 plans run where the device's row takes int8 activations.
 
 // The bf16 rotated rows H (D x) / 32 the int8 rows quantize (gguf_rotate's, which gguf-rotation checks).
 std::vector<float> rotatedRows(const std::vector<float> &x, uint32_t rows, uint32_t K,
@@ -843,26 +845,54 @@ std::vector<float> rotatedRows(const std::vector<float> &x, uint32_t rows, uint3
     }
   return out;
 }
-// The fp64 products of the rotated rows with each destination column's weights, and each one's int8 term: the
-// kernel's q = rint(x / s) is within 1/2 of x / s up to its division's rounding, so q s is within s / 2 (1 + 2^-12).
-struct Int8Dots {
-  std::vector<Dot> dots;
-  std::vector<double> term;
+// bf16 inputs of `rows` rows of K inputs whose rotation block b of row r is dense at 2^((r + 3b) mod 7 - 3), so that
+// a scale taken from another block shows, but for block (r / 3) mod (K / 1024) of every third row r, which rotates
+// to 63.5 at one input and to 0.25 and -0.25 at two (the inputs D (H y) / 32 of that y are bf16 values and its
+// butterflies exact): codes 127, 0 and 0, the halves rounded to even.
+std::vector<float> int8Inputs(uint32_t rows, uint32_t K, const std::vector<int8_t> &signs) {
+  std::vector<float> x = activations(Inputs::Dense, rows, K);
+  for (uint32_t r = 0; r < rows; ++r)
+    for (uint32_t k = 0; k < K; ++k)
+      x[uint64_t{r} * K + k] = std::ldexp(x[uint64_t{r} * K + k], int((r + 3 * (k / GGUF_ROTATION_BLOCK)) % 7) - 3);
+  std::vector<double> y(GGUF_ROTATION_BLOCK);
+  for (uint32_t r = 0; r < rows; r += 3) {
+    const uint32_t first = (r / 3) % (K / GGUF_ROTATION_BLOCK) * GGUF_ROTATION_BLOCK;
+    std::fill(y.begin(), y.end(), 0.0);
+    y[9] = 63.5, y[300] = 0.25, y[777] = -0.25;
+    rotationButterflies(y.data());
+    for (uint32_t i = 0; i < GGUF_ROTATION_BLOCK; ++i) {
+      const double v = y[i] / 32 * signs[first + i];
+      if (double(bf16(v)) != v) throw std::logic_error("an int8 tie input is no bf16 value");
+      x[uint64_t{r} * K + first + i] = float(v);
+    }
+  }
+  return x;
+}
+// The int8 tiles' outputs, exactly: the rotated rows' blocks coded by the int8-activation rule, as gguf_rotate_int8
+// codes them, and output (r, c) the sum over the row's PQ2_0 blocks of acc * d * s (acc the block's sum of the codes
+// times the weights' codes - 1, d its scale, s the row block's), in fp64, where each block's term is exact; and
+// sum_b |acc d s|, the magnitude their fp32 arithmetic rounds within.
+struct Int8Products {
+  std::vector<double> value, magnitude;
 };
-Int8Dots int8Products(const std::vector<const Tensor *> &parts, uint32_t columns, const std::vector<float> &xr,
-                      uint32_t rows) {
-  const uint32_t K = parts.front()->K, blocks = K / GGUF_ROTATION_BLOCK;
-  std::vector<double> halfScales(uint64_t{rows} * blocks);
+Int8Products int8Products(const std::vector<const Tensor *> &parts, uint32_t columns, const std::vector<float> &x,
+                          uint32_t rows, const std::vector<int8_t> &signs) {
+  const uint32_t K = parts.front()->K, blocks = K / GGUF_ROTATION_BLOCK, unit = 32 * kQuantFormats[PQ20].meta_groups;
+  const std::vector<float> rotated = rotatedRows(x, rows, K, signs);
+  std::vector<float> codes(rotated.size()), scales(uint64_t{rows} * blocks);
   for (uint32_t r = 0; r < rows; ++r)
     for (uint32_t b = 0; b < blocks; ++b) {
-      float m = 0;
+      const float *v = rotated.data() + uint64_t{r} * K + b * GGUF_ROTATION_BLOCK;
+      float largest = 0;
+      for (uint32_t i = 0; i < GGUF_ROTATION_BLOCK; ++i) largest = std::max(largest, std::fabs(v[i]));
+      const test::Int8Block block = test::int8Block(largest);
+      scales[uint64_t{r} * blocks + b] = block.scale;
       for (uint32_t i = 0; i < GGUF_ROTATION_BLOCK; ++i)
-        m = std::max(m, std::fabs(xr[uint64_t{r} * K + b * GGUF_ROTATION_BLOCK + i]));
-      halfScales[uint64_t{r} * blocks + b] = double(m / 127.0f) / 2 * (1 + 0x1p-12);
+        codes[uint64_t{r} * K + b * GGUF_ROTATION_BLOCK + i] = float(test::int8Code(v[i], block));
     }
-  Int8Dots out{products(parts, columns, xr, rows), std::vector<double>(uint64_t{rows} * columns)};
-  double *term = out.term.data();
-  const double *half = halfScales.data();
+  Int8Products out{std::vector<double>(uint64_t{rows} * columns), std::vector<double>(uint64_t{rows} * columns)};
+  double *value = out.value.data(), *magnitude = out.magnitude.data();
+  const float *code = codes.data(), *scale = scales.data();
   uint32_t offset = 0;
   for (const Tensor *t : parts) {
     const Fmt f = t->format;
@@ -871,30 +901,35 @@ Int8Dots int8Products(const std::vector<const Tensor *> &parts, uint32_t columns
     dispatch_apply(t->N, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t n) {
       std::vector<float> w(K);
       rowValues(f, native + n * rowBytes(f, K), K, w.data());
-      for (uint32_t b = 0; b < blocks; ++b) {
-        double sum = 0;
-        for (uint32_t i = 0; i < GGUF_ROTATION_BLOCK; ++i) sum += std::fabs(double(w[b * GGUF_ROTATION_BLOCK + i]));
-        for (uint32_t r = 0; r < rows; ++r)
-          term[uint64_t{r} * columns + at + n] += half[uint64_t{r} * blocks + b] * sum;
+      for (uint32_t r = 0; r < rows; ++r) {
+        double sum = 0, size = 0;
+        for (uint32_t k0 = 0; k0 < K; k0 += unit) {
+          // d * acc, exactly: the weights are d (q - 1), the codes integers.
+          double block = 0;
+          for (uint32_t k = k0; k < k0 + unit; ++k) block += double(code[uint64_t{r} * K + k]) * w[k];
+          const double term = block * scale[uint64_t{r} * blocks + k0 / GGUF_ROTATION_BLOCK];
+          sum += term;
+          size += std::fabs(term);
+        }
+        value[uint64_t{r} * columns + at + n] = sum;
+        magnitude[uint64_t{r} * columns + at + n] = size;
       }
     });
     offset += t->N;
   }
   return out;
 }
-// The int8 tiles' intervals: the staged tile's bound widened by the int8 term.
-Want int8Bound(const Int8Dots &d) {
-  return [&d](uint64_t i) {
-    const double e = projectionBound(d.dots[i], true) + d.term[i];
-    return Interval{d.dots[i].value - e, d.dots[i].value + e};
-  };
+// The int8 tiles' interval of each output over K inputs in `splits` partitions: the exact sum within
+// (K / 128 + splits + 2) roundings of u = 2^-24 of sum_b |acc d s|, which bounds every partial sum: d * s and each
+// block's fma round once, and the partitions' partials add in fp32.
+Want int8Bound(const Int8Products &p, uint32_t K, uint32_t splits) {
+  const double n = K / (32.0 * kQuantFormats[PQ20].meta_groups) + splits + 2, e = n * 0x1p-24 / (1 - n * 0x1p-24);
+  return [&p, e](uint64_t i) { return Interval{p.value[i] - e * p.magnitude[i], p.value[i] + e * p.magnitude[i]}; };
 }
 
 void decodeInt8(MetalBackend &backend, const Linear &linear) {
-  const uint32_t fromRows = linear.calibration().projection.decodeInt8FromRows;
-  const bool int8Tiles = fromRows != kNever;
-  uint32_t ran = 0;
-  double widest = 0;
+  const bool int8Tiles = linear.calibration().projection.decodeInt8FromRows != kNever;
+  uint32_t ran = 0, production = 0;
   // A rotated projection of `parts` and its sign buffer.
   const auto rotatedProjection = [&](const std::vector<const Tensor *> &parts, uint32_t columns,
                                      const MetalBuffer &signs) {
@@ -908,14 +943,6 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
     MetalBuffer buffer = test::sharedBuffer(backend, K);
     std::memcpy(buffer.contents(), signs.data(), K);
     return buffer;
-  };
-  // The products of `parts` with the rotated rows of `x`; the widest int8 term relative to its sum |x w| is reported.
-  const auto int8Dots = [&](const std::vector<const Tensor *> &parts, uint32_t columns, const std::vector<float> &x,
-                            const std::vector<int8_t> &signs) {
-    Int8Dots d = int8Products(parts, columns, rotatedRows(x, kMaximumRows, parts.front()->K, signs), kMaximumRows);
-    for (uint64_t i = 0; i < d.term.size(); ++i)
-      widest = std::max(widest, d.term[i] / std::max(d.dots[i].magnitude, 1e-30));
-    return d;
   };
   // run() of an int8 plan, which must dispatch an int8 tile.
   const auto runInt8 = [&](const LinearPlan &plan, const Projection &p, const Projection *gate,
@@ -936,9 +963,10 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
     const Tensor up = tensor(backend, PQ20, N, K), gateTensor = tensor(backend, PQ20, N, K);
     const Projection p = rotatedProjection({&up}, columns, signBuffer),
                      gate = rotatedProjection({&gateTensor}, columns, signBuffer);
-    const std::vector<float> x = activations(Inputs::Dense, kMaximumRows, K);
+    const std::vector<float> x = int8Inputs(kMaximumRows, K, signs);
     const std::vector<float> residual = residuals(kMaximumRows, columns);
-    const Int8Dots d = int8Dots({&up}, columns, x, signs), g = int8Dots({&gateTensor}, columns, x, signs);
+    const Int8Products d = int8Products({&up}, columns, x, kMaximumRows, signs),
+                       g = int8Products({&gateTensor}, columns, x, kMaximumRows, signs);
     for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
       const Projection *gated = epilogue == LinearEpilogue::GateUp ? &gate : nullptr;
       for (const uint32_t splits : kSplits) {
@@ -957,7 +985,7 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
             const std::string label = std::string("int8 pq2_0 ") + epilogueName(epilogue) + " lanes " +
                                       std::to_string(lanes) + " S" + std::to_string(splits) + (spread ? " spread" : "");
             const Outcome out = runInt8(plan, p, gated, rows, aux, kPoisonNaN, N, label);
-            checkValues(out, int8Bound(d), int8Bound(g), aux, w, w.rows, N, label);
+            checkValues(out, int8Bound(d, K, splits), int8Bound(g, K, splits), aux, w, w.rows, N, label);
             if (lanes == 1) oneLane = out.output;
             if (!sameRows(out.output, 0, oneLane, 0, kLaneRows, columns))
               fail(label + ": the first lane differs from one lane alone");
@@ -969,8 +997,8 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
                 fail(label + ": one pass differs from two");
             }
             if (epilogue == LinearEpilogue::None) {
-              floatOutput(backend, linear, Linear::plan(w, c, FloatOutput::Float32), p, rows, out, int8Bound(d), N,
-                          label);
+              floatOutput(backend, linear, Linear::plan(w, c, FloatOutput::Float32), p, rows, out,
+                          int8Bound(d, K, splits), N, label);
               ++ran;
             }
           }
@@ -988,8 +1016,8 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
     const std::vector<const Tensor *> parts{&a, &b, &c3};
     const uint32_t covered = segmentColumns(parts), columns = covered + kPadding;
     const Projection p = rotatedProjection(parts, columns, signBuffer);
-    const std::vector<float> x = activations(Inputs::Dense, kMaximumRows, K);
-    const Int8Dots d = int8Dots(parts, columns, x, signs);
+    const std::vector<float> x = int8Inputs(kMaximumRows, K, signs);
+    const Int8Products d = int8Products(parts, columns, x, kMaximumRows, signs);
     for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes)
       for (const auto [splits, spread] : {std::pair{1u, false}, std::pair{8u, true}}) {
         const LinearWorkload w = decode({columns, K}, lanes, LinearEpilogue::None);
@@ -999,46 +1027,46 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
         const std::string label = "int8 fused lanes " + std::to_string(lanes) + " S" + std::to_string(splits);
         const Outcome out =
             runInt8(plan, p, nullptr, storageRows(x, K, w.rows, plan.storageRows()), {}, kPoisonNaN, covered, label);
-        checkValues(out, int8Bound(d), {}, {}, w, w.rows, covered, label);
+        checkValues(out, int8Bound(d, K, splits), {}, {}, w, w.rows, covered, label);
       }
   }
-  // The production plans: Bonsai's GDN input and down shapes.
+  // The production plans: Bonsai's GDN input and down shapes, those of them in int8 activations.
   for (const auto [N, K, epilogue] : {std::tuple{8192u, 5120u, LinearEpilogue::None},
                                       std::tuple{5120u, 17408u, LinearEpilogue::Residual}}) {
     std::vector<int8_t> signs;
     const MetalBuffer signBuffer = signsOf(K, signs);
     const Tensor t = tensor(backend, PQ20, N, K);
     const Projection p = rotatedProjection({&t}, N, signBuffer), plain = projection({&t}, N);
-    const std::vector<float> x = activations(Inputs::Dense, kMaximumRows, K);
+    const std::vector<float> x = int8Inputs(kMaximumRows, K, signs);
     const std::vector<float> residual = residuals(kMaximumRows, N);
-    const Int8Dots d = int8Tiles ? int8Dots({&t}, N, x, signs) : Int8Dots{};
+    const Int8Products d = int8Tiles ? int8Products({&t}, N, x, kMaximumRows, signs) : Int8Products{};
     for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
       const LinearWorkload w = decode({N, K}, lanes, epilogue);
-      const LinearPlan plan = linear.plan(w, p);
       if (linear.plan(w, plain).configuration().decodeInt8)
         fail("an unrotated PQ2_0 projection takes int8 activations");
+      const LinearPlan plan = linear.plan(w, p);
       const LinearConfig c = plan.configuration();
-      if (c.tile != LinearTile::GgufStaged) continue;
-      // The device's row takes the int8 tiles on plans of decodeInt8FromRows rows or more (one lane's 16-row plan
-      // counts 16) and whole PQ2_0 blocks per split.
-      if (c.decodeInt8 != (decodeInt8TakesSplits(K, c.splits) && plan.storageRows() >= fromRows))
-        fail("the production plan of a rotated PQ2_0 projection of " + std::to_string(plan.storageRows()) +
-             " rows " + (c.decodeInt8 ? "takes" : "does not take") + " int8 activations");
       if (!c.decodeInt8) continue;
-      const uint32_t storage = plan.storageRows();
-      const std::vector<uint16_t> aux = storageRows(residual, N, w.rows, storage);
       const std::string label = "int8 production " + std::to_string(N) + "x" + std::to_string(K) + " lanes " +
                                 std::to_string(lanes) + " S" + std::to_string(c.splits);
+      if (!int8Tiles) {
+        fail(label + ": a device row of no int8 activations took them");
+        continue;
+      }
+      const uint32_t storage = plan.storageRows();
+      const std::vector<uint16_t> aux = storageRows(residual, N, w.rows, storage);
       const Outcome out = runInt8(plan, p, nullptr, storageRows(x, K, w.rows, storage), aux, kPoisonNaN, N, label);
-      checkValues(out, int8Bound(d), {}, aux, w, w.rows, N, label);
+      checkValues(out, int8Bound(d, K, c.splits), {}, aux, w, w.rows, N, label);
+      ++production;
     }
   }
   if (!int8Tiles) {
-    section("int8 decode (PQ2_0): production plans on bf16; int8 plans not run (the device row takes none)");
+    section("int8 decode (PQ2_0): int8 plans not run (the device row takes none), none among the production plans");
     return;
   }
-  // A NaN in one row's inputs and an infinity in another lane's leave those rows' outputs not finite, on the int8
-  // tiles (kernels/common/int8_activations.h) as on the bf16 tiles, and every other row's as they were.
+  // A NaN in one row's inputs and an infinity in another lane's, in blocks past the first, leave those rows' outputs
+  // not finite, on the int8 tiles (kernels/common/int8_activations.h) as on the bf16 tiles, and every other row's as
+  // they were.
   {
     constexpr uint32_t N = 512, K = 3072, kNaNRow = 3, kInfiniteRow = 18;
     std::vector<int8_t> signs;
@@ -1048,8 +1076,8 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
     const LinearWorkload w = decode({N, K}, kMaximumLanes, LinearEpilogue::Residual);
     const std::vector<float> x = activations(Inputs::Dense, w.rows, K), residual = residuals(w.rows, N);
     std::vector<float> poisoned = x;
-    poisoned[uint64_t{kNaNRow} * K + 5] = std::numeric_limits<float>::quiet_NaN();
-    poisoned[uint64_t{kInfiniteRow} * K + 700] = std::numeric_limits<float>::infinity();
+    poisoned[uint64_t{kNaNRow} * K + 2 * GGUF_ROTATION_BLOCK + 5] = std::numeric_limits<float>::quiet_NaN();
+    poisoned[uint64_t{kInfiniteRow} * K + GGUF_ROTATION_BLOCK + 700] = std::numeric_limits<float>::infinity();
     for (const bool int8 : {true, false}) {
       const LinearPlan plan =
           Linear::plan(w, {.tile = LinearTile::GgufStaged, .decodeInt8 = int8}, FloatOutput::BFloat16);
@@ -1071,9 +1099,9 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
   }
   section("int8 decode (PQ2_0): " + std::to_string(ran) +
           " plans (single, gate/up in one and two passes, residual, fp32, fused; 1-4 lanes, every split, both walks), "
-          "every value within fp64 plus the int8 term (at most " + std::to_string(widest) + " of sum |x w|), lanes and "
-          "pass modes bitwise, fp32 rounding to bf16's; production plans of " + std::to_string(fromRows) +
-          " rows or more on the int8 tiles; a non-finite input leaves its row alone not finite");
+          "every value within the fp32 rounding of the exact int8 products, lanes and pass modes bitwise, fp32 "
+          "rounding to bf16's; " + std::to_string(production) + " production plans in int8 activations within it; a "
+          "non-finite input leaves its row alone not finite");
 }
 
 // ---------------------------------------------------------------- int8 prefill
@@ -1082,13 +1110,16 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
 // error of the bf16 tile's on the exact inputs, on dense inputs and on dense inputs with one input of 1000 per row (a
 // model's outlier channel), which a scale per row would let zero the rest of its row. On dense inputs the RMS error
 // it adds over the bf16 tile's, relative to the outputs, stays within kBound. Outputs are finite and rows past the
-// chunk unwritten, at each epilogue, chunks of 168, 136 and 65 rows ending inside a row tile, the full budget and
-// fused segments, of one format and of both. A chunk's last 1 and 4 rows at their own height, as a prefill's last layer
-// runs the rows something reads (Linear::prefillPlan of a chunk's rows), write the chunk's bits. A view of leading
-// inputs gives its inputs repacked bit for bit. A non-finite input leaves its row's outputs not finite, as the bf16
-// tile's, and no other row's changed. Unlike the int8 decode test's per-element fp64 bound, these bounds are RMS ones
-// against the bf16 tile's own error: this tile's per-group affine folds lie outside projectionBound's model of exact
-// products accumulated in fp32.
+// chunk unwritten, at each epilogue, chunks of 168, 136 and 65 rows ending inside a row tile, one of 600 rows whose
+// walk ends on a partial block of row tiles, also over 5 column tiles, whose GEMM grid, 16 threadgroups wide, ends in
+// one past its tiles, the full budget and fused segments, of one format and of both. A
+// chunk's last 1 and 4 rows at their own height, as a prefill's last layer runs the rows something reads
+// (Linear::prefillPlan of a chunk's rows), write the chunk's bits. A fused projection quantizes its rows once and
+// runs a GEMM dispatch per segment, and a SwiGLU's up takes its gate's codes (LinearInput::PrefillInt8), bit for bit.
+// A view of leading inputs gives its inputs repacked bit for bit. A non-finite input leaves its row's outputs not
+// finite, as the bf16 tile's, and no other row's changed. Unlike the int8 decode test's exact model, these bounds are
+// RMS ones against the bf16 tile's own error: this tile's per-group affine folds lie outside projectionBound's model
+// of exact products accumulated in fp32.
 void prefillInt8(MetalBackend &backend, const Linear &linear) {
   if (!linear.calibration().projection.prefillInt8) {
     section("int8 prefill: skipped, the family does not run it");
@@ -1114,12 +1145,14 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
         ? residuals(storage, columns) : activations(Inputs::Dense, storage, columns);
     const std::vector<uint16_t> aux = storageRows(auxiliary, columns, storage, storage);
     const std::vector<Dot> dots = products(parts, columns, x, rows);
+    // The inputs as the codes of the int8-activation rule (test::int8Block) stand for them.
     std::vector<float> rounded = x;
     for (uint64_t at = 0; at < uint64_t{rows} * K; at += GGUF_PREFILL_INT8_GROUP) {
       float most = 0;
       for (uint32_t k = 0; k < GGUF_PREFILL_INT8_GROUP; ++k) most = std::max(most, std::fabs(x[at + k]));
-      for (uint32_t k = 0; most > 0 && k < GGUF_PREFILL_INT8_GROUP; ++k)
-        rounded[at + k] = std::clamp(std::rint(x[at + k] * (127.f / most)), -127.f, 127.f) * (most / 127.f);
+      const test::Int8Block block = test::int8Block(most);
+      for (uint32_t k = 0; k < GGUF_PREFILL_INT8_GROUP; ++k)
+        rounded[at + k] = float(test::int8Code(x[at + k], block)) * block.scale;
     }
     const std::vector<Dot> roundedDots = products(parts, columns, rounded, rows);
     const std::string name = what + " " + epilogueName(epilogue) + " " + std::to_string(rows) + " rows K " +
@@ -1128,6 +1161,15 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
                             covered, name);
     const Outcome base = run(backend, linear, Linear::plan(w, kTile, FloatOutput::BFloat16), p, nullptr,
                              storageRows(x, K, rows, storage), aux, kPoisonNaN, covered, name + " bf16 tile");
+    // One quantization of the chunk's rows, then a GEMM dispatch per segment.
+    const auto dispatches = [&](bool gemm) {
+      return std::count_if(out.pipelines.begin(), out.pipelines.end(), [&](const std::string &pipeline) {
+        return pipeline.starts_with("gguf_prefill_int8_") && (pipeline != "gguf_prefill_int8_quantize") == gemm;
+      });
+    };
+    if (dispatches(false) != 1 || size_t(dispatches(true)) != parts.size())
+      fail(name + ": ran " + std::to_string(dispatches(false)) + " quantizations and " +
+           std::to_string(dispatches(true)) + " GEMM dispatches for " + std::to_string(parts.size()) + " segments");
     // The output of products `d` through the epilogue.
     const auto output = [&](double d, double a) {
       if (epilogue == LinearEpilogue::Residual) return d + a;
@@ -1182,6 +1224,14 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
       for (const LinearEpilogue e : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
         for (const uint32_t rows : {168u, 136u, 65u})
           for (const bool outliers : {false, true}) chunk(p, {&t}, e, rows, outliers, fmtName(f));
+      // 600 rows: 19 row tiles, whose walk takes a block of 16 down each column tile, then one of 3.
+      static_assert(GGUF_PREFILL_INT8_WALK == 16 && GGUF_PREFILL_INT8_ROWS == 32,
+                    "600 rows end on a partial walk block");
+      chunk(p, {&t}, LinearEpilogue::Residual, 600, false, fmtName(f));
+      // 5 column tiles by 19 row tiles: 95 tiles on a grid of 6 runs of 16.
+      const Tensor narrow = tensor(backend, f, 5 * GGUF_TILE_COLUMNS, K);
+      chunk(projection({&narrow}, narrow.N), {&narrow}, LinearEpilogue::Residual, 600, false,
+            std::string(fmtName(f)) + " 5 column tiles");
       chunk(p, {&t}, LinearEpilogue::None, SPLASH_PREFILL_TOKEN_BUDGET, false, fmtName(f));
       const Tensor b = tensor(backend, f, 256, K), c = tensor(backend, f, 512, K);
       const std::vector<const Tensor *> parts{&t, &b, &c};
@@ -1224,6 +1274,43 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
       chunk(projection(parts, segmentColumns(parts) + kPadding), parts, LinearEpilogue::None, 168, outliers,
             "af4g64+af5g64 fused");
   }
+  // A SwiGLU's up after its gate over the same rows takes the codes and scales the gate's plan left in the scratch
+  // (LinearInput::PrefillInt8): it quantizes nothing itself and writes the bits of its plan run alone.
+  {
+    constexpr uint32_t N = 256, K = 1024, kRows = 168;
+    const Tensor gateTensor = tensor(backend, Fmt(GGUF_FMT_AF4G64), N, K),
+                 upTensor = tensor(backend, Fmt(GGUF_FMT_AF5G64), N, K);
+    const Projection gate = projection({&gateTensor}, N), up = projection({&upTensor}, N);
+    const LinearPlan gatePlan =
+        Linear::plan({{N, K}, kRows, LinearPhase::Prefill, LinearEpilogue::None}, kInt8, FloatOutput::BFloat16);
+    const LinearPlan upPlan =
+        Linear::plan({{N, K}, kRows, LinearPhase::Prefill, LinearEpilogue::UpWithGate}, kInt8, FloatOutput::BFloat16);
+    const uint32_t storage = gatePlan.storageRows();
+    const std::vector<uint16_t> x = storageRows(activations(Inputs::Dense, storage, K), K, kRows, storage);
+    LinearScratchSize size = gatePlan.scratchSize();
+    size.include(upPlan.scratchSize());
+    const Scratch scratch(backend, size);
+    const Guarded input = bfloats(backend, x), gateOutput(backend, uint64_t{storage} * N * 2, 0xFF),
+                  upOutput(backend, uint64_t{storage} * N * 2, 0xFF);
+    CommandGraph graph;
+    const PreparedInput codes =
+        linear.add(graph, {.input = input.view, .output = gateOutput.view, .scratch = scratch.bindings()}, gate,
+                   gatePlan);
+    const size_t gateDispatches = graph.dispatches().size();
+    static_cast<void>(linear.add(graph,
+                                 {.input = input.view, .output = upOutput.view, .gateScratch = gateOutput.view,
+                                  .scratch = scratch.bindings(), .prepared = codes},
+                                 up, upPlan));
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    if (codes.layout != LinearInput::PrefillInt8 ||
+        std::any_of(graph.dispatches().begin() + gateDispatches, graph.dispatches().end(),
+                    [](const ComputeDispatch &d) { return d.pipelineName == "gguf_prefill_int8_quantize"; }))
+      fail("int8 SwiGLU: the up projection quantized its gate's rows again");
+    const Outcome alone = run(backend, linear, upPlan, up, nullptr, x, gateOutput.halves(), kPoisonNaN, N,
+                              "int8 SwiGLU up alone");
+    if (!sameRows(upOutput.halves(), 0, alone.output, 0, kRows, N))
+      fail("int8 SwiGLU: the up projection on its gate's codes differs from its own");
+  }
   // A NaN in one row's inputs and an infinity in another's leave those rows' outputs not finite, on this tile as on
   // the bf16 tile, and every other row's as they were.
   for (const Fmt f : {Fmt(GGUF_FMT_AF4G64), Fmt(GGUF_FMT_AF5G64)}) {
@@ -1254,10 +1341,11 @@ void prefillInt8(MetalBackend &backend, const Linear &linear) {
     }
   }
   section("int8 prefill: af4g64, af5g64 and both fused, K 1024 and 5120, plain/residual/up-with-gate over 168-, "
-          "136- and 65-row chunks with and without outliers and the " + std::to_string(SPLASH_PREFILL_TOKEN_BUDGET) +
-          "-row budget: worst added relative RMS " + std::to_string(worst) + ", worst error from the inputs rounded "
-          "per group " + std::to_string(worstRounded) + "x the bf16 tile's; last rows and leading inputs bitwise; a "
-          "non-finite input leaves its row alone not finite");
+          "136- and 65-row chunks with and without outliers, 600 rows and the " +
+          std::to_string(SPLASH_PREFILL_TOKEN_BUDGET) + "-row budget: worst added relative RMS " +
+          std::to_string(worst) + ", worst error from the inputs rounded per group " + std::to_string(worstRounded) +
+          "x the bf16 tile's; a fused projection quantized once and a GEMM a segment; last rows, leading inputs and "
+          "an up on its gate's codes bitwise; a non-finite input leaves its row alone not finite");
 }
 
 // ---------------------------------------------------------------- leading inputs
@@ -1336,7 +1424,7 @@ void splitVisibility(MetalBackend &backend, const Linear &linear, LinearTile til
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = cores;
-    const Linear policy(device);
+    const Linear policy(device, Int8Activations::On);
     const LinearConfig a = policy.plan(workloads[0], weights[0][0]).configuration();
     const LinearConfig b = policy.plan(workloads[1], weights[1][0]).configuration();
     if (a.tile == tile && b.tile == tile && std::max(a.splits, b.splits) > 1) splitPairs.insert({a.splits, b.splits});
@@ -1588,7 +1676,7 @@ int main(int argc, char **argv) {
     }
     try {
       MetalBackend backend(argv[1]);
-      const Linear linear(backend.capabilities());
+      const Linear linear(backend.capabilities(), Int8Activations::On);
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
         decodeTile(backend, linear, tile, false, decodeInputs(false), tileFormats(tile));
         fusedDecode(backend, linear, tile, false);

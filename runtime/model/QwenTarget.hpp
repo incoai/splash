@@ -101,9 +101,9 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
       std::ranges::copy(captureLayers, captureLayerValues.begin());
   }
 
-  // The formats of the sparse MoE blocks' routers, which their plans follow
-  // (ops::moeFormats).
-  ops::MoeFormats moeFormats{};
+  // The format of the sparse MoE blocks' routers, which their plans follow
+  // (ops::moeRouterFormat).
+  uint32_t moeRouterFormat = ops::QuantizedSegment::kFloat32;
   // The layers whose output rows the DFlash2 draft reads, ascending.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;

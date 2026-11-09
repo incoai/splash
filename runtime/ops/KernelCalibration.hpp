@@ -95,8 +95,7 @@ struct ProjectionCalibration final {
   uint32_t decodeInt8FromRows;
   // Longer prefill chunks of a unit the int8 prefill tile takes
   // (UnitFormats::prefillInt8Takes) run that tile, where the family's int8
-  // matmul is faster than its bf16 one and serve's --prefill-int8 is on
-  // (Linear's prefillInt8).
+  // matmul is faster than its bf16 one.
   bool prefillInt8;
 };
 

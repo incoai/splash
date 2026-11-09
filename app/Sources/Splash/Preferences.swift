@@ -458,8 +458,8 @@ extension LaunchOption {
             help: "Reads long prompts faster on models that can use it.",
             section: .requests, kind: .toggle(on: false)),
         LaunchOption(
-            flag: "--prefill-int8", title: "8-bit prompt reading",
-            help: "Reads long prompts of MLX 4- and 5-bit models in up to about a quarter less time on M5 and later Macs, rounding their activations to 8 bits; Off runs them in 16-bit.",
+            flag: "--int8-activations", title: "8-bit activations",
+            help: "Rounds activations to 8 bits where M5 and later Macs multiply them twice as fast: MLX 4- and 5-bit models read long prompts in about a quarter less time, and Ternary-Bonsai models answer faster, at a small cost in precision. Off keeps every activation at 16 bits, for comparisons that need it.",
             section: .requests, kind: .choice(standard: "On", choices: [("off", "Off")], custom: nil)),
         LaunchOption(
             flag: "--allow-idle-sleep", title: "Keep Mac awake while answering",

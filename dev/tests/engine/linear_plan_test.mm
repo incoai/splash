@@ -48,7 +48,7 @@ DeviceCapabilities simulatedDevice(uint32_t family, uint32_t cores) {
   device.gpuCoreCount = cores;
   return device;
 }
-Linear gpu(uint32_t family, uint32_t cores) { return Linear(simulatedDevice(family, cores)); }
+Linear gpu(uint32_t family, uint32_t cores) { return Linear(simulatedDevice(family, cores), Int8Activations::On); }
 
 // Throws naming the rule a plan broke and the plan.
 [[noreturn]] void broke(const char *rule, uint32_t family, uint32_t cores, LinearWorkload w) {
@@ -168,24 +168,26 @@ void chunkRowPlans() {
 // Apple11 run every prefill chunk past the staged tile of a unit of af4g64
 // and af5g64 segments on it, at the prefill tile's storage, Apple9 none; a
 // unit with a segment of another format keeps the prefill tile, and so does
-// every unit with --prefill-int8 off, whose plans are then the bf16 ones; a
-// workload of no formats plans the same either way. The arena bound of a shape
-// holds the tile's codes and scales of a full chunk wherever the family runs
-// it on the shape's formats, or on a shape that names none.
+// every unit with int8 activations off, whose plans are then the bf16 ones and
+// whose device row is the same; a workload of no formats plans the same either
+// way. The arena bound of a shape holds the tile's codes and scales of a full
+// chunk wherever the family runs it on the shape's formats, or on a shape that
+// names none.
 void prefillInt8Rule() {
   const Projection af4 = blockProjection(5120, 17408, 1, GGUF_FMT_AF4G64);
   const Projection af5 = blockProjection(12288, 5120, 3, GGUF_FMT_AF5G64);
   const std::array<uint32_t, 3> mixedFormats{GGUF_FMT_AF4G64, GGUF_FMT_AF5G64, GGUF_FMT_Q4K};
   const Projection mixed = blockProjection(12288, 5120, mixedFormats);
   for (const auto [family, cores] : {std::pair{9U, 10U}, {9U, 40U}, {10U, 16U}, {10U, 32U}, {11U, 12U}}) {
-    const Linear linear = gpu(family, cores), bf16(simulatedDevice(family, cores), false);
+    const Linear linear = gpu(family, cores), bf16(simulatedDevice(family, cores), Int8Activations::Off);
     const ProjectionCalibration &law = linear.calibration().projection;
     const bool int8 = family >= 10;
-    require(law.prefillInt8 == int8 && !bf16.calibration().projection.prefillInt8,
-            "the int8 prefill tile takes Apple10's chunks past the staged tile, no Apple9 chunk and none off");
+    require(law.prefillInt8 == int8 && bf16.calibration().projection.prefillInt8 == int8,
+            "the int8 prefill tile takes Apple10's chunks past the staged tile and no Apple9 chunk, in the device's "
+            "row whatever the setting");
     const LinearWorkload noFormats{{5120, 17408}, 2048, LinearPhase::Prefill, LinearEpilogue::None};
     require(linear.plan(noFormats).configuration() == bf16.plan(noFormats).configuration(),
-            "--prefill-int8 changed a prefill plan of no formats");
+            "int8 activations changed a prefill plan of no formats");
     for (const uint32_t rows : {32U, 64U, 65U, 128U, 2048U})
       for (const auto &[p, epilogue] : {std::pair{&af4, LinearEpilogue::Residual}, {&af5, LinearEpilogue::None},
                                         {&af4, LinearEpilogue::UpWithGate}, {&mixed, LinearEpilogue::None}}) {
@@ -203,7 +205,7 @@ void prefillInt8Rule() {
         const LinearConfig bf16Config =
             tile == LinearTile::GgufPrefillInt8 ? LinearConfig{.tile = LinearTile::GgufPrefill} : plan.configuration();
         if (off.configuration() != bf16Config)
-          broke("--prefill-int8 off keeps the bf16 plans", family, cores, off.workload());
+          broke("int8 activations off keep the bf16 plans", family, cores, off.workload());
       }
     const LinearScratchSize bound = linear.prefillScratchSize({5120, 17408}),
                             bf16Bound = bf16.prefillScratchSize({5120, 17408});
@@ -212,7 +214,7 @@ void prefillInt8Rule() {
             "the prefill scratch bound holds the int8 tile's codes and scales where the family runs it");
     require(!bf16Bound.input && !bf16Bound.sums && bf16Bound.partials == bound.partials &&
                 bf16Bound.counters == bound.counters && bf16Bound.rotated == bound.rotated,
-            "the prefill scratch bound with --prefill-int8 off holds no int8 codes or scales");
+            "the prefill scratch bound with int8 activations off holds no int8 codes or scales");
     const LinearScratchSize q4k = linear.prefillScratchSize(blockProjection(5120, 17408, 1).shape()),
                             mixedBound = linear.prefillScratchSize(mixed.shape());
     require(sameScratch(linear.prefillScratchSize(af4.shape()), bound) && sameScratch(q4k, bf16Bound) &&
@@ -1202,6 +1204,26 @@ void rotatedRegisterInput(metal::MetalBackend &backend) {
   }
 }
 
+// Int8 activations off keep a rotated PQ2_0 projection's decode plans off the
+// int8 tiles and change nothing else of them; on, the plans of 16 rows or more
+// take them (gguf-projection checks each device's choice). Bonsai's GDN input,
+// 8192 x 5120, on a 16-core Apple10.
+void decodeInt8Setting(metal::MetalBackend &backend) {
+  constexpr uint32_t n = 8192, k = 5120;
+  Projection rotated(n, k, BlockWeights{{segmentPlanes(backend, GGUF_FMT_PQ20, n, k)}});
+  rotated.rotation.signs = allocate(backend, k);
+  const Linear on = gpu(10, 16), off(simulatedDevice(10, 16), Int8Activations::Off);
+  bool int8 = false;
+  for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
+    LinearConfig config = on.decodePlan(rotated, lanes).configuration();
+    int8 |= config.decodeInt8;
+    config.decodeInt8 = false;
+    require(off.decodePlan(rotated, lanes).configuration() == config,
+            "int8 activations off moved a rotated PQ2_0 decode plan other than off the int8 tiles");
+  }
+  require(int8, "no decode plan of a rotated PQ2_0 projection takes int8 activations with them on");
+}
+
 // The int8 tiles quantize a rotated input (LinearGguf.cpp): a plan in int8
 // activations over unrotated PQ2_0 weights is refused, not run in bf16.
 void decodeInt8TakesRotation(metal::MetalBackend &backend) {
@@ -1534,6 +1556,7 @@ int main(int argc, char **argv) {
     ggufProjectionMatrix(backend);
     producerTableContract(backend);
     rotatedRegisterInput(backend);
+    decodeInt8Setting(backend);
     decodeInt8TakesRotation(backend);
     blockExtents(backend);
     leadingInputViews(backend);

@@ -3,6 +3,7 @@
 #include "StderrLine.hpp"
 
 #include <fcntl.h>
+#include <sys/mount.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -18,13 +19,14 @@ namespace {
 constexpr uint64_t kGiB = uint64_t{1} << 30;
 constexpr uint64_t kFloorBytes = 10 * kGiB;
 
-} // namespace
-
-DiskVolume DiskVolume::of(const struct statfs &status) {
+// The volume fstatfs describes.
+DiskVolume volumeFrom(const struct statfs &status) {
   const uint64_t block = status.f_bsize;
   return {status.f_mntonname, uint64_t{status.f_bavail} * block,
           uint64_t{status.f_blocks} * block, (status.f_flags & MNT_LOCAL) != 0};
 }
+
+} // namespace
 
 std::optional<DiskVolume> volumeOf(const std::filesystem::path &path) {
   std::filesystem::path directory = path;
@@ -34,7 +36,7 @@ std::optional<DiskVolume> volumeOf(const std::filesystem::path &path) {
       struct statfs status {};
       const bool measured = ::fstatfs(descriptor, &status) == 0;
       ::close(descriptor);
-      return measured ? std::optional(DiskVolume::of(status)) : std::nullopt;
+      return measured ? std::optional(volumeFrom(status)) : std::nullopt;
     }
     if (!directory.has_relative_path())
       return std::nullopt;
@@ -100,11 +102,9 @@ DiskSpace::DiskSpace(std::shared_ptr<model::DiskBudget> budget, bool automatic,
   measure();
 }
 
-void DiskSpace::measure() { measure(readVolume_()); }
-
-void DiskSpace::measure(std::optional<DiskVolume> volume) {
+void DiskSpace::measure() {
   const bool full = budget_->takeFullReport();
-  volume_ = std::move(volume);
+  volume_ = readVolume_();
   uint64_t own = 0;
   for (const std::shared_ptr<model::SlotFile> &file : files_)
     own += file->allocatedBytes();
