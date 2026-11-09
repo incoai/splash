@@ -87,11 +87,13 @@ struct Wall final {
     return bytes + spill.model.hotFloorShortfall(decoding);
   }
   // What a claim keeps of the room now, `owed` the lanes' first reads before it: the room less the first reads its
-  // releases created.
-  [[nodiscard]] uint64_t kept(uint64_t owed) const {
+  // releases created. A start's (Need::afterStart) keeps too what its start, which allocated `allocated` before it, no
+  // longer allocates (Model::startStateBytes).
+  [[nodiscard]] uint64_t kept(uint64_t owed, std::optional<uint64_t> allocated = std::nullopt) const {
     const uint64_t created = owedReads() - std::min(owedReads(), owed);
-    const uint64_t room = spill.host.governor.snapshot().headroomBytes;
-    return room - std::min(room, created);
+    const uint64_t room = spill.host.governor.snapshot().headroomBytes + allocated.value_or(0);
+    const uint64_t taken = created + (allocated ? spill.model.startStateBytes() : 0);
+    return room - std::min(room, taken);
   }
   // The memory wall: the engine holds what it does now and `room` more.
   void wall(uint64_t room = 0) { spill.host.leaveRoom(room); }
@@ -172,10 +174,11 @@ void claimTwoLanesCount(bool shared) {
   MemoryGovernor &governor = spill.host.governor;
   const uint64_t counted = governor.available(kNormalStart, {.bytes = 20ULL << 30, .afterStart = true});
   const uint64_t owed = lanes.owedReads();
+  const uint64_t allocated = spill.model.startStateBytes();
   const ClaimId claim = governor.ledger().open(kNormalStart);
   const FreeResult freed = governor.free(claim, {.bytes = counted, .afterStart = true});
   governor.ledger().close(claim);
-  const uint64_t kept = lanes.kept(owed);
+  const uint64_t kept = lanes.kept(owed, allocated);
   require(freed.outcome == FreeOutcome::Met && kept >= counted,
           std::string(shared ? "two lanes on one conversation" : "two lanes") + ": a start counted " +
               std::to_string(counted) + " B of their releases; a claim of that much was " +
@@ -662,10 +665,13 @@ private:
     const MemoryLedger::CountChecks before = governor.snapshot().countChecks;
     const std::string pool = lanes_.pool();
     // A need of bytes its count covers, with no claim waiting to hold room above it: what the claim keeps of the
-    // room once the lanes' first reads its releases created are set aside holds the need.
+    // room once the lanes' first reads its releases created are set aside, a start's with what its start no longer
+    // allocates, holds the need.
     const bool counts = (kind == 0 || kind == 2) && host_ == Host::Normal && !ledger.claimWaiting() &&
                         governor.available(spec, need) >= need.bytes;
     const uint64_t owed = lanes_.owedReads();
+    const std::optional<uint64_t> allocated =
+        need.afterStart ? std::optional(spill.model.startStateBytes()) : std::nullopt;
     FreeResult freed;
     claiming_ = true;
     if (kind == 3) {
@@ -698,7 +704,7 @@ private:
       totals_.shortUnits.add(detail);
     // Met, the claim takes its need from the room; one that waits or falls short asks again.
     if (counts && freed.outcome == FreeOutcome::Met) {
-      const uint64_t kept = lanes_.kept(owed);
+      const uint64_t kept = lanes_.kept(owed, allocated);
       ++totals_.countedClaims;
       if (kept < need.bytes)
         (quiet ? totals_.notKept : totals_.notKeptInFlight)

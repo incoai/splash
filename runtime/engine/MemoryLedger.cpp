@@ -432,6 +432,12 @@ uint64_t MemoryLedger::pooledBytes(const VictimQuery &query, const Lacking &lack
   return bufferBytes_(states, query.need.afterStart, keepLane);
 }
 
+uint64_t MemoryLedger::startPooledBytes(const VictimQuery &query) const {
+  if (!query.need.afterStart || !bufferBytes_)
+    return 0;
+  return saturatingSubtract(bufferBytes_(0, false, false), bufferBytes_(0, true, false));
+}
+
 // The most the order gives a claim, counted without taking: the units
 // take() would take, in its order, each at what its source says it frees
 // at most (VictimSource::peek), and none past the unit that covers the
@@ -497,12 +503,16 @@ MemoryLedger::Run MemoryLedger::bound(const VictimQuery &query, const Lacking &l
 // taken give a need of bytes as in bound(), read from the model's pool once
 // their takes returned them to it, so that each counts once: what the pool
 // releases now beyond what it released before the run, an idle buffer a
-// take released being in what that take freed. An Immediate claim passes
-// over what lands later.
+// take released being in what that take freed. For a need afterStart,
+// whose count credits them as the pool's, so do those the start then takes
+// from the pool beyond what it took before the run, which it no longer
+// allocates (startPooledBytes). An Immediate claim passes over what lands
+// later.
 MemoryLedger::Run MemoryLedger::take(const VictimQuery &query, const Lacking &lack) {
   Order order(*this, query);
   Run run{.freed = {.outcome = FreeOutcome::Met}};
   const uint64_t pooledBefore = pooledBytes(query, lack, 0);
+  const uint64_t before = saturatingAdd(pooledBefore, startPooledBytes(query));
   // A pending unit holds back the stages after the cache's writes.
   Order::Stage ceiling = Order::Stage::LaneStart;
   while (!lack.none() && !lack.covered(run.bytes, run.pages, run.buffers)) {
@@ -560,7 +570,8 @@ MemoryLedger::Run MemoryLedger::take(const VictimQuery &query, const Lacking &la
     run.freed.laterBytes = saturatingAdd(run.freed.laterBytes, taken.laterBytes);
     const uint64_t pooledNow = pooledBytes(query, lack, 0);
     run.pooled = saturatingSubtract(pooledNow, pooledBefore);
-    run.bytes = saturatingSubtract(saturatingAdd(saturatingAdd(run.freed.nowBytes, run.freed.laterBytes), pooledNow), pooledBefore);
+    const uint64_t after = saturatingAdd(pooledNow, startPooledBytes(query));
+    run.bytes = saturatingSubtract(saturatingAdd(saturatingAdd(run.freed.nowBytes, run.freed.laterBytes), after), before);
     run.pages += taken.pages;
     run.buffers += taken.stateBuffers;
     run.costly = run.costly || Order::stage(*best) > Order::Stage::NeedsWrite;
@@ -578,6 +589,7 @@ MemoryLedger::Run MemoryLedger::take(const VictimQuery &query, const Lacking &la
 }
 
 uint64_t MemoryLedger::takeUnsized(const VictimQuery &query) {
+  const uint64_t startPooled = startPooledBytes(query);
   uint64_t bytes = 0;
   for (VictimSource *source : sources_) {
     for (std::optional<Victim> unit = source->peek(query, nullptr);
@@ -588,7 +600,7 @@ uint64_t MemoryLedger::takeUnsized(const VictimQuery &query) {
         break;
     }
   }
-  return bytes;
+  return saturatingSubtract(bytes, saturatingSubtract(startPooled, startPooledBytes(query)));
 }
 
 // The one rule. The units that cost nothing and cannot be sized go first. Then

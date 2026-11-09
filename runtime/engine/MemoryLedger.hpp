@@ -110,8 +110,11 @@ struct ClaimId final {
 // one no cached state holds (unheldStateBuffer), which their states meet only
 // by the bytes their buffers free. afterStart: a need that counts a lane's
 // start and the state it captures, which take their buffers from the model's
-// pool before any unit's return to it (Model::startStateBytes). kv: a need
-// of KV pages (a TokenAdmission's), whatever measure lacks them.
+// pool before any unit's return to it (Model::startStateBytes); a buffer a
+// unit returns that they then take, not allocate, gives the need its bytes
+// as one the pool releases does, and a pooled one released that they would
+// have taken gives it none. kv: a need of KV pages (a TokenAdmission's),
+// whatever measure lacks them.
 struct Need final {
   uint64_t bytes = 0;
   bool hostRefused = false;
@@ -524,6 +527,11 @@ private:
   // to what it released before the run.
   [[nodiscard]] uint64_t pooledBytes(const VictimQuery &query, const Lacking &lack, uint32_t states,
                                      bool keepLane = true) const;
+  // What a lane's start and the state it captures take from the model's
+  // pool, for a need afterStart: what the pool releases without keeping a
+  // lane, less what it releases once they took theirs. What they lack of it
+  // they allocate (Model::startStateBytes).
+  [[nodiscard]] uint64_t startPooledBytes(const VictimQuery &query) const;
   // The most the units the claim's rights take give it, counted in the
   // one order without taking any, up to the lack.
   [[nodiscard]] Run bound(const VictimQuery &query, const Lacking &lack) const;
@@ -531,7 +539,9 @@ private:
   // now and later covers the lack, or none is left.
   [[nodiscard]] Run take(const VictimQuery &query, const Lacking &lack);
   // Takes each source's units that cost nothing and are sized only when
-  // taken, until one frees nothing; the bytes they freed.
+  // taken, until one frees nothing; the bytes they freed, for a need
+  // afterStart less the pooled buffers among them its start would have
+  // taken, which it then allocates (startPooledBytes).
   uint64_t takeUnsized(const VictimQuery &query);
 
   void log(const ClaimSpec &spec, const Need &need, const Run *run, const FreeResult &result,

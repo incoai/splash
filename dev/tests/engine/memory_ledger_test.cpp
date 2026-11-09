@@ -2221,6 +2221,61 @@ void testUnitsThatCountOnePageTwiceOvercount() {
   }
 }
 
+// A start's count (Need::afterStart) credits the buffers a cached state returns to the pool the start leaves, those
+// the start then takes from it in place of an allocation among them, and its take credits them alike. Of a pool that
+// holds no buffer for the start, a state of one buffer meets a start that lacks that buffer's bytes, and the buffer
+// stays pooled for it. Read only as what the pool releases, the take credited none, and the run was overcounted.
+void testAStartsCountOfAStateWhoseBufferItTakesIsMet() {
+  Fixture fixture(host(32 * kGiB));
+  MemoryLedger &ledger = fixture.ledger();
+  BufferPool pool(64);
+  CachedStates cache(pool);
+  cache.units = {{.key = 1, .stateBuffers = 1}};
+  ledger.addSource(cache);
+  // A start takes a buffer from the pool first.
+  ledger.setBufferBytes([&pool](uint32_t states, bool afterStart, bool) {
+    const uint32_t pooled = afterStart ? pool.idle - std::min(pool.idle, 1U) : pool.idle;
+    return uint64_t{pooled + states} * 64;
+  });
+  const ClaimId claim = ledger.open(request(1, RequestPriority::Normal, ClaimClass::Start));
+  const FreeResult freed = ledger.free(claim, {.bytes = 64, .afterStart = true}, 0, false);
+  ledger.close(claim);
+  const MemoryLedger::CountChecks checks = fixture.governor->snapshot().countChecks;
+  require(freed.outcome == FreeOutcome::Met && cache.taken == std::vector<uint64_t>{1} && pool.idle == 1 &&
+              checks.coveredRuns == 1 && !checks.overcountedRuns,
+          "a start's count of a state whose buffer it takes was not met: outcome " +
+              std::to_string(static_cast<int>(freed.outcome)) + ", " + std::to_string(cache.taken.size()) +
+              " states taken, " + std::to_string(pool.idle) + " buffers pooled, " +
+              std::to_string(checks.overcountedRuns) + " runs overcounted");
+}
+
+// A start's take of the buffers that cost nothing (MemoryLedger::takeUnsized) credits none it releases that the start
+// would have taken from the pool, which the start then allocates. Of a pool whose one buffer the start takes, its
+// release leaves the start lacking that buffer's bytes still, and a cached state's bytes meet them. Credited as the
+// pool's release, the buffer met the start, which then allocated it again, and the state stayed.
+void testAStartsTakeOfABufferItWouldTakeCreditsNothing() {
+  Fixture fixture(host(32 * kGiB));
+  MemoryLedger &ledger = fixture.ledger();
+  BufferPool pool(64);
+  pool.idle = 1;
+  CachedStates cache(pool);
+  cache.units = {{.key = 1, .bytes = 64}};
+  ledger.addSource(pool);
+  ledger.addSource(cache);
+  // A start takes a buffer from the pool first.
+  ledger.setBufferBytes([&pool](uint32_t states, bool afterStart, bool) {
+    const uint32_t pooled = afterStart ? pool.idle - std::min(pool.idle, 1U) : pool.idle;
+    return uint64_t{pooled + states} * 64;
+  });
+  const ClaimId claim = ledger.open(request(1, RequestPriority::Normal, ClaimClass::Start));
+  const FreeResult freed = ledger.free(claim, {.bytes = 64, .afterStart = true}, 0, false);
+  ledger.close(claim);
+  require(freed.outcome == FreeOutcome::Met && cache.taken == std::vector<uint64_t>{1},
+          "a start's release of a pooled buffer it would take met it: outcome " +
+              std::to_string(static_cast<int>(freed.outcome)) + ", " + std::to_string(freed.nowBytes) +
+              " B now, " + std::to_string(cache.taken.size()) + " states taken");
+}
+
 // Growth counts what the host's reading does not show yet, so a lagging reading grows no unit that later goes back.
 void testGrowthCountsWhatTheHostDoesNotShowYet() {
   // M + 1.5 GiB of headroom beside the store's 2 GiB.
@@ -2475,6 +2530,8 @@ std::span<const test::TestCase> ledgerTests() {
       {"testTheOrderTakesCacheThenRebuiltPoolsThenReleasesThenTheStore",
        testTheOrderTakesCacheThenRebuiltPoolsThenReleasesThenTheStore},
       {"testUnitsThatCountOnePageTwiceOvercount", testUnitsThatCountOnePageTwiceOvercount},
+      {"testAStartsCountOfAStateWhoseBufferItTakesIsMet", testAStartsCountOfAStateWhoseBufferItTakesIsMet},
+      {"testAStartsTakeOfABufferItWouldTakeCreditsNothing", testAStartsTakeOfABufferItWouldTakeCreditsNothing},
       {"testGrowthCountsWhatTheHostDoesNotShowYet", testGrowthCountsWhatTheHostDoesNotShowYet},
       {"testGrowthLeavesTheHostWhatTheLanesGrowInto", testGrowthLeavesTheHostWhatTheLanesGrowInto},
       {"testRequestsMetFromCacheLeaveRegrowthQuiet", testRequestsMetFromCacheLeaveRegrowthQuiet},

@@ -1717,6 +1717,10 @@ otherwise. A refusal of KV counts the free pages of its form as its own: the
 ledger never releases their extent for it, which it would only allocate again.
 One that lacks pages takes them in place, and the pages its takes free there
 stay with the free ones: its count, as its takes, empties no extent of its form.
+A start's count credits the state buffers its units return to the model's pool,
+whether the pool releases them or the start takes them in place of buffers it
+would allocate, and so do its takes; a pooled buffer they release that the
+start would have taken frees it nothing, as the start then allocates it.
 `/status` counts the takes on a count that covered what the claim lacked, and
 those that freed less though no unit waited for a transfer and the host refused
 nothing meanwhile (`memory_governor.count_checks`).
