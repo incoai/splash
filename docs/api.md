@@ -757,10 +757,13 @@ Exact-prefix caching reuses model work while the server runs, and across
 restarts with `--persistent-cache` ([persistent cache](server.md#persistent-cache)).
 Text requests also reuse tokenized history at literal message-end boundaries
 when the tokenizer supports independent encoding there. This process-local cache
-retains at most four prefixes, in storage sized for four prompts of the served
-context however Python stores their text (24 bytes a token); it falls back to
-full encoding for other tokenizer pipelines. `/status.tokenizer_cache` reports
-its usage. It does not alter prompt text, token IDs or the GPU KV cache.
+retains the newest prefix of up to sixteen conversations, in storage sized for
+four prompts of the served context however Python stores their text (24 bytes a
+token); it falls back to full encoding for other tokenizer pipelines.
+`/status.tokenizer_cache` reports its usage: `hits` and `misses` count the
+prompts long enough to look up (4,096 characters through their last message
+end) that found a cached prefix and that did not, and `evictions` the prefixes
+dropped to make room. It does not alter prompt text, token IDs or the GPU KV cache.
 
 ## Errors
 
