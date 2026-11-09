@@ -283,7 +283,9 @@ private struct ActivitySection: View {
     var body: some View {
         Section {
             ActivityFigures(activity: state.server.activity, context: state.server.context)
-            RequestLog(entries: state.server.requestLog, totals: RequestLog.totals(state.server.activity), open: advanced)
+            RequestLog(requests: state.server.requests,
+                       totals: RequestLog.totals(state.server.activity, running: state.server.requests.count { $0.end == nil }),
+                       open: advanced)
         } header: {
             SectionTitle(text: "Activity")
         }
@@ -313,10 +315,10 @@ private struct ActivityFigures: View {
     }
 }
 
-/// The requests since the model started, their totals on the row, and when opened, one line for
+/// The requests since the model started, their totals on the row, and when opened, a line for
 /// each in a box of its own that scrolls, from the top down, following the latest once full.
 private struct RequestLog: View {
-    let entries: [RequestEntry]
+    let requests: [ServedRequest]
     let totals: String?
     @State var open = false
 
@@ -325,11 +327,11 @@ private struct RequestLog: View {
         if open {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    if entries.isEmpty {
+                    if requests.isEmpty {
                         Text("No requests yet.").font(.callout).foregroundStyle(.tertiary).frame(height: 22)
                     }
-                    ForEach(Array(entries.enumerated()), id: \.offset) { _, entry in
-                        RequestRow(entry: entry)
+                    ForEach(requests) { request in
+                        RequestRow(request: request)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -343,53 +345,78 @@ private struct RequestLog: View {
         }
     }
 
-    /// How many requests, the tokens they wrote and read, those taken from the cache, and any
-    /// running; none before the first.
-    static func totals(_ activity: Server.Activity) -> String? {
-        guard activity.served > 0 || activity.running > 0 else { return nil }
+    /// How many requests, the tokens they wrote and read, those taken from the cache, and those
+    /// `running` as the rows show them; none before the first.
+    static func totals(_ activity: Server.Activity, running: Int) -> String? {
+        guard activity.served > 0 || running > 0 else { return nil }
         var parts = [activity.served.formatted(), "\(Format.count(activity.generated)) tokens out", "\(Format.count(activity.read)) in"]
         if activity.cached > 0 { parts.append("\(Format.count(activity.cached)) cached") }
-        if activity.running > 0 { parts.append("\(activity.running) running") }
+        if running > 0 { parts.append("\(running) running") }
         return parts.joined(separator: " · ")
     }
 }
 
-/// A request as a line: when, the tokens it wrote, and how fast, how soon and from how much prompt;
-/// or that it was cancelled, or why it failed. The server's own line is a hover away.
+/// A request as a line: when it came; while it runs, a spinner and how far it has got, reading
+/// its prompt or answering, or why it waits; once it ended, the tokens it wrote, how fast, how soon
+/// and from how much prompt, or that it was cancelled, or why it failed, the server's line a hover
+/// away.
 private struct RequestRow: View {
-    let entry: RequestEntry
+    let request: ServedRequest
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(entry.time).font(.subheadline).foregroundStyle(.tertiary).frame(width: 56, alignment: .leading)
-            switch entry.outcome {
-            case .done:
-                Text("\((entry.output ?? 0).formatted()) tokens")
-                Text(facts).foregroundStyle(.secondary)
-            case .cancelled:
-                Text("Cancelled").foregroundStyle(.secondary)
-            case .error:
-                Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor).font(.system(size: 11))
-                Text(entry.message ?? "").foregroundStyle(.secondary)
+            Text(request.time).font(.subheadline).foregroundStyle(.tertiary).frame(width: 56, alignment: .leading)
+            if let end = request.end {
+                switch end.outcome {
+                case .cancelled:
+                    Text("Cancelled").foregroundStyle(.secondary)
+                case .error:
+                    Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor).font(.system(size: 11))
+                    Text(end.message ?? "").foregroundStyle(.secondary)
+                case .done, .started:
+                    Text(tokens(end.output ?? 0))
+                    Text(Self.facts(end)).foregroundStyle(.secondary)
+                }
+            } else {
+                let input = request.input ?? 0
+                ProgressView().controlSize(.mini)
+                switch request.stage {
+                case .waiting(let why):
+                    Text(why)
+                    Text("\(input.formatted()) in").foregroundStyle(.secondary)
+                case .reading(let read):
+                    Text("Reading \(Int(Double(read) / Double(max(input, 1)) * 100))%")
+                    Text("\(read.formatted()) of \(input.formatted()) in").foregroundStyle(.secondary)
+                case .answering(let written):
+                    Text(tokens(written))
+                    Text("Answering · \(input.formatted()) in").foregroundStyle(.secondary)
+                }
             }
         }
         .font(.callout)
         .monospacedDigit()
         .lineLimit(1)
         .frame(height: 22)
-        .help(entry.raw)
+        .help(request.end?.raw ?? "")
         .contextMenu {
-            Button("Copy Line") { NSPasteboard.put(entry.raw) }
+            if let line = request.end?.raw {
+                Button("Copy Line") { NSPasteboard.put(line) }
+            }
         }
     }
 
-    private var facts: String {
-        [entry.rate.map { "\($0.formatted(.number.precision(.fractionLength(1)))) tok/s" },
-         entry.firstToken.map { "first \(Format.seconds($0))" },
-         entry.input.map { "\($0.formatted()) in" },
-         entry.cached.flatMap { $0 > 0 ? "\($0.formatted()) cached" : nil }]
+    private static func facts(_ end: RequestEntry) -> String {
+        [end.rate.map { "\($0.formatted(.number.precision(.fractionLength(1)))) tok/s" },
+         end.firstToken.map { "first \(Format.seconds($0))" },
+         end.input.map { "\($0.formatted()) in" },
+         end.cached.flatMap { $0 > 0 ? "\($0.formatted()) cached" : nil }]
             .compactMap { $0 }.joined(separator: " · ")
     }
+}
+
+/// So many tokens, as a request's line says them.
+private func tokens(_ count: Int) -> String {
+    "\(count.formatted()) \(count == 1 ? "token" : "tokens")"
 }
 
 /// The coding agents to open in Terminal on the model that runs, and its API address to copy.

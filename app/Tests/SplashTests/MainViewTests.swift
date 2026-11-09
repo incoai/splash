@@ -91,6 +91,29 @@ struct MainViewTests {
     }
 }
 
+extension MainViewTests {
+    /// A request is one row from its start to its end: its Started line adds it, the status
+    /// moves it on, its Done line ends it in its place, and a status that still has it, as one
+    /// answered from an earlier snapshot, leaves it ended.
+    @Test func aRequestIsOneRowFromItsStartToItsEnd() async throws {
+        let server = try FakeServer()
+        defer { server.remove() }
+        let state = server.state
+        state.server.start("example/Model", settings: ServeSettings(values: ["--port": String(server.port)]))
+        server.signal("loaded")
+        server.signal("warm")
+        try await waitFor(state.server.phase == .ready)
+        server.signal("answering")
+        try await waitFor(state.server.requests.first?.stage == .answering(1))
+        #expect(state.server.requests.map(\.id) == [1] && state.server.requests[0].input == 13 && state.server.requests[0].end == nil)
+        server.signal("finished")
+        try await waitFor(state.server.requests.first?.end != nil)
+        // Past the next status, which still reports it running.
+        try await Task.sleep(for: .seconds(2.5))
+        #expect(state.server.requests.map(\.id) == [1] && state.server.requests[0].end?.output == 1)
+    }
+}
+
 /// A runtime whose launcher starts as `splash serve` does, one step at a time as the test signals
 /// it, then answers as a ready server; its status reports a request running, then its engine
 /// stopped, once signalled so.

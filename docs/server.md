@@ -984,10 +984,11 @@ semantics (off when omitted) unless the request's `chat_template_kwargs` set
 built-in chat page offers Auto, the efforts `/v1/models` reports and Off, and
 no menu for a model that decides; it sends no effort unless the user picks one.
 
-The console's Started line shows how each chat request reasons: the effort it
-sent, or `absent` and the default it took, its `enable_thinking` when it set
-one, and whether it thinks, as in
-`Started · input 2,473 · cached 0 · effort absent → low · thinking on`.
+The console's Started line names the request the engine took, by the id its
+Done, Cancelled or Error line names too, and shows how each chat request
+reasons: the effort it sent, or `absent` and the default it took, its
+`enable_thinking` when it set one, and whether it thinks, as in
+`Started · request 12 · input 2,473 · cached 0 · effort absent → low · thinking on`.
 
 A Chat or Messages request's `chat_template_kwargs` are passed to the template
 as variables and outrank the effort, and in Messages `thinking`, so

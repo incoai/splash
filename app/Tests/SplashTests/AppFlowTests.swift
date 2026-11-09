@@ -107,7 +107,7 @@ final class AppFlowTests {
         state.chats.flush()
         #expect(ChatStore(folder: folder).conversations.first?.messages == conversation.messages, "saved")
         await Snapshot.save("chat-ready", MainView().environment(state))
-        #expect(state.server.requestLog.contains { $0.outcome == .done && ($0.output ?? 0) > 0 })
+        #expect(state.server.requests.contains { $0.id > 0 && $0.end?.outcome == .done && ($0.end?.output ?? 0) > 0 })
         #expect(state.server.activity.generated > 0)
         await Snapshot.save("server-activity", size: CGSize(width: 1120, height: 1100), ServerView(advanced: true).environment(state))
         await Snapshot.save("menu-bar", size: CGSize(width: 300, height: 400), MenuBarPanel().environment(state))

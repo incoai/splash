@@ -55,7 +55,7 @@ class DiagnosticsTests(HarnessTestCase):
                 "Error · invalid_request_error · POST /v1/messages", error=True
             )
 
-    def test_request_record_contains_metrics_but_console_omits_prompt_and_id(self):
+    def test_request_record_contains_metrics_but_console_omits_the_prompt(self):
         records = []
         harness = self.harness(FakeRuntime(), request_logger=records.append)
         status, _, _ = harness.request(
@@ -72,17 +72,18 @@ class DiagnosticsTests(HarnessTestCase):
         for logged, pattern in (
             (
                 started,
-                r"^\d{2}:\d{2}:\d{2} Started · input \d+ · cached \d+"
+                r"^\d{2}:\d{2}:\d{2} Started · request (\d+) · input \d+ · cached \d+"
                 r" · effort none · thinking off\n$",
             ),
-            (record, r"^\d{2}:\d{2}:\d{2} Done · input [^\n]*\n$"),
+            (record, r"^\d{2}:\d{2}:\d{2} Done · request (\d+) · input [^\n]*\n$"),
         ):
             with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
                 diagnostics.print_request(logged)
             line = output.getvalue()
             self.assertRegex(line, pattern)
-            self.assertNotIn("request_id", line)
             self.assertNotIn("hello", line)
+        # Both lines name the request the engine took, as its own lines do.
+        self.assertEqual(started["request_id"], record["request_id"])
 
     def test_console_request_summary(self):
         record = {
@@ -105,7 +106,7 @@ class DiagnosticsTests(HarnessTestCase):
             diagnostics.print_request(record)
         self.assertEqual(
             output.getvalue(),
-            "14:32:08 Done · input 10,240 · cached 8,192 · output 320"
+            "14:32:08 Done · request 123 · input 10,240 · cached 8,192 · output 320"
             " · TTFT 0.8s · 85.0 tok/s\n",
         )
 
@@ -294,7 +295,8 @@ class DiagnosticsTests(HarnessTestCase):
                 }
             )
         self.assertRegex(
-            errors.getvalue(), r"^\d{2}:\d{2}:\d{2} Error · context_length_exceeded\n$"
+            errors.getvalue(),
+            r"^\d{2}:\d{2}:\d{2} Error · request 123 · context_length_exceeded\n$",
         )
         self.assertEqual(output.getvalue(), "")
 
@@ -366,7 +368,7 @@ class DiagnosticsTests(HarnessTestCase):
 
     def test_request_lines_are_the_ones_the_app_reads(self):
         """The server writes its request lines as log_lines_golden.txt holds
-        them, which the app parses (RequestEntry)."""
+        them, in its order, which the app parses (RequestEntry)."""
         golden = [
             line
             for line in (Path(__file__).parent / "log_lines_golden.txt")
@@ -374,9 +376,10 @@ class DiagnosticsTests(HarnessTestCase):
             .splitlines()
             if line and not line.startswith("#")
         ]
-        records = {
-            "Started": {
+        records = [
+            {
                 "outcome": "started",
+                "request_id": 7,
                 "prompt_tokens": 4096,
                 "cached_tokens": 1024,
                 "reasoning": {
@@ -386,8 +389,9 @@ class DiagnosticsTests(HarnessTestCase):
                     "thinking": False,
                 },
             },
-            "Done": {
+            {
                 "outcome": "stop",
+                "request_id": 7,
                 "prompt_tokens": 4096,
                 "completion_tokens": 574,
                 "metrics": {
@@ -399,28 +403,27 @@ class DiagnosticsTests(HarnessTestCase):
                     "speculation": {"accepted_draft_tokens": 9, "cycles": 10},
                 },
             },
-            "Cancelled": {
+            {
                 "outcome": "cancelled",
+                "request_id": 8,
                 "prompt_tokens": 69,
                 "completion_tokens": 12,
                 "metrics": {"cache": {"matched_tokens": 0}},
             },
-            "Error": {"outcome": "error", "error_code": "invalid_request_error"},
-        }
-        for line in golden:
-            time, kind = line.split()[:2]
-            if kind not in records:
-                continue
+            # A request the engine took, and one refused before it.
+            {"outcome": "error", "request_id": 9, "error_code": "runtime_unavailable"},
+            {"outcome": "error", "error_code": "invalid_request_error"},
+        ]
+        self.assertEqual(len(golden), len(records))
+        for line, record in zip(golden, records):
             with (
-                self.subTest(kind=kind),
-                mock.patch.object(api.time, "strftime", return_value=time),
+                self.subTest(line=line),
+                mock.patch.object(api.time, "strftime", return_value=line.split()[0]),
                 mock.patch("sys.stdout", new_callable=io.StringIO) as output,
                 mock.patch("sys.stderr", new_callable=io.StringIO) as errors,
             ):
-                diagnostics.print_request(records.pop(kind))
+                diagnostics.print_request(record)
                 self.assertEqual(output.getvalue() + errors.getvalue(), line + "\n")
-        self.assertEqual(records, {})
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -105,8 +105,9 @@ final class Server {
         Stage(phase: phase, next: next, model: model, serving: serving, acceptsImages: acceptsImages, reasoning: reasoning)
     }
 
-    /// Once ready: each request the server finished, as its log line gives it, the latest last.
-    private(set) var requestLog: [RequestEntry] = []
+    /// Once ready: the requests the server has taken, a row each, in the order they came
+    /// (`ServedRequest`).
+    private(set) var requests: [ServedRequest] = []
 
     /// The server's work since it started, from `/status`: requests served and running, the average
     /// speed of answers and of reading prompts in tokens a second, the median time to an answer's
@@ -222,7 +223,7 @@ final class Server {
         recovering = false
         context = nil
         activity = Activity()
-        requestLog = []
+        requests = []
         acceptsImages = false
         reasoning = nil
         stopRequested = false
@@ -264,8 +265,7 @@ final class Server {
 
     private func received(_ line: String) {
         if phase == .ready, let entry = RequestEntry(line) {
-            requestLog.append(entry)
-            if requestLog.count > 1000 { requestLog.removeFirst(requestLog.count - 1000) }
+            requests = ServedRequest.taking(entry, into: requests)
         }
     }
 
@@ -393,17 +393,22 @@ final class Server {
         while !Task.isCancelled, phase == .ready {
             if !unwatched || ContinuousClock.now - asked >= .seconds(10) {
                 asked = .now
-                if let report = await status(), phase == .ready {
-                    asleep = report.asleep
-                    recovering = report.recovering
-                    activity = report.activity
-                    // A relaunched engine may serve less context than the first did.
-                    if let served = report.context { context = served }
-                    if let stopped = report.stopped { phase = .failed(stopped) }
-                }
+                await askStatus()
             }
             try? await Task.sleep(for: .seconds(2))
         }
+    }
+
+    /// Asks the server's status and takes what it reports.
+    private func askStatus() async {
+        guard let report = await status(), phase == .ready else { return }
+        asleep = report.asleep
+        recovering = report.recovering
+        activity = report.activity
+        requests = ServedRequest.taking(report.live, into: requests)
+        // A relaunched engine may serve less context than the first did.
+        if let served = report.context { context = served }
+        if let stopped = report.stopped { phase = .failed(stopped) }
     }
 
     /// What the server's status says: the work it has done, whether it has given the weights back
@@ -416,10 +421,12 @@ final class Server {
         var stopped: String?
         /// The tokens of context the server serves now.
         var context: Int?
+        /// The requests it works on, as they were `now`.
+        var live: [LiveRequest] = []
     }
 
-    /// The report of `/status`'s body, if it is one.
-    nonisolated static func report(_ data: Data) -> Report? {
+    /// The report of `/status`'s body, if it is one, asked `now`.
+    nonisolated static func report(_ data: Data, at now: Date = .now) -> Report? {
         guard let status = try? JSONDecoder().decode(Status.self, from: data) else { return nil }
         let metrics = status.metrics
         return Report(
@@ -439,7 +446,13 @@ final class Server {
             // The engine failed in a way restarting cannot help; the server stays up but serves
             // nothing.
             stopped: status.transport?.stopped == true ? status.transport?.error ?? "Its engine stopped." : nil,
-            context: status.capabilities?.max_context_tokens
+            context: status.capabilities?.max_context_tokens,
+            live: (status.active_requests ?? []).enumerated().map { index, request in
+                LiveRequest(id: request.id ?? index, time: LiveRequest.time(of: now.addingTimeInterval(-(request.age_ms ?? 0) / 1000)),
+                            input: request.prompt_tokens ?? 0,
+                            stage: LiveRequest.stage(phase: request.phase, read: request.prompt_processed ?? 0,
+                                                     written: request.generated_tokens ?? 0))
+            }
         )
     }
 
@@ -448,7 +461,14 @@ final class Server {
         struct Weights: Decodable { let released: Bool? }
         struct Transport: Decodable { let recovering: Bool?; let stopped: Bool?; let error: String? }
         struct Requests: Decodable { let completed: Int? }
-        struct Request: Decodable {}
+        struct Request: Decodable {
+            let id: Int?
+            let phase: String?
+            let prompt_tokens: Int?
+            let prompt_processed: Int?
+            let generated_tokens: Int?
+            let age_ms: Double?
+        }
         struct Metrics: Decodable {
             struct Percentiles: Decodable { let p50: Double? }
             let decode_tokens_per_second: Double?
@@ -492,16 +512,135 @@ final class Server {
     }
 }
 
-/// A request the server finished, as its log line gives it: when, how it ended, and, for one that
+/// A request the server works on, as its status gives it: when it came, the tokens of its prompt,
+/// and what it does now.
+struct LiveRequest: Equatable, Identifiable {
+    enum Stage: Equatable {
+        /// Not begun, and why: queued, or waiting for memory or for a prefix another request reads.
+        case waiting(String)
+        /// Reading its prompt, so many of its tokens read, those taken from the cache among them.
+        case reading(Int)
+        /// Answering, so many tokens written.
+        case answering(Int)
+    }
+
+    let id: Int
+    /// When it came, as the status's age of it says, as the server's lines give the time of day.
+    let time: String
+    let input: Int
+    let stage: Stage
+
+    /// What a request in the engine's `phase` does, having read `read` tokens of its prompt and
+    /// written `written`.
+    nonisolated static func stage(phase: String?, read: Int, written: Int) -> Stage {
+        switch phase {
+        case "queued": .waiting("Queued")
+        case "waiting_resources": .waiting("Waiting for memory")
+        case "waiting_prefix": .waiting("Waiting for a shared prefix")
+        case "prefill": .reading(read)
+        default: .answering(written)
+        }
+    }
+
+    /// `date`'s time of day as the server's lines give it.
+    nonisolated static func time(of date: Date) -> String {
+        let parts = Calendar.current.dateComponents([.hour, .minute, .second], from: date)
+        return String(format: "%02d:%02d:%02d", parts.hour ?? 0, parts.minute ?? 0, parts.second ?? 0)
+    }
+}
+
+extension LiveRequest.Stage {
+    /// How far on it is: waiting, then reading, then answering, each by its tokens.
+    fileprivate var progress: (Int, Int) {
+        switch self {
+        case .waiting: (0, 0)
+        case .reading(let read): (1, read)
+        case .answering(let written): (2, written)
+        }
+    }
+}
+
+/// A row of the Server's request list: one for each request the engine took, from the line that
+/// started it or the status that had it first, which goes on as later statuses say, never back,
+/// until the line that ends it ends it in its place; and one for each line that names no request,
+/// as a request refused before the engine took it, or an earlier server's line.
+struct ServedRequest: Equatable, Identifiable {
+    /// The engine's id of the request, as its lines and the status name it; below zero for a line
+    /// that names none.
+    let id: Int
+    /// When it came: its first line's time of day, or the time the status first had it come.
+    let time: String
+    /// The tokens of its prompt, where they are known.
+    var input: Int?
+    /// How far it has got while it runs.
+    var stage: LiveRequest.Stage
+    /// The line that ended it; nil while it runs.
+    var end: RequestEntry?
+
+    /// The rows a list keeps, the latest.
+    static let kept = 1000
+
+    /// `requests` with `line` taken: a request's start adds its row, unless the status had it
+    /// first; its end ends its row, or adds one ended where it was never seen; a line that names no
+    /// request adds a row of its own, an earlier server's start none, as nothing could end it.
+    static func taking(_ line: RequestEntry, into requests: [ServedRequest]) -> [ServedRequest] {
+        var requests = requests
+        let index = line.request.flatMap { id in requests.firstIndex { $0.id == id } }
+        switch (line.outcome, index) {
+        case (.started, let index?):
+            requests[index].input = line.input ?? requests[index].input
+            if requests[index].end == nil { requests[index].moveOn(to: .reading(line.cached ?? 0)) }
+        case (.started, nil):
+            guard let id = line.request else { return requests }
+            requests.append(ServedRequest(id: id, time: line.time, input: line.input, stage: .reading(line.cached ?? 0)))
+        case (_, let index?):
+            requests[index].input = line.input ?? requests[index].input
+            requests[index].end = line
+        case (_, nil):
+            let id = line.request ?? min(-1, (requests.map(\.id).min() ?? 0) - 1)
+            requests.append(ServedRequest(id: id, time: line.time, input: line.input, stage: .answering(line.output ?? 0),
+                                          end: line))
+        }
+        return Array(requests.suffix(kept))
+    }
+
+    /// `requests` with the status's `live` ones taken: each running goes on as the status says,
+    /// never back, as a status answered from an earlier snapshot would take it; one ended stays as
+    /// its line left it; one not seen before is added, at the time it came.
+    static func taking(_ live: [LiveRequest], into requests: [ServedRequest]) -> [ServedRequest] {
+        var requests = requests
+        for request in live {
+            if let index = requests.firstIndex(where: { $0.id == request.id }) {
+                guard requests[index].end == nil else { continue }
+                requests[index].input = requests[index].input ?? request.input
+                requests[index].moveOn(to: request.stage)
+            } else {
+                requests.append(ServedRequest(id: request.id, time: request.time, input: request.input, stage: request.stage))
+            }
+        }
+        return Array(requests.suffix(kept))
+    }
+
+    /// Takes `stage` where it is no further back than the row's.
+    private mutating func moveOn(to stage: LiveRequest.Stage) {
+        if stage.progress >= self.stage.progress { self.stage = stage }
+    }
+}
+
+/// A request line of the server's log: when, that the request started or how it ended, and the
+/// request it names; for one that started, its prompt and the part of it cached; for one that
 /// answered, the tokens it read, took from the cache and wrote, how soon it began and how fast it
 /// went; for one that failed, why.
 struct RequestEntry: Equatable {
-    enum Outcome: Equatable { case done, cancelled, error }
+    enum Outcome: Equatable { case started, done, cancelled, error }
 
     let time: String
     let outcome: Outcome
     /// The line itself.
     let raw: String
+    /// The engine's id of the request; nil for one refused before the engine took it, or an
+    /// earlier server's line, which names none.
+    var request: Int?
     var input: Int?
     var cached: Int?
     var output: Int?
@@ -510,18 +649,24 @@ struct RequestEntry: Equatable {
     var rate: Double?
     var message: String?
 
-    /// The request `line` of the server's log finishes, if it finishes one.
+    /// The request `line` of the server's log starts or ends, if it is a request's line.
     init?(_ line: String) {
-        guard let match = line.wholeMatch(of: /(\d\d:\d\d:\d\d) (Done|Cancelled|Error) · (.*)/) else { return nil }
+        guard let match = line.wholeMatch(of: /(\d\d:\d\d:\d\d) (Started|Done|Cancelled|Error) · (.*)/) else { return nil }
         time = String(match.1)
-        outcome = match.2 == "Done" ? .done : match.2 == "Cancelled" ? .cancelled : .error
-        raw = line
-        guard outcome != .error else {
-            message = String(match.3)
-            return
+        outcome = switch match.2 {
+        case "Started": .started
+        case "Done": .done
+        case "Cancelled": .cancelled
+        default: .error
         }
+        raw = line
+        var why: [String] = []
         for part in match.3.components(separatedBy: " · ") {
-            if let count = part.wholeMatch(of: /(input|cached|output) ([\d,]+)/) {
+            if let id = part.wholeMatch(of: /request (\d+)/) {
+                request = Int(id.1)
+            } else if outcome == .error {
+                why.append(part)
+            } else if let count = part.wholeMatch(of: /(input|cached|output) ([\d,]+)/) {
                 let tokens = Int(count.2.replacing(",", with: ""))
                 switch count.1 {
                 case "input": input = tokens
@@ -534,5 +679,6 @@ struct RequestEntry: Equatable {
                 rate = Double(speed.1)
             }
         }
+        if outcome == .error { message = why.joined(separator: " · ") }
     }
 }

@@ -520,10 +520,14 @@ struct AppStateTests {
 struct ServerTests {
     @Test func readsTheStatus() throws {
         let golden = URL(filePath: #filePath).deletingLastPathComponent().appending(path: "../../../dev/tests/engine/status_golden.json")
-        let report = try #require(Server.report(try Data(contentsOf: golden)))
+        let now = Date(timeIntervalSince1970: 1_000)
+        let report = try #require(Server.report(try Data(contentsOf: golden), at: now))
         #expect(report == Server.Report(activity: Server.Activity(served: 2, running: 2, generated: 32, read: 4096, cached: 64,
                                                                   memory: 4_294_967_296),
-                                        asleep: false))
+                                        asleep: false,
+                                        live: [LiveRequest(id: 7, time: LiveRequest.time(of: now - 1.5005), input: 4096, stage: .reading(2048)),
+                                               LiveRequest(id: 9, time: LiveRequest.time(of: now - 2.25025), input: 512,
+                                                           stage: .answering(40))]))
         let busy = Server.report(Data(#"{"requests": {"completed": 5}, "metrics": {"decode_tokens_per_second": 71.5, "prefill_tokens_per_second": 900, "ttft_ms": {"p50": 120}}, "weights": {"released": true}, "transport": {"stopped": true, "error": "the engine failed"}}"#.utf8))
         #expect(busy == Server.Report(activity: Server.Activity(served: 5, generation: 71.5, reading: 900, firstToken: .milliseconds(120)),
                                       asleep: true, stopped: "the engine failed"))
@@ -532,20 +536,69 @@ struct ServerTests {
         #expect(Server.report(Data("not json".utf8)) == nil)
     }
 
+    /// What a running request does, as the engine's phase gives it, and when it came.
+    @Test func readsTheRequestsRunning() throws {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let status = Data(#"""
+            {"active_requests": [{"id": 1, "phase": "queued", "prompt_tokens": 10, "age_ms": 500},
+              {"id": 2, "phase": "waiting_resources", "prompt_tokens": 20}, {"id": 3, "phase": "waiting_prefix", "prompt_tokens": 30},
+              {"id": 4, "phase": "prefill", "prompt_tokens": 40, "prompt_processed": 16},
+              {"id": 5, "phase": "waiting_mask", "prompt_tokens": 50, "prompt_processed": 50, "generated_tokens": 7}]}
+            """#.utf8)
+        let report = try #require(Server.report(status, at: now))
+        #expect(report.live.map(\.stage) == [.waiting("Queued"), .waiting("Waiting for memory"), .waiting("Waiting for a shared prefix"),
+                                             .reading(16), .answering(7)])
+        #expect(report.live.map(\.input) == [10, 20, 30, 40, 50] && report.live[0].time == LiveRequest.time(of: now - 0.5))
+        #expect(report.activity.running == 5)
+    }
+
+    /// Each request the engine took is one row, in the order they came: its start or the status
+    /// adds it, the status moves it on and never back, its end ends it in its place, and a status
+    /// from before its end leaves it ended; a line that names no request is a row of its own.
+    @Test func keepsOneRowPerRequest() throws {
+        func line(_ text: String) throws -> RequestEntry { try #require(RequestEntry(text)) }
+        func live(_ id: Int, _ stage: LiveRequest.Stage, input: Int) -> LiveRequest {
+            LiveRequest(id: id, time: "12:00:00", input: input, stage: stage)
+        }
+        var rows = ServedRequest.taking(try line("12:00:01 Started · request 1 · input 881 · cached 0"), into: [])
+        rows = ServedRequest.taking([live(1, .answering(52), input: 881), live(2, .reading(6656), input: 8193)], into: rows)
+        #expect(rows.map(\.id) == [1, 2] && rows.map(\.time) == ["12:00:01", "12:00:00"])
+        #expect(rows.map(\.stage) == [.answering(52), .reading(6656)] && rows.allSatisfy { $0.end == nil })
+        rows = ServedRequest.taking(try line("12:00:05 Done · request 1 · input 881 · cached 0 · output 65 · TTFT 1.6s · 32.7 tok/s"),
+                                    into: rows)
+        // A status from before that end, as one the server answers from an earlier snapshot.
+        rows = ServedRequest.taking([live(1, .answering(52), input: 881), live(2, .reading(4096), input: 8193)], into: rows)
+        #expect(rows.count == 2 && rows[0].end?.output == 65 && rows[1].end == nil && rows[1].stage == .reading(6656))
+        // Its Started line, later than the status that had it first, moves it on no further back.
+        rows = ServedRequest.taking(try line("12:00:02 Started · request 2 · input 8,193 · cached 0"), into: rows)
+        #expect(rows.map(\.time) == ["12:00:01", "12:00:00"] && rows[1].stage == .reading(6656))
+        rows = ServedRequest.taking(try line("12:00:06 Error · not_found · HEAD /api/hello"), into: rows)
+        rows = ServedRequest.taking(try line("12:00:09 Done · request 2 · input 8,193 · cached 0 · output 33"), into: rows)
+        #expect(rows.map(\.id) == [1, 2, -1] && rows.allSatisfy { $0.end != nil })
+        #expect(rows[2].end?.message == "not_found · HEAD /api/hello" && rows[2].time == "12:00:06")
+        // An earlier server's lines name no request: its ends are rows of their own, its starts none.
+        let earlier = ServedRequest.taking(try line("12:01:00 Started · input 5 · cached 0"), into: [])
+        #expect(earlier.isEmpty)
+        #expect(ServedRequest.taking(try line("12:01:02 Done · input 5 · cached 0 · output 1"), into: earlier).map(\.id) == [-1])
+    }
+
     /// The request lines the server writes, as the golden the server's tests check them against
     /// holds them.
     @Test func readsTheRequestLinesTheServerWrites() throws {
         let golden = try String(contentsOf: ServerTests.goldens.appending(path: "server/log_lines_golden.txt"), encoding: .utf8)
         let lines = golden.split(separator: "\n").map(String.init).filter { !$0.hasPrefix("#") }
-        try #require(lines.count == 4)
-        #expect(RequestEntry(lines[0]) == nil)
+        try #require(lines.count == 5)
+        let started = try #require(RequestEntry(lines[0]))
+        #expect(started.outcome == .started && started.request == 7 && (started.input, started.cached) == (4096, 1024))
         let done = try #require(RequestEntry(lines[1]))
-        #expect(done.outcome == .done && (done.input, done.cached, done.output, done.firstToken, done.rate)
+        #expect(done.outcome == .done && done.request == 7 && (done.input, done.cached, done.output, done.firstToken, done.rate)
             == (4096, 1024, 574, 0.4, 36.8))
         let cancelled = try #require(RequestEntry(lines[2]))
-        #expect(cancelled.outcome == .cancelled && cancelled.output == 12)
-        let error = try #require(RequestEntry(lines[3]))
-        #expect(error.outcome == .error && error.message == "invalid_request_error")
+        #expect(cancelled.outcome == .cancelled && cancelled.request == 8 && cancelled.output == 12)
+        let failed = try #require(RequestEntry(lines[3]))
+        #expect(failed.outcome == .error && failed.request == 9 && failed.message == "runtime_unavailable")
+        let refused = try #require(RequestEntry(lines[4]))
+        #expect(refused.outcome == .error && refused.request == nil && refused.message == "invalid_request_error")
     }
 
     /// The goldens the server's tests write, as the app reads them.

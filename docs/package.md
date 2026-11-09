@@ -112,8 +112,11 @@ name, and at launch it runs `install/cached.py`. While a model runs, the Server
 shows its context limit, from `/v1/models`, and its `/status`, asked every 2 s,
 or every 10 s while neither the window nor the menu bar's panel is open: requests,
 answering and prompt speed, time to first token, the tokens generated, read and
-taken from the cache, and the Metal memory it holds, with each request's line
-of the server's log, folded. A start that fails says why, as its serve record
+taken from the cache, and the Metal memory it holds, with a row for each
+request, folded: from the server's line that starts it or the status that has it
+first, how far it has read its prompt or answered, or why it waits, never back,
+until the line that ends it, which names it by the same id. A start that fails
+says why, as its serve record
 has it, the log keeping the starts before it; one that failed for want of
 memory offers the start that would fit, under a memory limit that holds the
 model or with the context length on Auto. Its chat is its own, not the chat page: it streams
