@@ -745,6 +745,22 @@ class NativeBackendContractTests(unittest.TestCase):
             ("error", 500, "engine_failed", "Splash stopped restarting the engine"),
         )
 
+    def test_a_request_not_yet_admitted_hears_why_the_engine_stopped(self):
+        # The server closes as its engine's stop tells it to exit: a request
+        # that arrives then is owed the reason too, not a retry.
+        transport, _driven = self.make_transport()
+        transport.stop_reason = "Splash stopped restarting the engine"
+        transport.closing = True
+        self.addCleanup(setattr, transport, "closing", False)
+        refusal = transport.refusal()
+        self.assertEqual((refusal.status, refusal.code), (500, "engine_failed"))
+        job = make_job()
+        transport.submit(job)
+        kind, error = self.terminal(job)
+        self.assertEqual(
+            (kind, error.status, error.code), ("error", 500, "engine_failed")
+        )
+
     def test_close_does_not_wait_for_a_frame_being_written(self):
         # A writer stuck mid-frame holds the write lock for up to its write
         # budget; shutdown fails the calls and stops the engine without it.

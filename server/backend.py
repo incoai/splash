@@ -419,6 +419,13 @@ class NativeBackend:
             if self.on_stopped is not None:
                 self.on_stopped(stopped)
 
+    def _closed_error_locked(self):
+        """What a request gets from a server closing: why its engine stopped
+        for good, where that is why it closes."""
+        if self.stop_reason is not None:
+            return APIError(500, self.stop_reason, "engine_failed")
+        return APIError(503, "server is shutting down", "server_shutdown")
+
     def _stop_message(self, failure):
         """Why relaunching stopped after `failure`, and what to do."""
         kind = failure.start.kind if failure.start is not None else None
@@ -603,10 +610,8 @@ class NativeBackend:
         """The error a request not yet admitted gets now; None while the
         engine serves."""
         with self.lock:
-            if self.closing:
-                return APIError(503, "server is shutting down", "server_shutdown")
-            if self.stop_reason is not None:
-                return APIError(500, self.stop_reason, "engine_failed")
+            if self.closing or self.stop_reason is not None:
+                return self._closed_error_locked()
             self._ensure_recovery_locked()
             if self.runtime.ready:
                 return None
@@ -886,16 +891,7 @@ class NativeBackend:
         with self.lock:
             if self.closing:
                 state.detach()
-                job.events.put(
-                    (
-                        "error",
-                        APIError(
-                            503,
-                            "server is shutting down",
-                            "server_shutdown",
-                        ),
-                    )
-                )
+                job.events.put(("error", self._closed_error_locked()))
                 return
             if self.quarantine.refuses(request.fingerprint):
                 # Retrying fails the same way until the quarantine ends.
