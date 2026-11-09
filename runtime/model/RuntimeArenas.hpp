@@ -225,6 +225,9 @@ enum class PrefillTensor : uint32_t {
   MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,
   LinearPartials,
   LinearCounters,
+  // The int8 prefill tile's codes and scales (ops::LinearScratch::input, sums).
+  LinearTable,
+  LinearSums,
   // The rotated input of a rotated projection (ops::LinearScratch::rotated).
   LinearRotated,
   // A prefill group's scratch GDN cell, which carries the state from a chunk

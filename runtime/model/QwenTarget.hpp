@@ -101,9 +101,9 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
       std::ranges::copy(captureLayers, captureLayerValues.begin());
   }
 
-  // The formats of the sparse MoE blocks' weights, which their plans follow
-  // (ops::moeFormats).
-  ops::MoeFormats moeFormats{};
+  // The format of the sparse MoE blocks' routers, which their plans follow
+  // (ops::moeRouterFormat).
+  uint32_t moeRouterFormat = ops::QuantizedSegment::kFloat32;
   // The layers whose output rows the DFlash2 draft reads, ascending.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
@@ -459,7 +459,8 @@ public:
   // what the layers before left in the chunks' buffers and the target's
   // prefill scratch the layers after read on, from another command, with no
   // other prefill between. With the last layer, returns each chunk's buffer
-  // of its last layer's output rows, and else nothing.
+  // of its last layer's output rows, and else nothing; of those only each
+  // sequence's last row is sure to be computed (planOutputRows).
   //
   // With the first layer, it first writes the inputs the target makes of
   // the chunks' tokens on the CPU and stages a streamed table's rows of
@@ -536,6 +537,13 @@ protected:
     ops::AneFfn *aneFfn = nullptr;
     uint32_t gdnLayer = 0;
     uint32_t attentionLayer = 0;
+    // The rows of the layer being added that something reads, ascending, when
+    // not every row (planOutputRows): its state writes run on every row, its
+    // output work on these alone, read row i as row i.
+    std::vector<uint32_t> readRows{};
+    [[nodiscard]] uint32_t outputRows() const noexcept {
+      return readRows.empty() ? rows : static_cast<uint32_t>(readRows.size());
+    }
   };
 
   struct VerifyStep {
@@ -676,6 +684,14 @@ protected:
   // of hiddenSize values.
   void addCapture(metal::CommandGraph &graph, uint32_t slot, metal::MetalBuffer output, uint32_t sourceRow,
                   metal::MetalBuffer captured, uint32_t destinationRow, uint32_t rows) const;
+  // Before prefill layer `index`: the target's last layer, an attention
+  // layer the draft does not read, outputs each sequence's last row alone,
+  // all the runtime reads of it (addPrefill), its MoE on a plan of those rows
+  // (step.readRows).
+  void planOutputRows(PrefillStep &step, uint32_t index) const;
+  // Copies a step's read rows of its output work, rows 0.. of `compact`, to
+  // their rows of `output`; nothing when it outputs every row.
+  void addReadRows(const PrefillStep &step, const metal::MetalBuffer &compact, const metal::MetalBuffer &output) const;
   // Each of a prefill step's captures of layer `index`'s output rows, when
   // the draft reads the layer: capture(slot, source row, destination row,
   // rows) of the captured hidden rows' slot `slot`.

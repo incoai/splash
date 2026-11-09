@@ -847,12 +847,12 @@ class HttpTransportTests(HarnessTestCase):
                 api.FrontendServer, "finish_request", side_effect=RuntimeError("test")
             ),
             mock.patch.object(
-                api.HTTPServer, "handle_error", side_effect=lambda *_: failed.set()
-            ) as handle_error,
+                api, "log_unexpected", side_effect=lambda _: failed.set()
+            ) as logged,
         ):
             server.handle_request()
             self.assertTrue(failed.wait(1))
-        handle_error.assert_called_once()
+        logged.assert_called_once()
         self._wait_for_http_active(server.connections, 0)
         self.assertEqual(client.recv(1), b"")
 

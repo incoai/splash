@@ -82,13 +82,15 @@ RuntimeResourcesConfig budgetConfig(const char *metallibPath, const std::filesys
 // What a start sized: its context, the least memory its plan needs, its
 // arenas, the budget of states and KV, its streamed table's row cache and
 // what the host held back of the streamed stores, its routed experts' store,
-// whether its SSD cache started, its backend's memory, its log and how many
-// times it loaded the weights.
+// whether its SSD cache started and what that cache measured free on its
+// volume, its backend's memory, its log and how many times it loaded the
+// weights.
 struct StreamedStart final {
   uint32_t context = 0;
   uint64_t minimumRequired = 0, arenaBytes = 0, dynamicBudget = 0, table = 0, heldBack = 0;
   std::optional<model::ExpertStoreStats> experts;
   bool tier = false;
+  uint64_t volumeAvailable = 0;
   metal::MetalMemoryStats memory;
   std::string log;
   size_t loads = 0;
@@ -115,7 +117,9 @@ StreamedStart startStreamed(const RuntimeResourcesConfig &config, uint32_t reque
     started.table = budget.streamedTableBytes;
     started.heldBack = budget.hostHeldBackBytes;
     started.experts = resources->streamedExpertStats();
-    started.tier = resources->cache().snapshot().kvTier.capacityBytes != 0;
+    const KvTierSnapshot tier = resources->cache().snapshot().kvTier;
+    started.tier = tier.capacityBytes != 0;
+    started.volumeAvailable = tier.volumeAvailableBytes;
     started.memory = resources->backend().refreshMemoryStats();
   });
   started.loads = occurrences(started.log, "Weights loaded");
@@ -160,7 +164,7 @@ void testStreamableWeightsAreWhatLoads(const RuntimeResourcesConfig &config) {
            loaded.vision.actualAllocatedBytes;
   };
   metal::MetalBackend backend(config.metallibPath.string());
-  const ops::ExecutionPlans operators(backend.capabilities());
+  const ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
   const auto arenas = [&](const model::LoadedModel &loaded, model::StreamedParts parts) {
     const model::ModelMemoryPlan plan =
         model::plannedRuntimeMemory(loaded, operators, kv::Format::Int8, ops::GdnStateFormat::Float32, parts);
@@ -1167,12 +1171,53 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
           "a persistent cache with no room anywhere did not leave the tier off once");
 }
 
+// Once its files open, the SSD cache measures the volume of the folder they
+// opened in, through the probe the start read volumes with: a persistent
+// tier's root, else the temporary files' directory, as for a persistent cache
+// whose root has no room. The probe gives the root, the temporary directory and
+// any other folder volumes of their own.
+void testTheCacheMeasuresItsFilesFolder(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-measured"), caches("splash-measured-root");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "measured-test");
+  config.cacheDisk = {.automatic = true};
+  config.cacheRoot = caches.path() / "prefix-cache";
+  std::filesystem::create_directory(config.cacheRoot);
+  constexpr uint64_t kTemporary = 300 * kGiB, kOther = 200 * kGiB;
+  uint64_t rootAvailable = 400 * kGiB;
+  config.diskVolume = [&](const std::filesystem::path &directory) {
+    std::error_code error;
+    return std::optional(localVolume(
+        std::filesystem::equivalent(directory, config.cacheRoot, error)                         ? rootAvailable
+        : std::filesystem::equivalent(directory, std::filesystem::temp_directory_path(), error) ? kTemporary
+                                                                                                : kOther));
+  };
+  // The volume the cache measured, and whether it is persistent.
+  const auto measured = [&] {
+    std::pair<uint64_t, bool> result;
+    static_cast<void>(test::capturedStderr([&] {
+      const CacheSnapshot cache = RuntimeResources::create(config, 0)->cache().snapshot();
+      result = {cache.kvTier.volumeAvailableBytes, cache.persistent};
+    }));
+    return result;
+  };
+  config.persistentCache = true;
+  require(measured() == std::pair{rootAvailable, true}, "a persistent SSD cache did not measure its root's volume");
+  config.persistentCache = false;
+  require(measured() == std::pair{kTemporary, false},
+          "an SSD cache of temporary files did not measure their directory's volume");
+  config.persistentCache = true;
+  rootAvailable = 11 * kGiB;
+  require(measured() == std::pair{kTemporary, false},
+          "a persistent cache whose root had no room did not measure its temporary files' volume");
+}
+
 // A block-sparse target's context past what memory holds spills to the SSD
 // cache, so where the automatic cache's volume has no room for it, a first
 // start serves only what memory holds. A relaunch keeps its first engine's
 // context whatever room the volume has left since, that of a server started
 // with --max-context, which asks for it again, as well: its spilling plan
 // opens the cache's temporary files however little room their volume has.
+// Once its files open, the cache measures the volume the start read for them.
 void testRelaunchKeepsTheSpilledContext(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-relaunch");
   RuntimeResourcesConfig config = flashNextConfig(metallibPath, root.path());
@@ -1181,6 +1226,8 @@ void testRelaunchKeepsTheSpilledContext(const char *metallibPath) {
   // A budget whose memory holds less of the window than spilling does.
   config.maximumMemoryBytes = startStreamed(config).minimumRequired + 512 * kMiB;
   const StreamedStart first = startStreamed(config);
+  require(first.volumeAvailable == 500 * kGiB,
+          "an SSD cache whose files opened did not read the volume its start read to open them");
   require(startStreamed(config, first.context).context >= first.context,
           "a --max-context of the context a start spills for was not held");
   config.diskVolume = reading(localVolume(11 * kGiB));
@@ -1806,6 +1853,7 @@ int main(int argc, char **argv) {
       testMadeCacheRootStaysOutOfBackups(argv[1]);
       testAutomaticTierYieldsToTheContext(argv[1]);
       testAutomaticContextIgnoresTheVolume(argv[1]);
+      testTheCacheMeasuresItsFilesFolder(argv[1]);
       testRelaunchKeepsTheSpilledContext(argv[1]);
       testAStoreKeepsTheFloorOfTheRunsSpill(argv[1]);
       testAnExplicitRelaunchServesItsFirstContext(argv[1]);

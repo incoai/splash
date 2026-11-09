@@ -40,11 +40,16 @@ executable, or a start whose GPU commands another process's memory starved
 restart that failed for want of memory the Mac refused is retried, at most 60 s
 apart, for as long as it fails, and neither counts toward the six below nor
 starts them anew. For any other cause it stops after the sixth failure in a
-row, each within 60 s of starting. Once it stops, requests get 500
-`engine_failed` until the server is restarted; its message names the crash
-trace when
-`SPLASH_CRASH_TRACE=1` recorded one
-([crash traces](internals.md#failures-and-crash-traces)). Meanwhile generation requests get
+row, each within 60 s of starting. Once it stops, the server logs why
+(`Engine stopped · …`), naming the crash trace when `SPLASH_CRASH_TRACE=1`
+recorded one ([crash traces](internals.md#failures-and-crash-traces)), and
+exits with status 69 (`EX_UNAVAILABLE`), where a stop exits 0, a failed start
+1, refused arguments 2 and a stop before the server runs 130 or 143; a stop
+that lands as the engine stops for good may still exit 69. Until then requests
+get 500 `engine_failed` in the same words. What
+runs the server, such as launchd with `KeepAlive`, decides whether to start it
+again, and a new server counts failures from none; the app shows why it
+stopped. While the engine restarts, generation requests get
 503 `engine_recovering`, whose message names the last failure and whose
 `Retry-After` the time until the next bound on the restart's start: when it
 should be ready, as long after its spawn as the start before took, then up to
@@ -73,6 +78,24 @@ when the Mac sleeps continues when it wakes. While requests run, Splash keeps
 the Mac from sleeping automatically, as `caffeinate -i` does; the display may
 still sleep, and closing the lid or choosing Sleep still sleeps the Mac.
 `serve --allow-idle-sleep` lets it sleep automatically.
+
+### Console
+
+The server writes its console lines, its engine's and Python's tracebacks
+from one thread, in the order they come, so that a log of both streams, as
+`2>&1` or the app's server log, keeps that order: status and request lines go
+to stdout, errors, warnings, tracebacks and the engine's lines to stderr. A
+stdout that stops draining therefore holds up stderr too. Output that stops
+draining, as a log pipe whose reader stalls, holds up that thread alone, never
+a request, the engine or an HTTP answer. Once 1024 lines wait, each further
+line is dropped; once the console writes again, a `Warning · N console lines
+dropped …` line takes their place, and `/status` counts them as
+`console.dropped_lines`. A failed engine's last lines, why it failed or what
+it saved as it stopped, come before the lines the server prints after the
+failure, its report among them, which wait up to 1 s for the engine's stderr
+to end; the failure itself reaches the requests in flight and schedules the
+restart at once. At exit the server waits up to 1 s for its last lines, run
+with or without `python -u`.
 
 ### Shell completion
 
@@ -132,6 +155,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](internals.md#neural-engine-prefill). |
+| `--int8-activations` | `on` | On M5 and later Macs, whose GPUs multiply int8 at twice their bf16 rate, round activations to int8 where that is faster: prefill chunks of more than 64 rows through a target's MLX 4- and 5-bit weights in groups of 64 (not a MoE model's routed experts), rounded per row and 64 inputs, about a quarter less time to the first token on Qwen3.8-27B MLX 4-bit; a Ternary-Bonsai (rotated PQ2_0) model's decode, 13-16% less time a cycle on a 20-core M5 Pro; and attention over the INT8 KV cache where a split reads 8 pages or more, 4-7% sooner first tokens at 32K-64K (see [KV cache precision](#kv-cache-precision)). `off` is a precision opt-out for evaluations and bf16 parity: every activation stays bf16. What `on` costs, as next-token KL against bf16: about 2.2e-3 for Qwen3.8-27B MLX 4-bit's prefill on the GPU alone, 2.8e-4 for Bonsai's decode, and with INT8 queries 1.37x the KL the INT8 KV cache alone gives Qwen3.8-27B. The Neural Engine split, which multiplies its part in int8 whatever this option, has its own switch, `--disable-ane`. See [kernel selection](internals.md#kernel-selection). |
 | `--verify-rows` | `auto` | The rows of each draft block decode cycles verify: `auto` lets the verify budget choose a MoE target's rows, which is faster but makes its greedy and seeded outputs vary from run to run, and verifies every row of a dense target; `all` verifies every row the output limit leaves on every target, so those outputs repeat when a request runs alone with the same cached prefixes. See [drafts](models.md#drafts) and [sampling](api.md#sampling). |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
@@ -433,12 +457,20 @@ off` loads every expert, as a SIZE that holds them all does.
   experts go first), and reads them from their
   files into a staging of a decode cycle's experts on the engine's SSD
   readers, and a repack kernel writes them into their slots before the expert
-  passes run. A decode step's load is one such round; a prefill command's
-  loads take as many rounds as its rows may route experts, each staging half
-  of the staging while the other half is read ahead. The kernels read every
-  routed expert through the layer's slot table and the chunks that hold its
-  slots, so resident experts, one chunk of every expert, and streamed
+  passes over them run. A decode step's load is one such round; a prefill
+  command's loads take as many rounds as its rows may route experts, each
+  staging half of the staging while the other half is read ahead. The kernels
+  find every routed expert through a table of its slot and the chunks that
+  hold its slots, so resident experts, one chunk of every expert, and streamed
   experts run the same kernels.
+- The grouping puts the tiles of the experts already resident first and those
+  a load brings last (their slot-table entry is marked absent). A decode
+  step's expert passes over the resident ones and the shared expert run while
+  its load's host step reads from the SSD, on the grouping's copy of the slot
+  table; the passes over the experts it brought and the combine run after the
+  repack, through a second table of the slots the load routed, which the host
+  step writes and the GPU reads no earlier. Outputs are bitwise the same: each
+  expert's tiles, their kinds and the combine order do not change.
 - An expert's rows a GGUF stores as they are are read straight into the
   staging (`F_NOCACHE`, widened to whole 16 KiB pages, which the kernel reads
   without the buffer cache: an M5 Pro reads 460 KiB pieces from four threads
@@ -562,6 +594,13 @@ memory, and can be slower at long contexts. Model weights are unchanged. Restart
 to switch formats. Omit `--kv-format` or use `--kv-format int8` for the default.
 The [SSD cache](#ssd-cache) supports both formats, preserving their stored
 bytes without further quantization.
+
+On M5 and later Macs, whose GPUs multiply int8 at twice their bf16 rate, INT8 KV
+also quantizes the attention queries to INT8 where each split of dense attention
+reads at least 8 pages of 32 tokens. Prefill chunks of about 225 tokens or more
+take INT8 queries even with no history, and verify takes them from about 7K
+tokens of history. `--int8-activations off` keeps the queries bf16 with either
+KV format.
 
 ### State precision
 

@@ -240,7 +240,7 @@ struct ServeSettingsTests {
         #expect(problem(failure("model", message: "no supported model has this architecture (Llama)"))
             == "Splash can’t serve this model: no supported model has this architecture (Llama)")
         #expect(problem(failure("internal"))
-            == "It stopped while starting: the engine's words. The log has the details.")
+            == "It stopped: the engine's words. The log has the details.")
         // The rest in the engine's words, as its refusal of a MAX_CONTEXT past the model's.
         for kind in ["configuration", "memory_budget", "device"] {
             #expect(problem(failure(kind)) == "the engine's words")
@@ -410,9 +410,9 @@ struct ServerTests {
         #expect(report == Server.Report(activity: Server.Activity(served: 2, running: 2, generated: 32, read: 4096, cached: 64,
                                                                   memory: 4_294_967_296),
                                         asleep: false))
-        let busy = Server.report(Data(#"{"requests": {"completed": 5}, "metrics": {"decode_tokens_per_second": 71.5, "prefill_tokens_per_second": 900, "ttft_ms": {"p50": 120}}, "weights": {"released": true}, "transport": {"stopped": true, "error": "the engine failed"}}"#.utf8))
+        let busy = Server.report(Data(#"{"requests": {"completed": 5}, "metrics": {"decode_tokens_per_second": 71.5, "prefill_tokens_per_second": 900, "ttft_ms": {"p50": 120}}, "weights": {"released": true}}"#.utf8))
         #expect(busy == Server.Report(activity: Server.Activity(served: 5, generation: 71.5, reading: 900, firstToken: .milliseconds(120)),
-                                      asleep: true, stopped: "the engine failed"))
+                                      asleep: true))
         // While the server starts a failed engine again.
         #expect(Server.report(Data(#"{"transport": {"ready": false, "recovering": true, "stopped": false}}"#.utf8))?.recovering == true)
         #expect(Server.report(Data("not json".utf8)) == nil)
@@ -441,7 +441,6 @@ struct ServerTests {
         let golden = Self.goldens.appending(path: "server/status_transport_golden.json")
         let report = try #require(Server.report(try Data(contentsOf: golden)))
         #expect(report.context == 131072)
-        #expect(report.stopped?.hasPrefix("Splash stopped restarting the engine: --kv-format bf16 is refused.") == true)
         #expect(!report.recovering)
     }
 
@@ -454,20 +453,29 @@ struct ServerTests {
             == "It needs 10.1 GB of memory but the memory limit is 1 GB. Raise the memory limit in Launch Options.")
     }
 
-    @Test func wordsAFailedStartByItsOwnRecord() throws {
-        let golden = Self.goldens.appending(path: "server/serve_record_golden.json")
-        let record = try JSONDecoder().decode(ServeRecord.self, from: Data(contentsOf: golden))
+    @Test func wordsAnExitByItsOwnRecord() throws {
+        func golden(_ name: String) throws -> ServeRecord {
+            try JSONDecoder().decode(ServeRecord.self, from: Data(contentsOf: Self.goldens.appending(path: "server/\(name)")))
+        }
+        let record = try golden("serve_record_golden.json")
         let words = "It needs 10.1 GB of memory but the memory limit is 1 GB. Raise the memory limit in Launch Options."
         func problem(_ record: ServeRecord?, pid: pid_t, holder: pid_t? = nil) -> String {
-            Server.startProblem(record: record, pid: pid, port: 8000, holder: holder)
+            Server.exitProblem(record: record, pid: pid, port: 8000, holder: holder)
         }
         #expect(problem(record, pid: 4242) == words)
+        // A ready server that stopped restarting its engine, in the server's own words.
+        let stopped = try golden("serve_record_stopped_golden.json")
+        #expect(problem(stopped, pid: 4242) == stopped.failure?.message)
         // A record of another start, as one a server before this one wrote, or none.
         let unknown = "It stopped unexpectedly. The log has the details."
         #expect(problem(record, pid: 4243) == unknown)
         #expect(problem(nil, pid: 4242) == unknown)
+        // A start, or a ready server, that crashed or was killed.
+        for phase in ["starting", "ready"] {
+            let unsaid = try JSONDecoder().decode(ServeRecord.self, from: Data(#"{"pid":4242,"phase":"\#(phase)"}"#.utf8))
+            #expect(problem(unsaid, pid: 4242) == unknown)
+        }
         let starting = try JSONDecoder().decode(ServeRecord.self, from: Data(#"{"pid":4242,"phase":"starting"}"#.utf8))
-        #expect(problem(starting, pid: 4242) == unknown)
         // Refused the port's lock, which another server holds, with its record.
         #expect(problem(starting, pid: 4243, holder: 4242)
             == "Another Splash server is using port 8000. Stop it, or choose another port in Launch Options › Advanced.")

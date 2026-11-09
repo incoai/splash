@@ -17,6 +17,7 @@ from dev.tests.server_fixtures import (
     anthropic_body,
     byte_backend,
     chat_body,
+    console_written,
     response_events,
     responses_body,
 )
@@ -381,6 +382,7 @@ class RequestFailureTests(HarnessTestCase):
         self.assertEqual(status, 500, payload)
         self.assertEqual(json.loads(payload)["error"]["code"], "internal_server_error")
         cancel.assert_called_once()
+        console_written()
         # Where the server, in a subpackage too, last had the error, and not
         # its message.
         self.assertRegex(
@@ -458,6 +460,7 @@ class RequestFailureTests(HarnessTestCase):
         )
         cancel.assert_called_once()
         self.assertTrue(plan.ended.is_set())
+        console_written()
         self.assertRegex(
             stderr.getvalue(),
             r"^\d{2}:\d{2}:\d{2} Error · internal_server_error · RuntimeError · "

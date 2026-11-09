@@ -6,6 +6,7 @@ import math
 import queue
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 from tokenizers.decoders import DecodeStream
@@ -365,12 +366,13 @@ class NativeBackend:
         self.failure_to_count = None
         # Set by close() to cut a relaunch's backoff short.
         self.wakeup = threading.Event()
+        # Called once relaunching has stopped for good, with stop_reason,
+        # without the lock: the server then exits (server.main).
+        self.on_stopped: Callable[[str], None] | None = None
         # Why the engine cannot serve: its failure, the last failed restart or
         # why restarts stopped.
         self.engine_error = None
-        # What the finalizer runs, in order: requests' Started lines and
-        # terminals, which must not hold up the runtime's reader thread.
-        self.finalizer_queue = queue.Queue()
+        self.terminals = queue.Queue()
         self.finalizer = threading.Thread(
             target=self._finalize_loop,
             name="splash-http-finalizer",
@@ -414,6 +416,8 @@ class NativeBackend:
         print_status(f"{event} · {failure.message}", error=True)
         if stopped is not None:
             print_status(f"Engine stopped · {stopped}", error=True)
+            if self.on_stopped is not None:
+                self.on_stopped(stopped)
 
     def _stop_message(self, failure):
         """Why relaunching stopped after `failure`, and what to do."""
@@ -422,14 +426,18 @@ class NativeBackend:
             return (
                 "the engine's start ran out of GPU memory another process holds "
                 "(another Splash server?); Splash stopped restarting it. Quit that "
-                "process, then restart the Splash server."
+                "process, then start the Splash server again."
             )
         if kind is wire.StartFailureKind.MODEL:
             return (
                 f"the model's files can no longer be served ({failure.message}); "
                 "Splash stopped restarting the engine. Restore or reinstall the "
-                "model, then restart the Splash server."
+                "model, then start the Splash server again."
             )
+        if failure.launch:
+            # A missing executable stays missing: no crash trace or restart
+            # helps, only the current installation, which its message names.
+            return f"Splash stopped restarting the engine: {failure.message}."
         cause = (
             failure.message
             if supervision.permanent(failure)
@@ -447,12 +455,12 @@ class NativeBackend:
                 if trace
                 else "Set SPLASH_CRASH_TRACE=1 to record a crash trace. "
             )
-            + "Restart the Splash server after fixing the cause."
+            + "Start the Splash server again after fixing the cause."
         )
 
     def _stop_restarting_locked(self, message):
-        """Stop relaunching for good; there is no way back but a server
-        restart."""
+        """Stop relaunching for good: the server exits once _failed has said
+        why (on_stopped)."""
         self.restart_due = None
         self.stop_reason = message
         self.engine_error = message
@@ -862,7 +870,7 @@ class NativeBackend:
                 if state.call is None:
                     state.call = call
                 state.terminal_enqueued = True
-                self.finalizer_queue.put(functools.partial(self._finalize, state, call))
+                self.terminals.put((state, call))
 
         try:
             self._admit(state, request, on_event, on_complete)
@@ -963,10 +971,7 @@ class NativeBackend:
                     "enable_thinking": job.reasoning.enable_thinking,
                     "thinking": job.thinking,
                 }
-            # The finalizer prints it, as it prints the Done line: a console
-            # that stops draining must not hold up the reader thread, which
-            # delivers every request's tokens and masks.
-            self.finalizer_queue.put(functools.partial(self._log, record))
+            self._log(record)
             job.events.put(("start", None))
         elif isinstance(event, wire.PromptProgressEvent):
             job.events.put(
@@ -1000,11 +1005,15 @@ class NativeBackend:
             call.cancel()
 
     def _finalize_loop(self):
-        while (work := self.finalizer_queue.get()) is not None:
-            work()
+        while True:
+            item = self.terminals.get()
+            if item is None:
+                return
+            state, call = item
+            self._finalize(state, call)
             # Do not keep a finished request, its output and its events,
             # alive while waiting for the next one.
-            del work
+            del item, state, call
 
     def _finalize(self, state, call):
         job = state.job
@@ -1197,5 +1206,5 @@ class NativeBackend:
                 error = APIError(503, "server is shutting down", "server_shutdown")
                 self._record(state.job, error=error)
                 state.job.events.put(("error", error))
-            self.finalizer_queue.put(None)
+            self.terminals.put(None)
             self.finalizer.join()

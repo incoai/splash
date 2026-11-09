@@ -297,7 +297,10 @@ prefilled four at a time.
 A change of the weight images' layout (`EXPECT_IMAGE_CHANGE=1`) makes
 `backend_regression` report the images it changed instead of failing on them.
 `decode-profile --dispatch-list FILE` writes the profiled B1 cycles'
-dispatches in order with their GPU time.
+dispatches in order with their GPU time. Its `--verify-rows all` verifies
+every row of a MoE target's cycles, as `backend-benchmark` does, so two
+builds' runs route the same experts; each width also reports its tokens per
+cycle and wall ms per token.
 
 To compare the model's numerics with another engine on the same weights,
 `make teacher-logits MODEL=... TEACHER_LOGITS_ARGS='TOKENS OUTPUT --window END:ROWS ...'`
@@ -306,15 +309,15 @@ a file of uint32 token ids (`dev/benchmarks/teacher_logits.mm`): for each
 window, the fp32 logits of the prefill's final position and of ROWS decode
 positions after it, each computed by a verify row forced to the true next
 token, in `OUTPUT-END.f32`, and prints how well they predict the true ids. It
-also takes `--kv-format`, `--state-format`, `--expert-memory` and
-`--ple-memory`, and, with `--captures yes`, writes the output rows of the
-target layers the model's draft reads (its `target_layer_ids`) at the
-positions a window's prefill computed, in one command, to
-`OUTPUT-END.captures.f32` (fp32, a row per position of each layer's hidden
-values in the draft's layer order), which a reference's residuals after those
-layers compare with (`dev/tools/flint_reference.py` writes Flint's,
-`residuals.npy`): a draft of the layers to compare, such as a test draft whose
-`fc` reads them, makes them its captures.
+also takes `--kv-format`, `--state-format`, `--int8-activations`,
+`--expert-memory` and `--ple-memory`, and, with `--captures yes`, writes the
+output rows of the target layers the model's draft reads (its
+`target_layer_ids`) at the positions a window's prefill computed, in one
+command, to `OUTPUT-END.captures.f32` (fp32, a row per position of each
+layer's hidden values in the draft's layer order), which a reference's
+residuals after those layers compare with (`dev/tools/flint_reference.py`
+writes Flint's, `residuals.npy`): a draft of the layers to compare, such as a
+test draft whose `fc` reads them, makes them its captures.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
 report. Its cache checks reuse each context's cached prefix, so they need that

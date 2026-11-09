@@ -25,7 +25,7 @@ Messages requires it.
 | `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit and what reasoning efforts do ([default reasoning effort](server.md#default-reasoning-effort)) |
 | `POST /tokenize`, `/apply-template` | A text's tokens, or a conversation's rendered prompt, without inference |
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
-| `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](internals.md#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, `409 engine_busy` while the engine serves a request or restores its weights, `503 engine_busy` when the engine does not answer within 5 s, and `503 engine_recovering` or `server_shutdown` while the engine restarts or the server stops |
+| `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](internals.md#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, `409 engine_busy` while the engine serves a request or restores its weights, `503 engine_busy` when the engine does not answer within 5 s, `503 engine_recovering` or `server_shutdown` while the engine restarts or the server stops, and `500 engine_failed` once the engine has stopped for good, before the server exits |
 | `GET /status`, `/metrics` | JSON status and Prometheus metrics ([status](#status-readiness-and-metrics)) |
 | `GET /health` | 200 while the server answers; public |
 | `GET /ready` | 200 while the engine is ready, else 503; public |
@@ -253,49 +253,55 @@ decodes greedily, its draft's proposals too: it selects what sampling would
 but for equally likely tokens, of which it takes the lowest id.
 
 A lane's arithmetic can depend on the batch it decodes in and on how its prompt
-is chunked. On a GGUF MoE target's staged expert tiles, an expert that a step
-routes at most two rows to runs them on the column tile, which sums in another
-order than the staged matmul, so a row's result also depends on the rows decoded
-or prefilled beside it. Concurrent requests change both, and chunk boundaries
-also come from the cached boundary a request resumes from, from a boundary
-another request waits to resume from, and from one whose state, or the KV past
-it, memory could not hold. With `--state-format bf16` the state is also rounded
-at each state a chunk captures (a replay point, junction or checkpoint). So on a
-dense target, or a MoE target under `--verify-rows all`, a greedy or seeded
-request repeats its output when it runs alone with the same cached prefixes;
-alongside other requests, or with other prefixes cached, it can differ. A
-request's own repeat is such a case: served from the prefix cache, it computes
-only the rows past the state its first run cached, so its output can differ
-from that run's, which computed the whole prompt; repeats meant to match each
-take a `cache_salt` of their own (below). By
-default a MoE target's decode cycles verify the rows the verify budget chooses
-([Drafts](models.md#drafts)), which follow the machine's timing and the requests served
-before, and a row's MoE result depends on which rows share its expert tiles:
-there the same greedy (temperature 0) or seeded request can give different text
-from run to run even alone on an idle server, as on other engines that batch
-requests, while sampled outputs keep their exact distribution. A request that
-restores nothing can still read cached KV: once a command completes, each block
-it filled whose prefix, tokens and identity (images and cache salt) match a
-cached block is swapped for that block's page, which another command computed,
-and its later commands read it. A request suspended for memory or for a higher
-priority can also resume from a state another request cached past the blocks it
-had computed, and its replay then reads the KV of the blocks it restores there.
-The Done line of the request log counts the tokens of both, as does
-`metrics.cache.deduplicated_tokens` in Chat Completions and text completions
-responses (in a stream, its usage chunk), and `/status` sums them in
-`cache.deduplicated_kv_tokens`. One case goes uncounted: while a request is
-suspended, blocks it computed can be evicted and computed again by another
-request, and when it resumes it reads those as its own. A request with a
-`cache_salt` no other request uses reads no cached KV, though its images'
-encoded rows may come from another request's encoding of the same image, which
-gives the same rows. Alone, it computes what it would on a server that served
-nothing before, with two exceptions. The [Neural Engine
-split](internals.md#neural-engine-prefill) may have stopped: the split stays off for the
-life of the process, so such a server prefills on the GPU alone the chunks a
-fresh one splits. And where other requests' cache leaves its states no free
-memory, a state's prefill command can end at the state's boundary instead of
-capturing it inside a longer command, which changes the chunks. Either way the
-logits differ slightly.
+is chunked. On a GGUF MoE target, an expert that a step routes at most two rows
+to runs them on the column tile, which sums in another order than the staged
+matmul, so a row's result also depends on the rows decoded or prefilled beside
+it. On M5 and later Macs with `--int8-activations` on, the default, attention
+over INT8 KV scores INT8 queries where its splits read 8 pages or more, which
+follows the chunk's rows and history and, in verify, the batch's longest lane;
+a target's MLX 4- or 5-bit projection rounds its prefill rows to int8 when their
+chunk, with the rows prefilled beside them, has more than 64 rows; and a rotated
+PQ2_0 projection decodes in int8 activations on plans of 16 rows or more, though
+not on a lone lane's split plans of 8 rows, which keep bf16. Concurrent requests
+change the batch and the chunking, and chunk boundaries also come from the
+cached boundary a request resumes from, from a boundary another request waits to
+resume from, and from one whose state, or the KV past it, memory could not hold.
+With `--state-format bf16` the state is also rounded at each state a chunk
+captures (a replay point, junction or checkpoint). So on a dense target, or a
+MoE target under `--verify-rows all`, a greedy or seeded request repeats its
+output when it runs alone with the same cached prefixes; alongside other
+requests, or with other prefixes cached, it can differ. A request's own repeat
+is such a case: served from the prefix cache, it computes only the rows past the
+state its first run cached, so its output can differ from that run's, which
+computed the whole prompt; repeats meant to match each take a `cache_salt` of
+their own (below). By default a MoE target's decode cycles verify the rows the
+verify budget chooses ([Drafts](models.md#drafts)), which follow the machine's
+timing and the requests served before, and a row's MoE result depends on which
+rows share its expert tiles: there the same greedy (temperature 0) or seeded
+request can give different text from run to run even alone on an idle server, as
+on other engines that batch requests, while sampled outputs keep their exact
+distribution. A request that restores nothing can still read cached KV: once a
+command completes, each block it filled whose prefix, tokens and identity
+(images and cache salt) match a cached block is swapped for that block's page,
+which another command computed, and its later commands read it. A request
+suspended for memory or for a higher priority can also resume from a state
+another request cached past the blocks it had computed, and its replay then
+reads the KV of the blocks it restores there. The Done line of the request log
+counts the tokens of both, as does `metrics.cache.deduplicated_tokens` in Chat
+Completions and text completions responses (in a stream, its usage chunk), and
+`/status` sums them in `cache.deduplicated_kv_tokens`. One case goes uncounted:
+while a request is suspended, blocks it computed can be evicted and computed
+again by another request, and when it resumes it reads those as its own. A
+request with a `cache_salt` no other request uses reads no cached KV, though its
+images' encoded rows may come from another request's encoding of the same image,
+which gives the same rows. Alone, it computes what it would on a server that
+served nothing before, with two exceptions. The [Neural Engine
+split](internals.md#neural-engine-prefill) may have stopped: the split stays off
+for the life of the process, so such a server prefills on the GPU alone the
+chunks a fresh one splits. And where other requests' cache leaves its states no
+free memory, a state's prefill command can end at the state's boundary instead
+of capturing it inside a longer command, which changes the chunks. Either way
+the logits differ slightly.
 
 ## Output limits and streaming
 
@@ -695,8 +701,9 @@ fields; additional fields may be added:
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` for a model serving without vision |
 | `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
-| `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after a failure a restart would meet again, or after 6 failures in a row ([engine restarts](server.md#engine-restarts-and-sleep)); `error` names its failure, the last failed restart, or why restarts stopped |
+| `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after a failure a restart would meet again, or after 6 failures in a row, and the server is exiting ([engine restarts](server.md#engine-restarts-and-sleep)); `error` names its failure, the last failed restart, or why restarts stopped |
 | `capabilities.max_context_tokens` | The context the server serves now: the latest engine's, which a restart whose plan holds less may lower until a later one regains it |
+| `console.dropped_lines` | The console lines, the server's and its engine's, dropped since the server started because stdout or stderr stopped draining with 1024 lines waiting; the log marks each gap with a `Warning · N console lines dropped …` line ([console](server.md#console)) |
 
 `GET /ready` is 200 while the engine's own `ready` is true. While the engine
 loop is busy, `/ready` keeps its last answer until the loop has left status
@@ -795,7 +802,7 @@ its path, `/v1/systemone`'s included: OpenAI's `server_error` with code
 | 408 | `request_timeout` | The upload stalled or ran past its time. |
 | 413 | `request_too_large` | The body exceeds `--max-request-size`. |
 | 415 | `invalid_request_error` | The body is not `application/json`, or is compressed. |
-| 500 | `engine_failed` | The engine failed in a way a restart would meet again, or failed 6 times in a row, and Splash stopped restarting it ([engine restarts](server.md#engine-restarts-and-sleep)). |
+| 500 | `engine_failed` | The engine failed in a way a restart would meet again, or failed 6 times in a row, and Splash stopped restarting it; the server exits with status 69 ([engine restarts](server.md#engine-restarts-and-sleep)). |
 | 500 | `model_result_invalid` | The model produced a non-finite result for this request; others continue ([failures](internals.md#failures-and-crash-traces)). |
 | 500 | `internal_server_error` | A fault in the server, not in the request; the console names the error's type and the server line it arose at. |
 | 501 | `not_implemented` | The request's method is not one the server has. |

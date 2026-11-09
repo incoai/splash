@@ -1,6 +1,5 @@
 import array
 import dataclasses
-import io
 import itertools
 import math
 import queue
@@ -20,8 +19,10 @@ from dev.tests.server_fixtures import (
     READY,
     FakeFactory,
     FakeRuntime,
+    StalledConsole,
     byte_alphabet,
     byte_backend,
+    console_written,
     interface_drift,
     make_frontend,
     make_job,
@@ -464,18 +465,13 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(constraint.finish_calls, 1)
         self.assertFalse(transport.active)
 
-    def test_a_console_that_stops_draining_does_not_stall_the_reader(self):
-        # A request's Started line is printed when the engine starts it. On a
-        # console that stops draining (a paused terminal, an unread pipe) the
-        # write blocks; the finalizer makes it, as it does the Done line's,
-        # so the reader thread still delivers every request's tokens.
+    def test_a_console_that_stops_draining_holds_up_no_request(self):
+        # A request's Started line is printed when the engine starts it, its
+        # Done line when it completes. On a console that stops draining (a
+        # paused terminal, an unread pipe) a write blocks; the console thread
+        # makes it, so the reader thread still delivers every request's tokens
+        # and the finalizer every request's completion.
         drained = threading.Event()
-
-        class Console(io.StringIO):
-            def write(self, text):
-                drained.wait(5.0)
-                return super().write(text)
-
         factory = FakeFactory()
         native = runtime.MultiplexedRuntime(
             process_factory=factory, pending_limit=4, eager_start=True
@@ -486,7 +482,7 @@ class NativeBackendContractTests(unittest.TestCase):
         self.addCleanup(transport.close)
         # A failed assertion leaves the console drained for close.
         self.addCleanup(drained.set)
-        console = Console()
+        console = StalledConsole(drained)
         job = make_job()
         with mock.patch("sys.stdout", console):
             transport.submit(job)
@@ -501,8 +497,9 @@ class NativeBackendContractTests(unittest.TestCase):
                     frame.request_id, wire.FinishReason.STOP, 4, 1, 100, 200, 350, ()
                 )
             )
-            drained.set()
             self.assertEqual(self.terminal(job)[0], "done")
+            drained.set()
+            console_written()
         lines = [line.split(" ", 1)[1] for line in console.getvalue().splitlines()]
         self.assertEqual(len(lines), 2)
         self.assertEqual(lines[0], "Started · input 4 · cached 0")
@@ -1103,7 +1100,7 @@ class NativeBackendContractTests(unittest.TestCase):
             transport.close()
             # Keep this regression's fixture bounded even if close regresses.
             if transport.finalizer.is_alive():
-                transport.finalizer_queue.put(None)
+                transport.terminals.put(None)
                 transport.finalizer.join(1.0)
 
     def test_failed_status_thread_start_releases_refresh_ownership(self):

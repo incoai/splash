@@ -12,7 +12,8 @@
 // gate's hidden rows are also checked bit for bit against the prefill gate's
 // from the same recurrent rows. Changing multi-step batches are compared
 // bit for bit with independent lanes, with rejected tape rows poisoned. The
-// decode over a bf16 state is checked against the fp32 decode.
+// decode over a bf16 state is checked against the fp32 decode. A lane's step
+// rows past its verify rows change only those rows' outputs, which are zero.
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "TestFamilies.hpp"
@@ -137,6 +138,8 @@ struct Fixture final {
   uint64_t packedStride, tapeBytes, kvWidth;
   Random random;
   MetalBuffer packed, convWeights, decayWeights, timeBias, hidden, tape;
+  // Each lane's verify rows: every row.
+  MetalBuffer verifyRows;
   NormWeights mixerNorm;
   std::array<MetalBuffer, kMaxLanes> current, next;
   std::array<GdnTapeLane, kMaxLanes> tapeLanes{};
@@ -167,6 +170,8 @@ struct Fixture final {
                    "gdn hidden");
     tape = alloc(2 * kMaxLanes * kLayers * tapeBytes, "gdn tape");
     std::memset(tape.contents(), 0, tape.sizeBytes());
+    verifyRows = alloc(kMaxLanes * sizeof(uint32_t), "gdn verify rows");
+    std::fill_n(static_cast<uint32_t *>(verifyRows.contents()), kMaxLanes, kRows);
     mixerNorm = makeNormWeights(backend, kHeadDim, float32,
                                 [&](uint32_t) { return random.unit(); });
     for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
@@ -216,7 +221,7 @@ struct Fixture final {
 
   GdnDecodeBuffers decodeBuffers(uint32_t layer) const {
     return {packedLayer[layer], convWeights, current, next, tape, tapeLanes,
-            decayWeights, timeBias, mixerNorm, hidden};
+            decayWeights, timeBias, mixerNorm, hidden, verifyRows};
   }
 
   // Row `token` of lane `lane` in layer `layer` of the packed projection.
@@ -890,7 +895,8 @@ void bufferExtents(MetalBackend &backend, const GdnShape &shape, LinearInput lay
            {&GdnDecodeBuffers::decayWeights, uint64_t{shape.valueHeads} * 4, 4, "GDN decay weight"},
            {&GdnDecodeBuffers::timeBias, uint64_t{shape.valueHeads} * 2, 2, "GDN time bias"},
            {&GdnDecodeBuffers::tape, fixture.slot(lanes - 1, 1) + kLayers * fixture.tapeBytes, 2, "GDN tape"},
-           {&GdnDecodeBuffers::hidden, rows * width * 2, 2, "GDN hidden"}})
+           {&GdnDecodeBuffers::hidden, rows * width * 2, 2, "GDN hidden"},
+           {&GdnDecodeBuffers::verifyRows, uint64_t{lanes} * 4, 4, "GDN verify rows"}})
     requireExtent(backend, decode.*member, bytes, element, what, [&](CommandGraph &graph, const MetalBuffer &buffer) {
       GdnDecodeBuffers changed = decode;
       changed.*member = buffer;
@@ -1046,6 +1052,116 @@ void gateMatchesPrefill(MetalBackend &backend, const GdnShape &shape, bool float
     require(!std::memcmp(fixture.hiddenRow(lane, 0, 0), prefill.hidden.contents(), valueRows),
             where + ": decode and prefill gates wrote different hidden rows");
   }
+}
+
+// Two steps of every layer over cells of `format`, the second folding
+// retained[l] rows of the first, with lane l verifying verify[l] rows of each
+// step: what they leave in the hidden rows, the tape and the next cells. Where
+// `layout` is a table, each step's out-projection table and sums must be the
+// reference preparation of its hidden rows.
+struct StepsRun final {
+  std::vector<uint8_t> hidden, tape;
+  std::vector<std::vector<uint8_t>> cells;
+};
+StepsRun runSteps(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, LinearInput layout, bool float32,
+                  GdnHeadOrder order, GdnStateFormat format, const std::array<uint32_t, kMaxLanes> &verify,
+                  const std::array<uint32_t, kMaxLanes> &retained, const std::string &what) {
+  const auto bytesOf = [](const MetalBuffer &buffer) {
+    const auto *bytes = static_cast<const uint8_t *>(buffer.contents());
+    return std::vector<uint8_t>(bytes, bytes + buffer.sizeBytes());
+  };
+  Fixture fixture(backend, shape, lanes, float32);
+  const Cell cell(shape, format);
+  const bool narrow = format == GdnStateFormat::BFloat16;
+  std::array<MetalBuffer, kMaxLanes> current = fixture.current, next = fixture.next;
+  if (narrow) {
+    // The fixture's fp32 cells rounded to bf16, as bfloatState takes them.
+    const uint64_t elements = uint64_t{shape.valueHeads} * shape.headDimension * shape.headDimension;
+    for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
+      current[lane] = sharedBuffer(backend, cell.bytes);
+      next[lane] = sharedBuffer(backend, cell.bytes);
+      std::memset(next[lane].contents(), 0, cell.bytes);
+      std::memcpy(current[lane].contents(), fixture.current[lane].contents(), cell.convBytes);
+      for (uint32_t layer = 0; layer < kLayers; ++layer) {
+        const float *values = fixture.cell.recurrent(fixture.cellBytes(fixture.current[lane]), layer);
+        auto *rounded = reinterpret_cast<uint16_t *>(static_cast<uint8_t *>(current[lane].contents()) +
+                                                     cell.convBytes + layer * cell.recurrentLayerBytes);
+        for (uint64_t index = 0; index < elements; ++index) rounded[index] = floatToBf16(values[index]);
+      }
+    }
+  }
+  std::optional<PreparedTables> tables;
+  if (layout != LinearInput::Plain)
+    tables.emplace(backend, layout, shape.valueHeads * shape.headDimension, lanes);
+  std::memcpy(fixture.verifyRows.contents(), verify.data(), sizeof(verify));
+  for (uint32_t step = 0; step < 2; ++step) {
+    if (step) {
+      fixture.advance(retained);
+      if (narrow) {
+        std::swap(current, next);
+        for (const MetalBuffer &buffer : next) std::memset(buffer.contents(), 0, cell.bytes);
+      } else {
+        current = fixture.current;
+        next = fixture.next;
+      }
+      fixture.fillPacked();
+      fixture.clear();
+    }
+    CommandGraph graph;
+    PreparedInput prepared;
+    for (uint32_t layer = 0; layer < kLayers; ++layer) {
+      GdnDecodeBuffers buffers = fixture.decodeBuffers(layer);
+      buffers.currentStates = current;
+      buffers.nextStates = next;
+      if (tables) buffers.linearScratch = tables->scratch();
+      prepared = GDN::addDecode(graph, buffers, shape, lanes, layer, cell.strides(), order, layout);
+    }
+    if (tables) tables->addReference(graph, fixture.hidden);
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
+    if (tables)
+      tables->requireWritten(prepared, fixture.hidden, what + " step " + std::to_string(step));
+    else
+      require(prepared.layout == LinearInput::Plain, what + ": plain GDN claimed a table");
+  }
+  StepsRun run{bytesOf(fixture.hidden), bytesOf(fixture.tape), {}};
+  for (uint32_t lane = 0; lane < kMaxLanes; ++lane) run.cells.push_back(bytesOf(next[lane]));
+  return run;
+}
+
+// A lane verifying fewer rows leaves the state, the tape and its verified
+// rows' outputs as every row does, and zero in its other rows; its next step
+// retains at most the rows it verified.
+void partialVerifyRows(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, LinearInput layout,
+                       bool float32, GdnHeadOrder order, GdnStateFormat format) {
+  const std::string what = caseName("partial verify rows", shape, lanes, layout) +
+                           (order == GdnHeadOrder::Tiled ? " tiled" : " grouped") + " " +
+                           std::string(formatName(format));
+  std::array<uint32_t, kMaxLanes> every{}, verify{}, retained{};
+  every.fill(kRows);
+  // Lane l verifies 1 + (5 l + 3) % 8 rows (4, 1, 6, 3) and retains
+  // 1 + (3 l + 2) % those (3, 1, 3, 3).
+  for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
+    verify[lane] = 1 + (5 * lane + 3) % kRows;
+    retained[lane] = 1 + (3 * lane + 2) % verify[lane];
+  }
+  const StepsRun reference =
+      runSteps(backend, shape, lanes, layout, float32, order, format, every, retained, what + " every row");
+  const StepsRun run = runSteps(backend, shape, lanes, layout, float32, order, format, verify, retained, what);
+  require(run.tape == reference.tape, what + ": tape differs from every row's");
+  require(run.cells == reference.cells, what + ": state cells differ from every row's");
+  const uint64_t rowValues = uint64_t{shape.valueHeads} * shape.headDimension;
+  const auto *got = reinterpret_cast<const uint16_t *>(run.hidden.data());
+  const auto *expected = reinterpret_cast<const uint16_t *>(reference.hidden.data());
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    for (uint32_t token = 0; token < kRows; ++token) {
+      const uint64_t row = (uint64_t{lane} * kRows + token) * rowValues;
+      if (token < verify[lane])
+        require(!std::memcmp(got + row, expected + row, rowValues * 2),
+                what + ": a verified row differs from every row's");
+      else
+        require(std::all_of(got + row, got + row + rowValues, [](uint16_t v) { return (v & 0x7FFF) == 0; }),
+                what + ": an unverified row is not zero");
+    }
 }
 
 void rejectsInvalid(MetalBackend &backend) {
@@ -1282,6 +1398,13 @@ int main(int argc, char **argv) {
         for (bool float32 : familyNorms(shape))
           for (LinearInput layout : {LinearInput::Plain, LinearInput::Table16})
             bfloatState(backend, shape, lanes, float32, layout);
+    for (const GdnShape &shape : kShapes)
+      for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
+        for (bool float32 : familyNorms(shape))
+          for (LinearInput layout : {LinearInput::Plain, LinearInput::Table16})
+            for (GdnStateFormat format : {GdnStateFormat::Float32, GdnStateFormat::BFloat16})
+              partialVerifyRows(backend, shape, lanes, layout, float32,
+                                float32 ? GdnHeadOrder::Tiled : GdnHeadOrder::Grouped, format);
     std::cout << "gdn_decode_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

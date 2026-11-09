@@ -147,7 +147,7 @@ final class AppState {
             }
             return ServerStatus(look: look, phrase: server.serving.rawValue)
         case .failed:
-            return ServerStatus(look: .failed, phrase: server.running ? "Not responding" : "Ran into a problem")
+            return ServerStatus(look: .failed, phrase: "Ran into a problem")
         }
     }
 
