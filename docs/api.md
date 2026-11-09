@@ -22,7 +22,7 @@ Messages requires it.
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/messages/count_tokens` | A Messages request's prompt tokens, images included, as `{"input_tokens": N}`, without inference |
 | `POST /v1/chat/completions/count_tokens` | A Chat request's prompt tokens, images included, as `{"input_tokens": N}`, without inference |
-| `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit and what reasoning efforts do ([default reasoning effort](server.md#default-reasoning-effort)) |
+| `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit, the input it takes (`input_modalities`), what a request may carry (`limits`: `request_bytes`, `images`, `image_bytes`, `pdf_bytes`, `pdf_pages`, as [images and PDFs](#images-and-pdfs) has them) and what reasoning efforts do ([default reasoning effort](server.md#default-reasoning-effort)) |
 | `POST /tokenize`, `/apply-template` | A text's tokens, or a conversation's rendered prompt, without inference |
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
 | `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](internals.md#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, `409 engine_busy` while the engine serves a request or restores its weights, `503 engine_busy` when the engine does not answer within 5 s, and `503 engine_recovering` or `server_shutdown` while the engine restarts or the server stops |
