@@ -268,13 +268,8 @@ private struct ControlBar: View {
         let server = state.server
         switch server.phase {
         case .stopped, .failed:
-            // A server that runs but serves nothing can be stopped, and gives way to the model
-            // picked.
-            if server.running { Button("Stop") { state.stop() } }
-            let switching = server.running && state.selection != server.model
             Button { if let model = state.selection { state.start(model) } } label: {
-                Text(failedPicked ? "Try Again" : switching ? "Switch to \(state.selection.map(state.displayName(of:)) ?? "")" : "Start")
-                    .frame(maxWidth: 240)
+                Text(failedPicked ? "Try Again" : "Start").frame(maxWidth: 240)
             }
             .buttonStyle(.borderedProminent)
             .disabled(state.selection == nil || !state.canStart)

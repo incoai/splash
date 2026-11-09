@@ -215,11 +215,11 @@ final class Server {
     /// otherwise.
     private(set) var remedy: Remedy?
 
-    /// Clears a failure the user has read, stopping a server that still runs but serves nothing.
+    /// Clears a failure the user has read, and what it offered.
     func dismissFailure() {
         guard case .failed = phase else { return }
         remedy = nil
-        if child != nil { stop() } else { phase = .stopped }
+        phase = .stopped
     }
 
     /// Stops the server an app started before it quit or crashed, if it still runs, and waits
