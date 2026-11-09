@@ -119,11 +119,15 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
                          kRaggedAttentionRows *
                          geometry.target.attentionHeadDimension));
   // The split partials and counters and the rotated rows of the largest
-  // prefill plan, the draft's context projections' too.
+  // prefill plan, the draft's context projections' too. The draft's run at
+  // up to its ring's capture rows, which a variant of a longer ring holds
+  // past the prefill chunk budget: its rotated scratch sizes by those.
   const auto &draft = geometry.draft;
   std::vector<ops::ProjectionShape> prefillProjections = geometry.target.prefillProjections;
-  prefillProjections.push_back({draft.hiddenSize, draft.targetHiddenSize()});
-  prefillProjections.push_back({draft.contextKvSize(), draft.hiddenSize});
+  const ops::ProjectionShape draftHiddenProjection{draft.hiddenSize, draft.targetHiddenSize()};
+  const ops::ProjectionShape draftContextProjection{draft.contextKvSize(), draft.hiddenSize};
+  prefillProjections.push_back(draftHiddenProjection);
+  prefillProjections.push_back(draftContextProjection);
   for (const auto &projection : prefillProjections) {
     const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection);
     put(PrefillTensor::LinearPartials, linear.partials);

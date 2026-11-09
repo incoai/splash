@@ -1,3 +1,4 @@
+#include <iostream>
 #include "model/Runtime.hpp"
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
 #include "metal/abi/GDN.h"
@@ -3022,6 +3023,10 @@ Runtime::prefillAsync(const BatchPlan &plan,
       if (!finite[lane]) {
         // The chunk's state is not committed; the engine ends the request.
         entry.resultInvalid = true;
+        std::cerr << "splash: prefill row not finite: request " << entry.id
+                  << " logical " << item.logicalPosition << " .. "
+                  << nextLength << " of " << entry.promptTokens
+                  << " prompt tokens\n";  // a prefill-stage finiteness probe names the stage
         results.push_back({.requestId = entry.id,
                            .consumedPromptTokens = item.tokenCount,
                            .failure = "target prefill row is not finite"});
