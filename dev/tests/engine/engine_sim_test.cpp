@@ -858,7 +858,7 @@ void testRandomSchedulesWithReleasesEndAsWithoutThem() {
       }
       require(serving.errors.empty(), at(machine) + "seed " + std::to_string(seed) + ": a request failed: " +
                                           (serving.errors.empty() ? std::string() : serving.errors.front()));
-      const engine::MemoryLedger::CountChecks checks = serving.fixture.governor->ledger().countChecks();
+      const engine::MemoryLedger::CountChecks checks = serving.fixture.governor->snapshot().countChecks;
       require(checks.overcountedRuns == 0,
               at(machine) + "seed " + std::to_string(seed) + ": " + std::to_string(checks.overcountedRuns) + " of " +
                   std::to_string(checks.coveredRuns) + " claims whose count covered their need took less");

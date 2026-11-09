@@ -160,11 +160,12 @@ struct MemoryGovernorSnapshot {
   // The host's memory as macOS counts it, which /status reports; none when
   // it does not (queryHostTelemetry).
   std::optional<HostTelemetry> hostTelemetry{};
-  // The ledger's accounts, what transfers will return, and the claims that
-  // wait.
+  // The ledger's accounts, what transfers will return, the claims that
+  // wait, and how its takes kept to its counts.
   std::vector<MemoryAccountSnapshot> accounts{};
   OwedBytesSnapshot owed{};
   MemoryClaimsSnapshot claims{};
+  MemoryLedger::CountChecks countChecks{};
 };
 
 // The sole memory admission. It does not allocate, evict or schedule work;

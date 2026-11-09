@@ -543,7 +543,6 @@ MemoryLedger::Run MemoryLedger::take(const VictimQuery &query, const Lacking &la
         const uint64_t counted = unit.pages ? std::min<uint64_t>(unit.pages, lacking.lackingPages)
                                             : std::min(unit.bytes, lacking.lackingBytes);
         const uint64_t freed = unit.pages ? taken.pages : saturatingAdd(taken.nowBytes, taken.laterBytes);
-        ++checks_.firstReleases;
         checks_.shortReleases += freed < counted && hostRefusals_ == hostRefusals;
       }
     }
@@ -680,8 +679,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
       const uint64_t hostRefusals = hostRefusals_;
       run = take(query, lack);
       ++checks_.coveredRuns;
-      if (!run->covered)
-        ++(run->pending || hostRefusals_ != hostRefusals ? checks_.blockedRuns : checks_.overcountedRuns);
+      checks_.overcountedRuns += !run->covered && !run->pending && hostRefusals_ == hostRefusals;
       if (run->uncopied)
         uncopiedReachedSeconds_ = nowSeconds_;
       FreeResult taken = run->freed;
@@ -921,6 +919,7 @@ void MemoryLedger::fill(MemoryGovernorSnapshot &snapshot, uint64_t chargedBytes)
   if (oldest)
     snapshot.claims.oldestMilliseconds = std::max(0.0, nowSeconds_ - *oldest) * 1000.0;
   snapshot.owed.toClaimsBytes = std::min(snapshot.owed.bytes, snapshot.claims.bytes);
+  snapshot.countChecks = checks_;
 }
 
 void MemoryLedger::log(const ClaimSpec &spec, const Need &need, const Run *run, const FreeResult &result,

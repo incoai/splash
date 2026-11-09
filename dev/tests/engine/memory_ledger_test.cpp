@@ -2197,21 +2197,22 @@ private:
 };
 
 // The peek contract's units count disjoint memory (VictimSource): a source whose units count the pages two lanes
-// share each overcounts, and free() then takes them on a count that covers a need its takes do not meet, which
-// CountChecks names an overcounted run; counted once, the count falls short and nothing is taken.
+// share each overcounts, and free() then takes them on a count that covers a need its takes do not meet, which the
+// status snapshot counts as an overcounted run (memory_governor.count_checks), the first release having freed what it
+// counted; counted once, the count falls short and nothing is taken.
 void testUnitsThatCountOnePageTwiceOvercount() {
   for (const bool twice : {true, false}) {
-    MemoryLedger ledger;
+    Fixture fixture(host(32 * kGiB));
+    MemoryLedger &ledger = fixture.ledger();
     SharedPages lanes(kGiB, 256 * kMiB, twice);
     ledger.addSource(lanes);
     const ClaimId claim = ledger.open(request(3, RequestPriority::Normal));
     const FreeResult freed = ledger.free(claim, {.bytes = 2 * kGiB}, 0, false);
-    const MemoryLedger::CountChecks checks = ledger.countChecks();
+    const MemoryLedger::CountChecks checks = fixture.governor->snapshot().countChecks;
     if (twice)
       require(freed.outcome == FreeOutcome::Short && lanes.taken == std::vector<uint64_t>{1, 2} &&
-                  checks.coveredRuns == 1 && checks.overcountedRuns == 1 && checks.blockedRuns == 0 &&
-                  checks.firstReleases == 1 && checks.shortReleases == 0,
-              "units that count the shared pages each were not taken on their count and named overcounted");
+                  checks.coveredRuns == 1 && checks.overcountedRuns == 1 && checks.shortReleases == 0,
+              "units that count the shared pages each were not taken on their count and reported overcounted");
     else
       require(freed.outcome == FreeOutcome::Short && lanes.taken.empty() && checks.coveredRuns == 0 &&
                   checks.overcountedRuns == 0,

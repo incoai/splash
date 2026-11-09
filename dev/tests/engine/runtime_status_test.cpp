@@ -263,6 +263,9 @@ StatusInputs representativeStatus() {
                         .shrinks = 2}};
   governor.owed = {.transfers = 2, .bytes = 64 * 4096ULL, .toClaimsBytes = 32 * 4096ULL, .oldestMilliseconds = 12.5};
   governor.claims = {.waiting = 2, .bytes = 32 * 4096ULL, .oldestMilliseconds = 1250.0};
+  // Of 40 takes on a count that covered what their claim lacked, one freed
+  // less; two releases taken first freed less than they counted.
+  governor.countChecks = {.coveredRuns = 40, .overcountedRuns = 1, .shortReleases = 2};
 
   // A streamed table, the experts' store and KV on the SSD cache with its
   // readers.

@@ -1714,6 +1714,9 @@ whose copies land) waits for them (`Pending`) and is retried as they land; one
 they do not meet waits while what it reached or started lands, and is `Short`
 otherwise. A refusal of KV counts the free pages of its form as its own: the
 ledger never releases their extent for it, which it would only allocate again.
+`/status` counts the takes on a count that covered what the claim lacked, and
+those that freed less though no unit waited for a transfer and the host refused
+nothing meanwhile (`memory_governor.count_checks`).
 
 A claim for memory nothing needs yet, such as the Index runway's refill with
 no Spill lane in service, takes only what costs nothing. The runway refills

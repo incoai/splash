@@ -456,24 +456,21 @@ public:
   [[nodiscard]] uint64_t hostRefusedWaitingBytes() const noexcept;
   // The units the pools gave back since the engine started.
   [[nodiscard]] uint64_t poolReleases() const noexcept;
-  // How free()'s takes kept to its counts, for the tests that hold the
-  // sources to the peek contract (VictimSource): the runs whose count
+  // How free()'s takes kept to its counts since the engine started, which
+  // /status reports (memory_governor.count_checks): the runs whose count
   // (bound) covered what the claim lacked; of those, the takes that covered
   // less though no unit they reached waited for a transfer and the host
-  // refused no allocation in the claim's scope (overcounted), and the other
-  // takes that covered less (blocked); the units that release a lane's pages
-  // (VictimKind::Release) taken first in a run, and of those the takes that
-  // freed less than the lesser of their count and what the claim lacked,
-  // though the host refused nothing (short). Two lanes on one conversation
-  // counting their shared pages each overcount by those pages.
+  // refused no allocation in the claim's scope (overcounted: a source
+  // counted memory its takes did not free, against the peek contract); and
+  // the units that release a lane's pages (VictimKind::Release) taken first
+  // in a run that freed less than the lesser of their count and what the
+  // claim lacked, though the host refused nothing (short). Two lanes on one
+  // conversation counting their shared pages each overcount by those pages.
   struct CountChecks final {
     uint64_t coveredRuns = 0;
     uint64_t overcountedRuns = 0;
-    uint64_t blockedRuns = 0;
-    uint64_t firstReleases = 0;
     uint64_t shortReleases = 0;
   };
-  [[nodiscard]] const CountChecks &countChecks() const noexcept { return checks_; }
   // The largest unit a pool grows by next: the host's band reaches past its
   // margin by it.
   [[nodiscard]] uint64_t largestGrowthUnit() const;
@@ -503,7 +500,7 @@ public:
   // One growth pass. True when a pool grew.
   bool grow(uint64_t freeBytes, const GrowthHost &host);
 
-  // The accounts, owed bytes and claims.
+  // The accounts, owed bytes, claims and count checks.
   void fill(MemoryGovernorSnapshot &snapshot, uint64_t chargedBytes) const;
 
 private:

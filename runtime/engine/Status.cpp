@@ -390,7 +390,7 @@ void writeMemoryGovernor(json::Writer &w, const MemoryGovernorSnapshot &governor
     }
     // The memory ledger: each account's floor, current bytes and cap, its
     // unit, and the units it took and gave back; the bytes transfers will
-    // return; and the claims that wait for memory.
+    // return; the claims that wait for memory; and its count checks.
     w.array("accounts", [&] {
       for (const MemoryAccountSnapshot &account : governor.accounts) {
         w.object([&] {
@@ -414,6 +414,11 @@ void writeMemoryGovernor(json::Writer &w, const MemoryGovernorSnapshot &governor
       w.field("waiting", governor.claims.waiting)
           .field("bytes", governor.claims.bytes)
           .field("oldest_ms", governor.claims.oldestMilliseconds);
+    });
+    w.object("count_checks", [&] {
+      w.field("covered", governor.countChecks.coveredRuns)
+          .field("overcounted", governor.countChecks.overcountedRuns)
+          .field("short_releases", governor.countChecks.shortReleases);
     });
   });
 }

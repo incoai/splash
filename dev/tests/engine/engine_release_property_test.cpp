@@ -501,13 +501,13 @@ private:
     const uint32_t transfers = spill.tier.demotions + spill.tier.restores;
     const size_t suspended = spill.model.suspendedIds.size();
     const uint64_t preemptions = spill.engine.snapshot().prioritySuspensions;
-    const MemoryLedger::CountChecks before = spill.host.governor.ledger().countChecks();
+    const MemoryLedger::CountChecks before = spill.host.governor.snapshot().countChecks;
     bytesAndPagesShort_ = false;
     static_cast<void>(spill.engine.tick(spill.now++));
     if (spill.engine.snapshot().prioritySuspensions != preemptions)
       preempted_.insert(spill.model.suspendedIds.begin() + static_cast<std::ptrdiff_t>(suspended),
                         spill.model.suspendedIds.end());
-    const MemoryLedger::CountChecks after = spill.host.governor.ledger().countChecks();
+    const MemoryLedger::CountChecks after = spill.host.governor.snapshot().countChecks;
     const uint64_t overcounted = after.overcountedRuns - before.overcountedRuns;
     totals_.engineOvercounts += overcounted;
     if (overcounted && quiet && transfers == spill.tier.demotions + spill.tier.restores)
@@ -676,7 +676,7 @@ private:
       break;
     }
     const bool quiet = spill.tier.inFlight() == 0;
-    const MemoryLedger::CountChecks before = ledger.countChecks();
+    const MemoryLedger::CountChecks before = governor.snapshot().countChecks;
     const std::string pool = lanes_.pool();
     // A need of bytes its count covers, with no claim waiting to hold room above it: what the claim keeps of the
     // room once the lanes' first reads its releases created are set aside holds the need.
@@ -699,7 +699,7 @@ private:
       ledger.close(id);
     }
     claiming_ = false;
-    const MemoryLedger::CountChecks after = ledger.countChecks();
+    const MemoryLedger::CountChecks after = governor.snapshot().countChecks;
     ++totals_.claims;
     totals_.quietClaims += quiet;
     totals_.coveredRuns += after.coveredRuns - before.coveredRuns;
