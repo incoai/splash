@@ -81,8 +81,8 @@ metadata derived from a GGUF; `families.py` each family's draft repository;
 which inspects them and publishes them as `upstream.py` does a repository's;
 and `models.py` model IDs, selections, the
 installation lock, the command line (`install/models.py --model ID
-prepare|verify|link`, where `link` prints the selection link) and running the
-engine's checks. Since the installer checks a model with the engine, a source
+prepare|verify|link|remove`, where `link` prints the selection link) and
+running the engine's checks. Since the installer checks a model with the engine, a source
 checkout builds the engine before it installs, as `make install` and the first
 `./splash serve` do, and a packaged install ships it. The assembly's
 `model.json` records the resolved sources and selected formats. The native
@@ -102,6 +102,15 @@ files from different revisions. It pins those snapshots in the Hub cache
 an installed model links. Publishing a new assembly retires the installation's
 other pins, in the repositories it links and in those its predecessor linked,
 so pruning can free what no installation links any more.
+
+`remove` takes an installation away under the installation lock, refusing one
+a server holds: its selection link and pins, then its assembly, which garbage
+collection finds unlinked and unheld, then the files of its Hub snapshots that
+no remaining assembly links, the blobs no snapshot names any more and a
+repository folder left empty. A snapshot pinned by an installation of another
+models root, which this root's records don't describe, keeps all its files. It
+reports `{"event": "removed", "bytes": FREED}` on stdout, or fails as
+`prepare` does.
 
 `hub.Repository.download` first removes the partial files
 (`<blob>.<random>.incomplete`) killed downloads left in the repository's blobs

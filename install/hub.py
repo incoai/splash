@@ -19,6 +19,7 @@ import errno
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -201,6 +202,57 @@ def pin(path: Path, repo_id: str, installation: Path) -> Path:
     # A pin's content is its own name, so writers never disagree.
     _publish(ref, commit)
     return ref
+
+
+def remove_unused(snapshot: Path, owners, linked) -> int:
+    """Remove what of the Hub snapshot at snapshot nothing uses any more, and
+    return the bytes freed. An installation whose pin owner is not in owners,
+    that of another models root, keeps every file. Else the files go that no
+    remaining installation links (linked, their resolved paths), then the
+    blobs no snapshot of the repository names, and the repository's folder
+    once it holds neither; a blob a download is still writing stays."""
+    folder = snapshot.parent.parent
+    if any(
+        ref.parent.name not in owners
+        for ref in (folder / "refs" / "splash").glob(f"*/{snapshot.name}")
+    ):
+        return 0
+    freed = 0
+    # Deepest first, so that a folder emptied goes too.
+    for entry in sorted(
+        snapshot.rglob("*"), key=lambda path: len(path.parts), reverse=True
+    ):
+        if entry.is_symlink() or entry.is_file():
+            if entry.resolve() not in linked:
+                if not entry.is_symlink():
+                    freed += entry.stat().st_size
+                entry.unlink()
+        else:
+            try:
+                entry.rmdir()
+            except OSError:
+                pass
+    try:
+        snapshot.rmdir()
+    except OSError:
+        pass
+    snapshots, blobs = folder / "snapshots", folder / "blobs"
+    named = {
+        entry.resolve()
+        for entry in snapshots.rglob("*")
+        if entry.is_symlink() or entry.is_file()
+    }
+    for blob in blobs.glob("*"):
+        if (
+            blob.is_file()
+            and not blob.name.endswith(".incomplete")
+            and blob.resolve() not in named
+        ):
+            freed += blob.stat().st_size
+            blob.unlink()
+    if not any(snapshots.glob("*")) and not any(blobs.glob("*")):
+        shutil.rmtree(folder)
+    return freed
 
 
 def retire_other_pins(pins, replaced=()):

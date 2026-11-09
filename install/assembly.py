@@ -424,6 +424,26 @@ def collect_garbage(models_root: Path):
         shutil.rmtree(stage)
 
 
+def linked_files(models_root: Path):
+    """The files the assemblies under models_root link, each resolved: the Hub
+    cache's blobs and the local files that removing another installation keeps.
+    None where a record cannot be read, which links files no one can tell."""
+    linked = set()
+    for assembly in _directories((models_root / ".resolved").glob("*")):
+        try:
+            files = models.read_json(assembly / "model.json").get("files")
+        except models.ModelError:
+            return None
+        if not isinstance(files, dict):
+            return None
+        for entry in files.values():
+            path = entry.get("path") if isinstance(entry, dict) else None
+            if not isinstance(path, str):
+                return None
+            linked.add(Path(path).resolve())
+    return linked
+
+
 def _directories(paths):
     """The directories among paths, in name order: the entries and staging
     installations write, which are never links."""
