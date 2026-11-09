@@ -1705,6 +1705,55 @@ class UpstreamTest(unittest.TestCase):
         with self.assertRaisesRegex(models.ModelError, "is not installed"):
             self.remove(first)
 
+    def test_remove_keeps_the_files_its_installation_never_linked(self):
+        # The snapshot holds a file another tool downloaded, or an install
+        # of another file under way, and the repository a blob no snapshot
+        # names and a download's partial file: none was the model's, so all
+        # stay, with the folders holding them; the model's own files go.
+        fake = fake_hub(self, self.cache)
+        fake.publish(
+            MODEL,
+            "a" * 40,
+            lambda p: (mlx_target(p, DENSE) / "README.md").write_text("notes"),
+        )
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        size = blob_bytes(self.cache)
+        snapshot = fake.snapshot(MODEL, "a" * 40)
+        readme = Path(fake.hf_hub_download(MODEL, "README.md", revision="a" * 40))
+        blobs = self.cache / hub.folder_name(MODEL) / "blobs"
+        orphan, partial = blobs / ("e" * 40), blobs / f"{'f' * 64}.0123abcd.incomplete"
+        orphan.write_bytes(b"orphan")
+        partial.write_bytes(b"partial")
+        self.assertEqual(self.remove(chosen), size)
+        self.assertEqual(listing(snapshot), ["README.md"])
+        self.assertEqual(readme.read_text(), "notes")
+        self.assertEqual(
+            sorted(blob.name for blob in blobs.iterdir()),
+            sorted([readme.resolve().name, orphan.name, partial.name]),
+        )
+
+    def test_an_update_leaves_the_files_it_shares_to_the_delete(self):
+        # A commit that changed only its README shares every blob with the
+        # one installed: the update removes the old snapshot's files and
+        # keeps the blobs, which the new one names, and a Delete then frees
+        # them all.
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        size = blob_bytes(self.cache, MODEL)
+        fake.publish(
+            MODEL,
+            "b" * 40,
+            lambda p: (mlx_target(p, DENSE) / "README.md").write_text("notes"),
+        )
+        self.prepare(chosen)
+        self.assertFalse(fake.snapshot(MODEL, "a" * 40).exists())
+        self.assertEqual(blob_bytes(self.cache, MODEL), size)
+        size = blob_bytes(self.cache)
+        self.assertEqual(self.remove(chosen), size)
+        self.assertEqual(list(self.cache.iterdir()), [])
+
     def test_remove_keeps_what_a_server_or_another_models_root_holds(self):
         fake_hub(self, self.cache)
         chosen = selection(self.root)
@@ -1737,6 +1786,31 @@ class UpstreamTest(unittest.TestCase):
         )
         status, events, _ = self.run_installer("remove")
         self.assertEqual((status, [event["event"] for event in events]), (1, ["error"]))
+
+    def test_a_removal_that_cannot_free_a_file_still_removes_the_model(self):
+        # The target's snapshot cannot be written: the model is removed all
+        # the same, with a warning, and the bytes freed are the draft's.
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        snapshot = next((self.cache / hub.folder_name(MODEL) / "snapshots").iterdir())
+        snapshot.chmod(0o555)
+        self.addCleanup(snapshot.chmod, 0o755)
+        size = blob_bytes(self.cache, DENSE.draft_repo)
+        status, events, warnings = self.run_installer("remove")
+        self.assertEqual((status, events), (0, [{"event": "removed", "bytes": size}]))
+        self.assertRegex(
+            warnings,
+            "^Warning: could not remove what no installation uses: .*"
+            + re.escape(str(snapshot)),
+        )
+        self.assertFalse(chosen.link.is_symlink())
+        self.assertEqual(list((self.root / "models" / ".resolved").glob("*")), [])
+        status, events, _ = self.run_installer("remove")
+        self.assertEqual(
+            events[0]["message"],
+            f"{MODEL} is not installed in {(self.root / 'models').resolve()}",
+        )
 
     def test_pins_are_required_before_publishing(self):
         fake_hub(self, self.cache)

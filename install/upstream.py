@@ -19,7 +19,7 @@ import json
 import os
 import re
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -590,40 +590,33 @@ def prepare(selection):
 
 def remove(selection):
     """Remove selection's installation, and what of its sources nothing else
-    uses, and return the bytes freed: its selection link and pins, then its
-    assembly, which nothing links or holds any more (collect_garbage), and the
-    files of its Hub snapshots that no remaining installation links
-    (hub.remove_unused). A snapshot another models root pins keeps its files,
-    as do all snapshots where a record cannot be read. An installation a
-    server holds is refused: it is stopped first."""
+    uses, and return the bytes freed in the Hub cache: its selection link,
+    then its pins, and its assembly, which nothing links or holds any more,
+    with the files of its Hub snapshots no remaining installation links
+    (assembly.collect_garbage). An installation a server holds is refused:
+    it is stopped first. Once its link is gone the model is removed, and
+    what follows only frees space: a failure is a warning, and the rest goes
+    on."""
     root = selection.models_root
     with models.installation_lock(root):
         link = selection.link
         if models.installation_kind(link) != models.ASSEMBLY:
             raise models.ModelError(f"{selection.model} is not installed in {root}")
-        installed = link.resolve()
-        if assembly.is_held(installed):
+        if assembly.is_held(link.resolve()):
             raise models.ModelError(
                 f"{selection.model} is being served: stop it, then remove it"
             )
-        snapshots = [
-            path
-            for path, _ in assembly.pins(models.read_json(installed / "model.json"))
-        ]
+        # A record that cannot be read names no pins: its snapshots then keep
+        # their files, as another models root's do.
+        record = assembly.recorded(link)
         link.unlink()
-        for path in snapshots:
-            ref = hub.pinned(path, link)
-            ref.unlink(missing_ok=True)
-            try:
-                ref.parent.rmdir()
-            except OSError:
-                pass
-        assembly.collect_garbage(root)
-        linked = assembly.linked_files(root)
-        if linked is None:
-            return 0
-        owners = {hub.pin_owner(other) for other in models.selection_links(root)}
-        return sum(hub.remove_unused(path, owners, linked) for path in snapshots)
+        for path, _ in assembly.pins(record) if record else ():
+            with models.freeing():
+                ref = hub.pinned(path, link)
+                ref.unlink(missing_ok=True)
+                with suppress(OSError):
+                    ref.parent.rmdir()
+        return assembly.collect_garbage(root)
 
 
 def _start_installed(selection, target, installed):
@@ -802,12 +795,11 @@ def publish(models_root, link, record, files):
         ]
         published = assembly.build(models_root, record, files)
         models.link_selection(link, published)
-        # Published: what follows only frees space; its failures are warnings.
+        # Published: what follows only frees space; its failures are
+        # warnings. The assembly replaced goes once no server holds it, with
+        # the files of its snapshots the new one does not link.
         hub.retire_other_pins(pins, replaced)
-        try:
-            assembly.collect_garbage(models_root)
-        except OSError as error:
-            models.warn(f"could not remove what no installation uses: {error}")
+        assembly.collect_garbage(models_root)
     return published
 
 

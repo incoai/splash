@@ -394,54 +394,73 @@ def is_held(assembly: Path) -> bool:
     return False
 
 
-def collect_garbage(models_root: Path):
-    """Remove what no installation uses: assemblies that no selection links
-    and no server holds, metadata entries the remaining assemblies do not
-    link, and staging an interrupted installation left. Each is a directory
+def collect_garbage(models_root: Path) -> int:
+    """Remove what no installation uses, and return the bytes this frees in
+    the Hub cache: assemblies that no selection links and no server holds,
+    with the files of their Hub snapshots no remaining assembly links
+    (hub.release); metadata entries the remaining assemblies do not link;
+    and staging an interrupted installation left. Each is a directory
     (_directories): anything else there, such as the .DS_Store Finder
-    leaves, is not an installation's. Call it under the installation lock,
-    where all of these are written."""
+    leaves, is not an installation's. A remaining assembly whose record
+    cannot be read links files no one can tell, so then no Hub cache file
+    goes. Call it under the installation lock, where all of these are
+    written. It only frees space: a failure is a warning (models.freeing),
+    and the rest goes on."""
     resolved, derived = models_root / ".resolved", models_root / ".metadata"
-    linked = {link.resolve() for link in models.selection_links(models_root)}
-    used = set()
+    links = models.selection_links(models_root)
+    linked = {link.resolve() for link in links}
+    # The records of the assemblies removed; the files the others link, and
+    # whether their records name them all; the metadata entries they link.
+    gone, kept, known, used = [], set(), True, set()
     for assembly in _directories(resolved.glob("*")):
         if assembly not in linked and not is_held(assembly):
-            shutil.rmtree(assembly)
+            gone += [record] if (record := recorded(assembly)) else []
+            with models.freeing():
+                shutil.rmtree(assembly)
             continue
         # A damaged record protects no metadata: its assembly is rebuilt.
         try:
             files = models.read_json(assembly / "model.json").get("files")
         except models.ModelError:
-            continue
-        for entry in files.values() if isinstance(files, dict) else ():
-            path = Path(entry.get("path", "")) if isinstance(entry, dict) else None
-            if path and path.is_relative_to(derived):
-                used.add(path.relative_to(derived).parts[0])
-    for entry in _directories(derived.glob("*")):
-        if entry.name not in used:
-            shutil.rmtree(entry)
-    for stage in _directories(models_root.glob(f"*/{models.LINK_STAGING}*")):
-        shutil.rmtree(stage)
-
-
-def linked_files(models_root: Path):
-    """The files the assemblies under models_root link, each resolved: the Hub
-    cache's blobs and the local files that removing another installation keeps.
-    None where a record cannot be read, which links files no one can tell."""
-    linked = set()
-    for assembly in _directories((models_root / ".resolved").glob("*")):
-        try:
-            files = models.read_json(assembly / "model.json").get("files")
-        except models.ModelError:
-            return None
+            files = None
         if not isinstance(files, dict):
-            return None
+            known = False
+            continue
         for entry in files.values():
             path = entry.get("path") if isinstance(entry, dict) else None
             if not isinstance(path, str):
-                return None
-            linked.add(Path(path).resolve())
-    return linked
+                known = False
+                continue
+            kept.add(Path(path))
+            if Path(path).is_relative_to(derived):
+                used.add(Path(path).relative_to(derived).parts[0])
+    for entry in _directories(derived.glob("*")):
+        if entry.name not in used:
+            with models.freeing():
+                shutil.rmtree(entry)
+    for stage in _directories(models_root.glob(f"*/{models.LINK_STAGING}*")):
+        with models.freeing():
+            shutil.rmtree(stage)
+    if not known:
+        return 0
+    owners = {hub.pin_owner(link) for link in links}
+    entries = [path for record in gone for path in _hub_entries(record)]
+    # A failure to tell the files kept apart frees none of them.
+    with models.freeing():
+        return hub.release(entries, kept, owners)
+    return 0
+
+
+def _hub_entries(record):
+    """The files an assembly links from its Hub sources' snapshots
+    (_snapshots), as its record names them: the snapshots' entries, not the
+    blobs they name. A local source's files are never among them."""
+    snapshots = set(_snapshots(record).values())
+    return {
+        Path(entry["path"])
+        for entry in record["files"].values()
+        if hub.snapshot_of(entry["path"]) in snapshots
+    }
 
 
 def _directories(paths):

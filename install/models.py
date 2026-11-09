@@ -85,6 +85,16 @@ def warn(message):
     print(f"Warning: {message}", file=sys.stderr, flush=True)
 
 
+@contextmanager
+def freeing():
+    """Run a block that only frees space, removing what no installation
+    uses: an OSError ends the block with a warning, and the caller goes on."""
+    try:
+        yield
+    except OSError as error:
+        warn(f"could not remove what no installation uses: {error}")
+
+
 def run_engine(arguments, check):
     """The output of one of the engine's checks, `ENGINE ARGUMENTS`, which
     check names. A ModelError names an engine that cannot run, or that

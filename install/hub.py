@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -204,55 +205,104 @@ def pin(path: Path, repo_id: str, installation: Path) -> Path:
     return ref
 
 
-def remove_unused(snapshot: Path, owners, linked) -> int:
-    """Remove what of the Hub snapshot at snapshot nothing uses any more, and
-    return the bytes freed. An installation whose pin owner is not in owners,
-    that of another models root, keeps every file. Else the files go that no
-    remaining installation links (linked, their resolved paths), then the
-    blobs no snapshot of the repository names, and the repository's folder
-    once it holds neither; a blob a download is still writing stays."""
-    folder = snapshot.parent.parent
-    if any(
-        ref.parent.name not in owners
-        for ref in (folder / "refs" / "splash").glob(f"*/{snapshot.name}")
-    ):
-        return 0
+def release(entries, kept, owners) -> int:
+    """Remove the Hub cache files an assembly that went linked, entries (the
+    snapshot files its record names), and return the bytes freed: each entry
+    no remaining installation links, kept naming the files the remaining
+    assemblies link, compared as entries, not as the blobs they name; then
+    the blobs the entries removed named, once no entry left in any snapshot
+    of their repository names them; then the folders this empties: an
+    entry's folders up to its snapshot, and the repository's folder once its
+    snapshots and blobs are empty. A snapshot an installation of another
+    models root pins (a pin whose owner is not in owners) keeps every entry.
+    Nothing else is touched: no entry or blob the assembly did not link, such
+    as another tool's download of the same commit or a download under way,
+    and no partial .incomplete file. It only frees space: a failure is a
+    warning (models.freeing), and the rest goes on."""
+    kept = list(kept)
+    kept_entries, kept_files = _identities(kept, os.lstat), _identities(kept, os.stat)
+    snapshots = {}
+    for entry in map(Path, entries):
+        if (snapshot := snapshot_of(entry)) is not None:
+            snapshots.setdefault(snapshot, set()).add(entry)
     freed = 0
-    # Deepest first, so that a folder emptied goes too.
-    for entry in sorted(
-        snapshot.rglob("*"), key=lambda path: len(path.parts), reverse=True
-    ):
-        if entry.is_symlink() or entry.is_file():
-            if entry.resolve() not in linked:
-                if not entry.is_symlink():
-                    freed += entry.stat().st_size
-                entry.unlink()
-        else:
-            try:
-                entry.rmdir()
-            except OSError:
-                pass
-    try:
-        snapshot.rmdir()
-    except OSError:
-        pass
-    snapshots, blobs = folder / "snapshots", folder / "blobs"
-    named = {
-        entry.resolve()
-        for entry in snapshots.rglob("*")
-        if entry.is_symlink() or entry.is_file()
-    }
-    for blob in blobs.glob("*"):
-        if (
-            blob.is_file()
-            and not blob.name.endswith(".incomplete")
-            and blob.resolve() not in named
+    # Each repository folder an entry went from -> the blobs those named.
+    named = {}
+    for snapshot, paths in sorted(snapshots.items()):
+        folder = snapshot.parent.parent
+        if any(
+            ref.parent.name not in owners
+            for ref in (folder / "refs" / "splash").glob(f"*/{snapshot.name}")
         ):
-            freed += blob.stat().st_size
-            blob.unlink()
-    if not any(snapshots.glob("*")) and not any(blobs.glob("*")):
-        shutil.rmtree(folder)
+            continue
+        blobs = named.setdefault(folder, set())
+        with models.freeing():
+            for entry in sorted(paths):
+                try:
+                    if _file(entry) in kept_entries:
+                        continue
+                    if entry.is_symlink():
+                        blobs.add(entry.resolve())
+                except FileNotFoundError:
+                    continue
+                freed += _unlink(entry)
+                _remove_empty(entry.parent, snapshot)
+    for folder, blobs in named.items():
+        with models.freeing():
+            left = _identities((folder / "snapshots").rglob("*"), os.stat)
+            for blob in sorted(blobs):
+                try:
+                    status = blob.stat()
+                    ours = os.path.samefile(blob.parent, folder / "blobs")
+                except FileNotFoundError:
+                    continue
+                identity = status.st_dev, status.st_ino
+                if ours and identity not in left and identity not in kept_files:
+                    freed += _unlink(blob)
+            if not any((folder / "snapshots").glob("*")) and not any(
+                (folder / "blobs").glob("*")
+            ):
+                shutil.rmtree(folder)
     return freed
+
+
+def _identities(paths, status):
+    """The (device, inode) of each of paths by status, os.lstat for the path
+    itself or os.stat for the file a link names; a path that names nothing
+    is left out."""
+    identities = set()
+    for path in paths:
+        try:
+            result = status(path)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        identities.add((result.st_dev, result.st_ino))
+    return identities
+
+
+def _unlink(path) -> int:
+    """Remove the file or link at path, and return the bytes this frees: a
+    file's size once its last link goes; nothing for a symbolic link or a
+    path already gone."""
+    try:
+        status = path.lstat()
+        path.unlink()
+    except FileNotFoundError:
+        return 0
+    if stat.S_ISREG(status.st_mode) and status.st_nlink == 1:
+        return status.st_size
+    return 0
+
+
+def _remove_empty(folder, top):
+    """Remove folder, then each of its parents up to top, while each is
+    empty."""
+    while folder.is_relative_to(top):
+        try:
+            folder.rmdir()
+        except OSError:
+            return
+        folder = folder.parent
 
 
 def retire_other_pins(pins, replaced=()):
