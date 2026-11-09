@@ -1,4 +1,5 @@
 import AppKit
+import PDFKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -18,6 +19,9 @@ final class Draft {
     private var lastAttachment: Task<Void, Never>?
     /// Asks the text field for the keyboard; counts the requests.
     private(set) var focusRequests = 0
+    /// Why the server refused the message the draft holds again (`restore`), which the composer
+    /// says until it is sent or emptied.
+    private(set) var refusal: String?
     /// Where attachments are kept.
     let files: URL
 
@@ -52,6 +56,33 @@ final class Draft {
         }
     }
 
+    /// Attaches the PDFs at `urls` as they are, with their names and pages, read and kept away from
+    /// the main thread, in the order they were attached; one PDFKit can't open still attaches, for
+    /// the server to say why.
+    func attach(pdfs urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        attaching += urls.count
+        let files = files
+        let reading = Task.detached(priority: .userInitiated) { urls.compactMap { Self.keptPDF($0, in: files) } }
+        let previous = lastAttachment
+        lastAttachment = Task {
+            await previous?.value
+            attachments += await reading.value
+            attaching -= urls.count
+        }
+    }
+
+    /// The record of the PDF at `url`, kept as a file in `files`; nil where it can't be read or
+    /// kept.
+    nonisolated private static func keptPDF(_ url: URL, in files: URL) -> Attachment? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let attachment = Attachment(kind: .pdf, type: "application/pdf", bytes: data.count, name: url.lastPathComponent,
+                                    pages: PDFDocument(data: data)?.pageCount)
+        try? FileManager.default.createDirectory(at: files, withIntermediateDirectories: true)
+        guard (try? data.write(to: files.appending(path: attachment.file), options: .atomic)) != nil else { return nil }
+        return attachment
+    }
+
     /// Takes attachment `index` off, and its file.
     func remove(at index: Int) {
         let attachment = attachments.remove(at: index)
@@ -66,8 +97,21 @@ final class Draft {
             text = ""
             attachments = []
             thumbnails = [:]
+            refusal = nil
         }
         return (text.trimmingCharacters(in: .whitespacesAndNewlines), attachments)
+    }
+
+    /// Takes back `refused`, the message the server didn't take, with why: its text where the
+    /// draft has none since, and its attachments before those attached since.
+    func restore(_ refused: ChatStore.Refused) {
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { text = refused.text }
+        attachments.insert(contentsOf: refused.attachments, at: 0)
+        for attachment in refused.attachments where attachment.kind == .image {
+            thumbnails[attachment.id] = NSImage(contentsOf: files.appending(path: attachment.file))
+        }
+        refusal = refused.reason
+        focus()
     }
 
     /// The record of image `data`, kept as a file in `files`, with the data; nil where it can't be
@@ -108,19 +152,28 @@ struct Composer: View {
     var body: some View {
         let images = state.server.acceptsImages
         VStack(alignment: .leading, spacing: 10) {
+            if let refusal = draft.refusal, !draft.isEmpty {
+                // As a reply says why it stopped short.
+                Label {
+                    Text(refusal).foregroundStyle(.secondary)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
+                }
+                .font(.system(size: 12))
+            }
             if !draft.attachments.isEmpty {
                 Attachments(draft: draft)
             }
             ComposerField(text: $draft.text, focusRequests: draft.focusRequests,
                           placeholder: "Message Splash", submit: state.sendDraft, cancel: stop, acceptsImages: images,
-                          attach: draft.attach)
+                          attach: draft.attach, attachPDFs: { draft.attach(pdfs: $0) })
             HStack(spacing: 6) {
-                // Only for a model that sees images.
+                // Only for a model that sees images and reads PDFs.
                 if images {
                     Button { picking = true } label: { Image(systemName: "plus") }
                         .foregroundStyle(.secondary)
-                        .help("Attach Images")
-                        .accessibilityLabel("Attach Images")
+                        .help("Attach Images or PDFs")
+                        .accessibilityLabel("Attach Images or PDFs")
                 }
                 EngineSlot()
                 Spacer(minLength: 12)
@@ -152,8 +205,11 @@ struct Composer: View {
                     in: .rect(cornerRadius: 22))
         .overlay { RoundedRectangle(cornerRadius: 22).strokeBorder(.separator) }
         .shadow(color: .black.opacity(0.06), radius: 14, y: 4)
-        .fileImporter(isPresented: $picking, allowedContentTypes: [.image], allowsMultipleSelection: true) { result in
-            draft.attach(((try? result.get()) ?? []).compactMap(NSImage.init(contentsOf:)))
+        .fileImporter(isPresented: $picking, allowedContentTypes: [.image, .pdf], allowsMultipleSelection: true) { result in
+            let urls = (try? result.get()) ?? []
+            let pdfs = urls.filter { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .pdf) == true }
+            draft.attach(urls.filter { !pdfs.contains($0) }.compactMap(NSImage.init(contentsOf:)))
+            draft.attach(pdfs: pdfs)
         }
         // The ring counts the next prompt as it is written.
         .onChange(of: state.contextRequest, initial: true) { _, request in
@@ -168,7 +224,7 @@ struct Composer: View {
 
     private var help: String {
         if !state.server.answers { return "Available once a model is running" }
-        if !draft.attachments.isEmpty && !state.server.acceptsImages { return "This model can’t see images" }
+        if let problem = state.attachmentProblem { return problem }
         if let note = state.overflow?.note { return note }
         return "Send"
     }
@@ -343,10 +399,12 @@ private struct EffortMenu: View {
     }
 }
 
-/// The images attached to a draft, each with a button that takes it off. Each has a hairline, so
-/// that a white one keeps its edge on the composer, and its button a solid disc, which stands out
-/// over any image in either appearance.
+/// What is attached to a draft, each with a button that takes it off: an image as itself, a PDF as
+/// its name and pages, in red where the model's limits leave it out. Each has a hairline, so that
+/// a white one keeps its edge on the composer, and its button a solid disc, which stands out over
+/// any image in either appearance.
 private struct Attachments: View {
+    @Environment(AppState.self) private var state
     let draft: Draft
 
     var body: some View {
@@ -354,14 +412,18 @@ private struct Attachments: View {
             HStack(spacing: 8) {
                 ForEach(Array(draft.attachments.enumerated()), id: \.element.id) { index, attachment in
                     ZStack(alignment: .topTrailing) {
-                        if let image = draft.thumbnails[attachment.id] {
-                            Image(nsImage: image)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: 56, height: 56)
-                                .clipShape(.rect(cornerRadius: 10))
-                                .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(.separator) }
+                        Group {
+                            if attachment.kind == .pdf {
+                                document(attachment)
+                            } else if let image = draft.thumbnails[attachment.id] {
+                                Image(nsImage: image)
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 56, height: 56)
+                            }
                         }
+                        .clipShape(.rect(cornerRadius: 10))
+                        .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(.separator) }
                         Button { draft.remove(at: index) } label: {
                             Image(systemName: "xmark.circle.fill")
                                 .symbolRenderingMode(.palette)
@@ -369,7 +431,7 @@ private struct Attachments: View {
                         }
                         .buttonStyle(.borderless)
                         .offset(x: 6, y: -6)
-                        .accessibilityLabel("Remove Image")
+                        .accessibilityLabel(attachment.kind == .pdf ? "Remove PDF" : "Remove Image")
                     }
                 }
             }
@@ -379,9 +441,29 @@ private struct Attachments: View {
     }
 }
 
+extension Attachments {
+    /// A PDF's chip: its glyph, name and pages, which show in red where the model's limits leave
+    /// it out by itself.
+    private func document(_ attachment: Attachment) -> some View {
+        let over = AppState.attachmentProblem([attachment], vision: true, limits: state.server.limits) != nil
+        return HStack(spacing: 8) {
+            Image(systemName: "doc.text").font(.system(size: 22, weight: .light)).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(attachment.name ?? "PDF").font(.callout).lineLimit(1).truncationMode(.middle)
+                Text(attachment.details)
+                    .font(.caption)
+                    .foregroundStyle(over ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(maxWidth: 200, minHeight: 56, maxHeight: 56, alignment: .leading)
+        .background(.quaternary.opacity(0.5))
+    }
+}
+
 /// The message's text view: Return sends and Shift-Return starts a new line, and Escape stops the
-/// reply, after the input method has finished what it composes; pasted and dropped images attach
-/// when the model sees images. It is as tall as its text, from one line to 220 points, past which
+/// reply, after the input method has finished what it composes; pasted and dropped images and PDF
+/// files attach when the model takes them. It is as tall as its text, from one line to 220 points, past which
 /// the text scrolls.
 private struct ComposerField: NSViewRepresentable {
     @Binding var text: String
@@ -389,8 +471,10 @@ private struct ComposerField: NSViewRepresentable {
     let placeholder: String
     let submit: () -> Void
     let cancel: () -> Bool
+    /// Whether the model takes images and PDFs.
     let acceptsImages: Bool
     let attach: ([NSImage]) -> Void
+    let attachPDFs: ([URL]) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -523,7 +607,7 @@ private final class MessageTextView: NSTextView {
 
     // A plain-text view turns Paste off for a clipboard of image data alone.
     override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
-        if item.action == #selector(paste(_:)), holdsImages(.general) { return true }
+        if item.action == #selector(paste(_:)), holdsAttachments(.general) { return true }
         return super.validateUserInterfaceItem(item)
     }
 
@@ -532,44 +616,47 @@ private final class MessageTextView: NSTextView {
         pasteAsPlainText(sender)
     }
 
-    // A text view takes only text it can read; images it takes here, when the model sees them.
+    // A text view takes only text it can read; images and PDFs it takes here, when the model
+    // takes them.
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        holdsImages(sender.draggingPasteboard) ? .copy : super.draggingEntered(sender)
+        holdsAttachments(sender.draggingPasteboard) ? .copy : super.draggingEntered(sender)
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        holdsImages(sender.draggingPasteboard) ? .copy : super.draggingUpdated(sender)
+        holdsAttachments(sender.draggingPasteboard) ? .copy : super.draggingUpdated(sender)
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         attach(from: sender.draggingPasteboard) || super.performDragOperation(sender)
     }
 
-    /// Attaches the images `pasteboard` holds; false when it holds none to attach.
+    /// Attaches what `pasteboard` holds to attach (`holdsAttachments`): its image and PDF files,
+    /// or, with none, its images; false when it holds none.
     private func attach(from pasteboard: NSPasteboard) -> Bool {
-        let images = images(in: pasteboard)
-        guard !images.isEmpty else { return false }
-        coordinator?.field.attach(images)
+        guard holdsAttachments(pasteboard) else { return false }
+        let pdfs = (pasteboard.readObjects(forClasses: [NSURL.self], options: Self.pdfFiles) as? [URL]) ?? []
+        // A file comes with a picture of itself, which is no image to attach.
+        let images = pasteboard.canReadObject(forClasses: [NSURL.self], options: Self.files)
+            ? ((pasteboard.readObjects(forClasses: [NSURL.self], options: Self.imageFiles) as? [URL]) ?? []).compactMap(NSImage.init(contentsOf:))
+            : (pasteboard.readObjects(forClasses: [NSImage.self]) as? [NSImage]) ?? []
+        guard !images.isEmpty || !pdfs.isEmpty else { return false }
+        if !images.isEmpty { coordinator?.field.attach(images) }
+        if !pdfs.isEmpty { coordinator?.field.attachPDFs(pdfs) }
         return true
     }
 
-    /// Whether `pasteboard` holds images to attach, when the model sees images: image files, or
-    /// images without text, as copied rich text comes with a picture of itself. Told by their
-    /// types alone: Paste's menu item and every move of a drag ask, so nothing is read until they
-    /// are attached.
-    private func holdsImages(_ pasteboard: NSPasteboard) -> Bool {
+    /// Whether `pasteboard` holds something to attach, when the model takes images and PDFs: image
+    /// or PDF files, or images without text, as copied rich text comes with a picture of itself.
+    /// Told by their types alone: Paste's menu item and every move of a drag ask, so nothing is
+    /// read until they are attached.
+    private func holdsAttachments(_ pasteboard: NSPasteboard) -> Bool {
         guard coordinator?.field.acceptsImages == true else { return false }
-        if pasteboard.canReadObject(forClasses: [NSURL.self], options: Self.imageFiles) { return true }
+        if pasteboard.canReadObject(forClasses: [NSURL.self], options: Self.files) { return true }
         return pasteboard.string(forType: .string) == nil && pasteboard.canReadObject(forClasses: [NSImage.self])
     }
 
-    /// The images `pasteboard` holds to attach (`holdsImages`), image files read.
-    private func images(in pasteboard: NSPasteboard) -> [NSImage] {
-        guard holdsImages(pasteboard) else { return [] }
-        let files = (pasteboard.readObjects(forClasses: [NSURL.self], options: Self.imageFiles) as? [URL]) ?? []
-        if !files.isEmpty { return files.compactMap(NSImage.init(contentsOf:)) }
-        return (pasteboard.readObjects(forClasses: [NSImage.self]) as? [NSImage]) ?? []
-    }
-
     private static let imageFiles: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingContentsConformToTypes: [UTType.image.identifier]]
+    private static let pdfFiles: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingContentsConformToTypes: [UTType.pdf.identifier]]
+    private static let files: [NSPasteboard.ReadingOptionKey: Any] =
+        [.urlReadingContentsConformToTypes: [UTType.image.identifier, UTType.pdf.identifier]]
 }

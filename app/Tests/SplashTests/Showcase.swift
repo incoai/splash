@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import PDFKit
 import Testing
 
 @testable import Splash
@@ -85,6 +86,18 @@ enum Showcase {
         try? picture.write(to: folder.appending(path: pictureAttachment.file))
         return folder
     }()
+
+    /// A PDF of `pages` pages of the picture, written at `url`.
+    static func pdf(pages: Int, at url: URL) throws -> URL {
+        let document = PDFDocument()
+        for index in 0..<pages {
+            let image = try #require(NSImage(data: picture))
+            document.insert(try #require(PDFPage(image: image)), at: index)
+        }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try #require(document.write(to: url))
+        return url
+    }
 
     static let picture: Data = {
         let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 240, pixelsHigh: 240, bitsPerSample: 8,

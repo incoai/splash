@@ -59,6 +59,11 @@ struct Attachment: Codable, Identifiable, Equatable, Sendable {
     static func image(_ data: Data) -> Attachment {
         Attachment(kind: .image, type: ChatClient.mediaType(data), bytes: data.count)
     }
+
+    /// Its pages, where they are known, and its size, as a PDF's chip says them.
+    var details: String {
+        [pages.map { $0 == 1 ? "1 page" : "\($0) pages" }, Format.size(Int64(bytes))].compactMap { $0 }.joined(separator: " · ")
+    }
 }
 
 struct Conversation: Codable, Identifiable, Equatable {
@@ -221,31 +226,60 @@ final class ChatStore {
         write(conversations[index])
     }
 
+    /// A message the server refused, as `send` gives it back: what it held, and why.
+    struct Refused: Equatable {
+        let text: String
+        let attachments: [Attachment]
+        let reason: String
+    }
+
     /// Sends `text` and `attachments`, kept in the attachments folder already, in the open
     /// conversation, or a new one, to the model `server` serves, and streams its reply into the
-    /// conversation.
-    func send(_ text: String, attachments: [Attachment], to server: ChatTarget) {
+    /// conversation. A message the server refuses leaves the conversation as it was and goes to
+    /// `refused`, with why.
+    func send(_ text: String, attachments: [Attachment], to server: ChatTarget,
+              refused: @escaping (Refused) -> Void = { _ in }) {
         guard streaming == nil else { return }
-        var conversation = current ?? Conversation()
-        if conversation.title.isEmpty { conversation.title = Self.firstLine(text) }
+        let before = current
+        var conversation = before ?? Conversation()
+        if conversation.title.isEmpty { conversation.title = Self.firstLine(text, attachments: attachments) }
         conversation.messages.append(ChatMessage(role: .user, text: text, attachments: attachments.isEmpty ? nil : attachments))
-        stream(conversation, to: server)
+        stream(conversation, to: server) { [weak self] reason in
+            self?.restore(before, of: conversation.id)
+            refused(Refused(text: text, attachments: attachments, reason: reason))
+        }
+    }
+
+    /// Puts conversation `id` back as it was, `before`, in its place and on disk; one that was new
+    /// goes, but for its attachments, which a refused message takes back.
+    private func restore(_ before: Conversation?, of id: UUID) {
+        conversations.removeAll { $0.id == id }
+        guard let before else {
+            let file = file(id)
+            files.async { try? FileManager.default.removeItem(at: file) }
+            if selection == id { selection = nil }
+            return
+        }
+        conversations.insert(before, at: conversations.firstIndex { $0.updated < before.updated } ?? conversations.endIndex)
+        write(before)
     }
 
     /// A chat's title until the model sums it up (`title`): the first line of its first message,
-    /// or Image for one of images alone.
-    static func firstLine(_ text: String) -> String {
-        String((text.split(separator: "\n").first.map(String.init) ?? "Image").prefix(80))
+    /// or, for attachments alone, the first PDF's name, else Image.
+    static func firstLine(_ text: String, attachments: [Attachment] = []) -> String {
+        let line = text.split(separator: "\n").first.map(String.init) ?? attachments.lazy.compactMap(\.name).first ?? "Image"
+        return String(line.prefix(80))
     }
 
     /// Titles conversation `id` as the model sums up its first exchange, `question` and `answer`,
     /// while its title is still the first line; renaming or deleting it meanwhile cancels the
     /// request, and where the model gives no title, the first line stays.
-    private func title(_ id: UUID, question: String, answer: String, with server: ChatTarget) {
-        guard conversations.first(where: { $0.id == id })?.title == Self.firstLine(question) else { return }
+    private func title(_ id: UUID, question: ChatMessage, answer: String, with server: ChatTarget) {
+        guard conversations.first(where: { $0.id == id })?.title == Self.firstLine(question.text, attachments: question.attachments ?? [])
+        else { return }
         titling[id]?.cancel()
         titling[id] = Task { [weak self] in
-            let title = try? await ChatClient.title(question: question, answer: answer, with: server)
+            let title = try? await ChatClient.title(question: question.text, answer: answer, with: server)
             guard let self, !Task.isCancelled else { return }
             titling[id] = nil
             guard let title, let index = conversations.firstIndex(where: { $0.id == id }) else { return }
@@ -266,7 +300,9 @@ final class ChatStore {
         replying?.cancel()
     }
 
-    private func stream(_ conversation: Conversation, to server: ChatTarget) {
+    /// Streams the reply to `conversation`'s last message; a request the server refuses goes to
+    /// `refused`, with why, where it is given, and is the reply's error otherwise.
+    private func stream(_ conversation: Conversation, to server: ChatTarget, refused: ((String) -> Void)? = nil) {
         var conversation = conversation
         let history = conversation.messages
         var answer = ChatMessage(role: .assistant, text: "", model: server.model)
@@ -308,6 +344,10 @@ final class ChatStore {
                 // Cancelled, the stream just ends; what it said stays.
                 if Task.isCancelled { answer.stopped = true }
             } catch {
+                if let refused, let refusal = error as? ChatClient.Refusal {
+                    self?.reply = nil
+                    return refused(refusal.localizedDescription)
+                }
                 answer.error = error.localizedDescription
             }
             // A reply that ended while the model still thought.
@@ -316,7 +356,7 @@ final class ChatStore {
             self?.reply = nil
             // A first exchange answered in full gets the title the model sums it up in.
             if history.count == 1, answer.error == nil, answer.stopped == nil, !answer.text.isEmpty {
-                self?.title(conversation.id, question: history[0].text, answer: answer.text, with: server)
+                self?.title(conversation.id, question: history[0], answer: answer.text, with: server)
             }
         }
     }
@@ -392,6 +432,11 @@ enum ChatClient {
         let errorDescription: String?
     }
 
+    /// A request the server answered with an error in place of a reply, which it read nothing of.
+    struct Refusal: LocalizedError {
+        let errorDescription: String?
+    }
+
     /// The tokens `messages` take as the model reads them, its template, images and earlier
     /// thinking included, counted without inference and without waking a sleeping engine.
     static func countTokens(_ messages: [ChatMessage], with server: ChatTarget, files: URL,
@@ -438,7 +483,7 @@ enum ChatClient {
                     if let status = (response as? HTTPURLResponse)?.statusCode, status != 200 {
                         var data = Data()
                         for try await byte in bytes { data.append(byte) }
-                        throw Failure(errorDescription: message(of: data, for: messages, server: server)
+                        throw Refusal(errorDescription: message(of: data, for: messages, server: server)
                             ?? HTTPURLResponse.localizedString(forStatusCode: status))
                     }
                     for try await line in bytes.lines {
@@ -521,11 +566,15 @@ enum ChatClient {
             case .user where !attachments.isEmpty && vision:
                 let parts: [[String: Any]] = attachments.compactMap { attachment in
                     guard let data = try? Data(contentsOf: files.appending(path: attachment.file)) else { return nil }
-                    return ["type": "image_url", "image_url": ["url": "data:\(attachment.type);base64,\(data.base64EncodedString())"]]
+                    let url = "data:\(attachment.type);base64,\(data.base64EncodedString())"
+                    return switch attachment.kind {
+                    case .image: ["type": "image_url", "image_url": ["url": url]]
+                    case .pdf: ["type": "file", "file": ["filename": attachment.name ?? "document.pdf", "file_data": url]]
+                    }
                 }
                 return ["role": "user", "content": parts + [["type": "text", "text": message.text]]]
             case .user where !attachments.isEmpty:
-                let note = attachments.count == 1 ? "[An image this model can’t see]" : "[\(attachments.count) images this model can’t see]"
+                let note = unseen(attachments)
                 return ["role": "user", "content": message.text.isEmpty ? note : "\(note)\n\n\(message.text)"]
             case .user:
                 return ["role": "user", "content": message.text]
@@ -588,6 +637,14 @@ enum ChatClient {
         // A new chat leaves the earlier messages behind; a first message has none to leave.
         return messages.count == 1 ? "This message is longer than \(context)."
             : "This chat is longer than \(context). Start a new chat to continue."
+    }
+
+    /// What a model that sees no attachments is told in their place.
+    private static func unseen(_ attachments: [Attachment]) -> String {
+        let images = attachments.count { $0.kind == .image }, pdfs = attachments.count { $0.kind == .pdf }
+        let notes = [images == 1 ? "[An image this model can’t see]" : images > 1 ? "[\(images) images this model can’t see]" : nil,
+                     pdfs == 1 ? "[A PDF this model can’t read]" : pdfs > 1 ? "[\(pdfs) PDFs this model can’t read]" : nil]
+        return notes.compactMap { $0 }.joined(separator: " ")
     }
 
     /// The type of an image the app keeps, PNG or JPEG.

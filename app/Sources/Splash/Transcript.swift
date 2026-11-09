@@ -22,7 +22,8 @@ final class Transcript {
     init(runtime: Runtime, attachments: URL) {
         images = ChatImages(folder: attachments)
         page = WebPage("transcript", in: "Transcript", runtime: runtime,
-                       glyphs: ["again": Glyph("arrow.clockwise", size: 12)], schemes: [ChatImages.scheme: images])
+                       glyphs: ["again": Glyph("arrow.clockwise", size: 12), "document": Glyph("doc.text", size: 20, weight: .light)],
+                       schemes: [ChatImages.scheme: images])
         page.receive = { [weak self] message in
             if message["askAgain"] != nil { self?.askAgain() }
         }
@@ -122,6 +123,14 @@ struct TranscriptMessage: Encodable, Equatable {
     let reasoning: String
     /// The user's images, sent as the addresses the page loads them from (`ChatImages`).
     let images: [Attachment]
+    /// The user's PDFs, as their chips show them.
+    let documents: [Document]
+
+    struct Document: Encodable, Equatable {
+        let name: String
+        /// Its pages and size, as its chip shows them.
+        let details: String
+    }
     let error: String?
     /// The line over a reply, if it has one.
     let line: ReplyLine?
@@ -136,6 +145,7 @@ struct TranscriptMessage: Encodable, Equatable {
         text = message.text
         reasoning = message.reasoning
         images = (message.attachments ?? []).filter { $0.kind == .image }
+        documents = (message.attachments ?? []).filter { $0.kind == .pdf }.map { Document(name: $0.name ?? "PDF", details: $0.details) }
         error = message.error
         line = message.role == .assistant ? ReplyLine(message, live: live, asleep: asleep) : nil
         self.live = live != nil
@@ -145,7 +155,7 @@ struct TranscriptMessage: Encodable, Equatable {
     }
 
     private enum CodingKeys: CodingKey {
-        case id, role, text, reasoning, images, error, line, live, details
+        case id, role, text, reasoning, images, documents, error, line, live, details
     }
 
     func encode(to encoder: any Encoder) throws {
@@ -155,6 +165,7 @@ struct TranscriptMessage: Encodable, Equatable {
         try container.encode(text, forKey: .text)
         try container.encode(reasoning, forKey: .reasoning)
         try container.encode(images.indices.map { ChatImages.url(message: id, index: $0) }, forKey: .images)
+        try container.encode(documents, forKey: .documents)
         try container.encode(error, forKey: .error)
         try container.encode(line, forKey: .line)
         try container.encode(live, forKey: .live)

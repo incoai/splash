@@ -1316,6 +1316,62 @@ struct ChatTests {
         #expect((text["messages"] as! [[String: Any]])[0]["content"] as? String == "[An image this model can’t see]\n\nWhat is this?")
     }
 
+    @Test func asksWithPDFsAsFiles() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-pdf-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let data = Data("%PDF-1.4 plan".utf8)
+        let pdf = Splash.Attachment(kind: .pdf, type: "application/pdf", bytes: data.count, name: "Plan.pdf", pages: 1)
+        try data.write(to: folder.appending(path: pdf.file))
+        try Showcase.picture.write(to: folder.appending(path: Showcase.pictureAttachment.file))
+        let messages = [ChatMessage(role: .user, text: "Compare", attachments: [Showcase.pictureAttachment, pdf])]
+        let body = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "", vision: true, files: folder)) as! [String: Any]
+        let parts = (body["messages"] as! [[String: Any]])[0]["content"] as! [[String: Any]]
+        #expect(parts.map { $0["type"] as? String } == ["image_url", "file", "text"])
+        #expect(parts[1]["file"] as? [String: String] == ["filename": "Plan.pdf", "file_data": "data:application/pdf;base64,\(data.base64EncodedString())"])
+        // A model that takes neither gets a note for each kind.
+        let text = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "", vision: false, files: folder)) as! [String: Any]
+        #expect((text["messages"] as! [[String: Any]])[0]["content"] as? String
+            == "[An image this model can’t see] [A PDF this model can’t read]\n\nCompare")
+    }
+
+    @MainActor @Test func aChatOfAttachmentsAloneIsNamedForItsPDF() {
+        let pdf = Splash.Attachment(kind: .pdf, type: "application/pdf", bytes: 1, name: "Plan.pdf", pages: 1)
+        #expect(ChatStore.firstLine("Read this\nplease", attachments: [pdf]) == "Read this")
+        #expect(ChatStore.firstLine("", attachments: [Showcase.pictureAttachment, pdf]) == "Plan.pdf")
+        #expect(ChatStore.firstLine("", attachments: [Showcase.pictureAttachment]) == "Image")
+    }
+
+    /// What the model can't take stays in the draft, which says why: a kind it doesn't take, a PDF
+    /// over its bytes or pages, PDFs over their bytes together, an image over its bytes, more
+    /// images and pages than a request takes, or more bytes than it takes once encoded.
+    @Test func attachmentsTheModelCannotTakeSayWhy() {
+        let limits = Server.Limits(request_bytes: 800, images: 4, image_bytes: 300, pdf_bytes: 400, pdf_pages: 3)
+        func pdf(_ name: String, bytes: Int = 100, pages: Int? = 1) -> Splash.Attachment {
+            Splash.Attachment(kind: .pdf, type: "application/pdf", bytes: bytes, name: name, pages: pages)
+        }
+        let image = Splash.Attachment(kind: .image, type: "image/png", bytes: 100)
+        func problem(_ attachments: [Splash.Attachment], vision: Bool = true, limits: Server.Limits? = limits) -> String? {
+            AppState.attachmentProblem(attachments, vision: vision, limits: limits)
+        }
+        #expect(problem([]) == nil && problem([], vision: false) == nil)
+        #expect(problem([image], vision: false) == "This model can’t see images")
+        #expect(problem([image, pdf("a.pdf")], vision: false) == "This model can’t read PDFs")
+        // A server that doesn't say its limits says why itself, as it refuses them.
+        #expect(problem([pdf("a.pdf", bytes: 10_000)], limits: nil) == nil)
+        #expect(problem([image, pdf("a.pdf", pages: 3)]) == nil)
+        // One PDFKit can't count goes, for the server to say why.
+        #expect(problem([pdf("a.pdf", pages: nil)]) == nil)
+        #expect(problem([pdf("a.pdf", bytes: 401)]) == "a.pdf is larger than the model’s \(Format.size(400)) limit")
+        #expect(problem([pdf("a.pdf", pages: 4)]) == "a.pdf has more than the model’s 3 pages")
+        #expect(problem([pdf("a.pdf", bytes: 250), pdf("b.pdf", bytes: 250)])
+            == "These PDFs are larger together than the model’s \(Format.size(400)) limit")
+        #expect(problem([Splash.Attachment(kind: .image, type: "image/png", bytes: 301)]) == "An image is larger than the model’s \(Format.size(300)) limit")
+        #expect(problem([image, image, pdf("a.pdf", pages: 3)]) == "The images and PDF pages are more than the model’s 4")
+        // Sent as base64, a third larger: 700 bytes are 936.
+        #expect(problem([image, image, image, pdf("a.pdf", bytes: 400)]) == "The attachments are larger than one message to the model takes")
+    }
+
     /// A conversation keeps its attachments as files of their own: the images an earlier app kept
     /// inside its messages move into files as it is read, in their order, the conversation written
     /// again without them; a file no conversation names goes, unless a conversation that can't be

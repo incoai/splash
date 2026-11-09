@@ -393,8 +393,43 @@ final class AppState {
     /// too long.
     var canSendDraft: Bool {
         guard !draft.isEmpty, draft.attaching == 0, server.answers, chats.streaming == nil,
-              draft.attachments.isEmpty || server.acceptsImages else { return false }
+              attachmentProblem == nil else { return false }
         return overflow == nil
+    }
+
+    /// Why the draft's attachments can't go to the model that runs (`attachmentProblem(_:vision:limits:)`).
+    var attachmentProblem: String? {
+        Self.attachmentProblem(draft.attachments, vision: server.acceptsImages, limits: server.limits)
+    }
+
+    /// Why `attachments` can't go to a model with `vision` and `limits`: one it can't take, a PDF
+    /// over its bytes or pages, or more than the request takes of them together; nil when they can
+    /// go, or the model doesn't say its limits.
+    nonisolated static func attachmentProblem(_ attachments: [Attachment], vision: Bool, limits: Server.Limits?) -> String? {
+        guard !attachments.isEmpty else { return nil }
+        let pdfs = attachments.filter { $0.kind == .pdf }
+        guard vision else { return pdfs.isEmpty ? "This model can’t see images" : "This model can’t read PDFs" }
+        guard let limits else { return nil }
+        if let pdf = pdfs.first(where: { $0.bytes > limits.pdf_bytes }) {
+            return "\(pdf.name ?? "This PDF") is larger than the model’s \(Format.size(Int64(limits.pdf_bytes))) limit"
+        }
+        if let pdf = pdfs.first(where: { ($0.pages ?? 0) > limits.pdf_pages }) {
+            return "\(pdf.name ?? "This PDF") has more than the model’s \(limits.pdf_pages) pages"
+        }
+        if pdfs.reduce(0, { $0 + $1.bytes }) > limits.pdf_bytes {
+            return "These PDFs are larger together than the model’s \(Format.size(Int64(limits.pdf_bytes))) limit"
+        }
+        if attachments.contains(where: { $0.kind == .image && $0.bytes > limits.image_bytes }) {
+            return "An image is larger than the model’s \(Format.size(Int64(limits.image_bytes))) limit"
+        }
+        if attachments.reduce(0, { $0 + ($1.kind == .pdf ? $1.pages ?? 1 : 1) }) > limits.images {
+            return "The images and PDF pages are more than the model’s \(limits.images)"
+        }
+        // Sent as base64, a third larger.
+        if (attachments.reduce(0, { $0 + $1.bytes }) + 2) / 3 * 4 > limits.request_bytes {
+            return "The attachments are larger than one message to the model takes"
+        }
+        return nil
     }
 
     /// The count of the next prompt when the model's context cannot hold it; nil while it fits or
@@ -407,7 +442,9 @@ final class AppState {
     func sendDraft() {
         guard canSendDraft, let target else { return }
         let message = draft.take()
-        chats.send(message.text, attachments: message.attachments, to: target)
+        chats.send(message.text, attachments: message.attachments, to: target) { [weak self] refused in
+            self?.draft.restore(refused)
+        }
     }
 
     /// Asks the running model again for the open conversation's last answer.

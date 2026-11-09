@@ -126,7 +126,10 @@ model or with the context length on Auto. Its chat is its own, not the chat page
 `/v1/chat/completions` and keeps each conversation as a JSON file in
 `~/Library/Application Support/Splash/Chats`, its attachments as files of their
 own in that folder's `Attachments`, so a conversation outlives a switch of
-models. A chat takes the title the model sums its first exchange up
+models. A message attaches images and PDFs, a PDF shown by its name and pages,
+where the model takes them, and is held back where the limits `/v1/models`
+gives leave them out; one the server refuses goes back to the composer, with
+why. A chat takes the title the model sums its first exchange up
 in, asked in the background without thinking. The list puts the pinned chats
 first, the last pinned at the top, then the others by day; a chat's menu, at
 its row's end or its title in the toolbar, pins, renames and deletes it, and

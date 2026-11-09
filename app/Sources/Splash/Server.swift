@@ -78,8 +78,21 @@ final class Server {
     private(set) var recovering = false
     /// Once ready: the tokens the model's context holds, as the option set it or Auto fitted it.
     private(set) var context: Int?
-    /// Once ready: whether the model takes images.
+    /// Once ready: whether the model takes images and PDFs, which come together (`input_modalities`).
     private(set) var acceptsImages = false
+    /// Once ready: what a request to it may carry, as `/v1/models` says.
+    private(set) var limits: Limits?
+
+    /// What a request may carry (`/v1/models`' `limits`): its bytes, its images, a PDF's pages
+    /// counted among them, an image's bytes, and a PDF's bytes, which a request's PDFs share, and
+    /// pages.
+    struct Limits: Decodable, Equatable, Sendable {
+        let request_bytes: Int
+        let images: Int
+        let image_bytes: Int
+        let pdf_bytes: Int
+        let pdf_pages: Int
+    }
     /// Once ready: what a reasoning effort does to the model.
     private(set) var reasoning: Reasoning?
     /// Once ready: the work the server reports, as its status gives it.
@@ -225,6 +238,7 @@ final class Server {
         activity = Activity()
         requests = []
         acceptsImages = false
+        limits = nil
         reasoning = nil
         stopRequested = false
         remedy = nil
@@ -379,6 +393,7 @@ final class Server {
                     let served = await servedModel()
                     guard !Task.isCancelled, phase == .starting else { break }
                     acceptsImages = served?.input_modalities?.contains("image") ?? false
+                    limits = served?.limits
                     reasoning = served?.reasoning
                     context = served?.context_length
                     phase = .ready
@@ -492,6 +507,7 @@ final class Server {
     private struct ServedModel: Decodable {
         /// Text, and images and PDFs with vision.
         let input_modalities: [String]?
+        let limits: Limits?
         let reasoning: Reasoning?
         let context_length: Int?
     }

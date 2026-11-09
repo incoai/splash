@@ -11,11 +11,17 @@ root = Path(__file__).resolve().parents[1]
 port = int(sys.argv[sys.argv.index("--port") + 1])
 
 
+def words(content):
+    if isinstance(content, str):
+        return content
+    return " ".join(part["text"] for part in content if part["type"] == "text")
+
+
 def size(content):
     if isinstance(content, str):
         return len(content.encode())
     return sum(
-        64 if part["type"] == "image_url" else len(part["text"].encode())
+        64 if part["type"] in ("image_url", "file") else len(part["text"].encode())
         for part in content
     )
 
@@ -37,7 +43,17 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(
                 {
                     "data": [
-                        {"context_length": 1024, "input_modalities": ["text", "image"]}
+                        {
+                            "context_length": 1024,
+                            "input_modalities": ["text", "image", "pdf"],
+                            "limits": {
+                                "request_bytes": 1 << 20,
+                                "images": 4,
+                                "image_bytes": 1 << 20,
+                                "pdf_bytes": 1 << 20,
+                                "pdf_pages": 3,
+                            },
+                        }
                     ]
                 }
             )
@@ -63,6 +79,9 @@ class Handler(BaseHTTPRequestHandler):
         # A title, which the app asks for once a first exchange is answered, streams nothing.
         if not body.get("stream"):
             return self.reply({"choices": [{"message": {"content": "A Title"}}]})
+        # A message the server refuses, as one over its limits.
+        if words(body["messages"][-1]["content"]) == "refuse this":
+            return self.reply({"error": {"message": "Request body too large"}}, 413)
         with (root / "sent.jsonl").open("a") as output:
             output.write(json.dumps(body["messages"]) + "\n")
         self.reply(
