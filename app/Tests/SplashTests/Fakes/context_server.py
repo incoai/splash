@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -89,6 +90,22 @@ class Handler(BaseHTTPRequestHandler):
             kind="text/event-stream",
         )
 
+
+def end_with_app():
+    """Ends this as `splash serve` does once the app that started it is gone (SPLASH_APP_PID): the
+    tests' process, as when a run fails."""
+    app = int(os.environ.get("SPLASH_APP_PID", "0"))
+    while app:
+        try:
+            os.kill(app, 0)
+        except ProcessLookupError:
+            os._exit(0)
+        except PermissionError:
+            pass
+        time.sleep(0.5)
+
+
+threading.Thread(target=end_with_app, daemon=True).start()
 
 server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
 record = root / "build/runtime" / f"serve-{port}.json"
