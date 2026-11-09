@@ -56,6 +56,16 @@ final class Drawer {
         view.showFindBar()
     }
 
+    /// Whether the keyboard is in the drawer, as `window` has it: with a terminal, each of which is
+    /// the drawer's, or its log, or the find bar of either; or with nothing, as when the terminal
+    /// that had it has closed. The drawer gives the composer the keyboard as it hides only then
+    /// (`WithDrawer`).
+    func hasKeyboard(in window: NSWindow?) -> Bool {
+        guard let responder = window?.firstResponder as? NSView else { return true }
+        let log = logText.map { $0.enclosingScrollView ?? $0 }
+        return sequence(first: responder, next: \.superview).contains { $0 is TypingTerminalView || $0 === log }
+    }
+
     /// Ends every shell at once, for a quit that goes on to wait for the model or a download to
     /// stop. Any other end of the app hangs them up (`TerminalSession`).
     func endAll() {
@@ -244,6 +254,8 @@ struct WithDrawer<Content: View>: View {
     @ViewBuilder let content: Content
     /// The room the content and the drawer share.
     @State private var room: CGFloat = 0
+    /// Its AppKit view, for the window whose keyboard it gives back as it hides.
+    @State private var anchor = Anchor()
 
     /// The tallest the drawer is: 640 points, leaving the content 240 at least, once the room is
     /// measured.
@@ -270,13 +282,21 @@ struct WithDrawer<Content: View>: View {
         // animation, as a closing terminal's, which SwiftUI then updated the window for at once,
         // reading the drawer as it was, and missed its closing.
         .animation(Motion.settle, value: shown)
+        // The keyboard leaves it only where it is in it, for the composer: a terminal that exits
+        // while chat search or a rename field has it leaves it there.
         .onChange(of: shown) {
-            if !shown {
+            if !shown && state.drawer.hasKeyboard(in: anchor.view?.window) {
                 focused = false
                 state.returnKeyboard()
             }
         }
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { room = $0 }
+        .background(ViewAnchor { anchor.view = $0 })
+    }
+
+    /// A view's AppKit view, held by reference: taking it changes no state the view reads.
+    private final class Anchor {
+        weak var view: NSView?
     }
 }
 

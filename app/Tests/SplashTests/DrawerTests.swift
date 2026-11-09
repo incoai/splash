@@ -332,6 +332,30 @@ struct DrawerTests {
         try await waitFor(window.firstResponder === window)
     }
 
+    /// The drawer has the keyboard to give the composer as it hides where a terminal or the log
+    /// has it, or nothing does, as when the terminal that had it has closed; not where a field
+    /// elsewhere has it, as chat search or a rename field.
+    @Test func theDrawerHasTheKeyboardOnlyWhereItsViewsOrNothingHaveIt() async throws {
+        let (state, folder) = AppState.forTests()
+        let window = Self.window(WithDrawer { Color.clear }.environment(state))
+        defer { Self.close(window); state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        state.toggleDrawer()
+        let terminal = try #require(state.drawer.terminals.first)
+        try await waitFor(window.firstResponder === terminal.view)
+        #expect(state.drawer.hasKeyboard(in: window))
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 120, height: 22))
+        window.contentView?.addSubview(field)
+        #expect(window.makeFirstResponder(field))
+        #expect(!state.drawer.hasKeyboard(in: window))
+        #expect(window.makeFirstResponder(nil))
+        #expect(state.drawer.hasKeyboard(in: window))
+        state.showDrawer(.logs)
+        try await waitFor(Self.textView(in: window) != nil)
+        let log = try #require(Self.textView(in: window))
+        try await waitFor(window.firstResponder === log)
+        #expect(state.drawer.hasKeyboard(in: window))
+    }
+
     /// Find… shows the find bar of what the drawer shows, whose field takes the keyboard, the
     /// keyboard elsewhere.
     @Test func findShowsTheFindBarOfTheLogTheDrawerShows() async throws {
