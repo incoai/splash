@@ -427,7 +427,7 @@ final class AppState {
 
     func copyAPIAddress() {
         let settings = server.running ? server.settings : options
-        NSPasteboard.put(settings.url.appending(path: "v1").absoluteString)
+        NSPasteboard.put(settings.address().appending(path: "v1").absoluteString)
     }
 
     /// Lists the models installed here, the suggested ones first in the list's order, then the model

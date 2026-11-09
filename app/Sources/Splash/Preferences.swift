@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import SystemConfiguration
 
 /// The keys of what the app keeps in UserDefaults.
 enum Preference {
@@ -54,13 +55,33 @@ struct ServeSettings: Equatable {
 
     /// What `splash serve` takes to serve `model`, a Hugging Face ID or the path of model files on
     /// this Mac, with these options.
-    func serveArguments(model: String) -> [String] {
+    func serveArguments(model: String, localName: String? = Self.localName) -> [String] {
         let source = model.hasPrefix("/") ? ["--model", Self.localID(model), "--model-dir", model] : ["--model", model]
         var arguments = ["serve"] + source + ["--port", String(port), "--offline"]
         for option in LaunchOption.all where option.flag != "--port" && option.applies(self) {
             arguments += option.arguments(values[option.flag])
         }
+        // The name the API address gives other devices (`address`), which the server then accepts.
+        if sharesNetwork, let localName, !LaunchOption.items(values["--allowed-host"] ?? "").contains(localName) {
+            arguments += ["--allowed-host", localName]
+        }
         return arguments
+    }
+
+    /// Whether the server listens on every network this Mac is on, for other devices too.
+    var sharesNetwork: Bool { values["--host"] == "0.0.0.0" }
+
+    /// This Mac's name on its local networks, as Bonjour gives it (`name.local`); nil where it has
+    /// none.
+    static var localName: String? {
+        (SCDynamicStoreCopyLocalHostName(nil) as String?).map { "\($0.lowercased()).local" }
+    }
+
+    /// The address Copy API Address gives: this Mac's name on its networks while the server
+    /// listens on them, where other devices reach it; the loopback address otherwise (`url`).
+    func address(localName: String? = Self.localName) -> URL {
+        guard sharesNetwork, let localName else { return url }
+        return URL(string: "http://\(localName):\(port)")!
     }
 
     /// The ID the API reports for the model files at `path`: local/ and the file's or folder's name,
@@ -366,7 +387,7 @@ extension LaunchOption {
                 ? "Any device on these networks can use the model. Set an API key to require one." : nil }),
         LaunchOption(
             flag: "--allowed-host", title: "Host names",
-            help: "Other names clients reach this Mac by, such as mymac.local.",
+            help: "Names other than this Mac’s own .local name that clients reach it by, such as a DNS name.",
             section: .network,
             kind: .text(Value(prompt: "None", message: "", parse: { items($0).isEmpty ? nil : items($0).joined(separator: ", ") }),
                         list: true)),

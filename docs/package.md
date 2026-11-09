@@ -93,7 +93,10 @@ family, from the engine's `families` command and the options' own needs
 they serve; a model's family is its assembly record's, and a model whose
 family is not known yet gets every option. The API key reaches the server as
 `SPLASH_API_KEY`, from the
-Keychain, and nothing starts while the Keychain does not give it. The server
+Keychain, and nothing starts while the Keychain does not give it. Copy
+API Address gives the loopback address, or, while the server listens on all
+networks, this Mac's `.local` name, which the app then adds to its Host
+names. The server
 stops as SIGTERM stops it once the app has ended, by a crash too, since the app
 passes its process ID as `SPLASH_APP_PID`; the app's next launch stops one still
 running, as it does a download, by the process ID and start time it keeps. An

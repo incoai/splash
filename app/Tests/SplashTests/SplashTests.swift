@@ -79,7 +79,7 @@ struct ServeSettingsTests {
             "--host": "0.0.0.0", "--allowed-origin": "a.example, b.example", "--no-webui": "true",
             "--thinking-end-text": "Now the answer. </think>", "--disable-ane": "true",
         ], apiKey: "secret")
-        #expect(settings.serveArguments(model: "a/b")
+        #expect(settings.serveArguments(model: "a/b", localName: nil)
             == ["serve", "--model", "a/b", "--port", "8100", "--offline", "--max-context", "131072",
                 "--max-memory", "48G", "--idle-release", "off", "--language-only", "--kv-format", "bf16",
                 "--max-cache-disk", "16G", "--persistent-cache", "--host", "0.0.0.0",
@@ -89,6 +89,20 @@ struct ServeSettingsTests {
         #expect(settings.environment == ["SPLASH_API_KEY": "secret"])
         #expect(settings.request("status").value(forHTTPHeaderField: "Authorization") == "Bearer secret")
         #expect(settings.url.absoluteString == "http://127.0.0.1:8100")
+    }
+
+    /// Listening on every network, the server accepts this Mac's .local name, once, which the API
+    /// address it gives other devices names; on this Mac alone, neither.
+    @Test func givesOtherDevicesThisMacsLocalName() {
+        var settings = ServeSettings(values: ["--port": "8100", "--host": "0.0.0.0"])
+        #expect(settings.serveArguments(model: "a/b", localName: "mymac.local").suffix(2) == ["--allowed-host", "mymac.local"])
+        #expect(settings.address(localName: "mymac.local").absoluteString == "http://mymac.local:8100")
+        settings["--allowed-host"] = "proxy.example, mymac.local"
+        #expect(settings.serveArguments(model: "a/b", localName: "mymac.local").filter { $0 == "mymac.local" }.count == 1)
+        settings["--host"] = nil
+        #expect(!settings.serveArguments(model: "a/b", localName: "mymac.local").contains("--host"))
+        #expect(settings.address(localName: "mymac.local").absoluteString == "http://127.0.0.1:8100")
+        #expect(settings.address(localName: nil) == settings.url)
     }
 
     @Test func leavesOutOptionsTheOthersLeaveNoEffect() {
