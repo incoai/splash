@@ -93,6 +93,10 @@ Vision and the tokenizer come from the target model's source.
 [Model loading and compatibility](docs/models.md#upstream-model-loading) ·
 [Supported formats](docs/models.md#gguf-targets)
 
+Qwen3.8-27B also supports an experimental
+[DSpine drafter](docs/models.md#experimental-dspine): pass
+`--draft-model tencent/Qwen3.8-27B-DSpine-b16`. DFlash2 remains the default.
+
 To serve files already on this Mac, pass the target's GGUF file or GGUF/MLX
 directory directly, and a compatible local DFlash2 draft:
 

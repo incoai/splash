@@ -10,11 +10,11 @@ inline void draft_context_kv_phase(
     device const bfloat *context_kv, device const bfloat *k_norm,
     device const float *rope_cos, device const float *rope_sin,
     device bfloat *keys, device bfloat *values, uint start_position,
-    uint active_tokens, uint task,
+    uint active_tokens, uint task, uint window,
     uint thread_index, uint lane, uint simd_group,
     threadgroup float *reductions, threadgroup bfloat *normalized) {
-  constexpr uint KVHeads = SPLASH_DRAFT_KV_HEADS, HeadDim = SPLASH_DRAFT_HEAD_DIMENSION,
-                 Window = SPLASH_DRAFT_SLIDING_WINDOW;
+  constexpr uint KVHeads = SPLASH_DRAFT_KV_HEADS, HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
+  const uint Window = window;
   constexpr uint KWidth = KVHeads * HeadDim, RowWidth = 2 * KWidth;
   uint row = task / KVHeads;
   if (row >= active_tokens)

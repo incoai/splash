@@ -1242,7 +1242,7 @@ bool Engine::addStateBoundary(Request &active, uint32_t after, uint32_t tokens,
   // boundary before it, from `after` when the lane's draft state is
   // complete there, or whole past `after` (planDraftContext).
   if (!completeAfter && found == remaining &&
-      tokens - after < model::ExecutionLimits::draftContextTokens)
+      tokens - after < config_.draftContextTokens)
     return false;
   active.stateBoundaries.insert(found, {tokens, disposable});
   return true;
@@ -1270,7 +1270,7 @@ DraftContextPlan Engine::pendingDraftStatePlan(const Request &active,
   boundaries.reserve(active.stateBoundaries.size() - active.stateBoundaryCursor);
   for (size_t i = active.stateBoundaryCursor; i < active.stateBoundaries.size(); ++i)
     boundaries.push_back(active.stateBoundaries[i].tokens);
-  return planDraftContext(stateBoundary, active.replayTokens, boundaries);
+  return planDraftContext(stateBoundary, active.replayTokens, boundaries, config_.draftContextTokens);
 }
 
 void Engine::discardPendingStateBoundaries(Request &active) noexcept {

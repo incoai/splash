@@ -291,7 +291,7 @@ engine's model check).
 
 ## Drafts
 
-Every model decodes with a DFlash2 draft. Each family names the repository
+By default every model decodes with a DFlash2 draft. Each family names the repository
 of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
 it as the release publishes it: `config.json` and BF16 `model.safetensors`
 (or the shards its index names), and `mask_embedding.safetensors` when the
@@ -302,7 +302,7 @@ holds them. A checkpoint is installed only when the engine accepts its
 configuration with the target's (its `model-check`), so a draft of another
 architecture never replaces one that loads.
 
-A draft's `config.json` states its layers, intermediate size, rotary base and
+A DFlash2 draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
 ascending, at most eight); its hidden size, vocabulary and mask token are its
 target's (Flint's vocabulary keeps no mask token: a Flint draft chooses one of
@@ -393,6 +393,33 @@ one for the rest, and `GgufPreparation` quantizes each projection into af4g64
 planes, 4 bits in groups of 64 as MLX's affine quantization rounds them, and
 copies every other tensor as stored. The draft runs on the block kernels its
 target's projections run on.
+
+### Experimental DSpine
+
+Qwen3.8-27B can also use Tencent's
+[DSpine checkpoint](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16):
+
+```bash
+splash serve --model mlx-community/Qwen3.8-27B-4bit \
+  --draft-model tencent/Qwen3.8-27B-DSpine-b16
+```
+
+The backend uses the first eight rows of the checkpoint's trained 16-row
+block: an anchor and seven proposals. It preserves the full 8,192-token
+sliding context, including prefix-cache restore. Each draft layer uses causal
+attention and passes predecessor features through a learned code bridge;
+the final write is refined against the selected predecessor token. Greedy
+and temperature sampling share the target verifier, which reads the refined
+conditional proposal probabilities for acceptance and correction.
+
+As with DFlash2, preparation converts the backbone projections to affine
+4-bit groups of 64. The codebook and bridge projections remain BF16. The
+initial implementation accepts a single unrotated vocabulary projection;
+targets with a rotated vocabulary head require another drafter. DFlash2
+remains the default. Compare throughput on the same target, prompts and Mac:
+the upstream 27B results use CUDA, BF16 and a 16-row draft block.
+See the [local comparison with DFlash2](performance.md#experimental-dspine-against-dflash2)
+for the measured throughput, method and limitations of the eight-row backend.
 
 ## Vision
 
@@ -556,7 +583,7 @@ splash serve --model local/qwen \
 `--model` remains required in `OWNER/REPO[:VARIANT]` form as the API's model
 name; it selects no files and makes no Hub request in this mode. Preparation
 never contacts the Hub, whether or not `--offline` is set. `--draft-model`
-must name a local compatible DFlash2 draft directory; without one, the
+must name a local compatible DFlash2 or DSpine draft directory; without one, the
 family's released draft must already be in the Hub cache at the commit its
 default branch records, as `hf download REPO` or `splash serve` leaves it. A
 missing draft is refused with its download instruction; it is never downloaded
@@ -601,7 +628,7 @@ model's source options (`--revision`, `--draft-model`, `--language-only`,
   which lie beside it; or a directory whose root holds an MLX model or else
   GGUF targets of one name ([GGUF targets](#gguf-targets)), beside any
   projectors named `mmproj`.
-- `draft`: the directory of a DFlash2 draft ([Drafts](#drafts)). Without
+- `draft`: a compatible DFlash2 or DSpine draft directory ([Drafts](#drafts)). Without
   one, the family's released draft is taken from the Hugging Face cache, at
   the commit last recorded there for its default branch, as `hf download
   incoai/Qwen3.8-27B-DFlash2` and `splash serve` record it.

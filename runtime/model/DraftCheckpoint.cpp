@@ -4,6 +4,7 @@
 #include "model/GgufPreparation.hpp"
 
 #include <initializer_list>
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
@@ -23,6 +24,16 @@ public:
   void stored(const std::string &name, const std::vector<uint64_t> &shape) {
     const SourceTensor &tensor = require(name, shape);
     image_.copy({name, ggml::kBF16, tensor.offset, 1, tensor.bytes, {}, tensor.file});
+  }
+
+  void stacked(std::initializer_list<std::string> names, uint64_t rows, uint64_t columns) {
+    const uint64_t bytes = rows * columns * 2;
+    uint64_t destination = image_.section(names.size() * bytes);
+    for (const auto &name : names) {
+      const auto &tensor = require(name, {rows, columns});
+      image_.copyAt(destination, {name, ggml::kBF16, tensor.offset, 1, tensor.bytes, {}, tensor.file}, gguf::Conversion::None);
+      destination += bytes;
+    }
   }
 
   // A projection of `columns` inputs: its parts' rows in order, af4g64 planes.
@@ -65,14 +76,14 @@ gguf::Image layerImage(const SafetensorsCheckpoint &checkpoint, const DFlashDraf
     b.projection({{name + ".kernel_projection", layout.dynamicSize}}, hidden);
   };
   b.stored(prefix + "input_layernorm.weight", {hidden});
-  convolution(prefix + "attention_conv");
+  if (!layout.isDSpine()) convolution(prefix + "attention_conv");
   b.projection({{attention + "q_proj", layout.attentionSize}, {attention + "k_proj", kv}, {attention + "v_proj", kv}},
                hidden);
   b.stored(attention + "q_norm.weight", {layout.attentionHeadDimension});
   b.stored(attention + "k_norm.weight", {layout.attentionHeadDimension});
   b.projection({{attention + "o_proj", hidden}}, layout.attentionSize);
   b.stored(prefix + "post_attention_layernorm.weight", {hidden});
-  convolution(prefix + "mlp_conv");
+  if (!layout.isDSpine()) convolution(prefix + "mlp_conv");
   b.projection({{prefix + "mlp.gate_proj", layout.intermediateSize}}, hidden);
   b.projection({{prefix + "mlp.up_proj", layout.intermediateSize}}, hidden);
   b.projection({{prefix + "mlp.down_proj", hidden}}, layout.intermediateSize);
@@ -86,9 +97,20 @@ gguf::Image modelImage(const SafetensorsCheckpoint &checkpoint, const DFlashDraf
   b.projection({{"fc", hidden}}, layout.targetHiddenSize());
   b.stored("hidden_norm.weight", {hidden});
   b.stored("norm.weight", {hidden});
-  b.projection({{selector + "hidden_projection", layout.selectorRank}}, hidden);
-  b.stored(selector + "predecessor_codebook", {layout.vocabularySize, layout.selectorRank});
-  b.stored(selector + "successor_codebook", {layout.vocabularySize, layout.selectorRank});
+  if (layout.isDSpine()) {
+    const std::string bridge = "selected_prefix_bridge.";
+    const uint64_t code = layout.bridgeCodeSize, rank = layout.bridgeRank;
+    b.stored(bridge + "early_read_weights", {layout.layers - 1, code, hidden});
+    b.stored(bridge + "read_weight", {code, hidden});
+    b.stored(bridge + "feature_write_weights", {layout.layers, hidden, rank});
+    b.stacked({bridge + "gate.weight", bridge + "predecessor_gate.weight", bridge + "prev.weight"}, rank, code);
+    b.stored(bridge + "gate.bias", {rank});
+    b.stored(bridge + "codebook", {layout.vocabularySize, code});
+  } else {
+    b.projection({{selector + "hidden_projection", layout.selectorRank}}, hidden);
+    b.stored(selector + "predecessor_codebook", {layout.vocabularySize, layout.selectorRank});
+    b.stored(selector + "successor_codebook", {layout.vocabularySize, layout.selectorRank});
+  }
   if (checkpoint.find(kDraftMaskEmbedding)) b.stored(std::string(kDraftMaskEmbedding), {hidden});
   return b.finish();
 }
@@ -96,6 +118,27 @@ gguf::Image modelImage(const SafetensorsCheckpoint &checkpoint, const DFlashDraf
 } // namespace
 
 std::vector<gguf::Image> planDraftImages(const SafetensorsCheckpoint &checkpoint, const DFlashDraftLayout &layout) {
+  if (layout.isDSpine()) {
+    for (const char *name : {"draft_block_causal_version", "last_write_refine_version",
+                           "selected_prefix_bridge.independent_write_version", "selected_prefix_bridge.terminal_disabled_version"}) {
+      const auto &tensor = checkpoint.require(name);
+      int64_t version = 0;
+      if (tensor.dtype != "I64" || !tensor.shape.empty() || tensor.bytes != sizeof(version))
+        throw WeightStoreError(std::string("invalid DSpine version tensor: ") + name);
+      tensor.read(0, {reinterpret_cast<uint8_t *>(&version), sizeof(version)});
+      if (version != 1) throw WeightStoreError(std::string("unsupported DSpine version: ") + name);
+    }
+    const auto &terminal = checkpoint.require("selected_prefix_bridge.out.weight");
+    if (terminal.dtype != "BF16" || terminal.shape != std::vector<uint64_t>{layout.bridgeCodeSize, layout.bridgeRank})
+      throw WeightStoreError("invalid DSpine terminal projection");
+    std::array<uint16_t, 4096> values{};
+    for (uint64_t at = 0; at < terminal.bytes; at += sizeof(values)) {
+      const auto bytes = static_cast<size_t>(std::min<uint64_t>(sizeof(values), terminal.bytes - at));
+      terminal.read(at, {reinterpret_cast<uint8_t *>(values.data()), bytes});
+      for (size_t i = 0; i < bytes / 2; ++i)
+        if (values[i] & 0x7fffu) throw WeightStoreError("DSpine terminal projection is not disabled");
+    }
+  }
   std::vector<gguf::Image> images;
   for (uint32_t layer = 0; layer < layout.layers; ++layer) images.push_back(layerImage(checkpoint, layout, layer));
   images.push_back(modelImage(checkpoint, layout));

@@ -90,7 +90,8 @@ MetalBuffer randomBfloat(MetalBackend &backend, uint64_t count, Random &random,
 void referenceRows(const uint16_t *queries, const uint16_t *keys,
                    const uint16_t *values, const uint16_t *queryKeys,
                    const uint16_t *queryValues, uint32_t cacheLength,
-                   std::vector<float> &output) {
+                   std::vector<float> &output, uint32_t window = kWindow, bool causal = false) {
+  const uint32_t kWindow = window;
   const uint32_t commonStart =
       cacheLength >= kWindow - 1 ? cacheLength - (kWindow - 1) : 0;
   const uint32_t oldCount = cacheLength - commonStart;
@@ -106,7 +107,7 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
     double best = -INFINITY;
     for (uint32_t key = 0; key < oldCount + kRows; ++key) {
       double score = -INFINITY;
-      if (key >= oldCount) {
+      if (key >= oldCount && (!causal || key - oldCount <= proposal)) {
         const uint32_t current = key - oldCount;
         double dot = 0.0;
         for (uint32_t d = 0; d < kHeadDim; ++d) {
@@ -114,7 +115,7 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
                  bf16ToFloat(queryKeys[current * kHeadDim + d]);
         }
         score = dot * kScale;
-      } else if (key >= hiddenPrefix) {
+      } else if (key < oldCount && key >= hiddenPrefix) {
         const uint32_t slot = (commonStart + key) % kWindow;
         double dot = 0.0;
         for (uint32_t d = 0; d < kHeadDim; ++d) {
@@ -149,6 +150,7 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
 
 void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
              const std::array<uint32_t, kLanes> &cacheLengths) {
+  const uint32_t kWindow = shape.contextTokens;
   Random random(0x5eed0000ULL + cacheLengths[0]);
   const uint64_t ringElements = uint64_t{kKvHeads} * kWindow * kHeadDim;
   // The grouped-queries tensor is sized by the plan so the split partials
@@ -228,7 +230,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
               (uint64_t{lane} * kKvHeads + head) * kRows * kHeadDim,
           static_cast<const uint16_t *>(queryValues.contents()) +
               (uint64_t{lane} * kKvHeads + head) * kHeadDim * kRows,
-          cacheLengths[lane], reference);
+          cacheLengths[lane], reference, shape.contextTokens, shape.causal);
       for (uint64_t index = 0; index < reference.size(); ++index) {
         const float actual = bf16ToFloat(output[queryOffset + index]);
         const float expected = reference[index];
@@ -444,6 +446,7 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
 // its rows from a start position, the commit each lane's retained verify
 // rows (at most eight). The buffers hold exactly what the writers read.
 void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
+  const uint32_t kWindow = shape.contextTokens;
   // A context row holds its keys, then its values.
   constexpr uint32_t kRowWidth = 2048, kKeyColumn = 0, kValueColumn = 1024;
   constexpr uint16_t kUntouched = 0xC2C2;
@@ -520,7 +523,8 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   };
 
   // Prefill: 37 rows from position 6130 (slot 2034), across the ring's end.
-  constexpr uint32_t kTokens = 37, kStart = 6130;
+  constexpr uint32_t kTokens = 37;
+  const uint32_t kStart = 3 * kWindow - 14;
   const MetalBuffer kv = randomBfloat(backend, uint64_t{kTokens} * kRowWidth,
                                       random, "draft context kv");
   const MetalBuffer ropeCos = table(kTokens, false),
@@ -536,7 +540,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
 
   // Commit: three lanes retaining 8, 3 and (clamped) 8 of their verify rows.
   constexpr uint32_t kCommitLanes = 3;
-  const std::array<uint32_t, kCommitLanes> starts{2044, 0, 4101};
+  const std::array<uint32_t, kCommitLanes> starts{kWindow - 4, 0, 2 * kWindow + 5};
   const uint32_t retained[kCommitLanes] = {8, 3, 12};
   const MetalBuffer laneKv =
       randomBfloat(backend, uint64_t{kCommitLanes} * kRows * kRowWidth, random,
@@ -881,6 +885,12 @@ int main(int argc, char **argv) {
       runCase(backend, 4, shape, {2046, 2049, 4095, 4096});
       runCase(backend, 2, shape, {8191, 262144, 0, 0});
     }
+    auto dspine = kShapes[0];
+    dspine.contextTokens = 8192;
+    dspine.causal = true;
+    contextWriters(backend, dspine);
+    runCase(backend, 1, dspine, {0, 0, 0, 0});
+    runCase(backend, 4, dspine, {31, 8191, 8192, 16389});
     std::cout << "draft_attention_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

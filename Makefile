@@ -258,6 +258,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/AneFfnMeasurement.cpp \
 	runtime/ops/DraftAttention.cpp \
 	runtime/ops/DraftSelector.cpp \
+	runtime/ops/DSpine.cpp \
 	runtime/ops/Embedding.cpp \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
@@ -330,6 +331,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/QwenTarget.cpp \
 	runtime/model/QwenTargetLoader.cpp \
 	runtime/model/DFlashDraft.cpp \
+	runtime/model/DSpineDraft.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/ModelSizing.cpp \
 	runtime/model/SlotFile.cpp \

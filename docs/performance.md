@@ -69,6 +69,66 @@ Prefilling a 2,048-token chunk, it runs at 559 tok/s against 374 on the 27B
 and 3,662 against 1,968 on the 35B on the M5 Pro, and at 245 against 193 and
 1,814 against 1,575 on the M3 Max.
 
+## Experimental DSpine against DFlash2
+
+An exploratory comparison on November 9, 2026 used an Apple M5 Pro
+(18-core CPU, 20-core GPU, 48 GB), macOS 26.6, and the same
+`mlx-community/Qwen3.8-27B-4bit` target for both drafters. The native DSpine
+backend currently serves **eight rows of its trained sixteen-row block**;
+DFlash2 also serves eight rows. Each retains its own draft context window:
+8,192 tokens for DSpine and 2,048 for DFlash2. This measures the current
+implementation, with both backbones prepared as affine 4-bit groups of 64
+and DSpine's bridge kept in BF16.
+
+Four rounds ran DFlash2, DSpine, DSpine, then DFlash2, restarting the server
+between rounds. The server used a 32K target context, INT8 KV, FP32 recurrent
+state, `--disable-ane`, `--verify-rows all`, and a persistent 4 GiB SSD cache.
+The short requests used distinct cache salts, temperature 0, seed 42,
+`reasoning_effort: "none"`, and a 256-token output limit. Fibonacci stopped
+after 95 tokens; each other short prompt reached the output limit. Each
+prompt ran once per round. Startup and warmup are excluded.
+
+| Workload | DFlash2 tok/s | DSpine tok/s | DSpine throughput change |
+| --- | ---: | ---: | ---: |
+| Python iterative Fibonacci | 106.1 | 97.4 | −8.2% |
+| Python stable merge sort | 91.3 | 78.0 | −14.6% |
+| Python LRU cache | 81.0 | 64.8 | −20.1% |
+| TypeScript retry with backoff | 78.3 | 85.6 | +9.2% † |
+| All four solo requests, combined decode rate | 85.2 | 77.0 | −9.6% |
+| Four simultaneous requests, end-to-end aggregate | 192.7 | 172.6 | −10.4% † |
+
+The per-prompt rates are means of each backend's two runs. The combined solo
+rate is total decode tokens divided by total decode time, excluding the
+first token selected during prefill. The four-request aggregate divides all
+863 completion tokens by the client wall time from submitting the four
+requests until all finish, so it includes prefill, queueing and decode; the
+table averages the two round rates.
+
+† These observations are **inconclusive** under the repository's
+[ABBA rule](../dev/benchmarks/abba.py): the TypeScript baseline spread is
+7.7%, and the four-request baseline spread is 13.4%, above the 5% noise
+limit. The combined solo spread is 2.9%; its slowdown exceeds the rule's
+noise allowance. No continuous machine-quietness or thermal trace was
+captured. Four short prompts with capped outputs are a small sample, so the
+figures establish neither a general speedup nor a general ranking of the
+drafter architectures. Both drafters ran on the same candidate build; this
+comparison does not measure default DFlash2 against an unmodified main
+build. DFlash2 remains the default.
+
+All four solo greedy outputs matched byte for byte across all four rounds.
+Additional serving checks passed for temperature sampling, four concurrent
+requests, a 14,316-token prompt with prefix reuse, disk restore of 14,304
+cached tokens, greedy and sampled JSON-schema output, and stream cancellation
+followed by another request. The disk, schema and cancellation checks also
+ran with Metal GPU validation enabled.
+
+The [measurement record](../dev/benchmarks/results/dspine-qwen38-27b-2026-11-09.json)
+contains the exact prompts, model revisions, measured build identity,
+per-request timings and speculative counts, output hashes, round totals and
+ABBA calculations. Its local paths and request identifiers are omitted.
+For use and current compatibility limits, see
+[experimental DSpine](models.md#experimental-dspine).
+
 ## Smaller GGUFs on 24 GB Macs
 
 Measured on a 24 GB M6 (12-core GPU), with each model's DFlash2 draft:

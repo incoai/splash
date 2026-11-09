@@ -285,6 +285,15 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(r * geometry.draft.intermediateSize));
   put(DecodeTensor::DraftFinalHidden,
       bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
+  if (geometry.draft.isDSpine()) {
+    put(DecodeTensor::BridgeRaw, bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
+    put(DecodeTensor::BridgeRms, bytesFor<float>(r));
+    put(DecodeTensor::BridgeCodes, bytesFor<uint16_t>(r * geometry.draft.bridgeCodeSize));
+    put(DecodeTensor::BridgePacked, bytesFor<uint16_t>(r * 3 * geometry.draft.bridgeRank));
+    put(DecodeTensor::BridgeMessage, bytesFor<uint16_t>(r * geometry.draft.bridgeRank));
+    put(DecodeTensor::BridgeCandidateHead,
+        bytesFor<uint16_t>(uint64_t{kDraftProposalTokens} * SPLASH_DRAFT_CANDIDATES * geometry.draft.hiddenSize));
+  }
   put(DecodeTensor::SelectorHidden,
       bytesFor<uint16_t>(r * geometry.draft.selectorRank));
   put(DecodeTensor::Candidates, selectorWorkspace.candidatesBytes);
@@ -343,6 +352,10 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
        {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}})
     result.include(operators.linear().decodeScratchSize(shape));
+  if (d.isDSpine())
+    for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.bridgeCodeSize, d.hiddenSize},
+         {3 * d.bridgeRank, d.bridgeCodeSize}, {d.hiddenSize, d.bridgeRank}})
+      result.include(operators.linear().decodeScratchSize(shape));
   return result;
 }
 

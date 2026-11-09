@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/DSpine.hpp"
+
 #include "Model.hpp"
 #include "StateLayout.hpp"
 #include "WeightStore.hpp"
@@ -68,11 +70,14 @@ private:
   uint64_t actualAllocatedBytes_ = 0;
 };
 
-// The dimensions of a DFlash2 draft, as its checkpoint's config.json gives
-// them (ModelDescriptor.mm readDraftLayout): every draft's attention widths
-// and selector are those the kernels are built for; its layers, intermediate
+// The dimensions of a draft, as its checkpoint's config.json gives
+// them (ModelDescriptor.mm readDraftLayout): attention widths are those the
+// kernels are built for; DFlash2 has its selector, DSpine its code bridge.
+// The layers, intermediate
 // size, rotary base and the target layers it reads are its own, and its
 // hidden size and vocabulary its target's.
+enum class DraftArchitecture : uint8_t { DFlash2, DSpine };
+
 struct DFlashDraftLayout final {
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
@@ -89,9 +94,17 @@ struct DFlashDraftLayout final {
   // first targetLayerCount of targetLayers, targetHiddenSize() values a row.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};
   uint32_t targetLayerCount = 0;
+  DraftArchitecture architecture = DraftArchitecture::DFlash2;
+  uint32_t contextTokens = SPLASH_DRAFT_SLIDING_WINDOW;
+  uint32_t bridgeCodeSize = 0;
+  uint32_t bridgeRank = 0;
+
+  [[nodiscard]] constexpr bool isDSpine() const noexcept {
+    return architecture == DraftArchitecture::DSpine;
+  }
 
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
-    return {layers, kvHeads, attentionHeadDimension, hiddenSize};
+    return {layers, kvHeads, attentionHeadDimension, hiddenSize, contextTokens};
   }
   [[nodiscard]] constexpr std::span<const uint32_t> targetLayerIds() const noexcept {
     return {targetLayers.data(), targetLayerCount};
@@ -101,7 +114,7 @@ struct DFlashDraftLayout final {
   [[nodiscard]] constexpr ops::DraftAttentionShape attentionShape() const noexcept {
     return {hiddenSize, dynamicSize, qkvSize, attentionSize,
             attentionSize / attentionHeadDimension, kvHeads,
-            attentionHeadDimension};
+            attentionHeadDimension, contextTokens, isDSpine()};
   }
   // The key and value columns of the fused QKV projection, all the context
   // writers read.
@@ -141,6 +154,8 @@ struct DFlashDecodeBuffers final {
   metal::MetalBuffer ropeCos;
   metal::MetalBuffer ropeSin;
   metal::MetalBuffer gateScratch;
+  metal::MetalBuffer inputTokens;
+  ops::DSpineBuffers bridge;
   std::vector<std::array<metal::MetalBuffer,
                          ExecutionLimits::maximumBatchWidth>> persistentKeys;
   std::vector<std::array<metal::MetalBuffer,
@@ -219,6 +234,7 @@ struct DFlashDraftWeights final {
   ops::Projection selectorProjection;
   metal::MetalBuffer predecessorCodebook;
   metal::MetalBuffer successorCodebook;
+  ops::DSpineWeights bridge;
   // The mask token's BF16 embedding the checkpoint ships, or none
   // (kDraftMaskEmbedding).
   metal::MetalBuffer maskEmbedding;
@@ -234,9 +250,9 @@ class DraftCheckpointLoader;
 loadDFlashDraftWeights(metal::MetalBackend &backend, DraftCheckpointLoader &files,
                        DFlashDraftLayout layout);
 
-// Builds the draft layer graph and its proposal selection
-// (ops::DraftSelector) from batch buffers and persistent context; the
-// target's sampling and acceptance policy remain outside the model.
+// Shared draft context controller. Dispatches DFlash2's layer graph and
+// selector here, or DSpineDraft's backbone and ops::DSpine refinement. The
+// target's sampling and acceptance policy remain outside the draft.
 class DFlashDraft final {
 public:
   DFlashDraft(const DFlashDraftWeights &weights, metal::MetalBackend &backend,
@@ -266,7 +282,9 @@ public:
   void addSelection(metal::CommandGraph &graph,
                     const ops::DraftSelectorBuffers &buffers,
                     std::span<const uint32_t> anchors,
-                    std::span<const ops::SamplingPolicy> policies) const;
+                    std::span<const ops::SamplingPolicy> policies,
+                    const ops::DSpineBuffers &bridge = {},
+                    const ops::Projection *vocabularyProjection = nullptr) const;
   // Sets each of `lanes` lanes' mask rows of the draft input `rows` (all but
   // its anchor's, row 0 of its draftQueryRows) to the mask embedding the
   // checkpoint ships; without one they keep the target table's row.

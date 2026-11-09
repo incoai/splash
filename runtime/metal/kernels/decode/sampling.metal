@@ -1219,6 +1219,20 @@ inline void top16_merge_shards(device const uint *partial_ids,
   }
 }
 
+// DSpine refines this fixed top-16 support. Keep token-id order for ties and
+// the serial sampler's cumulative distribution.
+kernel void dspine_select_candidates(device const uint *partial_ids [[buffer(0)]],
+    device const float *partial_values [[buffer(1)]], device uint *candidates [[buffer(2)]],
+    uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+  float value;
+  uint token;
+  top16_merge_shards(partial_ids, partial_values, row, lane, value, token);
+  uint rank = 0;
+  for (uint other = 0; other < SPLASH_DRAFT_CANDIDATES; ++other)
+    rank += simd_broadcast(token, other) < token;
+  if (lane < SPLASH_DRAFT_CANDIDATES) candidates[row * SPLASH_DRAFT_CANDIDATES + rank] = token;
+}
+
 // One group per proposal row. Simdgroup 0 merges its candidates and unary
 // scores; simdgroup 1 merges the preceding row (the anchor for row 0). The
 // remaining simdgroups score the 16 x 16 predecessor/candidate edge table in

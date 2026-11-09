@@ -1198,16 +1198,16 @@ struct Runtime::Impl {
   // continue the ring, which must hold rows ending at `begin`. A prefill
   // capture also keeps the rows' context in the window (`windowed`), which
   // stays current if it was; decode commits leave it behind.
-  static QwenLogicalLengths
+  QwenLogicalLengths
   advanceDraftContext(const QwenLogicalLengths &previous, uint64_t targetTokens,
-                      uint64_t begin, uint64_t end, bool reset, bool windowed) {
+                      uint64_t begin, uint64_t end, bool reset, bool windowed) const {
     if (!reset && (!previous.draftLength || previous.draftEnd() != begin))
       throw std::logic_error("draft capture does not continue the draft ring");
     const uint64_t combined = (reset ? 0 : previous.draftLength) + (end - begin);
     QwenLogicalLengths next = previous;
     next.targetTokens = targetTokens;
     next.draftLength =
-        static_cast<uint32_t>(std::min<uint64_t>(combined, kDraftCacheStride));
+        static_cast<uint32_t>(std::min<uint64_t>(combined, geometry.draft.contextTokens));
     next.draftBase = end - next.draftLength;
     if (windowed && (reset || previous.hasCurrentContextWindow()))
       next.windowEnd = end;
@@ -1771,11 +1771,14 @@ struct Runtime::Impl {
   void addDraftRebuild(CommandGraph &graph, uint32_t lane,
                        const Request::DraftRebuild &rebuild) const {
     auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor, 0); };
-    ops::RoPE::addDraftRangeTables(graph, p(PrefillTensor::DraftInverseFrequencies),
+    for (uint32_t offset = 0; offset < rebuild.rows; offset += kPrefillRows) {
+      const uint32_t rows = std::min(kPrefillRows, rebuild.rows - offset);
+      ops::RoPE::addDraftRangeTables(graph, p(PrefillTensor::DraftInverseFrequencies),
                                    p(PrefillTensor::DraftRopeCos), p(PrefillTensor::DraftRopeSin),
-                                   rebuild.rows, rebuild.begin, kPrefillRows);
-    draftModel.addContextRebuild(graph, draftPrefillBuffers(*prefillArena, 0), states.window(lane),
-                                 states.draft(lane), rebuild.rows, rebuild.begin);
+                                   rows, rebuild.begin + offset, kPrefillRows);
+      draftModel.addContextRebuild(graph, draftPrefillBuffers(*prefillArena, 0), states.window(lane),
+                                   states.draft(lane), rows, rebuild.begin + offset);
+    }
   }
 
   // The draft's context of chunk `index` of a command's chunks: the rows its
@@ -2013,7 +2016,7 @@ struct Runtime::Impl {
     }
     const QwenLaneMetadata &metadata = states.metadata(entry.stateLane);
     if (metadata.lengths.targetTokens != item.logicalPosition ||
-        !metadata.lengths.hasCompleteDraftWindow(kDraftCacheStride)) {
+        !metadata.lengths.hasCompleteDraftWindow(geometry.draft.contextTokens)) {
       throw std::logic_error("decode state length is not exact");
     }
     // The target reads the history before the pending token from the
@@ -2121,6 +2124,11 @@ struct Runtime::Impl {
     buffers.ropeCos = d(DecodeTensor::DraftRopeCos);
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.gateScratch = decodeArena->gateScratch();
+    buffers.inputTokens = d(DecodeTensor::DraftInputTokens);
+    const ops::DSpineBuffers bridge{d(DecodeTensor::BridgeRaw), d(DecodeTensor::BridgeRms),
+        d(DecodeTensor::BridgeCodes), d(DecodeTensor::BridgePacked), d(DecodeTensor::BridgeMessage),
+        d(DecodeTensor::BridgeCandidateHead)};
+    buffers.bridge = bridge;
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
     draftModel.addDecode(graph, std::move(buffers),
                          targetModel->vocabularyProjection(),
@@ -2141,7 +2149,7 @@ struct Runtime::Impl {
          d(DecodeTensor::Unary), d(DecodeTensor::SelectorHidden),
          d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
          d(DecodeTensor::ProposalProbs), d(DecodeTensor::VerifyConfidence)},
-        std::span(anchors).first(lanes), std::span(policies).first(lanes));
+        std::span(anchors).first(lanes), std::span(policies).first(lanes), bridge, &targetModel->vocabularyProjection());
     ops::VerifyRowsModel verify;
     if (verifyBudget && !verifyBudget->explores(lanes, constrained)) {
       const VerifyBudget::Acceptance &acceptance = verifyBudget->acceptance();
@@ -2717,7 +2725,7 @@ void Runtime::beginColdRequest(const ModelRequest &request,
   try {
     setDraftContextPlan(
         request.id,
-        planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}));
+        planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}, impl_->geometry.draft.contextTokens));
   } catch (...) {
     end(request.id);
     throw;
@@ -2837,7 +2845,7 @@ void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
       impl_->states.metadata(entry.stateLane).lengths;
   if (lengths.targetTokens != restoredPrefixLength ||
       (restoreDraftState &&
-       !lengths.hasCompleteDraftWindow(kDraftCacheStride)) ||
+       !lengths.hasCompleteDraftWindow(impl_->geometry.draft.contextTokens)) ||
       (!restoreDraftState && lengths.draftLength != 0)) {
     throw std::invalid_argument("prefix logical length does not match state");
   }
@@ -3040,7 +3048,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
       QwenLogicalLengths lengths = impl->states.metadata(entry.stateLane).lengths;
       lengths.targetTokens = nextLength;
       for (const DispatchDraftCaptureSpan &capture : outputs.captures[lane]) {
-        lengths = Impl::advanceDraftContext(lengths, nextLength,
+        lengths = impl->advanceDraftContext(lengths, nextLength,
                                             capture.absoluteBegin,
                                             capture.absoluteEnd,
                                             capture.resetDraftState, true);
@@ -3557,7 +3565,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
                            lengths.targetTokens ==
                                1 + decoded[lane].outputTokens.size() -
                                    decoded[lane].outputTokensWithoutKv &&
-                           lengths.hasCompleteDraftWindow(kDraftCacheStride);
+                           lengths.hasCompleteDraftWindow(impl_->geometry.draft.contextTokens);
     }
     if (!committedEveryLane) {
       throw std::runtime_error(
@@ -3611,10 +3619,10 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     beginColdRequest(request, 1);
     if (beginRestore(id, prefixTokens, cachedState, true, {}))
       throw std::logic_error("a resident state restore returned a read");
-    setDraftContextPlan(id, planDraftContext(prefixTokens, promptTokens, {}));
+    setDraftContextPlan(id, planDraftContext(prefixTokens, promptTokens, {}, impl_->geometry.draft.contextTokens));
     const auto &restored = impl_->states.metadata(1).lengths;
     if (restored.targetTokens != prefixTokens ||
-        !restored.hasCompleteDraftWindow(kDraftCacheStride)) {
+        !restored.hasCompleteDraftWindow(impl_->geometry.draft.contextTokens)) {
       throw std::runtime_error("prefix restore length mismatch");
     }
 
@@ -3645,7 +3653,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     wallSeconds += historicalDecodeWallSeconds;
     const auto &continued = impl_->states.metadata(1).lengths;
     if (decoded.size() != 1 || decoded[0].outputTokens.empty() ||
-        !continued.hasCompleteDraftWindow(kDraftCacheStride) ||
+        !continued.hasCompleteDraftWindow(impl_->geometry.draft.contextTokens) ||
         continued.targetTokens <= promptTokens ||
         continued.targetTokens !=
             promptTokens + decoded[0].outputTokens.size() -

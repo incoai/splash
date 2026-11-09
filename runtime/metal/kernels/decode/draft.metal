@@ -136,7 +136,7 @@ kernel void draft_context_kv_commit(
       context_kv + ulong(batch) * Rows * RowWidth, k_norm,
       rope_cos + ulong(batch) * RopeLaneStride,
       rope_sin + ulong(batch) * RopeLaneStride, keys, values,
-      params.start_position[batch], min(retained[batch], Rows), task,
+      params.start_position[batch], min(retained[batch], Rows), task, params.window,
       thread_index, lane, simd_group, reductions, normalized);
 }
 
@@ -151,14 +151,14 @@ kernel void draft_context_kv_commit(
 inline void draft_attention_split_phase(
     device bfloat *queries, device bfloat *keys, device bfloat *values,
     device bfloat *query_keys, device bfloat *query_values,
-    device float *partial, uint value_stride, uint cache_length, uint split,
+    device float *partial, uint value_stride, uint cache_length, uint split, bool causal,
     threadgroup float *score_storage, threadgroup float *row_max,
     threadgroup float *row_sum, threadgroup float *previous_scale,
     uint thread_index, uint lane, uint simd_group) {
   constexpr ushort M = SPLASH_DRAFT_ATTENTION_ROWS, N = 128,
                    D = SPLASH_DRAFT_HEAD_DIMENSION, TileK = 64;
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, Window = SPLASH_DRAFT_SLIDING_WINDOW,
-                 Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
+  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
+  const uint Window = value_stride;
   uint common_start =
       cache_length >= Window - 1 ? cache_length - (Window - 1) : 0;
   uint old_count = cache_length - common_start;
@@ -334,7 +334,7 @@ inline void draft_attention_split_phase(
 
     for (ushort batch = 0; batch < M; batch += 8) {
       ushort matrix_row = batch + simd_group;
-      float score = lane < CurrentN
+      float score = lane < CurrentN && (!causal || lane <= matrix_row % Rows)
                         ? current_raw_scores[matrix_row * CurrentN + lane] *
                               0.08838834765f
                         : -INFINITY;
@@ -519,7 +519,7 @@ kernel void draft_attention_bf16_split(
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr ulong Attention = SPLASH_DRAFT_ATTENTION_WIDTH;
   constexpr ulong HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
-  constexpr ulong Window = SPLASH_DRAFT_SLIDING_WINDOW;
+  const ulong Window = params.value_stride;
   constexpr ulong PartialFloats = AttentionM * HeadDim + 2 * AttentionM;
   uint batch = group.y;
   device bfloat *keys = SPLASH_LANE_BINDING(batch, keys0, keys1, keys2, keys3);
@@ -536,7 +536,7 @@ kernel void draft_attention_bf16_split(
       query_keys + batch * KVHeads * Rows * HeadDim + group.x * Rows * HeadDim,
       query_values + batch * KVHeads * HeadDim * Rows +
           group.x * Rows * HeadDim,
-      partials, params.value_stride, params.cache_length[batch], group.z,
+      partials, params.value_stride, params.cache_length[batch], group.z, params.causal != 0,
       workspace, workspace + AttentionM * AttentionN,
       workspace + AttentionM * AttentionN + AttentionM,
       workspace + AttentionM * AttentionN + 2 * AttentionM, thread_index,

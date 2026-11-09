@@ -52,6 +52,7 @@ inline constexpr uint32_t kProjectedOutputTokens = 4096;
 struct EngineConfig final {
   uint32_t maxContext = 0;
   uint32_t vocabularySize = 0;
+  uint32_t draftContextTokens = model::ExecutionLimits::draftContextTokens;
   // Patches per image the server's --max-image-pixels allows; zero rejects
   // images.
   uint32_t maxImagePatches = ops::kMaximumImagePatches;

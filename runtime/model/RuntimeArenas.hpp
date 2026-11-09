@@ -44,7 +44,6 @@ inline constexpr uint32_t kPrefillGroupChunks = 4;
 inline constexpr uint32_t kTileRows = kv::kPageTokens;
 inline constexpr uint32_t kRaggedAttentionRows =
     kPrefillRows + kLaneCount * (kTileRows - 1);
-inline constexpr uint32_t kDraftCacheStride = ExecutionLimits::draftContextTokens;
 inline constexpr uint32_t kMaximumPageTableEntries =
     (kv::kMaximumPhysicalTokens + kv::kPageTokens - 1) / kv::kPageTokens;
 
@@ -422,6 +421,12 @@ enum class DecodeTensor : uint32_t {
   DraftResidual,
   DraftIntermediate,
   DraftFinalHidden,
+  BridgeRaw,
+  BridgeRms,
+  BridgeCodes,
+  BridgePacked,
+  BridgeMessage,
+  BridgeCandidateHead,
   SelectorHidden,
   Candidates,
   Unary,

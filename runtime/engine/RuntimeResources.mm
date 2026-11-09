@@ -575,7 +575,7 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
   if (gdn.auxiliaryBytes) canonical << " auxiliary " << gdn.auxiliaryBytes;
   canonical << '\n'
             << "draft " << draft.layers << ' ' << draft.kvHeads << ' ' << draft.headDimension << ' '
-            << SPLASH_DRAFT_SLIDING_WINDOW << '\n'
+            << draft.windowTokens << '\n'
             << "context " << draft.contextWidth << " q4 " << SPLASH_DRAFT_CONTEXT_GROUP << '\n';
   // Without YaRN the line is left out, so the caches written before it
   // existed stay valid. The factor takes the digits that read back as the
@@ -909,6 +909,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       const std::chrono::duration<double> loading = AwakeClock::now() - started;
       logLine("Weights loaded ", again ? "again " : "", "in ", std::fixed, std::setprecision(2), loading.count(),
               " s.");
+      if (loaded.draft.layout.isDSpine())
+        logLine("Experimental DSpine draft: ", model::ExecutionLimits::draftQueryRows,
+                " rows, ", loaded.draft.layout.contextTokens, " context tokens.");
     } catch (const metal::MetalAllocationError &error) {
       throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                   error.what(), {},

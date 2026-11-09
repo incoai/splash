@@ -1,6 +1,7 @@
 #include "DFlashDraft.hpp"
 #include "Checked.hpp"
 #include "DraftCheckpoint.hpp"
+#include "DSpineDraft.hpp"
 #include "metal/abi/DraftAttention.h"
 #include "ops/Embedding.hpp"
 
@@ -13,6 +14,9 @@ namespace splash::model {
 namespace {
 
 void requireLayout(const DFlashDraftLayout &layout) {
+  if ((layout.isDSpine() && (layout.contextTokens != 8192 || layout.bridgeCodeSize != 1024 || layout.bridgeRank != 512)) ||
+      (!layout.isDSpine() && (layout.contextTokens != SPLASH_DRAFT_SLIDING_WINDOW || layout.bridgeCodeSize || layout.bridgeRank)))
+    throw WeightStoreError("unsupported draft architecture layout");
   if (!layout.layers || !layout.hiddenSize || !layout.vocabularySize ||
       !layout.dynamicSize || !layout.qkvSize || !layout.attentionSize ||
       !layout.intermediateSize || !layout.attentionHeadDimension ||
@@ -146,7 +150,16 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
 void DFlashDraft::addSelection(
     metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
     std::span<const uint32_t> anchors,
-    std::span<const ops::SamplingPolicy> policies) const {
+    std::span<const ops::SamplingPolicy> policies, const ops::DSpineBuffers &bridge,
+    const ops::Projection *vocabularyProjection) const {
+  if (weights_.layout.isDSpine()) {
+    if (!vocabularyProjection) throw std::invalid_argument("DSpine refinement needs the target head");
+    const auto &layout = weights_.layout;
+    ops::DSpine::addRefinement(graph, weights_.bridge, weights_.finalNorm, *vocabularyProjection, bridge, buffers,
+        {layout.hiddenSize, layout.bridgeCodeSize, layout.bridgeRank,
+         static_cast<uint32_t>(anchors.size()) * ExecutionLimits::draftQueryRows}, anchors, policies);
+    return;
+  }
   selector_.add(graph, buffers,
                 {weights_.predecessorCodebook, weights_.successorCodebook},
                 anchors, policies);
@@ -172,7 +185,7 @@ void DFlashDraft::addContextPrefill(
                          const metal::MetalBuffer &window) {
     ops::DraftAttention::addWindowStore(graph,
                                         backend_.view(buffers.hidden, compactRow * rowBytes, count * rowBytes),
-                                        window, count, startPosition, layout.hiddenSize);
+                                        window, count, startPosition, layout.hiddenSize, layout.contextTokens);
   };
   for (const DFlashPrefillSpan &span : spans)
     store(span.compactRow, span.rows, span.startPosition, span.window);
@@ -187,13 +200,11 @@ void DFlashDraft::addContextRebuild(metal::CommandGraph &graph,
                                     const metal::MetalBuffer &window,
                                     std::span<const DFlashDraftRingLayer> ring,
                                     uint32_t rows, uint32_t startPosition) const {
-  static_assert(ExecutionLimits::draftContextTokens <= ExecutionLimits::prefillTokenBudget,
-                "a whole draft window passes through buffers of one prefill chunk's rows");
   const DFlashDraftLayout &layout = weights_.layout;
-  if (!rows || rows > ExecutionLimits::draftContextTokens || ring.size() != layout.layers)
+  if (!rows || rows > ExecutionLimits::prefillTokenBudget || ring.size() != layout.layers)
     throw std::invalid_argument("invalid draft context rebuild");
   ops::DraftAttention::addWindowLoad(graph, window, buffers.hidden, rows, startPosition,
-                                     layout.hiddenSize);
+                                     layout.hiddenSize, layout.contextTokens);
   const DFlashPrefillSpan span{0, rows, startPosition, ring, window};
   addContextKv(graph, buffers, rows, {&span, 1});
 }
@@ -231,7 +242,7 @@ uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
   const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
   uint32_t storageRows = rows;
   const auto include = [&](const ops::Projection &p) {
-    storageRows = std::max(storageRows, linear.decodeStorageRows(rows, p.shape()));
+    if (p.outputSize) storageRows = std::max(storageRows, linear.decodeStorageRows(rows, p.shape()));
   };
   for (const DFlashDraftLayerWeights &layer : weights_.layers)
     for (const ops::Projection *p : {&layer.attentionDynamic, &layer.qkvProjection, &layer.outputProjection,
@@ -240,6 +251,11 @@ uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
       include(*p);
   include(weights_.contextProjection);
   include(weights_.selectorProjection);
+  if (weights_.layout.isDSpine()) {
+    for (const auto &p : weights_.bridge.read) include(p);
+    for (const auto &p : weights_.bridge.write) include(p);
+    include(weights_.bridge.packed);
+  }
   for (const ops::Projection &p : contextKvProjections_) include(p);
   return storageRows / ExecutionLimits::draftQueryRows;
 }
@@ -253,6 +269,10 @@ void DFlashDraft::addDecode(
       buffers.persistentKeys.size() != weights_.layout.layers ||
       buffers.persistentValues.size() != weights_.layout.layers) {
     throw std::invalid_argument("invalid draft decode batch");
+  }
+  if (weights_.layout.isDSpine()) {
+    DSpineDraft::addDecode(graph, weights_, operators_, std::move(buffers), vocabularyProjection, cacheLengths);
+    return;
   }
   const DFlashDraftLayout &layout = weights_.layout;
   const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
@@ -408,11 +428,13 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
     WeightFile file = files.layer(layerIndex);
     DFlashDraftLayerWeights layer;
     layer.inputNorm = readNorm(file, layout.hiddenSize, false, "input-norm");
-    layer.attentionConvolution =
+    if (!layout.isDSpine()) {
+      layer.attentionConvolution =
         file.section(convolutionBytes, "attention-convolution");
-    layer.attentionDynamic = readBlockProjection(
+      layer.attentionDynamic = readBlockProjection(
         file, layout.dynamicSize, layout.hiddenSize,
         "attention-dynamic");
+    }
     layer.qkvProjection = readBlockProjection(
         file, layout.qkvSize, layout.hiddenSize, "qkv");
     layer.queryNorm = file.section(headNormBytes, "query-norm");
@@ -422,9 +444,11 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
         "attention-output");
     layer.postAttentionNorm =
         readNorm(file, layout.hiddenSize, false, "post-attention-norm");
-    layer.mlpConvolution = file.section(convolutionBytes, "mlp-convolution");
-    layer.mlpDynamic = readBlockProjection(
+    if (!layout.isDSpine()) {
+      layer.mlpConvolution = file.section(convolutionBytes, "mlp-convolution");
+      layer.mlpDynamic = readBlockProjection(
         file, layout.dynamicSize, layout.hiddenSize, "mlp-dynamic");
+    }
     layer.gateProjection = readBlockProjection(
         file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
     layer.upProjection = readBlockProjection(
@@ -443,7 +467,29 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
         "context-projection");
     result.hiddenNorm = readNorm(file, layout.hiddenSize, false, "hidden-norm");
     result.finalNorm = readNorm(file, layout.hiddenSize, false, "final-norm");
-    result.selectorProjection = readBlockProjection(
+    if (layout.isDSpine()) {
+      auto &bridge = result.bridge;
+      const uint32_t code = layout.bridgeCodeSize, rank = layout.bridgeRank, hidden = layout.hiddenSize;
+      const auto projection = [](metal::MetalBuffer buffer, uint32_t output, uint32_t input) {
+        return ops::Projection{output, input, ops::BlockWeights{{ops::QuantizedSegment::rows(GGUF_FMT_BF16, output, input, buffer)}}};
+      };
+      const uint64_t readBytes = uint64_t{code} * hidden * 2, writeBytes = uint64_t{hidden} * rank * 2;
+      const auto early = file.section((layout.layers - 1) * readBytes, "bridge-early-reads");
+      for (uint32_t i = 0; i + 1 < layout.layers; ++i)
+        bridge.read.push_back(projection(backend.view(early, i * readBytes, readBytes), code, hidden));
+      bridge.read.push_back(projection(file.section(readBytes, "bridge-final-read"), code, hidden));
+      const auto writes = file.section(layout.layers * writeBytes, "bridge-writes");
+      for (uint32_t i = 0; i < layout.layers; ++i)
+        bridge.write.push_back(projection(backend.view(writes, i * writeBytes, writeBytes), hidden, rank));
+      const uint64_t matrixBytes = uint64_t{rank} * code * 2;
+      const auto packed = file.section(3 * matrixBytes, "bridge-packed");
+      bridge.packed = projection(packed, 3 * rank, code);
+      bridge.predecessorGate = backend.view(packed, matrixBytes, matrixBytes);
+      bridge.previous = backend.view(packed, 2 * matrixBytes, matrixBytes);
+      bridge.gateBias = file.section(uint64_t{rank} * 2, "bridge-gate-bias");
+      bridge.codebook = file.section(uint64_t{layout.vocabularySize} * code * 2, "bridge-codebook");
+    } else {
+      result.selectorProjection = readBlockProjection(
         file, layout.selectorRank, layout.hiddenSize, "selector");
     const uint64_t codebookBytes = checkedMultiply<WeightStoreError>(
         checkedMultiply<WeightStoreError>(layout.vocabularySize,
@@ -454,6 +500,7 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
         file.section(codebookBytes, "predecessor-codebook");
     result.successorCodebook =
         file.section(codebookBytes, "successor-codebook");
+    }
     if (files.hasMaskEmbedding())
       result.maskEmbedding = file.section(uint64_t{layout.hiddenSize} * kBFloat16Bytes, "mask-embedding");
     file.finish();
