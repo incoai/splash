@@ -497,6 +497,46 @@ group, and `--dump <dir>` writes the plan lines; a change of a rule or an entry
 shows as the groups it changes. Kernels and their instances do not depend on
 any of this.
 
+### Warmup and pipelines
+
+Metal creates a kernel's pipeline, one for each set of its function constants
+(a fused projection's formats), the first time a dispatch names it, on the
+thread that submits the command, which is the serving loop's: a request whose
+command names a kernel no earlier command did waits while its pipeline is
+created, and so does every status request behind it. With a warm shader cache
+that is a load of milliseconds; cold, after an install or a macOS update, it
+is a compile, and the 27B's first 17-row chunk waited 19 s for its kernels on
+an M5 Max planned as a 16-core Apple9 GPU. So before Ready the start runs a
+command of each kind serving runs, through every projection
+(`ServingRuntime::requireWarmup`):
+
+- a prefill of the most rows, 2048, and one of each class of chunk whose
+  projections run kernels of their own, of its fewest rows
+  (`ExecutionPlans::prefillRowClasses`): each staged tile height a chunk takes,
+  from 1, 9, 17 and, where `stagedPrefillRows` is 64, 33 rows, and the prefill
+  tile, from a row past `stagedPrefillRows`. These need no memory the first
+  did not, and are required as it is. Every other kernel choice a chunk's
+  rows make today has one threshold (the float tiles, the MoE expert and
+  router tiles, the staged norm, the hyper-connection norm's quarters, and the
+  Neural Engine split, which takes no class's first chunk), so the chunks of
+  one row and of the most take both sides. `kernel-selection` checks that
+  every projection, float and MoE tile a chunk of 1 to 2048 rows selects on
+  its fifteen devices, and its prefill attention after each history it plans,
+  is one of these chunks'. Each prefill also creates, without running it, the
+  draft rebuild a restored lane's first chunk begins with, which no other
+  command runs, so a memory-limited restore warmup leaves none of its kernels
+  to serving;
+- a decode of each width the memory plan holds, and a state restore;
+
+and it prepares the sampling kernels' dispatches without running them
+(`MetalBackend::preparePipelines`). What memory keeps from running
+(`warmup.memory_limited_steps` in `/status`) stays cold, as do the paths no
+warmup takes: a decode width the host refused or the plan does not hold, a
+decode after enough history to score INT8 queries, an image, KV on the SSD.
+From Ready on the backend counts each pipeline it creates
+(`metal.pipelines_created_while_serving`) and logs it once, with its name, its
+function constants and how long it took.
+
 ### GGUF tiles
 
 Decode runs one of two kernel families, chosen by the device's calibration row
@@ -780,11 +820,14 @@ experts' gate and up in one pass `moe_expert_gguf_m<rows>_gate_up` and their dow
 Apple9 GPUs of 10 cores or fewer, in prefill chunks of 33 to 64 rows (`gguf_decode_fused_m64`),
 and in longer prefill chunks one `gguf_prefill_<format>_a` per format over that format's
 segments (or, on the int8-activation tile, `gguf_prefill_int8_quantize` and one
-`gguf_prefill_int8_<format>_a` per segment). The norm, GDN, attention-gate and attention-gather
-variants that also write the register kernels' input table carry `table16` in their names. The
-epilogue kinds of both GGUF families are in `kernels/common/gguf_tile.h`, the SiLU and sigmoid
-every kernel shares in `kernels/common/activation.h`, and the MMA helpers every register kernel
-uses, GGUF or fp32, in `kernels/common/sgmatrix.h`.
+`gguf_prefill_int8_<format>_a` per segment). A `gguf_decode_fused_m<rows>` pipeline decodes
+its segments' formats alone, which specialize it as Metal function constants
+(`ComputeDispatch::constants`, a pipeline per name and values), so its first use compiles a
+staged loop for each of those formats rather than for all 44. The norm, GDN, attention-gate and
+attention-gather variants that also write the register kernels' input table carry `table16` in
+their names. The epilogue kinds of both GGUF families are in `kernels/common/gguf_tile.h`, the
+SiLU and sigmoid every kernel shares in `kernels/common/activation.h`, and the MMA helpers every
+register kernel uses, GGUF or fp32, in `kernels/common/sgmatrix.h`.
 
 The ABIs are in `runtime/metal/abi/Gguf.h`, which also defines the tile geometry the kernels
 and `LinearGguf.cpp` share, and `MoE.h`; the image formats in

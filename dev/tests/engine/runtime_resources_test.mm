@@ -982,6 +982,33 @@ void testYarnRuntime(const char *metallibPath) {
   static_cast<void>(runtime->warmupDecodeBatch(1));
 }
 
+// A restored lane's first chunk begins with its draft rebuild, which only a
+// restore runs, and a start's restore warmup may be memory-limited, as a
+// 16 GB Mac's is. After the start's other warmups, a restore in service
+// creates no pipeline: each prefill warmup created the rebuild's.
+void testARestoreAfterTheOtherWarmupsCreatesNothing(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-restore-pipelines");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "restore-pipelines-test");
+  std::unique_ptr<RuntimeResources> resources;
+  static_cast<void>(test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); }));
+  const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+  std::unique_ptr<model::RuntimeModel> runtime;
+  require(static_cast<bool>(resources->memoryGovernor().allocationAdmission()(
+              budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+              [&] { runtime = model::createRuntime(resources->modelContext()); })),
+          "the runtime's arenas were refused");
+  const KvPool::RunwayHold runway(resources->kvPool());
+  static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+    static_cast<void>(runtime->warmupPrefill(rows));
+  static_cast<void>(runtime->warmupDecodeBatch(1));
+  metal::MetalBackend &backend = resources->backend();
+  backend.beginServing();
+  const std::string log = test::capturedStderr([&] { static_cast<void>(runtime->warmupCompositeStateRestore()); });
+  require(backend.pipelinesCreatedWhileServing() == 0,
+          "a restore after the start's other warmups created pipelines: " + log);
+}
+
 // The SSD cache holds no write back unless a write budget is set; one that
 // is set starts with a quarter of a day's.
 void testWriteBudgetOnlyWhenSet(const char *metallibPath) {
@@ -1848,6 +1875,7 @@ int main(int argc, char **argv) {
       testStartGrowsThroughHostPressure(argv[1]);
       testStartChecksTheReserveWithWhatItServes(argv[1]);
       testYarnRuntime(argv[1]);
+      testARestoreAfterTheOtherWarmupsCreatesNothing(argv[1]);
       testWriteBudgetOnlyWhenSet(argv[1]);
       testStaleCachesGoAtEveryStart(argv[1]);
       testMadeCacheRootStaysOutOfBackups(argv[1]);

@@ -267,11 +267,30 @@ void raisePeak(std::atomic<T> &peak, T value) noexcept {
                                        std::memory_order_relaxed)) {}
 }
 
-// Hashes pipeline names as views, so a cache lookup builds no string.
-struct PipelineNameHash {
+// A pipeline: its function's name and the values of its function constants
+// (ComputeDispatch::constants). The cache hashes and compares keys as views,
+// so a lookup builds nothing.
+struct PipelineKeyView {
+    std::string_view name;
+    std::span<const uint32_t> constants;
+};
+struct PipelineKey {
+    std::string name;
+    std::vector<uint32_t> constants;
+    operator PipelineKeyView() const noexcept { return {name, constants}; }
+};
+struct PipelineKeyHash {
     using is_transparent = void;
-    size_t operator()(std::string_view name) const noexcept {
-        return std::hash<std::string_view>{}(name);
+    size_t operator()(PipelineKeyView key) const noexcept {
+        size_t hash = std::hash<std::string_view>{}(key.name);
+        for (const uint32_t value : key.constants) hash = hash * 31 + value;
+        return hash;
+    }
+};
+struct PipelineKeyEqual {
+    using is_transparent = void;
+    bool operator()(PipelineKeyView a, PipelineKeyView b) const noexcept {
+        return a.name == b.name && std::ranges::equal(a.constants, b.constants);
     }
 };
 
@@ -1176,9 +1195,12 @@ struct MetalBackend::Impl {
     // Looked up for every dispatch when its command is prepared, which the
     // GPU may be waiting for; a hit allocates nothing. Used only by the
     // submitting thread.
-    std::unordered_map<std::string, id<MTLComputePipelineState>,
-                       PipelineNameHash, std::equal_to<>>
+    std::unordered_map<PipelineKey, id<MTLComputePipelineState>,
+                       PipelineKeyHash, PipelineKeyEqual>
         pipelines;
+    // From Ready on (MetalBackend::beginServing), the pipelines created since.
+    std::atomic<bool> serving{false};
+    std::atomic<uint64_t> pipelinesWhileServing{0};
 
     DeviceCapabilities capabilities;
     std::shared_ptr<AllocationAccounting> accounting =
@@ -1226,32 +1248,54 @@ struct MetalBackend::Impl {
         return allocation;
     }
 
-    id<MTLComputePipelineState> pipeline(std::string_view name) {
-        if (name.empty()) {
+    id<MTLComputePipelineState> pipeline(const ComputeDispatch &dispatch) {
+        const PipelineKeyView key{dispatch.pipelineName, dispatch.constants};
+        if (key.name.empty()) {
             throw MetalBackendError("Metal pipeline name must not be empty");
         }
-        if (const auto cached = pipelines.find(name); cached != pipelines.end())
+        if (const auto cached = pipelines.find(key); cached != pipelines.end())
             return cached->second;
-        id<MTLComputePipelineState> result = newPipeline(library, name);
-        pipelines.emplace(name, result);
+        id<MTLComputePipelineState> result = newPipeline(library, key.name, key.constants);
+        pipelines.emplace(PipelineKey{dispatch.pipelineName, dispatch.constants}, result);
         sampleDeviceMemory();
         return result;
     }
 
-    id<MTLComputePipelineState> newPipeline(id<MTLLibrary> source, std::string_view name) {
+    id<MTLComputePipelineState> newPipeline(id<MTLLibrary> source, std::string_view name,
+                                            std::span<const uint32_t> constants = {}) {
+        const auto started = AwakeClock::now();
         NSString *key = checkedNSString(name, "pipeline name");
-        id<MTLFunction> function = [source newFunctionWithName:key];
+        NSError *error = nil;
+        id<MTLFunction> function = nil;
+        if (constants.empty()) {
+            function = [source newFunctionWithName:key];
+        } else {
+            MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+            [values setConstantValues:constants.data() type:MTLDataTypeUInt
+                            withRange:NSMakeRange(0, constants.size())];
+            function = [source newFunctionWithName:key constantValues:values error:&error];
+        }
         if (!function) {
             throw MetalBackendError(
-                "missing Metal function: " + std::string(name));
+                "missing Metal function: " + std::string(name) +
+                (error ? ": " + errorDescription(error) : ""));
         }
-        NSError *error = nil;
         id<MTLComputePipelineState> result =
             [device newComputePipelineStateWithFunction:function error:&error];
         if (!result) {
             throw MetalBackendError(
                 "unable to create Metal pipeline " + std::string(name) +
                 ": " + errorDescription(error));
+        }
+        if (serving.load(std::memory_order_relaxed)) {
+            pipelinesWhileServing.fetch_add(1, std::memory_order_relaxed);
+            std::string values;
+            for (const uint32_t value : constants)
+                values += (values.empty() ? "(" : ",") + std::to_string(value);
+            if (!values.empty()) values += ')';
+            logWarning("Metal created pipeline ", name, values, " while serving, in ",
+                       std::chrono::duration<double, std::milli>(AwakeClock::now() - started).count(),
+                       " ms: no warmup of the start created it");
         }
         return result;
     }
@@ -1428,7 +1472,7 @@ struct MetalBackend::Impl {
         }
 
         for (PreparedDispatch &item : command.dispatches) {
-            item.pipeline = pipeline(item.source->pipelineName);
+            item.pipeline = pipeline(*item.source);
             if (item.threadCount >
                 item.pipeline.maxTotalThreadsPerThreadgroup) {
                 throw MetalBackendError(
@@ -1649,10 +1693,12 @@ struct MetalBackend::Impl {
     }
 
     // The spin of awake host steps, from host_step_wait of the library beside
-    // the backend's, with a release buffer whose counter starts at zero.
+    // the backend's, created once and reused by every check, with a release
+    // buffer whose counter starts at zero.
     HostStepSpin newHostStepSpin() {
+        if (!hostStepWait) hostStepWait = newPipeline(loadLibrary(device, hostStepLibraryPath), "host_step_wait");
         HostStepSpin spin;
-        spin.pipeline = newPipeline(loadLibrary(device, hostStepLibraryPath), "host_step_wait");
+        spin.pipeline = hostStepWait;
         spin.releases = newBuffer(kHostStepSeenOffset + 2 * sizeof(uint32_t), BufferStorage::Shared,
                                   @"host-step releases");
         std::memset(spin.releases.contents, 0, spin.releases.length);
@@ -1906,6 +1952,8 @@ struct MetalBackend::Impl {
 
     // host-step.metallib beside the backend's library (kHostStepLibrary).
     std::string hostStepLibraryPath;
+    // Its host_step_wait, created by the first spin check (newHostStepSpin).
+    __strong id<MTLComputePipelineState> hostStepWait = nil;
     // The spin of awake host steps, once checked (checkHostStepSpin); until
     // then they run as plain ones.
     std::optional<HostStepSpin> hostStepSpin;
@@ -2326,6 +2374,14 @@ void MetalBackend::preparePipelines(
     std::span<const ComputeDispatch> dispatches) {
     checkOperation();
     static_cast<void>(impl_->prepare(dispatches));
+}
+
+void MetalBackend::beginServing() noexcept {
+    impl_->serving.store(true, std::memory_order_relaxed);
+}
+
+uint64_t MetalBackend::pipelinesCreatedWhileServing() const noexcept {
+    return impl_->pipelinesWhileServing.load(std::memory_order_relaxed);
 }
 
 MetalMemoryStats MetalBackend::memoryStats() const noexcept {

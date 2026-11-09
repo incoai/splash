@@ -221,6 +221,21 @@ QUANT_FORMATS(GGUF_DECODE_GATE_UP_FORMAT)
   GGUF_SEGMENT_PLANE(w0, w0);                                                                                      \
   GGUF_SEGMENT_PLANE(w1, w1);                                                                                      \
   GGUF_SEGMENT_PLANE(meta, m)
+// A fused pipeline decodes its dispatch's segment formats alone, function constants 0-2 (ops::Linear: each once, the
+// last repeated past them): the GPU compiler builds a staged loop for each format a pipeline decodes, and a cold
+// 16-row fused pipeline took 18 s to build with all 44 on the 16-core M5 Pro, 0.5 s with three.
+// fused_formats runs body(F()) with the format type of `format`, one body per distinct format; an id the pipeline
+// does not decode decodes as its first, so every id runs one body.
+constant uint kFusedFormat0 [[function_constant(0)]];
+constant uint kFusedFormat1 [[function_constant(1)]];
+constant uint kFusedFormat2 [[function_constant(2)]];
+struct fused_formats {
+  template <class Body> void operator()(uint format, Body body) const {
+    if (kFusedFormat2 != kFusedFormat1 && format == kFusedFormat2) quant_format_switch(kFusedFormat2, body);
+    else if (kFusedFormat1 != kFusedFormat0 && format == kFusedFormat1) quant_format_switch(kFusedFormat1, body);
+    else quant_format_switch(kFusedFormat0, body);
+  }
+};
 #define GGUF_DECODE_FUSED(R)                                                                                       \
   kernel void gguf_decode_fused_m##R(device bfloat *input [[buffer(0)]], GGUF_SEGMENTS,                          \
                                      device bfloat *output [[buffer(10)]],                                        \
@@ -240,7 +255,7 @@ QUANT_FORMATS(GGUF_DECODE_GATE_UP_FORMAT)
     gguf_zero(acc);                                                                                               \
     staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(p.fmt[s], input, w0, w1, meta, p.input_size, origin, my, tl, \
                                             simd_group * 32 + simd_lane, simd_lane, sb, se,                       \
-                                            staged_first_step(local, sb, se, p.spread), acc);                     \
+                                            staged_first_step(local, sb, se, p.spread), acc, fused_formats());    \
     gguf_store_sums<R>(acc, p.splits, group.y, partials, counters + p.offset[s] / GGUF_TILE_COLUMNS + local,       \
                        p.out_stride, column0, simd_group * 32 + simd_lane, &arrival,                              \
                        [&](uint row, uint column, float v) { output[ulong(row) * p.out_stride + column0 + column] = bfloat(v); }); \

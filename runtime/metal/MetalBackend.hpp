@@ -163,6 +163,9 @@ struct ComputeDispatch {
   DispatchSize threadsPerThreadgroup;
   IndirectGrid indirectThreadgroups = {};
   AddressTable addresses = {};
+  // The values of the function's uint function constants at indices 0 up,
+  // which specialize its pipeline: a pipeline per name and values.
+  std::vector<uint32_t> constants = {};
 };
 
 // A host step's round trip on the host clock (AwakeClock, the time base of
@@ -479,6 +482,14 @@ public:
   // dispatches would compile. Validates them as submission does and throws
   // as it would, but encodes and commits nothing.
   void preparePipelines(std::span<const ComputeDispatch> dispatches);
+  // The engine is Ready. A pipeline is created the first time a dispatch
+  // names it, on the submitting thread, which waits while Metal compiles it
+  // if the shader cache is cold: 19 s for the 27B's first 17-row prefill
+  // chunk on a 16-core Apple9 plan. Startup warmup creates the pipelines its
+  // commands name; each one created from here on is counted, and logged once
+  // with its name, function constants and time.
+  void beginServing() noexcept;
+  [[nodiscard]] uint64_t pipelinesCreatedWhileServing() const noexcept;
 
   [[nodiscard]] MetalMemoryStats memoryStats() const noexcept;
   // Explicit safe-point refresh for memory admission/reclamation code. A

@@ -691,7 +691,8 @@ void writeMetrics(json::Writer &w, const RuntimeMetricsSnapshot &metrics, const 
 // Each warmup step, whether it ran, and the steps memory kept from running.
 void writeWarmup(json::Writer &w, const WarmupReport &warmup) {
   std::vector<std::pair<std::string, WarmupStepStatus>> steps{
-      {"prefill_" + std::to_string(model::ExecutionLimits::prefillTokenBudget), warmup.maximumPrefill}};
+      {"prefill_" + std::to_string(model::ExecutionLimits::prefillTokenBudget), warmup.maximumPrefill},
+      {"prefill_row_classes", warmup.prefillRowClasses}};
   for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width)
     steps.emplace_back("decode_b" + std::to_string(width), warmup.decodeBatches[width - 1]);
   steps.emplace_back("composite_state_restore", warmup.compositeStateRestore);
@@ -831,7 +832,9 @@ std::string runtimeStatusJson(const StatusStart &start, const StatusSample &samp
     w.key("warmup");
     writeWarmup(w, start.warmup);
     w.object("metal", [&] {
-      w.field("healthy", sample.metalHealthy).field("failure_reason", sample.metalFailureReason);
+      w.field("healthy", sample.metalHealthy)
+          .field("failure_reason", sample.metalFailureReason)
+          .field("pipelines_created_while_serving", sample.pipelinesCreatedWhileServing);
     });
   });
   return w.str();
