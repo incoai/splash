@@ -76,6 +76,13 @@ struct Attachment: Codable, Identifiable, Equatable, Sendable {
         return "\(id.uuidString).\(suffix)"
     }
 
+    /// Writes `data`, its content, as its file in `folder`, made where there is none; false where
+    /// it can't be written.
+    func write(_ data: Data, in folder: URL) -> Bool {
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return (try? data.write(to: folder.appending(path: file), options: .atomic)) != nil
+    }
+
     /// The record of an image, of its PNG or JPEG data.
     static func image(_ data: Data) -> Attachment {
         Attachment(kind: .image, type: ChatClient.mediaType(data), bytes: data.count)
@@ -198,7 +205,6 @@ final class ChatStore {
     /// their own in `folder`, in their order; one that can't be written stays where it was.
     nonisolated static func movingImages(of conversation: Conversation, to folder: URL) -> Conversation {
         var conversation = conversation
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         for index in conversation.messages.indices {
             let images = conversation.messages[index].images
             guard !images.isEmpty else { continue }
@@ -206,7 +212,7 @@ final class ChatStore {
             var kept: [Data] = []
             for image in images {
                 let attachment = Attachment.image(image)
-                if (try? image.write(to: folder.appending(path: attachment.file), options: .atomic)) != nil {
+                if attachment.write(image, in: folder) {
                     attached.append(attachment)
                 } else {
                     kept.append(image)

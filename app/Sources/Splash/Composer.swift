@@ -101,9 +101,7 @@ final class Draft {
         guard let data = try? Data(contentsOf: url) else { return nil }
         let attachment = Attachment(kind: .pdf, type: "application/pdf", bytes: data.count, name: url.lastPathComponent,
                                     pages: PDFDocument(data: data)?.pageCount)
-        try? FileManager.default.createDirectory(at: files, withIntermediateDirectories: true)
-        guard (try? data.write(to: files.appending(path: attachment.file), options: .atomic)) != nil else { return nil }
-        return attachment
+        return attachment.write(data, in: files) ? attachment : nil
     }
 
     /// Takes attachment `index` off, and its file.
@@ -143,9 +141,7 @@ final class Draft {
     /// written.
     nonisolated private static func kept(_ data: Data, in files: URL) -> (Attachment, Data)? {
         let attachment = Attachment.image(data)
-        try? FileManager.default.createDirectory(at: files, withIntermediateDirectories: true)
-        guard (try? data.write(to: files.appending(path: attachment.file), options: .atomic)) != nil else { return nil }
-        return (attachment, data)
+        return attachment.write(data, in: files) ? (attachment, data) : nil
     }
 
     nonisolated private static func encoded(_ source: CGImage) -> Data? {
