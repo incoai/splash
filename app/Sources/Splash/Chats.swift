@@ -274,35 +274,19 @@ final class ChatStore {
 
     /// Sends `text` and `attachments`, kept in the attachments folder already, in the open
     /// conversation, or a new one, to the model `server` serves, and streams its reply into the
-    /// conversation. A message the server refuses leaves the conversation as it was and goes to
-    /// `refused`, with why.
+    /// conversation. A message the server refuses comes out of the conversation again, which a
+    /// new one leaves with it (`takeBack`), and goes to `refused`, with why.
     func send(_ text: String, attachments: [Attachment], to server: ChatTarget,
               refused: @escaping (Refused) -> Void = { _ in }) {
         guard streaming == nil else { return }
-        let before = current
-        var conversation = before ?? Conversation()
+        let new = current == nil
+        var conversation = current ?? Conversation()
         if conversation.title.isEmpty { conversation.title = Self.firstLine(text, attachments: attachments) }
         conversation.messages.append(ChatMessage(role: .user, text: text, attachments: attachments.isEmpty ? nil : attachments))
-        stream(conversation, to: server) { [weak self] reason in
-            self?.restore(before, of: conversation.id)
-            refused(Refused(text: text, attachments: attachments, reason: reason, conversation: before?.id))
+        let id = conversation.id
+        stream(conversation, to: server) { reason in
+            refused(Refused(text: text, attachments: attachments, reason: reason, conversation: new ? nil : id))
         }
-    }
-
-    /// Puts conversation `id` back as it was, `before`, in its place and on disk, and opens it, a
-    /// new chat for one that was new, which goes, but for its attachments, which a refused message
-    /// takes back.
-    private func restore(_ before: Conversation?, of id: UUID) {
-        conversations.removeAll { $0.id == id }
-        guard let before else {
-            let file = file(id)
-            files.async { try? FileManager.default.removeItem(at: file) }
-            selection = nil
-            return
-        }
-        conversations.insert(before, at: conversations.firstIndex { $0.updated < before.updated } ?? conversations.endIndex)
-        write(before)
-        selection = before.id
     }
 
     /// A chat's title until the model sums it up (`title`): the first line of its first message,
@@ -330,16 +314,16 @@ final class ChatStore {
     }
 
     /// Answers the open conversation's last message again, in place of the last answer, which
-    /// stays where the server refuses the request or the new answer ends before it says anything:
-    /// stopped, or failed, which goes to `refused` with why, as a refusal does.
+    /// comes back where the server refuses the request or the new answer ends before it says
+    /// anything (`takeBack`): stopped, or failed, which goes to `refused` with why, as a refusal
+    /// does.
     func retry(with server: ChatTarget, refused: @escaping (Refused) -> Void = { _ in }) {
         guard streaming == nil, var conversation = current, let previous = conversation.messages.last,
               previous.role == .assistant else { return }
-        let before = conversation
         conversation.messages.removeLast()
-        stream(conversation, to: server, instead: previous) { [weak self] reason in
-            self?.restore(before, of: before.id)
-            refused(Refused(text: "", attachments: [], reason: reason, conversation: before.id))
+        let id = conversation.id
+        stream(conversation, to: server, instead: previous) { reason in
+            refused(Refused(text: "", attachments: [], reason: reason, conversation: id))
         }
     }
 
@@ -349,12 +333,15 @@ final class ChatStore {
     }
 
     /// Streams the reply to `conversation`'s last message, asked again `instead` of an earlier
-    /// answer where one is given; a request the server refuses goes to `refused`, with why, where
-    /// it is given, and is the reply's error otherwise.
+    /// answer where one is given. A request that ends with nothing to show, which the server
+    /// refused, or which was asked again and stopped or failed before it said anything, takes back
+    /// what it added (`takeBack`); refused or failed, it goes to `refused`, with why, in its chat,
+    /// which opens.
     private func stream(_ conversation: Conversation, to server: ChatTarget, instead previous: ChatMessage? = nil,
-                        refused: ((String) -> Void)? = nil) {
+                        refused: @escaping (String) -> Void) {
         var conversation = conversation
         let history = conversation.messages
+        let updated = conversation.updated
         var answer = ChatMessage(role: .assistant, text: "", model: server.model)
         conversation.messages.append(answer)
         conversation.updated = .now
@@ -367,6 +354,7 @@ final class ChatStore {
             var shown = ContinuousClock.now
             var thinking: Date?
             var read: Double?
+            var refusal: String?
             do {
                 for try await delta in ChatClient.stream(history, with: server, files: files) {
                     if !delta.reasoning.isEmpty, thinking == nil {
@@ -393,36 +381,60 @@ final class ChatStore {
                 }
                 // Cancelled, the stream just ends; what it said stays.
                 if Task.isCancelled { answer.stopped = true }
+            } catch let error as ChatClient.Refusal {
+                refusal = error.localizedDescription
             } catch {
-                if let refused, let refusal = error as? ChatClient.Refusal {
-                    self?.reply = nil
-                    return refused(refusal.localizedDescription)
-                }
                 answer.error = error.localizedDescription
             }
-            // An answer asked again that said nothing, stopped or failed, gives the earlier one back.
-            if let previous, answer.text.isEmpty, answer.reasoning.isEmpty, answer.stopped == true || answer.error != nil {
-                self?.reply = nil
-                if let error = answer.error, let refused { return refused(error) }
-                self?.finish(previous, replacing: answer.id, in: conversation.id)
-                return
+            guard let self else { return }
+            if refusal != nil || (previous != nil && answer.isEmpty && (answer.stopped == true || answer.error != nil)) {
+                self.reply = nil
+                guard takeBack(answer.id, question: previous == nil ? history.last?.id : nil, instead: previous,
+                               updated: updated, in: conversation.id),
+                      let reason = refusal ?? answer.error
+                else { return }
+                // A new chat that went opens new, its composer saying why.
+                selection = conversations.contains { $0.id == conversation.id } ? conversation.id : nil
+                return refused(reason)
             }
             // A reply that ended while the model still thought.
             if let thinking, answer.thinkingTime == nil { answer.thinkingTime = Date.now.timeIntervalSince(thinking) }
-            self?.finish(answer, in: conversation.id)
-            self?.reply = nil
+            finish(answer, in: conversation.id)
+            self.reply = nil
             // A first exchange answered in full gets the title the model sums it up in.
             if history.count == 1, answer.error == nil, answer.stopped == nil, !answer.text.isEmpty {
-                self?.title(conversation.id, question: history[0], answer: answer.text, with: server)
+                title(conversation.id, question: history[0], answer: answer.text, with: server)
             }
         }
     }
 
+    /// Takes back what a request that ended with nothing to show added to conversation `id`, from
+    /// the conversation as it is now, so that a pin, a name or a title it took meanwhile stays: its
+    /// `answer`, with the one it was asked again `instead` of back in its place, and the `question`
+    /// of a message the server refused. A conversation left with no message, a new one, goes with
+    /// its file; another goes back to its place in the list, as last `updated`. False where the
+    /// conversation is gone, as when deleted meanwhile, which stays gone.
+    private func takeBack(_ answer: UUID, question: UUID?, instead previous: ChatMessage?, updated: Date,
+                          in id: UUID) -> Bool {
+        guard let index = conversations.firstIndex(where: { $0.id == id }) else { return false }
+        var conversation = conversations.remove(at: index)
+        conversation.messages = conversation.messages.compactMap { $0.id == answer ? previous : $0.id == question ? nil : $0 }
+        guard !conversation.messages.isEmpty else {
+            let file = file(id)
+            files.async { try? FileManager.default.removeItem(at: file) }
+            return true
+        }
+        conversation.updated = updated
+        conversations.insert(conversation, at: conversations.firstIndex { $0.updated < updated } ?? conversations.endIndex)
+        write(conversation)
+        return true
+    }
+
     /// Puts the reply that ended, `message`, in its conversation, which it brings to the top, and
     /// writes it.
-    private func finish(_ message: ChatMessage, replacing id: UUID? = nil, in conversation: UUID) {
+    private func finish(_ message: ChatMessage, in conversation: UUID) {
         guard var updated = conversations.first(where: { $0.id == conversation }),
-              let index = updated.messages.firstIndex(where: { $0.id == (id ?? message.id) })
+              let index = updated.messages.firstIndex(where: { $0.id == message.id })
         else { return }
         updated.messages[index] = message
         updated.updated = .now
