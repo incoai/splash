@@ -96,7 +96,10 @@ class Handler(BaseHTTPRequestHandler):
             body = {
                 "active_requests": running,
                 "metrics": {"decode_tokens_per_second": 41.6},
-                "transport": {"status_stale": age is not None, "status_age_ms": age or 0.0},
+                "transport": {
+                    "status_stale": age is not None,
+                    "status_age_ms": age or 0.0,
+                },
             }
         data = json.dumps(body).encode()
         self.send_response(200)
