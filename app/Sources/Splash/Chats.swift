@@ -12,10 +12,9 @@ struct ChatMessage: Codable, Identifiable, Equatable, Sendable {
     var reasoning = ""
     /// What the user attached (`Attachment`); nil for nothing, as in a message an earlier app kept.
     var attachments: [Attachment]?
-    /// Images an earlier app kept in the message itself, as PNG or JPEG data, which `ChatStore`
-    /// moves into files of their own as it reads the conversation; none after. Always written, as
-    /// the 1.6.0 app requires it of every message, and skips a chat that lacks it, as after a
-    /// downgrade; read where it is missing too, as an earlier 1.6.1 wrote it.
+    /// Images an earlier app kept in the message itself, as PNG or JPEG data, which
+    /// `ChatStore.adoptFiles` moves into files of their own; none after. Always written, as the
+    /// 1.6.0 app requires it of every message, and skips a chat that lacks it, as after a downgrade.
     var images: [Data] = []
     /// The model that answered.
     var model: String?
@@ -30,25 +29,6 @@ struct ChatMessage: Codable, Identifiable, Equatable, Sendable {
 
     /// Whether the answer holds nothing to send back to the model.
     var isEmpty: Bool { text.isEmpty && reasoning.isEmpty }
-}
-
-extension ChatMessage {
-    /// As the decoding Swift derives, but with `images` read where present alone.
-    init(from decoder: any Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decode(UUID.self, forKey: .id)
-        role = try container.decode(Role.self, forKey: .role)
-        text = try container.decode(String.self, forKey: .text)
-        reasoning = try container.decode(String.self, forKey: .reasoning)
-        attachments = try container.decodeIfPresent([Attachment].self, forKey: .attachments)
-        images = try container.decodeIfPresent([Data].self, forKey: .images) ?? []
-        model = try container.decodeIfPresent(String.self, forKey: .model)
-        tokensPerSecond = try container.decodeIfPresent(Double.self, forKey: .tokensPerSecond)
-        thinkingTime = try container.decodeIfPresent(Double.self, forKey: .thinkingTime)
-        reasoningTokens = try container.decodeIfPresent(Int.self, forKey: .reasoningTokens)
-        error = try container.decodeIfPresent(String.self, forKey: .error)
-        stopped = try container.decodeIfPresent(Bool.self, forKey: .stopped)
-    }
 }
 
 /// A file the user attached to a message: an image, PNG or JPEG, or a PDF. It is kept as a file of
@@ -166,7 +146,7 @@ final class ChatStore {
     /// a conversation with images takes milliseconds to encode and write, which a send and a
     /// reply's end would otherwise wait for.
     private let files = DispatchQueue(label: "ChatStore.files", qos: .utility)
-    /// Whether every conversation's file could be read, so that `sweep` knows each file a
+    /// Whether every conversation's file could be read, so that `adoptFiles` knows each file a
     /// conversation names.
     @ObservationIgnored private var readAll = false
 
@@ -175,22 +155,23 @@ final class ChatStore {
         attachments = folder.appending(path: "Attachments")
         let files = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
         let kept = files.filter { $0.pathExtension == "json" }
-        var read = kept.compactMap { try? JSONDecoder().decode(Conversation.self, from: Data(contentsOf: $0)) }
-        // The images an earlier app kept inside its conversations, moved into files of their own.
-        var moved: [Conversation] = []
-        for index in read.indices where read[index].messages.contains(where: { !$0.images.isEmpty }) {
-            read[index] = Self.movingImages(of: read[index], to: attachments)
-            moved.append(read[index])
-        }
+        let read = kept.compactMap { try? JSONDecoder().decode(Conversation.self, from: Data(contentsOf: $0)) }
         conversations = read.map(Self.interrupted).sorted { $0.updated > $1.updated }
-        moved.forEach(write)
         readAll = read.count == kept.count
     }
 
-    /// Removes the attachments no conversation names, as those of a draft the app quit with,
-    /// unless a conversation that can't be read may name them. The app does it as it launches,
-    /// once it is the one Splash that runs, before any draft (`AppState.launch`).
-    func sweep() {
+    /// Brings the folder to how this app keeps it: the images an earlier app kept inside its
+    /// conversations go into files of their own; then the attachments no conversation names go,
+    /// as those of a draft the app quit with, unless a conversation that can't be read may name
+    /// them. In that order: the removal, off the main thread, would take the moved images for
+    /// strays. The app does it as it launches, before any draft (`AppState.launch`), once it is
+    /// the one Splash that runs, from where it can: a copy that gives way or one on the disk image
+    /// leaves the chats as the app that goes on running reads them.
+    func adoptFiles() {
+        for index in conversations.indices where conversations[index].messages.contains(where: { !$0.images.isEmpty }) {
+            conversations[index] = Self.movingImages(of: conversations[index], to: attachments)
+            write(conversations[index])
+        }
         guard readAll else { return }
         let named = Set(conversations.flatMap(\.attachmentFiles))
         let attachments = attachments

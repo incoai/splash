@@ -234,9 +234,6 @@ final class AppState {
     /// Face cache holds; meanwhile it reads what each model family makes of the launch options.
     func launch() async {
         defer { launched = true }
-        // Only now that this is the one Splash that runs: another, that gives way to the first
-        // one, would take the files of its draft.
-        chats.sweep()
         // The shell's Hugging Face settings, read beside the checks, for all the app runs after them.
         let shellSettings = Task { await Runtime.readShellSettings(drawer.shell()) }
         if let reason = await runtime.unsupportedReason() {
@@ -248,6 +245,7 @@ final class AppState {
                               message: "Splash can’t run from the disk image. Drag it to your Applications folder, then open it from there.")
             return
         }
+        chats.adoptFiles()
         runtime.shellSettings.set(await shellSettings.value)
         await listed()
         Task { families = await runtime.families() }

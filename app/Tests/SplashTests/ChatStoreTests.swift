@@ -9,8 +9,7 @@ import Testing
 @Suite(.serialized)
 struct ChatStoreTests {
     /// A chat this app writes, the 1.6.0 app reads, which requires every message's images: an
-    /// empty list, once they are files of their own. One whose messages lack them, as an earlier
-    /// 1.6.1 wrote it, reads here.
+    /// empty list, once they are files of their own.
     @Test func the160AppReadsTheChatsThisOneWrites() throws {
         struct Message160: Decodable {
             let id: UUID
@@ -30,7 +29,7 @@ struct ChatStoreTests {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let id = UUID()
         let written = #"{"id": "\#(id)", "title": "Plan", "updated": 0, "messages": [{"id": "\#(UUID())", "role": "user", "#
-            + #""text": "Read this", "reasoning": "", "attachments": [{"id": "\#(UUID())", "kind": "pdf", "#
+            + #""text": "Read this", "reasoning": "", "images": [], "attachments": [{"id": "\#(UUID())", "kind": "pdf", "#
             + #""type": "application/pdf", "bytes": 3, "name": "a.pdf", "pages": 1}]}]}"#
         try Data(written.utf8).write(to: folder.appending(path: "\(id).json"))
         let store = ChatStore(folder: folder)
