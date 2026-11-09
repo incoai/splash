@@ -590,17 +590,22 @@ private:
   // The tokens the request's KV is projected to hold: those it holds and
   // the output it may still generate, at most kProjectedOutputTokens.
   [[nodiscard]] static uint64_t projectedTokens(const Request &request) noexcept;
-  // Where the KV of a request that starts now lives:
-  // on a target that can spill, Spill only when its projection's Resident
-  // KV is more than its Spill peak (its floor, and the larger of the staging
-  // its prompt's history takes and its lane's hot block floor, priced as
-  // laneDemand prices it), and memory for the Resident KV, less the pages
-  // in memory of the chain it restores (Cache::residentChainPages), beside
-  // every lane's projected growth (laneDemand) is not there for its start
-  // without the expert store,
-  // as the governor finds it keeping that chain (MemoryGovernor::available);
-  // for every request under --kv-spill
-  // always; Resident otherwise. Correctness never depends on it.
+  // Where the KV of a request that starts now lives: on a target that can
+  // spill, Spill only when its projection's Resident KV is more than its
+  // Spill peak (its floor, and the larger of the staging its prompt's
+  // history takes and its lane's hot block floor, priced as laneDemand
+  // prices it), and memory for the Resident KV, less the pages in memory of
+  // the chain it restores (Cache::residentChainPages), beside every lane's
+  // projected growth (laneDemand) is not there for its start without the
+  // expert store, as the governor finds it keeping that chain, the releases
+  // of the Spill lanes of its priority or a lower one counted
+  // (MemoryGovernor::available, TakeRights::lanes); for every request under
+  // --kv-spill always; Resident otherwise. A start alone is priced so too,
+  // keeping what only work in service takes, the pooled buffers the next
+  // lane starts from among it, which Spill, taking less memory, leaves to
+  // the requests that follow; a start the SSD cache cannot take has no such
+  // choice and goes on as the claim its admission makes finds memory
+  // (inMemory). Its outputs never depend on the mode.
   [[nodiscard]] KvMode placement(const Request &request) const;
   // What `tokens` of a start's Resident KV need now beside every lane's
   // projected growth, as placement prices it, and how much of it what `spec`

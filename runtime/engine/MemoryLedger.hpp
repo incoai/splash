@@ -467,8 +467,7 @@ public:
   // counted memory its takes did not free, against the peek contract); and
   // the units that release a lane's pages (VictimKind::Release) taken first
   // in a run that freed less than the lesser of their count and what the
-  // claim lacked, though the host refused nothing (short). Two lanes on one
-  // conversation counting their shared pages each overcount by those pages.
+  // claim lacked, though the host refused nothing (short).
   struct CountChecks final {
     uint64_t coveredRuns = 0;
     uint64_t overcountedRuns = 0;
