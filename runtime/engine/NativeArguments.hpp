@@ -87,10 +87,10 @@ struct NativeArguments final {
   // --verify-rows auto|all: the rows of the draft's block a decode
   // cycle verifies (RuntimeResourcesConfig::verifyRows).
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
-  // --prefill-int8 on|off: whether prefill chunks of MLX affine 4- and 5-bit
-  // projections may run in int8 activations where the GPU multiplies int8
-  // faster (RuntimeResourcesConfig::prefillInt8).
-  bool prefillInt8 = true;
+  // --int8-activations on|off: whether activations may round to int8 where
+  // an int8-activation path takes them
+  // (RuntimeResourcesConfig::int8Activations).
+  ops::Int8Activations int8Activations = ops::Int8Activations::On;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

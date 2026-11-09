@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/abi/PagedAttention.h"
+#include "metal/kernels/common/int8_activations.h"
 #include "metal/kernels/common/kv_extent.h"
 #include "metal/kernels/common/kv_paging.h"
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -271,12 +272,12 @@ inline void splash_attention_page_softmax(
   probabilities4[1] = bfloat4(high);
 }
 
-// The tile's queries as INT8 codes with one scale per fused row (absmax /
-// 127), for the INT8 x INT8 score product. A row's softmax lanes quantize
-// it, a quarter of its dimensions each, so each returns its own row's scale.
-// Lanes past those of M rows return 0. A non-finite query need not reach its
-// row's scores (fast math's max may drop a NaN, and every code is finite),
-// which is harmless: that row's residual still carries it.
+// The tile's queries as INT8 codes with one scale per fused row, by the
+// int8-activation rule (kernels/common/int8_activations.h), for the INT8 x
+// INT8 score product. A row's softmax lanes quantize it, a quarter of its
+// dimensions each, so each returns its own row's scale: NaN for a row holding
+// an infinity or a NaN, whose scores are then NaN, as with bf16 queries.
+// Lanes past those of M rows return 0.
 template <uint M, uint HeadDim>
 inline float splash_attention_query_codes(device const bfloat *queries, device int8_t *codes,
                                           uint thread_index) {
@@ -288,21 +289,24 @@ inline float splash_attention_query_codes(device const bfloat *queries, device i
   const uint first = thread_index / LanesPerRow * HeadDim + thread_index % LanesPerRow * Quarter;
   device const bfloat4 *source = reinterpret_cast<device const bfloat4 *>(queries + first);
   float maximum = 0.0f;
+  uint finite = 1;
 #pragma unroll
   for (uint i = 0; i < Quarter / 4; ++i) {
-    const float4 value = abs(float4(source[i]));
+    const bfloat4 query = source[i];
+    finite &= !int8_activation_not_finite(query);
+    const float4 value = abs(float4(query));
     maximum = max(maximum, max(max(value.x, value.y), max(value.z, value.w)));
   }
   maximum = max(maximum, simd_shuffle_xor(maximum, 1));
   maximum = max(maximum, simd_shuffle_xor(maximum, 2));
-  // A row below 2^-100 (inactive or stale) codes as zeros: 127 / maximum
-  // would overflow.
-  const float inverse = maximum > 0x1p-100f ? 127.0f / maximum : 0.0f;
+  finite &= simd_shuffle_xor(finite, 1);
+  finite &= simd_shuffle_xor(finite, 2);
+  const Int8Block block = int8_activation_block(maximum);
   device char4 *target = reinterpret_cast<device char4 *>(codes + first);
 #pragma unroll
   for (uint i = 0; i < Quarter / 4; ++i)
-    target[i] = char4(rint(float4(source[i]) * inverse));
-  return maximum / 127.0f;
+    target[i] = char4(int8_activation_code(float4(source[i]), block.inverse));
+  return as_type<float>(int8_activation_bits(block.scale, finite != 0));
 }
 
 // One tile over its split's pages, whose K/V (INT8 with their scales, or

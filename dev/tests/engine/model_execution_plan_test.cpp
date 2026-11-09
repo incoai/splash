@@ -128,7 +128,7 @@ void checkGateUpLayers() {
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = 16;
-    ops::ExecutionPlans plans(device);
+    ops::ExecutionPlans plans(device, ops::Int8Activations::On);
     const auto geometry = model::RuntimeGeometry::from(dense, kv::Format::Int8, ops::GdnStateFormat::Float32);
     const auto head = target.logitsProjection.shape();
     const auto containsHead = [&](const auto &shapes) {
@@ -175,34 +175,35 @@ void checkGateUpLayers() {
 
 // The prefill arena holds the int8 prefill tile's codes and scales of a full
 // chunk of the target's widest projection the tile takes, wherever the family
-// runs it, and none for the draft, which prefills on the bf16 tiles: a GGUF
-// target holds none, and Qwen3.8-27B MLX 4-bit its down projection's (17408
-// inputs), not its draft's context projection's (25600).
+// runs it with int8 activations on, and none for the draft, which prefills on
+// the bf16 tiles: a GGUF target holds none, and Qwen3.8-27B MLX 4-bit its down
+// projection's (17408 inputs), not its draft's context projection's (25600).
 void checkPrefillInt8Scratch() {
-  for (uint32_t family : {9U, 10U, 11U}) {
-    DeviceCapabilities device;
-    device.appleGpuFamily = family;
-    device.gpuCoreCount = 20;
-    const ops::ExecutionPlans plans(device);
-    // The arena's codes and scales for `loaded`.
-    const auto int8Scratch = [&](const model::LoadedModel &loaded) {
-      const auto sizes = model::prefillTensorBytes(
-          model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32), plans);
-      return std::pair{sizes[uint32_t(model::PrefillTensor::LinearTable)],
-                       sizes[uint32_t(model::PrefillTensor::LinearSums)]};
-    };
-    for (const model::LoadedModel &gguf :
-         {loadedModel<model::Qwen3_8Weights>(), loadedModel<model::Qwen3_6MoeWeights>()})
-      require(int8Scratch(gguf) == std::pair<uint64_t, uint64_t>{},
-              "the prefill arena of a GGUF target holds int8 prefill scratch");
-    const uint32_t down = model::Qwen3_8Layout{}.intermediateSize;
-    const auto [table, sums] =
-        int8Scratch(loadedModel<model::Qwen3_8Weights>({}, test::qwen3_8Draft(), GGUF_FMT_AF4G64));
-    const bool int8 = family >= 10;
-    require(table == (int8 ? gguf_prefill_int8_table_bytes(down, SPLASH_PREFILL_TOKEN_BUDGET) : 0) &&
-                sums == (int8 ? gguf_prefill_int8_scale_bytes(down, SPLASH_PREFILL_TOKEN_BUDGET) : 0),
-            "the prefill arena of an MLX target holds other int8 prefill scratch than its down projection's");
-  }
+  for (uint32_t family : {9U, 10U, 11U})
+    for (const ops::Int8Activations setting : {ops::Int8Activations::On, ops::Int8Activations::Off}) {
+      DeviceCapabilities device;
+      device.appleGpuFamily = family;
+      device.gpuCoreCount = 20;
+      const ops::ExecutionPlans plans(device, setting);
+      // The arena's codes and scales for `loaded`.
+      const auto int8Scratch = [&](const model::LoadedModel &loaded) {
+        const auto sizes = model::prefillTensorBytes(
+            model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32), plans);
+        return std::pair{sizes[uint32_t(model::PrefillTensor::LinearTable)],
+                         sizes[uint32_t(model::PrefillTensor::LinearSums)]};
+      };
+      for (const model::LoadedModel &gguf :
+           {loadedModel<model::Qwen3_8Weights>(), loadedModel<model::Qwen3_6MoeWeights>()})
+        require(int8Scratch(gguf) == std::pair<uint64_t, uint64_t>{},
+                "the prefill arena of a GGUF target holds int8 prefill scratch");
+      const uint32_t down = model::Qwen3_8Layout{}.intermediateSize;
+      const auto [table, sums] =
+          int8Scratch(loadedModel<model::Qwen3_8Weights>({}, test::qwen3_8Draft(), GGUF_FMT_AF4G64));
+      const bool int8 = family >= 10 && setting == ops::Int8Activations::On;
+      require(table == (int8 ? gguf_prefill_int8_table_bytes(down, SPLASH_PREFILL_TOKEN_BUDGET) : 0) &&
+                  sums == (int8 ? gguf_prefill_int8_scale_bytes(down, SPLASH_PREFILL_TOKEN_BUDGET) : 0),
+              "the prefill arena of an MLX target holds other int8 prefill scratch than its down projection's");
+    }
 }
 
 // One decode arena serves every lane count, and a staged plan's partials
@@ -222,7 +223,7 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
       DeviceCapabilities device;
       device.appleGpuFamily = family;
       device.gpuCoreCount = cores;
-      const ops::ExecutionPlans plans(device);
+      const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
       const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
       for (const auto matrix : matrices)
         for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes)
@@ -259,7 +260,7 @@ uint64_t decodeBytes(const model::RuntimeGeometry &geometry, model::DecodeTensor
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
-  return model::decodeTensorBytes(geometry, ops::ExecutionPlans(device))[static_cast<uint32_t>(tensor)];
+  return model::decodeTensorBytes(geometry, ops::ExecutionPlans(device, ops::Int8Activations::On))[static_cast<uint32_t>(tensor)];
 }
 
 // A block-sparse target selects its blocks through index tables of their
@@ -320,7 +321,7 @@ void checkArenasWithoutGdnLayers() {
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
-  const ops::ExecutionPlans plans(device);
+  const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
   // Whether `bytes` are the hybrid's but for the GDN tensors, which only the
   // hybrid's arena holds.
   const auto withoutGdn = [](const auto &hybridBytes, const auto &bytes, const auto &gdnTensors) {
@@ -422,7 +423,7 @@ void checkPrefillAttentionHistory() {
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
-  const ops::ExecutionPlans plans(device);
+  const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
   model::QwenTargetPrefillSequence sequence;
   sequence.rows = 300;
   const auto splitsAfter = [&](uint32_t history) {

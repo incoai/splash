@@ -55,9 +55,9 @@ kernel void gguf_rotate(device const bfloat *input [[buffer(0)]], device const c
 }
 
 // The int8 rows of the int8 decode tiles (metal/abi/Gguf.h GgufRotationInt8Params): gguf_rotate's bf16 values H (D x),
-// quantized per rotation block of a row as q = clamp(rint(x / s), -127, 127) with s = max |x| / 127 (fp32), in the
-// tiles' stage order (gguf_decode_int8_position), the scales after the p.rows int8 rows; a block holding an infinity or
-// a NaN takes a NaN scale (kernels/common/int8_activations.h). Grid (width / GGUF_ROTATION_BLOCK, rows).
+// each rotation block of a row quantized by the int8-activation rule (kernels/common/int8_activations.h), in the
+// tiles' stage order (gguf_decode_int8_position), the scales after the p.rows int8 rows. Grid (width /
+// GGUF_ROTATION_BLOCK, rows).
 kernel void gguf_rotate_int8(device const bfloat *input [[buffer(0)]], device const char *signs [[buffer(1)]],
                              device uchar *output [[buffer(2)]], constant GgufRotationInt8Params &p [[buffer(3)]],
                              uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
@@ -88,17 +88,16 @@ kernel void gguf_rotate_int8(device const bfloat *input [[buffer(0)]], device co
   threadgroup_barrier(mem_flags::mem_threadgroup);
   m = peak[0];
   for (uint i = 1; i < GGUF_ROTATION_THREADS / 32; ++i) m = max(m, peak[i]);
-  const float s = m / 127.0f;
+  const Int8Block block = int8_activation_block(m);
   for (uint i = 0; i < 4; ++i) {
     const uint k = column + 4 * tid + i;
-    const float q = s > 0.0f ? clamp(rint(x[i] / s), -127.0f, 127.0f) : 0.0f;
-    output[row - column + (k & ~31u) + gguf_decode_int8_position(k & 31u)] = uchar(char(int(q)));
+    output[row - column + (k & ~31u) + gguf_decode_int8_position(k & 31u)] =
+        uchar(char(int8_activation_code(x[i], block.inverse)));
   }
   if (tid != 0) return;
   for (uint i = 0; i < GGUF_ROTATION_THREADS / 32; ++i) finite &= simd_finite[i] != 0;
-  device float *scale = (device float *)(output + ulong(p.rows) * K) + group.y * (K / GGUF_ROTATION_BLOCK) + group.x;
-  if (finite) *scale = s;
-  else *(device uint *)scale = 0x7fc00000u;
+  device uint *scale = (device uint *)(output + ulong(p.rows) * K) + group.y * (K / GGUF_ROTATION_BLOCK) + group.x;
+  *scale = int8_activation_bits(block.scale, finite);
 }
 
 // The token rows of a PQ2_0 table stored rotated (GgufEmbedPQ20), as D (H r): the gathered values enter the

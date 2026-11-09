@@ -3,8 +3,6 @@
 #include "engine/CacheDirectory.hpp"
 #include "model/SlotFile.hpp"
 
-#include <sys/mount.h>
-
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -28,8 +26,6 @@ struct DiskVolume final {
   // A volume of this Mac's own (MNT_LOCAL), whose free space the tier
   // follows.
   bool local = false;
-
-  [[nodiscard]] static DiskVolume of(const struct statfs &status);
 };
 
 // The volume the directory at `path`, or the nearest one above it that
@@ -122,8 +118,6 @@ public:
 
   // Reads the volume and sets the limit from it. Engine thread.
   void measure();
-  // The same with a reading of the volume the caller made.
-  void measure(std::optional<DiskVolume> volume);
   // As of the last measure: the volume, empty when it could not be measured;
   // what the tier's files and the other namespaces held then; and what the
   // other namespaces held.

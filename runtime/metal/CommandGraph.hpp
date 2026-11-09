@@ -88,13 +88,14 @@ public:
   // `timed` gets its round trip once the command completed, `gpu` says
   // whether the GPU spins through it, and `then` runs once the work after it
   // may go. `beside` adds dispatches, and nothing else, that run while
-  // `work` runs (EventStep::beside).
+  // `work` runs and use no 128-byte line of `writes`, the buffers `work`
+  // writes (EventStep::beside).
   void host(std::function<void()> work, std::function<void(const HostStepTiming &)> timed = {},
             HostStepGpu gpu = HostStepGpu::Idle, std::function<void()> then = {},
-            const std::function<void()> &beside = {}) {
+            const std::function<void()> &beside = {}, std::vector<MetalBuffer> writes = {}) {
     const size_t step = events_.size(), before = dispatches_.size();
     events_.push_back({before, {}, 0, EventStep::Kind::Host, std::move(work), std::move(timed), gpu,
-                       std::move(then)});
+                       std::move(then), 0, std::move(writes)});
     if (!beside) return;
     beside();
     if (events_.size() != step + 1) throw std::logic_error("a host step's beside work adds dispatches only");

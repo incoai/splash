@@ -256,11 +256,13 @@ A lane's arithmetic can depend on the batch it decodes in and on how its prompt
 is chunked. On a GGUF MoE target, an expert that a step routes at most two rows
 to runs them on the column tile, which sums in another order than the staged
 matmul, so a row's result also depends on the rows decoded or prefilled beside
-it. With INT8 KV on M5 and later Macs, attention scores INT8 queries where its
-splits read 8 pages or more, which follows the chunk's rows and history and, in
-verify, the batch's longest lane. On M5 and later Macs with `--prefill-int8` on,
-a target's MLX 4- or 5-bit projection rounds its rows to int8 when their chunk,
-with the rows prefilled beside them, has more than 64 rows. Concurrent requests
+it. On M5 and later Macs with `--int8-activations` on, the default, attention
+over INT8 KV scores INT8 queries where its splits read 8 pages or more, which
+follows the chunk's rows and history and, in verify, the batch's longest lane;
+a target's MLX 4- or 5-bit projection rounds its prefill rows to int8 when their
+chunk, with the rows prefilled beside them, has more than 64 rows; and a rotated
+PQ2_0 projection decodes in int8 activations on plans of 16 rows or more, though
+not on a lone lane's split plans of 8 rows, which keep bf16. Concurrent requests
 change the batch and the chunking, and chunk boundaries also come from the
 cached boundary a request resumes from, from a boundary another request waits to
 resume from, and from one whose state, or the KV past it, memory could not hold.
