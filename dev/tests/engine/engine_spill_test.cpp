@@ -2899,6 +2899,34 @@ void testACriticalPassReleasesPastTheEnginesLimit() {
   require(spill.events.failures.empty() && spill.events.usage.at(1).second == 1'000, "the lane did not complete");
 }
 
+// A take a refused allocation cuts short is no overcount: the driver denies the Index extent the host's pass under
+// critical pressure refills after its first runway, so the release moves one runway of the two extents it counted,
+// and /status counts neither an overcounted take nor a short release (MemoryLedger::CountChecks), as for the host's
+// refusal or the engine's limit. On the parent the driver's denial counted as both, an accounting defect to report.
+void testARefillTheDriverDeniesIsNoOvercount() {
+  CriticalLane critical;
+  Spilling &spill = critical.spill;
+  bool denied = false;
+  spill.storage.driverDenies = [&](kv::PageForm form) {
+    return form == kv::PageForm::Index && !std::exchange(denied, true);
+  };
+  const uint32_t before = spill.cache.indexPages(1);
+  const uint64_t extents = 2 * 256 * (FlashNextLanes::kPages.fullBytes - FlashNextLanes::kPages.indexBytes);
+  const FreeResult freed = test::hostPass(spill.host.governor, extents, true);
+  const uint32_t released = spill.cache.indexPages(1) - before;
+  const MemoryLedger::CountChecks checks = spill.host.governor.snapshot().countChecks;
+  require(denied && freed.nowBytes < extents && released == 256 && checks.coveredRuns != 0 &&
+              checks.overcountedRuns == 0 && checks.shortReleases == 0,
+          "a pass whose refill the driver denied released " + std::to_string(released) + " pages, freed " +
+              std::to_string(freed.nowBytes) + " B and counted " + std::to_string(checks.overcountedRuns) +
+              " overcounted takes and " + std::to_string(checks.shortReleases) + " short releases");
+  spill.storage.driverDenies = {};
+  spill.host.setPressure(MemoryPressure::Normal);
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.usage.at(1).second == 1'000, "the lane did not complete");
+}
+
 // Under critical pressure a lane's growth the host refuses releases its own lane's pages whose copies landed, in
 // place: into free Index pages, the Full pages they free taken by the growth, so the lane decodes on rather than
 // yield.
@@ -4025,6 +4053,7 @@ std::span<const test::TestCase> spillTests() {
       {"testAStartNeverReleasesAHigherPriorityLane", testAStartNeverReleasesAHigherPriorityLane},
       {"testCriticalReleasesCleanPagesBeforeAnyLaneYields", testCriticalReleasesCleanPagesBeforeAnyLaneYields},
       {"testACriticalPassReleasesPastTheEnginesLimit", testACriticalPassReleasesPastTheEnginesLimit},
+      {"testARefillTheDriverDeniesIsNoOvercount", testARefillTheDriverDeniesIsNoOvercount},
       {"testAWarningDeficitReleasesALanesLandedPages", testAWarningDeficitReleasesALanesLandedPages},
       {"testAHostRefusedGrowthReleasesItsOwnLane", testAHostRefusedGrowthReleasesItsOwnLane},
       {"testAReleaseInPlaceKeepsTheIndexRunway", testAReleaseInPlaceKeepsTheIndexRunway},

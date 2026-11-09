@@ -1828,8 +1828,10 @@ whether the pool releases them or the start takes them in place of buffers it
 would allocate, and so do its takes; a pooled buffer they release that the
 start would have taken frees it nothing, as the start then allocates it.
 `/status` counts the takes on a count that covered what the claim lacked, and
-those that freed less though no unit waited for a transfer and the host refused
-nothing meanwhile (`memory_governor.count_checks`).
+those that freed less though no unit waited for a transfer and no allocation was
+refused meanwhile, by the host, the engine's limit or the driver
+(`memory_governor.count_checks`): a refused refill cuts a release short by the
+runways it would have moved, which is no overcount.
 
 The log has a line for each decision of a request's claim
 (`Memory: <class> claim of request N needs ...`) that waits, is short, is

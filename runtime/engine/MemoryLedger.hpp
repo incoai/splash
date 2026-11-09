@@ -449,6 +449,10 @@ public:
   [[nodiscard]] ClaimId open(const ClaimSpec &spec);
   void update(ClaimId claim, const ClaimSpec &spec);
   void refused(ClaimId claim, const Need &need);
+  // An allocation in a claim's scope was refused: by the host's rule, the
+  // engine's limit or the driver. A take it cuts short is no overcount
+  // (CountChecks).
+  void allocationRefused() noexcept;
   void setWaiting(ClaimId claim, bool waiting);
   void setHostRefusedWaiting(ClaimId claim, bool waiting);
   void setHostExempt(ClaimId claim, bool exempt);
@@ -475,12 +479,14 @@ public:
   // How free()'s takes kept to its counts since the engine started, which
   // /status reports (memory_governor.count_checks): the runs whose count
   // (bound) covered what the claim lacked; of those, the takes that covered
-  // less though no unit they reached waited for a transfer and the host
-  // refused no allocation in the claim's scope (overcounted: a source
-  // counted memory its takes did not free, against the peek contract); and
-  // the units that release a lane's pages (VictimKind::Release) taken first
-  // in a run that freed less than the lesser of their count and what the
-  // claim lacked, though the host refused nothing (short).
+  // less though no unit they reached waited for a transfer and no
+  // allocation in the claim's scope was refused, by the host, the engine's
+  // limit or the driver (overcounted: a source counted memory its takes did
+  // not free, against the peek contract); and the units that release a
+  // lane's pages (VictimKind::Release) taken first in a run that freed less
+  // than the lesser of their count and what the claim lacked, though no
+  // allocation was refused (short). A refused allocation cuts a take short
+  // by what it would have refilled, as a release's Index runway.
   struct CountChecks final {
     uint64_t coveredRuns = 0;
     uint64_t overcountedRuns = 0;
@@ -587,8 +593,8 @@ private:
   double quietSinceSeconds_ = 0.0;
   uint64_t growthLackBytes_ = 0;
   CountChecks checks_;
-  // The allocations the host refused in any claim's scope (refused).
-  uint64_t hostRefusals_ = 0;
+  // The allocations refused in any claim's scope (allocationRefused).
+  uint64_t refusals_ = 0;
 };
 
 } // namespace splash::engine

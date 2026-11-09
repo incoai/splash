@@ -238,6 +238,7 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
     if (deniedReservations_ != std::numeric_limits<uint64_t>::max())
       ++deniedReservations_;
     ledger_.refused(scope_, {.bytes = bytes, .hostRefused = !hostAdmits});
+    ledger_.allocationRefused();
     return std::nullopt;
   }
   // A pool's growth reaches the host's counters only as it fills: until
@@ -262,6 +263,7 @@ metal::AllocationAdmission MemoryGovernor::allocationAdmission() noexcept {
       allocate();
     } catch (const metal::MetalAllocationError &error) {
       // Host headroom is an estimate; the driver can still deny the allocation.
+      ledger_.allocationRefused();
       return error.failure();
     }
     // Only memory allocated takes back what the scope's work released: a
