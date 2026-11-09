@@ -1150,11 +1150,27 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
       pages = static_cast<uint32_t>(std::min<uint64_t>(whole, releasable.clean));
     }
     const uint64_t before = engine.cache_.allocatedBytes();
+    const auto readsFirst = [&] {
+      std::vector<uint64_t> lanes;
+      for (const uint64_t id : releasable.holders)
+        if (!engine.cache_.holdsIndexPages(id))
+          lanes.push_back(id);
+      return lanes;
+    }();
     const uint32_t moved = engine.cache_.releasePages(victim.key, pages, inPlace, rule,
                                                        [&](uint64_t bytes) { engine.governor().fund(bytes); });
     if (!moved)
       return {};
     ++engine.ledgerChanges_;
+    // Critical pressure refuses a lane's first reads at its next prepare:
+    // what this release freed pays for them here (MemoryGovernor::fund), or a
+    // lane that needed no memory would stop and time out.
+    if (query.rights.laneStart == TakeRights::LaneStart::First)
+      for (const uint64_t id : readsFirst)
+        if (engine.cache_.holdsIndexPages(id))
+          static_cast<void>(engine.model_.reserveSpilledReads(
+              id, {engine.scheduler_.phase(id) == Phase::Prefill ? WorkKind::Prefill : WorkKind::Decode,
+                   engine.nextCommandPages(engine.requests_.at(id))}));
     // What it frees net of the first reads it gave the lanes, as its count
     // is: taken gross, a claim of two lanes' releases kept a 390 MiB hot
     // block floor less for each than it counted. In place an extent more

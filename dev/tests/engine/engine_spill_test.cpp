@@ -2787,6 +2787,30 @@ void testAStartNeverReleasesAHigherPriorityLane() {
   require(spill.events.failures.empty() && spill.events.completedCount == 2, "the requests did not complete");
 }
 
+// A decoding Spill lane that never held its hot block floor needs no memory until a release gives it Index pages.
+// Under macOS's critical pressure, which refuses every allocation, what the host's pass freed pays for the floor, or
+// a lane that needed nothing would stop and time out.
+void testACriticalPassPaysForTheFirstReadsOfALaneItReleases() {
+  FlashNextGoverned lanes;
+  Spilling &spill = lanes.spill;
+  lanes.startSpill(Spilling::prompt(1, 1, 3'070, 1'000));
+  lanes.decode(1, 10);
+  require(!spill.cache.holdsIndexPages(1) && !spill.model.spilledReadFloors.contains(1),
+          "the lane held Index pages or its floor before any release");
+  spill.host.setPressure(MemoryPressure::Critical);
+  const uint64_t extents = 8 * 256 * (FlashNextLanes::kPages.fullBytes - FlashNextLanes::kPages.indexBytes);
+  static_cast<void>(test::hostPass(spill.host.governor, extents, true));
+  require(spill.cache.holdsIndexPages(1), "the host's pass released none of the lane's pages");
+  require(spill.model.spilledReadFloors.contains(1), "the release left the lane without its floor");
+  // As far as the pages it has hold; a new page would need memory critical pressure refuses.
+  lanes.decode(1, spill.events.outputs[1].size() + 32);
+  require(spill.engine.snapshot().resourceSuspensions == 0, "the lane yielded under critical pressure");
+  spill.host.setPressure(MemoryPressure::Normal);
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.completedCount == 1, "the lane did not complete");
+}
+
 // A request alone at the wall waits for the copies a finished Spill lane left in flight, which free the lane's pages
 // as they land: refused then, it would be told to shrink its context, where a retry a moment later succeeds.
 void testALoneRequestWaitsForTheCopiesAFinishedSpillLaneLeft() {
@@ -4085,6 +4109,7 @@ std::span<const test::TestCase> spillTests() {
       {"testTheFirstReleaseFundsTheLanesReads", testTheFirstReleaseFundsTheLanesReads},
       {"testAStartReleasesALaneOfItsPriority", testAStartReleasesALaneOfItsPriority},
       {"testAStartNeverReleasesAHigherPriorityLane", testAStartNeverReleasesAHigherPriorityLane},
+      {"testACriticalPassPaysForTheFirstReadsOfALaneItReleases", testACriticalPassPaysForTheFirstReadsOfALaneItReleases},
       {"testALoneRequestWaitsForTheCopiesAFinishedSpillLaneLeft", testALoneRequestWaitsForTheCopiesAFinishedSpillLaneLeft},
       {"testCriticalReleasesCleanPagesBeforeAnyLaneYields", testCriticalReleasesCleanPagesBeforeAnyLaneYields},
       {"testACriticalPassReleasesPastTheEnginesLimit", testACriticalPassReleasesPastTheEnginesLimit},
