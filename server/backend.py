@@ -1088,7 +1088,11 @@ class NativeBackend:
             error = self._api_error(unexpected)
         finally:
             with self.lock:
-                shutdown_requested = state.shutdown_requested
+                # A server whose engine stopped for good closes as it exits:
+                # that stop, not the close, ended these requests.
+                shutdown_requested = (
+                    state.shutdown_requested and self.stop_reason is None
+                )
                 self._detach_locked(state)
         if shutdown_requested:
             # Once close() has claimed an active HTTP request, its public

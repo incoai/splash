@@ -722,6 +722,29 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual((error.status, error.code), (503, "server_shutdown"))
         self.assertFalse(transport.active)
 
+    def test_a_request_the_engines_stop_ended_says_so_through_the_close(self):
+        # A server whose engine stopped for good exits, and its close claims
+        # the calls the failure is ending: their clients are owed why.
+        transport, driven = self.make_transport()
+        job = make_job()
+        transport.submit(job)
+        call = driven.calls[0]
+        transport.stop_reason = "Splash stopped restarting the engine"
+        original_close = driven.close
+
+        def close_after_failure():
+            call.complete(error=runtime.EngineUnhealthy("native protocol reached EOF"))
+            original_close()
+
+        driven.close = close_after_failure
+        transport.close()
+
+        kind, error = self.terminal(job)
+        self.assertEqual(
+            (kind, error.status, error.code, error.message),
+            ("error", 500, "engine_failed", "Splash stopped restarting the engine"),
+        )
+
     def test_close_does_not_wait_for_a_frame_being_written(self):
         # A writer stuck mid-frame holds the write lock for up to its write
         # budget; shutdown fails the calls and stops the engine without it.
