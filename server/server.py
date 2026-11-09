@@ -388,15 +388,23 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _log_api_error(self, code):
         path = "".join(char if char.isprintable() else "?" for char in self.route)
-        print_status(f"Error · {code} · {self.command} {path[:256]}", error=True)
+        # A request the engine took is named as the backend's lines name it,
+        # so that the app joins them.
+        job = getattr(self, "_submitted", None)
+        engine_id = job.engine_request_id if job is not None else None
+        request = "" if engine_id is None else f"request {engine_id} · "
+        print_status(
+            f"Error · {request}{code} · {self.command} {path[:256]}", error=True
+        )
 
     def safe_error(self, error, *, log=True):
         """Answer with `error` as its path's API answers it, unless the
-        response has begun."""
+        response has begun. `log` prints its line unless the backend has:
+        one line ends a request."""
         if self.response_started:
             return
         status, code, payload = self.errors.answer(error)
-        if log:
+        if log and not error.logged:
             self._log_api_error(code)
         try:
             self.send_json(status, payload, error.retry_after)
@@ -637,8 +645,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.safe_error(error, log=self._submitted is None)
         except APIError as error:
             self._cancel_submitted()
-            # The native outcome was already logged; a server-side failure
-            # after submission must still reach the console.
+            # A failure the backend ended the request with is logged, under
+            # the engine's id; another server-side failure after submission
+            # must still reach the console.
             self.safe_error(error, log=self._submitted is None or error.status >= 500)
         except Exception as error:
             self._cancel_submitted()
@@ -917,7 +926,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.app.backend.cancel(job)
             if not self.response_started:
                 raise
-            if error.status >= 500:
+            if error.status >= 500 and not error.logged:
                 self._log_api_error(error.code)
             try:
                 send_error(error)

@@ -141,6 +141,9 @@ class Job:
     response_format: dict | None = None
     constraint: TokenConstraint | None = None
     cache: CacheInfo = field(default_factory=CacheInfo)
+    # The engine's id of the request once the engine has taken it, by which
+    # the console's lines name it.
+    engine_request_id: int | None = None
     # Image placeholder spans with their grids and digests, plus the
     # concatenated resized pixels the engine encodes during prefill and their
     # charge against the in-flight image budget, held until the frame is
@@ -920,6 +923,7 @@ class NativeBackend:
                 if not state.detached:
                     state.call = call
                 cancel = state.detached or self.closing or job.cancelled.is_set()
+            job.engine_request_id = call.request_id
             if cancel:
                 call.cancel()
         except Exception as error:
@@ -1172,6 +1176,7 @@ class NativeBackend:
             record["error_code"] = error.code
             if error.code in _ENGINE_RESOURCE_CODES:
                 record["engine_reason"] = error.message
+            error.logged = True
         self._log(record)
 
     def _log(self, record):

@@ -153,6 +153,19 @@ extension ServerScreenTests {
 }
 
 extension ServerScreenTests {
+    /// The server's line for its own failure of a request the engine took names the request, as
+    /// the backend's lines do: it ends that request's row, which stays the one row.
+    @Test func aFailureLineThatNamesARequestEndsItsRow() throws {
+        let started = try #require(RequestEntry("12:00:00 Started · request 7 · input 1,200 · cached 0"))
+        let failed = try #require(RequestEntry("12:00:03 Error · request 7 · request_timeout · POST /v1/chat/completions"))
+        #expect(failed.request == 7 && failed.message == "request_timeout · POST /v1/chat/completions")
+        var rows = ServedRequest.taking(started, at: .now, into: [])
+        rows = ServedRequest.taking(failed, at: .now, into: rows)
+        #expect(rows.map(\.id) == [7] && rows.first?.end == failed)
+    }
+}
+
+extension ServerScreenTests {
     /// The Requests row counts the requests the model answered, as the status counts them and the
     /// menu bar's panel says: the rows stop at the latest 1,000 and hold refused requests too. Its
     /// rows say how many run.
