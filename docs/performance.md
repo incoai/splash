@@ -207,6 +207,49 @@ python -m dev.benchmarks.draft_comparison \
   --output build/dspine-refinement-abba
 ```
 
+### Acceptance by proposal position
+
+A follow-up native trace on November 10 used the same four prompts, target,
+draft precision, eight-row blocks and 256-token output caps, with one greedy
+continuation per prompt. The native outputs matched each other and the HTTP
+output hashes; their speculative cycle counts also reproduced the HTTP
+comparison. Each cycle records its verified draft count and accepted prefix.
+The analysis excludes the final cycle conservatively for EOS/output-cap
+censoring, then excludes any other partial-width cycle.
+
+| Workload | DFlash2 cycles accepting all seven proposals | DSpine cycles accepting all seven proposals |
+| --- | ---: | ---: |
+| Fibonacci | 10/12 (83.3%) | 10/12 (83.3%) |
+| Merge sort | 25/40 (62.5%) | 20/43 (46.5%) |
+| LRU cache | 19/45 (42.2%) | 15/51 (29.4%) |
+| TypeScript retry | 21/45 (46.7%) | 20/39 (51.3%) |
+
+The denominators are eligible full-width, non-final cycles. In LRU, DSpine
+rejects fewer first proposals (3/51) than DFlash2 (4/45); the larger losses
+in this trace occur at positions two and six. Merge sort loses more at
+positions five and seven. Those small conditional samples identify places
+to inspect, without establishing a model defect or a quantization cause.
+
+Fibonacci frequently reaches the block cap, making it a useful case for
+measuring native sixteen-row execution. A longer block can extend a full
+accepted prefix, but these fractions do not predict the acceptance of later
+positions or their verification cost. BF16-versus-4-bit draft acceptance and
+sixteen-row performance remain unmeasured.
+
+The [trace record](../dev/benchmarks/results/dspine-acceptance-qwen38-27b-2026-11-10.json)
+contains every cycle, output tokens, conditional acceptance and survival by
+position. These are four short deterministic continuations, not a general
+quality evaluation. To collect and summarize traces:
+
+```sh
+build/engine-tests/backend-benchmark METALLIB MODEL_ROOT \
+  --scenario acceptance --samples 1 --ane-ffn-share 0 --max-context 32768 \
+  > TRACE.json
+python -m dev.benchmarks.draft_acceptance \
+  --baseline DFLASH_TRACE.json --candidate DSPINE_TRACE.json \
+  --output SUMMARY.json
+```
+
 ## Smaller GGUFs on 24 GB Macs
 
 Measured on a 24 GB M6 (12-core GPU), with each model's DFlash2 draft:
