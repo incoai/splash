@@ -442,7 +442,7 @@ engine or the models branches on the GPU:
   through them.
 
 One setting sits beside the measured row: `Int8Activations`
-(`runtime/ops/Linear.hpp`; `splash serve --int8-activations`, on by default),
+(`runtime/ops/Linear.hpp`; `splash serve --activations`, on at `auto`, the default, off at `bf16`),
 whether a plan may round activations to int8 where an int8-activation path of
 rules 1, 2 and 5 takes them. The engine decides it once for `ExecutionPlans`,
 whose `Linear` holds it beside the calibration for `selectProjection` and
@@ -947,7 +947,7 @@ staged tile (more than 64 rows) of a projection whose quantized segments are all
 5-bit in groups of 64 (`af4g64`, `af5g64`) runs `LinearTile::GgufPrefillInt8`
 (`kernels/prefill/gguf_prefill_int8.metal`) instead of the bf16 tile
 (`ProjectionCalibration::prefillInt8`; Apple9, whose int8 matmul runs at 0.9x its bf16 rate, never),
-with int8 activations on. With them off (`--int8-activations off`) every chunk runs the bf16 tiles,
+with int8 activations on. With them off (`--activations bf16`) every chunk runs the bf16 tiles,
 bit for bit, and the prefill arena holds no codes. `gguf_prefill_int8_quantize` writes each 64-input
 group of each row as int8 codes with its own scale, by the int8-activation rule
 (`kernels/common/int8_activations.h`), which a SwiGLU's up takes from its gate's plan
@@ -1174,13 +1174,13 @@ put T's least a unit off: a unit past where the ANE's part takes the longer
 costs the ANE's time per unit, a unit short of it the GPU's, and on an M5 Max
 and an M5 Pro the ANE's is the longer (1.7 ms a unit of the full-chunk layer
 against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms), all with
-`--int8-activations off`. On Qwen3.8-27B that takes 8 of the 34 units on an M5
-Max, 14-15 on an M5 Pro and 25-26 on an M6 with `--int8-activations off`, the best
+`--activations bf16`. On Qwen3.8-27B that takes 8 of the 34 units on an M5
+Max, 14-15 on an M5 Pro and 25-26 on an M6 with `--activations bf16`, the best
 each Mac's sweeps measured. By default the int8-activation tile makes the
 GPU's part faster, so the split takes fewer: 10 on a 20-core M5 Pro (the M5
 Max and M6 unmeasured). The split runs if T there gains 5% on the GPU alone. A
 start calibrates the split once for a Mac, a model, a macOS version, an engine
-build, `--int8-activations` and the most units its memory plan holds, and remembers
+build, `--activations` and the most units its memory plan holds, and remembers
 what it found (`remembered-*` in the cache directory below): the units, the
 least chunk and the GPU alone's layer at 512 and 2048 rows, or that no split
 gains enough. Later starts take it untimed: they build the split, check it as

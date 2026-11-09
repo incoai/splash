@@ -87,7 +87,7 @@ struct NativeArguments final {
   // --verify-rows auto|all: the rows of the draft's block a decode
   // cycle verifies (RuntimeResourcesConfig::verifyRows).
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
-  // --int8-activations on|off: whether activations may round to int8 where
+  // --activations auto|bf16: whether activations may round to int8 where
   // an int8-activation path takes them
   // (RuntimeResourcesConfig::int8Activations).
   ops::Int8Activations int8Activations = ops::Int8Activations::On;

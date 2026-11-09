@@ -740,11 +740,11 @@ uint32_t parseMaxContext(std::string_view value) {
   return tokens;
 }
 
-// --int8-activations, as serve's: whether activations may round to int8
+// --activations, as serve's: whether activations may round to int8
 // where an int8-activation path takes them.
 ops::Int8Activations parseInt8Activations(std::string_view value) {
-  if (value != "on" && value != "off") throw std::invalid_argument("--int8-activations requires on or off");
-  return value == "on" ? ops::Int8Activations::On : ops::Int8Activations::Off;
+  if (value != "auto" && value != "bf16") throw std::invalid_argument("--activations requires auto or bf16");
+  return value == "auto" ? ops::Int8Activations::On : ops::Int8Activations::Off;
 }
 
 // --ane-ffn-minimum-rows: the least rows of a chunk the prefill FFN's Neural
@@ -902,7 +902,7 @@ int main(int argc, char **argv) {
                    "[--samples COUNT] [--progress PATH] "
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
                    "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
-                   "[--int8-activations on|off] "
+                   "[--activations auto|bf16] "
                    "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
                    "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
                    "(default: decode,partial,context)\n"
@@ -913,7 +913,7 @@ int main(int argc, char **argv) {
                    "  TOKENS: the context the engine serves, as serve's "
                    "--max-context, with YaRN past the model's native window "
                    "(default: what memory holds)\n"
-                   "  --int8-activations: as serve's (default: on)\n"
+                   "  --activations: as serve's (default: auto)\n"
                    "  DIR: the logits scenario's dump, and the earlier dump whose "
                    "prefixes it scores (default: its own greedy transcripts')\n"
                    "  LANES: the score requests the logits scenario runs at once "
@@ -946,7 +946,7 @@ int main(int argc, char **argv) {
         aneFfnMinimumRows = parseAneFfnMinimumRows(argv[index + 1]);
       } else if (option == "--max-context") {
         maxContext = parseMaxContext(argv[index + 1]);
-      } else if (option == "--int8-activations") {
+      } else if (option == "--activations") {
         int8Activations = parseInt8Activations(argv[index + 1]);
       } else if (option == "--logits") {
         logitsDirectory = std::filesystem::path(argv[index + 1]);

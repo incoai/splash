@@ -152,7 +152,7 @@ void printUsage(std::string_view executable) {
       " [--max-image-patches PATCHES] [--persistent-cache on|off] [--cache-dir DIRECTORY]"
       " [--max-cache-disk-writes BYTES]"
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]"
-      " [--int8-activations on|off] [--relaunch-context TOKENS] [--ple-memory BYTES|auto|off]"
+      " [--activations auto|bf16] [--relaunch-context TOKENS] [--ple-memory BYTES|auto|off]"
       " [--expert-memory BYTES|auto|off] [--sparse-kv-memory BYTES|auto]"
       " [--kv-spill always] [--kv-window-trim on|off] [--verify-rows auto|all]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");

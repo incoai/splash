@@ -153,12 +153,12 @@ void testServerCommandLines(const char *path) {
        [](NativeArguments &read) { read.maxImagePatches = 16384; }},
       {"idle_sleep", [](NativeArguments &read) { read.preventIdleSleep = false; }},
       {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
-      {"int8_activations_off", [](NativeArguments &read) { read.int8Activations = ops::Int8Activations::Off; }},
+      {"activations_bf16", [](NativeArguments &read) { read.int8Activations = ops::Int8Activations::Off; }},
       {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
       // The defaults the server leaves out are the engine's: each meaning
       // names the value, so a change of the engine's default fails it.
       {"verify_rows_auto", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::Auto; }},
-      {"int8_activations_on", [](NativeArguments &read) { read.int8Activations = ops::Int8Activations::On; }},
+      {"activations_auto", [](NativeArguments &read) { read.int8Activations = ops::Int8Activations::On; }},
       {"kv_format_default", [](NativeArguments &read) { read.kvFormat = kv::Format::Int8; }},
       {"state_format_default",
        [](NativeArguments &read) { read.stateFormat = ops::GdnStateFormat::Float32; }},
@@ -237,14 +237,14 @@ void testNeuralEngine() {
           "--ane did not reach the arguments as given");
 }
 
-// Activations may round to int8 unless --int8-activations off keeps them
-// bf16; --int8-activations on, which the server never writes, keeps the rule.
+// Activations may round to int8 unless --activations bf16 keeps them bf16;
+// --activations auto, which the server never writes, keeps the rule.
 void testInt8Activations() {
   const ModelDirectory model;
   require(parse(model, {"auto", "auto"}).int8Activations == ops::Int8Activations::On &&
-              parse(model, {"auto", "auto", "--int8-activations", "on"}).int8Activations == ops::Int8Activations::On &&
-              parse(model, {"auto", "auto", "--int8-activations", "off"}).int8Activations == ops::Int8Activations::Off,
-          "--int8-activations did not reach the arguments as given");
+              parse(model, {"auto", "auto", "--activations", "auto"}).int8Activations == ops::Int8Activations::On &&
+              parse(model, {"auto", "auto", "--activations", "bf16"}).int8Activations == ops::Int8Activations::Off,
+          "--activations did not reach the arguments as given");
 }
 
 // --verify-rows auto, which the server never writes, is the engine's rule.
@@ -306,8 +306,8 @@ void testRefusals() {
   refuses({"auto", "auto", "--idle-sleep", "never"},
           "--idle-sleep requires prevent or allow");
   refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
-  for (const char *value : {"auto", "OFF", "bf16", ""})
-    refuses({"auto", "auto", "--int8-activations", value}, "--int8-activations requires on or off");
+  for (const char *value : {"on", "off", "BF16", ""})
+    refuses({"auto", "auto", "--activations", value}, "--activations requires auto or bf16");
   for (const char *rows : {"budget", "every", "ALL", ""})
     refuses({"auto", "auto", "--verify-rows", rows}, "--verify-rows requires auto or all");
   // The server passes bytes, auto or off.

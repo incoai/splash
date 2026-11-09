@@ -310,7 +310,7 @@ a file of uint32 token ids (`dev/benchmarks/teacher_logits.mm`): for each
 window, the fp32 logits of the prefill's final position and of ROWS decode
 positions after it, each computed by a verify row forced to the true next
 token, in `OUTPUT-END.f32`, and prints how well they predict the true ids. It
-also takes `--kv-format`, `--state-format`, `--int8-activations`,
+also takes `--kv-format`, `--state-format`, `--activations`,
 `--expert-memory` and `--ple-memory`, and, with `--captures yes`, writes the
 output rows of the target layers the model's draft reads (its
 `target_layer_ids`) at the positions a window's prefill computed, in one

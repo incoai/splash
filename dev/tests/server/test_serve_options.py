@@ -83,8 +83,8 @@ OPTIONS = {
         "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
     ),
     "--disable-ane": ([(["--disable-ane"], True)], []),
-    "--int8-activations": values(
-        "--int8-activations", {"on": "on", "off": "off"}, ("", "auto", "OFF", "bf16")
+    "--activations": values(
+        "--activations", {"auto": "auto", "bf16": "bf16"}, ("", "on", "off", "BF16")
     ),
     "--verify-rows": values(
         "--verify-rows",

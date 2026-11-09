@@ -259,7 +259,7 @@ A lane's arithmetic can depend on the batch it decodes in and on how its prompt
 is chunked. On a GGUF MoE target, an expert that a step routes at most two rows
 to runs them on the column tile, which sums in another order than the staged
 matmul, so a row's result also depends on the rows decoded or prefilled beside
-it. On M5 and later Macs with `--int8-activations` on, the default, attention
+it. On M5 and later Macs with `--activations auto`, the default, attention
 over INT8 KV scores INT8 queries where its splits read 8 pages or more, which
 follows the chunk's rows and history and, in verify, the batch's longest lane;
 a target's MLX 4- or 5-bit projection rounds its prefill rows to int8 when their

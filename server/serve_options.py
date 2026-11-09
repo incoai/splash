@@ -354,7 +354,7 @@ class EngineArgument:
     """How the server passes an option on to the engine's serve-native. The
     server leaves out an optional one at the option's default, which must
     equal the engine's own (native_arguments_test.cpp pins the KV and state
-    formats, verify rows, image patches and int8 activations)."""
+    formats, verify rows, image patches and activations)."""
 
     # The engine's flag, or the slot of its positional argument after
     # MODEL_DIRECTORY. An optional positional comes after every required
@@ -765,19 +765,19 @@ SERVE_OPTIONS = (
         needs="dense_ffn",
     ),
     ServeOption(
-        "--int8-activations",
+        "--activations",
         "requests",
         dict(
-            choices=("on", "off"),
-            default="on",
-            help="round activations to 8 bits where the GPU multiplies them "
-            "twice as fast (M5 and later): long prompts through MLX 4- and "
-            "5-bit weights (about a quarter less time to the first token), "
-            "rotated PQ2_0 decode and attention over the INT8 KV cache; off "
-            "keeps every activation bf16, for evaluations and bf16 parity "
-            "(default: on)",
+            choices=("auto", "bf16"),
+            default="auto",
+            help="auto rounds activations to 8 bits where the GPU multiplies "
+            "them twice as fast (M5 and later) and leaves the others bf16: "
+            "long prompts through MLX 4- and 5-bit weights (about a quarter "
+            "less time to the first token), rotated PQ2_0 decode and attention "
+            "over the INT8 KV cache; bf16 keeps every activation bf16, for "
+            "evaluations and bf16 parity (default: auto)",
         ),
-        engine=EngineArgument("--int8-activations"),
+        engine=EngineArgument("--activations"),
     ),
     ServeOption(
         "--verify-rows",
