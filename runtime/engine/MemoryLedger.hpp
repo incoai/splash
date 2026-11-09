@@ -18,6 +18,13 @@
 
 namespace splash::engine {
 
+// macOS's memory pressure, as the host reports it (MemoryGovernor).
+enum class MemoryPressure : uint8_t {
+  Normal,
+  Warning,
+  Critical,
+};
+
 struct MemoryGovernorSnapshot;
 class RestoredChains;
 
@@ -226,8 +233,10 @@ struct TakeRights final {
 // need its reach. A Spill lane's pages whose copies landed cost it the reads
 // of their blocks: work that can wait, in service or a start, releases them
 // from its own lane and those of its priority or a lower one, never a higher
-// one's; a need the host refused from its own lane, in place; the host under
-// critical pressure from every lane; no other claim. Certain reuse, which a
+// one's; a need the host refused from its own lane, in place; the host from
+// every lane while macOS's pressure is above normal, for its deficit under
+// its warning as for its margin under its critical pressure, as 1.6.0's
+// lanes gave those pages back once their copies landed; no other claim. Certain reuse, which a
 // request rebuilds at its whole prefill, goes to in-service work; a start
 // and optional work take the resume point but never a queued chain, since a
 // running lane beats a queued one and a new request does not. The host waits
@@ -247,7 +256,7 @@ struct TakeRights final {
 // with no Spill lane in service, trims with no lane in service), takes no
 // unit: its rights are the narrowest, TakeRights{}, for memory it can go
 // without.
-[[nodiscard]] TakeRights takeRights(const ClaimSpec &spec, const Need &need, bool critical,
+[[nodiscard]] TakeRights takeRights(const ClaimSpec &spec, const Need &need, MemoryPressure pressure,
                                     std::optional<RequestPriority> highestLane);
 
 struct VictimQuery final {
@@ -489,13 +498,13 @@ public:
   [[nodiscard]] uint64_t growthLackBytes() const noexcept { return growthLackBytes_; }
 
   // The rule: what is taken for a claim, what is there for one, what grows.
-  // `critical`: macOS's critical pressure; `kept`: the chains a walk for
-  // what is there keeps (VictimQuery::kept). `exempts`: a need the host
-  // refused that is short is met by the host exemption (hostExempt).
-  [[nodiscard]] FreeResult free(ClaimId claim, const Need &need, uint64_t freeBytes, bool critical,
+  // `pressure`: macOS's memory pressure; `kept`: the chains a walk for what
+  // is there keeps (VictimQuery::kept). `exempts`: a need the host refused
+  // that is short is met by the host exemption (hostExempt).
+  [[nodiscard]] FreeResult free(ClaimId claim, const Need &need, uint64_t freeBytes, MemoryPressure pressure,
                                 bool exempts = false);
-  [[nodiscard]] uint64_t available(const ClaimSpec &spec, const Need &need, uint64_t freeBytes, bool critical,
-                                   const RestoredChains *kept = nullptr) const;
+  [[nodiscard]] uint64_t available(const ClaimSpec &spec, const Need &need, uint64_t freeBytes,
+                                   MemoryPressure pressure, const RestoredChains *kept = nullptr) const;
   // An allocation of the claim was granted: what it lacks next logs afresh
   // (free).
   void granted(ClaimId claim);

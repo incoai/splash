@@ -1471,13 +1471,17 @@ every source of units reads (`MemoryLedger::Order`, `Cache::walkFor`):
 | `Optional` of a request | yes | no | yes | no | no | no | yes | no | no | no |
 | `Optional` of the engine's own, of no request | no | no | no | no | no | no | no | no | no | no |
 | `Growth` | yes | no | no | no | no | no | no | no | no | no |
-| `Host` with a deficit | yes | yes | yes | no | no | no | no | no | no | no |
+| `Host` with a deficit | yes | yes | yes | no | every lane's under warning pressure; none at normal | no | no | no | no | no |
 | `Host` under critical pressure | yes | no | yes | no | every lane's | yes | yes | yes | yes | first |
 | A need the host refused | in place | no | yes | no | its own, in place | no | as its class | as its class | no | no |
 
 Under critical pressure every claim that takes units takes the next lane's buffers
 first, with the idle ones, and the empty extent the next request starts from,
-never the Index runway.
+never the Index runway. The host reaches the lanes' landed pages whenever
+macOS's pressure is above normal: under warning its pass for its deficit
+releases them, the lowest-ranked lane's first, as its pass under critical
+pressure does, which gives the host what a lane gave back as its copies landed
+before lanes kept their pages; at normal pressure its deficit leaves them Full.
 
 The resume point is the newest ordinary state in RAM (`StateCache::resumePoint`),
 the one a conversation's next turn most likely resumes from. A claim of no

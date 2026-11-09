@@ -76,12 +76,6 @@ struct HostTelemetry final {
 // report any part of it.
 [[nodiscard]] std::optional<HostTelemetry> queryHostTelemetry() noexcept;
 
-enum class MemoryPressure : uint8_t {
-  Normal,
-  Warning,
-  Critical,
-};
-
 // One spelling of the levels for status JSON and startup diagnostics.
 [[nodiscard]] inline const char *
 memoryPressureName(MemoryPressure pressure) noexcept {
@@ -345,8 +339,9 @@ private:
     MemoryPressure system_ = MemoryPressure::Normal;
     bool constrained_ = true;
   };
-  // The host claim's pass: up to `target` of what it may take.
-  [[nodiscard]] FreeResult hostPass(uint64_t target, bool critical);
+  // The host claim's pass: up to `target` of what it may take at the
+  // host's pressure now.
+  [[nodiscard]] FreeResult hostPass(uint64_t target);
   // Room under the limit beside what is charged and being allocated.
   [[nodiscard]] uint64_t roomBytes() const noexcept;
   // HostRule::sample at a fresh sample of the host.

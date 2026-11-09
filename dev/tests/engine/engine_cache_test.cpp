@@ -4188,9 +4188,9 @@ void testCriticalKeepsTheIndexRunway() {
   // As the host's pass asks (MemoryGovernor::hostPass): what it finds of
   // all the cache holds, a Full and an Index extent, both empty.
   const ClaimSpec host{.cls = ClaimClass::Host};
-  const uint64_t found = ledger.available(host, {.bytes = spill.storage.allocatedBytes()}, 0, true);
+  const uint64_t found = ledger.available(host, {.bytes = spill.storage.allocatedBytes()}, 0, MemoryPressure::Critical);
   const engine::ClaimId claim = ledger.open(host);
-  const FreeResult freed = ledger.free(claim, {.bytes = found}, 0, true);
+  const FreeResult freed = ledger.free(claim, {.bytes = found}, 0, MemoryPressure::Critical);
   ledger.close(claim);
   require(freed.nowBytes == 4 * spill.storage.bytesPerPage(kv::PageForm::Full) &&
               !spill.pool.allocatedExtents(kv::PageForm::Full) && spill.pool.freePageCount(kv::PageForm::Index) == 4,
@@ -4234,7 +4234,7 @@ void testANeedInPlaceEmptiesNoExtentOfItsForm() {
   MemoryLedger ledger;
   ledger.addSource(cache);
   const ClaimId claim = ledger.open(test::kInServiceGrowth);
-  const FreeResult freed = ledger.free(claim, {.bytes = 400, .pages = 12, .kv = true}, 0, false);
+  const FreeResult freed = ledger.free(claim, {.bytes = 400, .pages = 12, .kv = true}, 0, MemoryPressure::Normal);
   ledger.close(claim);
   MemoryGovernorSnapshot snapshot;
   ledger.fill(snapshot, 0);
@@ -5992,11 +5992,11 @@ void testARefusedRequestWaitsForThePageOnItsWayBack() {
                         [&cache](std::span<const uint64_t> requestIds) { return cache.returningFor(requestIds); });
     if (heldAbove) {
       const engine::ClaimId above = ledger.open({.cls = ClaimClass::InService, .requestId = 3, .rank = {.priority = 2}});
-      require(ledger.free(above, {.pages = 1}, 0, false).outcome == FreeOutcome::Pending,
+      require(ledger.free(above, {.pages = 1}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Pending,
               "the claim above did not wait for the page on its way back");
     }
     const engine::ClaimId below = ledger.open({.cls = ClaimClass::InService, .requestId = 2, .rank = {.priority = 1}});
-    const FreeOutcome outcome = ledger.free(below, {.pages = 1}, 0, false).outcome;
+    const FreeOutcome outcome = ledger.free(below, {.pages = 1}, 0, MemoryPressure::Normal).outcome;
     require(outcome == FreeOutcome::Pending && tier.demotions == 1,
             heldAbove ? "a request below a claim that takes the page first did not wait as its hold ends"
                       : "a request did not wait for the page on its way back");
@@ -6521,7 +6521,7 @@ private:
 // A claim of `bytes` that can wait, for in-service work that reaches what is in use.
 FreeResult claimBytes(engine::MemoryLedger &ledger, uint64_t bytes) {
   const engine::ClaimId id = ledger.open(test::kInServiceGrowth);
-  const FreeResult freed = ledger.free(id, {.bytes = bytes}, 0, false);
+  const FreeResult freed = ledger.free(id, {.bytes = bytes}, 0, MemoryPressure::Normal);
   ledger.close(id);
   return freed;
 }
@@ -6714,7 +6714,7 @@ void testGrowthCountsNoPageInTransfer() {
   engine::MemoryLedger ledger;
   ledger.addSource(cache);
   const engine::ClaimId claim = ledger.open({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate});
-  const FreeResult freed = ledger.free(claim, {.bytes = 300}, 0, false);
+  const FreeResult freed = ledger.free(claim, {.bytes = 300}, 0, MemoryPressure::Normal);
   ledger.close(claim);
   require(freed.outcome == FreeOutcome::Short && !freed.nowBytes && cache.residentChainPages({&dead, 1}),
           "growth took the dead leaf for a unit only copies in flight could fund");
@@ -6740,7 +6740,7 @@ void testGrowthCountsNoStateThatWaitsForAWrite() {
   ledger.addSource(cache);
   ledger.setBufferBytes([&control](uint32_t states, bool, bool) { return control->poolBytes(states); });
   const engine::ClaimId claim = ledger.open({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate});
-  const FreeResult freed = ledger.free(claim, {.bytes = 200}, 0, false);
+  const FreeResult freed = ledger.free(claim, {.bytes = 200}, 0, MemoryPressure::Normal);
   ledger.close(claim);
   require(freed.outcome == FreeOutcome::Short && !freed.nowBytes && cache.residentChainPages({&dead, 1}),
           "growth took the dead leaf for a unit only a state's write could fund");
@@ -6787,7 +6787,7 @@ void testStagedStateFreesItsCopiedChain() {
   const engine::ClaimId claim = ledger.open({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate});
   // Both states' buffers and two of the chain's three extents, the third
   // the runway growth keeps.
-  const FreeResult freed = ledger.free(claim, {.bytes = 400}, 0, false);
+  const FreeResult freed = ledger.free(claim, {.bytes = 400}, 0, MemoryPressure::Normal);
   ledger.close(claim);
   require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 200 && !cache.stateResident(earlier) &&
               cache.snapshot().stateCache.offloads == 2 && tier.demotions == 3,

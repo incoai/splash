@@ -840,7 +840,8 @@ what memory holds, as a dense target's is.
   shortage of the host's makes a request spill. When other memory is short,
   a state, a spilling request's reads, or the host's, what can go goes in a
   fixed order: a cached prefix, the caches the model rebuilds, the pages of
-  spilling requests (below; for the host only under critical pressure),
+  spilling requests (below; for the host only under macOS's warning or
+  critical pressure),
   then, for a request in service, a chunk of the store above its floor, of
   which a target that can spill has none.
 - A spilling request writes each committed page once to the SSD cache and
@@ -849,8 +850,9 @@ what memory holds, as a dense target's is.
   landed gives its memory back, the oldest first, and keeps only its index,
   24 KiB of the int8 page's 414 KiB: as much as a request lacks, in whole
   extents, for the request's own growth or reads, for a request in service or
-  a start of its priority or a higher one, and under macOS's critical pressure
-  for the host, which takes every request's. Where every request holding them
+  a start of its priority or a higher one, and under macOS's warning or
+  critical pressure for the host, which takes every request's, the lowest
+  priority's first. Where every request holding them
   reads pages back already, a request's growth, one the host refuses among
   them, first takes the pages it lacks in place. Where those would leave too
   few index pages free for the next, an extent more gives its memory back

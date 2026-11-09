@@ -2831,6 +2831,48 @@ void testCriticalReleasesCleanPagesBeforeAnyLaneYields() {
   require(spill.events.failures.empty() && spill.events.usage.at(1).second == 1'000, "the lane did not complete");
 }
 
+// Under macOS's warning pressure the host's pass for its deficit releases the pages whose copies landed of the Spill
+// lanes, the lowest-ranked first, as its pass under critical pressure does: the Full extents they empty go back to the
+// host, as 1.6.0's lanes gave them back once their copies landed. At normal pressure the same deficit leaves them
+// Full. Either way the lane decodes on and completes. On the parent the pass at warning released none.
+void testAWarningDeficitReleasesALanesLandedPages() {
+  for (const MemoryPressure pressure : {MemoryPressure::Normal, MemoryPressure::Warning}) {
+    FlashNextGoverned lanes;
+    Spilling &spill = lanes.spill;
+    lanes.startSpill(Spilling::prompt(1, 1, 3'070, 1'000));
+    spill.runUntil(
+        [&] {
+          const KvSpillSnapshot written = spill.cache.spillSnapshot();
+          return spill.events.outputs[1].size() >= 10 && written.writeThroughPages >= 3'000 &&
+                 written.writeThroughInFlight == 0 && !spill.engine.commandInFlight();
+        },
+        "the lane's copies did not land");
+    const auto fullBytes = [&] {
+      const KvPoolSnapshot pool = spill.pool.snapshot();
+      return pool.allocatedBytes - pool.index.allocatedBytes;
+    };
+    const uint64_t full = fullBytes();
+    // Other applications leave the host half its margin: a deficit.
+    spill.host.pause(true);
+    spill.host.setPressure(pressure);
+    static_cast<void>(spill.host.governor.controlPass(spill.now));
+    const uint64_t released = spill.cache.spillSnapshot().releasedPages;
+    const uint64_t extent = 256 * FlashNextLanes::kPages.fullBytes;
+    const bool warning = pressure == MemoryPressure::Warning;
+    require(warning ? released >= 2 * 256 && fullBytes() + 2 * extent <= full
+                    : released == 0 && !spill.cache.holdsIndexPages(1) && fullBytes() == full,
+            std::string(warning ? "under warning pressure" : "at normal pressure") + " the host's deficit pass released " +
+                std::to_string(released) + " of the lane's pages and took its Full extents from " +
+                std::to_string(full) + " B to " + std::to_string(fullBytes()) + " B");
+    spill.host.setPressure(MemoryPressure::Normal);
+    spill.host.pause(false);
+    spill.runUntilIdle();
+    require(spill.events.failures.empty() && spill.events.usage.at(1).second == 1'000 &&
+                spill.engine.snapshot().resourceSuspensions == 0,
+            "the lane did not complete without a yield after the host's pass" + failureDetail(spill.events));
+  }
+}
+
 // With Metal memory outside the engine's buffers holding the charge over the engine's limit by more than a Full
 // extent, the host's pass under critical pressure still releases two extents of a lane's pages, 204 MB on
 // Qwen3.8-Flash-Next: each runway's emptied Full extent pays for the next Index extent past the limit as past the
@@ -3983,6 +4025,7 @@ std::span<const test::TestCase> spillTests() {
       {"testAStartNeverReleasesAHigherPriorityLane", testAStartNeverReleasesAHigherPriorityLane},
       {"testCriticalReleasesCleanPagesBeforeAnyLaneYields", testCriticalReleasesCleanPagesBeforeAnyLaneYields},
       {"testACriticalPassReleasesPastTheEnginesLimit", testACriticalPassReleasesPastTheEnginesLimit},
+      {"testAWarningDeficitReleasesALanesLandedPages", testAWarningDeficitReleasesALanesLandedPages},
       {"testAHostRefusedGrowthReleasesItsOwnLane", testAHostRefusedGrowthReleasesItsOwnLane},
       {"testAReleaseInPlaceKeepsTheIndexRunway", testAReleaseInPlaceKeepsTheIndexRunway},
       {"testAReleaseInPlaceKeepsTheRunwayTheRoomCannotRefill", testAReleaseInPlaceKeepsTheRunwayTheRoomCannotRefill},
