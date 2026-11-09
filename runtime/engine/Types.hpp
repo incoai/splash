@@ -31,8 +31,8 @@ struct StepResult final {
 
 // Where a request's committed KV lives, chosen at admission and kept across
 // suspension: in memory (Resident), or, on a target that can spill, in the
-// SSD cache tier once its copies have landed, with memory keeping each
-// page's index (Spill).
+// SSD cache tier for the pages a claim released once their copies landed,
+// memory keeping each such page's index (Spill).
 enum class KvMode : uint8_t { Resident, Spill };
 
 // Values are the Done event's reason byte.

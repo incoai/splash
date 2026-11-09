@@ -1262,7 +1262,8 @@ struct MetalBackend::Impl {
     }
 
     // The creation time from which a pipeline created while serving is logged
-    // as a warning (newPipeline).
+    // as a warning (newPipeline): a wait its request notices, as the seconds
+    // of a cold format were, past the 93 ms at most of the paths no warmup takes.
     static constexpr double kNoticedPipelineMs = 100;
 
     id<MTLComputePipelineState> newPipeline(id<MTLLibrary> source, std::string_view name,
@@ -1298,8 +1299,8 @@ struct MetalBackend::Impl {
                 values += (values.empty() ? "(" : ",") + std::to_string(value);
             if (!values.empty()) values += ')';
             // Its request waited for it: a warning where that is a wait to
-            // notice, as a cold pipeline of every format's seconds were
-            // (#715); a notice otherwise, as an image's first kernels.
+            // notice, as a cold pipeline of every format's seconds were; a
+            // notice otherwise, as an image's first kernels.
             const double ms = std::chrono::duration<double, std::milli>(AwakeClock::now() - started).count();
             if (ms >= kNoticedPipelineMs)
                 logWarning("Metal created pipeline ", name, values, " while serving, in ", ms,

@@ -235,27 +235,26 @@ struct TakeRights final {
 // from its own lane and those of its priority or a lower one, never a higher
 // one's; a need the host refused from its own lane, in place; the host from
 // every lane while macOS's pressure is above normal, for its deficit under
-// its warning as for its margin under its critical pressure, as 1.6.0's
-// lanes gave those pages back once their copies landed; no other claim. Certain reuse, which a
-// request rebuilds at its whole prefill, goes to in-service work; a start
-// and optional work take the resume point but never a queued chain, since a
-// running lane beats a queued one and a new request does not. The host waits
-// for writes short of critical pressure and never for landings, which its
-// pass's target is net of; at critical pressure it is Immediate but takes
-// the store, certain reuse and units in use. No pool unit for a claim below
-// a lane in service, since the pools serve every lane, and none for a pool's
-// growth. The pooled buffers the next lane starts from go to in-service KV
-// that can wait, last of all: the memory plan sizes the context for one lane
-// beside its own state, not beside a next lane's buffers, so a lane alone
-// reaches it, and a lone restore takes its whole chain. Every other need
-// keeps them: a need of state buffers (a lane's start among them), which
-// their release would only make allocate again, and the model's other
-// memory. At critical pressure every claim takes them first, and the next
-// extent. A Floor claim takes nothing (logic_error). The engine's own
-// optional work, an Optional claim of no request (the Index runway's refill
-// with no Spill lane in service, trims with no lane in service), takes no
-// unit: its rights are the narrowest, TakeRights{}, for memory it can go
-// without.
+// its warning as for its margin under its critical pressure; no other claim.
+// Certain reuse, which a request rebuilds at its whole prefill, goes to
+// in-service work; a start and optional work take the resume point but never
+// a queued chain, since a running lane beats a queued one and a new request
+// does not. The host waits for writes short of critical pressure and never
+// for landings, which its pass's target is net of; at critical pressure it
+// is Immediate but takes the store, certain reuse and units in use. No pool
+// unit for a claim below a lane in service, since the pools serve every
+// lane, and none for a pool's growth. The pooled buffers the next lane
+// starts from go to in-service KV that can wait, last of all: the memory
+// plan sizes the context for one lane beside its own state, not beside a
+// next lane's buffers, so a lane alone reaches it, and a lone restore takes
+// its whole chain. Every other need keeps them: a need of state buffers (a
+// lane's start among them), which their release would only make allocate
+// again, and the model's other memory. At critical pressure every claim
+// takes them first, and the next extent. A Floor claim takes nothing
+// (logic_error). The engine's own optional work, an Optional claim of no
+// request (the Index runway's refill with no Spill lane in service, trims
+// with no lane in service), takes no unit: its rights are the narrowest,
+// TakeRights{}, for memory it can go without.
 [[nodiscard]] TakeRights takeRights(const ClaimSpec &spec, const Need &need, MemoryPressure pressure,
                                     std::optional<RequestPriority> highestLane);
 

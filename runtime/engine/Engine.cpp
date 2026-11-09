@@ -1488,7 +1488,7 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
     }
     return false;
   };
-  // Pages whose copies have landed leave memory before any lane grows.
+  // The Index runway refills, as at the tick's start, before any lane grows.
   spillLanded(false);
   // So do a windowed layout's windowed layers' K/V of the pages every
   // window has passed, the processed rows' (Cache::trimWindows): into the
