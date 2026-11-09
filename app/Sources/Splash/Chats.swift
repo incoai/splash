@@ -134,6 +134,9 @@ final class ChatStore {
     /// a conversation with images takes milliseconds to encode and write, which a send and a
     /// reply's end would otherwise wait for.
     private let files = DispatchQueue(label: "ChatStore.files", qos: .utility)
+    /// Whether every conversation's file could be read, so that `sweep` knows each file a
+    /// conversation names.
+    @ObservationIgnored private var readAll = false
 
     init(folder: URL) {
         self.folder = folder
@@ -149,13 +152,21 @@ final class ChatStore {
         }
         conversations = read.map(Self.interrupted).sorted { $0.updated > $1.updated }
         moved.forEach(write)
-        // Files no conversation names, as those of a draft the app quit with, unless a
-        // conversation that can't be read may name them.
-        guard read.count == kept.count else { return }
-        let named = Set(read.flatMap { $0.messages.flatMap { ($0.attachments ?? []).map(\.file) } })
-        let stray = ((try? FileManager.default.contentsOfDirectory(at: attachments, includingPropertiesForKeys: nil)) ?? [])
-            .filter { !named.contains($0.lastPathComponent) }
-        self.files.async { stray.forEach { try? FileManager.default.removeItem(at: $0) } }
+        readAll = read.count == kept.count
+    }
+
+    /// Removes the attachments no conversation names, as those of a draft the app quit with,
+    /// unless a conversation that can't be read may name them. The app does it as it launches,
+    /// once it is the one Splash that runs, before any draft (`AppState.launch`).
+    func sweep() {
+        guard readAll else { return }
+        let named = Set(conversations.flatMap { $0.messages.flatMap { ($0.attachments ?? []).map(\.file) } })
+        let attachments = attachments
+        files.async {
+            let stray = ((try? FileManager.default.contentsOfDirectory(at: attachments, includingPropertiesForKeys: nil)) ?? [])
+                .filter { !named.contains($0.lastPathComponent) }
+            stray.forEach { try? FileManager.default.removeItem(at: $0) }
+        }
     }
 
     /// `conversation` with the images an earlier app kept in its messages moved into files of

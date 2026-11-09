@@ -13,14 +13,16 @@ struct MenuBarPanel: View {
 
     var body: some View {
         let server = state.server
+        // The model stopped is the window's to name, as the one to start again.
+        let model = server.phase == .stopped ? nil : server.model
         VStack(alignment: .leading, spacing: 1) {
             HStack(spacing: 10) {
                 StatusMark(look: state.serverStatus.look, since: server.since)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(server.model.map(state.displayName(of:)) ?? "No model running")
+                    Text(model.map(state.displayName(of:)) ?? "No model running")
                         .font(.headline)
                         .truncationMode(.middle)
-                    if server.model != nil { Text(state.serverStatus.phrase).font(.callout).foregroundStyle(.secondary) }
+                    if model != nil { Text(state.serverStatus.phrase).font(.callout).foregroundStyle(.secondary) }
                 }
                 .lineLimit(1)
             }

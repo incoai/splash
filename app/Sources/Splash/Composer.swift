@@ -189,6 +189,7 @@ struct Composer: View {
                 Attachments(draft: draft)
             }
             ComposerField(text: $draft.text, focusRequests: draft.focusRequests,
+                          yields: state.terminalShows,
                           placeholder: "Message Splash", submit: state.sendDraft, cancel: stop, acceptsImages: images,
                           attach: draft.attach, attachPDFs: { draft.attach(pdfs: $0) })
             HStack(spacing: 6) {
@@ -499,6 +500,9 @@ extension Attachments {
 private struct ComposerField: NSViewRepresentable {
     @Binding var text: String
     let focusRequests: Int
+    /// Whether a terminal of the drawer shows, which keeps the keyboard as the field shows
+    /// (`AppState.terminalShows`).
+    let yields: Bool
     let placeholder: String
     let submit: () -> Void
     let cancel: () -> Bool
@@ -566,15 +570,23 @@ private struct ComposerField: NSViewRepresentable {
             context.coordinator.undo.removeAllActions()
         }
         if context.coordinator.focusRequests != focusRequests {
+            // A request made before the field showed, as for the Chat a window opens on, gives way
+            // to a terminal shown with it; one made since takes the keyboard.
+            let pending = !context.coordinator.shown
             context.coordinator.focusRequests = focusRequests
-            DispatchQueue.main.async { view.window?.makeFirstResponder(view) }
+            if !(pending && yields) {
+                DispatchQueue.main.async { view.window?.makeFirstResponder(view) }
+            }
         }
+        context.coordinator.shown = true
     }
 
     @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         var field: ComposerField
         var focusRequests = 0
+        /// Whether the field has shown, past its first update.
+        var shown = false
         /// The text the view and the draft last agreed on.
         var published = ""
         /// The field's own edits, which a message sent clears.

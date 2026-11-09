@@ -13,53 +13,7 @@ struct SplashApp: App {
                 .environment(state)
         }
         .defaultSize(width: 1120, height: 780)
-        .commands {
-            CommandGroup(after: .appInfo) {
-                Button("Check for Updates…") { updates.check() }
-                    .disabled(!updates.canCheck)
-            }
-            CommandGroup(after: .pasteboard) {
-                // In what has the keyboard: a log of the drawer's, a terminal.
-                Button("Find…") { NSApp.keyWindow?.firstResponder?.showFindBar() }
-                    .keyboardShortcut("f")
-            }
-            CommandGroup(replacing: .newItem) {
-                Button("New Chat") {
-                    state.section = .chat
-                    state.chats.newChat()
-                    state.draft.focus()
-                }
-                .keyboardShortcut("n")
-                .disabled(!state.available)
-            }
-            // The toolbar holds the switch to the Chat and the Server's button; it is not to be
-            // hidden. The sidebar is.
-            CommandGroup(replacing: .toolbar) {
-                Button(state.showsSidebar ? "Hide Sidebar" : "Show Sidebar") { state.toggleSidebar() }
-                    .keyboardShortcut("b")
-                    .disabled(!state.available || state.section == .server)
-                Button(state.showsDrawer ? "Hide Terminal and Logs" : "Show Terminal and Logs") { state.toggleDrawer() }
-                    .keyboardShortcut("j")
-                    .disabled(!state.available)
-                Button("New Terminal") {
-                    state.newTerminal()
-                    state.showDrawer(.terminal)
-                }
-                .keyboardShortcut("t", modifiers: [.command, .shift])
-                .disabled(!state.available)
-                Divider()
-                Button("Server") { state.section = .server }
-                    .keyboardShortcut("1")
-                    .disabled(!state.available)
-                Button("Chat") { state.section = .chat }
-                    .keyboardShortcut("2")
-                    .disabled(!state.available)
-            }
-            CommandGroup(replacing: .help) {
-                Button("Show Server Log") { NSWorkspace.shared.open(state.server.log) }
-                Button("Show Download Log") { NSWorkspace.shared.open(state.installer.log) }
-            }
-        }
+        .commands { SplashCommands(state: state, updates: updates) }
 
         MenuBarExtra {
             MenuBarPanel()
@@ -69,6 +23,86 @@ struct SplashApp: App {
                 .accessibilityLabel("Splash")
         }
         .menuBarExtraStyle(.window)
+    }
+}
+
+/// The menus' commands. Those of the window bring it forward, and open it where it is closed, as
+/// the app runs on without it: the sidebar and the drawer then show.
+struct SplashCommands: Commands {
+    let state: AppState
+    let updates: Updates
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        let shows = state.windowShows
+        CommandGroup(after: .appInfo) {
+            Button("Check for Updates…") { updates.check() }
+                .disabled(!updates.canCheck)
+        }
+        CommandGroup(after: .pasteboard) {
+            // In what the drawer shows: a terminal, a log.
+            Button("Find…") { state.drawer.find() }
+                .keyboardShortcut("f")
+                .disabled(!state.available || !shows || !state.showsDrawer)
+        }
+        CommandGroup(replacing: .newItem) {
+            Button("New Chat") {
+                inWindow {
+                    state.section = .chat
+                    state.chats.newChat()
+                    state.draft.focus()
+                }
+            }
+            .keyboardShortcut("n")
+            .disabled(!state.available)
+        }
+        // The toolbar holds the switch to the Chat and the Server's button; it is not to be
+        // hidden. The sidebar is.
+        CommandGroup(replacing: .toolbar) {
+            Button(shows && state.showsSidebar ? "Hide Sidebar" : "Show Sidebar") {
+                if shows { state.toggleSidebar() } else { inWindow { state.showsSidebar = true } }
+            }
+            .keyboardShortcut("b")
+            .disabled(!state.available || state.section == .server)
+            Button(shows && state.showsDrawer ? "Hide Terminal and Logs" : "Show Terminal and Logs") {
+                if shows { state.toggleDrawer() } else { inWindow { state.showDrawer(state.drawer.part) } }
+            }
+            .keyboardShortcut("j")
+            .disabled(!state.available)
+            Button("New Terminal") {
+                inWindow {
+                    state.newTerminal()
+                    state.showDrawer(.terminal)
+                }
+            }
+            .keyboardShortcut("t", modifiers: [.command, .shift])
+            .disabled(!state.available)
+            Divider()
+            Button("Server") { inWindow { state.section = .server } }
+                .keyboardShortcut("1")
+                .disabled(!state.available)
+            Button("Chat") { inWindow { state.section = .chat } }
+                .keyboardShortcut("2")
+                .disabled(!state.available)
+        }
+        CommandGroup(replacing: .help) {
+            Button("Show Server Log") { Self.open(state.server.log) }
+            Button("Show Download Log") { Self.open(state.installer.log) }
+        }
+    }
+
+    /// Does `change`, then brings the window forward, opening it where it is closed.
+    private func inWindow(_ change: () -> Void) {
+        change()
+        openWindow(id: "main")
+    }
+
+    /// Opens log `url` in the app that shows logs; one not written yet is made, empty, as the
+    /// drawer's Logs make it, for that app to follow.
+    private static func open(_ url: URL) {
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: url.path) { FileManager.default.createFile(atPath: url.path, contents: nil) }
+        NSWorkspace.shared.open(url)
     }
 }
 

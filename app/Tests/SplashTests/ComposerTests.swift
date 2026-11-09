@@ -29,6 +29,24 @@ struct ComposerTests {
         #expect(state.draft.text == "你好再次")
     }
 
+    /// The composer takes the keyboard back from the drawer as it closes, by ⌘J or as its last
+    /// terminal closes.
+    @Test func theComposerTakesTheKeyboardBackFromTheDrawer() async throws {
+        let (state, window, folder) = try chat(drawer: true)
+        defer { window.orderOut(nil); state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        let composer = try await focusedComposer(in: window)
+        state.toggleDrawer()
+        let terminal = try #require(state.drawer.terminals.first)
+        try await waitFor(window.firstResponder === terminal.view)
+        state.toggleDrawer()
+        try await waitFor(window.firstResponder === composer)
+        state.toggleDrawer()
+        try await waitFor(window.firstResponder === terminal.view)
+        state.drawer.close(terminal.id)
+        #expect(!state.showsDrawer)
+        try await waitFor(window.firstResponder === composer)
+    }
+
     /// A new chat, and a chat's first message, keep the composer's text view, and the keyboard in it.
     @Test func aNewChatKeepsTheComposer() async throws {
         let (state, window, folder) = try chat()
@@ -219,15 +237,20 @@ struct ComposerTests {
     }
 
     /// A window showing the Chat of a conversation with one exchange.
-    private func chat() throws -> (AppState, NSWindow, URL) {
+    /// A window of the Chat, open on a conversation; with the drawer under it where `drawer`.
+    private func chat(drawer: Bool = false) throws -> (AppState, NSWindow, URL) {
         let folder = FileManager.default.temporaryDirectory.appending(path: "splash-composer-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let conversation = Conversation(messages: [ChatMessage(role: .user, text: "Hi"), ChatMessage(role: .assistant, text: "Hello.")])
         try JSONEncoder().encode(conversation).write(to: folder.appending(path: "\(conversation.id.uuidString).json"))
         let state = AppState.forTests(in: folder)
         state.chats.selection = conversation.id
+        state.section = .chat
         _ = NSApplication.shared
-        let window = NSWindow(contentViewController: NSHostingController(rootView: ChatScreen().environment(state)))
+        let chat = ChatScreen().environment(state)
+        let window = NSWindow(contentViewController: drawer
+            ? NSHostingController(rootView: AnyView(WithDrawer { ChatScreen() }.environment(state)))
+            : NSHostingController(rootView: AnyView(chat)))
         window.setContentSize(CGSize(width: 900, height: 600))
         window.setFrameOrigin(NSPoint(x: -30000, y: -30000))
         window.orderFrontRegardless()

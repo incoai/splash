@@ -27,7 +27,9 @@ struct ChatScreen: View {
         } content: {
             ConversationView()
         }
-        .onAppear { state.draft.focus() }
+        // The composer takes the keyboard as the Chat shows, unless a terminal of the drawer shows
+        // with it, which keeps it, as in a window that ⌘J opens.
+        .onAppear { if !state.terminalShows { state.draft.focus() } }
         // The open chat's title, in the window's top row; a new chat, with nothing in it, has none.
         .toolbar {
             if let open = state.chats.current, !open.messages.isEmpty {

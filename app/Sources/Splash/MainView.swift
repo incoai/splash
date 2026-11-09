@@ -182,7 +182,12 @@ struct WithSidebar<Side: View, Content: View>: View {
             .accessibilityHidden(!shown)
             content
         }
-        .onChange(of: shown) { if !shown { focused = false } }
+        .onChange(of: shown) {
+            if !shown {
+                focused = false
+                state.returnKeyboard()
+            }
+        }
     }
 }
 
@@ -192,18 +197,23 @@ extension AppState {
         drawer.add(TerminalSession(shell: drawer.shell(), environment: runtime.userEnvironment))
     }
 
-    /// Opens or closes the drawer, sliding; opened on the terminals, it starts one where there is
-    /// none.
+    /// Opens or closes the drawer, which slides (`WithDrawer`); opened on the terminals, it starts one
+    /// where there is none.
     func toggleDrawer() {
-        withAnimation(Motion.settle) { showsDrawer.toggle() }
+        showsDrawer.toggle()
         if showsDrawer && drawer.part == .terminal && drawer.terminals.isEmpty { newTerminal() }
+    }
+
+    /// Closes the drawer.
+    func hideDrawer() {
+        showsDrawer = false
     }
 
     /// Opens the drawer on `part`.
     func showDrawer(_ part: Drawer.Part) {
         drawer.part = part
         if part == .terminal && drawer.terminals.isEmpty { newTerminal() }
-        withAnimation(Motion.settle) { showsDrawer = true }
+        showsDrawer = true
     }
 
     /// Opens the drawer on `log`.
@@ -215,6 +225,15 @@ extension AppState {
     /// Hides the sidebar shown, or shows the one hidden, sliding.
     func toggleSidebar() {
         withAnimation(Motion.settle) { showsSidebar.toggle() }
+    }
+
+    /// Whether the drawer shows one of its terminals, which has the keyboard.
+    var terminalShows: Bool { showsDrawer && drawer.part == .terminal }
+
+    /// Gives the keyboard to the Chat's composer as what had it hides: the drawer, its last
+    /// terminal, the sidebar. The Server has nothing to type into; its window keeps it.
+    func returnKeyboard() {
+        if section == .chat { draft.focus() }
     }
 }
 

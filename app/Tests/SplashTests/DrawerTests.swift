@@ -127,8 +127,55 @@ struct DrawerTests {
         try await waitFor(busy.runsProgram, "the program to have the terminal")
         #expect(!idle.runsProgram && state.drawer.runningPrograms == 1)
         #expect(state.quitCost.message == "A terminal is running a program.")
+        // Its close asks first, as closing ends what runs; the other's closes at once.
+        state.drawer.askToClose(busy.id)
+        #expect(state.drawer.closing == busy.id && !busy.ended)
+        state.drawer.closing = nil
+        state.drawer.askToClose(idle.id)
+        #expect(state.drawer.closing == nil && idle.ended && state.drawer.terminals.map(\.id) == [busy.id])
         state.drawer.close(busy.id)
         #expect(!busy.runsProgram && state.drawer.runningPrograms == 0)
+    }
+
+    /// The drawer showing terminals closes as its last one does; showing logs, it stays.
+    @Test func closingTheLastTerminalClosesTheDrawer() throws {
+        let (state, folder) = AppState.forTests()
+        defer { state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        state.toggleDrawer()
+        let only = try #require(state.drawer.terminals.first)
+        state.drawer.close(only.id)
+        #expect(!state.showsDrawer)
+        state.newTerminal()
+        state.showDrawer(.logs)
+        state.drawer.close(try #require(state.drawer.terminals.first).id)
+        #expect(state.showsDrawer && state.drawer.part == .logs)
+    }
+
+    /// A shell that exits cleanly, as `exit` ends it, takes its tab with it, as in Terminal; one
+    /// that fails stays, ended, with what it said.
+    @Test func aShellThatExitsCleanlyTakesItsTab() async throws {
+        let (state, folder) = AppState.forTests()
+        defer { state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        state.newTerminal()
+        state.newTerminal()
+        let (clean, failing) = (state.drawer.terminals[0], state.drawer.terminals[1])
+        clean.view.send(txt: "exit\n")
+        failing.view.send(txt: "exit 3\n")
+        try await waitFor(failing.ended && clean.ended, seconds: 10)
+        try await waitFor(state.drawer.terminals.map(\.id) == [failing.id])
+    }
+
+    /// A line typed into a terminal as it starts, as an agent's command is, waits for the shell's
+    /// prompt: it runs, and shows once, at the prompt, rather than echoed ahead of it too.
+    @Test func aLineTypedAsATerminalStartsShowsOnceAtThePrompt() async throws {
+        let (state, folder) = AppState.forTests()
+        defer { state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        let session = TerminalSession(shell: .bare, environment: ["HOME": NSHomeDirectory(), "PATH": "/usr/bin:/bin"],
+                                      typing: "echo typed-$((6 * 7))")
+        state.drawer.add(session)
+        func screen() -> String { String(decoding: session.view.getTerminal().getBufferAsData(), as: UTF8.self) }
+        try await waitFor(screen().contains("typed-42"), seconds: 10)
+        #expect(screen().components(separatedBy: "echo typed-").count == 2)
     }
 
     /// Quitting ends every shell.
@@ -240,8 +287,8 @@ struct DrawerTests {
     }
 
     /// The terminal shown takes the keyboard: one added, one picked, the drawer opened on it. One
-    /// hidden, as another is picked, the logs show or the drawer closes, gives it up, and so does
-    /// a log as the drawer closes.
+    /// hidden, as another is picked or the drawer closes, gives it up; the logs shown take it, and
+    /// give it up as the drawer closes.
     @Test func theTerminalShownHasTheKeyboardAndWhatHidesGivesItUp() async throws {
         let (state, folder) = AppState.forTests()
         let window = Self.window(WithDrawer { Color.clear }.environment(state))
@@ -259,14 +306,31 @@ struct DrawerTests {
         state.toggleDrawer()
         try await waitFor(window.firstResponder === first.view)
         state.showDrawer(.logs)
-        try await waitFor(window.firstResponder === window)
         try await waitFor(Self.textView(in: window) != nil)
         let log = try #require(Self.textView(in: window))
-        window.makeFirstResponder(log)
-        // SwiftUI sees where the keyboard went, as it does before the user's next key.
-        Self.update(window)
+        try await waitFor(window.firstResponder === log)
         state.toggleDrawer()
         try await waitFor(window.firstResponder === window)
+    }
+
+    /// Find… shows the find bar of what the drawer shows, whose field takes the keyboard, the
+    /// keyboard elsewhere.
+    @Test func findShowsTheFindBarOfTheLogTheDrawerShows() async throws {
+        let (state, folder) = AppState.forTests()
+        let window = Self.window(WithDrawer { Color.clear }.environment(state))
+        defer { Self.close(window); state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        // Open before the logs show: off the screen, the window may not run the drawer's slide.
+        state.toggleDrawer()
+        let terminal = try #require(state.drawer.terminals.first)
+        try await waitFor(window.firstResponder === terminal.view)
+        state.showDrawer(.logs)
+        try await waitFor(Self.textView(in: window) != nil)
+        let log = try #require(Self.textView(in: window))
+        try await waitFor(window.firstResponder === log)
+        window.makeFirstResponder(nil)
+        state.drawer.find()
+        #expect(log.enclosingScrollView?.isFindBarVisible == true)
+        #expect((window.firstResponder as? NSTextView)?.isFieldEditor == true)
     }
 
     /// A log shows the lines that start in its last 512 KB, then what is written to it.

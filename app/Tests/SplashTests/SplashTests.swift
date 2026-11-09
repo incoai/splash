@@ -1375,8 +1375,8 @@ struct ChatTests {
 
     /// A conversation keeps its attachments as files of their own: the images an earlier app kept
     /// inside its messages move into files as it is read, in their order, the conversation written
-    /// again without them; a file no conversation names goes, unless a conversation that can't be
-    /// read may name it; and a conversation deleted takes its files.
+    /// again without them; a file no conversation names goes at the sweep, unless a conversation
+    /// that can't be read may name it; and a conversation deleted takes its files.
     @MainActor @Test func keepsAttachmentsAsFilesOfTheirOwn() throws {
         let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -1396,12 +1396,19 @@ struct ChatTests {
         store.flush()
         let written = try String(contentsOf: folder.appending(path: "\(id).json"), encoding: .utf8)
         #expect(written.contains("attachments") && !written.contains(png.base64EncodedString()))
+        // A file no conversation names stays until the sweep, which the app makes once it is the
+        // one Splash that runs.
+        #expect(FileManager.default.fileExists(atPath: stray.path))
+        store.sweep()
+        store.flush()
         #expect(!FileManager.default.fileExists(atPath: stray.path))
         // A conversation that can't be read keeps every file: it may name them.
         try Data([1]).write(to: stray)
         let unreadable = folder.appending(path: "\(UUID()).json")
         try Data("{".utf8).write(to: unreadable)
-        ChatStore(folder: folder).flush()
+        let other = ChatStore(folder: folder)
+        other.sweep()
+        other.flush()
         #expect(FileManager.default.fileExists(atPath: stray.path))
         try FileManager.default.removeItem(at: unreadable)
         // Deleted, a conversation takes its files.

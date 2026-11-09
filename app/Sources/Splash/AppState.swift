@@ -64,8 +64,9 @@ final class AppState {
     /// can take some seconds; the window says it under its spinner.
     private(set) var launchWait: String?
     /// Whether the window is open, and the menu bar's panel; while neither is, the server's status
-    /// is asked less often (`Server.unwatched`).
-    @ObservationIgnored var windowShows = true { didSet { server.unwatched = !windowShows && !panelShows } }
+    /// is asked less often (`Server.unwatched`). The menus' commands of the window open it where
+    /// it is closed (`SplashCommands`).
+    var windowShows = true { didSet { server.unwatched = !windowShows && !panelShows } }
     @ObservationIgnored var panelShows = false { didSet { server.unwatched = !windowShows && !panelShows } }
     var section = Section.server
     /// The launch options the next start uses; their API key reaches the Keychain once typed
@@ -108,6 +109,11 @@ final class AppState {
         transcript = Transcript(runtime: runtime, attachments: chats.attachments)
         installer.installed = { [weak self] in self?.didInstall($0) }
         installer.changed = { [weak self] _ in self?.refresh() }
+        // The last terminal closed, the drawer showing terminals closes too.
+        drawer.emptied = { [weak self] in
+            guard let self, drawer.part == .terminal else { return }
+            hideDrawer()
+        }
         // A start prepares model files on this Mac, which then have a family, and the model that
         // runs stays listed only while it runs.
         server.phaseChanged = { [weak self] in self?.refresh() }
@@ -227,6 +233,9 @@ final class AppState {
     /// Face cache holds; meanwhile it reads what each model family makes of the launch options.
     func launch() async {
         defer { launched = true }
+        // Only now that this is the one Splash that runs: another, that gives way to the first
+        // one, would take the files of its draft.
+        chats.sweep()
         // The shell's Hugging Face settings, read beside the checks, for all the app runs after them.
         let shellSettings = Task { await Runtime.readShellSettings(drawer.shell()) }
         if let reason = await runtime.unsupportedReason() {
@@ -373,7 +382,10 @@ final class AppState {
     }
 
     var quitCost: QuitCost {
-        let requests = server.phase == .ready ? max(server.activity.running, chats.streaming == nil ? 0 : 1) : 0
+        // The status is asked as seldom as every 10 s; the requests the server's log has started
+        // and not ended count at once.
+        let live = server.requests.count { $0.end == nil }
+        let requests = server.phase == .ready ? max(server.activity.running, live, chats.streaming == nil ? 0 : 1) : 0
         // A download, or a check's update, starts over; a check that has found nothing loses nothing,
         // and a deletion, quick, ends first.
         let downloading = installer.running && (installer.work == .download || installer.progress != nil)
@@ -514,13 +526,15 @@ final class AppState {
     }
 
     /// Asks for the folder the coding agents work in, from the last one; whether one was chosen.
+    /// `missing` says the last one is gone.
     @discardableResult
-    func chooseAgentFolder() -> Bool {
+    func chooseAgentFolder(missing: Bool = false) -> Bool {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.prompt = "Choose"
-        panel.message = "Choose the project folder the coding agents work in."
+        let gone = missing ? agentFolder.map { "“\($0.lastPathComponent)” can’t be found. " } ?? "" : ""
+        panel.message = gone + "Choose the project folder the coding agents work in."
         panel.directoryURL = agentFolder
         NSApp.activate()
         guard panel.runModal() == .OK, let folder = panel.url else { return false }
@@ -531,7 +545,10 @@ final class AppState {
     /// Opens `agent` on the model that serves, in a new terminal of the window's drawer, in the
     /// agents' folder, which it asks for the first time; that terminal holds the server's API key.
     func open(_ agent: Agent) {
-        guard agentFolder != nil || chooseAgentFolder(), let folder = agentFolder else { return }
+        // A folder renamed, deleted or on a disk no longer there is asked for again: the shell
+        // would start in `/`.
+        let exists = agentFolder.map { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true } ?? false
+        guard exists || chooseAgentFolder(missing: agentFolder != nil), let folder = agentFolder else { return }
         var environment = runtime.userEnvironment
         environment["SPLASH_API_KEY"] = server.settings.apiKey
         drawer.add(TerminalSession(shell: drawer.shell(), environment: environment, folder: folder,
