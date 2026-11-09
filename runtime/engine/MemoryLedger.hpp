@@ -324,7 +324,9 @@ struct ClaimState final {
   // passes the host (MemoryGovernor::growthHost).
   bool hostExempt = false;
   // The decisions its lines logged since its last grant, by what the need
-  // lacks rather than how much: a retry back to one of them logs nothing.
+  // lacks rather than how much: a retry back to one of them logs nothing, and
+  // the grant after a logged wait (pending or short) logs that it ended
+  // (MemoryLedger::granted).
   struct Logged final {
     struct Lack final {
       bool bytes = false, hostRefused = false, pages = false, stateBuffers = false;
@@ -389,8 +391,9 @@ public:
   void setLanes(uint64_t demandBytes, std::optional<RequestPriority> highest) noexcept;
   [[nodiscard]] uint64_t laneDemandBytes() const noexcept { return laneDemandBytes_; }
   // Where the ledger writes the decisions it logs, with the claimant, what
-  // it took, the bytes and the outcome (free), and the units its pools grew
-  // (grow).
+  // it took, the bytes and the outcome (free), the grants that end a logged
+  // wait (granted), a need refused after it was met (refusedAfterMet), and
+  // the units its pools grew (grow).
   void setDecisionLog(std::function<void(std::string_view)> log);
 
   // Claims.
@@ -444,8 +447,15 @@ public:
   [[nodiscard]] uint64_t available(const ClaimSpec &spec, const Need &need, uint64_t freeBytes, bool critical,
                                    const RestoredChains *kept = nullptr) const;
   // An allocation of the claim was granted: what it lacks next logs afresh
-  // (free).
+  // (free), and a wait a line of the claim's logged since its last grant
+  // logs that it ended, which no met can say: a wait may end in an attempt
+  // that runs no free() at all, as the pages it waited for land.
   void granted(ClaimId claim);
+  // The engine refused an allocation of the claim again after free() met
+  // its need (Engine::allocate): the ledger counted room the attempt did not
+  // find. A request's claim logs it once since its last grant, any other
+  // claim each time.
+  void refusedAfterMet(ClaimId claim, const Need &need);
   // One growth pass. True when a pool grew.
   bool grow(uint64_t freeBytes, const GrowthHost &host);
 
@@ -485,6 +495,9 @@ private:
 
   void log(const ClaimSpec &spec, const Need &need, const Run *run, const FreeResult &result,
            bool exempted) const;
+  // A line of the claim's that is no decision of free(): `what` came of its
+  // need, or of the claim where it has none.
+  void note(const ClaimSpec &spec, const Need *need, std::string_view what) const;
 
   std::vector<Account> accounts_;
   std::vector<VictimSource *> sources_;

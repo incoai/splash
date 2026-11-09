@@ -37,6 +37,46 @@ const char *outcomeName(FreeOutcome outcome) noexcept {
   return "short";
 }
 
+// The decisions a request's claim logged since its last grant, a bit each
+// (ClaimState::Logged): an outcome, a need met past the host, and a need
+// refused after it was met; a wait is a pending or a short.
+constexpr uint8_t decisionBit(FreeOutcome outcome) noexcept { return uint8_t(1U << static_cast<unsigned>(outcome)); }
+constexpr uint8_t kMetPastTheHost = 1U << 3U, kRefusedAfterMet = 1U << 4U;
+constexpr uint8_t kWaits = decisionBit(FreeOutcome::Pending) | decisionBit(FreeOutcome::Short);
+
+// Whether `decision` on `need` is new to request claim `claim` since its
+// last grant, which it marks: a kind of need is what it lacks, not how much.
+bool newDecision(ClaimState &claim, const Need &need, uint8_t decision) {
+  const ClaimState::Logged::Lack lack{.bytes = need.bytes != 0,
+                                      .hostRefused = need.hostRefused,
+                                      .pages = need.pages != 0,
+                                      .stateBuffers = need.lacksStateBuffers(),
+                                      .form = need.form};
+  auto found = std::ranges::find(claim.logged, lack, &ClaimState::Logged::lack);
+  if (found == claim.logged.end())
+    found = claim.logged.insert(claim.logged.end(), {lack});
+  const bool fresh = !(found->decisions & decision);
+  found->decisions |= decision;
+  return fresh;
+}
+
+// The start of every line of claim `spec`'s: its class, its request, and
+// what it needs, for a line of a need.
+void describe(std::ostringstream &line, const ClaimSpec &spec, const Need *need) {
+  line << std::fixed << std::setprecision(1) << "Memory: " << className(spec.cls) << " claim";
+  if (spec.requestId)
+    line << " of request " << spec.requestId;
+  if (!need)
+    return;
+  line << " needs " << double(need->bytes) / kMiB << " MiB";
+  if (need->pages)
+    line << ", " << need->pages << " pages";
+  if (need->stateBuffers)
+    line << ", " << need->stateBuffers << " state buffers";
+  if (need->unheldStateBuffer)
+    line << ", a state buffer no cached state holds";
+}
+
 } // namespace
 
 TakeRights takeRights(const ClaimSpec &spec, const Need &need, bool critical,
@@ -182,7 +222,15 @@ void MemoryLedger::setHostExempt(ClaimId claim, bool exempt) { claims_.at(claim.
 
 void MemoryLedger::granted(ClaimId claim) {
   ClaimState &state = claims_.at(claim.value);
+  if (std::ranges::any_of(state.logged, [](const ClaimState::Logged &logged) { return (logged.decisions & kWaits) != 0; }))
+    note(state.spec, nullptr, "granted");
   state.logged.clear();
+}
+
+void MemoryLedger::refusedAfterMet(ClaimId claimId, const Need &need) {
+  ClaimState &claim = claims_.at(claimId.value);
+  if (!claim.spec.requestId || newDecision(claim, need, kRefusedAfterMet))
+    note(claim.spec, &need, "met, yet refused again");
 }
 
 void MemoryLedger::close(ClaimId claim) noexcept { claims_.erase(claim.value); }
@@ -684,12 +732,16 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
   } else if (result.outcome == FreeOutcome::Short) {
     claim.waiting = false;
   }
+  // Met by the room, or by takes that cost no work later (Run::costly): the
+  // cache's own units and the caches the model rebuilds, steps 1 to 4 of the
+  // take order. It is the outcome before the host exemption below, which no
+  // need met that way is.
+  const bool metAtNoCost = result.outcome == FreeOutcome::Met && !(run && run->costly);
   // A request whose claim is not met, or that took what costs work later,
   // restarts the pools' wait to regrow: a unit regrown now would go back to
-  // its next claim. One met from cache does not, or requests arriving every
+  // its next claim. One met at no cost does not, or requests arriving every
   // few seconds would keep the pools from ever regrowing.
-  const bool metFromCache = result.outcome == FreeOutcome::Met && !(run && run->costly);
-  if (spec.requestId && !metFromCache)
+  if (spec.requestId && !metAtNoCost)
     quietSinceSeconds_ = nowSeconds_;
   // Met past the host on its retry, the line says so: logged short, a
   // prefill whose every extent the host refused read as short for 67 s
@@ -705,25 +757,13 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
   // logs nothing, whatever it took and however much the need still lacks: a
   // claim that flips between short and pending as copies land logged 669
   // lines in one second, and one whose pages came a page at a time a pair
-  // of lines a page (5,216 of a run's 5,812). Nor does a met from cache
-  // unless the claim logged since that grant, so that a wait the log shows
-  // ends there: a decode that took each next page from the cache logged a
-  // line a page, 1-2 a second through a whole reply. A claim of no request
-  // logs each take.
-  bool logs = spec.requestId ? !metFromCache || !claim.logged.empty() : run.has_value();
-  if (spec.requestId && logs) {
-    const auto bit = static_cast<uint8_t>(1U << (exempted ? 3U : static_cast<unsigned>(result.outcome)));
-    const ClaimState::Logged::Lack lack{.bytes = need.bytes != 0,
-                                        .hostRefused = need.hostRefused,
-                                        .pages = need.pages != 0,
-                                        .stateBuffers = need.lacksStateBuffers(),
-                                        .form = need.form};
-    auto found = std::ranges::find(claim.logged, lack, &ClaimState::Logged::lack);
-    if (found == claim.logged.end())
-      found = claim.logged.insert(claim.logged.end(), {lack});
-    logs = !(found->decisions & bit);
-    found->decisions |= bit;
-  }
+  // of lines a page (5,216 of a run's 5,812). Nor does a met at no cost: a
+  // decode that took each next page from the cache logged a line a page,
+  // 1-2 a second through a whole reply. The grant after a logged wait says
+  // the wait ended (granted). A claim of no request logs each take.
+  const bool logs = spec.requestId ? !metAtNoCost && newDecision(claim, need, exempted ? kMetPastTheHost
+                                                                                         : decisionBit(result.outcome))
+                                   : run.has_value();
   if (logs)
     log(spec, need, run ? &*run : nullptr, result, exempted);
   return result;
@@ -891,16 +931,7 @@ void MemoryLedger::log(const ClaimSpec &spec, const Need &need, const Run *run, 
   if (!log_)
     return;
   std::ostringstream line;
-  line << std::fixed << std::setprecision(1) << "Memory: " << className(spec.cls) << " claim";
-  if (spec.requestId)
-    line << " of request " << spec.requestId;
-  line << " needs " << double(need.bytes) / kMiB << " MiB";
-  if (need.pages)
-    line << ", " << need.pages << " pages";
-  if (need.stateBuffers)
-    line << ", " << need.stateBuffers << " state buffers";
-  if (need.unheldStateBuffer)
-    line << ", a state buffer no cached state holds";
+  describe(line, spec, &need);
   line << ": " << outcomeName(result.outcome);
   if (exempted)
     line << " past the host";
@@ -922,6 +953,15 @@ void MemoryLedger::log(const ClaimSpec &spec, const Need &need, const Run *run, 
   }
   line << " (" << double(result.nowBytes) / kMiB << " MiB now, "
        << double(result.laterBytes) / kMiB << " later)";
+  log_(line.str());
+}
+
+void MemoryLedger::note(const ClaimSpec &spec, const Need *need, std::string_view what) const {
+  if (!log_)
+    return;
+  std::ostringstream line;
+  describe(line, spec, need);
+  line << ": " << what;
   log_(line.str());
 }
 
