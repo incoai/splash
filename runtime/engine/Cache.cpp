@@ -1934,8 +1934,9 @@ uint32_t Cache::writeThrough() {
 bool Cache::writeThrough(Request &active, uint32_t &started) {
   while (!active.owedCopies.empty()) {
     const uint64_t block = active.owedCopies.front();
-    // Another request's write, or a restore, gave it a copy meanwhile.
-    if (kv_.kvCopied(block)) {
+    // Another request's write, or a restore, gave it a copy meanwhile, or
+    // its restore failed and its page holds nothing to write.
+    if (kv_.kvCopied(block) || !kv_.matchable(block)) {
       active.owedCopies.pop_front();
       returnCommitment(active, 1);
       continue;
@@ -2991,7 +2992,10 @@ PersistStatus Cache::persist(uint64_t block) {
         continue;
       }
       persisting_.landed = std::min(persisting_.landed, index);
-      // Only a resident block lacks a disk copy.
+      // Only a resident block lacks a disk copy. One whose restore failed
+      // holds nothing to write, and no lookup reaches the point past it.
+      if (!kv_.matchable(id))
+        return settled(PersistStatus::Unneeded);
       if (yields || !tier_->canDemote(WriteClass::Persist))
         return settled(inFlight ? PersistStatus::Started : PersistStatus::Busy);
       std::shared_ptr<KvDiskSlot> slot = persistent_
