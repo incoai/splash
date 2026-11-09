@@ -278,12 +278,15 @@ def _holds_others(snapshot, entries, kept):
     """Whether another tool has downloaded into snapshot: it holds a file that
     is neither one of entries nor one of kept, the entries remaining
     assemblies link. Splash downloads what it links and reads a repository's
-    JSON metadata besides, so those leave no sign; a whole repository's
-    download leaves its other weights, README.md or .gitattributes."""
+    JSON metadata besides, so those leave no sign, nor does the .DS_Store
+    Finder writes; a whole repository's download leaves its other weights,
+    README.md or .gitattributes."""
     files = (
         path
         for path in snapshot.rglob("*")
-        if path.suffix != ".json" and not (path.is_dir() and not path.is_symlink())
+        if path.suffix != ".json"
+        and path.name != ".DS_Store"
+        and not (path.is_dir() and not path.is_symlink())
     )
     return bool(_identities(files, os.lstat) - _identities(entries, os.lstat) - kept)
 

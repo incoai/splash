@@ -392,7 +392,7 @@ def parse_args(argv=None):
     commands.add_parser("link", help="print the selection link")
     commands.add_parser(
         "remove",
-        help="remove the installation and the Hub cache files no other one uses",
+        help="remove the model's installations and the Hub cache files no other uses",
     )
     return parser.parse_args(argv)
 

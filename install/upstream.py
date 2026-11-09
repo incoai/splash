@@ -630,17 +630,18 @@ def _selections_of(selection):
     """The selection links removing selection takes: its own, and for the
     model alone, named without source options, every selection of that model.
     A start with Text only or a draft of its own has a link no list shows,
-    whose files nothing could delete once the model's row is gone."""
-    links = [selection.link]
+    whose files nothing could delete once the model's row is gone. Its own
+    comes last, so that a removal cut short can be asked for again."""
+    links = []
     if not (selection.revision or selection.language_only or selection.draft_model):
-        links += [
+        links = [
             link
             for link in models.selection_links(selection.models_root)
             if link != selection.link
             and (record := assembly.recorded(link))
             and record["model"] == selection.model
         ]
-    return links
+    return [*links, selection.link]
 
 
 def _start_installed(selection, target, installed):

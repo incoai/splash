@@ -103,9 +103,9 @@ an installed model links. Publishing a new assembly retires the installation's
 other pins, in the repositories it links and in those its predecessor linked;
 the assembly it replaces goes, at this publish or, if a server holds it, at the
 next publish or `remove`, with the files of its Hub snapshots no remaining
-assembly links, as for `remove`, except a snapshot another tool has downloaded
-into: one holding a file no assembly links beyond the JSON metadata the
-installer reads.
+assembly links, as for `remove`; a publish leaves whole a snapshot another tool
+has downloaded into, one holding a file no assembly links beyond the JSON
+metadata the installer reads.
 
 `remove` takes an installation away under the installation lock, refusing one
 a server holds; the model named alone takes every selection of it, Text only's

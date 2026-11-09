@@ -1893,6 +1893,32 @@ class UpstreamTest(unittest.TestCase):
         self.assertNotIn(
             Path(record["files"][name]["path"]), assembly._hub_entries(record)
         )
+        # A `..` before the snapshot is the cache's own, as HF_HOME may have.
+        self.assertTrue(
+            assembly._stays_in_its_snapshot(
+                "/x/../hub/models--a--b/snapshots/" + "a" * 40 + "/file"
+            )
+        )
+
+    def test_finders_file_is_no_sign_of_another_tool(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        earlier = fake.snapshot(MODEL, "a" * 40)
+        (earlier / ".DS_Store").write_bytes(b"finder")
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        self.prepare(chosen)
+        self.assertEqual([p.name for p in earlier.iterdir()], [".DS_Store"])
+
+    def test_a_removal_cut_short_can_be_asked_for_again(self):
+        # The named link goes last: it is what a second removal finds.
+        fake = fake_hub(self, self.cache)
+        fake.publish(MODEL, "d" * 40, vision_target)
+        plain = selection(self.root, language_only=False)
+        text_only = selection(self.root)
+        self.prepare(plain)
+        self.prepare(text_only)
+        self.assertEqual(upstream._selections_of(plain), [text_only.link, plain.link])
 
     def test_the_remove_command_reports_the_bytes_freed(self):
         fake_hub(self, self.cache)

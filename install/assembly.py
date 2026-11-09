@@ -461,9 +461,15 @@ def _hub_entries(record):
     return {
         Path(entry["path"])
         for entry in record["files"].values()
-        if ".." not in Path(entry["path"]).parts
-        and hub.snapshot_of(entry["path"]) in snapshots
+        if hub.snapshot_of(entry["path"]) in snapshots
+        and _stays_in_its_snapshot(entry["path"])
     }
+
+
+def _stays_in_its_snapshot(path):
+    """Whether path goes no higher than the Hub snapshot it names: a `..`
+    before the snapshot is the cache's own, as where HF_HOME has one."""
+    return ".." not in Path(path).absolute().relative_to(hub.snapshot_of(path)).parts
 
 
 def _directories(paths):
