@@ -599,8 +599,8 @@ void testSiblingFailedInTheAdmissionPassGetsNoJunction() {
   require(events.capacityExhaustedCount == 1 && events.startIds == std::vector<uint64_t>{2},
           "the two requests were not admitted in one pass");
   const std::string &message = events.failureDetails.front().first;
-  require(message.find("could not allocate request state for a Resident lane of 97 tokens at its start: ") !=
-              std::string::npos,
+  require(message.starts_with("could not allocate request state: ") &&
+              message.find("; the request, a Resident lane of 97 tokens at its start, ") != std::string::npos,
           "the request alone without its state did not fail naming its lane at its start: " + message);
   h.runUntilIdle();
   const auto &boundaries = executor.plans.at(2).boundaries;
@@ -1445,8 +1445,8 @@ void testStalledSuspensionFailsWithCapacity() {
               engine.snapshot().resourceResumptions == 0 && executor.prefillRows == 0,
           "stalled suspension did not converge to a capacity failure");
   const std::string &message = events.failureDetails.back().first;
-  require(message.find(" for a Resident lane of ") != std::string::npos &&
-              message.find(" tokens at its resume: ") != std::string::npos,
+  require(message.find(", a Resident lane of ") != std::string::npos &&
+              message.find(" tokens at its resume, ") != std::string::npos,
           "the suspended lane did not fail naming its lane at its resume: " + message);
 }
 

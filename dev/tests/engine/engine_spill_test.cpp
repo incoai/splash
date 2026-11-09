@@ -149,8 +149,8 @@ void testConversionCommitsTheHistoryWithoutCopies() {
                   spill.events.failures == std::vector<std::string>{"capacity_exhausted"},
               "a conversion the quota could not hold with the history went ahead");
       const std::string &message = spill.events.failureDetails.front().first;
-      require(message.find(" for a Resident lane of ") != std::string::npos &&
-                  message.find(" tokens in decode: ") != std::string::npos &&
+      require(message.find(", a Resident lane of ") != std::string::npos &&
+                  message.find(" tokens in decode, ") != std::string::npos &&
                   message.find("SSD cache") == std::string::npos,
               "the lane the quota refused did not fail naming its mode and phase alone: " + message);
     } else {
@@ -514,8 +514,8 @@ void testAShortLaneDoesNotConvert() {
     require(spill.events.failures == std::vector<std::string>{"capacity_exhausted"},
             "the lone lane did not fail at the wall");
     const std::string &message = spill.events.failureDetails.front().first;
-    require(message.find(" for a Resident lane of ") != std::string::npos &&
-                message.find(prefilling ? " tokens in prefill: " : " tokens in decode: ") != std::string::npos &&
+    require(message.find(", a Resident lane of ") != std::string::npos &&
+                message.find(prefilling ? " tokens in prefill, " : " tokens in decode, ") != std::string::npos &&
                 message.find("SSD cache") == std::string::npos,
             "the lone lane's failure did not name its mode and phase alone: " + message);
   }
@@ -539,8 +539,8 @@ void testALoneResidentWallNamesItsModeAndPhase() {
   require(spill.events.failures == std::vector<std::string>{"capacity_exhausted"},
           "the lone prefill did not fail at the limit");
   const std::string &message = spill.events.failureDetails.front().first;
-  require(message.find(" for a Resident lane of 65473 tokens in prefill: ") != std::string::npos &&
-              message.find("; beside device_untracked_bytes=" + std::to_string(untracked) + " of Metal memory") !=
+  require(message.find("; the request, a Resident lane of 65473 tokens in prefill, ") != std::string::npos &&
+              message.find(" beside device_untracked_bytes=" + std::to_string(untracked) + " of Metal memory") !=
                   std::string::npos &&
               message.find("SSD cache") == std::string::npos,
           "the lone prefill's failure did not name its lane and the memory outside the engine's buffers alone: " +
@@ -623,9 +623,26 @@ struct ShortOfBoth {
   Spilling spill;
 };
 
+// What a 64K start refused at its start for want of memory and of the SSD cache names of memory, as
+// capacity_exhausted does: its Resident lane of 65,473 tokens at its start, the Metal memory outside the
+// engine's buffers, and the bytes its least start needs, its prompt and the rows of the decode step after
+// it in eight Full extents with its state, less than a page, beside fewer that memory has for it.
+bool namesTheMemoryShortfall(const std::string &message) {
+  const uint64_t extents = 8 * 256 * FlashNextLanes::kPages.fullBytes;
+  const std::string lane = "; the request, a Resident lane of 65473 tokens at its start, does not fit in the "
+                           "memory this server may use beside device_untracked_bytes=";
+  const std::string needs = ": it needs memory_needed_bytes=", has = ", where memory_available_bytes=";
+  const size_t at = message.find(needs), there = message.find(has);
+  if (message.find(lane) == std::string::npos || at == std::string::npos || there == std::string::npos)
+    return false;
+  const uint64_t needed = std::stoull(message.substr(at + needs.size()));
+  return needed >= extents && needed < extents + FlashNextLanes::kPages.fullBytes &&
+         std::stoull(message.substr(there + has.size())) < needed;
+}
+
 // A start alone that cannot spill, the SSD cache's room short of its projection or the tier closed,
-// and whose Resident KV memory does not hold now is refused at its start, naming what memory and the
-// SSD cache have for it, rather than start Resident and fail partway through its prefill.
+// and whose prompt memory does not hold now is refused at its start, naming what memory and the SSD
+// cache have for it, rather than start Resident and fail partway through its prefill.
 void testALoneStartMemoryCannotHoldIsRefusedAtItsStart() {
   for (const bool closed : {false, true}) {
     ShortOfBoth both(400ULL << 20);
@@ -635,8 +652,7 @@ void testALoneStartMemoryCannotHoldIsRefusedAtItsStart() {
     spill.runUntilIdle();
     const std::string message = spill.events.failureDetails.empty() ? "" : spill.events.failureDetails.front().first;
     require(spill.events.failures == std::vector<std::string>{closed ? "capacity_exhausted" : "kv_disk_quota"} &&
-                spill.model.prefillChunks[1] == 0 && message.find("resident_bytes=") != std::string::npos &&
-                message.find("memory_bytes=") != std::string::npos,
+                spill.model.prefillChunks[1] == 0 && namesTheMemoryShortfall(message),
             std::string("a start alone that neither memory nor the SSD cache holds was not refused at its start "
                         "naming both") +
                 (closed ? " while the tier took no writes: " : " for a short quota: ") + message);
@@ -3164,8 +3180,8 @@ void testALoneSpillWallNamesWhyItsKvGaveNoMoreMemory() {
     const std::string_view named = written ? "even with its KV released down to its floor"
                                            : "the SSD cache took no more of its KV";
     const std::string_view other = written ? "SSD cache" : "down to its floor";
-    require(message.find(" for a Spill lane of ") != std::string::npos &&
-                message.find(" tokens in prefill: ") != std::string::npos &&
+    require(message.find(", a Spill lane of ") != std::string::npos &&
+                message.find(" tokens in prefill, ") != std::string::npos &&
                 message.find(named) != std::string::npos && message.find(other) == std::string::npos &&
                 message.find("device_untracked_bytes=" + std::to_string(untracked)) != std::string::npos,
             std::string("a lone Spill prefill whose copies ") + (written ? "landed" : "the tier did not take") +
@@ -3198,7 +3214,7 @@ void testLoneSpillLaneEndsAtTheWall() {
       require(spill.events.failures == std::vector<std::string>{"capacity_exhausted"},
               "a lone Spill prefill at the wall did not fail");
       const std::string &message = spill.events.failureDetails.front().first;
-      require(message.find(" for a Spill lane of 321 tokens in prefill: ") != std::string::npos &&
+      require(message.find("; the request, a Spill lane of 321 tokens in prefill, ") != std::string::npos &&
                   message.find("; even with its KV released down to its floor") != std::string::npos,
               "a lone Spill prefill at the wall did not fail naming its lane and its floor: " + message);
     }

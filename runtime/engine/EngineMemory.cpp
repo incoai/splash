@@ -312,12 +312,6 @@ Engine::InMemory Engine::inMemory(const Request &active, const ClaimSpec &spec) 
   return {.room = residentRoom(active, spec, active.exactTokens.size() + rows + 1)};
 }
 
-std::string Engine::InMemory::detail() const {
-  return room ? "; in memory it needs resident_bytes=" + std::to_string(room->needed) +
-                    ", where memory_bytes=" + std::to_string(room->available) + " are there for it now"
-              : std::string();
-}
-
 Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64_t chainEnd, const ClaimSpec &spec,
                                           double now) {
   const SpillGeometry &geometry = config_.spill.geometry;
@@ -334,6 +328,11 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
     }
     return *memory.admission;
   };
+  // A start refused names what memory does not hold of it, where memory was
+  // asked.
+  const auto shortfall = [&](const InMemory &memory) {
+    return memory.room ? "; " + memoryShortfall(active, memory.room) : std::string();
+  };
   // A resume goes on spilling whatever the tier and the write budget: its
   // writes are in use, and pages a closed tier does not take stay Full.
   if (!resuming) {
@@ -349,11 +348,11 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
         // what Spill requests committed, or sooner as they end.
         const double admitted = cache_.spillWritesAdmittedAt().value_or(now);
         settle(active, {LaneOutcome::KvWriteBudget,
-                        reason + "whose daily write budget (--max-cache-disk-writes) is spent" + memory.detail(),
+                        reason + "whose daily write budget (--max-cache-disk-writes) is spent" + shortfall(memory),
                         static_cast<uint32_t>(std::lround(std::max(0.0, admitted - now) / 1000.0))});
       } else {
         ++counters_.spill.refusedClosed;
-        settle(active, {LaneOutcome::CapacityExhausted, reason + "which takes no writes" + memory.detail()});
+        settle(active, {LaneOutcome::CapacityExhausted, reason + "which takes no writes" + shortfall(memory)});
       }
       return SpillAdmission::Settled;
     }
@@ -405,7 +404,7 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
                         std::to_string(needed * geometry.slotBytes) +
                         " of the SSD cache, which may hold active_limit_bytes=" +
                         std::to_string(activeLimitBytes) +
-                        " of active KV now (--max-cache-disk and the volume's free space)" + memory.detail()});
+                        " of active KV now (--max-cache-disk and the volume's free space)" + shortfall(memory)});
   }
   return SpillAdmission::Settled;
 }

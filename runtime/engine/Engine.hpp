@@ -655,8 +655,8 @@ private:
   // the anchor of a resume that holds one included; it waits while other
   // requests' active KV (the copies of the blocks they hold, and their
   // commitments) holds what it lacks; and otherwise a start is refused,
-  // naming what memory and the SSD cache have for it, and a resume ends at
-  // its length.
+  // naming what the SSD cache has for it and, where memory was asked, the
+  // memoryShortfall of its least start, and a resume ends at its length.
   enum class SpillAdmission : uint8_t {
     // The quota holds what it publishes: commit it once the lane is taken.
     Commit,
@@ -687,8 +687,6 @@ private:
     std::optional<SpillAdmission> admission;
     std::optional<uint64_t> tokens;
     std::optional<ResidentRoom> room;
-    // What memory has for a start refused, where it was asked.
-    [[nodiscard]] std::string detail() const;
   };
   [[nodiscard]] InMemory inMemory(const Request &request, const ClaimSpec &spec) const;
   // A start the SSD cache's quota of active KV refused while other requests'
@@ -1207,10 +1205,16 @@ private:
   // A lane of either command ends at its deadline so (tick).
   void settle(Request &request, LaneEnd end);
   [[nodiscard]] static LaneEnd deadlineEnd();
+  // What says that memory does not hold a request, in every end for want
+  // of memory: its lane's KV mode, phase and tokens, which tell the limit it
+  // met, the Metal memory outside the server's buffers, which the limit
+  // charges beside it (MemoryGovernor::untrackedBytes), and where admission
+  // priced its Resident KV (`room`, the mode then Resident) the bytes that
+  // needs and those memory has for it.
+  [[nodiscard]] std::string memoryShortfall(const Request &request,
+                                            const std::optional<ResidentRoom> &room = {}) const;
   // The end of a request that cannot fit even alone: what it could not
-  // allocate, why, its lane's mode, phase and tokens, which tell the limit
-  // it met, and the Metal memory outside the server's buffers, which takes
-  // the budget beside it (MemoryGovernor::untrackedBytes).
+  // allocate and why, and its memoryShortfall.
   [[nodiscard]] LaneEnd capacityExhausted(const Request &request,
                                           std::string_view what,
                                           metal::AllocationFailure failure,

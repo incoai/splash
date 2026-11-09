@@ -1555,9 +1555,10 @@ quota bounds a Spill start's, where it holds the prompt and a token past it
 with the 7 rows past that its decode step verifies (`Cache::growthPages`).
 Otherwise one the tier refuses is refused, and one whose room is short takes
 the SSD cache's bound on its output or waits for its quota as a Spill start
-does, and is otherwise refused; refused at its start, it names what memory
-and the SSD cache have for it, rather than fail partway through its
-prefill. The lanes' projected growth (`Engine::laneDemand`) is each lane's
+does, and is otherwise refused at its start rather than fail partway through
+its prefill. The refusal names what the SSD cache has for it and, within the
+resident context, what memory has for its least start
+(`Engine::memoryShortfall`, as `capacity_exhausted` names memory). The lanes' projected growth (`Engine::laneDemand`) is each lane's
 KV up to its projection and what the lanes that hold Index pages still lack
 to read it: their hot block floors, and in prefill their history's staging
 through the next command. One rule prices a hot block floor in both
@@ -2024,13 +2025,14 @@ applies throughout.
 Readiness does not guarantee that a request-sized allocation fits. A request
 that cannot fit even alone, after every cached prefix was evicted and the expert
 store shrank to its floor, fails with 400 `capacity_exhausted`
-(`Engine::capacityExhausted`), naming its lane's mode, phase and tokens, the
-Metal memory outside the backend's buffers (`MemoryGovernor::untrackedBytes`),
-only for a Spill lane why its KV gave no more memory back (the SSD cache took no
-more of it where it owes copies no write started, `Cache::owesCopies`;
-otherwise even a release down to its floor does not cover what it lacks), and a
-smaller `--max-context`, or a larger `--max-memory` where one lowered the
-budget; retrying it fails the same way.
+(`Engine::capacityExhausted`), naming what it could not allocate, then, as
+every end for want of memory does (`Engine::memoryShortfall`), its lane's
+mode, phase and tokens and the Metal memory outside the backend's buffers
+(`MemoryGovernor::untrackedBytes`), only for a Spill lane why its KV gave no
+more memory back (the SSD cache took no more of it where it owes copies no
+write started, `Cache::owesCopies`; otherwise even a release down to its floor
+does not cover what it lacks), and a smaller `--max-context`, or a larger
+`--max-memory` where one lowered the budget; retrying it fails the same way.
 
 ## Sliding windows
 

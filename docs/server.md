@@ -336,6 +336,10 @@ past the runtime reserves. Only a `Spill` lane's, the one whose KV goes there,
 says why its KV gave no more memory back: the SSD cache took no more of it,
 where its writes stopped for the quota, the write budget or a closed cache, or
 otherwise the request does not fit even with its KV released down to its floor.
+A request refused at its start because neither memory nor the [SSD
+cache](#kv-on-the-ssd) holds it names its lane, tokens and
+`device_untracked_bytes` the same way, with what its least start needs
+(`memory_needed_bytes`) and what memory has for it (`memory_available_bytes`).
 
 ### PLE table streaming
 
@@ -819,8 +823,11 @@ what memory holds, as a dense target's is.
   the SSD cache bounds a spilling request's, and ends at that bound; where
   memory does not, it takes the SSD cache's bound on its output or waits for
   its quota as a spilling request does, and is otherwise refused at its
-  start, naming what memory and the SSD cache have for it, rather than fail
-  partway through its prefill.
+  start rather than fail partway through its prefill. The refusal names what
+  the SSD cache has for it and, as `capacity_exhausted` does, the request's
+  lane and tokens and `device_untracked_bytes`, with the memory its prompt
+  needs (`memory_needed_bytes`) and what memory has for it
+  (`memory_available_bytes`).
 - A request in memory whose KV cannot grow, in decode or in prefill, spills
   from then on rather than yield its lane or fail, where that covers what it
   lacks: what spilling the pages only it holds frees, past its first 2,048
