@@ -411,9 +411,10 @@ final class AppState {
     }
 
     /// The next prompt, the open conversation and the draft, for the composer to count; nil while
-    /// a reply streams or there is nothing to count.
+    /// a reply streams, there is nothing to count, or the draft can't go: a count would read and
+    /// upload what the server refuses, at every pause in the typing.
     var contextRequest: ChatContext.Request? {
-        guard let target, let limit = target.context, limit > 0, chats.streaming == nil else { return nil }
+        guard let target, let limit = target.context, limit > 0, chats.streaming == nil, attachmentProblem == nil else { return nil }
         let history = chats.current?.messages ?? []
         let text = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !history.isEmpty || !text.isEmpty || !draft.attachments.isEmpty else { return nil }
