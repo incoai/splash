@@ -286,10 +286,7 @@ private struct ChatList<Actions: View>: View {
 
     var body: some View {
         let chats = state.chats
-        let shown = query.isEmpty ? chats.conversations : chats.conversations.filter { conversation in
-            conversation.title.localizedStandardContains(query)
-                || conversation.messages.contains { $0.text.localizedStandardContains(query) }
-        }
+        let shown = chats.matching(query)
         VStack(spacing: 0) {
             // A new chat, at the top of the chats it joins, its icon in line with the search's.
             Button {
@@ -309,6 +306,16 @@ private struct ChatList<Actions: View>: View {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                 TextField("Search", text: $query, prompt: Text("Search"))
                     .textFieldStyle(.plain)
+                    // Esc clears it, as it does a search field.
+                    .onExitCommand { query = "" }
+                if !query.isEmpty {
+                    Button { query = "" } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear Search")
+                    .accessibilityLabel("Clear Search")
+                }
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
@@ -318,7 +325,11 @@ private struct ChatList<Actions: View>: View {
             if let picked {
                 picking(picked, shown: shown)
             }
-            list(shown)
+            if shown.isEmpty {
+                empty
+            } else {
+                list(shown)
+            }
         }
         .background(.background.secondary)
         .onReceive(NotificationCenter.default.publisher(for: .NSCalendarDayChanged)) { _ in today = .now }
@@ -330,6 +341,7 @@ private struct ChatList<Actions: View>: View {
         let all = !shown.isEmpty && shown.allSatisfy { picked.contains($0.id) }
         return HStack(spacing: 2) {
             Button(all ? "Deselect All" : "Select All") { self.picked = all ? [] : Set(shown.map(\.id)) }
+                .disabled(shown.isEmpty)
             Spacer()
             Button("Delete") { deletion = ChatDeletion(state.chats.conversations.filter { picked.contains($0.id) }) }
                 .disabled(picked.isEmpty)
@@ -338,6 +350,22 @@ private struct ChatList<Actions: View>: View {
         .buttonStyle(.hover)
         .padding(.horizontal, 12)
         .padding(.bottom, 4)
+    }
+
+    /// What the list says where it has no chat to show: that there is none yet, or that none holds
+    /// what is searched for, which the search field's button clears.
+    private var empty: some View {
+        VStack(spacing: 4) {
+            Text(query.isEmpty ? "No Chats Yet" : "No Results for “\(query)”")
+                .font(.callout.weight(.medium))
+            Text(query.isEmpty ? "Chats show here once they have a message." : "Check the spelling or try a new search.")
+                .font(.caption)
+        }
+        .foregroundStyle(.secondary)
+        .multilineTextAlignment(.center)
+        .padding(.horizontal, 20)
+        .padding(.top, 28)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
     /// The conversations in their groups, the latest first in each, the open one held highlighted;

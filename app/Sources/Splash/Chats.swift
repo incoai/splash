@@ -107,6 +107,16 @@ final class ChatStore {
         conversations.first { $0.id == selection }
     }
 
+    /// The conversations whose title or messages hold `query`, as the list's search finds them, in
+    /// the list's order; every one for an empty query.
+    func matching(_ query: String) -> [Conversation] {
+        guard !query.isEmpty else { return conversations }
+        return conversations.filter { conversation in
+            conversation.title.localizedStandardContains(query)
+                || conversation.messages.contains { $0.text.localizedStandardContains(query) }
+        }
+    }
+
     func newChat() {
         selection = nil
     }

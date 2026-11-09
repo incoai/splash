@@ -1147,6 +1147,23 @@ struct ChatTests {
         #expect(ChatStore(folder: folder).conversations.first?.pinned == nil)
     }
 
+    /// The list's search: the chats whose title or a message holds the query, whatever its case;
+    /// none for a query nothing holds; every chat, in the list's order, for an empty query.
+    @MainActor @Test func theChatListSearchesTitlesAndMessages() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for conversation in [Conversation(title: "Plan the Lisbon trip", messages: [ChatMessage(role: .user, text: "Four days in May.")]),
+                             Conversation(title: "Grocery list", messages: [ChatMessage(role: .user, text: "Eggs, milk and bread.")])] {
+            try JSONEncoder().encode(conversation).write(to: folder.appending(path: "\(conversation.id.uuidString).json"))
+        }
+        let store = ChatStore(folder: folder)
+        #expect(store.matching("lisbon").map(\.title) == ["Plan the Lisbon trip"])
+        #expect(store.matching("MILK").map(\.title) == ["Grocery list"])
+        #expect(store.matching("Porto").isEmpty)
+        #expect(store.matching("").map(\.id) == store.conversations.map(\.id))
+    }
+
     /// A title is the first line of the model's reply that holds any, without a Title: label,
     /// quotes, Markdown's marks or a closing stop, in at most 80 characters; a reply with none
     /// gives no title.
