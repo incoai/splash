@@ -453,6 +453,29 @@ struct DrawerTests {
         #expect(try String(contentsOf: file, encoding: .utf8) == "its first line\n\n── Starting c/d\n")
     }
 
+    /// A start reads only the end of the log before it, however long a run grew it: one past what
+    /// it keeps is cut to its last lines there, and one within it has the start's line added, the
+    /// file kept.
+    @Test func aStartReadsOnlyTheEndOfALongLog() throws {
+        let (folder, file) = try Self.log("")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        // 4 GiB, all but its last line a hole, which reading would fill.
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.truncate(atOffset: 4 << 30)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("\nthe run's last line\n".utf8))
+        try handle.close()
+        let start = beginLog(file, heading: "── Starting a/b", kept: 1 << 20)
+        #expect(try Data(contentsOf: file) == Data("the run's last line\n\n── Starting a/b\n".utf8))
+        #expect(start == UInt64(try Data(contentsOf: file).count))
+        let number = try FileManager.default.attributesOfItem(atPath: file.path)[.systemFileNumber] as? Int
+        let next = beginLog(file, heading: "── Starting c/d", kept: 1 << 20)
+        #expect(try String(contentsOf: file, encoding: .utf8)
+            == "the run's last line\n\n── Starting a/b\n\n── Starting c/d\n")
+        #expect(next == UInt64(try Data(contentsOf: file).count))
+        #expect(try FileManager.default.attributesOfItem(atPath: file.path)[.systemFileNumber] as? Int == number)
+    }
+
     /// As a log grows, its oldest lines go: past 512 K characters, it keeps the lines that start
     /// in its last seven eighths of that.
     @Test func aLogKeepsAtMostTheLinesOfItsLast512KCharactersAsItGrows() async throws {

@@ -356,22 +356,38 @@ func resetLog(_ url: URL) {
 
 /// Begins a run in `url`'s log, after the runs before it and a blank line, with `heading`, a line
 /// that names the run, and returns where the run's own lines start. The log keeps its last `kept`
-/// bytes, from the start of a line; it is made, with its folder, where there is none.
+/// bytes, from the start of a line; it is made, with its folder, where there is none. Only its
+/// end is read, however long a run grew it: a log past `kept` is written again from its last
+/// `kept` bytes, and one within it has the heading added.
 @discardableResult
 func beginLog(_ url: URL, heading: String, kept: Int = 8 << 20) -> UInt64 {
     try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-    var log = (try? Data(contentsOf: url)) ?? Data()
-    if log.count > kept {
-        log = Data(log.suffix(kept))
-        if let newline = log.firstIndex(of: 0x0A) { log = Data(log[log.index(after: newline)...]) }
+    let file = try? FileHandle(forUpdating: url)
+    defer { try? file?.close() }
+    let size = (try? file?.seekToEnd()) ?? 0
+    let trims = size > UInt64(kept)
+    // Its last `kept` bytes, from the start of a line, where it trims; otherwise its last byte,
+    // which says whether its last line ended.
+    var tail = Data()
+    if let file, size > 0 {
+        try? file.seek(toOffset: trims ? size - UInt64(kept) : size - 1)
+        tail = (try? file.readToEnd()) ?? Data()
+        if trims, let newline = tail.firstIndex(of: 0x0A) { tail = Data(tail[tail.index(after: newline)...]) }
     }
-    if !log.isEmpty {
-        if log.last != 0x0A { log.append(0x0A) }
-        log.append(0x0A)
+    var added = Data()
+    if !tail.isEmpty {
+        if tail.last != 0x0A { added.append(0x0A) }
+        added.append(0x0A)
     }
-    log.append(Data((heading + "\n").utf8))
-    try? log.write(to: url, options: .atomic)
-    return UInt64(log.count)
+    added.append(Data((heading + "\n").utf8))
+    guard let file, !trims else {
+        let log = (trims ? tail : Data()) + added
+        try? log.write(to: url, options: .atomic)
+        return UInt64(log.count)
+    }
+    _ = try? file.seekToEnd()
+    try? file.write(contentsOf: added)
+    return size + UInt64(added.count)
 }
 
 /// Adds `line` at the end of `url`'s log.
