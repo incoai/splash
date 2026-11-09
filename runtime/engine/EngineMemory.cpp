@@ -388,14 +388,14 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
   }
   // What it lacks is other requests' active KV, the copies of the blocks
   // they hold and their commitments: it waits for them to end. The quota
-  // cannot hold it even alone: a start is refused, and a resume that has no
-  // room left for output ends.
+  // cannot hold it even alone: a resume with output ends at its length, and
+  // a start, or a resume with no output to return, is refused.
   const uint64_t activeLimitBytes = cache_.spillLimit();
   if (activeLimitBytes / geometry.slotBytes >= needed) {
     waitForResources(active, now, {.diskQuota = true});
     return SpillAdmission::Waiting;
   }
-  if (resuming) {
+  if (resuming && generatedTokens(active)) {
     endAtLength(active);
   } else {
     ++counters_.spill.refusedQuota;

@@ -708,6 +708,34 @@ void testALoneStartTakesMemorysBound() {
   }
 }
 
+// That bound holds through a suspension: a Resident resume meets no admission that sets it again, and
+// without it the lane would run into the wall past what it has streamed and fail there.
+void testAResumeKeepsMemorysBound() {
+  ShortOfBoth both(900ULL << 20);
+  Spilling &spill = both.spill;
+  cannotSpill(spill, Unspillable::Closed);
+  EngineRequest background = Spilling::prompt(1, 1, 2'046, 300);
+  background.priority = RequestPriority::Background;
+  spill.engine.submit(std::move(background));
+  spill.runUntil([&] { return spill.events.outputs[1].size() >= 10; }, "the request did not decode");
+  require(spill.model.outputLimits.at(1) == 56, "the request did not start under memory's bound");
+  // A Normal start is refused memory while it is resident, which suspends it.
+  spill.model.beginGrowthBlocked = [&] {
+    return spill.model.lastBeginId == 2 && spill.model.requests.at(1).resident;
+  };
+  spill.model.resumeDenied = true;
+  spill.engine.submit(Spilling::prompt(2, 2, 1, 1));
+  spill.runUntil([&] { return spill.model.suspensions == 1 && spill.events.completedCount == 1; },
+                 "the Normal request did not run beside the suspended one");
+  spill.model.resumeDenied = false;
+  spill.runUntilIdle();
+  require(spill.model.resumptions == 1 && spill.events.completedCount == 2 && spill.events.failures.empty() &&
+              spill.model.outputLimits.at(1) == 56 && spill.events.usage.at(1).second == 56 &&
+              spill.events.boundedIds == std::vector<uint64_t>{1},
+          "a resume lost the bound memory set at its start: limit " +
+              std::to_string(spill.model.outputLimits.at(1)) + failureDetail(spill.events));
+}
+
 // A guard: the same start beside the next lane's pooled buffers, which cover what memory lacks,
 // starts Resident and decodes its output. The claim it makes in service takes them, as its growth
 // does; a start's would keep them, and it would not start.
@@ -1850,6 +1878,43 @@ void testSpillResumeInItsPromptHoldsNoAnchor() {
               spill.events.completedCount == 2 && spill.events.usage.at(1).second == 1 &&
               spill.events.boundedIds == std::vector<uint64_t>{1} && spill.committedSlots() == 0,
           "a resume in its prompt was not bounded to the token its prompt's pages leave");
+}
+
+// A request suspended before it has any output, whose prompt the quota can no longer hold even alone
+// (the volume filled meanwhile), is refused as a start is. Ending at its length would answer with
+// nothing, and a score that ends so is one the server takes for a broken engine.
+void testASpillResumeWithNoOutputIsRefusedOutOfQuota() {
+  for (const bool score : {false, true}) {
+    Spilling spill(20, true, 100'000, 0, {4}, test::commandShape(KvCache::pageTokens));
+    // No copies: the request holds its whole history without any.
+    spill.allowSpillWrites(false);
+    // Three pages of prompt, and each prefill command takes a page of them.
+    EngineRequest background = request(1, std::vector<uint32_t>(3 * KvCache::pageTokens - 1, 1));
+    background.maxNewTokens = score ? 0 : 100;
+    if (score)
+      background.scoreTokens = {1, 2};
+    background.priority = RequestPriority::Background;
+    spill.engine.submit(std::move(background));
+    spill.runUntil([&] { return spill.model.prefillChunks[1] == 1; }, "the prompt did not start");
+    // A Normal start is refused memory while it is resident, which suspends it.
+    spill.model.beginGrowthBlocked = [&] {
+      return spill.model.lastBeginId == 2 && spill.model.requests.at(1).resident;
+    };
+    spill.model.resumeDenied = true;
+    spill.engine.submit(Spilling::prompt(2, 2, 1, 1));
+    spill.runUntil([&] { return spill.events.completedCount == 1; }, "the Normal request did not run");
+    require(spill.model.suspensions == 1, "the request was not suspended in its prompt");
+    spill.budget->setActiveLimitBytes(100);
+    spill.model.resumeDenied = false;
+    spill.runUntilIdle();
+    require(spill.model.resumptions == 0 && spill.events.completedCount == 1 &&
+                spill.events.failures == std::vector<std::string>{"kv_disk_quota"} &&
+                spill.engine.snapshot().spill.lengthEnds == 0 && spill.committedSlots() == 0,
+            std::string(score ? "a score" : "a prompt") +
+                " that the quota could no longer hold at its resume was not refused: " +
+                std::to_string(spill.engine.snapshot().spill.lengthEnds) + " length ends" +
+                failureDetail(spill.events));
+  }
 }
 
 // A resumed Spill request takes its replay's Full pages a command at a time, so a replay larger
@@ -4050,6 +4115,7 @@ std::span<const test::TestCase> spillTests() {
       {"testALoneStartMemoryCannotHoldIsRefusedAtItsStart", testALoneStartMemoryCannotHoldIsRefusedAtItsStart},
       {"testALoneStartCountsTheNextLanesBuffers", testALoneStartCountsTheNextLanesBuffers},
       {"testALoneStartTakesMemorysBound", testALoneStartTakesMemorysBound},
+      {"testAResumeKeepsMemorysBound", testAResumeKeepsMemorysBound},
       {"testALoneStartMemoryCannotHoldTakesTheQuotasBound", testALoneStartMemoryCannotHoldTakesTheQuotasBound},
       {"testAStartMemoryCannotHoldBesideALaneWaitsForIt", testAStartMemoryCannotHoldBesideALaneWaitsForIt},
       {"testAStartMemoryNeverHoldsIsDecidedOnceTheLaneEnds", testAStartMemoryNeverHoldsIsDecidedOnceTheLaneEnds},
@@ -4089,6 +4155,7 @@ std::span<const test::TestCase> spillTests() {
       {"testSpillResumeOnAClosedTier", testSpillResumeOnAClosedTier},
       {"testSpillResumeBoundLeavesOutputPastItsAnchor", testSpillResumeBoundLeavesOutputPastItsAnchor},
       {"testSpillResumeInItsPromptHoldsNoAnchor", testSpillResumeInItsPromptHoldsNoAnchor},
+      {"testASpillResumeWithNoOutputIsRefusedOutOfQuota", testASpillResumeWithNoOutputIsRefusedOutOfQuota},
       {"testSpillResumeTakesItsReplaysPagesAsItRuns", testSpillResumeTakesItsReplaysPagesAsItRuns},
       {"testAWaitingResumeFindsTheMemoryItsKvHeldFree", testAWaitingResumeFindsTheMemoryItsKvHeldFree},
       {"testDecodeLeavesOutALaneRefusedItsHotFloor", testDecodeLeavesOutALaneRefusedItsHotFloor},
