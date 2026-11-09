@@ -214,14 +214,13 @@ BF16, and other publishers keep alpha and beta, GDN projections, experts or
 the token table in F16. Their planes hold the values as stored, with an FP32
 scale of 1 per 256 values; the staged tiles round each value once to half, the
 Apple9 register tile reads BF16 exactly and takes no F16, so a projection with
-an F16 weight stages there, as do all of a model's experts when any expert
-weight is F16. Whole-BF16 and F16 models are not a target: before any weight
-download, and before the engine's model check, the installer refuses a GGUF
-whose BF16, F16 and F32 tensors hold more of its values than its quantized
-ones (`gguf.require_quantized`), with one message that asks for a quantized
-variant. A whole-BF16 file with its token table quantized is still refused;
-these files pass, and so does a MoE whose routed experts alone are quantized.
-The native loader does not check this.
+an F16 weight stages there. Whole-BF16 and F16 models are not a target: before
+any weight download, and before the engine's model check, the installer
+refuses a GGUF whose BF16, F16 and F32 tensors hold more of its values than
+its quantized ones (`gguf.require_quantized`), with one message that asks for
+a quantized variant. A whole-BF16 file with its token table quantized is still
+refused; these files pass, and so does a MoE whose routed experts alone are
+quantized. The native loader does not check this.
 
 Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B and
 Qwen3.6-35B-A3B from UD-IQ1_S to UD-Q8_K_XL. llama-quantize's default type

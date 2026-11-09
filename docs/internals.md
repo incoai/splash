@@ -454,7 +454,7 @@ The rules:
 4. *MoE.* Every GPU runs the experts on the staged tile, on 8-row tiles
    while a prefill chunk's routes average at most one row per expert and
    32-row tiles beyond. One plan per step serves every block, so its router
-   follows rule 3 in the format of most blocks' routers (`ops::moeFormats`).
+   follows rule 3 in the format of most blocks' routers (`ops::moeRouterFormat`).
 5. *Attention.* The kernels follow how a layout reads its pages
    (`kv::Layout::reads`, below). A dense prefill tile takes one history split
    per `AttentionCalibration::prefillPagesPerSplit` pages its rows read (32,
@@ -664,7 +664,7 @@ slices in the grouped passes: the planner keeps its gate and up rows and lays it
 out as column windows (`gguf::TensorRows::windows`), so slice s's rows of each projection follow
 slice s - 1's (`moe_gguf_segment`). The select kernel names the routing's select suffix
 (`moe_route_select_f32_sigmoid_s2`), the grouping and expert passes its slices suffix
-(`moe_group_routes_s2`, `moe_expert_gguf_m8_a_s2`); the softmax router's one gated slice is the
+(`moe_group_routes_s2`, `moe_expert_gguf_m8_down_s2`); the softmax router's one gated slice is the
 unsuffixed instances. The expert passes launch the live tiles alone: the grouping kernel writes each
 pass's grid with the tile count, and the pass reads it as an indirect dispatch
 (`ComputeDispatch::indirectThreadgroups`). They find a routed expert through the block's slot table
@@ -744,8 +744,8 @@ up pass with the silu gate. The staged ones are `gguf_decode_<format>_m<rows>_<e
 up in one pass `gguf_decode_<format>_m<rows>_gate_up`, and
 `gguf_prefill_<format>_<e>` (and `gguf_prefill_<format>_r_leading_inputs` over a view of the
 leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lanes>_<e>`, and the
-experts `moe_expert_gguf_m<rows>_<e>`, with gate and up in one pass
-`moe_expert_gguf_m<rows>_gate_up`; the fused projections run
+experts' gate and up in one pass `moe_expert_gguf_m<rows>_gate_up` and their down pass
+`moe_expert_gguf_m<rows>_down`; the fused projections run
 `gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode and, on Apple10 and on
 Apple9 GPUs of 10 cores or fewer, in prefill chunks of 33 to 64 rows (`gguf_decode_fused_m64`),
 and in longer prefill chunks one `gguf_prefill_<format>_a` per format over that format's

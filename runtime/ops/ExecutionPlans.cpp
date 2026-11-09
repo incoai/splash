@@ -42,16 +42,16 @@ DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
   return DraftAttention::plan(shape, lanes);
 }
 
-MoePlan ExecutionPlans::moePrefill(MoeShape shape, const MoeFormats &formats, uint32_t rows) const {
-  return MoE::prefillPlan(shape, rows, selectMoe(calibration(), shape, formats, rows, MoePhase::Prefill));
+MoePlan ExecutionPlans::moePrefill(MoeShape shape, uint32_t routerFormat, uint32_t rows) const {
+  return MoE::prefillPlan(shape, rows, selectMoe(calibration(), shape, routerFormat, rows, MoePhase::Prefill));
 }
 
-MoePlan ExecutionPlans::moeDecode(MoeShape shape, const MoeFormats &formats, uint32_t lanes) const {
+MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t routerFormat, uint32_t lanes) const {
   // Validate before multiplying an untrusted width into the plan's rows.
   if (!lanes || lanes > kMaximumLanes)
     throw std::invalid_argument("invalid MoE decode width");
   return MoE::decodePlan(shape, lanes,
-                         selectMoe(calibration(), shape, formats, lanes * kDecodeRows, MoePhase::Decode));
+                         selectMoe(calibration(), shape, routerFormat, lanes * kDecodeRows, MoePhase::Decode));
 }
 
 AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(
@@ -72,20 +72,20 @@ DraftAttentionWorkspace ExecutionPlans::draftAttentionWorkspacePerLane(
   return DraftAttention::plan(shape, 1).workspace();
 }
 
-MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape, const MoeFormats &formats,
+MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape, uint32_t routerFormat,
                                                  uint32_t maximumRows) const {
   // Validate the bound before iterating; every row is included even if a
   // future grouped layout's largest field is not monotone in row count.
-  auto bound = moePrefill(shape, formats, maximumRows).workspace();
+  auto bound = moePrefill(shape, routerFormat, maximumRows).workspace();
   for (uint32_t rows = 1; rows <= maximumRows; ++rows)
-    include(bound, moePrefill(shape, formats, rows).workspace(), kMoeWorkspaceFields);
+    include(bound, moePrefill(shape, routerFormat, rows).workspace(), kMoeWorkspaceFields);
   return bound;
 }
 
-MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape, const MoeFormats &formats) const {
+MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape, uint32_t routerFormat) const {
   MoeWorkspace bound;
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes)
-    include(bound, moeDecode(shape, formats, lanes).workspace(), kMoeWorkspaceFields, lanes);
+    include(bound, moeDecode(shape, routerFormat, lanes).workspace(), kMoeWorkspaceFields, lanes);
   return bound;
 }
 

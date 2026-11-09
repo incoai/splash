@@ -317,8 +317,9 @@ void floatTiles(Golden &golden, const std::string &name, const Linear &linear) {
 
 // ---- MoE ------------------------------------------------------------------
 
-// The formats of a target's MoE blocks: each GGUF format in every block, and
-// the mixes the matrix GGUFs and their failure cases hold.
+// The formats of a target's MoE blocks, whose plans follow the routers'
+// alone (moeRouterFormat): Q4_K experts under F32 routers, and routers in
+// BF16, in quantized rows and of mixed formats.
 struct BlockFormats final {
   uint32_t gate, up, down, shared, router;
 };
@@ -329,20 +330,8 @@ struct MoeFormatSet final {
 std::vector<MoeFormatSet> moeFormatSets() {
   constexpr uint32_t f32 = QuantizedSegment::kFloat32;
   std::vector<MoeFormatSet> sets;
-  for (uint32_t format = 0; format < GGUF_FMT_COUNT; ++format)
-    sets.push_back({formatName(format), std::vector<BlockFormats>(4, {format, format, format, format, f32})});
-  // A UD quant's experts: grid-lookup gate/up over an IQ3_XXS down, Q8_0 shared.
-  sets.push_back({"ud-iq2", std::vector<BlockFormats>(4, {GGUF_FMT_IQ2XS, GGUF_FMT_IQ2XS, GGUF_FMT_IQ3XXS,
-                                                          GGUF_FMT_Q80, f32})});
-  // Grid-lookup experts in every block but the last.
-  sets.push_back({"iq2-then-q4_k", {{GGUF_FMT_IQ2XS, GGUF_FMT_IQ2XS, GGUF_FMT_IQ2XS, GGUF_FMT_Q80, f32},
-                                    {GGUF_FMT_IQ2XS, GGUF_FMT_IQ2XS, GGUF_FMT_IQ2XS, GGUF_FMT_Q80, f32},
-                                    {GGUF_FMT_IQ2XS, GGUF_FMT_IQ2XS, GGUF_FMT_IQ2XS, GGUF_FMT_Q80, f32},
-                                    {GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q80, f32}}});
-  // A shared expert the register tile does not take.
-  sets.push_back({"q4_k-shared-f16", std::vector<BlockFormats>(4, {GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K,
-                                                                   GGUF_FMT_F16, f32})});
-  // Routers in BF16, in quantized rows, and of mixed formats.
+  sets.push_back({formatName(GGUF_FMT_Q4K), std::vector<BlockFormats>(4, {GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K,
+                                                                          GGUF_FMT_Q4K, f32})});
   sets.push_back({"router-bf16", std::vector<BlockFormats>(4, {GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K,
                                                                GGUF_FMT_Q4K, GGUF_FMT_BF16})});
   sets.push_back({"router-q8_0", std::vector<BlockFormats>(4, {GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K,
@@ -368,12 +357,12 @@ std::vector<BlockMoeWeights> moeBlocks(const MoeShape &shape, const MoeFormatSet
   return blocks;
 }
 
-// The formats of the target's MoE blocks, as its loaded weights give them
-// (QwenTargetGeometry::finish).
-MoeFormats formatsOf(const std::vector<BlockMoeWeights> &blocks) {
+// The router format of the target's MoE blocks, as its loaded weights give
+// it (QwenTargetGeometry::finish).
+uint32_t routerFormatOf(const std::vector<BlockMoeWeights> &blocks) {
   std::vector<const BlockMoeWeights *> pointers;
   for (const BlockMoeWeights &block : blocks) pointers.push_back(&block);
-  return moeFormats(pointers);
+  return moeRouterFormat(pointers);
 }
 
 std::string describe(const MoePlan &plan) {
@@ -397,21 +386,21 @@ void moePlans(Golden &golden, const std::string &name, const ExecutionPlans &pla
     const std::string f(family.family);
     for (const MoeFormatSet &set : sets) {
       const MoeShape shape = family.moeBlockShape();
-      const MoeFormats formats = formatsOf(moeBlocks(shape, set));
+      const uint32_t routerFormat = routerFormatOf(moeBlocks(shape, set));
       Group &decode = golden.group(name, "moe-decode", f);
       Group &prefill = golden.group(name, "moe-prefill", f);
       Group &workspace = golden.group(name, "moe-workspace", f);
       for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
         decode.add(set.name + " lanes " + std::to_string(lanes) + ": " +
-                   attempt([&] { return describe(plans.moeDecode(shape, formats, lanes)); }));
+                   attempt([&] { return describe(plans.moeDecode(shape, routerFormat, lanes)); }));
       for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; rows += rows < 128 ? 1 : 16)
         prefill.add(set.name + " rows " + std::to_string(rows) + ": " +
-                    attempt([&] { return describe(plans.moePrefill(shape, formats, rows)); }));
+                    attempt([&] { return describe(plans.moePrefill(shape, routerFormat, rows)); }));
       for (const uint32_t rows : {64U, 512U, uint32_t{SPLASH_PREFILL_TOKEN_BUDGET}})
         workspace.add(set.name + " prefill " + std::to_string(rows) + ":" +
-                      attempt([&] { return describe(plans.moePrefillWorkspace(shape, formats, rows)); }));
+                      attempt([&] { return describe(plans.moePrefillWorkspace(shape, routerFormat, rows)); }));
       workspace.add(set.name + " decode per lane:" +
-                    attempt([&] { return describe(plans.moeDecodeWorkspacePerLane(shape, formats)); }));
+                    attempt([&] { return describe(plans.moeDecodeWorkspacePerLane(shape, routerFormat)); }));
     }
   });
 }

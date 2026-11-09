@@ -272,15 +272,12 @@ FloatTile selectFloatTile(const KernelCalibration &calibration, uint32_t rows, u
              : FloatTile::Simdgroup;
 }
 
-MoeFormats moeFormats(std::span<const BlockMoeWeights *const> blocks) noexcept {
+uint32_t moeRouterFormat(std::span<const BlockMoeWeights *const> blocks) noexcept {
   // Routers per format, F32 counted one past the GGUF formats.
   std::array<uint32_t, GGUF_FMT_COUNT + 1> routers{};
-  MoeFormats formats;
   for (const BlockMoeWeights *block : blocks) ++routers[std::min<uint32_t>(block->router.formatId, GGUF_FMT_COUNT)];
   const auto router = std::max_element(routers.begin(), routers.end());
-  formats.router = *router && router < routers.end() - 1 ? uint32_t(router - routers.begin())
-                                                         : QuantizedSegment::kFloat32;
-  return formats;
+  return *router && router < routers.end() - 1 ? uint32_t(router - routers.begin()) : QuantizedSegment::kFloat32;
 }
 
 // Every GPU runs the experts on the staged tile: against the register tile, a
@@ -292,13 +289,13 @@ MoeFormats moeFormats(std::span<const BlockMoeWeights *const> blocks) noexcept {
 // weights once for up to 32 of its rows (its tiles run 8-, 16- or 32-row
 // matmuls by their live rows, moe_live_rows). The router's float tile follows
 // selectFloatTile by its rows' format.
-MoeConfig selectMoe(const KernelCalibration &calibration, const MoeShape &shape, const MoeFormats &formats,
+MoeConfig selectMoe(const KernelCalibration &calibration, const MoeShape &shape, uint32_t routerFormat,
                     uint32_t rows, MoePhase phase) noexcept {
   MoeConfig config;
   config.expertTile = phase == MoePhase::Prefill && uint64_t{rows} * shape.expertsPerToken > shape.experts
                           ? MoeExpertTile::M32
                           : MoeExpertTile::M8;
-  config.ggufRouterTile = selectFloatTile(calibration, rows, shape.experts, formats.router);
+  config.ggufRouterTile = selectFloatTile(calibration, rows, shape.experts, routerFormat);
   return config;
 }
 
