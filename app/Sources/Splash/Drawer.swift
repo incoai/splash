@@ -3,8 +3,9 @@ import SwiftTerm
 import SwiftUI
 
 /// What the drawer under the window's content holds (`WithDrawer`): terminals, each running the
-/// program `shell` names as it starts, in the home folder, and the logs of what the app runs. Whether it shows,
-/// and its height, are the window's (`AppState.showsDrawer`), as the sidebar's are.
+/// program `shell` names as it starts, in the home folder or a coding agent's project folder, and
+/// the logs of what the app runs. Whether it shows, and its height, are the window's
+/// (`AppState.showsDrawer`), as the sidebar's are.
 @MainActor @Observable
 final class Drawer {
     enum Part: Hashable { case terminal, logs }
@@ -106,14 +107,14 @@ struct Shell {
     }
 }
 
-/// A shell in a pseudo-terminal, as Terminal opens one, in the home folder, with the app's own
-/// environment (`Runtime.userEnvironment`), and Option typing what the keyboard layout gives, as
-/// there. Its view outlives the drawer's, so that a terminal keeps what it shows while the drawer
-/// is closed or the window shows another part.
+/// A shell in a pseudo-terminal, as Terminal opens one, in the home folder or a coding agent's
+/// project folder (`AppState.open`), with the app's own environment (`Runtime.userEnvironment`),
+/// and Option typing what the keyboard layout gives, as there. Its view outlives the drawer's, so
+/// that a terminal keeps what it shows while the drawer is closed or the window shows another part.
 @MainActor @Observable
 final class TerminalSession: Identifiable {
     let id = UUID()
-    /// What the shell calls itself, its title escape, or the home folder's name until it does.
+    /// What the shell calls itself, its title escape, or its folder's name until it does.
     private(set) var title: String
     private(set) var ended = false
     @ObservationIgnored let view: TypingTerminalView
