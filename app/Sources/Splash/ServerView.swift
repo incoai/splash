@@ -757,9 +757,10 @@ private struct SuggestedRow: View {
     }
 }
 
-/// What a check for updates found, as the installer reported it: the model downloaded what had
-/// moved on, which its next start uses, had it all, or couldn't be checked or updated, where the
-/// log says why.
+/// What a check for updates or a deletion did, as the installer reported it: the model downloaded
+/// what had moved on, which its next start uses, had it all, couldn't be checked or updated, where
+/// the log says why, or was deleted, freeing the space its files took unless other models or tools
+/// use them.
 private struct CheckedRow: View {
     @Environment(AppState.self) private var state
     let model: String

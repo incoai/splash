@@ -78,9 +78,25 @@ final class Installer {
         }
     }
 
-    /// What a check for updates that ended did, which the Server shows until read.
+    /// What a check for updates or a deletion that ended did, which the Server shows until read.
     enum Result: Equatable {
         case checked(Outcome)
+        /// A deletion, and the bytes it freed: none where other models or tools use the files.
+        case deleted(freed: Int64)
+    }
+
+    /// The bytes a line of the installer's output says a removal freed, if it is a `removed`
+    /// event.
+    nonisolated static func freed(line: String) -> Int64? {
+        struct Event: Decodable {
+            let event: String
+            let bytes: Int64
+        }
+        guard line.hasPrefix("{"),
+              let event = try? JSONDecoder().decode(Event.self, from: Data(line.utf8)),
+              event.event == "removed"
+        else { return nil }
+        return event.bytes
     }
 
     /// What the Server says of `result` for the model `name`: a title, the line under it, and
@@ -91,6 +107,8 @@ final class Installer {
         case .checked(.upToDate): ("\(name) is up to date", "Hugging Face has nothing newer.", true)
         case .checked(.unreachable): ("Splash couldn’t check \(name) for updates", "Hugging Face was not reachable.", false)
         case .checked(.kept): ("Splash couldn’t update \(name)", "It kept the installed version.", false)
+        case .deleted(let freed) where freed > 0: ("Deleted \(name)", "Freed \(Format.size(freed)).", true)
+        case .deleted: ("Deleted \(name)", "Its files stayed: other models or tools use them.", true)
         }
     }
 
@@ -134,16 +152,15 @@ final class Installer {
     }
     /// What the installation running does, or else what the last one did.
     private(set) var work = Work.download
-    /// The last check for updates that ended, as the installer reported it: its model, and what
-    /// it found.
+    /// The last check for updates or deletion that ended, as the installer reported it: its model,
+    /// and what it found or freed.
     private(set) var checked: (model: String, result: Result)?
 
     /// Gets each model once it is downloaded.
     @ObservationIgnored var installed: (String) -> Void = { _ in }
-    /// Gets each model once a check or a deletion of it has changed its files.
+    /// Gets each model once a check of it ended or a deletion of it ran, which may have changed its
+    /// files.
     @ObservationIgnored var changed: (String) -> Void = { _ in }
-    /// Gets each model once it is removed.
-    @ObservationIgnored var removed: (String) -> Void = { _ in }
 
     /// The downloads' log, which each download begins again.
     let log: URL
@@ -153,8 +170,9 @@ final class Installer {
     let record: ChildRecord
     private var cancelled = false
     private var reported: Failure?
-    /// What the check running found, as reported.
+    /// What the check running found, or the bytes the deletion running freed, as reported.
     private var outcome: Outcome?
+    private var freed: Int64?
     private var activity: NSObjectProtocol?
     /// When and at how many bytes the model's own download was first reported.
     private var began: (date: Date, done: Int64)?
@@ -196,6 +214,7 @@ final class Installer {
         checked = nil
         reported = nil
         outcome = nil
+        freed = nil
         cancelled = false
         resetLog(log)
         do {
@@ -252,6 +271,10 @@ final class Installer {
             self.outcome = outcome
             return
         }
+        if let freed = Self.freed(line: line) {
+            self.freed = freed
+            return
+        }
         guard let event = Progress(line: line) else { return }
         guard let model, event.repo == model.split(separator: ":")[0] else { return }
         if began == nil { began = (.now, event.done) }
@@ -265,13 +288,15 @@ final class Installer {
         guard let model else { return }
         self.model = nil
         progress = nil
+        // A removal that failed may have removed the model all the same: the list says.
+        if work == .removal { changed(model) }
         if status == 0 {
             switch work {
             case .download: installed(model)
             case .check:
                 checked = outcome.map { (model, .checked($0)) }
                 changed(model)
-            case .removal: changed(model)
+            case .removal: checked = freed.map { (model, .deleted(freed: $0)) }
             }
         } else if !cancelled {
             failure = (model, reported.map { Self.problem($0, model: model) }

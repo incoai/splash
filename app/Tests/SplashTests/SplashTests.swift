@@ -463,12 +463,14 @@ struct AppStateTests {
         #expect(state.installer.checked == nil)
     }
 
-    /// Deleting a model runs the installer's removal, then lists the models again; a removal the
-    /// installer refuses says why.
+    /// Deleting a model runs the installer's removal, says what it freed, and lists the models
+    /// again; a removal the installer refuses says why, and lists them again too, as one that
+    /// failed may have removed the model all the same.
     @Test func deletingAModelRunsTheInstallersRemoval() async throws {
         let fake = try FakeRuntime("splash-delete", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
         try fake.install("a/b")
+        try fake.install("c/d")
         let state = fake.state(keychain: Keychain(service: "Splash Tests"))
         defer { state.quit() }
         await state.launch()
@@ -489,14 +491,19 @@ struct AppStateTests {
         try await waitFor(!state.installer.running, "the removal")
         try await waitFor(!state.isInstalled("a/b"), "the list")
         #expect(state.installer.failure == nil)
+        #expect(state.installer.checked?.model == "a/b" && state.installer.checked?.result == .deleted(freed: 1))
         try """
-        import json
+        import json, shutil
+        shutil.rmtree("\(models.appending(path: "c/d").path)")
         print(json.dumps({"event": "error", "kind": None, "message": "c/d is being served: stop it, then remove it"}), flush=True)
         raise SystemExit(1)
         """.write(to: installer, atomically: true, encoding: .utf8)
+        #expect(state.isInstalled("c/d"))
         state.installer.remove("c/d")
+        #expect(state.installer.checked == nil)
         try await waitFor(!state.installer.running, "the refusal")
         #expect(state.installer.failure?.message == "c/d is being served: stop it, then remove it")
+        try await waitFor(!state.isInstalled("c/d"), "the list")
     }
 
     /// The server's status is asked less often while neither the window nor the menu bar's panel
@@ -1240,8 +1247,8 @@ struct OutputTests {
         #expect(Installer.Failure(line: "error: cannot install a/b") == nil)
     }
 
-    /// What a check for updates found is worded as the installer reports it last
-    /// (install/models.py prepare --json-progress).
+    /// What a check for updates found and what a deletion freed are worded as the installer
+    /// reports them last (install/models.py prepare --json-progress, remove).
     @Test func checkAndDeletionResultsAreWordedAsReported() throws {
         func outcome(_ name: String) -> Installer.Outcome? {
             Installer.Outcome(line: #"{"event": "prepared", "outcome": "\#(name)"}"#)
@@ -1250,6 +1257,8 @@ struct OutputTests {
         #expect(outcome("unreachable") == .unreachable && outcome("kept") == .kept)
         #expect(outcome("later") == nil)
         #expect(Installer.Outcome(line: #"{"event": "removed", "bytes": 1}"#) == nil)
+        #expect(Installer.freed(line: #"{"event": "removed", "bytes": 15000000000}"#) == 15_000_000_000)
+        #expect(Installer.freed(line: #"{"event": "prepared", "outcome": "kept"}"#) == nil)
         func words(_ result: Installer.Result) -> String {
             let words = Installer.words(result, name: "Q")
             return "\(words.title) / \(words.detail)\(words.done ? "" : " !")"
@@ -1258,6 +1267,8 @@ struct OutputTests {
         #expect(words(.checked(.upToDate)) == "Q is up to date / Hugging Face has nothing newer.")
         #expect(words(.checked(.unreachable)) == "Splash couldn’t check Q for updates / Hugging Face was not reachable. !")
         #expect(words(.checked(.kept)) == "Splash couldn’t update Q / It kept the installed version. !")
+        #expect(words(.deleted(freed: 15_000_000_000)) == "Deleted Q / Freed 15 GB.")
+        #expect(words(.deleted(freed: 0)) == "Deleted Q / Its files stayed: other models or tools use them.")
     }
 
     @Test func readsDownloadEvents() {
