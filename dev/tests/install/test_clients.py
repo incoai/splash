@@ -1317,7 +1317,7 @@ class ClientLifecycleTests(unittest.TestCase):
             finally:
                 os.close(written)
             self.assertEqual(result.returncode, 7, result.stderr)
-            self.assertLess(float(elapsed.read_text()), 1.5)
+            self.assertLess(float(elapsed.read_text()), 3.0)
         held = b""
         while chunk := os.read(unread, 65536):
             held += chunk

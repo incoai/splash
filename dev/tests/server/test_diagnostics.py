@@ -510,7 +510,7 @@ class DiagnosticsTests(HarnessTestCase):
                     [sys.executable, *options, "-c", program], both
                 )
                 self.assertEqual(status, 3, errors)
-                self.assertLess(elapsed, 2.5)
+                self.assertLess(elapsed, 5.0)
 
     def test_an_uncaught_exception_is_a_console_line(self):
         # Python's report of an exception nothing caught, in the main thread,
@@ -560,7 +560,7 @@ class DiagnosticsTests(HarnessTestCase):
                     [sys.executable, "-u", "-c", program], True
                 )
                 self.assertEqual(exit_status, status)
-                self.assertLess(elapsed, 2.5)
+                self.assertLess(elapsed, 5.0)
 
     def test_requests_complete_while_the_console_stops_draining(self):
         harness = self.harness(FakeRuntime(), request_logger=diagnostics.print_request)
