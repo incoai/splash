@@ -358,7 +358,7 @@ private struct ActivityFigures: View {
 
 /// The requests since the model started, their totals on the row, and when opened, a line for
 /// each in a box of its own that scrolls, from the top down, following the latest once full.
-private struct RequestLog: View {
+struct RequestLog: View {
     let requests: [ServedRequest]
     let totals: String?
     @State var open = false
@@ -386,12 +386,14 @@ private struct RequestLog: View {
         }
     }
 
-    /// How many `requests`, as the rows count them, the tokens they wrote and read, those taken from
-    /// the cache, and those running; none before the first.
+    /// How many requests the model answered, as the status counts them and the menu bar's panel
+    /// says, the tokens they wrote and read, those taken from the cache, and the rows of `requests`
+    /// running; none before the first. The rows are no count of the requests answered: they keep
+    /// the latest 1,000 (`ServedRequest.kept`), and those refused too.
     static func totals(_ activity: Server.Activity, requests: [ServedRequest]) -> String? {
-        guard !requests.isEmpty else { return nil }
+        guard activity.served > 0 || !requests.isEmpty else { return nil }
         let running = requests.count(where: \.running)
-        var parts = [requests.count.formatted(), "\(Format.count(activity.generated)) tokens out", "\(Format.count(activity.read)) in"]
+        var parts = [activity.served.formatted(), "\(Format.count(activity.generated)) tokens out", "\(Format.count(activity.read)) in"]
         if activity.cached > 0 { parts.append("\(Format.count(activity.cached)) cached") }
         if running > 0 { parts.append("\(running) running") }
         return parts.joined(separator: " · ")

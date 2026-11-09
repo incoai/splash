@@ -151,3 +151,19 @@ extension ServerScreenTests {
         #expect(state.server.requests.first { $0.id == 1 }?.end == nil && state.quitCost.requests == 1)
     }
 }
+
+extension ServerScreenTests {
+    /// The Requests row counts the requests the model answered, as the status counts them and the
+    /// menu bar's panel says: the rows stop at the latest 1,000 and hold refused requests too. Its
+    /// rows say how many run.
+    @Test func theRequestsRowCountsTheRequestsAnswered() throws {
+        let refused = try #require(RequestEntry("12:00:01 Error · not_found · HEAD /api/hello"))
+        var rows = (1...ServedRequest.kept).map { ServedRequest(id: $0, time: "12:00:00", stage: .answering(1)) }
+        rows[0].end = refused
+        let activity = Server.Activity(served: 1500, generated: 2_000_000, read: 9_000_000)
+        #expect(RequestLog.totals(activity, requests: rows)
+            == "\(1500.formatted()) · \(Format.count(2_000_000)) tokens out · \(Format.count(9_000_000)) in · \(999.formatted()) running")
+        #expect(RequestLog.totals(Server.Activity(), requests: []) == nil)
+        #expect(RequestLog.totals(Server.Activity(), requests: [rows[0]]) == "0 · 0 tokens out · 0 in")
+    }
+}
