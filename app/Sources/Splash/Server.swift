@@ -11,6 +11,26 @@ final class Server {
         case failed(String)
     }
 
+    /// A change of the launch options for a start that failed for want of memory (`remedy`).
+    enum Remedy: Equatable {
+        /// The memory limit, as `--max-memory` takes it; nil for none, Auto.
+        case memoryLimit(String?)
+        /// The context length on Auto.
+        case autoContext
+        /// Model files on this Mac Splash can't prepare or serve, which no start would: off the list.
+        case removeFromList
+
+        /// Its button: the start with it, or taking the files off the list.
+        var title: String {
+            switch self {
+            case .memoryLimit(let limit?): "Start with \(limit.dropLast()) GB"
+            case .memoryLimit(nil): "Start Without a Limit"
+            case .autoContext: "Start with Auto Context"
+            case .removeFromList: "Remove from List"
+            }
+        }
+    }
+
     /// What a start does, as the server's serve record gives it: the server starts, reads the
     /// model's weights into memory, then runs the model once at full size so that its first answer
     /// comes quickly; the first start after an update also prepares the GPU's programs then, which
@@ -61,8 +81,21 @@ final class Server {
     private(set) var recovering = false
     /// Once ready: the tokens the model's context holds, as the option set it or Auto fitted it.
     private(set) var context: Int?
-    /// Once ready: whether the model takes images.
+    /// Once ready: whether the model takes images and PDFs, which come together (`input_modalities`).
     private(set) var acceptsImages = false
+    /// Once ready: what a request to it may carry, as `/v1/models` says.
+    private(set) var limits: Limits?
+
+    /// What a request may carry (`/v1/models`' `limits`): its bytes, its images, a PDF's pages
+    /// counted among them, an image's bytes, and a PDF's bytes, which a request's PDFs share, and
+    /// pages.
+    struct Limits: Decodable, Equatable, Sendable {
+        let request_bytes: Int
+        let images: Int
+        let image_bytes: Int
+        let pdf_bytes: Int
+        let pdf_pages: Int
+    }
     /// Once ready: what a reasoning effort does to the model.
     private(set) var reasoning: Reasoning?
     /// Once ready: the work the server reports, as its status gives it.
@@ -88,8 +121,9 @@ final class Server {
         Stage(phase: phase, next: next, model: model, serving: serving, acceptsImages: acceptsImages, reasoning: reasoning)
     }
 
-    /// Once ready: each request the server finished, as its log line gives it, the latest last.
-    private(set) var requestLog: [RequestEntry] = []
+    /// Once ready: the requests the server has taken, a row each, in the order they came
+    /// (`ServedRequest`).
+    private(set) var requests: [ServedRequest] = []
 
     /// The server's work since it started, from `/status`: requests served and running, the average
     /// speed of answers and of reading prompts in tokens a second, the median time to an answer's
@@ -125,7 +159,8 @@ final class Server {
     nonisolated static let killAfter = Supervision.stop * 2
 
     private let runtime: Runtime
-    /// Its log, which each start begins again.
+    /// Its log: each start goes on under the starts before it, from a line that names it, for the
+    /// one that failed to be read after the next one begins (`beginLog`).
     let log: URL
     private let killAfter: Duration
     private var child: ChildProcess?
@@ -146,6 +181,10 @@ final class Server {
     }
 
     var running: Bool { child != nil }
+
+    /// Whether neither the window nor the menu bar's panel shows the server's status: it is asked
+    /// every 10 s rather than every 2 s then, for the menu bar's icon alone.
+    @ObservationIgnored var unwatched = false
 
     /// The model to start once the one stopping has stopped: another one, or the same one again.
     var next: String? { queued?.model }
@@ -171,10 +210,16 @@ final class Server {
         child.stop(SIGINT, killAfter: killAfter)
     }
 
-    /// Clears a failure the user has read.
+    /// A change of the launch options that would let the start that failed start: the failure says
+    /// what the model needs, a memory limit that holds it or the context length on Auto; nil
+    /// otherwise.
+    private(set) var remedy: Remedy?
+
+    /// Clears a failure the user has read, stopping a server that still runs but serves nothing.
     func dismissFailure() {
         guard case .failed = phase else { return }
-        phase = .stopped
+        remedy = nil
+        if child != nil { stop() } else { phase = .stopped }
     }
 
     /// Stops the server an app started before it quit or crashed, if it still runs, and waits
@@ -182,9 +227,9 @@ final class Server {
     /// (`SPLASH_APP_PID`), and is left to finish; this stops one that has not yet. An app before
     /// 1.6 kept its server's ID alone, with its port: the process that still holds that port's
     /// lock under the ID is that server, which nothing stops by itself.
-    func stopLeftover() async {
+    func stopLeftover(stopping: () -> Void = {}) async {
         let port = record.defaults.integer(forKey: Preference.olderServerPort)
-        await record.stopLeftover { pid in port > 0 && runtime.serveLockHolder(port: port) == pid }
+        await record.stopLeftover(olderApps: { pid in port > 0 && runtime.serveLockHolder(port: port) == pid }, stopping: stopping)
         record.defaults.removeObject(forKey: Preference.olderServerPort)
     }
 
@@ -195,11 +240,13 @@ final class Server {
         recovering = false
         context = nil
         activity = Activity()
-        requestLog = []
+        requests = []
         acceptsImages = false
+        limits = nil
         reasoning = nil
         stopRequested = false
-        resetLog(log)
+        remedy = nil
+        let start = beginLog(log, heading: "── Starting \(model), \(Date.now.formatted(date: .abbreviated, time: .standard))")
         if portInUse(settings.port) {
             return refuse(Self.portTaken(settings.port))
         }
@@ -215,6 +262,7 @@ final class Server {
                 environment: runtime.environment.merging(settings.environment) { $1 }
                     .merging(["SPLASH_APP_PID": String(getpid())]) { $1 },
                 log: log,
+                from: start,
                 line: { [weak self] in self?.received($0) },
                 exited: { [weak self] in self?.exited($0) }
             )
@@ -229,14 +277,13 @@ final class Server {
 
     /// Fails a start before it runs anything, saying why in the log too.
     private func refuse(_ message: String) {
-        try? Data((message + "\n").utf8).write(to: log)
+        appendLog(log, message)
         phase = .failed(message)
     }
 
     private func received(_ line: String) {
         if phase == .ready, let entry = RequestEntry(line) {
-            requestLog.append(entry)
-            if requestLog.count > 1000 { requestLog.removeFirst(requestLog.count - 1000) }
+            requests = ServedRequest.taking(entry, into: requests)
         }
     }
 
@@ -249,8 +296,12 @@ final class Server {
         } else if stopRequested {
             phase = .stopped
         } else {
-            phase = .failed(Self.exitProblem(record: runtime.serveRecord(port: settings.port), pid: pid,
-                                             port: settings.port, holder: runtime.serveLockHolder(port: settings.port)))
+            let record = runtime.serveRecord(port: settings.port)
+            phase = .failed(Self.exitProblem(record: record, pid: pid, port: settings.port,
+                                             holder: runtime.serveLockHolder(port: settings.port)))
+            // A failure that a change of the launch options would let start offers it.
+            remedy = record.flatMap { $0.pid == pid ? $0.failure : nil }
+                .flatMap { Self.remedy(for: $0, settings: settings, memory: Catalog.memory, local: model?.hasPrefix("/") == true) }
         }
     }
 
@@ -267,6 +318,27 @@ final class Server {
             return "Another Splash server is using port \(port). Stop it, or choose another port in Launch Options › Advanced."
         }
         return "It stopped unexpectedly. The log has the details."
+    }
+
+    /// What the launch options would need for a start that failed with `settings` on a Mac with
+    /// `memory` GB to start: a memory limit that holds what the model needs, the least one the
+    /// options offer, or none where none does; the context length on Auto, which the server fits to
+    /// the memory, where one was set that doesn't fit; for `local` model files Splash couldn't
+    /// prepare or can't serve, taking them off the list. Other failures it can't tell a change for.
+    nonisolated static func remedy(for failure: ServeRecord.Failure, settings: ServeSettings, memory: Int,
+                                   local: Bool = false) -> Remedy? {
+        switch (failure.kind, failure.bound) {
+        case (let kind, _) where local && (kind == "model" || kind == "install"):
+            return .removeFromList
+        case ("memory_budget", "max_memory"):
+            guard let needed = failure.required_bytes else { return nil }
+            let limit = ServeSettings.memoryLimits(memory: memory).first { Int64($0) << 30 >= needed }
+            return .memoryLimit(limit.map { "\($0)G" })
+        case ("context_budget", _) where settings["--max-context"] != nil:
+            return .autoContext
+        default:
+            return nil
+        }
     }
 
     /// That another app holds `port`.
@@ -329,6 +401,7 @@ final class Server {
                     let served = await servedModel()
                     guard !Task.isCancelled, phase == .starting else { break }
                     acceptsImages = served?.input_modalities?.contains("image") ?? false
+                    limits = served?.limits
                     reasoning = served?.reasoning
                     context = served?.context_length
                     phase = .ready
@@ -337,17 +410,27 @@ final class Server {
             }
             try? await Task.sleep(for: .milliseconds(500))
         }
-        // Then its status, every 2 s while it serves.
+        // Then its status while it serves: every 2 s, or every 10 s while nothing but the menu bar's
+        // icon shows it.
+        var asked = ContinuousClock.now - .seconds(10)
         while !Task.isCancelled, phase == .ready {
-            if let report = await status(), phase == .ready {
-                asleep = report.asleep
-                recovering = report.recovering
-                activity = report.activity
-                // A relaunched engine may serve less context than the first did.
-                if let served = report.context { context = served }
+            if !unwatched || ContinuousClock.now - asked >= .seconds(10) {
+                asked = .now
+                await askStatus()
             }
             try? await Task.sleep(for: .seconds(2))
         }
+    }
+
+    /// Asks the server's status and takes what it reports.
+    private func askStatus() async {
+        guard let report = await status(), phase == .ready else { return }
+        asleep = report.asleep
+        recovering = report.recovering
+        activity = report.activity
+        requests = ServedRequest.taking(report.live, into: requests)
+        // A relaunched engine may serve less context than the first did.
+        if let served = report.context { context = served }
     }
 
     /// What the server's status says: the work it has done, whether it has given the weights back
@@ -358,10 +441,12 @@ final class Server {
         var recovering = false
         /// The tokens of context the server serves now.
         var context: Int?
+        /// The requests it works on, as they were `now`.
+        var live: [LiveRequest] = []
     }
 
-    /// The report of `/status`'s body, if it is one.
-    nonisolated static func report(_ data: Data) -> Report? {
+    /// The report of `/status`'s body, if it is one, asked `now`.
+    nonisolated static func report(_ data: Data, at now: Date = .now) -> Report? {
         guard let status = try? JSONDecoder().decode(Status.self, from: data) else { return nil }
         let metrics = status.metrics
         return Report(
@@ -378,7 +463,13 @@ final class Server {
             ),
             asleep: status.weights?.released ?? false,
             recovering: status.transport?.recovering ?? false,
-            context: status.capabilities?.max_context_tokens
+            context: status.capabilities?.max_context_tokens,
+            live: (status.active_requests ?? []).enumerated().map { index, request in
+                LiveRequest(id: request.id ?? index, time: LiveRequest.time(of: now.addingTimeInterval(-(request.age_ms ?? 0) / 1000)),
+                            input: request.prompt_tokens ?? 0,
+                            stage: LiveRequest.stage(phase: request.phase, read: request.prompt_processed ?? 0,
+                                                     written: request.generated_tokens ?? 0))
+            }
         )
     }
 
@@ -387,7 +478,14 @@ final class Server {
         struct Weights: Decodable { let released: Bool? }
         struct Transport: Decodable { let recovering: Bool? }
         struct Requests: Decodable { let completed: Int? }
-        struct Request: Decodable {}
+        struct Request: Decodable {
+            let id: Int?
+            let phase: String?
+            let prompt_tokens: Int?
+            let prompt_processed: Int?
+            let generated_tokens: Int?
+            let age_ms: Double?
+        }
         struct Metrics: Decodable {
             struct Percentiles: Decodable { let p50: Double? }
             let decode_tokens_per_second: Double?
@@ -411,6 +509,7 @@ final class Server {
     private struct ServedModel: Decodable {
         /// Text, and images and PDFs with vision.
         let input_modalities: [String]?
+        let limits: Limits?
         let reasoning: Reasoning?
         let context_length: Int?
     }
@@ -431,16 +530,135 @@ final class Server {
     }
 }
 
-/// A request the server finished, as its log line gives it: when, how it ended, and, for one that
+/// A request the server works on, as its status gives it: when it came, the tokens of its prompt,
+/// and what it does now.
+struct LiveRequest: Equatable, Identifiable {
+    enum Stage: Equatable {
+        /// Not begun, and why: queued, or waiting for memory or for a prefix another request reads.
+        case waiting(String)
+        /// Reading its prompt, so many of its tokens read, those taken from the cache among them.
+        case reading(Int)
+        /// Answering, so many tokens written.
+        case answering(Int)
+    }
+
+    let id: Int
+    /// When it came, as the status's age of it says, as the server's lines give the time of day.
+    let time: String
+    let input: Int
+    let stage: Stage
+
+    /// What a request in the engine's `phase` does, having read `read` tokens of its prompt and
+    /// written `written`.
+    nonisolated static func stage(phase: String?, read: Int, written: Int) -> Stage {
+        switch phase {
+        case "queued": .waiting("Queued")
+        case "waiting_resources": .waiting("Waiting for memory")
+        case "waiting_prefix": .waiting("Waiting for a shared prefix")
+        case "prefill": .reading(read)
+        default: .answering(written)
+        }
+    }
+
+    /// `date`'s time of day as the server's lines give it.
+    nonisolated static func time(of date: Date) -> String {
+        let parts = Calendar.current.dateComponents([.hour, .minute, .second], from: date)
+        return String(format: "%02d:%02d:%02d", parts.hour ?? 0, parts.minute ?? 0, parts.second ?? 0)
+    }
+}
+
+extension LiveRequest.Stage {
+    /// How far on it is: waiting, then reading, then answering, each by its tokens.
+    fileprivate var progress: (Int, Int) {
+        switch self {
+        case .waiting: (0, 0)
+        case .reading(let read): (1, read)
+        case .answering(let written): (2, written)
+        }
+    }
+}
+
+/// A row of the Server's request list: one for each request the engine took, from the line that
+/// started it or the status that had it first, which goes on as later statuses say, never back,
+/// until the line that ends it ends it in its place; and one for each line that names no request,
+/// as a request refused before the engine took it, or an earlier server's line.
+struct ServedRequest: Equatable, Identifiable {
+    /// The engine's id of the request, as its lines and the status name it; below zero for a line
+    /// that names none.
+    let id: Int
+    /// When it came: its first line's time of day, or the time the status first had it come.
+    let time: String
+    /// The tokens of its prompt, where they are known.
+    var input: Int?
+    /// How far it has got while it runs.
+    var stage: LiveRequest.Stage
+    /// The line that ended it; nil while it runs.
+    var end: RequestEntry?
+
+    /// The rows a list keeps, the latest.
+    static let kept = 1000
+
+    /// `requests` with `line` taken: a request's start adds its row, unless the status had it
+    /// first; its end ends its row, or adds one ended where it was never seen; a line that names no
+    /// request adds a row of its own, an earlier server's start none, as nothing could end it.
+    static func taking(_ line: RequestEntry, into requests: [ServedRequest]) -> [ServedRequest] {
+        var requests = requests
+        let index = line.request.flatMap { id in requests.firstIndex { $0.id == id } }
+        switch (line.outcome, index) {
+        case (.started, let index?):
+            requests[index].input = line.input ?? requests[index].input
+            if requests[index].end == nil { requests[index].moveOn(to: .reading(line.cached ?? 0)) }
+        case (.started, nil):
+            guard let id = line.request else { return requests }
+            requests.append(ServedRequest(id: id, time: line.time, input: line.input, stage: .reading(line.cached ?? 0)))
+        case (_, let index?):
+            requests[index].input = line.input ?? requests[index].input
+            requests[index].end = line
+        case (_, nil):
+            let id = line.request ?? min(-1, (requests.map(\.id).min() ?? 0) - 1)
+            requests.append(ServedRequest(id: id, time: line.time, input: line.input, stage: .answering(line.output ?? 0),
+                                          end: line))
+        }
+        return Array(requests.suffix(kept))
+    }
+
+    /// `requests` with the status's `live` ones taken: each running goes on as the status says,
+    /// never back, as a status answered from an earlier snapshot would take it; one ended stays as
+    /// its line left it; one not seen before is added, at the time it came.
+    static func taking(_ live: [LiveRequest], into requests: [ServedRequest]) -> [ServedRequest] {
+        var requests = requests
+        for request in live {
+            if let index = requests.firstIndex(where: { $0.id == request.id }) {
+                guard requests[index].end == nil else { continue }
+                requests[index].input = requests[index].input ?? request.input
+                requests[index].moveOn(to: request.stage)
+            } else {
+                requests.append(ServedRequest(id: request.id, time: request.time, input: request.input, stage: request.stage))
+            }
+        }
+        return Array(requests.suffix(kept))
+    }
+
+    /// Takes `stage` where it is no further back than the row's.
+    private mutating func moveOn(to stage: LiveRequest.Stage) {
+        if stage.progress >= self.stage.progress { self.stage = stage }
+    }
+}
+
+/// A request line of the server's log: when, that the request started or how it ended, and the
+/// request it names; for one that started, its prompt and the part of it cached; for one that
 /// answered, the tokens it read, took from the cache and wrote, how soon it began and how fast it
 /// went; for one that failed, why.
 struct RequestEntry: Equatable {
-    enum Outcome: Equatable { case done, cancelled, error }
+    enum Outcome: Equatable { case started, done, cancelled, error }
 
     let time: String
     let outcome: Outcome
     /// The line itself.
     let raw: String
+    /// The engine's id of the request; nil for one refused before the engine took it, or an
+    /// earlier server's line, which names none.
+    var request: Int?
     var input: Int?
     var cached: Int?
     var output: Int?
@@ -449,18 +667,24 @@ struct RequestEntry: Equatable {
     var rate: Double?
     var message: String?
 
-    /// The request `line` of the server's log finishes, if it finishes one.
+    /// The request `line` of the server's log starts or ends, if it is a request's line.
     init?(_ line: String) {
-        guard let match = line.wholeMatch(of: /(\d\d:\d\d:\d\d) (Done|Cancelled|Error) · (.*)/) else { return nil }
+        guard let match = line.wholeMatch(of: /(\d\d:\d\d:\d\d) (Started|Done|Cancelled|Error) · (.*)/) else { return nil }
         time = String(match.1)
-        outcome = match.2 == "Done" ? .done : match.2 == "Cancelled" ? .cancelled : .error
-        raw = line
-        guard outcome != .error else {
-            message = String(match.3)
-            return
+        outcome = switch match.2 {
+        case "Started": .started
+        case "Done": .done
+        case "Cancelled": .cancelled
+        default: .error
         }
+        raw = line
+        var why: [String] = []
         for part in match.3.components(separatedBy: " · ") {
-            if let count = part.wholeMatch(of: /(input|cached|output) ([\d,]+)/) {
+            if let id = part.wholeMatch(of: /request (\d+)/) {
+                request = Int(id.1)
+            } else if outcome == .error {
+                why.append(part)
+            } else if let count = part.wholeMatch(of: /(input|cached|output) ([\d,]+)/) {
                 let tokens = Int(count.2.replacing(",", with: ""))
                 switch count.1 {
                 case "input": input = tokens
@@ -473,5 +697,6 @@ struct RequestEntry: Equatable {
                 rate = Double(speed.1)
             }
         }
+        if outcome == .error { message = why.joined(separator: " · ") }
     }
 }

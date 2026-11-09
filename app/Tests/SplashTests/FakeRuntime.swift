@@ -34,6 +34,14 @@ struct FakeRuntime {
         port = freePort()
     }
 
+    /// Lists `model` as installed, of `family` where one is given: an assembly record of no files.
+    func install(_ model: String, family: String? = nil) throws {
+        let link = Runtime(root: root).models.appending(path: model)
+        try FileManager.default.createDirectory(at: link, withIntermediateDirectories: true)
+        let family = family.map { #", "family": "\#($0)""# } ?? ""
+        try #"{"model": "\#(model)"\#(family), "files": {}}"#.write(to: link.appending(path: "model.json"), atomically: true, encoding: .utf8)
+    }
+
     /// The folder of the chats of `state`.
     var chats: URL { root.appending(path: "chats") }
 

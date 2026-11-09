@@ -6,42 +6,88 @@ private let column: CGFloat = 640
 
 /// The Server screen, where the window opens: the models on this Mac to pick from, how they
 /// start, the suggested ones this Mac can run to download, and, under them all, what runs with
-/// Start, Stop and Switch. Models start and change only here.
+/// Start, Stop and Switch. Models start and change here, from the menu bar's panel
+/// (`MenuBarPanel`) and from the composer (`EngineSlot`), with the same launch options and by the
+/// same rule (`AppState.canStart`).
 struct ServerView: View {
     @Environment(AppState.self) private var state
     @State private var customModel = false
-    @State private var width: CGFloat = 0
     /// For pictures of the screen: the launch options' Advanced group and the request log open.
     var advanced = false
 
     var body: some View {
+        GroupedPage(column: column) {
+            ServerSections(advanced: advanced, customModel: $customModel)
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if !state.installed.isEmpty || state.server.running {
+                VStack(spacing: 0) {
+                    Divider()
+                    ControlBar()
+                }
+                .background(.bar)
+            }
+        }
+        .onAppear { state.refresh() }
+        .sheet(isPresented: $customModel) { CustomModelSheet() }
+    }
+}
+
+/// The Server screen's sections, in the hierarchy of its page (`GroupedPage`), where they change
+/// shape as one: rows and sections fade in and out as the models, downloads and options change, the
+/// rows after them moving along; as the server's stage changes too, as the rest of the window does
+/// (`MainView`).
+private struct ServerSections: View {
+    @Environment(AppState.self) private var state
+    let advanced: Bool
+    /// Whether the sheet for another model from Hugging Face shows.
+    @Binding var customModel: Bool
+
+    var body: some View {
         let suggestions = state.catalog.suggestions(memory: Catalog.memory)
         let installedNames = Set(state.installed.map { state.catalog.name(of: $0.id) })
-        let available = suggestions.filter { !installedNames.contains($0.name) && $0.id != state.installer.model }
+        let available = suggestions.filter {
+            !installedNames.contains($0.name) && $0.id != state.installer.model && $0.id != state.arriving
+        }
         let first = state.installed.isEmpty
         let failed = if case .failed = state.server.phase { true } else { false }
-        Form {
+        Group {
             if state.server.phase == .ready {
                 ActivitySection(advanced: advanced)
             }
-            if first || failed || state.installer.failure != nil || state.installer.running || state.keyProblem != nil {
-                Section {
+            if first || failed || state.installer.failure != nil || state.installer.checked != nil || state.installer.running
+                || state.keyProblem != nil {
+                GroupedSection {
                     if let problem = state.keyProblem {
                         ProblemRow(title: "Splash can’t use its API key",
                                    message: "The Keychain says: \(problem) Allow Splash to use it, then try again.",
-                                   action: ("Try Again", state.readKey))
+                                   action: ("Try Again", state.retryKey))
                     }
                     if case .failed(let message) = state.server.phase, let model = state.server.model {
+                        // What its failure says would help: a start that would fit, or, for files on
+                        // this Mac Splash can't serve, taking them off the list.
                         ProblemRow(title: "\(state.displayName(of: model)) ran into a problem", message: message,
                                    log: .server, dismiss: state.server.dismissFailure,
-                                   // Files on this Mac that can't serve won't serve on a second try.
-                                   action: model.hasPrefix("/")
-                                       ? ("Remove from List", { state.server.dismissFailure(); state.removeLocal(model) }) : nil)
+                                   action: state.server.remedy.map { remedy in (remedy.title, { state.retry(model, with: remedy) }) })
                     }
                     if let failure = state.installer.failure {
-                        ProblemRow(title: "\(state.displayName(of: failure.model)) couldn’t download",
-                                   message: failure.message, log: .downloads, dismiss: state.installer.dismissFailure,
-                                   action: ("Download Again", { state.download(failure.model) }))
+                        let name = state.displayName(of: failure.model)
+                        switch state.installer.work {
+                        case .download:
+                            ProblemRow(title: "\(name) couldn’t download", message: failure.message, log: .downloads,
+                                       dismiss: state.installer.dismissFailure,
+                                       action: ("Download Again", { state.download(failure.model) }))
+                        case .check:
+                            ProblemRow(title: "Splash couldn’t check \(name) for updates", message: failure.message,
+                                       log: .downloads, dismiss: state.installer.dismissFailure,
+                                       action: ("Check Again", { state.checkForUpdates(failure.model) }))
+                        case .removal:
+                            ProblemRow(title: "Splash couldn’t delete \(name)", message: failure.message, log: .downloads,
+                                       dismiss: state.installer.dismissFailure)
+                        }
+                    }
+                    if let checked = state.installer.checked {
+                        CheckedRow(model: checked.model, updated: checked.updated)
                     }
                     if state.installer.running { DownloadRow() }
                 } header: {
@@ -49,7 +95,7 @@ struct ServerView: View {
                 }
             }
             if !first {
-                Section {
+                GroupedSection {
                     ForEach(state.installed) { ModelRow(model: $0) }
                 } header: {
                     SectionTitle(text: "Models on This Mac")
@@ -58,7 +104,7 @@ struct ServerView: View {
                 }
                 LaunchOptions(advanced: advanced)
             }
-            Section {
+            GroupedSection {
                 ForEach(available, id: \.id) { variant in
                     SuggestedRow(variant: variant, recommended: variant == suggestions.first,
                                  lead: first && !state.installer.running && !state.findingCachedModels && variant == suggestions.first)
@@ -72,27 +118,11 @@ struct ServerView: View {
                 if first { otherModels }
             }
         }
-        .formStyle(.grouped)
-        // The screen changes its shape as one: rows and sections fade in and out as the models,
-        // downloads and options change, the rows after them moving along; as the server's stage
-        // changes too, which the window animates (`MainView`).
         .animation(Motion.settle, value: Layout(installed: state.installed.map(\.id), downloading: state.installer.running,
                                                 failure: state.installer.failure?.message, keyProblem: state.keyProblem,
                                                 finding: state.findingCachedModels, options: state.options,
                                                 family: state.family(of: state.selection)))
-        .contentMargins(.horizontal, max(0, (width - column) / 2), for: .scrollContent)
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            if !first || state.server.running {
-                VStack(spacing: 0) {
-                    Divider()
-                    ControlBar()
-                }
-                .background(.bar)
-            }
-        }
-        .onAppear { state.refresh() }
-        .sheet(isPresented: $customModel) { CustomModelSheet() }
+        .animation(Motion.settle, value: state.server.stage)
     }
 
     /// What the screen holds besides the server's stage: the models, a download or a problem, and
@@ -224,7 +254,7 @@ private struct ControlBar: View {
                     .help(server.asleep ? "It freed its memory while idle and loads again with the next message." : "")
                 CopyButton(copy: state.copyAPIAddress)
                     .buttonStyle(.hover)
-                    .help("Copy API Address: \(server.settings.url.appending(path: "v1").absoluteString)")
+                    .help("Copy API Address: \(state.apiAddress)")
                     .accessibilityLabel("Copy API Address")
             }
         case .failed where othersFailure:
@@ -238,33 +268,56 @@ private struct ControlBar: View {
         let server = state.server
         switch server.phase {
         case .stopped, .failed:
-            Button(failedPicked ? "Try Again" : "Start") {
-                if let model = state.selection { state.start(model) }
+            // A server that runs but serves nothing can be stopped, and gives way to the model
+            // picked.
+            if server.running { Button("Stop") { state.stop() } }
+            let switching = server.running && state.selection != server.model
+            Button { if let model = state.selection { state.start(model) } } label: {
+                Text(failedPicked ? "Try Again" : switching ? "Switch to \(state.selection.map(state.displayName(of:)) ?? "")" : "Start")
+                    .frame(maxWidth: 240)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(state.selection == nil || !state.ready || state.keyProblem != nil)
+            .disabled(state.selection == nil || !state.canStart)
         case .starting:
-            Button("Cancel") { state.stop() }
+            LateButton(title: "Cancel") { state.stop() }
         case .stopping:
-            if server.next != nil { Button("Cancel") { state.stop() } }
+            if server.next != nil { LateButton(title: "Cancel") { state.stop() } }
         case .ready:
             if let selection = state.selection, selection != server.model {
                 Button("Stop") { state.stop() }
-                Button("Switch to \(state.displayName(of: selection))") { state.start(selection) }
+                Button { state.start(selection) } label: {
+                    Text("Switch to \(state.displayName(of: selection))").frame(maxWidth: 240)
+                }
                     .buttonStyle(.borderedProminent)
-                    .disabled(state.keyProblem != nil)
+                    .disabled(!state.canStart)
             } else {
                 AgentsPopup()
                 Button("Stop") { state.stop() }
                 if state.optionsChanged, let model = server.model {
                     Button("Restart to Apply") { state.start(model) }
                         .buttonStyle(.borderedProminent)
-                        .disabled(state.keyProblem != nil)
+                        .disabled(!state.canStart)
                 } else {
                     Button("Open Chat") { state.section = .chat }.buttonStyle(.borderedProminent)
                 }
             }
         }
+    }
+}
+
+/// A button that takes clicks half a second after it shows: one that takes the place of the button
+/// just clicked would take the second click of a double click.
+private struct LateButton: View {
+    let title: String
+    let action: () -> Void
+    @State private var armed = false
+
+    var body: some View {
+        Button(title) { if armed { action() } }
+            .task {
+                try? await Task.sleep(for: .milliseconds(500))
+                armed = true
+            }
     }
 }
 
@@ -275,9 +328,10 @@ private struct ActivitySection: View {
     let advanced: Bool
 
     var body: some View {
-        Section {
+        GroupedSection {
             ActivityFigures(activity: state.server.activity, context: state.server.context)
-            RequestLog(entries: state.server.requestLog, totals: RequestLog.totals(state.server.activity), open: advanced)
+            RequestLog(requests: state.server.requests, totals: RequestLog.totals(state.server.activity, requests: state.server.requests),
+                       open: advanced)
         } header: {
             SectionTitle(text: "Activity")
         }
@@ -307,10 +361,10 @@ private struct ActivityFigures: View {
     }
 }
 
-/// The requests since the model started, their totals on the row, and when opened, one line for
+/// The requests since the model started, their totals on the row, and when opened, a line for
 /// each in a box of its own that scrolls, from the top down, following the latest once full.
 private struct RequestLog: View {
-    let entries: [RequestEntry]
+    let requests: [ServedRequest]
     let totals: String?
     @State var open = false
 
@@ -319,11 +373,11 @@ private struct RequestLog: View {
         if open {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    if entries.isEmpty {
+                    if requests.isEmpty {
                         Text("No requests yet.").font(.callout).foregroundStyle(.tertiary).frame(height: 22)
                     }
-                    ForEach(Array(entries.enumerated()), id: \.offset) { _, entry in
-                        RequestRow(entry: entry)
+                    ForEach(requests) { request in
+                        RequestRow(request: request)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -337,67 +391,98 @@ private struct RequestLog: View {
         }
     }
 
-    /// How many requests, the tokens they wrote and read, those taken from the cache, and any
-    /// running; none before the first.
-    static func totals(_ activity: Server.Activity) -> String? {
-        guard activity.served > 0 || activity.running > 0 else { return nil }
-        var parts = [activity.served.formatted(), "\(Format.count(activity.generated)) tokens out", "\(Format.count(activity.read)) in"]
+    /// How many `requests`, as the rows count them, the tokens they wrote and read, those taken from
+    /// the cache, and those running; none before the first.
+    static func totals(_ activity: Server.Activity, requests: [ServedRequest]) -> String? {
+        guard !requests.isEmpty else { return nil }
+        let running = requests.count { $0.end == nil }
+        var parts = [requests.count.formatted(), "\(Format.count(activity.generated)) tokens out", "\(Format.count(activity.read)) in"]
         if activity.cached > 0 { parts.append("\(Format.count(activity.cached)) cached") }
-        if activity.running > 0 { parts.append("\(activity.running) running") }
+        if running > 0 { parts.append("\(running) running") }
         return parts.joined(separator: " · ")
     }
 }
 
-/// A request as a line: when, the tokens it wrote, and how fast, how soon and from how much prompt;
-/// or that it was cancelled, or why it failed. The server's own line is a hover away.
+/// A request as a line: when it came; while it runs, a spinner and how far it has got, reading
+/// its prompt or answering, or why it waits; once it ended, the tokens it wrote, how fast, how soon
+/// and from how much prompt, or that it was cancelled, or why it failed, the server's line a hover
+/// away.
 private struct RequestRow: View {
-    let entry: RequestEntry
+    let request: ServedRequest
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(entry.time).font(.subheadline).foregroundStyle(.tertiary).frame(width: 56, alignment: .leading)
-            switch entry.outcome {
-            case .done:
-                Text("\((entry.output ?? 0).formatted()) tokens")
-                Text(facts).foregroundStyle(.secondary)
-            case .cancelled:
-                Text("Cancelled").foregroundStyle(.secondary)
-            case .error:
-                Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor).font(.system(size: 11))
-                Text(entry.message ?? "").foregroundStyle(.secondary)
+            Text(request.time).font(.subheadline).foregroundStyle(.tertiary).frame(width: 56, alignment: .leading)
+            if let end = request.end {
+                switch end.outcome {
+                case .cancelled:
+                    Text("Cancelled").foregroundStyle(.secondary)
+                case .error:
+                    Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor).font(.system(size: 11))
+                    Text(end.message ?? "").foregroundStyle(.secondary)
+                case .done, .started:
+                    Text(tokens(end.output ?? 0))
+                    Text(Self.facts(end)).foregroundStyle(.secondary)
+                }
+            } else {
+                let input = request.input ?? 0
+                ProgressView().controlSize(.mini)
+                switch request.stage {
+                case .waiting(let why):
+                    Text(why)
+                    Text("\(input.formatted()) in").foregroundStyle(.secondary)
+                case .reading(let read):
+                    Text("Reading \(Int(Double(read) / Double(max(input, 1)) * 100))%")
+                    Text("\(read.formatted()) of \(input.formatted()) in").foregroundStyle(.secondary)
+                case .answering(let written):
+                    Text(tokens(written))
+                    Text("Answering · \(input.formatted()) in").foregroundStyle(.secondary)
+                }
             }
         }
         .font(.callout)
         .monospacedDigit()
         .lineLimit(1)
         .frame(height: 22)
-        .help(entry.raw)
+        .help(request.end?.raw ?? "")
         .contextMenu {
-            Button("Copy Line") { NSPasteboard.put(entry.raw) }
+            if let line = request.end?.raw {
+                Button("Copy Line") { NSPasteboard.put(line) }
+            }
         }
     }
 
-    private var facts: String {
-        [entry.rate.map { "\($0.formatted(.number.precision(.fractionLength(1)))) tok/s" },
-         entry.firstToken.map { "first \(Format.seconds($0))" },
-         entry.input.map { "\($0.formatted()) in" },
-         entry.cached.flatMap { $0 > 0 ? "\($0.formatted()) cached" : nil }]
+    private static func facts(_ end: RequestEntry) -> String {
+        [end.rate.map { "\($0.formatted(.number.precision(.fractionLength(1)))) tok/s" },
+         end.firstToken.map { "first \(Format.seconds($0))" },
+         end.input.map { "\($0.formatted()) in" },
+         end.cached.flatMap { $0 > 0 ? "\($0.formatted()) cached" : nil }]
             .compactMap { $0 }.joined(separator: " · ")
     }
 }
 
-/// The coding agents to open in Terminal on the model that runs, and its API address to copy.
+/// So many tokens, as a request's line says them.
+private func tokens(_ count: Int) -> String {
+    "\(count.formatted()) \(count == 1 ? "token" : "tokens")"
+}
+
+/// The coding agents to open on the model that runs, in the drawer's terminals, in the folder they
+/// work in, which it names; that folder to choose; and the model's API address to copy.
 private struct AgentsPopup: View {
     @Environment(AppState.self) private var state
-    private static let copy = "copy"
+    private static let folder = "folder", copy = "copy"
 
     var body: some View {
-        PopupMenu(header: "Open in Terminal",
-                  items: Agent.allCases.map { PopupItem(id: $0.rawValue, title: "\($0.title)…") }
-                      + [PopupItem(id: Self.copy, title: "Copy API Address", separated: true)],
+        let folder = state.agentFolder?.lastPathComponent
+        PopupMenu(header: folder.map { "Open in \($0)" } ?? "Open in a Terminal",
+                  items: Agent.allCases.map { PopupItem(id: $0.rawValue, title: folder == nil ? "\($0.title)…" : $0.title) }
+                      + [PopupItem(id: Self.folder, title: "Choose Folder…", separated: true),
+                         PopupItem(id: Self.copy, title: "Copy API Address", separated: true)],
                   chosen: nil, above: true) { choice in
             if let agent = Agent(rawValue: choice) {
                 state.open(agent)
+            } else if choice == Self.folder {
+                state.chooseAgentFolder()
             } else {
                 state.copyAPIAddress()
             }
@@ -410,7 +495,7 @@ private struct AgentsPopup: View {
             .padding(.vertical, 5)
         }
         .fixedSize()
-        .help("Open a coding agent in Terminal, connected to this model")
+        .help("Open a coding agent in a terminal of the drawer, connected to this model")
     }
 }
 
@@ -420,6 +505,7 @@ struct SectionTitle: View {
 
     var body: some View {
         Text(text).font(.headline).foregroundStyle(.primary).textCase(nil)
+            .accessibilityAddTraits(.isHeader)
     }
 }
 
@@ -470,9 +556,13 @@ private struct DownloadRow: View {
         let installer = state.installer
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Downloading \(installer.model.map(state.displayName(of:)) ?? "")").font(.headline)
+                let name = installer.model.map(state.displayName(of:)) ?? ""
+                // A check says so until it finds something to download.
+                Text(installer.work.phrase(name, downloading: installer.progress != nil))
+                    .font(.headline)
                 Spacer()
-                Button("Cancel") { installer.cancel() }
+                // A deletion is quick, and cut short it would leave files no one uses.
+                if installer.work != .removal { Button("Cancel") { installer.cancel() } }
             }
             if let progress = installer.progress {
                 ProgressView(value: progress.fraction)
@@ -488,7 +578,13 @@ private struct DownloadRow: View {
 
     private var caption: String {
         let installer = state.installer
-        guard let progress = installer.progress else { return "Preparing download…" }
+        guard let progress = installer.progress else {
+            switch installer.work {
+            case .download: return "Preparing download…"
+            case .check: return "Asking Hugging Face…"
+            case .removal: return "Removing its files…"
+            }
+        }
         let amount = "\(Format.size(progress.done)) of \(Format.size(progress.total))"
         guard let remaining = installer.remaining else { return amount }
         if remaining < .seconds(60) { return "\(amount) — less than a minute left" }
@@ -503,10 +599,15 @@ private struct DownloadRow: View {
 private struct ModelRow: View {
     @Environment(AppState.self) private var state
     let model: InstalledModel
+    @State private var hovering = false
+    /// Whether the question to delete the model asks.
+    @State private var deleting = false
 
     var body: some View {
         let selected = state.selection == model.id
-        let detail = ([model.id, model.missing ? "Not found" : model.bytes.map(Format.size)] as [String?])
+        let files = state.modelFiles[model.id]
+        let detail = ([model.id, model.missing ? "Not found" : model.bytes.map(Format.size),
+                       files?.projector.map { _ in "with projector" }, files?.draft.map { _ in "with draft" }] as [String?])
             .compactMap { $0 }.joined(separator: " · ")
         Button { state.selection = model.id } label: {
             HStack(spacing: 8) {
@@ -520,6 +621,8 @@ private struct ModelRow: View {
                 }
                 Spacer()
                 if let phase { Text(phase).foregroundStyle(.secondary) }
+                // Room for the menu's button, which shows under the pointer, so that nothing moves.
+                Color.clear.frame(width: 24, height: 24)
                 Image(systemName: "checkmark")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.tint)
@@ -528,20 +631,92 @@ private struct ModelRow: View {
                     .animation(Motion.quick, value: selected)
             }
         }
-        .buttonStyle(.hoverRow)
+        // The highlight kept while the pointer is on the menu's button.
+        .buttonStyle(HoverStyle(padding: EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8), hovered: hovering))
+        .overlay(alignment: .trailing) {
+            if hovering {
+                // A square button, as the chat list's rows have, before the check.
+                Menu(content: { actions }) {
+                    Image(systemName: "ellipsis").foregroundStyle(.secondary).frame(width: 24, height: 24)
+                }
+                .menuStyle(.button)
+                .buttonStyle(HoverStyle(padding: EdgeInsets(), shape: AnyShape(.rect(cornerRadius: 6))))
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .padding(.trailing, 8 + 16 + 8)
+                .help("More")
+                .accessibilityLabel("More")
+            }
+        }
+        .onHover { hovering = $0 }
         .hoverRowAligned()
         .accessibilityLabel("\(state.displayName(of: model.id)), \(detail)")
         .accessibilityValue(phase ?? "")
         .accessibilityAddTraits(selected ? .isSelected : [])
         .help(state.catalog.about(of: model.id) ?? model.id)
-        .contextMenu {
-            if model.local {
-                Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: model.id)]) }
-                Button("Remove from List") { state.removeLocal(model.id) }
-            } else {
-                CopyModelID(id: model.id)
-            }
+        .contextMenu { actions }
+        .confirmationDialog("Delete \(state.displayName(of: model.id))?", isPresented: $deleting) {
+            Button("Delete", role: .destructive) { state.delete(model.id) }
+        } message: {
+            Text("Its files\(model.bytes.map { ", \(Format.size($0))," } ?? "") go from the Hugging Face cache, where the splash "
+                + "command and other apps may use them too, unless another model on this Mac uses them.")
         }
+    }
+
+    /// What can be done with the model, as its menu's button and a right click on its row give it.
+    /// Model files on this Mac: choose a vision projector, a GGUF's alone, and a draft in place of
+    /// their family's, show them in the Finder or take them off the list. A model Splash installed:
+    /// check it for updates, which its starts don't ask the Hub for, copy its ID or delete it.
+    @ViewBuilder private var actions: some View {
+        if model.local {
+            let files = state.modelFiles[model.id] ?? AppState.ModelFiles()
+            if model.gguf {
+                Button(files.projector == nil ? "Choose Vision Projector…" : "Change Vision Projector…") { chooseProjector() }
+                if files.projector != nil {
+                    Button("Remove Vision Projector") { state.modelFiles[model.id, default: files].projector = nil }
+                }
+            }
+            Button(files.draft == nil ? "Choose Draft Model…" : "Change Draft Model…") { chooseDraft() }
+            if files.draft != nil {
+                Button("Use the Family’s Draft") { state.modelFiles[model.id, default: files].draft = nil }
+            }
+            Divider()
+            Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: model.id)]) }
+            Button("Remove from List") { state.removeLocal(model.id) }
+        } else {
+            // One download at a time; the model that runs is checked or deleted once stopped.
+            let busy = !state.ready || state.installer.running || state.serving(model.id)
+            Button("Check for Updates") { state.checkForUpdates(model.id) }
+                .disabled(busy)
+            CopyModelID(id: model.id)
+            Divider()
+            Button("Delete…", role: .destructive) { deleting = true }
+                .disabled(busy)
+        }
+    }
+
+    /// Asks for the GGUF vision projector the model files start with, from their folder.
+    private func chooseProjector() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = UTType(filenameExtension: "gguf").map { [$0] } ?? []
+        panel.directoryURL = model.id.hasSuffix(".gguf") ? URL(filePath: model.id).deletingLastPathComponent() : URL(filePath: model.id)
+        panel.prompt = "Choose"
+        panel.message = "Choose the GGUF vision projector of this model, such as mmproj-BF16.gguf."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        state.modelFiles[model.id, default: AppState.ModelFiles()].projector = url.path
+    }
+
+    /// Asks for the folder of the DFlash2 draft the model files start with.
+    private func chooseDraft() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.prompt = "Choose"
+        panel.message = "Choose the folder of a DFlash2 draft for this model."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        state.modelFiles[model.id, default: AppState.ModelFiles()].draft = url.path
     }
 
     /// What the server does with this model, if anything.
@@ -565,7 +740,7 @@ private struct SuggestedRow: View {
         LabeledContent {
             Button("Download") { state.download(variant.id) }
                 .disabled(state.installer.running || !state.ready)
-                .help(state.installer.running ? "One download at a time" : "")
+                .help(state.downloadStatus.map { "One at a time: \($0)" } ?? "")
                 .prominent(lead)
         } label: {
             // The anatomy of a model row.
@@ -579,6 +754,34 @@ private struct SuggestedRow: View {
         }
         .help(variant.id)
         .contextMenu { CopyModelID(id: variant.id) }
+    }
+}
+
+/// What a check for updates found: the model downloaded what had moved on, which its next start
+/// uses, or had it all.
+private struct CheckedRow: View {
+    @Environment(AppState.self) private var state
+    let model: String
+    let updated: Bool
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(updated ? "\(state.displayName(of: model)) is updated" : "\(state.displayName(of: model)) is up to date")
+                    .font(.headline)
+                Text(updated ? "Its next start uses the new files." : "Hugging Face has nothing newer.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 12)
+            Button(action: state.installer.dismissChecked) { Image(systemName: "xmark") }
+                .buttonStyle(.hover)
+                .foregroundStyle(.secondary)
+                .help("Dismiss")
+                .accessibilityLabel("Dismiss")
+        }
+        .padding(.vertical, 2)
     }
 }
 
@@ -641,6 +844,7 @@ private struct CustomModelSheet: View {
 extension View {
     /// The screen's one prominent button, which Return presses.
     @ViewBuilder func prominent(_ on: Bool) -> some View {
-        if on { buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction) } else { self }
+        // No Return for it: a key pressed in a drawer's terminal or a field must not start a download.
+        if on { buttonStyle(.borderedProminent) } else { self }
     }
 }

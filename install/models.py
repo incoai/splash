@@ -380,6 +380,10 @@ def parse_args(argv=None):
     )
     commands.add_parser("verify").add_argument("--full", action="store_true")
     commands.add_parser("link", help="print the selection link")
+    commands.add_parser(
+        "remove",
+        help="remove the installation and the Hub cache files no other one uses",
+    )
     return parser.parse_args(argv)
 
 
@@ -406,6 +410,9 @@ def main(argv=None):
             if args.json_progress:
                 hub.report_json_progress()
             upstream.prepare(selection)
+        elif args.command == "remove":
+            freed = upstream.remove(selection)
+            print(json.dumps({"event": "removed", "bytes": freed}), flush=True)
         else:
             kind = installation_kind(selection.link)
             if kind == PACKAGE:
@@ -422,7 +429,7 @@ def main(argv=None):
                 f"({'full' if args.full else 'quick'})."
             )
     except (ModelError, OSError) as error:
-        if args.command == "prepare":
+        if args.command in ("prepare", "remove"):
             # The app and the launcher word the failure by it, beside any
             # progress and messages.
             kind = error.kind if isinstance(error, ModelError) else None

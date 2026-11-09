@@ -46,6 +46,7 @@ from .constraints import (
     validate_tokenizer,
 )
 from .diagnostics import console_stats, log_unexpected, print_request, print_status
+from .documents import MAX_PAGES, MAX_PDF_BYTES
 from .errors import (
     OPENAI_ERRORS,
     RETRY_STATUSES,
@@ -62,6 +63,7 @@ from .http_security import (
     authenticate,
     validate_headers,
 )
+from .images import MAX_IMAGE_BYTES
 from .latency import RequestLatency
 from .metrics import prometheus_metrics
 from .origins import ANY_ORIGIN
@@ -70,6 +72,7 @@ from .output import (
     StreamingToolCallProjector,
     validate_response_content,
 )
+from .protocol import MAX_IMAGE_SPANS
 from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
 
 # Request bodies held at once, from upload through preparation and, for what
@@ -552,6 +555,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "context_length": self.app.max_context,
                 "vision": self.app.vision,
                 "input_modalities": self.app.input_modalities,
+                "limits": self._limits(),
                 "reasoning": self.app.reasoning,
                 **(
                     {"root": self.app.response_model}
@@ -561,6 +565,19 @@ class FrontendHandler(BaseHTTPRequestHandler):
             }
             for name in self.app.model_names
         ]
+
+    def _limits(self):
+        """What a request may carry, which a client can check an attachment
+        against before it sends: its bytes (--max-request-size); its images,
+        a PDF's pages counted among them; an image's bytes; a PDF's bytes,
+        which the request's PDFs share, and its pages."""
+        return {
+            "request_bytes": self.server.max_request_bytes,
+            "images": MAX_IMAGE_SPANS,
+            "image_bytes": MAX_IMAGE_BYTES,
+            "pdf_bytes": MAX_PDF_BYTES,
+            "pdf_pages": MAX_PAGES,
+        }
 
     def _get_models(self):
         models = self._models()

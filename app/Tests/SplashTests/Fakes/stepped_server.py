@@ -44,7 +44,15 @@ class Handler(BaseHTTPRequestHandler):
                 "reasoning": {"thinks": True, "efforts": ["low", "medium", "high"], "default": "medium"},
             }]}
         if self.path == "/status":
-            running = [{}] if (root / "answering").exists() else []
+            # A request answering, which this status goes on reporting once the test has
+            # finished it, as one the server answers from an earlier snapshot does; or those
+            # the test writes.
+            running = []
+            if (root / "answering").exists():
+                running = [{"id": 1, "phase": "decode", "prompt_tokens": 13, "prompt_processed": 13,
+                            "generated_tokens": 1, "age_ms": 400}]
+            if (root / "running.json").exists():
+                running = json.loads((root / "running.json").read_text())
             body = {
                 "active_requests": running,
                 "metrics": {"decode_tokens_per_second": 41.6},
@@ -64,7 +72,32 @@ def stop():
     os._exit(69)
 
 
+def answer():
+    # As the server logs a request the engine takes, then ends.
+    after("answering")
+    print(time.strftime("%H:%M:%S") + " Started · request 1 · input 13 · cached 0", flush=True)
+    after("finished")
+    print(time.strftime("%H:%M:%S") + " Done · request 1 · input 13 · cached 0 · output 1 · TTFT 0.4s · 2.5 tok/s", flush=True)
+
+
+def end_with_app():
+    """Ends this as `splash serve` does once the app that started it is gone (SPLASH_APP_PID): the
+    tests' process, as when a run fails."""
+    app = int(os.environ.get("SPLASH_APP_PID", "0"))
+    while app:
+        try:
+            os.kill(app, 0)
+        except ProcessLookupError:
+            os._exit(0)
+        except PermissionError:
+            pass
+        time.sleep(0.5)
+
+
+threading.Thread(target=end_with_app, daemon=True).start()
+
 server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+threading.Thread(target=answer, daemon=True).start()
 record("ready")
 threading.Thread(target=stop, daemon=True).start()
 server.serve_forever()

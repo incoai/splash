@@ -12,7 +12,7 @@ struct LaunchOptions: View {
 
     var body: some View {
         let family = state.family(of: state.selection)
-        Section {
+        GroupedSection {
             ForEach(Self.options(.main, for: family)) { OptionRow(option: $0, family: family) }
             DisclosureRow(title: "Advanced", open: $advanced)
                 .background(ViewAnchor { row.view = $0 })
@@ -151,7 +151,7 @@ private struct OptionRow: View {
                     FolderRow(title: option.title, help: option.help, value: value)
                 case .secret:
                     TextRow(title: option.title, help: option.help, custom: LaunchOption.Value(prompt: "None", message: "", parse: { $0.isEmpty ? nil : $0 }),
-                            takes: takes, secure: true, value: $state.options.apiKey)
+                            takes: takes, secure: true, value: $state.options.apiKey, left: state.keepKey)
                         .disabled(state.keyProblem != nil)
                 }
             }
@@ -230,6 +230,8 @@ private struct TextRow: View {
     let takes: (String) -> Bool
     var secure = false
     @Binding var value: String?
+    /// What the field's leaving does besides, as an API key's reaching the Keychain.
+    var left: () -> Void = {}
     @State private var text = ""
     @FocusState private var focused: Bool
 
@@ -246,7 +248,10 @@ private struct TextRow: View {
             .textFieldStyle(.plain)
             .multilineTextAlignment(.trailing)
             .focused($focused)
-            .onSubmit(show)
+            .onSubmit {
+                show()
+                left()
+            }
             .optionField(focused: focused, invalid: taken(text) == nil)
             .frame(maxWidth: 220)
         }
@@ -254,7 +259,12 @@ private struct TextRow: View {
         .onChange(of: text) { if let taken = taken(text) { value = taken } }
         // Changed elsewhere, as by Restore Defaults.
         .onChange(of: value) { if taken(text) != .some(value) { show() } }
-        .onChange(of: focused) { if !focused { show() } }
+        .onChange(of: focused) {
+            if !focused {
+                show()
+                left()
+            }
+        }
     }
 
     /// The value `text` sets: none for empty text, the value parsed, or nil for text the option or

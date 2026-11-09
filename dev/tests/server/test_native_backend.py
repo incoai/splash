@@ -502,8 +502,10 @@ class NativeBackendContractTests(unittest.TestCase):
             console_written()
         lines = [line.split(" ", 1)[1] for line in console.getvalue().splitlines()]
         self.assertEqual(len(lines), 2)
-        self.assertEqual(lines[0], "Started · input 4 · cached 0")
-        self.assertTrue(lines[1].startswith("Done · input 4 · cached 0 · output 1"))
+        # Both name the request as the engine knows it.
+        request = f"request {frame.request_id}"
+        self.assertEqual(lines[0], f"Started · {request} · input 4 · cached 0")
+        self.assertTrue(lines[1].startswith(f"Done · {request} · input 4 · cached 0 · output 1"))
 
     def test_inline_completion_cannot_leave_stale_active_job(self):
         transport, _runtime = self.make_transport(DrivenRuntime("complete_inline"))

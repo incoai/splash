@@ -75,9 +75,33 @@ final class Installer {
     private(set) var progress: Progress?
     /// The last installation that failed: its model and why.
     private(set) var failure: (model: String, message: String)?
+    /// What the installer does with a model: downloads it, checks an installed one for updates,
+    /// which downloads only what has moved on, if anything, or removes an installed one.
+    enum Work {
+        case download, check, removal
 
-    /// Gets each model once it is installed.
+        /// What it does to the model `name`: a check, once it finds something to download,
+        /// downloads it.
+        func phrase(_ name: String, downloading: Bool) -> String {
+            switch self {
+            case .download: "Downloading \(name)"
+            case .check: downloading ? "Downloading \(name)" : "Checking \(name) for updates"
+            case .removal: "Deleting \(name)"
+            }
+        }
+    }
+    /// What the installation running does, or else what the last one did.
+    private(set) var work = Work.download
+    /// The last check for updates that ended: its model, and whether it downloaded what had moved
+    /// on rather than finding it all there.
+    private(set) var checked: (model: String, updated: Bool)?
+
+    /// Gets each model once it is downloaded.
     @ObservationIgnored var installed: (String) -> Void = { _ in }
+    /// Gets each model once a check or a deletion of it has changed its files.
+    @ObservationIgnored var changed: (String) -> Void = { _ in }
+    /// Gets each model once it is removed.
+    @ObservationIgnored var removed: (String) -> Void = { _ in }
 
     /// The downloads' log, which each download begins again.
     let log: URL
@@ -90,6 +114,8 @@ final class Installer {
     private var activity: NSObjectProtocol?
     /// When and at how many bytes the model's own download was first reported.
     private var began: (date: Date, done: Int64)?
+    /// Whether anything downloaded, the draft's files too.
+    private var downloaded = false
 
     init(runtime: Runtime, log: URL, defaults: UserDefaults) {
         self.runtime = runtime
@@ -107,28 +133,43 @@ final class Installer {
         return .seconds(Double(progress.total - progress.done) * elapsed / Double(progress.done - began.done))
     }
 
-    func install(_ model: String) {
+    /// Downloads `model`, or checks it for updates (`Work`).
+    func install(_ model: String, _ work: Work = .download) {
+        run(model, work)
+    }
+
+    /// Removes `model`, an installed one, with the files of it that no other installation uses
+    /// (`install/models.py remove`), which a server serving it refuses.
+    func remove(_ model: String) {
+        run(model, .removal)
+    }
+
+    private func run(_ model: String, _ work: Work) {
         guard child == nil else { return }
         self.model = model
+        self.work = work
         progress = nil
         began = nil
+        downloaded = false
         failure = nil
+        checked = nil
         reported = nil
         cancelled = false
         resetLog(log)
         do {
             child = try record.start(
-                runtime.installCommand(model),
+                work == .removal ? runtime.removeCommand(model) : runtime.installCommand(model),
                 environment: runtime.environment,
                 log: log,
                 line: { [weak self] in self?.received($0) },
                 exited: { [weak self] in self?.exited($0) }
             )
         } catch {
-            failure = (model, "The download couldn’t start: \(error.localizedDescription)")
+            failure = (model, "Splash couldn’t start: \(error.localizedDescription)")
             self.model = nil
             return
         }
+        guard work != .removal else { return }
         // A download takes long; the Mac must not sleep through it.
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .idleSystemSleepDisabled], reason: "Downloading \(model)")
@@ -147,12 +188,17 @@ final class Installer {
         failure = nil
     }
 
+    /// Clears what a check found, once read.
+    func dismissChecked() {
+        checked = nil
+    }
+
     /// Stops the download this app started before it quit or crashed, if it still runs; its record
     /// stays until then, for the next launch should this one end first. An app before 1.6 kept its
     /// download's ID alone: the process that still runs the installer under the ID as an app
     /// starts it is that download.
-    func stopLeftover() async {
-        await record.stopLeftover(olderApps: runtime.runsInstaller)
+    func stopLeftover(stopping: () -> Void = {}) async {
+        await record.stopLeftover(olderApps: runtime.runsInstaller, stopping: stopping)
     }
 
     private func received(_ line: String) {
@@ -161,6 +207,7 @@ final class Installer {
             return
         }
         guard let event = Progress(line: line) else { return }
+        downloaded = true
         guard let model, event.repo == model.split(separator: ":")[0] else { return }
         if began == nil { began = (.now, event.done) }
         progress = event
@@ -174,10 +221,16 @@ final class Installer {
         self.model = nil
         progress = nil
         if status == 0 {
-            installed(model)
+            switch work {
+            case .download: installed(model)
+            case .check:
+                checked = (model, downloaded)
+                changed(model)
+            case .removal: changed(model)
+            }
         } else if !cancelled {
             failure = (model, reported.map { Self.problem($0, model: model) }
-                ?? "The download stopped unexpectedly. The log has the details.")
+                ?? "It stopped unexpectedly. The log has the details.")
         }
     }
 }

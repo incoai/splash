@@ -164,7 +164,8 @@ struct LogLines {
     }
 }
 
-/// Follows a log file as it grows, one call per complete line, on the main queue.
+/// Follows a log file as it grows, from `offset`, where the run it follows starts, one call per
+/// complete line, on the main queue.
 @MainActor
 final class LogTail {
     private let handle: FileHandle
@@ -172,10 +173,11 @@ final class LogTail {
     private let line: (String) -> Void
     private var lines = LogLines()
 
-    init?(_ url: URL, line: @escaping (String) -> Void) {
+    init?(_ url: URL, from offset: UInt64 = 0, line: @escaping (String) -> Void) {
         let descriptor = open(url.path, O_RDONLY | O_CLOEXEC)
         guard descriptor >= 0 else { return nil }
         handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        try? handle.seek(toOffset: offset)
         self.line = line
         source = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: descriptor, eventMask: [.extend, .write], queue: .main)
@@ -223,15 +225,15 @@ struct ChildRecord {
     /// Starts `command` as `ChildProcess` does and keeps it as the program this record names until
     /// it exits, giving `line` each line of `log` as it is written; `exited` gets its status once
     /// the log has been read to its end.
-    func start(_ command: [String], environment: [String: String], log: URL, line: @escaping (String) -> Void,
-               exited: @escaping @MainActor (Int32) -> Void) throws -> ChildProcess {
+    func start(_ command: [String], environment: [String: String], log: URL, from offset: UInt64 = 0,
+               line: @escaping (String) -> Void, exited: @escaping @MainActor (Int32) -> Void) throws -> ChildProcess {
         var tail: LogTail?
         let child = try ChildProcess(command: command, environment: environment, log: log) { status in
             tail?.finish()
             forget()
             exited(status)
         }
-        tail = LogTail(log, line: line)
+        tail = LogTail(log, from: offset, line: line)
         keep(child)
         return child
     }
@@ -250,16 +252,22 @@ struct ChildRecord {
     /// running stays kept, for the launch after. A record of the ID alone, as an app before 1.6
     /// kept it, gives no start to tell its program from a later process given the ID: that
     /// program is stopped only where `olderApps` shows the ID is still its own, and the record is
-    /// forgotten.
-    func stopLeftover(olderApps: (pid_t) -> Bool) async {
+    /// forgotten. `stopping` runs as the stop of a program that runs begins, which can take long.
+    func stopLeftover(olderApps: (pid_t) -> Bool, stopping: () -> Void = {}) async {
         if let older = defaults.object(forKey: key) as? Int, let pid = pid_t(exactly: older) {
-            if olderApps(pid) { await stopProcessGroup(pid, with: stop, killAfter: killAfter) }
+            if olderApps(pid) {
+                stopping()
+                await stopProcessGroup(pid, with: stop, killAfter: killAfter)
+            }
             return forget()
         }
         guard let kept = defaults.array(forKey: key) as? [Int], kept.count == 2,
               let pid = pid_t(exactly: kept[0])
         else { return forget() }
-        if processStart(pid) == kept[1] { await stopProcessGroup(pid, with: stop, killAfter: killAfter) }
+        if processStart(pid) == kept[1] {
+            stopping()
+            await stopProcessGroup(pid, with: stop, killAfter: killAfter)
+        }
         if processStart(pid) != kept[1] { forget() }
     }
 }
@@ -333,4 +341,32 @@ func portInUse(_ port: Int) -> Bool {
 func resetLog(_ url: URL) {
     try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
     FileManager.default.createFile(atPath: url.path, contents: nil)
+}
+
+/// Begins a run in `url`'s log, after the runs before it and a blank line, with `heading`, a line
+/// that names the run, and returns where the run's own lines start. The log keeps its last `kept`
+/// bytes, from the start of a line; it is made, with its folder, where there is none.
+@discardableResult
+func beginLog(_ url: URL, heading: String, kept: Int = 8 << 20) -> UInt64 {
+    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    var log = (try? Data(contentsOf: url)) ?? Data()
+    if log.count > kept {
+        log = Data(log.suffix(kept))
+        if let newline = log.firstIndex(of: 0x0A) { log = Data(log[log.index(after: newline)...]) }
+    }
+    if !log.isEmpty {
+        if log.last != 0x0A { log.append(0x0A) }
+        log.append(0x0A)
+    }
+    log.append(Data((heading + "\n").utf8))
+    try? log.write(to: url, options: .atomic)
+    return UInt64(log.count)
+}
+
+/// Adds `line` at the end of `url`'s log.
+func appendLog(_ url: URL, _ line: String) {
+    guard let handle = try? FileHandle(forWritingTo: url) else { return }
+    defer { try? handle.close() }
+    _ = try? handle.seekToEnd()
+    try? handle.write(contentsOf: Data((line + "\n").utf8))
 }

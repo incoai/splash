@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import SystemConfiguration
 
 /// The keys of what the app keeps in UserDefaults.
 enum Preference {
@@ -7,6 +8,8 @@ enum Preference {
     static let model = "model"
     /// The model files on this Mac the user added, by path, which `splash serve` prepares.
     static let localModels = "localModels"
+    /// What model files on this Mac start with besides, by their path (`AppState.ModelFiles`).
+    static let localModelFiles = "localModelFiles"
     static let agentFolder = "agentFolder"
     /// Whether the Chat shows its sidebar.
     static let sidebar = "sidebar"
@@ -33,6 +36,10 @@ struct ServeSettings: Equatable {
     /// `splash serve` takes otherwise.
     var values: [String: String] = [:]
     var apiKey: String?
+    /// The files of model files on this Mac that only their own start passes: a GGUF's vision
+    /// projector (`--mmproj`) and a draft in place of its family's (`--draft-model`).
+    var projector: String?
+    var draft: String?
 
     subscript(flag: String) -> String? {
         get { values[flag] }
@@ -54,13 +61,36 @@ struct ServeSettings: Equatable {
 
     /// What `splash serve` takes to serve `model`, a Hugging Face ID or the path of model files on
     /// this Mac, with these options.
-    func serveArguments(model: String) -> [String] {
-        let source = model.hasPrefix("/") ? ["--model", Self.localID(model), "--model-dir", model] : ["--model", model]
+    func serveArguments(model: String, localName: String? = Self.localName) -> [String] {
+        let source = model.hasPrefix("/")
+            ? ["--model", Self.localID(model), "--model-dir", model] + (projector.map { ["--mmproj", $0] } ?? [])
+                + (draft.map { ["--draft-model", $0] } ?? [])
+            : ["--model", model]
         var arguments = ["serve"] + source + ["--port", String(port), "--offline"]
         for option in LaunchOption.all where option.flag != "--port" && option.applies(self) {
             arguments += option.arguments(values[option.flag])
         }
+        // The name the API address gives other devices (`address`), which the server then accepts.
+        if sharesNetwork, let localName, !LaunchOption.items(values["--allowed-host"] ?? "").contains(localName) {
+            arguments += ["--allowed-host", localName]
+        }
         return arguments
+    }
+
+    /// Whether the server listens on every network this Mac is on, for other devices too.
+    var sharesNetwork: Bool { values["--host"] == "0.0.0.0" }
+
+    /// This Mac's name on its local networks, as Bonjour gives it (`name.local`); nil where it has
+    /// none.
+    static var localName: String? {
+        (SCDynamicStoreCopyLocalHostName(nil) as String?).map { "\($0.lowercased()).local" }
+    }
+
+    /// The address Copy API Address gives: this Mac's name on its networks while the server
+    /// listens on them, where other devices reach it; the loopback address otherwise (`url`).
+    func address(localName: String? = Self.localName) -> URL {
+        guard sharesNetwork, let localName else { return url }
+        return URL(string: "http://\(localName):\(port)")!
     }
 
     /// The ID the API reports for the model files at `path`: local/ and the file's or folder's name,
@@ -85,13 +115,14 @@ struct ServeSettings: Equatable {
     /// The options a model of `family` starts with: those set but the ones it does not take
     /// (`ModelFamily.takes`), whose values stay kept for a model that does.
     func usable(by family: ModelFamily) -> ServeSettings {
-        ServeSettings(values: values.filter { family.takes($0.key, $0.value) }, apiKey: apiKey)
+        ServeSettings(values: values.filter { family.takes($0.key, $0.value) }, apiKey: apiKey, projector: projector, draft: draft)
     }
 
     /// These options with the ones a model of `family` can use, those the card shows, back at their
-    /// defaults, the API key too; values kept for the others stay, for a model that can use them.
+    /// defaults; values kept for the others stay, for a model that can use them, and the API key,
+    /// which is no default's to replace.
     func defaults(for family: ModelFamily) -> ServeSettings {
-        ServeSettings(values: values.filter { !family.uses($0.key) })
+        ServeSettings(values: values.filter { !family.uses($0.key) }, apiKey: apiKey)
     }
 
     /// Whether a model of `family` started with these options would start otherwise with `other`.
@@ -366,7 +397,7 @@ extension LaunchOption {
                 ? "Any device on these networks can use the model. Set an API key to require one." : nil }),
         LaunchOption(
             flag: "--allowed-host", title: "Host names",
-            help: "Other names clients reach this Mac by, such as mymac.local.",
+            help: "Names other than this Mac’s own .local name that clients reach it by, such as a DNS name.",
             section: .network,
             kind: .text(Value(prompt: "None", message: "", parse: { items($0).isEmpty ? nil : items($0).joined(separator: ", ") }),
                         list: true)),

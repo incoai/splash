@@ -958,6 +958,7 @@ class NativeBackend:
                 job.cache = cache
             record = {
                 "outcome": "started",
+                "request_id": event.request_id,
                 "prompt_tokens": len(job.prompt_tokens),
                 "cached_tokens": cache.matched_tokens,
             }
@@ -1097,7 +1098,7 @@ class NativeBackend:
             # before close() acquires the state lock remains a normal result.
             result = None
             error = APIError(503, "server is shutting down", "server_shutdown")
-        self._record(job, result=result, error=error)
+        self._record(job, result=result, error=error, request_id=call.request_id)
         job.events.put(("error", error) if error else ("done", result))
 
     @staticmethod
@@ -1152,11 +1153,13 @@ class NativeBackend:
             return APIError(504, "request timed out", "request_timeout")
         return APIError(500, str(error), "runtime_error")
 
-    def _record(self, job, result=None, error=None):
+    def _record(self, job, result=None, error=None, request_id=None):
         record = {
             "outcome": result.reason if result else "error",
             "prompt_tokens": len(job.prompt_tokens),
         }
+        if request_id is not None:
+            record["request_id"] = request_id
         if result:
             record["completion_tokens"] = result.completion_tokens
             record["metrics"] = result.metrics
@@ -1204,7 +1207,11 @@ class NativeBackend:
                     self._detach_locked(state)
                     stranded.append((state, self._closed_error_locked()))
             for state, error in stranded:
-                self._record(state.job, error=error)
+                self._record(
+                    state.job,
+                    error=error,
+                    request_id=state.call.request_id if state.call else None,
+                )
                 state.job.events.put(("error", error))
             self.terminals.put(None)
             self.finalizer.join()

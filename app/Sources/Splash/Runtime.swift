@@ -1,10 +1,25 @@
 import Foundation
+import Synchronization
+
+/// What the user's login shell sets for Hugging Face (`Runtime.readShellSettings`), read once the
+/// app launches, which every copy of a runtime shares.
+final class ShellSettings: Sendable {
+    private let store = Mutex<[String: String]>([:])
+
+    var values: [String: String] { store.withLock { $0 } }
+
+    func set(_ values: [String: String]) {
+        store.withLock { $0 = values }
+    }
+}
 
 /// The Splash runtime the app runs: the packaged release tree inside the app bundle, or, for
 /// development, the tree `SPLASH_RUNTIME` names (a packaged tree or a source checkout). Its layout
 /// and data folders are the ones `install/paths.py` resolves.
 struct Runtime: Sendable {
     let root: URL
+    /// The Hugging Face settings of the user's login shell, once read (`readShellSettings`).
+    let shellSettings = ShellSettings()
 
     static func locate() -> Runtime? {
         let candidates = [
@@ -45,6 +60,11 @@ struct Runtime: Sendable {
         scriptCommand("install/models.py", ["--model", model, "prepare", "--json-progress"])
     }
 
+    /// The command line of the installer removing `model`, an installed one.
+    func removeCommand(_ model: String) -> [String] {
+        scriptCommand("install/models.py", ["--model", model, "remove"])
+    }
+
     /// Whether `pid` runs this runtime's installer as an app starts it (`installCommand`), for any
     /// model, as the kernel keeps its arguments; `splash serve` runs it with others. Its program is
     /// left out: an interpreter can start another in its place, under the same ID and arguments,
@@ -73,8 +93,56 @@ struct Runtime: Sendable {
     /// writing bytecode.
     var environment: [String: String] {
         var environment = userEnvironment
+        // Where the Hugging Face cache is, the token and the like, as `splash` in a terminal has them.
+        environment.merge(shellSettings.values) { $1 }
         environment["PYTHONNOUSERSITE"] = "1"
         return environment
+    }
+
+    /// The Hugging Face settings of the user's login shell, which an app doesn't get: its `HF_` and
+    /// `HUGGINGFACE_` variables, such as where the cache is and the token, as `shell` has them
+    /// started as a terminal starts it, interactive. None where it gives none within `limit`,
+    /// which then stops it.
+    @MainActor
+    static func readShellSettings(_ shell: Shell, environment: [String: String] = ProcessInfo.processInfo.environment,
+                                  limit: Duration = .seconds(5)) async -> [String: String] {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-shell-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let output = folder.appending(path: "environment")
+        let marker = "SPLASH-SHELL-SETTINGS"
+        let (ended, end) = AsyncStream<Int32>.makeStream()
+        let script = "printf '\\0\(marker)\\0'; command env -0; printf '\(marker)\\0'"
+        guard let child = try? ChildProcess(command: [shell.path] + shell.arguments + ["-i", "-l", "-c", script],
+                                            environment: environment, log: output, exited: { end.yield($0); end.finish() })
+        else { return [:] }
+        let timer = Task { @MainActor in
+            try await Task.sleep(for: limit)
+            child.stop(SIGKILL, killAfter: .zero)
+        }
+        var status: Int32?
+        for await code in ended { status = code }
+        timer.cancel()
+        guard status == 0, let data = try? Data(contentsOf: output) else { return [:] }
+        return huggingFace(in: data, between: marker)
+    }
+
+    /// The `HF_` and `HUGGINGFACE_` variables of `env -0`'s output between two `marker` records,
+    /// whatever the shell printed around them.
+    nonisolated static func huggingFace(in output: Data, between marker: String) -> [String: String] {
+        let records = output.split(separator: 0, omittingEmptySubsequences: false).map { String(decoding: $0, as: UTF8.self) }
+        guard let start = records.firstIndex(of: marker),
+              let end = records[(start + 1)...].firstIndex(of: marker)
+        else { return [:] }
+        var settings: [String: String] = [:]
+        for record in records[(start + 1)..<end] {
+            guard let equals = record.firstIndex(of: "=") else { continue }
+            let name = String(record[..<equals])
+            if name.hasPrefix("HF_") || name.hasPrefix("HUGGINGFACE_") {
+                settings[name] = String(record[record.index(after: equals)...])
+            }
+        }
+        return settings
     }
 
     /// The app's own environment (an app does not get the shell's), without an API key the server
@@ -224,8 +292,15 @@ struct InstalledModel: Identifiable, Hashable, Sendable {
     /// Its family, as its assembly record names it; nil for model files on this Mac not prepared yet.
     var family: String?
 
+    /// Whether model files on this Mac hold a GGUF besides a projector, as they were measured.
+    var holdsGGUF = false
+
     /// Whether it is model files on this Mac rather than a model Splash installed.
     var local: Bool { id.hasPrefix("/") }
+
+    /// Whether it is a GGUF model: one Splash installed by its variant (`OWNER/REPO:VARIANT`), or
+    /// model files on this Mac that are a GGUF file or a folder holding one besides a projector.
+    var gguf: Bool { local ? holdsGGUF : id.contains(":") }
 
     /// The model files at `path`, a GGUF file or a folder, measured.
     static func local(_ path: String) -> InstalledModel {
@@ -237,6 +312,10 @@ struct InstalledModel: Identifiable, Hashable, Sendable {
         let bytes = files.reduce(Int64(0)) { total, file in
             total + Int64((try? file.resolvingSymlinksInPath().resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         }
-        return InstalledModel(id: path, bytes: bytes)
+        var model = InstalledModel(id: path, bytes: bytes)
+        model.holdsGGUF = files.contains {
+            $0.pathExtension.lowercased() == "gguf" && !$0.lastPathComponent.localizedCaseInsensitiveContains("mmproj")
+        }
+        return model
     }
 }

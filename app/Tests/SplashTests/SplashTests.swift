@@ -49,8 +49,9 @@ struct CatalogTests {
         try FileManager.default.createDirectory(at: folder.appending(path: "Q4"), withIntermediateDirectories: true)
         try Data(count: 12_345).write(to: folder.appending(path: "m.gguf"))
         try Data(count: 1000).write(to: folder.appending(path: "Q4/m-00001-of-00002.gguf"))
-        #expect(InstalledModel.local(folder.appending(path: "m.gguf").path) == InstalledModel(id: folder.appending(path: "m.gguf").path, bytes: 12_345))
-        #expect(InstalledModel.local(folder.path).bytes == 13_345)
+        #expect(InstalledModel.local(folder.appending(path: "m.gguf").path)
+            == InstalledModel(id: folder.appending(path: "m.gguf").path, bytes: 12_345, holdsGGUF: true))
+        #expect(InstalledModel.local(folder.path).bytes == 13_345 && InstalledModel.local(folder.path).gguf)
         #expect(InstalledModel.local(folder.appending(path: "gone").path).missing)
     }
 }
@@ -79,7 +80,7 @@ struct ServeSettingsTests {
             "--host": "0.0.0.0", "--allowed-origin": "a.example, b.example", "--no-webui": "true",
             "--thinking-end-text": "Now the answer. </think>", "--disable-ane": "true",
         ], apiKey: "secret")
-        #expect(settings.serveArguments(model: "a/b")
+        #expect(settings.serveArguments(model: "a/b", localName: nil)
             == ["serve", "--model", "a/b", "--port", "8100", "--offline", "--max-context", "131072",
                 "--max-memory", "48G", "--idle-release", "off", "--language-only", "--kv-format", "bf16",
                 "--max-cache-disk", "16G", "--persistent-cache", "--host", "0.0.0.0",
@@ -89,6 +90,37 @@ struct ServeSettingsTests {
         #expect(settings.environment == ["SPLASH_API_KEY": "secret"])
         #expect(settings.request("status").value(forHTTPHeaderField: "Authorization") == "Bearer secret")
         #expect(settings.url.absoluteString == "http://127.0.0.1:8100")
+    }
+
+    /// Model files on this Mac start with their own projector and draft, which their start alone
+    /// passes, after the files; a model Splash installed passes neither. A change of either
+    /// starts the model otherwise.
+    @Test func passesTheModelFilesOwnProjectorAndDraft() {
+        var settings = ServeSettings(values: ["--port": "8100"])
+        settings.projector = "/models/mmproj-BF16.gguf"
+        settings.draft = "/models/draft"
+        #expect(settings.serveArguments(model: "/models/q.gguf", localName: nil)
+            == ["serve", "--model", "local/q", "--model-dir", "/models/q.gguf", "--mmproj", "/models/mmproj-BF16.gguf",
+                "--draft-model", "/models/draft", "--port", "8100", "--offline"])
+        #expect(settings.serveArguments(model: "a/b", localName: nil) == ["serve", "--model", "a/b", "--port", "8100", "--offline"])
+        #expect(settings.usable(by: .unknown).projector == settings.projector && settings.usable(by: .unknown).draft == settings.draft)
+        var other = settings
+        other.projector = nil
+        #expect(settings.differs(from: other, model: "/models/q.gguf", family: .unknown))
+    }
+
+    /// Listening on every network, the server accepts this Mac's .local name, once, which the API
+    /// address it gives other devices names; on this Mac alone, neither.
+    @Test func givesOtherDevicesThisMacsLocalName() {
+        var settings = ServeSettings(values: ["--port": "8100", "--host": "0.0.0.0"])
+        #expect(settings.serveArguments(model: "a/b", localName: "mymac.local").suffix(2) == ["--allowed-host", "mymac.local"])
+        #expect(settings.address(localName: "mymac.local").absoluteString == "http://mymac.local:8100")
+        settings["--allowed-host"] = "proxy.example, mymac.local"
+        #expect(settings.serveArguments(model: "a/b", localName: "mymac.local").filter { $0 == "mymac.local" }.count == 1)
+        settings["--host"] = nil
+        #expect(!settings.serveArguments(model: "a/b", localName: "mymac.local").contains("--host"))
+        #expect(settings.address(localName: "mymac.local").absoluteString == "http://127.0.0.1:8100")
+        #expect(settings.address(localName: nil) == settings.url)
     }
 
     @Test func leavesOutOptionsTheOthersLeaveNoEffect() {
@@ -179,12 +211,12 @@ struct ServeSettingsTests {
     }
 
     /// Restore Defaults acts on the options the card shows the model picked; the values kept for
-    /// those it leaves out stay, and alone they don't offer it.
+    /// those it leaves out stay, and the API key; alone they don't offer it.
     @Test func defaultsAreRestoredForTheOptionsShown() {
-        let hidden = ServeSettings(values: ["--state-format": "bf16"])
+        let hidden = ServeSettings(values: ["--state-format": "bf16"], apiKey: "k")
         let set = ServeSettings(values: ["--state-format": "bf16", "--expert-memory": "16G"], apiKey: "k")
         #expect(set.defaults(for: Self.flint) == hidden && hidden.defaults(for: Self.flint) == hidden)
-        #expect(set.defaults(for: Self.moe) == ServeSettings() && set.defaults(for: .unknown) == ServeSettings())
+        #expect(set.defaults(for: Self.moe) == ServeSettings(apiKey: "k") && set.defaults(for: .unknown) == ServeSettings(apiKey: "k"))
     }
 
     @Test func theContextHintIsTheModels() {
@@ -245,6 +277,30 @@ struct ServeSettingsTests {
         for kind in ["configuration", "memory_budget", "device"] {
             #expect(problem(failure(kind)) == "the engine's words")
         }
+    }
+
+    /// A start that failed for want of memory offers the start that would fit: under a memory
+    /// limit, the least limit the options offer that holds what it needs, or none where none does;
+    /// with a context length set, Auto. Other failures offer none.
+    @Test func aFailureForWantOfMemoryOffersTheStartThatWouldFit() {
+        func failure(_ kind: String, _ bound: String?, required: Int64? = nil) -> ServeRecord.Failure {
+            ServeRecord.Failure(kind: kind, message: "", bound: bound, required_bytes: required, budget_bytes: nil,
+                                plan_context_tokens: nil)
+        }
+        func remedy(_ failure: ServeRecord.Failure, _ settings: ServeSettings) -> Server.Remedy? {
+            Server.remedy(for: failure, settings: settings, memory: 36)
+        }
+        var settings = ServeSettings()
+        settings["--max-memory"] = "8G"
+        #expect(remedy(failure("memory_budget", "max_memory", required: 10_858_659_840), settings) == .memoryLimit("12G"))
+        #expect(remedy(failure("memory_budget", "max_memory", required: 34_359_738_369), settings) == .memoryLimit(nil))
+        #expect(remedy(failure("memory_budget", "device_memory", required: 10_858_659_840), settings) == nil)
+        #expect(remedy(failure("context_budget", "max_memory"), settings) == nil)
+        settings["--max-context"] = String(256 * 1024)
+        #expect(remedy(failure("context_budget", "disk"), settings) == .autoContext)
+        #expect(remedy(failure("host_memory", nil), settings) == nil)
+        #expect([Server.Remedy.memoryLimit("12G"), .memoryLimit(nil), .autoContext].map(\.title)
+            == ["Start with 12 GB", "Start Without a Limit", "Start with Auto Context"])
     }
 
     @Test func keepsTheOptionsAndReadsBadOnesAsDefaults() throws {
@@ -337,14 +393,119 @@ struct AppStateTests {
         let state = AppState(runtime: Runtime(root: root), folders: .init(in: root.appending(path: "Chats")), keychain: keychain,
                              defaults: .kept(in: root), shell: { .bare })
         #expect(state.options.apiKey == "first" && state.keyProblem == nil)
+        // Kept once typed, not at each key.
         state.options.apiKey = "second"
+        #expect(try keychain.read() == "first")
+        state.keepKey()
         #expect(try keychain.read() == "second")
         // A key changed elsewhere is read again.
         try keychain.write("third")
         state.readKey()
         #expect(state.options.apiKey == "third")
         state.options.apiKey = nil
+        state.keepKey()
         #expect(try keychain.read() == nil)
+    }
+
+    /// What model files on this Mac start with besides is kept as it is set, joins the settings
+    /// their start uses, and goes with them off the list.
+    @Test func keepsWhatModelFilesStartWith() throws {
+        let fake = try FakeRuntime("splash-model-files", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        state.modelFiles["/m/q.gguf", default: AppState.ModelFiles()].projector = "/m/mmproj.gguf"
+        state.modelFiles["/m/q.gguf", default: AppState.ModelFiles()].draft = "/m/draft"
+        let again = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { again.quit() }
+        #expect(again.modelFiles["/m/q.gguf"] == AppState.ModelFiles(projector: "/m/mmproj.gguf", draft: "/m/draft"))
+        #expect(state.settings(for: "/m/q.gguf").projector == "/m/mmproj.gguf" && state.settings(for: "a/b").projector == nil)
+        state.modelFiles["/m/q.gguf"]?.projector = nil
+        #expect(state.modelFiles["/m/q.gguf"] == AppState.ModelFiles(draft: "/m/draft"))
+        state.removeLocal("/m/q.gguf")
+        #expect(state.modelFiles.isEmpty)
+    }
+
+    /// A check for updates says what it found: that the model had it all, where nothing
+    /// downloaded, or that it is updated, where something did, its draft's files too.
+    @Test func aCheckForUpdatesSaysWhatItFound() async throws {
+        let fake = try FakeRuntime("splash-check", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        await state.launch()
+        let installer = fake.root.appending(path: "install/models.py")
+        try "import sys\n".write(to: installer, atomically: true, encoding: .utf8)
+        state.checkForUpdates("a/b")
+        #expect(state.installer.running && state.installer.work == .check)
+        try await waitFor(!state.installer.running, "the check")
+        #expect(state.installer.checked?.model == "a/b" && state.installer.checked?.updated == false)
+        try "print('{\"event\": \"download\", \"repo\": \"a/b-draft\", \"done\": 1, \"total\": 2}', flush=True)\n"
+            .write(to: installer, atomically: true, encoding: .utf8)
+        state.checkForUpdates("a/b")
+        #expect(state.installer.checked == nil)
+        try await waitFor(!state.installer.running, "the check")
+        #expect(state.installer.checked?.updated == true)
+        state.installer.dismissChecked()
+        #expect(state.installer.checked == nil)
+        // A download is no check.
+        state.download("a/b")
+        #expect(state.installer.work == .download)
+        try await waitFor(!state.installer.running, "the download")
+        #expect(state.installer.checked == nil)
+    }
+
+    /// Deleting a model runs the installer's removal, then lists the models again; a removal the
+    /// installer refuses says why.
+    @Test func deletingAModelRunsTheInstallersRemoval() async throws {
+        let fake = try FakeRuntime("splash-delete", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        try fake.install("a/b")
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        await state.launch()
+        await state.listed()
+        #expect(state.isInstalled("a/b"))
+        // An installer whose removal takes the model's installation away, as `remove` does.
+        let installer = fake.root.appending(path: "install/models.py")
+        let models = Runtime(root: fake.root).models
+        try """
+        import json, shutil, sys
+        if sys.argv[-1] != "remove" or sys.argv[-2] != "a/b":
+            sys.exit(2)
+        shutil.rmtree("\(models.appending(path: "a/b").path)")
+        print(json.dumps({"event": "removed", "bytes": 1}), flush=True)
+        """.write(to: installer, atomically: true, encoding: .utf8)
+        state.delete("a/b")
+        #expect(state.installer.running && state.installer.work == .removal)
+        try await waitFor(!state.installer.running, "the removal")
+        try await waitFor(!state.isInstalled("a/b"), "the list")
+        #expect(state.installer.failure == nil)
+        try """
+        import json
+        print(json.dumps({"event": "error", "kind": None, "message": "c/d is being served: stop it, then remove it"}), flush=True)
+        raise SystemExit(1)
+        """.write(to: installer, atomically: true, encoding: .utf8)
+        state.installer.remove("c/d")
+        try await waitFor(!state.installer.running, "the refusal")
+        #expect(state.installer.failure?.message == "c/d is being served: stop it, then remove it")
+    }
+
+    /// The server's status is asked less often while neither the window nor the menu bar's panel
+    /// shows it.
+    @Test func theStatusIsAskedLessOftenWhileNothingShowsIt() throws {
+        let fake = try FakeRuntime("splash-watched", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        #expect(!state.server.unwatched)
+        state.windowShows = false
+        #expect(state.server.unwatched)
+        state.panelShows = true
+        #expect(!state.server.unwatched)
+        state.panelShows = false
+        state.windowShows = true
+        #expect(!state.server.unwatched)
     }
 
     /// A model whose files are gone, as when its Hugging Face cache folder was deleted, is not on
@@ -401,15 +562,74 @@ struct AppStateTests {
         #expect(state.installed.map(\.id) == ["owner/repo:IQ3_S", "owner/repo:Q2_0"])
         #expect(state.selection == "owner/repo:Q2_0")
     }
+
+    /// Nothing starts before the app is ready or once it quits (`canStart`). The menu bar's panel
+    /// checks the model that starts or runs, then the one a switch goes to, and none once it
+    /// failed, whether its server ended or runs on, or while it stops; choosing another starts or
+    /// switches to it, choosing the failed one starts it again, and the one checked goes on as it is.
+    @Test func thePanelStartsTheModelChosen() async throws {
+        let fake = try FakeRuntime("splash-menus", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let first = "a/First-GGUF:Q4", second = "a/Second-GGUF:Q4"
+        try fake.install(first)
+        try fake.install(second)
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        func step(_ name: String) { FileManager.default.createFile(atPath: fake.root.appending(path: name).path, contents: nil) }
+        #expect(!state.canStart)
+        state.choose(first)
+        #expect(!state.server.running)
+        await state.launch()
+        #expect(state.canStart && state.checkedModel == nil)
+        state.options["--port"] = String(fake.port)
+        // Refused by the engine, the start fails and stops: nothing is checked, and choosing the
+        // model again starts it again.
+        step("refused")
+        step("loaded")
+        state.choose(first)
+        try await waitFor(state.serverStatus.look == .failed && !state.server.running, "the refusal")
+        #expect(state.checkedModel == nil)
+        try FileManager.default.removeItem(at: fake.root.appending(path: "refused"))
+        step("warm")
+        state.choose(first)
+        #expect(state.checkedModel == first && state.selection == first)
+        try await waitFor(state.server.phase == .ready, "\(first) ready")
+        let since = state.server.since
+        state.choose(first)
+        #expect(state.server.phase == .ready && state.server.since == since)
+        state.choose(second)
+        #expect(state.checkedModel == second && state.selection == second)
+        try await waitFor(state.server.model == second && state.server.phase == .ready, "\(second) ready")
+        #expect(state.server.since > since)
+        // Its engine stopped while its server runs on, nothing is checked, and choosing the model
+        // starts it again.
+        step("broken")
+        try await waitFor(state.serverStatus.look == .failed && state.server.running, "the engine's stop")
+        #expect(state.checkedModel == nil)
+        try FileManager.default.removeItem(at: fake.root.appending(path: "broken"))
+        let broken = state.server.since
+        state.choose(second)
+        try await waitFor(state.server.phase == .ready && state.server.since > broken, "\(second) ready again")
+        state.stop()
+        #expect(state.checkedModel == nil)
+        state.quit()
+        #expect(!state.canStart)
+        state.choose(first)
+        #expect(state.server.next == nil)
+    }
 }
 
 struct ServerTests {
     @Test func readsTheStatus() throws {
         let golden = URL(filePath: #filePath).deletingLastPathComponent().appending(path: "../../../dev/tests/engine/status_golden.json")
-        let report = try #require(Server.report(try Data(contentsOf: golden)))
+        let now = Date(timeIntervalSince1970: 1_000)
+        let report = try #require(Server.report(try Data(contentsOf: golden), at: now))
         #expect(report == Server.Report(activity: Server.Activity(served: 2, running: 2, generated: 32, read: 4096, cached: 64,
                                                                   memory: 4_294_967_296),
-                                        asleep: false))
+                                        asleep: false,
+                                        live: [LiveRequest(id: 7, time: LiveRequest.time(of: now - 1.5005), input: 4096, stage: .reading(2048)),
+                                               LiveRequest(id: 9, time: LiveRequest.time(of: now - 2.25025), input: 512,
+                                                           stage: .answering(40))]))
         let busy = Server.report(Data(#"{"requests": {"completed": 5}, "metrics": {"decode_tokens_per_second": 71.5, "prefill_tokens_per_second": 900, "ttft_ms": {"p50": 120}}, "weights": {"released": true}}"#.utf8))
         #expect(busy == Server.Report(activity: Server.Activity(served: 5, generation: 71.5, reading: 900, firstToken: .milliseconds(120)),
                                       asleep: true))
@@ -418,20 +638,69 @@ struct ServerTests {
         #expect(Server.report(Data("not json".utf8)) == nil)
     }
 
+    /// What a running request does, as the engine's phase gives it, and when it came.
+    @Test func readsTheRequestsRunning() throws {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let status = Data(#"""
+            {"active_requests": [{"id": 1, "phase": "queued", "prompt_tokens": 10, "age_ms": 500},
+              {"id": 2, "phase": "waiting_resources", "prompt_tokens": 20}, {"id": 3, "phase": "waiting_prefix", "prompt_tokens": 30},
+              {"id": 4, "phase": "prefill", "prompt_tokens": 40, "prompt_processed": 16},
+              {"id": 5, "phase": "waiting_mask", "prompt_tokens": 50, "prompt_processed": 50, "generated_tokens": 7}]}
+            """#.utf8)
+        let report = try #require(Server.report(status, at: now))
+        #expect(report.live.map(\.stage) == [.waiting("Queued"), .waiting("Waiting for memory"), .waiting("Waiting for a shared prefix"),
+                                             .reading(16), .answering(7)])
+        #expect(report.live.map(\.input) == [10, 20, 30, 40, 50] && report.live[0].time == LiveRequest.time(of: now - 0.5))
+        #expect(report.activity.running == 5)
+    }
+
+    /// Each request the engine took is one row, in the order they came: its start or the status
+    /// adds it, the status moves it on and never back, its end ends it in its place, and a status
+    /// from before its end leaves it ended; a line that names no request is a row of its own.
+    @Test func keepsOneRowPerRequest() throws {
+        func line(_ text: String) throws -> RequestEntry { try #require(RequestEntry(text)) }
+        func live(_ id: Int, _ stage: LiveRequest.Stage, input: Int) -> LiveRequest {
+            LiveRequest(id: id, time: "12:00:00", input: input, stage: stage)
+        }
+        var rows = ServedRequest.taking(try line("12:00:01 Started · request 1 · input 881 · cached 0"), into: [])
+        rows = ServedRequest.taking([live(1, .answering(52), input: 881), live(2, .reading(6656), input: 8193)], into: rows)
+        #expect(rows.map(\.id) == [1, 2] && rows.map(\.time) == ["12:00:01", "12:00:00"])
+        #expect(rows.map(\.stage) == [.answering(52), .reading(6656)] && rows.allSatisfy { $0.end == nil })
+        rows = ServedRequest.taking(try line("12:00:05 Done · request 1 · input 881 · cached 0 · output 65 · TTFT 1.6s · 32.7 tok/s"),
+                                    into: rows)
+        // A status from before that end, as one the server answers from an earlier snapshot.
+        rows = ServedRequest.taking([live(1, .answering(52), input: 881), live(2, .reading(4096), input: 8193)], into: rows)
+        #expect(rows.count == 2 && rows[0].end?.output == 65 && rows[1].end == nil && rows[1].stage == .reading(6656))
+        // Its Started line, later than the status that had it first, moves it on no further back.
+        rows = ServedRequest.taking(try line("12:00:02 Started · request 2 · input 8,193 · cached 0"), into: rows)
+        #expect(rows.map(\.time) == ["12:00:01", "12:00:00"] && rows[1].stage == .reading(6656))
+        rows = ServedRequest.taking(try line("12:00:06 Error · not_found · HEAD /api/hello"), into: rows)
+        rows = ServedRequest.taking(try line("12:00:09 Done · request 2 · input 8,193 · cached 0 · output 33"), into: rows)
+        #expect(rows.map(\.id) == [1, 2, -1] && rows.allSatisfy { $0.end != nil })
+        #expect(rows[2].end?.message == "not_found · HEAD /api/hello" && rows[2].time == "12:00:06")
+        // An earlier server's lines name no request: its ends are rows of their own, its starts none.
+        let earlier = ServedRequest.taking(try line("12:01:00 Started · input 5 · cached 0"), into: [])
+        #expect(earlier.isEmpty)
+        #expect(ServedRequest.taking(try line("12:01:02 Done · input 5 · cached 0 · output 1"), into: earlier).map(\.id) == [-1])
+    }
+
     /// The request lines the server writes, as the golden the server's tests check them against
     /// holds them.
     @Test func readsTheRequestLinesTheServerWrites() throws {
         let golden = try String(contentsOf: ServerTests.goldens.appending(path: "server/log_lines_golden.txt"), encoding: .utf8)
         let lines = golden.split(separator: "\n").map(String.init).filter { !$0.hasPrefix("#") }
-        try #require(lines.count == 4)
-        #expect(RequestEntry(lines[0]) == nil)
+        try #require(lines.count == 5)
+        let started = try #require(RequestEntry(lines[0]))
+        #expect(started.outcome == .started && started.request == 7 && (started.input, started.cached) == (4096, 1024))
         let done = try #require(RequestEntry(lines[1]))
-        #expect(done.outcome == .done && (done.input, done.cached, done.output, done.firstToken, done.rate)
+        #expect(done.outcome == .done && done.request == 7 && (done.input, done.cached, done.output, done.firstToken, done.rate)
             == (4096, 1024, 574, 0.4, 36.8))
         let cancelled = try #require(RequestEntry(lines[2]))
-        #expect(cancelled.outcome == .cancelled && cancelled.output == 12)
-        let error = try #require(RequestEntry(lines[3]))
-        #expect(error.outcome == .error && error.message == "invalid_request_error")
+        #expect(cancelled.outcome == .cancelled && cancelled.request == 8 && cancelled.output == 12)
+        let failed = try #require(RequestEntry(lines[3]))
+        #expect(failed.outcome == .error && failed.request == 9 && failed.message == "runtime_unavailable")
+        let refused = try #require(RequestEntry(lines[4]))
+        #expect(refused.outcome == .error && refused.request == nil && refused.message == "invalid_request_error")
     }
 
     /// The goldens the server's tests write, as the app reads them.
@@ -531,15 +800,16 @@ struct ServerTests {
         let killAfter = Duration.seconds(1)
         let server = Server(runtime: runtime, log: log, defaults: .kept(in: root), killAfter: killAfter)
         server.start("a/b", settings: ServeSettings(values: ["--port": "0"]))
-        var started: String { (try? String(contentsOf: log, encoding: .utf8)) ?? "" }
-        try await waitFor(started.hasSuffix("\n"), "the start")
-        let pid = try #require(pid_t(started.trimmingCharacters(in: .whitespacesAndNewlines)))
+        // The start's own lines, after the line that names it.
+        var lines: [Substring] { ((try? String(contentsOf: log, encoding: .utf8)) ?? "").split(separator: "\n").dropFirst().map { $0 } }
+        try await waitFor(!lines.isEmpty, "the start")
+        let pid = try #require(pid_t(lines[0]))
         defer { killpg(pid, SIGKILL) }
         let stopped = ContinuousClock.now
         server.stop()
         try await waitFor(!server.running, "the kill", seconds: 11)
         #expect(ContinuousClock.now - stopped >= killAfter)
-        #expect(started.split(separator: "\n").filter { $0 == "INT" }.count == 1)
+        #expect(lines.filter { $0 == "INT" }.count == 1)
     }
 
     @MainActor @Test func givesTheServerTheAppsProcessID() async throws {
@@ -555,7 +825,8 @@ struct ServerTests {
         // On a port nothing serves.
         server.start("a/b", settings: ServeSettings(values: ["--port": "0"]))
         try await waitFor(!server.running, "the end")
-        #expect(try String(contentsOf: log, encoding: .utf8) == "SPLASH_APP_PID=\(getpid())\n")
+        let lines = try String(contentsOf: log, encoding: .utf8).split(separator: "\n")
+        #expect(lines.count == 2 && lines[0].hasPrefix("── Starting a/b, ") && lines[1] == "SPLASH_APP_PID=\(getpid())")
     }
 }
 
@@ -571,9 +842,14 @@ struct ChildRecordTests {
         let child = try ChildProcess(command: ["/bin/sleep", "60"], environment: [:], log: folder.appending(path: "child.log")) { _ in }
         #expect(child.started != nil)
         record.keep(child)
-        await record.stopLeftover(olderApps: { _ in false })
+        var stopping = 0
+        await record.stopLeftover(olderApps: { _ in false }) { stopping += 1 }
         #expect(processStart(child.pid) == nil)
         #expect(defaults.object(forKey: record.key) == nil)
+        // The launch said it waited for the stop, once; with nothing left to stop, it doesn't.
+        #expect(stopping == 1)
+        await record.stopLeftover(olderApps: { _ in false }) { stopping += 1 }
+        #expect(stopping == 1)
     }
 
     @Test func leavesAnotherProcessWithTheIDAlone() async throws {
@@ -586,8 +862,9 @@ struct ChildRecordTests {
         // Kept with another start: an earlier process that had the ID, or a record an older app
         // kept as the ID alone.
         defaults.set([Int(other.pid), try #require(other.started) - 1], forKey: record.key)
-        await record.stopLeftover(olderApps: { _ in false })
-        #expect(processStart(other.pid) != nil)
+        var stopping = false
+        await record.stopLeftover(olderApps: { _ in false }) { stopping = true }
+        #expect(processStart(other.pid) != nil && !stopping)
         #expect(defaults.object(forKey: record.key) == nil)
         defaults.set(Int(other.pid), forKey: record.key)
         await record.stopLeftover(olderApps: { _ in false })
@@ -835,7 +1112,7 @@ struct ModelFamilyTests {
         try Data(count: 1000).write(to: file)
         state.addLocal(file)
         await state.listed()
-        #expect(state.installed.last == InstalledModel(id: file.path, bytes: 1000) && state.selection == file.path)
+        #expect(state.installed.last == InstalledModel(id: file.path, bytes: 1000, holdsGGUF: true) && state.selection == file.path)
         #expect(state.family(of: file.path) == .unknown)
         state.options["--port"] = String(fake.port)
         state.start(file.path)
@@ -863,12 +1140,8 @@ struct ModelFamilyTests {
         try #"print('{"Flint": {"unusable": ["--state-format"], "context_tokens": 262144, "max_context_tokens": 262144}}')"#
             .write(to: runtime.root.appending(path: "install/families.py"), atomically: true, encoding: .utf8)
         let flint = "a/Flint-GGUF:Q4", other = "a/Other-GGUF:Q4"
-        for (model, family) in [(flint, "Flint"), (other, "Other")] {
-            let link = runtime.models.appending(path: model)
-            try FileManager.default.createDirectory(at: link, withIntermediateDirectories: true)
-            try #"{"model": "\#(model)", "family": "\#(family)", "files": {}}"#
-                .write(to: link.appending(path: "model.json"), atomically: true, encoding: .utf8)
-        }
+        try fake.install(flint, family: "Flint")
+        try fake.install(other, family: "Other")
         let state = fake.state(keychain: Keychain(service: "Splash Tests"))
         defer { state.quit() }
         #expect(state.family(of: flint) == .unknown)
@@ -915,17 +1188,27 @@ struct ModelFamilyTests {
 }
 
 struct AgentTests {
-    @Test func runsInTheFolderPickedWithTheServersKey() {
-        let runtime = Runtime(root: URL(filePath: "/opt/splash"))
-        let folder = URL(filePath: "/tmp/it's a project")
-        let script = Agent.claude.script(runtime: runtime, port: 8100, folder: folder)
-        #expect(script.hasPrefix("#!/bin/sh\nrm -f -- \"$0\"\n"))
-        #expect(script.contains(#"cd '/tmp/it'\''s a project' || exit"#))
-        #expect(script.contains(#"'claude' '--port' '8100'"#))
-        #expect(script.contains("'-I' '-B' '-u'"))
-        #expect(!script.contains("SPLASH_API_KEY"))
-        #expect(Agent.claude.script(runtime: runtime, port: 8100, folder: folder, apiKey: "k'ey")
-            .contains(#"export SPLASH_API_KEY='k'\''ey'"#))
+    /// An agent's command line runs this runtime's `splash` on the server's port, each word quoted
+    /// for the shell that types it.
+    @Test func runsThisRuntimesSplashOnTheServersPort() {
+        let runtime = Runtime(root: URL(filePath: "/opt/it's splash"))
+        let command = Agent.claude.command(runtime: runtime, port: 8100)
+        #expect(command.hasPrefix(#"'/opt/it'\''s splash/.venv/bin/python' '-I' '-B' '-u'"#))
+        #expect(command.hasSuffix(#"'claude' '--port' '8100'"#))
+    }
+
+    /// An agent opens in a new terminal of the drawer, which shows, in the agents' folder.
+    @MainActor @Test func opensInADrawerTerminalInTheAgentsFolder() throws {
+        let fake = try FakeRuntime("splash-agent", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        let folder = fake.root.appending(path: "project")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        state.agentFolder = folder
+        state.open(.claude)
+        #expect(state.drawer.terminals.count == 1 && state.drawer.terminals[0].title == "project")
+        #expect(state.showsDrawer && state.drawer.part == .terminal)
     }
 }
 
@@ -1017,13 +1300,14 @@ struct ChatTests {
     }
 
     @Test func asksWithImagesEarlierThoughtsAndTheEffort() throws {
-        let png = Data([0x89, 0x50, 0x4E, 0x47, 1])
-        let messages = [ChatMessage(role: .user, text: "What is this?", images: [png]),
+        let png = Showcase.picture
+        let messages = [ChatMessage(role: .user, text: "What is this?", attachments: [Showcase.pictureAttachment]),
                         ChatMessage(role: .assistant, text: "A cat.", reasoning: "Whiskers."),
                         ChatMessage(role: .user, text: "Sure?"),
                         ChatMessage(role: .assistant, text: "", error: "The reply was interrupted."),
                         ChatMessage(role: .user, text: "Well?")]
-        let body = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "low", images: true)) as! [String: Any]
+        let files = Showcase.attachments
+        let body = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "low", vision: true, files: files)) as! [String: Any]
         #expect(body["reasoning_effort"] as? String == "low")
         #expect(body["stream"] as? Bool == true)
         #expect(body["return_progress"] as? Bool == true)
@@ -1034,11 +1318,111 @@ struct ChatTests {
         #expect(wire[1]["reasoning_content"] as? String == "Whiskers.")
         // The interrupted answer, which holds nothing, is left out.
         #expect(wire.map { $0["role"] as? String } == ["user", "assistant", "user", "user"])
-        let auto = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "", images: true)) as! [String: Any]
+        let auto = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "", vision: true, files: files)) as! [String: Any]
         #expect(auto["reasoning_effort"] == nil)
         // A model that cannot see images gets a note in their place.
-        let text = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "", images: false)) as! [String: Any]
+        let text = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "", vision: false, files: files)) as! [String: Any]
         #expect((text["messages"] as! [[String: Any]])[0]["content"] as? String == "[An image this model can’t see]\n\nWhat is this?")
+    }
+
+    @Test func asksWithPDFsAsFiles() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-pdf-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let data = Data("%PDF-1.4 plan".utf8)
+        let pdf = Splash.Attachment(kind: .pdf, type: "application/pdf", bytes: data.count, name: "Plan.pdf", pages: 1)
+        try data.write(to: folder.appending(path: pdf.file))
+        try Showcase.picture.write(to: folder.appending(path: Showcase.pictureAttachment.file))
+        let messages = [ChatMessage(role: .user, text: "Compare", attachments: [Showcase.pictureAttachment, pdf])]
+        let body = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "", vision: true, files: folder)) as! [String: Any]
+        let parts = (body["messages"] as! [[String: Any]])[0]["content"] as! [[String: Any]]
+        #expect(parts.map { $0["type"] as? String } == ["image_url", "file", "text"])
+        #expect(parts[1]["file"] as? [String: String] == ["filename": "Plan.pdf", "file_data": "data:application/pdf;base64,\(data.base64EncodedString())"])
+        // A model that takes neither gets a note for each kind.
+        let text = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "", vision: false, files: folder)) as! [String: Any]
+        #expect((text["messages"] as! [[String: Any]])[0]["content"] as? String
+            == "[An image this model can’t see] [A PDF this model can’t read]\n\nCompare")
+    }
+
+    @MainActor @Test func aChatOfAttachmentsAloneIsNamedForItsPDF() {
+        let pdf = Splash.Attachment(kind: .pdf, type: "application/pdf", bytes: 1, name: "Plan.pdf", pages: 1)
+        #expect(ChatStore.firstLine("Read this\nplease", attachments: [pdf]) == "Read this")
+        #expect(ChatStore.firstLine("", attachments: [Showcase.pictureAttachment, pdf]) == "Plan.pdf")
+        #expect(ChatStore.firstLine("", attachments: [Showcase.pictureAttachment]) == "Image")
+    }
+
+    /// What the model can't take stays in the draft, which says why: a kind it doesn't take, a PDF
+    /// over its bytes or pages, PDFs over their bytes together, an image over its bytes, more
+    /// images and pages than a request takes, or more bytes than it takes once encoded.
+    @Test func attachmentsTheModelCannotTakeSayWhy() {
+        let limits = Server.Limits(request_bytes: 800, images: 4, image_bytes: 300, pdf_bytes: 400, pdf_pages: 3)
+        func pdf(_ name: String, bytes: Int = 100, pages: Int? = 1) -> Splash.Attachment {
+            Splash.Attachment(kind: .pdf, type: "application/pdf", bytes: bytes, name: name, pages: pages)
+        }
+        let image = Splash.Attachment(kind: .image, type: "image/png", bytes: 100)
+        func problem(_ attachments: [Splash.Attachment], vision: Bool = true, limits: Server.Limits? = limits) -> String? {
+            AppState.attachmentProblem(attachments, vision: vision, limits: limits)
+        }
+        #expect(problem([]) == nil && problem([], vision: false) == nil)
+        #expect(problem([image], vision: false) == "This model can’t see images")
+        #expect(problem([image, pdf("a.pdf")], vision: false) == "This model can’t read PDFs")
+        // A server that doesn't say its limits says why itself, as it refuses them.
+        #expect(problem([pdf("a.pdf", bytes: 10_000)], limits: nil) == nil)
+        #expect(problem([image, pdf("a.pdf", pages: 3)]) == nil)
+        // One PDFKit can't count goes, for the server to say why.
+        #expect(problem([pdf("a.pdf", pages: nil)]) == nil)
+        #expect(problem([pdf("a.pdf", bytes: 401)]) == "a.pdf is larger than the model’s \(Format.size(400)) limit")
+        #expect(problem([pdf("a.pdf", pages: 4)]) == "a.pdf has more than the model’s 3 pages")
+        #expect(problem([pdf("a.pdf", bytes: 250), pdf("b.pdf", bytes: 250)])
+            == "These PDFs are larger together than the model’s \(Format.size(400)) limit")
+        #expect(problem([Splash.Attachment(kind: .image, type: "image/png", bytes: 301)]) == "An image is larger than the model’s \(Format.size(300)) limit")
+        #expect(problem([image, image, pdf("a.pdf", pages: 3)]) == "The images and PDF pages are more than the model’s 4")
+        // Sent as base64, a third larger: 700 bytes are 936.
+        #expect(problem([image, image, image, pdf("a.pdf", bytes: 400)]) == "The attachments are larger than one message to the model takes")
+    }
+
+    /// A conversation keeps its attachments as files of their own: the images an earlier app kept
+    /// inside its messages move into files as it is read, in their order, the conversation written
+    /// again without them; a file no conversation names goes at the sweep, unless a conversation
+    /// that can't be read may name it; and a conversation deleted takes its files.
+    @MainActor @Test func keepsAttachmentsAsFilesOfTheirOwn() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder.appending(path: "Attachments"), withIntermediateDirectories: true)
+        let png = Showcase.picture, jpeg = Data([0xFF, 0xD8, 0xFF, 0xE0, 1, 2])
+        let id = UUID()
+        let old = #"{"id": "\#(id)", "title": "Old", "updated": 0, "messages": [{"id": "\#(UUID())", "role": "user", "#
+            + #""text": "Look", "reasoning": "", "images": ["\#(png.base64EncodedString())", "\#(jpeg.base64EncodedString())"]}]}"#
+        try Data(old.utf8).write(to: folder.appending(path: "\(id).json"))
+        let stray = folder.appending(path: "Attachments/stray.png")
+        try Data([1]).write(to: stray)
+        let store = ChatStore(folder: folder)
+        let message = try #require(store.conversations.first?.messages.first)
+        let attachments = try #require(message.attachments)
+        #expect(attachments.map(\.type) == ["image/png", "image/jpeg"] && message.images == nil)
+        #expect(try attachments.map { try Data(contentsOf: store.attachments.appending(path: $0.file)) } == [png, jpeg])
+        store.flush()
+        let written = try String(contentsOf: folder.appending(path: "\(id).json"), encoding: .utf8)
+        #expect(written.contains("attachments") && !written.contains(png.base64EncodedString()))
+        // A file no conversation names stays until the sweep, which the app makes once it is the
+        // one Splash that runs.
+        #expect(FileManager.default.fileExists(atPath: stray.path))
+        store.sweep()
+        store.flush()
+        #expect(!FileManager.default.fileExists(atPath: stray.path))
+        // A conversation that can't be read keeps every file: it may name them.
+        try Data([1]).write(to: stray)
+        let unreadable = folder.appending(path: "\(UUID()).json")
+        try Data("{".utf8).write(to: unreadable)
+        let other = ChatStore(folder: folder)
+        other.sweep()
+        other.flush()
+        #expect(FileManager.default.fileExists(atPath: stray.path))
+        try FileManager.default.removeItem(at: unreadable)
+        // Deleted, a conversation takes its files.
+        store.delete([id])
+        store.flush()
+        #expect(attachments.allSatisfy { !FileManager.default.fileExists(atPath: store.attachments.appending(path: $0.file).path) })
     }
 
     @MainActor @Test func keepsConversationsInTheirFolder() async throws {
@@ -1048,7 +1432,7 @@ struct ChatTests {
         #expect(store.conversations.isEmpty)
         // Sending to no server fails, and the conversation keeps the question and why.
         let nowhere = ChatTarget(url: URL(string: "http://127.0.0.1:9")!, model: "a/b", acceptsImages: false, effort: "")
-        store.send("Hello\nthere", images: [], to: nowhere)
+        store.send("Hello\nthere", attachments: [], to: nowhere)
         #expect(store.current?.title == "Hello")
         #expect(store.streaming != nil)
         while store.streaming != nil { try await Task.sleep(for: .milliseconds(20)) }
@@ -1060,10 +1444,187 @@ struct ChatTests {
         let reloaded = ChatStore(folder: folder)
         #expect(reloaded.conversations.map(\.title) == ["Greeting"])
         #expect(reloaded.conversations[0].messages == store.conversations[0].messages)
-        store.delete(store.conversations[0].id)
+        store.delete([store.conversations[0].id])
         #expect(store.conversations.isEmpty && store.selection == nil)
         store.flush()
         #expect(ChatStore(folder: folder).conversations.isEmpty)
+    }
+
+    /// The list's groups: the pinned chats, whenever they changed, the last pinned first; then today,
+    /// yesterday, the week before, the month before and older, by the day each changed last, each
+    /// in its chats' order; a group with no chat is left out.
+    @Test func theChatListGroupsThePinnedChatsThenTheOthersByDay() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        func chat(_ title: String, _ daysAgo: Double, pinnedDaysAgo: Double? = nil) -> Conversation {
+            Conversation(title: title, updated: now.addingTimeInterval(-daysAgo * 86_400),
+                         pinned: pinnedDaysAgo.map { now.addingTimeInterval(-$0 * 86_400) })
+        }
+        let chats = [chat("a", 0), chat("p", 0, pinnedDaysAgo: 5), chat("b", 1), chat("c", 3), chat("d", 20), chat("e", 60),
+                     chat("f", 60, pinnedDaysAgo: 1), chat("g", 0)]
+        let sections = ChatSection.of(chats, now: now, calendar: calendar)
+        #expect(sections.map(\.group) == [.pinned, .today, .yesterday, .week, .month, .older])
+        #expect(sections.map { $0.chats.map(\.title) } == [["f", "p"], ["a", "g"], ["b"], ["c"], ["d"], ["e"]])
+        #expect(ChatSection.of([chat("b", 1)], now: now, calendar: calendar).map(\.group) == [.yesterday])
+    }
+
+    /// A pinned chat stays pinned on disk, and one unpinned stays so; a file from before pinning
+    /// reads as not pinned.
+    @MainActor @Test func aChatPinnedStaysPinned() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let old = Conversation(title: "Old")
+        try JSONEncoder().encode(old).write(to: folder.appending(path: "\(old.id.uuidString).json"))
+        #expect(try !String(contentsOf: folder.appending(path: "\(old.id.uuidString).json"), encoding: .utf8).contains("pinned"))
+        let store = ChatStore(folder: folder)
+        #expect(store.conversations.map(\.pinned) == [nil])
+        store.pin(old.id, true)
+        store.flush()
+        #expect(ChatStore(folder: folder).conversations.first?.pinned != nil)
+        store.pin(old.id, false)
+        store.flush()
+        #expect(ChatStore(folder: folder).conversations.first?.pinned == nil)
+    }
+
+    /// The list's search: the chats whose title or a message holds the query, whatever its case;
+    /// none for a query nothing holds; every chat, in the list's order, for an empty query.
+    @MainActor @Test func theChatListSearchesTitlesAndMessages() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for conversation in [Conversation(title: "Plan the Lisbon trip", messages: [ChatMessage(role: .user, text: "Four days in May.")]),
+                             Conversation(title: "Grocery list", messages: [ChatMessage(role: .user, text: "Eggs, milk and bread.")])] {
+            try JSONEncoder().encode(conversation).write(to: folder.appending(path: "\(conversation.id.uuidString).json"))
+        }
+        let store = ChatStore(folder: folder)
+        #expect(store.matching("lisbon").map(\.title) == ["Plan the Lisbon trip"])
+        #expect(store.matching("MILK").map(\.title) == ["Grocery list"])
+        #expect(store.matching("Porto").isEmpty)
+        #expect(store.matching("").map(\.id) == store.conversations.map(\.id))
+    }
+
+    /// A title is the first line of the model's reply that holds any, without a Title: label,
+    /// quotes, Markdown's marks or a closing stop, in at most 80 characters; a reply with none
+    /// gives no title.
+    @Test func aTitleIsTheReplysFirstLineTidied() {
+        #expect(ChatClient.title(in: "Planning a Lisbon Trip") == "Planning a Lisbon Trip")
+        #expect(ChatClient.title(in: "Title: \"Swift Concurrency Basics.\"") == "Swift Concurrency Basics")
+        #expect(ChatClient.title(in: "**KV Cache Paging**\nIt covers…") == "KV Cache Paging")
+        #expect(ChatClient.title(in: "\n  “法语学习计划。”  ") == "法语学习计划")
+        #expect(ChatClient.title(in: "What Is Speculative Decoding?") == "What Is Speculative Decoding?")
+        #expect(ChatClient.title(in: "## Learning C#") == "Learning C#")
+        #expect(ChatClient.title(in: "**Title:** Trip Plans") == "Trip Plans")
+        #expect(ChatClient.title(in: "# Title: Trip Plans") == "Trip Plans")
+        #expect(ChatClient.title(in: "**Trip Plans**.") == "Trip Plans")
+        #expect(ChatClient.title(in: "**\nTrip Plans") == "Trip Plans")
+        #expect(ChatClient.title(in: String(repeating: "a", count: 100))?.count == 80)
+        #expect(ChatClient.title(in: " \n ") == nil)
+        #expect(ChatClient.title(in: "\"\"") == nil)
+    }
+
+    /// A title is asked of the start of the first exchange, in the background, without thinking, in a
+    /// few tokens and not streamed.
+    @Test func aTitleIsAskedOfTheFirstExchangeWithoutThinking() throws {
+        let body = try JSONSerialization.jsonObject(with: ChatClient.titleBody(question: "Hi", answer: String(repeating: "x", count: 3000))) as! [String: Any]
+        #expect(body["reasoning_effort"] as? String == "none" && body["thinking_token_budget"] as? Int == 0)
+        #expect(body["priority"] as? String == "background")
+        #expect(body["max_tokens"] as? Int == 32)
+        #expect(body["stream"] == nil)
+        let content = try #require(((body["messages"] as? [[String: Any]])?.first?["content"]) as? String)
+        #expect(content.contains("User: Hi\n\nAssistant: " + String(repeating: "x", count: 1000)) && !content.contains(String(repeating: "x", count: 1001)))
+    }
+
+    /// Its first exchange answered, a chat takes the title the model sums it up in, tidied; until
+    /// then it has its first line.
+    @MainActor @Test func aChatTakesTheTitleTheModelSumsItUpIn() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let server = Process()
+        server.executableURL = URL(filePath: "/usr/bin/python3")
+        server.arguments = [try #require(Bundle.module.path(forResource: "streaming_server", ofType: "py", inDirectory: "Fakes")),
+                            "--title", "“Greeting the user.”"]
+        let output = Pipe()
+        server.standardOutput = output
+        try server.run()
+        defer { server.terminate() }
+        let port = try #require(String(data: output.fileHandleForReading.availableData, encoding: .utf8)
+            .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+        let store = ChatStore(folder: folder)
+        store.send("Hello\nthere", attachments: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        #expect(store.current?.title == "Hello")
+        try await waitFor(store.current?.title == "Greeting the user", "the model's title")
+        store.flush()
+        #expect(ChatStore(folder: folder).conversations.first?.title == "Greeting the user")
+    }
+
+    /// A chat renamed before its first reply ends keeps its name: no title is asked for.
+    @MainActor @Test func aChatRenamedKeepsItsName() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let server = Process()
+        server.executableURL = URL(filePath: "/usr/bin/python3")
+        server.arguments = [try #require(Bundle.module.path(forResource: "streaming_server", ofType: "py", inDirectory: "Fakes")),
+                            "--title", "Not Mine"]
+        let output = Pipe()
+        server.standardOutput = output
+        try server.run()
+        defer { server.terminate() }
+        let port = try #require(String(data: output.fileHandleForReading.availableData, encoding: .utf8)
+            .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+        let store = ChatStore(folder: folder)
+        store.send("Hello", attachments: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        let id = try #require(store.current?.id)
+        store.rename(id, to: "Mine")
+        try await waitFor(store.streaming == nil, "the reply to end")
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(store.current?.title == "Mine")
+    }
+
+    /// The question to delete chats names one by its title, and else how many.
+    @MainActor @Test func theQuestionToDeleteChatsNamesOneByItsTitleElseHowMany() {
+        let one = ChatDeletion([Conversation(title: "Greeting")])
+        #expect(one.title == "Delete this chat?" && one.message == "“Greeting” will be deleted from this Mac.")
+        let three = ChatDeletion([Conversation(), Conversation(), Conversation()])
+        #expect(three.ids.count == 3 && three.title == "Delete 3 chats?" && three.message == "They will be deleted from this Mac.")
+    }
+
+    /// Deleting chats deletes each with its file and stops the reply that streams in one, and the
+    /// open one deleted, a new chat opens; a file in the folder that is no chat stays, even under
+    /// the name of an id asked for.
+    @MainActor @Test func deletingChatsDeletesThemWithTheirFiles() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let kept = Conversation(title: "Kept"), gone = Conversation(title: "Gone")
+        for conversation in [kept, gone] {
+            try JSONEncoder().encode(conversation).write(to: folder.appending(path: "\(conversation.id.uuidString).json"))
+        }
+        let unread = UUID()
+        let stray = folder.appending(path: "\(unread.uuidString).json")
+        try Data("not a chat".utf8).write(to: stray)
+        // A reply without end: only the stop ends it.
+        let server = Process()
+        server.executableURL = URL(filePath: "/usr/bin/python3")
+        server.arguments = [try #require(Bundle.module.path(forResource: "streaming_server", ofType: "py", inDirectory: "Fakes")), "--endless"]
+        let output = Pipe()
+        server.standardOutput = output
+        try server.run()
+        defer { server.terminate() }
+        let port = try #require(String(data: output.fileHandleForReading.availableData, encoding: .utf8)
+            .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+        let store = ChatStore(folder: folder)
+        store.send("Hi", attachments: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        let streaming = try #require(store.streaming)
+        #expect(store.selection == streaming)
+        store.delete([streaming, gone.id, unread])
+        #expect(store.conversations.map(\.id) == [kept.id] && store.selection == nil)
+        try await waitFor(store.streaming == nil, "the reply to stop")
+        #expect(store.conversations.map(\.id) == [kept.id])
+        store.flush()
+        #expect(ChatStore(folder: folder).conversations.map(\.id) == [kept.id])
+        #expect(FileManager.default.fileExists(atPath: stray.path))
     }
 
     @MainActor @Test func aReplyStreamsApartFromTheConversationsUntilItEnds() async throws {
@@ -1079,7 +1640,7 @@ struct ChatTests {
         let port = try #require(String(data: output.fileHandleForReading.availableData, encoding: .utf8)
             .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
         let store = ChatStore(folder: folder)
-        store.send("Hi", images: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        store.send("Hi", attachments: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
         // While it streams, the reply holds what came, and the conversation, which the list and
         // the composer read, holds it empty and changes no more.
         try await waitFor(store.reply?.message.text.isEmpty == false)

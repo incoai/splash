@@ -1654,6 +1654,80 @@ class UpstreamTest(unittest.TestCase):
             assembly.verify(chosen.link)["sources"]["target"]["revision"], "b" * 40
         )
 
+    @staticmethod
+    def remove(chosen):
+        """upstream.remove's bytes freed, its output kept quiet."""
+        with contextlib.redirect_stdout(io.StringIO()):
+            return upstream.remove(chosen)
+
+    @staticmethod
+    def size(folder):
+        return sum(file.stat().st_size for file in folder.rglob("*") if file.is_file())
+
+    def test_remove_frees_the_files_only_its_installation_used(self):
+        # Two models of one family share its draft: removing one leaves the
+        # other and the draft whole, freeing its own files and folder; the
+        # last one takes the draft with it.
+        fake = fake_hub(self, self.cache)
+        other = "mlx-community/Qwen3.8-27B-8bit"
+        fake.publish(other, "c" * 40, lambda p: mlx_target(p, DENSE))
+        first, second = selection(self.root), selection(self.root, other)
+        self.prepare(first)
+        self.prepare(second)
+        target = self.cache / hub.folder_name(MODEL)
+        size = self.size(target / "snapshots")
+        self.assertEqual(self.remove(first), size)
+        self.assertFalse(first.link.is_symlink() or target.exists())
+        verified = assembly.verify(second.link)
+        self.assertEqual(verified["sources"]["target"]["repo"], other)
+        self.assertEqual(pins(self.cache), sorted(["c" * 40, DRAFT_COMMIT]))
+        self.remove(second)
+        self.assertEqual(pins(self.cache), [])
+        self.assertFalse((self.cache / hub.folder_name(DENSE.draft_repo)).exists())
+        self.assertEqual(list((self.root / "models" / ".resolved").glob("*")), [])
+        with self.assertRaisesRegex(models.ModelError, "is not installed"):
+            self.remove(first)
+
+    def test_remove_keeps_what_a_server_or_another_models_root_holds(self):
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        # A server holds it: refused, and left whole.
+        _, held = assembly.hold(chosen.link)
+        with self.assertRaisesRegex(models.ModelError, "is being served"):
+            self.remove(chosen)
+        held.close()
+        assembly.verify(chosen.link)
+        # An installation of another models root pins its snapshot: its
+        # files stay; the draft's, which nothing else pins, go.
+        snapshot = next((self.cache / hub.folder_name(MODEL) / "snapshots").iterdir())
+        elsewhere = hub.pinned(snapshot, self.root / "elsewhere" / "models" / MODEL)
+        elsewhere.parent.mkdir(parents=True)
+        elsewhere.write_text(snapshot.name)
+        draft = self.cache / hub.folder_name(DENSE.draft_repo)
+        size = self.size(draft / "snapshots")
+        self.assertEqual(self.remove(chosen), size)
+        self.assertTrue(any(snapshot.iterdir()))
+        self.assertFalse(draft.exists())
+
+    def test_the_remove_command_reports_the_bytes_freed(self):
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        size = sum(self.size(snapshots) for snapshots in self.cache.glob("*/snapshots"))
+        arguments = ["--models", str(chosen.models_root), "--model", MODEL]
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(models.main([*arguments, "--language-only", "remove"]), 0)
+        self.assertEqual(
+            json.loads(output.getvalue()), {"event": "removed", "bytes": size}
+        )
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(models.main([*arguments, "--language-only", "remove"]), 1)
+        self.assertEqual(json.loads(output.getvalue())["event"], "error")
+
     def test_pins_are_required_before_publishing(self):
         fake_hub(self, self.cache)
         chosen = selection(self.root)

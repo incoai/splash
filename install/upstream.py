@@ -588,6 +588,44 @@ def prepare(selection):
         _install_commit(selection, target, installed)
 
 
+def remove(selection):
+    """Remove selection's installation, and what of its sources nothing else
+    uses, and return the bytes freed: its selection link and pins, then its
+    assembly, which nothing links or holds any more (collect_garbage), and the
+    files of its Hub snapshots that no remaining installation links
+    (hub.remove_unused). A snapshot another models root pins keeps its files,
+    as do all snapshots where a record cannot be read. An installation a
+    server holds is refused: it is stopped first."""
+    root = selection.models_root
+    with models.installation_lock(root):
+        link = selection.link
+        if models.installation_kind(link) != models.ASSEMBLY:
+            raise models.ModelError(f"{selection.model} is not installed in {root}")
+        installed = link.resolve()
+        if assembly.is_held(installed):
+            raise models.ModelError(
+                f"{selection.model} is being served: stop it, then remove it"
+            )
+        snapshots = [
+            path
+            for path, _ in assembly.pins(models.read_json(installed / "model.json"))
+        ]
+        link.unlink()
+        for path in snapshots:
+            ref = hub.pinned(path, link)
+            ref.unlink(missing_ok=True)
+            try:
+                ref.parent.rmdir()
+            except OSError:
+                pass
+        assembly.collect_garbage(root)
+        linked = assembly.linked_files(root)
+        if linked is None:
+            return 0
+        owners = {hub.pin_owner(other) for other in models.selection_links(root)}
+        return sum(hub.remove_unused(path, owners, linked) for path in snapshots)
+
+
 def _start_installed(selection, target, installed):
     """Start the verified installation of the target's commit, assembled again
     first when its draft moved or this release changes it (_changes). The
