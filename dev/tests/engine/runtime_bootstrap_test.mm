@@ -204,9 +204,10 @@ private:
   Executor executor_;
 };
 
-RuntimeBootstrapReport warmup(Harness &harness, const EngineMemoryPlan &plan) {
-  return ServingRuntime::requireWarmup(plan, harness.executor(), harness.pool(),
-                                         [&] { return validActual(plan); });
+RuntimeBootstrapReport warmup(Harness &harness, const EngineMemoryPlan &plan,
+                              std::span<const uint32_t> prefillRowClasses = {}) {
+  return ServingRuntime::requireWarmup(plan, prefillRowClasses, harness.executor(), harness.pool(),
+                                       [&] { return validActual(plan); });
 }
 
 void requireReady(const RuntimeBootstrapReport &report) {
@@ -217,16 +218,48 @@ void requireReady(const RuntimeBootstrapReport &report) {
 void testAllNativeWarmupsPrecedeReady() {
   const EngineMemoryPlan plan = memoryPlan();
   Harness harness;
-  auto report = warmup(harness, plan);
+  constexpr uint32_t rowClasses[] = {1, 9, 17, 33};
+  auto report = warmup(harness, plan, rowClasses);
   require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid,
           "successful native bootstrap was incomplete");
-  require(harness.executor().calls == std::vector<int>({0, 1, 2, 3, 4, 5}),
-          "bootstrap did not warm a prefill and B1/B2/B3/B4 in order");
-  require(harness.executor().prefillRows == std::vector<uint32_t>({model::ExecutionLimits::prefillTokenBudget}),
-          "bootstrap did not warm a prefill of maximum rows");
-  require(report.warmup.decodeBatches[2] == WarmupStepStatus::Complete,
-          "bootstrap report omitted the real B3 graph");
+  require(harness.executor().calls == std::vector<int>({0, 0, 0, 0, 0, 1, 2, 3, 4, 5}),
+          "bootstrap did not warm its prefills and B1/B2/B3/B4 in order");
+  require(harness.executor().prefillRows ==
+              std::vector<uint32_t>({model::ExecutionLimits::prefillTokenBudget, 1, 9, 17, 33}),
+          "bootstrap did not warm a prefill of maximum rows and one of each row class");
+  require(report.warmup.prefillRowClasses == WarmupStepStatus::Complete &&
+              report.warmup.decodeBatches[2] == WarmupStepStatus::Complete,
+          "bootstrap report omitted the row classes' prefills or the real B3 graph");
 }
+
+// A row class's prefill is required, as the prefill of the most rows is: it
+// needs no memory that one did not, so any failure of it, a refused
+// allocation too, fails the start at its stage with the runway released.
+void testPrefillRowClassesAreRequired() {
+  const EngineMemoryPlan plan = memoryPlan();
+  constexpr uint32_t rowClasses[] = {1, 9, 17};
+  const std::function<void()> failures[] = {
+      [] { throw metal::MetalAllocationError("injected allocation denial"); },
+      [] { throw metal::MetalBackendError("injected GPU command failure"); }};
+  for (const std::function<void()> &failure : failures) {
+    Harness harness;
+    harness.executor().warmupHook = [&harness, &failure](int step, model::WarmupStepResult &) {
+      if (step == 0 && harness.executor().prefillRows.back() == 9)
+        failure();
+    };
+    try {
+      static_cast<void>(warmup(harness, plan, rowClasses));
+      throw std::runtime_error("a row class's failed prefill passed");
+    } catch (const RuntimeBootstrapError &error) {
+      require(error.report().stage == RuntimeBootstrapStage::PrefillRowClasses &&
+                  harness.executor().prefillRows ==
+                      std::vector<uint32_t>({model::ExecutionLimits::prefillTokenBudget, 1, 9}) &&
+                  harness.pool().snapshot().pagesActive == 0,
+              "a row class's failed prefill did not fail the start at its stage, or kept the runway held");
+    }
+  }
+}
+
 
 // Warmup runs on the KV runway and holds its pages as a request holds its
 // own (KvPool::RunwayHold); none is held once the engine is Ready.
@@ -370,7 +403,7 @@ void testFinalHostPressurePreventsReady() {
   Harness harness;
   try {
     static_cast<void>(ServingRuntime::requireWarmup(
-        plan, harness.executor(), harness.pool(), []() -> ActualMemoryReport {
+        plan, {}, harness.executor(), harness.pool(), []() -> ActualMemoryReport {
           throw metal::MetalAllocationError("pressure after warmup",
                                              metal::AllocationFailure::HostPressure);
         }));
@@ -444,7 +477,7 @@ void testExceptionsAndMemoryAreFailClosed() {
     Harness harness(3);
     try {
       static_cast<void>(engine::ServingRuntime::requireWarmup(
-          plan, harness.executor(), harness.pool(), [] { return ActualMemoryReport{}; }));
+          plan, {}, harness.executor(), harness.pool(), [] { return ActualMemoryReport{}; }));
       throw std::runtime_error("warmup exception passed");
     } catch (const engine::RuntimeBootstrapError &error) {
       require(error.report().stage ==
@@ -457,7 +490,7 @@ void testExceptionsAndMemoryAreFailClosed() {
     Harness harness;
     try {
       static_cast<void>(engine::ServingRuntime::requireWarmup(
-          plan, harness.executor(), harness.pool(), [] { return ActualMemoryReport{}; }));
+          plan, {}, harness.executor(), harness.pool(), [] { return ActualMemoryReport{}; }));
       throw std::runtime_error("invalid memory report passed");
     } catch (const engine::RuntimeBootstrapError &error) {
       require(error.report().stage ==
@@ -633,6 +666,7 @@ int main() {
     testRuntimeCacheIdentityReportsTheLoadedModel();
     testAllNativeWarmupsPrecedeReady();
     testWarmupHoldsTheRunway();
+    testPrefillRowClassesAreRequired();
     testBudgetLimitedWarmupTriesOnlyWidthsThatFit();
     testOptionalAllocationFailuresAreMemoryLimited();
     testResourceFailureClassificationSurvivesBootstrap();

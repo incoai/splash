@@ -1780,6 +1780,14 @@ struct Runtime::Impl {
                                  states.draft(lane), rebuild.rows, rebuild.begin);
   }
 
+  // Creates the pipelines of a draft rebuild of `rows` on `lane` without
+  // running it (Runtime::warmupPrefill).
+  void prepareDraftRebuild(uint32_t lane, uint32_t rows) const {
+    CommandGraph graph;
+    addDraftRebuild(graph, lane, {0, rows});
+    backend.preparePipelines(graph.dispatches());
+  }
+
   // The draft's context of chunk `index` of a command's chunks: the rows its
   // parts capture go into their lanes' rings and windows. A state captured
   // inside the command takes into its window the rows its lane's parts
@@ -3498,6 +3506,12 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
     }
     lanes.push_back({std::move(result[0]), impl_->request(id).pendingToken,
                      impl_->states.metadata(0).lengths.targetTokens});
+    // A restored lane's first chunk begins with its draft rebuild, which no
+    // other command runs, and a start's restore warmup may be memory-limited,
+    // as a 16 GB Mac's is: so each prefill warmup creates the rebuild's
+    // pipelines on its lane. Without them the 35B's first cached prefix on
+    // the 10-core M4 created two, 15 ms cold.
+    impl_->prepareDraftRebuild(0, std::min(rows, ExecutionLimits::draftContextTokens));
     end(id);
   } catch (...) {
     end(id);

@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -23,6 +24,7 @@ enum class RuntimeBootstrapStage {
     ResourceAssembly,
     ModelCreation,
     MaximumPrefill,
+    PrefillRowClasses,
     DecodeWarmup,
     CompositeStateRestore,
     MemoryAudit,
@@ -142,9 +144,12 @@ public:
 
     // Completes warmup and validation, at stage Ready. Warmup runs on
     // kvPool's runway (model::ExecutionLimits::warmupKvPages) and holds its
-    // pages while it runs (KvPool::RunwayHold).
+    // pages while it runs (KvPool::RunwayHold): a prefill of the most rows,
+    // one of each of `prefillRowClasses` (ops::ExecutionPlans), each decode
+    // width that fits and a state restore.
     [[nodiscard]] static RuntimeBootstrapReport requireWarmup(
         const EngineMemoryPlan &memoryPlan,
+        std::span<const uint32_t> prefillRowClasses,
         model::RuntimeModel &modelRuntime,
         KvPool &kvPool,
         ActualMemoryReporter memoryReporter);

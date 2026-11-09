@@ -26,6 +26,8 @@ enum class WarmupStepStatus { Pending, Complete, MemoryLimited };
 
 struct WarmupReport {
   WarmupStepStatus maximumPrefill = WarmupStepStatus::Pending;
+  // A prefill of each class of chunk (ops::ExecutionPlans::prefillRowClasses).
+  WarmupStepStatus prefillRowClasses = WarmupStepStatus::Pending;
   std::array<WarmupStepStatus, model::ExecutionLimits::maximumBatchWidth>
       decodeBatches{};
   WarmupStepStatus compositeStateRestore = WarmupStepStatus::Pending;

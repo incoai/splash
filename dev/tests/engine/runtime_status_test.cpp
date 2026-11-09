@@ -190,6 +190,7 @@ StatusInputs representativeStatus() {
 
   WarmupReport warmup;
   warmup.maximumPrefill = WarmupStepStatus::Complete;
+  warmup.prefillRowClasses = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
   warmup.maximumPrefillDetail = "rows=2048";
@@ -561,6 +562,7 @@ void testWarmupStepsReportMeasurementTruth() {
   const EngineMemoryPlan memoryPlan = plan();
   WarmupReport warmup;
   warmup.maximumPrefill = WarmupStepStatus::Complete;
+  warmup.prefillRowClasses = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
   MemoryGovernorSnapshot governor;

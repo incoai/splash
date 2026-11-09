@@ -6,7 +6,9 @@
 #include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
 
+#include <cstdint>
 #include <span>
+#include <vector>
 
 namespace splash::ops {
 
@@ -25,6 +27,13 @@ public:
   // Qwen3.6-35B-A3B GGUF, whose own projections never take the tile.
   [[nodiscard]] const Linear &draftLinear() const noexcept { return draftLinear_; }
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return linear_.calibration(); }
+  // The fewest rows of each class of prefill chunk whose projections run
+  // kernels of their own: each staged tile height a chunk takes, and the
+  // prefill tile (ExecutionPlans.cpp). Startup warmup runs a chunk of each and
+  // one of the most rows; kernel-selection checks that they select every
+  // projection, float and MoE tile a chunk of any rows selects, and its
+  // prefill attention after each history it plans.
+  [[nodiscard]] std::vector<uint32_t> prefillRowClasses() const;
 
   [[nodiscard]] PrefillAttentionPlan prefillAttention(
       uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,

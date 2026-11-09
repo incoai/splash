@@ -505,12 +505,33 @@ created, and so does every status request behind it. With a warm shader cache
 that is a load of milliseconds; cold, after an install or a macOS update, it
 is a compile, and the 27B's first 17-row chunk waited 19 s for its kernels on
 an M5 Max planned as a 16-core Apple9 GPU. So before Ready the start runs a
-command of each kind serving runs (`ServingRuntime::requireWarmup`): a prefill
-of the most rows, 2048, a decode of each width the memory plan holds and a
-state restore; and it prepares the sampling kernels' dispatches without
-running them (`MetalBackend::preparePipelines`). What memory keeps from running
+command of each kind serving runs, through every projection
+(`ServingRuntime::requireWarmup`):
+
+- a prefill of the most rows, 2048, and one of each class of chunk whose
+  projections run kernels of their own, of its fewest rows
+  (`ExecutionPlans::prefillRowClasses`): each staged tile height a chunk takes,
+  from 1, 9, 17 and, where `stagedPrefillRows` is 64, 33 rows, and the prefill
+  tile, from a row past `stagedPrefillRows`. These need no memory the first
+  did not, and are required as it is. Every other kernel choice a chunk's
+  rows make today has one threshold (the float tiles, the MoE expert and
+  router tiles, the staged norm, the hyper-connection norm's quarters, and the
+  Neural Engine split, which takes no class's first chunk), so the chunks of
+  one row and of the most take both sides. `kernel-selection` checks that
+  every projection, float and MoE tile a chunk of 1 to 2048 rows selects on
+  its fifteen devices, and its prefill attention after each history it plans,
+  is one of these chunks'. Each prefill also creates, without running it, the
+  draft rebuild a restored lane's first chunk begins with, which no other
+  command runs, so a memory-limited restore warmup leaves none of its kernels
+  to serving;
+- a decode of each width the memory plan holds, and a state restore;
+
+and it prepares the sampling kernels' dispatches without running them
+(`MetalBackend::preparePipelines`). What memory keeps from running
 (`warmup.memory_limited_steps` in `/status`) stays cold, as do the paths no
-warmup takes. From Ready on the backend counts each pipeline it creates
+warmup takes: a decode width the host refused or the plan does not hold, a
+decode after enough history to score INT8 queries, an image, KV on the SSD.
+From Ready on the backend counts each pipeline it creates
 (`metal.pipelines_created_while_serving`) and logs it once, with its name, its
 function constants and how long it took.
 
