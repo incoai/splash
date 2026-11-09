@@ -44,10 +44,6 @@ class ToolCallSyntax:
     # TOOL_CALL_OPEN and TOOL_CALL_CLOSE are in every family's, which grammars
     # then write as that token; otherwise they write the tags as text.
     tags_are_tokens: bool
-    # Whether the call's arguments are one JSON value of their own, between
-    # name_close and arguments_close (Ripple's), rather than the key and
-    # value tags' layout. The key and value tags are then empty and unused.
-    json_arguments: bool = False
 
     @property
     def call_open(self):
@@ -116,26 +112,18 @@ GLM_ARGS = ToolCallSyntax(
 class ChatFormat:
     """What the server reads, writes and checks in a family's tokens."""
 
-    # The model's vocabulary, the rows of its logits that a constraint's
-    # masks cover: its target layout's vocabularySize, which may exceed its
-    # tokenizer's.
-    vocabulary: int
-    # The engine's stop tokens (its target layout's stopTokens), each with the
-    # text its tokenizer encodes as that token; the tokenizer's EOS is one.
-    stop_tokens: tuple[tuple[str, int], ...]
-    # The token of THINK_END, which closes the reasoning; None where the
-    # template's close is text the tokenizer splits (Ripple's), which the
-    # output's decoding matches instead.
-    think_end_id: int | None
+    # The texts its tokenizer encodes as the engine's stop tokens (Ready's
+    # stop_token_ids), one token each; the tokenizer's EOS is one of them.
+    stop_tokens: tuple[str, ...]
+    # The token of THINK_END, which closes the reasoning.
+    think_end_id: int
     # The token of THINK_START where the model opens its reasoning itself, as
     # its first token, as a template without a thinking switch leaves it to
     # (Flint's); None where the generation prompt opens it, as Qwen's do by
-    # the request's reasoning effort. A model whose opener is text (Ripple's)
-    # holds None too, and the output's decoding matches the opener's text.
+    # the request's reasoning effort.
     think_start_id: int | None
-    # The token of TOOL_CALL_OPEN; None where the template's call tags are
-    # text the tokenizer splits (Ripple's).
-    call_open_id: int | None
+    # The token of TOOL_CALL_OPEN.
+    call_open_id: int
     call_syntax: ToolCallSyntax
     # The template's special token after which prompt tokenization reuses a
     # cached prompt's tokens (tokenization.PromptTokenizer).
@@ -145,23 +133,12 @@ class ChatFormat:
     image_pad: str | None
 
     @property
-    def tags_are_text(self):
-        """Whether the template's think and call tags are text its tokenizer
-        splits, which the output's decoding matches, rather than tokens: the
-        token-id fields are None there."""
-        return self.think_end_id is None
-
-    @property
-    def stop_ids(self):
-        return tuple(token for _text, token in self.stop_tokens)
-
-    @property
     def reasoning_switch(self):
         """Whether a request turns the model's reasoning on and off, its
         effort or enable_thinking opening the generation prompt's think block
         or leaving it out; a model that opens its reasoning itself decides
         each turn, whatever the request says."""
-        return self.think_start_id is None and not self.tags_are_text
+        return self.think_start_id is None
 
     @property
     def calls_end_reasoning(self):
@@ -197,28 +174,4 @@ FLINT = ChatFormat(
     call_syntax=GLM_ARGS,
     message_boundary="<|assistant|>",
     image_pad=None,
-)
-# Ripple's: a vocabulary the tokenizer fills, <|im_end|> and <|endofprompt|>
-# as stop tokens, and a generation prompt, <|im_start|>assistant, that leaves
-# reasoning to the model, which opens, closes and calls with the standard
-# tags as TEXT its tokenizer splits, and lays a call's arguments out as one
-# JSON value.
-RIPPLE = ChatFormat(
-    vocabulary=100352,
-    stop_tokens=(("<|im_end|>", 100265), ("<|endoftext|>", 100257)),
-    think_end_id=None,
-    think_start_id=None,
-    call_open_id=None,
-    call_syntax=ToolCallSyntax(
-        name_open='\n{"name": "',
-        name_close='", "arguments": ',
-        key_open="",
-        key_close="",
-        value_open="",
-        value_close="",
-        arguments_close="}\n",
-        tags_are_tokens=False,
-        json_arguments=True,
-    ),
-    message_boundary="<|im_end|>",
 )

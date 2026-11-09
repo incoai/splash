@@ -176,6 +176,7 @@ struct QwenTargetDimensions {
   [[nodiscard]] constexpr uint32_t pleHeads() const noexcept {
     return pleNgram ? (pleNgram - 1) * pleHeadsPerNgram : 0;
   }
+  [[nodiscard]] constexpr bool hasPle() const noexcept { return pleNgram != 0; }
   [[nodiscard]] constexpr uint32_t pleWidth() const noexcept { return pleHeads() * pleHeadDimension; }
   // The PLE convolution's history: (taps - 1) * dilation rows, the dilation
   // being the n-gram size.

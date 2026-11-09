@@ -1,6 +1,7 @@
 // The staged GGUF tile's dequantization (dequant32, kernels/shared/gguf_linear.metal, which the test kernels of
 // gguf_dequant_test.metal expose before the matmul): every weight of every format is the half rounding of its
 // GGML fp32 value, the CPU reference that gguf-reference pins to llama.cpp's golden hashes.
+#include <limits>
 #include "GgufFormatReference.hpp"
 #include "TestBuffers.hpp"
 #include "metal/CommandGraph.hpp"
@@ -50,7 +51,7 @@ int main(int argc, char **argv) {
         const MetalBuffer w1 = kQuantFormats[f].plane1_bytes ? upload(backend, planes.w1) : meta;
         const MetalBuffer output = sharedBuffer(backend, uint64_t{N} * K * 2);
         CommandGraph graph;
-        graph.add(std::string("gguf_test_dequant_") + fmtName(f), {w0, w1, meta, output}, GgufDecodeParams{K, 1, N, 0, 0},
+        graph.add(std::string("gguf_test_dequant_") + fmtName(f), {w0, w1, meta, output}, GgufDecodeParams{K, 1, N, 0, 0, std::numeric_limits<float>::infinity()},
                   {N * (K / kGroup) / kThreads, 1, 1}, {kThreads, 1, 1});
         static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
         const auto *got = static_cast<const uint16_t *>(output.contents());

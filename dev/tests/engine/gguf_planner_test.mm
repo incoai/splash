@@ -4,6 +4,7 @@
 // quantizes to Q8_0, where a streamed table's rows are, which part of a split
 // GGUF each tensor is read from, and the sources it refuses.
 //   gguf-planner
+#include <iostream>
 #include "GgufFixtures.hpp"
 #include "metal/abi/Gguf.h"
 #include "model/GgufPreparation.hpp"
@@ -926,9 +927,18 @@ void checkRipple(const std::filesystem::path &directory) {
     const model::gguf::Image &image = ripple.images[layer];
     const std::string p = "blk." + std::to_string(layer) + ".";
     const auto *queries = repackOf(image, p + "attn_q.weight");
-    check(queries && queries->rows == 2 * g.attentionWidth && queries->sources.size() == 2 &&
-              queries->sources[0].name == p + "attn_q.weight" &&
-              queries->sources[1].name == p + "attn_gate.weight",
+    // The packed q interleaves each head's queries with its gate (the
+    // prepare kernel reads them so), head by head over the two tensors.
+    const uint32_t heads = g.attentionWidth / g.attentionHeadDimension;
+    bool interleaved = queries && queries->rows == 2 * g.attentionWidth &&
+                       queries->sources.size() == 2 * heads;
+    for (uint32_t head = 0; interleaved && head < heads; ++head) {
+      interleaved = queries->sources[2 * head].name == p + "attn_q.weight" &&
+                    queries->sources[2 * head].first == head * g.attentionHeadDimension &&
+                    queries->sources[2 * head + 1].name == p + "attn_gate.weight" &&
+                    queries->sources[2 * head + 1].first == head * g.attentionHeadDimension;
+    }
+    check(interleaved,
           "planner plans layer " + std::to_string(layer) + "'s queries and gate as one projection");
     check(asStored(copyOf(image, p + "attn_vres_lambda.weight"), tensorNamed(tensors, p + "attn_vres_lambda.weight").data),
           "planner copies layer " + std::to_string(layer) + "'s value-residual lambda as stored");

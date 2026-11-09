@@ -1214,7 +1214,7 @@ void leadingInputViews(metal::MetalBackend &backend) {
     metal::CommandGraph graph;
     (void)linear.add(graph, buffersOf(ggufPlan), gguf, ggufPlan);
     const std::string kernel = leadingInputsInstance("gguf_prefill_q5k_r");
-    const GgufPrefillLeadingParams params{{k, rows, n, 0}, wide};
+    const GgufPrefillLeadingParams params{{k, rows, n, 0, std::numeric_limits<float>::infinity()}, wide};
     require(graph.dispatches().size() == 1, "a view of leading inputs did not encode one dispatch");
     const metal::ComputeDispatch &dispatch = graph.dispatches()[0];
     require(dispatch.pipelineName == kernel && dispatch.bytes.size() == 1 &&

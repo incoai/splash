@@ -157,6 +157,10 @@ enum class Reads : uint8_t { EveryPage, SelectedBlocks };
 struct LayerMask final {
   uint64_t words[2] = {};
 
+  LayerMask() = default;
+  constexpr LayerMask(uint64_t low) noexcept : words{low, 0} {}
+  constexpr LayerMask(uint64_t low, uint64_t high) noexcept : words{low, high} {}
+
   [[nodiscard]] constexpr bool test(uint32_t layer) const noexcept {
     return layer < 64 ? (words[0] >> layer & 1)
                       : layer < 128 ? (words[1] >> (layer - 64) & 1) : false;

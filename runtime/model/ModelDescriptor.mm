@@ -674,20 +674,21 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   // kernels run it (metal/abi/DraftAttention.h): the one its five numbers
   // are, and a config near one is refused by the first number that differs
   // from it, as the sizes are; one near none is refused with the variants
-  // this build serves.
+  // this build serves. A config whose proposal is longer than its variant's
+  // rows, or that keeps more candidates, is served by the variant as a
+  // subset of its own until the variant of its proposal compiles; a shorter
+  // one the kernels refuse to run at all.
   struct DraftGeometryKey final {
     const char *key;
     uint32_t SplashDraftVariant::*field;
     NSDictionary *source;
   };
-  const std::initializer_list<DraftGeometryKey> keys{
+  const std::initializer_list<DraftGeometryKey> geometryKeys{
       {"num_attention_heads", &SplashDraftVariant::query_heads, draft},
       {"num_key_value_heads", &SplashDraftVariant::kv_heads, draft},
       {"head_dim", &SplashDraftVariant::head_dimension, draft},
       {"sliding_window", &SplashDraftVariant::window, draft},
-      {"conv_kernel_size", &SplashDraftVariant::convolution_taps, flash},
-      {"block_size", &SplashDraftVariant::rows, flash},
-      {"selector_top_k", &SplashDraftVariant::candidates, flash}};
+      {"conv_kernel_size", &SplashDraftVariant::convolution_taps, flash}};
   const SplashDraftVariant *variant = nullptr;
   size_t matched = 0;
   std::string mismatch;
@@ -695,7 +696,7 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   for (const SplashDraftVariant &compiled : SPLASH_DRAFT_VARIANTS) {
     size_t agreed = 0;
     std::string difference;
-    for (const DraftGeometryKey &key : keys) {
+    for (const DraftGeometryKey &key : geometryKeys) {
       const uint32_t found = requireWhole(key.source[@(key.key)], std::string("draft config ") + key.key);
       if (found == compiled.*key.field) {
         ++agreed;
@@ -705,7 +706,7 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
         difference = std::string("draft config ") + key.key + " mismatch: checkpoint " +
                      std::to_string(found) + ", runtime " + std::to_string(compiled.*key.field);
     }
-    if (agreed == keys.size()) {
+    if (agreed == geometryKeys.size()) {
       variant = &compiled;
       break;
     }
@@ -726,6 +727,16 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                                     ? "draft config attention geometry is not a compiled draft variant (" +
                                           supported + ")"
                                     : mismatch);
+  const uint32_t blockSize =
+      requireWhole(flash[@"block_size"], "draft config dflash_config block_size");
+  if (blockSize < variant->rows)
+    throw std::invalid_argument("draft config dflash_config block_size is less than the " +
+                                std::to_string(variant->rows) + " rows a cycle drafts");
+  const uint32_t selectorTopK =
+      requireWhole(flash[@"selector_top_k"], "draft config dflash_config selector_top_k");
+  if (selectorTopK < variant->candidates)
+    throw std::invalid_argument("draft config dflash_config selector_top_k is below the " +
+                                std::to_string(variant->candidates) + " candidates the kernels keep");
   requireNumbers(draft, "checkpoint", "draft config",
                  {{"hidden_size", target.hiddenSize},
                   {"vocab_size", target.vocabularySize},

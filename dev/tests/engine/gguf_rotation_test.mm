@@ -145,7 +145,7 @@ int main(int argc, char **argv) {
         const MetalBuffer out = sharedBuffer(backend, fp32.size() * 2);
         CommandGraph graph;
         graph.add("gguf_embed_rotated_pq20", {tokenBuffer, rows, signBuffer, out},
-                  GgufEmbedParams{uint32_t(tokens.size()), vocabulary, hidden}, {hidden / kBlock, uint32_t(tokens.size()), 1},
+                  GgufEmbedParams{uint32_t(tokens.size()), vocabulary, hidden, 1.0F}, {hidden / kBlock, uint32_t(tokens.size()), 1},
                   {GGUF_ROTATION_THREADS, 1, 1});
         static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
         failures += check("gguf_embed_rotated_pq20 D (H r)", static_cast<const uint16_t *>(out.contents()), fp32, fp64);

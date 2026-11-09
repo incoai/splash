@@ -456,10 +456,6 @@ private:
                         bool whole = true) const {
     const std::string stem = tensor.name.ends_with(".weight") ? tensor.name.substr(0, tensor.name.size() - 7) : "";
     if (tensor.type != ggml::kNVFP4) {
-      if (!stem.empty())
-        if (const GgufTensor *scale = file_.find(stem + ".scale"))
-          throw GgufError(scale->name + " scales a " + ggmlTypeName(tensor.type) +
-                          " tensor; Splash reads a .scale tensor beside an NVFP4 weight only");
       if (whole && (!count || count * rowBytes != tensor.bytes)) throw GgufError("unexpected size for " + tensor.name);
       return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
     }

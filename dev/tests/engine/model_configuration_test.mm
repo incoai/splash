@@ -1045,19 +1045,23 @@ void testFlint(const std::filesystem::path &fixtures) {
 // without the draft.
 void testRipple(const std::filesystem::path &fixtures) {
   const std::string config = text(fixtures / "ripple-65b" / "config.json");
-  const std::string metadata = text(fixtures / "ripple-65b" / "gguf-metadata.json");
   const std::string draft = text(fixtures / "ripple-65b" / "draft" / "config.json");
-  const auto check = [&](std::string configText, std::string metadataText,
+  // The headers the installer copies, which the planner checks as at every
+  // start: a GGUF of the family's layout, zero-data tensors.
+  const GgufHeaders rippleHeaders = ggufHeaders(model::RippleLayout{});
+  const auto check = [&](std::string configText, const GgufHeaders &headers,
                          std::optional<std::string> draftText) {
     const test::TemporaryDirectory directory("splash-ripple-check");
     test::writeFile(directory.path() / "config.json", configText);
-    test::writeFile(directory.path() / "gguf-metadata.json", metadataText);
+    std::filesystem::create_directory(directory.path() / "target");
+    test::writeFile(directory.path() / "target" / "ripple.gguf",
+                    test_gguf::file(headers.keys.front(), headers.tensors.front()));
     std::optional<std::filesystem::path> draftFile;
     if (draftText) test::writeFile(draftFile.emplace(directory.path() / "draft.json"), *draftText);
     return std::string(model::inspectSourceConfiguration("gguf", "none", directory.path() / "config.json",
-                                                         directory.path() / "gguf-metadata.json", draftFile));
+                                                         directory.path() / "target", draftFile));
   };
-  require(check(config, metadata, std::nullopt) == "Ripple-65B",
+  require(check(config, rippleHeaders, std::nullopt) == "Ripple-65B",
           "Ripple's configuration was not found to be its family");
   // The trained selector keeps more candidates than the kernels do, whose
   // subset the proposal serves exactly; fewer than the kernels keep cannot
@@ -1066,7 +1070,8 @@ void testRipple(const std::filesystem::path &fixtures) {
   test::writeFile(rippleRoot.path() / "model.json",
                   R"({"version":1,"model":"community/fine-tune","target_format":"gguf","vision_format":"none"})");
   test::writeFile(rippleRoot.path() / "config.json", config);
-  test::writeFile(rippleRoot.path() / "gguf-metadata.json", metadata);
+  test::writeFile(rippleRoot.path() / "gguf-metadata.json",
+                  text(fixtures / "ripple-65b" / "gguf-metadata.json"));
   std::filesystem::create_directory(rippleRoot.path() / "draft");
   test::writeFile(rippleRoot.path() / "draft" / "config.json", draft);
   const model::ModelDescriptor rippleDescriptor = model::inspectModelRoot(rippleRoot.path());
@@ -1081,8 +1086,8 @@ void testRipple(const std::filesystem::path &fixtures) {
     const std::string from = R"("selector_top_k": 32)";
     truncated.replace(truncated.find(from), from.size(),
                       R"("selector_top_k": )" + std::to_string(topK));
-    rejects([&] { static_cast<void>(check(config, metadata, truncated)); },
-            "is below the 16 candidates the kernels keep",
+    rejects([&] { static_cast<void>(check(config, rippleHeaders, truncated)); },
+            "is below the 32 candidates the kernels keep",
             "a Ripple draft of " + std::to_string(topK) + " candidates was accepted");
   }
   const SourceModel ripple =
@@ -1105,24 +1110,49 @@ void testRipple(const std::filesystem::path &fixtures) {
            {R"("model_type": "ricursive")", R"("model_type": "qwen3_5_text")", "no supported model has this architecture"}})
     refuses(ripple.with(&SourceModel::config, refused.from, refused.to), refused.error,
             "a Ripple config with " + std::string(refused.to) + " was accepted");
-  for (const Refused &refused : std::initializer_list<Refused>{
-           {R"("ricursive.attention.sliding_window": 1024)", R"("ricursive.attention.sliding_window": 512)",
-            "GGUF metadata does not match the target: attention.sliding_window"},
-           {R"("ricursive.embedding_scale": 71.5541763305664)", R"("ricursive.embedding_scale": 1.0)",
-            "GGUF metadata does not match the target: embedding_scale"},
-           {R"("ricursive.swiglu_clamp": 20.0)", R"("ricursive.swiglu_clamp": 6.0)",
-            "GGUF metadata does not match the target: swiglu_clamp"},
-           {R"("ricursive.attention.head_count": 80)", R"("ricursive.attention.head_count": 64)",
-            "GGUF metadata does not match the target: attention.head_count"},
-           {R"("ricursive.block_count": 80)", R"("ricursive.block_count": 61)",
-            "GGUF metadata does not match the target: block_count"}}) {
-    std::string metadataText(metadata);
-    const size_t at = metadataText.find(refused.from);
-    require(at != std::string::npos, std::string("the Ripple metadata has no ") + std::string(refused.from));
-    metadataText.replace(at, refused.from.size(), refused.to);
-    rejects([&] { static_cast<void>(check(config, metadataText, std::nullopt)); }, refused.error,
-            "a Ripple GGUF with " + std::string(refused.to) + " was accepted");
-  }
+  // The headers' metadata key mutated; the tensors stay, as the metadata
+  // check runs before the planner's.
+  const auto withMetadata = [&](const char *name, test_gguf::Key replacement) {
+    GgufHeaders mutated = rippleHeaders;
+    bool found = false;
+    for (test_gguf::Key &entry : mutated.keys.front())
+      if (entry.name == name) {
+        entry = std::move(replacement);
+        found = true;
+      }
+    require(found, std::string("the Ripple metadata has no ") + name);
+    return mutated;
+  };
+  rejects([&] {
+            static_cast<void>(check(config, withMetadata("ricursive.attention.sliding_window",
+                                                         test_gguf::uint32Key("ricursive.attention.sliding_window", 512)),
+                                    std::nullopt));
+          }, "GGUF metadata does not match the target: attention.sliding_window",
+          "a Ripple GGUF with a window of 512 was accepted");
+  rejects([&] {
+            static_cast<void>(check(config, withMetadata("ricursive.embedding_scale",
+                                                         test_gguf::float32Key("ricursive.embedding_scale", 1.0F)),
+                                    std::nullopt));
+          }, "GGUF metadata does not match the target: embedding_scale",
+          "a Ripple GGUF with an embedding scale of 1 was accepted");
+  rejects([&] {
+            static_cast<void>(check(config, withMetadata("ricursive.swiglu_clamp",
+                                                         test_gguf::float32Key("ricursive.swiglu_clamp", 6.0F)),
+                                    std::nullopt));
+          }, "GGUF metadata does not match the target: swiglu_clamp",
+          "a Ripple GGUF with a clamp of 6 was accepted");
+  rejects([&] {
+            static_cast<void>(check(config, withMetadata("ricursive.attention.head_count",
+                                                         test_gguf::uint32Key("ricursive.attention.head_count", 64)),
+                                    std::nullopt));
+          }, "GGUF metadata does not match the target: attention.head_count",
+          "a Ripple GGUF with 64 query heads was accepted");
+  rejects([&] {
+            static_cast<void>(check(config, withMetadata("ricursive.block_count",
+                                                         test_gguf::uint32Key("ricursive.block_count", 61)),
+                                    std::nullopt));
+          }, "GGUF metadata does not match the target: block_count",
+          "a Ripple GGUF of 61 layers was accepted");
 }
 
 int main(int argc, char **argv) {
@@ -1145,3 +1175,4 @@ int main(int argc, char **argv) {
     return 1;
   }
 }
+

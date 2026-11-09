@@ -1,4 +1,5 @@
 #include "TestChecks.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 #include "model/Model.hpp"
 #include "benchmarks/PrefillWork.hpp"
 #include "engine/Engine.hpp"
@@ -20,7 +21,7 @@ using splash::test::rejects;
 using splash::test::require;
 
 DraftContextPlan activePlan(uint32_t replayBegin, uint32_t replayEnd) {
-  return planDraftContext(replayBegin, replayEnd, {});
+  return planDraftContext(replayBegin, replayEnd, {}, SPLASH_DRAFT_SLIDING_WINDOW);
 }
 
 DraftContextPlan
@@ -28,7 +29,8 @@ cachedPlan(uint32_t replayBegin, uint32_t replayEnd,
            std::initializer_list<uint32_t> materializationBoundaries) {
   return planDraftContext(
       replayBegin, replayEnd,
-      {materializationBoundaries.begin(), materializationBoundaries.size()});
+      {materializationBoundaries.begin(), materializationBoundaries.size()},
+      SPLASH_DRAFT_SLIDING_WINDOW);
 }
 
 // The rows a plan captures for the boundaries of one purpose.
@@ -109,7 +111,9 @@ void testFinalFullBlockBound() {
 }
 
 void testBenchmarkWorkIncludesRecoveryPoints() {
-  const uint32_t interval = engine::kPrefillCheckpointTokens;
+  // The shipped drafts' spacing: two of their windows, which the default
+  // derives for a model that keeps their ring.
+  const uint32_t interval = 2 * SPLASH_DRAFT_SLIDING_WINDOW;
   using benchmark::expectedDraftContextRows;
   // No checkpoint lies within one prefill chunk of an end: not 8192 before
   // the 10K prompt's replay boundary at 9984, nor 12288 before the 14K

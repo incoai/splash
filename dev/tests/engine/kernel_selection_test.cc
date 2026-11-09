@@ -418,7 +418,7 @@ void attentionPlans(Golden &golden, const std::string &name, const ExecutionPlan
     std::vector<AttentionVariant> variants;
     const kv::Layout base = family.kvLayout();
     for (uint32_t a = 0; a < base.attentionLayers; ++a) {
-      const AttentionVariant v{.rotated = a >= 64 || !(family.unrotatedLayers >> a & 1),
+      const AttentionVariant v{.rotated = !family.unrotatedLayers.test(a),
                                .windowTokens = base.windowed(a) ? base.windowTokens : 0};
       if (std::find(variants.begin(), variants.end(), v) == variants.end()) variants.push_back(v);
     }

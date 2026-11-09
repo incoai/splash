@@ -112,7 +112,7 @@ void testSharedCheckpointSurvivesPeerRollingReplacement() {
 }
 
 void testRepeatedRetriesRollTheRestoredCheckpoint() {
-  test::EngineHarness h({.pages = 2048, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  test::EngineHarness h({.pages = 2048, .engine = {.prefillCheckpointTokens = kPrefillCheckpointTokens}, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
   engine::Cache &resources = h.cache;
   Executor &executor = h.model;
   Events &events = h.events;
@@ -140,7 +140,7 @@ void testRepeatedRetriesRollTheRestoredCheckpoint() {
 }
 
 void testRetryCancelledBeforeNextCheckpointKeepsItsSource() {
-  test::EngineHarness h({.pages = 1024, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  test::EngineHarness h({.pages = 1024, .engine = {.prefillCheckpointTokens = kPrefillCheckpointTokens}, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
   engine::Cache &resources = h.cache;
   Events &events = h.events;
   engine::Engine &engine = h.engine;
@@ -168,7 +168,7 @@ void testRetryCancelledBeforeNextCheckpointKeepsItsSource() {
 void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
   for (bool disk : {false, true}) {
     for (uint32_t suffix : {1U, 31U}) {
-      test::EngineHarness h({.pages = 1024, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+      test::EngineHarness h({.pages = 1024, .engine = {.prefillCheckpointTokens = kPrefillCheckpointTokens}, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
       engine::Cache &resources = h.cache;
       Executor &executor = h.model;
       Events &events = h.events;
@@ -252,7 +252,7 @@ void testRetryRetiresCheckpointAtDeeperJunction() {
 }
 
 void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
-  test::EngineHarness h({.pages = 1024, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  test::EngineHarness h({.pages = 1024, .engine = {.prefillCheckpointTokens = kPrefillCheckpointTokens}, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
   engine::Cache &resources = h.cache;
   Executor &executor = h.model;
   engine::Engine &engine = h.engine;
@@ -284,7 +284,7 @@ void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
 // takes buffers only from the pool or an admission: refused them, it
 // recycles no other lane's checkpoint, and its command ends there.
 void testPinnedPredecessorTakesNoRoomFromOtherStates() {
-  test::EngineHarness h({.pages = 2048, .shape = [](Executor &shape) { shape.maximumLanes = 2; }});
+  test::EngineHarness h({.pages = 2048, .engine = {.prefillCheckpointTokens = kPrefillCheckpointTokens}, .shape = [](Executor &shape) { shape.maximumLanes = 2; }});
   engine::Cache &resources = h.cache;
   Executor &executor = h.model;
   engine::Engine &engine = h.engine;
@@ -326,7 +326,7 @@ void testPinnedPredecessorTakesNoRoomFromOtherStates() {
 // unpinned while the command runs, it takes the predecessor's buffers after it;
 // still pinned, it is not published.
 void testPinnedPredecessorReleasedDuringTheCommand() {
-  test::EngineHarness h({.pages = 1024, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  test::EngineHarness h({.pages = 1024, .engine = {.prefillCheckpointTokens = kPrefillCheckpointTokens}, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
   engine::Cache &resources = h.cache;
   Executor &executor = h.model;
   Events &events = h.events;
@@ -403,7 +403,7 @@ void testFailedReplacementContinuesWithoutRecoveryPoint() {
 }
 
 void testRollingHandleCannotRetirePromotedState() {
-  test::EngineHarness h({.pages = 1024, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  test::EngineHarness h({.pages = 1024, .engine = {.prefillCheckpointTokens = kPrefillCheckpointTokens}, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
   engine::Cache &resources = h.cache;
   engine::Engine &engine = h.engine;
   const std::vector<uint32_t> prompt(25001, 37);
@@ -1068,7 +1068,7 @@ void testReplayPointWithoutRoomTakesTheCheckpointItsCommandCaptures() {
 }
 
 void testShortSuffixContinuesCheckpointDraftState() {
-  test::EngineHarness h({.pages = 1024, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  test::EngineHarness h({.pages = 1024, .engine = {.prefillCheckpointTokens = kPrefillCheckpointTokens}, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
   Executor &executor = h.model;
   Events &events = h.events;
   engine::Engine &engine = h.engine;
@@ -1151,7 +1151,7 @@ void testDefaultCheckpointRestoresLatestCommittedPrefix() {
 // its replay boundary: not for a follow-up resuming at 2976 whose replay
 // boundary is 4192, nor for one resuming at 4064.
 void testCheckpointsSkipNearResumeAndReplayBoundaries() {
-  test::EngineHarness h({.pages = 1024, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+  test::EngineHarness h({.pages = 1024, .engine = {.prefillCheckpointTokens = kPrefillCheckpointTokens}, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
   Executor &executor = h.model;
   Events &events = h.events;
   engine::Engine &engine = h.engine;

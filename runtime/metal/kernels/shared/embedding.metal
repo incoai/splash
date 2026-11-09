@@ -6,24 +6,36 @@
 // element its decode as T: bf16, the token gathers', or fp32, the F32 values load-time widening writes
 // (model/GgufPreparation.cpp). Inlined, with the format's decode, so every gather stays one function (the compiler
 // otherwise keeps Q6_K's as a call).
-template <class F, class T>
+template <bool Scaled, class F, class T>
 __attribute__((always_inline)) inline void gguf_embedding(device const uint *tokens, device const uchar *table,
-                                                         device T *output, constant GgufEmbedParams &p, uint index) {
+                                                         device T *output, constant GgufEmbedParams &p,
+                                                         uint index) {
   const uint elements = p.rows * p.hidden; if (index >= elements) return;
   const uint row = index / p.hidden, dim = index % p.hidden;
   uint token = tokens[row]; token = token < p.vocabulary ? token : 0;
   device const uchar *block = table + (ulong(token) * (p.hidden / F::Weights) + dim / F::Weights) * F::Bytes;
-  output[index] = T(F::decode(block, dim) * p.scale);
+  // The unscaled gather writes the decode as it is: a multiply flushes the
+  // subnormals fp32 keeps (Metal's fast math), which a bf16 table stores.
+  if constexpr (Scaled) output[index] = T(F::decode(block, dim) * p.scale);
+  else output[index] = T(F::decode(block, dim));
 }
 
 #define GGUF_GATHER(Name, F, T) \
   kernel void Name(device const uint *tokens [[buffer(0)]], device const uchar *table [[buffer(1)]], \
                    device T *output [[buffer(2)]], constant GgufEmbedParams &p [[buffer(3)]], \
                    uint index [[thread_position_in_grid]]) { \
-    gguf_embedding<F>(tokens, table, output, p, index); \
+    gguf_embedding<false, F>(tokens, table, output, p, index); \
+  } \
+  kernel void Name##_scaled(device const uint *tokens [[buffer(0)]], device const uchar *table [[buffer(1)]], \
+                            device T *output [[buffer(2)]], constant GgufEmbedParams &p [[buffer(3)]], \
+                            uint index [[thread_position_in_grid]]) { \
+    gguf_embedding<true, F>(tokens, table, output, p, index); \
   }
-// Two gathers per GGUF format (metal/abi/QuantFormat.h), named by its kQuantFormats token: gguf_embed_<token>
-// into bf16 and gguf_embed_f32_<token> into fp32.
+// Two gathers per GGUF format (metal/abi/QuantFormat.h), named by its
+// kQuantFormats token: gguf_embed_<token> into bf16 and
+// gguf_embed_f32_<token> into fp32, and their -scaled forms, which multiply
+// each gathered row by the params' scale (a family whose embeddings the
+// hidden size's root scales).
 #define GGUF_EMBEDDING_FORMAT(f, F) GGUF_GATHER(gguf_embed_##f, F, bfloat) GGUF_GATHER(gguf_embed_f32_##f, F, float)
 GGUF_EMBEDDING_FORMATS(GGUF_EMBEDDING_FORMAT)
 #undef GGUF_EMBEDDING_FORMAT

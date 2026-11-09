@@ -41,7 +41,8 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
               params, {table.inputSize / GGUF_ROTATION_BLOCK, rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
     return;
   }
-  graph.add(std::string("gguf_embed_") + format.name, {std::move(tokens), stored.rows, std::move(output)}, params,
+  graph.add(std::string("gguf_embed_") + format.name + (scale == 1.0F ? "" : "_scaled"),
+            {std::move(tokens), stored.rows, std::move(output)}, params,
             {(rows * table.inputSize + 255) / 256, 1, 1}, {256, 1, 1});
 }
 

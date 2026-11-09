@@ -23,7 +23,7 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 constexpr double kMaskWaitMilliseconds = double(supervision::kMaskWait.count());
 // A junction costs a cached state, its capture and up to a draft window of
 // draft-context rows; a later request must save at least that much prefill.
-constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftWindowLimit;
+
 
 constexpr std::string_view kKvUnreadableMessage =
     "KV of an earlier part of the conversation could not be read from the SSD cache";
@@ -1205,12 +1205,21 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   const uint32_t latestReplayBoundary = replayStateBoundary(active);
   // Plan draft windows before prefill; arbitrary chunk ends do not carry a
   // complete draft state, the point the lane resumes from does. Progress
-  // points remain disposable after restoration.
-  for (const uint32_t checkpoint : plannedCheckpoints(
-           stateBoundary, latestReplayBoundary, config_.prefillCheckpointTokens)) {
+  // points remain disposable after restoration. The interval spans two of
+  // the model's own draft windows, whole KV pages, within the compiled
+  // rings' ceiling, unless the start names one; a junction is worth
+  // capturing from a window of the model's own gain.
+  const uint32_t window = model_.draftWindow();
+  const uint32_t derived = std::min<uint32_t>(
+      (2u * window + KvCache::pageTokens - 1) / KvCache::pageTokens * KvCache::pageTokens,
+      kPrefillCheckpointTokens);
+  const uint32_t interval = config_.prefillCheckpointTokens ? config_.prefillCheckpointTokens : derived;
+  const uint32_t gain = std::max(model::ExecutionLimits::draftContextTokens, window);
+  for (const uint32_t checkpoint :
+       plannedCheckpoints(stateBoundary, latestReplayBoundary, interval)) {
     addStateBoundary(active, stateBoundary, checkpoint, true, true);
   }
-  if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
+  if (junctionBoundary >= stateBoundary + gain)
     addStateBoundary(active, stateBoundary, junctionBoundary, false, true);
   addStateBoundary(active, stateBoundary, latestReplayBoundary,
                    latestReplayBoundary != promptReplayBoundary(active), true);
@@ -1242,7 +1251,7 @@ bool Engine::addStateBoundary(Request &active, uint32_t after, uint32_t tokens,
   // boundary before it, from `after` when the lane's draft state is
   // complete there, or whole past `after` (planDraftContext).
   if (!completeAfter && found == remaining &&
-      tokens - after < model::ExecutionLimits::draftWindowLimit)
+      tokens - after < std::max(model::ExecutionLimits::draftContextTokens, model_.draftWindow()))
     return false;
   active.stateBoundaries.insert(found, {tokens, disposable});
   return true;

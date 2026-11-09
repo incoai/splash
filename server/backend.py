@@ -13,7 +13,7 @@ from tokenizers.decoders import DecodeStream
 from . import json_codec, supervision
 from . import protocol as wire
 from . import runtime as engine_runtime
-from .chat_format import THINK_END, THINK_START, ChatFormat
+from .chat_format import THINK_END, ChatFormat
 from .constraints import TokenConstraint
 from .diagnostics import print_status
 from .errors import APIError, ConstraintError
@@ -46,21 +46,7 @@ def thinking_end_tokens(tokenizer, text, chat_format):
     if text is None:
         return None
     tokens = tuple(tokenizer.encode(text, add_special_tokens=False))
-    if chat_format.tags_are_text:
-        # The close of thinking is text: what the engine selects must decode
-        # to text that ends with the close, and hold no special token.
-        if (
-            not tokens
-            or not tokenizer.decode(tokens, skip_special_tokens=True).endswith(
-                THINK_END
-            )
-            or not tokenizer.added_tokens_decoder.keys().isdisjoint(tokens)
-        ):
-            raise ThinkingEndError(
-                f"--thinking-end-text must end with {THINK_END} and hold no other "
-                "special token"
-            )
-    elif (
+    if (
         not tokens
         or tokens[-1] != chat_format.think_end_id
         or not tokenizer.added_tokens_decoder.keys().isdisjoint(tokens[:-1])
@@ -275,16 +261,11 @@ class CallbackStreamer:
         """The reasoning's tokens, as ReasoningSplitter reads the text: from
         the start of the output where the generation prompt opened the
         reasoning (thinking), or after the model's own opening of it
-        (chat_format.think_start_id, or the opener's text), to its close or,
-        where a call may follow and a call's opening ends the reasoning, a
-        call's opening; none for a request without a chat format. A close
-        that is text (chat_format.tags_are_text) ends the reasoning inside
-        the token that spells it: those tokens count with the answer's, as
-        the splitter drops the close's text from neither side."""
+        (chat_format.think_start_id), to its close or, where a call may follow
+        and a call's opening ends the reasoning, a call's opening; none for
+        a request without a chat format."""
         if chat_format is None:
             return 0
-        if chat_format.tags_are_text:
-            return self._count_text_reasoning(chat_format, thinking, tool_calls)
         if thinking:
             start = 0
         elif chat_format.think_start_id is not None and self.token_ids[:1] == [
@@ -303,55 +284,6 @@ class CallbackStreamer:
             ):
                 return index - start
         return len(self.token_ids) - start
-
-    def _count_text_reasoning(self, chat_format, thinking, tool_calls):
-        """The reasoning's tokens of an output whose think and call tags are
-        text: the tokens whose decoded text lies before the reasoning's end,
-        which is the close of thinking, or a call's opening where one may
-        follow and ends the reasoning. The reasoning runs from the output's
-        start where the generation prompt opened it, or follows the opener's
-        text where the model opened it; without either there is none, as
-        ReasoningSplitter reads the same stream."""
-        # The reasoning's ends, as ReasoningSplitter holds them: the close of
-        # thinking, and where a call may follow and ends the reasoning, the
-        # call's opening, whose whole text a stray tag's does not complete.
-        ends = [THINK_END]
-        if tool_calls and chat_format.calls_end_reasoning:
-            ends.append(chat_format.call_syntax.call_open)
-        stream = DecodeStream(skip_special_tokens=True)
-        text = ""
-        lengths = []
-        opened_at = 0 if thinking else None
-        for index, token in enumerate(self.token_ids):
-            try:
-                piece = stream.step(self.backend, token)
-            except Exception:
-                piece = ""
-            text += piece or ""
-            lengths.append(len(text))
-            if opened_at is None:
-                if THINK_START in text:
-                    # The model opened its reasoning: the tokens that spelled
-                    # the opener count with what came before it, none of it
-                    # reasoning.
-                    opened_at = index + 1
-                    text = text[text.index(THINK_START) + len(THINK_START) :]
-                    lengths[-1] = len(text)
-                elif len(text) < len(THINK_START) and THINK_START.startswith(text):
-                    continue
-                else:
-                    return 0
-        # The reasoning's end: the earliest marker the text holds, at the
-        # marker's start, so the tokens that spell it count with what
-        # follows it.
-        if opened_at is None:
-            # The opener never completed: no reasoning, as the splitter reads it.
-            return 0
-        boundary = min(
-            (text.index(marker) for marker in ends if marker in text),
-            default=len(text),
-        )
-        return sum(1 for length in lengths[opened_at:] if 0 <= length <= boundary)
 
     def _opens_call(self, index, call_open):
         """Whether the text from the call-open token at `index` on begins
@@ -852,11 +784,6 @@ class NativeBackend:
         if job.thinking_token_budget is None:
             return None
         chat_format = job.chat_format
-        if chat_format.tags_are_text:
-            # The engine cuts thinking at a token; the family's close is
-            # text, which the engine cannot see. The reasoning runs to the
-            # model's own close, and the budget's tokens still count.
-            return None
         return wire.ThinkingBudget(
             job.thinking_token_budget,
             self.thinking_end or (chat_format.think_end_id,),

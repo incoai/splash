@@ -868,8 +868,11 @@ public:
   // state holds, such as Qwen's draft rings).
   [[nodiscard]] virtual std::optional<uint32_t> statesToActivate() const noexcept { return 0; }
   // The draft ring's slots the served model's draft keeps (its compiled
-  // variant's window), which its context plans and length checks read.
-  [[nodiscard]] virtual uint32_t draftWindow() const noexcept { return 0; }
+  // variant's window), which its context plans and length checks read. A
+  // model that does not state its ring keeps the shipped drafts'.
+  [[nodiscard]] virtual uint32_t draftWindow() const noexcept {
+    return SPLASH_DRAFT_SLIDING_WINDOW;
+  }
   // The bytes releaseIdleBuffer(keepLane), called until it gives none,
   // releases once the cache has let go of `evictedStates` more cached states,
   // whose buffers return to the pool: the pooled buffers, beyond those one

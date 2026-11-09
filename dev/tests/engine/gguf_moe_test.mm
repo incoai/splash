@@ -303,7 +303,7 @@ QuantizedSegment gatheredValues(MetalBackend &backend, Fmt f, uint32_t N, uint32
   const MetalBuffer values = backend.allocateBuffer(uint64_t{N} * K * 4, BufferStorage::Shared, "gguf-floats");
   CommandGraph graph;
   graph.add(std::string("gguf_embed_f32_") + kQuantFormats[f].name, {idBuffer, rows, values},
-            GgufEmbedParams{N, N, K}, {(N * K + 255) / 256, 1, 1}, {256, 1, 1});
+            GgufEmbedParams{N, N, K, 1.0F}, {(N * K + 255) / 256, 1, 1}, {256, 1, 1});
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   return QuantizedSegment::floats(N, K, values);
 }

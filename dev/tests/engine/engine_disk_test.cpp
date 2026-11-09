@@ -51,7 +51,7 @@ void testStateWithoutACacheSlotGoesToDisk() {
   executor.stateTier = std::make_shared<OffloadControl>();
   executor.decodeFinishes = false;
   Events events;
-  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  engine::Engine engine(test::engineConfig({.prefillCheckpointTokens = kPrefillCheckpointTokens}), cache, executor, events);
   guardReleases(storage, engine);
   const std::vector<uint32_t> first(65, 1);
   auto decoding = request(1, first);
@@ -204,7 +204,7 @@ void testFailedFinalStateKeepsTheDiskCheckpoint() {
     executor.stateTier->ready = true;
     executor.restoreControl->promotionDenied = true;
     Events events;
-    engine::Engine engine(test::engineConfig(), cache, executor, events);
+    engine::Engine engine(test::engineConfig({.prefillCheckpointTokens = kPrefillCheckpointTokens}), cache, executor, events);
     guardReleases(storage, engine);
     const std::vector<uint32_t> prompt(2 * kPrefillCheckpointTokens + 1, 65);
     EngineRequest decoding = request(610, prompt);
@@ -267,7 +267,7 @@ void testDiskCheckpointStaysUntilItsSuccessorIsPublished() {
   executor.stateTier->ready = true;
   executor.restoreControl->promotionDenied = true;
   Events events;
-  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  engine::Engine engine(test::engineConfig({.prefillCheckpointTokens = kPrefillCheckpointTokens}), cache, executor, events);
   guardReleases(storage, engine);
   // Checkpoints at 4096 and 8192, the replay point at 12288.
   const std::vector<uint32_t> prompt(3 * kPrefillCheckpointTokens + 1, 67);
@@ -321,7 +321,7 @@ void testNoCheckpointWithinAChunkOfTheReplayBoundary() {
       executor.stateTier = std::make_shared<OffloadControl>();
       executor.stateTier->ready = true;
       Events events;
-      engine::Engine engine(test::engineConfig(), cache, executor, events);
+      engine::Engine engine(test::engineConfig({.prefillCheckpointTokens = kPrefillCheckpointTokens}), cache, executor, events);
       guardReleases(storage, engine);
       const std::vector<uint32_t> prompt(kPrefillCheckpointTokens + remaining + 1, 71);
       engine.submit(request(1, prompt));
@@ -362,7 +362,7 @@ void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
     executor.restoreControl->ready = true;
     executor.restoreControl->promotionDenied = disk;
     Events events;
-    engine::Engine engine(test::engineConfig(), cache, executor, events);
+    engine::Engine engine(test::engineConfig({.prefillCheckpointTokens = kPrefillCheckpointTokens}), cache, executor, events);
     guardReleases(storage, engine);
     const std::vector<uint32_t> prompt(2 * kPrefillCheckpointTokens + 33, 73);
     engine.submit(request(1, prompt));

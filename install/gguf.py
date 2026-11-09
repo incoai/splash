@@ -592,26 +592,6 @@ def require_quantized(headers):
             "quantized variant of the repository"
         )
 
-# Ripple (ricursive): four norms a block, its gate beside its queries, its
-# value-residual lambda, and a dense FFN of a whole width.
-RIPPLE_LAYER_TENSORS = {
-    "attn_norm.weight": NORM_TYPES,
-    "post_attention_norm.weight": NORM_TYPES,
-    "ffn_norm.weight": NORM_TYPES,
-    "post_ffw_norm.weight": NORM_TYPES,
-    "attn_vres_lambda.weight": F32,
-}
-RIPPLE_ATTENTION_TENSORS = {
-    "attn_q.weight": FORMAT_TYPES,
-    "attn_gate.weight": FORMAT_TYPES,
-    "attn_k.weight": FORMAT_TYPES,
-    "attn_v.weight": FORMAT_TYPES,
-    "attn_q_norm.weight": NORM_TYPES,
-    "attn_k_norm.weight": NORM_TYPES,
-    "attn_output.weight": FORMAT_TYPES,
-}
-
-
 def ripple_text_config(metadata, arch):
     """What Ripple's config.json states beyond the sizes every architecture's
     does, from its header: the FFN's width, the sliding window, the scale of
@@ -668,11 +648,7 @@ ARCHITECTURES = {
     ),
     "ricursive": Architecture(
         "ricursive",
-        MODEL_TENSORS,
-        RIPPLE_LAYER_TENSORS,
         moe=False,
-        attention_tensors=RIPPLE_ATTENTION_TENSORS,
-        hybrid=False,
         text_config=ripple_text_config,
         flat=True,
     ),
