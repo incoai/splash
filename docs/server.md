@@ -360,6 +360,10 @@ past the runtime reserves. Only a `Spill` lane's, the one whose KV goes there,
 says why its KV gave no more memory back: the SSD cache took no more of it,
 where its writes stopped for the quota, the write budget or a closed cache, or
 otherwise the request does not fit even with its KV released down to its floor.
+A request refused at its start because neither memory nor the [SSD
+cache](#kv-on-the-ssd) holds it names its lane, tokens and
+`device_untracked_bytes` the same way, with what its least start needs
+(`memory_needed_bytes`) and what memory has for it (`memory_available_bytes`).
 
 ### PLE table streaming
 
@@ -837,10 +841,18 @@ what memory holds, as a dense target's is.
   KV now: beside other requests in service, with what a start may take, as
   above; alone, with what a request in service may take, the buffers the
   next request starts from among it. Where memory does not hold it, it waits
-  for the other requests in service; alone, it takes the SSD cache's bound
-  on its output or waits for its quota as a spilling request does, and is
-  otherwise refused at its start, naming what memory and the SSD cache have
-  for it, rather than fail partway through its prefill.
+  for the other requests in service, and makes one of a lower priority yield
+  only while all of them are of a lower priority. Alone, where memory holds
+  its prompt,
+  it keeps its KV in memory with its output bounded to what memory holds, as
+  the SSD cache bounds a spilling request's, and ends at that bound; where
+  memory does not, it takes the SSD cache's bound on its output or waits for
+  its quota as a spilling request does, and is otherwise refused at its
+  start rather than fail partway through its prefill. The refusal names what
+  the SSD cache has for it and, as `capacity_exhausted` does, the request's
+  lane and tokens and `device_untracked_bytes`, with the memory its prompt
+  needs (`memory_needed_bytes`) and what memory has for it
+  (`memory_available_bytes`).
 - A request in memory whose KV cannot grow, in decode or in prefill, spills
   from then on rather than yield its lane or fail, where that covers what it
   lacks: what spilling the pages only it holds frees, past its first 2,048
@@ -853,7 +865,8 @@ what memory holds, as a dense target's is.
   shortage of the host's makes a request spill. When other memory is short,
   a state, a spilling request's reads, or the host's, what can go goes in a
   fixed order: a cached prefix, the caches the model rebuilds, the pages of
-  spilling requests (below; for the host only under critical pressure),
+  spilling requests (below; for the host only under macOS's warning or
+  critical pressure),
   then, for a request in service, a chunk of the store above its floor, of
   which a target that can spill has none.
 - A spilling request writes each committed page once to the SSD cache and
@@ -862,8 +875,9 @@ what memory holds, as a dense target's is.
   landed gives its memory back, the oldest first, and keeps only its index,
   24 KiB of the int8 page's 414 KiB: as much as a request lacks, in whole
   extents, for the request's own growth or reads, for a request in service or
-  a start of its priority or a higher one, and under macOS's critical pressure
-  for the host, which takes every request's. Where every request holding them
+  a start of its priority or a higher one, and under macOS's warning or
+  critical pressure for the host, which takes every request's, the lowest
+  priority's first. Where every request holding them
   reads pages back already, a request's growth, one the host refuses among
   them, first takes the pages it lacks in place. Where those would leave too
   few index pages free for the next, an extent more gives its memory back
@@ -924,19 +938,21 @@ what memory holds, as a dense target's is.
   `model_context_window_exceeded`. A request that cannot spill, the cache
   short of room, its file closed or its write budget spent, keeps its KV in
   memory where it fits the context memory holds of one request
-  (`context_bounds.resident`) and memory holds it now (above). Past what it
-  committed, as when its output outgrows the 4,096 tokens admission
-  counted, a request commits each page's slot as it writes it, while the
-  room lasts; its pages stay in memory beyond it, and the other requests'
-  committed pages are still written.
+  (`context_bounds.resident`) and memory holds it now, or alone its prompt
+  under memory's bound (above). Past what it committed, as when its output
+  outgrows the 4,096 tokens admission counted, a request commits each
+  page's slot as it writes it, while the room lasts; its pages stay in
+  memory beyond it, and the other requests' committed pages are still
+  written.
 - The KV a spilling request writes is in use and always written, so one long
   request may overdraw `--max-cache-disk-writes` once. Until the budget
   covers what spilling requests were promised, a new request that would
   spill keeps its KV in memory where it fits the context memory holds of
-  one request and memory holds it now (above), waits for the other requests
-  in service where memory does not hold it beside them, and is refused
-  otherwise (`kv_write_budget`, 503 with a `Retry-After` of the seconds
-  until the budget covers them again as it refills).
+  one request and memory holds it now, or alone its prompt under memory's
+  bound (above), waits for the other requests in service where memory does
+  not hold it beside them, and is refused otherwise (`kv_write_budget`, 503
+  with a `Retry-After` of the seconds until the budget covers them again as
+  it refills).
 - A block that cannot be read back fails only the requests that read it, as
   `kv_unreadable`, which they may retry; the copy is dropped.
 

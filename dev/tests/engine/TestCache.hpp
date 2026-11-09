@@ -54,7 +54,11 @@ inline std::vector<uint64_t> indexBlocks(engine::Cache &cache, uint64_t requestI
 // no lane in service (MemoryLedger::free).
 inline engine::VictimQuery query(const engine::ClaimSpec &spec, const engine::Need &need, bool critical = false,
                                  const engine::RestoredChains *kept = nullptr) {
-  return {.rights = engine::takeRights(spec, need, critical, std::nullopt), .need = need, .kept = kept};
+  return {.rights = engine::takeRights(spec, need,
+                                       critical ? engine::MemoryPressure::Critical : engine::MemoryPressure::Normal,
+                                       std::nullopt),
+          .need = need,
+          .kept = kept};
 }
 
 // What the ledger takes of the cache for a claim of `spec` that lacks
@@ -76,7 +80,7 @@ inline engine::FreeResult freeFromCache(engine::Cache &cache, const engine::Clai
   ledger.setReturning([&cache] { return cache.returning(); },
                       [&cache](std::span<const uint64_t> requestIds) { return cache.returningFor(requestIds); });
   const engine::ClaimId claim = ledger.open(spec);
-  const engine::FreeResult result = ledger.free(claim, need, 0, false);
+  const engine::FreeResult result = ledger.free(claim, need, 0, engine::MemoryPressure::Normal);
   ledger.close(claim);
   return result;
 }

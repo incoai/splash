@@ -300,7 +300,7 @@ class RequestFailureTests(HarnessTestCase):
             "POST", "/v1/chat/completions", chat_body()
         )
         error = json.loads(payload)["error"]
-        # Retrying fails the same way, and memory is not what it lacks.
+        # Retrying fails the same way while memory and the quota stay as they are.
         self.assertEqual(status, 400)
         self.assertEqual(error["code"], "kv_disk_quota")
         self.assertEqual(error["message"], native)

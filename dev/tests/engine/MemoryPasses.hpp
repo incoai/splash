@@ -19,12 +19,12 @@ inline engine::FreeResult hostPass(engine::MemoryGovernor &governor,
                                    uint64_t bytes = std::numeric_limits<uint64_t>::max(), bool critical = false) {
   engine::MemoryLedger &ledger = governor.ledger();
   const engine::ClaimSpec spec{.cls = engine::ClaimClass::Host};
-  const uint64_t found = ledger.available(spec, {.bytes = bytes}, 0, critical);
+  const uint64_t found = ledger.available(spec, {.bytes = bytes}, 0, critical ? engine::MemoryPressure::Critical : engine::MemoryPressure::Normal);
   const engine::ClaimId claim = ledger.open(spec);
   engine::FreeResult result;
   {
     const engine::MemoryGovernor::Scope scope(governor, claim);
-    result = ledger.free(claim, {.bytes = std::min(bytes, found)}, 0, critical);
+    result = ledger.free(claim, {.bytes = std::min(bytes, found)}, 0, critical ? engine::MemoryPressure::Critical : engine::MemoryPressure::Normal);
   }
   ledger.close(claim);
   return result;

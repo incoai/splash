@@ -91,11 +91,13 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, Refusal refusal)
     claim.id = ledger.open(spec);
   }
   ledger.setLanes(laneDemandBytes(), highestLanePriority());
-  // Each attempt runs in the claim's scope, from a need the scope's refusal
-  // records afresh; what a waiting claim holds stays held.
+  // The allocation runs in the claim's one scope, so what an attempt's work
+  // released pays for the later attempts' allocations too (fund); each
+  // attempt starts from a need the scope's refusal records afresh, and what
+  // a waiting claim holds stays held.
+  const MemoryGovernor::Scope scope(governor, claim.id);
   const auto tryOnce = [&] {
     ledger.refused(claim.id, {});
-    const MemoryGovernor::Scope scope(governor, claim.id);
     return attempt();
   };
   Allocation<Admission> result{tryOnce(), {}};

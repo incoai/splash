@@ -84,18 +84,18 @@ KvMode Engine::placement(const Request &active) const {
   // only their rebuild and the releases of Spill lanes of its priority or a
   // lower one (TakeRights::lanes), never the expert store, whose chunks a
   // Spill lane leaves in place.
-  return residentRoom(active, claimFor(active, ClaimClass::Start)).holds() ? KvMode::Resident : KvMode::Spill;
+  return residentRoom(active, claimFor(active, ClaimClass::Start), tokens).holds() ? KvMode::Resident
+                                                                                   : KvMode::Spill;
 }
 
-Engine::ResidentRoom Engine::residentRoom(const Request &active, const ClaimSpec &spec) const {
-  const uint64_t tokens = projectedTokens(active);
+Engine::ResidentRoom Engine::residentRoom(const Request &active, const ClaimSpec &spec, uint64_t tokens) const {
   const auto pages = static_cast<uint32_t>((tokens + KvCache::pageTokens - 1) / KvCache::pageTokens);
-  // Its projection's pages less the restored chain's pages in memory, which
-  // its start takes in place; the claim keeps that chain for the start to
-  // reuse. Counted as the claims take it: its and the Resident lanes' KV
-  // from the free pages the walk keeps, then in whole extents, plus what its
-  // lane and the state it captures allocate, with what the claim frees
-  // counted against the pool they leave.
+  // Its pages less the restored chain's pages in memory, which its start
+  // takes in place; the claim keeps that chain for the start to reuse.
+  // Counted as the claims take it: its and the Resident lanes' KV from the
+  // free pages the walk keeps, then in whole extents, plus what its lane and
+  // the state it captures allocate, with what the claim frees counted
+  // against the pool they leave.
   RestoredChains own;
   uint32_t held = 0;
   if (active.admissionProbe && !active.skipCache) {
@@ -104,9 +104,18 @@ Engine::ResidentRoom Engine::residentRoom(const Request &active, const ClaimSpec
   }
   const LaneDemand lanes = laneDemand();
   Need need = cache_.growthNeed(pages - std::min(pages, held) + lanes.residentPages);
-  need.bytes += model_.startStateBytes() + lanes.bytes;
+  const uint64_t beside = model_.startStateBytes() + lanes.bytes;
+  need.bytes += beside;
   need.afterStart = true;
-  return {.needed = need.bytes, .available = governor().available(spec, need, &own)};
+  const uint64_t available = governor().available(spec, need, &own);
+  // Short of the need, what is there holds the restored chain's pages and
+  // those the rest allocates past its state and the lanes' growth.
+  uint64_t heldPages = 0;
+  if (available >= beside) {
+    const uint64_t allocated = cache_.growthPages(available - beside);
+    heldPages = held + allocated - std::min<uint64_t>(allocated, lanes.residentPages);
+  }
+  return {.needed = need.bytes, .available = available, .heldTokens = heldPages * KvCache::pageTokens};
 }
 
 void Engine::placeCandidates(std::span<const PrefillAdmission> candidates) {
@@ -289,30 +298,40 @@ uint32_t Engine::spillPages(const Request &active, uint32_t copied) const {
 Engine::InMemory Engine::inMemory(const Request &active, const ClaimSpec &spec) const {
   if (!fitsResidentAlone(active))
     return {};
-  const ResidentRoom room = residentRoom(active, spec);
+  const ResidentRoom room = residentRoom(active, spec, projectedTokens(active));
   if (room.holds())
-    return {.admission = SpillAdmission::Resident, .room = room};
+    return {.admission = SpillAdmission::Resident};
   if (spec.cls == ClaimClass::Start)
-    return {.admission = SpillAdmission::Waiting, .room = room};
-  return {.room = room};
-}
-
-std::string Engine::InMemory::detail() const {
-  return room ? "; in memory it needs resident_bytes=" + std::to_string(room->needed) +
-                    ", where memory_bytes=" + std::to_string(room->available) + " are there for it now"
-              : std::string();
+    return {.admission = SpillAdmission::Waiting};
+  // Alone, the KV memory holds bounds its output where it holds a token past
+  // the prompt and the rows past it that the decode step verifies
+  // (workEndOf): a lane of T tokens takes the KV of T + 7 at its last step.
+  const uint64_t rows = model::ExecutionLimits::targetVerifyRows - 1;
+  if (room.heldTokens > active.exactTokens.size() + rows)
+    return {.admission = SpillAdmission::Resident, .tokens = room.heldTokens - rows};
+  return {.room = residentRoom(active, spec, active.exactTokens.size() + rows + 1)};
 }
 
 Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64_t chainEnd, const ClaimSpec &spec,
                                           double now) {
   const SpillGeometry &geometry = config_.spill.geometry;
-  // It goes on as memory says: Resident, or waiting for the lanes in service.
-  const auto goInMemory = [&](SpillAdmission admission) {
-    if (admission == SpillAdmission::Resident)
+  // It goes on as memory says: Resident, under memory's bound where memory
+  // sets one, or waiting for the lanes in service.
+  const auto goInMemory = [&](const InMemory &memory) {
+    if (*memory.admission == SpillAdmission::Waiting) {
+      waitForMemory(active, now, {.projection = true});
+    } else {
       active.kvMode = KvMode::Resident;
-    else
-      waitForMemory(active, now, {});
-    return admission;
+      if (memory.tokens)
+        active.outputLimit = static_cast<uint32_t>(
+            std::min<uint64_t>(active.outputLimit, *memory.tokens - active.promptTokens));
+    }
+    return *memory.admission;
+  };
+  // A start refused names what memory does not hold of it, where memory was
+  // asked.
+  const auto shortfall = [&](const InMemory &memory) {
+    return memory.room ? "; " + memoryShortfall(active, memory.room) : std::string();
   };
   // A resume goes on spilling whatever the tier and the write budget: its
   // writes are in use, and pages a closed tier does not take stay Full.
@@ -320,7 +339,7 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
     if (const SpillGate gate = cache_.spillGate(); gate != SpillGate::Open) {
       const InMemory memory = inMemory(active, spec);
       if (memory.admission)
-        return goInMemory(*memory.admission);
+        return goInMemory(memory);
       const std::string reason = "requests past " + std::to_string(geometry.residentTokens) +
                                  " tokens keep their KV on the SSD cache, ";
       if (gate == SpillGate::WriteBudget) {
@@ -329,11 +348,11 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
         // what Spill requests committed, or sooner as they end.
         const double admitted = cache_.spillWritesAdmittedAt().value_or(now);
         settle(active, {LaneOutcome::KvWriteBudget,
-                        reason + "whose daily write budget (--max-cache-disk-writes) is spent" + memory.detail(),
+                        reason + "whose daily write budget (--max-cache-disk-writes) is spent" + shortfall(memory),
                         static_cast<uint32_t>(std::lround(std::max(0.0, admitted - now) / 1000.0))});
       } else {
         ++counters_.spill.refusedClosed;
-        settle(active, {LaneOutcome::CapacityExhausted, reason + "which takes no writes" + memory.detail()});
+        settle(active, {LaneOutcome::CapacityExhausted, reason + "which takes no writes" + shortfall(memory)});
       }
       return SpillAdmission::Settled;
     }
@@ -351,7 +370,7 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
   if (!resuming && !config_.spill.always) {
     memory = inMemory(active, spec);
     if (memory.admission)
-      return goInMemory(*memory.admission);
+      return goInMemory(memory);
   }
   // Otherwise the quota bounds its output to the pages it holds, if they
   // hold a token past the request's tokens; pages of the restored chain
@@ -385,7 +404,7 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
                         std::to_string(needed * geometry.slotBytes) +
                         " of the SSD cache, which may hold active_limit_bytes=" +
                         std::to_string(activeLimitBytes) +
-                        " of active KV now (--max-cache-disk and the volume's free space)" + memory.detail()});
+                        " of active KV now (--max-cache-disk and the volume's free space)" + shortfall(memory)});
   }
   return SpillAdmission::Settled;
 }
@@ -400,7 +419,9 @@ void Engine::waitForMemory(Request &active, double now, const Denial &denial) {
   active.refusedResources = true;
   scheduler_.waitForResources(active.request.id);
   deferResourceRetry(active, now, denial);
-  if (!scheduler_.suspended(active.request.id) && !denial.pending)
+  const std::optional<RequestPriority> highest = highestLanePriority();
+  if (!scheduler_.suspended(active.request.id) && !denial.pending &&
+      (!denial.projection || (highest && *highest > active.request.priority)))
     static_cast<void>(preemptBelow(active.request.priority, now));
 }
 
@@ -454,7 +475,8 @@ void Engine::spillLanded(bool controlPass) {
   // The Index runway the pages draw on refills if memory allows. Index
   // pages, the runway's included, are memory the resident Spill lanes need,
   // like their Full pages, and a fraction of what the moves free, which
-  // pays for them past the host (MemoryGovernor::fund): with no such lane
+  // pays for them past the engine's limit and the host
+  // (MemoryGovernor::fund): with no such lane
   // in service they take only what costs nothing; with one, they are the
   // highest-ranked such lane's, at its priority, since the room its waiting
   // claim holds is the room its released pages move into.

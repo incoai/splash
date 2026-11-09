@@ -241,7 +241,7 @@ void waitForItsCopies(MemoryLedger &ledger, ClaimId claim, const Need &need) {
   ledger.setReturning([] { return Returning{}; }, [=](std::span<const uint64_t> lanes) {
     return std::ranges::find(lanes, id) != lanes.end() ? own : Returning{};
   });
-  require(ledger.free(claim, need, 0, false).outcome == FreeOutcome::Pending && ledger.claim(claim).waiting,
+  require(ledger.free(claim, need, 0, MemoryPressure::Normal).outcome == FreeOutcome::Pending && ledger.claim(claim).waiting,
           "a claim its lane's owed copies cover did not wait");
 }
 
@@ -314,7 +314,7 @@ void testSnapshotRendersEveryAccount() {
                       [](std::span<const uint64_t>) { return Returning{}; });
   ledger.setNow(10.0);
   const ClaimId waiting = ledger.open(request(7, RequestPriority::Normal));
-  require(ledger.free(waiting, {.bytes = 2 * kMiB}, 0, false).outcome == FreeOutcome::Pending,
+  require(ledger.free(waiting, {.bytes = 2 * kMiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Pending,
           "a claim the landings cover did not wait");
   ledger.setNow(14.0);
   const MemoryGovernorSnapshot snapshot = fixture.governor->snapshot();
@@ -448,7 +448,7 @@ void testWaitingBytesHoldPagesOfEachForm() {
   const ClaimId same = ledger.open(request(5, RequestPriority::Normal));
   const ClaimId above = ledger.open(request(6, RequestPriority::Foreground));
   const ClaimId below = ledger.open(request(7, RequestPriority::Background));
-  require(ledger.free(shortClaim, {.bytes = 20'000}, 0, false).outcome == FreeOutcome::Short,
+  require(ledger.free(shortClaim, {.bytes = 20'000}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Short,
           "a claim nothing covers did not find free() short");
   waitForItsCopies(ledger, waiting, {.bytes = 10'000});
   require(ledger.heldPages(below, 0) == std::array<uint32_t, 3>{3, 0, 4},
@@ -469,13 +469,13 @@ void testAMetNeedKeepsTheWaitAShortOneEndsIt() {
   const ClaimId waiting = ledger.open(request(1, RequestPriority::Foreground));
   const ClaimId below = ledger.open(request(2, RequestPriority::Background));
   waitForItsCopies(ledger, waiting, {.bytes = kGiB});
-  require(ledger.free(waiting, {.pages = 4}, 0, false).outcome == FreeOutcome::Met &&
+  require(ledger.free(waiting, {.pages = 4}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Met &&
               cache.taken == std::vector<uint64_t>{1},
           "the leaf did not meet the claim's need of pages");
   require(ledger.claim(waiting).waiting && ledger.claim(waiting).need.bytes == kGiB &&
               ledger.heldBytes(below) == kGiB,
           "a claim whose free() for another need was met stopped waiting for its copies");
-  require(ledger.free(waiting, {.bytes = 2 * kGiB}, 0, false).outcome == FreeOutcome::Short &&
+  require(ledger.free(waiting, {.bytes = 2 * kGiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Short &&
               !ledger.claim(waiting).waiting && ledger.heldBytes(below) == 0,
           "a claim free() found short still waits");
 }
@@ -732,7 +732,7 @@ void testSourceOrderIsKeptWithinASource() {
   cache.units = {unit(1, kGiB), unit(2, kGiB)};
   ledger.addSource(cache);
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
-  require(ledger.free(claim, {.bytes = kGiB}, 0, false).outcome == FreeOutcome::Met &&
+  require(ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Met &&
               cache.taken == std::vector<uint64_t>{1},
           "free() skipped ahead inside a source's order");
 }
@@ -773,7 +773,7 @@ void testUnitsKeyedByTheirPlaceAreTakenAsChosen() {
   ClaimSpec spec = request(1, RequestPriority::Normal);
   spec.timing = NeedTiming::Immediate;
   const ClaimId claim = ledger.open(spec);
-  require(ledger.free(claim, {.bytes = 4 * kGiB}, 0, false).outcome == FreeOutcome::Met,
+  require(ledger.free(claim, {.bytes = 4 * kGiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Met,
           "the claim was not met");
   require(placed.taken == std::vector<uint64_t>{1, 3, 4} && other.taken == std::vector<uint64_t>{5} &&
               placed.units.size() == 1 && placed.units.front().first == 2,
@@ -789,7 +789,7 @@ void testTakeRightsTable() {
   using Lanes = TakeRights::Lanes;
   const auto rights = [](const ClaimSpec &spec, const Need &need = {.bytes = kMiB}, bool critical = false,
                          std::optional<RequestPriority> highest = std::nullopt) {
-    return takeRights(spec, need, critical, highest);
+    return takeRights(spec, need, critical ? MemoryPressure::Critical : MemoryPressure::Normal, highest);
   };
   const ClaimSpec everything{.cls = ClaimClass::InService, .requestId = 7, .reach = ReclaimClass::InUse,
                              .supersedes = true, .kvGrowth = true};
@@ -845,6 +845,11 @@ void testTakeRightsTable() {
        {.units = true, .waitsForWrites = true, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::None,
         .reserves = Reserves::None, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
         .convertLane = 0}},
+      {"the host with a deficit under warning pressure",
+       takeRights({.cls = ClaimClass::Host}, {.bytes = kMiB}, MemoryPressure::Warning, std::nullopt),
+       {.units = true, .waitsForWrites = true, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::None,
+        .reserves = Reserves::None, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
+        .convertLane = 0, .lanes = Lanes::All}},
       {"the host at critical pressure", rights({.cls = ClaimClass::Host}, {.bytes = kMiB}, true),
        {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = true, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = false,
@@ -878,10 +883,10 @@ void testAFloorClaimTakesNothing() {
   cache.units = {unit(1, kMiB)};
   ledger.addSource(cache);
   const ClaimSpec floor{.cls = ClaimClass::Floor};
-  test::rejects([&] { static_cast<void>(ledger.available(floor, {.bytes = kMiB}, 0, false)); },
+  test::rejects([&] { static_cast<void>(ledger.available(floor, {.bytes = kMiB}, 0, MemoryPressure::Normal)); },
                 "a Floor claim takes nothing", "available() counted units for a Floor claim");
   const ClaimId claim = ledger.open(floor);
-  test::rejects([&] { static_cast<void>(ledger.free(claim, {.bytes = kMiB}, 0, false)); },
+  test::rejects([&] { static_cast<void>(ledger.free(claim, {.bytes = kMiB}, 0, MemoryPressure::Normal)); },
                 "a Floor claim takes nothing", "free() took units for a Floor claim");
   require(cache.taken.empty(), "a Floor claim took a unit");
 }
@@ -901,7 +906,7 @@ void testThePoolsAndWritesEachClaimTakes() {
   ledger.addPool(pool);
   ledger.addPool(rebuilt);
   const auto counted = [&](ClaimSpec spec, bool critical = false, bool hostRefused = false) {
-    return ledger.available(spec, {.bytes = kGiB, .hostRefused = hostRefused}, 0, critical) / kMiB;
+    return ledger.available(spec, {.bytes = kGiB, .hostRefused = hostRefused}, 0, critical ? MemoryPressure::Critical : MemoryPressure::Normal) / kMiB;
   };
   // 1 cache that frees now, 2 cache that needs a write, 32 a store unit, 64
   // a unit that costs only its rebuild.
@@ -946,7 +951,7 @@ void testAHostRefusedNeedTakesOnlyWhatFreesNow() {
     spec.reach = ReclaimClass::InUse;
     spec.supersedes = true;
     const ClaimId claim = ledger.open(spec);
-    const FreeOutcome outcome = ledger.free(claim, {.hostRefused = true, .pages = pages}, 0, false).outcome;
+    const FreeOutcome outcome = ledger.free(claim, {.hostRefused = true, .pages = pages}, 0, MemoryPressure::Normal).outcome;
     if (pages == 1)
       require(outcome == FreeOutcome::Met && cache.taken == std::vector<uint64_t>{1} && engine.taken.empty(),
               "a host-refused need took more than what frees now");
@@ -966,7 +971,7 @@ void testRoomHeldForHigherRanksMakesAWait() {
   const ClaimId high = ledger.open(request(1, RequestPriority::Foreground));
   waitForItsCopies(ledger, high, {.bytes = kGiB});
   const ClaimId low = ledger.open(request(2, RequestPriority::Background));
-  require(ledger.free(low, {.bytes = 512 * kMiB}, kGiB, false).outcome == FreeOutcome::Pending &&
+  require(ledger.free(low, {.bytes = 512 * kMiB}, kGiB, MemoryPressure::Normal).outcome == FreeOutcome::Pending &&
               cache.taken.empty(),
           "a claim the room held above it fits took a victim instead of waiting");
 }
@@ -981,19 +986,19 @@ void testUnitsHeldForHigherRanksMakeAWait() {
   const ClaimId high = ledger.open(request(1, RequestPriority::Foreground));
   waitForItsCopies(ledger, high, {.bytes = kGiB});
   const ClaimId low = ledger.open(request(2, RequestPriority::Normal));
-  const FreeOutcome outcome = ledger.free(low, {.bytes = kGiB}, 0, false).outcome;
+  const FreeOutcome outcome = ledger.free(low, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome;
   require(outcome == FreeOutcome::Pending && cache.taken.empty() && ledger.claim(low).waiting,
           std::string("a claim the cache meets but for the room a waiting claim ranked above it holds found free() ") +
               (outcome == FreeOutcome::Short ? "short" : outcome == FreeOutcome::Met ? "met" : "pending") +
               ", " + std::to_string(cache.taken.size()) + " units taken");
   const ClaimId larger = ledger.open(request(4, RequestPriority::Background));
-  require(ledger.free(larger, {.bytes = 2 * kGiB}, 0, false).outcome == FreeOutcome::Short &&
+  require(ledger.free(larger, {.bytes = 2 * kGiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Short &&
               cache.taken.empty() && !ledger.claim(larger).waiting,
           "a claim the cache does not meet without the room held above it either waited for that room");
   ClaimSpec spec = request(3, RequestPriority::Normal);
   spec.timing = NeedTiming::Immediate;
   const ClaimId now = ledger.open(spec);
-  require(ledger.free(now, {.bytes = kGiB}, 0, false).outcome == FreeOutcome::Short && cache.taken.empty(),
+  require(ledger.free(now, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Short && cache.taken.empty(),
           "an Immediate claim waited behind the room held above it");
 }
 
@@ -1007,16 +1012,16 @@ void testLandingThenVictimsThenOwed() {
   ledger.setReturning([] { return Returning{.landingBytes = 256 * kMiB, .owedBytes = 4 * kGiB}; },
                       [](std::span<const uint64_t>) { return Returning{}; });
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
-  require(ledger.free(claim, {.bytes = kGiB}, 0, false).outcome == FreeOutcome::Met &&
+  require(ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Met &&
               cache.taken == std::vector<uint64_t>{1},
           "the claim waited on owed copies before it took a victim");
-  require(ledger.free(claim, {.bytes = kGiB}, 0, false).outcome == FreeOutcome::Pending &&
+  require(ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Pending &&
               ledger.claim(claim).waiting,
           "with no victim left the claim did not wait for the owed copies");
   ledger.setReturning([] { return Returning{.landingBytes = 2 * kGiB}; },
                       [](std::span<const uint64_t>) { return Returning{}; });
   cache.units = {unit(2, kGiB)};
-  require(ledger.free(claim, {.bytes = kGiB}, 0, false).outcome == FreeOutcome::Pending && cache.taken.size() == 1,
+  require(ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Pending && cache.taken.size() == 1,
           "landings that meet the need did not come first");
 }
 
@@ -1029,10 +1034,10 @@ void testImmediateSkipsLandings() {
   ledger.setReturning([] { return Returning{.landingBytes = 4 * kGiB}; },
                       [](std::span<const uint64_t>) { return Returning{}; });
   const ClaimId claim = ledger.open({.cls = ClaimClass::Optional, .requestId = 1, .timing = NeedTiming::Immediate});
-  require(ledger.free(claim, {.bytes = kGiB}, 0, false).outcome == FreeOutcome::Met &&
+  require(ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Met &&
               cache.taken == std::vector<uint64_t>{2},
           "an Immediate claim waited or took a unit that lands later");
-  require(ledger.free(claim, {.bytes = kGiB}, 0, false).outcome == FreeOutcome::Short,
+  require(ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Short,
           "an Immediate claim waited for landings");
 }
 
@@ -1052,7 +1057,7 @@ void testImmediateTakesAWriteThatFreesNowAfterRebuiltPools() {
   ledger.addPool(vision);
   const auto lacks = [&](uint64_t bytes) {
     const ClaimId claim = ledger.open({.cls = ClaimClass::Optional, .requestId = 1, .timing = NeedTiming::Immediate});
-    const FreeOutcome outcome = ledger.free(claim, {.bytes = bytes}, 0, false).outcome;
+    const FreeOutcome outcome = ledger.free(claim, {.bytes = bytes}, 0, MemoryPressure::Normal).outcome;
     ledger.close(claim);
     return outcome;
   };
@@ -1092,7 +1097,7 @@ void testLandingCountsBeforeVictimsInPart() {
     ClaimSpec spec = request(1, RequestPriority::Normal);
     spec.timing = each.timing;
     const ClaimId claim = ledger.open(spec);
-    require(ledger.free(claim, {.bytes = kGiB}, 0, false).outcome == each.outcome && cache.taken == each.taken &&
+    require(ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome == each.outcome && cache.taken == each.taken &&
                 ledger.claim(claim).waiting == (each.outcome == FreeOutcome::Pending),
             "the claim took victims for what lands, or did not wait for it after taking the rest");
   }
@@ -1105,13 +1110,13 @@ void testLandingCountsBeforeVictimsInPart() {
                         [](std::span<const uint64_t>) { return Returning{}; });
     if (heldAbove) {
       const ClaimId high = ledger.open(request(2, RequestPriority::Foreground));
-      require(ledger.free(high, {.pages = 2}, 0, false).outcome == FreeOutcome::Pending,
+      require(ledger.free(high, {.pages = 2}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Pending,
               "the claim above did not wait for the pages that land");
     }
     for (uint64_t key : {1, 2})
       cache.units.push_back({.key = key, .pages = 2});
     const ClaimId claim = ledger.open(request(3, RequestPriority::Background));
-    const FreeOutcome outcome = ledger.free(claim, {.pages = 4}, 0, false).outcome;
+    const FreeOutcome outcome = ledger.free(claim, {.pages = 4}, 0, MemoryPressure::Normal).outcome;
     require(heldAbove ? outcome == FreeOutcome::Met && cache.taken == std::vector<uint64_t>{1, 2}
                       : outcome == FreeOutcome::Pending && cache.taken == std::vector<uint64_t>{1},
             "the pages that land were not counted before victims, or counted although held above");
@@ -1128,12 +1133,12 @@ void testLandingCountsBeforeVictimsInPart() {
       return std::ranges::find(lanes, 2) != lanes.end() ? Returning{.owedBytes = 8192} : Returning{};
     });
     const ClaimId high = ledger.open(request(2, RequestPriority::Foreground));
-    require(ledger.free(high, {.bytes = 8192}, 0, false).outcome == FreeOutcome::Pending,
+    require(ledger.free(high, {.bytes = 8192}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Pending,
             "the claim above did not wait for its copies");
     for (uint64_t key : {1, 2})
       cache.units.push_back({.key = key, .pages = 2});
     const ClaimId claim = ledger.open(request(3, RequestPriority::Background));
-    require(ledger.free(claim, {.pages = 4}, 8192, false).outcome == FreeOutcome::Pending &&
+    require(ledger.free(claim, {.pages = 4}, 8192, MemoryPressure::Normal).outcome == FreeOutcome::Pending &&
                 cache.taken == std::vector<uint64_t>{1},
             "the bytes a claim above waits for, which the room covers, were held as landing pages too");
   }
@@ -1218,7 +1223,7 @@ void testStateBuffersCountBeyondThoseThePoolKeeps() {
   ledger.addSource(pool);
   ledger.setBufferBytes([&pool](uint32_t states, bool, bool) { return pool.releases(states); });
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
-  const FreeResult freed = ledger.free(claim, {.bytes = 2 * kGiB}, 0, false);
+  const FreeResult freed = ledger.free(claim, {.bytes = 2 * kGiB}, 0, MemoryPressure::Normal);
   require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 2 * kGiB &&
               cache.taken == std::vector<uint64_t>{1, 2, 3} && pool.idle == 1,
           "free() did not count the bytes of the state buffers the model's pool releases, once: " +
@@ -1259,7 +1264,7 @@ void testTheBuffersALaneStartsFromGoLast() {
     ledger.addSource(cache);
     ledger.addSource(pool);
     ledger.setBufferBytes([&pool](uint32_t states, bool, bool keepLane) { return pool.releases(states, keepLane); });
-    const FreeResult freed = ledger.free(ledger.open(each.spec), each.need, 0, false);
+    const FreeResult freed = ledger.free(ledger.open(each.spec), each.need, 0, MemoryPressure::Normal);
     require(freed.outcome == each.outcome && cache.taken == each.taken && pool.idle == each.idle &&
                 freed.nowBytes == (each.outcome == FreeOutcome::Met ? each.need.bytes : 0),
             each.name + ": the buffers a lane starts from were taken out of order or miscounted: " +
@@ -1285,13 +1290,13 @@ void testStateBuffersMeetANeedOfBytes() {
     return pooled ? uint64_t{pooled + 1} * 32 * kMiB : 0;
   });
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
-  const FreeResult freed = ledger.free(claim, {.bytes = 100 * kMiB}, 0, false);
+  const FreeResult freed = ledger.free(claim, {.bytes = 100 * kMiB}, 0, MemoryPressure::Normal);
   require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 192 * kMiB &&
               cache.taken == std::vector<uint64_t>{1, 2, 3} && !pool.idle,
           "a need of bytes did not take the states whose buffers the pool releases, or left them in the pool");
   cache.units.push_back({.key = 4, .stateBuffers = 1});
   const ClaimId lane = ledger.open(request(2, RequestPriority::Normal));
-  const FreeResult inPlace = ledger.free(lane, {.stateBuffers = 1}, 0, false);
+  const FreeResult inPlace = ledger.free(lane, {.stateBuffers = 1}, 0, MemoryPressure::Normal);
   require(inPlace.outcome == FreeOutcome::Met && !inPlace.nowBytes && cache.taken.back() == 4 && pool.idle == 1,
           "a need of buffers in place did not keep the buffers its state freed");
 }
@@ -1309,7 +1314,7 @@ void testIdleBuffersThatCoverARefusalTakeNothingInPlace() {
     pool.idle = 1;
     const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
     const Need need = pages ? Need{.bytes = 48 * kMiB, .pages = 4} : Need{.bytes = 48 * kMiB, .stateBuffers = 1};
-    const FreeResult freed = ledger.free(claim, need, 0, false);
+    const FreeResult freed = ledger.free(claim, need, 0, MemoryPressure::Normal);
     require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 64 * kMiB && cache.taken.empty() && !pool.idle,
             std::string("a refusal of bytes the idle buffers cover took ") + (pages ? "a unit's pages" : "a state") +
                 " in place: " + std::to_string(cache.taken.size()) + " taken, " +
@@ -1322,7 +1327,7 @@ void testIdleBuffersThatCoverARefusalTakeNothingInPlace() {
   ledger.addSource(cache);
   ledger.addSource(pool);
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
-  require(ledger.free(claim, {.stateBuffers = 1}, 0, false).outcome == FreeOutcome::Met &&
+  require(ledger.free(claim, {.stateBuffers = 1}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Met &&
               cache.taken == std::vector<uint64_t>{1} && pool.idle == 1,
           "a need of buffers alone was not met in place");
 }
@@ -1415,7 +1420,7 @@ void testZeroCostUnsizedUnitsGoFirst() {
   ledger.addSource(cache);
   ledger.addSource(engine);
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
-  const FreeResult freed = ledger.free(claim, {.bytes = kGiB}, 512 * kMiB, false);
+  const FreeResult freed = ledger.free(claim, {.bytes = kGiB}, 512 * kMiB, MemoryPressure::Normal);
   require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 600 * kMiB && engine.taken.size() == 1 &&
               cache.taken.empty(),
           "the unsized buffers did not go first and end the need");
@@ -1435,7 +1440,7 @@ void testTheHostClaimCountsTheIdleBuffersInItsTarget() {
   ledger.addSource(cache);
   ledger.addSource(engine);
   const ClaimId claim = ledger.open({.cls = ClaimClass::Host});
-  const FreeResult freed = ledger.free(claim, {.bytes = 512 * kMiB}, 0, false);
+  const FreeResult freed = ledger.free(claim, {.bytes = 512 * kMiB}, 0, MemoryPressure::Normal);
   ledger.close(claim);
   require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 512 * kMiB && cache.taken.size() == 2,
           "the host's claim took " + std::to_string(freed.nowBytes / kMiB) + " MiB for a target of 512 MiB");
@@ -1450,7 +1455,7 @@ void testAClaimThatTakesNoUnitsTakesNone() {
   ledger.addSource(cache);
   for (const uint64_t requestId : {uint64_t{0}, uint64_t{7}}) {
     const ClaimId claim = ledger.open({.cls = ClaimClass::Optional, .requestId = requestId});
-    const FreeOutcome outcome = ledger.free(claim, {.bytes = kGiB}, 0, false).outcome;
+    const FreeOutcome outcome = ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome;
     ledger.close(claim);
     require(requestId ? outcome == FreeOutcome::Met && cache.taken.size() == 2
                       : outcome == FreeOutcome::Short && cache.taken.empty(),
@@ -1466,7 +1471,7 @@ void testAClaimThatTakesNoUnitsCountsNone() {
   cache.units = {unit(1, kGiB, true), unit(2, kGiB)};
   ledger.addSource(cache);
   const ClaimId claim = ledger.open({.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate});
-  const FreeOutcome outcome = ledger.free(claim, {.bytes = kGiB}, 0, false).outcome;
+  const FreeOutcome outcome = ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome;
   ledger.close(claim);
   require(outcome == FreeOutcome::Short && cache.taken.empty(), "a claim that takes no units took one");
   require(cache.peeks == 1, "a claim that takes no units peeked " + std::to_string(cache.peeks) + " units");
@@ -1482,10 +1487,10 @@ void testAvailableTakesNothing() {
   cache.units = {unit(1, kGiB), unit(2, kGiB, true)};
   ledger.addSource(cache);
   ledger.addPool(pool);
-  require(ledger.available(request(1, RequestPriority::Normal), {.bytes = 10 * kGiB}, 256 * kMiB, false) ==
+  require(ledger.available(request(1, RequestPriority::Normal), {.bytes = 10 * kGiB}, 256 * kMiB, MemoryPressure::Normal) ==
               256 * kMiB + 4 * kGiB,
           "available() did not count the room, the cache and the pool's units above its floor");
-  require(ledger.available(request(1, RequestPriority::Normal), {.bytes = kGiB}, 256 * kMiB, false) == kGiB,
+  require(ledger.available(request(1, RequestPriority::Normal), {.bytes = kGiB}, 256 * kMiB, MemoryPressure::Normal) == kGiB,
           "available() did not stop at enough");
   require(cache.taken.empty() && pool.units() == 3 && pool.shrinks == 0, "available() took something");
 }
@@ -1499,11 +1504,11 @@ void testCountsStopAtTheLack() {
   ledger.addSource(cache);
   const auto stopped = [&] { return std::ranges::find(cache.peeked, uint64_t{1}) == cache.peeked.end(); };
   const ClaimSpec spec = request(1, RequestPriority::Normal);
-  require(ledger.available(spec, {.bytes = kGiB}, 256 * kMiB, false) == kGiB && stopped(),
+  require(ledger.available(spec, {.bytes = kGiB}, 256 * kMiB, MemoryPressure::Normal) == kGiB && stopped(),
           "available() counted past what the claim lacks");
   cache.peeked.clear();
   const ClaimId claim = ledger.open(spec);
-  require(ledger.free(claim, {.bytes = kGiB}, 256 * kMiB, false).outcome == FreeOutcome::Met &&
+  require(ledger.free(claim, {.bytes = kGiB}, 256 * kMiB, MemoryPressure::Normal).outcome == FreeOutcome::Met &&
               cache.taken == std::vector<uint64_t>{1} && stopped(),
           "free() counted past what the claim lacks");
   ledger.close(claim);
@@ -1522,11 +1527,11 @@ void testAvailableCountsWhatLandsForAClaimThatCanWait() {
                                                                            : Returning{};
                       });
   const ClaimSpec start = request(1, RequestPriority::Normal, ClaimClass::Start);
-  require(ledger.available(start, {.bytes = 2 * kGiB}, 128 * kMiB, false) == 1024 * kMiB,
+  require(ledger.available(start, {.bytes = 2 * kGiB}, 128 * kMiB, MemoryPressure::Normal) == 1024 * kMiB,
           "available() did not count what lands and the copies the request owes before its victims");
   ClaimSpec immediate = start;
   immediate.timing = NeedTiming::Immediate;
-  require(ledger.available(immediate, {.bytes = 2 * kGiB}, 128 * kMiB, false) == 384 * kMiB,
+  require(ledger.available(immediate, {.bytes = 2 * kGiB}, 128 * kMiB, MemoryPressure::Normal) == 384 * kMiB,
           "available() counted what lands for a claim that cannot wait");
   require(cache.taken.empty(), "available() took something");
 }
@@ -1553,7 +1558,7 @@ void testGrowthRetakesFreeRoomBeyondLaneDemand() {
   require(unitsAt(4 * kRegrowQuietSeconds) == 5, "the pool did not take the room the lanes no longer project");
   // A request that lacks room takes a unit back and restarts the wait.
   const ClaimId claim = fixture.ledger().open(request(1, RequestPriority::Normal));
-  require(fixture.ledger().free(claim, {.bytes = kGiB}, 0, false).outcome == FreeOutcome::Met &&
+  require(fixture.ledger().free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Met &&
               experts.units() == 4,
           "the request did not take a unit");
   fixture.ledger().close(claim);
@@ -1869,13 +1874,13 @@ void testAClaimLacksTheRoomHeldAboveIt() {
   waitForItsCopies(ledger, high, {.bytes = kGiB});
   const ClaimSpec spec = request(2, RequestPriority::Background);
   const ClaimId low = ledger.open(spec);
-  require(ledger.available(spec, {.bytes = kGiB}, 512 * kMiB, false) == 512 * kMiB,
+  require(ledger.available(spec, {.bytes = kGiB}, 512 * kMiB, MemoryPressure::Normal) == 512 * kMiB,
           "available() counted the room the claim above holds");
-  require(ledger.free(low, {.bytes = kGiB}, 512 * kMiB, false).outcome == FreeOutcome::Pending &&
+  require(ledger.free(low, {.bytes = kGiB}, 512 * kMiB, MemoryPressure::Normal).outcome == FreeOutcome::Pending &&
               cache.taken.empty(),
           "the claim took cache for an allocation the room held above it refuses, or did not wait for it");
   cache.units.push_back(unit(2, kGiB));
-  require(ledger.free(low, {.bytes = kGiB}, 512 * kMiB, false).outcome == FreeOutcome::Met &&
+  require(ledger.free(low, {.bytes = kGiB}, 512 * kMiB, MemoryPressure::Normal).outcome == FreeOutcome::Met &&
               cache.taken.size() == 2,
           "the claim did not take what it and the room held above it lack");
 }
@@ -1891,7 +1896,7 @@ void testANeedMetInPlaceLacksNoHeldBytes() {
   const ClaimId high = ledger.open(request(1, RequestPriority::Foreground));
   waitForItsCopies(ledger, high, {.bytes = kGiB});
   const ClaimId low = ledger.open(request(2, RequestPriority::Background));
-  require(ledger.free(low, {.pages = 8}, 0, false).outcome == FreeOutcome::Met &&
+  require(ledger.free(low, {.pages = 8}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Met &&
               cache.taken == std::vector<uint64_t>{1} && !ledger.claim(low).waiting,
           "a pages-only need waited on the room held above it instead of taking the leaf");
   leaf.key = 3;
@@ -1899,7 +1904,7 @@ void testANeedMetInPlaceLacksNoHeldBytes() {
   ClaimSpec spec = request(3, RequestPriority::Background);
   spec.timing = NeedTiming::Immediate;
   const ClaimId now = ledger.open(spec);
-  require(ledger.free(now, {.pages = 8}, 0, false).outcome == FreeOutcome::Met &&
+  require(ledger.free(now, {.pages = 8}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Met &&
               cache.taken == std::vector<uint64_t>{1, 3},
           "an Immediate pages-only need took cache bytes that leave no page");
 }
@@ -1936,7 +1941,7 @@ void testALoneConvertedLaneWaitsForItsOwnCopies() {
                                                                           : Returning{};
                       });
   const ClaimId lane = ledger.open(request(5, RequestPriority::Normal));
-  require(ledger.free(lane, {.bytes = kGiB}, 0, false).outcome == FreeOutcome::Pending && experts.units() == 3,
+  require(ledger.free(lane, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Pending && experts.units() == 3,
           "a lone Spill lane took a store unit instead of waiting for its own copies");
 }
 
@@ -1954,11 +1959,11 @@ void testARetryAfterItsConversionTakesNothingElse() {
                         return std::ranges::any_of(lanes, converted) ? Returning{.owedBytes = kGiB} : Returning{};
                       });
   const ClaimId claim = ledger.open(growth(1, RequestPriority::Normal));
-  require(ledger.free(claim, {.bytes = kGiB}, 0, false).outcome == FreeOutcome::Pending &&
+  require(ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Pending &&
               engine.taken == std::vector<uint64_t>{1},
           "the claim did not convert its lane");
   for (int retry = 0; retry < 5; ++retry)
-    require(ledger.free(claim, {.bytes = kGiB}, 0, false).outcome == FreeOutcome::Pending &&
+    require(ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Pending &&
                 engine.taken.size() == 1,
             "a retry took another unit while its lane's copies were owed");
 }
@@ -1975,7 +1980,7 @@ void testOneConversionDoesNotStallTheStore() {
                                                                           : Returning{};
                       });
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
-  require(ledger.free(claim, {.bytes = kGiB}, 0, false).outcome == FreeOutcome::Met && experts.units() == 2,
+  require(ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Met && experts.units() == 2,
           "another lane's write-through held the claim back from the store");
 }
 
@@ -1988,7 +1993,7 @@ void testCopiesAheadOnlyAfterDemandReachedUncopiedCache() {
   ledger.setNow(100.0);
   require(!ledger.copyDemand(), "copies ahead were wanted before any free()");
   const ClaimId claim = ledger.open({.cls = ClaimClass::Optional, .requestId = 1, .timing = NeedTiming::Immediate});
-  require(ledger.free(claim, {.bytes = kGiB}, 0, false).outcome == FreeOutcome::Met &&
+  require(ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Met &&
               cache.taken == std::vector<uint64_t>{2},
           "the Immediate claim did not skip the uncopied unit");
   require(ledger.copyDemand(), "an Immediate claim's skip of an uncopied unit asked no copies");
@@ -2007,7 +2012,7 @@ void testAShortfallTakesAtMostOneUnitBeyondIt() {
     ledger.addPool(experts);
     const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
     const uint64_t shortfall = 1331 * kMiB;
-    const FreeResult freed = ledger.free(claim, {.bytes = shortfall}, 0, false);
+    const FreeResult freed = ledger.free(claim, {.bytes = shortfall}, 0, MemoryPressure::Normal);
     require(freed.outcome == FreeOutcome::Met && freed.nowBytes >= shortfall &&
                 freed.nowBytes < shortfall + unitBytes,
             "a shortfall took more than itself and one unit");
@@ -2016,7 +2021,7 @@ void testAShortfallTakesAtMostOneUnitBeyondIt() {
   MemoryLedger ledger;
   ledger.addPool(experts);
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
-  const FreeResult freed = ledger.free(claim, {.bytes = 300 * kMiB}, 0, false);
+  const FreeResult freed = ledger.free(claim, {.bytes = 300 * kMiB}, 0, MemoryPressure::Normal);
   require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 1140 * kMiB &&
               experts.currentBytes() == kGiB + 1023 * kMiB,
           "a shortfall of 300 MiB took " + std::to_string(freed.nowBytes / kMiB) +
@@ -2050,11 +2055,11 @@ void testPoolFloorBoundsEveryTake() {
     MemoryLedger ledger;
     ledger.addPool(experts);
     const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
-    static_cast<void>(ledger.free(claim, {.bytes = 2 * kGiB}, 0, false));
-    static_cast<void>(ledger.free(claim, {.bytes = 512 * kMiB}, 0, false));
+    static_cast<void>(ledger.free(claim, {.bytes = 2 * kGiB}, 0, MemoryPressure::Normal));
+    static_cast<void>(ledger.free(claim, {.bytes = 512 * kMiB}, 0, MemoryPressure::Normal));
     require(experts.units() == (floor == 20 ? 20 : 18),
             "a claim took a pool below its floor or less than the need");
-    static_cast<void>(ledger.free(claim, {.bytes = 256 * kMiB}, 0, false));
+    static_cast<void>(ledger.free(claim, {.bytes = 256 * kMiB}, 0, MemoryPressure::Normal));
     require(experts.units() == floor, "the pool did not give units down to its floor");
   }
 }
@@ -2068,9 +2073,9 @@ void testEachDecisionLogsOneLine() {
   ledger.setDecisionLog([&](std::string_view line) { lines.emplace_back(line); });
   ledger.addPool(experts);
   const ClaimId claim = ledger.open(request(4, RequestPriority::Normal));
-  static_cast<void>(ledger.free(claim, {.bytes = kGiB}, 0, false));
-  static_cast<void>(ledger.free(claim, {.bytes = kGiB}, 0, false));
-  static_cast<void>(ledger.free(claim, {.bytes = kGiB}, 0, false));
+  static_cast<void>(ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal));
+  static_cast<void>(ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal));
+  static_cast<void>(ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal));
   require(lines.size() == 2 && lines[0].find("request 4") != std::string::npos &&
               lines[0].find(": met, took experts unit") != std::string::npos &&
               lines[1].find(": short") != std::string::npos,
@@ -2100,14 +2105,14 @@ void testARequestMetFromCacheLogsNothing() {
   for (int taken = 0; taken < 9; ++taken) {
     if (taken)
       ledger.granted(claim);
-    require(ledger.free(claim, page, 0, false).outcome == FreeOutcome::Met,
+    require(ledger.free(claim, page, 0, MemoryPressure::Normal).outcome == FreeOutcome::Met,
             "a page the cache or a rebuilt cache holds did not meet the decode's next page");
   }
   require(cache.taken.size() == 8 && vision.units() == 0 && lines.empty(),
           "a request's claim met at no cost logged " + std::to_string(lines.size()) +
               " lines: " + (lines.empty() ? std::string() : lines[0]));
   ledger.granted(claim);
-  require(ledger.free(claim, page, 0, false).outcome == FreeOutcome::Met && lines.size() == 1 &&
+  require(ledger.free(claim, page, 0, MemoryPressure::Normal).outcome == FreeOutcome::Met && lines.size() == 1 &&
               lines[0].find(": met, took experts unit") != std::string::npos,
           "a met at no cost hid the store chunk the same need took next: " +
               (lines.empty() ? std::string() : lines[0]));
@@ -2127,7 +2132,7 @@ void testAGrantEndsALoggedWait() {
                       [](std::span<const uint64_t>) { return Returning{}; });
   ledger.addPool(experts);
   const ClaimId claim = ledger.open(request(9, RequestPriority::Normal));
-  require(ledger.free(claim, {.bytes = kGiB, .pages = 4}, 0, false).outcome == FreeOutcome::Pending,
+  require(ledger.free(claim, {.bytes = kGiB, .pages = 4}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Pending,
           "a need what lands covers did not wait for it");
   ledger.granted(claim);
   ledger.granted(claim);
@@ -2135,7 +2140,7 @@ void testAGrantEndsALoggedWait() {
               lines[1].find("claim of request 9: granted") != std::string::npos,
           "the grant did not end the logged wait once: " + (lines.empty() ? std::string() : lines.back()));
   landing = 0;
-  require(ledger.free(claim, {.bytes = kGiB}, 0, false).outcome == FreeOutcome::Met,
+  require(ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Met,
           "the store's chunk did not meet the need");
   ledger.granted(claim);
   require(lines.size() == 3 && lines[2].find(": met, took experts unit") != std::string::npos,
@@ -2181,13 +2186,13 @@ void testARetryBackToALoggedOutcomeLogsNothing() {
   const ClaimId claim = ledger.open(request(4, RequestPriority::Normal));
   for (uint32_t retry = 0; retry < 6; ++retry) {
     landing = retry % 2 ? kGiB : 0;
-    static_cast<void>(ledger.free(claim, {.bytes = kGiB - retry * kMiB, .pages = 6 - retry}, 0, false));
+    static_cast<void>(ledger.free(claim, {.bytes = kGiB - retry * kMiB, .pages = 6 - retry}, 0, MemoryPressure::Normal));
   }
-  static_cast<void>(ledger.free(claim, {.pages = 3}, 0, false));
+  static_cast<void>(ledger.free(claim, {.pages = 3}, 0, MemoryPressure::Normal));
   ledger.granted(claim);
   landing = 0;
-  static_cast<void>(ledger.free(claim, {.bytes = kGiB}, 0, false));
-  static_cast<void>(ledger.free(claim, {.bytes = kGiB}, kGiB, false));
+  static_cast<void>(ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal));
+  static_cast<void>(ledger.free(claim, {.bytes = kGiB}, kGiB, MemoryPressure::Normal));
   const std::array<std::string_view, 5> outcomes{": short", ": pending", ": short", ": granted", ": short"};
   bool each = lines.size() == outcomes.size();
   for (size_t line = 0; each && line < lines.size(); ++line)
@@ -2235,7 +2240,7 @@ void testTheOrderTakesCacheThenRebuiltPoolsThenReleasesThenTheStore() {
   ledger.addPool(vision);
   const auto lacks = [&](uint64_t id, uint64_t bytes) {
     const ClaimId claim = ledger.open(growth(id, RequestPriority::Normal));
-    static_cast<void>(ledger.free(claim, {.bytes = bytes}, 0, false));
+    static_cast<void>(ledger.free(claim, {.bytes = bytes}, 0, MemoryPressure::Normal));
     ledger.close(claim);
   };
   lacks(1, 256 * kMiB);
@@ -2295,7 +2300,7 @@ void testUnitsThatCountOnePageTwiceOvercount() {
     SharedPages lanes(kGiB, 256 * kMiB, twice);
     ledger.addSource(lanes);
     const ClaimId claim = ledger.open(request(3, RequestPriority::Normal));
-    const FreeResult freed = ledger.free(claim, {.bytes = 2 * kGiB}, 0, false);
+    const FreeResult freed = ledger.free(claim, {.bytes = 2 * kGiB}, 0, MemoryPressure::Normal);
     const MemoryLedger::CountChecks checks = fixture.governor->snapshot().countChecks;
     if (twice)
       require(freed.outcome == FreeOutcome::Short && lanes.taken == std::vector<uint64_t>{1, 2} &&
@@ -2326,7 +2331,7 @@ void testAStartsCountOfAStateWhoseBufferItTakesIsMet() {
     return uint64_t{pooled + states} * 64;
   });
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal, ClaimClass::Start));
-  const FreeResult freed = ledger.free(claim, {.bytes = 64, .afterStart = true}, 0, false);
+  const FreeResult freed = ledger.free(claim, {.bytes = 64, .afterStart = true}, 0, MemoryPressure::Normal);
   ledger.close(claim);
   const MemoryLedger::CountChecks checks = fixture.governor->snapshot().countChecks;
   require(freed.outcome == FreeOutcome::Met && cache.taken == std::vector<uint64_t>{1} && pool.idle == 1 &&
@@ -2356,7 +2361,7 @@ void testAStartsTakeOfABufferItWouldTakeCreditsNothing() {
     return uint64_t{pooled + states} * 64;
   });
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal, ClaimClass::Start));
-  const FreeResult freed = ledger.free(claim, {.bytes = 64, .afterStart = true}, 0, false);
+  const FreeResult freed = ledger.free(claim, {.bytes = 64, .afterStart = true}, 0, MemoryPressure::Normal);
   ledger.close(claim);
   require(freed.outcome == FreeOutcome::Met && cache.taken == std::vector<uint64_t>{1},
           "a start's release of a pooled buffer it would take met it: outcome " +
@@ -2409,7 +2414,7 @@ void testRequestsMetFromCacheLeaveRegrowthQuiet() {
   fixture.ledger().addSource(cache);
   const auto request = [&](uint64_t id, uint64_t bytes, ClaimClass cls = ClaimClass::InService) {
     const ClaimId claim = fixture.ledger().open(::request(id, RequestPriority::Normal, cls));
-    const FreeOutcome outcome = fixture.ledger().free(claim, {.bytes = bytes}, 0, false).outcome;
+    const FreeOutcome outcome = fixture.ledger().free(claim, {.bytes = bytes}, 0, MemoryPressure::Normal).outcome;
     fixture.ledger().close(claim);
     return outcome;
   };
@@ -2501,11 +2506,11 @@ void testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes() {
   ledger.addSource(pool);
   ledger.setBufferBytes([&pool](uint32_t states, bool, bool) { return pool.releases(states); });
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal, ClaimClass::Start));
-  const FreeResult freed = ledger.free(claim, {.bytes = 48 * kMiB, .unheldStateBuffer = true}, 0, false);
+  const FreeResult freed = ledger.free(claim, {.bytes = 48 * kMiB, .unheldStateBuffer = true}, 0, MemoryPressure::Normal);
   require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 64 * kMiB &&
               cache.taken == std::vector<uint64_t>{1} && !pool.idle,
           "the evicted state's buffers stayed in the pool for a need no state meets in place");
-  require(ledger.free(claim, {.bytes = 48 * kMiB, .unheldStateBuffer = true}, 0, false).outcome == FreeOutcome::Short,
+  require(ledger.free(claim, {.bytes = 48 * kMiB, .unheldStateBuffer = true}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Short,
           "a need with no state left to evict was not short");
   require(lines.size() == 1 && lines[0].find(", a state buffer no cached state holds") != std::string::npos &&
               lines[0].find("4294967295") == std::string::npos,
@@ -2522,7 +2527,7 @@ void testABufferNoStateHoldsReachesNoCachedState() {
   ledger.addSource(cache);
   ledger.addSource(pool);
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal, ClaimClass::Start));
-  const FreeResult freed = ledger.free(claim, {.hostRefused = true, .unheldStateBuffer = true}, 0, false);
+  const FreeResult freed = ledger.free(claim, {.hostRefused = true, .unheldStateBuffer = true}, 0, MemoryPressure::Normal);
   require(freed.outcome == FreeOutcome::Short && cache.taken.empty() && !ledger.copyDemand(),
           "a need no cached state meets reached an uncopied state and asked copies ahead");
 }

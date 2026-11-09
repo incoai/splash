@@ -1411,8 +1411,10 @@ lane's pages stay Full once their copies land, until a claim releases them
 (`Cache::releasePages`, [below](#memory-rules)); under `--kv-spill always`
 they move as their copies land (`Cache::spillWritten`). Either moves pages a
 runway at a time: the Full extents each runway's moves empty leave before the
-runway refills, and their bytes pay for its Index extent, which therefore
-passes the host at every pressure level (`MemoryGovernor::fund`); a Full
+runway refills, and the refill passes the engine's limit and the host at every
+pressure level when the bytes those extents released cover it
+(`MemoryGovernor::fund`: a credit that lasts the allocation the moves run in,
+its retries included, and that only memory allocated takes back); a Full
 extent returns 17 times an Index one's bytes on Qwen3.8-Flash-Next. A release
 for a claim's bytes releases every one, the Full pages left first gathered in
 the fewest extents, so that each runway's moves pay for the next
@@ -1499,8 +1501,9 @@ the margin and the pressure test (`MemoryGovernor::free`), since waiting would
 stall work in service; so does the KV a prefill command takes past its first state
 boundary, which the lane's next command would take anyway. A `Floor` claim
 passes short of critical pressure, and critical pressure refuses every claim,
-except an allocation that the same work's releases have paid for already
-(`MemoryGovernor::fund`).
+except an allocation covered by what the same allocation released, which
+passes the engine's limit too: its net change raises neither the charge nor
+what the host gives (`MemoryGovernor::fund`).
 The engine's start needs only what macOS can hand out at all beyond a reserve
 of a tenth of a small Mac's memory and 2 GiB of a larger one, counting what
 compressing the anonymous pages would free at the compressor's present ratio,
@@ -1560,13 +1563,17 @@ every source of units reads (`MemoryLedger::Order`, `Cache::walkFor`):
 | `Optional` of a request | yes | no | yes | no | no | no | yes | no | no | no |
 | `Optional` of the engine's own, of no request | no | no | no | no | no | no | no | no | no | no |
 | `Growth` | yes | no | no | no | no | no | no | no | no | no |
-| `Host` with a deficit | yes | yes | yes | no | no | no | no | no | no | no |
+| `Host` with a deficit | yes | yes | yes | no | every lane's under warning pressure; none at normal | no | no | no | no | no |
 | `Host` under critical pressure | yes | no | yes | no | every lane's | yes | yes | yes | yes | first |
 | A need the host refused | in place | no | yes | no | its own, in place | no | as its class | as its class | no | no |
 
 Under critical pressure every claim that takes units takes the next lane's buffers
 first, with the idle ones, and the empty extent the next request starts from,
-never the Index runway.
+never the Index runway. The host reaches the lanes' landed pages whenever
+macOS's pressure is above normal: under warning its pass for its deficit
+releases them, the lowest-ranked lane's first, as its pass under critical
+pressure does, which gives the host what a lane gave back as its copies landed
+before lanes kept their pages; at normal pressure its deficit leaves them Full.
 
 The resume point is the newest ordinary state in RAM (`StateCache::resumePoint`),
 the one a conversation's next turn most likely resumes from. A claim of no
@@ -1617,10 +1624,10 @@ unit the cache pays for whole needs only no critical pressure and no host
 deficit: it returns the host nothing, and a host short of memory takes those
 cache units itself. One that needs free room needs normal pressure, the margin
 and the host out of its band (`MemoryGovernor::growthHost`). Nothing is taken
-before the host admits it. The Index extent spilling refills needs neither once
-the Full extents its moves emptied have paid for it (`MemoryGovernor::fund`):
-they returned more than it takes back, and the refill is what lets the moves go
-on returning memory.
+before the host admits it. The Index extent spilling refills needs neither when
+the Full extents its moves released cover it (`MemoryGovernor::fund`): they
+returned more than it takes back, and the refill is what lets the moves go on
+returning memory.
 
 **Placement** (`Engine::placement`, `runtime/engine/EngineMemory.cpp`). A
 start's projection is its tokens plus up to 4096 output tokens. It runs
@@ -1633,14 +1640,21 @@ spent, or its room short of the projection) goes on in memory only where its
 projection fits one request's resident context (`Engine::inMemory`). There
 it starts Resident where the claim its admission makes covers its Resident
 KV now, as placement prices it. Beside another lane in service that claim
-is a `Start`'s, whose test placed it Spill unless every request spills, and
-short of it the start waits for memory. Alone it is `InService`, as its
+is a `Start`'s, whose test placed it Spill unless every request spills;
+short of it the start waits for memory, and a lane of a lower priority yields
+to it only while every lane in service is of a lower priority, when each
+suspension brings it closer to alone (`Engine::waitForMemory`). Alone it is
+`InService`, as its
 lane's growth is, which takes the pooled buffers the next lane starts from
-too. Otherwise one the tier refuses is refused, and one whose room is short
-takes the SSD cache's bound on its output or waits for its quota as a Spill
-start does, and is otherwise refused; refused at its start, it names what
-memory and the SSD cache have for it, rather than fail partway through its
-prefill. The lanes' projected growth (`Engine::laneDemand`) is each lane's
+too, and short of the projection the KV it covers bounds the output, as the
+quota bounds a Spill start's, where it holds the prompt and a token past it
+with the 7 rows past that its decode step verifies (`Cache::growthPages`).
+Otherwise one the tier refuses is refused, and one whose room is short takes
+the SSD cache's bound on its output or waits for its quota as a Spill start
+does, and is otherwise refused at its start rather than fail partway through
+its prefill. The refusal names what the SSD cache has for it and, within the
+resident context, what memory has for its least start
+(`Engine::memoryShortfall`, as `capacity_exhausted` names memory). The lanes' projected growth (`Engine::laneDemand`) is each lane's
 KV up to its projection and what the lanes that hold Index pages still lack
 to read it: their hot block floors, and in prefill their history's staging
 through the next command. One rule prices a hot block floor in both
@@ -2122,13 +2136,14 @@ applies throughout.
 Readiness does not guarantee that a request-sized allocation fits. A request
 that cannot fit even alone, after every cached prefix was evicted and the expert
 store shrank to its floor, fails with 400 `capacity_exhausted`
-(`Engine::capacityExhausted`), naming its lane's mode, phase and tokens, the
-Metal memory outside the backend's buffers (`MemoryGovernor::untrackedBytes`),
-only for a Spill lane why its KV gave no more memory back (the SSD cache took no
-more of it where it owes copies no write started, `Cache::owesCopies`;
-otherwise even a release down to its floor does not cover what it lacks), and a
-smaller `--max-context`, or a larger `--max-memory` where one lowered the
-budget; retrying it fails the same way.
+(`Engine::capacityExhausted`), naming what it could not allocate, then, as
+every end for want of memory does (`Engine::memoryShortfall`), its lane's
+mode, phase and tokens and the Metal memory outside the backend's buffers
+(`MemoryGovernor::untrackedBytes`), only for a Spill lane why its KV gave no
+more memory back (the SSD cache took no more of it where it owes copies no
+write started, `Cache::owesCopies`; otherwise even a release down to its floor
+does not cover what it lacks), and a smaller `--max-context`, or a larger
+`--max-memory` where one lowered the budget; retrying it fails the same way.
 
 ## Sliding windows
 

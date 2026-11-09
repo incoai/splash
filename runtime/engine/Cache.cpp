@@ -667,6 +667,12 @@ Need Cache::growthNeed(uint32_t pages) const {
   return need;
 }
 
+uint64_t Cache::growthPages(uint64_t bytes) const {
+  constexpr kv::PageForm full = kv::PageForm::Full;
+  const uint64_t extent = pool_.extentPages();
+  return pool_.freePageCount(full) + bytes / (extent * pool_.bytesPerPage(full)) * extent;
+}
+
 bool Cache::freesOnLanding(uint64_t block, const std::unordered_set<uint64_t> &freeing) const {
   return kv_.leafOnceChildrenLeave(block) && !states_.stateResident(block) && !pool_.pageActive(kv_.page(block)) &&
          (kv_.residentLeaf(block) || std::ranges::all_of(kv_.children(block), [&](uint64_t child) {
@@ -2173,9 +2179,10 @@ TokenAdmission Cache::moveLandedPages(const std::function<std::vector<uint32_t>(
   // extents each runway's moves empty leave as `extents` says (released,
   // the Full pages left first gather in the fewest extents), past the
   // `claimed` Full pages a claim takes in place, and their bytes pay for the
-  // Index extent the runway refills with next (`funds`): it so passes the
-  // host under critical pressure too, since on Qwen3.8-Flash-Next a Full
-  // extent returns 17 times an Index one's bytes. The pages that wait are
+  // Index extent the runway refills with next (`funds`): where they cover
+  // it, it passes the engine's limit and the host, under critical pressure
+  // too, since on Qwen3.8-Flash-Next a Full extent returns 17 times an Index
+  // one's bytes. The pages that wait are
   // found again for each runway, since gathering moves them. The runway then
   // stands for the next spill, at the memory wall too, where a lane's
   // release moves its pages through it.

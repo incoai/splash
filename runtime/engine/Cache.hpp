@@ -623,6 +623,9 @@ public:
   // takes them (KvPool::takeFreePages): the free pages first, which a walk
   // for it keeps (Need::keptPages), then whole extents.
   [[nodiscard]] Need growthNeed(uint32_t pages) const;
+  // The most Full pages whose growthNeed `bytes` meets: the free ones, then
+  // those of the whole extents the bytes allocate.
+  [[nodiscard]] uint64_t growthPages(uint64_t bytes) const;
   // Between commands, with a window: moves to the Slim form every Full page
   // no row will read whole again: every request that holds it has
   // published windowPages blocks past it (its next command's rows, at or

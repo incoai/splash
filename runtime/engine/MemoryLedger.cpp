@@ -79,7 +79,7 @@ void describe(std::ostringstream &line, const ClaimSpec &spec, const Need *need)
 
 } // namespace
 
-TakeRights takeRights(const ClaimSpec &spec, const Need &need, bool critical,
+TakeRights takeRights(const ClaimSpec &spec, const Need &need, MemoryPressure pressure,
                       std::optional<RequestPriority> highestLane) {
   using Reuse = TakeRights::CertainReuse;
   using Reserves = TakeRights::Reserves;
@@ -91,6 +91,7 @@ TakeRights takeRights(const ClaimSpec &spec, const Need &need, bool critical,
   // narrowest.
   if (spec.cls == ClaimClass::Optional && !spec.requestId)
     return {};
+  const bool critical = pressure == MemoryPressure::Critical;
   const bool host = spec.cls == ClaimClass::Host;
   const bool inService = spec.cls == ClaimClass::InService;
   const bool hostCritical = host && critical;
@@ -109,7 +110,7 @@ TakeRights takeRights(const ClaimSpec &spec, const Need &need, bool critical,
           .passCommand = inService && waits && spec.supersedes,
           .convertLane = inService && waits && spec.kvGrowth ? spec.requestId : 0,
           .lanes = need.hostRefused                                        ? Lanes::Own
-                   : hostCritical                                          ? Lanes::All
+                   : host && pressure != MemoryPressure::Normal            ? Lanes::All
                    : waits && (inService || spec.cls == ClaimClass::Start) ? Lanes::AtOrBelow
                                                                            : Lanes::None,
           .laneStart = critical                         ? LaneStart::First
@@ -668,11 +669,12 @@ uint64_t MemoryLedger::takeUnsized(const VictimQuery &query) {
 // leave the model's pool, so the units that cost nothing go again (a need in
 // place keeps them). A claim that can wait, short only by the room waiting
 // claims ranked above it hold, waits as their holds end.
-FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBytes, bool critical, bool exempts) {
+FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBytes, MemoryPressure pressure,
+                              bool exempts) {
   const uint64_t id = claimId.value;
   ClaimState &claim = claims_.at(id);
   const ClaimSpec &spec = claim.spec;
-  const VictimQuery query{.rights = takeRights(spec, need, critical, lanePriority_),
+  const VictimQuery query{.rights = takeRights(spec, need, pressure, lanePriority_),
                           .need = need,
                           .requestId = spec.requestId,
                           .priority = spec.priority};
@@ -820,9 +822,9 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
 // taken count as their sources size them now (peek), and for a claim that
 // can wait what lands and the copies its own request owes count before
 // victims, as free() counts them.
-uint64_t MemoryLedger::available(const ClaimSpec &spec, const Need &need, uint64_t freeBytes, bool critical,
-                                 const RestoredChains *kept) const {
-  const VictimQuery query{.rights = takeRights(spec, need, critical, lanePriority_),
+uint64_t MemoryLedger::available(const ClaimSpec &spec, const Need &need, uint64_t freeBytes,
+                                 MemoryPressure pressure, const RestoredChains *kept) const {
+  const VictimQuery query{.rights = takeRights(spec, need, pressure, lanePriority_),
                           .need = need,
                           .kept = kept,
                           .requestId = spec.requestId,
@@ -885,7 +887,7 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
       uint64_t funded = 0;
       bool grown = true;
       if (lacking) {
-        const VictimQuery query{.rights = takeRights(spec, {.bytes = unit}, false, lanePriority_),
+        const VictimQuery query{.rights = takeRights(spec, {.bytes = unit}, MemoryPressure::Normal, lanePriority_),
                                 .need = {.bytes = unit}};
         const Run run = bound(query, {.bytes = lacking});
         if (run.uncopied)
@@ -901,7 +903,7 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
       if (grown) {
         const ClaimId claim = open(spec);
         if (lacking) {
-          const FreeResult taken = free(claim, {.bytes = unit}, room, false);
+          const FreeResult taken = free(claim, {.bytes = unit}, room, MemoryPressure::Normal);
           freeBytes = saturatingAdd(freeBytes, taken.nowBytes);
           grown = taken.outcome == FreeOutcome::Met;
         }

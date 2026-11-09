@@ -487,7 +487,7 @@ bool claimCache(engine::Cache &resources, const engine::Need &need) {
   ledger.addSource(resources);
   const engine::ClaimId claim =
       ledger.open({.cls = engine::ClaimClass::InService, .reach = engine::ReclaimClass::InUse});
-  const engine::FreeResult freed = ledger.free(claim, need, 0, false);
+  const engine::FreeResult freed = ledger.free(claim, need, 0, engine::MemoryPressure::Normal);
   ledger.close(claim);
   return freed.gave();
 }

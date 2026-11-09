@@ -76,12 +76,6 @@ struct HostTelemetry final {
 // report any part of it.
 [[nodiscard]] std::optional<HostTelemetry> queryHostTelemetry() noexcept;
 
-enum class MemoryPressure : uint8_t {
-  Normal,
-  Warning,
-  Critical,
-};
-
 // One spelling of the levels for status JSON and startup diagnostics.
 [[nodiscard]] inline const char *
 memoryPressureName(MemoryPressure pressure) noexcept {
@@ -201,9 +195,8 @@ public:
   // claim's Scope; one outside any is a defect (std::logic_error). It
   // reserves the bytes under the limit, beside the room claims ranked above
   // it hold, while the allocation runs, if the host's rule admits them for
-  // the claim (its class's, or a lane's growth's for what the lane needs),
-  // or the scope's work released them already (fund), which leaves the host
-  // no less memory and so passes under critical pressure too.
+  // the claim (its class's, or a lane's growth's for what the lane needs).
+  // Bytes the scope's work released already pass all three (fund).
   // Otherwise it refuses with the cause: HostPressure when the host refuses,
   // whether or not the limit does too, EngineBudget when only the limit
   // does. A refusal records what the claim lacks (need).
@@ -228,8 +221,8 @@ public:
   [[nodiscard]] const MemoryLedger &ledger() const noexcept { return ledger_; }
   // While one lives, admissions are for `claim`, under the host's rule for
   // its class and the room claims ranked above it hold
-  // (MemoryLedger::heldBytes), past the rule for what its work released
-  // (fund). It restores the scope it replaced.
+  // (MemoryLedger::heldBytes), past both for what its work released (fund).
+  // It restores the scope it replaced.
   class Scope final {
   public:
     Scope(MemoryGovernor &governor, ClaimId claim) noexcept;
@@ -243,14 +236,17 @@ public:
     uint64_t previousFunded_ = 0;
   };
   // The scope's work released `bytes`, which its allocations take back
-  // past the host's rule (allocationAdmission) while the scope lives: a
-  // spill's moves pay for the Index extents they move into with the Full
-  // extents they empty (Cache::spillWritten, Cache::releasePages), 17 times
-  // an Index extent's bytes on Qwen3.8-Flash-Next, and the refill is what
-  // lets the moves go on returning memory; a pool's growth the cache funds
-  // whole returns the host nothing, and so still waits out critical
-  // pressure and a deficit (growthHost). std::logic_error outside any
-  // scope.
+  // while the scope lives (an allocation's attempts share one,
+  // Engine::allocate): one of no more than is left passes the engine's
+  // limit, the room claims ranked above it hold and the host's rule
+  // (allocationAdmission), since the scope's net change never raises the
+  // charge, and only one that succeeds takes it back. A spill's moves pay
+  // for the Index extents they move into with the Full extents they empty
+  // (Cache::spillWritten, Cache::releasePages), 17 times an Index extent's
+  // bytes on Qwen3.8-Flash-Next, and the refill is what lets the moves go on
+  // returning memory; a pool's growth the cache funds whole returns the
+  // host nothing, and so still waits out critical pressure and a deficit
+  // (growthHost). std::logic_error outside any scope.
   void fund(uint64_t bytes);
   // The need its scope's refusals recorded, with the caller's in-place part.
   [[nodiscard]] Need need(ClaimId claim, const std::optional<Need> &inPlace = {}) const;
@@ -343,8 +339,9 @@ private:
     MemoryPressure system_ = MemoryPressure::Normal;
     bool constrained_ = true;
   };
-  // The host claim's pass: up to `target` of what it may take.
-  [[nodiscard]] FreeResult hostPass(uint64_t target, bool critical);
+  // The host claim's pass: up to `target` of what it may take at the
+  // host's pressure now.
+  [[nodiscard]] FreeResult hostPass(uint64_t target);
   // Room under the limit beside what is charged and being allocated.
   [[nodiscard]] uint64_t roomBytes() const noexcept;
   // HostRule::sample at a fresh sample of the host.

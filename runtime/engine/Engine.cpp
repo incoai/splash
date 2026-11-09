@@ -1915,7 +1915,7 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
     }
     // Score requests carry maxNewTokens == 0; only the model's finished flag
     // on the final prompt chunk completes them. A request whose output the
-    // SSD cache's quota bounded ends at that bound.
+    // SSD cache's quota or memory bounded ends at that bound.
     const bool complete =
         result.finished || (!scoring && completionTokens >= active.outputLimit);
     const bool boundEnd = complete && !result.finished && active.outputLimit < active.request.maxNewTokens;
@@ -2035,33 +2035,41 @@ Engine::LaneEnd Engine::deadlineEnd() {
   return {LaneOutcome::DeadlineExceeded, std::string(kDeadlineExceededMessage)};
 }
 
-Engine::LaneEnd Engine::capacityExhausted(const Request &active,
-                                          std::string_view what,
-                                          metal::AllocationFailure failure,
-                                          std::string_view detail) const {
+std::string Engine::memoryShortfall(const Request &active, const std::optional<ResidentRoom> &room) const {
   const uint64_t id = active.request.id;
   const Phase phase = scheduler_.phase(id);
   const char *const when = phase == Phase::Prefill                                   ? "in prefill"
                            : phase == Phase::Decode || phase == Phase::WaitingMask ? "in decode"
                            : scheduler_.suspended(id)                              ? "at its resume"
                                                                                     : "at its start";
-  std::string message = "could not allocate " + std::string(what) + " for a " +
-                        (active.kvMode == KvMode::Spill ? "Spill" : "Resident") + " lane of " +
-                        std::to_string(active.exactTokens.size()) + " tokens " + when + ": " +
-                        metal::allocationFailureName(failure);
+  // Less Metal memory outside the server's buffers, which the limit charges
+  // past the runtime reserves, fits it too: 17 MB of it on a 64 GB M5 Pro
+  // serving Flash-Next.
+  const bool spill = !room && active.kvMode == KvMode::Spill;
+  std::string message = "the request, a " + std::string(spill ? "Spill" : "Resident") + " lane of " +
+                        std::to_string(active.exactTokens.size()) + " tokens " + when +
+                        ", does not fit in the memory this server may use beside device_untracked_bytes=" +
+                        std::to_string(governor().untrackedBytes()) + " of Metal memory outside the server's buffers";
+  if (room)
+    message += ": it needs memory_needed_bytes=" + std::to_string(room->needed) +
+               ", where memory_available_bytes=" + std::to_string(room->available) + " are there for it now";
+  return message;
+}
+
+Engine::LaneEnd Engine::capacityExhausted(const Request &active,
+                                          std::string_view what,
+                                          metal::AllocationFailure failure,
+                                          std::string_view detail) const {
+  std::string message = "could not allocate " + std::string(what) + ": " + metal::allocationFailureName(failure);
   if (!detail.empty())
     message += " (" + std::string(detail) + ")";
-  // A lone lane judge failed: only other limits fit it, or less Metal
-  // memory outside the server's buffers, which the limit charges past the
-  // runtime reserves (17 MB of it on a 64 GB M5 Pro serving Flash-Next).
-  // --max-memory only lowers this Mac's budget
-  // (EngineMemoryPolicy::hardBudgetBytes), so a larger one helps only where
-  // one lowered it.
-  message += "; beside device_untracked_bytes=" + std::to_string(governor().untrackedBytes()) +
-             " of Metal memory outside the server's buffers, the request does not fit in the "
-             "memory this server may use, even after every cached prefix was evicted and any "
-             "store of streamed experts shrank to its floor: restart the server with a smaller "
-             "--max-context, or with a larger --max-memory where one lowered it";
+  // A lone lane judge failed: only other limits fit it. --max-memory only
+  // lowers this Mac's budget (EngineMemoryPolicy::hardBudgetBytes), so a
+  // larger one helps only where one lowered it.
+  message += "; " + memoryShortfall(active) +
+             ", even after every cached prefix was evicted and any store of streamed experts shrank to its "
+             "floor: restart the server with a smaller --max-context, or with a larger --max-memory where one "
+             "lowered it";
   return {LaneOutcome::CapacityExhausted, std::move(message)};
 }
 
@@ -2074,7 +2082,8 @@ void Engine::finish(Request &active, EngineFinishReason reason,
   active.finalized = true;
   const uint32_t completionTokens = generatedTokens(active);
   // Only a bound of the engine's own ends a request with Length short of
-  // its output: the quota's (outputLimit) or a lone lane's at the wall.
+  // its output: the quota's or memory's (outputLimit), or a lone Spill
+  // lane's at the wall.
   const bool bounded =
       reason == EngineFinishReason::Length && completionTokens < active.request.maxNewTokens;
   events_.completed(active.request.id, reason, bounded, active.promptTokens,
