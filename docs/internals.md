@@ -1770,6 +1770,21 @@ start would have taken frees it nothing, as the start then allocates it.
 those that freed less though no unit waited for a transfer and the host refused
 nothing meanwhile (`memory_governor.count_checks`).
 
+The log has a line for each decision of a request's claim
+(`Memory: <class> claim of request N needs ...`) that waits, is short, is
+met past the host or takes what costs work later, a unit from step 5 of the
+[take order](#memory-rules) on (the next lane's buffers among them), with
+what it took, once for each kind of need until an allocation of the claim is
+granted; a claim of no request logs each take. A request's claim met by the
+room or by steps 1 to 4 alone logs nothing: a decode taking each next page
+from the cache logged such a met 1-2 times a second through a long reply.
+The grant that ends a logged wait logs `granted`, since a wait can end in an
+attempt that runs no `free()`, as the pages it waited for land; and a need
+`free()` met whose attempt is still refused logs `met, yet refused again`, the
+ledger having counted room the attempt did not find. `/status` shows the
+cache's pages (`kv.pages_cache`), its evicted states (`state.evictions`) and
+the pools' shrinks (`memory_governor.accounts`).
+
 A claim for memory nothing needs yet, such as the Index runway's refill with
 no Spill lane in service, takes only what costs nothing. The runway refills
 at every point between commands where memory is judged, before admission and

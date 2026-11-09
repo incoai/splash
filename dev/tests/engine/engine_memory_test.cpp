@@ -3561,7 +3561,7 @@ void testBudgetDenialRetriesAfterRelease() {
 
 // A lane's start keeps the pooled buffers a lane starts from: a need of state buffers would only allocate them
 // again. Its KV the engine's limit refused takes them once nothing else meets it, and fits; under critical pressure
-// KV takes them first.
+// KV takes them first, and its need, which the storage refuses again, logs short, not a met refused again.
 void testAStartKeepsThePooledLaneBuffersItsKvTakesThemLast() {
   constexpr uint64_t kExtent = 4 * 4096;
   enum class Refused { State, KvAtTheLimit, KvCritical };
@@ -3591,8 +3591,17 @@ void testAStartKeepsThePooledLaneBuffersItsKvTakesThemLast() {
       storage.growthBlocked = true;
       host.setPressure(MemoryPressure::Critical);
     }
+    std::vector<std::string> lines;
+    host.governor.ledger().setDecisionLog([&](std::string_view line) { lines.emplace_back(line); });
     engine.submit(request(286, {286}));
     runUntilIdle(engine);
+    if (refused == Refused::KvCritical) {
+      const auto logs = [&](std::string_view text) {
+        return std::ranges::any_of(lines, [&](const std::string &line) { return line.find(text) != std::string::npos; });
+      };
+      require(logs("claim of request 286 needs 0.0 MiB, 1 pages: short") && !logs("yet refused again"),
+              "a KV need free() found short logged as met: " + (lines.empty() ? std::string() : lines.back()));
+    }
     const bool completes = refused == Refused::KvAtTheLimit;
     require(idle(engine) && (events.completedCount == 1) == completes &&
                 events.failures == (completes ? std::vector<std::string>{}
