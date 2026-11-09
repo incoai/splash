@@ -36,9 +36,11 @@ struct ServerView: View {
                     if case .failed(let message) = state.server.phase, let model = state.server.model {
                         ProblemRow(title: "\(state.displayName(of: model)) ran into a problem", message: message,
                                    log: .server, dismiss: state.server.dismissFailure,
-                                   // Files on this Mac that can't serve won't serve on a second try.
-                                   action: model.hasPrefix("/") && !state.server.running
-                                       ? ("Remove from List", { state.server.dismissFailure(); state.removeLocal(model) }) : nil)
+                                   // The start its failure says would fit; files on this Mac that can't
+                                   // serve won't serve on a second try.
+                                   action: state.server.remedy.map { remedy in (remedy.title, { state.retry(model, with: remedy) }) }
+                                       ?? (model.hasPrefix("/") && !state.server.running
+                                           ? ("Remove from List", { state.server.dismissFailure(); state.removeLocal(model) }) : nil))
                     }
                     if let failure = state.installer.failure {
                         ProblemRow(title: "\(state.displayName(of: failure.model)) couldn’t download",

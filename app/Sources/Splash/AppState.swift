@@ -267,6 +267,15 @@ final class AppState {
         server.stop()
     }
 
+    /// Starts `model` again with the launch options its failure asks for (`Server.remedy`).
+    func retry(_ model: String, with remedy: Server.Remedy) {
+        switch remedy {
+        case .memoryLimit(let limit): options["--max-memory"] = limit
+        case .autoContext: options["--max-context"] = nil
+        }
+        start(model)
+    }
+
     /// The model Stop names, while a server runs: the one a switch goes to, else the one that runs;
     /// and whether Stop does anything now, which it doesn't once a stop with no switch is under way.
     var stopItem: (model: String, enabled: Bool)? {

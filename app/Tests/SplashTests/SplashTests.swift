@@ -247,6 +247,30 @@ struct ServeSettingsTests {
         }
     }
 
+    /// A start that failed for want of memory offers the start that would fit: under a memory
+    /// limit, the least limit the options offer that holds what it needs, or none where none does;
+    /// with a context length set, Auto. Other failures offer none.
+    @Test func aFailureForWantOfMemoryOffersTheStartThatWouldFit() {
+        func failure(_ kind: String, _ bound: String?, required: Int64? = nil) -> ServeRecord.Failure {
+            ServeRecord.Failure(kind: kind, message: "", bound: bound, required_bytes: required, budget_bytes: nil,
+                                plan_context_tokens: nil)
+        }
+        func remedy(_ failure: ServeRecord.Failure, _ settings: ServeSettings) -> Server.Remedy? {
+            Server.remedy(for: failure, settings: settings, memory: 36)
+        }
+        var settings = ServeSettings()
+        settings["--max-memory"] = "8G"
+        #expect(remedy(failure("memory_budget", "max_memory", required: 10_858_659_840), settings) == .memoryLimit("12G"))
+        #expect(remedy(failure("memory_budget", "max_memory", required: 34_359_738_369), settings) == .memoryLimit(nil))
+        #expect(remedy(failure("memory_budget", "device_memory", required: 10_858_659_840), settings) == nil)
+        #expect(remedy(failure("context_budget", "max_memory"), settings) == nil)
+        settings["--max-context"] = String(256 * 1024)
+        #expect(remedy(failure("context_budget", "disk"), settings) == .autoContext)
+        #expect(remedy(failure("host_memory", nil), settings) == nil)
+        #expect([Server.Remedy.memoryLimit("12G"), .memoryLimit(nil), .autoContext].map(\.title)
+            == ["Start with 12 GB", "Start Without a Limit", "Start with Auto Context"])
+    }
+
     @Test func keepsTheOptionsAndReadsBadOnesAsDefaults() throws {
         let folder = FileManager.default.temporaryDirectory.appending(path: "splash-options-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -578,15 +602,16 @@ struct ServerTests {
         let killAfter = Duration.seconds(1)
         let server = Server(runtime: runtime, log: log, defaults: .kept(in: root), killAfter: killAfter)
         server.start("a/b", settings: ServeSettings(values: ["--port": "0"]))
-        var started: String { (try? String(contentsOf: log, encoding: .utf8)) ?? "" }
-        try await waitFor(started.hasSuffix("\n"), "the start")
-        let pid = try #require(pid_t(started.trimmingCharacters(in: .whitespacesAndNewlines)))
+        // The start's own lines, after the line that names it.
+        var lines: [Substring] { ((try? String(contentsOf: log, encoding: .utf8)) ?? "").split(separator: "\n").dropFirst().map { $0 } }
+        try await waitFor(!lines.isEmpty, "the start")
+        let pid = try #require(pid_t(lines[0]))
         defer { killpg(pid, SIGKILL) }
         let stopped = ContinuousClock.now
         server.stop()
         try await waitFor(!server.running, "the kill", seconds: 11)
         #expect(ContinuousClock.now - stopped >= killAfter)
-        #expect(started.split(separator: "\n").filter { $0 == "INT" }.count == 1)
+        #expect(lines.filter { $0 == "INT" }.count == 1)
     }
 
     @MainActor @Test func givesTheServerTheAppsProcessID() async throws {
@@ -602,7 +627,8 @@ struct ServerTests {
         // On a port nothing serves.
         server.start("a/b", settings: ServeSettings(values: ["--port": "0"]))
         try await waitFor(!server.running, "the end")
-        #expect(try String(contentsOf: log, encoding: .utf8) == "SPLASH_APP_PID=\(getpid())\n")
+        let lines = try String(contentsOf: log, encoding: .utf8).split(separator: "\n")
+        #expect(lines.count == 2 && lines[0].hasPrefix("── Starting a/b, ") && lines[1] == "SPLASH_APP_PID=\(getpid())")
     }
 }
 

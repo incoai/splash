@@ -11,6 +11,23 @@ final class Server {
         case failed(String)
     }
 
+    /// A change of the launch options for a start that failed for want of memory (`remedy`).
+    enum Remedy: Equatable {
+        /// The memory limit, as `--max-memory` takes it; nil for none, Auto.
+        case memoryLimit(String?)
+        /// The context length on Auto.
+        case autoContext
+
+        /// Its button: the start with it.
+        var title: String {
+            switch self {
+            case .memoryLimit(let limit?): "Start with \(limit.dropLast()) GB"
+            case .memoryLimit(nil): "Start Without a Limit"
+            case .autoContext: "Start with Auto Context"
+            }
+        }
+    }
+
     /// What a start does, as the server's serve record gives it: the server starts, reads the
     /// model's weights into memory, then runs the model once at full size so that its first answer
     /// comes quickly; the first start after an update also prepares the GPU's programs then, which
@@ -125,7 +142,8 @@ final class Server {
     nonisolated static let killAfter = Supervision.stop * 2
 
     private let runtime: Runtime
-    /// Its log, which each start begins again.
+    /// Its log: each start goes on under the starts before it, from a line that names it, for the
+    /// one that failed to be read after the next one begins (`beginLog`).
     let log: URL
     private let killAfter: Duration
     private var child: ChildProcess?
@@ -170,9 +188,15 @@ final class Server {
         child.stop(SIGINT, killAfter: killAfter)
     }
 
+    /// A change of the launch options that would let the start that failed start: the failure says
+    /// what the model needs, a memory limit that holds it or the context length on Auto; nil
+    /// otherwise.
+    private(set) var remedy: Remedy?
+
     /// Clears a failure the user has read, stopping a server that still runs but serves nothing.
     func dismissFailure() {
         guard case .failed = phase else { return }
+        remedy = nil
         if child != nil { stop() } else { phase = .stopped }
     }
 
@@ -198,7 +222,8 @@ final class Server {
         acceptsImages = false
         reasoning = nil
         stopRequested = false
-        resetLog(log)
+        remedy = nil
+        let start = beginLog(log, heading: "── Starting \(model), \(Date.now.formatted(date: .abbreviated, time: .standard))")
         if portInUse(settings.port) {
             return refuse(Self.portTaken(settings.port))
         }
@@ -214,6 +239,7 @@ final class Server {
                 environment: runtime.environment.merging(settings.environment) { $1 }
                     .merging(["SPLASH_APP_PID": String(getpid())]) { $1 },
                 log: log,
+                from: start,
                 line: { [weak self] in self?.received($0) },
                 exited: { [weak self] in self?.exited($0) }
             )
@@ -228,7 +254,7 @@ final class Server {
 
     /// Fails a start before it runs anything, saying why in the log too.
     private func refuse(_ message: String) {
-        try? Data((message + "\n").utf8).write(to: log)
+        appendLog(log, message)
         phase = .failed(message)
     }
 
@@ -248,8 +274,11 @@ final class Server {
         } else if stopRequested {
             phase = .stopped
         } else if phase == .starting, let pid {
-            phase = .failed(Self.startProblem(record: runtime.serveRecord(port: settings.port), pid: pid,
-                                              port: settings.port, holder: runtime.serveLockHolder(port: settings.port)))
+            let record = runtime.serveRecord(port: settings.port)
+            phase = .failed(Self.startProblem(record: record, pid: pid, port: settings.port,
+                                              holder: runtime.serveLockHolder(port: settings.port)))
+            remedy = record.flatMap { $0.pid == pid ? $0.failure : nil }
+                .flatMap { Self.remedy(for: $0, settings: settings, memory: Catalog.memory) }
         } else {
             phase = .failed("It stopped unexpectedly. The log has the details.")
         }
@@ -267,6 +296,23 @@ final class Server {
             return "Another Splash server is using port \(port). Stop it, or choose another port in Launch Options › Advanced."
         }
         return "It stopped unexpectedly. The log has the details."
+    }
+
+    /// What the launch options would need for a start that failed with `settings` on a Mac with
+    /// `memory` GB to start: a memory limit that holds what the model needs, the least one the
+    /// options offer, or none where none does; the context length on Auto, which the server fits to
+    /// the memory, where one was set that doesn't fit. Other failures it can't tell a change for.
+    nonisolated static func remedy(for failure: ServeRecord.Failure, settings: ServeSettings, memory: Int) -> Remedy? {
+        switch (failure.kind, failure.bound) {
+        case ("memory_budget", "max_memory"):
+            guard let needed = failure.required_bytes else { return nil }
+            let limit = ServeSettings.memoryLimits(memory: memory).first { Int64($0) << 30 >= needed }
+            return .memoryLimit(limit.map { "\($0)G" })
+        case ("context_budget", _) where settings["--max-context"] != nil:
+            return .autoContext
+        default:
+            return nil
+        }
     }
 
     /// That another app holds `port`.

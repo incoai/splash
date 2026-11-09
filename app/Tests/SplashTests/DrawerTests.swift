@@ -302,6 +302,24 @@ struct DrawerTests {
         #expect(lines == ["first", "Started · a/b", "last"])
     }
 
+    /// The server's log goes on under the starts before the one that begins: from a blank line and
+    /// a line that names it, its oldest lines going past what it keeps; the start's tail gives only
+    /// the start's own lines.
+    @Test func aStartsLogGoesOnUnderTheStartsBeforeIt() async throws {
+        let (folder, file) = try Self.log("an earlier start\nits failure")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let start = beginLog(file, heading: "── Starting a/b")
+        #expect(try String(contentsOf: file, encoding: .utf8) == "an earlier start\nits failure\n\n── Starting a/b\n")
+        var lines: [String] = []
+        let tail = try #require(LogTail(file, from: start) { lines.append($0) })
+        try Self.append("its first line\n", to: file)
+        try await waitFor(lines == ["its first line"])
+        tail.finish()
+        #expect(lines == ["its first line"])
+        beginLog(file, heading: "── Starting c/d", kept: 24)
+        #expect(try String(contentsOf: file, encoding: .utf8) == "its first line\n\n── Starting c/d\n")
+    }
+
     /// As a log grows, its oldest lines go: past 512 K characters, it keeps the lines that start
     /// in its last seven eighths of that.
     @Test func aLogKeepsAtMostTheLinesOfItsLast512KCharactersAsItGrows() async throws {

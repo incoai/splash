@@ -107,7 +107,10 @@ name, and at launch it runs `install/cached.py`. While a model runs, the Server
 shows its context limit, from `/v1/models`, and its `/status`: requests,
 answering and prompt speed, time to first token, the tokens generated, read and
 taken from the cache, and the Metal memory it holds, with each request's line
-of the server's log, folded. Its chat is its own, not the chat page: it streams
+of the server's log, folded. A start that fails says why, as its serve record
+has it, the log keeping the starts before it; one that failed for want of
+memory offers the start that would fit, under a memory limit that holds the
+model or with the context length on Auto. Its chat is its own, not the chat page: it streams
 `/v1/chat/completions` and keeps each conversation as a JSON file in
 `~/Library/Application Support/Splash/Chats`, so a conversation outlives a
 switch of models. A chat takes the title the model sums its first exchange up
