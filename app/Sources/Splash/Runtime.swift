@@ -292,15 +292,12 @@ struct InstalledModel: Identifiable, Hashable, Sendable {
     /// Its family, as its assembly record names it; nil for model files on this Mac not prepared yet.
     var family: String?
 
-    /// Whether model files on this Mac hold a GGUF besides a projector, as they were measured.
-    var holdsGGUF = false
+    /// Whether it is model files on this Mac that are a GGUF file, or a folder holding one besides
+    /// a projector, as they were measured; the vision projector they may be given is a GGUF's.
+    var gguf = false
 
     /// Whether it is model files on this Mac rather than a model Splash installed.
     var local: Bool { id.hasPrefix("/") }
-
-    /// Whether it is a GGUF model: one Splash installed by its variant (`OWNER/REPO:VARIANT`), or
-    /// model files on this Mac that are a GGUF file or a folder holding one besides a projector.
-    var gguf: Bool { local ? holdsGGUF : id.contains(":") }
 
     /// The model files at `path`, a GGUF file or a folder, measured.
     static func local(_ path: String) -> InstalledModel {
@@ -313,7 +310,7 @@ struct InstalledModel: Identifiable, Hashable, Sendable {
             total + Int64((try? file.resolvingSymlinksInPath().resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         }
         var model = InstalledModel(id: path, bytes: bytes)
-        model.holdsGGUF = files.contains {
+        model.gguf = files.contains {
             $0.pathExtension.lowercased() == "gguf" && !$0.lastPathComponent.localizedCaseInsensitiveContains("mmproj")
         }
         return model
