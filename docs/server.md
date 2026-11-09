@@ -81,17 +81,21 @@ still sleep, and closing the lid or choosing Sleep still sleeps the Mac.
 
 ### Console
 
-The server writes its console lines, and its engine's, from one thread, in
-the order they come, so that a log of both streams, as `2>&1` or the app's
-server log, keeps that order: status and request lines go to stdout, errors,
-warnings and the engine's lines to stderr. A stdout that stops draining
-therefore holds up stderr too. Output that stops draining, as a log pipe whose
-reader stalls, holds up that thread alone, never a request, the engine or an
-HTTP answer. Once 1024 lines wait, each further line is dropped, and `/status`
-counts them as `console.dropped_lines`. A failed engine's last lines, why it
-failed or what it saved as it stopped, come before the server's report of the
-failure, which waits up to 1 s for them; at exit the server waits up to 1 s
-for its last lines.
+The server writes its console lines, its engine's and Python's tracebacks
+from one thread, in the order they come, so that a log of both streams, as
+`2>&1` or the app's server log, keeps that order: status and request lines go
+to stdout, errors, warnings, tracebacks and the engine's lines to stderr. A
+stdout that stops draining therefore holds up stderr too. Output that stops
+draining, as a log pipe whose reader stalls, holds up that thread alone, never
+a request, the engine or an HTTP answer. Once 1024 lines wait, each further
+line is dropped; once the console writes again, a `Warning · N console lines
+dropped …` line takes their place, and `/status` counts them as
+`console.dropped_lines`. A failed engine's last lines, why it failed or what
+it saved as it stopped, come before the lines the server prints after the
+failure, its report among them, which wait up to 1 s for the engine's stderr
+to end; the failure itself reaches the requests in flight and schedules the
+restart at once. At exit the server waits up to 1 s for its last lines, run
+with or without `python -u`.
 
 ### Shell completion
 

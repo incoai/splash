@@ -20,7 +20,7 @@ from unittest import mock
 
 import yaml
 
-from dev.tests.server_fixtures import console_written
+from dev.tests.server_fixtures import console_written, full_pipe
 from install import clients, launcher
 from server import serve_options
 
@@ -1272,6 +1272,56 @@ class ClientLifecycleTests(unittest.TestCase):
             ],
             result.stderr,
         )
+
+    def test_a_stalled_console_holds_up_the_clients_launch_1_s_at_most(self):
+        # The launcher's stdout is a pipe nobody reads, full already: its
+        # lines wait for it until it executes the client, which drops them,
+        # the console's second later.
+        unread, written, filler = full_pipe()
+        self.addCleanup(os.close, unread)
+        with tempfile.TemporaryDirectory() as directory:
+            client = Path(directory) / "claude"
+            client.write_text("#!/bin/sh\nexit 7\n")
+            client.chmod(0o755)
+            elapsed = Path(directory) / "elapsed"
+            program = "\n".join(
+                (
+                    "import os, time",
+                    "from unittest import mock",
+                    "from install import launcher",
+                    "model = {'id': 'm', 'owned_by': 'splash', 'context_length': 8192}",
+                    "listing = {'data': [{**model, 'input_modalities': ['text']}]}",
+                    "execute = os.execvpe",
+                    "def timed(*arguments):",
+                    f"    with open({str(elapsed)!r}, 'w') as seconds:",
+                    "        seconds.write(str(time.monotonic() - started))",
+                    "    execute(*arguments)",
+                    "with (",
+                    "    mock.patch.object(launcher, '_request_json', return_value=listing),",
+                    "    mock.patch.object(os, 'execvpe', timed),",
+                    "):",
+                    "    started = time.monotonic()",
+                    "    launcher.main(['claude'])",
+                )
+            )
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-c", program],
+                    cwd=launcher.ROOT,
+                    env={**os.environ, "PATH": f"{directory}:/usr/bin:/bin"},
+                    stdout=written,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=10,
+                )
+            finally:
+                os.close(written)
+            self.assertEqual(result.returncode, 7, result.stderr)
+            self.assertLess(float(elapsed.read_text()), 1.5)
+        held = b""
+        while chunk := os.read(unread, 65536):
+            held += chunk
+        self.assertEqual(held, b"x" * filler)
 
     def test_missing_client_is_checked_before_connection(self):
         with (

@@ -1883,6 +1883,86 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(lines[0], line)
                 self.assertRegex(lines[1], r"^\d{2}:\d{2}:\d{2} Engine failed$")
 
+    def test_a_hung_engines_failure_waits_for_nothing_and_its_report_1_s(self):
+        # The server fails an engine whose loop hangs: it sends bytes that
+        # start no frame for its request, ignores SIGTERM, keeps its stderr
+        # open and says why 0.5 s later. The request's terminal and the
+        # failure listener, which schedules the restart (backend._failed),
+        # come at once; the report, printed then, is written after the
+        # engine's line, once the console's second has passed.
+        cause = "error: the loop stopped answering (test)"
+        engine = "\n".join(
+            (
+                "import os, signal, sys, time",
+                "from dev.tests import native_peer as n",
+                "from server import protocol as w",
+                "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})",
+                f"sys.stdout.buffer.write(n.serialize_event({READY_SOURCE}))",
+                "sys.stdout.buffer.flush()",
+                "frames = n.ClientFrameReader()",
+                "while data := os.read(0, 65536):",
+                "    if any(isinstance(m, w.RequestFrame) for m, _ in frames.feed(data)):",
+                "        break",
+                "sys.stdout.buffer.write(b'\\xff' * 64)",
+                "sys.stdout.buffer.flush()",
+                "time.sleep(0.5)",
+                f"sys.stderr.write({cause!r} + '\\n')",
+                "sys.stderr.flush()",
+                "time.sleep(30)",
+            )
+        )
+        server = "\n".join(
+            (
+                "import sys, time",
+                "from dev.tests import native_peer as n",
+                "from server import diagnostics, runtime",
+                "from server import protocol as w",
+                "heard = []",
+                "def failed(*_failure):",
+                "    heard.append(time.monotonic())",
+                "    diagnostics.print_status('Engine failed', error=True)",
+                "native = runtime.MultiplexedRuntime(",
+                f"    (sys.executable, '-c', {engine!r}), pending_limit=1",
+                ")",
+                "native.on_engine_failure = failed",
+                "native.wait_ready(10)",
+                "frame = n.request_frame(",
+                "    request_id=0, absolute_deadline_unix_micros=0,",
+                "    remaining_deadline_micros=0,",
+                ")",
+                "sent = time.monotonic()",
+                "call = native.submit(runtime.GenerationRequest(",
+                "    frame, sent + 30, None, w.request_fingerprint(frame)",
+                "))",
+                "try:",
+                "    call.result(10)",
+                "except runtime.EngineRuntimeError:",
+                "    ended = time.monotonic()",
+                "written = diagnostics.flush_console(5)",
+                "reported = time.monotonic()",
+                "native.kill()",
+                "native.close()",
+                "print(ended - sent, heard[0] - sent, reported - sent, written)",
+            )
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", server],
+            cwd=Path(engine_runtime.__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ended, heard, reported, written = result.stdout.split()
+        self.assertLess(float(ended), 0.4, result.stderr)
+        self.assertLess(float(heard), 0.4, result.stderr)
+        self.assertLess(float(reported), 1.5, result.stderr)
+        self.assertEqual(written, "True")
+        lines = result.stderr.splitlines()
+        self.assertEqual(len(lines), 2, result.stderr)
+        self.assertEqual(lines[0], cause)
+        self.assertRegex(lines[1], r"^\d{2}:\d{2}:\d{2} Engine failed$")
+
     def test_the_failure_listener_hears_which_requests_had_started(self):
         """The fingerprints of the started requests reach the listener with
         the engine's exit status; a queued request was in no command."""

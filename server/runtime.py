@@ -1517,8 +1517,15 @@ class MultiplexedRuntime:
             return process.poll()
 
         def finish() -> None:
+            if relay is not None and not isinstance(failure, RuntimeClosed):
+                # An engine says on stderr why it failed as it exits
+                # (main.mm's error: lines), and what it saved as it stops:
+                # the console writes those before the lines printed from here
+                # on, the failure's report among them, while the failure
+                # itself reaches the listener and the calls at once.
+                diagnostics.hold_behind_engine(relay)
             # A failed engine is asked to stop at once, and killed if it still
-            # runs past the stop grace: its report below waits for its exit.
+            # runs past the stop grace.
             if process is not None and process.poll() is None:
                 try:
                     process.terminate()
@@ -1526,13 +1533,6 @@ class MultiplexedRuntime:
                     pass
                 self._arm_kill_fallback(process)
             if not isinstance(failure, RuntimeClosed):
-                if relay is not None:
-                    # An engine says on stderr why it failed as it exits
-                    # (main.mm's error: lines), and what it saved as it stops:
-                    # those lines reach the console before its failure is
-                    # reported, which waits for its exit, LAST_LINES_SECONDS
-                    # at most.
-                    relay.join(diagnostics.LAST_LINES_SECONDS)
                 try:
                     self._crash_trace.dump(
                         generation,

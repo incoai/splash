@@ -589,6 +589,20 @@ def console_written():
         raise AssertionError("the console did not write its lines within 5 s")
 
 
+def full_pipe():
+    """A pipe that takes nothing more, as one whose reader stalled: its read
+    end, its write end, blocking, and the bytes it holds."""
+    unread, written = os.pipe()
+    os.set_blocking(written, False)
+    held = 0
+    try:
+        while True:
+            held += os.write(written, b"x" * 65536)
+    except BlockingIOError:
+        os.set_blocking(written, True)
+    return unread, written, held
+
+
 class StalledConsole(io.StringIO):
     """A console that stops draining, as a pipe whose reader stalled: each
     write waits until `drained` is set, or 10 s; `writing` is set once one

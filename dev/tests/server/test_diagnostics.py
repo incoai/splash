@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -16,6 +17,7 @@ from dev.tests.server_fixtures import (
     StalledConsole,
     chat_body,
     console_written,
+    full_pipe,
 )
 from server import diagnostics
 from server import server as api
@@ -25,6 +27,46 @@ def printed(record):
     """Print a request's line and wait for the console to write it."""
     diagnostics.print_request(record)
     console_written()
+
+
+def dropped_warning(count):
+    """The console's warning that `count` lines were dropped, as a pattern."""
+    return (
+        r"\d{2}:\d{2}:\d{2} Warning · "
+        f"{count:,} console lines dropped while the output stopped draining"
+    )
+
+
+def exited(command, both):
+    """Run `command` from the checkout with its stdout, and its stderr too when
+    `both`, on a pipe nobody reads, full already: its exit status, None once
+    10 s pass first, the seconds it ran and what it wrote on a separate
+    stderr."""
+    unread, written, _ = full_pipe()
+    try:
+        started = time.monotonic()
+        try:
+            child = subprocess.Popen(
+                command,
+                cwd=Path(diagnostics.__file__).resolve().parents[1],
+                stdout=written,
+                stderr=written if both else subprocess.PIPE,
+            )
+        finally:
+            os.close(written)
+        try:
+            status = child.wait(10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+            status = None
+        elapsed = time.monotonic() - started
+        if both:
+            return status, elapsed, b""
+        with child.stderr:
+            return status, elapsed, child.stderr.read()
+    finally:
+        os.close(unread)
 
 
 class DiagnosticsTests(HarnessTestCase):
@@ -392,7 +434,8 @@ class DiagnosticsTests(HarnessTestCase):
     def test_a_console_that_stops_draining_holds_up_no_caller(self):
         # With a line being written, the next 1024 wait and the 100 after them
         # are dropped and counted; the waiting ones are written, in order,
-        # once the console drains.
+        # once the console drains, and a warning on stderr says how many were
+        # dropped.
         drained = threading.Event()
         console = StalledConsole(drained)
         self.addCleanup(console_written)
@@ -404,7 +447,10 @@ class DiagnosticsTests(HarnessTestCase):
                 diagnostics.print_status(f"line {n}") for n in range(1, kept + 100)
             ]
         )
-        with mock.patch("sys.stdout", console):
+        with (
+            mock.patch("sys.stdout", console),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as errors,
+        ):
             diagnostics.print_status("line 0")
             self.assertTrue(console.writing.wait(5.0))
             printer.start()
@@ -417,12 +463,12 @@ class DiagnosticsTests(HarnessTestCase):
             console_written()
         written = [line.split(" ", 1)[1] for line in console.getvalue().splitlines()]
         self.assertEqual(written, [f"line {n}" for n in range(kept)])
+        self.assertRegex(errors.getvalue(), rf"^{dropped_warning(100)}\n$")
 
     def test_the_exit_writes_the_last_lines_and_its_engines(self):
         # An engine writes its last lines, such as the persistent cache's, as
-        # it stops, here once its input ends, while the server exits, with the
-        # status of one that stopped restarting its engine
-        # (ENGINE_STOPPED_STATUS).
+        # it stops, here once its input ends, while the process exits: the
+        # exit writes them, and keeps the process's status.
         engine = "import sys; sys.stdin.read(); sys.stderr.write('Stopped\\n')"
         program = (
             "import subprocess, sys; from server import diagnostics; "
@@ -444,12 +490,85 @@ class DiagnosticsTests(HarnessTestCase):
         self.assertRegex(result.stdout, r"^\d{2}:\d{2}:\d{2} Stopping\n$")
         self.assertEqual(result.stderr, "Stopped\n")
 
+    def test_an_exit_on_a_console_that_stopped_draining_takes_its_second(self):
+        # Its stdout, or both streams as 2>&1 gives them, on a pipe nobody
+        # reads: the exit gives up on its lines after the console's second
+        # and keeps the process's status, without -u, as docs/models.md
+        # starts the server, as with it.
+        program = (
+            "from server import diagnostics; "
+            "[diagnostics.print_line(f'line {n}') for n in range(10)]; "
+            "raise SystemExit(3)"
+        )
+        for case, options, both in (
+            ("stdout", [], False),
+            ("2>&1", [], True),
+            ("-u 2>&1", ["-u"], True),
+        ):
+            with self.subTest(case=case):
+                status, elapsed, errors = exited(
+                    [sys.executable, *options, "-c", program], both
+                )
+                self.assertEqual(status, 3, errors)
+                self.assertLess(elapsed, 2.5)
+
+    def test_an_uncaught_exception_is_a_console_line(self):
+        # Python's report of an exception nothing caught, in the main thread,
+        # as server.main's of a bug, or in another, comes after the lines
+        # printed before it; on a stderr nobody reads, the process still exits
+        # with its status after the console's second.
+        before = "\n".join(
+            (
+                "import threading",
+                "from server import diagnostics",
+                "for n in range(100):",
+                "    diagnostics.print_line(f'line {n} ' + 'x' * 1000, error=True)",
+            )
+        )
+        lines = [f"line {n} " + "x" * 1000 for n in range(100)]
+        for case, uncaught, status, report in (
+            (
+                "main",
+                "raise RuntimeError('bug')",
+                1,
+                ("Traceback (most recent call last):", "RuntimeError: bug"),
+            ),
+            (
+                "thread",
+                "worker = threading.Thread(target=lambda: 1 / 0, name='worker')\n"
+                "worker.start()\n"
+                "worker.join()",
+                0,
+                ("Exception in thread worker:", "ZeroDivisionError: division by zero"),
+            ),
+        ):
+            program = f"{before}\n{uncaught}\n"
+            with self.subTest(case=case, stderr="read"):
+                result = subprocess.run(
+                    [sys.executable, "-u", "-c", program],
+                    cwd=Path(diagnostics.__file__).resolve().parents[1],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode, status, result.stderr)
+                written = result.stderr.splitlines()
+                self.assertEqual(written[:100], lines)
+                self.assertEqual((written[100], written[-1]), report)
+            with self.subTest(case=case, stderr="unread"):
+                exit_status, elapsed, _ = exited(
+                    [sys.executable, "-u", "-c", program], True
+                )
+                self.assertEqual(exit_status, status)
+                self.assertLess(elapsed, 2.5)
+
     def test_requests_complete_while_the_console_stops_draining(self):
         harness = self.harness(FakeRuntime(), request_logger=diagnostics.print_request)
         drained = threading.Event()
         console = StalledConsole(drained)
         self.addCleanup(console_written)
         self.addCleanup(drained.set)
+        before = diagnostics.console_stats()["dropped_lines"]
         with mock.patch("sys.stdout", console), mock.patch("sys.stderr", console):
             for _ in range(2):
                 status, _, payload = harness.request(
@@ -471,6 +590,14 @@ class DiagnosticsTests(HarnessTestCase):
             self.assertEqual(
                 json.loads(payload)["console"]["dropped_lines"] - dropped, 2
             )
+            # Once it drains, a warning after the lines that waited, where the
+            # dropped ones would have been, says how many there were.
+            drained.set()
+            console_written()
+        count = diagnostics.console_stats()["dropped_lines"] - before
+        self.assertRegex(
+            console.getvalue().splitlines()[-1], rf"^{dropped_warning(count)}$"
+        )
 
     def test_request_lines_are_the_ones_the_app_reads(self):
         """The server writes its request lines as log_lines_golden.txt holds

@@ -5,6 +5,7 @@
 #include "StderrLine.hpp"
 #include "engine/Status.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -1006,25 +1007,49 @@ void testThermalStateTransitions() {
           "a warm start was not logged once");
 }
 
-// The server and the runtime share stderr, as `serve > log 2>&1` does: a
-// line written from any thread arrives whole.
+// The server reads the runtime's stderr from a pipe, which, once full, keeps a
+// write whole only up to PIPE_BUF (512 bytes on macOS): 8 threads write lines
+// of 2 KiB at once while the reader drains the pipe 256 bytes at a time, and
+// every line arrives whole.
 void testStderrLinesStayWhole() {
-  std::istringstream lines(capturedStderr([] {
-    std::vector<std::thread> writers;
-    for (int writer = 0; writer < 8; ++writer)
-      writers.emplace_back([writer] {
-        for (int line = 0; line < 300; ++line)
-          writeStderrLine("writer " + std::to_string(writer) + " line " +
-                          std::to_string(line));
-      });
-    for (std::thread &writer : writers)
-      writer.join();
-  }));
-  const std::regex whole("writer [0-7] line [0-9]+");
+  int ends[2];
+  require(::pipe(ends) == 0, "no pipe");
+  const int saved = ::dup(STDERR_FILENO);
+  ::dup2(ends[1], STDERR_FILENO);
+  ::close(ends[1]);
+  std::string received;
+  std::thread reader([&] {
+    char chunk[256];
+    for (ssize_t got; (got = ::read(ends[0], chunk, sizeof chunk)) > 0;) {
+      received.append(chunk, static_cast<size_t>(got));
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+  });
+  std::vector<std::thread> writers;
+  for (int writer = 0; writer < 8; ++writer)
+    writers.emplace_back([writer] {
+      for (int line = 0; line < 50; ++line)
+        writeStderrLine("writer " + std::to_string(writer) + " line " +
+                        std::to_string(line) + ' ' + std::string(2048, char('a' + writer)));
+    });
+  for (std::thread &writer : writers)
+    writer.join();
+  // The pipe's last write end closes: the reader reads to its end.
+  ::dup2(saved, STDERR_FILENO);
+  ::close(saved);
+  reader.join();
+  ::close(ends[0]);
+  std::istringstream lines(received);
+  const std::regex head("writer ([0-7]) line [0-9]+ ");
   int count = 0;
-  for (std::string line; std::getline(lines, line); ++count)
-    require(std::regex_match(line, whole), "a stderr line was broken");
-  require(count == 8 * 300, "stderr lines were lost or merged");
+  for (std::string line; std::getline(lines, line); ++count) {
+    std::smatch parts;
+    require(std::regex_search(line, parts, head, std::regex_constants::match_continuous) &&
+                line.substr(parts.length(0)) ==
+                    std::string(2048, char('a' + std::stoi(parts[1].str()))),
+            "a stderr line was broken");
+  }
+  require(count == 8 * 50, "stderr lines were lost or merged");
 }
 
 // A notice carries the time first, as the server's console lines do, and
