@@ -1261,6 +1261,10 @@ struct MetalBackend::Impl {
         return result;
     }
 
+    // The creation time from which a pipeline created while serving is logged
+    // as a warning (newPipeline).
+    static constexpr double kNoticedPipelineMs = 100;
+
     id<MTLComputePipelineState> newPipeline(id<MTLLibrary> source, std::string_view name,
                                             std::span<const uint32_t> constants = {}) {
         const auto started = AwakeClock::now();
@@ -1293,9 +1297,15 @@ struct MetalBackend::Impl {
             for (const uint32_t value : constants)
                 values += (values.empty() ? "(" : ",") + std::to_string(value);
             if (!values.empty()) values += ')';
-            logWarning("Metal created pipeline ", name, values, " while serving, in ",
-                       std::chrono::duration<double, std::milli>(AwakeClock::now() - started).count(),
-                       " ms: no warmup of the start created it");
+            // Its request waited for it: a warning where that is a wait to
+            // notice, as a cold pipeline of every format's seconds were
+            // (#715); a notice otherwise, as an image's first kernels.
+            const double ms = std::chrono::duration<double, std::milli>(AwakeClock::now() - started).count();
+            if (ms >= kNoticedPipelineMs)
+                logWarning("Metal created pipeline ", name, values, " while serving, in ", ms,
+                           " ms: no warmup of the start created it");
+            else
+                logLine("Metal created pipeline ", name, values, " while serving, in ", ms, " ms");
         }
         return result;
     }

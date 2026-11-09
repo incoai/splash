@@ -532,10 +532,14 @@ and it prepares the sampling kernels' dispatches without running them
 (`MetalBackend::preparePipelines`). What memory keeps from running
 (`warmup.memory_limited_steps` in `/status`) stays cold, as do the paths no
 warmup takes: a decode width the host refused or the plan does not hold, a
-decode after enough history to score INT8 queries, an image, KV on the SSD.
+decode after enough history to score INT8 queries, an image, KV on the SSD,
+and Flash-Next's sparse attention, which a sequence takes past 2,048 tokens
+(its indexer's scoring and selection, and the attention's block lists).
 From Ready on the backend counts each pipeline it creates
 (`metal.pipelines_created_while_serving`) and logs it once, with its name, its
-function constants and how long it took.
+function constants and how long it took: as a warning where that was 100 ms or
+more, a wait its request notices, as a cold pipeline of every GGUF format's
+seconds were.
 
 ### GGUF tiles
 
