@@ -760,6 +760,9 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(
             (kind, error.status, error.code), ("error", 500, "engine_failed")
         )
+        with self.assertRaises(api_errors.APIError) as released:
+            transport.release_weights()
+        self.assertEqual(released.exception.code, "engine_failed")
 
     def test_close_does_not_wait_for_a_frame_being_written(self):
         # A writer stuck mid-frame holds the write lock for up to its write

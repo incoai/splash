@@ -1740,8 +1740,8 @@ bool Cache::transfersInFlight() const noexcept {
 bool Cache::transfersInFlight(const Walk &walk) const noexcept {
   // A write counts by what its landing frees: a page written through or
   // copied ahead returns something only where, under --kv-spill always, it
-  // spills once its copy lands or, copied ahead, where the walk then frees
-  // its block through the copy.
+  // spills once its copy lands, or where the walk then frees its block
+  // through the copy.
   return !restores_.empty() || writes(WriteClass::Reclaim) || copyAheadReturns(walk) || states_.writing() ||
          spillingWrites();
 }

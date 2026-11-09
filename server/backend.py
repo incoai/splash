@@ -816,7 +816,7 @@ class NativeBackend:
         """
         with self.lock:
             if self.closing:
-                raise APIError(503, "server is shutting down", "server_shutdown")
+                raise self._closed_error_locked()
         restarts = self.runtime.restart_count
         try:
             event = self.runtime.release_weights(timeout=timeout)
@@ -1202,9 +1202,8 @@ class NativeBackend:
                     if state.terminal_enqueued:
                         continue
                     self._detach_locked(state)
-                    stranded.append(state)
-            for state in stranded:
-                error = APIError(503, "server is shutting down", "server_shutdown")
+                    stranded.append((state, self._closed_error_locked()))
+            for state, error in stranded:
                 self._record(state.job, error=error)
                 state.job.events.put(("error", error))
             self.terminals.put(None)
