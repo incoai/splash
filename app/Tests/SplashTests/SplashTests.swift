@@ -601,10 +601,10 @@ struct AppStateTests {
         #expect(state.checkedModel == second && state.selection == second)
         try await waitFor(state.server.model == second && state.server.phase == .ready, "\(second) ready")
         #expect(state.server.since > since)
-        // Its engine stopped while its server runs on, nothing is checked, and choosing the model
-        // starts it again.
+        // Its engine stopped, its server stops too, as it no longer starts the engine again: nothing
+        // is checked, and choosing the model starts it again.
         step("broken")
-        try await waitFor(state.serverStatus.look == .failed && state.server.running, "the engine's stop")
+        try await waitFor(state.serverStatus.look == .failed && !state.server.running, "the engine's stop")
         #expect(state.checkedModel == nil)
         try FileManager.default.removeItem(at: fake.root.appending(path: "broken"))
         let broken = state.server.since
