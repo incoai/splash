@@ -45,12 +45,19 @@ struct ServerView: View {
                     }
                     if let failure = state.installer.failure {
                         let name = state.displayName(of: failure.model)
-                        let check = state.installer.work == .check
-                        ProblemRow(title: check ? "Splash couldn’t check \(name) for updates" : "\(name) couldn’t download",
-                                   message: failure.message, log: .downloads, dismiss: state.installer.dismissFailure,
-                                   action: check
-                                       ? ("Check Again", { state.checkForUpdates(failure.model) })
-                                       : ("Download Again", { state.download(failure.model) }))
+                        switch state.installer.work {
+                        case .download:
+                            ProblemRow(title: "\(name) couldn’t download", message: failure.message, log: .downloads,
+                                       dismiss: state.installer.dismissFailure,
+                                       action: ("Download Again", { state.download(failure.model) }))
+                        case .check:
+                            ProblemRow(title: "Splash couldn’t check \(name) for updates", message: failure.message,
+                                       log: .downloads, dismiss: state.installer.dismissFailure,
+                                       action: ("Check Again", { state.checkForUpdates(failure.model) }))
+                        case .removal:
+                            ProblemRow(title: "Splash couldn’t delete \(name)", message: failure.message, log: .downloads,
+                                       dismiss: state.installer.dismissFailure)
+                        }
                     }
                     if let checked = state.installer.checked {
                         CheckedRow(model: checked.model, updated: checked.updated)
@@ -513,10 +520,12 @@ private struct DownloadRow: View {
             HStack {
                 let name = installer.model.map(state.displayName(of:)) ?? ""
                 // A check says so until it finds something to download.
-                Text(installer.work == .check && installer.progress == nil ? "Checking \(name) for updates" : "Downloading \(name)")
+                Text(installer.work == .removal ? "Deleting \(name)"
+                     : installer.work == .check && installer.progress == nil ? "Checking \(name) for updates" : "Downloading \(name)")
                     .font(.headline)
                 Spacer()
-                Button("Cancel") { installer.cancel() }
+                // A deletion is quick, and cut short it would leave files no one uses.
+                if installer.work != .removal { Button("Cancel") { installer.cancel() } }
             }
             if let progress = installer.progress {
                 ProgressView(value: progress.fraction)
@@ -532,7 +541,13 @@ private struct DownloadRow: View {
 
     private var caption: String {
         let installer = state.installer
-        guard let progress = installer.progress else { return installer.work == .check ? "Asking Hugging Face…" : "Preparing download…" }
+        guard let progress = installer.progress else {
+            switch installer.work {
+            case .download: return "Preparing download…"
+            case .check: return "Asking Hugging Face…"
+            case .removal: return "Removing its files…"
+            }
+        }
         let amount = "\(Format.size(progress.done)) of \(Format.size(progress.total))"
         guard let remaining = installer.remaining else { return amount }
         if remaining < .seconds(60) { return "\(amount) — less than a minute left" }
@@ -548,6 +563,8 @@ private struct ModelRow: View {
     @Environment(AppState.self) private var state
     let model: InstalledModel
     @State private var hovering = false
+    /// Whether the question to delete the model asks.
+    @State private var deleting = false
 
     var body: some View {
         let selected = state.selection == model.id
@@ -601,12 +618,18 @@ private struct ModelRow: View {
         .accessibilityAddTraits(selected ? .isSelected : [])
         .help(state.catalog.about(of: model.id) ?? model.id)
         .contextMenu { actions }
+        .confirmationDialog("Delete \(state.displayName(of: model.id))?", isPresented: $deleting) {
+            Button("Delete", role: .destructive) { state.delete(model.id) }
+        } message: {
+            Text("Its files\(model.bytes.map { ", \(Format.size($0))," } ?? "") go from the Hugging Face cache, where the splash "
+                + "command and other apps may use them too, unless another model on this Mac uses them.")
+        }
     }
 
     /// What can be done with the model, as its menu's button and a right click on its row give it.
     /// Model files on this Mac: choose a vision projector, a GGUF's alone, and a draft in place of
     /// their family's, show them in the Finder or take them off the list. A model Splash installed:
-    /// check it for updates, which its starts don't ask the Hub for, or copy its ID.
+    /// check it for updates, which its starts don't ask the Hub for, copy its ID or delete it.
     @ViewBuilder private var actions: some View {
         if model.local {
             let files = state.modelFiles[model.id] ?? AppState.ModelFiles()
@@ -624,10 +647,14 @@ private struct ModelRow: View {
             Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: model.id)]) }
             Button("Remove from List") { state.removeLocal(model.id) }
         } else {
-            // One download at a time; the model that runs is checked once stopped.
+            // One download at a time; the model that runs is checked or deleted once stopped.
+            let busy = !state.ready || state.installer.running || (state.server.running && state.server.model == model.id)
             Button("Check for Updates") { state.checkForUpdates(model.id) }
-                .disabled(!state.ready || state.installer.running || (state.server.running && state.server.model == model.id))
+                .disabled(busy)
             CopyModelID(id: model.id)
+            Divider()
+            Button("Delete…", role: .destructive) { deleting = true }
+                .disabled(busy)
         }
     }
 

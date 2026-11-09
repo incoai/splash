@@ -75,9 +75,9 @@ final class Installer {
     private(set) var progress: Progress?
     /// The last installation that failed: its model and why.
     private(set) var failure: (model: String, message: String)?
-    /// What the installer does with a model: downloads it, or checks an installed one for
-    /// updates, which downloads only what has moved on, if anything.
-    enum Work { case download, check }
+    /// What the installer does with a model: downloads it, checks an installed one for updates,
+    /// which downloads only what has moved on, if anything, or removes an installed one.
+    enum Work { case download, check, removal }
     /// What the installation running does, or else what the last one did.
     private(set) var work = Work.download
     /// The last check for updates that ended: its model, and whether it downloaded what had moved
@@ -86,6 +86,8 @@ final class Installer {
 
     /// Gets each model once it is installed.
     @ObservationIgnored var installed: (String) -> Void = { _ in }
+    /// Gets each model once it is removed.
+    @ObservationIgnored var removed: (String) -> Void = { _ in }
 
     /// The downloads' log, which each download begins again.
     let log: URL
@@ -119,6 +121,16 @@ final class Installer {
 
     /// Downloads `model`, or checks it for updates (`Work`).
     func install(_ model: String, _ work: Work = .download) {
+        run(model, work)
+    }
+
+    /// Removes `model`, an installed one, with the files of it that no other installation uses
+    /// (`install/models.py remove`), which a server serving it refuses.
+    func remove(_ model: String) {
+        run(model, .removal)
+    }
+
+    private func run(_ model: String, _ work: Work) {
         guard child == nil else { return }
         self.model = model
         self.work = work
@@ -132,17 +144,18 @@ final class Installer {
         resetLog(log)
         do {
             child = try record.start(
-                runtime.installCommand(model),
+                work == .removal ? runtime.removeCommand(model) : runtime.installCommand(model),
                 environment: runtime.environment,
                 log: log,
                 line: { [weak self] in self?.received($0) },
                 exited: { [weak self] in self?.exited($0) }
             )
         } catch {
-            failure = (model, "The download couldn’t start: \(error.localizedDescription)")
+            failure = (model, "Splash couldn’t start: \(error.localizedDescription)")
             self.model = nil
             return
         }
+        guard work != .removal else { return }
         // A download takes long; the Mac must not sleep through it.
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .idleSystemSleepDisabled], reason: "Downloading \(model)")
@@ -195,10 +208,10 @@ final class Installer {
         progress = nil
         if status == 0 {
             if work == .check { checked = (model, downloaded) }
-            installed(model)
+            if work == .removal { removed(model) } else { installed(model) }
         } else if !cancelled {
             failure = (model, reported.map { Self.problem($0, model: model) }
-                ?? "The download stopped unexpectedly. The log has the details.")
+                ?? "It stopped unexpectedly. The log has the details.")
         }
     }
 }

@@ -60,6 +60,11 @@ struct Runtime: Sendable {
         scriptCommand("install/models.py", ["--model", model, "prepare", "--json-progress"])
     }
 
+    /// The command line of the installer removing `model`, an installed one.
+    func removeCommand(_ model: String) -> [String] {
+        scriptCommand("install/models.py", ["--model", model, "remove"])
+    }
+
     /// Whether `pid` runs this runtime's installer as an app starts it (`installCommand`), for any
     /// model, as the kernel keeps its arguments; `splash serve` runs it with others. Its program is
     /// left out: an interpreter can start another in its place, under the same ID and arguments,

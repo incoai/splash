@@ -103,6 +103,7 @@ final class AppState {
         catalog = Catalog(contentsOf: runtime.suggestedModels)
         transcript = Transcript(runtime: runtime)
         installer.installed = { [weak self] in self?.didInstall($0) }
+        installer.removed = { [weak self] _ in self?.refresh() }
         // A start prepares model files on this Mac, which then have a family, and the model that
         // runs stays listed only while it runs.
         server.phaseChanged = { [weak self] in self?.refresh() }
@@ -546,6 +547,13 @@ final class AppState {
         settings.projector = files?.projector
         settings.draft = files?.draft
         return settings
+    }
+
+    /// Deletes `model`, a model Splash installed, with the files of it nothing else uses; the
+    /// model that runs is deleted once it is stopped.
+    func delete(_ model: String) {
+        guard ready, !(server.running && server.model == model) else { return }
+        installer.remove(model)
     }
 
     /// Asks the Hub whether `model` or its draft has moved on, and installs what has, as its

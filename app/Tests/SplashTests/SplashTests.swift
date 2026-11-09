@@ -454,6 +454,42 @@ struct AppStateTests {
         #expect(state.installer.checked == nil)
     }
 
+    /// Deleting a model runs the installer's removal, then lists the models again; a removal the
+    /// installer refuses says why.
+    @Test func deletingAModelRunsTheInstallersRemoval() async throws {
+        let fake = try FakeRuntime("splash-delete", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        try fake.install("a/b")
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        await state.launch()
+        await state.listed()
+        #expect(state.isInstalled("a/b"))
+        // An installer whose removal takes the model's installation away, as `remove` does.
+        let installer = fake.root.appending(path: "install/models.py")
+        let models = Runtime(root: fake.root).models
+        try """
+        import json, shutil, sys
+        if sys.argv[-1] != "remove" or sys.argv[-2] != "a/b":
+            sys.exit(2)
+        shutil.rmtree("\(models.appending(path: "a/b").path)")
+        print(json.dumps({"event": "removed", "bytes": 1}), flush=True)
+        """.write(to: installer, atomically: true, encoding: .utf8)
+        state.delete("a/b")
+        #expect(state.installer.running && state.installer.work == .removal)
+        try await waitFor(!state.installer.running, "the removal")
+        try await waitFor(!state.isInstalled("a/b"), "the list")
+        #expect(state.installer.failure == nil)
+        try """
+        import json
+        print(json.dumps({"event": "error", "kind": None, "message": "c/d is being served: stop it, then remove it"}), flush=True)
+        raise SystemExit(1)
+        """.write(to: installer, atomically: true, encoding: .utf8)
+        state.installer.remove("c/d")
+        try await waitFor(!state.installer.running, "the refusal")
+        #expect(state.installer.failure?.message == "c/d is being served: stop it, then remove it")
+    }
+
     /// The server's status is asked less often while neither the window nor the menu bar's panel
     /// shows it.
     @Test func theStatusIsAskedLessOftenWhileNothingShowsIt() throws {
