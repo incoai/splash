@@ -310,7 +310,9 @@ them or they already were. An engine serving a request or restoring its weights
 keeps them, and the server answers `409 engine_busy`. An engine that does not
 answer within 5 s, as while it runs a long command, gets `503 engine_busy`, and
 while the engine restarts or the server stops the release gets
-`503 engine_recovering` or `server_shutdown`, as other requests do. The request
+`503 engine_recovering` or `server_shutdown`, and once the engine has stopped
+for good, before the server exits, `500 engine_failed`, as other requests do.
+The request
 takes no body:
 
 ```sh

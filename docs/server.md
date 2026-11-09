@@ -43,8 +43,10 @@ starts them anew. For any other cause it stops after the sixth failure in a
 row, each within 60 s of starting. Once it stops, the server logs why
 (`Engine stopped · …`), naming the crash trace when `SPLASH_CRASH_TRACE=1`
 recorded one ([crash traces](internals.md#failures-and-crash-traces)), and
-exits with status 69 (`EX_UNAVAILABLE`), where a stop exits 0 and a failed
-start 1; until then requests get 500 `engine_failed` in the same words. What
+exits with status 69 (`EX_UNAVAILABLE`), where a stop exits 0, a failed start
+1, refused arguments 2 and a stop before the server runs 130 or 143; a stop
+that lands as the engine stops for good may still exit 69. Until then requests
+get 500 `engine_failed` in the same words. What
 runs the server, such as launchd with `KeepAlive`, decides whether to start it
 again, and a new server counts failures from none; the app shows why it
 stopped. While the engine restarts, generation requests get

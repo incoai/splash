@@ -984,8 +984,8 @@ class MultiplexedRuntime:
             failure = (
                 EngineLaunchFailed(
                     "native engine executable is missing; the installation may "
-                    "have been upgraded or removed. Stop the server and restart "
-                    "Splash from the current installation"
+                    "have been upgraded or removed. Start Splash again from the "
+                    "current installation"
                 )
                 if isinstance(error, FileNotFoundError)
                 else EngineUnhealthy(f"could not launch native engine: {error}")

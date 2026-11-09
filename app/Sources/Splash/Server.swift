@@ -129,8 +129,9 @@ final class Server {
     let log: URL
     private let killAfter: Duration
     private var child: ChildProcess?
-    /// The process of the server starting or serving, as its serve record names it.
-    private var pid: pid_t?
+    /// The process of the server this object started last, as its serve record names it: an
+    /// exit it did not ask for is worded from that record.
+    private var pid: pid_t = 0
     /// SIGTERM, which a running server takes for Ctrl+C and one already stopping ignores, where a
     /// second Ctrl+C would stop its engine at once.
     let record: ChildRecord
@@ -247,11 +248,9 @@ final class Server {
             launch(queued.model, settings: queued.settings)
         } else if stopRequested {
             phase = .stopped
-        } else if let pid {
+        } else {
             phase = .failed(Self.exitProblem(record: runtime.serveRecord(port: settings.port), pid: pid,
                                              port: settings.port, holder: runtime.serveLockHolder(port: settings.port)))
-        } else {
-            phase = .failed("It stopped unexpectedly. The log has the details.")
         }
     }
 

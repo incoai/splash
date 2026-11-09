@@ -161,8 +161,8 @@ struct Runtime: Sendable {
         return (try? JSONDecoder().decode(Owner.self, from: data))?.pid
     }
 
-    /// What the launcher serving `port`, or the server it runs as, last wrote of its start
-    /// (`server/serve_record.py`), beside the port's lock; nil before one has.
+    /// What the launcher serving `port`, or the server it runs as, last wrote of its start or its
+    /// stop (`server/serve_record.py`), beside the port's lock; nil before one has.
     func serveRecord(port: Int) -> ServeRecord? {
         guard let data = try? Data(contentsOf: locks.appending(path: "serve-\(port).json")) else { return nil }
         return try? JSONDecoder().decode(ServeRecord.self, from: data)
