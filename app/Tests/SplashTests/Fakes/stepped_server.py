@@ -3,6 +3,7 @@
 # thinks at three efforts (MainViewTests, ComposerTests).
 import json
 import os
+import runpy
 import sys
 import threading
 import time
@@ -24,22 +25,8 @@ def record(phase, **fields):
     path.write_text(json.dumps({"pid": os.getpid(), "phase": phase} | fields))
 
 
-def end_with_app():
-    """Ends this as `splash serve` does once the app that started it is gone (SPLASH_APP_PID): the
-    tests' process, as when a run fails; from the start, so that one held loading or warming ends
-    too."""
-    app = int(os.environ.get("SPLASH_APP_PID", "0"))
-    while app:
-        try:
-            os.kill(app, 0)
-        except ProcessLookupError:
-            os._exit(0)
-        except PermissionError:
-            pass
-        time.sleep(0.5)
-
-
-threading.Thread(target=end_with_app, daemon=True).start()
+# From the start, so that one held loading or warming ends with the app too.
+runpy.run_path(str(Path(__file__).with_name("app_bound.py")))["end_with_app"]()
 
 
 record("loading")

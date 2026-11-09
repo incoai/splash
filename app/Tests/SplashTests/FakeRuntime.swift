@@ -30,6 +30,9 @@ struct FakeRuntime {
         try #require(resolver.terminationStatus == 0 && !executable.isEmpty)
         try manager.createSymbolicLink(at: root.appending(path: ".venv/bin/python"), withDestinationURL: URL(filePath: executable))
         try manager.copyItem(at: script, to: root.appending(path: "install/launcher.py"))
+        // What the launchers share, which each runs from beside itself.
+        let shared = try #require(Bundle.module.url(forResource: "app_bound", withExtension: "py", subdirectory: "Fakes"))
+        try manager.copyItem(at: shared, to: root.appending(path: "install/app_bound.py"))
         self.root = root
         port = freePort()
     }

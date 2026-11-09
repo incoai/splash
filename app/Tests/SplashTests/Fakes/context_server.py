@@ -2,8 +2,8 @@
 # and writes what it was asked to the runtime's folder (ChatContextFlowTests).
 import json
 import os
+import runpy
 import sys
-import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -91,21 +91,7 @@ class Handler(BaseHTTPRequestHandler):
         )
 
 
-def end_with_app():
-    """Ends this as `splash serve` does once the app that started it is gone (SPLASH_APP_PID): the
-    tests' process, as when a run fails."""
-    app = int(os.environ.get("SPLASH_APP_PID", "0"))
-    while app:
-        try:
-            os.kill(app, 0)
-        except ProcessLookupError:
-            os._exit(0)
-        except PermissionError:
-            pass
-        time.sleep(0.5)
-
-
-threading.Thread(target=end_with_app, daemon=True).start()
+runpy.run_path(str(Path(__file__).with_name("app_bound.py")))["end_with_app"]()
 
 server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
 record = root / "build/runtime" / f"serve-{port}.json"
