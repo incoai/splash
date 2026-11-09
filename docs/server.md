@@ -812,7 +812,9 @@ what memory holds, as a dense target's is.
   KV now: beside other requests in service, with what a start may take, as
   above; alone, with what a request in service may take, the buffers the
   next request starts from among it. Where memory does not hold it, it waits
-  for the other requests in service. Alone, where memory holds its prompt,
+  for the other requests in service, and makes one of a lower priority yield
+  only while all of them are of a lower priority. Alone, where memory holds
+  its prompt,
   it keeps its KV in memory with its output bounded to what memory holds, as
   the SSD cache bounds a spilling request's, and ends at that bound; where
   memory does not, it takes the SSD cache's bound on its output or waits for

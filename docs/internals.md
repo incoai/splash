@@ -1544,8 +1544,11 @@ spent, or its room short of the projection) goes on in memory only where its
 projection fits one request's resident context (`Engine::inMemory`). There
 it starts Resident where the claim its admission makes covers its Resident
 KV now, as placement prices it. Beside another lane in service that claim
-is a `Start`'s, whose test placed it Spill unless every request spills, and
-short of it the start waits for memory. Alone it is `InService`, as its
+is a `Start`'s, whose test placed it Spill unless every request spills;
+short of it the start waits for memory, and a lane of a lower priority yields
+to it only while every lane in service is of a lower priority, when each
+suspension brings it closer to alone (`Engine::waitForMemory`). Alone it is
+`InService`, as its
 lane's growth is, which takes the pooled buffers the next lane starts from
 too, and short of the projection the KV it covers bounds the output, as the
 quota bounds a Spill start's, where it holds the prompt and a token past it

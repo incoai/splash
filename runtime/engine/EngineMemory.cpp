@@ -325,7 +325,7 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
   // sets one, or waiting for the lanes in service.
   const auto goInMemory = [&](const InMemory &memory) {
     if (*memory.admission == SpillAdmission::Waiting) {
-      waitForMemory(active, now, {});
+      waitForMemory(active, now, {.projection = true});
     } else {
       active.kvMode = KvMode::Resident;
       if (memory.tokens)
@@ -420,7 +420,9 @@ void Engine::waitForMemory(Request &active, double now, const Denial &denial) {
   active.refusedResources = true;
   scheduler_.waitForResources(active.request.id);
   deferResourceRetry(active, now, denial);
-  if (!scheduler_.suspended(active.request.id) && !denial.pending)
+  const std::optional<RequestPriority> highest = highestLanePriority();
+  if (!scheduler_.suspended(active.request.id) && !denial.pending &&
+      (!denial.projection || (highest && *highest > active.request.priority)))
     static_cast<void>(preemptBelow(active.request.priority, now));
 }
 

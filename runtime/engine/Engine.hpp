@@ -949,6 +949,9 @@ private:
     bool pending = false;
     // Not memory but the SSD cache's quota of active KV (ResourceWait).
     bool diskQuota = false;
+    // Not an allocation but its projection beside the lanes' projected
+    // growth (inMemory).
+    bool projection = false;
     // The KV pages a refusal of pages lacked, of their form; none for the
     // model's memory.
     uint32_t pages = 0;
@@ -1118,7 +1121,12 @@ private:
   // A start or resume refused memory (`denial`) waits for it
   // (Request::refusedResources), and a start takes it from a lane of a lower
   // priority (preemptBelow), whose suspension makes it retry at the next
-  // pass. Memory on its way back makes no lane yield: it waits for that.
+  // pass. Memory on its way back makes no lane yield: it waits for that. Nor
+  // does a lane yield to a start refused for its projection
+  // (Denial::projection) while one of its priority or above is in service:
+  // it waits for that lane, which it cannot make yield, and a lower lane
+  // suspended would wait behind it as long; with every lane lower, each
+  // suspension brings it closer to alone, where it is decided (inMemory).
   void waitForMemory(Request &request, double nowMilliseconds, const Denial &denial);
   // The latest refusal of the request's memory, as a wait or beside lanes
   // that run: what refused it, whether memory is on its way back, and when

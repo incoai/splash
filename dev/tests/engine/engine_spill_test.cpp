@@ -764,6 +764,46 @@ void testAStartMemoryCannotHoldBesideALowerLaneMakesItYield() {
           "it, or the two did not decode");
 }
 
+// Beside a Foreground lane whose KV and projected growth keep memory from holding it, a Foreground start
+// that cannot spill waits for that lane and suspends none of the Background lanes beside it, which would
+// bring it no closer to running: they keep their lanes and KV. Once that lane ends it starts, and all four
+// decode. The parent suspended both Background lanes while the Foreground lane decoded.
+void testAStartWaitingForALaneOfItsPriorityLeavesLowerLanesRunning() {
+  ShortOfBoth both(1'200ULL << 20);
+  Spilling &spill = both.spill;
+  const auto submit = [&](uint64_t id, uint32_t pages, uint32_t output, RequestPriority priority) {
+    EngineRequest request = Spilling::prompt(id, static_cast<uint32_t>(id), pages, output);
+    request.priority = priority;
+    spill.engine.submit(std::move(request));
+  };
+  submit(2, 100, 300, RequestPriority::Background);
+  submit(3, 100, 300, RequestPriority::Background);
+  spill.runUntil([&] { return spill.events.outputs.contains(2) && spill.events.outputs.contains(3); },
+                 "the Background lanes did not decode");
+  submit(1, 1'000, 100, RequestPriority::Foreground);
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the Foreground lane did not decode");
+  submit(4, 2'046, 50, RequestPriority::Foreground);
+  // While the Foreground lane is in service: the lanes suspended, and the start's prefill chunks.
+  uint64_t suspended = 0;
+  uint32_t chunks = 0;
+  spill.runUntil(
+      [&] {
+        if (!spill.events.usage.contains(1)) {
+          const EngineSnapshot snapshot = spill.engine.snapshot();
+          suspended = snapshot.prioritySuspensions + snapshot.resourceSuspensions;
+          chunks = spill.model.prefillChunks[4];
+        }
+        return idle(spill.engine);
+      },
+      "the requests did not end");
+  require(suspended == 0 && chunks == 0 && spill.events.completedCount == 4 && spill.events.failures.empty() &&
+              spill.events.usage.at(4).second == 50 && spill.events.usage.at(2).second == 300 &&
+              spill.events.usage.at(3).second == 300,
+          "beside a lane of its priority, a start that waits for it suspended " + std::to_string(suspended) +
+              " lanes and ran " + std::to_string(chunks) + " prefill chunks, or the requests did not decode" +
+              failureDetail(spill.events));
+}
+
 // Lane demand counts the hot block floor a prefilling Spill lane waits for, and none once it holds
 // it.
 void testLaneDemandCountsTheHotFloorALaneWaitsFor() {
@@ -3709,6 +3749,8 @@ std::span<const test::TestCase> spillTests() {
       {"testAStartMemoryCannotHoldBesideALowerLaneMakesItYield",
        testAStartMemoryCannotHoldBesideALowerLaneMakesItYield},
       {"testALanesGrowthConvertsNoOtherLane", testALanesGrowthConvertsNoOtherLane},
+      {"testAStartWaitingForALaneOfItsPriorityLeavesLowerLanesRunning",
+       testAStartWaitingForALaneOfItsPriorityLeavesLowerLanesRunning},
       {"testLaneDemandCountsTheHotFloorALaneWaitsFor", testLaneDemandCountsTheHotFloorALaneWaitsFor},
       {"testAStartRefusedMemoryCountsNoConversion", testAStartRefusedMemoryCountsNoConversion},
       {"testShortQuotaBoundsWaitsOrRefusesASpillStart", testShortQuotaBoundsWaitsOrRefusesASpillStart},
