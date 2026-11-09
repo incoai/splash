@@ -672,10 +672,17 @@ final class AppState {
         return settings
     }
 
-    /// Deletes `model`, a model Splash installed, with the files of it nothing else uses; the
-    /// model that runs is deleted once it is stopped.
+    /// Whether `model` can be deleted now: not the model that runs, which is deleted once it is
+    /// stopped, nor during a download, while a start prepares its model's files, or while the
+    /// Hugging Face cache is looked through for models.
+    func canDelete(_ model: String) -> Bool {
+        ready && !installer.running && !serving(model) && server.phase != .starting && server.next == nil
+            && !findingCachedModels
+    }
+
+    /// Deletes `model`, a model Splash installed, with the files of it nothing else uses.
     func delete(_ model: String) {
-        guard ready, !serving(model) else { return }
+        guard canDelete(model) else { return }
         installer.remove(model)
     }
 

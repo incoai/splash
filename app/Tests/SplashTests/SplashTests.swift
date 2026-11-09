@@ -516,6 +516,10 @@ struct AppStateTests {
         shutil.rmtree("\(models.appending(path: "a/b").path)")
         print(json.dumps({"event": "removed", "bytes": 1}), flush=True)
         """.write(to: installer, atomically: true, encoding: .utf8)
+        // Not while the launch still looks through the Hugging Face cache for models.
+        state.delete("a/b")
+        #expect(!state.installer.running || !state.findingCachedModels)
+        try await waitFor(!state.findingCachedModels, "the look through the cache")
         state.delete("a/b")
         #expect(state.installer.running && state.installer.work == .removal)
         try await waitFor(!state.installer.running, "the removal")
