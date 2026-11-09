@@ -94,6 +94,10 @@ struct Conversation: Codable, Identifiable, Equatable {
     var messages: [ChatMessage] = []
     /// When it was pinned to the top of the list; nil where it is not.
     var pinned: Date?
+
+    /// The files its attachments are kept in, by name in the attachments' folder
+    /// (`ChatStore.attachments`).
+    var attachmentFiles: [String] { messages.flatMap { ($0.attachments ?? []).map(\.file) } }
 }
 
 /// The model a message goes to: the server's address, the model it serves and whether it sees
@@ -181,7 +185,7 @@ final class ChatStore {
     /// once it is the one Splash that runs, before any draft (`AppState.launch`).
     func sweep() {
         guard readAll else { return }
-        let named = Set(conversations.flatMap { $0.messages.flatMap { ($0.attachments ?? []).map(\.file) } })
+        let named = Set(conversations.flatMap(\.attachmentFiles))
         let attachments = attachments
         files.async {
             let stray = ((try? FileManager.default.contentsOfDirectory(at: attachments, includingPropertiesForKeys: nil)) ?? [])
@@ -239,7 +243,7 @@ final class ChatStore {
         for id in ids { titling.removeValue(forKey: id)?.cancel() }
         let deleted = conversations.filter { ids.contains($0.id) }
         let removed = deleted.map { file($0.id) }
-            + deleted.flatMap { $0.messages.flatMap { ($0.attachments ?? []).map { attachments.appending(path: $0.file) } } }
+            + deleted.flatMap(\.attachmentFiles).map { attachments.appending(path: $0) }
         conversations.removeAll { ids.contains($0.id) }
         files.async { removed.forEach { try? FileManager.default.removeItem(at: $0) } }
         if let selection, ids.contains(selection) { self.selection = nil }
