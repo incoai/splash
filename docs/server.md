@@ -48,7 +48,8 @@ exits with status 69 (`EX_UNAVAILABLE`), where a stop exits 0, a failed start
 that lands as the engine stops for good may still exit 69. Until then requests
 get 500 `engine_failed` in the same words. What
 runs the server, such as launchd with `KeepAlive`, decides whether to start it
-again, and a new server counts failures from none; the app shows why it
+again, and a new server counts failures from none, so give it a
+`ThrottleInterval` for a cause the next start meets again; the app shows why it
 stopped. While the engine restarts, generation requests get
 503 `engine_recovering`, whose message names the last failure and whose
 `Retry-After` the time until the next bound on the restart's start: when it
@@ -980,8 +981,9 @@ Each start follows the model's default branch, or the branch or tag
 commit, and when the Hub answered, another asks for the commit of the draft
 repository's default branch ([Drafts](models.md#drafts)). A new commit downloads only
 the files that changed and replaces the installed model once it is installed,
-freeing the earlier commit's files nothing else links, which an older
-`--revision` downloads again. There is no update flag; to stay on one commit,
+freeing the earlier commit's files, unless another tool's files share its
+snapshot. An older `--revision` downloads them again, as a new commit that then
+fails to load would need. There is no update flag; to stay on one commit,
 pass it as `--revision`. A 40-hex `--revision` never moves, nor does its draft,
 and `--offline` (or
 `HF_HUB_OFFLINE=1`) forbids the Hub: both start the installed model without a

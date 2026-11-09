@@ -142,7 +142,8 @@ source tree and commits.
 ## Release check
 
 A release is checked once per source identity, and then on each Apple GPU
-family (an Apple9 M3 and an Apple10 M5) against a retained baseline build,
+family (an Apple9 M3, an Apple10 M5 and, by hand until a runner has one, an
+Apple11 M6) against a retained baseline build,
 `BASELINE`: a checkout whose `build/` holds `splash`, `splash.metallib`,
 `engine-tests/backend-benchmark` and `engine-tests/weight-digests`.
 `release-check` fails without it. The baseline must load the model: it is the previous release's

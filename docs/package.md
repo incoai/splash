@@ -81,8 +81,8 @@ button at its end the Server: it shows the model that runs, a spinner while
 one starts and a ring for a download's progress. Models, locks and
 downloads are the ones a packaged `splash` uses, in `~/Library/Application
 Support/Splash` and the Hugging Face cache, where the user's login shell has it:
-as it launches, the app reads that shell's `HF_` variables, the cache's and the
-token's among them, for every program it runs. The app offers
+as it launches, the app reads that shell's Hugging Face variables, the cache's
+and the token's among them, for every program it runs. The app offers
 `install/suggested-models.tsv`, per model the variant meant for the Mac's
 memory with its download size and a few words about the model, and starts
 coding agents with `splash AGENT --port PORT`, typed into a new terminal of the
@@ -119,8 +119,9 @@ or every 10 s while neither the window nor the menu bar's panel is open: request
 answering and prompt speed, time to first token, the tokens generated, read and
 taken from the cache, and the Metal memory it holds, with a row for each
 request, folded: from the server's line that starts it or the status that has it
-first, how far it has read its prompt or answered, or why it waits, never back,
-until the line that ends it, which names it by the same id. A start that fails
+first, how far it has read its prompt or answered, or why it waits, back too
+where the engine suspends it, until the line that ends it, which names it by
+the same id, or a status no longer has it. A start that fails
 says why, as its serve record
 has it, the log keeping the starts before it; one that failed for want of
 memory offers the start that would fit, under a memory limit that holds the
@@ -137,7 +138,8 @@ first, the last pinned at the top, then the others by day; a chat's menu, at
 its row's end or its title in the toolbar, pins, renames and deletes it, and
 the row's Select picks chats, or all of them, to delete at once. The window's
 drawer, ⌘J or the toolbar's terminal button,
-holds terminals, each the user's login shell in the home folder, through
+holds terminals, each the user's login shell in the home folder, or for a coding
+agent in its folder, through
 SwiftTerm, and the server's and the downloads' logs as they are written.
 Quitting stops what runs. A quit from ⌘Q, the menus or the Dock asks first
 where it would cut off requests the model is answering, a download or a program
