@@ -1291,13 +1291,14 @@ struct ChatTests {
     }
 
     @Test func asksWithImagesEarlierThoughtsAndTheEffort() throws {
-        let png = Data([0x89, 0x50, 0x4E, 0x47, 1])
-        let messages = [ChatMessage(role: .user, text: "What is this?", images: [png]),
+        let png = Showcase.picture
+        let messages = [ChatMessage(role: .user, text: "What is this?", attachments: [Showcase.pictureAttachment]),
                         ChatMessage(role: .assistant, text: "A cat.", reasoning: "Whiskers."),
                         ChatMessage(role: .user, text: "Sure?"),
                         ChatMessage(role: .assistant, text: "", error: "The reply was interrupted."),
                         ChatMessage(role: .user, text: "Well?")]
-        let body = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "low", images: true)) as! [String: Any]
+        let files = Showcase.attachments
+        let body = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "low", vision: true, files: files)) as! [String: Any]
         #expect(body["reasoning_effort"] as? String == "low")
         #expect(body["stream"] as? Bool == true)
         #expect(body["return_progress"] as? Bool == true)
@@ -1308,11 +1309,48 @@ struct ChatTests {
         #expect(wire[1]["reasoning_content"] as? String == "Whiskers.")
         // The interrupted answer, which holds nothing, is left out.
         #expect(wire.map { $0["role"] as? String } == ["user", "assistant", "user", "user"])
-        let auto = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "", images: true)) as! [String: Any]
+        let auto = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "", vision: true, files: files)) as! [String: Any]
         #expect(auto["reasoning_effort"] == nil)
         // A model that cannot see images gets a note in their place.
-        let text = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "", images: false)) as! [String: Any]
+        let text = try JSONSerialization.jsonObject(with: ChatClient.body(messages, effort: "", vision: false, files: files)) as! [String: Any]
         #expect((text["messages"] as! [[String: Any]])[0]["content"] as? String == "[An image this model can’t see]\n\nWhat is this?")
+    }
+
+    /// A conversation keeps its attachments as files of their own: the images an earlier app kept
+    /// inside its messages move into files as it is read, in their order, the conversation written
+    /// again without them; a file no conversation names goes, unless a conversation that can't be
+    /// read may name it; and a conversation deleted takes its files.
+    @MainActor @Test func keepsAttachmentsAsFilesOfTheirOwn() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder.appending(path: "Attachments"), withIntermediateDirectories: true)
+        let png = Showcase.picture, jpeg = Data([0xFF, 0xD8, 0xFF, 0xE0, 1, 2])
+        let id = UUID()
+        let old = #"{"id": "\#(id)", "title": "Old", "updated": 0, "messages": [{"id": "\#(UUID())", "role": "user", "#
+            + #""text": "Look", "reasoning": "", "images": ["\#(png.base64EncodedString())", "\#(jpeg.base64EncodedString())"]}]}"#
+        try Data(old.utf8).write(to: folder.appending(path: "\(id).json"))
+        let stray = folder.appending(path: "Attachments/stray.png")
+        try Data([1]).write(to: stray)
+        let store = ChatStore(folder: folder)
+        let message = try #require(store.conversations.first?.messages.first)
+        let attachments = try #require(message.attachments)
+        #expect(attachments.map(\.type) == ["image/png", "image/jpeg"] && message.images == nil)
+        #expect(try attachments.map { try Data(contentsOf: store.attachments.appending(path: $0.file)) } == [png, jpeg])
+        store.flush()
+        let written = try String(contentsOf: folder.appending(path: "\(id).json"), encoding: .utf8)
+        #expect(written.contains("attachments") && !written.contains(png.base64EncodedString()))
+        #expect(!FileManager.default.fileExists(atPath: stray.path))
+        // A conversation that can't be read keeps every file: it may name them.
+        try Data([1]).write(to: stray)
+        let unreadable = folder.appending(path: "\(UUID()).json")
+        try Data("{".utf8).write(to: unreadable)
+        ChatStore(folder: folder).flush()
+        #expect(FileManager.default.fileExists(atPath: stray.path))
+        try FileManager.default.removeItem(at: unreadable)
+        // Deleted, a conversation takes its files.
+        store.delete([id])
+        store.flush()
+        #expect(attachments.allSatisfy { !FileManager.default.fileExists(atPath: store.attachments.appending(path: $0.file).path) })
     }
 
     @MainActor @Test func keepsConversationsInTheirFolder() async throws {
@@ -1322,7 +1360,7 @@ struct ChatTests {
         #expect(store.conversations.isEmpty)
         // Sending to no server fails, and the conversation keeps the question and why.
         let nowhere = ChatTarget(url: URL(string: "http://127.0.0.1:9")!, model: "a/b", acceptsImages: false, effort: "")
-        store.send("Hello\nthere", images: [], to: nowhere)
+        store.send("Hello\nthere", attachments: [], to: nowhere)
         #expect(store.current?.title == "Hello")
         #expect(store.streaming != nil)
         while store.streaming != nil { try await Task.sleep(for: .milliseconds(20)) }
@@ -1442,7 +1480,7 @@ struct ChatTests {
         let port = try #require(String(data: output.fileHandleForReading.availableData, encoding: .utf8)
             .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
         let store = ChatStore(folder: folder)
-        store.send("Hello\nthere", images: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        store.send("Hello\nthere", attachments: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
         #expect(store.current?.title == "Hello")
         try await waitFor(store.current?.title == "Greeting the user", "the model's title")
         store.flush()
@@ -1464,7 +1502,7 @@ struct ChatTests {
         let port = try #require(String(data: output.fileHandleForReading.availableData, encoding: .utf8)
             .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
         let store = ChatStore(folder: folder)
-        store.send("Hello", images: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        store.send("Hello", attachments: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
         let id = try #require(store.current?.id)
         store.rename(id, to: "Mine")
         try await waitFor(store.streaming == nil, "the reply to end")
@@ -1505,7 +1543,7 @@ struct ChatTests {
         let port = try #require(String(data: output.fileHandleForReading.availableData, encoding: .utf8)
             .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
         let store = ChatStore(folder: folder)
-        store.send("Hi", images: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        store.send("Hi", attachments: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
         let streaming = try #require(store.streaming)
         #expect(store.selection == streaming)
         store.delete([streaming, gone.id, unread])
@@ -1530,7 +1568,7 @@ struct ChatTests {
         let port = try #require(String(data: output.fileHandleForReading.availableData, encoding: .utf8)
             .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
         let store = ChatStore(folder: folder)
-        store.send("Hi", images: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        store.send("Hi", attachments: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
         // While it streams, the reply holds what came, and the conversation, which the list and
         // the composer read, holds it empty and changes no more.
         try await waitFor(store.reply?.message.text.isEmpty == false)

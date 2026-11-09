@@ -124,8 +124,9 @@ has it, the log keeping the starts before it; one that failed for want of
 memory offers the start that would fit, under a memory limit that holds the
 model or with the context length on Auto. Its chat is its own, not the chat page: it streams
 `/v1/chat/completions` and keeps each conversation as a JSON file in
-`~/Library/Application Support/Splash/Chats`, so a conversation outlives a
-switch of models. A chat takes the title the model sums its first exchange up
+`~/Library/Application Support/Splash/Chats`, its attachments as files of their
+own in that folder's `Attachments`, so a conversation outlives a switch of
+models. A chat takes the title the model sums its first exchange up
 in, asked in the background without thinking. The list puts the pinned chats
 first, the last pinned at the top, then the others by day; a chat's menu, at
 its row's end or its title in the toolbar, pins, renames and deletes it, and

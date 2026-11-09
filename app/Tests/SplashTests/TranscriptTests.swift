@@ -13,7 +13,7 @@ struct TranscriptTests {
 
     @Test func sendsMessagesAsThePageReadsThem() throws {
         let conversation = Conversation(messages: [
-            ChatMessage(role: .user, text: "What is this?", images: [Showcase.picture]),
+            ChatMessage(role: .user, text: "What is this?", attachments: [Showcase.pictureAttachment]),
             ChatMessage(role: .assistant, text: "A cat.", reasoning: "Whiskers.", model: "a/Big-GGUF:Q4", tokensPerSecond: 38.4,
                         thinkingTime: 3.2, reasoningTokens: 1_200, stopped: true),
             ChatMessage(role: .user, text: "Sure?"),
@@ -100,14 +100,14 @@ struct TranscriptTests {
 
     @Test func thePageDrawsRepliesSafelyAndAsksAgain() async throws {
         try Showcase.requireScripts()
-        let transcript = Transcript(runtime: Showcase.runtime)
+        let transcript = Transcript(runtime: Showcase.runtime, attachments: Showcase.attachments)
         var askedAgain = 0
         transcript.askAgain = { askedAgain += 1 }
         transcript.page.load()
         let webView = try #require(transcript.page.webView)
         try await waitFor(transcript.page.loaded)
         let conversation = Conversation(messages: [
-            ChatMessage(role: .user, text: "<b>Hi</b>", images: [Showcase.picture]),
+            ChatMessage(role: .user, text: "<b>Hi</b>", attachments: [Showcase.pictureAttachment]),
             ChatMessage(role: .assistant, text: """
                 [web](https://a.b) [mail](mailto:a@b.c) [file](file:///Applications) [script](javascript:alert(1)) \
                 ![cat](https://a.b/cat.png) <b>bold</b>
@@ -188,7 +188,7 @@ struct TranscriptTests {
     }
 
     @Test func followsTheLatestUntilTheReaderScrollsUp() async throws {
-        let transcript = Transcript(runtime: Showcase.runtime)
+        let transcript = Transcript(runtime: Showcase.runtime, attachments: Showcase.attachments)
         transcript.page.load()
         let webView = try #require(transcript.page.webView)
         _ = NSApplication.shared
@@ -492,7 +492,7 @@ struct TranscriptTests {
 
     /// Without Markdown a reply shows as it came, as it streams too.
     @Test func withoutMarkdownAReplyStreamsAsItCame() async throws {
-        let transcript = Transcript(runtime: Runtime(root: URL(filePath: "/nonexistent")))
+        let transcript = Transcript(runtime: Runtime(root: URL(filePath: "/nonexistent")), attachments: Showcase.attachments)
         transcript.page.load()
         let webView = try #require(transcript.page.webView)
         try await waitFor(transcript.page.loaded)
@@ -759,7 +759,7 @@ struct TranscriptTests {
     /// holds back the animation frames of a page it can't see.
     private func shownPage() async throws -> (Transcript, WKWebView, NSWindow) {
         try Showcase.requireScripts()
-        let transcript = Transcript(runtime: Showcase.runtime)
+        let transcript = Transcript(runtime: Showcase.runtime, attachments: Showcase.attachments)
         transcript.page.load()
         let webView = try #require(transcript.page.webView)
         _ = NSApplication.shared
@@ -796,7 +796,7 @@ struct TranscriptTests {
 @MainActor
 struct WebPageTests {
     @Test func aPageWhoseProcessKeepsEndingLoadsAgainThreeTimesAMinute() async throws {
-        let transcript = Transcript(runtime: Showcase.runtime)
+        let transcript = Transcript(runtime: Showcase.runtime, attachments: Showcase.attachments)
         let page = transcript.page
         page.load()
         let webView = try #require(page.webView)
@@ -851,7 +851,7 @@ struct TranscriptPictures {
 
     @Test func whileAReplyStreams() async throws {
         try Showcase.requireScripts()
-        let transcript = Transcript(runtime: Showcase.runtime)
+        let transcript = Transcript(runtime: Showcase.runtime, attachments: Showcase.attachments)
         // Loaded first, as the app loads it with its window, so that each picture shows its state,
         // and drawn as on screen from the first, whose Reading shows half a second in.
         transcript.page.load()

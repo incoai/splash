@@ -39,7 +39,7 @@ final class AppState {
     /// The count of the next prompt, which the composer's ring shows.
     let chatContext = ChatContext()
     /// The message being written, kept while the window shows something else.
-    let draft = Draft()
+    let draft: Draft
     /// The open conversation's page, kept while the window shows something else, so that the Chat
     /// shows again at once.
     let transcript: Transcript
@@ -98,10 +98,11 @@ final class AppState {
         options = ServeSettings.current(defaults)
         drawer = Drawer(shell: shell)
         chats = ChatStore(folder: folders.chats)
+        draft = Draft(files: chats.attachments)
         server = Server(runtime: runtime, log: folders.logs.appending(path: "server.log"), defaults: defaults)
         installer = Installer(runtime: runtime, log: folders.logs.appending(path: "install.log"), defaults: defaults)
         catalog = Catalog(contentsOf: runtime.suggestedModels)
-        transcript = Transcript(runtime: runtime)
+        transcript = Transcript(runtime: runtime, attachments: chats.attachments)
         installer.installed = { [weak self] in self?.didInstall($0) }
         installer.removed = { [weak self] _ in self?.refresh() }
         // A start prepares model files on this Mac, which then have a family, and the model that
@@ -372,8 +373,9 @@ final class AppState {
         guard let target, let limit = target.context, limit > 0, chats.streaming == nil else { return nil }
         let history = chats.current?.messages ?? []
         let text = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !history.isEmpty || !text.isEmpty || !draft.images.isEmpty else { return nil }
-        return ChatContext.Request(history: history, text: text, images: draft.images, target: target, started: server.since)
+        guard !history.isEmpty || !text.isEmpty || !draft.attachments.isEmpty else { return nil }
+        return ChatContext.Request(history: history, text: text, attachments: draft.attachments, target: target,
+                                   started: server.since, files: chats.attachments)
     }
 
     /// The count the composer's ring shows: the next prompt's, or the last one of the open
@@ -391,7 +393,7 @@ final class AppState {
     /// too long.
     var canSendDraft: Bool {
         guard !draft.isEmpty, draft.attaching == 0, server.answers, chats.streaming == nil,
-              draft.images.isEmpty || server.acceptsImages else { return false }
+              draft.attachments.isEmpty || server.acceptsImages else { return false }
         return overflow == nil
     }
 
@@ -405,7 +407,7 @@ final class AppState {
     func sendDraft() {
         guard canSendDraft, let target else { return }
         let message = draft.take()
-        chats.send(message.text, images: message.images, to: target)
+        chats.send(message.text, attachments: message.attachments, to: target)
     }
 
     /// Asks the running model again for the open conversation's last answer.

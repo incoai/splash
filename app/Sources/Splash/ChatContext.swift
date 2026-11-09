@@ -47,13 +47,16 @@ final class ChatContext {
     struct Request: Equatable, Sendable {
         let history: [ChatMessage]
         let text: String
-        let images: [Data]
+        let attachments: [Attachment]
         let target: ChatTarget
         /// A restarted model may use another tokenizer even under the same name.
         var started: Date? = nil
+        /// Where the attachments are kept (`ChatStore.attachments`).
+        var files: URL = FileManager.default.temporaryDirectory
 
         var messages: [ChatMessage] {
-            history + (text.isEmpty && images.isEmpty ? [] : [ChatMessage(role: .user, text: text, images: images)])
+            history + (text.isEmpty && attachments.isEmpty ? []
+                : [ChatMessage(role: .user, text: text, attachments: attachments.isEmpty ? nil : attachments)])
         }
     }
 
@@ -68,7 +71,7 @@ final class ChatContext {
     @ObservationIgnored private var task: Task<Void, Never>?
 
     init(delay: Duration = .milliseconds(300),
-         counter: @escaping Counter = { try await ChatClient.countTokens($0.messages, with: $0.target) }) {
+         counter: @escaping Counter = { try await ChatClient.countTokens($0.messages, with: $0.target, files: $0.files) }) {
         self.delay = delay
         self.counter = counter
     }
@@ -90,7 +93,7 @@ final class ChatContext {
         // A new chat's count shows only on the chat its message started: other chats share its
         // empty history. Message ids tell any other conversation apart.
         let sent = history.starts(with: base) && grown.count <= 2 && (!base.isEmpty || grown.first.map {
-            $0.role == .user && $0.text == counted.request.text && $0.images == counted.request.images
+            $0.role == .user && $0.text == counted.request.text && ($0.attachments ?? []) == counted.request.attachments
         } ?? true)
         let askedAgain = base.last?.role == .assistant && history.count == base.count
             && history.dropLast().elementsEqual(base.dropLast())

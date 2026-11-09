@@ -10,8 +10,11 @@ struct ChatMessage: Codable, Identifiable, Equatable, Sendable {
     var text: String
     /// What the model thought before it answered.
     var reasoning = ""
-    /// Images the user attached, as PNG or JPEG data.
-    var images: [Data] = []
+    /// What the user attached (`Attachment`); nil for nothing, as in a message an earlier app kept.
+    var attachments: [Attachment]?
+    /// Images an earlier app kept in the message itself, as PNG or JPEG data, which `ChatStore`
+    /// moves into files of their own as it reads the conversation; nil after.
+    var images: [Data]?
     /// The model that answered.
     var model: String?
     var tokensPerSecond: Double?
@@ -25,6 +28,37 @@ struct ChatMessage: Codable, Identifiable, Equatable, Sendable {
 
     /// Whether the answer holds nothing to send back to the model.
     var isEmpty: Bool { text.isEmpty && reasoning.isEmpty }
+}
+
+/// A file the user attached to a message: an image, PNG or JPEG, or a PDF. It is kept as a file of
+/// its own in the attachments folder (`ChatStore.attachments`), not inside its conversation's file,
+/// and read as a request or the transcript needs it.
+struct Attachment: Codable, Identifiable, Equatable, Sendable {
+    enum Kind: String, Codable, Sendable { case image, pdf }
+
+    var id = UUID()
+    var kind: Kind
+    /// Its media type: image/png, image/jpeg or application/pdf.
+    var type: String
+    var bytes: Int
+    /// A PDF's name and pages, which its chip shows.
+    var name: String?
+    var pages: Int?
+
+    /// Its file's name in the attachments folder.
+    var file: String {
+        let suffix = switch type {
+        case "image/png": "png"
+        case "application/pdf": "pdf"
+        default: "jpg"
+        }
+        return "\(id.uuidString).\(suffix)"
+    }
+
+    /// The record of an image, of its PNG or JPEG data.
+    static func image(_ data: Data) -> Attachment {
+        Attachment(kind: .image, type: ChatClient.mediaType(data), bytes: data.count)
+    }
 }
 
 struct Conversation: Codable, Identifiable, Equatable {
@@ -86,6 +120,8 @@ final class ChatStore {
     var streaming: UUID? { reply?.conversation }
 
     private let folder: URL
+    /// Where the conversations' attachments are kept, a file each (`Attachment.file`).
+    nonisolated let attachments: URL
     private var replying: Task<Void, Never>?
     /// The requests for titles under way, by conversation (`title`).
     @ObservationIgnored private var titling: [UUID: Task<Void, Never>] = [:]
@@ -96,11 +132,48 @@ final class ChatStore {
 
     init(folder: URL) {
         self.folder = folder
+        attachments = folder.appending(path: "Attachments")
         let files = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
-        conversations = files.filter { $0.pathExtension == "json" }
-            .compactMap { try? JSONDecoder().decode(Conversation.self, from: Data(contentsOf: $0)) }
-            .map(Self.interrupted)
-            .sorted { $0.updated > $1.updated }
+        let kept = files.filter { $0.pathExtension == "json" }
+        var read = kept.compactMap { try? JSONDecoder().decode(Conversation.self, from: Data(contentsOf: $0)) }
+        // The images an earlier app kept inside its conversations, moved into files of their own.
+        var moved: [Conversation] = []
+        for index in read.indices where read[index].messages.contains(where: { !($0.images ?? []).isEmpty }) {
+            read[index] = Self.movingImages(of: read[index], to: attachments)
+            moved.append(read[index])
+        }
+        conversations = read.map(Self.interrupted).sorted { $0.updated > $1.updated }
+        moved.forEach(write)
+        // Files no conversation names, as those of a draft the app quit with, unless a
+        // conversation that can't be read may name them.
+        guard read.count == kept.count else { return }
+        let named = Set(read.flatMap { $0.messages.flatMap { ($0.attachments ?? []).map(\.file) } })
+        let stray = ((try? FileManager.default.contentsOfDirectory(at: attachments, includingPropertiesForKeys: nil)) ?? [])
+            .filter { !named.contains($0.lastPathComponent) }
+        self.files.async { stray.forEach { try? FileManager.default.removeItem(at: $0) } }
+    }
+
+    /// `conversation` with the images an earlier app kept in its messages moved into files of
+    /// their own in `folder`, in their order; one that can't be written stays where it was.
+    nonisolated static func movingImages(of conversation: Conversation, to folder: URL) -> Conversation {
+        var conversation = conversation
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for index in conversation.messages.indices {
+            guard let images = conversation.messages[index].images, !images.isEmpty else { continue }
+            var attached = conversation.messages[index].attachments ?? []
+            var kept: [Data] = []
+            for image in images {
+                let attachment = Attachment.image(image)
+                if (try? image.write(to: folder.appending(path: attachment.file), options: .atomic)) != nil {
+                    attached.append(attachment)
+                } else {
+                    kept.append(image)
+                }
+            }
+            conversation.messages[index].attachments = attached.isEmpty ? nil : attached
+            conversation.messages[index].images = kept.isEmpty ? nil : kept
+        }
+        return conversation
     }
 
     var current: Conversation? {
@@ -126,7 +199,9 @@ final class ChatStore {
     func delete(_ ids: Set<UUID>) {
         if let streaming, ids.contains(streaming) { stop() }
         for id in ids { titling.removeValue(forKey: id)?.cancel() }
-        let removed = conversations.filter { ids.contains($0.id) }.map { file($0.id) }
+        let deleted = conversations.filter { ids.contains($0.id) }
+        let removed = deleted.map { file($0.id) }
+            + deleted.flatMap { $0.messages.flatMap { ($0.attachments ?? []).map { attachments.appending(path: $0.file) } } }
         conversations.removeAll { ids.contains($0.id) }
         files.async { removed.forEach { try? FileManager.default.removeItem(at: $0) } }
         if let selection, ids.contains(selection) { self.selection = nil }
@@ -146,13 +221,14 @@ final class ChatStore {
         write(conversations[index])
     }
 
-    /// Sends `text` and `images` in the open conversation, or a new one, to the model `server`
-    /// serves, and streams its reply into the conversation.
-    func send(_ text: String, images: [Data], to server: ChatTarget) {
+    /// Sends `text` and `attachments`, kept in the attachments folder already, in the open
+    /// conversation, or a new one, to the model `server` serves, and streams its reply into the
+    /// conversation.
+    func send(_ text: String, attachments: [Attachment], to server: ChatTarget) {
         guard streaming == nil else { return }
         var conversation = current ?? Conversation()
         if conversation.title.isEmpty { conversation.title = Self.firstLine(text) }
-        conversation.messages.append(ChatMessage(role: .user, text: text, images: images))
+        conversation.messages.append(ChatMessage(role: .user, text: text, attachments: attachments.isEmpty ? nil : attachments))
         stream(conversation, to: server)
     }
 
@@ -200,12 +276,13 @@ final class ChatStore {
         selection = conversation.id
         let reply = Reply(answer, in: conversation.id)
         self.reply = reply
+        let files = attachments
         replying = Task { [weak self] in
             var shown = ContinuousClock.now
             var thinking: Date?
             var read: Double?
             do {
-                for try await delta in ChatClient.stream(history, with: server) {
+                for try await delta in ChatClient.stream(history, with: server, files: files) {
                     if !delta.reasoning.isEmpty, thinking == nil {
                         thinking = .now
                         reply.live.thinking = thinking
@@ -317,8 +394,9 @@ enum ChatClient {
 
     /// The tokens `messages` take as the model reads them, its template, images and earlier
     /// thinking included, counted without inference and without waking a sleeping engine.
-    static func countTokens(_ messages: [ChatMessage], with server: ChatTarget, session: URLSession = .shared) async throws -> Int {
-        let request = try countRequest(messages, with: server)
+    static func countTokens(_ messages: [ChatMessage], with server: ChatTarget, files: URL,
+                            session: URLSession = .shared) async throws -> Int {
+        let request = try countRequest(messages, with: server, files: files)
         let (data, response) = try await session.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200 else {
@@ -332,9 +410,11 @@ enum ChatClient {
         return count.input_tokens
     }
 
-    /// The request counting `messages`: the prompt `stream` sends, as it sends it.
-    static func countRequest(_ messages: [ChatMessage], with server: ChatTarget) throws -> URLRequest {
-        let json = try JSONSerialization.data(withJSONObject: prompt(messages, effort: server.effort, images: server.acceptsImages))
+    /// The request counting `messages`, their attachments in `files`: the prompt `stream` sends, as
+    /// it sends it.
+    static func countRequest(_ messages: [ChatMessage], with server: ChatTarget, files: URL) throws -> URLRequest {
+        let json = try JSONSerialization.data(withJSONObject: prompt(messages, effort: server.effort, vision: server.acceptsImages,
+                                                                     files: files))
         return request("v1/chat/completions/count_tokens", json, to: server, timeout: 30)
     }
 
@@ -349,11 +429,11 @@ enum ChatClient {
         return request
     }
 
-    static func stream(_ messages: [ChatMessage], with server: ChatTarget) -> AsyncThrowingStream<Delta, Error> {
+    static func stream(_ messages: [ChatMessage], with server: ChatTarget, files: URL) -> AsyncThrowingStream<Delta, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let json = try body(messages, effort: server.effort, images: server.acceptsImages)
+                    let json = try body(messages, effort: server.effort, vision: server.acceptsImages, files: files)
                     let (bytes, response) = try await URLSession.shared.bytes(for: request("v1/chat/completions", json, to: server, timeout: 3600))
                     if let status = (response as? HTTPURLResponse)?.statusCode, status != 200 {
                         var data = Data()
@@ -421,28 +501,31 @@ enum ChatClient {
         return line.isEmpty ? nil : String(line.prefix(80))
     }
 
-    /// The request for `messages`: the prompt, streamed, with its progress and the usage asked for.
-    static func body(_ messages: [ChatMessage], effort: String, images: Bool) throws -> Data {
-        var body = prompt(messages, effort: effort, images: images)
+    /// The request for `messages`, their attachments in `files`: the prompt, streamed, with its
+    /// progress and the usage asked for.
+    static func body(_ messages: [ChatMessage], effort: String, vision: Bool, files: URL) throws -> Data {
+        var body = prompt(messages, effort: effort, vision: vision, files: files)
         body["stream"] = true
         body["stream_options"] = ["include_usage": true]
         body["return_progress"] = true
         return try JSONSerialization.data(withJSONObject: body)
     }
 
-    /// The prompt of `messages`: images as data URLs, or a note in their place for a model that
-    /// cannot see them; earlier answers with what the model thought, empty ones left out; and the
-    /// reasoning effort unless it is the model's default.
-    private static func prompt(_ messages: [ChatMessage], effort: String, images: Bool) -> [String: Any] {
+    /// The prompt of `messages`: their attachments, read from `files`, as data URLs, or a note in
+    /// their place for a model without `vision`; earlier answers with what the model thought, empty
+    /// ones left out; and the reasoning effort unless it is the model's default.
+    private static func prompt(_ messages: [ChatMessage], effort: String, vision: Bool, files: URL) -> [String: Any] {
         let wire: [[String: Any]] = messages.compactMap { message in
+            let attachments = message.attachments ?? []
             switch message.role {
-            case .user where !message.images.isEmpty && images:
-                let parts: [[String: Any]] = message.images.map { image in
-                    ["type": "image_url", "image_url": ["url": "data:\(mediaType(image));base64,\(image.base64EncodedString())"]]
+            case .user where !attachments.isEmpty && vision:
+                let parts: [[String: Any]] = attachments.compactMap { attachment in
+                    guard let data = try? Data(contentsOf: files.appending(path: attachment.file)) else { return nil }
+                    return ["type": "image_url", "image_url": ["url": "data:\(attachment.type);base64,\(data.base64EncodedString())"]]
                 }
                 return ["role": "user", "content": parts + [["type": "text", "text": message.text]]]
-            case .user where !message.images.isEmpty:
-                let note = message.images.count == 1 ? "[An image this model can’t see]" : "[\(message.images.count) images this model can’t see]"
+            case .user where !attachments.isEmpty:
+                let note = attachments.count == 1 ? "[An image this model can’t see]" : "[\(attachments.count) images this model can’t see]"
                 return ["role": "user", "content": message.text.isEmpty ? note : "\(note)\n\n\(message.text)"]
             case .user:
                 return ["role": "user", "content": message.text]

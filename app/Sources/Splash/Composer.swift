@@ -2,19 +2,30 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// The message being written: its text and the images attached to it.
+/// The message being written: its text and what is attached to it, kept as files in the store's
+/// attachments folder as it attaches (`ChatStore.attachments`), which become the message's once it
+/// is sent; one taken off goes.
 @MainActor @Observable
 final class Draft {
     var text = ""
-    private(set) var images: [Data] = []
-    /// How many attached images are still being encoded, which join `images` once they are.
+    private(set) var attachments: [Attachment] = []
+    /// The images attached, as the composer shows them, by attachment.
+    private(set) var thumbnails: [UUID: NSImage] = [:]
+    /// How many attached images are still being encoded and kept, which join `attachments` once
+    /// they are.
     private(set) var attaching = 0
-    /// The attachment that joins `images` last, which the next one waits for.
+    /// The attachment that joins `attachments` last, which the next one waits for.
     private var lastAttachment: Task<Void, Never>?
     /// Asks the text field for the keyboard; counts the requests.
     private(set) var focusRequests = 0
+    /// Where attachments are kept.
+    let files: URL
 
-    var isEmpty: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && images.isEmpty }
+    init(files: URL) {
+        self.files = files
+    }
+
+    var isEmpty: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty }
 
     func focus() { focusRequests += 1 }
 
@@ -26,21 +37,46 @@ final class Draft {
         let sources = images.compactMap { $0.cgImage(forProposedRect: nil, context: nil, hints: nil) }
         guard !sources.isEmpty else { return }
         attaching += sources.count
-        let encoding = Task.detached(priority: .userInitiated) { sources.compactMap(Self.encoded) }
+        let files = files
+        let encoding = Task.detached(priority: .userInitiated) {
+            sources.compactMap { source in Self.encoded(source).flatMap { Self.kept($0, in: files) } }
+        }
         let previous = lastAttachment
         lastAttachment = Task {
             await previous?.value
-            self.images += await encoding.value
+            for (attachment, data) in await encoding.value {
+                attachments.append(attachment)
+                thumbnails[attachment.id] = NSImage(data: data)
+            }
             attaching -= sources.count
         }
     }
 
-    func remove(at index: Int) { images.remove(at: index) }
+    /// Takes attachment `index` off, and its file.
+    func remove(at index: Int) {
+        let attachment = attachments.remove(at: index)
+        thumbnails[attachment.id] = nil
+        let file = files.appending(path: attachment.file)
+        Task.detached { try? FileManager.default.removeItem(at: file) }
+    }
 
-    /// Takes the message, leaving the draft empty.
-    func take() -> (text: String, images: [Data]) {
-        defer { text = ""; images = [] }
-        return (text.trimmingCharacters(in: .whitespacesAndNewlines), images)
+    /// Takes the message, leaving the draft empty; its attachments' files are the message's.
+    func take() -> (text: String, attachments: [Attachment]) {
+        defer {
+            text = ""
+            attachments = []
+            thumbnails = [:]
+        }
+        return (text.trimmingCharacters(in: .whitespacesAndNewlines), attachments)
+    }
+
+    /// The record of image `data`, kept as a file in `files`, with the data; nil where it can't be
+    /// written.
+    nonisolated private static func kept(_ data: Data, in files: URL) -> (Attachment, Data)? {
+        let attachment = Attachment.image(data)
+        try? FileManager.default.createDirectory(at: files, withIntermediateDirectories: true)
+        guard (try? data.write(to: files.appending(path: attachment.file), options: .atomic)) != nil else { return nil }
+        return (attachment, data)
     }
 
     nonisolated private static func encoded(_ source: CGImage) -> Data? {
@@ -72,7 +108,7 @@ struct Composer: View {
     var body: some View {
         let images = state.server.acceptsImages
         VStack(alignment: .leading, spacing: 10) {
-            if !draft.images.isEmpty {
+            if !draft.attachments.isEmpty {
                 Attachments(draft: draft)
             }
             ComposerField(text: $draft.text, focusRequests: draft.focusRequests,
@@ -132,7 +168,7 @@ struct Composer: View {
 
     private var help: String {
         if !state.server.answers { return "Available once a model is running" }
-        if !draft.images.isEmpty && !state.server.acceptsImages { return "This model can’t see images" }
+        if !draft.attachments.isEmpty && !state.server.acceptsImages { return "This model can’t see images" }
         if let note = state.overflow?.note { return note }
         return "Send"
     }
@@ -316,9 +352,9 @@ private struct Attachments: View {
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                ForEach(Array(draft.images.enumerated()), id: \.offset) { index, data in
+                ForEach(Array(draft.attachments.enumerated()), id: \.element.id) { index, attachment in
                     ZStack(alignment: .topTrailing) {
-                        if let image = NSImage(data: data) {
+                        if let image = draft.thumbnails[attachment.id] {
                             Image(nsImage: image)
                                 .resizable()
                                 .scaledToFill()

@@ -10,7 +10,7 @@ struct ChatContextTests {
                                     effort: "high", context: 32768, apiKey: "secret")
 
     private func request(_ text: String = "Hello", history: [ChatMessage] = []) -> ChatContext.Request {
-        ChatContext.Request(history: history, text: text, images: [], target: target)
+        ChatContext.Request(history: history, text: text, attachments: [], target: target, files: Showcase.attachments)
     }
 
     /// The ring's three states: room for a reply, less than the reply allowance, no room at all.
@@ -35,12 +35,13 @@ struct ChatContextTests {
     }
 
     @Test func countsTheSameImagesHistoryAndReasoningAsGeneration() throws {
-        let history = [ChatMessage(role: .user, text: "你好", images: [Data([0x89, 0x50, 0x4E, 0x47])]),
+        let history = [ChatMessage(role: .user, text: "你好", attachments: [Showcase.pictureAttachment]),
                        ChatMessage(role: .assistant, text: "A cat", reasoning: "Whiskers"),
                        ChatMessage(role: .assistant, text: "", error: "Interrupted")]
         let input = request("Sure?", history: history)
-        let count = try ChatClient.countRequest(input.messages, with: input.target)
-        var generation = try #require(JSONSerialization.jsonObject(with: ChatClient.body(input.messages, effort: "high", images: true)) as? [String: Any])
+        let count = try ChatClient.countRequest(input.messages, with: input.target, files: input.files)
+        var generation = try #require(JSONSerialization.jsonObject(with: ChatClient.body(input.messages, effort: "high", vision: true,
+                                                                                           files: input.files)) as? [String: Any])
         for key in ["stream", "stream_options", "return_progress"] { generation.removeValue(forKey: key) }
         let body = try #require(count.httpBody)
         let counted = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
@@ -64,11 +65,13 @@ struct ChatContextTests {
         #expect(context.usage(for: request("Different")) == nil)
         var smaller = target
         smaller.context = 1024
-        #expect(context.usage(for: .init(history: [], text: input.text, images: [], target: smaller)) == nil)
+        #expect(context.usage(for: .init(history: [], text: input.text, attachments: [], target: smaller, files: input.files)) == nil)
         let other = ChatTarget(url: target.url, model: "a/other", acceptsImages: true, effort: "high", context: 32768)
-        #expect(context.usage(for: .init(history: [], text: input.text, images: [], target: other)) == nil)
-        #expect(context.usage(for: .init(history: [], text: input.text, images: [Data([1])], target: target)) == nil)
-        #expect(context.usage(for: .init(history: [], text: input.text, images: [], target: target, started: .now)) == nil)
+        #expect(context.usage(for: .init(history: [], text: input.text, attachments: [], target: other, files: input.files)) == nil)
+        #expect(context.usage(for: .init(history: [], text: input.text, attachments: [Showcase.pictureAttachment], target: target,
+                                         files: input.files)) == nil)
+        #expect(context.usage(for: .init(history: [], text: input.text, attachments: [], target: target, started: .now,
+                                         files: input.files)) == nil)
     }
 
     @Test func anOldCountCannotReplaceANewerPromptsCount() async throws {
@@ -171,7 +174,7 @@ struct ChatContextTests {
             CountProtocol.responses.withLock { $0[endpoint.absoluteString] = (status, Data(payload.utf8)) }
             defer { _ = CountProtocol.responses.withLock { $0.removeValue(forKey: endpoint.absoluteString) } }
             do {
-                let result = try await ChatClient.countTokens([ChatMessage(role: .user, text: "Hi")], with: target, session: session)
+                let result = try await ChatClient.countTokens([ChatMessage(role: .user, text: "Hi")], with: target, files: Showcase.attachments, session: session)
                 #expect(result == expected)
             } catch {
                 #expect(expected == nil)

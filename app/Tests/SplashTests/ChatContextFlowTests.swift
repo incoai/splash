@@ -21,13 +21,13 @@ struct ChatContextFlowTests {
                 we should implement next.
                 """
             state.draft.attach([try #require(NSImage(data: Showcase.picture))])
-            try await waitFor(!state.draft.images.isEmpty)
-            let text = state.draft.text, images = state.draft.images
+            try await waitFor(!state.draft.attachments.isEmpty)
+            let text = state.draft.text, attachments = state.draft.attachments
             let usage = try await count(state)
             #expect(usage.level == .full && state.contextUsage == usage)
             #expect(!state.canSendDraft && state.overflow == usage)
             state.sendDraft()
-            #expect(state.draft.text == text && state.draft.images == images)
+            #expect(state.draft.text == text && state.draft.attachments == attachments)
             #expect(state.chats.current?.messages == fixture.history.messages)
             #expect(try fixture.sent().isEmpty)
             await picture("chat-context-full", state: state)
@@ -108,7 +108,7 @@ struct ChatContextFlowTests {
             // Return again once the image shows, if the first one waited for it.
             if !state.draft.isEmpty {
                 #expect(!state.canSendDraft)
-                try await waitFor(!state.draft.images.isEmpty)
+                try await waitFor(!state.draft.attachments.isEmpty)
                 state.sendDraft()
             }
             try await waitFor(state.chats.streaming == nil && !((try? fixture.sent()) ?? []).isEmpty)

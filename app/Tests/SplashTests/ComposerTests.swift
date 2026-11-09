@@ -140,15 +140,25 @@ struct ComposerTests {
     /// join the draft in the order they were attached, a photo before a small image attached after
     /// it, which is encoded sooner.
     @Test func imagesAttachAwayFromTheMainThreadInTheirOrder() async throws {
-        let draft = Draft()
+        let files = FileManager.default.temporaryDirectory.appending(path: "splash-draft-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: files) }
+        let draft = Draft(files: files)
         let photo = try #require(NSImage(data: Self.photo(width: 4032, height: 3024)))
         let picture = try #require(NSImage(data: Showcase.picture))
         draft.attach([photo])
         draft.attach([picture])
-        #expect(draft.images.isEmpty)
-        try await waitFor(draft.images.count == 2)
-        let widths = draft.images.map { NSBitmapImageRep(data: $0)?.pixelsWide }
-        #expect(widths == [2048, 240])
+        #expect(draft.attachments.isEmpty)
+        try await waitFor(draft.attachments.count == 2)
+        let kept = try draft.attachments.map { try Data(contentsOf: files.appending(path: $0.file)) }
+        #expect(kept.map { NSBitmapImageRep(data: $0)?.pixelsWide } == [2048, 240])
+        #expect(draft.attachments.map(\.type) == ["image/jpeg", "image/png"] && draft.thumbnails.count == 2)
+        // One taken off goes, with its file; those taken with the message stay, the message's.
+        let first = draft.attachments[0]
+        draft.remove(at: 0)
+        try await waitFor(!FileManager.default.fileExists(atPath: files.appending(path: first.file).path))
+        let message = draft.take()
+        #expect(message.attachments.count == 1 && draft.attachments.isEmpty && draft.thumbnails.isEmpty)
+        #expect(FileManager.default.fileExists(atPath: files.appending(path: message.attachments[0].file).path))
     }
 
     /// A new line grows the field in the layout that follows it, before the window shows it: its
