@@ -212,7 +212,10 @@ final class ChatStore {
         if let selection, ids.contains(selection) { self.selection = nil }
     }
 
+    /// Renames conversation `id` `title`, trimmed; a name of nothing leaves it as it was.
     func rename(_ id: UUID, to title: String) {
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return }
         titling.removeValue(forKey: id)?.cancel()
         guard let index = conversations.firstIndex(where: { $0.id == id }) else { return }
         conversations[index].title = title
@@ -226,11 +229,14 @@ final class ChatStore {
         write(conversations[index])
     }
 
-    /// A message the server refused, as `send` gives it back: what it held, and why.
+    /// A message the server refused, as `send` gives it back: what it held, why, and its
+    /// conversation, nil for a new one; or a reply asked again that the server refused or that
+    /// failed before it said anything, which holds nothing.
     struct Refused: Equatable {
         let text: String
         let attachments: [Attachment]
         let reason: String
+        let conversation: UUID?
     }
 
     /// Sends `text` and `attachments`, kept in the attachments folder already, in the open
@@ -246,22 +252,24 @@ final class ChatStore {
         conversation.messages.append(ChatMessage(role: .user, text: text, attachments: attachments.isEmpty ? nil : attachments))
         stream(conversation, to: server) { [weak self] reason in
             self?.restore(before, of: conversation.id)
-            refused(Refused(text: text, attachments: attachments, reason: reason))
+            refused(Refused(text: text, attachments: attachments, reason: reason, conversation: before?.id))
         }
     }
 
-    /// Puts conversation `id` back as it was, `before`, in its place and on disk; one that was new
-    /// goes, but for its attachments, which a refused message takes back.
+    /// Puts conversation `id` back as it was, `before`, in its place and on disk, and opens it, a
+    /// new chat for one that was new, which goes, but for its attachments, which a refused message
+    /// takes back.
     private func restore(_ before: Conversation?, of id: UUID) {
         conversations.removeAll { $0.id == id }
         guard let before else {
             let file = file(id)
             files.async { try? FileManager.default.removeItem(at: file) }
-            if selection == id { selection = nil }
+            selection = nil
             return
         }
         conversations.insert(before, at: conversations.firstIndex { $0.updated < before.updated } ?? conversations.endIndex)
         write(before)
+        selection = before.id
     }
 
     /// A chat's title until the model sums it up (`title`): the first line of its first message,
@@ -288,11 +296,18 @@ final class ChatStore {
         }
     }
 
-    /// Answers the open conversation's last message again, in place of the last answer.
-    func retry(with server: ChatTarget) {
-        guard streaming == nil, var conversation = current, conversation.messages.last?.role == .assistant else { return }
+    /// Answers the open conversation's last message again, in place of the last answer, which
+    /// stays where the server refuses the request or the new answer ends before it says anything:
+    /// stopped, or failed, which goes to `refused` with why, as a refusal does.
+    func retry(with server: ChatTarget, refused: @escaping (Refused) -> Void = { _ in }) {
+        guard streaming == nil, var conversation = current, let previous = conversation.messages.last,
+              previous.role == .assistant else { return }
+        let before = conversation
         conversation.messages.removeLast()
-        stream(conversation, to: server)
+        stream(conversation, to: server, instead: previous) { [weak self] reason in
+            self?.restore(before, of: before.id)
+            refused(Refused(text: "", attachments: [], reason: reason, conversation: before.id))
+        }
     }
 
     /// Stops the reply; what it said so far stays.
@@ -300,9 +315,11 @@ final class ChatStore {
         replying?.cancel()
     }
 
-    /// Streams the reply to `conversation`'s last message; a request the server refuses goes to
-    /// `refused`, with why, where it is given, and is the reply's error otherwise.
-    private func stream(_ conversation: Conversation, to server: ChatTarget, refused: ((String) -> Void)? = nil) {
+    /// Streams the reply to `conversation`'s last message, asked again `instead` of an earlier
+    /// answer where one is given; a request the server refuses goes to `refused`, with why, where
+    /// it is given, and is the reply's error otherwise.
+    private func stream(_ conversation: Conversation, to server: ChatTarget, instead previous: ChatMessage? = nil,
+                        refused: ((String) -> Void)? = nil) {
         var conversation = conversation
         let history = conversation.messages
         var answer = ChatMessage(role: .assistant, text: "", model: server.model)
@@ -350,6 +367,13 @@ final class ChatStore {
                 }
                 answer.error = error.localizedDescription
             }
+            // An answer asked again that said nothing, stopped or failed, gives the earlier one back.
+            if let previous, answer.text.isEmpty, answer.reasoning.isEmpty, answer.stopped == true || answer.error != nil {
+                self?.reply = nil
+                if let error = answer.error, let refused { return refused(error) }
+                self?.finish(previous, replacing: answer.id, in: conversation.id)
+                return
+            }
             // A reply that ended while the model still thought.
             if let thinking, answer.thinkingTime == nil { answer.thinkingTime = Date.now.timeIntervalSince(thinking) }
             self?.finish(answer, in: conversation.id)
@@ -363,9 +387,9 @@ final class ChatStore {
 
     /// Puts the reply that ended, `message`, in its conversation, which it brings to the top, and
     /// writes it.
-    private func finish(_ message: ChatMessage, in conversation: UUID) {
+    private func finish(_ message: ChatMessage, replacing id: UUID? = nil, in conversation: UUID) {
         guard var updated = conversations.first(where: { $0.id == conversation }),
-              let index = updated.messages.firstIndex(where: { $0.id == message.id })
+              let index = updated.messages.firstIndex(where: { $0.id == (id ?? message.id) })
         else { return }
         updated.messages[index] = message
         updated.updated = .now

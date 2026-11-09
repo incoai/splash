@@ -43,6 +43,7 @@ struct ChatScreen: View {
         ), presenting: renaming) { conversation in
             TextField("Name", text: $name)
             Button("Rename") { state.chats.rename(conversation.id, to: name) }
+                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             Button("Cancel", role: .cancel) {}
         }
         .confirmationDialog(deletion?.title ?? "", isPresented: Binding(
@@ -343,8 +344,9 @@ private struct ChatList<Actions: View>: View {
             Button(all ? "Deselect All" : "Select All") { self.picked = all ? [] : Set(shown.map(\.id)) }
                 .disabled(shown.isEmpty)
             Spacer()
-            Button("Delete") { deletion = ChatDeletion(state.chats.conversations.filter { picked.contains($0.id) }) }
-                .disabled(picked.isEmpty)
+            // The chats picked that the search shows.
+            Button("Delete") { deletion = ChatDeletion(shown.filter { picked.contains($0.id) }) }
+                .disabled(!shown.contains { picked.contains($0.id) })
             Button("Done") { self.picked = nil }
         }
         .buttonStyle(.hover)
@@ -387,8 +389,14 @@ private struct ChatList<Actions: View>: View {
                         .accessibilityAddTraits(.isHeader)
                     ForEach(section.chats) { conversation in
                         let id = conversation.id
-                        ChatRow(conversation: conversation, open: chats.selection == id, picked: picked.map { $0.contains(id) }) {
-                            if picked == nil { chats.selection = id } else { picked?.formSymmetricDifference([id]) }
+                        ChatRow(conversation: conversation, open: chats.selection == id, picked: picked.map { $0.contains(id) },
+                                answering: chats.streaming == id) {
+                            if picked == nil {
+                                chats.selection = id
+                                state.draft.focus()
+                            } else {
+                                picked?.formSymmetricDifference([id])
+                            }
                         } actions: {
                             actions(conversation)
                             if picked == nil {
@@ -415,6 +423,8 @@ private struct ChatRow<Actions: View>: View {
     let open: Bool
     /// Whether it is picked, while the list picks chats to delete; nil otherwise.
     let picked: Bool?
+    /// Whether its reply streams.
+    let answering: Bool
     let choose: () -> Void
     @ViewBuilder let actions: () -> Actions
     @State private var hovering = false
@@ -430,6 +440,9 @@ private struct ChatRow<Actions: View>: View {
                 Text(conversation.title.isEmpty ? "New Chat" : conversation.title)
                     .lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                if answering && !more {
+                    ProgressView().controlSize(.mini).accessibilityLabel("Answering")
+                }
             }
             .contentShape(.rect)
         }

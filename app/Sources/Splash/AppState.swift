@@ -476,7 +476,8 @@ final class AppState {
 
     /// Asks the running model again for the open conversation's last answer.
     func retry() {
-        target.map(chats.retry(with:))
+        guard let target else { return }
+        chats.retry(with: target) { [weak self] refused in self?.draft.restore(refused) }
     }
 
     private var target: ChatTarget? {

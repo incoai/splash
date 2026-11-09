@@ -8,7 +8,9 @@ import UniformTypeIdentifiers
 /// is sent; one taken off goes.
 @MainActor @Observable
 final class Draft {
-    var text = ""
+    var text = "" {
+        didSet { if text != oldValue { notice = nil } }
+    }
     private(set) var attachments: [Attachment] = []
     /// The images attached, as the composer shows them, by attachment.
     private(set) var thumbnails: [UUID: NSImage] = [:]
@@ -19,9 +21,16 @@ final class Draft {
     private var lastAttachment: Task<Void, Never>?
     /// Asks the text field for the keyboard; counts the requests.
     private(set) var focusRequests = 0
-    /// Why the server refused the message the draft holds again (`restore`), which the composer
-    /// says until it is sent or emptied.
-    private(set) var refusal: String?
+    /// What the composer says over the message, in the chat it is about, until the draft changes
+    /// or is sent: why the server refused what the draft holds again or a reply asked again
+    /// (`restore`), or a file that couldn't be attached.
+    private(set) var notice: Notice?
+
+    struct Notice: Equatable {
+        let text: String
+        /// The conversation it is about; nil for a new one.
+        let conversation: UUID?
+    }
     /// Where attachments are kept.
     let files: URL
 
@@ -46,13 +55,18 @@ final class Draft {
             sources.compactMap { source in Self.encoded(source).flatMap { Self.kept($0, in: files) } }
         }
         let previous = lastAttachment
+        let missed = images.count - sources.count
         lastAttachment = Task {
             await previous?.value
-            for (attachment, data) in await encoding.value {
+            let kept = await encoding.value
+            for (attachment, data) in kept {
                 attachments.append(attachment)
                 thumbnails[attachment.id] = NSImage(data: data)
             }
             attaching -= sources.count
+            let failed = missed + sources.count - kept.count
+            if failed > 0 { notice = Notice(text: failed == 1 ? "An image couldn’t be attached" : "\(failed) images couldn’t be attached",
+                                            conversation: conversation) }
         }
     }
 
@@ -63,14 +77,23 @@ final class Draft {
         guard !urls.isEmpty else { return }
         attaching += urls.count
         let files = files
-        let reading = Task.detached(priority: .userInitiated) { urls.compactMap { Self.keptPDF($0, in: files) } }
+        let reading = Task.detached(priority: .userInitiated) { urls.map { ($0, Self.keptPDF($0, in: files)) } }
         let previous = lastAttachment
         lastAttachment = Task {
             await previous?.value
-            attachments += await reading.value
+            let read = await reading.value
+            attachments += read.compactMap(\.1)
             attaching -= urls.count
+            let failed = read.filter { $0.1 == nil }.map { $0.0.lastPathComponent }
+            if let first = failed.first {
+                notice = Notice(text: failed.count == 1 ? "“\(first)” couldn’t be read" : "\(failed.count) PDFs couldn’t be read",
+                                conversation: conversation)
+            }
         }
     }
+
+    /// The conversation the composer writes in, for a notice about it (`ComposerField` sets it).
+    @ObservationIgnored var conversation: UUID?
 
     /// The record of the PDF at `url`, kept as a file in `files`; nil where it can't be read or
     /// kept.
@@ -85,6 +108,7 @@ final class Draft {
 
     /// Takes attachment `index` off, and its file.
     func remove(at index: Int) {
+        notice = nil
         let attachment = attachments.remove(at: index)
         thumbnails[attachment.id] = nil
         let file = files.appending(path: attachment.file)
@@ -97,12 +121,12 @@ final class Draft {
             text = ""
             attachments = []
             thumbnails = [:]
-            refusal = nil
+            notice = nil
         }
         return (text.trimmingCharacters(in: .whitespacesAndNewlines), attachments)
     }
 
-    /// Takes back `refused`, the message the server didn't take, with why: its text where the
+    /// Takes back `refused`, what the server didn't take, with why, in its chat: its text where the
     /// draft has none since, and its attachments before those attached since.
     func restore(_ refused: ChatStore.Refused) {
         if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { text = refused.text }
@@ -110,7 +134,7 @@ final class Draft {
         for attachment in refused.attachments where attachment.kind == .image {
             thumbnails[attachment.id] = NSImage(contentsOf: files.appending(path: attachment.file))
         }
-        refusal = refused.reason
+        notice = Notice(text: refused.reason, conversation: refused.conversation)
         focus()
     }
 
@@ -152,10 +176,10 @@ struct Composer: View {
     var body: some View {
         let images = state.server.acceptsImages
         VStack(alignment: .leading, spacing: 10) {
-            if let refusal = draft.refusal, !draft.isEmpty {
+            if let notice = draft.notice, notice.conversation == state.chats.selection {
                 // As a reply says why it stopped short.
                 Label {
-                    Text(refusal).foregroundStyle(.secondary)
+                    Text(notice.text).foregroundStyle(.secondary)
                 } icon: {
                     Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
                 }
@@ -215,6 +239,8 @@ struct Composer: View {
         .onChange(of: state.contextRequest, initial: true) { _, request in
             state.chatContext.refresh(request)
         }
+        // A file that can't be attached is told in the chat it was attached in.
+        .onChange(of: state.chats.selection, initial: true) { _, open in draft.conversation = open }
     }
 
     /// Whether the open conversation's reply streams.
@@ -224,6 +250,11 @@ struct Composer: View {
 
     private var help: String {
         if !state.server.answers { return "Available once a model is running" }
+        if draft.attaching > 0 { return "Reading the attachments…" }
+        if let streaming = state.chats.streaming, streaming != state.chats.selection {
+            let title = state.chats.conversations.first { $0.id == streaming }?.title ?? ""
+            return title.isEmpty ? "Wait for the reply in another chat" : "Wait for the reply in “\(title)”"
+        }
         if let problem = state.attachmentProblem { return problem }
         if let note = state.overflow?.note { return note }
         return "Send"
@@ -571,7 +602,9 @@ private struct ComposerField: NSViewRepresentable {
                 }
                 return true
             case #selector(NSResponder.cancelOperation(_:)):
-                return field.cancel()
+                // Stops a reply; else does nothing, rather than open the text view's completions.
+                _ = field.cancel()
+                return true
             default:
                 return false
             }

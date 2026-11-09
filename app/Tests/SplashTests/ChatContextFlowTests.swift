@@ -169,17 +169,19 @@ struct ChatContextFlowTests {
             let attachments = state.draft.attachments
             state.sendDraft()
             #expect(state.draft.isEmpty)
-            try await waitFor(state.chats.streaming == nil && state.draft.refusal != nil)
+            try await waitFor(state.chats.streaming == nil && state.draft.notice != nil)
             #expect(state.draft.text == "refuse this" && state.draft.attachments == attachments)
             #expect(state.draft.thumbnails[attachments[0].id] != nil)
-            #expect(state.draft.refusal == "Request body too large")
+            // About that chat, where alone the composer says it.
+            #expect(state.draft.notice == Draft.Notice(text: "Request body too large", conversation: chat.id))
             #expect(state.chats.current == chat)
             #expect(attachments.allSatisfy { FileManager.default.fileExists(atPath: state.chats.attachments.appending(path: $0.file).path) })
             // In a new chat, which stays new: nothing kept of it, in the list or on disk.
             state.chats.newChat()
             let count = state.chats.conversations.count
             state.sendDraft()
-            try await waitFor(state.chats.streaming == nil && state.draft.refusal != nil)
+            try await waitFor(state.chats.streaming == nil && state.draft.notice != nil)
+            #expect(state.draft.notice?.conversation == nil)
             #expect(state.chats.conversations.count == count && state.chats.selection == nil)
             #expect(state.draft.attachments == attachments)
             state.chats.flush()
@@ -188,7 +190,7 @@ struct ChatContextFlowTests {
             // Sent once it can go, the note goes with it.
             state.draft.text = "Then this"
             state.sendDraft()
-            #expect(state.draft.refusal == nil)
+            #expect(state.draft.notice == nil)
             try await waitFor(state.chats.streaming == nil && state.chats.current?.messages.count == 2)
             #expect(state.chats.current?.messages.first?.attachments == attachments)
         }
