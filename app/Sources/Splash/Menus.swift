@@ -51,7 +51,7 @@ struct MenuBarPanel: View {
                                 PanelRow(title: state.displayName(of: model.id), indent: true, check: model.id == checked) {
                                     state.choose(model.id)
                                 }
-                                .disabled(!state.canStart)
+                                .disabled(!state.canStart(model.id))
                             }
                         }
                         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { modelRows = $0 }

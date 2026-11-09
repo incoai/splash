@@ -133,13 +133,14 @@ final class AppState {
     /// Whether models can download, and start where the Keychain gives the API key (`canStart`).
     var ready: Bool { available && !quitting }
 
-    /// Whether a model can start, or the one that runs give way to another, now: the app is ready
-    /// and the Keychain gives the API key (`keyProblem`). The Server's buttons, the menu bar's
-    /// panel and the composer's model menu ask it.
-    var canStart: Bool { ready && keyProblem == nil && !removing(selection) }
+    /// Whether `model` can start now, or the one that runs give way to it: the app is ready, the
+    /// Keychain gives the API key (`keyProblem`), and `model` is not being deleted. `start` asks
+    /// it, and so do the Server's buttons, the menu bar's panel and the composer's model menu, of
+    /// each model they start.
+    func canStart(_ model: String) -> Bool { ready && keyProblem == nil && !removing(model) }
 
     /// Whether `model` is being deleted.
-    func removing(_ model: String?) -> Bool {
+    func removing(_ model: String) -> Bool {
         installer.running && installer.work == .removal && installer.model == model
     }
 
@@ -301,10 +302,11 @@ final class AppState {
         }
     }
 
-    /// Starts `model` with the launch options, stopping the one that runs first.
+    /// Starts `model` with the launch options, stopping the one that runs first, where it can start
+    /// now (`canStart`).
     func start(_ model: String) {
         keepKey()
-        guard canStart else { return }
+        guard canStart(model) else { return }
         selection = model
         chats.stop()
         server.start(model, settings: settings(for: model))

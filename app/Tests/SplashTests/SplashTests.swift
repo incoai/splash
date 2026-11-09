@@ -591,11 +591,11 @@ struct AppStateTests {
         let state = fake.state(keychain: Keychain(service: "Splash Tests"))
         defer { state.quit() }
         func step(_ name: String) { FileManager.default.createFile(atPath: fake.root.appending(path: name).path, contents: nil) }
-        #expect(!state.canStart)
+        #expect(!state.canStart(first))
         state.choose(first)
         #expect(!state.server.running)
         await state.launch()
-        #expect(state.canStart && state.checkedModel == nil)
+        #expect(state.canStart(first) && state.checkedModel == nil)
         state.options["--port"] = String(fake.port)
         // Refused by the engine, the start fails and stops: nothing is checked, and choosing the
         // model again starts it again.
@@ -628,7 +628,7 @@ struct AppStateTests {
         state.stop()
         #expect(state.checkedModel == nil)
         state.quit()
-        #expect(!state.canStart)
+        #expect(!state.canStart(first))
         state.choose(first)
         #expect(state.server.next == nil)
     }

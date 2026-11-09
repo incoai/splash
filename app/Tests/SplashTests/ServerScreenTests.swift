@@ -44,3 +44,55 @@ struct ServerScreenTests {
         #expect(state.server.phase == .stopped && state.server.remedy == nil && !state.server.running)
     }
 }
+
+extension ServerScreenTests {
+    /// A model being deleted doesn't start, from the menu bar's panel, the composer or the Server's
+    /// bar, while the others do (`canStart`): choosing it leaves the model that runs as it is, and
+    /// the model picked being deleted holds none of the others back.
+    @Test func aModelBeingDeletedDoesNotStartWhileOthersDo() async throws {
+        let fake = try FakeRuntime("splash-deleting", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let first = "a/First-GGUF:Q4", second = "a/Second-GGUF:Q4"
+        try fake.install(first)
+        try fake.install(second)
+        let hold = fake.root.appending(path: "holding")
+        // An installer whose removal runs while the test holds it.
+        try """
+        import pathlib, time
+        while pathlib.Path("\(hold.path)").exists():
+            time.sleep(0.02)
+        """.write(to: fake.root.appending(path: "install/models.py"), atomically: true, encoding: .utf8)
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        await state.launch()
+        state.options["--port"] = String(fake.port)
+        for step in ["loaded", "warm"] { FileManager.default.createFile(atPath: fake.root.appending(path: step).path, contents: nil) }
+        func delete(_ model: String) {
+            FileManager.default.createFile(atPath: hold.path, contents: nil)
+            state.delete(model)
+        }
+
+        // The second picked and serving, the first being deleted.
+        state.start(second)
+        try await waitFor(state.server.phase == .ready, "\(second) ready")
+        delete(first)
+        #expect(state.removing(first))
+        #expect(!state.canStart(first) && state.canStart(second))
+        state.choose(first)
+        #expect(state.server.phase == .ready && state.server.model == second && state.server.next == nil)
+        #expect(state.selection == second)
+        try FileManager.default.removeItem(at: hold)
+        try await waitFor(!state.installer.running, "the deletion")
+
+        // The first picked and being deleted, nothing serving: the second starts.
+        state.stop()
+        try await waitFor(!state.server.running, "the stop")
+        state.selection = first
+        delete(first)
+        #expect(!state.canStart(first) && state.canStart(second))
+        state.choose(second)
+        #expect(state.server.running && state.server.model == second && state.selection == second)
+        try FileManager.default.removeItem(at: hold)
+        try await waitFor(!state.installer.running, "the deletion")
+    }
+}

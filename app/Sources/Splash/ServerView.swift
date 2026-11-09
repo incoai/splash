@@ -272,7 +272,7 @@ private struct ControlBar: View {
                 Text(failedPicked ? "Try Again" : "Start").frame(maxWidth: 240)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(state.selection == nil || !state.canStart)
+            .disabled(!(state.selection.map(state.canStart) ?? false))
         case .starting:
             LateButton(title: "Cancel") { state.stop() }
         case .stopping:
@@ -284,14 +284,14 @@ private struct ControlBar: View {
                     Text("Switch to \(state.displayName(of: selection))").frame(maxWidth: 240)
                 }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!state.canStart)
+                    .disabled(!state.canStart(selection))
             } else {
                 AgentsPopup()
                 Button("Stop") { state.stop() }
                 if state.optionsChanged, let model = server.model {
                     Button("Restart to Apply") { state.start(model) }
                         .buttonStyle(.borderedProminent)
-                        .disabled(!state.canStart)
+                        .disabled(!state.canStart(model))
                 } else {
                     Button("Open Chat") { state.section = .chat }.buttonStyle(.borderedProminent)
                 }

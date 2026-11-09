@@ -9,6 +9,9 @@ struct PopupItem: Identifiable, Hashable {
     var badge: String?
     /// Set apart from the items before it by a line.
     var separated = false
+    /// Shown faded, as a menu's item that can't be chosen now: the pointer and the arrow keys pass
+    /// it by.
+    var disabled = false
 }
 
 /// A menu in Splash's own style: a rounded panel under the control that opens it, or over it,
@@ -130,8 +133,11 @@ private struct PopupRow: View {
             .contentShape(.rect(cornerRadius: 7))
         }
         .buttonStyle(.plain)
+        .disabled(item.disabled)
+        // As `HoverStyle` fades a button disabled.
+        .opacity(item.disabled ? 0.4 : 1)
         .onHover { inside in
-            if inside { highlighted = item.id } else if highlighted == item.id { highlighted = nil }
+            if inside, !item.disabled { highlighted = item.id } else if highlighted == item.id { highlighted = nil }
         }
         .accessibilityAddTraits(chosen ? .isSelected : [])
     }
@@ -250,8 +256,10 @@ final class Popup {
         choose(id)
     }
 
-    /// Moves the highlight `step` items on, starting at the chosen item when none is highlighted.
+    /// Moves the highlight `step` items on, of those that can be chosen, starting at the chosen item
+    /// when none is highlighted.
     private func move(_ step: Int) {
+        let items = self.items.filter { !$0.disabled }
         guard !items.isEmpty else { return }
         let index = if let current = items.firstIndex(where: { $0.id == highlighted }) {
             current + step
