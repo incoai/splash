@@ -388,6 +388,16 @@ class RequestContractTests(HarnessTestCase):
         with self.assertRaises(ConnectionResetError):
             handler.setup()
 
+    def test_a_socket_option_refused_for_another_reason_is_reported(self):
+        handler = object.__new__(api.FrontendHandler)
+        refused = OSError(errno.ENOPROTOOPT, "Protocol not available")
+        handler.request = mock.Mock(setsockopt=mock.Mock(side_effect=refused))
+        # Only a client's reset ends a connection quietly.
+        with self.assertRaises(OSError) as raised:
+            handler.setup()
+        self.assertNotIsInstance(raised.exception, ConnectionResetError)
+        self.assertEqual(raised.exception.errno, errno.ENOPROTOOPT)
+
     def test_a_client_keepalive_found_gone_reads_as_disconnected(self):
         local, peer = socket.socketpair()
         self.addCleanup(local.close)

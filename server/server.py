@@ -3,6 +3,7 @@ handler; each API's handlers, request conversion and answers live in its
 module in dialects/."""
 
 import argparse
+import errno
 import json
 import math
 import os
@@ -236,7 +237,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self.request.setsockopt(level, option, value)
         except OSError as error:
             # macOS refuses options on a connection its client reset before
-            # it was served (EINVAL): it ends as any reset does.
+            # it was served (EINVAL): it ends as any reset does. Any other
+            # refusal is the server's to report.
+            if error.errno != errno.EINVAL:
+                raise
             raise ConnectionResetError from error
         super().setup()
         self.connection.settimeout(HTTP_IO_TIMEOUT)
