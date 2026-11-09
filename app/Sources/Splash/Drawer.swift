@@ -180,9 +180,10 @@ struct WithDrawer<Content: View>: View {
         VStack(spacing: 0) {
             content
             // Closed, it keeps its place and its height, clipped to none, its terminals and their
-            // views with it; the keyboard leaves it.
+            // views with it; the keyboard leaves it. Its tabs keep to its top edge, with no
+            // terminal under them too.
             DrawerView()
-                .frame(height: state.drawerHeight)
+                .frame(height: state.drawerHeight, alignment: .top)
                 .focused($focused)
                 .frame(height: shown ? state.drawerHeight : 0, alignment: .top)
                 .clipped()
@@ -265,6 +266,7 @@ private struct DrawerView: View {
                         .id(drawer.log)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(.background)
         .onChange(of: shown, initial: true) { focused = shown }
