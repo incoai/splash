@@ -690,8 +690,11 @@ private struct ModelRow: View {
                 .disabled(busy)
             CopyModelID(id: model.id)
             Divider()
+            // Nor while a start prepares its model's files, or the Hugging Face cache is looked
+            // through for models.
             Button("Delete…", role: .destructive) { deleting = true }
-                .disabled(busy)
+                .disabled(busy || state.server.phase == .starting || state.server.next != nil
+                          || state.findingCachedModels)
         }
     }
 
