@@ -67,7 +67,7 @@ function createChat(storage = new Map(), writable = true, models = null,
   const clipboard = {writeText: async text => { copied.push(text); }};
   let scrolls = 0;
   let scrollBehavior;
-  for (const id of ['chat', 'form', 'input', 'attachments', 'image-input',
+  for (const id of ['chat', 'form', 'input', 'attachments', 'file-input',
                    'attach', 'effort', 'api-key', 'send', 'recents', 'new-chat',
                    'mobile-new', 'menu', 'scrim', 'scroll-bottom', 'sidebar',
                    'sidebar-close', 'sidebar-open', 'credentials', 'thinking']) elements[id] = new Element();
@@ -78,7 +78,7 @@ function createChat(storage = new Map(), writable = true, models = null,
     .map(([, value, textContent]) => Object.assign(new Element('option'), {value, textContent}));
   class FileReader {
     readAsDataURL(file) {
-      this.result = `data:image/png;base64,${file.name}`;
+      this.result = `data:${file.type};base64,${file.data ?? file.name}`;
       reads.push(this);
     }
   }
@@ -145,8 +145,8 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 const QWEN36 = {thinks: true, efforts: [], default: null};
 const QWEN38 = {thinks: true, efforts: ['low', 'medium', 'xhigh'], default: 'xhigh'};
 const FLINT = {thinks: null, efforts: [], default: null};
-const served = (modalities = ['text', 'image', 'pdf'], reasoning = QWEN36) =>
-  ({ok: true, json: async () => ({data: [{input_modalities: modalities, reasoning}]})});
+const served = (modalities = ['text', 'image', 'pdf'], reasoning = QWEN36, limits = undefined) =>
+  ({ok: true, json: async () => ({data: [{input_modalities: modalities, reasoning, limits}]})});
 const effortMenu = chat => chat.elements.effort.options.map(option => [option.value, option.textContent]);
 const submit = chat => chat.elements.form.handlers.submit({preventDefault() {}});
 const enter = chat => chat.elements.input.handlers.keydown({
@@ -157,24 +157,26 @@ function setText(chat, value) {
   chat.elements.input.value = value;
   chat.elements.input.handlers.input();
 }
-function pasteImages(chat, ...names) {
+function pasteFiles(chat, ...files) {
   const start = chat.reads.length;
   chat.elements.input.handlers.paste({
     clipboardData: {
-      items: names.map(name => ({type: 'image/png', getAsFile: () => ({type: 'image/png', name})})),
+      items: files.map(file => ({type: file.type, getAsFile: () => file})),
       getData: () => '',
     },
     preventDefault() {},
   });
   return chat.reads.slice(start);
 }
+const pasteImages = (chat, ...names) => pasteFiles(chat, ...names.map(name => ({type: 'image/png', name})));
 const pasteImage = (chat, name) => pasteImages(chat, name)[0];
-function selectImages(chat, ...names) {
+function selectFiles(chat, ...files) {
   const start = chat.reads.length;
-  chat.elements['image-input'].files = names.map(name => ({type: 'image/png', name}));
-  chat.elements['image-input'].handlers.change();
+  chat.elements['file-input'].files = files;
+  chat.elements['file-input'].handlers.change();
   return chat.reads.slice(start);
 }
+const selectImages = (chat, ...names) => selectFiles(chat, ...names.map(name => ({type: 'image/png', name})));
 const imagePart = name => ({type: 'image_url', image_url: {url: `data:image/png;base64,${name}`}});
 const draftImages = chat => chat.elements.attachments.children.flatMap(
   item => item.children.filter(child => child.tagName === 'IMG').map(image => image.src)
@@ -299,6 +301,65 @@ assert.equal(fresh.requests[0].headers.Authorization, undefined);
   assert.equal(chat.modelRequests.at(-1).Authorization, 'Bearer key');
   assert.ok(chat.elements.attach.hidden, 'text-only model kept the button');
   assert.equal(chat.elements.attachments.children.length, 0, 'early image kept');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+    def test_pdfs_attach_as_files_within_the_models_limits(self):
+        # A model that reads PDFs takes them as it takes images, chosen or
+        # pasted: shown by name, sent as file parts, and held back over the PDF
+        # limit /v1/models gives, which the server would refuse.
+        self.run_chat(r"""
+(async () => {
+  class Storage extends Map {
+    set(key, value) {
+      if (value.length > 10000) throw Object.assign(new Error('Quota exceeded'), {name: 'QuotaExceededError'});
+      return super.set(key, value);
+    }
+  }
+  const storage = new Storage();
+  const limits = {request_bytes: 1 << 27, images: 64, image_bytes: 1 << 25, pdf_bytes: 20000, pdf_pages: 64};
+  const chat = createChat(storage, true, () => served(['text', 'image', 'pdf'], QWEN36, limits));
+  await flush();
+  const plan = {type: 'application/pdf', name: 'plan.pdf', size: 12000, data: 'P'.repeat(12000)};
+  const [reading] = selectFiles(chat, plan);
+  const chip = () => chat.elements.attachments.children[0].children[0];
+  assert.equal(chip().className, 'attachment-file');
+  assert.equal(chip().children[0].textContent, 'plan.pdf');
+  assert.equal(chip().children[1].className, 'file-detail');
+  setText(chat, 'Summarize');
+  assert.ok(chat.elements.send.disabled, 'sent before the PDF was read');
+  reading.onload();
+  await flush();
+  assert.ok(!chat.elements.send.disabled, 'a read PDF held the message back');
+  submit(chat);
+  const pdfPart = {type: 'file', file: {filename: 'plan.pdf', file_data: `data:application/pdf;base64,${plan.data}`}};
+  assert.deepEqual(chat.requests[0].body.messages[0].content, [{type: 'text', text: 'Summarize'}, pdfPart]);
+  succeed(chat.requests[0]);
+  await flush();
+  // The message shows the PDF by name; storage too small for it keeps the chat without it.
+  const shown = chat.elements.chat.children.find(child => child.className === 'message user').querySelector('.user-file');
+  assert.equal(shown.children[0].textContent, 'plan.pdf');
+  assert.deepEqual(JSON.parse(storage.get('splash-chats'))[0].messages[0].content,
+    [{type: 'text', text: 'Summarize'}, {type: 'text', text: '[plan.pdf not saved]'}]);
+  // One over the limit stays unread, says so, and holds the message back
+  // until it is taken off.
+  const reads = chat.reads.length;
+  pasteFiles(chat, {type: 'application/pdf', name: 'big.pdf', size: 20001});
+  assert.equal(chat.reads.length, reads, 'read a PDF over the limit');
+  assert.ok(chat.elements.attachments.children[0].title.startsWith('big.pdf is larger than the model’s '));
+  assert.equal(chip().children[1].textContent, 'Too large');
+  assert.equal(chip().children[1].className, 'file-detail error');
+  setText(chat, 'And this?');
+  assert.ok(chat.elements.send.disabled, 'a PDF over the limit went');
+  removeImage(chat, 0);
+  assert.ok(!chat.elements.send.disabled);
+  // A model that sees images but reads no PDFs takes only the images.
+  const images = createChat(new Map(), true, () => served(['text', 'image']));
+  await flush();
+  assert.ok(!images.elements.attach.hidden);
+  assert.equal(selectFiles(images, plan).length, 0);
+  assert.equal(pasteFiles(images, plan, {type: 'image/png', name: 'pasted'}).length, 1);
+  assert.equal(images.elements.attachments.children.length, 1);
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """)
 
@@ -1041,8 +1102,8 @@ class ChatPageTest(HarnessTestCase):
         )
         self.assertIn(b"function cleanMessage", payload)
         self.assertIn(b"if (input.value === '') input.value = text", payload)
-        self.assertIn(b'id="image-input"', payload)
-        self.assertIn(b'accept="image/*"', payload)
+        self.assertIn(b'id="file-input"', payload)
+        self.assertIn(b'accept="image/*,application/pdf"', payload)
         self.assertIn(b"reader.readAsDataURL(file)", payload)
         self.assertIn(b"type: 'image_url'", payload)
         self.assertIn(b"input.addEventListener('paste'", payload)
