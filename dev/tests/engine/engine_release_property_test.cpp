@@ -818,6 +818,7 @@ void testRandomConversationTreesKeepTheReleaseCounts() {
   if (!apart.empty())
     std::cout << "release trees, apart:" << apart << "\n";
   require(failures.empty(), "release trees broke an invariant:" + failures);
+  require(totals.releases != 0 && totals.countedClaims != 0, "no tree released a lane's pages on a counted claim");
 }
 
 } // namespace
