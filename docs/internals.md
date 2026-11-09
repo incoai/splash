@@ -101,17 +101,26 @@ files from different revisions. It pins those snapshots in the Hub cache
 (`refs/splash/<installation>/<commit>`), so pruning the cache cannot remove files
 an installed model links. Publishing a new assembly retires the installation's
 other pins, in the repositories it links and in those its predecessor linked;
-the assembly it replaces goes once no server holds it, with the files of its
-Hub snapshots no remaining assembly links, as for `remove`.
+the assembly it replaces goes, at this publish or, if a server holds it, at the
+next publish or `remove`, with the files of its Hub snapshots no remaining
+assembly links, as for `remove`, except a snapshot another tool has downloaded
+into: one holding a file no assembly links beyond the JSON metadata the
+installer reads.
 
 `remove` takes an installation away under the installation lock, refusing one
-a server holds: its selection link and pins, then its assembly, which garbage
-collection finds unlinked and unheld, then the files of its Hub snapshots that
-no remaining assembly links, the blobs no snapshot names any more and a
-repository folder left empty. A snapshot pinned by an installation of another
-models root, which this root's records don't describe, keeps all its files. It
-reports `{"event": "removed", "bytes": FREED}` on stdout, or fails as
-`prepare` does.
+a server holds; the model named alone takes every selection of it, Text only's
+and a start's own draft's included. Its selection link and pins go, then its
+assembly, which garbage collection finds unlinked and unheld, then the entries
+its record names in Hub snapshots that no remaining assembly links, the blobs
+those named once no snapshot names them, the references to a snapshot that
+went, and a repository folder left empty of all but the Hub's own. A snapshot
+pinned by an installation of another models root, which this root's records
+don't describe, keeps all its files. It reports
+`{"event": "removed", "bytes": FREED}` on stdout; it fails as `prepare` does
+until a link is gone, and a failure to free files after that is a warning.
+`prepare --json-progress` reports what it did last as
+`{"event": "prepared", "outcome": OUTCOME}`, `updated`, `up_to_date`,
+`unreachable` or `kept`.
 
 `hub.Repository.download` first removes the partial files
 (`<blob>.<random>.incomplete`) killed downloads left in the repository's blobs

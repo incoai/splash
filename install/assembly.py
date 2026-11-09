@@ -394,7 +394,7 @@ def is_held(assembly: Path) -> bool:
     return False
 
 
-def collect_garbage(models_root: Path) -> int:
+def collect_garbage(models_root: Path, *, updating=False) -> int:
     """Remove what no installation uses, and return the bytes this frees in
     the Hub cache: assemblies that no selection links and no server holds,
     with the files of their Hub snapshots no remaining assembly links
@@ -404,8 +404,9 @@ def collect_garbage(models_root: Path) -> int:
     leaves, is not an installation's. A remaining assembly whose record
     cannot be read links files no one can tell, so then no Hub cache file
     goes. Call it under the installation lock, where all of these are
-    written. It only frees space: a failure is a warning (models.freeing),
-    and the rest goes on."""
+    written. An update (updating) leaves a snapshot another tool may share
+    whole (hub.release). It only frees space: a failure is a warning
+    (models.freeing), and the rest goes on."""
     resolved, derived = models_root / ".resolved", models_root / ".metadata"
     links = models.selection_links(models_root)
     linked = {link.resolve() for link in links}
@@ -447,19 +448,21 @@ def collect_garbage(models_root: Path) -> int:
     entries = [path for record in gone for path in _hub_entries(record)]
     # A failure to tell the files kept apart frees none of them.
     with models.freeing():
-        return hub.release(entries, kept, owners)
+        return hub.release(entries, kept, owners, keep_shared=updating)
     return 0
 
 
 def _hub_entries(record):
     """The files an assembly links from its Hub sources' snapshots
     (_snapshots), as its record names them: the snapshots' entries, not the
-    blobs they name. A local source's files are never among them."""
+    blobs they name. A local source's files are never among them, nor a path
+    that climbs out of its snapshot, as a record is only a file on disk."""
     snapshots = set(_snapshots(record).values())
     return {
         Path(entry["path"])
         for entry in record["files"].values()
-        if hub.snapshot_of(entry["path"]) in snapshots
+        if ".." not in Path(entry["path"]).parts
+        and hub.snapshot_of(entry["path"]) in snapshots
     }
 
 

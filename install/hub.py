@@ -24,7 +24,7 @@ import stat
 import sys
 import tempfile
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 from . import models
@@ -205,20 +205,25 @@ def pin(path: Path, repo_id: str, installation: Path) -> Path:
     return ref
 
 
-def release(entries, kept, owners) -> int:
+def release(entries, kept, owners, *, keep_shared=False) -> int:
     """Remove the Hub cache files an assembly that went linked, entries (the
     snapshot files its record names), and return the bytes freed: each entry
     no remaining installation links, kept naming the files the remaining
     assemblies link, compared as entries, not as the blobs they name; then
     the blobs the entries removed named, once no entry left in any snapshot
-    of their repository names them; then the folders this empties: an
-    entry's folders up to its snapshot, and the repository's folder once its
-    snapshots and blobs are empty. A snapshot an installation of another
-    models root pins (a pin whose owner is not in owners) keeps every entry.
-    Nothing else is touched: no entry or blob the assembly did not link, such
-    as another tool's download of the same commit or a download under way,
-    and no partial .incomplete file. It only frees space: a failure is a
-    warning (models.freeing), and the rest goes on."""
+    of their repository names them; then the references to a snapshot that
+    went, and what empties: an entry's folders up to its snapshot, and the
+    Hub's folders of a repository whose snapshots and blobs are empty, with
+    the repository's own unless something else lies in it. A snapshot an
+    installation of another models root pins (a pin whose owner is not in
+    owners) keeps every entry, and with keep_shared, as an update asks, so
+    does one another tool has downloaded into (_holds_others), which may use
+    the rest, and nobody asked for them to go as a deletion does. Nothing
+    else is touched: no
+    entry or blob the assembly did not link, such as another tool's download
+    of the same commit or a download under way, and no partial .incomplete
+    file. It only frees space: a failure is a warning (models.freeing), and
+    the rest goes on."""
     kept = list(kept)
     kept_entries, kept_files = _identities(kept, os.lstat), _identities(kept, os.stat)
     snapshots = {}
@@ -235,6 +240,8 @@ def release(entries, kept, owners) -> int:
             for ref in (folder / "refs" / "splash").glob(f"*/{snapshot.name}")
         ):
             continue
+        if keep_shared and _holds_others(snapshot, paths, kept_entries):
+            continue
         blobs = named.setdefault(folder, set())
         with models.freeing():
             for entry in sorted(paths):
@@ -247,6 +254,8 @@ def release(entries, kept, owners) -> int:
                     continue
                 freed += _unlink(entry)
                 _remove_empty(entry.parent, snapshot)
+            if not snapshot.exists():
+                _remove_references(folder, snapshot.name)
     for folder, blobs in named.items():
         with models.freeing():
             left = _identities((folder / "snapshots").rglob("*"), os.stat)
@@ -261,8 +270,41 @@ def release(entries, kept, owners) -> int:
             if not any((folder / "snapshots").glob("*")) and not any(
                 (folder / "blobs").glob("*")
             ):
-                shutil.rmtree(folder)
+                _remove_repository(folder)
     return freed
+
+
+def _holds_others(snapshot, entries, kept):
+    """Whether another tool has downloaded into snapshot: it holds a file that
+    is neither one of entries nor one of kept, the entries remaining
+    assemblies link. Splash downloads what it links and reads a repository's
+    JSON metadata besides, so those leave no sign; a whole repository's
+    download leaves its other weights, README.md or .gitattributes."""
+    files = (
+        path
+        for path in snapshot.rglob("*")
+        if path.suffix != ".json" and not (path.is_dir() and not path.is_symlink())
+    )
+    return bool(_identities(files, os.lstat) - _identities(entries, os.lstat) - kept)
+
+
+def _remove_references(folder, commit):
+    """Remove the references that name commit, whose snapshot went: the Hub's
+    cache scan refuses a repository with a reference to a missing commit,
+    which would hide the commits it still holds."""
+    for ref in (folder / "refs").rglob("*"):
+        if ref.is_file() and ref.read_bytes().strip() == commit.encode():
+            ref.unlink()
+
+
+def _remove_repository(folder):
+    """Remove the folders the Hub cache keeps of a repository, then its own,
+    unless something else, a user's file or another tool's, lies in it."""
+    for name in ("snapshots", "blobs", "refs", ".no_exist"):
+        if (folder / name).exists():
+            shutil.rmtree(folder / name)
+    with suppress(OSError):
+        folder.rmdir()
 
 
 def _identities(paths, status):

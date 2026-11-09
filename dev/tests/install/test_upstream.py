@@ -15,6 +15,7 @@ from unittest import mock
 import httpx
 from huggingface_hub.errors import IncompleteSnapshotError, RepositoryNotFoundError
 
+from dev.tests.install.test_cached import vision_target
 from dev.tests.installer_fixtures import (
     CONFIGS,
     DENSE,
@@ -1775,6 +1776,123 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(self.remove(chosen), size)
         self.assertTrue(any(snapshot.iterdir()))
         self.assertFalse(draft.exists())
+
+    def test_removing_a_model_takes_its_other_selections(self):
+        # A start with Text only has a selection of its own, which the app's
+        # list does not show: its weights would stay with nothing to delete
+        # them. A selection named with its options goes alone.
+        fake = fake_hub(self, self.cache)
+        fake.publish(MODEL, "d" * 40, vision_target)
+        plain = selection(self.root, language_only=False)
+        text_only = selection(self.root)
+        self.prepare(plain)
+        self.prepare(text_only)
+        self.remove(text_only)
+        self.assertTrue(plain.link.is_symlink())
+        self.assertFalse(text_only.link.is_symlink())
+        self.prepare(text_only)
+        self.assertGreater(self.remove(plain), 0)
+        self.assertFalse(plain.link.is_symlink() or text_only.link.is_symlink())
+        snapshot = fake.snapshot(MODEL, "d" * 40)
+        self.assertEqual(list(snapshot.glob("*.safetensors")), [])
+
+    def test_removing_a_model_is_refused_while_a_server_holds_any_selection(self):
+        fake = fake_hub(self, self.cache)
+        fake.publish(MODEL, "d" * 40, vision_target)
+        plain = selection(self.root, language_only=False)
+        text_only = selection(self.root)
+        self.prepare(plain)
+        self.prepare(text_only)
+        _, server = assembly.hold(text_only.link)
+        self.addCleanup(server.close)
+        with self.assertRaisesRegex(models.ModelError, "is being served"):
+            self.remove(plain)
+        self.assertTrue(plain.link.is_symlink() and text_only.link.is_symlink())
+
+    def test_an_update_frees_the_earlier_commits_files_only_it_fetched(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        earlier = fake.snapshot(MODEL, "a" * 40)
+        self.assertTrue(earlier.exists())
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        self.prepare(chosen)
+        self.assertFalse(earlier.exists())
+
+    def test_an_update_leaves_whole_a_snapshot_another_tool_added_to(self):
+        # A file no assembly links says another tool downloaded this commit
+        # too, and nobody asked for its files to go, as a deletion does.
+        fake = fake_hub(self, self.cache)
+        fake.publish(
+            MODEL,
+            "a" * 40,
+            lambda p: (mlx_target(p, DENSE) / "README.md").write_text("notes"),
+        )
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        fake.hf_hub_download(MODEL, "README.md", revision="a" * 40)
+        earlier = fake.snapshot(MODEL, "a" * 40)
+        files = sorted(p.name for p in earlier.iterdir())
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        self.prepare(chosen)
+        self.assertEqual(sorted(p.name for p in earlier.iterdir()), files)
+
+    def test_a_commit_removed_leaves_no_reference_to_it(self):
+        # The Hub's cache scan refuses a repository with a reference to a
+        # missing commit, which would hide the commit that stays.
+        fake = fake_hub(self, self.cache)
+        fake.publish(
+            MODEL,
+            "a" * 40,
+            lambda p: (mlx_target(p, DENSE) / "README.md").write_text("notes"),
+        )
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        fake.hf_hub_download(MODEL, "README.md", revision="a" * 40)
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        self.prepare(chosen)
+        main = self.cache / hub.folder_name(MODEL) / "refs" / "main"
+        main.parent.mkdir(parents=True, exist_ok=True)
+        main.write_text("b" * 40)
+        self.remove(chosen)
+        self.assertFalse(main.exists())
+        self.assertTrue(fake.snapshot(MODEL, "a" * 40).exists())
+
+    def test_a_repository_folder_keeps_what_the_hub_did_not_put_there(self):
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        folder = self.cache / hub.folder_name(MODEL)
+        (folder / "notes.md").write_text("mine")
+        self.remove(chosen)
+        self.assertEqual([p.name for p in folder.iterdir()], ["notes.md"])
+
+    def test_a_record_that_cannot_be_read_frees_nothing(self):
+        # It may link any file, which a rebuild without the Hub would need.
+        fake = fake_hub(self, self.cache)
+        other = "mlx-community/Qwen3.8-27B-8bit"
+        fake.publish(other, "c" * 40, lambda p: mlx_target(p, DENSE))
+        first, second = selection(self.root), selection(self.root, other)
+        self.prepare(first)
+        self.prepare(second)
+        size = blob_bytes(self.cache, MODEL)
+        record = second.link.resolve() / "model.json"
+        record.chmod(0o644)
+        record.write_text("{")
+        self.assertEqual(self.remove(first), 0)
+        self.assertEqual(blob_bytes(self.cache, MODEL), size)
+
+    def test_a_recorded_path_that_climbs_out_of_its_snapshot_is_never_freed(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        record = assembly.recorded(chosen.link)
+        name = next(n for n, e in record["files"].items() if "/snapshots/" in e["path"])
+        snapshot = fake.snapshot(MODEL, "a" * 40)
+        record["files"][name]["path"] = str(snapshot / ".." / ".." / ".." / "outside")
+        self.assertNotIn(
+            Path(record["files"][name]["path"]), assembly._hub_entries(record)
+        )
 
     def test_the_remove_command_reports_the_bytes_freed(self):
         fake_hub(self, self.cache)

@@ -599,30 +599,48 @@ def remove(selection):
     uses, and return the bytes freed in the Hub cache: its selection link,
     then its pins, and its assembly, which nothing links or holds any more,
     with the files of its Hub snapshots no remaining installation links
-    (assembly.collect_garbage). An installation a server holds is refused:
-    it is stopped first. Once its link is gone the model is removed, and
-    what follows only frees space: a failure is a warning, and the rest goes
-    on."""
+    (assembly.collect_garbage). The model alone takes every selection of it
+    (_selections_of). An installation a server holds is refused: it is
+    stopped first. Once a link is gone the model is removed, and what follows
+    only frees space: a failure is a warning, and the rest goes on."""
     root = selection.models_root
     with models.installation_lock(root):
-        link = selection.link
-        if models.installation_kind(link) != models.ASSEMBLY:
+        if models.installation_kind(selection.link) != models.ASSEMBLY:
             raise models.ModelError(f"{selection.model} is not installed in {root}")
-        if assembly.is_held(link.resolve()):
+        links = _selections_of(selection)
+        if any(assembly.is_held(link.resolve()) for link in links):
             raise models.ModelError(
                 f"{selection.model} is being served: stop it, then remove it"
             )
-        # A record that cannot be read names no pins: its snapshots then keep
-        # their files, as another models root's do.
-        record = assembly.recorded(link)
-        link.unlink()
-        for path, _ in assembly.pins(record) if record else ():
-            with models.freeing():
-                ref = hub.pinned(path, link)
-                ref.unlink(missing_ok=True)
-                with suppress(OSError):
-                    ref.parent.rmdir()
+        for link in links:
+            # A record that cannot be read names no pins: its snapshots then
+            # keep their files, as another models root's do.
+            record = assembly.recorded(link)
+            link.unlink()
+            for path, _ in assembly.pins(record) if record else ():
+                with models.freeing():
+                    ref = hub.pinned(path, link)
+                    ref.unlink(missing_ok=True)
+                    with suppress(OSError):
+                        ref.parent.rmdir()
         return assembly.collect_garbage(root)
+
+
+def _selections_of(selection):
+    """The selection links removing selection takes: its own, and for the
+    model alone, named without source options, every selection of that model.
+    A start with Text only or a draft of its own has a link no list shows,
+    whose files nothing could delete once the model's row is gone."""
+    links = [selection.link]
+    if not (selection.revision or selection.language_only or selection.draft_model):
+        links += [
+            link
+            for link in models.selection_links(selection.models_root)
+            if link != selection.link
+            and (record := assembly.recorded(link))
+            and record["model"] == selection.model
+        ]
+    return links
 
 
 def _start_installed(selection, target, installed):
@@ -815,9 +833,10 @@ def publish(models_root, link, record, files):
         models.link_selection(link, published)
         # Published: what follows only frees space; its failures are
         # warnings. The assembly replaced goes once no server holds it, with
-        # the files of its snapshots the new one does not link.
+        # the files of its snapshots the new one does not link, where nothing
+        # says another tool shares them.
         hub.retire_other_pins(pins, replaced)
-        assembly.collect_garbage(models_root)
+        assembly.collect_garbage(models_root, updating=True)
     return published
 
 
