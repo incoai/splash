@@ -64,12 +64,10 @@ final class AppState {
     /// can take some seconds; the window says it under its spinner.
     private(set) var launchWait: String?
     var section = Section.server
-    /// The launch options the next start uses.
+    /// The launch options the next start uses; their API key reaches the Keychain once typed
+    /// (`keepKey`).
     var options: ServeSettings {
-        didSet {
-            options.save(defaults)
-            if options.apiKey != keptKey { keep(options.apiKey) }
-        }
+        didSet { options.save(defaults) }
     }
     /// The API key the Keychain holds, as last read or written.
     @ObservationIgnored private var keptKey: String?
@@ -247,6 +245,13 @@ final class AppState {
         }
     }
 
+    /// Keeps the options' API key in the Keychain where it differs from the one kept: as its field
+    /// is left, as a start uses it and as the app quits, rather than at each key typed, which could
+    /// have the Keychain ask each time.
+    func keepKey() {
+        if options.apiKey != keptKey { keep(options.apiKey) }
+    }
+
     private func keep(_ key: String?) {
         do {
             try keychain.write(key)
@@ -260,6 +265,7 @@ final class AppState {
 
     /// Starts `model` with the launch options, stopping the one that runs first.
     func start(_ model: String) {
+        keepKey()
         guard canStart else { return }
         selection = model
         chats.stop()

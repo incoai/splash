@@ -92,8 +92,8 @@ family, from the engine's `families` command and the options' own needs
 (`ServeOption.needs`), the options none of its models can use and the context
 they serve; a model's family is its assembly record's, and a model whose
 family is not known yet gets every option. The API key reaches the server as
-`SPLASH_API_KEY`, from the
-Keychain, and nothing starts while the Keychain does not give it. Copy
+`SPLASH_API_KEY`, from the Keychain, which takes it as its field is left or
+a start uses it, and nothing starts while the Keychain does not give it. Copy
 API Address gives the loopback address, or, while the server listens on all
 networks, this Mac's `.local` name, which the app then adds to its Host
 names. The server

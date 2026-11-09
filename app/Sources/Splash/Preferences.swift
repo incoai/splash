@@ -110,9 +110,10 @@ struct ServeSettings: Equatable {
     }
 
     /// These options with the ones a model of `family` can use, those the card shows, back at their
-    /// defaults, the API key too; values kept for the others stay, for a model that can use them.
+    /// defaults; values kept for the others stay, for a model that can use them, and the API key,
+    /// which is no default's to replace.
     func defaults(for family: ModelFamily) -> ServeSettings {
-        ServeSettings(values: values.filter { !family.uses($0.key) })
+        ServeSettings(values: values.filter { !family.uses($0.key) }, apiKey: apiKey)
     }
 
     /// Whether a model of `family` started with these options would start otherwise with `other`.

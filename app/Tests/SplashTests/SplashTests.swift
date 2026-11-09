@@ -193,12 +193,12 @@ struct ServeSettingsTests {
     }
 
     /// Restore Defaults acts on the options the card shows the model picked; the values kept for
-    /// those it leaves out stay, and alone they don't offer it.
+    /// those it leaves out stay, and the API key; alone they don't offer it.
     @Test func defaultsAreRestoredForTheOptionsShown() {
-        let hidden = ServeSettings(values: ["--state-format": "bf16"])
+        let hidden = ServeSettings(values: ["--state-format": "bf16"], apiKey: "k")
         let set = ServeSettings(values: ["--state-format": "bf16", "--expert-memory": "16G"], apiKey: "k")
         #expect(set.defaults(for: Self.flint) == hidden && hidden.defaults(for: Self.flint) == hidden)
-        #expect(set.defaults(for: Self.moe) == ServeSettings() && set.defaults(for: .unknown) == ServeSettings())
+        #expect(set.defaults(for: Self.moe) == ServeSettings(apiKey: "k") && set.defaults(for: .unknown) == ServeSettings(apiKey: "k"))
     }
 
     @Test func theContextHintIsTheModels() {
@@ -375,13 +375,17 @@ struct AppStateTests {
         let state = AppState(runtime: Runtime(root: root), folders: .init(in: root.appending(path: "Chats")), keychain: keychain,
                              defaults: .kept(in: root), shell: { .bare })
         #expect(state.options.apiKey == "first" && state.keyProblem == nil)
+        // Kept once typed, not at each key.
         state.options.apiKey = "second"
+        #expect(try keychain.read() == "first")
+        state.keepKey()
         #expect(try keychain.read() == "second")
         // A key changed elsewhere is read again.
         try keychain.write("third")
         state.readKey()
         #expect(state.options.apiKey == "third")
         state.options.apiKey = nil
+        state.keepKey()
         #expect(try keychain.read() == nil)
     }
 
