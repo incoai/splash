@@ -17,7 +17,7 @@ using test::require;
 using test::floatToBf16;
 using test::bf16ToFloat;
 using metal::MetalBuffer;
-constexpr uint32_t H = 256, C = 64, R = 32, V = 128;
+constexpr uint32_t V = 128;
 constexpr uint32_t Rows = SPLASH_DRAFT_QUERY_ROWS, Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
 constexpr uint32_t K = SPLASH_DRAFT_CANDIDATES;
 
@@ -48,12 +48,14 @@ void close(float actual, double expected, double tolerance, const char *what) {
   }
 }
 
-void run(metal::MetalBackend &backend, uint32_t lanes) {
+template <uint32_t H = 256, uint32_t C = 64, uint32_t R = 32>
+void run(metal::MetalBackend &backend, uint32_t lanes, bool sampleAll = false) {
   const uint32_t rows = lanes * Rows;
   DSpineParams shape{H, C, R, rows};
   DSpineBuffers b{allocate(backend, uint64_t{rows} * H * 2), allocate(backend, rows * 4),
       random(backend, uint64_t{rows} * C, 0.3f, 19), random(backend, uint64_t{rows} * 3 * R, 0.3f, 23),
-      allocate(backend, uint64_t{rows} * R * 2), allocate(backend, uint64_t{lanes} * Positions * K * H * 2)};
+      allocate(backend, uint64_t{rows} * R * 2), allocate(backend, uint64_t{lanes} * Positions * K * H * 2),
+      allocate(backend, uint64_t{lanes} * R * 4), allocate(backend, uint64_t{lanes} * H * 4)};
   DSpineWeights weights;
   weights.codebook = random(backend, uint64_t{V} * C, 0.15f, 29);
   weights.gateBias = random(backend, R, 0.1f, 31);
@@ -124,7 +126,7 @@ void run(metal::MetalBackend &backend, uint32_t lanes) {
   std::vector<SamplingPolicy> policies(lanes);
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     anchors[lane] = 3 + lane;
-    policies[lane].temperature = lane % 3 == 0 ? 0 : 0.5f + 0.4f * lane;
+    policies[lane].temperature = !sampleAll && lane % 3 == 0 ? 0 : 0.5f + 0.4f * lane;
   }
   metal::CommandGraph refine;
   DSpine::addRefinement(refine, weights, {norm, false}, projection(head, V, H), b, s, shape, anchors, policies);
@@ -192,6 +194,9 @@ int main(int argc, char **argv) {
     if (argc != 2) throw std::invalid_argument("usage: dspine METALLIB");
     metal::MetalBackend backend(argv[1]);
     for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) run(backend, lanes);
+    run<257, 65, 35>(backend, 2);
+    run<5120, 1024, 512>(backend, 1, true);
+    run<5120, 1024, 512>(backend, SPLASH_MAXIMUM_BATCH_WIDTH);
     std::cout << "DSpine bridge and refinement: PASS\n";
     return 0;
   } catch (const std::exception &error) {

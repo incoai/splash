@@ -311,6 +311,31 @@ void checkArenasWithoutGdnLayers() {
           "the decode arena without GDN layers is not a hybrid's without its GDN scratch");
 }
 
+// Refinement scratch is one FP32 message/state per lane, reused across
+// positions. It belongs to the accounted arena only for the DSpine graph.
+void checkDSpineRefinementScratch() {
+  using model::DecodeTensor;
+  const ops::ExecutionPlans plans(DeviceCapabilities{});
+  const auto sizes = [&](model::DFlashDraftLayout draft) {
+    const auto loaded = loadedModel<model::Qwen3_8Weights>({}, draft);
+    const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+    return model::decodeTensorBytes(geometry, plans);
+  };
+  auto draft = test::qwen3_8Draft();
+  const auto dflash = sizes(draft);
+  const auto at = [](DecodeTensor tensor) { return static_cast<uint32_t>(tensor); };
+  require(!dflash[at(DecodeTensor::BridgeRefineMessage)] && !dflash[at(DecodeTensor::BridgeRefineState)],
+          "DFlash2 reserves DSpine refinement scratch");
+  draft.architecture = model::DraftArchitecture::DSpine;
+  draft.contextTokens = 8192;
+  draft.bridgeCodeSize = 1024;
+  draft.bridgeRank = 512;
+  const auto dspine = sizes(draft);
+  require(dspine[at(DecodeTensor::BridgeRefineMessage)] == uint64_t{draft.bridgeRank} * sizeof(float) &&
+              dspine[at(DecodeTensor::BridgeRefineState)] == uint64_t{draft.hiddenSize} * sizeof(float),
+          "DSpine refinement scratch does not reserve one FP32 message/state per lane");
+}
+
 // Arenas are sized from the projections the weights hold, so each must have
 // sizes; an empty one would drop its workspace from the bound silently.
 void checkUnsizedProjection() {
@@ -408,6 +433,7 @@ int main() {
     checkIndexTables();
     checkSpilledKvGeometry();
     checkArenasWithoutGdnLayers();
+    checkDSpineRefinementScratch();
     checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));

@@ -71,7 +71,8 @@ and 3,662 against 1,968 on the 35B on the M5 Pro, and at 245 against 193 and
 
 ## Experimental DSpine against DFlash2
 
-An exploratory comparison on November 9, 2026 used an Apple M5 Pro
+An exploratory comparison of the initial serial refinement implementation
+on November 9, 2026 used an Apple M5 Pro
 (18-core CPU, 20-core GPU, 48 GB), macOS 26.6, and the same
 `mlx-community/Qwen3.8-27B-4bit` target for both drafters. The native DSpine
 backend currently serves **eight rows of its trained sixteen-row block**;
@@ -128,6 +129,83 @@ per-request timings and speculative counts, output hashes, round totals and
 ABBA calculations. Its local paths and request identifiers are omitted.
 For use and current compatibility limits, see
 [experimental DSpine](models.md#experimental-dspine).
+
+### Parallel DSpine refinement
+
+On November 10, profiling identified final-write refinement as the largest
+DSpine-specific cost: about 5.8 ms per decode cycle. Its single threadgroup
+per request performed the message and hidden-state matrix-vector products
+with long scalar loops. The parallel implementation distributes their output
+coordinates across threadgroups with SIMD reductions. Each of the seven
+positions runs message, state and scoring dispatches in order, preserving
+the selected-predecessor dependency and the conditional sampling
+probabilities within the existing GPU command. FP32 scratch is planned in
+the decode arena, 22 KiB per lane, and reused between positions.
+
+A fresh HTTP ABBA comparison used the same hardware, models, quantization,
+prompts and serving options above. The baseline was `8de9b727`; each server
+restarted, waited for nominal thermal state, and completed an untimed
+128-token Fibonacci warmup before measurement. Thermal state was sampled at
+round boundaries, with some rounds ending fair; there was no continuous
+machine-quietness trace.
+
+| Workload | Serial DSpine tok/s | Parallel DSpine tok/s | Throughput change |
+| --- | ---: | ---: | ---: |
+| Python iterative Fibonacci | 97.3 | 104.6 | +7.5% |
+| Python stable merge sort | 77.9 | 83.8 | +7.5% |
+| Python LRU cache | 64.7 | 69.3 | +7.0% |
+| TypeScript retry with backoff | 85.4 | 91.2 | +6.7% |
+| Combined solo decode rate | 77.0 | 82.4 | +7.1% |
+
+These rates are `1000 / mean milliseconds per token` over each backend's
+two rounds. The combined metric sums decode tokens and decode times within
+each round before applying ABBA. Its spread was 1.1%; all solo output hashes
+and speculative cycle counts matched across the four rounds. The
+four-concurrent result was inconclusive at 9.9% spread.
+
+A separate ABBA comparison on the parallel candidate build measured the two
+drafters again. All 66 loaded target weight images were byte-identical
+between their installations, checked with `weight-digests`; the draft
+images differ. All four solo output hashes also matched.
+
+| Workload | DFlash2 tok/s | Parallel DSpine tok/s | DSpine throughput change |
+| --- | ---: | ---: | ---: |
+| Python iterative Fibonacci | 105.4 | 103.9 | −1.5% |
+| Python stable merge sort | 91.4 | 82.7 | −9.4% |
+| Python LRU cache | 81.1 | 68.1 | −16.0% |
+| TypeScript retry with backoff | 81.2 | 89.4 | +10.1% |
+| Combined solo decode rate | 86.2 | 81.2 | −5.8% |
+| Four simultaneous requests, end-to-end aggregate | 201.6 | 176.6 | −12.4% |
+
+Combined solo spread was 0.2%. Fibonacci's small difference is within the
+ABBA noise allowance. The four-request spread was 4.8%, close to the 5%
+inconclusive threshold, though its slowdown exceeded the rule's allowance.
+This remains an exploratory sample, not a general ranking of the drafters.
+The kernel improvement leaves acceptance unchanged on these prompts:
+DSpine still uses 44 cycles for merge sort against DFlash2's 41, and 53 for
+LRU against 46; it uses 40 for retry against 46. Improving refinement alone
+does not remove that difference in cycles.
+
+Kernel checks against independent CPU equations passed under Metal shader
+validation for batch widths one through four, mixed sampling, SIMD boundary
+cases and production hidden/code/rank dimensions. Live shader-validated
+serving also passed temperature sampling, four concurrent requests, a
+14,316-token cold prompt, prefix and suffix reuse, a 14,304-token disk
+restore, greedy and sampled JSON-schema output, and stream cancellation
+followed by another request.
+
+The [measurement record](../dev/benchmarks/results/dspine-refinement-qwen38-27b-2026-11-10.json)
+contains both comparisons, exact prompts, revisions, binary/build identities,
+request metrics, output hashes and ABBA calculations. Repeat the before/after
+comparison with saved builds (each binary needs its matching Metal libraries
+beside it) and the same installed DSpine root:
+
+```sh
+python -m dev.benchmarks.draft_comparison \
+  --baseline-binary BASELINE/splash --candidate-binary CANDIDATE/splash \
+  --baseline-model-root DSPINE_ROOT --candidate-model-root DSPINE_ROOT \
+  --output build/dspine-refinement-abba
+```
 
 ## Smaller GGUFs on 24 GB Macs
 

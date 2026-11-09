@@ -88,90 +88,112 @@ kernel void dspine_write(device const bfloat *raw [[buffer(0)]], device const fl
   output[i] = row % SPLASH_DRAFT_QUERY_ROWS == 0 ? raw[i] : bfloat(float(raw[i]) + rms[row] * float(delta[i]));
 }
 
-// One group per request. Only the selected predecessor is refined at each
-// position, so there is no full-vocabulary derived table or 16x16xH tensor.
-// The conditional q written here is the one consumed by rejection sampling.
-kernel void dspine_refine(device const bfloat *raw [[buffer(0)]], device const float *rms [[buffer(1)]],
-    device const bfloat *packed [[buffer(2)]], device const bfloat *book [[buffer(3)]],
-    device const bfloat *pred_gate [[buffer(4)]], device const bfloat *previous [[buffer(5)]],
-    device const bfloat *bias [[buffer(6)]], device const bfloat *write [[buffer(7)]],
-    device const bfloat *norm [[buffer(8)]], device const bfloat *head [[buffer(9)]],
-    device const uint *candidates [[buffer(10)]], device const float *uniforms [[buffer(11)]],
-    device uint *tokens [[buffer(12)]], device float *probabilities [[buffer(13)]],
-    device float *confidence [[buffer(14)]], constant DSpineRefineParams &params [[buffer(15)]],
-    uint batch [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+// Each simdgroup reduces one message coordinate. Matrix rows are read
+// contiguously, and independent coordinates run across many threadgroups.
+// The preceding score dispatch supplies the selected predecessor token.
+kernel void dspine_refine_message(device const bfloat *packed [[buffer(0)]],
+    device const bfloat *book [[buffer(1)]], device const bfloat *pred_gate [[buffer(2)]],
+    device const bfloat *previous [[buffer(3)]], device const bfloat *bias [[buffer(4)]],
+    device const uint *tokens [[buffer(5)]], device float *message [[buffer(6)]],
+    constant DSpineRefineParams &params [[buffer(7)]], uint2 group [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
   const DSpineParams p = params.shape;
-  constexpr uint K = SPLASH_DRAFT_CANDIDATES, Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  threadgroup float code[1024], message[512], state[5120], scores[K], scratch[8];
-  threadgroup uint selected_token;
-  if (tid == 0) selected_token = params.selection.anchor[batch];
+  uint r = group.x * 4 + sg, batch = group.y;
+  if (r >= p.rank) return;
+  uint predecessor = params.position == 0 ? params.selection.anchor[batch]
+      : tokens[batch * SPLASH_DRAFT_PROPOSAL_TOKENS + params.position - 1];
+  uint row = batch * SPLASH_DRAFT_QUERY_ROWS + params.position + 1;
+  float gate = 0, value = 0;
+  for (uint c = lane; c < p.code; c += 32) {
+    float code = sqrt(float(p.code)) * float(book[ulong(predecessor) * p.code + c]);
+    gate += code * float(pred_gate[ulong(r) * p.code + c]);
+    value += code * float(previous[ulong(r) * p.code + c]);
+  }
+  gate = simd_sum(gate);
+  value = simd_sum(value);
+  if (lane == 0) {
+    float q = float(packed[ulong(row) * 3 * p.rank + r]);
+    message[batch * p.rank + r] = value / (1.0f + exp(-(q + gate + float(bias[r]))));
+  }
+}
+
+// One simdgroup per hidden coordinate spreads the final write over the GPU.
+// Keep the state in FP32 until normalization and candidate scoring, as in
+// the direct refinement equations, without an intermediate BF16 rounding.
+kernel void dspine_refine_state(device const bfloat *raw [[buffer(0)]], device const float *rms [[buffer(1)]],
+    device const float *message [[buffer(2)]], device const bfloat *write [[buffer(3)]],
+    device float *state [[buffer(4)]], constant DSpineRefineParams &params [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  const DSpineParams p = params.shape;
+  uint h = group.x * 4 + sg, batch = group.y;
+  if (h >= p.hidden) return;
+  float delta = 0;
+  for (uint r = lane; r < p.rank; r += 32)
+    delta += message[batch * p.rank + r] * float(write[ulong(h) * p.rank + r]);
+  delta = simd_sum(delta);
+  uint row = batch * SPLASH_DRAFT_QUERY_ROWS + params.position + 1;
+  if (lane == 0) state[batch * p.hidden + h] = float(raw[ulong(row) * p.hidden + h]) + rms[row] * delta;
+}
+
+// One group scores a position's candidate support and records the actual
+// conditional q used by rejection sampling. The next message dispatch
+// reads its chosen token; all positions remain in one ordered GPU command.
+kernel void dspine_refine_score(device const float *state [[buffer(0)]], device const bfloat *norm [[buffer(1)]],
+    device const bfloat *head [[buffer(2)]], device const uint *candidates [[buffer(3)]],
+    device const float *uniforms [[buffer(4)]], device uint *tokens [[buffer(5)]],
+    device float *probabilities [[buffer(6)]], device float *confidence [[buffer(7)]],
+    constant DSpineRefineParams &params [[buffer(8)]], uint batch [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  const DSpineParams p = params.shape;
+  constexpr uint K = SPLASH_DRAFT_CANDIDATES;
+  threadgroup float scratch[8], scores[K], normalized[5120];
+  float sum = 0;
+  for (uint h = tid; h < p.hidden; h += 256) {
+    float x = state[batch * p.hidden + h];
+    sum += x * x;
+  }
+  float inverse = rsqrt(dspine_sum(sum, scratch, tid, lane, sg) / p.hidden + 1e-6f);
+  for (uint h = tid; h < p.hidden; h += 256)
+    normalized[h] = state[batch * p.hidden + h] * (inverse * float(norm[h]));
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint position = 0; position < Positions; ++position) {
-    uint row = batch * SPLASH_DRAFT_QUERY_ROWS + position + 1;
-    uint candidate_row = batch * Positions + position;
-    for (uint c = tid; c < p.code; c += 256)
-      code[c] = sqrt(float(p.code)) * float(book[ulong(selected_token) * p.code + c]);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint r = tid; r < p.rank; r += 256) {
-      float gate = 0, value = 0;
-      for (uint c = 0; c < p.code; ++c) {
-        gate += code[c] * float(pred_gate[ulong(r) * p.code + c]);
-        value += code[c] * float(previous[ulong(r) * p.code + c]);
+  uint candidate_row = batch * SPLASH_DRAFT_PROPOSAL_TOKENS + params.position;
+  for (uint k = sg; k < K; k += 8) {
+    float score = 0;
+    for (uint h = lane; h < p.hidden; h += 32)
+      score += normalized[h] * float(head[(ulong(candidate_row) * K + k) * p.hidden + h]);
+    score = simd_sum(score);
+    if (lane == 0) scores[k] = score;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    float best = scores[0];
+    uint choice = 0;
+    for (uint k = 1; k < K; ++k)
+      if (scores[k] > best) { best = scores[k]; choice = k; }
+    float mass = 0;
+    for (uint k = 0; k < K; ++k) mass += exp(scores[k] - best);
+    confidence[candidate_row] = 1.0f / mass;
+    if (params.selection.sampling_mask & (1u << batch)) {
+      float total = 0;
+      for (uint k = 0; k < K; ++k) {
+        scores[k] = exp((scores[k] - best) / params.selection.temperature[batch]);
+        total += scores[k];
       }
-      float q = float(packed[ulong(row) * 3 * p.rank + r]);
-      message[r] = value / (1.0f + exp(-(q + gate + float(bias[r]))));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float sum = 0;
-    for (uint h = tid; h < p.hidden; h += 256) {
-      float delta = 0;
-      for (uint r = 0; r < p.rank; ++r) delta += message[r] * float(write[ulong(h) * p.rank + r]);
-      float x = float(raw[ulong(row) * p.hidden + h]) + rms[row] * delta;
-      state[h] = x;
-      sum += x * x;
-    }
-    float inverse = rsqrt(dspine_sum(sum, scratch, tid, lane, sg) / p.hidden + 1e-6f);
-    for (uint h = tid; h < p.hidden; h += 256) state[h] *= inverse * float(norm[h]);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint k = sg; k < K; k += 8) {
-      float score = 0;
-      for (uint h = lane; h < p.hidden; h += 32)
-        score += state[h] * float(head[(ulong(candidate_row) * K + k) * p.hidden + h]);
-      score = simd_sum(score);
-      if (lane == 0) scores[k] = score;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-      float best = scores[0];
-      uint choice = 0;
-      for (uint k = 1; k < K; ++k)
-        if (scores[k] > best) { best = scores[k]; choice = k; }
-      float mass = 0;
-      for (uint k = 0; k < K; ++k) mass += exp(scores[k] - best);
-      confidence[candidate_row] = 1.0f / mass;
-      if (params.selection.sampling_mask & (1u << batch)) {
-        float total = 0;
-        for (uint k = 0; k < K; ++k) {
-          scores[k] = exp((scores[k] - best) / params.selection.temperature[batch]);
-          total += scores[k];
-        }
-        float cumulative = 0;
-        choice = K - 1;
-        bool found = false;
-        for (uint k = 0; k < K; ++k) {
-          float q = scores[k] / total;
-          probabilities[candidate_row * K + k] = q;
-          cumulative += q;
-          if (!found && cumulative > uniforms[batch * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_PROPOSALS + position]) {
-            choice = k;
-            found = true;
-          }
+      float cumulative = 0;
+      choice = K - 1;
+      bool found = false;
+      for (uint k = 0; k < K; ++k) {
+        float q = scores[k] / total;
+        probabilities[candidate_row * K + k] = q;
+        cumulative += q;
+        if (!found && cumulative > uniforms[batch * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_PROPOSALS + params.position]) {
+          choice = k;
+          found = true;
         }
       }
-      selected_token = candidates[candidate_row * K + choice];
-      tokens[candidate_row] = selected_token;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    tokens[candidate_row] = candidates[candidate_row * K + choice];
   }
 }

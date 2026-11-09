@@ -13,6 +13,7 @@ struct DSpineParams {
 struct DSpineRefineParams {
   DSpineParams shape;
   SelectorBatchParams selection;
+  uint32_t position;
 };
 
 struct DSpineGatherParams {
@@ -21,5 +22,5 @@ struct DSpineGatherParams {
 };
 
 static_assert(sizeof(DSpineParams) == 16, "DSpine bridge parameters are 16 bytes");
-static_assert(sizeof(DSpineRefineParams) == 60, "DSpine refinement parameters are 60 bytes");
+static_assert(sizeof(DSpineRefineParams) == 64, "DSpine refinement parameters are 64 bytes");
 static_assert(sizeof(DSpineGatherParams) == 8, "DSpine gather parameters are 8 bytes");

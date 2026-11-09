@@ -25,6 +25,10 @@ struct DSpineBuffers final {
   metal::MetalBuffer packed;
   metal::MetalBuffer message;
   metal::MetalBuffer candidateHead;
+  // FP32 scratch for one serial refinement position per lane. Reused only
+  // after the preceding position's score has selected its successor token.
+  metal::MetalBuffer refineMessage;
+  metal::MetalBuffer refineState;
 };
 
 class DSpine final {

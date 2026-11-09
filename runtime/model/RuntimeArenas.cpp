@@ -293,6 +293,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
     put(DecodeTensor::BridgeMessage, bytesFor<uint16_t>(r * geometry.draft.bridgeRank));
     put(DecodeTensor::BridgeCandidateHead,
         bytesFor<uint16_t>(uint64_t{kDraftProposalTokens} * SPLASH_DRAFT_CANDIDATES * geometry.draft.hiddenSize));
+    put(DecodeTensor::BridgeRefineMessage, bytesFor<float>(geometry.draft.bridgeRank));
+    put(DecodeTensor::BridgeRefineState, bytesFor<float>(geometry.draft.hiddenSize));
   }
   put(DecodeTensor::SelectorHidden,
       bytesFor<uint16_t>(r * geometry.draft.selectorRank));

@@ -427,6 +427,8 @@ enum class DecodeTensor : uint32_t {
   BridgePacked,
   BridgeMessage,
   BridgeCandidateHead,
+  BridgeRefineMessage,
+  BridgeRefineState,
   SelectorHidden,
   Candidates,
   Unary,

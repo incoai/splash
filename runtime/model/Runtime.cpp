@@ -2127,7 +2127,8 @@ struct Runtime::Impl {
     buffers.inputTokens = d(DecodeTensor::DraftInputTokens);
     const ops::DSpineBuffers bridge{d(DecodeTensor::BridgeRaw), d(DecodeTensor::BridgeRms),
         d(DecodeTensor::BridgeCodes), d(DecodeTensor::BridgePacked), d(DecodeTensor::BridgeMessage),
-        d(DecodeTensor::BridgeCandidateHead)};
+        d(DecodeTensor::BridgeCandidateHead), d(DecodeTensor::BridgeRefineMessage),
+        d(DecodeTensor::BridgeRefineState)};
     buffers.bridge = bridge;
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
     draftModel.addDecode(graph, std::move(buffers),

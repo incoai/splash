@@ -95,7 +95,7 @@ void DSpine::addRefinement(metal::CommandGraph &g, const DSpineWeights &w, const
     throw std::invalid_argument("DSpine refinement requires BF16 write weights");
   requireBytes(write.blocks().segments.front().plane0, uint64_t{p.hidden} * p.rank * 2, "DSpine final write");
   requireBytes(w.gateBias, uint64_t{p.rank} * 2, "DSpine gate bias");
-  DSpineRefineParams params{p, {}};
+  DSpineRefineParams params{p, {}, 0};
   params.selection.lanes = lanes;
   params.selection.vocabulary = head.outputSize;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -118,14 +118,25 @@ void DSpine::addRefinement(metal::CommandGraph &g, const DSpineWeights &w, const
   requireBytes(w.predecessorGate, uint64_t{p.rank} * p.code * 2, "DSpine predecessor gate");
   requireBytes(w.previous, uint64_t{p.rank} * p.code * 2, "DSpine predecessor value");
   requireBytes(norm.buffer, uint64_t{p.hidden} * 2, "DSpine final norm");
+  requireBytes(b.refineMessage, uint64_t{lanes} * p.rank * 4, "DSpine refinement message");
+  requireBytes(b.refineState, uint64_t{lanes} * p.hidden * 4, "DSpine refinement state");
   g.add("draft_select_top16_sharded", {s.logits, s.partialIds, s.partialValues}, head.outputSize,
         {uint64_t{lanes} * SPLASH_DRAFT_PROPOSAL_TOKENS * SPLASH_DRAFT_SAMPLING_SHARDS, 1, 1});
   g.add("dspine_select_candidates", {s.partialIds, s.partialValues, s.candidates},
         {uint64_t{lanes} * SPLASH_DRAFT_PROPOSAL_TOKENS, 1, 1}, {32, 1, 1});
   gatherHead(g, head, s.candidates, b.candidateHead, lanes * SPLASH_DRAFT_PROPOSAL_TOKENS * SPLASH_DRAFT_CANDIDATES);
-  g.add("dspine_refine", {b.raw, b.rms, b.packed, w.codebook, w.predecessorGate, w.previous,
-        w.gateBias, w.write.back().blocks().segments.front().plane0, norm.buffer, b.candidateHead,
-        s.candidates, s.uniforms, s.proposedTokens, s.proposalProbabilities, s.confidence}, params, {lanes, 1, 1});
+  // Positions remain conditional on the selected predecessor. Each matrix
+  // vector product spans the GPU; dispatch order carries the dependency
+  // without another command submission or CPU readback.
+  for (uint32_t position = 0; position < SPLASH_DRAFT_PROPOSAL_TOKENS; ++position) {
+    params.position = position;
+    g.add("dspine_refine_message", {b.packed, w.codebook, w.predecessorGate, w.previous,
+          w.gateBias, s.proposedTokens, b.refineMessage}, params, {(p.rank + 3) / 4, lanes, 1}, {128, 1, 1});
+    g.add("dspine_refine_state", {b.raw, b.rms, b.refineMessage, write.blocks().segments.front().plane0,
+          b.refineState}, params, {(p.hidden + 3) / 4, lanes, 1}, {128, 1, 1});
+    g.add("dspine_refine_score", {b.refineState, norm.buffer, b.candidateHead, s.candidates,
+          s.uniforms, s.proposedTokens, s.proposalProbabilities, s.confidence}, params, {lanes, 1, 1});
+  }
 }
 
 } // namespace splash::ops
