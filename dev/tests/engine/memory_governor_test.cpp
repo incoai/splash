@@ -11,6 +11,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -349,6 +350,57 @@ void testReleasedBytesPayOnlyForTheirScope() {
   governor.ledger().close(claim);
 }
 
+// What a scope's work released pays for its allocations of no more than that past the engine's limit and the room a
+// claim ranked above it holds, as past the host's rule: the scope's net change never raises the charge. Only memory
+// allocated takes it back; a driver's denial leaves it.
+void testReleasedBytesPayPastTheLimitAndTheHeldRoom() {
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t limit = 4 * kGiB, room = 64 * kMiB;
+  MemoryGovernor governor(backend, limit, kGiB, kGiB, [] { return hostMemory(8 * kGiB); }, 0);
+  MemoryLedger &ledger = governor.ledger();
+  const metal::AllocationAdmission admission = governor.allocationAdmission();
+  const auto refusal = [&](uint64_t bytes) { return admission(bytes, [&] { allocate(bytes); }).failure; };
+  const ClaimId claim = ledger.open({.cls = ClaimClass::InService});
+  // Metal memory outside the backend's buffers holds the charge over the
+  // limit, by more than the scope's work releases.
+  allocate(limit - room);
+  test::metalStatistics().deviceCurrentAllocatedBytes += 2 * room;
+  {
+    const MemoryGovernor::Scope scope(governor, claim);
+    require(refusal(kMiB) == metal::AllocationFailure::EngineBudget, "an allocation past the engine's limit passed");
+    test::metalStatistics().allocatedBytes -= 2 * kMiB;
+    test::metalStatistics().deviceCurrentAllocatedBytes -= 2 * kMiB;
+    governor.fund(2 * kMiB);
+    const metal::AllocationResult denied =
+        admission(2 * kMiB, [] { throw metal::MetalAllocationError("injected driver allocation denial"); });
+    require(denied.failure == metal::AllocationFailure::DriverRejected &&
+                refusal(2 * kMiB) == metal::AllocationFailure::None,
+            "the engine's limit refused an allocation its scope's releases paid for, or a driver's denial took them");
+    require(refusal(kMiB) == metal::AllocationFailure::EngineBudget,
+            "an allocation passed the engine's limit on releases another allocation took back");
+  }
+  // A Foreground start ranked above the claim waits for its copies, holding
+  // twice the room the limit leaves.
+  test::metalStatistics().deviceCurrentAllocatedBytes = test::metalStatistics().allocatedBytes;
+  const ClaimId start = ledger.open({.cls = ClaimClass::Start, .requestId = 1, .rank = {.priority = 2}});
+  ledger.setReturning([] { return Returning{}; },
+                      [](std::span<const uint64_t>) { return Returning{.owedBytes = 2 * room}; });
+  require(governor.free(start, {.bytes = 2 * room}).outcome == FreeOutcome::Pending &&
+              ledger.heldBytes(claim) == 2 * room,
+          "the start did not wait holding its room");
+  {
+    const MemoryGovernor::Scope scope(governor, claim);
+    require(refusal(kMiB) == metal::AllocationFailure::EngineBudget,
+            "an allocation took the room a claim ranked above it holds");
+    governor.fund(kMiB);
+    require(refusal(kMiB) == metal::AllocationFailure::None,
+            "the room a claim ranked above holds refused an allocation its scope's releases paid for");
+  }
+  ledger.close(start);
+  ledger.close(claim);
+}
+
 // The host telemetry reads the task's footprint and compressed bytes, not its resident size, and the host's
 // file-backed, inactive plus speculative and file cache pages, not its active ones; the snapshot carries it.
 void testHostTelemetryReadsTheTaskAndTheHost() {
@@ -389,6 +441,7 @@ int main() {
     testHostRefusalComesBeforeTheEngineLimit();
     testAnAllocationOutsideAClaimThrows();
     testReleasedBytesPayOnlyForTheirScope();
+    testReleasedBytesPayPastTheLimitAndTheHeldRoom();
     testHostTelemetryReadsTheTaskAndTheHost();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;

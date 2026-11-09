@@ -2173,9 +2173,10 @@ TokenAdmission Cache::moveLandedPages(const std::function<std::vector<uint32_t>(
   // extents each runway's moves empty leave as `extents` says (released,
   // the Full pages left first gather in the fewest extents), past the
   // `claimed` Full pages a claim takes in place, and their bytes pay for the
-  // Index extent the runway refills with next (`funds`): it so passes the
-  // host under critical pressure too, since on Qwen3.8-Flash-Next a Full
-  // extent returns 17 times an Index one's bytes. The pages that wait are
+  // Index extent the runway refills with next (`funds`): where they cover
+  // it, it passes the engine's limit and the host, under critical pressure
+  // too, since on Qwen3.8-Flash-Next a Full extent returns 17 times an Index
+  // one's bytes. The pages that wait are
   // found again for each runway, since gathering moves them. The runway then
   // stands for the next spill, at the memory wall too, where a lane's
   // release moves its pages through it.

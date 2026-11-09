@@ -454,7 +454,8 @@ void Engine::spillLanded(bool controlPass) {
   // The Index runway the pages draw on refills if memory allows. Index
   // pages, the runway's included, are memory the resident Spill lanes need,
   // like their Full pages, and a fraction of what the moves free, which
-  // pays for them past the host (MemoryGovernor::fund): with no such lane
+  // pays for them past the engine's limit and the host
+  // (MemoryGovernor::fund): with no such lane
   // in service they take only what costs nothing; with one, they are the
   // highest-ranked such lane's, at its priority, since the room its waiting
   // claim holds is the room its released pages move into.

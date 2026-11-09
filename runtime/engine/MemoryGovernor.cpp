@@ -225,11 +225,13 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   const ClaimState &claim = ledger_.claim(scope_);
   const bool fits = engineFits && ledger_.heldBytes(scope_) <= limitBytes_ - observed - requested;
   const ClaimClass cls = hostClass(claim.spec);
-  // What the scope's work released pays for it, under critical pressure
-  // too: the host gets back at least what it gives (fund).
-  const bool funded = bytes <= fundedBytes_;
-  const bool hostAdmits = funded || hostRule_.admits(cls, hostBytes(cls, bytes), claim.hostExempt);
-  if (!fits || !hostAdmits) {
+  const bool hostAdmits = hostRule_.admits(cls, hostBytes(cls, bytes), claim.hostExempt);
+  // What the scope's work released and its allocations have not taken back
+  // pays for one of no more than that past both, under critical pressure
+  // too: the scope's net change never raises the charge, so it takes no room
+  // from the limit, the claims ranked above or the host (fund).
+  const bool funded = !overflows && bytes <= fundedBytes_;
+  if (!funded && (!fits || !hostAdmits)) {
     // The host's refusal lifts with its pressure, the limit's only once
     // memory is freed: a refusal they share is the host's.
     failure = hostAdmits ? metal::AllocationFailure::EngineBudget : metal::AllocationFailure::HostPressure;
@@ -246,8 +248,6 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
     unseenGrowthHeadroom_ = hostHeadroomBytes(host, 0);
     unseenGrowthUntilMilliseconds_ = clockMilliseconds_ + kHostSettleMilliseconds;
   }
-  if (funded)
-    fundedBytes_ -= bytes;
   reservedBytes_ = requested;
   return Reservation(this, bytes);
 }
@@ -264,6 +264,9 @@ metal::AllocationAdmission MemoryGovernor::allocationAdmission() noexcept {
       // Host headroom is an estimate; the driver can still deny the allocation.
       return error.failure();
     }
+    // Only memory allocated takes back what the scope's work released: a
+    // refusal, the driver's too, leaves it (fund).
+    fundedBytes_ = saturatingSubtract(fundedBytes_, bytes);
     return {};
   };
 }

@@ -725,7 +725,8 @@ private:
   // with none in service an Optional one that takes only what costs nothing
   // (allocate()), which only the control pass asks: no command needs the
   // runway then, and a refusal would run at each. The Full extents the
-  // moves release pay for them past the host (MemoryGovernor::fund).
+  // moves release pay for them past the engine's limit and the host
+  // (MemoryGovernor::fund).
   void spillLanded(bool controlPass);
   // Ends a request at its length outside a command: in Spill mode, once its
   // KV gives no more memory back, by the SSD cache or a release (refuse).

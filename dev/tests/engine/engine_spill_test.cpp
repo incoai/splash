@@ -2568,6 +2568,32 @@ void testCriticalReleasesCleanPagesBeforeAnyLaneYields() {
   require(spill.events.failures.empty() && spill.events.usage.at(1).second == 1'000, "the lane did not complete");
 }
 
+// With Metal memory outside the engine's buffers holding the charge over the engine's limit by more than a Full
+// extent, the host's pass under critical pressure still releases two extents of a lane's pages, 204 MB on
+// Qwen3.8-Flash-Next: each runway's emptied Full extent pays for the next Index extent past the limit as past the
+// host (MemoryGovernor::fund), and the runway stands again once the release ends. Refused by the limit, the first
+// refill ended the release at one runway, 108,527,680 B, and left no free Index page for the next.
+void testACriticalPassReleasesPastTheEnginesLimit() {
+  CriticalLane critical;
+  Spilling &spill = critical.spill;
+  const uint64_t extent = 256 * FlashNextLanes::kPages.fullBytes;
+  spill.host.memory.holdUntracked(spill.host.governor.snapshot().headroomBytes + extent + extent / 2);
+  const uint32_t before = spill.cache.indexPages(1);
+  const uint64_t extents = 2 * 256 * (FlashNextLanes::kPages.fullBytes - FlashNextLanes::kPages.indexBytes);
+  const FreeResult freed = test::hostPass(spill.host.governor, extents, true);
+  const uint32_t released = spill.cache.indexPages(1) - before;
+  require(freed.nowBytes >= extents && released >= 2 * 256 &&
+              spill.pool.freePageCount(kv::PageForm::Index) >= spill.pool.extentPages(),
+          "over the engine's limit the host's pass freed " + std::to_string(freed.nowBytes) + " B, released " +
+              std::to_string(released) + " of the lane's pages and left " +
+              std::to_string(spill.pool.freePageCount(kv::PageForm::Index)) + " free Index pages");
+  spill.host.memory.holdUntracked(0);
+  spill.host.setPressure(MemoryPressure::Normal);
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.usage.at(1).second == 1'000, "the lane did not complete");
+}
+
 // Under critical pressure a lane's growth the host refuses releases its own lane's pages whose copies landed, in
 // place: into free Index pages, the Full pages they free taken by the growth, so the lane decodes on rather than
 // yield.
@@ -3685,6 +3711,7 @@ std::span<const test::TestCase> spillTests() {
       {"testAStartReleasesALaneOfItsPriority", testAStartReleasesALaneOfItsPriority},
       {"testAStartNeverReleasesAHigherPriorityLane", testAStartNeverReleasesAHigherPriorityLane},
       {"testCriticalReleasesCleanPagesBeforeAnyLaneYields", testCriticalReleasesCleanPagesBeforeAnyLaneYields},
+      {"testACriticalPassReleasesPastTheEnginesLimit", testACriticalPassReleasesPastTheEnginesLimit},
       {"testAHostRefusedGrowthReleasesItsOwnLane", testAHostRefusedGrowthReleasesItsOwnLane},
       {"testAReleaseInPlaceKeepsTheIndexRunway", testAReleaseInPlaceKeepsTheIndexRunway},
       {"testAReleaseInPlaceKeepsTheRunwayTheRoomCannotRefill", testAReleaseInPlaceKeepsTheRunwayTheRoomCannotRefill},
