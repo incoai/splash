@@ -4602,6 +4602,51 @@ void testWritersMoveOntoPagesBeingWritten() {
   spill.cache.endRequest(3);
 }
 
+// A block whose restore failed keeps a page of whatever the pool held, and with no request holding
+// that page it gives up its copy too. A writer that kept pages of its own beside the blocks a
+// restore was filling goes on below them, and nothing writes that page as the block's: a persistent
+// tier's next process would take it for the K/V.
+void testAFailedRestoresPageIsNeverWritten() {
+  for (const bool spills : {false, true}) {
+    Spilling spill;
+    const std::vector<uint32_t> prompt = Spilling::prompt(1000, 4);
+    spill.start(1, prompt, 3);
+    require(spill.cache.writeThrough() == 3, "the pages were not written through");
+    spill.publishState(spill.block(1, 2));
+    spill.tier.complete();
+    static_cast<void>(spill.cache.pollTransfers());
+    spill.cache.endRequest(1);
+    spill.toDisk();
+    CacheLookup lookup = spill.cache.lookup(std::span<const uint32_t>(prompt).first(3 * KvCache::pageTokens + 1), {});
+    spill.cache.beginRequest(2);
+    require(admitRestore(spill.cache, 2, lookup).granted() &&
+                spill.cache.kvRestoreStatus(2) == KvRestoreStatus::Pending,
+            "the chain's restore did not start");
+    spill.start(3, prompt, 3, KvMode::Resident);
+    lookup = {};
+    spill.cache.endRequest(2);
+    spill.tier.complete(false);
+    static_cast<void>(spill.cache.pollTransfers());
+    require(spill.cache.snapshot().kvTier.restoreFailures == 3, "the reads did not fail");
+    spill.grow(3, prompt, 4);
+    const uint64_t point = spill.block(3, 3);
+    spill.publishState(point);
+    const size_t before = spill.tier.writes.size();
+    if (spills) {
+      require(spill.cache.convertToSpill(3, 4), "the writer did not convert to Spill");
+      static_cast<void>(spill.cache.writeThrough());
+      require(spill.tier.writes.size() == before + 1, "a Spill request wrote a page whose restore failed");
+    } else {
+      require(spill.cache.persist(point) == PersistStatus::Unneeded && spill.tier.writes.size() == before,
+              "a point's copies wrote a page whose restore failed");
+    }
+    spill.cache.checkInvariants();
+    spill.tier.complete();
+    static_cast<void>(spill.cache.pollTransfers());
+    spill.cache.endRequest(3);
+  }
+}
+
 // Quota never gives up a copy a running request reads; its slots return once the command's cut
 // goes.
 void testQuotaGivesUpOnlyCopiesNothingReads() {
@@ -5190,9 +5235,9 @@ void testPoisonedBlockLeavesOnceItsWriteLands() {
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false);
-  fixture.cache.poisonCopy(fixture.blocks[1]);
   require(fixture.cache.persist(fixture.blocks[3]) == PersistStatus::Started && tier.writes.size() == 4,
-          "the point's copies did not go on through the poisoned block");
+          "the point's copies did not start");
+  fixture.cache.poisonCopy(fixture.blocks[1]);
   fixture.cache.endRequest(1);
   tier.transfers[2]->ready = tier.transfers[3]->ready = true;
   static_cast<void>(fixture.cache.pollTransfers());
@@ -6922,6 +6967,7 @@ int main() {
     testUnspillOnlyAsTheOnlyHolder();
     testAnUnspillLeavesTheHeldFreePages();
     testWritersMoveOntoPagesBeingWritten();
+    testAFailedRestoresPageIsNeverWritten();
     testQuotaGivesUpOnlyCopiesNothingReads();
     testQuotaKeepsTheSpilledLeafOfAStateInRam();
     testCommittedPagesTakeTheSpilledChainOfAStateInRam();
