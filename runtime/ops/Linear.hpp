@@ -311,6 +311,9 @@ private:
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
   KernelCalibration calibration_;
+  // Apple8 (M2) prefills from a half copy of each chunk's activations: its
+  // matmul2d runs half x half about 1.5x as fast as bfloat x half.
+  bool halfPrefillInput_ = false;
 };
 
 } // namespace splash::ops

@@ -8,9 +8,9 @@
 // partition, with scratch for scores, probabilities and row statistics.
 // INT8 and BF16 entries share one signature: pages are reached through the
 // tables, so no entry binds KV storage.
-#define PAGED_VERIFY_SPLIT_SIGNATURE(Name)                                     \
+#define PAGED_VERIFY_SPLIT_SIGNATURE(Name, T)                                  \
   kernel void Name(                                                            \
-      device bfloat *queries [[buffer(0)]],                                    \
+      device T *queries [[buffer(0)]],                                         \
       device float *partials [[buffer(1)]],                                    \
       device float *statistics [[buffer(2)]],                                  \
       device const SplashKvPage *page_table0 [[buffer(3)]],                    \
@@ -21,12 +21,12 @@
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]])
 
-#define PAGED_VERIFY_SCRATCH(Group)                                            \
+#define PAGED_VERIFY_SCRATCH(Group, T)                                         \
   constexpr uint M =                                                           \
       Group * SPLASH_TARGET_VERIFY_ROWS / SPLASH_ATTENTION_TILE_PARTS(Group);  \
   constexpr uint N = SplashKvPageTokens;                                       \
   alignas(16) threadgroup float scores[M * N];                                 \
-  alignas(16) threadgroup bfloat probabilities[M * N];                         \
+  alignas(16) threadgroup T probabilities[M * N];                              \
   threadgroup float row_max[M];                                                \
   threadgroup float row_sum[M];                                                \
   threadgroup float previous_scale[M];                                         \
@@ -47,13 +47,13 @@
   if (!tile.active || group.y >= tile.splits)                                  \
     return;
 
-#define PAGED_VERIFY_SPLIT(Name, Heads, Group, HeadDim, Window, CacheElement)  \
-  PAGED_VERIFY_SPLIT_SIGNATURE(Name) {                                         \
-    PAGED_VERIFY_SCRATCH(Group)                                                \
+#define PAGED_VERIFY_SPLIT(Name, Heads, Group, HeadDim, Window, CacheElement, T) \
+  PAGED_VERIFY_SPLIT_SIGNATURE(Name, T) {                                      \
+    PAGED_VERIFY_SCRATCH(Group, T)                                             \
     PAGED_VERIFY_TILE_AT(Heads, Group, HeadDim)                                \
     splash_paged_attention_tile<Heads, Group,                                  \
                                 SPLASH_TARGET_VERIFY_ROWS / Parts, HeadDim,    \
-                                Window, CacheElement>(                         \
+                                Window, CacheElement, T, T>(                   \
         queries + tile.offset,                                                 \
         SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2,    \
                             page_table3),                                      \
@@ -63,19 +63,26 @@
         thread_index);                                                         \
   }
 
-PAGED_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, 256, 0, int8_t)
-PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8, 2, 8, 256, 0, int8_t)
-PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g16, 2, 16, 256, 0, int8_t)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, 256, 0, int8_t, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8, 2, 8, 256, 0, int8_t, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g16, 2, 16, 256, 0, int8_t, bfloat)
 // Four KV heads of 128 dimensions over the whole history, and over a window
 // of the 512 keys before each row.
-PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv4_g8_d128, 4, 8, 128, 0, int8_t)
-PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv4_g8_d128_w512, 4, 8, 128, 512, int8_t)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv4_g8_d128, 4, 8, 128, 0, int8_t, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv4_g8_d128_w512, 4, 8, 128, 512, int8_t, bfloat)
+// Apple8 attends with half queries and probabilities (Q and P half, the _h
+// names): its matmul2d runs half operands about twice as fast as bfloat ones.
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_h, 4, 6, 256, 0, int8_t, half)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_h_kv2_g8, 2, 8, 256, 0, int8_t, half)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_h_kv2_g16, 2, 16, 256, 0, int8_t, half)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_h_kv4_g8_d128, 4, 8, 128, 0, int8_t, half)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_h_kv4_g8_d128_w512, 4, 8, 128, 512, int8_t, half)
 // BF16 shares the page loop and reduction, without quantization scales.
-PAGED_VERIFY_SPLIT(verify_attention_bf16_split, 4, 6, 256, 0, bfloat)
-PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8, 2, 8, 256, 0, bfloat)
-PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g16, 2, 16, 256, 0, bfloat)
-PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv4_g8_d128, 4, 8, 128, 0, bfloat)
-PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split, 4, 6, 256, 0, bfloat, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8, 2, 8, 256, 0, bfloat, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g16, 2, 16, 256, 0, bfloat, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv4_g8_d128, 4, 8, 128, 0, bfloat, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512, bfloat, bfloat)
 #undef PAGED_VERIFY_SPLIT
 #undef PAGED_VERIFY_TILE_AT
 #undef PAGED_VERIFY_SCRATCH

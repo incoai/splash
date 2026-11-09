@@ -62,20 +62,22 @@ struct Shape {
   }
   // A phase's ("verify" or "prefill") split and reduce entries, as its plans
   // name them.
-  std::string split(std::string_view phase) const {
-    return phase == "verify" ? verifyPlan().splitPipeline : prefillPlan().splitPipeline;
+  std::string split(std::string_view phase, bool halfQueries = false) const {
+    return phase == "verify" ? verifyPlan(halfQueries).splitPipeline
+                             : prefillPlan(halfQueries).splitPipeline;
   }
   std::string reduce(std::string_view phase) const {
     return phase == "verify" ? verifyPlan().reducePipeline : prefillPlan().reducePipeline;
   }
 
 private:
-  splash::ops::PrefillAttentionPlan prefillPlan() const {
-    return splash::ops::PagedAttention::prefillPlan(kRows, 0, queryHeads(), layout(), kPagesPerSplit);
+  splash::ops::PrefillAttentionPlan prefillPlan(bool halfQueries = false) const {
+    return splash::ops::PagedAttention::prefillPlan(kRows, 0, queryHeads(), layout(), kPagesPerSplit, {},
+                                                   halfQueries);
   }
-  splash::ops::VerifyAttentionPlan verifyPlan() const {
+  splash::ops::VerifyAttentionPlan verifyPlan(bool halfQueries = false) const {
     const std::array<uint32_t, 1> history{0};
-    return splash::ops::PagedAttention::verifyPlan(1, queryHeads(), layout(), history);
+    return splash::ops::PagedAttention::verifyPlan(1, queryHeads(), layout(), history, {}, halfQueries);
   }
 };
 const std::vector<Shape> kShapes = [] {
@@ -475,6 +477,19 @@ std::vector<BFloat16Bits> cpuReference(const Case &data, bool quantized) {
   return output;
 }
 
+// Apple8 runs the split instances that read half queries and probabilities
+// (_h, PagedAttention::prefillPlan/verifyPlan): the cases' bf16 queries go in
+// as half, each value exact in half's range, against the same references.
+bool gHalfQueries = false;
+
+void toHalfQueries(void *bytes, uint64_t length) {
+  auto *values = static_cast<BFloat16Bits *>(bytes);
+  for (uint64_t i = 0; i < length / sizeof(BFloat16Bits); ++i) {
+    const _Float16 value = static_cast<_Float16>(bfloat16ToFloat(values[i]));
+    std::memcpy(values + i, &value, sizeof(value));
+  }
+}
+
 // The verify and prefill split of one geometry, each with its reduction.
 struct Pipelines {
   std::string splitName;
@@ -488,10 +503,13 @@ struct Pipelines {
 Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
                         Shape shape) {
   Pipelines result;
-  result.splitName = shape.split("verify");
+  // Sparse shapes attend through another kernel, which reads plain bf16
+  // queries: half applies to the split geometries only (Apple8).
+  gHalfQueries = !shape.sparse() && ![device supportsFamily:MTLGPUFamilyApple9];
+  result.splitName = shape.split("verify", gHalfQueries);
   result.split = makePipeline(device, library, result.splitName);
   result.reduce = makePipeline(device, library, shape.reduce("verify"));
-  result.prefillSplitName = shape.split("prefill");
+  result.prefillSplitName = shape.split("prefill", gHalfQueries);
   result.prefillSplit = makePipeline(device, library, result.prefillSplitName);
   result.prefillReduce = makePipeline(device, library, shape.reduce("prefill"));
   const uint64_t scratch = result.split.staticThreadgroupMemoryLength;
@@ -540,6 +558,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   // With QSA masks every lane attends through a copy of the case's list,
   // lane l's list kQsaJunkLists + l.
   const BlockLists blocks = data.maskWords ? qsaBlockLists(device, data, width) : BlockLists{partials, partials, 0};
+  if (gHalfQueries) toHalfQueries(queries.contents, queries.length);
   std::array<VerifyAttentionParams, 4> params{};
   for (uint32_t lane = 0; lane < params.size(); ++lane)
     params[lane] = {data.params.committed_tokens, data.params.page_table_entries, data.params.kv, splits, splits,
@@ -603,10 +622,16 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   PrefillAttentionParams params = data.params;
   params.block_stride = blocks.stride;
   params.block_list = blocks.stride ? kQsaJunkLists : 0;
+  id<MTLBuffer> queries = data.queries;
+  if (gHalfQueries) {
+    queries = makeBuffer(device, data.queries.length);
+    std::memcpy(queries.contents, data.queries.contents, data.queries.length);
+    toHalfQueries(queries.contents, queries.length);
+  }
   id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:split];
-  [encoder setBuffer:data.queries offset:0 atIndex:0];
+  [encoder setBuffer:queries offset:0 atIndex:0];
   [encoder setBuffer:partials offset:0 atIndex:1];
   [encoder setBuffer:statistics offset:0 atIndex:2];
   [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:3];
