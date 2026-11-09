@@ -464,11 +464,15 @@ final class Server {
             asleep: status.weights?.released ?? false,
             recovering: status.transport?.recovering ?? false,
             context: status.capabilities?.max_context_tokens,
-            live: (status.active_requests ?? []).enumerated().map { index, request in
-                LiveRequest(id: request.id ?? index, time: LiveRequest.time(of: now.addingTimeInterval(-(request.age_ms ?? 0) / 1000)),
-                            input: request.prompt_tokens ?? 0,
-                            stage: LiveRequest.stage(phase: request.phase, read: request.prompt_processed ?? 0,
-                                                     written: request.generated_tokens ?? 0))
+            // A request without the engine's id has none: no line or later status could be told
+            // from it.
+            live: (status.active_requests ?? []).compactMap { request in
+                request.id.map { id in
+                    LiveRequest(id: id, time: LiveRequest.time(of: now.addingTimeInterval(-(request.age_ms ?? 0) / 1000)),
+                                input: request.prompt_tokens ?? 0,
+                                stage: LiveRequest.stage(phase: request.phase, read: request.prompt_processed ?? 0,
+                                                         written: request.generated_tokens ?? 0))
+                }
             }
         )
     }

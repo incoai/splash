@@ -653,20 +653,23 @@ struct ServerTests {
         #expect(Server.report(Data("not json".utf8)) == nil)
     }
 
-    /// What a running request does, as the engine's phase gives it, and when it came.
+    /// What a running request does, as the engine's phase gives it, and when it came; one without
+    /// the engine's id, which nothing could tell from another, counts but has no row.
     @Test func readsTheRequestsRunning() throws {
         let now = Date(timeIntervalSince1970: 1_000)
         let status = Data(#"""
             {"active_requests": [{"id": 1, "phase": "queued", "prompt_tokens": 10, "age_ms": 500},
               {"id": 2, "phase": "waiting_resources", "prompt_tokens": 20}, {"id": 3, "phase": "waiting_prefix", "prompt_tokens": 30},
               {"id": 4, "phase": "prefill", "prompt_tokens": 40, "prompt_processed": 16},
-              {"id": 5, "phase": "waiting_mask", "prompt_tokens": 50, "prompt_processed": 50, "generated_tokens": 7}]}
+              {"id": 5, "phase": "waiting_mask", "prompt_tokens": 50, "prompt_processed": 50, "generated_tokens": 7},
+              {"phase": "decode", "prompt_tokens": 60, "generated_tokens": 1}]}
             """#.utf8)
         let report = try #require(Server.report(status, at: now))
         #expect(report.live.map(\.stage) == [.waiting("Queued"), .waiting("Waiting for memory"), .waiting("Waiting for a shared prefix"),
                                              .reading(16), .answering(7)])
+        #expect(report.live.map(\.id) == [1, 2, 3, 4, 5])
         #expect(report.live.map(\.input) == [10, 20, 30, 40, 50] && report.live[0].time == LiveRequest.time(of: now - 0.5))
-        #expect(report.activity.running == 5)
+        #expect(report.activity.running == 6)
     }
 
     /// Each request the engine took is one row, in the order they came: its start or the status
