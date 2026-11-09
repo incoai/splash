@@ -267,6 +267,10 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
       variant.windowTokens ? step.windowedAttention : step.attention;
   if (!blocks.empty() && blocks.size() != step.sequences.size())
     throw std::invalid_argument("Qwen prefill attention blocks do not match its sequences");
+  // A layer that outputs its read rows alone adds its output to their
+  // residual rows, which it gathers.
+  if (!step.readRows.empty() && !output.residual)
+    throw std::logic_error("a Qwen prefill layer that outputs its read rows alone has no residual rows");
   const auto u16Rows = [&](const metal::MetalBuffer &buffer, const QwenTargetPrefillSequence &sequence,
                            uint32_t width) {
     return rowsOf<uint16_t>(buffer, sequence.rowBegin, sequence.rows, width);
@@ -308,23 +312,19 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
           geometry_.attentionQueryHeads, geometry_.kvLayout);
       continue;
     }
-    // Only the sequence's last row is read (a layer without blocks,
-    // planOutputRows): the tile that holds it attends as in the chunk
-    // (prefillTail), and its gated row is read row `index`.
+    // Only the sequence's last row is read (planOutputRows): the tile that
+    // holds it attends as in the chunk (prefillTail), and its gated row is
+    // read row `index`.
     const uint32_t last = sequence.rows - 1;
     const ops::PrefillAttentionTail tail = ops::PagedAttention::prefillTail(plans[index], last);
-    // A staged row of a KV head: its group's query heads.
-    const uint64_t rowBytes = uint64_t{geometry_.attentionQueryHeads / geometry_.attentionKvHeads} *
-                              geometry_.attentionHeadDimension * sizeof(uint16_t);
     const auto from = [&](const metal::MetalBuffer &rows, uint32_t row) {
-      return backend_.view(rows, row * rowBytes, queryBytes - row * rowBytes);
+      return backend_.view(rows, tail.offsetBytes(row), queryBytes - tail.offsetBytes(row));
     };
-    kv::ChunkedPrefillParams chunk = sequence.chunk;
-    chunk.committed_tokens += tail.first;
-    chunk.chunk_tokens -= tail.first;
     ops::PagedAttention::addPrefill(step.graph, attended.kv, from(queries, tail.first),
                                     from(attentionRows, tail.first), b.attentionPartials, b.attentionStatistics,
-                                    attended.table, chunk, tail.plan, {}, mixer.sinks);
+                                    attended.table, tail.chunk(sequence.chunk), tail.plan,
+                                    tail.blocks(blocks.empty() ? ops::AttentionBlocks{} : blocks[index]),
+                                    mixer.sinks);
     ops::PagedAttention::addPrefillGate(
         step.graph, rowsOf<uint16_t>(b.fullPacked, sequence.rowBegin + last, 1, geometry_.packedFullWidth),
         from(attentionRows, last), rowsOf<uint16_t>(b.attentionHidden, static_cast<uint32_t>(index), 1,

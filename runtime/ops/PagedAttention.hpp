@@ -162,14 +162,6 @@ private:
         splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse), sinks(sinks) {}
 };
 
-// The rows of a prefill chunk from `first`, the first row of a tile, to its
-// last, planned as a chunk of their own after the rows before them
-// (PagedAttention::prefillTail).
-struct PrefillAttentionTail final {
-  const uint32_t first;
-  const PrefillAttentionPlan plan;
-};
-
 struct VerifyAttentionPlan final {
   const kv::Layout layout;
   const uint32_t queryHeads;
@@ -230,6 +222,31 @@ struct AttentionBlocks final {
   uint32_t list = 0;
   metal::MetalBuffer locations{};
   metal::MetalBuffer locationPages{};
+};
+
+// The rows of a prefill chunk from `first`, the first row of a tile, to its
+// last, planned as a chunk of their own after the rows before them
+// (PagedAttention::prefillTail). Row r of the chunk's staged queries and of
+// its attention rows starts offsetBytes(r) into their buffers (a KV head's
+// rows lie apart, at the chunk's stride, so each head's rows from `first` on
+// start there too), chunk(params) gives the tail the chunk's params with the
+// rows before it committed, and blocks(lists) a sparse chunk's block lists
+// from the list of the tail's first tile on.
+struct PrefillAttentionTail final {
+  const uint32_t first;
+  const PrefillAttentionPlan plan;
+  // A staged row: a KV head's group of query heads, bf16.
+  const uint64_t rowBytes;
+  [[nodiscard]] uint64_t offsetBytes(uint32_t row) const noexcept { return row * rowBytes; }
+  [[nodiscard]] kv::ChunkedPrefillParams chunk(kv::ChunkedPrefillParams params) const noexcept {
+    params.committed_tokens += first;
+    params.chunk_tokens -= first;
+    return params;
+  }
+  [[nodiscard]] AttentionBlocks blocks(AttentionBlocks lists) const {
+    if (lists.stride) lists.list += first / kv::kPrefillAttentionTileRows;
+    return lists;
+  }
 };
 
 // Rows whose block masks become block lists (PagedAttention::addBlockLists):
@@ -398,6 +415,14 @@ public:
   static void addStageLayer(metal::CommandGraph &graph, SplashKvLayer poolLayer, metal::MetalBuffer poolTable,
                             SplashKvLayer stagedLayer, metal::MetalBuffer stagedTable, uint32_t firstPage,
                             uint32_t pages, kv::Layout layout);
+
+private:
+  // A prefill plan of `rows` rows in `splits` history splits on the split and
+  // reduce kernels named: its tiles' workspace and grids (prefillPlan,
+  // prefillTail).
+  [[nodiscard]] static PrefillAttentionPlan prefillPlanOf(uint32_t rows, uint32_t splits, std::string splitPipeline,
+                                                          std::string reducePipeline, bool sparse, bool sinks,
+                                                          kv::Layout layout, uint32_t queryHeads);
 };
 
 } // namespace splash::ops

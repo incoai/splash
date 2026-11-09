@@ -787,31 +787,51 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layou
 
 // A chunk's last tile attended alone (ops::PagedAttention::prefillTail of its
 // last row), as a chunk of its own after the rows before it on the chunk's
-// splits, writes the bits the whole chunk writes for its rows.
+// splits, from the chunk's staged rows where the tail says its rows start, on
+// the chunk's params with the rows before it committed and, with `masks`, QSA
+// masks of a sparse layout, through the chunk's block lists from its tile's on,
+// writes the bits the whole chunk writes for its rows.
 void checkPrefillTail(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout, uint32_t history,
-                      uint32_t rows) {
+                      uint32_t rows, bool masks = false) {
   auto data = makeCase(backend, heads, layout, 1, rows, history, false);
+  if (masks) setQsaMasks(data);
   const std::vector<uint16_t> whole = run<Phase::Prefill>(backend, data, false);
   const auto chunk = ops::PagedAttention::prefillPlan(rows, history, heads, layout, kApple10Row);
   const uint32_t first = (rows - 1) / kv::kPrefillAttentionTileRows * kv::kPrefillAttentionTileRows;
-  const auto [start, tail] = ops::PagedAttention::prefillTail(chunk, rows - 1);
-  require(start == first && tail.rows == rows - first && tail.tiles == 1 && tail.splits == chunk.splits &&
-              tail.splitPipeline == chunk.splitPipeline && tail.reducePipeline == chunk.reducePipeline,
-          "a prefill tail departed from its chunk's plan");
+  const ops::PrefillAttentionTail tail = ops::PagedAttention::prefillTail(chunk, rows - 1);
+  const uint64_t rowValues = uint64_t{heads / layout.kvHeads} * layout.headDimension;
+  const kv::ChunkedPrefillParams params = tail.chunk(data.stores[0]);
+  require(tail.first == first && tail.plan.rows == rows - first && tail.plan.tiles == 1 &&
+              tail.plan.splits == chunk.splits && tail.plan.splitPipeline == chunk.splitPipeline &&
+              tail.plan.reducePipeline == chunk.reducePipeline && tail.offsetBytes(first) == first * rowValues * 2 &&
+              params.committed_tokens == data.stores[0].committed_tokens + first &&
+              params.chunk_tokens == rows - first,
+          "a prefill tail departed from its chunk's plan or staged rows");
   rejects([&] { (void)ops::PagedAttention::prefillTail(chunk, rows); }, "a prefill tail starts within its chunk",
           "a tail past its chunk was accepted");
-  kv::ChunkedPrefillParams params = data.stores[0];
-  params.committed_tokens += first;
-  params.chunk_tokens = rows - first;
-  const uint64_t rowValues = uint64_t{heads / layout.kvHeads} * layout.headDimension;
   const metal::MetalBuffer output = allocate(backend, data.queries.sizeBytes());
   const auto from = [&](const metal::MetalBuffer &buffer) {
-    return backend.view(buffer, first * rowValues * 2, buffer.sizeBytes() - first * rowValues * 2);
+    return backend.view(buffer, tail.offsetBytes(first), buffer.sizeBytes() - tail.offsetBytes(first));
   };
   metal::CommandGraph graph;
+  // The chunk's block lists, as the whole chunk's run makes them.
+  ops::AttentionBlocks blocks;
+  if (masks) {
+    const uint32_t lists = kv::prefillAttentionTiles(rows);
+    const uint32_t stride = (history + rows) / SPLASH_ATTENTION_BLOCK_TOKENS + 1;
+    const metal::MetalBuffer maskBuffer = allocate(backend, data.mask.size() * sizeof(uint32_t));
+    std::memcpy(maskBuffer.contents(), data.mask.data(), maskBuffer.sizeBytes());
+    blocks = {allocate(backend, uint64_t{lists} * stride * sizeof(uint32_t)),
+              allocate(backend, lists * sizeof(uint32_t)), stride, 0};
+    const std::vector<ops::BlockListRows> sequences{{0, rows, history, 0}};
+    ops::PagedAttention::addBlockLists(graph, maskBuffer, data.maskWords, sequences, blocks);
+    require(tail.blocks(blocks).list == first / kv::kPrefillAttentionTileRows,
+            "a sparse prefill tail does not take its tiles' block lists");
+  }
   ops::PagedAttention::addPrefill(graph, data.layer, from(data.queries), from(output),
-                                  allocate(backend, tail.workspace.partialsBytes),
-                                  allocate(backend, tail.workspace.statisticsBytes), data.tables[0], params, tail);
+                                  allocate(backend, tail.plan.workspace.partialsBytes),
+                                  allocate(backend, tail.plan.workspace.statisticsBytes), data.tables[0], params,
+                                  tail.plan, tail.blocks(blocks));
   (void)backend.submitCommandAsync(graph.dispatches()).wait();
   const auto *bits = static_cast<const uint16_t *>(output.contents());
   for (uint32_t head = 0; head < layout.kvHeads; ++head)
@@ -821,7 +841,7 @@ void checkPrefillTail(metal::MetalBackend &backend, uint32_t heads, kv::Layout l
               "a prefill tail's rows differ from its chunk's");
     }
   std::cout << "paged prefill tail: format=" << kv::formatName(layout.format) << " q=" << heads
-            << " history=" << history << " rows=" << rows << " PASS\n";
+            << " history=" << history << " rows=" << rows << (masks ? " (block lists)" : "") << " PASS\n";
 }
 
 // A prefill that reads its history staged, as one whose history has pages
@@ -1679,11 +1699,12 @@ int main(int argc, char **argv) {
       checkVerify(backend, heads, layout, 16384, 2);
       if (selectsBlocks(layout)) {
         // The sparse kernels through the block lists of QSA masks: a chunk
-        // whose last tile holds fewer rows, and verify lanes of their own
-        // histories.
+        // whose last tile holds fewer rows, its tail, and verify lanes of
+        // their own histories.
         auto prefill = makeCase(backend, heads, layout, 1, 77, 6145, false);
         setQsaMasks(prefill);
         checkReference(prefill, run<Phase::Prefill>(backend, prefill, false));
+        checkPrefillTail(backend, heads, layout, 6145, 77, true);
         auto verify = makeCase(backend, heads, layout, 3, 8, 1023, true);
         setQsaMasks(verify);
         checkReference(verify, run<Phase::Verify>(backend, verify, false));

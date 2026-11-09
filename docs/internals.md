@@ -387,12 +387,14 @@ read row attends as a chunk of its own on the chunk's split count
 (`PagedAttention::prefillTail`), and its gate, o-projection, norm and FFN run
 on the read rows compacted, on the chunk's projection tile kinds and K splits
 (`Linear::prefillPlan` of a chunk's rows), so a dense target's read rows keep
-their bits. A MoE block runs the plan of the read rows, whose routes then see
+their bits where the GPU runs the layer. A MoE block runs the plan of the read
+rows, whose routes then see
 fewer rows of their experts and sum in another order (abi/MoE.h), so a MoE
 target's read rows are not bitwise the whole chunk's: their next-token KL is
 about 1e-8, against about 1e-3 between the same prompts at other batch widths.
-The Neural Engine split, which takes whole chunks, leaves them to the GPU. On
-a 16-core M5 Pro this takes about 2% off the 35B's prefill of 8K tokens.
+The Neural Engine split, which takes whole chunks, leaves the read rows to the
+GPU, so in a chunk it takes their last FFN rounds as the GPU's alone. On a
+16-core M5 Pro this takes about 2% off the 35B's prefill of 8K tokens.
 
 ### Kernel selection
 
