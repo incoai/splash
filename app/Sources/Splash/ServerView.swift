@@ -12,9 +12,36 @@ private let column: CGFloat = 640
 struct ServerView: View {
     @Environment(AppState.self) private var state
     @State private var customModel = false
-    @State private var width: CGFloat = 0
     /// For pictures of the screen: the launch options' Advanced group and the request log open.
     var advanced = false
+
+    var body: some View {
+        GroupedPage(column: column) {
+            ServerSections(advanced: advanced, customModel: $customModel)
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if !state.installed.isEmpty || state.server.running {
+                VStack(spacing: 0) {
+                    Divider()
+                    ControlBar()
+                }
+                .background(.bar)
+            }
+        }
+        .onAppear { state.refresh() }
+        .sheet(isPresented: $customModel) { CustomModelSheet() }
+    }
+}
+
+/// The Server screen's sections, in the hierarchy of its page (`GroupedPage`), where they change
+/// shape as one: rows and sections fade in and out as the models, downloads and options change, the
+/// rows after them moving along; as the server's stage changes too, as the rest of the window does
+/// (`MainView`).
+private struct ServerSections: View {
+    @Environment(AppState.self) private var state
+    let advanced: Bool
+    /// Whether the sheet for another model from Hugging Face shows.
+    @Binding var customModel: Bool
 
     var body: some View {
         let suggestions = state.catalog.suggestions(memory: Catalog.memory)
@@ -24,13 +51,13 @@ struct ServerView: View {
         }
         let first = state.installed.isEmpty
         let failed = if case .failed = state.server.phase { true } else { false }
-        Form {
+        Group {
             if state.server.phase == .ready {
                 ActivitySection(advanced: advanced)
             }
             if first || failed || state.installer.failure != nil || state.installer.checked != nil || state.installer.running
                 || state.keyProblem != nil {
-                Section {
+                GroupedSection {
                     if let problem = state.keyProblem {
                         ProblemRow(title: "Splash can’t use its API key",
                                    message: "The Keychain says: \(problem) Allow Splash to use it, then try again.",
@@ -68,7 +95,7 @@ struct ServerView: View {
                 }
             }
             if !first {
-                Section {
+                GroupedSection {
                     ForEach(state.installed) { ModelRow(model: $0) }
                 } header: {
                     SectionTitle(text: "Models on This Mac")
@@ -77,7 +104,7 @@ struct ServerView: View {
                 }
                 LaunchOptions(advanced: advanced)
             }
-            Section {
+            GroupedSection {
                 ForEach(available, id: \.id) { variant in
                     SuggestedRow(variant: variant, recommended: variant == suggestions.first,
                                  lead: first && !state.installer.running && !state.findingCachedModels && variant == suggestions.first)
@@ -91,27 +118,11 @@ struct ServerView: View {
                 if first { otherModels }
             }
         }
-        .formStyle(.grouped)
-        // The screen changes its shape as one: rows and sections fade in and out as the models,
-        // downloads and options change, the rows after them moving along; as the server's stage
-        // changes too, which the window animates (`MainView`).
         .animation(Motion.settle, value: Layout(installed: state.installed.map(\.id), downloading: state.installer.running,
                                                 failure: state.installer.failure?.message, keyProblem: state.keyProblem,
                                                 finding: state.findingCachedModels, options: state.options,
                                                 family: state.family(of: state.selection)))
-        .contentMargins(.horizontal, max(0, (width - column) / 2), for: .scrollContent)
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            if !first || state.server.running {
-                VStack(spacing: 0) {
-                    Divider()
-                    ControlBar()
-                }
-                .background(.bar)
-            }
-        }
-        .onAppear { state.refresh() }
-        .sheet(isPresented: $customModel) { CustomModelSheet() }
+        .animation(Motion.settle, value: state.server.stage)
     }
 
     /// What the screen holds besides the server's stage: the models, a download or a problem, and
@@ -317,7 +328,7 @@ private struct ActivitySection: View {
     let advanced: Bool
 
     var body: some View {
-        Section {
+        GroupedSection {
             ActivityFigures(activity: state.server.activity, context: state.server.context)
             RequestLog(requests: state.server.requests, totals: RequestLog.totals(state.server.activity, requests: state.server.requests),
                        open: advanced)
@@ -494,6 +505,7 @@ struct SectionTitle: View {
 
     var body: some View {
         Text(text).font(.headline).foregroundStyle(.primary).textCase(nil)
+            .accessibilityAddTraits(.isHeader)
     }
 }
 

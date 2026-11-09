@@ -12,7 +12,7 @@ struct LaunchOptions: View {
 
     var body: some View {
         let family = state.family(of: state.selection)
-        Section {
+        GroupedSection {
             ForEach(Self.options(.main, for: family)) { OptionRow(option: $0, family: family) }
             DisclosureRow(title: "Advanced", open: $advanced)
                 .background(ViewAnchor { row.view = $0 })
