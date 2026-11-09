@@ -979,9 +979,11 @@ Each start follows the model's default branch, or the branch or tag
 `--revision` names: one Hub request of at most 5 seconds asks for its current
 commit, and when the Hub answered, another asks for the commit of the draft
 repository's default branch ([Drafts](models.md#drafts)). A new commit downloads only
-the files that changed and replaces the installed model once it is installed.
-There is no update flag; to stay on one commit, pass it as `--revision`. A
-40-hex `--revision` never moves, nor does its draft, and `--offline` (or
+the files that changed and replaces the installed model once it is installed,
+freeing the earlier commit's files nothing else links, which an older
+`--revision` downloads again. There is no update flag; to stay on one commit,
+pass it as `--revision`. A 40-hex `--revision` never moves, nor does its draft,
+and `--offline` (or
 `HF_HUB_OFFLINE=1`) forbids the Hub: both start the installed model without a
 request.
 

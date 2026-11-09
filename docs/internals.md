@@ -100,8 +100,9 @@ that commit and records it in `model.json`, so a repository update cannot mix
 files from different revisions. It pins those snapshots in the Hub cache
 (`refs/splash/<installation>/<commit>`), so pruning the cache cannot remove files
 an installed model links. Publishing a new assembly retires the installation's
-other pins, in the repositories it links and in those its predecessor linked,
-so pruning can free what no installation links any more.
+other pins, in the repositories it links and in those its predecessor linked;
+the assembly it replaces goes once no server holds it, with the files of its
+Hub snapshots no remaining assembly links, as for `remove`.
 
 `remove` takes an installation away under the installation lock, refusing one
 a server holds: its selection link and pins, then its assembly, which garbage
