@@ -252,11 +252,10 @@ def release(entries, kept, owners) -> int:
             left = _identities((folder / "snapshots").rglob("*"), os.stat)
             for blob in sorted(blobs):
                 try:
-                    status = blob.stat()
+                    identity = _file(blob, os.stat)
                     ours = os.path.samefile(blob.parent, folder / "blobs")
                 except FileNotFoundError:
                     continue
-                identity = status.st_dev, status.st_ino
                 if ours and identity not in left and identity not in kept_files:
                     freed += _unlink(blob)
             if not any((folder / "snapshots").glob("*")) and not any(
@@ -273,10 +272,9 @@ def _identities(paths, status):
     identities = set()
     for path in paths:
         try:
-            result = status(path)
+            identities.add(_file(path, status))
         except (FileNotFoundError, NotADirectoryError):
             continue
-        identities.add((result.st_dev, result.st_ino))
     return identities
 
 
@@ -326,13 +324,14 @@ def retire_other_pins(pins, replaced=()):
         models.warn(f"could not retire old Hub cache references: {error}")
 
 
-def _file(path):
+def _file(path, status=os.lstat):
     """The entry at path, however the path spells it (through a symbolic link
     to a folder, or in another case on a case-insensitive volume): its device
-    and inode. A symbolic link at path is itself, not the file it names, so
-    one that names nothing is no pin rather than an error."""
-    status = path.lstat()
-    return status.st_dev, status.st_ino
+    and inode. By default a symbolic link at path is itself, not the file it
+    names, so one that names nothing is no pin rather than an error; os.stat
+    takes the file it names."""
+    result = status(path)
+    return result.st_dev, result.st_ino
 
 
 def repair_pins(installation: Path, snapshots):
