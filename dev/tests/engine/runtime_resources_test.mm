@@ -1171,6 +1171,46 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
           "a persistent cache with no room anywhere did not leave the tier off once");
 }
 
+// Once its files open, the SSD cache measures the volume of the folder they
+// opened in, through the probe the start read volumes with: a persistent
+// tier's root, else the temporary files' directory, as for a persistent cache
+// whose root has no room. The probe gives the root, the temporary directory and
+// any other folder volumes of their own.
+void testTheCacheMeasuresItsFilesFolder(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-measured"), caches("splash-measured-root");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "measured-test");
+  config.cacheDisk = {.automatic = true};
+  config.cacheRoot = caches.path() / "prefix-cache";
+  std::filesystem::create_directory(config.cacheRoot);
+  constexpr uint64_t kTemporary = 300 * kGiB, kOther = 200 * kGiB;
+  uint64_t rootAvailable = 400 * kGiB;
+  config.diskVolume = [&](const std::filesystem::path &directory) {
+    std::error_code error;
+    return std::optional(localVolume(
+        std::filesystem::equivalent(directory, config.cacheRoot, error)                         ? rootAvailable
+        : std::filesystem::equivalent(directory, std::filesystem::temp_directory_path(), error) ? kTemporary
+                                                                                                : kOther));
+  };
+  // The volume the cache measured, and whether it is persistent.
+  const auto measured = [&] {
+    std::pair<uint64_t, bool> result;
+    static_cast<void>(test::capturedStderr([&] {
+      const CacheSnapshot cache = RuntimeResources::create(config, 0)->cache().snapshot();
+      result = {cache.kvTier.volumeAvailableBytes, cache.persistent};
+    }));
+    return result;
+  };
+  config.persistentCache = true;
+  require(measured() == std::pair{rootAvailable, true}, "a persistent SSD cache did not measure its root's volume");
+  config.persistentCache = false;
+  require(measured() == std::pair{kTemporary, false},
+          "an SSD cache of temporary files did not measure their directory's volume");
+  config.persistentCache = true;
+  rootAvailable = 11 * kGiB;
+  require(measured() == std::pair{kTemporary, false},
+          "a persistent cache whose root had no room did not measure its temporary files' volume");
+}
+
 // A block-sparse target's context past what memory holds spills to the SSD
 // cache, so where the automatic cache's volume has no room for it, a first
 // start serves only what memory holds. A relaunch keeps its first engine's
@@ -1813,6 +1853,7 @@ int main(int argc, char **argv) {
       testMadeCacheRootStaysOutOfBackups(argv[1]);
       testAutomaticTierYieldsToTheContext(argv[1]);
       testAutomaticContextIgnoresTheVolume(argv[1]);
+      testTheCacheMeasuresItsFilesFolder(argv[1]);
       testRelaunchKeepsTheSpilledContext(argv[1]);
       testAStoreKeepsTheFloorOfTheRunsSpill(argv[1]);
       testAnExplicitRelaunchServesItsFirstContext(argv[1]);
