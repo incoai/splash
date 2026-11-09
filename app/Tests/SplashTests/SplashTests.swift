@@ -517,9 +517,9 @@ struct AppStateTests {
         print(json.dumps({"event": "removed", "bytes": 1}), flush=True)
         """.write(to: installer, atomically: true, encoding: .utf8)
         // Not while the launch still looks through the Hugging Face cache for models.
-        state.delete("a/b")
-        #expect(!state.installer.running || !state.findingCachedModels)
+        if state.findingCachedModels { #expect(!state.canDelete("a/b")) }
         try await waitFor(!state.findingCachedModels, "the look through the cache")
+        #expect(state.canDelete("a/b"))
         state.delete("a/b")
         #expect(state.installer.running && state.installer.work == .removal)
         try await waitFor(!state.installer.running, "the removal")
@@ -643,6 +643,7 @@ struct AppStateTests {
         state.choose(first)
         #expect(state.checkedModel == first && state.selection == first)
         try await waitFor(state.server.phase == .ready, "\(first) ready")
+        #expect(!state.canDelete(first))
         let since = state.server.since
         state.choose(first)
         #expect(state.server.phase == .ready && state.server.since == since)

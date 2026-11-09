@@ -60,31 +60,31 @@ private struct ServerSections: View {
                 GroupedSection {
                     if let problem = state.keyProblem {
                         NoticeRow(title: "Splash can’t use its API key",
-                                   message: "The Keychain says: \(problem) Allow Splash to use it, then try again.",
-                                   action: ("Try Again", state.retryKey))
+                                  message: "The Keychain says: \(problem) Allow Splash to use it, then try again.",
+                                  action: ("Try Again", state.retryKey))
                     }
                     if case .failed(let message) = state.server.phase, let model = state.server.model {
                         // What its failure says would help: a start that would fit, or, for files on
                         // this Mac Splash can't serve, the start without the projector or draft
                         // chosen for them, else taking them off the list.
                         NoticeRow(title: "\(state.displayName(of: model)) ran into a problem", message: message,
-                                   log: .server, dismiss: state.server.dismissFailure,
-                                   action: state.server.remedy.map { remedy in (remedy.title, { state.retry(model, with: remedy) }) })
+                                  log: .server, dismiss: state.server.dismissFailure,
+                                  action: state.server.remedy.map { remedy in (remedy.title, { state.retry(model, with: remedy) }) })
                     }
                     if let failure = state.installer.failure {
                         let name = state.displayName(of: failure.model)
                         switch state.installer.work {
                         case .download:
                             NoticeRow(title: "\(name) couldn’t download", message: failure.message, log: .downloads,
-                                       dismiss: state.installer.dismissFailure,
-                                       action: ("Download Again", { state.download(failure.model) }))
+                                      dismiss: state.installer.dismissFailure,
+                                      action: ("Download Again", { state.download(failure.model) }))
                         case .check:
                             NoticeRow(title: "Splash couldn’t check \(name) for updates", message: failure.message,
-                                       log: .downloads, dismiss: state.installer.dismissFailure,
-                                       action: ("Check Again", { state.checkForUpdates(failure.model) }))
+                                      log: .downloads, dismiss: state.installer.dismissFailure,
+                                      action: ("Check Again", { state.checkForUpdates(failure.model) }))
                         case .removal:
                             NoticeRow(title: "Splash couldn’t delete \(name)", message: failure.message, log: .downloads,
-                                       dismiss: state.installer.dismissFailure)
+                                      dismiss: state.installer.dismissFailure)
                         }
                     }
                     if let finished = state.installer.finished {
@@ -653,6 +653,8 @@ private struct ModelRow: View {
         .accessibilityAddTraits(selected ? .isSelected : [])
         .help(state.catalog.about(of: model.id) ?? model.id)
         .contextMenu { actions }
+        // The question goes where its answer no longer could, as a start begun from the menu bar.
+        .onChange(of: state.canDelete(model.id)) { _, can in if !can { deleting = false } }
         .confirmationDialog("Delete \(state.displayName(of: model.id))?", isPresented: $deleting) {
             Button("Delete", role: .destructive) { state.delete(model.id) }
         } message: {
