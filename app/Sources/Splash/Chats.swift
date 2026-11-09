@@ -13,8 +13,10 @@ struct ChatMessage: Codable, Identifiable, Equatable, Sendable {
     /// What the user attached (`Attachment`); nil for nothing, as in a message an earlier app kept.
     var attachments: [Attachment]?
     /// Images an earlier app kept in the message itself, as PNG or JPEG data, which `ChatStore`
-    /// moves into files of their own as it reads the conversation; nil after.
-    var images: [Data]?
+    /// moves into files of their own as it reads the conversation; none after. Always written, as
+    /// the 1.6.0 app requires it of every message, and skips a chat that lacks it, as after a
+    /// downgrade; read where it is missing too, as an earlier 1.6.1 wrote it.
+    var images: [Data] = []
     /// The model that answered.
     var model: String?
     var tokensPerSecond: Double?
@@ -28,6 +30,25 @@ struct ChatMessage: Codable, Identifiable, Equatable, Sendable {
 
     /// Whether the answer holds nothing to send back to the model.
     var isEmpty: Bool { text.isEmpty && reasoning.isEmpty }
+}
+
+extension ChatMessage {
+    /// As the decoding Swift derives, but with `images` read where present alone.
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        role = try container.decode(Role.self, forKey: .role)
+        text = try container.decode(String.self, forKey: .text)
+        reasoning = try container.decode(String.self, forKey: .reasoning)
+        attachments = try container.decodeIfPresent([Attachment].self, forKey: .attachments)
+        images = try container.decodeIfPresent([Data].self, forKey: .images) ?? []
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        tokensPerSecond = try container.decodeIfPresent(Double.self, forKey: .tokensPerSecond)
+        thinkingTime = try container.decodeIfPresent(Double.self, forKey: .thinkingTime)
+        reasoningTokens = try container.decodeIfPresent(Int.self, forKey: .reasoningTokens)
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+        stopped = try container.decodeIfPresent(Bool.self, forKey: .stopped)
+    }
 }
 
 /// A file the user attached to a message: an image, PNG or JPEG, or a PDF. It is kept as a file of
@@ -146,7 +167,7 @@ final class ChatStore {
         var read = kept.compactMap { try? JSONDecoder().decode(Conversation.self, from: Data(contentsOf: $0)) }
         // The images an earlier app kept inside its conversations, moved into files of their own.
         var moved: [Conversation] = []
-        for index in read.indices where read[index].messages.contains(where: { !($0.images ?? []).isEmpty }) {
+        for index in read.indices where read[index].messages.contains(where: { !$0.images.isEmpty }) {
             read[index] = Self.movingImages(of: read[index], to: attachments)
             moved.append(read[index])
         }
@@ -175,7 +196,8 @@ final class ChatStore {
         var conversation = conversation
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         for index in conversation.messages.indices {
-            guard let images = conversation.messages[index].images, !images.isEmpty else { continue }
+            let images = conversation.messages[index].images
+            guard !images.isEmpty else { continue }
             var attached = conversation.messages[index].attachments ?? []
             var kept: [Data] = []
             for image in images {
@@ -187,7 +209,7 @@ final class ChatStore {
                 }
             }
             conversation.messages[index].attachments = attached.isEmpty ? nil : attached
-            conversation.messages[index].images = kept.isEmpty ? nil : kept
+            conversation.messages[index].images = kept
         }
         return conversation
     }

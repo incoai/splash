@@ -1533,7 +1533,7 @@ struct ChatTests {
         let store = ChatStore(folder: folder)
         let message = try #require(store.conversations.first?.messages.first)
         let attachments = try #require(message.attachments)
-        #expect(attachments.map(\.type) == ["image/png", "image/jpeg"] && message.images == nil)
+        #expect(attachments.map(\.type) == ["image/png", "image/jpeg"] && message.images.isEmpty)
         #expect(try attachments.map { try Data(contentsOf: store.attachments.appending(path: $0.file)) } == [png, jpeg])
         store.flush()
         let written = try String(contentsOf: folder.appending(path: "\(id).json"), encoding: .utf8)
