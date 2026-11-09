@@ -2,9 +2,9 @@
 
 // Routed experts that stay in their source files and are read into slots when
 // a step routes them (--expert-memory), so a MoE target whose experts do not
-// fit in memory runs with part of them resident. The kernels read every
-// routed expert through its block's slot table (ops::BlockMoeWeights), so
-// resident and streamed experts run the same kernels.
+// fit in memory runs with part of them resident. The kernels find every
+// routed expert's slot in a table (ops::BlockMoeWeights), so resident and
+// streamed experts run the same kernels.
 //
 // Experts of one size (the formats and shapes of their gate, up and down
 // projections) share its slots, which chunks hold, each a buffer of its own
@@ -91,8 +91,8 @@
 // staged experts whose repack never ran, whose slots are claimed but hold
 // nothing. The store cannot tell that a command failed after a load's host
 // step ran, and need not: its guards refuse only where it knows of an
-// unfinished load, each once a load failed, and a shrink also while routed
-// experts wait to be staged.
+// unfinished load, each once a load failed, and a shrink and a load also
+// while routed experts wait to be staged.
 
 #include "metal/MetalBackend.hpp"
 #include "model/ExpertChunkLayout.hpp"

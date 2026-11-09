@@ -1220,10 +1220,14 @@ threw, and must not throw: the command may have completed by then, so a
 those right after it (`EventStep::beside`), run while its work runs, in a
 buffer of their own after its signal, and the work after them waits for the
 step (a streamed MoE layer's passes over its resident experts beside its
-load). They write nothing the work reads and read no 128-byte cache line it
-writes: a line the GPU read before the work wrote it is unproven fresh after
-the step, so those MoE passes read the grouping's copy of the slot table, and
-the passes after the load a table of their own. A step's work may run after
+load). They write nothing the work reads and use no 128-byte line, the GPU's
+cache line, of the buffers the step names as its work's writes, which the
+backend checks as the command is submitted: a line the GPU read while the step
+ran is unproven fresh after it. So those MoE passes read the grouping's copy of
+the slot table, and the passes after the load a table of their own. Only
+Metal's tracking of the buffers they use orders the work after the step, and
+the command's end, after them, so that work reads what they write (the MoE
+combine reads those passes' outputs). A step's work may run after
 submitCommandAsync or wait() threw (its encoding failed after its first
 buffers were committed, or the watchdog or a shutdown gave the command up),
 so the work owns what it touches.

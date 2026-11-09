@@ -434,11 +434,11 @@ off` loads every expert, as a SIZE that holds them all does.
   experts go first), and reads them from their
   files into a staging of a decode cycle's experts on the engine's SSD
   readers, and a repack kernel writes them into their slots before the expert
-  passes run. A decode step's load is one such round; a prefill command's
-  loads take as many rounds as its rows may route experts, each staging half
-  of the staging while the other half is read ahead. The kernels read every
-  routed expert through the layer's slot table and the chunks that hold its
-  slots, so resident experts, one chunk of every expert, and streamed
+  passes over them run. A decode step's load is one such round; a prefill
+  command's loads take as many rounds as its rows may route experts, each
+  staging half of the staging while the other half is read ahead. The kernels
+  find every routed expert through a table of its slot and the chunks that
+  hold its slots, so resident experts, one chunk of every expert, and streamed
   experts run the same kernels.
 - The grouping puts the tiles of the experts already resident first and those
   a load brings last (their slot-table entry is marked absent). A decode
