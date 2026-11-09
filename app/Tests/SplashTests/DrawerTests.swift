@@ -209,29 +209,48 @@ struct DrawerTests {
     }
 
     /// The programs the app runs get the Hugging Face settings of the user's login shell, as its
-    /// startup files make them, an app getting none: its HF_ and HUGGINGFACE_ variables alone,
-    /// whatever else the shell prints; none from a shell that doesn't answer in time.
+    /// startup files make them, an app getting none: the variables the app takes alone, whatever
+    /// else the shell prints; none from a shell that doesn't answer in time. No other variable
+    /// leaves the shell, whatever its value holds.
     @Test func theProgramsGetTheLoginShellsHuggingFaceSettings() async throws {
-        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-shell-\(UUID().uuidString)")
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-zdotdir-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: folder) }
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let zsh = Shell(path: "/bin/zsh", arguments: [], name: "zsh")
-        var environment = ProcessInfo.processInfo.environment.filter { !$0.key.hasPrefix("HF_") && !$0.key.hasPrefix("HUGGINGFACE_") }
+        var environment = ProcessInfo.processInfo.environment.filter { !Runtime.takesShellSetting($0.key) }
         environment["ZDOTDIR"] = folder.path
-        try "echo a greeting\nexport HF_HUB_CACHE=/Volumes/Models/hub HUGGINGFACE_HUB_VERBOSITY=info OTHER=1\n"
-            .write(to: folder.appending(path: ".zshrc"), atomically: true, encoding: .utf8)
+        try """
+            echo a greeting
+            export HF_HUB_CACHE=/Volumes/Models/hub HUGGINGFACE_HUB_VERBOSITY=info OTHER=1
+            export HUGGING_FACE_HUB_TOKEN=hf_fake XDG_CACHE_HOME=/Volumes/Cache SECRET=fake-secret
+            export NOTES=$'a line\\nHF_LEAK=fake-leak'
+
+            """.write(to: folder.appending(path: ".zshrc"), atomically: true, encoding: .utf8)
         let settings = await Runtime.readShellSettings(zsh, environment: environment)
-        #expect(settings == ["HF_HUB_CACHE": "/Volumes/Models/hub", "HUGGINGFACE_HUB_VERBOSITY": "info"])
+        #expect(settings == ["HF_HUB_CACHE": "/Volumes/Models/hub", "HUGGINGFACE_HUB_VERBOSITY": "info",
+                             "HUGGING_FACE_HUB_TOKEN": "hf_fake", "XDG_CACHE_HOME": "/Volumes/Cache"])
         let runtime = Runtime(root: folder)
         runtime.shellSettings.set(settings)
         #expect(runtime.environment["HF_HUB_CACHE"] == "/Volumes/Models/hub" && runtime.environment["OTHER"] == nil)
+        // What the shell gives: the variables taken, a value's newline and all, and nothing else.
+        let filter = Process()
+        filter.executableURL = URL(filePath: "/bin/sh")
+        filter.arguments = ["-c", Runtime.shellSettingsCommand]
+        filter.environment = ["HF_TOKEN": "hf_fake", "HF_NOTE": "one\ntwo", "SECRET": "fake-secret",
+                              "NOTES": "a line\nHF_LEAK=fake-leak", "XDG_CACHE_HOMES": "/elsewhere"]
+        let given = Pipe()
+        filter.standardOutput = given
+        try filter.run()
+        let records = given.fileHandleForReading.readDataToEndOfFile().split(separator: 0).map { String(decoding: $0, as: UTF8.self) }
+        filter.waitUntilExit()
+        #expect(Set(records) == ["HF_TOKEN=hf_fake", "HF_NOTE=one\ntwo"] && records.count == 2)
         // A shell that hangs is stopped at the limit.
         try "sleep 30\n".write(to: folder.appending(path: ".zshrc"), atomically: true, encoding: .utf8)
         let start = ContinuousClock.now
         #expect(await Runtime.readShellSettings(zsh, environment: environment, limit: .milliseconds(500)).isEmpty)
         #expect(ContinuousClock.now - start < .seconds(5))
-        let output = Data("motd\0SPLASH-SHELL-SETTINGS\0HF_HOME=/h\0PATH=/bin\0HF_TOKEN=a=b\0SPLASH-SHELL-SETTINGS\0after".utf8)
-        #expect(Runtime.huggingFace(in: output, between: "SPLASH-SHELL-SETTINGS") == ["HF_HOME": "/h", "HF_TOKEN": "a=b"])
+        let output = Data("motd\0SPLASH-SHELL-SETTINGS\0HF_HOME=/h\0PATH=/bin\0HF_TOKEN=a=b\0XDG_CACHE_HOME=/c\0SPLASH-SHELL-SETTINGS\0after".utf8)
+        #expect(Runtime.shellSettings(in: output, between: "SPLASH-SHELL-SETTINGS") == ["HF_HOME": "/h", "HF_TOKEN": "a=b", "XDG_CACHE_HOME": "/c"])
     }
 
     /// A terminal runs the login shell the user database names; where it names none, the one

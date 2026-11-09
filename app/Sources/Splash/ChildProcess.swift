@@ -4,8 +4,9 @@ import Foundation
 /// A program run as a terminal runs a foreground job: in a process group of its own, so a signal
 /// reaches it and every program it starts (the installer, the engine), the way Ctrl+C does. Its
 /// output goes to a log file rather than a pipe, so it never waits on this app, and keeps working
-/// if the app quits or crashes. Every program the app runs but the drawer's shells, which need a
-/// terminal of their own, runs as one.
+/// if the app quits or crashes; but for output only this app may read, which no file may hold,
+/// as the login shell's settings (`Runtime.readShellSettings`). Every program the app runs but the
+/// drawer's shells, which need a terminal of their own, runs as one.
 final class ChildProcess: @unchecked Sendable {
     let pid: pid_t
     /// When it started (`processStart`), which tells it apart from a later process given its ID.
@@ -18,7 +19,7 @@ final class ChildProcess: @unchecked Sendable {
     /// Starts `command` with `environment`, standard input from /dev/null and standard output and
     /// error appended to `log`. `exited` gets the exit status, as a shell reports it, on the main
     /// queue once the program has ended.
-    init(
+    convenience init(
         command: [String],
         environment: [String: String],
         log: URL,
@@ -27,7 +28,17 @@ final class ChildProcess: @unchecked Sendable {
         let output = open(log.path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0o644)
         guard output >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
         defer { close(output) }
+        try self.init(command: command, environment: environment, output: output, exited: exited)
+    }
 
+    /// Starts `command` as `init(command:environment:log:exited:)` does, but with standard output
+    /// and error to `output`, an open descriptor, as a pipe's writing end, which stays open here.
+    init(
+        command: [String],
+        environment: [String: String],
+        output: Int32,
+        exited: @escaping @MainActor (Int32) -> Void
+    ) throws {
         var actions: posix_spawn_file_actions_t?
         posix_spawn_file_actions_init(&actions)
         defer { posix_spawn_file_actions_destroy(&actions) }

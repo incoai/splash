@@ -99,23 +99,30 @@ struct Runtime: Sendable {
         return environment
     }
 
-    /// The Hugging Face settings of the user's login shell, which an app doesn't get: its `HF_` and
-    /// `HUGGINGFACE_` variables, such as where the cache is and the token, as `shell` has them
-    /// started as a terminal starts it, interactive. None where it gives none within `limit`,
-    /// which then stops it.
+    /// The Hugging Face settings of the user's login shell, which an app doesn't get, as `shell`
+    /// has them started as a terminal starts it, interactive: the variables `takesShellSetting`
+    /// names, such as where the cache is and the token. They come through a pipe, never a file,
+    /// and the shell gives those alone (`shellSettingsCommand`), so that no other variable, a
+    /// secret among them, leaves it. None where it gives none within `limit`, which then stops it.
     @MainActor
     static func readShellSettings(_ shell: Shell, environment: [String: String] = ProcessInfo.processInfo.environment,
                                   limit: Duration = .seconds(5)) async -> [String: String] {
-        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-shell-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: folder) }
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let output = folder.appending(path: "environment")
+        var ends: [Int32] = [-1, -1]
+        guard pipe(&ends) == 0 else { return [:] }
+        // Neither end goes to another program the app starts; the shell gets the writing end as
+        // its output.
+        for end in ends { _ = fcntl(end, F_SETFD, FD_CLOEXEC) }
+        let output = PipeOutput(ends[0])
         let marker = "SPLASH-SHELL-SETTINGS"
+        let script = "printf '\\0\(marker)\\0'; \(shellSettingsCommand); printf '\(marker)\\0'"
         let (ended, end) = AsyncStream<Int32>.makeStream()
-        let script = "printf '\\0\(marker)\\0'; command env -0; printf '\(marker)\\0'"
-        guard let child = try? ChildProcess(command: [shell.path] + shell.arguments + ["-i", "-l", "-c", script],
-                                            environment: environment, log: output, exited: { end.yield($0); end.finish() })
-        else { return [:] }
+        let child = try? ChildProcess(command: [shell.path] + shell.arguments + ["-i", "-l", "-c", script],
+                                      environment: environment, output: ends[1], exited: { end.yield($0); end.finish() })
+        close(ends[1])
+        guard let child else {
+            _ = output.finish()
+            return [:]
+        }
         let timer = Task { @MainActor in
             try await Task.sleep(for: limit)
             child.stop(SIGKILL, killAfter: .zero)
@@ -123,13 +130,32 @@ struct Runtime: Sendable {
         var status: Int32?
         for await code in ended { status = code }
         timer.cancel()
-        guard status == 0, let data = try? Data(contentsOf: output) else { return [:] }
-        return huggingFace(in: data, between: marker)
+        let data = output.finish()
+        guard status == 0 else { return [:] }
+        return shellSettings(in: data, between: marker)
     }
 
-    /// The `HF_` and `HUGGINGFACE_` variables of `env -0`'s output between two `marker` records,
+    /// Whether the app takes the login shell's variable `name`: those the Hugging Face tools read,
+    /// by their `HF_` and `HUGGINGFACE_` prefixes, the token's older name, and where caches go,
+    /// which holds the Hugging Face cache unless `HF_HOME` says otherwise.
+    nonisolated static func takesShellSetting(_ name: String) -> Bool {
+        shellSettingPrefixes.contains { name.hasPrefix($0) } || shellSettingNames.contains(name)
+    }
+
+    private nonisolated static let shellSettingPrefixes = ["HF_", "HUGGINGFACE_"]
+    private nonisolated static let shellSettingNames = ["HUGGING_FACE_HUB_TOKEN", "XDG_CACHE_HOME"]
+
+    /// The command the login shell runs to give the variables the app takes, each `NAME=value`
+    /// and a NUL: zsh, which every Mac has, picks them by name from the environment the shell
+    /// gives it, whatever their values hold, newlines or other bytes.
+    nonisolated static var shellSettingsCommand: String {
+        let pattern = (shellSettingPrefixes + shellSettingNames.map { $0 + "=" }).joined(separator: "|")
+        return #"/bin/zsh -f -c 'print -rN -- ${(M)${(0)"$(/usr/bin/env -0)"}:#("# + pattern + #")*}'"#
+    }
+
+    /// The variables the app takes of the NUL-terminated records between two `marker` records,
     /// whatever the shell printed around them.
-    nonisolated static func huggingFace(in output: Data, between marker: String) -> [String: String] {
+    nonisolated static func shellSettings(in output: Data, between marker: String) -> [String: String] {
         let records = output.split(separator: 0, omittingEmptySubsequences: false).map { String(decoding: $0, as: UTF8.self) }
         guard let start = records.firstIndex(of: marker),
               let end = records[(start + 1)...].firstIndex(of: marker)
@@ -138,9 +164,7 @@ struct Runtime: Sendable {
         for record in records[(start + 1)..<end] {
             guard let equals = record.firstIndex(of: "=") else { continue }
             let name = String(record[..<equals])
-            if name.hasPrefix("HF_") || name.hasPrefix("HUGGINGFACE_") {
-                settings[name] = String(record[record.index(after: equals)...])
-            }
+            if takesShellSetting(name) { settings[name] = String(record[record.index(after: equals)...]) }
         }
         return settings
     }
@@ -249,6 +273,47 @@ struct Runtime: Sendable {
         else { return nil }
         let reason = said.trimmingCharacters(in: .whitespacesAndNewlines).replacing(#/^error: /#, with: "")
         return reason.isEmpty ? nil : reason
+    }
+}
+
+/// A pipe's reading end, read as data comes, on a queue of its own, so that its writer never
+/// waits on a full pipe.
+private final class PipeOutput: @unchecked Sendable {
+    private let descriptor: Int32
+    private let queue = DispatchQueue(label: "PipeOutput")
+    private let source: DispatchSourceRead
+    /// What came, on the queue alone.
+    private var data = Data()
+
+    init(_ descriptor: Int32) {
+        self.descriptor = descriptor
+        _ = fcntl(descriptor, F_SETFL, O_NONBLOCK)
+        source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: queue)
+        source.setEventHandler { [weak self] in self?.read() }
+        source.setCancelHandler { close(descriptor) }
+        source.resume()
+    }
+
+    /// What came, once the writer has ended, and the pipe closed: read as far as it holds data
+    /// rather than to its end, which a program the writer left running can hold off.
+    func finish() -> Data {
+        queue.sync {
+            read()
+            source.cancel()
+            return data
+        }
+    }
+
+    private func read() {
+        var buffer = [UInt8](repeating: 0, count: 1 << 16)
+        while !source.isCancelled {
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            // At its end, which every writer has closed, it is read no more: the source would go
+            // on firing.
+            if count == 0 { source.cancel() }
+            guard count > 0 else { return }
+            data.append(contentsOf: buffer[..<count])
+        }
     }
 }
 
