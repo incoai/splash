@@ -164,7 +164,7 @@ struct RuntimeResourcesConfig {
   // (model::budgetsVerifyRows); a benchmark round verifies every row so that
   // rounds repeat one another.
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
-  // --int8-activations: whether the plans may round activations to int8
+  // --activations: whether the plans may round activations to int8
   // where an int8-activation path takes them, or keep every activation bf16
   // (ops::Int8Activations), for the life of the engine (ops::ExecutionPlans).
   ops::Int8Activations int8Activations = ops::Int8Activations::On;

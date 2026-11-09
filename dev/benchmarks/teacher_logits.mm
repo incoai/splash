@@ -2,7 +2,7 @@
 // parity checks against another engine fed the same token ids.
 //
 //   teacher-logits METALLIB MODEL_ROOT TOKENS OUTPUT --window END:ROWS [--window END:ROWS...]
-//                  [--kv-format int8|bf16] [--state-format fp32|bf16] [--int8-activations on|off]
+//                  [--kv-format int8|bf16] [--state-format fp32|bf16] [--activations auto|bf16]
 //                  [--expert-memory SIZE] [--ple-memory SIZE] [--captures yes]
 //
 // TOKENS holds little-endian uint32 token ids, read as they are: no BOS, no
@@ -224,7 +224,7 @@ int main(int argc, char **argv) {
       if (argc < 5) {
         std::cerr << "usage: teacher-logits METALLIB MODEL_ROOT TOKENS OUTPUT --window END:ROWS "
                      "[--window END:ROWS...] [--kv-format int8|bf16] [--state-format fp32|bf16] "
-                     "[--int8-activations on|off] [--expert-memory SIZE] [--ple-memory SIZE] [--captures yes]\n";
+                     "[--activations auto|bf16] [--expert-memory SIZE] [--ple-memory SIZE] [--captures yes]\n";
         return 2;
       }
       std::vector<Window> windows;
@@ -253,10 +253,10 @@ int main(int argc, char **argv) {
           if (value != "fp32" && value != "bf16")
             throw std::invalid_argument("--state-format takes fp32 or bf16");
           stateFormat = value == "fp32" ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
-        } else if (option == "--int8-activations") {
-          if (value != "on" && value != "off")
-            throw std::invalid_argument("--int8-activations requires on or off");
-          int8Activations = value == "on" ? ops::Int8Activations::On : ops::Int8Activations::Off;
+        } else if (option == "--activations") {
+          if (value != "auto" && value != "bf16")
+            throw std::invalid_argument("--activations requires auto or bf16");
+          int8Activations = value == "auto" ? ops::Int8Activations::On : ops::Int8Activations::Off;
         } else if (!tools::takeLoadOption(option, value, loadOptions))
           throw std::invalid_argument("unknown option " + std::string(option));
       }
