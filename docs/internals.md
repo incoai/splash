@@ -1329,8 +1329,8 @@ runway an extent of free Index pages, or moves an extent of pages more, as for
 bytes, whose emptied Full extent refills it (`Cache::inPlaceMoves`), or moves
 none: at a wall whose room holds no Index extent nothing else refills a runway
 left short, and short of an extent of free Index pages no release for bytes can
-start (`Cache::releaseFreesAnExtent`). Under `--kv-spill always` the moves as
-copies land release every one under critical pressure (`Engine::landedExtents`).
+start (`Cache::releaseMoves`). Under `--kv-spill always` the moves as copies
+land release every one under critical pressure (`Engine::landedExtents`).
 `/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
 those requests and the cache hold (`pages_active`, `pages_cache`) and those
 nothing holds (`pages_free`), the extents of the pages requests hold and their
@@ -1588,15 +1588,19 @@ history's staging in prefill (`Engine::readsShortfall`), in whole extents of
 pages, whose Full extents then leave and whose bytes refill the Index runway: a
 page frees its Full bytes less its Index page's, so a growth's 108.5 MB extent
 and a prefill's 40 MB of staging release 512 pages, two extents, on
-Qwen3.8-Flash-Next. It moves pages only where the runway's first moves empty a
-Full extent (`Cache::releaseFreesAnExtent`): short of that they would cost the
-lanes their reads and free nothing. A need of Full pages first moves the pages
-it lacks in place, where the reads of those lanes lack nothing more, as where
-they hold Index pages, since what it frees is not sized for a floor or staging:
-into free Index pages where those hold them and the runway beside them; else
-with an extent of pages more, released as for bytes past the claim's pages,
-whose emptied Full extent refills the runway (`Cache::inPlaceMoves`); else
-none: a lane whose release cannot empty an extent more moves none. It comes
+Qwen3.8-Flash-Next. Its take gives the claim what it frees net of those reads,
+as its count does: taken gross, a claim of two lanes' releases kept a 390 MiB
+floor less for each than it counted. It moves pages only where the runway's
+first moves empty a Full extent, and only as many extents of them as compaction
+can empty, since a page in transfer pins its extent (`Cache::releaseMoves`):
+past that they would cost the lanes their reads, and the runway's refill
+memory, and free nothing. A need of Full pages first moves the pages it lacks
+in place, where the reads of those lanes lack nothing more, as where they hold
+Index pages, since what it frees is not sized for a floor or staging: into free
+Index pages where those hold them and the runway beside them; else with an
+extent of pages more, released as for bytes past the claim's pages, whose
+emptied Full extent refills the runway (`Cache::inPlaceMoves`); else none: a
+lane whose release cannot empty an extent more moves none. It comes
 before the lane's release for bytes, which moves more pages and could take
 those it needs yet leave the claim short of its Full extent. A need the host
 refused lacks no bytes: it takes only its own lane's pages, in place. A claim

@@ -1682,19 +1682,23 @@ Cache::ReclaimResult Cache::releaseExtent(const Walk &walk) {
 
 bool Cache::compactExtent(std::optional<kv::PageForm> form) {
   const auto start = AwakeClock::now();
-  std::vector<uint32_t> inTransfer;
-  inTransfer.reserve(writes_.size() + restores_.size());
-  for (const Write &write : writes_)
-    inTransfer.push_back(kv_.page(write.block));
-  for (const auto &[block, _] : restores_)
-    inTransfer.push_back(kv_.page(block));
-  const KvPageMoves moves = pool_.compactExtent(inTransfer, form);
+  const KvPageMoves moves = pool_.compactExtent(pagesInTransfer(), form);
   if (moves.empty())
     return false;
   followMoves(moves);
   extentCompactMaxMilliseconds_ =
       std::max(extentCompactMaxMilliseconds_, millisecondsSince(start));
   return true;
+}
+
+std::vector<uint32_t> Cache::pagesInTransfer() const {
+  std::vector<uint32_t> pages;
+  pages.reserve(writes_.size() + restores_.size());
+  for (const Write &write : writes_)
+    pages.push_back(kv_.page(write.block));
+  for (const auto &[block, _] : restores_)
+    pages.push_back(kv_.page(block));
+  return pages;
 }
 
 void Cache::followMoves(const KvPageMoves &moves) {
@@ -2057,18 +2061,26 @@ void Cache::countRelease(uint64_t requestId, uint32_t pages, bool landing, const
   });
 }
 
-bool Cache::releaseFreesAnExtent(uint32_t pages) const noexcept {
-  return std::min(pages, pool_.freePageCount(kv::PageForm::Index)) + pool_.freePageCount(kv::PageForm::Full) >=
-         pool_.extentPages();
+uint32_t Cache::releaseMoves(uint32_t pages, bool landing, const ReleaseCount &count) const {
+  const uint32_t extent = pool_.extentPages();
+  uint32_t extents = pages / extent;
+  if (!landing) {
+    const uint32_t unpinned = pool_.unfixedExtents(pagesInTransfer(), kv::PageForm::Full);
+    const auto counted = static_cast<uint32_t>(count.blocks.size() / extent);
+    extents = std::min(extents, unpinned - std::min(unpinned, counted));
+  }
+  const uint32_t moves = extents * extent;
+  const uint32_t firstRunway = std::min(moves, pool_.freePageCount(kv::PageForm::Index));
+  return moves && firstRunway + pool_.freePageCount(kv::PageForm::Full) >= extent ? moves : 0;
 }
 
-uint32_t Cache::inPlaceMoves(uint32_t pages, uint32_t clean) const noexcept {
+uint32_t Cache::inPlaceMoves(uint32_t pages, uint32_t clean) const {
   const uint32_t extent = pool_.extentPages();
   if (!pages || pages > clean)
     return 0;
   if (pool_.freePageCount(kv::PageForm::Index) >= pages + extent)
     return pages;
-  return clean - pages >= extent && releaseFreesAnExtent(pages + extent) ? pages + extent : 0;
+  return clean - pages >= extent && releaseMoves(extent, false) ? pages + extent : 0;
 }
 
 uint32_t Cache::releasePages(uint64_t requestId, uint32_t pages, bool inPlace, const ReleaseRule &rule,
@@ -2078,14 +2090,14 @@ uint32_t Cache::releasePages(uint64_t requestId, uint32_t pages, bool inPlace, c
     return 0;
   // A need of bytes takes whole extents, which only the Full pages left
   // gathered in the fewest extents leave (SpilledExtents::Released), and
-  // only where its first runway's moves empty one, whose bytes pay for the
-  // next runway: short of that the moves would cost the lane the reads of
-  // its blocks and free nothing. In place an extent more leaves so, past
+  // only those compaction can empty, whose bytes pay for the next runway:
+  // past them the moves would cost the lane the reads of its blocks and
+  // free nothing (releaseMoves). In place an extent more leaves so, past
   // the claim's pages (inPlaceMoves).
   const auto found =
       static_cast<uint32_t>(landedPages(active, pages + (inPlace ? pool_.extentPages() : 0), rule).size());
-  const uint32_t wanted = inPlace ? inPlaceMoves(pages, found) : found;
-  if (!wanted || (!inPlace && !releaseFreesAnExtent(wanted)))
+  const uint32_t wanted = inPlace ? inPlaceMoves(pages, found) : releaseMoves(found, false);
+  if (!wanted)
     return 0;
   const uint32_t claimed = inPlace ? pool_.freePageCount(kv::PageForm::Full) + pages : 0;
   const uint64_t moves = spilled_.spillMoves;

@@ -338,6 +338,16 @@ KvPageMoves KvPool::compactExtent(std::span<const uint32_t> fixed, std::optional
   return moves;
 }
 
+uint32_t KvPool::unfixedExtents(std::span<const uint32_t> fixed, kv::PageForm form) const {
+  std::vector<uint32_t> held;
+  for (const uint32_t page : fixed)
+    if (page < pageCount() && extents_[extentOf(page)].usedPages && extents_[extentOf(page)].form == form)
+      held.push_back(extentOf(page));
+  std::ranges::sort(held);
+  held.erase(std::ranges::unique(held).begin(), held.end());
+  return allocatedExtents(form) - emptyExtents(form) - static_cast<uint32_t>(held.size());
+}
+
 KvPoolSnapshot KvPool::snapshot() const {
   KvPoolSnapshot result;
   result.index = formSnapshot(kv::PageForm::Index);

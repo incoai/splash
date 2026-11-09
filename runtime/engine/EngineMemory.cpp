@@ -942,23 +942,27 @@ std::vector<Victim> Engine::EngineVictims::releases(const VictimQuery &query) co
   std::ranges::sort(lanes, [&](const Request *left, const Request *right) {
     return engine.rankOf(*left) < engine.rankOf(*right);
   });
-  const uint32_t extentPages = engine.cache_.extentPages();
   const uint64_t pageBytes = engine.config_.spill.geometry.releasedPageBytes();
   // A lane's unit for a need of bytes, of `pages` pages: whole extents of
   // them, each page freeing its Full bytes less its Index page's, less the
   // first reads of the lanes they give Index pages: a growth's extent takes
-  // two extents of pages. They free only where the first runway's moves
-  // empty a Full extent. A need the host refused lacks no bytes. These units
-  // add up as their takes in turn free them, each moving its lane's oldest
-  // pages, so each counts only the pages and first reads those before it
-  // leave: a page lanes share counts once (Cache::ReleaseCount).
+  // two extents of pages. They free only as many Full extents as
+  // compaction can empty, where the first runway's moves empty one
+  // (Cache::releaseMoves). A need the host refused lacks no bytes. These
+  // units add up as their takes in turn free them, each moving its lane's
+  // oldest pages, so each counts only the pages, first reads and extents
+  // those before it leave: a page lanes share counts once
+  // (Cache::ReleaseCount).
   Cache::ReleaseCount count;
   const bool forBytes = query.need.bytes && !query.need.hostRefused;
   const auto offer = [&](uint64_t id, uint32_t pages, uint64_t reads, bool landing) {
-    const uint32_t whole = pages / extentPages * extentPages;
-    Victim unit{.key = id, .form = kv::PageForm::Full, .write = landing, .later = landing, .kind = VictimKind::Release};
-    if (forBytes && engine.cache_.releaseFreesAnExtent(pages))
-      unit.bytes = saturatingSubtract(uint64_t{whole} * pageBytes, reads);
+    const uint32_t whole = forBytes ? engine.cache_.releaseMoves(pages, landing, count) : 0;
+    const Victim unit{.key = id,
+                      .bytes = saturatingSubtract(uint64_t{whole} * pageBytes, reads),
+                      .form = kv::PageForm::Full,
+                      .write = landing,
+                      .later = landing,
+                      .kind = VictimKind::Release};
     if (!unit.bytes)
       return;
     units.push_back(unit);
@@ -1113,19 +1117,21 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
     if (victim.later)
       return {.outcome = FreeOutcome::Pending};
     const ReleaseRule rule = releaseRule(query);
+    const Cache::ReleasablePages releasable = engine.cache_.releasablePages(victim.key, rule);
+    const uint64_t reads = engine.readsShortfall(releasable.holders);
     // In place, the pages the claim lacks still. Else what it lacks still in
     // bytes and the first reads of the lanes the pages give Index pages
-    // beside it, in whole extents, each page freeing its Full bytes less its
-    // Index page's: four extents of pages for a 390 MiB hot block floor.
+    // beside it, in whole extents (Cache::releaseMoves), each page freeing
+    // its Full bytes less its Index page's: four extents of pages for a
+    // 390 MiB hot block floor.
     const bool inPlace = victim.pages != 0;
     uint32_t pages = std::min(query.lackingPages, victim.pages);
     if (!inPlace) {
-      const Cache::ReleasablePages releasable = engine.cache_.releasablePages(victim.key, rule);
       const uint64_t pageBytes = engine.config_.spill.geometry.releasedPageBytes();
       const uint64_t extent = engine.cache_.extentPages();
-      const uint64_t lacking = saturatingAdd(query.lackingBytes, engine.readsShortfall(releasable.holders));
+      const uint64_t lacking = saturatingAdd(query.lackingBytes, reads);
       const uint64_t whole = ((lacking + pageBytes - 1) / pageBytes + extent - 1) / extent * extent;
-      pages = static_cast<uint32_t>(std::min<uint64_t>(whole, uint64_t{releasable.clean} / extent * extent));
+      pages = static_cast<uint32_t>(std::min<uint64_t>(whole, releasable.clean));
     }
     const uint64_t before = engine.cache_.allocatedBytes();
     const uint32_t moved = engine.cache_.releasePages(victim.key, pages, inPlace, rule,
@@ -1133,9 +1139,12 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
     if (!moved)
       return {};
     ++engine.ledgerChanges_;
-    // Moves whose Full extent a page in transfer holds back free nothing; in
-    // place an extent more may leave beside the claim's pages (inPlaceMoves).
-    const uint64_t freed = saturatingSubtract(before, engine.cache_.allocatedBytes());
+    // What it frees net of the first reads it gave the lanes, as its count
+    // is: taken gross, a claim of two lanes' releases kept a 390 MiB hot
+    // block floor less for each than it counted. In place an extent more
+    // may leave beside the claim's pages (inPlaceMoves).
+    const uint64_t created = saturatingSubtract(reads, engine.readsShortfall(releasable.holders));
+    const uint64_t freed = saturatingSubtract(saturatingSubtract(before, engine.cache_.allocatedBytes()), created);
     if (inPlace)
       return {.outcome = FreeOutcome::Met, .nowBytes = freed, .pages = std::min(moved, pages)};
     if (!freed)

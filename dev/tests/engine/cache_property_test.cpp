@@ -101,7 +101,7 @@ public:
   }
 
   void step() {
-    switch (pick(0, peeks_ ? 16 : 15)) {
+    switch (pick(0, peeks_ ? 17 : 16)) {
     case 0: start(); break;
     case 1: case 2: grow(); break;
     case 3: static_cast<void>(cache_.writeThrough()); break;
@@ -122,7 +122,8 @@ public:
     case 13: failWrites(); break;
     case 14: release(); break;
     case 15: countReleases(); break;
-    case 16: checkTake(); break;
+    case 16: releaseExtents(); break;
+    case 17: checkTake(); break;
     }
     cache_.checkInvariants();
   }
@@ -133,6 +134,10 @@ public:
   // those offered as needing no write the same: a short one of those is one
   // of the classes checkTake names.
   uint64_t exactUnits = 0, shortUnits = 0, exactNoWrite = 0, shortNoWrite = 0;
+  // Releases of whole extents for bytes (releaseExtents): those taken, those beside transfers in flight, and those
+  // that freed less than their count where the runway held less than an extent before, or where the runway's refill
+  // was refused and moved fewer pages.
+  uint64_t extentReleases = 0, inFlightReleases = 0, shortRunwayReleases = 0, refusedReleases = 0;
 
   // Every request ends, every transfer lands, and nothing leaks: the pool's
   // pages and the tier's slots belong to the cache's blocks alone.
@@ -610,6 +615,41 @@ private:
     }
   }
 
+  // A release of a Spill request's pages whose copies landed, in whole
+  // extents, as a claim's unit for bytes takes it (EngineVictims::releases),
+  // frees the bytes that unit counts of its moves (Cache::releaseMoves),
+  // each page its Full bytes less its Index page's, wherever the Index
+  // runway held an extent before it, transfers in flight or not: its moves
+  // empty that many Full extents, none a page in transfer pins, which
+  // leave, and refill the runway an extent at a time. Short of the runway,
+  // its refill takes an Index extent more; a refused refill moves fewer
+  // pages: those are counted apart.
+  void releaseExtents() {
+    Request *request = anyRequest();
+    if (!spill_ || !request || request->mode != KvMode::Spill) return;
+    const uint64_t id = idOf(*request);
+    if (waiting(id)) return;
+    const uint32_t extent = pool_.extentPages();
+    const uint32_t pages = cache_.releaseMoves(cache_.releasablePages(id, {}).clean, false);
+    if (!pages) return;
+    const bool runway = pool_.freePageCount(kv::PageForm::Index) >= extent;
+    const bool inFlight = tier_.inFlight() != 0;
+    const uint64_t before = pool_.allocatedBytes();
+    const uint32_t moved = cache_.releasePages(id, pages, false, {});
+    const uint64_t freed = before - std::min(before, pool_.allocatedBytes());
+    const uint64_t counted =
+        uint64_t{pages} * (storage_.bytesPerPage(kv::PageForm::Full) - storage_.bytesPerPage(kv::PageForm::Index));
+    ++extentReleases;
+    inFlightReleases += inFlight;
+    if (freed >= counted) return;
+    ++(moved < pages ? refusedReleases : shortRunwayReleases);
+    require(moved < pages || !runway,
+            "a release of " + std::to_string(pages / extent) + " whole extents of pages, moving " +
+                std::to_string(moved) + (inFlight ? " beside transfers in flight" : "") +
+                " with the runway whole, freed " + std::to_string(freed) + " B of the " + std::to_string(counted) +
+                " its count gives them");
+  }
+
   // A read of a spilled block fails. The engine applies the results of the
   // command that read it while the command, and what it read, lives on: the
   // lane ends and the block's copy is given up.
@@ -682,7 +722,8 @@ private:
 // Seeds 1..plainSeeds plain and 1..windowedSeeds windowed, plus windowed seed 9454 (a poisoned
 // block's write lands after its subtree left).
 void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
-  const auto check = [](uint32_t seed, bool windowed) {
+  uint64_t releases = 0, inFlight = 0, shortRunway = 0, refused = 0;
+  const auto check = [&](uint32_t seed, bool windowed) {
     Run run(seed, windowed);
     try {
       for (int step = 0; step < 600; ++step)
@@ -694,13 +735,20 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
       throw std::runtime_error(std::string(windowed ? "windowed " : "") + "seed " + std::to_string(seed) + ": " +
                                error.what());
     }
+    releases += run.extentReleases;
+    inFlight += run.inFlightReleases;
+    shortRunway += run.shortRunwayReleases;
+    refused += run.refusedReleases;
   };
   for (const bool windowed : {false, true})
     for (uint32_t seed = 1; seed <= (windowed ? windowedSeeds : plainSeeds); ++seed)
       check(seed, windowed);
   check(9454, true);
   std::cout << "cache property runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds
-            << " windowed and windowed seed 9454\n";
+            << " windowed and windowed seed 9454; " << releases << " releases of whole extents, " << inFlight
+            << " of them beside transfers in flight; of all, " << shortRunway
+            << " freed less than counted with the runway short of an extent and " << refused
+            << " with its refill refused\n";
 }
 
 // The same runs with random claims counted and taken (checkTake), again with requests using the states they resume

@@ -2164,6 +2164,62 @@ void testTheOrderTakesCacheThenRebuiltPoolsThenReleasesThenTheStore() {
   require(experts.units() == 5, "the store did not give a unit once nothing else was left");
 }
 
+// The releases of two lanes on one conversation, each lane's own pages beside the pages both hold, which the first
+// take of either frees. With `twice`, each lane's unit counts the shared pages, as each lane alone holds them;
+// otherwise the second counts its own pages alone.
+class SharedPages final : public VictimSource {
+public:
+  SharedPages(uint64_t shared, uint64_t own, bool twice) : shared_(shared), own_(own), twice_(twice) {}
+
+  [[nodiscard]] std::string_view name() const noexcept override { return "lanes"; }
+  [[nodiscard]] std::optional<Victim> peek(const VictimQuery &, const Victim *after) const override {
+    uint64_t lane = after ? after->key + 1 : 1;
+    while (std::ranges::count(taken, lane))
+      ++lane;
+    if (lane > 2)
+      return std::nullopt;
+    const bool counts = !sharedFreed_ && (lane == 1 || twice_);
+    return Victim{.key = lane, .bytes = own_ + (counts ? shared_ : 0), .kind = VictimKind::Release};
+  }
+  FreeResult take(const VictimQuery &, const Victim &victim) override {
+    const uint64_t freed = own_ + (sharedFreed_ ? 0 : shared_);
+    sharedFreed_ = true;
+    taken.push_back(victim.key);
+    return {FreeOutcome::Met, freed};
+  }
+
+  std::vector<uint64_t> taken;
+
+private:
+  uint64_t shared_, own_;
+  bool twice_;
+  bool sharedFreed_ = false;
+};
+
+// The peek contract's units count disjoint memory (VictimSource): a source whose units count the pages two lanes
+// share each overcounts, and free() then takes them on a count that covers a need its takes do not meet, which
+// CountChecks names an overcounted run; counted once, the count falls short and nothing is taken.
+void testUnitsThatCountOnePageTwiceOvercount() {
+  for (const bool twice : {true, false}) {
+    MemoryLedger ledger;
+    SharedPages lanes(kGiB, 256 * kMiB, twice);
+    ledger.addSource(lanes);
+    const ClaimId claim = ledger.open(request(3, RequestPriority::Normal));
+    const FreeResult freed = ledger.free(claim, {.bytes = 2 * kGiB}, 0, false);
+    const MemoryLedger::CountChecks checks = ledger.countChecks();
+    if (twice)
+      require(freed.outcome == FreeOutcome::Short && lanes.taken == std::vector<uint64_t>{1, 2} &&
+                  checks.coveredRuns == 1 && checks.overcountedRuns == 1 && checks.blockedRuns == 0 &&
+                  checks.firstReleases == 1 && checks.shortReleases == 0,
+              "units that count the shared pages each were not taken on their count and named overcounted");
+    else
+      require(freed.outcome == FreeOutcome::Short && lanes.taken.empty() && checks.coveredRuns == 0 &&
+                  checks.overcountedRuns == 0,
+              "units that count the shared pages once covered a need their takes do not meet, or were taken");
+    ledger.close(claim);
+  }
+}
+
 // Growth counts what the host's reading does not show yet, so a lagging reading grows no unit that later goes back.
 void testGrowthCountsWhatTheHostDoesNotShowYet() {
   // M + 1.5 GiB of headroom beside the store's 2 GiB.
@@ -2417,6 +2473,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testAHostExemptionLogsMetPastTheHost", testAHostExemptionLogsMetPastTheHost},
       {"testTheOrderTakesCacheThenRebuiltPoolsThenReleasesThenTheStore",
        testTheOrderTakesCacheThenRebuiltPoolsThenReleasesThenTheStore},
+      {"testUnitsThatCountOnePageTwiceOvercount", testUnitsThatCountOnePageTwiceOvercount},
       {"testGrowthCountsWhatTheHostDoesNotShowYet", testGrowthCountsWhatTheHostDoesNotShowYet},
       {"testGrowthLeavesTheHostWhatTheLanesGrowInto", testGrowthLeavesTheHostWhatTheLanesGrowInto},
       {"testRequestsMetFromCacheLeaveRegrowthQuiet", testRequestsMetFromCacheLeaveRegrowthQuiet},

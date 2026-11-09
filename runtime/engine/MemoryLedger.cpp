@@ -178,6 +178,7 @@ void MemoryLedger::update(ClaimId claim, const ClaimSpec &spec) { claims_.at(cla
 
 void MemoryLedger::refused(ClaimId claim, const Need &need) {
   claims_.at(claim.value).refusal = {.bytes = need.bytes, .hostRefused = need.hostRefused};
+  hostRefusals_ += need.hostRefused;
 }
 
 void MemoryLedger::setWaiting(ClaimId claim, bool waiting) {
@@ -532,9 +533,19 @@ MemoryLedger::Run MemoryLedger::take(const VictimQuery &query, const Lacking &la
       VictimQuery lacking = query;
       lacking.lackingBytes = saturatingSubtract(lack.bytes, run.bytes);
       lacking.lackingPages = static_cast<uint32_t>(saturatingSubtract(lack.pages, run.pages));
+      const uint64_t hostRefusals = hostRefusals_;
       taken = sources_[best->source]->take(lacking, unit);
       if (unit.later && unit.kind == VictimKind::Memory)
         run.uncopied = true;
+      // A release taken first frees what it counted, as far as the claim
+      // lacks it: in place its pages, else its bytes (CountChecks).
+      if (unit.kind == VictimKind::Release && !unit.later && run.took.empty()) {
+        const uint64_t counted = unit.pages ? std::min<uint64_t>(unit.pages, lacking.lackingPages)
+                                            : std::min(unit.bytes, lacking.lackingBytes);
+        const uint64_t freed = unit.pages ? taken.pages : saturatingAdd(taken.nowBytes, taken.laterBytes);
+        ++checks_.firstReleases;
+        checks_.shortReleases += freed < counted && hostRefusals_ == hostRefusals;
+      }
     }
     if (!taken.gave()) {
       if (taken.outcome == FreeOutcome::Pending && query.rights.waitsForWrites) {
@@ -666,7 +677,11 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
     if (most.uncopied)
       uncopiedReachedSeconds_ = nowSeconds_;
     if (most.covered) {
+      const uint64_t hostRefusals = hostRefusals_;
       run = take(query, lack);
+      ++checks_.coveredRuns;
+      if (!run->covered)
+        ++(run->pending || hostRefusals_ != hostRefusals ? checks_.blockedRuns : checks_.overcountedRuns);
       if (run->uncopied)
         uncopiedReachedSeconds_ = nowSeconds_;
       FreeResult taken = run->freed;

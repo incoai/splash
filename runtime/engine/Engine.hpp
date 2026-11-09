@@ -887,12 +887,13 @@ private:
     // (Cache::inPlaceMoves), offered where the reads of the lanes they give
     // Index pages lack nothing, since what it frees is not sized for them;
     // then for a need of bytes the host did not refuse, whole extents of
-    // pages, each page freeing its Full bytes less its Index page's, less
-    // what those reads take (readsShortfall), offered where they free some;
-    // last, after every lane's, outside --kv-spill always, for a claim that
-    // waits for writes, those whose copies land, which leave it Pending
-    // (later). The units for bytes count what their takes in turn free as
-    // the copies stand, each page and each lane's first reads once
+    // pages, as many as compaction can empty (Cache::releaseMoves), each
+    // page freeing its Full bytes less its Index page's, less what those
+    // reads take (readsShortfall), offered where they free some; last,
+    // after every lane's, outside --kv-spill always, for a claim that waits
+    // for writes, those whose copies land, which leave it Pending (later).
+    // The units for bytes count what their takes in turn free as the copies
+    // stand, each page, each lane's first reads and each extent once
     // (Cache::ReleaseCount): copies that land before the takes can lower the
     // count, by 102 MB for two lanes on one conversation, as a lane's landed
     // pages then join, in its whole extents, shared pages a later lane's

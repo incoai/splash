@@ -279,9 +279,11 @@ KvMode kvMode(const Spilling &spill, uint64_t id) {
 }
 
 // Flash-Next's proportions: 256-page extents, 423,936 B Full and 24,576 B Index pages, a 390 MiB hot
-// block floor, and a dense history and tail window of a page each.
+// block floor, and a dense history and tail window of a page each. Its page ids hold every extent the
+// lanes reach, so memory limits the pool and never the ids, as production's hold every extent the limit
+// could hold of Index pages: 8,192 held 32 extents, and the runway's refill failed for ids.
 struct FlashNextLanes {
-  static constexpr Spilling::Pages kPages{.count = 8192, .fullBytes = 423'936, .indexBytes = 24'576};
+  static constexpr Spilling::Pages kPages{.count = 65'536, .fullBytes = 423'936, .indexBytes = 24'576};
   Spilling spill{16'384, false, 0, 200'000, Spilling::Extent{256}, {}, {}, false, kPages};
   FlashNextLanes() { spill.model.spilledReadFloorBytes = 390ULL << 20; }
   // No Full extent more: the bytes held, in whole Full pages.

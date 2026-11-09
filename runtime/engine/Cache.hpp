@@ -562,24 +562,29 @@ public:
   // too: the pages, and the holders of the oldest.
   void countRelease(uint64_t requestId, uint32_t pages, bool landing, const ReleaseRule &rule,
                     ReleaseCount &count) const;
-  // Whether a release of `pages` pages for bytes frees memory: the Full
-  // pages its first runway's moves into free Index pages leave, with those
-  // free already, fill a Full extent, which leaves and pays for the next
-  // runway.
-  [[nodiscard]] bool releaseFreesAnExtent(uint32_t pages) const noexcept;
+  // The pages of `pages` a release for bytes moves: whole extents of them,
+  // each emptying a Full extent, which leaves and pays for the next runway,
+  // and none unless its first runway's moves into free Index pages, with
+  // the Full pages free already, fill one. Compaction empties only extents
+  // that hold pages and none in transfer, so as many as those beyond the
+  // whole extents of pages `count` counted: moves past them would empty
+  // none, yet refill the runway and give the lanes Index pages and reads.
+  // With `landing`, as the extents stand once the transfers land, which a
+  // release of pages whose copies land waits for.
+  [[nodiscard]] uint32_t releaseMoves(uint32_t pages, bool landing, const ReleaseCount &count = {}) const;
   // The pages a release freeing `pages` Full pages in place moves, of a
   // request's `clean` ones, so that an extent of free Index pages stays, the
   // runway the next release moves into: those pages where free Index pages
   // hold them beside it; else an extent more, as for bytes, whose emptied
-  // Full extent refills it, where releaseFreesAnExtent; else none. Moved
+  // Full extent refills it, where releaseMoves moves one; else none. Moved
   // alone into the runway they could leave it short where the room holds no
   // Index extent (6.3 MB on Qwen3.8-Flash-Next), and no release for bytes
   // could start again.
-  [[nodiscard]] uint32_t inPlaceMoves(uint32_t pages, uint32_t clean) const noexcept;
+  [[nodiscard]] uint32_t inPlaceMoves(uint32_t pages, uint32_t clean) const;
   // Between commands: moves the request's `pages` oldest clean pages
   // (releasablePages, by the same rule) to the index form, as spillWritten
-  // moves landed pages: into free Index pages; for a need of bytes, where
-  // releaseFreesAnExtent, the Full extents they empty then leave, the Full
+  // moves landed pages: into free Index pages; for a need of bytes its
+  // releaseMoves, the Full extents they empty then leave, the Full
   // pages left first gathered in the fewest extents, their bytes told to
   // `funds`, and the runway refills from them, a runway at a time; for a
   // need of pages in place (`inPlace`) its inPlaceMoves, an extent past
@@ -1475,6 +1480,8 @@ private:
   // them. A page a transfer reads or writes stays where it is until the
   // transfer has landed. False when the free pages cover no extent.
   [[nodiscard]] bool compactExtent(std::optional<kv::PageForm> form = std::nullopt);
+  // The pages transfers in flight read or write.
+  [[nodiscard]] std::vector<uint32_t> pagesInTransfer() const;
   // The blocks and requests on moved pages follow them, and the requests'
   // page lists change from the first one moved.
   void followMoves(const KvPageMoves &moves);

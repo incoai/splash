@@ -280,7 +280,11 @@ struct VictimQuery final {
 // in flight holds part of the unit, a reclaim empties fewer extents than
 // counted). The bound is that running total, not the unit's own count: a
 // take may first free what a unit before it counts (the cache's reclaims
-// free the free pages, and the extents they fill, first).
+// free the free pages, and the extents they fill, first). No two units of a
+// source count the same memory (a page lanes share, a buffer, a chunk), so
+// that, but for a transfer in flight or an allocation the host refuses,
+// their takes in turn free what their counts add up to as far as the claim
+// lacks it: a count that covers it is met (MemoryLedger::CountChecks).
 // This is the one peek contract: free() counts with it (bound) and takes
 // nothing unless the count covers the need, the claim's retries taking what
 // a take fell short by, and every reader of peek relies on it alone (the
@@ -452,6 +456,24 @@ public:
   [[nodiscard]] uint64_t hostRefusedWaitingBytes() const noexcept;
   // The units the pools gave back since the engine started.
   [[nodiscard]] uint64_t poolReleases() const noexcept;
+  // How free()'s takes kept to its counts, for the tests that hold the
+  // sources to the peek contract (VictimSource): the runs whose count
+  // (bound) covered what the claim lacked; of those, the takes that covered
+  // less though no unit they reached waited for a transfer and the host
+  // refused no allocation in the claim's scope (overcounted), and the other
+  // takes that covered less (blocked); the units that release a lane's pages
+  // (VictimKind::Release) taken first in a run, and of those the takes that
+  // freed less than the lesser of their count and what the claim lacked,
+  // though the host refused nothing (short). Two lanes on one conversation
+  // counting their shared pages each overcount by those pages.
+  struct CountChecks final {
+    uint64_t coveredRuns = 0;
+    uint64_t overcountedRuns = 0;
+    uint64_t blockedRuns = 0;
+    uint64_t firstReleases = 0;
+    uint64_t shortReleases = 0;
+  };
+  [[nodiscard]] const CountChecks &countChecks() const noexcept { return checks_; }
   // The largest unit a pool grows by next: the host's band reaches past its
   // margin by it.
   [[nodiscard]] uint64_t largestGrowthUnit() const;
@@ -535,6 +557,9 @@ private:
   // and no pool grew or tried to (grow).
   double quietSinceSeconds_ = 0.0;
   uint64_t growthLackBytes_ = 0;
+  CountChecks checks_;
+  // The allocations the host refused in any claim's scope (refused).
+  uint64_t hostRefusals_ = 0;
 };
 
 } // namespace splash::engine
