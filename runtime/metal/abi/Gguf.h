@@ -109,7 +109,8 @@ struct GgufPrefillInt8QuantizeParams {
 };
 static_assert(sizeof(GgufPrefillInt8QuantizeParams) == 12,
               "int8 prefill quantize parameters are 12 bytes on both sides");
-// gguf_prefill_int8_<format>_<e>: grid (column tiles of one segment, row tiles).
+// gguf_prefill_int8_<format>_<e>: grid (16, ceil(tiles / 16)), the walk of
+// GGUF_PREFILL_INT8_WALK row tiles down each column tile.
 struct GgufPrefillInt8Params {
   uint32_t input_size;        // K
   uint32_t rows;              // rows of the chunk

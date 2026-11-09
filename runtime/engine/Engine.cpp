@@ -1490,8 +1490,8 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
   };
   // The Index runway refills, as at the tick's start, before any lane grows.
   spillLanded(false);
-  // So do a windowed layout's windowed layers' K/V of the pages every
-  // window has passed, the processed rows' (Cache::trimWindows): into the
+  // A windowed layout's windowed layers' K/V of the pages every window has
+  // passed, the processed rows' (Cache::trimWindows), leaves too: into the
   // Slim runway and what memory allows, the rest Full for a later pass. A
   // Slim page takes a fraction of the Full page it frees for the lanes to
   // grow into, so the Slim extents are memory the lanes in service need: an

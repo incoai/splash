@@ -1643,7 +1643,7 @@ KV now, as placement prices it. Beside another lane in service that claim
 is a `Start`'s, whose test placed it Spill unless every request spills;
 short of it the start waits for memory, and a lane of a lower priority yields
 to it only while every lane in service is of a lower priority, when each
-suspension brings it closer to alone (`Engine::waitForMemory`). Alone it is
+suspension brings it closer to alone (`Engine::waitForResources`). Alone it is
 `InService`, as its
 lane's growth is, which takes the pooled buffers the next lane starts from
 too, and short of the projection the KV it covers bounds the output, as the
