@@ -46,6 +46,9 @@ struct ServeSettings: Equatable {
     /// `splash serve` refuses beside a vision projector.
     var textOnly: Bool { values["--language-only"] == "true" }
 
+    /// The vision projector a start passes: none under Text only.
+    var passedProjector: String? { textOnly ? nil : projector }
+
     subscript(flag: String) -> String? {
         get { values[flag] }
         set { values[flag] = newValue }
@@ -68,7 +71,7 @@ struct ServeSettings: Equatable {
     /// this Mac, with these options.
     func serveArguments(model: String, localName: String? = Self.localName) -> [String] {
         let source = model.hasPrefix("/")
-            ? ["--model", Self.localID(model), "--model-dir", model] + (projector.flatMap { textOnly ? nil : ["--mmproj", $0] } ?? [])
+            ? ["--model", Self.localID(model), "--model-dir", model] + (passedProjector.map { ["--mmproj", $0] } ?? [])
                 + (draft.map { ["--draft-model", $0] } ?? [])
             : ["--model", model]
         var arguments = ["serve"] + source + ["--port", String(port), "--offline"]

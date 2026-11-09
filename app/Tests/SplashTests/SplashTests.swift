@@ -308,6 +308,31 @@ struct ServeSettingsTests {
             == ["Start with 12 GB", "Start Without a Limit", "Start with Auto Context"])
     }
 
+    /// Model files on this Mac that Splash couldn't prepare or serve offer the start without the
+    /// projector or draft chosen for them, where it passed either, as either may be what failed;
+    /// without, taking them off the list.
+    @Test func aFailureOfModelFilesOffersTheStartWithoutWhatWasChosenForThem() {
+        let failure = ServeRecord.Failure(kind: "model", message: "", bound: nil, required_bytes: nil, budget_bytes: nil,
+                                          plan_context_tokens: nil)
+        func remedy(projector: String? = nil, draft: String? = nil, textOnly: Bool = false) -> Server.Remedy? {
+            var settings = ServeSettings()
+            settings.projector = projector
+            settings.draft = draft
+            if textOnly { settings["--language-only"] = "true" }
+            return Server.remedy(for: failure, settings: settings, memory: 36, local: true)
+        }
+        #expect(remedy(projector: "/m/mmproj.gguf") == .without(projector: true, draft: false))
+        #expect(remedy(draft: "/m/draft") == .without(projector: false, draft: true))
+        #expect(remedy(projector: "/m/mmproj.gguf", draft: "/m/draft") == .without(projector: true, draft: true))
+        // A projector Text only left out of the start had no part in its failure.
+        #expect(remedy(projector: "/m/mmproj.gguf", textOnly: true) == .removeFromList)
+        #expect(remedy() == .removeFromList)
+        #expect(Server.remedy(for: failure, settings: ServeSettings(), memory: 36) == nil)
+        #expect([Server.Remedy.without(projector: true, draft: false), .without(projector: false, draft: true),
+                 .without(projector: true, draft: true), .removeFromList].map(\.title)
+            == ["Start Without Projector", "Start Without Draft", "Start Without Projector and Draft", "Remove from List"])
+    }
+
     @Test func keepsTheOptionsAndReadsBadOnesAsDefaults() throws {
         let folder = FileManager.default.temporaryDirectory.appending(path: "splash-options-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: folder) }

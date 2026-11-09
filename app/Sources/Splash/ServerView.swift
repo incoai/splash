@@ -65,7 +65,8 @@ private struct ServerSections: View {
                     }
                     if case .failed(let message) = state.server.phase, let model = state.server.model {
                         // What its failure says would help: a start that would fit, or, for files on
-                        // this Mac Splash can't serve, taking them off the list.
+                        // this Mac Splash can't serve, the start without the projector or draft
+                        // chosen for them, else taking them off the list.
                         ProblemRow(title: "\(state.displayName(of: model)) ran into a problem", message: message,
                                    log: .server, dismiss: state.server.dismissFailure,
                                    action: state.server.remedy.map { remedy in (remedy.title, { state.retry(model, with: remedy) }) })

@@ -17,6 +17,10 @@ final class Server {
         case memoryLimit(String?)
         /// The context length on Auto.
         case autoContext
+        /// Model files on this Mac that started with a vision projector or a draft chosen for them,
+        /// either of which may be what Splash couldn't prepare or serve: the start without them,
+        /// each saying whether it was passed.
+        case without(projector: Bool, draft: Bool)
         /// Model files on this Mac Splash can't prepare or serve, which no start would: off the list.
         case removeFromList
 
@@ -26,6 +30,9 @@ final class Server {
             case .memoryLimit(let limit?): "Start with \(limit.dropLast()) GB"
             case .memoryLimit(nil): "Start Without a Limit"
             case .autoContext: "Start with Auto Context"
+            case .without(projector: true, draft: true): "Start Without Projector and Draft"
+            case .without(projector: true, draft: false): "Start Without Projector"
+            case .without(projector: false, _): "Start Without Draft"
             case .removeFromList: "Remove from List"
             }
         }
@@ -324,12 +331,14 @@ final class Server {
     /// `memory` GB to start: a memory limit that holds what the model needs, the least one the
     /// options offer, or none where none does; the context length on Auto, which the server fits to
     /// the memory, where one was set that doesn't fit; for `local` model files Splash couldn't
-    /// prepare or can't serve, taking them off the list. Other failures it can't tell a change for.
+    /// prepare or can't serve, the start without the projector or draft chosen for them, where it
+    /// passed either, else taking them off the list. Other failures it can't tell a change for.
     nonisolated static func remedy(for failure: ServeRecord.Failure, settings: ServeSettings, memory: Int,
                                    local: Bool = false) -> Remedy? {
         switch (failure.kind, failure.bound) {
         case (let kind, _) where local && (kind == "model" || kind == "install"):
-            return .removeFromList
+            let projector = settings.passedProjector != nil, draft = settings.draft != nil
+            return projector || draft ? .without(projector: projector, draft: draft) : .removeFromList
         case ("memory_budget", "max_memory"):
             guard let needed = failure.required_bytes else { return nil }
             let limit = ServeSettings.memoryLimits(memory: memory).first { Int64($0) << 30 >= needed }

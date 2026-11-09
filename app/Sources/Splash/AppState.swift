@@ -317,11 +317,15 @@ final class AppState {
         server.stop()
     }
 
-    /// Starts `model` again with the launch options its failure asks for (`Server.remedy`).
+    /// Starts `model` again with the launch options its failure asks for, or without the projector
+    /// or draft chosen for it, or takes it off the list (`Server.remedy`).
     func retry(_ model: String, with remedy: Server.Remedy) {
         switch remedy {
         case .memoryLimit(let limit): options["--max-memory"] = limit
         case .autoContext: options["--max-context"] = nil
+        case .without(let projector, let draft):
+            if projector { modelFiles[model]?.projector = nil }
+            if draft { modelFiles[model]?.draft = nil }
         case .removeFromList:
             server.dismissFailure()
             return removeLocal(model)

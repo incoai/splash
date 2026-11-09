@@ -167,3 +167,39 @@ extension ServerScreenTests {
         #expect(RequestLog.totals(Server.Activity(), requests: [rows[0]]) == "0 · 0 tokens out · 0 in")
     }
 }
+
+extension ServerScreenTests {
+    /// Model files on this Mac whose start with a projector and a draft chosen for them fails as
+    /// files Splash can't serve start again without them, which they no longer start with; failing
+    /// without, they are offered to be taken off the list.
+    @Test func modelFilesThatFailStartAgainWithoutTheirProjectorAndDraft() async throws {
+        let fake = try FakeRuntime("splash-files-failed", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        // A launcher whose start fails on files Splash can't serve, as its serve record says.
+        try """
+        import json, os, sys
+        from pathlib import Path
+        port = int(sys.argv[sys.argv.index("--port") + 1])
+        record = Path(__file__).resolve().parents[1] / "build/runtime" / f"serve-{port}.json"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps({"pid": os.getpid(), "phase": "failed", "failure": {"kind": "model", "message": "x"}}))
+        sys.exit(1)
+        """.write(to: fake.root.appending(path: "install/launcher.py"), atomically: true, encoding: .utf8)
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        await state.launch()
+        state.options["--port"] = String(fake.port)
+        let files = "/m/q.gguf"
+        state.modelFiles[files] = AppState.ModelFiles(projector: "/m/mmproj.gguf", draft: "/m/draft")
+        state.start(files)
+        try await waitFor(state.serverStatus.look == .failed, "the failure")
+        let remedy = try #require(state.server.remedy)
+        #expect(remedy == .without(projector: true, draft: true))
+        let failed = state.server.since
+        state.retry(files, with: remedy)
+        #expect(state.modelFiles[files] == AppState.ModelFiles())
+        try await waitFor(state.serverStatus.look == .failed && state.server.since > failed, "the start without them")
+        #expect(state.server.settings.projector == nil && state.server.settings.draft == nil)
+        #expect(state.server.remedy == .removeFromList)
+    }
+}
