@@ -52,7 +52,7 @@ final class ChatContext {
         /// A restarted model may use another tokenizer even under the same name.
         var started: Date? = nil
         /// Where the attachments are kept (`ChatStore.attachments`).
-        var files: URL = FileManager.default.temporaryDirectory
+        let files: URL
 
         var messages: [ChatMessage] {
             history + (text.isEmpty && attachments.isEmpty ? []
