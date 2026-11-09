@@ -41,4 +41,20 @@ struct ChatStoreTests {
         let read = try JSONDecoder().decode(Conversation160.self, from: Data(contentsOf: folder.appending(path: "\(id).json")))
         #expect(read.title == "Renamed" && read.messages.map(\.images) == [[]] && read.messages.map(\.text) == ["Read this"])
     }
+
+    /// A message the server refuses goes back to the composer before what was typed there since,
+    /// which stays; a reply asked again gives no text back.
+    @Test func aRefusedMessageGoesBackBeforeWhatWasTypedSince() {
+        let draft = Draft(files: FileManager.default.temporaryDirectory.appending(path: "splash-draft-\(UUID().uuidString)"))
+        let refused = ChatStore.Refused(text: "Summarize this", attachments: [], reason: "Too large", conversation: nil)
+        draft.text = "and then this"
+        draft.restore(refused)
+        #expect(draft.text == "Summarize this\n\nand then this")
+        #expect(draft.notice == Draft.Notice(text: "Too large", conversation: nil))
+        draft.text = " \n"
+        draft.restore(refused)
+        #expect(draft.text == "Summarize this")
+        draft.restore(ChatStore.Refused(text: "", attachments: [], reason: "Too large", conversation: nil))
+        #expect(draft.text == "Summarize this")
+    }
 }

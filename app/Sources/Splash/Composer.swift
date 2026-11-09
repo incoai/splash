@@ -126,10 +126,11 @@ final class Draft {
         return (text.trimmingCharacters(in: .whitespacesAndNewlines), attachments)
     }
 
-    /// Takes back `refused`, what the server didn't take, with why, in its chat: its text where the
-    /// draft has none since, and its attachments before those attached since.
+    /// Takes back `refused`, what the server didn't take, with why, in its chat: its text before
+    /// what was typed since, a blank line apart, and its attachments before those attached since.
     func restore(_ refused: ChatStore.Refused) {
-        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { text = refused.text }
+        let typed = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : text
+        text = [refused.text, typed].filter { !$0.isEmpty }.joined(separator: "\n\n")
         attachments.insert(contentsOf: refused.attachments, at: 0)
         for attachment in refused.attachments where attachment.kind == .image {
             thumbnails[attachment.id] = NSImage(contentsOf: files.appending(path: attachment.file))
