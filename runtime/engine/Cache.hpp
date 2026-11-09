@@ -1075,8 +1075,9 @@ private:
   // page freed), the states on the way among a unit's victims unless the
   // need counts state buffers too (statesAreUnits). A device need that also
   // lacks pages of a form keeps the free pages of that form it takes first,
-  // and those of the other forms its attempt takes (keptPages): its reclaims
-  // release an extent of a form only past them.
+  // those its takes free there among them, and those of the other forms its
+  // attempt takes (keptPages): its reclaims release an extent of a form only
+  // past them, and none of its own form.
   struct Walk final {
     WalkScope scope;
     ReclaimTiming timing = ReclaimTiming::CanWait;

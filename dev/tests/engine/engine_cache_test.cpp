@@ -4215,6 +4215,37 @@ void testIndexShortfallCompactsOnlyFullExtents() {
     spill.pool.releasePage(page, false);
 }
 
+// A need of bytes and pages takes its pages in place: each take ends once it has a page more there
+// (Cache::takeReclaim), which the next keeps with the other free ones, so neither its takes nor its count empty an
+// extent of its form. A prefix's eight pages in two extents, none free, give a KV need of an extent's bytes and twelve
+// pages eight pages in place and no bytes: short, it takes nothing and the prefix stays. Counted as the two extents
+// those pages fill, the bytes were covered, the takes freed the eight pages one at a time, no extent, and the run was
+// overcounted.
+void testANeedInPlaceEmptiesNoExtentOfItsForm() {
+  test::TestKvStorage storage{8, 100, 4};
+  KvPool pool{storage, 0};
+  engine::Cache cache(pool, nullptr, nullptr);
+  cache.beginRequest(1);
+  require(cache.ensureTokens(1, 8 * KvCache::pageTokens).granted(), "the prefix's pages were denied");
+  cache.publishCommittedBlocks(1, Spilling::prompt(1000, 8), 8 * KvCache::pageTokens, {});
+  cache.endRequest(1);
+  require(pool.allocatedExtents(kv::PageForm::Full) == 2 && !pool.freePageCount(kv::PageForm::Full),
+          "the prefix did not fill two extents");
+  MemoryLedger ledger;
+  ledger.addSource(cache);
+  const ClaimId claim = ledger.open(test::kInServiceGrowth);
+  const FreeResult freed = ledger.free(claim, {.bytes = 400, .pages = 12, .kv = true}, 0, false);
+  ledger.close(claim);
+  MemoryGovernorSnapshot snapshot;
+  ledger.fill(snapshot, 0);
+  require(freed.outcome == FreeOutcome::Short && !freed.pages && !pool.freePageCount(kv::PageForm::Full) &&
+              !snapshot.countChecks.overcountedRuns,
+          "a need of an extent's bytes and twelve pages, of eight pages in place, freed " +
+              std::to_string(freed.pages) + " pages, left " +
+              std::to_string(pool.freePageCount(kv::PageForm::Full)) + " free, and was overcounted " +
+              std::to_string(snapshot.countChecks.overcountedRuns) + " times");
+}
+
 // A page need of a form the cache holds none of gets no eviction offered.
 void testAPageNeedOfAFormTheCacheHoldsNoneOfCountsNothing() {
   Spilling spill;
@@ -6879,6 +6910,7 @@ int main() {
     testFullShortfallReleasesEmptyIndexExtents();
     testCriticalKeepsTheIndexRunway();
     testIndexShortfallCompactsOnlyFullExtents();
+    testANeedInPlaceEmptiesNoExtentOfItsForm();
     testAPageNeedOfAFormTheCacheHoldsNoneOfCountsNothing();
     testReusablePagesCountTheirForm();
     testPendingPagesCountWritesThatSpill();

@@ -1715,6 +1715,8 @@ whose copies land) waits for them (`Pending`) and is retried as they land; one
 they do not meet waits while what it reached or started lands, and is `Short`
 otherwise. A refusal of KV counts the free pages of its form as its own: the
 ledger never releases their extent for it, which it would only allocate again.
+One that lacks pages takes them in place, and the pages its takes free there
+stay with the free ones: its count, as its takes, empties no extent of its form.
 `/status` counts the takes on a count that covered what the claim lacked, and
 those that freed less though no unit waited for a transfer and the host refused
 nothing meanwhile (`memory_governor.count_checks`).

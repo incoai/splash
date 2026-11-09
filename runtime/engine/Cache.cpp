@@ -1199,9 +1199,13 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
     written[index] = std::min(all[index], pool_.freePageCount(form) + pages.now[index] + pages.written[index]);
     // Compaction gathers the pages that stay into the fewest extents, and
     // the rest empty, but for the free pages a KV need takes and the
-    // runway the walk keeps.
+    // runway the walk keeps. A need in place empties none of its form: each
+    // take ends once it has a page more there (takeReclaim), which the next
+    // keeps with the other free pages.
     const uint64_t extentBytes = uint64_t{extent} * pool_.bytesPerPage(form);
     const auto extents = [&](uint32_t pages) {
+      if (walk.inPlace && form == walk.form)
+        return 0u;
       const uint32_t whole = (pages - std::min(pages, walk.keptPages[index])) / extent;
       return whole - std::min(whole, walk.keeps(form) ? 1u : 0u);
     };

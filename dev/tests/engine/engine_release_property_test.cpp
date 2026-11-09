@@ -351,12 +351,9 @@ struct PropertyTotals final {
            engineOvercounts = 0, residentStarts = 0, completed = 0, failed = 0;
   // Invariant 2 as the ledger sees it (a count that covered its need, takes that did not) and net of the reads the
   // releases created (notKept), each with no transfer in flight and apart with transfers; 5 (units); 4 (runway); 3
-  // (placement). Apart too, the engine's runs for a need of bytes and pages together that went short: the cache's
-  // walk in place counts whole extents and pages in place for it, while each take returns once it has a page more
-  // in place, so its takes can fall short of a count that covered the need. That walk predates the releases and is
-  // not theirs to fix.
+  // (placement).
   Violations overcounted, notKept, shortUnits, blockedByTransfers, notKeptInFlight, runway, placement,
-      engineOvercounted, bytesAndPagesOvercounted, failures;
+      engineOvercounted, failures;
 };
 
 class TreeRun final {
@@ -375,10 +372,6 @@ public:
       if (log_.size() > 40)
         log_.erase(log_.begin());
       noteShort(line);
-      // A need of bytes and pages together reads "needs B MiB, P pages", B above zero.
-      bytesAndPagesShort_ = bytesAndPagesShort_ || (line.find(" MiB, ") != std::string_view::npos &&
-                                                     line.find(" pages: short") != std::string_view::npos &&
-                                                     line.find("needs 0.0 MiB") == std::string_view::npos);
     });
   }
 
@@ -502,7 +495,6 @@ private:
     const size_t suspended = spill.model.suspendedIds.size();
     const uint64_t preemptions = spill.engine.snapshot().prioritySuspensions;
     const MemoryLedger::CountChecks before = spill.host.governor.snapshot().countChecks;
-    bytesAndPagesShort_ = false;
     static_cast<void>(spill.engine.tick(spill.now++));
     if (spill.engine.snapshot().prioritySuspensions != preemptions)
       preempted_.insert(spill.model.suspendedIds.begin() + static_cast<std::ptrdiff_t>(suspended),
@@ -511,21 +503,9 @@ private:
     const uint64_t overcounted = after.overcountedRuns - before.overcountedRuns;
     totals_.engineOvercounts += overcounted;
     if (overcounted && quiet && transfers == spill.tier.demotions + spill.tier.restores)
-      (bytesAndPagesShort() ? totals_.bytesAndPagesOvercounted : totals_.engineOvercounted)
-          .add(where() + ": " + lanes_.pool() + "; " + lastLog());
+      totals_.engineOvercounted.add(where() + ": " + lanes_.pool() + "; " + lastLog());
     spill.tier.complete();
     noteStarts();
-  }
-
-  // Whether a claim's need of bytes and pages together went short: a line in this tick, or the record of an open
-  // claim that went so since its last grant, as its retries back to that decision log nothing (MemoryLedger::free).
-  [[nodiscard]] bool bytesAndPagesShort() const {
-    const auto shortOfBoth = [](const ClaimState::Logged &logged) {
-      return logged.lack.bytes && logged.lack.pages &&
-             (logged.decisions & (1U << static_cast<unsigned>(FreeOutcome::Short))) != 0;
-    };
-    const auto claimShort = [&](const auto &entry) { return std::ranges::any_of(entry.second.logged, shortOfBoth); };
-    return bytesAndPagesShort_ || std::ranges::any_of(lanes_.spill.host.governor.ledger().claims(), claimShort);
   }
 
   // The starts placed Resident beside a lane at normal pressure, whose placement counted the lanes' releases
@@ -755,8 +735,6 @@ private:
   // The requests a start of a higher priority preempted.
   std::set<uint64_t> preempted_;
   bool claiming_ = false;
-  // A line in this tick logged a need of bytes and pages together short (PropertyTotals).
-  bool bytesAndPagesShort_ = false;
   uint64_t room_ = 0;
   uint64_t closedFor_ = 0;
   Host host_ = Host::Normal;
@@ -776,8 +754,7 @@ void report(std::string_view name, const Violations &violations, std::string &fa
 // own runs in the engine's ticks too, and what a met claim keeps of the room beside the first reads its releases
 // created holds its need; a release taken first frees what it counted; between commands at normal pressure the Index
 // runway holds an extent where the room does; a start placed Resident beside the lanes prefills with no yield, no
-// short claim and no conversion while the host and the wall stay. With transfers in flight they are counted apart, as
-// are the engine's runs for a need of bytes and pages together (PropertyTotals).
+// short claim and no conversion while the host and the wall stay. With transfers in flight they are counted apart.
 void testRandomConversationTreesKeepTheReleaseCounts() {
   const char *seeds = std::getenv("SPLASH_RELEASE_SEEDS");
   const char *one = std::getenv("SPLASH_RELEASE_SEED");
@@ -806,8 +783,6 @@ void testRandomConversationTreesKeepTheReleaseCounts() {
   report("invariant 3, a start placed Resident yielded, went short or converted", totals.placement, failures);
   std::string apart;
   report("a count not met, transfers in flight", totals.blockedByTransfers, apart);
-  report("a count not met, the cache's walk in place for a need of bytes and pages", totals.bytesAndPagesOvercounted,
-         apart);
   report("a count not kept, transfers in flight", totals.notKeptInFlight, apart);
   report("requests that failed", totals.failures, apart);
   if (!apart.empty())
