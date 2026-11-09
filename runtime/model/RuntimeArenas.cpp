@@ -93,18 +93,22 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<float>(uint64_t{kPrefillRows} * geometry.target.rotaryPairs));
   put(PrefillTensor::RopeSin,
       bytesFor<float>(uint64_t{kPrefillRows} * geometry.target.rotaryPairs));
+  // The draft's ring replay at a rebuild: a restored lane rebuilds its ring
+  // from up to the draft's own window's rows, which a variant of a longer
+  // ring (Ripple's 4096-slot one) holds past the prefill chunk budget.
+  const uint32_t draftContextRows = std::max(kPrefillRows, geometry.draft.window);
   put(PrefillTensor::ContextProjected,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(uint64_t{draftContextRows} * geometry.draft.hiddenSize));
   put(PrefillTensor::ContextHidden,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(uint64_t{draftContextRows} * geometry.draft.hiddenSize));
   put(PrefillTensor::ContextKv,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+      bytesFor<uint16_t>(uint64_t{draftContextRows} *
                          geometry.draft.contextKvSize()));
   put(PrefillTensor::DraftRopeCos,
-      bytesFor<float>(uint64_t{kPrefillRows} *
+      bytesFor<float>(uint64_t{draftContextRows} *
                       geometry.draftRotaryPairs()));
   put(PrefillTensor::DraftRopeSin,
-      bytesFor<float>(uint64_t{kPrefillRows} *
+      bytesFor<float>(uint64_t{draftContextRows} *
                       geometry.draftRotaryPairs()));
   put(PrefillTensor::ChunkKeys,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *

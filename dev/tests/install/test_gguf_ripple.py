@@ -66,8 +66,7 @@ CHAT_TEMPLATE = "{%- if tools %}{{- '<|im_start|>system\\n' }}{%- endif %}"
 
 def scalar_metadata():
     """The release file header's scalars, as the fixture holds them."""
-    typed = json.loads((FIXTURES / "gguf-metadata.json").read_text())
-    return typed["unsigned"] | typed["float"] | typed["string"]
+    return json.loads((FIXTURES / "gguf-metadata.json").read_text())
 
 
 def header_values():

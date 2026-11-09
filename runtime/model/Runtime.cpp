@@ -1775,9 +1775,11 @@ struct Runtime::Impl {
   void addDraftRebuild(CommandGraph &graph, uint32_t lane,
                        const Request::DraftRebuild &rebuild) const {
     auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor, 0); };
-    ops::RoPE::addDraftRangeTables(graph, p(PrefillTensor::DraftInverseFrequencies),
-                                   p(PrefillTensor::DraftRopeCos), p(PrefillTensor::DraftRopeSin),
-                                   rebuild.rows, rebuild.begin, kPrefillRows);
+    ops::RoPE::addDraftRangeTables(
+        graph, p(PrefillTensor::DraftInverseFrequencies),
+        p(PrefillTensor::DraftRopeCos), p(PrefillTensor::DraftRopeSin),
+        rebuild.rows, rebuild.begin,
+        std::max(kPrefillRows, states.layout().draft.window));
     draftModel.addContextRebuild(graph, draftPrefillBuffers(*prefillArena, 0), states.window(lane),
                                  states.draft(lane), rebuild.rows, rebuild.begin);
   }
