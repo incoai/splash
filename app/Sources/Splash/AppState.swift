@@ -437,10 +437,40 @@ final class AppState {
         }
     }
 
-    /// Opens `agent` in Terminal, on the model that serves.
-    func open(_ agent: Agent) {
+    /// The folder the coding agents work in, the last one chosen; none before the first.
+    var agentFolder: URL? {
+        get {
+            access(keyPath: \.agentFolder)
+            return defaults.url(forKey: Preference.agentFolder)
+        }
+        set { withMutation(keyPath: \.agentFolder) { defaults.set(newValue, forKey: Preference.agentFolder) } }
+    }
+
+    /// Asks for the folder the coding agents work in, from the last one; whether one was chosen.
+    @discardableResult
+    func chooseAgentFolder() -> Bool {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.prompt = "Choose"
+        panel.message = "Choose the project folder the coding agents work in."
+        panel.directoryURL = agentFolder
         NSApp.activate()
-        agent.open(runtime: runtime, settings: server.settings, defaults: defaults)
+        guard panel.runModal() == .OK, let folder = panel.url else { return false }
+        agentFolder = folder
+        return true
+    }
+
+    /// Opens `agent` on the model that serves, in a new terminal of the window's drawer, in the
+    /// agents' folder, which it asks for the first time; that terminal holds the server's API key.
+    func open(_ agent: Agent) {
+        guard agentFolder != nil || chooseAgentFolder(), let folder = agentFolder else { return }
+        var environment = runtime.userEnvironment
+        environment["SPLASH_API_KEY"] = server.settings.apiKey
+        drawer.add(TerminalSession(shell: drawer.shell(), environment: environment, folder: folder,
+                                   typing: agent.command(runtime: runtime, port: server.settings.port)))
+        showDrawer(.terminal)
+        NSApp.activate()
     }
 
     func copyAPIAddress() {

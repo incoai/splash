@@ -86,8 +86,8 @@ final class TerminalSession: Identifiable {
     @ObservationIgnored let view: LocalProcessTerminalView
     @ObservationIgnored private var delegate: Delegate?
 
-    init(shell: Shell, environment: [String: String]) {
-        let folder = URL.homeDirectory
+    /// Starts `shell` in `folder`, typing `typing` into it once, as a command a user typed.
+    init(shell: Shell, environment: [String: String], folder: URL = .homeDirectory, typing: String? = nil) {
         title = folder.lastPathComponent
         view = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 280))
         view.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
@@ -105,6 +105,8 @@ final class TerminalSession: Identifiable {
         // Only the app holds the terminal's master, not the shells started after this one, nor what
         // they leave running: the app's end hangs this shell up, however it ends.
         _ = fcntl(view.process.childfd, F_SETFD, FD_CLOEXEC)
+        // The shell reads it once it starts, as what was typed ahead.
+        if let typing { view.send(txt: typing + "\n") }
     }
 
     /// Paints it in the window's appearance: the text and background of a text view.

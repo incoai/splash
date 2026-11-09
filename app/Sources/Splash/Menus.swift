@@ -65,8 +65,15 @@ struct MenuBarPanel: View {
             if server.phase == .ready {
                 PanelRow(title: "Coding Agents", open: agents) { withAnimation(Motion.settle) { agents.toggle() } }
                 if agents {
+                    // In the window's drawer, which comes forward; a folder is asked for first.
                     ForEach(Agent.allCases) { agent in
-                        PanelRow(title: "\(agent.title)…", indent: true) { state.open(agent) }
+                        PanelRow(title: state.agentFolder == nil ? "\(agent.title)…" : agent.title, indent: true) {
+                            openWindow(id: "main")
+                            state.open(agent)
+                        }
+                    }
+                    PanelRow(title: "Choose Folder…", shortcut: state.agentFolder?.lastPathComponent, indent: true) {
+                        state.chooseAgentFolder()
                     }
                     CopyButton(copy: state.copyAPIAddress) { PanelLabel(title: "Copy API Address", indent: true, check: $0) }
                         .buttonStyle(.hoverFlush)

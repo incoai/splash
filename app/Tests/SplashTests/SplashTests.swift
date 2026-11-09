@@ -1179,17 +1179,27 @@ struct ModelFamilyTests {
 }
 
 struct AgentTests {
-    @Test func runsInTheFolderPickedWithTheServersKey() {
-        let runtime = Runtime(root: URL(filePath: "/opt/splash"))
-        let folder = URL(filePath: "/tmp/it's a project")
-        let script = Agent.claude.script(runtime: runtime, port: 8100, folder: folder)
-        #expect(script.hasPrefix("#!/bin/sh\nrm -f -- \"$0\"\n"))
-        #expect(script.contains(#"cd '/tmp/it'\''s a project' || exit"#))
-        #expect(script.contains(#"'claude' '--port' '8100'"#))
-        #expect(script.contains("'-I' '-B' '-u'"))
-        #expect(!script.contains("SPLASH_API_KEY"))
-        #expect(Agent.claude.script(runtime: runtime, port: 8100, folder: folder, apiKey: "k'ey")
-            .contains(#"export SPLASH_API_KEY='k'\''ey'"#))
+    /// An agent's command line runs this runtime's `splash` on the server's port, each word quoted
+    /// for the shell that types it.
+    @Test func runsThisRuntimesSplashOnTheServersPort() {
+        let runtime = Runtime(root: URL(filePath: "/opt/it's splash"))
+        let command = Agent.claude.command(runtime: runtime, port: 8100)
+        #expect(command.hasPrefix(#"'/opt/it'\''s splash/.venv/bin/python' '-I' '-B' '-u'"#))
+        #expect(command.hasSuffix(#"'claude' '--port' '8100'"#))
+    }
+
+    /// An agent opens in a new terminal of the drawer, which shows, in the agents' folder.
+    @MainActor @Test func opensInADrawerTerminalInTheAgentsFolder() throws {
+        let fake = try FakeRuntime("splash-agent", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        let folder = fake.root.appending(path: "project")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        state.agentFolder = folder
+        state.open(.claude)
+        #expect(state.drawer.terminals.count == 1 && state.drawer.terminals[0].title == "project")
+        #expect(state.showsDrawer && state.drawer.part == .terminal)
     }
 }
 

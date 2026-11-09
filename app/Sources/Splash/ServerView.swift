@@ -434,18 +434,23 @@ private func tokens(_ count: Int) -> String {
     "\(count.formatted()) \(count == 1 ? "token" : "tokens")"
 }
 
-/// The coding agents to open in Terminal on the model that runs, and its API address to copy.
+/// The coding agents to open on the model that runs, in the drawer's terminals, in the folder they
+/// work in, which it names; that folder to choose; and the model's API address to copy.
 private struct AgentsPopup: View {
     @Environment(AppState.self) private var state
-    private static let copy = "copy"
+    private static let folder = "folder", copy = "copy"
 
     var body: some View {
-        PopupMenu(header: "Open in Terminal",
-                  items: Agent.allCases.map { PopupItem(id: $0.rawValue, title: "\($0.title)…") }
-                      + [PopupItem(id: Self.copy, title: "Copy API Address", separated: true)],
+        let folder = state.agentFolder?.lastPathComponent
+        PopupMenu(header: folder.map { "Open in \($0)" } ?? "Open in a Terminal",
+                  items: Agent.allCases.map { PopupItem(id: $0.rawValue, title: folder == nil ? "\($0.title)…" : $0.title) }
+                      + [PopupItem(id: Self.folder, title: "Choose Folder…", separated: true),
+                         PopupItem(id: Self.copy, title: "Copy API Address", separated: true)],
                   chosen: nil, above: true) { choice in
             if let agent = Agent(rawValue: choice) {
                 state.open(agent)
+            } else if choice == Self.folder {
+                state.chooseAgentFolder()
             } else {
                 state.copyAPIAddress()
             }
@@ -458,7 +463,7 @@ private struct AgentsPopup: View {
             .padding(.vertical, 5)
         }
         .fixedSize()
-        .help("Open a coding agent in Terminal, connected to this model")
+        .help("Open a coding agent in a terminal of the drawer, connected to this model")
     }
 }
 

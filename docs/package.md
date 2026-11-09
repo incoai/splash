@@ -83,9 +83,9 @@ as it launches, the app reads that shell's `HF_` variables, the cache's and the
 token's among them, for every program it runs. The app offers
 `install/suggested-models.tsv`, per model the variant meant for the Mac's
 memory with its download size and a few words about the model, and starts
-coding agents with `splash AGENT --port PORT` in Terminal, in a folder the user
-picks, from a script that holds the running server's API key and removes itself
-as it starts. Its launch options are every option `splash serve` takes but the
+coding agents with `splash AGENT --port PORT`, typed into a new terminal of the
+window's drawer in the folder the agents work in, the last one chosen, whose
+environment holds the running server's API key. Its launch options are every option `splash serve` takes but the
 ones of one model (`--revision`, `--draft-model`, `--mmproj`) and the ones it
 sets itself, from one table (`LaunchOption.all`) the tests hold to `splash
 serve --help`. It offers a model only those its family can use, and passes
