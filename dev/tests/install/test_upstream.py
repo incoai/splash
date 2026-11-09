@@ -24,6 +24,7 @@ from dev.tests.installer_fixtures import (
     MOE,
     PROCESSOR,
     FakeHub,
+    blob_bytes,
     cached_snapshot,
     draft_dir,
     fake_hub,
@@ -1134,7 +1135,8 @@ class UpstreamTest(unittest.TestCase):
         fake = fake_hub(self, self.cache)
         chosen = selection(self.root)
         output, _ = self.prepare(chosen)
-        self.assertIn("Fetching 4 file(s), 0.00 GB, from " + MODEL, output)
+        # config.json downloaded first, for the inspection.
+        self.assertIn("Fetching 3 file(s), 0.00 GB, from " + MODEL, output)
         old = chosen.link.resolve()
         fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
         fake.requests.clear(), fake.downloads.clear()
@@ -1660,9 +1662,23 @@ class UpstreamTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return upstream.remove(chosen)
 
-    @staticmethod
-    def size(folder):
-        return sum(file.stat().st_size for file in folder.rglob("*") if file.is_file())
+    def run_installer(self, *arguments):
+        """models.main's status, JSON events and warnings, for arguments after
+        the models root and MODEL, text only."""
+        argv = ["--models", str(self.root / "models"), "--model", MODEL]
+        with (
+            mock.patch.object(hub, "json_progress", False),
+            mock.patch("huggingface_hub.utils.disable_progress_bars"),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            contextlib.redirect_stderr(io.StringIO()) as warnings,
+        ):
+            status = models.main([*argv, "--language-only", *arguments])
+        events = [
+            json.loads(line)
+            for line in output.getvalue().splitlines()
+            if line.startswith("{")
+        ]
+        return status, events, warnings.getvalue()
 
     def test_remove_frees_the_files_only_its_installation_used(self):
         # Two models of one family share its draft: removing one leaves the
@@ -1675,15 +1691,16 @@ class UpstreamTest(unittest.TestCase):
         self.prepare(first)
         self.prepare(second)
         target = self.cache / hub.folder_name(MODEL)
-        size = self.size(target / "snapshots")
+        size = blob_bytes(self.cache, MODEL)
         self.assertEqual(self.remove(first), size)
         self.assertFalse(first.link.is_symlink() or target.exists())
         verified = assembly.verify(second.link)
         self.assertEqual(verified["sources"]["target"]["repo"], other)
         self.assertEqual(pins(self.cache), sorted(["c" * 40, DRAFT_COMMIT]))
-        self.remove(second)
+        size = blob_bytes(self.cache)
+        self.assertEqual(self.remove(second), size)
         self.assertEqual(pins(self.cache), [])
-        self.assertFalse((self.cache / hub.folder_name(DENSE.draft_repo)).exists())
+        self.assertEqual(list(self.cache.iterdir()), [])
         self.assertEqual(list((self.root / "models" / ".resolved").glob("*")), [])
         with self.assertRaisesRegex(models.ModelError, "is not installed"):
             self.remove(first)
@@ -1705,7 +1722,7 @@ class UpstreamTest(unittest.TestCase):
         elsewhere.parent.mkdir(parents=True)
         elsewhere.write_text(snapshot.name)
         draft = self.cache / hub.folder_name(DENSE.draft_repo)
-        size = self.size(draft / "snapshots")
+        size = blob_bytes(self.cache, DENSE.draft_repo)
         self.assertEqual(self.remove(chosen), size)
         self.assertTrue(any(snapshot.iterdir()))
         self.assertFalse(draft.exists())
@@ -1714,19 +1731,12 @@ class UpstreamTest(unittest.TestCase):
         fake_hub(self, self.cache)
         chosen = selection(self.root)
         self.prepare(chosen)
-        size = sum(self.size(snapshots) for snapshots in self.cache.glob("*/snapshots"))
-        arguments = ["--models", str(chosen.models_root), "--model", MODEL]
-        with contextlib.redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(models.main([*arguments, "--language-only", "remove"]), 0)
+        size = blob_bytes(self.cache)
         self.assertEqual(
-            json.loads(output.getvalue()), {"event": "removed", "bytes": size}
+            self.run_installer("remove"), (0, [{"event": "removed", "bytes": size}], "")
         )
-        with (
-            contextlib.redirect_stdout(io.StringIO()) as output,
-            contextlib.redirect_stderr(io.StringIO()),
-        ):
-            self.assertEqual(models.main([*arguments, "--language-only", "remove"]), 1)
-        self.assertEqual(json.loads(output.getvalue())["event"], "error")
+        status, events, _ = self.run_installer("remove")
+        self.assertEqual((status, [event["event"] for event in events]), (1, ["error"]))
 
     def test_pins_are_required_before_publishing(self):
         fake_hub(self, self.cache)
