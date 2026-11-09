@@ -17,6 +17,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -623,42 +624,6 @@ struct ShortOfBoth {
   Spilling spill;
 };
 
-// What a 64K start refused at its start for want of memory and of the SSD cache names of memory, as
-// capacity_exhausted does: its Resident lane of 65,473 tokens at its start, the Metal memory outside the
-// engine's buffers, and the bytes its least start needs, its prompt and the rows of the decode step after
-// it in eight Full extents with its state, less than a page, beside fewer that memory has for it.
-bool namesTheMemoryShortfall(const std::string &message) {
-  const uint64_t extents = 8 * 256 * FlashNextLanes::kPages.fullBytes;
-  const std::string lane = "; the request, a Resident lane of 65473 tokens at its start, does not fit in the "
-                           "memory this server may use beside device_untracked_bytes=";
-  const std::string needs = ": it needs memory_needed_bytes=", has = ", where memory_available_bytes=";
-  const size_t at = message.find(needs), there = message.find(has);
-  if (message.find(lane) == std::string::npos || at == std::string::npos || there == std::string::npos)
-    return false;
-  const uint64_t needed = std::stoull(message.substr(at + needs.size()));
-  return needed >= extents && needed < extents + FlashNextLanes::kPages.fullBytes &&
-         std::stoull(message.substr(there + has.size())) < needed;
-}
-
-// A start alone that cannot spill, the SSD cache's room short of its projection or the tier closed,
-// and whose prompt memory does not hold now is refused at its start, naming what memory and the SSD
-// cache have for it, rather than start Resident and fail partway through its prefill.
-void testALoneStartMemoryCannotHoldIsRefusedAtItsStart() {
-  for (const bool closed : {false, true}) {
-    ShortOfBoth both(400ULL << 20);
-    Spilling &spill = both.spill;
-    spill.tier.writableFile = !closed;
-    spill.engine.submit(Spilling::prompt(1, 1, 2'046, 200));
-    spill.runUntilIdle();
-    const std::string message = spill.events.failureDetails.empty() ? "" : spill.events.failureDetails.front().first;
-    require(spill.events.failures == std::vector<std::string>{closed ? "capacity_exhausted" : "kv_disk_quota"} &&
-                spill.model.prefillChunks[1] == 0 && namesTheMemoryShortfall(message),
-            std::string("a start alone that neither memory nor the SSD cache holds was not refused at its start "
-                        "naming both") +
-                (closed ? " while the tier took no writes: " : " for a short quota: ") + message);
-  }
-}
-
 // The ways the SSD cache cannot take a start: its room short of the projection, as ShortOfBoth's 1,000
 // slots are of a 64K prompt's 2,047 pages; the tier closed; or the daily write budget spent, which a
 // write of another writer's (a state in use) overdrew until it refills in 6 hours.
@@ -679,6 +644,46 @@ std::string unspillable(Unspillable way) {
 }
 std::string failureDetail(const Events &events) {
   return events.failureDetails.empty() ? std::string() : ": " + events.failureDetails.front().first;
+}
+
+// What a 64K start refused at its start for want of memory and of the SSD cache names of memory, as
+// capacity_exhausted does: its Resident lane of 65,473 tokens at its start, the Metal memory outside the
+// engine's buffers, and the bytes its least start needs, its prompt and the rows of the decode step after
+// it in eight Full extents with its state, less than a page, beside fewer that memory has for it.
+bool namesTheMemoryShortfall(const std::string &message) {
+  const uint64_t extents = 8 * 256 * FlashNextLanes::kPages.fullBytes;
+  const std::string lane = "; the request, a Resident lane of 65473 tokens at its start, does not fit in the "
+                           "memory this server may use beside device_untracked_bytes=";
+  const std::string needs = ": it needs memory_needed_bytes=", has = ", where memory_available_bytes=";
+  const size_t at = message.find(needs), there = message.find(has);
+  if (message.find(lane) == std::string::npos || at == std::string::npos || there == std::string::npos)
+    return false;
+  const uint64_t needed = std::stoull(message.substr(at + needs.size()));
+  return needed >= extents && needed < extents + FlashNextLanes::kPages.fullBytes &&
+         std::stoull(message.substr(there + has.size())) < needed;
+}
+
+// A start alone that cannot spill and whose prompt memory does not hold now is refused at its start,
+// naming what memory and the SSD cache have for it, rather than start Resident and fail partway through
+// its prefill: kv_disk_quota for a short quota, capacity_exhausted for a closed tier, kv_write_budget
+// with the 6 hours until the budget covers what spilling requests were promised for a spent one.
+void testALoneStartMemoryCannotHoldIsRefusedAtItsStart() {
+  for (const Unspillable way : kUnspillable) {
+    ShortOfBoth both(400ULL << 20);
+    Spilling &spill = both.spill;
+    cannotSpill(spill, way);
+    spill.engine.submit(Spilling::prompt(1, 1, 2'046, 200));
+    spill.runUntilIdle();
+    const std::string message = spill.events.failureDetails.empty() ? "" : spill.events.failureDetails.front().first;
+    const std::string code = way == Unspillable::Quota    ? "kv_disk_quota"
+                             : way == Unspillable::Closed ? "capacity_exhausted"
+                                                          : "kv_write_budget";
+    require(spill.events.failures == std::vector<std::string>{code} && spill.model.prefillChunks[1] == 0 &&
+                spill.events.retryAfters == std::vector<uint32_t>{way == Unspillable::WriteBudget ? 21'600U : 0U} &&
+                namesTheMemoryShortfall(message),
+            "a start alone that neither memory nor the SSD cache holds was not refused at its start naming both" +
+                unspillable(way) + failureDetail(spill.events));
+  }
 }
 
 // A start alone that cannot spill, whose prompt memory holds but not its projection, starts Resident
@@ -734,24 +739,49 @@ void testALoneStartMemoryCannotHoldTakesTheQuotasBound() {
               (spill.events.failureDetails.empty() ? std::string() : spill.events.failureDetails.front().first));
 }
 
-// Beside a lane in service, a start that cannot spill and whose Resident KV that lane keeps memory
-// from holding waits for it to end, then starts and decodes: it never prefills beside it.
+// Beside a lane in service, a start that cannot spill, its quota short, its tier closed or its write
+// budget spent, and whose Resident KV that lane keeps memory from holding waits for it to end, then starts
+// and decodes: it never prefills beside it.
 void testAStartMemoryCannotHoldBesideALaneWaitsForIt() {
-  ShortOfBoth both(1'200ULL << 20);
+  for (const Unspillable way : kUnspillable) {
+    ShortOfBoth both(1'200ULL << 20);
+    Spilling &spill = both.spill;
+    cannotSpill(spill, way);
+    spill.engine.submit(Spilling::prompt(1, 1, 1'000, 100));
+    spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the first lane did not decode");
+    spill.engine.submit(Spilling::prompt(2, 2, 2'046, 50));
+    bool beside = false;
+    spill.runUntil(
+        [&] {
+          beside = beside || (spill.events.completedCount == 0 && spill.model.prefillChunks[2] > 0);
+          return idle(spill.engine);
+        },
+        "the requests did not end");
+    require(!beside && spill.events.completedCount == 2 && spill.events.failures.empty() &&
+                spill.events.usage.at(2).second == 50,
+            "a start memory could not hold beside a lane prefilled beside it, or did not decode after it" +
+                unspillable(way) + failureDetail(spill.events));
+  }
+}
+
+// Beside a lane in service, a start the closed tier refuses whose prompt memory does not hold even
+// alone waits for that lane and is decided once it ends: refused at its start, naming what memory has
+// for it, never prefilled.
+void testAStartMemoryNeverHoldsIsDecidedOnceTheLaneEnds() {
+  ShortOfBoth both(800ULL << 20);
   Spilling &spill = both.spill;
+  spill.tier.writableFile = false;
   spill.engine.submit(Spilling::prompt(1, 1, 1'000, 100));
   spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the first lane did not decode");
   spill.engine.submit(Spilling::prompt(2, 2, 2'046, 50));
-  bool beside = false;
-  spill.runUntil(
-      [&] {
-        beside = beside || (spill.events.completedCount == 0 && spill.model.prefillChunks[2] > 0);
-        return idle(spill.engine);
-      },
-      "the requests did not end");
-  require(!beside && spill.events.completedCount == 2 && spill.events.failures.empty() &&
-              spill.events.usage.at(2).second == 50,
-          "a start memory could not hold beside a lane prefilled beside it, or did not decode after it");
+  spill.runUntil([&] { return spill.events.failedCount != 0; }, "the start was not refused");
+  require(spill.events.completedCount == 1 && spill.events.usage.at(1).second == 100 &&
+              spill.events.failures == std::vector<std::string>{"capacity_exhausted"} &&
+              spill.model.prefillChunks[2] == 0 &&
+              namesTheMemoryShortfall(spill.events.failureDetails.front().first),
+          "a start memory does not hold even alone was not refused at its start once the lane beside it ended" +
+              failureDetail(spill.events));
+  spill.runUntilIdle();
 }
 
 // Beside a lane of a lower priority, the same start makes that lane yield, as a start refused memory
@@ -1483,28 +1513,160 @@ void testSpillMovesThroughTheHostPause() {
           "a Spill prompt kept its landed pages Full under the host's pause until the engine's limit");
 }
 
-// Under critical pressure, which refuses every allocation the host's rule judges, a Spill lane's landed pages
-// still move past the Index runway: the Full extents each runway's moves empty leave and pay for the next Index
-// extent (MemoryGovernor::fund).
-void testLandedPagesSpillAtCriticalPressure() {
-  Spilling spill{4'096, true, 100'000, 0, Spilling::Extent{256}, {}, {}, true, FlashNextLanes::kPages};
-  const auto fullBytes = [&] {
+// A governed Spill lane in Flash-Next's proportions that decodes with its kPages pages past the dense history and
+// the window, three extents of them, not yet copied: their copies land once a test allows spill writes.
+struct LandingLane {
+  static constexpr uint32_t kPages = 3 * 256;
+  LandingLane() {
+    spill.allowSpillWrites(false);
+    spill.engine.submit(Spilling::prompt(1, 1, kPages + 2, 4'096));
+    spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the lane did not decode");
+  }
+  [[nodiscard]] uint64_t fullBytes() const {
     const KvPoolSnapshot pool = spill.pool.snapshot();
     return pool.allocatedBytes - pool.index.allocatedBytes;
+  }
+  Spilling spill{4'096, true, 100'000, 0, Spilling::Extent{256}, {}, {}, true, FlashNextLanes::kPages};
+};
+
+// Under critical pressure, which refuses every allocation the host's rule judges, a Spill lane's landed pages
+// still move past the Index runway, and so they do with Metal memory outside the engine's buffers holding the charge
+// over the engine's limit: the Full extents each runway's moves empty leave and pay for the next Index extent past
+// both (MemoryGovernor::fund), and the runway stands again once the moves end.
+void testLandedPagesSpillAtCriticalPressure() {
+  for (const bool overLimit : {false, true}) {
+    LandingLane lane;
+    Spilling &spill = lane.spill;
+    const uint64_t full = lane.fullBytes();
+    // Over the limit by all the lane's Full extents hold, the charge stays
+    // over it once the moves have released three of them.
+    if (overLimit) {
+      const uint64_t limit = test::GovernorLimits{}.limitBytes;
+      spill.host.memory.holdUntracked(limit - std::min(limit, spill.host.memory.total()) + full);
+    }
+    spill.host.setPressure(MemoryPressure::Critical);
+    spill.allowSpillWrites(true);
+    const std::string where = overLimit ? ", the charge over the engine's limit" : "";
+    const std::string stayed =
+        "under critical pressure the landed pages stayed Full once the Index runway was used" + where;
+    spill.runUntil([&] { return spill.cache.spillSnapshot().spilledPages >= LandingLane::kPages; }, stayed.c_str());
+    require(lane.fullBytes() + LandingLane::kPages * FlashNextLanes::kPages.fullBytes <= full &&
+                spill.pool.freePageCount(kv::PageForm::Index) >= spill.pool.extentPages() &&
+                spill.events.failures.empty() && spill.engine.snapshot().resourceSuspensions == 0,
+            "the moves kept the Full extents they emptied or left the Index runway short, or the lane failed or "
+            "yielded" + where);
+  }
+}
+
+// A refill the driver denies keeps what the moves released: the allocation's next attempt, once the ledger has freed
+// what costs nothing, pays for it with those bytes under critical pressure, and the moves go on past the runway.
+void testADriverDeniedRefillKeepsWhatTheMovesReleased() {
+  LandingLane lane;
+  Spilling &spill = lane.spill;
+  // The next lane's pooled buffers, which free() takes at once under
+  // critical pressure: the denied refill's allocation tries again.
+  poolTheNextLanesBuffers(spill, 64ULL << 20);
+  // The driver denies the first refill of an Index runway the moves used up.
+  bool denied = false;
+  spill.storage.driverDenies = [&](kv::PageForm form) {
+    return form == kv::PageForm::Index && !spill.pool.freePageCount(kv::PageForm::Index) &&
+           !std::exchange(denied, true);
   };
-  // Three extents of pages past the dense history and the window, with no
-  // copies until the lane decodes.
-  spill.allowSpillWrites(false);
-  spill.engine.submit(Spilling::prompt(1, 1, 3 * 256 + 2, 4'096));
-  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the lane did not decode");
-  const uint64_t full = fullBytes();
   spill.host.setPressure(MemoryPressure::Critical);
+  // Every copy lands at once, so the first moves use the whole runway.
+  spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 1024;
+  spill.runUntil([&] { return spill.cache.spillSnapshot().spilledPages >= LandingLane::kPages; },
+                 "a refill the driver denied lost what the moves had released: the landed pages stayed Full");
+  require(denied && spill.events.failures.empty() && spill.engine.snapshot().resourceSuspensions == 0,
+          "the driver denied no refill, or the lane failed or yielded");
+}
+
+// Under critical pressure a runway whose moves empty no Full extent, a write in flight holding a page in each, pays
+// for no refill: the moves wait, and once those writes land and the extents can empty, every landed page moves, with
+// no failure or yield.
+void testMovesThatEmptyNoFullExtentWaitAtCriticalPressure() {
+  LandingLane lane;
+  Spilling &spill = lane.spill;
+  // Past the dense history, the first page of the lane in each extent.
+  std::set<uint32_t> held, extents;
+  const std::span<const uint32_t> pages = spill.cache.pageTable(1).pages;
+  for (size_t index = 1; index + 1 < pages.size(); ++index)
+    if (extents.insert(pages[index] / spill.pool.extentPages()).second)
+      held.insert(pages[index]);
+  // Ticks on, landing every transfer but the writes of the held pages.
+  const auto runUntil = [&](const std::function<bool()> &done, const char *message) {
+    for (uint32_t step = 0; step < 2000 && !done(); ++step) {
+      static_cast<void>(spill.engine.tick(spill.now++));
+      size_t write = 0;
+      for (const auto &transfer : spill.tier.transfers) {
+        const bool heldWrite = transfer->write && held.contains(spill.tier.writes[write++].page);
+        if (!transfer->finished && transfer->submitted && !heldWrite)
+          transfer->ready = true;
+      }
+    }
+    require(done(), message);
+  };
+  spill.host.setPressure(MemoryPressure::Critical);
+  // Every write starts at once, the held pages' among them.
+  spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 1024;
+  runUntil([&] { return spill.cache.spillSnapshot().spilledPages >= spill.pool.extentPages(); },
+           "the landed pages did not take the Index runway");
+  // A hundred ticks on, the moves still wait.
+  const double waited = spill.now + 100;
+  runUntil([&] { return spill.now >= waited; }, "the engine stopped ticking");
+  require(spill.cache.spillSnapshot().spilledPages == spill.pool.extentPages() && extents.size() == 4,
+          "the moves went past the Index runway with no Full extent emptied to pay for it: " +
+              std::to_string(spill.cache.spillSnapshot().spilledPages) + " spilled, extents " +
+              std::to_string(extents.size()));
+  held.clear();
+  runUntil([&] { return spill.cache.spillSnapshot().spilledPages >= LandingLane::kPages; },
+           "once the writes in flight landed, the landed pages stayed Full under critical pressure");
+  require(spill.events.failures.empty() && spill.engine.snapshot().resourceSuspensions == 0,
+          "the lane failed or yielded while its moves waited");
+}
+
+// Under critical pressure a prefilling Spill prompt's moves keep no empty Full extent for it to grow into: only the
+// extents they release pay for the next Index extent (Engine::landedExtents), so its landed pages move past the
+// Index runway. Once memory refuses its KV the prompt yields, and it resumes and completes once the pressure lifts.
+void testASpillingPromptKeepsNoFullExtentAtCriticalPressure() {
+  Spilling spill{4'096, true, 100'000, 0, Spilling::Extent{256}, {}, {}, true, FlashNextLanes::kPages};
+  const uint64_t extent = uint64_t{spill.pool.extentPages()} * FlashNextLanes::kPages.fullBytes;
+  const auto emptyFullExtents = [&] {
+    const KvPoolSnapshot pool = spill.pool.snapshot();
+    return (pool.reclaimableBytes - pool.index.reclaimableBytes) / extent;
+  };
+  // A 64K prompt prefills three extents with no copies.
+  spill.allowSpillWrites(false);
+  spill.engine.submit(Spilling::prompt(1, 1, 2'046, 8));
+  spill.runUntil(
+      [&] { return spill.model.prefillChunks[1] && spill.cache.pageTable(1).pages.size() >= LandingLane::kPages; },
+      "the prompt did not prefill three extents");
+  spill.host.setPressure(MemoryPressure::Critical);
+  // Until it yields, the empty Full extents its moves leave.
+  uint64_t kept = 0;
+  const auto yielded = [&] {
+    if (spill.engine.snapshot().resourceSuspensions)
+      return true;
+    kept = std::max(kept, emptyFullExtents());
+    return false;
+  };
+  // Its copies land at once, and then no more: its KV outgrows its Full
+  // pages, which critical pressure grows by none.
+  spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 1024;
+  spill.runUntil([&] { return yielded() || spill.cache.spillSnapshot().spilledPages > spill.pool.extentPages(); },
+                 "the prompt's landed pages did not take the Index runway");
+  const uint32_t moved = spill.cache.spillSnapshot().spilledPages;
+  spill.allowSpillWrites(false);
+  spill.runUntil(yielded, "the prompt did not yield under critical pressure");
+  spill.host.setPressure(MemoryPressure::Normal);
   spill.allowSpillWrites(true);
-  spill.runUntil([&] { return spill.cache.spillSnapshot().spilledPages >= 3 * 256; },
-                 "under critical pressure the landed pages stayed Full once the Index runway was used");
-  require(fullBytes() + 3 * 256 * FlashNextLanes::kPages.fullBytes <= full && spill.events.failures.empty() &&
-              spill.engine.snapshot().resourceSuspensions == 0,
-          "the moves kept the Full extents they emptied, or the lane failed or yielded");
+  spill.runUntilIdle();
+  require(moved > spill.pool.extentPages() && kept == 0,
+          "under critical pressure the prompt's landed pages stayed Full once the Index runway was used, or its "
+          "moves kept a Full extent they emptied: " +
+              std::to_string(moved) + " moved, " + std::to_string(kept) + " kept");
+  require(spill.events.completedCount == 1 && spill.events.failures.empty(),
+          "the prompt that yielded under critical pressure failed or did not complete");
 }
 
 // A suspended Spill request returns its commitment and commits again on resume; a short quota
@@ -3762,6 +3924,7 @@ std::span<const test::TestCase> spillTests() {
       {"testALoneStartTakesMemorysBound", testALoneStartTakesMemorysBound},
       {"testALoneStartMemoryCannotHoldTakesTheQuotasBound", testALoneStartMemoryCannotHoldTakesTheQuotasBound},
       {"testAStartMemoryCannotHoldBesideALaneWaitsForIt", testAStartMemoryCannotHoldBesideALaneWaitsForIt},
+      {"testAStartMemoryNeverHoldsIsDecidedOnceTheLaneEnds", testAStartMemoryNeverHoldsIsDecidedOnceTheLaneEnds},
       {"testAStartMemoryCannotHoldBesideALowerLaneMakesItYield",
        testAStartMemoryCannotHoldBesideALowerLaneMakesItYield},
       {"testALanesGrowthConvertsNoOtherLane", testALanesGrowthConvertsNoOtherLane},
@@ -3789,6 +3952,10 @@ std::span<const test::TestCase> spillTests() {
       {"testSpilledFullExtentsLeaveOnceNoPromptGrows", testSpilledFullExtentsLeaveOnceNoPromptGrows},
       {"testSpillMovesThroughTheHostPause", testSpillMovesThroughTheHostPause},
       {"testLandedPagesSpillAtCriticalPressure", testLandedPagesSpillAtCriticalPressure},
+      {"testADriverDeniedRefillKeepsWhatTheMovesReleased", testADriverDeniedRefillKeepsWhatTheMovesReleased},
+      {"testMovesThatEmptyNoFullExtentWaitAtCriticalPressure", testMovesThatEmptyNoFullExtentWaitAtCriticalPressure},
+      {"testASpillingPromptKeepsNoFullExtentAtCriticalPressure",
+       testASpillingPromptKeepsNoFullExtentAtCriticalPressure},
       {"testSpillResumeCommitsAgain", testSpillResumeCommitsAgain},
       {"testABoundAtStartAndResumeCountsOnce", testABoundAtStartAndResumeCountsOnce},
       {"testSpillResumeOnAClosedTier", testSpillResumeOnAClosedTier},
