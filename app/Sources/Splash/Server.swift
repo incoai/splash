@@ -636,8 +636,8 @@ struct ServedRequest: Equatable, Identifiable {
 
     /// `requests` with `line` taken, as it came `now`: a request's start adds its row, unless the
     /// status had it first, which it moves on to reading where the status had it no further; its
-    /// end ends its row, or adds one ended where it was never seen; a line that names no request
-    /// adds a row of its own.
+    /// end ends its row, or adds one ended where it was never seen; an end that names no request
+    /// adds a row of its own, as nothing else could end it.
     static func taking(_ line: RequestEntry, at now: Date, into requests: [ServedRequest]) -> [ServedRequest] {
         var requests = requests
         let index = line.request.flatMap { id in requests.firstIndex { $0.id == id } }

@@ -758,7 +758,7 @@ struct ServerTests {
         rows = ServedRequest.taking(try line("12:00:09 Done · request 2 · input 8,193 · cached 0 · output 33"), at: at(9), into: rows)
         #expect(rows.map(\.id) == [1, 2, -1] && rows.allSatisfy { $0.end != nil })
         #expect(rows[2].end?.message == "not_found · HEAD /api/hello" && rows[2].time == "12:00:06")
-        // An earlier server's lines name no request: its ends are rows of their own, its starts none.
+        // A line that names no request: an end is a row of its own, a start none, as nothing could end it.
         let earlier = ServedRequest.taking(try line("12:01:00 Started · input 5 · cached 0"), at: at(60), into: [])
         #expect(earlier.isEmpty)
         #expect(ServedRequest.taking(try line("12:01:02 Done · input 5 · cached 0 · output 1"), at: at(62), into: earlier).map(\.id) == [-1])
@@ -1520,10 +1520,11 @@ struct ChatTests {
         #expect(problem([image, image, image, pdf("a.pdf", bytes: 400)]) == "The attachments are larger than one message to the model takes")
     }
 
-    /// A conversation keeps its attachments as files of their own: the images an earlier app kept
-    /// inside its messages move into files as it is read, in their order, the conversation written
-    /// again without them; a file no conversation names goes at the sweep, unless a conversation
-    /// that can't be read may name it; and a conversation deleted takes its files.
+    /// A conversation keeps its attachments as files of their own: once the app adopts the files
+    /// (`adoptFiles`), the images an earlier app kept inside its messages move into files, in their
+    /// order, the conversation written again without them, and a file no conversation names goes,
+    /// unless a conversation that can't be read may name it; and a conversation deleted takes its
+    /// files.
     @MainActor @Test func keepsAttachmentsAsFilesOfTheirOwn() throws {
         let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -1564,6 +1565,29 @@ struct ChatTests {
         store.delete([id])
         store.flush()
         #expect(attachments.allSatisfy { !FileManager.default.fileExists(atPath: store.attachments.appending(path: $0.file).path) })
+    }
+
+    /// A launch that can't go on, as on a Mac Splash can't run on, leaves the chats as the app that
+    /// goes on running reads them: only the Splash that stays moves their images into files.
+    @MainActor @Test func aBlockedLaunchLeavesTheChatsAsTheyAre() async throws {
+        let fake = try FakeRuntime("splash-blocked", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let engine = Runtime(root: fake.root).engine
+        try FileManager.default.createDirectory(at: engine.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "#!/bin/sh\necho 'error: no Metal GPU' >&2\nexit 1\n".write(to: engine, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: engine.path)
+        try FileManager.default.createDirectory(at: fake.chats, withIntermediateDirectories: true)
+        let id = UUID()
+        let old = #"{"id": "\#(id)", "title": "Old", "updated": 0, "messages": [{"id": "\#(UUID())", "role": "user", "#
+            + #""text": "Look", "reasoning": "", "images": ["\#(Showcase.picture.base64EncodedString())"]}]}"#
+        let file = fake.chats.appending(path: "\(id).json")
+        try Data(old.utf8).write(to: file)
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        await state.launch()
+        #expect(state.blocker != nil)
+        state.chats.flush()
+        #expect(try String(contentsOf: file, encoding: .utf8) == old)
     }
 
     @MainActor @Test func keepsConversationsInTheirFolder() async throws {
