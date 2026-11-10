@@ -1,0 +1,13 @@
+{
+  "frozen_utc": "2026-11-10T07:30:40.449189+00:00",
+  "name": "Gate/up row subdivisions with one shared weight stage",
+  "status": "Sourceimplemented;queuedbuild/oracles/operator/model/profilechecksaftersamplingandbeforefuturetiminggroups. No sharedkernelresultsyet.",
+  "motivation": "IndependentrowSG2reducesM64operator~2.6ms->.88ms butduplicatesweightload/dequant andTGstage. Existingtwo-pass~.82msissimpler/fasterinunpairedscreen. Testwhether sharingonedequantizedgate/upstageacrossrowSGskeepssmallaccumulatorswithoutduplicateweightwork. M32at8rowB3/B4isalsoacandidate.",
+  "design": "TwoSIMDgroups stageoneweighttensoreach:SG0gate,SG1up. All2/4rowSIMDgroups compute bothmatmuls fromthecommon4KiBstage, withwholeTGbarriers beforeuse andbeforerewrite. OneStagedColumn perloader instead ofgate+up perrowSG. Preserve Kwalk/splits, outputrounding,globalrowpartials,onearrivalcounterpercolumntile. AddAF4M32SG2shared,M64SG2/4shared;newresearchhostswitchdefaultoff.",
+  "primary_reference": "https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf",
+  "reference_interpretation": "AppleMPPguide recommends profilingtile/shader-localstorage tradeoffs. ItsdenseGEMMguidanceisnotproofforthisquantizedfusedkernel; registerspillremainsunmeasured. UseoneordinarysharedstagebecausequantizedweightsneeddequantizationbeforeMPP.",
+  "gates": "ExtendindependentFP64/bitwiseguardedoraclewithsharedmodes,32/64rowsandpartial3/4live,splits1..16andspread0/1. ThenproductionN17408K5120operatorscreens,exactsource8/16modeloutputs/profiles. Nominatepolicybeforecontrollednativebatchperformance comparison. No evidenceyet.",
+  "implementation_frozen_utc": "2026-11-10T07:34:11.272936+00:00",
+  "host_control": "SPLASH_GATE_UP_SHARED defaults0;requires existingSUBROWS16or32andAF4format,rows>subrows. Sharedkernelsnamed_sg2/4_shared. TWOPASS64must0toexerciseM64fusedsharedpath. Oldandnewpathsavailableinonebinary/library.",
+  "empty_default_note": "Defaultsingle-SIMDrow0offset is compile-time0;allmathematicalorderunchanged. Newbothdrafters8rowbatchscreensincludelegacyandsharedpolicies."
+}

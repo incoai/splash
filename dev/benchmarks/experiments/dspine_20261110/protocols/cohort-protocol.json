@@ -1,0 +1,11 @@
+{
+  "cohort": "cohort31.txt",
+  "sha256": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf",
+  "provenance": "/Users/linson/Documents/ai/splash-tree-certificate-20261108/probe/prompts31.txt",
+  "cases": 31,
+  "primary": "All cases except predeclared count_secondary; retain it as a high-acceptance control.",
+  "sampling_cohort": "sampling3.txt: three predeclared contexts, cap14, independent seed ranges for distribution tests.",
+  "qualification": "Nominate by correctness/count screens. Freeze source and artifacts before exactly three ABBA groups. Every group must improve beyond max(2%, twice maximum endpoint spread); every included case/control spread <=5%. Retain all failures and no repeat-to-pass.",
+  "scope": "Reused historical DFlash cohort, previously untested on these DSpine candidates; not a new independent benchmark or general model-quality guarantee.",
+  "publication": "Update existing DSpine PR with evidence-backed findings only; no default rollout from unqualified results."
+}

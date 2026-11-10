@@ -1,0 +1,13 @@
+{
+  "frozen_utc": "2026-11-10T05:48:07.785851+00:00",
+  "baseline": "8-rowM16policy; source8-rowGDNunchangedexceptresearchcompactbaseentry.",
+  "hypothesis": "Remove pendingK/V and scalar gates from threadgroup memory; read disjointstablependingtape and currentstepgatesdirectlywith devicebarrier. No extra buffer or GPUcommand. Sharedbytes12384->8192at8rows;24768->16384at16rows. Deviceactual32768Blimitqueriedread-only. Potentialoccupancyimprovement is ahypothesis, notmeasuredcounterdata.",
+  "risk": "Moredevice/L1readsandprivatepointersmayoffsetshared-memorybenefit. PreserveoperationorderandRowsInFlight2; no targetprecisionchange intended.",
+  "scope": "Research-only base16key/48valueheads,BF16norm,FP32state,plainoutputentry. Otherstates,norms,shapes,tablesretainsoriginal. Sourcekeepslegacyalias;nootherGPUperformanceclaim.",
+  "gates": [
+    "Unmodifiedfullgdn-decodesuiteunderMetalvalidation: independentFP64equations,alllanes,pending/replay,typednorms,gate-prefillandplain/tablebitwisechecks.",
+    "Loaded72imagebyteparity;31greedyoutputandcyclecounts;B1-B4decodeandattributedprofiles.",
+    "Noqualificationfromoperatorprofiles. Controlledwhole-modelandheldoutchecksrequiredifnominated."
+  ],
+  "timing_isolation": "Build andallnewGPUjobsareafterbothregisteredtimingcomparisons, beforebaseline sampling."
+}

@@ -1,0 +1,6 @@
+{
+  "frozen_utc": "2026-11-10T06:37:51.883692+00:00",
+  "purpose": "Explain the unpaired GDNmemory-reduction loss with a same-process/same-library legacy-vs-compact operator comparison. No new candidate nomination.",
+  "config": "Base48valueheads,128headDim,BF16norm,FP32state,8rows,B1-B4,pending0/1/4/8. Stablecurrentstate+pendingtape across rounds. Exacthidden/nextstate/fulltape comparison beforetiming.",
+  "timing": "Pipelines prepared first;3untimedpairs. Exactly3ABBAgroups perconfiguration,64identicalprojections perGPUcommand,orderlegacy/compact/compact/legacy. Controlled_round operating gates. Report all cases/noise; operator evidence alone does not qualify whole-model gain."
+}

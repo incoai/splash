@@ -1,0 +1,16 @@
+{
+  "frozen_utc": "2026-11-10T04:50:29.992178+00:00",
+  "candidate": "Trained16-row DSpine prototype with dense-only model guard, whole-head attention query partitions, fixed8-row-control K-split/pass choices and register paths disabled.",
+  "baseline": "8-row DSpine with existing PR653 M16 policy, measured independently in immediately preceding fixed three ABBAgroups. This is the stronger candidate baseline by prior screen, not a claim that its own qualification has already passed.",
+  "cohort_sha256": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf",
+  "groups": 3,
+  "samples_per_case": 1,
+  "order": [
+    "8rowM16",
+    "16row",
+    "16row",
+    "8rowM16"
+  ],
+  "gates": "Identical controlled_round operating gates and qualify_abba primary/noise/output gates as registered M16 protocol. All3 groups required, no repeat-to-pass. Count_secondary remains excluded primary and retained control.",
+  "remaining": "Per-case tradeoffs, heldout12, positive-temperature distribution, concurrency, lifecycle and16-row model compatibility remain separately required. No broad default rollout from serial-cohort pass."
+}

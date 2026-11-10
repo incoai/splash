@@ -1,0 +1,14 @@
+{
+  "observed_utc": "2026-11-10T09:36:13.895179+00:00",
+  "url": "https://github.com/incoai/splash/pull/731#issuecomment-6761876716",
+  "author": "sady4850",
+  "created_utc": "2026-11-10T07:43:00Z",
+  "reported_scope": "Author-reported117712pairedblockson43agenttraces,A100BF16/fakeMLX4target,NeMoDFlash2andTorchDSpineport;referenceagreementreported59/60tokens. Separate7sequenceMLXprecisionprobeonM1. Rawtracesnotprovidedinthecomment;notindependentlyverifiedhere.",
+  "reported_facts": {
+    "DS8_window8192_mean_accept": 4.49,
+    "DF8_mean_accept": 4.03,
+    "DS16_window8192_mean_accept": 5.9,
+    "draft_q4_vs_BF16_accept_ratio_8rows": 0.998
+  },
+  "our_interpretation": "Usefulevidenceagainstassumingbackbonequantizationcausesgap,andforlargertrainedblocks. Differentworkload/targetarithmetic/runtime/hardwarefromour4codingHTTPtests;donotcombinereportedratioswithourM5timings."
+}

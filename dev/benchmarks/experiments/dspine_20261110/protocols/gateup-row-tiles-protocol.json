@@ -1,0 +1,17 @@
+{
+  "frozen_utc": "2026-11-10T04:47:42.427895+00:00",
+  "motivation": "16-row prototype B3/B4 uses M64 gate/up: diagnostic177/185ms of272/306ms cycles (~65%). Hypothesis: smaller per-SIMDgroup accumulator tiles reduce register pressure. Hardware spill not yet measured, so that mechanism remains an inference.",
+  "source_scope": "AF4G64 fused gate/up only, research env0/16/32. Original entrypoints retain one SIMDgroup; add M32sg2, M64sg2, M64sg4. All Ksplit order, output rounding, full-row partial indexing and one arrival counter per column tile are preserved. Other operator families unchanged.",
+  "gates": [
+    "Shader-validated independent FP64 interval checks plus full output bitwise comparison against original for rows32/64, active3/4 orfull rows, K512/1152, spreadsfalse/true and valid splits1..16. Guarded input/output/partial/counter buffers and reset counters.",
+    "Fixed operator screens on production target N17408,K5120, 50 dispatches each; descriptive only, not qualification.",
+    "Default-off12-case model parity, then B1-B4 actual decode outputs/counts for each policy and profiles.",
+    "Nominate a policy after these screens; controlled whole-model and heldout comparisons required before gains."
+  ],
+  "timing_isolation": "All jobs appended after all12 M16ABBArounds; no builds or extra GPU measurements interleaved.",
+  "prebuild_amendment_utc": "2026-11-10T05:18:13.489597+00:00",
+  "additional_control": "Existingtwo-passgate/upforactualdecode>32rows,forcedatthesameKsplits. No newshaderneededforthiscontrol. Kerneloracleincludesone-pass,SG2/SG4andtwo-passoutputsandcountslogicalprojectiontime(two dispatchesfortwo-pass). NativehostenvTWO_PASS64default0;env1changesonlywidegate/uppasschoice. Comparethissimplercontrolbeforenominatingrow-splitkernels.",
+  "sources_amended_before_any_build_or_timing": true,
+  "pipeline_preparation_measurement": "OracleexplicitlytimespreparePipelineswalltimebeforeGPUsubmissionforeachkernel;recordsfirst-useandcache-hitCPUpreparationseparatelyfromfusedGPUprojectiontime.NoglobalGPUcachedisabledorcleared.",
+  "prebuild_measurement_amendment_utc": "2026-11-10T05:21:36.870147+00:00"
+}

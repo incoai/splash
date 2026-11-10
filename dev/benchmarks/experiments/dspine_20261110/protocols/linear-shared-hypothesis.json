@@ -1,0 +1,25 @@
+{
+  "utc": "2026-11-10T08:09:32.989395+00:00",
+  "source_base": "wide-policyfullpatchagainst33a",
+  "design": "Ordinarysingle-tensorAF4stageddecodeonly;rowSIMDgroups16/32reuse64-column8KiBdoubleweightstageviaexistinggguf_staged_steps. KeepKwalk/splits/storageRows/FP32partials/globalcounter/outputepilogues.Fusedmixed-formatkernelsunchanged;defaultoffenvSPLASH_LINEAR_SHARED_ROWS=0|16|32. TwoPass64=1allowsgate/upseparateprojectionstouseit. No newstatisticsnomination;wideexistingcandidateunchanged.",
+  "oracles": "32/64physicalrows,full/3of4live,NaNpadding,prefix/suffixoutputpadding,16splitcounterreuse,all4epiloguesincludingFP32,bitwiseoldkernelplusindependentFP64bounds. ProductionMLP/down/attention/headshapescreens.",
+  "jobs": [
+    "build-linear-shared16-v1",
+    "build-study-linear-shared16-v1",
+    "freeze-linear-shared16-v1",
+    "build-oracle-linear-shared16-v1",
+    "linear-shared16-oracle-shader-v1",
+    "linear-shared16-operator-screen-v1",
+    "linear-shared16-dspine-shader-v1",
+    "linear-shared16-draft-attention-shader-v1",
+    "linear-shared16-pipeline-resources-v1",
+    "linear-shared16-default-cohort31-v1",
+    "linear-shared16-rows0-decode-v1",
+    "profile-linear-shared16-rows0-v1",
+    "linear-shared16-rows16-decode-v1",
+    "profile-linear-shared16-rows16-v1",
+    "linear-shared16-rows32-decode-v1",
+    "profile-linear-shared16-rows32-v1"
+  ],
+  "scope": "Kernelprototype,notproductionorqualifiedgain. Sourcebuildsandtestsafterallcandidate samplingchunks,beforeanybroadernativeABBAgroup. No heavybuildinsidecontrolledtimings."
+}

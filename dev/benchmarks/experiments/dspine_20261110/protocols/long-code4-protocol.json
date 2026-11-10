@@ -1,0 +1,89 @@
+{
+  "frozen_utc": "2026-11-10T08:20:05.844315+00:00",
+  "cohort_sha256": "9b81b6ac0b0ab09f50c97c2eecf6ede6b0c2305f209304fc377cbd1edc933104",
+  "tasks": [
+    {
+      "name": "runtime_cache",
+      "prompt_tokens": 8193,
+      "cap": 256,
+      "question": "Summarize six concrete cache or state-lifetime invariants enforced by this code. Use six short bullet points.",
+      "source_order": [
+        "runtime/model/Runtime.cpp",
+        "runtime/engine/RuntimeResources.mm",
+        "runtime/model/DSpineDraft.cpp",
+        "runtime/model/RuntimeArenas.cpp",
+        "runtime/model/Model.hpp"
+      ],
+      "source_excerpt_tokens": 8144
+    },
+    {
+      "name": "resource_json",
+      "prompt_tokens": 12289,
+      "cap": 256,
+      "question": "Return a JSON object with keys ownership, admission, and cleanup. Each value should be one concise sentence describing this code.",
+      "source_order": [
+        "runtime/engine/RuntimeResources.mm",
+        "runtime/model/DSpineDraft.cpp",
+        "runtime/model/RuntimeArenas.cpp",
+        "runtime/model/Model.hpp",
+        "runtime/model/Runtime.cpp"
+      ],
+      "source_excerpt_tokens": 12239
+    },
+    {
+      "name": "draft_tests",
+      "prompt_tokens": 16385,
+      "cap": 384,
+      "question": "Write a C++ unit-test skeleton for verifying that draft-context state is isolated across request lanes. Return only code.",
+      "source_order": [
+        "runtime/model/DSpineDraft.cpp",
+        "runtime/model/RuntimeArenas.cpp",
+        "runtime/model/Model.hpp",
+        "runtime/model/Runtime.cpp",
+        "runtime/engine/RuntimeResources.mm"
+      ],
+      "source_excerpt_tokens": 16336
+    },
+    {
+      "name": "arena_tests",
+      "prompt_tokens": 8192,
+      "cap": 384,
+      "question": "Write a C++ unit-test skeleton for verifying that all decode lanes use disjoint arena slices. Return only code.",
+      "source_order": [
+        "runtime/model/RuntimeArenas.cpp",
+        "runtime/model/Model.hpp",
+        "runtime/model/Runtime.cpp",
+        "runtime/engine/RuntimeResources.mm",
+        "runtime/model/DSpineDraft.cpp"
+      ],
+      "source_excerpt_tokens": 8144
+    }
+  ],
+  "source_commit": "0a90d7b4caf725ee4f27afcd37f6d827d05a6300",
+  "source_files_sha256": {
+    "runtime/model/Runtime.cpp": "e852d7365c1054cde207d5ebd7fa3287eef0c1921ebb6c57b00bc1213eab7b14",
+    "runtime/engine/RuntimeResources.mm": "8fbfd7ec0876e97a5ef69fdaed0b3e402ca4f0c31b62baf382a6170d26ef21a6",
+    "runtime/model/DSpineDraft.cpp": "50fba52f06f566a09562922ca27eb1c8f409f0d038dd2a0321a30473bb9805be",
+    "runtime/model/RuntimeArenas.cpp": "bc01f27901136e377e2392eb01cfdac4b545e8f9ab992efe144dbd9680f59f08",
+    "runtime/model/Model.hpp": "bcc7489fc7ae04f1aca37e6da40d34c00ce3c37659fa151fcd5d84f2df525d1f"
+  },
+  "source_scope": "Publicrepositorycode,rotatedfileorderandtoken-truncatedexcerpts,wholechatframing/questionspreserved. Not a human-qualityevaluation. These are freshlongcontexts,unseenbeforefreeze.",
+  "comparison": "DF8M16versusDS16existingtwoPass;sameartifacts/settingsasthebroader31shortpromptnativecomparison. ThreefixedABBAgroups,exactarrays+percase/controlnoise<=5%+operating+positiveeffect>max2%/twicenoise;no repeats. All4casesprimary.",
+  "endpoint": "Serialnativecoldrequests;decodewallonlyexcludesprefill/firsttoken. Reportcoldprefillseparatelydescriptive;neitherendpointimpliesconcurrentranking.",
+  "operating_wrapper_sha256": "d7f39e71830985b8a7fffdf409d43e35c35183ca051974bc6ba3b0df9cb9dce5",
+  "jobs": [
+    "native-long-dflash-vs-dspine16-abba-g1-a1",
+    "native-long-dflash-vs-dspine16-abba-g1-b1",
+    "native-long-dflash-vs-dspine16-abba-g1-b2",
+    "native-long-dflash-vs-dspine16-abba-g1-a2",
+    "native-long-dflash-vs-dspine16-abba-g2-a1",
+    "native-long-dflash-vs-dspine16-abba-g2-b1",
+    "native-long-dflash-vs-dspine16-abba-g2-b2",
+    "native-long-dflash-vs-dspine16-abba-g2-a2",
+    "native-long-dflash-vs-dspine16-abba-g3-a1",
+    "native-long-dflash-vs-dspine16-abba-g3-b1",
+    "native-long-dflash-vs-dspine16-abba-g3-b2",
+    "native-long-dflash-vs-dspine16-abba-g3-a2"
+  ],
+  "relation_to_prior_failures": "Distinctsource-codecontexts/nativeendpoint;notarun-to-passofthefailed4codingHTTPcomparison. AllHTTPfailuresremain."
+}

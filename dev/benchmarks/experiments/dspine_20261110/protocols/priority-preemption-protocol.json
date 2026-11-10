@@ -1,0 +1,11 @@
+{
+  "frozen_utc": "2026-11-10T06:57:48.384827+00:00",
+  "reason": "Syntheticlocalgovernorpressureprobev1didnotcauseactualsuspensionwithin5s and failed. It isnotavalidatedsuspensiontest. Newprobeusesdifferentnativeproductionmechanism: prioritypreemptionwhenall4lanesareoccupied.",
+  "method": "For eachof5fixed256tokencases(including15,246tokenprompt),warmsharedprefix,submit4identicalBackgroundrequests. AfterfirstphysicalB4decode,submitunrelatedForegroundone-tokenrequest. NativeadmissionmustpreemptatleastoneBackgroundlane,restore/replayitandresume. NoOSpressureorforeignprocesschanges.",
+  "gates": "ActualprioritySuspensions>=1,resourceResumptions>=1,resourceReplayTokens>0;allfourcomplete256tokenarraysidenticalincludingthepreemptedclone anduninterruptedclones,Foregroundcompletes,Metalvalidationenabled. SavedeCodewidthtraceandallarrays. Anyfailurekept;notaperformancebenchmark.",
+  "limits": "Testspriority-drivenpreemptionandreplay,notproofthatmemorypressure-drivenresumptionswork. Widthchangescancausetargetnumericaldifferences;strictcloneagreement remainsrequiredhere.",
+  "prebuild_foreground_freshness_amendment": {
+    "utc": "2026-11-10T08:32:53.959487+00:00",
+    "reason": "Appendoneordinarytoken1000+(requestidmod1000)totheforegroundprefix,uniqueforcase.ThisforcesfreshmodelworkevenifanearliercasecachedtheFibonacciprefix. Beforefirstcompile/run;allprioritysuspension/replay/outputgatesunchanged."
+  }
+}

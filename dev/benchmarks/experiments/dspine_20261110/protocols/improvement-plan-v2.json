@@ -1,0 +1,73 @@
+{
+  "updated_utc": "2026-11-10T07:25:57.583845+00:00",
+  "recommendation": "First build proper per-model trained16 support for dense DSpine, preserving8-row DFlash2. Keep the wide-gate/up two-pass optimization independently reviewable. Qualify adaptive8/16 only after both geometries share a supported runtime.",
+  "observed_causes": [
+    {
+      "cause": "Useful work per target sweep",
+      "evidence": "Native8 primary31 uses1303cycles;16uses1062 at identical outputs. Freshheldout12 uses1251vs1102. Controlled serial3groups+15.3..16.2% vs8M16.",
+      "mechanism": "At lowbatch, targetweight traffic amortizes over more accepted tokens. Several8row projections already execute16row padded tiles; trained16 can use otherwise padded work. This explains some low incremental cost, alongside weight reuse. Not a hardware-counter proof."
+    },
+    {
+      "cause": "Arithmetic and kernel geometry at concurrency",
+      "evidence": "16rowB4means64rows vs8rowB4means32. Original16M64fusedgate/up alone~185ms of306mscycle. Rowpartition and existingtwo-pass screens reduce this cost; all naive/new16screens still fail B3vsB2 performancegate.",
+      "mechanism": "One-passM64holds two large accumulators perSIMDgroup; registerpressure is a hypothesis. Widerblocks also double realverify arithmetic, even after the pathologicalkernel is fixed."
+    },
+    {
+      "cause": "Acceptance varies by workload",
+      "evidence": "Freshcode/structuredcycle savings substantial; French/Hindi/Arabic/Japanese cycle savings small. Some serialprose regressions in controlled31.",
+      "mechanism": "Extra proposals pay only if accepted-prefix survival reaches them. Greedy8vs16 must be compared at identical contexts before making a causal prefix-survival predictor."
+    },
+    {
+      "cause": "Precision/reference mismatch not main demonstrated lever",
+      "evidence": "FullBF16nativeplanes1289cycles vs4bit1303;8bit1291;3bit1321. Bridge double-round fidelity1305. All31greedyoutputs match.",
+      "mechanism": "No experiment establishes backbone quantization as main acceptance cause. Targetfeature quantization vs BF16training remains a separate, unmeasured question."
+    }
+  ],
+  "implementation_steps": [
+    {
+      "priority": 1,
+      "name": "Per-model geometry",
+      "details": [
+        "Separate maximum capacity16 from actualdraft/verify width8or16; carry explicit typedgeometry from descriptor into model, scheduler/accounting, sampling andops.",
+        "Compile/select8and16specializations with distinct pipeline keys; preserve DF8 and all non-DS model behavior. Max-sized buffers need explicit active-stride semantics, not a global macro swap.",
+        "Keep KVPage32 and8192DScontextwindow; include changed tape/layout geometry in cache/build identities. Test checkpoint suffixes around31/32/33,8191/8192/8193 and longdiskrestore.",
+        "Remove researchglobalregisterdisable only after tableproducer/consumer support. Table16 is physically8rows; decouple its tile width from actualverifyRows. Host sum bytes currently divide byverifyRows and GDNwriter uses rowindex up to15 into8row layout. Either encode two8rowtables per16lane with all matching offsets/consumers, or explicitly reject unsupported layout selection.",
+        "Retain dense Qwen3.8+DSpine guard until other architectures have own geometry qualification."
+      ]
+    },
+    {
+      "priority": 2,
+      "name": "Wide gate/up pass policy",
+      "details": [
+        "Prefer measured existingtwo-pass path if controlledapplication results confirm benefit; it avoids maintaining a newSGkernel.",
+        "Production calibration should constrain measured AF4G64M64 shape/device (this20coreApple10), preserve Ksplits and all<=32row policies. No environment variable in finalselection.",
+        "Keep SG2/SG4 research kernels and bitwise oracles as alternatives if a differentdevice wins; no cross-device claim from thisMac.",
+        "Validate selectiongoldens, partial48/64rows, split-counter reuse, all supported epilogues and shape-specific resource budgets."
+      ]
+    },
+    {
+      "priority": 3,
+      "name": "Adaptive width",
+      "details": [
+        "Start with batch-dependent8/16 policy, then evaluate accepted-prefix history using counts already returned to CPU; no additionalGPUreadback or command.",
+        "Use measured cyclecost bybatch and history, not acceptance ratio alone. If first7behavior agrees, m16<=m8+8*P(full7) gives a conservative upside bound at fixed contexts. Tail acceptance needs calibration.",
+        "Use hysteresis and a minimum sample window to avoidoscillation; account for switching/repacking/composite-state costs.",
+        "Freeze policy on calibrationcohort; use new mixed/concurrent heldout and completionlatency/fairness/contextmemory gates. Do not tune on existingheldout12 or sampling3 outcomes."
+      ]
+    }
+  ],
+  "deprioritized": [
+    "Higher draftprecision: tinycycle gain plus moretraffic.",
+    "Separate2/3bitdrafthead:submillisecondB1saving,530.5MiBextra3bitimage,notfasterB3/B4.",
+    "Direct-device pendingK/V GDNcompact:correct8roworacle but no profilewin; waitpairedoperator results.",
+    "Furtherparallelrefinement/bridgefusion:small remainingwholecycleceiling.",
+    "ShorterDScontextwindow:risksacceptance and saveslittleatmeasuredshortcontexts."
+  ],
+  "not_production_ready": [
+    "Global16prototype has unsupported Table16/register path, observedshaderOOBretained.",
+    "OnlyoneGPU/model target/precision/KV/state setup measured.",
+    "Finitegreedyanddistribution tests are regression screens, not universalmathematicalequivalenceorhumanqualityproof."
+  ],
+  "memory_policy": "Allocate16-capacitymatrix/tapes only forenabledDSpinegeometry, notall8rowDFlashmodels. The researchnative16budgetreducesdynamicpoolby273338368B(~260.7MiB), plusactualstate/diskstagingcostsreportedseparately. Max-sizedadaptivebuffersmakewidthswitchcheap butmustnotimposethecapacitycostglobally.",
+  "fallback_option": "A16-onlybackendcouldscheduleatmost2physicaldecodelanes percommand toavoid64rowkernelsbeforefull8/16support. Existingprofilessuggest2B2commands costaboutas muchor slightlymorethan oneoptimizedB4, so no measuredpost-fixthroughputwinclaimed. Fourconcurrentrequests thenmeaninterleavedB2commands;fairness/latencyandcachememoryrequiretheir ownqualification."
+}

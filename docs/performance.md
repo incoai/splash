@@ -233,8 +233,8 @@ to inspect, without establishing a model defect or a quantization cause.
 Fibonacci frequently reaches the block cap, making it a useful case for
 measuring native sixteen-row execution. A longer block can extend a full
 accepted prefix, but these fractions do not predict the acceptance of later
-positions or their verification cost. BF16-versus-4-bit draft acceptance and
-sixteen-row performance remain unmeasured.
+positions or their verification cost. These questions motivated the
+precision and sixteen-row investigation below.
 
 The [trace record](../dev/benchmarks/results/dspine-acceptance-qwen38-27b-2026-11-10.json)
 contains every cycle, output tokens, conditional acceptance and survival by
@@ -249,6 +249,88 @@ python -m dev.benchmarks.draft_acceptance \
   --baseline DFLASH_TRACE.json --candidate DSPINE_TRACE.json \
   --output SUMMARY.json
 ```
+
+### Eight-hour DSpine investigation
+
+A November 10 follow-up on the same M5 Pro tested precision, matched prefixes,
+sixteen-row execution and several kernel alternatives. The native benchmark
+now also honors the selected draft's context window; serving already did.
+The **sixteen-row research prototype improves serial native decode throughput
+by 15.3–16.2%** against eight-row DSpine with the M16 policy, across three
+fixed ABBA groups. All complete output arrays, operating checks and per-case
+noise gates passed. The corpus has 30 primary tasks plus one secondary
+control, short prompts of 33–78 tokens, and output caps of 384–1,024.
+It reuses historical tasks and does not establish long-context speed or a
+general drafter ranking. Power receipts show AC/battery transitions during
+the first group; groups two and three stayed on AC at recorded boundaries.
+The registered native gates did not require AC. Results retain that limitation,
+and the report includes the per-round power audit.
+
+| Experiment | Result | Qualification |
+| --- | --- | --- |
+| M16 policy alone, eight rows | +1.61%, +1.74%, +2.07% serial decode | First two groups below the 2% effect floor |
+| Sixteen rows against eight-row M16 | +16.19%, +15.32%, +16.04% serial decode | All three registered groups pass; see power caveat |
+| Wide gate/up two-pass against one-pass | +56.8–64.4% concurrent HTTP, descriptive | Two groups fail output equality |
+
+The primary cycle count falls from 1,303 to 1,062 with sixteen rows. Increasing
+draft precision changes it much less: 1,291 with eight-bit weights and 1,289
+with native BF16 planes, with all 31 greedy outputs matching. These precision
+timings are unpaired screens; native BF16 storage is not a full upstream BF16
+arithmetic-equivalence test. Several prose cases have lower mean throughput
+with sixteen rows. At 67 matched short primary prefixes, DF8 and DS8 have
+very similar first-cycle output means (5.955 versus 5.940); DS16 reaches
+9.507. These overlapping historical prefixes do not predict production TPS
+or establish a general drafter acceptance ranking. Even perfect whole-task
+selection in hindsight adds only
+1.51% over fixed sixteen rows on these short-case means, before switching or
+prediction costs; this does not bound per-cycle or concurrent policies.
+
+At batches three and four, sixteen-row verification uses 48 and 64 actual
+rows, covered by the M64 tile. Its original fused gate/up dominates the cycle; the existing two-pass path avoids
+most of that cost. Smaller-accumulator and shared-storage prototypes passed
+independent numerical checks but established no further whole-model gain.
+Actual selected K partitions matter: an operator win at two partitions did
+not beat the deployed one-partition plan. The broader short-corpus native
+DFlash2 comparison shows +18.3–18.9% aggregate TPS descriptively, but fails
+qualification because two groups exceed the 5% per-case noise limit. The
+fresh DFlash2-versus-sixteen-row HTTP comparison remains inconclusive at
+11–46% endpoint spread. A fixed-width
+native probe reproduced the batch-dependent merge-sort output variation under
+both gate/up policies; this does not make the failed HTTP groups pass.
+
+A separate two-case native long comparison qualifies at +6.0–7.0% decode
+TPS against DFlash2+M16 across all three groups: the 8K prose case slows
+about 3.5%, while 16K code improves about 17–19%. All outputs and registered
+gates pass. The two cases were selected from the original four before any
+of those prompts ran, to fit the eight-hour window; both protocols remain.
+Summed cold request-wall means improve only 0.91% descriptively because
+prefill dominates. These measurements do not establish a general ranking.
+
+Functional coverage includes 9,000 cold sampling requests, long prefix/suffix
+reuse, a shader-validated restart restoring 15,904 cached tokens, and actual
+priority suspension/replay/resumption with matching complete clone outputs.
+None of 78 early-token sampling comparisons rejected after Holm correction;
+this finite screen does not prove identical distributions or cover long-range
+changes and EOS termination. The separate synthetic memory-pressure probe
+failed to trigger suspension and does not validate that mechanism.
+
+The serving backend on this PR remains **eight rows**. Production widening
+needs per-model geometry, preserving DFlash2's eight-row capacity, plus explicit
+support or rejection of Table16/register layouts. The full sixteen-row Table16
+test finds an out-of-bounds store; the prototype disables register paths and
+passes a separately scoped plain16 oracle. A late packing-only follow-up
+passes the complete sixteen-row GDN suite under Metal validation, while
+register consumers and per-model dispatch remain future work. The measured
+prototype's additional decode scratch
+reduces the available dynamic budget by about 260.7 MiB on this setup.
+
+The [investigation report and implementation plan](../dev/benchmarks/experiments/dspine_20261110/README.md)
+describe every result's scope, including the separate broader native DFlash2
+comparisons and target-feature diagnostics. The
+[result index](../dev/benchmarks/results/dspine-investigation-qwen38-27b-2026-11-10.json)
+links the compressed original receipts, failures and hardware trace.
+[Source patches, frozen cohorts and the rebuild harness](../dev/benchmarks/experiments/dspine_20261110/reproduce.py)
+reproduce the experiments without changing serving defaults.
 
 ## Smaller GGUFs on 24 GB Macs
 

@@ -1,0 +1,46 @@
+{
+  "observed_utc": "2026-11-10T10:19:48.299567+00:00",
+  "source_commit": "0a90d7b4caf725ee4f27afcd37f6d827d05a6300",
+  "contracts": [
+    {
+      "file": "runtime/metal/kernels/common/gguf_sgmatrix.h",
+      "contract": "gguf_sg::kRows=8; write_input takes local row0..7."
+    },
+    {
+      "file": "runtime/metal/kernels/shared/normalization.metal",
+      "contract": "Norm producer already uses globalrow/8 and globalrow%8."
+    },
+    {
+      "file": "runtime/metal/kernels/decode/attention_qkv.metal",
+      "contract": "Attention producers already use globalrow/8 and globalrow%8."
+    },
+    {
+      "file": "runtime/metal/kernels/decode/gdn.metal",
+      "contract": "GDN producer wrongly treats simd_group/requestrow as local8row index in global16 experiment; follow-up repairs it."
+    },
+    {
+      "file": "runtime/ops/Linear.cpp",
+      "contract": "tableSumsBytes divides rows by request width; must divide physical8 tile width."
+    },
+    {
+      "file": "runtime/ops/LinearGguf.cpp",
+      "contract": "addGgufRegister preparation grid and _l suffix currently use rows/verifyRows. Register consumers actually encode8rowtiles, so16rowneeds rows/8."
+    },
+    {
+      "file": "runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal",
+      "contract": "Instantiated L1/L2/L3/L4 table consumers only. Do not dispatch unsupported L6/L8 or silently use too few tiles."
+    },
+    {
+      "file": "runtime/ops/KernelSelection.cpp",
+      "contract": "register boundary table is indexed1..4; guard tile count before indexing when decoupling request width."
+    }
+  ],
+  "sixteen_row_mapping": {
+    "B1": "two8rowtiles, existing_l2",
+    "B2": "four8rowtiles, existing_l4",
+    "B3": "six8rowtiles, unavailable; staged fallback",
+    "B4": "eight8rowtiles, unavailable; staged fallback"
+  },
+  "device_scope": "On Apple10/20cores, 4*columnTiles*tileCount<6*20 forFourBitsOrMore, so only small projections select registers. Apple9 policy is different. Safety repair is not evidence of a large M5 performance opportunity.",
+  "not_done": "Register consumer/selection changes are a future independently qualified patch. Narrow queued follow-up keeps register paths disabled."
+}

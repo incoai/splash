@@ -1,0 +1,142 @@
+{
+  "updated_utc": "2026-11-10T09:31:26.444399+00:00",
+  "recommendation": "First build proper per-model trained16 support for dense DSpine, preserving8-row DFlash2. Keep the wide-gate/up two-pass optimization independently reviewable. Qualify adaptive8/16 only after both geometries share a supported runtime.",
+  "observed_causes": [
+    {
+      "cause": "Useful work per target sweep",
+      "evidence": "Native8 primary31 uses1303cycles;16uses1062 at identical outputs. Freshheldout12 uses1251vs1102. Controlled serial3groups+15.3..16.2% vs8M16.",
+      "mechanism": "At lowbatch, targetweight traffic amortizes over more accepted tokens. Several8row projections already execute16row padded tiles; trained16 can use otherwise padded work. This explains some low incremental cost, alongside weight reuse. Not a hardware-counter proof."
+    },
+    {
+      "cause": "Arithmetic and kernel geometry at concurrency",
+      "evidence": "16rowB4means64rows vs8rowB4means32. Original16M64fusedgate/up alone~185ms of306mscycle. Rowpartition and existingtwo-pass screens reduce this cost; all naive/new16screens still fail B3vsB2 performancegate.",
+      "mechanism": "One-passM64holds two large accumulators perSIMDgroup; registerpressure is a hypothesis. Widerblocks also double realverify arithmetic, even after the pathologicalkernel is fixed."
+    },
+    {
+      "cause": "Acceptance varies by workload",
+      "evidence": "Freshcode/structuredcycle savings substantial; French/Hindi/Arabic/Japanese cycle savings small. Some serialprose regressions in controlled31.",
+      "mechanism": "Extra proposals pay only if accepted-prefix survival reaches them. Greedy8vs16 must be compared at identical contexts before making a causal prefix-survival predictor."
+    },
+    {
+      "cause": "Precision/reference mismatch not main demonstrated lever",
+      "evidence": "FullBF16nativeplanes1289cycles vs4bit1303;8bit1291;3bit1321. Bridge double-round fidelity1305. All31greedyoutputs match.",
+      "mechanism": "No experiment establishes backbone quantization as main acceptance cause. Targetfeature quantization vs BF16training remains a separate, unmeasured question."
+    }
+  ],
+  "implementation_steps": [
+    {
+      "priority": 1,
+      "name": "Per-model geometry",
+      "details": [
+        "Separate maximum capacity16 from actualdraft/verify width8or16; carry explicit typedgeometry from descriptor into model, scheduler/accounting, sampling andops.",
+        "Compile/select8and16specializations with distinct pipeline keys; preserve DF8 and all non-DS model behavior. Max-sized buffers need explicit active-stride semantics, not a global macro swap.",
+        "Keep KVPage32 and8192DScontextwindow; include changed tape/layout geometry in cache/build identities. Test checkpoint suffixes around31/32/33,8191/8192/8193 and longdiskrestore.",
+        "Remove researchglobalregisterdisable only after tableproducer/consumer support. Table16 is physically8rows; decouple its tile width from actualverifyRows. Host sum bytes currently divide byverifyRows and GDNwriter uses rowindex up to15 into8row layout. Either encode two8rowtables per16lane with all matching offsets/consumers, or explicitly reject unsupported layout selection.",
+        "Retain dense Qwen3.8+DSpine guard until other architectures have own geometry qualification."
+      ]
+    },
+    {
+      "priority": 2,
+      "name": "Wide gate/up pass policy",
+      "details": [
+        "Prefer measured existingtwo-pass path if controlledapplication results confirm benefit; it avoids maintaining a newSGkernel.",
+        "Production calibration should constrain measured AF4G64M64 shape/device (this20coreApple10), preserve Ksplits and all<=32row policies. No environment variable in finalselection.",
+        "Keep SG2/SG4 research kernels and bitwise oracles as alternatives if a differentdevice wins; no cross-device claim from thisMac.",
+        "Validate selectiongoldens, partial48/64rows, split-counter reuse, all supported epilogues and shape-specific resource budgets."
+      ]
+    },
+    {
+      "priority": 3,
+      "name": "Adaptive width",
+      "details": [
+        "Start with batch-dependent8/16 policy, then evaluate accepted-prefix history using counts already returned to CPU; no additionalGPUreadback or command.",
+        "Use measured cyclecost bybatch and history, not acceptance ratio alone. If first7behavior agrees, m16<=m8+8*P(full7) gives a conservative upside bound at fixed contexts. Tail acceptance needs calibration.",
+        "Use hysteresis and a minimum sample window to avoidoscillation; account for switching/repacking/composite-state costs.",
+        "Freeze policy on calibrationcohort; use new mixed/concurrent heldout and completionlatency/fairness/contextmemory gates. Do not tune on existingheldout12 or sampling3 outcomes."
+      ]
+    }
+  ],
+  "deprioritized": [
+    "Higher draftprecision: tinycycle gain plus moretraffic.",
+    "Separate2/3bitdrafthead:submillisecondB1saving,530.5MiBextra3bitimage,notfasterB3/B4.",
+    "Furtherparallelrefinement/bridgefusion:small remainingwholecycleceiling.",
+    "ShorterDScontextwindow:risksacceptance and saveslittleatmeasuredshortcontexts.",
+    "GDN compact direct-device pending vectors: bitwise correct but no qualified improvement; B4/pending8 stable paired microgroups about8.7-9.0% lower operator throughput.",
+    "GDN phased lifetime sharing: 12384->8192B at8rows,24768->16384B at16rows. Full plain-path oracles and paired hidden/state/tape byte parity pass; stable B4/fullpending groups show lower operator throughput(~22.5-22.8%8row,~14.9-15.1%16row). More state traffic outweighs storage reduction in these tests.",
+    "Shared gate/up row subdivisions: independent equations and bitwise outputs pass; unpaired wholemodel screens do not qualify. No additional statistical nomination. Keep existingtwoPass as simpler current nominee."
+  ],
+  "not_production_ready": [
+    "Global16prototype has unsupported Table16/register path, observedshaderOOBretained.",
+    "OnlyoneGPU/model target/precision/KV/state setup measured.",
+    "Finitegreedyanddistribution tests are regression screens, not universalmathematicalequivalenceorhumanqualityproof."
+  ],
+  "memory_policy": "Allocate16-capacitymatrix/tapes only forenabledDSpinegeometry, notall8rowDFlashmodels. The researchnative16budgetreducesdynamicpoolby273338368B(~260.7MiB), plusactualstate/diskstagingcostsreportedseparately. Max-sizedadaptivebuffersmakewidthswitchcheap butmustnotimposethecapacitycostglobally.",
+  "fallback_option": "A16-onlybackendcouldscheduleatmost2physicaldecodelanes percommand toavoid64rowkernelsbeforefull8/16support. Existingprofilessuggest2B2commands costaboutas muchor slightlymorethan oneoptimizedB4, so no measuredpost-fixthroughputwinclaimed. Fourconcurrentrequests thenmeaninterleavedB2commands;fairness/latencyandcachememoryrequiretheir ownqualification.",
+  "version": 3,
+  "selection_model": {
+    "expected_emitted_tokens": "m_w = 1 + sum_{j=1}^{w-1} P(accepted_prefix >= j), with terminal/output-cap censoring handled separately.",
+    "decision": "Compare observed C16(B,L,pending-history)/m16 with C8(B,L,pending-history)/m8. Batch B, context L and previous accepted/pending GDN rows can affect cost. Use already returned counts/command timings; no extra GPU synchronization.",
+    "conditional_bound": "If the first seven proposal/acceptance behaviors agree, m16 <= m8 + 8*P(full7). Treat as a planning heuristic: matched-prefix experiment violates early-prefix equality in1/67 eligible primary cases.",
+    "sampling_warning": "Equal-weight overlapping prefix probes do not estimate request/cycle-weighted deployment acceptance. Freeze calibration on a separate corpus; do not tune from heldout12, sampling3 or new long-code comparison outcomes."
+  },
+  "new_research": "OrdinaryAF4rowSIMDgroupssharing64-columnstagepassallbitwise/FP64/padding/counteroraclesbutbroadwholemodelscreensdonotestablishgain. OperatorwinsdependonKsplit. ActualN17408K5120MLPplanuses1split;existing.401818msbeatsrow16split2.433577msandrow16split1.411441msinunpairedscreen. Scoped2splitselectorwasinactiveandwithdrawn;allpilotresultsretained.",
+  "hindsight_whole_task_selection": {
+    "utc": "2026-11-10T08:37:02.758484+00:00",
+    "source_sha256": "0154ab506331b85aa58ada170a6d608a7f6c64d2cc98de57b7866785d0dbabb8",
+    "primary_decode_tokens": 6523,
+    "mean_8row_decode_ms": 91675.2538333333,
+    "mean_16row_decode_ms": 79131.76150000001,
+    "hindsight_per_task_oracle_decode_ms": 77952.0405,
+    "optimistic_additional_throughput_vs_fixed16": 0.015133933536993327,
+    "tasks_choosing8": 6,
+    "interpretation": "Descriptive hindsight whole-task selection on the same calibration data, with zero prediction/switching/storage overhead. Not an adaptive policy, performance qualification, or an upper bound on per-cycle switching or other workloads. This is only the observed ceiling of perfect whole-task selection on these means."
+  },
+  "priority_refinement": "Perfectzero-overheadwhole-task8/16selectiononthesecontrolledshort-promptmeansaddsjust1.51%TPSoverfixed16. Thisdoesnotboundper-cycleadaptationorlong/concurrentworkloads. Prioritizesupportedgeometryandbatch-dependentwidekernelcostbeforecomplicatedper-taskclassification.",
+  "target_capture_diagnostic": "Same4bittargetsources:native8/16cold96x5featurecapturesand33forcedlogitrowsbitexactwithinKVformat. MatchingMLXtapclosesttoneighborsall5;nativeBF16KVvsMLXrelativeRMS.37..3.43%,all33argmaxagree. Supportsindexalignmentinthisprobe,notBF16trainingtargetequivalenceorall-contextparity.",
+  "long_context_cost": "Unpairedprofiles:DS8B1draft-attentionfamily1.057msat8192and1.135msat16384prompttokens,DS16B11.791/1.733ms. Targetattentionandwiderverificationcostgrowmore. Windowreductionacceptanceisuntested;profilesnotTPSqualification.",
+  "fidelity_followup": {
+    "motivation": "Communitypaired-agenttraceacceptanceisstrongerthanourearlierfourcodingcases. Workloadsandtargetarithmeticdiffer;notproof of a nativebug or generalarchitecturegap.",
+    "reference_check": "Pin upstream draft code/weights; feed identical token anchors and identical captured target features to native and reference DSpine. Compare bridge writes, per-layer hidden rows, shortlist rankings and normalized conditional proposal probabilities at eight/sixteen rows before attributing discrepancies to quality.",
+    "factorial": "Then swap only native-versus-MLX target feature captures with the draft implementation fixed; separately test raw BF16 training-target features only when genuine target weights/hardware are available. Dequantizing a four-bit target does not recreate BF16 training features.",
+    "corpus": "Need an independently frozen workload with realistic code/agent histories and output-length weighting. Existing overlapping short prefixes are a diagnostic and must not be treated as independent production samples."
+  },
+  "matched_drafters": {
+    "eligible_prefixes": 67,
+    "tasks": 30,
+    "first_cycle_equal_prefix_outputs": {
+      "DF8": 5.955223880597015,
+      "DS8": 5.940298507462686,
+      "DS16": 9.507462686567164
+    },
+    "DS8_vs_DF8": {
+      "higher": 8,
+      "equal": 51,
+      "lower": 8
+    },
+    "interpretation": "No broad DS8 acceptance deficit demonstrated on these matched short contexts. Different workload from externalagenttraces. Overlappinghistoricalprefixes,neitherindependentCI norTPSforecast. Bothwindowscoverallprefixes."
+  },
+  "agent_prefix_reuse_followup": "Forrepeat-promptagentworkloads,separatelyqualifyguardedjunction/prefixpackingwithDS8192restore/captureplanandbridge-stateidentity. Do notcopyDF2048thresholdblindly. Includecheckpointmaterialization+reuse,totalclientwall,retainedmemoryanddiskrestore. Currentlonglifecycleisfunctionalonly,nocachespeedupclaimed.",
+  "geometry_abi_and_transition_contracts": {
+    "common_ABI": "Sampling.h embeds tokens[MAX_BATCH][SPLASH_TARGET_VERIFY_ROWS]. Two separately compiled global8/16 libraries would disagree on lane offsets/struct size. Use one common capacity/ABI and pass active width/strides explicitly; compiling two macro values alone is insufficient.",
+    "pending_replay": "GDN.cpp currently rejects pendingRows>current global verifyRows and kernel replay storage depends on it. After16->8 switch, previous accepted9..16rows can remain pending. Replay capacity16 must be separate from current execution width8, or explicitly flush the old state before switching and measure that cost.",
+    "qualification": "Require transition8->16 and16->8, pending counts0..16, physical width1..4, lane reorder/shrink/rejoin, suspended replay, terminal/output caps, diskrestore and cache layout identity. Fixed per-model16 is the first implementation; adaptive work follows."
+  },
+  "next_performance_protocol": "DirectDF8vsDS16shortcomparisonwasnotqualifiedbecause4shortstructuredcasesacrossgroups1/2exceeded5%spread,despiteaggregate+18.3..18.9%. Futureindependentqualification:controlledpower,predeclaredinternalrepeatspershortcaseandnewfrozencorpus;keepfullarrays/allcasegates. Do notrepeatthisexistingexperimentuntilitpasses or dropnoisycases.",
+  "packing_followup": {
+    "full_sixteen_row_GDN_shader_suite": "PASS",
+    "elapsed_seconds": 68.434096,
+    "change": "Fixed8tile sumallocation andGDNglobalrow writer;testreferencecovers2tiles per16rowlane. Originalfailure retained.",
+    "remaining": "Registerconsumer _l tilecount/selection/fallback and proper permodel geometry. No performance claim; measured prototypes still have registers disabled."
+  },
+  "long_comparison": {
+    "all_three_groups_qualified": true,
+    "decode_throughput_change": [
+      0.06984908025339642,
+      0.060920832184590656,
+      0.06036207071905686
+    ],
+    "scope": "Two frozen8Kprose/16Kcode cases,allroundsonbatteryatboundaries. Prose-3.5%,code+17..19%;notgeneralranking.",
+    "descriptive_total_cold_request_throughput_change": 0.009105942516040688,
+    "implication": "Forcoldlongprompts,prefilldominates;separatelyqualifyprefixreuse,totalclientwallnotjustdecode."
+  }
+}

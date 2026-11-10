@@ -1,0 +1,35 @@
+{
+  "frozen_utc": "2026-11-10T04:26:05.564609+00:00",
+  "contexts": "sampling3.txt: python_lru, technical_memory, chinese_explanation;14outputtoken cap",
+  "per_arm_seeds": 1500,
+  "baseline_seed_range": [
+    0,
+    1499
+  ],
+  "candidate_seed_ranges": [
+    [
+      100000,
+      101499
+    ],
+    [
+      200000,
+      201499
+    ],
+    [
+      300000,
+      301499
+    ]
+  ],
+  "nomination": "At most3 source configurations; nominate and freeze all before inspecting any positive-temperature candidate outputs. Failed or nonbeneficial greedy screens do not need nomination.",
+  "settings": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "context_limit": 32768,
+    "ane_ffn_share": 0
+  },
+  "tests": "For each of3contexts: all14single-tokenpositions plus adjacentpairs starting0,1,5,6,11,12; total60percomparison. Encode ended sequences as absorbingSTOP so lengths do not condition token marginals on survival.",
+  "statistics": "Pearson contingency with exact SciPy survivalfunction, no Yates correction. Pool categories symmetrically by pooled marginal frequencies to keep expected cells>=5; if rare-pool mass is too small merge it into the largest pooled category. Degenerate tests are uninformative withp=1. Holm correction across the prespecified maximum180 tests (unused comparisons paddedp=1). Report effect sizes, sample counts and all unadjusted/adjustedp values.",
+  "interpretation": "Regression screen for gross sampling-distribution errors; no rejection is not proof of equivalence. Small/rare differences have limited power. Independent seed arms, rather than treating same-seed output equality as the correctness test. Greedy equality and independent operator equations remain separate checks.",
+  "source": "SciPy official chi2_contingency documentation, observed2026-11-10, v1.18.0; modern statistical result replaces the archived study Wilson-Hilferty approximation."
+}

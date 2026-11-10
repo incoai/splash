@@ -1,0 +1,18 @@
+{
+  "base": "wide-policy variant before packing repair",
+  "files": {
+    "runtime/ops/Linear.cpp": {
+      "before_sha256": "50985e11682cd7fdc05e22dd31213d345a1c637e688c94dcecad58c75d941772",
+      "after_sha256": "fb5df00f8ef777d5a1fe8636cbd45bb927670731cf5f5d028b44f773fc166304"
+    },
+    "runtime/metal/kernels/decode/gdn.metal": {
+      "before_sha256": "b3cd3b0897df32f44a524d7e62f2912239baa23fff66737b64dde73249212bef",
+      "after_sha256": "8703470c604b168eea24cfdcb47d509bc1d823117b7fb6ab289a40e43f355135"
+    },
+    "dev/tests/engine/LinearInputReference.hpp": {
+      "before_sha256": "d9f0a20263deb2601332a17f4231b30045957623614cf1ac2abf666a28627e48",
+      "after_sha256": "f329b9cca4dbde65c7ccd7317adc27cae6e084d607bc9c191121e8a95d0462df"
+    }
+  },
+  "scope": "Three-file review delta only; full rebuildable diff against33a is table16-layout-followup.patch. Register paths remain disabled."
+}

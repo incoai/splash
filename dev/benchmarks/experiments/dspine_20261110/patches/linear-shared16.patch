@@ -1,0 +1,560 @@
+diff --git a/dev/benchmarks/backend_benchmark.mm b/dev/benchmarks/backend_benchmark.mm
+index 5f5fb35e..aa669607 100644
+--- a/dev/benchmarks/backend_benchmark.mm
++++ b/dev/benchmarks/backend_benchmark.mm
+@@ -1090,6 +1090,7 @@ int main(int argc, char **argv) {
+     engine::EngineConfig engineConfig;
+     engineConfig.maxContext = bootstrap->nativeLoop().statusSnapshot().maximumContextTokens;
+     engineConfig.vocabularySize = capabilities.vocabularySize;
++    engineConfig.draftContextTokens = config.model.draft.contextTokens;
+     engine::connectToGovernor(engineConfig, resources->memoryGovernor());
+     engine::Engine engine(engineConfig, resources->cache(),
+                                   *executor, events);
+diff --git a/dev/tests/engine/draft_attention_metal_test.mm b/dev/tests/engine/draft_attention_metal_test.mm
+index 0553af02..732eaffe 100644
+--- a/dev/tests/engine/draft_attention_metal_test.mm
++++ b/dev/tests/engine/draft_attention_metal_test.mm
+@@ -37,18 +37,19 @@ using splash::test::bf16ToFloat;
+ using splash::test::floatToBf16;
+ using splash::test::ulpBf16;
+ 
+-constexpr uint32_t kRows = 8;
++constexpr uint32_t kRows = SPLASH_DRAFT_QUERY_ROWS;
+ constexpr uint32_t kKvHeads = 8;
+ constexpr uint32_t kQueryHeadsPerKv = 4;
+ constexpr uint32_t kHeadDim = 128;
+ constexpr uint32_t kWindow = 2048;
+ constexpr uint32_t kLanes = 4;
+ // The shipped split count and the fp32 partial one split leaves per (lane,
+-// head) behind the grouped queries: 32 rows x (128 + max + sum).
++// head) behind the grouped queries: each query row's four heads.
+ constexpr uint32_t kSplits = SPLASH_DRAFT_ATTENTION_SPLITS;
+-constexpr uint64_t kPartialBytes = uint64_t{32} * 130 * sizeof(float);
++constexpr uint64_t kPartialBytes = uint64_t{kQueryHeadsPerKv} * kRows * 130 * sizeof(float);
+ constexpr uint32_t kAttention = kKvHeads * kQueryHeadsPerKv * kHeadDim;
+ constexpr uint32_t kGroupRows = kQueryHeadsPerKv * kRows;
++constexpr uint32_t kParts = (kGroupRows + 31) / 32;
+ constexpr float kScale = 0.08838834765F;
+ 
+ // The drafts of Qwen3.8-27B, Qwen3.8-Flash-Next, Qwen3.6-35B-A3B and
+@@ -191,10 +192,10 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
+       std::span(cacheLengths).first(lanes), DraftAttention::plan(shape, lanes));
+   const auto dispatches = graph.dispatches();
+   require(dispatches.size() == 2 &&
+-              dispatches[0].threadgroups.x == kKvHeads &&
++              dispatches[0].threadgroups.x == kKvHeads * kParts &&
+               dispatches[0].threadgroups.y == lanes &&
+               dispatches[0].threadgroups.z == kSplits &&
+-              dispatches[1].threadgroups.x == kKvHeads &&
++              dispatches[1].threadgroups.x == kKvHeads * kParts &&
+               dispatches[1].threadgroups.y == lanes &&
+               dispatches[1].threadgroups.z == 1,
+           "draft attention core dispatch changed");
+@@ -538,10 +539,10 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
+         static_cast<const float *>(ropeCos.contents()),
+         static_cast<const float *>(ropeSin.contents()), kTokens, kStart);
+ 
+-  // Commit: three lanes retaining 8, 3 and (clamped) 8 of their verify rows.
++  // Commit: full, partial, and overfull (clamped) verify rows.
+   constexpr uint32_t kCommitLanes = 3;
+   const std::array<uint32_t, kCommitLanes> starts{kWindow - 4, 0, 2 * kWindow + 5};
+-  const uint32_t retained[kCommitLanes] = {8, 3, 12};
++  const uint32_t retained[kCommitLanes] = {kRows, 3, kRows + 4};
+   const MetalBuffer laneKv =
+       randomBfloat(backend, uint64_t{kCommitLanes} * kRows * kRowWidth, random,
+                    "draft lane kv");
+diff --git a/dev/tests/engine/gdn_decode_metal_test.mm b/dev/tests/engine/gdn_decode_metal_test.mm
+index 6bd7af69..a9b5f3b1 100644
+--- a/dev/tests/engine/gdn_decode_metal_test.mm
++++ b/dev/tests/engine/gdn_decode_metal_test.mm
+@@ -955,7 +955,7 @@ void bufferExtents(MetalBackend &backend, const GdnShape &shape, LinearInput lay
+ // recurrent rows. Both recurrences produce those rows exactly here: a_scale 0
+ // makes every decay one, convolution weights only on the query channels'
+ // current input make the keys and values zero, and at token t every key
+-// head's query input is one on columns 17 t and 127, which the RMS norm and
++// head's query input is one on columns (17 t) mod 127 and 127, which the RMS norm and
+ // its scale turn into 1/16 on both. Every recurrent row is then a state
+ // column over 16, which is exact for a state of bf16 values that is zero in
+ // column 127. The prefill's rows, both decays and the decode's unchanged
+@@ -964,7 +964,8 @@ void gateMatchesPrefill(MetalBackend &backend, const GdnShape &shape, bool float
+   const std::string what = std::string("gate parity vh") + std::to_string(shape.valueHeads) +
+                            (float32 ? " f32 norm" : "") + (order == GdnHeadOrder::Tiled ? " tiled" : "");
+   constexpr uint32_t kSharedColumn = kHeadDim - 1;
+-  const auto queryColumn = [](uint32_t token) { return 17 * token; };
++  static_assert(kRows <= kHeadDim - 1);
++  const auto queryColumn = [](uint32_t token) { return (17 * token) % (kHeadDim - 1); };
+   const uint32_t keyWidth = shape.keyHeads * kHeadDim;
+   const uint32_t valueWidth = shape.valueHeads * kHeadDim;
+   const uint64_t stateFloats = uint64_t{valueWidth} * kHeadDim, stateBytes = stateFloats * 4;
+diff --git a/runtime/metal/abi/DraftAttention.h b/runtime/metal/abi/DraftAttention.h
+index 2759ee43..6916c82f 100644
+--- a/runtime/metal/abi/DraftAttention.h
++++ b/runtime/metal/abi/DraftAttention.h
+@@ -109,3 +109,6 @@ struct DraftContextWindowParams {
+ 
+ static_assert(sizeof(DraftContextWindowParams) == 16,
+               "Draft context window parameters are 16 bytes on both sides");
++
++// Research: split whole query heads into parts of 32 fused rows.
++#define SPLASH_DRAFT_ATTENTION_PARTS (SPLASH_DRAFT_QUERY_ROWS / 8u)
+diff --git a/runtime/metal/abi/ExecutionGeometry.h b/runtime/metal/abi/ExecutionGeometry.h
+index 93f805b9..0c9cbb7a 100644
+--- a/runtime/metal/abi/ExecutionGeometry.h
++++ b/runtime/metal/abi/ExecutionGeometry.h
+@@ -3,9 +3,9 @@
+ // C/Metal ABI constants shared by host and shader compilation. Compile-time
+ // static assertions, beside the model's ExecutionLimits (model/Model.hpp)
+ // and the operators sized by these, check the contracts between them.
+-#define SPLASH_DRAFT_QUERY_ROWS 8u
+-#define SPLASH_DRAFT_PROPOSAL_TOKENS 7u
+-#define SPLASH_TARGET_VERIFY_ROWS 8u
++#define SPLASH_DRAFT_QUERY_ROWS 16u
++#define SPLASH_DRAFT_PROPOSAL_TOKENS 15u
++#define SPLASH_TARGET_VERIFY_ROWS 16u
+ // The KV ceiling: four times the targets' native window of 262,144 tokens,
+ // which holds the most context YaRN serves them
+ // (QwenTargetDimensions::yarnContextTokens).
+diff --git a/runtime/metal/abi/PagedAttention.h b/runtime/metal/abi/PagedAttention.h
+index ba9b1075..bd58f032 100644
+--- a/runtime/metal/abi/PagedAttention.h
++++ b/runtime/metal/abi/PagedAttention.h
+@@ -175,3 +175,7 @@ struct SplashKvStageParams {
+ 
+ static_assert(sizeof(SplashKvStageParams) == 28,
+               "KV stage parameters are 28 bytes on both sides");
++
++// Research16-row verify alone; prefill remains original8-row geometry.
++#define SPLASH_VERIFY_ATTENTION_TILE_PARTS(group) \
++  ((group) <= 4u ? 1u : (group) <= 8u ? 2u : (group) <= 16u ? 4u : 8u)
+diff --git a/runtime/metal/abi/Sampling.h b/runtime/metal/abi/Sampling.h
+index 53fbd4a3..f56e3c23 100644
+--- a/runtime/metal/abi/Sampling.h
++++ b/runtime/metal/abi/Sampling.h
+@@ -162,8 +162,8 @@ struct ThinkingCutoffParams {
+   uint32_t tokens[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_TARGET_VERIFY_ROWS];
+ };
+ 
+-static_assert(sizeof(ThinkingCutoffParams) == 220,
+-              "Thinking cutoff parameters are 220 bytes on both sides");
++static_assert(sizeof(ThinkingCutoffParams) == 348,
++              "Thinking cutoff parameters are 348 bytes on both sides");
+ 
+ // The batched selector and acceptance kernels' grids cover exactly the
+ // dispatch's lanes: per-lane arrays hold those lanes, and entries past them
+@@ -204,8 +204,8 @@ struct VerifyRowsParams {
+   uint32_t maximum[SPLASH_MAXIMUM_BATCH_WIDTH];
+ };
+ 
+-static_assert(sizeof(VerifyRowsParams) == 188,
+-              "Verify rows parameters are 188 bytes on both sides");
++static_assert(sizeof(VerifyRowsParams) == 348,
++              "Verify rows parameters are 348 bytes on both sides");
+ 
+ struct AcceptBatchParams {
+   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
+diff --git a/runtime/metal/kernels/decode/draft.metal b/runtime/metal/kernels/decode/draft.metal
+index 694fb0d5..9e354527 100644
+--- a/runtime/metal/kernels/decode/draft.metal
++++ b/runtime/metal/kernels/decode/draft.metal
+@@ -155,7 +155,7 @@ inline void draft_attention_split_phase(
+     threadgroup float *score_storage, threadgroup float *row_max,
+     threadgroup float *row_sum, threadgroup float *previous_scale,
+     uint thread_index, uint lane, uint simd_group) {
+-  constexpr ushort M = SPLASH_DRAFT_ATTENTION_ROWS, N = 128,
++  constexpr ushort M = SPLASH_DRAFT_ATTENTION_ROWS / SPLASH_DRAFT_ATTENTION_PARTS, N = 128,
+                    D = SPLASH_DRAFT_HEAD_DIMENSION, TileK = 64;
+   constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
+   const uint Window = value_stride;
+@@ -401,7 +401,7 @@ inline void draft_attention_split_phase(
+ inline void draft_attention_reduce_phase(device const float *partials,
+                                          device bfloat *output,
+                                          uint thread_index) {
+-  constexpr uint M = SPLASH_DRAFT_ATTENTION_ROWS, D = SPLASH_DRAFT_HEAD_DIMENSION,
++  constexpr uint M = SPLASH_DRAFT_ATTENTION_ROWS / SPLASH_DRAFT_ATTENTION_PARTS, D = SPLASH_DRAFT_HEAD_DIMENSION,
+                  Stride = M * D + 2 * M,
+                  Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
+   constexpr uint Chunk = D / 8;
+@@ -514,7 +514,7 @@ kernel void draft_attention_bf16_split(
+     uint thread_index [[thread_index_in_threadgroup]],
+     uint lane [[thread_index_in_simdgroup]],
+     uint simd_group [[simdgroup_index_in_threadgroup]]) {
+-  constexpr uint AttentionM = SPLASH_DRAFT_ATTENTION_ROWS, AttentionN = 128,
++  constexpr uint AttentionM = SPLASH_DRAFT_ATTENTION_ROWS / SPLASH_DRAFT_ATTENTION_PARTS, AttentionN = 128,
+                  KVHeads = SPLASH_DRAFT_KV_HEADS;
+   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
+   constexpr ulong Attention = SPLASH_DRAFT_ATTENTION_WIDTH;
+@@ -527,15 +527,15 @@ kernel void draft_attention_bf16_split(
+   device float *partials =
+       reinterpret_cast<device float *>(queries +
+                                        params.lanes * Rows * Attention) +
+-      ((batch * KVHeads + group.x) * SPLASH_DRAFT_ATTENTION_SPLITS + group.z) *
++      ((batch * KVHeads * SPLASH_DRAFT_ATTENTION_PARTS + group.x) * SPLASH_DRAFT_ATTENTION_SPLITS + group.z) *
+           PartialFloats;
+   threadgroup float workspace[AttentionM * AttentionN + 3 * AttentionM];
+   draft_attention_split_phase(
+       queries + batch * Rows * Attention + group.x * AttentionM * HeadDim,
+-      keys + group.x * Window * HeadDim, values + group.x * Window * HeadDim,
+-      query_keys + batch * KVHeads * Rows * HeadDim + group.x * Rows * HeadDim,
++      keys + (group.x / SPLASH_DRAFT_ATTENTION_PARTS) * Window * HeadDim, values + (group.x / SPLASH_DRAFT_ATTENTION_PARTS) * Window * HeadDim,
++      query_keys + batch * KVHeads * Rows * HeadDim + (group.x / SPLASH_DRAFT_ATTENTION_PARTS) * Rows * HeadDim,
+       query_values + batch * KVHeads * HeadDim * Rows +
+-          group.x * Rows * HeadDim,
++          (group.x / SPLASH_DRAFT_ATTENTION_PARTS) * Rows * HeadDim,
+       partials, params.value_stride, params.cache_length[batch], group.z, params.causal != 0,
+       workspace, workspace + AttentionM * AttentionN,
+       workspace + AttentionM * AttentionN + AttentionM,
+@@ -548,7 +548,7 @@ kernel void draft_attention_bf16_reduce(
+     constant DraftAttentionBatchParams &params [[buffer(1)]],
+     uint2 group [[threadgroup_position_in_grid]],
+     uint thread_index [[thread_index_in_threadgroup]]) {
+-  constexpr uint AttentionM = SPLASH_DRAFT_ATTENTION_ROWS, KVHeads = SPLASH_DRAFT_KV_HEADS;
++  constexpr uint AttentionM = SPLASH_DRAFT_ATTENTION_ROWS / SPLASH_DRAFT_ATTENTION_PARTS, KVHeads = SPLASH_DRAFT_KV_HEADS;
+   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
+   constexpr ulong Attention = SPLASH_DRAFT_ATTENTION_WIDTH;
+   constexpr ulong HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
+@@ -557,7 +557,7 @@ kernel void draft_attention_bf16_reduce(
+   device const float *partials =
+       reinterpret_cast<device const float *>(queries +
+                                              params.lanes * Rows * Attention) +
+-      (batch * KVHeads + group.x) * SPLASH_DRAFT_ATTENTION_SPLITS *
++      (batch * KVHeads * SPLASH_DRAFT_ATTENTION_PARTS + group.x) * SPLASH_DRAFT_ATTENTION_SPLITS *
+           PartialFloats;
+   draft_attention_reduce_phase(
+       partials,
+diff --git a/runtime/metal/kernels/decode/gdn.metal b/runtime/metal/kernels/decode/gdn.metal
+index 7fec1bab..dfb85327 100644
+--- a/runtime/metal/kernels/decode/gdn.metal
++++ b/runtime/metal/kernels/decode/gdn.metal
+@@ -22,7 +22,7 @@
+ // state a step writes is the one before its rows: it leaves the rows on the
+ // lane's tape, and the lane's next step folds the retained ones into the
+ // state before its own rows. A step reads and writes the state once.
+-constant uint kDecodeSimdgroups = 8;
++constant uint kDecodeSimdgroups = SPLASH_TARGET_VERIFY_ROWS;
+ 
+ // The threadgroup operands of one value head: the rows' prepared q/k, the
+ // head's v, the gates and the recurrent output rows, and the k, v and gates
+diff --git a/runtime/metal/kernels/decode/paged_attention.metal b/runtime/metal/kernels/decode/paged_attention.metal
+index 0dec392f..1bb0fecb 100644
+--- a/runtime/metal/kernels/decode/paged_attention.metal
++++ b/runtime/metal/kernels/decode/paged_attention.metal
+@@ -23,7 +23,7 @@
+ 
+ #define PAGED_VERIFY_SCRATCH(Group)                                            \
+   constexpr uint M =                                                           \
+-      Group * SPLASH_TARGET_VERIFY_ROWS / SPLASH_ATTENTION_TILE_PARTS(Group);  \
++      Group * SPLASH_TARGET_VERIFY_ROWS / SPLASH_VERIFY_ATTENTION_TILE_PARTS(Group);  \
+   constexpr uint N = SplashKvPageTokens;                                       \
+   alignas(16) threadgroup float scores[M * N];                                 \
+   alignas(16) threadgroup bfloat probabilities[M * N];                         \
+@@ -36,7 +36,7 @@
+ // group.y the history split and group.z the lane, whose parameters select the
+ // page table and the query tile.
+ #define PAGED_VERIFY_TILE_AT(Heads, Group, HeadDim)                            \
+-  constexpr uint Parts = SPLASH_ATTENTION_TILE_PARTS(Group);                   \
++  constexpr uint Parts = SPLASH_VERIFY_ATTENTION_TILE_PARTS(Group);                   \
+   const uint kv_head = group.x / Parts;                                        \
+   const SplashAttentionTile tile =                                             \
+       splash_attention_tile_part<Group, SPLASH_TARGET_VERIFY_ROWS, Parts,      \
+@@ -99,7 +99,7 @@ inline void splash_verify_attention_reduce_phase(
+   if (!tile.active || fused_row >= M || thread_index >= D)
+     return;
+   splash_attention_reduce_row<QueryHeadsPerKVHead, SPLASH_TARGET_VERIFY_ROWS,
+-                              SPLASH_ATTENTION_TILE_PARTS(QueryHeadsPerKVHead), HeadDim,
++                              SPLASH_VERIFY_ATTENTION_TILE_PARTS(QueryHeadsPerKVHead), HeadDim,
+                               Window>(
+       partials, statistics, output, tile, params[group.z].slot_splits,
+       fused_row, thread_index, weights, group_values,
+diff --git a/runtime/metal/kernels/shared/gguf_linear.metal b/runtime/metal/kernels/shared/gguf_linear.metal
+index cad49b60..4f1826c2 100644
+--- a/runtime/metal/kernels/shared/gguf_linear.metal
++++ b/runtime/metal/kernels/shared/gguf_linear.metal
+@@ -113,7 +113,7 @@ using GgufDecodeKernel = void(device bfloat *, device uchar *, device uchar *, d
+ // Prefill chunks of 33 to 64 rows run the 64-row tile (ops::Linear), whose bf16 epilogues prefill takes.
+ #define GGUF_DECODE_ROWS64(F, f, ep, Ep) GGUF_DECODE_ROWS(F, f, ep, Ep, bfloat) GGUF_DECODE(F, f, 64, ep, Ep, bfloat)
+ #define GGUF_DECODE_FORMAT(F, f)                                                                                  \
+-  GGUF_DECODE_ROWS64(F, f, a, EpNone) GGUF_DECODE_ROWS(F, f, a_f32, EpNone, float)                                \
++  GGUF_DECODE_ROWS64(F, f, a, EpNone) GGUF_DECODE_ROWS(F, f, a_f32, EpNone, float) GGUF_DECODE(F, f, 64, a_f32, EpNone, float)                                \
+   GGUF_DECODE_ROWS64(F, f, r, EpResidual) GGUF_DECODE_ROWS64(F, f, g, EpUpWithGate)
+ QUANT_FORMATS(GGUF_DECODE_FORMAT)
+ #undef GGUF_DECODE_FORMAT
+@@ -187,7 +187,7 @@ using GgufDecodeGateUpKernel = void(device bfloat *, device uchar *, device ucha
+                                     device atomic_uint *, constant GgufDecodeParams &, uint2, uint);
+ #define GGUF_DECODE_GATE_UP(F, f, R) \
+   template [[host_name("gguf_decode_" #f "_m" #R "_gate_up")]] kernel GgufDecodeGateUpKernel gguf_decode_gate_up<F, R>;
+-#define GGUF_DECODE_GATE_UP_FORMAT(F, f) GGUF_DECODE_GATE_UP(F, f, 8) GGUF_DECODE_GATE_UP(F, f, 16) GGUF_DECODE_GATE_UP(F, f, 32)
++#define GGUF_DECODE_GATE_UP_FORMAT(F, f) GGUF_DECODE_GATE_UP(F, f, 8) GGUF_DECODE_GATE_UP(F, f, 16) GGUF_DECODE_GATE_UP(F, f, 32) GGUF_DECODE_GATE_UP(F, f, 64)
+ QUANT_FORMATS(GGUF_DECODE_GATE_UP_FORMAT)
+ #undef GGUF_DECODE_GATE_UP_FORMAT
+ #undef GGUF_DECODE_GATE_UP
+diff --git a/runtime/metal/kernels/shared/gguf_linear_rows.metal b/runtime/metal/kernels/shared/gguf_linear_rows.metal
+new file mode 100644
+index 00000000..6527afcf
+--- /dev/null
++++ b/runtime/metal/kernels/shared/gguf_linear_rows.metal
+@@ -0,0 +1,66 @@
++// Research AF4 decode: row SIMDgroups share one 64-column weight stage.
++// Keep the existing K walk, dequantization, split reduction and epilogues.
++#pragma clang fp reassociate(off)
++#include "metal/kernels/common/gguf_staged_tile.h"
++#include "metal/kernels/common/split_reduce.h"
++
++template <ushort Rows, ushort PartRows, GgufEpilogue Ep, class Out>
++kernel void gguf_decode_rows_shared(device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]],
++    device uchar *w1 [[buffer(2)]], device uchar *meta [[buffer(3)]], device Out *output [[buffer(4)]],
++    device coherent(device) float *partials [[buffer(5)]], device atomic_uint *counters [[buffer(6)]],
++    device bfloat *aux [[buffer(7)]], constant GgufDecodeParams &p [[buffer(8)]],
++    uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
++    uint simd_group [[simdgroup_index_in_threadgroup]]) {
++  static_assert(Rows % PartRows == 0 && Rows > PartRows);
++  constexpr ushort Groups = Rows / PartRows;
++  constexpr ushort Columns = GGUF_TILE_COLUMNS, KS = GGUF_STAGED_STEP;
++  constexpr ushort Threads = Groups * 32;
++  threadgroup half stage[2 * Columns * KS];
++  threadgroup half2 tl[1];  // AF4 has no codebook.
++  threadgroup uint arrival;
++  const uint thread_index = simd_group * 32 + lane;
++  const uint row0 = simd_group * PartRows;
++  const uint origin = group.x * Columns, column0 = p.out_offset + origin;
++  const uint per = p.input_size / KS / p.splits, sb = group.y * per, se = sb + per;
++  device bfloat *mine = input + ulong(row0) * p.input_size;
++  auto acc = staged_accumulator<PartRows, Columns, KS>(mine, p.input_size, stage);
++  gguf_zero(acc);
++  gguf_staged_steps<FmtAF4G64, PartRows, Columns, KS, Threads>(mine, w0, w1, meta, p.input_size,
++      origin, stage, tl, thread_index, sb, se, staged_first_step(group.x, sb, se, p.spread), true, acc);
++  const auto out = [&](uint row, uint column, float value) {
++    const ulong at = ulong(row0 + row) * p.out_stride + column0 + column;
++    output[at] = gguf_epilogue<Ep, Out>(value, aux, at);
++  };
++  if (p.splits == 1) {
++    gguf_elements(acc, out);
++    return;
++  }
++  const auto at = [&](uint split, uint row, uint column) {
++    return (ulong(split) * Rows + row0 + row) * p.out_stride + column0 + column;
++  };
++  gguf_elements(acc, [&](uint row, uint column, float value) {
++    partials[at(group.y, row, column)] = value;
++  });
++  device atomic_uint *counter = counters + p.out_offset / Columns + group.x;
++  if (!split_arrive_last(counter, p.splits, thread_index, &arrival)) return;
++  gguf_elements(acc, [&](uint row, uint column, float value) {
++    out(row, column, split_sum(value, group.y, p.splits,
++        [&](uint split) { return partials[at(split, row, column)]; }));
++  });
++  split_release(counter, thread_index);
++}
++
++template <class Out>
++using GgufRowsSharedKernel = void(device bfloat *, device uchar *, device uchar *, device uchar *, device Out *,
++    device coherent(device) float *, device atomic_uint *, device bfloat *, constant GgufDecodeParams &, uint2, uint, uint);
++#define ROWS_SHARED(R, P, ep, Ep, Out) \
++  template [[host_name("gguf_decode_af4g64_m" #R "_" #ep "_rows" #P)]] \
++  kernel GgufRowsSharedKernel<Out> gguf_decode_rows_shared<R, P, Ep, Out>;
++#define ROWS_SHARED_EPILOGUES(R, P) \
++  ROWS_SHARED(R, P, a, EpNone, bfloat) ROWS_SHARED(R, P, a_f32, EpNone, float) \
++  ROWS_SHARED(R, P, r, EpResidual, bfloat) ROWS_SHARED(R, P, g, EpUpWithGate, bfloat)
++ROWS_SHARED_EPILOGUES(32, 16)
++ROWS_SHARED_EPILOGUES(64, 16)
++ROWS_SHARED_EPILOGUES(64, 32)
++#undef ROWS_SHARED_EPILOGUES
++#undef ROWS_SHARED
+diff --git a/runtime/metal/kernels/shared/sparse_attention.metal b/runtime/metal/kernels/shared/sparse_attention.metal
+index 5e096767..b90553fc 100644
+--- a/runtime/metal/kernels/shared/sparse_attention.metal
++++ b/runtime/metal/kernels/shared/sparse_attention.metal
+@@ -178,10 +178,12 @@ inline SplashSparseList splash_sparse_list(device const uint *lists, device cons
+     SPARSE_VERIFY_SPLIT_BODY(Heads, Group, HeadDim, CacheElement, true,        \
+                              locations, location_pages, places)                \
+   }
++#if SPLASH_TARGET_VERIFY_ROWS == 8
+ SPARSE_VERIFY_SPLIT(verify_attention_q8_sparse_kv2_g12, 2, 12, 256, int8_t)
+ SPARSE_VERIFY_SPLIT(verify_attention_bf16_sparse_kv2_g12, 2, 12, 256, bfloat)
+ SPARSE_VERIFY_LOCATED_SPLIT(verify_attention_q8_sparse_located_kv2_g12, 2, 12, 256, int8_t)
+ SPARSE_VERIFY_LOCATED_SPLIT(verify_attention_bf16_sparse_located_kv2_g12, 2, 12, 256, bfloat)
++#endif // Research block16 excludes unsupported sparse verify layouts.
+ #undef SPARSE_VERIFY_LOCATED_SPLIT
+ #undef SPARSE_VERIFY_SPLIT
+ #undef SPARSE_VERIFY_SPLIT_BODY
+diff --git a/runtime/model/ModelFactory.cpp b/runtime/model/ModelFactory.cpp
+index caacdfb0..948c9bbe 100644
+--- a/runtime/model/ModelFactory.cpp
++++ b/runtime/model/ModelFactory.cpp
+@@ -76,6 +76,10 @@ LoadedModel loadModel(metal::MetalBackend &backend,
+                               const std::filesystem::path &root,
+                               const ModelDescriptor &descriptor,
+                               const ModelLoadOptions &options) {
++  // Isolated prototype: all geometry in this binary is sixteen rows.
++  // Other model families and eight-row checkpoints remain unsupported.
++  if (!std::holds_alternative<Qwen3_8Layout>(descriptor.target) || !descriptor.draft.isDSpine())
++    throw std::invalid_argument("research block16 is restricted to Qwen3.8-27B DSpine");
+   LoadedModel result;
+   result.descriptor = descriptor;
+   if (!result.descriptor.valid())
+diff --git a/runtime/model/Qwen4Steps.cpp b/runtime/model/Qwen4Steps.cpp
+index 762a50f9..d298bfb3 100644
+--- a/runtime/model/Qwen4Steps.cpp
++++ b/runtime/model/Qwen4Steps.cpp
+@@ -61,7 +61,8 @@ uint32_t prefillScoreRows(const QwenTargetGeometry &g) {
+ // (ops::PagedAttention::addBlockLists): a verify lane's rows, or a prefill
+ // tile's. A row attends to at most its top blocks and the block of its tail,
+ // so a tile's list holds at most this many entries.
+-constexpr uint32_t kTileRows = SPLASH_TARGET_VERIFY_ROWS;
++// Sparse Qwen4 is not supported by this research block16 build. Keep its compile-only geometry unchanged.
++constexpr uint32_t kTileRows = SPLASH_PREFILL_ATTENTION_TILE_ROWS;
+ static_assert(kTileRows == SPLASH_PREFILL_ATTENTION_TILE_ROWS, "verify and prefill tiles hold as many rows");
+ uint32_t listStride(const QwenTargetGeometry &g) { return kTileRows * (g.indexerTopBlocks + 1); }
+ 
+diff --git a/runtime/ops/DraftAttention.cpp b/runtime/ops/DraftAttention.cpp
+index ac8dd241..07b089a7 100644
+--- a/runtime/ops/DraftAttention.cpp
++++ b/runtime/ops/DraftAttention.cpp
+@@ -196,9 +196,9 @@ void DraftAttention::addDecode(
+   bindings.push_back(buffers.queryKeys);
+   bindings.push_back(buffers.queryValues);
+   graph.add("draft_attention_bf16_split", std::move(bindings), params,
+-            {shape.kvHeads, lanes, kSplits});
++            {shape.kvHeads * SPLASH_DRAFT_ATTENTION_PARTS, lanes, kSplits});
+   graph.add("draft_attention_bf16_reduce", {buffers.groupedQueries}, params,
+-            {shape.kvHeads, lanes, 1});
++            {shape.kvHeads * SPLASH_DRAFT_ATTENTION_PARTS, lanes, 1});
+ }
+ 
+ void DraftAttention::addReorder(metal::CommandGraph &graph,
+diff --git a/runtime/ops/GDN.cpp b/runtime/ops/GDN.cpp
+index b2497263..5ab383b4 100644
+--- a/runtime/ops/GDN.cpp
++++ b/runtime/ops/GDN.cpp
+@@ -250,7 +250,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
+     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
+   const std::string name = std::string("verify_gdn_fused") + tableSuffix(input) + std::string(kernel.suffix);
+   graph.add(stateKernel(normKernel(name, buffers.mixerNorm, shape.headDimension), state.format),
+-            std::move(bindings), params, {shape.valueHeads, lanes, 1});
++            std::move(bindings), params, {shape.valueHeads, lanes, 1}, {SPLASH_TARGET_VERIFY_ROWS * 32, 1, 1});
+   if (!prepare) return {};
+   return {buffers.hidden, input};
+ }
+diff --git a/runtime/ops/KernelSelection.cpp b/runtime/ops/KernelSelection.cpp
+index c506c68c..b06cc00f 100644
+--- a/runtime/ops/KernelSelection.cpp
++++ b/runtime/ops/KernelSelection.cpp
+@@ -6,6 +6,9 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cstdlib>
++#include <stdexcept>
++#include <string_view>
+ #include <variant>
+ 
+ namespace splash::ops {
+@@ -182,12 +185,22 @@ LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorklo
+   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
+   const bool gateUp = w.epilogue == LinearEpilogue::GateUp,
+              onePass = gateUp && unit.oneFormat && cores >= p.onePassFromCores;
+-  if (unit.registerTakes &&
++  if (false && unit.registerTakes &&
+       registers(p.decodeRegister, unit.formatClass, lanes, (onePass ? 2 : 1) * uint64_t{n / GGUF_TILE_COLUMNS},
+                 cores))
+     return {.tile = LinearTile::GgufRegister,
+             .splits = splitsFor(p.registerSplits, n, k, w.rows, unit.weightBits16, cores).splits};
+-  LinearConfig config = staged(p, n, k, w.rows, unit.weightBits16, cores, onePass ? Passes::Either : Passes::Two);
++  // Research isolation: retain the eight-row control split/pass choice.
++  LinearConfig config = staged(p, n, k, w.rows / 2, unit.weightBits16, cores, onePass ? Passes::Either : Passes::Two);
++  // Research: compare the existing two-pass path at unchanged K splits.
++  static const bool twoPass64 = [] {
++    const char *value = std::getenv("SPLASH_GATE_UP_TWO_PASS64");
++    if (!value || std::string_view(value) == "0") return false;
++    if (std::string_view(value) != "1")
++      throw std::invalid_argument("research two-pass control must be 0 or 1");
++    return true;
++  }();
++  if (twoPass64 && gateUp && w.rows > 32) config.oneGateUpPass = false;
+   config.spread = cores >= p.spreadFromCores;
+   config.sixteenRows =
+       lanes == 1 && config.splits == 1 &&
+diff --git a/runtime/ops/LinearGguf.cpp b/runtime/ops/LinearGguf.cpp
+index 7db0666a..8aaa850c 100644
+--- a/runtime/ops/LinearGguf.cpp
++++ b/runtime/ops/LinearGguf.cpp
+@@ -8,9 +8,11 @@
+ #include "ops/KernelSelection.hpp"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <span>
+ #include <stdexcept>
+ #include <string>
++#include <string_view>
+ #include <type_traits>
+ #include <vector>
+ 
+@@ -242,12 +244,24 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
+   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
+   const uint32_t rows = plan.storageRows(), splits = config.splits;
+   const auto [partials, counters] = splitScratch(b, splits);
++  static const uint32_t sharedRows = [] {
++    const char *value = std::getenv("SPLASH_LINEAR_SHARED_ROWS");
++    if (!value || std::string_view(value) == "0") return 0u;
++    if (std::string_view(value) == "16") return 16u;
++    if (std::string_view(value) == "32") return 32u;
++    throw std::invalid_argument("SPLASH_LINEAR_SHARED_ROWS must be 0,16,32");
++  }();
+   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
+                           const metal::MetalBuffer &aux) {
+-    graph.add(kernelInstance(decodeKernel(s.name(), rows, epilogue), plan.destination()),
++    const bool shared = w.phase == LinearPhase::Decode && s.formatId == GGUF_FMT_AF4G64 &&
++                        sharedRows && rows > sharedRows;
++    std::string kernel = kernelInstance(decodeKernel(s.name(), rows, epilogue), plan.destination());
++    if (shared) kernel += "_rows" + std::to_string(sharedRows);
++    graph.add(std::move(kernel),
+               {b.input, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
+               GgufDecodeParams{k, splits, n, s.columnOffset, config.spread},
+-              {s.outputSize / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
++              {s.outputSize / GGUF_TILE_COLUMNS, splits, 1},
++              {shared ? rows / sharedRows * 32 : GGUF_STAGED_THREADS, 1, 1});
+   };
+   // A fused projection's segments in one dispatch (gguf_decode_fused_m*),
+   // in tile order: segments with the most bytes per tile first, so their
+diff --git a/runtime/ops/PagedAttention.cpp b/runtime/ops/PagedAttention.cpp
+index a65f2092..e969ed92 100644
+--- a/runtime/ops/PagedAttention.cpp
++++ b/runtime/ops/PagedAttention.cpp
+@@ -21,8 +21,8 @@ bool selectsBlocks(kv::Layout layout) { return layout.reads == kv::Reads::Select
+ 
+ // The parts a dense tile of a layout's GQA group runs in, each a threadgroup
+ // of the split (SPLASH_ATTENTION_TILE_PARTS); a sparse tile is one.
+-uint64_t tileParts(uint32_t queryHeads, kv::Layout layout) {
+-  return selectsBlocks(layout) ? 1 : SPLASH_ATTENTION_TILE_PARTS(queryHeads / layout.kvHeads);
++uint64_t tileParts(uint32_t queryHeads, kv::Layout layout, bool verify = false) {
++  return selectsBlocks(layout) ? 1 : verify ? SPLASH_VERIFY_ATTENTION_TILE_PARTS(queryHeads / layout.kvHeads) : SPLASH_ATTENTION_TILE_PARTS(queryHeads / layout.kvHeads);
+ }
+ 
+ // One thread per gate element, across rows x query heads x head dimension.
+@@ -323,7 +323,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
+           // (x the KV head, y the split) worse, running it up to 1.7x slower
+           // on most grids of more than 32 splits.
+           selectsBlocks(layout) ? metal::DispatchSize{layout.kvHeads * splits, 1, lanes}
+-                                : metal::DispatchSize{layout.kvHeads * tileParts(queryHeads, layout), splits, lanes},
++                                : metal::DispatchSize{layout.kvHeads * tileParts(queryHeads, layout, true), splits, lanes},
+           {layout.kvHeads,
+            kv::kVerifyRows * (queryHeads / layout.kvHeads), lanes},
+           selectsBlocks(layout), kernel.sinks,
+@@ -607,11 +607,13 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
+ 
+ void PagedAttention::addBlockLists(metal::CommandGraph &graph, const metal::MetalBuffer &mask, uint32_t maskWords,
+                                    std::span<const BlockListRows> sequences, const AttentionBlocks &blocks) {
+-  // The sparse kernels read a list's rows as a verify lane's or a prefill
+-  // tile's, which are as many, each a bit of an entry.
++  // This research build qualifies dense Qwen3.8 verification only. Sparse
++  // block lists still use the prefill tile width and have no sixteen-row ABI.
+   constexpr uint32_t tileRows = kv::kPrefillAttentionTileRows;
+-  static_assert(tileRows == kv::kVerifyRows && tileRows <= SPLASH_ATTENTION_BLOCK_ROW_BITS,
+-                "a block list's rows are a verify lane's and a prefill tile's");
++  static_assert(tileRows <= SPLASH_ATTENTION_BLOCK_ROW_BITS,
++                "a block list's rows must fit the mask bits");
++  if constexpr (tileRows != kv::kVerifyRows)
++    throw std::invalid_argument("sparse block lists are not qualified in this research geometry");
+   if (sequences.empty() || sequences.size() > SPLASH_MAXIMUM_BATCH_WIDTH || !maskWords || !blocks.stride)
+     throw std::invalid_argument("invalid attention block lists");
+   SplashAttentionBlockListParams params{

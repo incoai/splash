@@ -1,0 +1,31 @@
+{
+  "frozen_utc": "2026-11-10T06:16:19.376687+00:00",
+  "groups_per_comparison": 3,
+  "order": [
+    "A",
+    "B",
+    "B",
+    "A"
+  ],
+  "comparisons": {
+    "http-wide-policy-abba": "Same wide-policy executable/metallib and target/DSpine16 model. Only SPLASH_GATE_UP_TWO_PASS64=0 vs1 changes. Primary endpoint is four-concurrent end-to-end throughput; serial is a regression endpoint.",
+    "http-dflash-vs-dspine16-abba": "8row DFlash2 with existing M16 policy vs DSpine trained16 prototype with wide-only two-pass control; identical target source weights. Different draft/geometry intentional; report percase and batch, no causal claim for drafter alone."
+  },
+  "settings": {
+    "prompts": "Existing four coding prompts in dev.benchmarks.draft_comparison, not heldout",
+    "output_cap": 192,
+    "warmup_cap": 128,
+    "temperature": 0,
+    "seed": 42,
+    "context": 32768,
+    "kv": "int8",
+    "state": "fp32",
+    "ANE": false,
+    "verify_rows": "all"
+  },
+  "gates": "Fixed3groups, identical controlled_round nominal<=70C/CPU<=15% start and runtime thermal/no-swap gates, AC boundary receipts, output hashes/counts and target source equality, physicalB4 must be observed, every percase/combined endpoint ABBA spread<=5%. Positive effect separately requires latency improvement>max(2%,2*spread), all3groups. No repeat-to-pass. HTTPconcurrency is application endpoint, not pureGPU throughput.",
+  "frozen_scripts": {
+    "/Users/linson/Documents/ai/splash-dspine-investigation-20261110/scripts/http_round.py": "2a8deced576a26682993805a660236a5a3d262435e8d380d25776a44264dfc3c",
+    "/Users/linson/Documents/ai/splash-dspine-investigation-20261110/scripts/qualify_http.py": "5f90faceacecd1ab033a7d4d5538cf7e97e8ae895a825151bda9344f464d5e12"
+  }
+}
