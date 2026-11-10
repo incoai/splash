@@ -432,11 +432,11 @@ use are rejected.
 A prefill command encodes the images whose rows begin in it, from no cached
 rows, in a command of its own, and is submitted once that command has
 completed: an encode takes about 0.3 s for a 1000 x 1400 page on an M5 Max
-and seconds for a 4-megapixel image on a small GPU, which Metal would count
-against the 5 s it gives the prefill command's first host step or Neural
-Engine wait ([Host steps](internals.md#host-steps)). The scheduler counts the encodes'
-time in what the prefill owes decoding requests, and leaves it out of the
-measured time it sizes later prefill commands by.
+and seconds for a 4-megapixel image on a small GPU, which the scheduler,
+timing it apart, counts in what the prefill owes decoding requests and
+leaves out of the measured time it sizes later prefill commands by, and
+which Metal would count against the 5 s it gives the prefill command's first
+Neural Engine wait ([Host steps](internals.md#host-steps)).
 
 `--language-only` links and loads no vision weights and removes them from
 memory accounting. It skips a GGUF's mmproj download and an MLX shard that

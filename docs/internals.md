@@ -1292,12 +1292,13 @@ holds with the split it runs.
 ## Host steps
 
 A command can run CPU work between its GPU work. A host step
-(`metal::EventStep`, `CommandGraph::host`) runs once all the work before it
-has completed, on one thread of the backend's, and holds the work after it
-until it returns, through a shared event of its command's: it reads what the
-GPU wrote before it and writes Shared buffers the GPU reads after it, and it
-must not call the backend. A step after a failed command buffer is skipped,
-and one that throws fails its command with its message. A step's `then`, if
+(`metal::EventStep`, `CommandGraph::host`) runs on one thread of the
+backend's once the GPU has raised a shared event of its command's at the end
+of all the work before it, and the backend commits the command's buffers
+after it only once it returned: it reads what the GPU wrote before it and
+writes Shared buffers the GPU reads after it, and it must not call the
+backend. A step after a failed command buffer is skipped, and one that
+throws fails its command with its message. A step's `then`, if
 any, runs on the same thread once the step let the work after it go: CPU work
 the GPU need not wait for, such as starting reads that would hold the GPU's
 start back if they began as the step ends. It does not run after work that
@@ -1320,16 +1321,25 @@ so the work owns what it touches.
 
 Metal fails a command buffer whose event wait is still unmet 5 s after its
 queue reached the wait ("Caused GPU Timeout Error"), and with it the command
-and the engine. The backend commits a command's buffers as it encodes them, so
-the queue reaches a command's first host step, or Neural Engine wait, as the
-command is submitted, whatever GPU work runs ahead of it, and each later one
-once the one before it was met (macOS 27, M5 Max and M5 Pro; a wait committed
-behind 4.5 s of work and met 1 s after it fails at 5.0 s). The work between
-two steps, with the step, must therefore end within 5 s, which the
-scheduler's bounded prefill units keep with room to spare. Work outside them runs as
-a command of its own: a prefill command's image encodes, seconds of GPU work
-on a small GPU, run first, and the prefill command is submitted once they
-have completed ([Vision](models.md#vision)).
+and the engine. The queue reaches a wait as the buffer that holds it is
+committed, whatever GPU work runs ahead of it, and a later one once the one
+before it was met (macOS 27, M5 Max and M5 Pro; a wait committed behind
+4.5 s of work and met 1 s after it fails at 5.0 s). No wait spans a host
+step, so a step may work longer than 5 s, as an expert load or a spilled KV
+read from a slow disk does, and only the command watchdog bounds it: a
+command that makes no progress for 120 s fails the engine. A Neural Engine
+wait is such a wait, as is an awake step's spin (below), which waits for the
+end of the decode work before its step. The backend commits the buffers
+before a command's first host step as it encodes them, so the queue reaches
+the command's first Neural Engine wait, unless a host step comes before it,
+as the command is submitted. The work between two such waits, a layer's GPU
+part with the ANE's evaluation, must end within 5 s, which the scheduler's
+bounded prefill units and the split's 2 s bound on an evaluation keep with
+room to spare. A prefill command's image encodes, seconds of GPU work on a
+small GPU, run first as a command of their own, and the prefill command is
+submitted once they have completed, so that the scheduler counts their time
+apart from its rows' and Metal does not count it against its first Neural
+Engine wait ([Vision](models.md#vision)).
 
 A step about as short as the GPU's wake-up can keep the GPU awake: one GPU
 thread spins through it, from the end of the work before it until the CPU
