@@ -450,6 +450,10 @@ extension LaunchOption {
             kind: .choice(standard: "0.5", choices: [], custom: Value(prompt: "1", message: "A number, 0 or more.",
                                                                      parse: { Double($0).flatMap { $0 >= 0 ? String($0) : nil } }))),
         LaunchOption(
+            flag: "--draft-block-size", title: "Draft block size",
+            help: "Sixteen needs a DSpine draft trained for sixteen and a supported dense target. Eight is the default.",
+            section: .requests, kind: .choice(standard: "8", choices: [("16", "16")], custom: nil)),
+        LaunchOption(
             flag: "--verify-rows", title: "Repeatable answers",
             help: "A MoE model’s greedy and seeded answers repeat when a request runs alone with the same prompts cached, at some cost in speed. A prompt sent again reads from the cache, so its answer can differ.",
             section: .requests, kind: .choice(standard: "Off", choices: [("all", "On")], custom: nil)),

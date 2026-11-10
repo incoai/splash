@@ -77,14 +77,14 @@ struct ServeSettingsTests {
             "--port": "8100", "--max-context": "131072", "--max-memory": "48G", "--idle-release": "off",
             "--language-only": "true", "--kv-format": "bf16", "--max-cache-disk": "16G", "--persistent-cache": "true",
             "--host": "0.0.0.0", "--allowed-origin": "a.example, b.example", "--no-webui": "true",
-            "--thinking-end-text": "Now the answer. </think>", "--disable-ane": "true",
+            "--thinking-end-text": "Now the answer. </think>", "--draft-block-size": "16", "--disable-ane": "true",
         ], apiKey: "secret")
         #expect(settings.serveArguments(model: "a/b")
             == ["serve", "--model", "a/b", "--port", "8100", "--offline", "--max-context", "131072",
                 "--max-memory", "48G", "--idle-release", "off", "--language-only", "--kv-format", "bf16",
                 "--max-cache-disk", "16G", "--persistent-cache", "--host", "0.0.0.0",
                 "--allowed-origin", "a.example", "--allowed-origin", "b.example", "--no-webui",
-                "--thinking-end-text", "Now the answer. </think>", "--disable-ane"])
+                "--thinking-end-text", "Now the answer. </think>", "--draft-block-size", "16", "--disable-ane"])
         // The key reaches the server in its environment, never its command line.
         #expect(settings.environment == ["SPLASH_API_KEY": "secret"])
         #expect(settings.request("status").value(forHTTPHeaderField: "Authorization") == "Bearer secret")
