@@ -124,7 +124,7 @@ one that serves vision, so all three runs take
 `"--expert-memory 5632M --ple-memory 237M"` where the installation serves
 vision, whose default checks alone fit only up to about `7700M` of experts.
 Unlike `splash serve`, which
-streams the PLE table where memory cannot hold it, the oracle loads it whole
+streams the PLE table unless `--ple-memory off`, the oracle loads it whole
 unless `--ple-memory` streams it, and its weights then need 37555 MiB, which
 it refuses at once on the M6 (11-03); `237M` is the row cache `splash serve`
 gives the table there, with which the 32K check passed.

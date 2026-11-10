@@ -600,6 +600,21 @@ void testFlashNextOnTheThreeMacs() {
           "the floors did not hold both staging buffers where there are two");
 }
 
+// --ple-memory auto streams Flash-Next's table through its share however
+// much the budget holds: a budget of 192 GiB loads every routed expert and
+// would hold the table's 28.8 GB too, which off loads. A table no larger
+// than its share loads whole where the budget holds it
+// (testArenasFollowWhatStreams).
+void testAutoStreamsTheTableWhereMemoryHoldsIt() {
+  StreamedMemoryInputs inputs = kFlashNext.inputs(kM5Pro);
+  inputs.hardBudgetBytes = 192 * kGiB;
+  const StreamedMemoryPlan automatic = requirePlan(inputs);
+  require(!automatic.expertBytes && automatic.tableBytes == kFlashNextTableShare,
+          "auto did not stream Flash-Next's table through its share where a budget of 192 GiB holds it whole");
+  inputs.table.setting = {StreamedSetting::Mode::Off, 0};
+  require(!requirePlan(inputs).tableBytes, "--ple-memory off streamed Flash-Next's table");
+}
+
 // A spill-capable target keeps resident the requested context where that is
 // less than 64K: Flash-Next with --max-context 16K on the M6 leaves the KV of
 // 16K tokens and their speculative rows (513 pages) beside the experts, which
@@ -716,10 +731,11 @@ void testDense35BContextGrowsWithTheBudget() {
 
 // The arenas are those of the parts that stream: each plan is the one made
 // with the arenas of what it streams, the routed experts' prefill groups and
-// the table's staging. Flash-Next with its experts loaded through a store of
-// 12 GiB from a budget that loads its table whole to one that streams it,
-// with a staging of 512 MiB, and with experts the plan sizes from one that
-// loads them whole to one that streams them.
+// the table's staging. Beside Flash-Next's experts loaded through a store of
+// 12 GiB, a table no larger than its share, 200 MiB, from a budget that
+// streams it to one that loads it whole, with a staging of 512 MiB; and
+// Flash-Next with experts the plan sizes from one that loads them whole to
+// one that streams them.
 void testArenasFollowWhatStreams() {
   const auto same = [](const StreamedMemoryPlan &plan, const StreamedMemoryPlan &other) {
     return plan.expertBytes == other.expertBytes && plan.tableBytes == other.tableBytes &&
@@ -731,10 +747,11 @@ void testArenasFollowWhatStreams() {
   };
   StreamedMemoryInputs inputs = kFlashNext.inputs(kM5Pro);
   inputs.experts.setting = {StreamedSetting::Mode::Loaded, 12 * kGiB};
+  inputs.table.allBytes = 200 * kMiB;
   const uint64_t group = arenaBytes(kFlashNext.group), staged = group + 512 * kMiB;
   inputs.arenaBytes[1] = {group, staged};
   bool whole = false, streams = false;
-  for (inputs.hardBudgetBytes = 40 * kGiB; inputs.hardBudgetBytes < 56 * kGiB; inputs.hardBudgetBytes += kGiB / 4) {
+  for (inputs.hardBudgetBytes = 20 * kGiB; inputs.hardBudgetBytes < 24 * kGiB; inputs.hardBudgetBytes += kGiB / 16) {
     const StreamedMemoryPlan plan = requirePlan(inputs);
     require(same(plan, planned(inputs, plan.tableBytes ? staged : group)),
             "a plan's table was sized beside the arenas of another");
@@ -1154,6 +1171,7 @@ int main() {
     testExtentSizeFollowsThePool();
     testHotBlockCacheIsDefinedOnce();
     testFlashNextOnTheThreeMacs();
+    testAutoStreamsTheTableWhereMemoryHoldsIt();
     testSpillAllowanceFollowsASmallerRequestedContext();
     testDense35BKeepsMainsPlan();
     testDenseExplicitContextKeepsMainsExperts();

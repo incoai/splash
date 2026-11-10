@@ -502,8 +502,8 @@ SERVE_OPTIONS = (
             metavar="SIZE",
             help="RAM row cache of the PLE n-gram table of a Qwen3.8-Flash-Next "
             "GGUF, e.g. 2G, which streams the rest from the SSD; off loads the "
-            "whole table, tens of GB (default: auto, which streams it where "
-            "memory cannot hold it)",
+            "whole table, tens of GB (default: auto, a cache of at most the "
+            "rows of a 128K-token prompt, less where memory is short)",
         ),
         engine=EngineArgument("--ple-memory"),
         needs="ple_table",
