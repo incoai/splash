@@ -238,7 +238,8 @@ void verifyInputExtents(MetalBackend &backend) {
     requireExtent(backend, buffers[index], bytes, 4, what, [&](CommandGraph &graph, const MetalBuffer &view) {
       auto changed = buffers;
       changed[index] = view;
-      Embedding::addVerifyInput(graph, changed[0], changed[1], changed[2], vocabulary, lanes);
+      Embedding::addVerifyInput(graph, changed[0], changed[1], changed[2], vocabulary, lanes,
+                                SPLASH_TARGET_VERIFY_ROWS);
     });
 }
 

@@ -92,9 +92,9 @@ std::vector<uint32_t> QwenTarget::verifyTableRows(uint32_t) const { return {}; }
 
 void QwenTarget::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                                 metal::MetalBuffer proposals, metal::MetalBuffer verifyInput,
-                                uint32_t lanes) const {
+                                uint32_t lanes, uint32_t rows) const {
   ops::Embedding::addVerifyInput(graph, std::move(draftInput), std::move(proposals), std::move(verifyInput),
-                                 geometry_.vocabularySize, lanes);
+                                 geometry_.vocabularySize, lanes, rows);
 }
 
 void QwenTarget::addEmbedding(metal::CommandGraph &graph,

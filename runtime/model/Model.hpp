@@ -873,6 +873,16 @@ public:
   [[nodiscard]] virtual uint32_t draftWindow() const noexcept {
     return SPLASH_DRAFT_SLIDING_WINDOW;
   }
+  // The rows a draft cycle drafts and its target verifies (the compiled
+  // variant's block): the draft's proposals are rows 1..rows-1 of its input
+  // and the verify runs all rows through the target. The shipped drafts keep
+  // the ABI's 8-row block; a variant trained for longer blocks returns its
+  // own, which the verify kernels compile a geometry for.
+  [[nodiscard]] virtual uint32_t draftRows() const noexcept {
+    return SPLASH_DRAFT_QUERY_ROWS;
+  }
+  [[nodiscard]] uint32_t draftProposalTokens() const noexcept { return draftRows() - 1; }
+  [[nodiscard]] uint32_t targetVerifyRows() const noexcept { return draftRows(); }
   // The bytes releaseIdleBuffer(keepLane), called until it gives none,
   // releases once the cache has let go of `evictedStates` more cached states,
   // whose buffers return to the pool: the pooled buffers, beyond those one

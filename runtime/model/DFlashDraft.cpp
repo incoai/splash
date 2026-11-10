@@ -371,7 +371,7 @@ void DFlashDraft::addDecode(
 void DFlashDraft::addMaskRows(metal::CommandGraph &graph, metal::MetalBuffer rows, uint32_t lanes) const {
   if (!weights_.maskEmbedding) return;
   ops::Embedding::addDraftMaskRows(graph, weights_.maskEmbedding, std::move(rows), weights_.layout.hiddenSize,
-                                   lanes);
+                                   lanes, weights_.layout.rows);
 }
 
 void DFlashDraft::addContextCommit(

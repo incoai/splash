@@ -255,8 +255,11 @@ void Qwen4ExpTarget::prepareVerifyLane(uint32_t lane, uint64_t position, const Q
 
 void Qwen4ExpTarget::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                                     metal::MetalBuffer proposals, metal::MetalBuffer verifyInput,
-                                    uint32_t lanes) const {
-  QwenTarget::addVerifyInput(graph, std::move(draftInput), std::move(proposals), verifyInput, lanes);
+                                    uint32_t lanes, uint32_t rows) const {
+  QwenTarget::addVerifyInput(graph, std::move(draftInput), std::move(proposals), verifyInput, lanes, rows);
+  // The PLE steps' rows follow the ABI's block: this target's served drafts
+  // are the shipped 8-row ones (Qwen4Steps::addVerifyInput sizes the hash
+  // rows from ExecutionLimits::targetVerifyRows).
   steps_.addVerifyInput(graph, std::move(verifyInput), lanes);
 }
 

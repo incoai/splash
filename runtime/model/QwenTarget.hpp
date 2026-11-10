@@ -505,7 +505,8 @@ public:
   // target makes of them itself.
   virtual void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                               metal::MetalBuffer proposals,
-                              metal::MetalBuffer verifyInput, uint32_t lanes) const;
+                              metal::MetalBuffer verifyInput, uint32_t lanes,
+                              uint32_t rows) const;
   virtual void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                             metal::MetalBuffer hidden, uint32_t rows) const;
   // The commit after acceptance of a verify of `lanes` lanes: in the

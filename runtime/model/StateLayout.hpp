@@ -84,6 +84,9 @@ struct DraftStateLayout final {
   // The ring slots the draft's geometry keeps (the compiled draft variant's
   // window, the shipped drafts' unless another's config states one).
   uint32_t window = SPLASH_DRAFT_SLIDING_WINDOW;
+  // The rows a draft cycle drafts and the target verifies (the compiled
+  // draft variant's block; the ABI's 8 unless the variant states more).
+  uint32_t rows = SPLASH_DRAFT_QUERY_ROWS;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return layers && kvHeads && headDimension && contextWidth && window &&

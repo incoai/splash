@@ -1861,7 +1861,7 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
     sampling.addThinkingDrafts(verify, policies, acceptance.proposedTokens);
     require(draftDispatches(verify) == 1, "the started ends dispatched their drafts other than once");
     Embedding::addVerifyInput(verify, draftInput, acceptance.proposedTokens, batch.buffers.inputTokens, vocabulary,
-                              kLanes);
+                              kLanes, kRows);
     verifyLanes(verify, policies, expected, drafts);
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       require(std::ranges::equal(std::span(proposed + lane * kPositions, kPositions), drafts[lane]) &&
@@ -1925,7 +1925,7 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
     CommandGraph verify;
     sampling.addThinkingDrafts(verify, policies, acceptance.proposedTokens);
     Embedding::addVerifyInput(verify, draftInput, acceptance.proposedTokens, batch.buffers.inputTokens, vocabulary,
-                              kLanes);
+                              kLanes, kRows);
     sampling.addVerify(verify, policies, batch.buffers, stops, {});
     sampling.addAcceptance(verify, acceptance, maximumRetained, policies, stops);
     static_cast<void>(backend.submitCommandAsync(verify.dispatches()).wait());

@@ -2390,7 +2390,8 @@ struct Runtime::Impl {
     targetModel->addVerifyInput(
         graph, decodeArena->batchSlice(DecodeTensor::DraftInputTokens, lanes),
         decodeArena->batchSlice(DecodeTensor::ProposedTokens, lanes),
-        decodeArena->batchSlice(DecodeTensor::InputTokens, lanes), lanes);
+        decodeArena->batchSlice(DecodeTensor::InputTokens, lanes), lanes,
+        states.layout().draft.rows);
   }
 
   // A stop token or the last budgeted token needs no target work of its own:
