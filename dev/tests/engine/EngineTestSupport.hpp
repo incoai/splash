@@ -179,10 +179,12 @@ inline engine::EngineRequest constrainedRequest(uint64_t id, double deadline = 1
 }
 
 // A Spilling fixture's storage: its pages and the bytes of a Full and an
-// Index page.
+// Index page; and the pages of a prefill group, two of which a Spill lane
+// keeps Full beside its dense history and window (SpillGeometry).
 struct SpillPages final {
   uint32_t count = 256;
   uint64_t fullBytes = 100, indexBytes = 10;
+  uint32_t groupPages = 4;
 };
 
 // An engine whose requests may spill (EngineConfig::spill): Full pages of 100
@@ -256,7 +258,7 @@ struct Spilling {
             .residentTokens = residentTokens,
             .densePages = 1,
             .windowPages = 1,
-            .groupPages = 4};
+            .groupPages = pages.groupPages};
   }
   // A request whose prompt is `pages` whole pages of `token` and one token
   // more, which may generate `output` tokens.

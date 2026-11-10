@@ -298,8 +298,9 @@ struct FlashNextLanes {
 struct FlashNextGoverned {
   // The room a Spill start finds: its first command's extent and state, not its Resident KV's extents.
   static constexpr uint64_t kStartRoomBytes = 300ULL << 20;
-  explicit FlashNextGoverned(const std::function<void(Executor &)> &shape = {})
-      : spill{16'384, false, 0, 200'000, Spilling::Extent{256}, shape, {}, true, FlashNextLanes::kPages} {
+  explicit FlashNextGoverned(const std::function<void(Executor &)> &shape = {},
+                             const Spilling::Pages &pages = FlashNextLanes::kPages)
+      : spill{16'384, false, 0, 200'000, Spilling::Extent{256}, shape, {}, true, pages} {
     spill.model.spilledReadFloorBytes = 390ULL << 20;
     spill.model.stagingPageBytes = 36'864;
   }
@@ -3002,6 +3003,143 @@ void testTwoLanesThatDivergeFromOnePrefixCompleteWhereEachDoesAlone() {
   require(failed.empty(), "lanes failed at limits where each lane completes alone" + failed);
 }
 
+// Two distinct Spill prompts at the memory wall complete where each completes alone. With Flash-Next's prefill groups
+// (256 pages: a Spill lane keeps 514 pages Full) and its 8,192-row commands of six passes, a 2,740-page prompt and,
+// submitted while its first command runs, a 2,483-page one: the second has fewer rows left than the first past that
+// command, so it leads the next command and starts beside the first at once (Scheduler::prefillAdmissionOrder); one
+// page longer, it waits, queued, until the first's prefill ends, and both complete from 690 MB. Started together they
+// prefill side by side, each command's claim releasing the other's landed pages down to its floor; at the shorter's
+// decode its 390 MiB hot block floor is short, and the prefilling lane yields. Alone, the decoding lane's claim counted
+// the pages the yielded lane left cached and its own release in whole extents of each, at 700 MB 219 MiB of the 290 MiB
+// it lacked, where their takes free 316.5 MiB, and the lane failed capacity_exhausted from 690 to 720 MB having taken
+// nothing: a lone claim takes what the order gives (ClaimSpec::lone). On Qwen3.8-Flash-Next Q2_0 at --max-memory 9.4G
+// on a 48 GB M5 Pro, prompts of 87,682 and 79,475 tokens 0.5 s apart (15 rows the second's lead) failed so, where
+// 86,902 and 78,993 (283 rows the first's) completed and 1.6.0 completed both.
+void testTwoDistinctSpillPromptsAtTheWallCompleteWhereEachDoesAlone() {
+  Spilling::Pages pages = FlashNextLanes::kPages;
+  pages.groupPages = 4 * model::ExecutionLimits::prefillTokenBudget / KvCache::pageTokens;
+  // The failures from an idle engine with `megabytes` of room: of a 2,740-page prompt (`first`) and of a prompt of
+  // `second` pages (none: no such prompt) submitted while the first's first command runs.
+  const auto failures = [&](uint64_t megabytes, bool first, uint32_t second) {
+    FlashNextGoverned lanes(test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6, true), pages);
+    Spilling &spill = lanes.spill;
+    spill.host.leaveRoom(megabytes * 1'000'000);
+    if (first) {
+      spill.engine.submit(Spilling::prompt(1, 1, 2'740, 8));
+      spill.runUntil([&] { return spill.engine.commandInFlight(); }, "the first prompt did not start");
+    }
+    if (second)
+      spill.engine.submit(Spilling::prompt(2, 2, second, 8));
+    spill.runUntilIdle();
+    std::string found;
+    for (const auto &[message, retryable] : spill.events.failureDetails)
+      found += ": " + message.substr(0, 100);
+    return found;
+  };
+  std::string failed;
+  const auto check = [&](const char *lanes, uint64_t megabytes, bool first, uint32_t second) {
+    if (const std::string found = failures(megabytes, first, second); !found.empty())
+      failed += "; " + std::string(lanes) + " at " + std::to_string(megabytes) + " MB" + found;
+  };
+  for (const uint64_t megabytes : {690, 700, 710, 720}) {
+    check("the first alone", megabytes, true, 0);
+    check("the second alone", megabytes, false, 2'483);
+    check("the second one page longer", megabytes, true, 2'484);
+    check("the pair", megabytes, true, 2'483);
+  }
+  require(failed.empty(), "two Spill prompts failed at limits where each completes alone" + failed);
+}
+
+// A Spill lane alone on the chain another lane left cached completes where it completes from an idle engine. Lane 1,
+// 2,241 pages of one context and 501 of its own, runs alone to its end, which it reaches from 685 MB, and leaves its
+// pages cached; then lane 2, the context and 251 pages of its own, runs alone on the chain it reuses. At 670 MB its
+// claim for its 390 MiB hot block floor counted lane 1's cached pages and its own release in whole extents of each,
+// short of what it lacked, and the lane failed capacity_exhausted having taken nothing, where from an idle engine it
+// completes: a lone claim takes what the order gives (ClaimSpec::lone).
+void testALaneAloneOnTheChainAnotherLeftCompletesWhereItDoesFromIdle() {
+  Spilling::Pages pages = FlashNextLanes::kPages;
+  pages.groupPages = 4 * model::ExecutionLimits::prefillTokenBudget / KvCache::pageTokens;
+  const auto branch = [](uint64_t id, uint32_t own) {
+    EngineRequest request = Spilling::prompt(id, 1, 2'241, 8);
+    request.prompt.insert(request.prompt.end(), own * KvCache::pageTokens, static_cast<uint32_t>(id + 1));
+    return request;
+  };
+  // Lane 2's failures from an idle engine with `megabytes` of room, after lane 1 alone (`first`) or not.
+  const auto failures = [&](uint64_t megabytes, bool first) {
+    FlashNextGoverned lanes(test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6, true), pages);
+    Spilling &spill = lanes.spill;
+    spill.host.leaveRoom(megabytes * 1'000'000);
+    if (first) {
+      spill.engine.submit(branch(1, 501));
+      spill.runUntilIdle();
+    }
+    const size_t before = spill.events.failureDetails.size();
+    spill.engine.submit(branch(2, 251));
+    spill.runUntilIdle();
+    std::string found;
+    for (size_t index = before; index < spill.events.failureDetails.size(); ++index)
+      found += ": " + spill.events.failureDetails[index].first.substr(0, 100);
+    return found;
+  };
+  std::string failed;
+  for (const uint64_t megabytes : {670, 680, 690})
+    for (const bool first : {false, true})
+      if (const std::string found = failures(megabytes, first); !found.empty())
+        failed += "; lane 2 " + std::string(first ? "after lane 1" : "alone") + " at " + std::to_string(megabytes) +
+                  " MB" + found;
+  require(failed.empty(), "a lane failed alone at limits where it completes from an idle engine" + failed);
+}
+
+// A lone Spill lane fails capacity_exhausted only past what it holds alone, and then without waiting out its resource
+// wait: its claim takes what the order gives and waits while its writes are in flight, after which nothing else holds
+// memory it could get. A 2,740-page prompt completes from 690 MB; at 680 MB its 390 MiB hot block floor still lacks
+// 1.4 MiB once the lane's pages are released down to its floor. Where its copies never land, its wait ends with its
+// resource wait's limit; where they fail, the SSD cache's file takes no more writes, and it fails at once.
+void testALoneLaneFailsOnlyPastWhatItHoldsAlone() {
+  Spilling::Pages pages = FlashNextLanes::kPages;
+  pages.groupPages = 4 * model::ExecutionLimits::prefillTokenBudget / KvCache::pageTokens;
+  enum class Copies : uint8_t { Land, Stall, Fail };
+  // The lane's failures from an idle engine with `megabytes` of room, the copies it writes once it decodes landing,
+  // never landing, or failing, ticking 100 ms at a time for up to two resource waits within its own deadline.
+  const auto failures = [&](uint64_t megabytes, Copies copies) {
+    FlashNextGoverned lanes(test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6, true), pages);
+    Spilling &spill = lanes.spill;
+    spill.host.leaveRoom(megabytes * 1'000'000);
+    EngineRequest request = Spilling::prompt(1, 1, 2'740, 8);
+    request.deadlineMilliseconds = 3 * engine::kResourceWaitTimeoutMilliseconds;
+    spill.engine.submit(std::move(request));
+    if (copies == Copies::Land) {
+      spill.runUntilIdle();
+      return spill.events.failures;
+    }
+    spill.runUntil([&] { return spill.engine.snapshot().activeRequests.front().phase == Phase::Decode; },
+                   "the lane did not decode");
+    for (const double end = spill.now + 2 * engine::kResourceWaitTimeoutMilliseconds;
+         spill.now < end && !idle(spill.engine); spill.now += 100) {
+      static_cast<void>(spill.engine.tick(spill.now));
+      if (copies == Copies::Fail && spill.tier.inFlight()) {
+        spill.tier.fail(WriteClass::Spill);
+        spill.tier.writableFile = false;
+      }
+    }
+    require(idle(spill.engine), "the lane's wait for its copies did not end");
+    return spill.events.failures;
+  };
+  const auto check = [&](const char *what, uint64_t megabytes, Copies copies,
+                         const std::vector<std::string> &expected) {
+    const std::vector<std::string> found = failures(megabytes, copies);
+    std::string codes;
+    for (const std::string &code : found)
+      codes += " " + code;
+    require(found == expected, "a lone lane " + std::string(what) + " at " + std::to_string(megabytes) +
+                                   " MB ended with failures:" + (codes.empty() ? " none" : codes));
+  };
+  check("alone", 690, Copies::Land, {});
+  check("alone", 680, Copies::Land, {"capacity_exhausted"});
+  check("whose copies never land", 680, Copies::Stall, {"resource_timeout"});
+  check("whose copies fail", 680, Copies::Fail, {"capacity_exhausted"});
+}
+
 // Two Spill lanes on one prompt at the memory wall complete with the memory the longer completes with alone, as on
 // 1.6.0: the wall from lane 1's 1,024th page with up to four extents left, held until the lanes end, beside lane 2,
 // lane 1's first 1,534 pages, which waits for lane 1 to reach them and then decodes on them at once, taking its hot
@@ -4476,6 +4614,11 @@ std::span<const test::TestCase> spillTests() {
       {"testTheKvPastACheckpointMakesALanesFirstRelease", testTheKvPastACheckpointMakesALanesFirstRelease},
       {"testTwoLanesThatDivergeFromOnePrefixCompleteWhereEachDoesAlone",
        testTwoLanesThatDivergeFromOnePrefixCompleteWhereEachDoesAlone},
+      {"testTwoDistinctSpillPromptsAtTheWallCompleteWhereEachDoesAlone",
+       testTwoDistinctSpillPromptsAtTheWallCompleteWhereEachDoesAlone},
+      {"testALaneAloneOnTheChainAnotherLeftCompletesWhereItDoesFromIdle",
+       testALaneAloneOnTheChainAnotherLeftCompletesWhereItDoesFromIdle},
+      {"testALoneLaneFailsOnlyPastWhatItHoldsAlone", testALoneLaneFailsOnlyPastWhatItHoldsAlone},
       {"testTwoLanesOnOnePromptAtTheWallNeedNoMoreThanTheLongerAlone",
        testTwoLanesOnOnePromptAtTheWallNeedNoMoreThanTheLongerAlone},
       {"testTheFirstReleaseFundsTheLanesReads", testTheFirstReleaseFundsTheLanesReads},

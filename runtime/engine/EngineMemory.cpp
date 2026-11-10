@@ -862,7 +862,8 @@ ClaimSpec Engine::claimFor(const Request &active, ClaimClass cls) const {
           .requestId = active.request.id,
           .rank = rankOf(active),
           .reach = cls == ClaimClass::InService ? growthClass(active) : ReclaimClass::Ordinary,
-          .priority = active.request.priority};
+          .priority = active.request.priority,
+          .lone = cls == ClaimClass::InService && !anotherResident(active.request.id)};
 }
 
 bool Engine::yieldsBefore(const Request &a, const Request &b) const {
@@ -920,12 +921,13 @@ Engine::Verdict Engine::judge(const Denial &denial, uint64_t requestId) const {
   if (denial.pending)
     return Verdict::Wait;
   // Pages held by resident lanes come back when they finish, and memory the
-  // host refuses when its pressure lifts; only a lane that cannot fit on its
-  // own has hit the capacity.
+  // host refuses when its pressure lifts. Alone, its claim took what the
+  // order gives (ClaimSpec::lone): it fails only once no write is in flight
+  // either, nothing else holding memory it could get.
   if (anotherResident(requestId) ||
       denial.allocationFailure == metal::AllocationFailure::HostPressure)
     return Verdict::Yield;
-  return Verdict::Fail;
+  return cache_.writesInFlight() ? Verdict::Wait : Verdict::Fail;
 }
 
 ReleaseRule Engine::EngineVictims::releaseRule(const VictimQuery &query) const {
