@@ -1370,7 +1370,10 @@ def main():
         def warming(event):
             # As the warm-up begins and as each of its steps ends: it can take
             # minutes on the first start after an update, so the console and
-            # the record, which the app shows, say how far it is.
+            # the record, which the app shows, say how far it is. It runs on
+            # the reader thread, which must not block (on_warming):
+            # print_status only queues the line for the console's one writer,
+            # which drops it once 1024 lines wait (diagnostics.CONSOLE_LINES).
             print_status(f"Warming up · {event.steps_done} of {event.steps} steps")
             serve_record.warming(args.serve_record, event.steps_done, event.steps)
 
