@@ -601,6 +601,7 @@ class LauncherTests(unittest.TestCase):
             "--offline",
             "--revision",
             "--draft-model",
+            "--draft-block-size",
             "--mmproj",
         }
         self.assertIn("--max-memory", flags)

@@ -120,7 +120,7 @@ struct ServeSettings: Equatable {
 /// A `splash serve` option the Server screen offers: its flag, its words, its part of the screen,
 /// and how its value is chosen. `all` holds every option `splash serve` takes but those the app
 /// sets itself (`--model`, `--model-dir`, `--offline`) and those of one model rather than every
-/// start (`--revision`, `--draft-model`, `--mmproj`).
+/// start (`--revision`, `--draft-model`, `--draft-block-size`, `--mmproj`).
 struct LaunchOption: Identifiable, Sendable {
     enum Section: String, CaseIterable {
         case main = "Launch Options", memory = "Memory", cache = "SSD Cache"
@@ -449,10 +449,6 @@ extension LaunchOption {
             section: .requests,
             kind: .choice(standard: "0.5", choices: [], custom: Value(prompt: "1", message: "A number, 0 or more.",
                                                                      parse: { Double($0).flatMap { $0 >= 0 ? String($0) : nil } }))),
-        LaunchOption(
-            flag: "--draft-block-size", title: "Draft block size",
-            help: "Sixteen needs a DSpine draft trained for sixteen and a supported dense target. Eight is the default.",
-            section: .requests, kind: .choice(standard: "8", choices: [("16", "16")], custom: nil)),
         LaunchOption(
             flag: "--verify-rows", title: "Repeatable answers",
             help: "A MoE model’s greedy and seeded answers repeat when a request runs alone with the same prompts cached, at some cost in speed. A prompt sent again reads from the cache, so its answer can differ.",
