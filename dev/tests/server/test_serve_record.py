@@ -1,6 +1,7 @@
 import io
 import tempfile
 import unittest
+from functools import partial
 from pathlib import Path
 from unittest import mock
 
@@ -20,24 +21,24 @@ class ServeRecordTests(unittest.TestCase):
         )
 
     def test_a_record_other_than_starting_or_ready_is_best_effort(self):
-        """A later phase before ready, a refusal or a failure that cannot be
-        recorded is a warning line of its own, naming the record and the
-        system's error, and raises nothing: the start, or the failure it
-        records, stays as it was."""
+        """A later phase before ready, a step of the warm-up, a refusal or a
+        failure that cannot be recorded is a warning line of its own, naming
+        the record and the system's error, and raises nothing: the start, or
+        the failure it records, stays as it was."""
         for path, reason in self.unwritable:
-            for write, argument in (
-                (serve_record.entered, "loading"),
-                (serve_record.entered, "warming"),
-                (
+            for write in (
+                partial(serve_record.entered, phase="loading"),
+                partial(serve_record.warming, steps_done=3, steps=9),
+                partial(
                     serve_record.failed,
-                    serve_record.failure(serve_record.PORT, "in use"),
+                    failure=serve_record.failure(serve_record.PORT, "in use"),
                 ),
             ):
                 with (
-                    self.subTest(path=path.name, write=write.__name__),
+                    self.subTest(path=path.name, write=write.func.__name__),
                     mock.patch("sys.stderr", io.StringIO()) as log,
                 ):
-                    write(path, argument)
+                    write(path)
                     console_written()
                     (line,) = log.getvalue().splitlines()
                     self.assertTrue(
