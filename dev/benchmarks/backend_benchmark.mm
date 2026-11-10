@@ -1090,6 +1090,7 @@ int main(int argc, char **argv) {
     engine::EngineConfig engineConfig;
     engineConfig.maxContext = bootstrap->nativeLoop().statusSnapshot().maximumContextTokens;
     engineConfig.vocabularySize = capabilities.vocabularySize;
+    engineConfig.draftContextTokens = config.model.draft.contextTokens;
     engine::connectToGovernor(engineConfig, resources->memoryGovernor());
     engine::Engine engine(engineConfig, resources->cache(),
                                   *executor, events);
