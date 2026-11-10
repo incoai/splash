@@ -78,6 +78,25 @@ Projection blockProjection(uint32_t n, uint32_t k, uint32_t segments, uint32_t f
 // destination keeps the configuration, input table and scratch of its bf16
 // plan on every family and core count, and only plain decode workloads take
 // one. ggufProjectionMatrix checks the fp32 kernel it encodes.
+void decodeGeometryPlans() {
+  const DeviceCapabilities device = simulatedDevice(10, 20);
+  const Linear legacy(device);
+  const Linear wide(device, DecodeGeometry(16));
+  require(legacy.geometry().rows() == 8 && wide.geometry().rows() == 16,
+          "linear geometry must belong to its runtime rather than a process global");
+  for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+    const LinearPlan a = legacy.plan({{5120, 17408}, lanes * 8});
+    const LinearPlan b = wide.plan({{5120, 17408}, lanes * 16});
+    require(a.workload().geometry.rows() == 8 && b.workload().geometry.rows() == 16 &&
+                a.storageRows() >= lanes * 8 && b.storageRows() >= lanes * 16,
+            "linear plans must carry the requested execution geometry");
+  }
+  rejects([&] { (void)legacy.plan({{5120, 17408}, 64}); },
+          "invalid linear decode workload", "eight-row runtime admitted eight decode lanes");
+  for (uint32_t rows : {0U, 1U, 7U, 9U, 15U, 17U, UINT32_MAX})
+    rejects([&] { (void)DecodeGeometry(rows); }, "eight or sixteen", "invalid decode geometry");
+}
+
 // Table16 is a physical eight-row format, independent of request geometry.
 void tablePackingGeometry() {
   constexpr uint32_t width = 6144;
@@ -1377,6 +1396,7 @@ void registerSplitUnits(metal::MetalBackend &backend) {
 int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: linear-plan <production.metallib|--cpu>");
+    decodeGeometryPlans();
     tablePackingGeometry();
     ggufPlans();
     scratchBoundsRotated();

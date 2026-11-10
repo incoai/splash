@@ -14,7 +14,8 @@ namespace splash::ops {
 // object and production models borrow it; it never changes after creation.
 class ExecutionPlans final {
 public:
-  explicit ExecutionPlans(const DeviceCapabilities &device);
+  explicit ExecutionPlans(const DeviceCapabilities &device, DecodeGeometry geometry = {});
+  [[nodiscard]] DecodeGeometry geometry() const noexcept { return linear_.geometry(); }
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return linear_.calibration(); }
 

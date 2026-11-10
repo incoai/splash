@@ -180,7 +180,7 @@ LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorklo
   if (w.phase == LinearPhase::Prefill)
     return w.rows <= p.stagedPrefillRows ? staged(p, n, k, w.rows, unit.weightBits16, cores, Passes::Two)
                                          : LinearConfig{.tile = LinearTile::GgufPrefill};
-  const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
+  const uint32_t lanes = w.rows / w.geometry.rows();
   const bool gateUp = w.epilogue == LinearEpilogue::GateUp,
              onePass = gateUp && unit.oneFormat && cores >= p.onePassFromCores;
   if (unit.registerTakes &&
@@ -191,10 +191,10 @@ LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorklo
   LinearConfig config = staged(p, n, k, w.rows, unit.weightBits16, cores, onePass ? Passes::Either : Passes::Two);
   config.spread = cores >= p.spreadFromCores;
   config.sixteenRows =
-      lanes == 1 && config.splits == 1 &&
+      w.geometry.rows() == GGUF_TABLE16_ROWS && lanes == 1 && config.splits == 1 &&
       (gateUp ? !pairTensors.empty() && std::all_of(pairTensors.begin(), pairTensors.end(),
                                                     [&](const UnitFormats &tensor) {
-                                                      return selectProjection(calibration, {w.matrix, w.rows}, tensor)
+                                                      return selectProjection(calibration, {w.matrix, w.rows, w.phase, LinearEpilogue::None, w.geometry}, tensor)
                                                           .sixteenRows;
                                                     })
               : unit.weightBits16 && unit.weightBits16 < p.sixteenRowBelowBits16);

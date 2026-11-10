@@ -7,7 +7,6 @@ namespace splash::ops {
 namespace {
 
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-constexpr uint32_t kDecodeRows = SPLASH_TARGET_VERIFY_ROWS;
 
 template <typename Workspace, size_t N>
 void include(Workspace &bound, const Workspace &required,
@@ -22,7 +21,7 @@ void include(Workspace &bound, const Workspace &required,
 
 } // namespace
 
-ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device) : linear_(device) {}
+ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, DecodeGeometry geometry) : linear_(device, geometry) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
@@ -47,11 +46,12 @@ MoePlan ExecutionPlans::moePrefill(MoeShape shape, const MoeFormats &formats, ui
 }
 
 MoePlan ExecutionPlans::moeDecode(MoeShape shape, const MoeFormats &formats, uint32_t lanes) const {
+  if (geometry().rows() != 8) throw std::invalid_argument("sixteen-row MoE execution is unsupported");
   // Validate before multiplying an untrusted width into the plan's rows.
   if (!lanes || lanes > kMaximumLanes)
     throw std::invalid_argument("invalid MoE decode width");
   return MoE::decodePlan(shape, lanes,
-                         selectMoe(calibration(), shape, formats, lanes * kDecodeRows, MoePhase::Decode));
+                         selectMoe(calibration(), shape, formats, lanes * geometry().rows(), MoePhase::Decode));
 }
 
 AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(
@@ -92,8 +92,8 @@ MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape, const Moe
 uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape) const {
   uint64_t bound = 0;
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
-    const LinearWorkload workload{{shape.outputSize, shape.inputSize}, lanes * kDecodeRows,
-                                  LinearPhase::Decode, LinearEpilogue::GateUp};
+    const LinearWorkload workload{{shape.outputSize, shape.inputSize}, lanes * geometry().rows(),
+                                  LinearPhase::Decode, LinearEpilogue::GateUp, geometry()};
     bound = std::max(bound, linear_.plan(workload).gateScratchBytes());
   }
   return bound;

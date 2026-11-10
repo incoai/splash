@@ -1,0 +1,64 @@
+{
+  "scope": "Host projection planning foundation only: per-instance eight/sixteen geometry, bounded matrix rows/storage/scratch and fixed-eight Table16 tiles. Default runtime remains8rows; complete sixteen-row runtime/shader support follows separately. No performance claim.",
+  "source_base": {
+    "base": "425ad7400f3a00d2a1e6745bdacfa2881922d544",
+    "source_diff_sha256": "f10e7af3219799587e00095b67e905fe84422999e46dd4a9e034699ba8728829",
+    "patch": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/patches/geometry-foundation-v1.patch",
+    "patch_sha256": "c92027d5a37ef8cf7514505b522fa304ffbc0424914cbeca74e80d44b9c5dc27",
+    "command": [
+      "make",
+      "-C",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/geometry-foundation",
+      "-j6",
+      "all",
+      "test-engine-cpu",
+      "build/engine-tests/backend-benchmark",
+      "build/engine-tests/weight-digests",
+      "build/engine-tests/decode-profile",
+      "build/engine-tests/dspine",
+      "build/engine-tests/draft-attention",
+      "build/engine-tests/gdn-decode",
+      "build/engine-tests/linear-plan",
+      "build/engine-tests/target-sampling",
+      "build/engine-tests/draft-selector",
+      "build/engine-tests/attention-variants"
+    ],
+    "artifacts": {
+      "linear-plan": "b20b7e0c75a380e98e94b57cab3dbb0bc4306fb5c3b2a229e4d97a20a41af08d",
+      "splash": "6c20012b7987807329bd7024bc38d234259e47c32711d4e8ddbd56d7f1dd6701",
+      "host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "target-sampling": "e7effef349973a72c613aec4ee0835046161e557e33da4fe3d5502e4c220ac2b",
+      "draft-attention": "c389d7bf9745c96d13212de2e467a203522ab3248fb1ae4a8a7b4e4a596b8a82",
+      "gdn-decode": "97ba36f892046e4bed98130e06e41d9cf15f0827de66d93f383a4d5e7461c009",
+      "dspine": "90476ba038a3b3ac7f9d860ca7afe9006c97de9f5f43aa19bd7a95d53356d545",
+      "weight-digests": "9471556ee45c3bca562abb9c43c93e90034f1cb9356f62d59ef2effa8c951ceb",
+      "splash.metallib": "2f0ec0e26e5a06bfae70f4613b2d638672d544b59d211dc1fc3e2cc57884a295",
+      "decode-profile": "233775b2bd2cafa0c0a9dadc05dca46cd513404d50b7c91a7f13dbc2ba6324cc",
+      "draft-selector": "6b43ec2a412c52505fee1773be10ad64c6049cc3fcf35235c31fe9c527e4e69d",
+      "backend-benchmark": "62e44458d0ecb6c8810a8107da266675aed02898568827b514fe13659ca2bfd8",
+      "attention-variants": "3e28c089a0e51bf7bdda9fbdd0d58236dfd33876d3c78731dbec0ae962eeed42"
+    }
+  },
+  "checks": [
+    {
+      "id": "build-geometry-foundation-v1",
+      "exit_code": 0,
+      "state": "complete",
+      "elapsed_seconds": 184.4020545830001,
+      "artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/scripts/build_frozen.py": "ab38106ffdad6b9bbc45dbec0a68d5a0c997a79edce1352e2a604627b9cf19b5",
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/patches/geometry-foundation-v1.patch": "c92027d5a37ef8cf7514505b522fa304ffbc0424914cbeca74e80d44b9c5dc27"
+      }
+    },
+    {
+      "id": "geometry-foundation-linear-plan-shader-v1",
+      "exit_code": 0,
+      "state": "complete",
+      "elapsed_seconds": 1.9060739169999579,
+      "artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/geometry-foundation/linear-plan": "b20b7e0c75a380e98e94b57cab3dbb0bc4306fb5c3b2a229e4d97a20a41af08d",
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/geometry-foundation/splash.metallib": "2f0ec0e26e5a06bfae70f4613b2d638672d544b59d211dc1fc3e2cc57884a295"
+      }
+    }
+  ]
+}

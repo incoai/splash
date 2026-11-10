@@ -4,6 +4,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/KernelCalibration.hpp"
+#include "ops/DecodeGeometry.hpp"
 #include "ops/Weights.hpp"
 
 #include <algorithm>
@@ -82,7 +83,7 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // optional K splits.
 enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister };
 // The decode tiles hold at most a full decode batch.
-inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
+inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * DecodeGeometry::maximumRows;
 // The staged tile's tallest height, which holds prefill chunks of up to this
 // many rows (ProjectionCalibration::stagedPrefillRows).
 inline constexpr uint32_t kMaximumStagedPrefillRows = 64;
@@ -100,6 +101,7 @@ struct LinearWorkload final {
   uint32_t rows = 0;
   LinearPhase phase = LinearPhase::Decode;
   LinearEpilogue epilogue = LinearEpilogue::None;
+  DecodeGeometry geometry{};
   auto operator<=>(const LinearWorkload &) const = default;
 };
 
@@ -234,7 +236,8 @@ struct LinearBuffers final {
 // KernelCalibration (KernelSelection.cpp).
 class Linear final {
 public:
-  explicit Linear(const DeviceCapabilities &device) noexcept;
+  explicit Linear(const DeviceCapabilities &device, DecodeGeometry geometry = {}) noexcept;
+  [[nodiscard]] DecodeGeometry geometry() const noexcept { return geometry_; }
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return calibration_; }
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
@@ -310,6 +313,7 @@ private:
                        const Projection *gate) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
+  DecodeGeometry geometry_;
   KernelCalibration calibration_;
 };
 

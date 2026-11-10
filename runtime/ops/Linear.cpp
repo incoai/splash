@@ -25,17 +25,17 @@ void validate(LinearWorkload w) {
         w.epilogue == LinearEpilogue::GateUp)
       throw std::invalid_argument("invalid linear prefill workload");
   } else {
-    if (!w.rows || w.rows % SPLASH_TARGET_VERIFY_ROWS ||
-        w.rows > SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH ||
+    if (!w.rows || w.rows % w.geometry.rows() ||
+        w.rows > w.geometry.rows() * SPLASH_MAXIMUM_BATCH_WIDTH ||
         w.epilogue == LinearEpilogue::UpWithGate)
       throw std::invalid_argument("invalid linear decode workload");
   }
 }
 
-LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue) {
+LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue, DecodeGeometry geometry) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid linear decode batch width");
-  return {matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
+  return {matrix, lanes * geometry.rows(), LinearPhase::Decode, epilogue, geometry};
 }
 
 // LinearScratch::rotated bytes of `rows` bf16 rows of `width` inputs.
@@ -139,7 +139,8 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   requireConfiguration();
 }
 
-Linear::Linear(const DeviceCapabilities &device) noexcept : calibration_(KernelCalibration::of(device)) {}
+Linear::Linear(const DeviceCapabilities &device, DecodeGeometry geometry) noexcept
+    : geometry_(geometry), calibration_(KernelCalibration::of(device)) {}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
   // The None and Residual plans share a tile; a gate/up pair of one format
@@ -147,7 +148,7 @@ uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
   UnitFormats unit = unitFormats(shape);
   uint32_t storage = 0;
   for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::GateUp}) {
-    const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, epilogue};
+    const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, epilogue, geometry_};
     validate(w);
     unit.oneFormat = epilogue == LinearEpilogue::GateUp;
     storage = std::max(storage, LinearPlan(w, selectProjection(calibration_, w, unit)).storageRows());
@@ -156,6 +157,7 @@ uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
 }
 
 LinearPlan Linear::plan(LinearWorkload workload) const {
+  workload.geometry = geometry_;
   validate(workload);
   return LinearPlan(workload, selectProjection(calibration_, workload, {}));
 }
@@ -163,6 +165,7 @@ LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config, FloatOutpu
   return LinearPlan(workload, config, destination);
 }
 LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection *gate) const {
+  w.geometry = geometry_;
   validate(w);
   const std::array<const Projection *, 2> projections{&p, gate};
   // A gate/up pair's 16-row tile follows its tensors' own formats.
@@ -179,7 +182,7 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
 
 LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogue epilogue,
                               const Projection *gate) const {
-  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p, gate);
+  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue, geometry_), p, gate);
 }
 LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue) const {
   return plan({{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue}, p);
@@ -190,9 +193,9 @@ LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
   for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
       bound.include(
-          ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue), shape.registerFormats));
+          ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue, geometry_), shape.registerFormats));
   // Decode plans store at most every lane's rows.
-  if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, kMaximumDecodeTileRows);
+  if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, geometry_.rows() * SPLASH_MAXIMUM_BATCH_WIDTH);
   return bound;
 }
 
