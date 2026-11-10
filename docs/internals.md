@@ -1709,15 +1709,7 @@ to read it: their hot block floors, and in prefill their history's staging
 through the next command. One rule prices a hot block floor in both
 (`KvBlockCache::lanesShortfallBytes`): the floors lacked count once for all
 lanes, in whole extents, and extents no lane reads above the floors are a
-rebuilt cache, not a lane's floor. A Spill lane's KV grows as its floor does,
-but the pages of its next prefill command, as many rows as one command holds
-within its prompt (`Engine::nextCommandPages`), count Full, as a Resident
-lane's growth does, and its floor grows from their end: the command writes
-its rows to Full pages, which no release returns until their copies land.
-Priced at the floor, a 225-page command right after a start placed Resident
-beside the lane took the room the start counted, and the start converted
-itself to Spill in its prefill. A decode step adds a page as its tail window
-lets go of one whose copy landed long since, which keeps the floor's count.
+rebuilt cache, not a lane's floor.
 
 **Self-conversion** (`Engine::EngineVictims::conversions`). On a target whose
 run can spill, a Resident lane, decoding or between the commands of its
