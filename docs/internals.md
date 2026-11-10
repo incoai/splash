@@ -1731,7 +1731,14 @@ page frees its Full bytes less its Index page's, so a growth's 108.5 MB extent
 and a prefill's 40 MB of staging release 512 pages, two extents, on
 Qwen3.8-Flash-Next. Its take gives the claim what it frees net of those reads,
 as its count does: taken gross, a claim of two lanes' releases kept a 390 MiB
-floor less for each than it counted. It moves pages only where the runway's
+floor less for each than it counted. Where the lane's pages run short of a
+whole extent, the free Full pages compaction gathers with them complete it
+(`Cache::releaseBeside`): those of the extents that hold pages, less those the
+claim's attempt takes, and none where the pages only the cache holds would
+complete an extent with them, which its reclaims or its demotions as they land
+count then. Counted without them, a lane on a finished lane's prefix, its 511
+releasable pages beside 3 free ones, lacked the 390 MiB hot block floor it gets
+alone. It moves pages only where the runway's
 first moves empty a Full extent, and only as many extents of them as compaction
 can empty, since a page in transfer pins its extent (`Cache::releaseMoves`):
 past that they would cost the lanes their reads, and the runway's refill
@@ -1749,8 +1756,9 @@ that waits for writes waits for a lane's pages whose copies land, which it
 releases once they have. A count of the releases for bytes, placement's among
 them, adds up what their takes in turn free as the copies stand: each moves its
 lane's oldest pages, so a lane's release counts only the pages and first reads
-those before it leave, and a page several lanes share, like each lane's first
-reads, counts once, for the first release that moves it (`Cache::ReleaseCount`).
+those before it leave, its extents completed beside the free pages they leave,
+and a page several lanes share, like each lane's first reads, counts once, for
+the first release that moves it (`ReleaseCount`).
 Counted for each lane alone, two lanes on one conversation, of 3,000 pages and
 of those and 1,000 more, gave a start 307 MB more than their takes free. Copies
 that land before the takes can lower the count, since a lane's landed pages

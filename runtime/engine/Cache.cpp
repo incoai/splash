@@ -2073,12 +2073,12 @@ void Cache::countRelease(uint64_t requestId, const ReleaseMoves &moves, bool lan
     count.blocks.insert(block);
     return true;
   });
-  // The free pages beside fill what its moves leave of its last extent.
-  count.beside -= std::min(count.beside, moves.extents * pool_.extentPages() - moves.pages);
+  // The pages its moves free lie beside the next release's moves.
+  count.beside += moves.pages;
   count.extents += moves.extents;
 }
 
-uint32_t Cache::releaseBeside(const Need &need) const {
+uint32_t Cache::releaseBeside(const VictimQuery &query) const {
   constexpr kv::PageForm full = kv::PageForm::Full;
   if (!spill_ || spill_->always)
     return 0;
@@ -2089,15 +2089,14 @@ uint32_t Cache::releaseBeside(const Need &need) const {
     return 0;
   const uint32_t free = pool_.freePageCount(full);
   const uint32_t scattered = free - std::min(free, empty);
-  const uint32_t kept = need.form == full && need.pages ? free : need.keptPages[static_cast<size_t>(full)];
-  return scattered - std::min(scattered, kept);
+  return scattered - std::min(scattered, walkFor(query).keptPages[static_cast<size_t>(full)]);
 }
 
 Cache::ReleaseMoves Cache::releaseMoves(uint32_t pages, bool landing, const ReleaseCount &count) const {
   const uint32_t extent = pool_.extentPages();
-  // Fewer than an extent's free pages lie beside (releaseBeside): with the
-  // pages short of a whole extent, they complete one at most.
-  uint32_t extents = (pages + count.beside) / extent;
+  // The extents they complete beside the free pages, as reclaims and landings
+  // count them; no Full runway stays (SpilledExtents::Released).
+  uint32_t extents = completedExtents(count.beside, pages, extent, false);
   if (!landing) {
     const uint32_t unpinned = pool_.unfixedExtents(pagesInTransfer(), kv::PageForm::Full);
     extents = std::min(extents, unpinned - std::min(unpinned, count.extents));

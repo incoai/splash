@@ -342,7 +342,7 @@ struct ReleaseRule final {
 // requests on one prefix share, and a holder's first reads, count once.
 // Counted for each alone, two lanes on one conversation gave 307 MB more
 // than their takes free. Also the Full extents they empty, and the free Full
-// pages beside them (Cache::releaseBeside) that none of them gathered yet.
+// pages beside them (Cache::releaseBeside), with the pages their moves free.
 struct ReleaseCount final {
   std::unordered_set<uint64_t> blocks;
   std::unordered_set<uint64_t> holders;
@@ -546,19 +546,20 @@ public:
   // the runway's; the caller makes room for them or does without.
   [[nodiscard]] TokenAdmission spillWritten(SpilledExtents extents,
                                             const std::function<void(uint64_t bytes)> &funds = {});
-  // The free Full pages compaction gathers with a release's moves for
-  // `need`, which complete an extent that the moves alone leave short: those
-  // of the extents that hold pages (an empty extent leaves whole), less
-  // those the need's attempt takes itself (every one for a need of Full
-  // pages, else Need::keptPages). None where the pages only the cache holds
-  // would complete an extent with them, as the cache's reclaims (reach) and
-  // its demotions as they land (returning) count them then, so fewer than an
-  // extent; none under --kv-spill always, whose landings count them. Counted
-  // in whole extents of its own pages, a lane on a finished lane's prefix
-  // gave one extent of its 511 releasable pages beside 3 free ones, and its
-  // 390 MiB hot block floor failed it at a limit where it completes alone,
-  // on Qwen3.8-Flash-Next at 9.38G and 9.43G.
-  [[nodiscard]] uint32_t releaseBeside(const Need &need) const;
+  // The free Full pages compaction gathers with a release's moves for the
+  // claim, which complete an extent that the moves alone leave short: those
+  // of the extents that hold pages (an empty extent leaves whole), less those
+  // its walk keeps for it (Walk::keptPages). None where the pages only the
+  // cache holds would complete an extent with them, as its reclaims (reach)
+  // and its demotions as they land (returning) count them then: not the
+  // walk's reach of the Full form (Walk::reaches), which an empty extent
+  // alone gives a claim that keeps no Full runway. None under --kv-spill
+  // always, whose landings count them. Counted in whole extents of its own
+  // pages, a lane on a finished lane's prefix gave one extent of its 511
+  // releasable pages beside 3 free ones, and its 390 MiB hot block floor
+  // failed it at a limit where it completes alone, on Qwen3.8-Flash-Next at
+  // 9.38G and 9.43G.
+  [[nodiscard]] uint32_t releaseBeside(const VictimQuery &query) const;
   // A Spill request's pages a release moves to the index form, oldest
   // first: Full pages of its own blocks past its dense history and short of
   // its tail window, every holder of which spills and has passed them, that
@@ -578,8 +579,8 @@ public:
   [[nodiscard]] ReleasablePages releasablePages(uint64_t requestId, const ReleaseRule &rule,
                                                 const ReleaseCount &count = {}) const;
   // What a release for bytes moves of `pages` pages: whole extents of them,
-  // and where they run short the rest, should the free pages beside that
-  // `count` leaves complete an extent with them; and the Full extents those
+  // and where they run short the rest, should they complete one beside the
+  // free pages `count` holds (completedExtents); and the Full extents those
   // empty, each of which leaves and pays for the next runway, every page of
   // them freeing its Full bytes less an Index page's. None unless its first
   // runway's moves into free Index pages, with the Full pages free already,
@@ -595,8 +596,8 @@ public:
   [[nodiscard]] ReleaseMoves releaseMoves(uint32_t pages, bool landing, const ReleaseCount &count = {}) const;
   // Counts in `count` a release's `moves` of the request's oldest pages of
   // those releasablePages finds with it, clean or, with `landing`, landing
-  // too: the pages, the holders of the oldest, the extents they empty and
-  // the free pages beside those take.
+  // too: the pages, the holders of the oldest, the extents they empty, and
+  // the pages they free beside the free pages it holds.
   void countRelease(uint64_t requestId, const ReleaseMoves &moves, bool landing, const ReleaseRule &rule,
                     ReleaseCount &count) const;
   // The pages a release freeing `pages` Full pages in place moves, of a
