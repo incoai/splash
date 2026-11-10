@@ -192,28 +192,30 @@ enum class HostStepGpu : uint8_t {
 // signals, so a signal is never held back behind the dispatches that follow
 // it, and a signal is delivered even when the work before it fails.
 //
-// Metal fails a wait (a Wait, or the work after a host step) still unmet
-// supervision::kGpuWaitLimit after its queue reached it ("Caused GPU Timeout
-// Error"), and the command with it. The queue reaches a command's first wait
-// as the command is submitted, whatever work runs ahead of it, and each later
-// one once the wait before it was met: the work between two waits, with the
-// agent's or the step's part, must end within it. Longer work, such as the
-// encodes of a prefill command's images, runs as a command of its own.
+// Metal fails a Wait still unmet supervision::kGpuWaitLimit after its queue
+// reached it ("Caused GPU Timeout Error"), and the command with it. The queue
+// reaches a command's first wait as the command is submitted, whatever work
+// runs ahead of it, and each later one once the wait before it was met: the
+// work between two waits, with the agent's part, must end within it. Longer
+// work, such as the encodes of a prefill command's images, runs as a command
+// of its own.
 //
 // A Host step runs `work` on the CPU once all earlier work has completed and
-// holds all later work until it returned, through two shared events the
-// backend creates for the command's host steps, one the GPU raises and one the
-// backend's runner raises, so that no write of one side puts back a value of
-// the other (the step's event and value are unused). The exception: the runner
-// also raises the GPU's event, before its own, for an awake step it gives up
-// or that follows a failed buffer, as the step's spin waits for it and the
-// buffer may raise it late or never; every later step's GPU signal follows the
-// runner's. The work reads what the GPU wrote before it and writes Shared
-// buffers the GPU reads after it. With HostStepGpu::Awake, one GPU thread
-// spins from the end of the work before the step until the step returned, so
-// the GPU stays awake and starts the work after it at once and at full clocks:
-// for steps about as short as the GPU's wake-up (a streamed decode load), not
-// for long ones, where the spin saves little. The spin,
+// holds all later work until it returned: the GPU raises a shared event the
+// backend creates for the command's host steps once the work before a step
+// has completed, and the backend's runner commits the buffers after the step
+// once it returned (the step's event and value are unused). So no GPU wait
+// spans the step, and its work may take longer than Metal's wait limit (an
+// expert load from a slow disk): only the watchdog bounds it
+// (CommandWatchdog). The runner also raises the GPU's event for an awake step
+// it gives up or that follows a failed buffer, as the step's spin waits for it
+// and the buffer may raise it late or never; every later step's GPU signal
+// follows the runner's. The work reads what the GPU wrote before it and
+// writes Shared buffers the GPU reads after it. With HostStepGpu::Awake, one
+// GPU thread spins from the end of the work before the step until the step
+// returned, so the GPU stays awake and starts the work after it at once and
+// at full clocks: for steps about as short as the GPU's wake-up (a streamed
+// decode load), not for long ones, where the spin saves little. The spin,
 // host_step_wait of host-step.metallib beside the backend's metallib, sees the
 // CPU end it through a memory scope Metal's public headers leave out, so the
 // backend checks, before the first command with an awake step, that it does;
@@ -245,8 +247,8 @@ enum class HostStepGpu : uint8_t {
 // with the first failure; a step whose work threw names it (its ticket's
 // wait() throws its message). The failure also names, of the steps that ran,
 // the longest work and the longest pickup (from the end of the GPU work
-// before a step to its start), so that a buffer Metal timed out tells which
-// step held its wait. Once a command completed without a failure, `timed`
+// before a step to its start), so that a failed command tells which step held
+// it up. Once a command completed without a failure, `timed`
 // gets the round trip of each of its host steps (HostStepTiming) on Metal's
 // completion thread; one that throws marks the backend unhealthy, as a
 // completion callback that throws does. A command run under dispatch
@@ -464,13 +466,14 @@ public:
   [[nodiscard]] CommandTiming submit(const ComputeDispatch &dispatch);
 
   // Encodes a command into Metal command buffers, one plus one per buffer its
-  // event steps add (EventStep), and commits each as its encoding ends,
-  // without waiting: the GPU runs the work before an event step while the
-  // work after it is still encoded. The completion callback only notifies
-  // host control flow; command results and errors are consumed from the
-  // returned ticket, which reports the error of the first of its buffers that
-  // failed. A second command is rejected until wait() consumes the first
-  // ticket, preserving the one-in-flight runtime invariant.
+  // event steps add (EventStep), and commits each as its encoding ends, or
+  // once the host steps before it returned, without waiting: the GPU runs the
+  // work before an event step while the work after it is still encoded. The
+  // completion callback only notifies host control flow; command results and
+  // errors are consumed from the returned ticket, which reports the error of
+  // the first of its buffers that failed. A second command is rejected until
+  // wait() consumes the first ticket, preserving the one-in-flight runtime
+  // invariant.
   [[nodiscard]] CommandTicket
   submitCommandAsync(const Command &command, CommandCompletion completion = {});
   // A command of these dispatches without event steps: one command buffer.

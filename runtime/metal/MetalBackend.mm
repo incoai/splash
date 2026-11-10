@@ -483,15 +483,17 @@ struct BackendAsyncState {
         return activeSequence;
     }
 
-    // Commits a command's last buffer, the buffers before it committed as
-    // their encoding ended (Impl::commit).
+    // Commits a command's last buffer through `commit`, which holds it after
+    // the command's host steps (Impl::commit), the buffers before it handed
+    // on as their encoding ended.
+    template <class Commit>
     void commitSubmission(uint64_t sequence, id<MTLCommandBuffer> command,
-                          std::function<void(id<MTLCommandBuffer>)> completion) {
+                          std::function<void(id<MTLCommandBuffer>)> completion, Commit &&commit) {
         std::lock_guard lock(gateMutex);
         activeCommand = command;
         activeCompletion = std::move(completion);
         commandWatchdog.start(sequence, awakeSeconds());
-        [command commit];
+        commit(command);
     }
 
     void releaseSubmission(uint64_t sequence) noexcept {
@@ -574,34 +576,38 @@ struct BackendAsyncState {
     }
 };
 
-// The host steps of one command (EventStep::Kind::Host), which the backend
-// raises through two events of their own, each written by one side: the GPU
-// raises readyEvent to i + 1 once the work before step i has completed, and
-// the runner raises ranEvent to i + 1 once step i ran or was skipped, which
-// the work after it waits for. A shared event holds the value written last,
-// and a GPU signal can land after a later value the CPU wrote to the same
-// event (M5 Max, macOS 27: about once in a million steps), which puts it back
-// and holds the work waiting for the CPU's value until Metal fails it after
-// supervision::kGpuWaitLimit ("Caused GPU Timeout Error"). The exception is an
-// awake step's spin, which waits for readyEvent: a failed buffer may never
-// raise it and one still running when the runner gives the step up raises it
-// late, so for an awake step it gives up or that follows a failed buffer the
-// runner raises readyEvent to i + 1 itself, before ranEvent, which the GPU
+// The host steps of one command (EventStep::Kind::Host). The GPU raises
+// readyEvent to i + 1 once the work before step i has completed, which the
+// runner waits for, and the buffers after the step are committed once the
+// runner ran or skipped it, never before it with a wait for it: Metal fails a
+// wait still unmet supervision::kGpuWaitLimit after its queue reached it
+// ("Caused GPU Timeout Error"), and with it the engine, and a step's work has
+// no such bound (an expert load from a slow disk). So commitAfter holds a
+// buffer that follows a step that has not returned, and every buffer after
+// it, and the runner commits them in the order they came once the step
+// returned: the queue runs its buffers in the order they were committed. The
+// exception is an awake step's spin, which waits for readyEvent: a failed
+// buffer may never raise it and one still running when the runner gives the
+// step up raises it late, so for an awake step it gives up or that follows a
+// failed buffer the runner raises readyEvent to i + 1 itself, which the GPU
 // signals of later steps follow; the buffer's own signal carries the same
-// value. An earlier step's buffer whose signal lands after the runner gave up
-// a later awake step can put readyEvent back below that step's value, whose
-// spin then waits for its own buffer's signal, or, where that buffer failed
-// too, for Metal's limit: two faults. Past ranEvent of an awake step the
-// runner raises the backend's release counter to the step's value, which ends
-// the GPU's spin through it (host_step_wait), and then runs the step's `then`
-// once its work returned. Each step runs unless the command buffer before it
-// failed, or the buffer of an earlier step's beside dispatches failed by then,
-// or an earlier step of its command did not run or threw (halted); the first
-// step that throws names the command's failure, and a `then` that throws marks
-// the backend unhealthy (EventStep). The runner notes when it took each step
-// up and when its work returned, which the command's completion reports
-// (timed) against the GPU times of the buffers before and after the step, and
-// each is the command's progress for the watchdog (CommandWatchdog).
+// value. A shared event holds the value written last, and a GPU signal can
+// land after a later value the CPU wrote to the same event (M5 Max, macOS 27:
+// about once in a million steps): an earlier step's buffer whose signal lands
+// after the runner gave up a later awake step can put readyEvent back below
+// that step's value, whose spin then waits for its own buffer's signal, or,
+// where that buffer failed too, for Metal's limit: two faults. Once a step
+// returned the runner commits the buffers after it, raises the backend's
+// release counter to an awake step's value, which ends the GPU's spin through
+// it (host_step_wait), and then runs the step's `then`. Each step runs unless
+// the command buffer before it failed, or the buffer of an earlier step's
+// beside dispatches failed by then, or an earlier step of its command did not
+// run or threw (halted); the first step that throws names the command's
+// failure, and a `then` that throws marks the backend unhealthy (EventStep).
+// The runner notes when it took each step up and when its work returned,
+// which the command's completion reports (timed) against the GPU times of the
+// buffers before and after the step, and each is the command's progress for
+// the watchdog (CommandWatchdog).
 struct HostSteps {
     struct Step {
         uint64_t ready = 0;
@@ -619,8 +625,8 @@ struct HostSteps {
         // The last buffer of an earlier step's beside dispatches, if any.
         __weak id<MTLCommandBuffer> besideBefore = nil;
     };
-    __strong id<MTLSharedEvent> readyEvent = nil, ranEvent = nil;
-    // The last buffer of beside dispatches committed (the encoder's alone).
+    __strong id<MTLSharedEvent> readyEvent = nil;
+    // The last buffer of beside dispatches handed on (the encoder's alone).
     __weak id<MTLCommandBuffer> lastBeside = nil;
     std::shared_ptr<BackendAsyncState> backend;
     // The command's submission (BackendAsyncState::beginSubmission).
@@ -639,6 +645,28 @@ struct HostSteps {
     // Whether a step did not run or threw, after which the runner runs none
     // of the command's steps (the runner's alone).
     bool halted = false;
+    // The buffers handed to commitAfter while a step they follow had not
+    // returned, each with the steps it waits for, in the order they came, and
+    // the steps that returned: both under commitMutex, which orders every
+    // commit of the command.
+    std::mutex commitMutex;
+    std::deque<std::pair<uint64_t, id<MTLCommandBuffer>>> held;
+    uint64_t returnedSteps = 0;
+
+    // Commits `buffer` once the command's first `after` steps returned, and
+    // after every buffer handed here before it.
+    void commitAfter(id<MTLCommandBuffer> buffer, uint64_t after) {
+        std::lock_guard lock(commitMutex);
+        if (held.empty() && after <= returnedSteps) [buffer commit];
+        else held.emplace_back(after, buffer);
+    }
+    // The runner's, once step `ready` (its value) ran or was skipped: commits
+    // the buffers that waited for it.
+    void stepReturned(uint64_t ready) {
+        std::lock_guard lock(commitMutex);
+        returnedSteps = ready;
+        for (; !held.empty() && held.front().first <= ready; held.pop_front()) [held.front().second commit];
+    }
 
     void fail(std::string message) {
         std::lock_guard lock(mutex);
@@ -703,20 +731,21 @@ struct HostSteps {
 };
 
 // Runs the host steps of committed command buffers in order, on a thread of
-// its own: for each step it waits for the step's event to reach its value, runs
-// the step and raises the event, then the release counter, past it. The
-// value shows 15-40 us after the GPU ended the buffer before the step; the
-// runner spins on it for up to kHostStepSpin, longer than the GPU work
-// between two decode steps (about 1 ms), so it takes a step up as soon as the
-// value shows, and past that blocks on the event (long prefill work), which
-// wakes it 30-60 us later: at most 1% of a step behind more than 5 ms of GPU
-// work. Streamed decode runs 4% faster than with a runner that blocks at once
-// (M5 Max, ISTA Q2_0 with 16G of experts: pickup 26 against 70 us), for
-// about half a core while a streamed command runs; waking through
-// MTLSharedEventListener took about 0.3 ms. Once stopping it no longer waits:
-// a step whose work before it has completed still runs, and the others are
-// raised without running, so their commands drain; it waits for the work of a
-// step that is running, which nothing can interrupt.
+// its own: for each step it waits for the step's event to reach its value,
+// runs the step, commits the buffers after it, and raises the release counter
+// past it (HostSteps). The value shows 15-40 us after the GPU ended the buffer
+// before the step; the runner spins on it for up to kHostStepSpin, longer
+// than the GPU work between two decode steps (about 1 ms), so it takes a step
+// up as soon as the value shows, and past that blocks on the event (long
+// prefill work), which wakes it 30-60 us later: at most 1% of a step behind
+// more than 5 ms of GPU work. Streamed decode runs 4% faster than with a
+// runner that blocks at once (M5 Max, ISTA Q2_0 with 16G of experts: pickup
+// 26 against 70 us), for about half a core while a streamed command runs;
+// waking through MTLSharedEventListener took about 0.3 ms. Once stopping it no
+// longer waits: a step whose work before it has completed still runs, and the
+// others return without running, which commits the buffers after them, so
+// their commands drain; it waits for the work of a step that is running,
+// which nothing can interrupt.
 class HostStepRunner final {
 public:
     HostStepRunner() : thread_([this] { run(); }) {}
@@ -731,7 +760,7 @@ public:
     HostStepRunner(const HostStepRunner &) = delete;
     HostStepRunner &operator=(const HostStepRunner &) = delete;
 
-    // Queues `step` of `steps` once the buffer before it is committed.
+    // Queues `step` of `steps` once the buffer before it is handed on.
     void add(std::shared_ptr<HostSteps> steps, HostSteps::Step &step) {
         {
             std::lock_guard lock(mutex_);
@@ -802,7 +831,9 @@ private:
                     steps.fail("host step not run: the backend stopped");
                 }
                 if (!worked) steps.halted = true;
-                steps.ranEvent.signaledValue = step.ready;
+                // The work after the step is committed while the spin keeps
+                // the GPU awake.
+                steps.stepReturned(step.ready);
                 if (step.release) release(steps.releases, *step.release);
                 // The step's return moves the deadline once the GPU went on.
                 if (returned) steps.backend->progressSubmission(steps.sequence, *returned);
@@ -848,7 +879,7 @@ struct CommandTicket::State {
     uint64_t sequence = 0;
     CommandTiming timing;
     AwakeClock::time_point wallStart;
-    // Command buffers committed before the last one, split at event signals
+    // Command buffers handed on before the last one, split at event signals
     // and host steps.
     std::vector<id<MTLCommandBuffer>> leadingCommands;
     std::shared_ptr<HostSteps> hostSteps;
@@ -1527,28 +1558,28 @@ struct MetalBackend::Impl {
     // Ends `command` with host step `step` (EventStep::Kind::Host) of a
     // command's `steps`, creating them with its first, makes the buffers the
     // step adds (HostStepJoin) before it commits any, appends `command` to
-    // `leading` and commits it, hands the step to the runner
-    // (HostStepRunner), and returns the buffer the dispatches after it go in:
-    // the GPU raises readyEvent to i + 1 once the work before step i has
-    // completed (a failure skips the step); the runner then runs the step and
-    // raises ranEvent to i + 1, which the buffer after it waits for
-    // (HostSteps). A step with beside dispatches (EventStep::beside) returns a
-    // buffer of their own, which waits for nothing and which joinHostStep
-    // commits with the rest of `join`; else the buffer after the step. Between
-    // the two, for an awake step, a buffer of one host_step_wait waits for the
-    // step's signal and spins until the runner raises the release counter past
-    // the step, which keeps the GPU awake: a GPU idle through a step starts the
-    // work after it 75-80 us after the release (M5 Max, M5 Pro; M3 Max 100 us),
-    // and after 3-10 ms of idling 0.4-0.7 ms after it, at low clocks for 2-3 ms
+    // `leading` and commits it once the steps before it returned, hands the
+    // step to the runner (HostStepRunner), and returns the buffer the
+    // dispatches after it go in: the GPU raises readyEvent to i + 1 once the
+    // work before step i has completed (a failure skips the step); the runner
+    // then runs the step and commits the buffer after it (HostSteps). A step
+    // with beside dispatches (EventStep::beside) returns a buffer of their
+    // own, which waits for nothing and which joinHostStep commits with the
+    // rest of `join`; else the buffer after the step. Between the two, for an
+    // awake step, a buffer of one host_step_wait waits for the step's signal
+    // and spins until the runner raises the release counter past the step,
+    // which keeps the GPU awake: a GPU idle through a step starts the work
+    // after it 75-80 us after the release (M5 Max, M5 Pro; M3 Max 100 us), and
+    // after 3-10 ms of idling 0.4-0.7 ms after it, at low clocks for 2-3 ms
     // more; awake it starts in 12-22 us (M3 Max 70-80 us). The spin orders
-    // nothing: the work after the step starts in a buffer of its own that
-    // waits for ranEvent, and only a buffer's start makes what the CPU wrote
-    // visible (a wait inside a buffer that the GPU reaches after the signal
-    // leaves stale lines); a runner done before the spin is committed still
-    // ends it. The spin starts at the step's signal: one that ran ahead of the
-    // work before its step, while that work waited for earlier beside
-    // dispatches, held it up to its bound (100 ms). An awake step spins only
-    // once the spin was seen to end at its release (checkHostStepSpin).
+    // nothing: the work after the step starts in a buffer of its own, and only
+    // a buffer's start makes what the CPU wrote visible (a wait inside a buffer
+    // that the GPU reaches after the signal leaves stale lines); a runner done
+    // before the spin is committed still ends it. The spin starts at the
+    // step's signal: one that ran ahead of the work before its step, while
+    // that work waited for earlier beside dispatches, held it up to its bound
+    // (100 ms). An awake step spins only once the spin was seen to end at its
+    // release (checkHostStepSpin).
     template <class Fail>
     id<MTLCommandBuffer> encodeHostStep(id<MTLCommandBuffer> command, std::vector<id<MTLCommandBuffer>> &leading,
                                         std::shared_ptr<HostSteps> &steps, uint64_t sequence, const EventStep &step,
@@ -1558,8 +1589,7 @@ struct MetalBackend::Impl {
             steps->backend = asyncState;
             steps->sequence = sequence;
             steps->readyEvent = [device newSharedEvent];
-            steps->ranEvent = [device newSharedEvent];
-            if (!steps->readyEvent || !steps->ranEvent) failEncoding("unable to create Metal shared event");
+            if (!steps->readyEvent) failEncoding("unable to create Metal shared event");
             if (hostStepSpin) steps->releases = hostStepSpin->releases;
         }
         const uint64_t ready = steps->steps.size() + 1;
@@ -1578,26 +1608,26 @@ struct MetalBackend::Impl {
         }
         made.next = [queue commandBuffer];
         if (!made.next) failEncoding("unable to create Metal command buffer");
-        [made.next encodeWaitForEvent:steps->ranEvent value:ready];
         steps->steps.push_back(
             {ready, step.work, step.timed, step.then, command, made.next, 0.0, 0.0, released, steps->lastBeside});
         if (made.beside) steps->lastBeside = made.beside;
-        // `leading` holds the buffers committed, nothing failing in between.
+        // `leading` holds the buffers handed on, nothing failing in between.
         leading.push_back(command);
-        [command commit];
+        steps->commitAfter(command, ready - 1);
         hostStepRunner->add(steps, steps->steps.back());
         join = made;
-        return made.beside ? made.beside : joinHostStep(join, leading);
+        return made.beside ? made.beside : joinHostStep(join, leading, *steps);
     }
 
     // Commits the buffers of a host step's beside dispatches and of its
-    // awake spin, if any, and returns the buffer after the step, which waits
-    // for it (encodeHostStep).
-    id<MTLCommandBuffer> joinHostStep(HostStepJoin &join, std::vector<id<MTLCommandBuffer>> &leading) {
+    // awake spin, if any, after the buffer before the step, and returns the
+    // buffer after the step (encodeHostStep).
+    id<MTLCommandBuffer> joinHostStep(HostStepJoin &join, std::vector<id<MTLCommandBuffer>> &leading,
+                                      HostSteps &steps) {
         for (id<MTLCommandBuffer> buffer : {join.beside, join.awake}) {
             if (!buffer) continue;
             leading.push_back(buffer);
-            [buffer commit];
+            steps.commitAfter(buffer, steps.steps.size() - 1);
         }
         id<MTLCommandBuffer> next = join.next;
         join = {};
@@ -1742,20 +1772,21 @@ struct MetalBackend::Impl {
         auto failEncoding = [](std::string message) { throw MetalBackendError(std::move(message)); };
 
         auto wallStart = AwakeClock::now();
-        // The buffers before the last commit as their encoding ends, so the
-        // GPU starts the command's work while the rest is still encoded.
+        // The buffers before the last commit as their encoding ends, or once
+        // the host steps before them returned, so the GPU starts the
+        // command's work while the rest is still encoded.
         residency->use();
         // Metal may autorelease the command and its encoder, and the serving
         // loop's pool never drains, so their temporary ownership ends with
         // this submission. The command retains everything the GPU still
         // needs.
         @autoreleasepool {
-            // The buffers before `command` committed, each ended by an event
-            // signal or a host step.
+            // The buffers before `command` handed on to be committed, each
+            // ended by an event signal or a host step.
             std::vector<id<MTLCommandBuffer>> leading;
             // Any failure while encoding, such as Metal creating no buffer or
             // encoder, marks the backend unhealthy. The buffers already
-            // committed run on, with the host steps after them, so the backend
+            // handed on run on, with the host steps after them, so the backend
             // keeps their command's state, with its allocations, and its
             // submission, which owners read as a command in flight before
             // they free memory the buffers may reach by address (KV pages).
@@ -1772,13 +1803,21 @@ struct MetalBackend::Impl {
                 auto step = events.begin();
                 size_t joinAt = 0;
                 HostStepJoin join;
+                // Commits a buffer whose encoding ended, once every host step
+                // before it returned (HostSteps).
+                const auto commitEncoded = [&](id<MTLCommandBuffer> buffer) {
+                    if (const std::shared_ptr<HostSteps> &steps = ticketState->hostSteps)
+                        steps->commitAfter(buffer, steps->steps.size());
+                    else
+                        [buffer commit];
+                };
                 const auto encodeSteps = [&](size_t encoded) {
                     if (joinAt && joinAt == encoded) {
                         if (encoder) {
                             [encoder endEncoding];
                             encoder = nil;
                         }
-                        command = joinHostStep(join, leading);
+                        command = joinHostStep(join, leading, *ticketState->hostSteps);
                         joinAt = 0;
                     }
                     for (; step != events.end() && step->before == encoded; ++step) {
@@ -1811,7 +1850,7 @@ struct MetalBackend::Impl {
                                 signaled.signal(value);
                         }];
                         leading.push_back(command);
-                        [command commit];
+                        commitEncoded(command);
                         command = [queue commandBuffer];
                         if (!command) {
                             failEncoding("unable to create Metal command buffer");
@@ -1894,7 +1933,7 @@ struct MetalBackend::Impl {
                         id<MTLCommandBuffer> completed) {
                         if (auto ticket = weakTicket.lock())
                             ticket->finishCommand(completed);
-                    });
+                    }, commitEncoded);
             } catch (...) {
                 std::string reason = "Metal command encoding failed";
                 try {
@@ -1904,7 +1943,7 @@ struct MetalBackend::Impl {
                 } catch (...) {
                 }
                 markUnhealthy(std::move(reason));
-                // The state holds the committed buffers too: a host step's
+                // The state holds the buffers handed on too: a host step's
                 // runner reaches the buffer before it only through that.
                 if (leading.empty()) {
                     asyncState->releaseSubmission(ticketState->sequence);
@@ -2129,9 +2168,9 @@ MetalBackend::MetalBackend(std::string metallibPath, double residencyKeepAliveSe
         // A command takes one Metal command buffer, and one more per buffer
         // its event steps add (addedBuffers), and creating one waits while
         // the queue's limit of them is outstanding. The buffers a command
-        // committed stay outstanding while they wait on its later steps, so
-        // the queue holds as many as a command may take: at the default of
-        // 64, a 64-layer prefill with a Neural Engine step each would wait on
+        // made stay outstanding while they wait on its later steps, so the
+        // queue holds as many as a command may take: at the default of 64, a
+        // 64-layer prefill with a Neural Engine step each would wait on
         // itself.
         impl_->queue = [impl_->device
             newCommandQueueWithMaxCommandBufferCount:kMaximumCommandBuffers];
