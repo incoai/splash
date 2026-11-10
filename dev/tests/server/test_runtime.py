@@ -1328,23 +1328,24 @@ class RuntimeTests(unittest.TestCase):
 
     def test_the_first_engines_warming_is_heard_before_its_ready(self):
         """The server's start learns that its engine holds its weights and
-        warms up; a relaunched engine's warm-up is a recovery and is not
-        reported."""
-        warming_then_ready = native_peer.serialize_event(
-            wire.WarmingEvent()
-        ) + native_peer.serialize_event(READY)
-        factory = FakeFactory(initial_output=warming_then_ready)
+        warms up, and each step of its warm-up that ends; a relaunched
+        engine's warm-up is a recovery and is not reported."""
+        warming = (wire.WarmingEvent(0, 9), wire.WarmingEvent(1, 9))
+        factory = FakeFactory(
+            initial_output=b"".join(map(native_peer.serialize_event, warming))
+            + native_peer.serialize_event(READY)
+        )
         runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
         heard = []
-        runtime.on_warming = lambda: heard.append(runtime.ready)
+        runtime.on_warming = lambda event: heard.append((event, runtime.ready))
         self.assertTrue(runtime.wait_ready(1))
-        self.assertEqual(heard, [False])
+        self.assertEqual(heard, [(event, False) for event in warming])
         with mock.patch.object(runtime._crash_trace, "dump"):
             factory.processes[0].kill()
             self.assertTrue(runtime.wait_ready(1))
         self.assertEqual(len(factory.processes), 2)
-        self.assertEqual(heard, [False])
+        self.assertEqual(heard, [(event, False) for event in warming])
 
     def test_engines_after_the_first_ready_run_the_relaunch_command(self):
         # Engines started before any was Ready run the command, and every one

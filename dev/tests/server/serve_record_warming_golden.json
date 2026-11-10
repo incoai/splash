@@ -1,0 +1,8 @@
+{
+  "pid": 4242,
+  "phase": "warming",
+  "warmup": {
+    "steps_done": 3,
+    "steps": 9
+  }
+}

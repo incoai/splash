@@ -2,9 +2,9 @@
 from which the desktop app follows a server it started through its start and
 words why one did not start, or stopped serving. The launcher writes it,
 atomically, once it holds the lock; the server it executes, which keeps its
-pid, as each later phase of the start begins, and once it stops restarting its
-engine; either, when the start fails: a kind the app words and a message for
-the rest.
+pid, as each later phase of the start begins and as each step of the engine's
+warm-up ends, and once it stops restarting its engine; either, when the start
+fails: a kind the app words and a message for the rest.
 
 The app learns a start's outcome from the record and the process's exit
 alone: it waits until the record says ready and takes an exit it did not ask
@@ -62,9 +62,15 @@ def starting(path: Path | None):
 
 def entered(path: Path | None, phase: str):
     """Record, best effort, that this process's start entered a later
-    `phase`: "loading", the tokenizer, then the engine's weights; or
-    "warming", the engine runs the model once at full size (WarmingEvent)."""
+    `phase`: "loading", the tokenizer, then the engine's weights."""
     _write_best_effort(path, {"pid": os.getpid(), "phase": phase})
+
+
+def warming(path: Path | None, steps_done: int, steps: int):
+    """Record, best effort, that the engine warms up (WarmingEvent): as its
+    warm-up begins and as each of its steps ends, the steps done of all."""
+    warmup = {"steps_done": steps_done, "steps": steps}
+    _write_best_effort(path, {"pid": os.getpid(), "phase": "warming", "warmup": warmup})
 
 
 def ready(path: Path | None):

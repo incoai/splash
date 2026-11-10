@@ -1340,7 +1340,15 @@ def main():
             ),
             pending_limit=args.queue_size,
         )
-        runtime.on_warming = lambda: serve_record.entered(args.serve_record, "warming")
+
+        def warming(event):
+            # As the warm-up begins and as each of its steps ends: it can take
+            # minutes on the first start after an update, so the console and
+            # the record, which the app shows, say how far it is.
+            print_status(f"Warming up · {event.steps_done} of {event.steps} steps")
+            serve_record.warming(args.serve_record, event.steps_done, event.steps)
+
+        runtime.on_warming = warming
         backend = NativeBackend(
             runtime,
             tokenizer,

@@ -547,6 +547,17 @@ function constants and how long it took: as a warning where that was 100 ms or
 more, a wait its request notices, as a cold pipeline of every GGUF format's
 seconds were.
 
+The start counts its warm-up in steps, a command each: the prefill of the most
+rows, each row class's, each decode width a batch may take (one the plan does
+not hold, or memory keeps from running, ends at once) and the state restore.
+Warming says how many of all have ended, as the warm-up begins and as each
+step ends ([Native protocol](#native-protocol)); the server prints each
+(`Warming up · 3 of 11 steps`) and writes it to its serve record, from which
+the app shows the start's progress and why it can take long. The steps count
+commands, not time; the first start after an update, which creates every
+pipeline, spent 118 s before Ready for the 27B and 134 s for Flint on a 48 GB
+M5 Pro, where later starts take about 14 s.
+
 ### GGUF tiles
 
 Decode runs one of two kernel families, chosen by the device's calibration row
@@ -2600,9 +2611,12 @@ completion, where a Cancel frame would finish it cancelled. A Stop before the
 request's first token cancels it, and one for a request that has already
 ended is ignored.
 
-An engine sends Warming once it holds its weights, then its Ready event when
-its warm-up runs are done; the server writes the first engine's Warming to
-its serve record, where the app shows it as the start's Warming up step.
+An engine sends Warming once it holds its weights, with the steps of its
+warm-up done of all, and again as each step ends
+([Warmup and pipelines](#warmup-and-pipelines)), then its Ready event when the
+warm-up is done; the server prints the first engine's Warming and writes it to
+its serve record, where the app shows it as the start's Warming up step and
+its progress.
 Ready says what the start serves: its lanes, the context it resolved (a
 relaunch may serve less than the first engine did), whether it admits
 images, and the target's vocabulary, stop

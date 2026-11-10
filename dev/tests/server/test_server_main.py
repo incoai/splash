@@ -309,11 +309,13 @@ class ServerMainTests(unittest.TestCase):
 
     def test_a_start_writes_its_serve_record(self):
         """The record says the server is loading while the engine starts,
-        warming once the engine says it warms up, then, for a start the
-        engine refuses, the engine's class and numbers, as the app reads them
-        (serve_record_golden.json); for one the server refuses, its own
-        class."""
+        warming once the engine says it warms up, with the steps of its
+        warm-up done of all (serve_record_warming_golden.json), then, for a
+        start the engine refuses, the engine's class and numbers, as the app
+        reads them (serve_record_golden.json); for one the server refuses, its
+        own class."""
         record = Path(self.enterContext(tempfile.TemporaryDirectory())) / "s.json"
+        warming = json.loads((GOLDEN / "serve_record_warming_golden.json").read_text())
         golden = json.loads((GOLDEN / "serve_record_golden.json").read_text())
         failure = golden["failure"]
         event = native_wire.StartFailedEvent(
@@ -355,7 +357,7 @@ class ServerMainTests(unittest.TestCase):
 
                 def refuse(runtime=runtime, phases=phases, error=error):
                     phases.append(json.loads(record.read_text()))
-                    runtime.on_warming()
+                    runtime.on_warming(native_wire.WarmingEvent(**warming["warmup"]))
                     phases.append(json.loads(record.read_text()))
                     raise error
 
@@ -365,16 +367,12 @@ class ServerMainTests(unittest.TestCase):
                         main_args(serve_record=record), runtime
                     ):
                         stack.enter_context(patch)
-                    stack.enter_context(mock.patch.object(api, "print_status"))
+                    status = stack.enter_context(mock.patch.object(api, "print_status"))
                     with self.assertRaises(SystemExit):
                         api.main()
-                self.assertEqual(
-                    phases,
-                    [
-                        {"pid": 4242, "phase": "loading"},
-                        {"pid": 4242, "phase": "warming"},
-                    ],
-                )
+                self.assertEqual(phases, [{"pid": 4242, "phase": "loading"}, warming])
+                # The console says it too, for a start the app does not follow.
+                status.assert_any_call("Warming up · 3 of 9 steps")
                 self.assertEqual(json.loads(record.read_text()), written)
                 self.assertEqual(list(record.parent.iterdir()), [record])
 
