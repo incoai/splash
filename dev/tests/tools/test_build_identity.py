@@ -94,7 +94,9 @@ class BuildIdentityTests(unittest.TestCase):
             tool = root / "dev/tools/build_identity.py"
             tool.parent.mkdir(parents=True)
             tool.write_text("fixture tool")
-            (tool.parent / "metal_verify_variant.py").write_text("fixture variant generator")
+            (tool.parent / "metal_verify_variant.py").write_text(
+                "fixture variant generator"
+            )
             first = build_identity.build_id(root)
             geometry.write_text("#define SPLASH_DFLASH_QUERY_ROWS 7\n")
             self.assertNotEqual(first, build_identity.build_id(root))
@@ -105,7 +107,10 @@ class BuildIdentityTests(unittest.TestCase):
             tool = root / "dev/tools/build_identity.py"
             tool.parent.mkdir(parents=True)
             shutil.copy2(build_identity.ROOT / "dev/tools/build_identity.py", tool)
-            shutil.copy2(build_identity.ROOT / "dev/tools/metal_verify_variant.py", tool.parent / "metal_verify_variant.py")
+            shutil.copy2(
+                build_identity.ROOT / "dev/tools/metal_verify_variant.py",
+                tool.parent / "metal_verify_variant.py",
+            )
             shader = root / "runtime/metal/kernels/shared/alternate.metal"
             shader.parent.mkdir(parents=True)
             header = root / "generated/BuildIdentity.hpp"
@@ -416,7 +421,11 @@ class CompileConfigurationTests(unittest.TestCase):
                 for source in (*q8_sources, residency_source, removed_source)
             }
             production_airs.update(
-                str(build / "metal/verify16" / source.relative_to(kernel_root).with_suffix(".air"))
+                str(
+                    build
+                    / "metal/verify16"
+                    / source.relative_to(kernel_root).with_suffix(".air")
+                )
                 for source in q8_sources
                 if source.parts[-2] == "decode"
             )

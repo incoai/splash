@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Generate an isolated sixteen-row translation unit from production source."""
+
 from __future__ import annotations
 
 import argparse

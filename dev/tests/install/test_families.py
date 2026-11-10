@@ -21,8 +21,18 @@ UNUSABLE = {
         "--sparse-kv-memory",
         "--verify-rows",
     },
-    "Qwen3.6-35B-A3B": {"--ple-memory", "--sparse-kv-memory", "--disable-ane", "--draft-block-size"},
-    "Qwen3.5-122B-A10B": {"--ple-memory", "--sparse-kv-memory", "--disable-ane", "--draft-block-size"},
+    "Qwen3.6-35B-A3B": {
+        "--ple-memory",
+        "--sparse-kv-memory",
+        "--disable-ane",
+        "--draft-block-size",
+    },
+    "Qwen3.5-122B-A10B": {
+        "--ple-memory",
+        "--sparse-kv-memory",
+        "--disable-ane",
+        "--draft-block-size",
+    },
     "Qwen3.8-Flash-Next": {"--disable-ane", "--draft-block-size"},
     "Flint": {
         "--language-only",
