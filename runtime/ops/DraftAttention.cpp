@@ -168,7 +168,7 @@ void DraftAttention::addPrepare(metal::CommandGraph &graph,
 
 void DraftAttention::addDecode(
     metal::CommandGraph &graph, DraftDecodeAttentionBuffers buffers,
-    std::span<const uint32_t> cacheLengths, const DraftAttentionPlan &plan) {
+    std::span<const uint32_t> cacheLengths, const DraftAttentionPlan &plan, bool causal) {
   const auto shape = plan.shape();
   const auto workspace = plan.workspace();
   const uint32_t lanes = plan.lanes();
@@ -185,7 +185,7 @@ void DraftAttention::addDecode(
     requireBytes(buffers.persistentKeys[lane], ringBytes(shape), "draft key ring");
     requireBytes(buffers.persistentValues[lane], ringBytes(shape), "draft value ring");
   }
-  DraftAttentionBatchParams params{kWindow, lanes, {}};
+  DraftAttentionBatchParams params{kWindow, lanes, {}, causal};
   std::copy(cacheLengths.begin(), cacheLengths.end(),
             std::begin(params.cache_length));
   std::vector<metal::MetalBuffer> bindings{buffers.groupedQueries};

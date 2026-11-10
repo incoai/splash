@@ -45,7 +45,7 @@ inline constexpr std::string_view kMlxFloatFormats = "mxfp4 or nvfp4";
 enum class ModuleNames : uint8_t { Mlx, Transformers };
 
 // The names the checkpoint's tensors take: transformers' when it holds
-// lm_head.weight (or compressed-tensors' NVFP4 lm_head.weight_packed).
+// model.language_model.embed_tokens.weight, which a tied head has too.
 [[nodiscard]] ModuleNames moduleNames(const SafetensorsCheckpoint &checkpoint);
 
 // Whether the images hold the norms as F32, as they hold a checkpoint's of

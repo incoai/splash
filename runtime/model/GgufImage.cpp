@@ -704,7 +704,8 @@ std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions
   }
   Builder head(file, g, problems, "head.bin", g.layers, 2);
   Family::head(head, g);
-  head.quantized("output.weight", g.vocabularySize, g.hiddenSize);
+  // A tied head is the token table's tensor (QwenTargetDimensions::tiedEmbeddings).
+  head.quantized(g.tiedEmbeddings ? "token_embd.weight" : "output.weight", g.vocabularySize, g.hiddenSize);
   images.push_back(head.finish());
   Builder embedding(file, g, problems, "embedding.bin", g.vocabularySize, g.hiddenSize);
   embedding.embeddingRows("token_embd.weight");

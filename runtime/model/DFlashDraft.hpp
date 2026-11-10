@@ -68,12 +68,19 @@ private:
   uint64_t actualAllocatedBytes_ = 0;
 };
 
-// The dimensions of a DFlash2 draft, as its checkpoint's config.json gives
-// them (ModelDescriptor.mm readDraftLayout): every draft's attention widths
-// and selector are those the kernels are built for; its layers, intermediate
-// size, rotary base and the target layers it reads are its own, and its
-// hidden size and vocabulary its target's.
+// The dimensions of a DFlash2 or DFlash draft, as its checkpoint's
+// config.json gives them (ModelDescriptor.mm readDraftLayout): every draft's
+// attention widths and selector are those the kernels are built for; its
+// layers, intermediate size, rotary base and the target layers it reads are
+// its own, and its hidden size and vocabulary its target's.
 struct DFlashDraftLayout final {
+  // Whether it is a DFlash2 draft (DFlash2DraftModel): each layer's attention
+  // and FFN read a convolution of their input rows, whose taps a dynamic
+  // projection sets, and a selector scores each proposal's edge from its
+  // predecessor. A DFlash draft (z-lab's DFlashDraftModel) has neither: each
+  // layer's attention and FFN add their output to the residual, and each
+  // proposal is its position's own top candidate.
+  bool mixesRows = true;
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
   uint32_t vocabularySize = 0;
@@ -89,7 +96,11 @@ struct DFlashDraftLayout final {
   // first targetLayerCount of targetLayers, targetHiddenSize() values a row.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};
   uint32_t targetLayerCount = 0;
+  // The layers whose draft rows attend only those up to their own, a bit per
+  // layer (a DFlash draft's sliding layers); the others' attend every one.
+  uint64_t causalLayers = 0;
 
+  [[nodiscard]] constexpr bool causal(uint32_t layer) const noexcept { return causalLayers >> layer & 1; }
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
     return {layers, kvHeads, attentionHeadDimension, hiddenSize};
   }
@@ -112,15 +123,15 @@ struct DFlashDraftLayout final {
   bool operator==(const DFlashDraftLayout &) const = default;
 };
 
-// The layout of a DFlash2 draft of a target of `hiddenSize` and
-// `vocabularySize` with `layers` (at least one) layers of `intermediateSize`
+// The layout of a draft (DFlash2 unless `mixesRows` is false) of a target of `hiddenSize` and
+// `vocabularySize` with `layers` (1 to 64) layers of `intermediateSize`
 // (a positive multiple of 64), rotary base `rotaryTheta` (positive), reading
 // the target's layers `targetLayers` (ascending, 1 to
 // ExecutionLimits::maximumDraftTargetLayers): its attention widths and
-// selector are those the kernels are built for.
+// selector are those the kernels are built for, and no layer causal.
 [[nodiscard]] DFlashDraftLayout draftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint32_t layers,
                                             uint32_t intermediateSize, float rotaryTheta,
-                                            std::span<const uint32_t> targetLayers);
+                                            std::span<const uint32_t> targetLayers, bool mixesRows = true);
 
 struct DFlashDecodeBuffers final {
   ops::LinearScratch linearScratch{};
@@ -194,6 +205,8 @@ struct DFlashPrefillBuffers final {
   metal::MetalBuffer ropeSin;
 };
 
+// A DFlash draft's layers leave the convolutions and dynamic projections empty, and
+// its weights the selector and codebooks (DFlashDraftLayout::mixesRows).
 struct DFlashDraftLayerWeights final {
   ops::NormWeights inputNorm;
   metal::MetalBuffer attentionConvolution;
@@ -277,6 +290,16 @@ public:
                         std::span<const uint32_t> startPositions) const;
 
 private:
+  // Layer `layer`'s attention of the proposal QKV rows, which it leaves
+  // ready for the output projection.
+  void addAttention(metal::CommandGraph &graph, const DFlashDecodeBuffers &buffers,
+                    const DFlashDraftLayerWeights &weights, const ops::DraftAttentionPlan &attentionPlan,
+                    std::span<const uint32_t> cacheLengths, uint32_t layer) const;
+  // Layer `layer` of a DFlash draft's decode, from the hidden rows of its
+  // parity to the other's.
+  void addResidualLayer(metal::CommandGraph &graph, const DFlashDecodeBuffers &buffers,
+                        const DFlashDraftLayerWeights &weights, const ops::DraftAttentionPlan &attentionPlan,
+                        std::span<const uint32_t> cacheLengths, uint32_t layer) const;
   // Each layer's context keys and values of the `rows` context rows in the
   // buffers' hidden rows, written to the spans' rings.
   void addContextKv(metal::CommandGraph &graph, const DFlashPrefillBuffers &buffers,

@@ -47,7 +47,7 @@ __all__ = ["ModelError", "prepare_local_model"]
 def prepare_local_model(
     target, draft=None, *, mmproj=None, language_only=False, models_dir=paths.MODELS
 ):
-    """Prepare the target and its DFlash2 draft for the server, and return
+    """Prepare the target and its DFlash draft for the server, and return
     the directory the server loads, an absolute pathlib.Path.
 
     target: a GGUF file, any part of a split GGUF naming all of them, which

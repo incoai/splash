@@ -36,6 +36,20 @@ namespace bf16 fp32 4b73b38234ba34253dc2b6b75dc340a8
 state bf16 cell 78643200 lane 205127680 cached 84541440
 namespace int8 bf16 172879058b5e2bcc713e129a2b62393a
 namespace bf16 bf16 42a4e915c0e06b5a19ac419dbfca5147
+family Qwen3.5-4B
+facts experts 0 recurrent-state 1 ple-table 0 sparse-kv 0 dense-ffn 1 context 262144..1010000
+kv layers 8 heads 4 dimension 256 index 0
+kv int8 page 532480 index-page 0 alignment 128 extents 128..256
+kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:128 129:128 255:128 256:256 257:256 511:128 512:256 1000:128 4095:128 4096:256 10000:256 65535:128 65536:256 100000:128 262144:256 1000000:256
+kv bf16 page 1048576 index-page 0 alignment 1 extents 64..192
+kv bf16 extent-pages 1:0 31:0 32:0 63:0 64:64 127:127 128:128 129:129 255:85 256:128 257:128 511:73 512:128 1000:125 4095:117 4096:128 10000:125 65535:85 65536:128 100000:125 262144:128 1000000:125
+state fp32 cell 51511296 lane 156303360 cached 54460416
+namespace int8 fp32 9719d6e1cb1afd9668932625e024d6fa
+namespace bf16 fp32 e98a0c225cf4e1c31cc57d305eae5583
+state bf16 cell 26345472 lane 105971712 cached 29294592
+namespace int8 bf16 2b1b653aaf704a7e666582e7daf3b330
+namespace bf16 bf16 25e6d1992070cb308ca807f8f374c031
+
 family Qwen3.6-35B-A3B
 facts experts 1 recurrent-state 1 ple-table 0 sparse-kv 0 dense-ffn 0 context 262144..1010000
 kv layers 10 heads 2 dimension 256 index 0

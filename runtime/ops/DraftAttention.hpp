@@ -89,10 +89,11 @@ public:
   static void addPrepare(metal::CommandGraph &graph,
                          DraftPrepareBuffers buffers,
                          const DraftAttentionPlan &plan);
+  // With causal, each draft row attends the draft rows up to its own.
   static void addDecode(metal::CommandGraph &graph,
                         DraftDecodeAttentionBuffers buffers,
                         std::span<const uint32_t> cacheLengths,
-                        const DraftAttentionPlan &plan);
+                        const DraftAttentionPlan &plan, bool causal = false);
   static void addReorder(metal::CommandGraph &graph,
                          metal::MetalBuffer grouped,
                          metal::MetalBuffer rowMajor,

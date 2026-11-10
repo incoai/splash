@@ -81,9 +81,12 @@ uint32_t prefillSplits(uint32_t rows, uint32_t history, bool sparse) {
 // A layout's split or reduce pipeline of a phase ("prefill" or "verify").
 std::string pipelineName(std::string_view phase, bool split, uint32_t queryHeads, kv::Layout layout) {
   const bool sparse = selectsBlocks(layout);
-  // The kernels of four KV heads, the first compiled, have no suffix.
-  const std::string suffix = layout.kvHeads == 4 ? "" : "_kv" + std::to_string(layout.kvHeads) + "_g" +
-                                                            std::to_string(queryHeads / layout.kvHeads);
+  // The kernels of 24 query heads over four KV heads, the first compiled,
+  // have no suffix.
+  const uint32_t group = queryHeads / layout.kvHeads;
+  const std::string suffix = layout.kvHeads == 4 && group == 6
+                                 ? ""
+                                 : "_kv" + std::to_string(layout.kvHeads) + "_g" + std::to_string(group);
   const std::string format = layout.format == kv::Format::Int8 ? "q8_" : "bf16_";
   return std::string(phase) + "_attention_" +
          (split ? format + (sparse ? "sparse" : "split") : std::string(sparse ? "sparse_reduce" : "reduce")) +

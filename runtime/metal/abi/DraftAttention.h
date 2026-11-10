@@ -59,14 +59,17 @@ static_assert(sizeof(DraftConvBatchParams) == 8,
 // random, and reports no error, on an M5 Max under full
 // MTL_SHADER_VALIDATION; without validation its output is bitwise that of
 // the run-time stride.
+// causal: nonzero for a layer whose query rows attend only the draft rows up
+// to their own (a DFlash draft's sliding layers); zero, every draft row.
 struct DraftAttentionBatchParams {
   uint32_t value_stride;
   uint32_t lanes;
   uint32_t cache_length[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t causal;
 };
 
-static_assert(sizeof(DraftAttentionBatchParams) == 24,
-              "Draft attention parameters are 24 bytes on both sides");
+static_assert(sizeof(DraftAttentionBatchParams) == 28,
+              "Draft attention parameters are 28 bytes on both sides");
 
 struct DraftContextParams {
   uint32_t tokens;

@@ -37,7 +37,7 @@ DraftSelectorWorkspace DraftSelector::workspace(uint32_t positions) {
 
 void DraftSelector::add(metal::CommandGraph &graph,
                         const DraftSelectorBuffers &buffers,
-                        const DraftCodebooks &codebooks,
+                        const DraftCodebooks *codebooks,
                         std::span<const uint32_t> anchors,
                         std::span<const SamplingPolicy> policies) const {
   if (anchors.empty() || anchors.size() != policies.size() ||
@@ -64,9 +64,12 @@ void DraftSelector::add(metal::CommandGraph &graph,
   requireBytes(buffers.partialValues, workspace.partialValuesBytes, "draft selector partial value");
   requireBytes(buffers.candidates, workspace.candidatesBytes, "draft candidate");
   requireBytes(buffers.unary, workspace.unaryBytes, "draft candidate score");
-  requireBytes(buffers.selectorHidden, rows * SPLASH_DRAFT_SELECTOR_RANK * 2, "draft selector hidden");
-  requireBytes(codebooks.predecessor, codebook, "draft predecessor codebook");
-  requireBytes(codebooks.successor, codebook, "draft successor codebook");
+  params.unary_only = !codebooks;
+  if (codebooks) {
+    requireBytes(buffers.selectorHidden, rows * SPLASH_DRAFT_SELECTOR_RANK * 2, "draft selector hidden");
+    requireBytes(codebooks->predecessor, codebook, "draft predecessor codebook");
+    requireBytes(codebooks->successor, codebook, "draft successor codebook");
+  }
   requireBytes(buffers.proposedTokens, uint64_t{lanes} * kPositions * sizeof(uint32_t), "proposed token");
   requireBytes(buffers.confidence, uint64_t{lanes} * kPositions * sizeof(float), "proposal confidence");
   if (const uint64_t sampledLanes = std::bit_width(params.sampling_mask)) {
@@ -79,12 +82,17 @@ void DraftSelector::add(metal::CommandGraph &graph,
   graph.add("draft_select_top16_sharded",
             {buffers.logits, buffers.partialIds, buffers.partialValues},
             vocabulary_, {uint64_t{lanes} * kPositions * kShards, 1, 1});
-  graph.add("draft_select_edges",
-            {buffers.partialIds, buffers.partialValues, buffers.candidates,
-             buffers.unary, buffers.selectorHidden, codebooks.predecessor,
-             codebooks.successor},
-            params, {uint64_t{lanes} * kPositions, 1, 1},
-            {kEdgeThreads, 1, 1});
+  if (!codebooks)
+    graph.add("draft_select_candidates",
+              {buffers.partialIds, buffers.partialValues, buffers.candidates, buffers.unary},
+              {uint64_t{lanes} * kPositions, 1, 1}, {32, 1, 1});
+  else
+    graph.add("draft_select_edges",
+              {buffers.partialIds, buffers.partialValues, buffers.candidates,
+               buffers.unary, buffers.selectorHidden, codebooks->predecessor,
+               codebooks->successor},
+              params, {uint64_t{lanes} * kPositions, 1, 1},
+              {kEdgeThreads, 1, 1});
   graph.add("draft_select_dflash",
             {buffers.candidates, buffers.unary, buffers.partialValues,
              buffers.uniforms, buffers.proposedTokens,

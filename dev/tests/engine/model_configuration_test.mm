@@ -114,6 +114,12 @@ void testFamilies(const std::filesystem::path &fixtures) {
   require(inspect(dense.with(&SourceModel::record, R"("none")", R"("safetensors")")).visionSource ==
               model::VisionSource::Safetensors,
           "an MLX Qwen3.8-27B with its vision tower made another descriptor");
+  // Qwen3.5-4B's model type is the Qwen3.8-27B's: its sizes name its
+  // family, its head is its token table and its draft is z-lab's DFlash.
+  const model::ModelDescriptor smallDescriptor = inspect(mlxModel(fixtures, "qwen3.5-4b"));
+  require(smallDescriptor.target == model::TargetLayout{model::kQwen3_5_4BLayout} &&
+              smallDescriptor.draft == test::qwen3_5_4BDraft() && !smallDescriptor.draft.mixesRows,
+          "an MLX Qwen3.5-4B made another descriptor");
   const SourceModel moe = mlxModel(fixtures, "qwen3.6-35b-a3b");
   const model::ModelDescriptor moeDescriptor =
       inspect(moe.with(&SourceModel::record, R"("none")", R"("safetensors")"));
@@ -178,14 +184,14 @@ void testFamilies(const std::filesystem::path &fixtures) {
           "a draft's own sizes were not its descriptor's");
   // The model type names the family; the sizes every source's config states
   // tell its target from other models of the architecture, which Splash does
-  // not serve, such as Qwen3.5-4B.
+  // not serve, such as Qwen3.5-9B.
   constexpr std::string_view supported =
-      "; supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next";
+      "; supported: Qwen3.8-27B, Qwen3.5-4B, Qwen3.6-35B-A3B, Qwen3.5-122B-A10B, Qwen3.8-Flash-Next";
   struct Refused final {
     std::string_view from, to, difference;
   };
   for (const Refused &refused : std::initializer_list<Refused>{
-           {R"("hidden_size": 5120)", R"("hidden_size": 2560)", "text config hidden_size: safetensors 2560, Qwen3.8-27B 5120"},
+           {R"("hidden_size": 5120)", R"("hidden_size": 4096)", "text config hidden_size: safetensors 4096, Qwen3.8-27B 5120"},
            {R"("num_hidden_layers": 64)", R"("num_hidden_layers": 32)",
             "text config num_hidden_layers: safetensors 32, Qwen3.8-27B 64"},
            {R"("model_type": "qwen3_5_text")", R"("model_type": "gemma3_text")", "text model type gemma3_text"},
@@ -280,7 +286,9 @@ void testOneRulePerValue(const std::filesystem::path &fixtures) {
            {&SourceModel::draft, R"("intermediate_size": 17408)", R"("intermediate_size": 17416)",
             "a DFlash2 draft's intermediate size is a positive multiple of 64"},
            {&SourceModel::draft, R"("num_hidden_layers": 5)", R"("num_hidden_layers": 0)",
-            "a DFlash2 draft has at least one layer"},
+            "a DFlash2 draft has 1 to 64 layers"},
+           {&SourceModel::draft, R"("num_hidden_layers": 5)", R"("num_hidden_layers": 65)",
+            "a DFlash2 draft has 1 to 64 layers"},
            {&SourceModel::draft, R"("rope_theta": 10000000)", R"("rope_theta": -1)",
             "a DFlash2 draft's rotary theta is positive"},
            {&SourceModel::draft, R"("num_attention_heads": 32)", R"("num_attention_heads": 16)",

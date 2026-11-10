@@ -381,9 +381,11 @@ void walkLayer(Walk &b, const QwenTargetDimensions &g, ModuleNames names, uint32
   }
 }
 
+// A tied head is the token table's tensor, planned as a projection.
 template <class Walk> void walkHead(Walk &b, const QwenTargetDimensions &g, ModuleNames names) {
   b.norm(modelPrefix(names) + "norm", g.hiddenSize);
-  b.projection(headName(names), g.vocabularySize, g.hiddenSize);
+  b.projection(g.tiedEmbeddings ? modelPrefix(names) + "embed_tokens" : headName(names), g.vocabularySize,
+               g.hiddenSize);
 }
 
 template <class Walk> void walkEmbedding(Walk &b, ModuleNames names) {
@@ -393,7 +395,7 @@ template <class Walk> void walkEmbedding(Walk &b, ModuleNames names) {
 } // namespace
 
 ModuleNames moduleNames(const SafetensorsCheckpoint &checkpoint) {
-  return checkpoint.find("lm_head.weight") || checkpoint.find("lm_head.weight_packed") ? ModuleNames::Transformers
+  return checkpoint.find(modelPrefix(ModuleNames::Transformers) + "embed_tokens.weight") ? ModuleNames::Transformers
                                                                                          : ModuleNames::Mlx;
 }
 
