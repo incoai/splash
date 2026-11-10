@@ -411,8 +411,12 @@ requires a dense DSpine runtime. Each model owns its execution width; DFlash2
 keeps its eight-row default and allocations. Restart to change the width;
 the persistent state cache separates the two widths.
 
-Both widths preserve the full 8,192-token
-sliding context, including prefix-cache restore. Each draft layer uses causal
+Both widths use the checkpoint's 8,192-token sliding context, including
+prefix-cache restore. When `--max-context` is explicitly 2,048 or less, the
+runtime allocates its compiled 2,048-token window instead: no admitted request
+can use the older keys. Larger and automatic contexts retain 8,192 tokens.
+The persistent cache separates the two physical window layouts.
+Each draft layer uses causal
 attention and passes predecessor features through a learned code bridge;
 the final write is refined against the selected predecessor token. Greedy
 and temperature sampling share the target verifier, which reads the refined

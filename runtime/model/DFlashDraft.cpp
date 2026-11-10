@@ -14,7 +14,8 @@ namespace splash::model {
 namespace {
 
 void requireLayout(const DFlashDraftLayout &layout) {
-  if ((layout.isDSpine() && (layout.contextTokens != 8192 || layout.bridgeCodeSize != 1024 || layout.bridgeRank != 512)) ||
+  if ((layout.isDSpine() && ((layout.contextTokens != 8192 && layout.contextTokens != SPLASH_DRAFT_SLIDING_WINDOW) ||
+                           layout.bridgeCodeSize != 1024 || layout.bridgeRank != 512)) ||
       (!layout.isDSpine() && (layout.contextTokens != SPLASH_DRAFT_SLIDING_WINDOW || layout.bridgeCodeSize || layout.bridgeRank)))
     throw WeightStoreError("unsupported draft architecture layout");
   if (!layout.layers || !layout.hiddenSize || !layout.vocabularySize ||

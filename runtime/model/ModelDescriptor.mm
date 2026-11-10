@@ -939,6 +939,13 @@ ModelDescriptor servedFor(ModelDescriptor model, uint32_t contextTokens) {
         model.capabilities.maximumContextTokens = layout.servedContextTokens(model.ropeScaling);
       },
       model.target);
+  // A request within the compiled 2K window cannot consume any of the
+  // checkpoint's later keys. Keep the full checkpoint window otherwise.
+  if (model.draft.isDSpine()) {
+    model.draft.contextTokens = contextTokens && contextTokens <= SPLASH_DRAFT_SLIDING_WINDOW
+                                  ? SPLASH_DRAFT_SLIDING_WINDOW : 8192;
+    model.stateLayout.draft = model.draft.stateLayout();
+  }
   return model;
 }
 

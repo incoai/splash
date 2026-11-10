@@ -1043,6 +1043,26 @@ void testDSpine(const std::filesystem::path &fixtures) {
   require(model.draft.isDSpine() && model.draft.contextTokens == 8192 && model.draft.bridgeCodeSize == 1024 &&
       model.draft.bridgeRank == 512 && model.stateLayout.draft.windowTokens == 8192 &&
       model.draft.targetLayerIds()[0] == 1 && model.valid(), "DSpine checkpoint made the wrong descriptor");
+  for (const uint32_t context : {0u, 1u, 256u, 2048u, 2049u, 8192u, 32768u}) {
+    const auto served = model::servedFor(model, context);
+    const uint32_t window = context && context <= 2048 ? 2048 : 8192;
+    require(served.valid() && served.draft.contextTokens == window &&
+        served.stateLayout.draft == served.draft.stateLayout() &&
+        served.target == model.target && served.targetKvLayout == model.targetKvLayout &&
+        served.draft.bridgeCodeSize == model.draft.bridgeCodeSize &&
+        served.draft.bridgeRank == model.draft.bridgeRank,
+        "short served context changed the wrong DSpine dimensions");
+    if (window == 2048) {
+      require(model.stateLayout.draft.ringBytes() - served.stateLayout.draft.ringBytes() == 125829120 &&
+          model.stateLayout.draft.windowBytes() - served.stateLayout.draft.windowBytes() == 17694720,
+          "short DSpine state saving differs from its physical window");
+    }
+  }
+  for (const uint32_t context : {0u, 2049u, 8192u, 32768u}) {
+    const auto restored = model::servedFor(model::servedFor(model, 2048), context);
+    require(restored.draft == model.draft && restored.stateLayout == model.stateLayout,
+        "re-serving a short-context model failed to restore its checkpoint window");
+  }
   refuses(source.with(&SourceModel::draft, R"("rank": 512)", R"("rank": 256)"),
       "DSpine code bridge", "unsupported DSpine rank accepted");
   refuses(source.with(&SourceModel::draft, R"("draft_block_causal": true)", R"("draft_block_causal": false)"),
