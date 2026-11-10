@@ -2770,6 +2770,58 @@ void testASpillLaneAtTheWallReleasesOnlyWhatItLacks() {
   require(spill.events.failures.empty() && spill.events.usage.at(1).second == 8, "the lane did not complete");
 }
 
+// A Spill lane prefilling at the memory wall in commands of 8,192 rows, a checkpoint inside each, releases its own
+// landed pages for the KV past the checkpoint, as its next command would: wherever the wall falls, from its 1,024th or
+// 1,280th page with up to two extents of room left, no command is cut there and the lane decodes the output of a run
+// with room to spare. On Qwen3.8-Flash-Next each cut cost a pass more of the routed experts, which stream: 14 cuts in
+// a 237K prompt, its first token 8% later.
+void testASpillLaneAtTheWallCutsNoCommand() {
+  constexpr uint64_t extentBytes = uint64_t{256} * FlashNextLanes::kPages.fullBytes;
+  struct Run final {
+    std::vector<uint32_t> output;
+    std::vector<std::string> failures;
+    uint64_t cuts = 0, released = 0;
+  };
+  // The wall from `wallPage` on with `room` left, until the prompt is prefilled.
+  const auto run = [](uint32_t wallPage, std::optional<uint64_t> room) {
+    FlashNextGoverned lanes(test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6, true));
+    Spilling &spill = lanes.spill;
+    lanes.startSpill(Spilling::prompt(1, 1, 2'046, 8));
+    const auto prefilled = [&](uint32_t pages) {
+      return spill.events.usage.contains(1) || !spill.events.failures.empty() ||
+             (spill.cache.pageTable(1).pages.size() >= pages && !spill.engine.commandInFlight());
+    };
+    spill.runUntil([&] { return prefilled(wallPage); }, "the prompt did not reach the wall's page");
+    Run result;
+    if (room) {
+      spill.host.leaveRoom(*room);
+      const uint64_t cuts = spill.engine.snapshot().captureCuts;
+      const uint64_t released = spill.cache.spillSnapshot().releasedPages;
+      spill.runUntil([&] { return prefilled(2'046); }, "the prompt did not prefill at the wall");
+      result.cuts = spill.engine.snapshot().captureCuts - cuts;
+      result.released = spill.cache.spillSnapshot().releasedPages - released;
+      spill.host.leaveRoom(std::nullopt);
+    }
+    spill.runUntilIdle();
+    result.output = spill.events.outputs[1];
+    result.failures = spill.events.failures;
+    return result;
+  };
+  const Run roomy = run(1'024, std::nullopt);
+  std::string failures;
+  for (const uint32_t wallPage : {1'024u, 1'280u})
+    for (uint64_t quarters = 0; quarters <= 8; ++quarters) {
+      const Run walled = run(wallPage, quarters * extentBytes / 4);
+      if (!walled.failures.empty() || walled.output != roomy.output || !walled.released || walled.cuts)
+        failures += "; from page " + std::to_string(wallPage) + " with " + std::to_string(quarters) +
+                    "/4 extent left: " + std::to_string(walled.failures.size()) + " failures, " +
+                    std::to_string(walled.released) + " pages released, " + std::to_string(walled.cuts) + " cuts" +
+                    (walled.output == roomy.output ? "" : ", another output");
+    }
+  require(failures.empty(),
+          "a lane at the wall failed, released nothing, decoded another output or cut a command" + failures);
+}
+
 // A decoding Spill lane takes its hot block floor only at its first release, which frees the floor beside what its
 // growth lacks, and the same prepare reserves it: the command after the release reads with it. A Background start
 // refused at the same wall, which releases no Normal lane, takes none of it.
@@ -4173,6 +4225,7 @@ std::span<const test::TestCase> spillTests() {
       {"testAPageWaitingForItsCopyHoldsBackNoneAfterIt", testAPageWaitingForItsCopyHoldsBackNoneAfterIt},
       {"testASpillLaneKeepsLandedPagesWhileMemoryLasts", testASpillLaneKeepsLandedPagesWhileMemoryLasts},
       {"testASpillLaneAtTheWallReleasesOnlyWhatItLacks", testASpillLaneAtTheWallReleasesOnlyWhatItLacks},
+      {"testASpillLaneAtTheWallCutsNoCommand", testASpillLaneAtTheWallCutsNoCommand},
       {"testTheFirstReleaseFundsTheLanesReads", testTheFirstReleaseFundsTheLanesReads},
       {"testAStartReleasesALaneOfItsPriority", testAStartReleasesALaneOfItsPriority},
       {"testAStartNeverReleasesAHigherPriorityLane", testAStartNeverReleasesAHigherPriorityLane},

@@ -824,6 +824,8 @@ void testTakeRightsTable() {
   start.cls = ClaimClass::Start;
   ClaimSpec optional = immediate;
   optional.cls = ClaimClass::Optional;
+  ClaimSpec laneNeeds = optional;
+  laneNeeds.laneNeeds = true;
   ClaimSpec below = everything;
   below.priority = RequestPriority::Background;
   struct Row final {
@@ -864,6 +866,10 @@ void testTakeRightsTable() {
        {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::ResumePoint,
         .reserves = Reserves::None, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
         .convertLane = 0}},
+      {"the KV its lane takes anyway", rights(laneNeeds, {.bytes = kMiB, .kv = true}),
+       {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::ResumePoint,
+        .reserves = Reserves::None, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
+        .convertLane = 0, .lanes = Lanes::Own}},
       {"growth", rights({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate}), {.units = true}},
       {"the engine's own optional work", rights({.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate}), {}},
       {"the host with a deficit", rights({.cls = ClaimClass::Host}),

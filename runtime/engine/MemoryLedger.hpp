@@ -96,7 +96,8 @@ struct ClaimSpec final {
   // which the lane's next command takes should this one end there. The host
   // judges it as the lane's InService growth (by the margin, not the band);
   // refused, it takes the in-place units its take rights take and passes the
-  // margin once none meets the refusal (MemoryGovernor::free).
+  // margin once none meets the refusal (MemoryGovernor::free). It releases
+  // its own lane's landed pages, as that next command would (takeRights).
   bool laneNeeds = false;
 };
 
@@ -233,7 +234,8 @@ struct TakeRights final {
 // need its reach. A Spill lane's pages whose copies landed cost it the reads
 // of their blocks: work that can wait, in service or a start, releases them
 // from its own lane and those of its priority or a lower one, never a higher
-// one's; a need the host refused from its own lane, in place; the host from
+// one's; the KV its lane takes anyway (ClaimSpec::laneNeeds) from its own
+// lane; a need the host refused from its own lane, in place; the host from
 // every lane while macOS's pressure is above normal, for its deficit under
 // its warning as for its margin under its critical pressure; no other claim.
 // Certain reuse, which a request rebuilds at its whole prefill, goes to

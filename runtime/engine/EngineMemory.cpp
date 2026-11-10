@@ -752,7 +752,10 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
     // have passed, and the lane's next command asks again: an Optional
     // claim. The lane takes that KV anyway, so the host judges it as the
     // lane's growth: refused with nothing in place to meet it, it passes the
-    // host and does not end this command (ClaimSpec::laneNeeds).
+    // host and does not end this command (ClaimSpec::laneNeeds). So too it
+    // releases the lane's own landed pages, which that next command would
+    // release: a cut costs a pass more of the routed experts where they
+    // stream.
     const uint32_t next = index + 1 < boundaries.size() && boundaries[index + 1].tokens < end
                               ? boundaries[index + 1].tokens
                               : end;
