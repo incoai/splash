@@ -1380,6 +1380,53 @@ void testAQuotaRefusalReadsOnlyTheChainAStartKeeps() {
   require(spill.committedSlots() == 0, "the quota was not returned");
 }
 
+// A start refused memory keeps the probe it was placed with while it backs off, and the host's
+// pass at critical pressure may take the chain that probe found: placed again in the tick after
+// that control pass, it counts the chain only as far as the cache still has it, and waits on. Its
+// 16 pages Resident take more than Spill's floor, so at the memory wall placement counts what a
+// start may take beside the chain it restores (Engine::residentRoom), whose walk follows the chain
+// up from the state the probe found: with that state's block taken, it threw "unknown KV cache
+// block" out of the tick.
+void testAPlacementCountsOnlyTheChainAStartKeeps() {
+  Spilling spill(64, false, 0, 64 * KvCache::pageTokens);
+  const auto submit = [&](uint64_t id, std::vector<uint32_t> tokens, uint32_t output) {
+    EngineRequest value = request(id, std::move(tokens));
+    value.maxNewTokens = output;
+    value.deadlineMilliseconds = 1e9;
+    spill.engine.submit(std::move(value));
+  };
+  const std::vector<uint32_t> turn(16 * KvCache::pageTokens + 1, 50);
+  // An earlier turn ends; its chain stays cached.
+  submit(5, turn, 1);
+  spill.runUntil([&] { return spill.events.usage.contains(5); }, "the earlier turn did not end");
+  require(spill.cache.probe(turn, {}).cachedTokens() != 0, "the earlier turn's chain was not cached");
+  // The earlier turn sent again: the host refuses its start memory.
+  spill.model.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  spill.model.beginGrowthBlocked = [&] { return spill.model.lastBeginId == 3; };
+  submit(3, turn, 1);
+  spill.runUntil([&] { return spill.engine.resourceWaitSnapshot(spill.now).memory == 1; },
+                 "the resend was not refused memory");
+  // The control pass at critical pressure brings the probe up to date (Engine::collectLandings),
+  // then the host's pass takes the cache: the chain's state, which this model's states write to
+  // no SSD cache, and its blocks, of which no copy was written, leaf first.
+  spill.host.setPressure(MemoryPressure::Critical);
+  spill.engine.collectLandings(spill.now);
+  static_cast<void>(spill.host.governor.controlPass(spill.now));
+  require(!spill.cache.lookup(turn, {}).kvBoundary, "the host's pass did not take the chain");
+  spill.host.leaveRoom(0);
+  for (int step = 0; step < 5; ++step)
+    static_cast<void>(spill.engine.tick(spill.now++));
+  require(spill.engine.resourceWaitSnapshot(spill.now).memory == 1 && spill.events.failedCount == 0,
+          "the start did not wait on beside a chain the cache took");
+  // Memory back, it starts without the chain and completes.
+  spill.host.leaveRoom(std::nullopt);
+  spill.host.setPressure(MemoryPressure::Normal);
+  spill.model.beginGrowthBlocked = {};
+  spill.runUntilIdle();
+  require(spill.events.completedCount == 2 && spill.events.failedCount == 0,
+          "the start did not complete once memory came back");
+}
+
 // A start alone that cannot spill, the tier closed or the quota short, and whose projection fits
 // the resident context starts Resident where memory holds it now, the next lane's pooled buffers
 // among it, and is refused at its start where it does not.
@@ -4350,6 +4397,7 @@ std::span<const test::TestCase> spillTests() {
       {"testAQuotaRefusalHoldsBackAStartRestoringUnheldCopies",
        testAQuotaRefusalHoldsBackAStartRestoringUnheldCopies},
       {"testAQuotaRefusalReadsOnlyTheChainAStartKeeps", testAQuotaRefusalReadsOnlyTheChainAStartKeeps},
+      {"testAPlacementCountsOnlyTheChainAStartKeeps", testAPlacementCountsOnlyTheChainAStartKeeps},
       {"testAStartRestoringHeldCopiesStartsBesideAQuotaRefusal",
        testAStartRestoringHeldCopiesStartsBesideAQuotaRefusal},
       {"testASpillStartCountsTheCopiesItRestores", testASpillStartCountsTheCopiesItRestores},
