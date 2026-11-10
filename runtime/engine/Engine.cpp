@@ -1210,10 +1210,15 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   // rings' ceiling, unless the start names one; a junction is worth
   // capturing from a window of the model's own gain.
   const uint32_t window = model_.draftWindow();
+  // The interval the checkpoint capture lands at is under investigation for
+  // the long-conversation corruption: SPLASH_CHECKPOINT_INTERVAL overrides.
+  uint32_t configured = config_.prefillCheckpointTokens;
+  if (const char *interval = getenv("SPLASH_CHECKPOINT_INTERVAL"))
+    configured = static_cast<uint32_t>(std::stoul(interval));
   const uint32_t derived = std::min<uint32_t>(
       (2u * window + KvCache::pageTokens - 1) / KvCache::pageTokens * KvCache::pageTokens,
       kPrefillCheckpointTokens);
-  const uint32_t interval = config_.prefillCheckpointTokens ? config_.prefillCheckpointTokens : derived;
+  const uint32_t interval = configured ? configured : derived;
   const uint32_t gain = std::max(model::ExecutionLimits::draftContextTokens, window);
   for (const uint32_t checkpoint :
        plannedCheckpoints(stateBoundary, latestReplayBoundary, interval)) {

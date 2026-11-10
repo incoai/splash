@@ -245,7 +245,9 @@ struct QwenTargetPrefillSequence final {
   std::span<const metal::MetalBuffer> convolutionOut;
   std::span<const metal::MetalBuffer> recurrentIn;
   std::span<const metal::MetalBuffer> recurrentOut;
-  std::array<QwenTargetPrefillCapture, 2> captures{};
+  // The chunk's draft capture spans, one per assistant turn the chunk's
+  // rows cover: a long conversation's chunk holds many.
+  std::vector<QwenTargetPrefillCapture> captures;
   uint32_t captureCount = 0;
   // In row order, each inside (0, rows).
   std::span<const QwenTargetStateCapture> stateCaptures;

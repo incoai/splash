@@ -152,10 +152,13 @@ int main(int argc, char **argv) {
     engine::MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                                     engine::queryHostMemory, 0);
     const test::ClaimScope claim(governor, engine::ClaimClass::Floor);
-    const kv::Layout kvLayout = model.targetKvLayout(kv::Format::BFloat16);
+    const kv::Format kvFormat = getenv("SPLASH_SERVE_KV_INT8") ? kv::Format::Int8 : kv::Format::BFloat16;
+    const kv::Layout kvLayout = model.targetKvLayout(kvFormat);
     const uint32_t extent = kvLayout.minimumExtentPages();
     // A page of 32 tokens; the request's pages the runtime's tables name.
-    const uint32_t pages = 64;
+    const uint32_t pages = getenv("SPLASH_SERVE_PAGES")
+                               ? static_cast<uint32_t>(std::stoul(getenv("SPLASH_SERVE_PAGES")))
+                               : 64;
     kv::PageStorage kv(backend, governor.allocationAdmission(), kvLayout, pages / extent * extent, extent);
     for (uint32_t e = 0; e < pages / extent; ++e)
       require(static_cast<bool>(kv.allocateExtent(e)), "the served run's extent did not allocate");

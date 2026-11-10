@@ -1969,18 +1969,34 @@ struct Runtime::Impl {
         destination.stateCaptures = inside.emplace_back(insideStateCaptures(sequence.stateCaptures, part.tokenCount));
         // The rows the draft's context reads.
         destination.captureCount = static_cast<uint32_t>(sequence.captures.size());
-        for (uint32_t index = 0; index < sequence.captures.size(); ++index) {
-          const DispatchDraftCaptureSpan &capture = sequence.captures[index];
-          destination.captures[index] = {
+        destination.captures.clear();
+        for (const DispatchDraftCaptureSpan &capture : sequence.captures) {
+          destination.captures.push_back({
               sequence.rowBegin + static_cast<uint32_t>(capture.absoluteBegin - part.logicalPosition),
-              sequence.captureBegin + capture.compactDestinationRow, capture.absoluteEnd - capture.absoluteBegin};
+              sequence.captureBegin + capture.compactDestinationRow, capture.absoluteEnd - capture.absoluteBegin});
         }
       }
       model.sequences = sequences[c];
     }
+    // A finiteness probe's layer cap: SPLASH_PREFILL_LAYER_CAP=k runs every
+    // multi-chunk command's layers [0, k) alone, so the first cap whose
+    // prefill goes non-finite names the layer whose output first is. The
+    // startup warmup's single-chunk command runs whole.
+    QwenPrefillLayers probed = layers;
+    if (chunks.size() > 1)
+      if (const char *cap = getenv("SPLASH_PREFILL_LAYER_CAP")) {
+        const uint32_t bound = static_cast<uint32_t>(std::stoul(cap));
+        probed = {layers.first, std::min(layers.end, layers.first + bound)};
+      }
     const std::vector<MetalBuffer> finalHidden =
-        targetModel->addPrefill(graph, modelChunks, kvPages, reads, layers, aneFfn);
-    for (uint32_t c = 0; ends && c < chunks.size(); ++c) addDraftContext(graph, chunks, c);
+        targetModel->addPrefill(graph, modelChunks, kvPages, reads, probed, aneFfn);
+    const bool probing = probed.end - probed.first != layers.end - layers.first;
+    // A finiteness probe's capture toggle: SPLASH_NO_DRAFT_CONTEXT=1 runs
+    // the prefill commands without the draft's context captures, to bisect
+    // whether the corruption enters through them.
+    const bool draftContext = !getenv("SPLASH_NO_DRAFT_CONTEXT");
+    for (uint32_t c = 0; ends && draftContext && c < chunks.size(); ++c)
+      addDraftContext(graph, chunks, c);
 
     PrefillOutputs outputs;
     std::array<InitialSelection, kLaneCount> selections{};
@@ -1991,8 +2007,15 @@ struct Runtime::Impl {
       if (ends) {
         const auto [c, s] = parts[lane].back();
         const PrefillSequence &last = chunks[c].sequences[s];
+        // The probe's partial range ends its rows in the ring the layer
+        // count names; the whole stack ends in hidden[layers & 1], whose
+        // buffers addPrefill returns.
+        const MetalBuffer ring =
+            probing ? prefillArena->get(probed.end & 1 ? PrefillTensor::Hidden1
+                                                       : PrefillTensor::Hidden0, c)
+                    : finalHidden[c];
         const MetalBuffer lastRow =
-            prefillU16(finalHidden[c], last.rowBegin + last.part.tokenCount - 1, 1, geometry.target.hiddenSize);
+            prefillU16(ring, last.rowBegin + last.part.tokenCount - 1, 1, geometry.target.hiddenSize);
         if (const auto selection = finishPrompt(graph, *entries[lane], items[lane], lastRow, lane))
           selections[selectionCount++] = *selection;
         outputs.lastRows[lane] = lastRow;
