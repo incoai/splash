@@ -963,21 +963,24 @@ std::vector<Victim> Engine::EngineVictims::releases(const VictimQuery &query) co
   });
   const uint64_t pageBytes = engine.config_.spill.geometry.releasedPageBytes();
   // A lane's unit for a need of bytes, of `pages` pages: whole extents of
-  // them, each page freeing its Full bytes less its Index page's, less the
-  // first reads of the lanes they give Index pages: a growth's extent takes
-  // two extents of pages. They free only as many Full extents as
-  // compaction can empty, where the first runway's moves empty one
-  // (Cache::releaseMoves). A need the host refused lacks no bytes. These
-  // units add up as their takes in turn free them, each moving its lane's
-  // oldest pages, so each counts only the pages, first reads and extents
-  // those before it leave: a page lanes share counts once
-  // (Cache::ReleaseCount).
-  Cache::ReleaseCount count;
+  // them, and an extent more where the free Full pages beside complete it
+  // (Cache::releaseBeside), each page of those extents freeing its Full
+  // bytes less its Index page's, less the first reads of the lanes they give
+  // Index pages: a growth's extent takes two extents of pages. They free
+  // only as many Full extents as compaction can empty, where the first
+  // runway's moves empty one (Cache::releaseMoves). A need the host refused
+  // lacks no bytes. These units add up as their takes in turn free them,
+  // each moving its lane's oldest pages, so each counts only the pages,
+  // first reads, extents and free pages beside those before it leave: a
+  // page lanes share counts once (ReleaseCount).
   const bool forBytes = query.need.bytes && !query.need.hostRefused;
+  ReleaseCount count{.beside = forBytes ? engine.cache_.releaseBeside(query.need) : 0};
+  const uint64_t extentPages = engine.cache_.extentPages();
   const auto offer = [&](uint64_t id, uint32_t pages, uint64_t reads, bool landing) {
-    const uint32_t whole = forBytes ? engine.cache_.releaseMoves(pages, landing, count) : 0;
+    const Cache::ReleaseMoves moves =
+        forBytes ? engine.cache_.releaseMoves(pages, landing, count) : Cache::ReleaseMoves{};
     const Victim unit{.key = id,
-                      .bytes = saturatingSubtract(uint64_t{whole} * pageBytes, reads),
+                      .bytes = saturatingSubtract(moves.extents * extentPages * pageBytes, reads),
                       .form = kv::PageForm::Full,
                       .write = landing,
                       .later = landing,
@@ -985,7 +988,7 @@ std::vector<Victim> Engine::EngineVictims::releases(const VictimQuery &query) co
     if (!unit.bytes)
       return;
     units.push_back(unit);
-    engine.cache_.countRelease(id, whole, landing, rule, count);
+    engine.cache_.countRelease(id, moves, landing, rule, count);
   };
   // Each lane's units. For a need of Full pages, first the claim's pages
   // moved in place, with an extent more where they would leave the Index
@@ -1142,7 +1145,8 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
     // bytes and the first reads of the lanes the pages give Index pages
     // beside it, in whole extents (Cache::releaseMoves), each page freeing
     // its Full bytes less its Index page's: four extents of pages for a
-    // 390 MiB hot block floor.
+    // 390 MiB hot block floor, the free Full pages beside completing the
+    // last where the lane's pages run short (Cache::releaseBeside).
     const bool inPlace = victim.pages != 0;
     uint32_t pages = std::min(query.lackingPages, victim.pages);
     if (!inPlace) {
@@ -1160,8 +1164,9 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
           lanes.push_back(id);
       return lanes;
     }();
-    const uint32_t moved = engine.cache_.releasePages(victim.key, pages, inPlace, rule,
-                                                       [&](uint64_t bytes) { engine.governor().fund(bytes); });
+    const uint32_t moved = engine.cache_.releasePages(
+        victim.key, pages, inPlace, rule, [&](uint64_t bytes) { engine.governor().fund(bytes); },
+        inPlace ? 0 : engine.cache_.releaseBeside(query.need));
     if (!moved)
       return {};
     ++engine.ledgerChanges_;
