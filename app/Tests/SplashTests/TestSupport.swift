@@ -32,13 +32,21 @@ func freePort() -> Int {
 }
 
 extension UserDefaults {
-    /// Defaults of a test's own, kept in `folder`, apart from the user's and every other test's: a
-    /// domain named by a path keeps its file there, which goes with the folder. A write after the
-    /// folder is gone makes it again, so a test stops what writes them before it removes the folder.
+    /// Defaults of a test's own, kept in `folder` for the run, apart from the user's and every other
+    /// test's and run's: a run's start empty, and the calls of a run with one folder share them, as
+    /// the launches of one app share its defaults. A domain named by a path keeps its file there,
+    /// which goes with the folder. A write after the folder is gone makes it again, so a test stops
+    /// what writes them before it removes the folder.
     static func kept(in folder: URL) -> UserDefaults {
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        return UserDefaults(suiteName: folder.appending(path: "defaults").path(percentEncoded: false))!
+        return UserDefaults(suiteName: folder.appending(path: "defaults-\(run)").path(percentEncoded: false))!
     }
+
+    /// The run's part of the name of each domain it opens, so that no run opens a domain another
+    /// opened: on macOS 27 a process that opens a domain whose file holds a key goes on reading the
+    /// value it found after it writes the key, though the write reaches the file, and what a run
+    /// left can outlive the folder.
+    private static let run = UUID().uuidString
 }
 
 extension Shell {
