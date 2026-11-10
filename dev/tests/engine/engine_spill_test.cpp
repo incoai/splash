@@ -2822,6 +2822,60 @@ void testASpillLaneAtTheWallCutsNoCommand() {
           "a lane at the wall failed, released nothing, decoded another output or cut a command" + failures);
 }
 
+// A lane prefilling in commands of 6,144 rows meets the wall where its extent holds the next command's rows up to the
+// checkpoint and no more, while it holds no Index page: the KV past the checkpoint makes the lane's first release, the
+// command is planned again to stage the lane's history (Engine::prepare), and it runs whole, the lane decoding the
+// output of a run with room to spare. Every command reads spilled K/V through memory reserved for it (TestExecutor).
+void testTheKvPastACheckpointMakesALanesFirstRelease() {
+  struct Run final {
+    std::vector<uint32_t> output;
+    std::vector<std::string> failures;
+    uint64_t cuts = 0, replans = 0;
+    bool released = false;
+  };
+  const auto run = [](bool walled) {
+    FlashNextGoverned lanes(test::commandShape(3 * model::ExecutionLimits::prefillTokenBudget, 6, true));
+    Spilling &spill = lanes.spill;
+    lanes.startSpill(Spilling::prompt(1, 1, 2'046, 8));
+    // Past 1,024 pages, the first boundary whose extent leaves 128 to 255 Full pages free: the next command's rows up
+    // to its checkpoint fit, the KV past it needs an extent more.
+    spill.runUntil(
+        [&] {
+          const uint32_t free = spill.pool.freePageCount(kv::PageForm::Full);
+          return spill.cache.pageTable(1).pages.size() >= 1'024 && !spill.engine.commandInFlight() && free >= 128 &&
+                 free < 256;
+        },
+        "no boundary left part of an extent free");
+    require(!spill.cache.holdsIndexPages(1), "the lane released its pages before the wall");
+    Run result;
+    if (walled) {
+      const engine::EngineSnapshot before = spill.engine.snapshot();
+      lanes.wall();
+      spill.runUntil(
+          [&] {
+            return !spill.events.failures.empty() ||
+                   (spill.cache.pageTable(1).pages.size() >= 2'046 && !spill.engine.commandInFlight());
+          },
+          "the prompt did not prefill at the wall");
+      const engine::EngineSnapshot after = spill.engine.snapshot();
+      result.cuts = after.captureCuts - before.captureCuts;
+      result.replans = after.replans - before.replans;
+      result.released = spill.events.failures.empty() && spill.cache.holdsIndexPages(1);
+      spill.host.leaveRoom(std::nullopt);
+    }
+    spill.runUntilIdle();
+    result.output = spill.events.outputs[1];
+    result.failures = spill.events.failures;
+    return result;
+  };
+  const Run roomy = run(false), walled = run(true);
+  require(walled.failures.empty() && walled.output == roomy.output && walled.released,
+          "the lane at the wall failed, decoded another output or released nothing");
+  require(walled.cuts == 0 && walled.replans > 0,
+          "the KV past the checkpoint cut " + std::to_string(walled.cuts) + " commands, or no command was planned "
+              "again for the lane's first release");
+}
+
 // A decoding Spill lane takes its hot block floor only at its first release, which frees the floor beside what its
 // growth lacks, and the same prepare reserves it: the command after the release reads with it. A Background start
 // refused at the same wall, which releases no Normal lane, takes none of it.
@@ -4226,6 +4280,7 @@ std::span<const test::TestCase> spillTests() {
       {"testASpillLaneKeepsLandedPagesWhileMemoryLasts", testASpillLaneKeepsLandedPagesWhileMemoryLasts},
       {"testASpillLaneAtTheWallReleasesOnlyWhatItLacks", testASpillLaneAtTheWallReleasesOnlyWhatItLacks},
       {"testASpillLaneAtTheWallCutsNoCommand", testASpillLaneAtTheWallCutsNoCommand},
+      {"testTheKvPastACheckpointMakesALanesFirstRelease", testTheKvPastACheckpointMakesALanesFirstRelease},
       {"testTheFirstReleaseFundsTheLanesReads", testTheFirstReleaseFundsTheLanesReads},
       {"testAStartReleasesALaneOfItsPriority", testAStartReleasesALaneOfItsPriority},
       {"testAStartNeverReleasesAHigherPriorityLane", testAStartNeverReleasesAHigherPriorityLane},
