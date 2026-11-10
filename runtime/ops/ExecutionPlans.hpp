@@ -14,8 +14,13 @@ namespace splash::ops {
 // object and production models borrow it; it never changes after creation.
 class ExecutionPlans final {
 public:
-  explicit ExecutionPlans(const DeviceCapabilities &device, DecodeGeometry geometry = {});
+  // A nonzero history bound sizes verify scratch for the served context;
+  // zero preserves the global maximum for standalone plans and automatic starts.
+  explicit ExecutionPlans(const DeviceCapabilities &device, DecodeGeometry geometry = {},
+                           uint32_t maximumHistoryTokens = 0);
   [[nodiscard]] DecodeGeometry geometry() const noexcept { return linear_.geometry(); }
+  [[nodiscard]] uint32_t maximumHistoryTokens() const noexcept { return maximumHistoryTokens_; }
+  [[nodiscard]] uint32_t maximumVerifySplits() const noexcept { return maximumVerifySplits_; }
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return linear_.calibration(); }
 
@@ -48,6 +53,8 @@ public:
 
 private:
   Linear linear_;
+  uint32_t maximumHistoryTokens_ = 0;
+  uint32_t maximumVerifySplits_ = kv::kVerifyMaximumSplits;
 };
 
 } // namespace splash::ops

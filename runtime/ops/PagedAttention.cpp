@@ -155,9 +155,11 @@ AttentionWorkspace attentionWorkspace(uint64_t rows, uint32_t headDimension) {
 // Verify scratch is sized once for the maximum split count of every lane, so
 // a lane's history-scaled partition never needs a reallocation.
 AttentionWorkspace verifyWorkspaceBound(uint32_t lanes, uint32_t queryHeads,
-                                        kv::Layout layout, DecodeGeometry geometry) {
+                                        kv::Layout layout, DecodeGeometry geometry, uint32_t maximumSplits) {
+  if (!maximumSplits || maximumSplits > kv::kVerifyMaximumSplits)
+    throw std::invalid_argument("invalid verify attention scratch split bound");
   return attentionWorkspace(uint64_t{lanes} * geometry.rows() *
-                                kv::kVerifyMaximumSplits * queryHeads,
+                                maximumSplits * queryHeads,
                             layout.headDimension);
 }
 
@@ -302,7 +304,8 @@ PrefillAttentionPlan PagedAttention::prefillPlan(uint32_t rows, uint32_t history
 
 VerifyAttentionPlan PagedAttention::verifyPlan(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens, AttentionVariant variant, DecodeGeometry geometry) {
+    std::span<const uint32_t> historyTokens, AttentionVariant variant, DecodeGeometry geometry,
+    uint32_t maximumSplits) {
   if (geometry.rows() == 16 && selectsBlocks(layout))
     throw std::invalid_argument("sixteen-row sparse attention is not supported");
   const CompiledAttention &kernel = compiledAttention(queryHeads, layout, variant);
@@ -317,10 +320,12 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
       throw std::invalid_argument(
           "verify attention history exceeds physical context");
     laneSplits[lane] = kv::verifyAttentionSplits(historyTokens[lane], variant.windowTokens, geometry.rows());
+    if (laneSplits[lane] > maximumSplits)
+      throw std::invalid_argument("verify attention splits exceed the scratch bound");
     splits = std::max(splits, laneSplits[lane]);
   }
   return {lanes, laneSplits, splits,
-          verifyWorkspaceBound(lanes, queryHeads, layout, geometry),
+          verifyWorkspaceBound(lanes, queryHeads, layout, geometry, maximumSplits),
           geometry.kernel(kernelName("verify", kernelFormat(layout) + (selectsBlocks(layout) ? "_sparse" : "_split"),
                      splitSuffix(kernel, variant))),
           geometry.kernel(reduceKernel("verify", kernel, variant)),
@@ -357,11 +362,11 @@ AttentionWorkspace PagedAttention::prefillWorkspace(
 }
 
 AttentionWorkspace PagedAttention::verifyWorkspace(
-    uint32_t lanes, uint32_t queryHeads, kv::Layout layout, DecodeGeometry geometry) {
+    uint32_t lanes, uint32_t queryHeads, kv::Layout layout, DecodeGeometry geometry, uint32_t maximumSplits) {
   (void)compiledAttention(queryHeads, layout);
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid attention workspace batch width");
-  return verifyWorkspaceBound(lanes, queryHeads, layout, geometry);
+  return verifyWorkspaceBound(lanes, queryHeads, layout, geometry, maximumSplits);
 }
 
 bool PagedAttention::compiles(uint32_t queryHeads, kv::Layout layout, bool gated, uint32_t rotaryPairs) {

@@ -359,11 +359,48 @@ void physicalContextFollowsGeometry() {
   }
 }
 
+// Verify scratch follows an explicit served context, while dispatch splits
+// and pipeline names remain those of the actual lane histories.
+void boundedVerifyScratch() {
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  const kv::Layout layout{16, 4, 256, kv::Format::Int8};
+  for (uint32_t rows : {8U, 16U}) {
+    const DecodeGeometry geometry(rows);
+    const ExecutionPlans unbounded(device, geometry);
+    for (uint32_t limit : {8192U, 32768U, 65536U, 262144U}) {
+      const ExecutionPlans bounded(device, geometry, limit);
+      const uint32_t capacity = kv::verifyAttentionSplits(limit, 0, rows);
+      const auto workspace = bounded.verifyAttentionWorkspacePerLane(24, layout);
+      require(bounded.maximumVerifySplits() == capacity &&
+                  workspace.partialsBytes == uint64_t{capacity} * rows * 24 * 256 * 4 &&
+                  workspace.statisticsBytes == uint64_t{capacity} * rows * 24 * 2 * 4,
+              "verify scratch did not follow the context and geometry");
+      const std::array<uint32_t, 4> histories{0, limit / 2, limit - 1, limit};
+      const auto a = bounded.verifyAttention(4, 24, layout, histories);
+      const auto b = unbounded.verifyAttention(4, 24, layout, histories);
+      require(a.splits == b.splits && a.laneSplits == b.laneSplits &&
+                  a.splitPipeline == b.splitPipeline && a.reducePipeline == b.reducePipeline &&
+                  a.workspace.partialsBytes == 4 * workspace.partialsBytes &&
+                  a.workspace.partialsBytes <= b.workspace.partialsBytes,
+              "the allocation bound changed attention arithmetic or its dispatch");
+      if (capacity < kv::kVerifyMaximumSplits) {
+        const uint32_t beyond = capacity * kv::kVerifyPagesPerSplit * kv::kPageTokens;
+        rejects([&] { (void)bounded.verifyAttention(1, 24, layout, std::array{beyond}); },
+                "verify attention splits exceed the scratch bound", "a plan exceeding its scratch was accepted");
+      }
+    }
+  }
+  rejects([&] { (void)ExecutionPlans(device, {}, SPLASH_MAXIMUM_CONTEXT_TOKENS + 1); },
+          "verify history bound exceeds", "a context past the kernel limit was accepted");
+}
 } // namespace
 
 int main() {
   try {
     baselinePlans();
+    boundedVerifyScratch();
     ggufMoePlans();
     unknownCoreCount();
     prefillSplitsFollowTheDeviceRow();

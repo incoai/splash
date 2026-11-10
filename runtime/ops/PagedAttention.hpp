@@ -267,7 +267,8 @@ public:
   // one entry per lane.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-             std::span<const uint32_t> historyTokens, AttentionVariant variant = {}, DecodeGeometry geometry = {});
+             std::span<const uint32_t> historyTokens, AttentionVariant variant = {}, DecodeGeometry geometry = {},
+             uint32_t maximumSplits = kv::kVerifyMaximumSplits);
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences
@@ -277,7 +278,8 @@ public:
   prefillWorkspace(uint32_t maximumRows, uint32_t queryHeads,
                    kv::Layout layout);
   [[nodiscard]] static AttentionWorkspace
-  verifyWorkspace(uint32_t lanes, uint32_t queryHeads, kv::Layout layout, DecodeGeometry geometry = {});
+  verifyWorkspace(uint32_t lanes, uint32_t queryHeads, kv::Layout layout, DecodeGeometry geometry = {},
+                  uint32_t maximumSplits = kv::kVerifyMaximumSplits);
   // Whether the compiled geometry of `queryHeads` over a layout's KV heads
   // (kCompiledAttention) computes attention as a target's layout states it:
   // gated or not, rotating `rotaryPairs` pairs. Throws for a geometry with

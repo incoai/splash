@@ -21,7 +21,14 @@ void include(Workspace &bound, const Workspace &required,
 
 } // namespace
 
-ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, DecodeGeometry geometry) : linear_(device, geometry) {}
+ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, DecodeGeometry geometry,
+                                 uint32_t maximumHistoryTokens)
+    : linear_(device, geometry), maximumHistoryTokens_(maximumHistoryTokens),
+      maximumVerifySplits_(maximumHistoryTokens ? kv::verifyAttentionSplits(maximumHistoryTokens, 0, geometry.rows())
+                                                : kv::kVerifyMaximumSplits) {
+  if (maximumHistoryTokens > SPLASH_MAXIMUM_CONTEXT_TOKENS)
+    throw std::invalid_argument("verify history bound exceeds the logical context limit");
+}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
@@ -33,7 +40,7 @@ PrefillAttentionPlan ExecutionPlans::prefillAttention(
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
     std::span<const uint32_t> historyTokens, AttentionVariant variant) const {
-  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, variant, geometry());
+  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, variant, geometry(), maximumVerifySplits_);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
@@ -63,7 +70,7 @@ AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(
 // The verify bound is linear in the lanes: one lane's is every width's share.
 AttentionWorkspace ExecutionPlans::verifyAttentionWorkspacePerLane(
     uint32_t queryHeads, kv::Layout layout) const {
-  return PagedAttention::verifyWorkspace(1, queryHeads, layout, geometry());
+  return PagedAttention::verifyWorkspace(1, queryHeads, layout, geometry(), maximumVerifySplits_);
 }
 
 // The draft workspace is linear in the lanes: one lane's is every width's
