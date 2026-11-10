@@ -616,6 +616,17 @@ SERVE_OPTIONS = (
         engine=EngineArgument("--persistent-cache", text=_spelled("on")),
     ),
     ServeOption(
+        "--kv-window-trim",
+        "cache",
+        dict(
+            choices=("on", "off"),
+            default="on",
+            help="trim a windowed target's KV pages past the window floor to "
+            "Slim (on), or keep every page Full",
+        ),
+        engine=EngineArgument("--kv-window-trim", text=lambda value: value),
+    ),
+    ServeOption(
         "--cache-dir",
         "cache",
         dict(
