@@ -332,6 +332,33 @@ void invalidLookupsAndContextEdges() {
           "verify attention history exceeds physical context",
           "verify rows past the physical context were accepted");
 }
+void physicalContextFollowsGeometry() {
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  constexpr uint32_t pages = (kv::kMaximumSupportedPhysicalTokens + kv::kPageTokens - 1) / kv::kPageTokens;
+  static_assert(kv::kMaximumPhysicalTokens == kv::kMaximumLogicalTokens + 7);
+  static_assert(kv::kMaximumSupportedPhysicalTokens == kv::kMaximumLogicalTokens + 15);
+  for (uint32_t rows : {8U, 16U}) {
+    const DecodeGeometry geometry(rows);
+    const ExecutionPlans plans(device, geometry);
+    std::array<uint32_t, 1> history{kv::kMaximumLogicalTokens - 1};
+    (void)plans.verifyAttention(1, 24, attentionShapes[0].layout, history);
+    const auto chunk = PagedAttention::verifyParams(history[0], pages, geometry);
+    require(kv::chunkedPrefillValidationError(chunk, rows).empty(),
+            "the active geometry rejected its final physical rows");
+    auto past = chunk;
+    ++past.committed_tokens;
+    require(kv::chunkedPrefillValidationError(past, rows) == "context_out_of_range",
+            "an active geometry admitted a history beyond the logical ceiling");
+    ++history[0];
+    rejects([&] { (void)plans.verifyAttention(1, 24, attentionShapes[0].layout, history); },
+            "verify attention history exceeds physical context", "verify used another geometry's scratch allowance");
+    rejects([&] { (void)PagedAttention::verifyParams(history[0], pages, geometry); },
+            "context_out_of_range", "verify parameters used another geometry's scratch allowance");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -342,6 +369,7 @@ int main() {
     prefillSplitsFollowTheDeviceRow();
     workspaceBounds();
     invalidLookupsAndContextEdges();
+    physicalContextFollowsGeometry();
     std::cout << "PASS execution plans: device policies, device MoE tiles, B1-B4 "
                  "and prefill workspace bounds (CPU only)\n";
     return 0;

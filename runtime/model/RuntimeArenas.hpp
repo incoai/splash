@@ -45,7 +45,7 @@ inline constexpr uint32_t kTileRows = kv::kPageTokens;
 inline constexpr uint32_t kRaggedAttentionRows =
     kPrefillRows + kLaneCount * (kTileRows - 1);
 inline constexpr uint32_t kMaximumPageTableEntries =
-    (kv::kMaximumPhysicalTokens + kv::kPageTokens - 1) / kv::kPageTokens;
+    (kv::kMaximumSupportedPhysicalTokens + kv::kPageTokens - 1) / kv::kPageTokens;
 
 struct RuntimeGeometry final {
   QwenTargetGeometry target;

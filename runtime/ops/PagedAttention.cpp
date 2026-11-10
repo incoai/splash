@@ -313,8 +313,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
   std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits{};
   uint32_t splits = 0;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    if (uint64_t{historyTokens[lane]} + geometry.rows() >
-        kv::kMaximumPhysicalTokens)
+    if (historyTokens[lane] >= kv::kMaximumLogicalTokens)
       throw std::invalid_argument(
           "verify attention history exceeds physical context");
     laneSplits[lane] = kv::verifyAttentionSplits(historyTokens[lane], variant.windowTokens, geometry.rows());
@@ -472,13 +471,13 @@ PreparedInput PagedAttention::addVerifyGate(
 
 kv::ChunkedPrefillParams PagedAttention::prefillParams(
     uint64_t logicalPosition, uint32_t chunkTokens, uint32_t chunkStride,
-    uint32_t pageTableEntries) {
+    uint32_t pageTableEntries, DecodeGeometry geometry) {
   if (logicalPosition > std::numeric_limits<uint32_t>::max())
     throw std::overflow_error("KV logical position exceeds kernel ABI");
   kv::ChunkedPrefillParams params{static_cast<uint32_t>(logicalPosition),
                                   chunkTokens, chunkStride, pageTableEntries,
                                   {}};
-  const std::string_view error = kv::chunkedPrefillValidationError(params);
+  const std::string_view error = kv::chunkedPrefillValidationError(params, geometry.rows());
   if (!error.empty())
     throw std::invalid_argument(std::string(error));
   return params;
@@ -487,7 +486,7 @@ kv::ChunkedPrefillParams PagedAttention::prefillParams(
 kv::ChunkedPrefillParams PagedAttention::verifyParams(uint64_t logicalPosition,
                                                       uint32_t pageTableEntries, DecodeGeometry geometry) {
   return prefillParams(logicalPosition, geometry.rows(),
-                       kv::kVerifyChunkStride, pageTableEntries);
+                       kv::kVerifyChunkStride, pageTableEntries, geometry);
 }
 
 void PagedAttention::addPrefillStore(
@@ -568,7 +567,7 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
   for (uint32_t lane = 0; lane < plan.lanes; ++lane) {
     const kv::ChunkedPrefillParams &chunk = chunks[lane];
     if (chunk.chunk_tokens != plan.geometry.rows() || chunk.chunk_stride != kv::kVerifyChunkStride ||
-        !kv::chunkedPrefillValidationError(chunk).empty())
+        !kv::chunkedPrefillValidationError(chunk, plan.geometry.rows()).empty())
       throw std::invalid_argument("a paged verify lane's chunk is not a verify chunk");
     requirePageTable(buffers.pageTables[lane], chunk);
   }

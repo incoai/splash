@@ -21,7 +21,7 @@ namespace splash::model {
 namespace {
 
 // A staging page per page of the longest sequence.
-constexpr uint64_t kMostPages = (uint64_t{kv::kMaximumPhysicalTokens} + kv::kPageTokens - 1) / kv::kPageTokens;
+constexpr uint64_t kMostPages = (uint64_t{kv::kMaximumSupportedPhysicalTokens} + kv::kPageTokens - 1) / kv::kPageTokens;
 
 // Staging's pages: one layer of the pool's K/V, at the pool's places in an
 // extent.

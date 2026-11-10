@@ -103,6 +103,8 @@ inline constexpr uint32_t kMaximumLogicalTokens =
     SPLASH_MAXIMUM_CONTEXT_TOKENS;
 inline constexpr uint32_t kMaximumPhysicalTokens =
     SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS;
+inline constexpr uint32_t kMaximumSupportedPhysicalTokens =
+    SPLASH_MAXIMUM_SUPPORTED_PHYSICAL_KV_TOKENS;
 inline constexpr int32_t kQuantizedMinimum = -127;
 inline constexpr int32_t kQuantizedMaximum = 127;
 // Every tensor region of an extent starts on this boundary. The attention

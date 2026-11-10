@@ -121,6 +121,8 @@ void LinearPlan::requireConfiguration() const {
     // (quant_register_unit); addGgufRegister checks each segment's.
     if (!decode || !c.validSplits() || k / 64 < c.splits)
       throw std::invalid_argument("the register block decode tile takes a K unit per split");
+    if (workload_.rows / GGUF_TABLE16_ROWS > GGUF_REGISTER_MAXIMUM_TILES)
+      throw std::invalid_argument("the register block tile holds at most four physical table tiles");
     return;
   }
   if (c.tile == LinearTile::GgufPrefill) {

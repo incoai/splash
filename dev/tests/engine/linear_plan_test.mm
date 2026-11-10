@@ -112,6 +112,15 @@ void tablePackingGeometry() {
                                         .registerTakes = true, .weightBits16 = 72});
     require(plan.tile == (rows <= 32 ? LinearTile::GgufRegister : LinearTile::GgufStaged),
             "register selection must reject unavailable fifth through eighth table tiles");
+    const LinearWorkload workload{{128, width}, rows, LinearPhase::Decode, LinearEpilogue::None,
+                                  DecodeGeometry(rows > 32 ? 16 : 8)};
+    const LinearConfig forced{.tile = LinearTile::GgufRegister};
+    if (rows > 32)
+      rejects([&] { (void)Linear::plan(workload, forced, FloatOutput::BFloat16); },
+              "at most four physical table tiles", "an explicit plan selected unavailable register kernels");
+    else
+      require(Linear::plan(workload, forced, FloatOutput::BFloat16).storageRows() == rows,
+              "an available register tile changed its storage height");
   }
 }
 

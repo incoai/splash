@@ -89,11 +89,12 @@ chunkedPrefillRequiredPages(const ChunkedPrefillParams &params) noexcept {
 }
 
 [[nodiscard]] constexpr std::string_view
-chunkedPrefillValidationError(const ChunkedPrefillParams &params) noexcept {
+chunkedPrefillValidationError(const ChunkedPrefillParams &params, uint32_t verifyRows = kVerifyRows) noexcept {
+  if (verifyRows != 8 && verifyRows != 16) return "verify_rows_out_of_range";
   if (!params.chunk_tokens || params.chunk_tokens > kChunkedPrefillMaximumRows)
     return "chunk_tokens_out_of_range";
   if (uint64_t{params.committed_tokens} + params.chunk_tokens >
-      kMaximumPhysicalTokens)
+      uint64_t{kMaximumLogicalTokens} + verifyRows - 1)
     return "context_out_of_range";
   if (params.chunk_stride < params.chunk_tokens ||
       params.chunk_stride > kChunkedPrefillMaximumRows ||
@@ -326,7 +327,7 @@ public:
   // the extents.
   [[nodiscard]] static kv::ChunkedPrefillParams
   prefillParams(uint64_t logicalPosition, uint32_t chunkTokens,
-                uint32_t chunkStride, uint32_t pageTableEntries);
+                uint32_t chunkStride, uint32_t pageTableEntries, DecodeGeometry geometry = {});
   // A verify lane's chunk: its verify rows in kVerifyChunkStride rows of
   // staging, the only parameters addVerify attends.
   [[nodiscard]] static kv::ChunkedPrefillParams

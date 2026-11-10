@@ -21,6 +21,9 @@
 #define SPLASH_SPECULATIVE_SCRATCH_TOKENS                                  \
   (SPLASH_TARGET_VERIFY_ROWS - 1u)
 #define SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS                                  \
+  (SPLASH_MAXIMUM_CONTEXT_TOKENS + SPLASH_SPECULATIVE_SCRATCH_TOKENS)
+// Host allocations cover either per-model instance; validation uses its active width.
+#define SPLASH_MAXIMUM_SUPPORTED_PHYSICAL_KV_TOKENS \
   (SPLASH_MAXIMUM_CONTEXT_TOKENS + SPLASH_MAXIMUM_VERIFY_ROWS - 1u)
 #define SPLASH_MAXIMUM_BATCH_WIDTH 4u
 #define SPLASH_PREFILL_TOKEN_BUDGET 2048u

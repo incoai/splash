@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "utc": "2026-11-10T15:52:48.682016+00:00",
+  "baseline_commit": "425ad7400f3a00d2a1e6745bdacfa2881922d544",
+  "validated_patch_sha256": "7a0cdc07f792f648579ef066817c9827fa7210cad6d7973f72567a2bd26a04b1",
+  "source_manifest_sha256": "64956736013ae2742b8ba656d3dae53ac7353b66ebdfb28ebb4fbee02560e9a0",
+  "fix": "Separate active seven/fifteen-token physical KV limits from the maximum host allocation. Explicit sixteen-row validation cannot loosen the default eight-row limit. Reject forced register plans beyond four physical eight-row tiles after existing configuration checks.",
+  "independent_checks": "Full native CPU suite, explicit final logical/physical boundaries at both widths, forced register-height rejection, representative AF4G64/Q4K/IQ4XS/BF16 register16 FP64/guard/lane oracle, corrected full Q8 attention and chunked-prefill shader suites, affected sixteen-row suites and complete short native arrays.",
+  "short_arrays": {
+    "rows8_matches_committed_baseline": true,
+    "rows16_matches_prior16": true,
+    "cases": 3,
+    "output_cap": 64,
+    "scope": "Finite historical calibration; not long-context or distributional equivalence."
+  },
+  "retained_failures": [
+    "v10 broad run reached40min timeout after projection and all three MoE suites passed; component continuation found default Q8 validation admitted fifteen scratch tokens instead of seven.",
+    "v11 CPU linear-plan golden error check caught guard precedence for invalid prefill/register plans; v12 restores the previous validation order.",
+    "Initial v12 backend/handoff jobs had missing standalone test libraries; the explicit library build and v2 jobs above completed the checks."
+  ],
+  "limitations": [
+    "Eight rows remain default; sixteen is experimental and restricted to supported dense DSpine configurations.",
+    "No speed qualification claimed here. Three-group comparisons and fresh sampling/agent screens are separate.",
+    "No general cold/warm token equivalence claim: an old long-prefix calibration diverges in the committed baseline too.",
+    "Register kernels were exercised on this M5 Pro; no physical Apple9 device was available.",
+    "The original broad-suite timeout/failure receipts remain; final combined-source broad validation is still planned."
+  ],
+  "receipts": [
+    {
+      "job": "build-runtime16-v12",
+      "receipt_sha256": "226a671dff211fcebb66038db9e2cc6d9c941cfbd997e408c6d3f8b9f93e1da4",
+      "elapsed_seconds": 191.28613816699908
+    },
+    {
+      "job": "runtime16-v12-q8-flash-attention-shader",
+      "receipt_sha256": "7247094f212fa02416135be9f158add6cd8abf2b3fa16dedd40fc56f3ce795a0",
+      "elapsed_seconds": 481.9088130829987
+    },
+    {
+      "job": "runtime16-v12-q8-chunked-prefill-shader",
+      "receipt_sha256": "b2a0ac8069d811fe532c5a8e6e2b7b436c71b9f75543c60d471c14a40203377b",
+      "elapsed_seconds": 55.09059345800051
+    },
+    {
+      "job": "runtime16-v12-linear-plan-shader",
+      "receipt_sha256": "4c3694e833c05e947a5ffea4af5785ea8fdb18ca20b746c7908dc3c85eeeec3a",
+      "elapsed_seconds": 2.184498167000129
+    },
+    {
+      "job": "runtime16-v12-target-sampling-shader",
+      "receipt_sha256": "c2913d2b68e51c2516cfdda90178731d4f08f1fff636a1a85cb2b2904e45ec98",
+      "elapsed_seconds": 22.971422041999176
+    },
+    {
+      "job": "runtime16-v12-target-sampling16-shader",
+      "receipt_sha256": "53d5a78e72d17df46b0a236cb44dd0ce8ae3819f0b0410fe59e8416f847c9ab2",
+      "elapsed_seconds": 43.61373933399955
+    },
+    {
+      "job": "runtime16-v12-gdn-decode16-shader",
+      "receipt_sha256": "2b610dc3e655f125363c5d20418ea6cb60ca8ea8c79ae31e7e5e536d856d60a4",
+      "elapsed_seconds": 69.48003149999931
+    },
+    {
+      "job": "runtime16-v12-attention-variants-shader",
+      "receipt_sha256": "766558a38232042cebcfe5f6f6d787492424486469d123ed852b0c6556573ab7",
+      "elapsed_seconds": 12.18508812500113
+    },
+    {
+      "job": "runtime16-v12-attention-variants16-shader",
+      "receipt_sha256": "265987a34c99425ba2d13cdc1d196e0b6194e63df86419d9590fd8c27fe33eb0",
+      "elapsed_seconds": 12.033046915999876
+    },
+    {
+      "job": "runtime16-v12-draft-attention16-shader",
+      "receipt_sha256": "e45f6d3e71498c52f5be21246b88b49da9b5cd9ce453b075363fc8a1e84064fb",
+      "elapsed_seconds": 4.9461515840012
+    },
+    {
+      "job": "runtime16-v12-vision-metal-shader",
+      "receipt_sha256": "dfb82f1233b581a7644e6f620f194aee7d295518e260448de67a6931bbe1b0c0",
+      "elapsed_seconds": 0.539093249999496
+    },
+    {
+      "job": "runtime16-v12-vision-attention-shader",
+      "receipt_sha256": "a0c07938baf5279be26acb22c97c6ade9fd7f2640dec0ea5c59450abcb5ecb5d",
+      "elapsed_seconds": 4.773652583999137
+    },
+    {
+      "job": "runtime16-v12-pressure-serving-shader",
+      "receipt_sha256": "5b1fc4da1956f87c910e2df3b722246fd08d5971582fa16f2bf813cfe66b726f",
+      "elapsed_seconds": 59.047769082999366
+    },
+    {
+      "job": "runtime16-v12-metal-backend-shader-v2",
+      "receipt_sha256": "4074620d431601d2ee80d12e2e2967071e5473759a5e1d00cffa9c448ed89402",
+      "elapsed_seconds": 17.803092916999958
+    },
+    {
+      "job": "runtime16-v12-handoff-shader-v2",
+      "receipt_sha256": "6c4f9557fe239f4d0344cbb068fca7716c65010851fcf3d7f62c889ee9aa889e",
+      "elapsed_seconds": 3.782813208999869
+    },
+    {
+      "job": "register16-oracle-v1",
+      "receipt_sha256": "16854e789927b6d3c7be011661cc03c5436ff4102bf2776ef52733b3fd4b32b7",
+      "elapsed_seconds": 1.25904595800057
+    },
+    {
+      "job": "core-v12-smoke-r8",
+      "receipt_sha256": "29ef77fd3035f5fefd2d9994aa6198bcb1cdde0c03cb055952a66f428251506f",
+      "elapsed_seconds": 16.469505582999773
+    },
+    {
+      "job": "core-v12-smoke-r16",
+      "receipt_sha256": "ce4d01df9ded7283a255f6cc4be7a5ed0ad09494f0d1ce4847dcd57dcf2e6be7",
+      "elapsed_seconds": 16.486770458999672
+    }
+  ]
+}
