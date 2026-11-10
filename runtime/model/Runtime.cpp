@@ -3165,9 +3165,9 @@ Runtime::prefillAsync(const BatchPlan &plan,
   if (encodes.empty())
     return std::make_unique<DeferredMetalTicket>(submit({}), std::move(finish), std::move(count));
   // Metal fails an event wait unmet 5 s after its queue reached it, which it
-  // does for a command's first host step or Neural Engine wait as the
-  // command is submitted, whatever work runs ahead of it (MetalBackend.hpp,
-  // EventStep): the images' encodes, seconds of GPU work on a small GPU, run
+  // does for a command's first Neural Engine wait as the command is
+  // submitted, whatever work runs ahead of it (MetalBackend.hpp, EventStep):
+  // the images' encodes, seconds of GPU work on a small GPU, run
   // as a command of their own, and the command is submitted once they have
   // completed.
   return std::make_unique<DeferredMetalTicket>(impl_->backend.submitCommandAsync(encodes.command(), completion),

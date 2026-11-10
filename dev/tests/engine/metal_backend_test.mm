@@ -1,3 +1,4 @@
+#include "../../../runtime/Supervision.hpp"
 #include "../../../runtime/metal/BackendInstrumentation.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "TestBuffers.hpp"
@@ -2864,11 +2865,47 @@ void watchdogFollowsHostSteps(const std::string &metallibPath) {
     std::cout << "PASS the watchdog follows a command's host steps\n";
 }
 
+// A host step may work longer than Metal's wait limit (supervision::
+// kGpuWaitLimit), plain or awake, as an expert load from a slow disk does: the
+// command completes, the work after each step sees what the step wrote, and
+// the backend stays healthy. Were the work after a step committed with a wait
+// for it, Metal would fail that wait and the command ("Caused GPU Timeout
+// Error").
+void hostStepOutlastsTheGpuWaitLimit(const std::string &metallibPath) {
+    constexpr auto kPastLimit = splash::supervision::kGpuWaitLimit + std::chrono::seconds(1);
+    MetalBackend backend(metallibPath);
+    (void)spinCheck(backend, "an awake host step past Metal's wait limit");
+    MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
+    auto *value = static_cast<volatile uint32_t *>(buffer.contents());
+    *value = 0;
+    const uint32_t count = 1, one = 1;
+    const std::vector<ComputeDispatch> dispatches(3, addition(buffer, count, one));
+    std::vector<uint32_t> seen;
+    const auto slowStep = [&] {
+        seen.push_back(uint32_t{*value});
+        std::this_thread::sleep_for(kPastLimit);
+        *value += 1000;
+    };
+    const std::vector<EventStep> steps{{1, {}, 0, EventStep::Kind::Host, slowStep},
+                                       {2, {}, 0, EventStep::Kind::Host, slowStep, {}, HostStepGpu::Awake}};
+    std::string error;
+    try {
+        (void)backend.submitCommandAsync(Command{dispatches, steps}).wait();
+    } catch (const MetalBackendError &caught) {
+        error = caught.what();
+    }
+    require(error.empty() && backend.healthy() && seen == std::vector<uint32_t>{1, 1002} && *value == 2003,
+            "a command whose host steps outlasted Metal's wait limit failed or lost their work (value " +
+                std::to_string(*value) + "): " + error);
+    std::cout << "PASS a host step may outlast Metal's wait limit\n";
+}
+
 // A backend destroyed while its runner is blocked on a step, plain or awake
 // (the command held on an event past the runner's spin), stops the runner
-// within its stop check: the runner raises the step without running it, so the
-// command drains once the event lets its work go, and fails, as its step never
-// ran. It drains at once also when the buffer before the step then fails
+// within its stop check: the runner gives the step up without running it and
+// commits the work after it, so the command drains once the event lets its
+// work go, and fails, as its step never ran. It drains at once also when the
+// buffer before the step then fails
 // without its signal, which an awake step's spin waits for: the runner raised
 // it as it gave the step up (else Metal times the wait out after 5 s). Returns
 // the longest destruction of the backend.
@@ -3274,6 +3311,7 @@ std::span<const splash::test::TestCase> behaviourTests() {
         {"failedBesideBufferSkipsLaterSteps", [] { failedBesideBufferSkipsLaterSteps(metallib); }},
         {"hostStepAfterALongWait", [] { (void)hostStepAfterALongWait(metallib); }},
         {"watchdogFollowsHostSteps", [] { watchdogFollowsHostSteps(metallib); }},
+        {"hostStepOutlastsTheGpuWaitLimit", [] { hostStepOutlastsTheGpuWaitLimit(metallib); }},
         {"blockedHostStepRunnerStops", [] { (void)blockedHostStepRunnerStops(metallib); }},
         {"allocationDoesNotRequestResidency", [] { allocationDoesNotRequestResidency(metallib); }},
         {"residencyRacesTheHeartbeat", [] { residencyRacesTheHeartbeat(metallib); }},
