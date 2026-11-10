@@ -900,6 +900,10 @@ private:
     [[nodiscard]] std::string_view name() const noexcept override { return "engine"; }
     [[nodiscard]] std::optional<Victim> peek(const VictimQuery &query, const Victim *after) const override;
     FreeResult take(const VictimQuery &query, const Victim &victim) override;
+    // A lane's release of the claim's Full pages alone, where the claim
+    // counts one: the free Index pages it moves them into and the runway
+    // past them (Cache::inPlaceIndexPages), which the cache's reclaims keep.
+    [[nodiscard]] std::array<uint32_t, 3> movesInto(const VictimQuery &query) const override;
 
   private:
     // What the claim's releases may move: the pages of the Spill lanes its

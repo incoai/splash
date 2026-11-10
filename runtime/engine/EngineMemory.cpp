@@ -1205,6 +1205,17 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
   return {};
 }
 
+std::array<uint32_t, 3> Engine::EngineVictims::movesInto(const VictimQuery &query) const {
+  // Released for the claim's bytes first, those free Index pages left the
+  // release only the runway, and a lone lane's growth at the wall ended at
+  // its length.
+  std::array<uint32_t, 3> pages{};
+  if (query.need.pages && query.need.form == kv::PageForm::Full &&
+      std::ranges::any_of(releases(query), [](const Victim &unit) { return unit.pages != 0; }))
+    pages[static_cast<size_t>(kv::PageForm::Index)] = engine_.cache_.inPlaceIndexPages(query.need.pages);
+  return pages;
+}
+
 void Engine::suspendLane(Request &active, uint64_t workEnd, metal::AllocationFailure failure,
                          StateFailure reason, double now) {
   if (!active.lane || scheduler_.suspended(active.request.id)) {

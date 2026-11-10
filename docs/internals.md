@@ -1439,7 +1439,11 @@ runway an extent of free Index pages, or moves an extent of pages more, as for
 bytes, whose emptied Full extent refills it (`Cache::inPlaceMoves`), or moves
 none: at a wall whose room holds no Index extent nothing else refills a runway
 left short, and short of an extent of free Index pages no release for bytes can
-start (`Cache::releaseMoves`). Under `--kv-spill always` the moves as copies
+start (`Cache::releaseMoves`). A claim that counts such a release keeps the free
+Index pages it moves into and the runway past them from its reclaims
+(`Engine::EngineVictims::movesInto`): released for the claim's bytes first, they
+left the release only the runway, and a lone lane at the wall ended at its
+length. Under `--kv-spill always` the moves as copies
 land release every one under critical pressure (`Engine::landedExtents`).
 `/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
 those requests and the cache hold (`pages_active`, `pages_cache`) and those

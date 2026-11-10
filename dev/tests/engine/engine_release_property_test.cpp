@@ -309,12 +309,12 @@ void testAStartIsPlacedInTheMemoryItStartsIn() {
 
 // Invariant 2 for a page in place: a lone Spill lane decodes at the wall, with no free Full page and no room, beside
 // the two empty Index extents a lane's end left, the runway and one more. Its growth lacks a Full extent's bytes or a
-// Full page in place, and its count covers the page: a reclaim releases the empty Index extent past the runway
-// (Cache::releaseExtent), and the lane's release moves its oldest page whose copy landed into those free Index pages,
-// beside the runway (Cache::inPlaceMoves): fewer than an extent and a page of such pages move no extent more. Taken in
-// turn, the reclaim went first, the release found only the runway and moved nothing, and the lane ended at its length
-// after 24 of its 400 tokens. Its page now moves beside the runway into an extent of the room the reclaim left: the
-// run frees what it counted, and the lane decodes on.
+// Full page in place, and its count covers the page: the lane's release moves its oldest page whose copy landed into
+// those free Index pages, beside the runway (Cache::inPlaceMoves): fewer than an extent and a page of such pages move
+// no extent more. A reclaim also counted the empty Index extent past the runway (Cache::releaseExtent): taken in turn,
+// the reclaim went first, the release found only the runway and moved nothing, and the lane ended at its length after
+// 24 of its 400 tokens. The claim's reclaims now keep those Index pages (EngineVictims::movesInto): the run frees what
+// it counted, and the lane decodes on.
 void testAReleaseInPlaceAfterAReclaimOfItsIndexPagesFreesWhatItCounted() {
   constexpr uint32_t kExtentPages = 16;
   Wall lanes(kExtentPages, kPageIds);

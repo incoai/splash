@@ -600,15 +600,19 @@ public:
   // the pages they free beside the free pages it holds.
   void countRelease(uint64_t requestId, const ReleaseMoves &moves, bool landing, const ReleaseRule &rule,
                     ReleaseCount &count) const;
+  // The free Index pages a release of `pages` Full pages in place moves them
+  // into, and the runway past them, where free Index pages hold them all
+  // (inPlaceMoves); else none. A claim that counts such a release keeps them
+  // from its reclaims (EngineVictims::movesInto, walkFor).
+  [[nodiscard]] uint32_t inPlaceIndexPages(uint32_t pages) const noexcept;
   // The pages a release freeing `pages` Full pages in place moves, of a
   // request's `clean` ones, so that an extent of free Index pages stays, the
   // runway the next release moves into: those pages where free Index pages
-  // hold them beside it; else an extent more, as for bytes, whose emptied
-  // Full extent refills it, where releaseMoves moves one; else none. Moved
-  // alone into the runway they could leave it short where the room holds no
-  // Index extent (6.3 MB on Qwen3.8-Flash-Next), and no release for bytes
-  // could start again; beside it, an extent of that room (releasePages),
-  // which no count holds.
+  // hold them beside it (inPlaceIndexPages); else an extent more, as for
+  // bytes, whose emptied Full extent refills it, where releaseMoves moves
+  // one; else none. Moved alone into the runway they could leave it short
+  // where the room holds no Index extent (6.3 MB on Qwen3.8-Flash-Next), and
+  // no release for bytes could start again.
   [[nodiscard]] uint32_t inPlaceMoves(uint32_t pages, uint32_t clean) const;
   // Between commands: moves the request's `pages` oldest clean pages
   // (releasablePages, by the same rule) to the index form, as spillWritten
@@ -617,12 +621,10 @@ public:
   // extents they empty then leave, the Full pages left first gathered in
   // the fewest extents, their bytes told to `funds`, and the runway refills
   // from them, a runway at a time; for a need of pages in place (`inPlace`)
-  // an extent past `pages` moving as for bytes where inPlaceMoves moves one,
-  // or else the `pages` pages beside the runway, into the free Index pages
-  // past an extent of them and an extent allocated where those do not hold
-  // them, the `pages` Full pages staying free for the claim. A refused refill
-  // or extent ends it with what it moved. Returns the pages moved; a release
-  // counts (KvSpillSnapshot::releases) where it freed what it was for.
+  // its inPlaceMoves, an extent past `pages` moving as for bytes, the
+  // `pages` Full pages staying free for the claim. A refused refill ends it
+  // with what it moved. Returns the pages moved; a release counts
+  // (KvSpillSnapshot::releases) where it freed what it was for.
   uint32_t releasePages(uint64_t requestId, uint32_t pages, bool inPlace, const ReleaseRule &rule,
                         const std::function<void(uint64_t bytes)> &funds = {}, uint32_t beside = 0);
   // Whether a Spill request owes copies no write has started: the SSD
@@ -1109,9 +1111,10 @@ private:
   // page freed), the states on the way among a unit's victims unless the
   // need counts state buffers too (statesAreUnits). A device need that also
   // lacks pages of a form keeps the free pages of that form it takes first,
-  // those its takes free there among them, and those of the other forms its
-  // attempt takes (keptPages): its reclaims release an extent of a form only
-  // past them, and none of its own form.
+  // those its takes free there among them, those of the other forms its
+  // attempt takes, and those other sources' units move pages into
+  // (keptPages, VictimQuery::movedInto): its reclaims release an extent of a
+  // form only past them, and none of its own form.
   struct Walk final {
     WalkScope scope;
     ReclaimTiming timing = ReclaimTiming::CanWait;
@@ -1609,9 +1612,12 @@ private:
   [[nodiscard]] std::vector<uint64_t> holdersAt(uint32_t index, uint64_t block) const;
   // Moves the pages `landed` finds to the index form as spillWritten says,
   // the Full extents they empty leaving past the `claimed` free Full pages a
-  // claim takes in place.
+  // claim takes in place, or without `extents` only into free Index pages,
+  // which allocate nothing: those past them stay Full, and so do the Full
+  // extents they empty.
   [[nodiscard]] TokenAdmission moveLandedPages(const std::function<std::vector<uint32_t>()> &landed,
-                                               SpilledExtents extents, const std::function<void(uint64_t bytes)> &funds,
+                                               std::optional<SpilledExtents> extents,
+                                               const std::function<void(uint64_t bytes)> &funds,
                                                uint32_t claimed = 0);
   // The copy of the K/V on an Index page.
   [[nodiscard]] model::KvPageSource sourceOf(uint32_t page) const;
