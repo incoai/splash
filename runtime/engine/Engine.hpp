@@ -639,14 +639,16 @@ private:
   };
   [[nodiscard]] ResidentRoom residentRoom(const Request &request, const ClaimSpec &spec, uint64_t tokens) const;
   // The lanes' projected growth that has not happened yet: a Resident lane's
-  // pages up to its projection beyond those it holds, a Spill lane's floor
-  // up to its projection beyond its floor now; none for a lane that ended.
+  // pages up to its projection beyond those it holds; a Spill lane's floor
+  // up to its projection beyond its floor now, in prefill beyond its floor
+  // at its next command's end, whose pages beyond those it holds count Full
+  // (nextCommandPages); none for a lane that ended.
   struct LaneDemand final {
-    uint32_t residentPages = 0;
-    uint64_t bytes = 0;  // the Spill lanes' floors and the readers' hot block floors
+    uint32_t fullPages = 0;  // the Resident lanes' pages and the Spill lanes' next prefill commands'
+    uint64_t bytes = 0;      // the Spill lanes' floors and the readers' hot block floors
   };
   [[nodiscard]] LaneDemand laneDemand() const;
-  // laneDemand in bytes, the Resident pages at a Full page's bytes.
+  // laneDemand in bytes, the Full pages at a Full page's bytes.
   [[nodiscard]] uint64_t laneDemandBytes() const;
   // The highest priority among the lanes in service, none without one.
   [[nodiscard]] std::optional<RequestPriority> highestLanePriority() const;

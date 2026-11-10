@@ -15,7 +15,6 @@
 #include <cstdlib>
 #include <functional>
 #include <iostream>
-#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -680,21 +679,9 @@ private:
         ++totals_.residentStarts;
       }
     }
-    // A Spill lane's prefill command writes its rows Full beyond the floor the lanes' projected growth prices it at
-    // (Engine::laneDemand), until claims release them once their copies land (Engine::EngineVictims::releases): memory
-    // no placement counted, as a resumed lane's replay. A start placed Resident beside one whose pages grew may find
-    // what it counted taken, and then converts or the lane that yields first yields.
-    for (const ActiveRequestSnapshot &active : spill.engine.snapshot().activeRequests) {
-      if (active.kvMode != KvMode::Spill || active.phase != Phase::Prefill || !spill.model.requests.contains(active.id) ||
-          !spill.model.requests.at(active.id).resident)
-        continue;
-      const size_t pages = spill.cache.pageTable(active.id).pages.size();
-      if (pages > std::exchange(prefillPages_[active.id], pages))
-        std::erase_if(placed_, [&](uint64_t placed) { return placed != active.id; });
-    }
     // A start placed Resident yields, goes short or converts itself to Spill in its own prefill only where the host or
-    // the wall moved since, a suspended lane resumed, a start of a higher priority began or a Spill lane's prefill took
-    // pages. Only its own growth converts it, never the test's claims (Engine::EngineVictims::conversions).
+    // the wall moved since, a suspended lane resumed or a start of a higher priority began. Only its own growth
+    // converts it, never the test's claims (Engine::EngineVictims::conversions).
     for (auto entry = placed_.begin(); entry != placed_.end();) {
       const uint64_t id = *entry;
       const std::optional<Phase> phase = lanes_.phase(id);
@@ -900,8 +887,6 @@ private:
   std::set<uint64_t> placed_;
   // The moves of the host and the wall, a suspended lane's resume among them.
   uint64_t epoch_ = 0;
-  // The pages of each Spill lane in prefill at the last check (noteStarts).
-  std::map<uint64_t, size_t> prefillPages_;
   // The wall's and the host's moves at the last check that found the runway short.
   std::optional<uint64_t> runwayShortAt_;
   std::set<uint64_t> shortClaims_;
@@ -927,8 +912,8 @@ void report(std::string_view name, const Violations &violations, std::string &fa
 // own runs in the engine's ticks too, and what a met claim keeps of the room beside the first reads its releases
 // created holds its need; a release taken first frees what it counted; between commands at normal pressure the Index
 // runway holds an extent where the room does; a start placed Resident beside the lanes on their count prefills with
-// no yield, no short claim and no conversion while the host and the wall stay, no suspended lane resumes, no start of
-// a higher priority begins and no Spill lane's prefill takes pages. With transfers in flight they are counted apart.
+// no yield, no short claim and no conversion while the host and the wall stay, no suspended lane resumes and no start
+// of a higher priority begins. With transfers in flight they are counted apart.
 void testRandomConversationTreesKeepTheReleaseCounts() {
   const char *seeds = std::getenv("SPLASH_RELEASE_SEEDS");
   const char *one = std::getenv("SPLASH_RELEASE_SEED");
