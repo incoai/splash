@@ -1841,6 +1841,8 @@ what it took, once for each kind of need until an allocation of the claim is
 granted; a claim of no request logs each take. A request's claim met by the
 room or by steps 1 to 4 alone logs nothing: a decode taking each next page
 from the cache logged such a met 1-2 times a second through a long reply.
+Nor does a wait, until it has lasted a second: the same pages, each waiting a
+tick for its copy to land, logged a pending and a granted a page.
 The grant that ends a logged wait logs `granted`, since a wait can end in an
 attempt that runs no `free()`, as the pages it waited for land; and a need
 `free()` met whose attempt is still refused logs `met, yet refused again`, the

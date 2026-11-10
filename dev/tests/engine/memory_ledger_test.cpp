@@ -2159,6 +2159,9 @@ void testAGrantEndsALoggedWait() {
   const ClaimId claim = ledger.open(request(9, RequestPriority::Normal));
   require(ledger.free(claim, {.bytes = kGiB, .pages = 4}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Pending,
           "a need what lands covers did not wait for it");
+  require(lines.empty(), "a wait that had just begun logged");
+  ledger.setNow(1.5);
+  static_cast<void>(ledger.free(claim, {.bytes = kGiB, .pages = 4}, 0, MemoryPressure::Normal));
   ledger.granted(claim);
   ledger.granted(claim);
   require(lines.size() == 2 && lines[0].find(": pending") != std::string::npos &&
@@ -2170,6 +2173,26 @@ void testAGrantEndsALoggedWait() {
   ledger.granted(claim);
   require(lines.size() == 3 && lines[2].find(": met, took experts unit") != std::string::npos,
           "a grant after a met that cost work logged: " + lines.back());
+}
+
+// Pages that each wait a tick for their copies to land log nothing: at the memory limit a reply logged a pending and
+// a granted a page, more lines than the mets that #726 reported.
+void testABriefWaitLogsNothing() {
+  MemoryLedger ledger;
+  std::vector<std::string> lines;
+  ledger.setDecisionLog([&](std::string_view line) { lines.emplace_back(line); });
+  ledger.setReturning([&] { return Returning{.landingBytes = kGiB}; },
+                      [](std::span<const uint64_t>) { return Returning{}; });
+  const ClaimId claim = ledger.open(request(7, RequestPriority::Normal));
+  for (int page = 0; page < 8; ++page) {
+    ledger.setNow(10.0 + page * 0.5);
+    require(ledger.free(claim, {.bytes = 130 * kMiB, .pages = 1}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Pending,
+            "a page what lands covers did not wait for it");
+    ledger.granted(claim);
+    ledger.setWaiting(claim, false);
+  }
+  require(lines.empty(), "brief waits logged " + std::to_string(lines.size()) + " lines: " +
+                             (lines.empty() ? std::string() : lines[0]));
 }
 
 // A need the engine refused again after free() met it logs so, the ledger having counted room the attempt did not
@@ -2218,7 +2241,7 @@ void testARetryBackToALoggedOutcomeLogsNothing() {
   landing = 0;
   static_cast<void>(ledger.free(claim, {.bytes = kGiB}, 0, MemoryPressure::Normal));
   static_cast<void>(ledger.free(claim, {.bytes = kGiB}, kGiB, MemoryPressure::Normal));
-  const std::array<std::string_view, 5> outcomes{": short", ": pending", ": short", ": granted", ": short"};
+  const std::array<std::string_view, 4> outcomes{": short", ": short", ": granted", ": short"};
   bool each = lines.size() == outcomes.size();
   for (size_t line = 0; each && line < lines.size(); ++line)
     each = lines[line].find(outcomes[line]) != std::string::npos;
@@ -2648,6 +2671,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testEachDecisionLogsOneLine", testEachDecisionLogsOneLine},
       {"testARequestMetFromCacheLogsNothing", testARequestMetFromCacheLogsNothing},
       {"testAGrantEndsALoggedWait", testAGrantEndsALoggedWait},
+      {"testABriefWaitLogsNothing", testABriefWaitLogsNothing},
       {"testAMetRefusedAgainLogsOnce", testAMetRefusedAgainLogsOnce},
       {"testARetryBackToALoggedOutcomeLogsNothing", testARetryBackToALoggedOutcomeLogsNothing},
       {"testAHostExemptionLogsMetPastTheHost", testAHostExemptionLogsMetPastTheHost},
