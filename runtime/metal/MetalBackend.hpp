@@ -194,11 +194,11 @@ enum class HostStepGpu : uint8_t {
 //
 // Metal fails a Wait still unmet supervision::kGpuWaitLimit after its queue
 // reached it ("Caused GPU Timeout Error"), and the command with it. The queue
-// reaches a command's first wait as the command is submitted, whatever work
-// runs ahead of it, and each later one once the wait before it was met: the
-// work between two waits, with the agent's part, must end within it. Longer
-// work, such as the encodes of a prefill command's images, runs as a command
-// of its own.
+// reaches a command's first wait as the command is submitted, or, after a
+// host step, once the step returned (below), whatever work runs ahead of it,
+// and each later one once the wait before it was met: the work between two
+// waits, with the agent's part, must end within it. Longer work, such as the
+// encodes of a prefill command's images, runs as a command of its own.
 //
 // A Host step runs `work` on the CPU once all earlier work has completed and
 // holds all later work until it returned: the GPU raises a shared event the
