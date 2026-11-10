@@ -17,9 +17,10 @@ namespace splash::engine {
 // splits with the Neural Engine, the split's program in the ANE service
 // (ops::AneFfn::release). release() releases every part, then the program.
 // restore() takes back the first part released, a call at a time as the part
-// does (an image per call, a store in one), then loads the program in one
-// more call, so a release during a restore gives back what came back. A
-// split that stopped gives its program back once more, then nothing.
+// does (an image per call, which its thread writes until the next; a store
+// in one), then loads the program in one more call, so a release during a
+// restore gives back what came back. A split that stopped gives its program
+// back once more, then nothing.
 class ReleasableMemory final : public model::WeightMemory {
 public:
   // The split's part: `release` unloads its program between commands, true
@@ -48,16 +49,21 @@ public:
     if (!splitReleased_)
       splitReleased_ = split_ && split_->release();
   }
-  [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override {
+  [[nodiscard]] bool restore(const metal::AllocationAdmission &admit,
+                             const std::function<void()> &written) override {
     // Every part, then the program. With nothing released, the first part
-    // refuses the restore.
+    // refuses the restore. A part stays released while its last image is
+    // written, so the next part waits for that write.
     auto part = std::ranges::find_if(parts_, &model::WeightMemory::released);
     if (part == parts_.end() && !splitReleased_) part = parts_.begin();
     if (part != parts_.end())
-      return (*part)->restore(admit) && !released() && !splitReleased_;
+      return (*part)->restore(admit, written) && !released() && !splitReleased_;
     splitReleased_ = false;
     split_->restore();
     return true;
+  }
+  [[nodiscard]] bool writing() const noexcept override {
+    return std::ranges::any_of(parts_, &model::WeightMemory::writing);
   }
 
 private:

@@ -262,10 +262,16 @@ commands has the engine release the images' memory (`Engine::releaseIdleWeights`
 weights' views stay the same handles, and a command that binds released memory
 fails (`MetalBackend::releaseMemory`). The next request waits while the same
 writers write the images again (`WeightImages::restore`), the engine taking back
-an image per tick so that the loop keeps answering status and cancellations;
-meanwhile the tick still ends requests at their deadlines, collects the
-transfers that land and writes restore points behind (`Engine::tick`). The
-restore takes about as long as the load at startup and logs `Weights restored in
+an image per tick and writing it on a thread of its own, so that the loop keeps
+answering status and cancellations however long an image takes: Flash-Next's
+PLE table loaded whole (`--ple-memory off`) is one image of 28.8 GB, whose write
+from a disk slower than about 1 GB/s outlasts the 30 s within which the server
+stops an engine that leaves a status request unanswered
+(`supervision::kLoopStall`). While an image is written, which may allocate and
+run commands on the backend, the tick only ends requests at their deadlines and
+the control pass waits; between images the tick also collects the transfers
+that land and writes restore points behind (`Engine::tick`). The restore takes
+about as long as the load at startup and logs `Weights restored in
 N s`. The governor admits each image's memory
 (`MemoryGovernor::allocationAdmission`) as memory the waiting requests need:
 neither the host's margins nor macOS's warning refuse it, as for a request in
