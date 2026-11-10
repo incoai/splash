@@ -51,9 +51,9 @@ ResourceWaitSnapshot Engine::resourceWaitSnapshot(double now) const {
   return result;
 }
 
-uint64_t Engine::projectedTokens(const Request &active) noexcept {
+uint64_t Engine::projectedTokens(const Request &active, uint32_t outputLimit) noexcept {
   const uint64_t generated = active.exactTokens.size() - active.promptTokens;
-  const uint64_t remaining = active.outputLimit - std::min<uint64_t>(generated, active.outputLimit);
+  const uint64_t remaining = outputLimit - std::min<uint64_t>(generated, outputLimit);
   return active.exactTokens.size() + std::min<uint64_t>(remaining, kProjectedOutputTokens);
 }
 
@@ -63,7 +63,7 @@ KvMode Engine::placement(const Request &active) const {
     return KvMode::Resident;
   if (spill.always)
     return KvMode::Spill;
-  const uint64_t tokens = projectedTokens(active);
+  const uint64_t tokens = projectedTokens(active, active.request.maxNewTokens);
   if (tokens <= spill.denseTokens)
     return KvMode::Resident;
   // Spill never takes more than Resident: its peak is its floor and, while
@@ -117,16 +117,6 @@ Engine::ResidentRoom Engine::residentRoom(const Request &active, const ClaimSpec
     heldPages = held + allocated - std::min<uint64_t>(allocated, lanes.residentPages);
   }
   return {.needed = need.bytes, .available = available, .heldTokens = heldPages * KvCache::pageTokens};
-}
-
-void Engine::placeCandidates(std::span<const PrefillAdmission> candidates) {
-  for (const PrefillAdmission &candidate : candidates) {
-    Request &active = request(candidate.requestId);
-    if (active.placement && active.placementState == ledgerChanges_)
-      continue;
-    active.placement = placement(active);
-    active.placementState = ledgerChanges_;
-  }
 }
 
 uint64_t Engine::laneDemandBytes() const {
@@ -554,12 +544,9 @@ void Engine::deferWait(Request &active) {
   }
   active.resourceWait = kept;
   // Its claim holds no room from this pass on: the starts admission tries
-  // after it in the same pass may take that room, and are placed again.
-  MemoryLedger &ledger = governor().ledger();
-  if (active.claim.id && ledger.claim(active.claim.id).waiting) {
-    ledger.setWaiting(active.claim.id, false);
-    ++ledgerChanges_;
-  }
+  // after it in the same pass may take that room.
+  if (active.claim.id)
+    governor().ledger().setWaiting(active.claim.id, false);
 }
 
 double Engine::resourceDeadline(const Request &active) const noexcept {
@@ -1170,7 +1157,6 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
         inPlace ? 0 : engine.cache_.releaseBeside(query.need));
     if (!moved)
       return {};
-    ++engine.ledgerChanges_;
     // Critical pressure refuses a lane's first reads at its next prepare:
     // what this release freed pays for them here (MemoryGovernor::fund), or a
     // lane that needed no memory would stop and time out.
@@ -1264,7 +1250,6 @@ void Engine::collectLandings(double now) {
   for (const CacheProbe &probe : probes)
     chains.push_back(probe.restoredChain());
   cache_.setWantedChains(std::move(chains));
-  ++ledgerChanges_;
 }
 
 } // namespace splash::engine
