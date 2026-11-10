@@ -642,6 +642,21 @@ MemoryLedger::Run MemoryLedger::take(const VictimQuery &query, const Lacking &la
   return run;
 }
 
+VictimQuery MemoryLedger::claimQuery(const ClaimSpec &spec, const Need &need, MemoryPressure pressure,
+                                     const RestoredChains *kept) const {
+  VictimQuery query{.rights = takeRights(spec, need, pressure, lanePriority_),
+                    .need = need,
+                    .kept = kept,
+                    .requestId = spec.requestId,
+                    .priority = spec.priority};
+  for (const VictimSource *source : sources_) {
+    const std::array<uint32_t, 3> into = source->movesInto(query);
+    for (size_t form = 0; form < into.size(); ++form)
+      query.movedInto[form] += into[form];
+  }
+  return query;
+}
+
 uint64_t MemoryLedger::takeUnsized(const VictimQuery &query) {
   const uint64_t startPooled = startPooledBytes(query);
   uint64_t bytes = 0;
@@ -679,10 +694,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
   const uint64_t id = claimId.value;
   ClaimState &claim = claims_.at(id);
   const ClaimSpec &spec = claim.spec;
-  const VictimQuery query{.rights = takeRights(spec, need, pressure, lanePriority_),
-                          .need = need,
-                          .requestId = spec.requestId,
-                          .priority = spec.priority};
+  const VictimQuery query = claimQuery(spec, need, pressure, nullptr);
 
   FreeResult result{.nowBytes = takeUnsized(query)};
   const uint64_t room = saturatingAdd(freeBytes, result.nowBytes);
@@ -833,11 +845,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
 // victims, as free() counts them.
 uint64_t MemoryLedger::available(const ClaimSpec &spec, const Need &need, uint64_t freeBytes,
                                  MemoryPressure pressure, const RestoredChains *kept) const {
-  const VictimQuery query{.rights = takeRights(spec, need, pressure, lanePriority_),
-                          .need = need,
-                          .kept = kept,
-                          .requestId = spec.requestId,
-                          .priority = spec.priority};
+  const VictimQuery query = claimQuery(spec, need, pressure, kept);
   const uint64_t enough = need.bytes;
   const uint64_t held = heldFor(spec, std::nullopt);
   uint64_t landing = 0;

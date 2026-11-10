@@ -269,6 +269,10 @@ struct VictimQuery final {
   // releases keep its admission probe's chain as well
   // (EngineVictims::releaseRule).
   const RestoredChains *kept = nullptr;
+  // The free pages of each form a source's units for the claim move pages
+  // into (VictimSource::movesInto), which every other unit keeps as it keeps
+  // those the need's attempt takes (Cache::walkFor).
+  std::array<uint32_t, 3> movedInto{};
   // The claimant: its request (0 for none) and priority, which the lanes it
   // releases follow (TakeRights::lanes).
   uint64_t requestId = 0;
@@ -325,6 +329,9 @@ public:
   [[nodiscard]] virtual std::string_view name() const noexcept = 0;
   [[nodiscard]] virtual std::optional<Victim> peek(const VictimQuery &query, const Victim *after) const = 0;
   virtual FreeResult take(const VictimQuery &query, const Victim &victim) = 0;
+  // The free pages of each form the source's units for `query` count on
+  // moving pages into (VictimQuery::movedInto); none by default.
+  [[nodiscard]] virtual std::array<uint32_t, 3> movesInto(const VictimQuery &) const { return {}; }
 };
 
 // What transfers free when they land (Cache::returning). Landing: in flight
@@ -558,6 +565,11 @@ private:
   // lane, less what it releases once they took theirs. What they lack of it
   // they allocate (Model::startStateBytes).
   [[nodiscard]] uint64_t startPooledBytes(const VictimQuery &query) const;
+  // The query a claim's count and takes walk the sources with: its rights,
+  // need and kept chain, and the free pages the sources' units move pages
+  // into (VictimSource::movesInto).
+  [[nodiscard]] VictimQuery claimQuery(const ClaimSpec &spec, const Need &need, MemoryPressure pressure,
+                                       const RestoredChains *kept) const;
   // The most the units the claim's rights take give it, counted in the
   // one order without taking any, up to the lack.
   [[nodiscard]] Run bound(const VictimQuery &query, const Lacking &lack) const;
