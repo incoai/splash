@@ -2056,11 +2056,11 @@ Cache::ReleasablePages Cache::releasablePages(uint64_t requestId, const ReleaseR
   return result;
 }
 
-void Cache::countRelease(uint64_t requestId, uint32_t pages, bool landing, const ReleaseRule &rule,
+void Cache::countRelease(uint64_t requestId, const ReleaseMoves &moves, bool landing, const ReleaseRule &rule,
                          ReleaseCount &count) const {
   uint32_t counted = 0;
   forReleasable(request(requestId), rule, count, [&](uint32_t index, uint64_t block, bool clean) {
-    if (counted == pages)
+    if (counted == moves.pages)
       return false;
     if (!clean && !landing)
       return true;
@@ -2070,19 +2070,40 @@ void Cache::countRelease(uint64_t requestId, uint32_t pages, bool landing, const
     count.blocks.insert(block);
     return true;
   });
+  // The free pages beside fill what its moves leave of its last extent.
+  count.beside -= std::min(count.beside, moves.extents * pool_.extentPages() - moves.pages);
+  count.extents += moves.extents;
 }
 
-uint32_t Cache::releaseMoves(uint32_t pages, bool landing, const ReleaseCount &count) const {
+uint32_t Cache::releaseBeside(const Need &need) const {
+  constexpr kv::PageForm full = kv::PageForm::Full;
+  if (!spill_ || spill_->always)
+    return 0;
   const uint32_t extent = pool_.extentPages();
-  uint32_t extents = pages / extent;
+  const uint32_t empty = pool_.emptyExtents(full) * extent;
+  const uint32_t reusable = pool_.reusablePages(full);
+  if (reusable - std::min(reusable, empty) >= extent)
+    return 0;
+  const uint32_t free = pool_.freePageCount(full);
+  const uint32_t scattered = free - std::min(free, empty);
+  const uint32_t kept = need.form == full && need.pages ? free : need.keptPages[static_cast<size_t>(full)];
+  return scattered - std::min(scattered, kept);
+}
+
+Cache::ReleaseMoves Cache::releaseMoves(uint32_t pages, bool landing, const ReleaseCount &count) const {
+  const uint32_t extent = pool_.extentPages();
+  // Fewer than an extent's free pages lie beside (releaseBeside): with the
+  // pages short of a whole extent, they complete one at most.
+  uint32_t extents = (pages + count.beside) / extent;
   if (!landing) {
     const uint32_t unpinned = pool_.unfixedExtents(pagesInTransfer(), kv::PageForm::Full);
-    const auto counted = static_cast<uint32_t>(count.blocks.size() / extent);
-    extents = std::min(extents, unpinned - std::min(unpinned, counted));
+    extents = std::min(extents, unpinned - std::min(unpinned, count.extents));
   }
-  const uint32_t moves = extents * extent;
+  const uint32_t moves = std::min(pages, extents * extent);
   const uint32_t firstRunway = std::min(moves, pool_.freePageCount(kv::PageForm::Index));
-  return moves && firstRunway + pool_.freePageCount(kv::PageForm::Full) >= extent ? moves : 0;
+  if (!moves || firstRunway + pool_.freePageCount(kv::PageForm::Full) < extent)
+    return {};
+  return {.pages = moves, .extents = extents};
 }
 
 uint32_t Cache::inPlaceMoves(uint32_t pages, uint32_t clean) const {
@@ -2091,11 +2112,11 @@ uint32_t Cache::inPlaceMoves(uint32_t pages, uint32_t clean) const {
     return 0;
   if (pool_.freePageCount(kv::PageForm::Index) >= pages + extent)
     return pages;
-  return clean - pages >= extent && releaseMoves(extent, false) ? pages + extent : 0;
+  return clean - pages >= extent && releaseMoves(extent, false).pages ? pages + extent : 0;
 }
 
 uint32_t Cache::releasePages(uint64_t requestId, uint32_t pages, bool inPlace, const ReleaseRule &rule,
-                             const std::function<void(uint64_t)> &funds) {
+                             const std::function<void(uint64_t)> &funds, uint32_t beside) {
   Request &active = request(requestId);
   if (!spill_ || active.mode != KvMode::Spill || !pages)
     return 0;
@@ -2107,7 +2128,8 @@ uint32_t Cache::releasePages(uint64_t requestId, uint32_t pages, bool inPlace, c
   // the claim's pages (inPlaceMoves).
   const auto found =
       static_cast<uint32_t>(landedPages(active, pages + (inPlace ? pool_.extentPages() : 0), rule).size());
-  const uint32_t wanted = inPlace ? inPlaceMoves(pages, found) : releaseMoves(found, false);
+  const uint32_t wanted =
+      inPlace ? inPlaceMoves(pages, found) : releaseMoves(found, false, {.beside = beside}).pages;
   if (!wanted)
     return 0;
   const uint32_t claimed = inPlace ? pool_.freePageCount(kv::PageForm::Full) + pages : 0;

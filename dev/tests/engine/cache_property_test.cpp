@@ -134,10 +134,10 @@ public:
   // those offered as needing no write the same: a short one of those is one
   // of the classes checkTake names.
   uint64_t exactUnits = 0, shortUnits = 0, exactNoWrite = 0, shortNoWrite = 0;
-  // Releases of whole extents for bytes (releaseExtents): those taken, those beside transfers in flight, and those
-  // that freed less than their count where the runway held less than an extent before, or where the runway's refill
-  // was refused and moved fewer pages.
-  uint64_t extentReleases = 0, inFlightReleases = 0, shortRunwayReleases = 0, refusedReleases = 0;
+  // Releases of whole extents for bytes (releaseExtents): those taken, those whose last extent the free Full pages
+  // beside completed, those beside transfers in flight, and those that freed less than their count where the runway
+  // held less than an extent before, or where the runway's refill was refused and moved fewer pages.
+  uint64_t extentReleases = 0, besideReleases = 0, inFlightReleases = 0, shortRunwayReleases = 0, refusedReleases = 0;
 
   // Every request ends, every transfer lands, and nothing leaks: the pool's
   // pages and the tier's slots belong to the cache's blocks alone.
@@ -579,7 +579,7 @@ private:
 
   // Guard: a count of releases of Spill requests in turn, each of the whole
   // extents of its pages whose copies landed, as a claim's units for bytes
-  // count them (Cache::ReleaseCount), never counts more than their takes in
+  // count them (ReleaseCount), never counts more than their takes in
   // turn free: each request's count stays within the clean pages it holds
   // when its take comes, a page several hold counting for the first, and a
   // take gives a request its first Index pages only where a count named it.
@@ -591,11 +591,12 @@ private:
     std::shuffle(order.begin(), order.end(), random_);
     const ReleaseRule rule{.takesFrom = [&](uint64_t holder) { return std::ranges::count(order, holder) != 0; }};
     const uint32_t extent = pool_.extentPages();
-    engine::Cache::ReleaseCount count;
+    engine::ReleaseCount count;
     std::vector<engine::Cache::ReleasablePages> counted;
     for (const uint64_t id : order) {
       counted.push_back(cache_.releasablePages(id, rule, count));
-      cache_.countRelease(id, counted.back().clean / extent * extent, false, rule, count);
+      const uint32_t whole = counted.back().clean / extent;
+      cache_.countRelease(id, {.pages = whole * extent, .extents = whole}, false, rule, count);
     }
     std::set<uint64_t> named;
     for (size_t each = 0; each < order.size(); ++each) {
@@ -616,38 +617,42 @@ private:
   }
 
   // A release of a Spill request's pages whose copies landed, in whole
-  // extents, as a claim's unit for bytes takes it (EngineVictims::releases),
-  // frees the bytes that unit counts of its moves (Cache::releaseMoves),
-  // each page its Full bytes less its Index page's, wherever the Index
-  // runway held an extent before it, transfers in flight or not: its moves
-  // empty that many Full extents, none a page in transfer pins, which
-  // leave, and refill the runway an extent at a time. Short of the runway,
-  // its refill takes an Index extent more; a refused refill moves fewer
-  // pages: those are counted apart.
+  // extents and the one the free Full pages beside complete
+  // (Cache::releaseBeside), as a claim's unit for bytes takes it
+  // (EngineVictims::releases), frees the bytes that unit counts of the
+  // extents it empties (Cache::releaseMoves), each page of them its Full
+  // bytes less its Index page's, wherever the Index runway held an extent
+  // before it, transfers in flight or not: its moves empty that many Full
+  // extents, none a page in transfer pins, which leave, and refill the runway
+  // an extent at a time. Short of the runway, its refill takes an Index
+  // extent more; a refused refill moves fewer pages: those are counted apart.
   void releaseExtents() {
     Request *request = anyRequest();
     if (!spill_ || !request || request->mode != KvMode::Spill) return;
     const uint64_t id = idOf(*request);
     if (waiting(id)) return;
     const uint32_t extent = pool_.extentPages();
-    const uint32_t pages = cache_.releaseMoves(cache_.releasablePages(id, {}).clean, false);
-    if (!pages) return;
+    const uint32_t beside = cache_.releaseBeside({});
+    const engine::Cache::ReleaseMoves moves =
+        cache_.releaseMoves(cache_.releasablePages(id, {}).clean, false, {.beside = beside});
+    if (!moves.pages) return;
     const bool runway = pool_.freePageCount(kv::PageForm::Index) >= extent;
     const bool inFlight = tier_.inFlight() != 0;
     const uint64_t before = pool_.allocatedBytes();
-    const uint32_t moved = cache_.releasePages(id, pages, false, {});
+    const uint32_t moved = cache_.releasePages(id, moves.pages, false, {}, {}, beside);
     const uint64_t freed = before - std::min(before, pool_.allocatedBytes());
-    const uint64_t counted =
-        uint64_t{pages} * (storage_.bytesPerPage(kv::PageForm::Full) - storage_.bytesPerPage(kv::PageForm::Index));
+    const uint64_t counted = uint64_t{moves.extents} * extent *
+                             (storage_.bytesPerPage(kv::PageForm::Full) - storage_.bytesPerPage(kv::PageForm::Index));
     ++extentReleases;
+    besideReleases += moves.pages < moves.extents * extent;
     inFlightReleases += inFlight;
     if (freed >= counted) return;
-    ++(moved < pages ? refusedReleases : shortRunwayReleases);
-    require(moved < pages || !runway,
-            "a release of " + std::to_string(pages / extent) + " whole extents of pages, moving " +
-                std::to_string(moved) + (inFlight ? " beside transfers in flight" : "") +
-                " with the runway whole, freed " + std::to_string(freed) + " B of the " + std::to_string(counted) +
-                " its count gives them");
+    ++(moved < moves.pages ? refusedReleases : shortRunwayReleases);
+    require(moved < moves.pages || !runway,
+            "a release of " + std::to_string(moves.extents) + " extents of pages, moving " + std::to_string(moved) +
+                " beside " + std::to_string(beside) + " free Full pages" +
+                (inFlight ? " and transfers in flight" : "") + " with the runway whole, freed " +
+                std::to_string(freed) + " B of the " + std::to_string(counted) + " its count gives them");
   }
 
   // A read of a spilled block fails. The engine applies the results of the
@@ -722,7 +727,7 @@ private:
 // Seeds 1..plainSeeds plain and 1..windowedSeeds windowed, plus windowed seed 9454 (a poisoned
 // block's write lands after its subtree left).
 void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
-  uint64_t releases = 0, inFlight = 0, shortRunway = 0, refused = 0;
+  uint64_t releases = 0, beside = 0, inFlight = 0, shortRunway = 0, refused = 0;
   const auto check = [&](uint32_t seed, bool windowed) {
     Run run(seed, windowed);
     try {
@@ -736,6 +741,7 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
                                error.what());
     }
     releases += run.extentReleases;
+    beside += run.besideReleases;
     inFlight += run.inFlightReleases;
     shortRunway += run.shortRunwayReleases;
     refused += run.refusedReleases;
@@ -745,9 +751,9 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
       check(seed, windowed);
   check(9454, true);
   std::cout << "cache property runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds
-            << " windowed and windowed seed 9454; " << releases << " releases of whole extents, " << inFlight
-            << " of them beside transfers in flight; of all, " << shortRunway
-            << " freed less than counted with the runway short of an extent and " << refused
+            << " windowed and windowed seed 9454; " << releases << " releases of whole extents, " << beside
+            << " of them completed by free pages beside, " << inFlight << " beside transfers in flight; of all, "
+            << shortRunway << " freed less than counted with the runway short of an extent and " << refused
             << " with its refill refused\n";
 }
 

@@ -331,6 +331,20 @@ struct ReleaseRule final {
   std::span<const uint64_t> kept;
 };
 
+// A count of releases of requests in turn (Engine::EngineVictims::releases),
+// each moving its request's oldest pages as its take would: the pages those
+// it counted move and the requests they give Index pages, so that a page
+// requests on one prefix share, and a holder's first reads, count once.
+// Counted for each alone, two lanes on one conversation gave 307 MB more
+// than their takes free. Also the Full extents they empty, and the free Full
+// pages beside them (Cache::releaseBeside) that none of them gathered yet.
+struct ReleaseCount final {
+  std::unordered_set<uint64_t> blocks;
+  std::unordered_set<uint64_t> holders;
+  uint32_t extents = 0;
+  uint32_t beside = 0;
+};
+
 // KV restores a request waits for before it can run.
 enum class KvRestoreStatus : uint8_t { None, Pending, Failed };
 
@@ -529,16 +543,19 @@ public:
   // the runway's; the caller makes room for them or does without.
   [[nodiscard]] TokenAdmission spillWritten(SpilledExtents extents,
                                             const std::function<void(uint64_t bytes)> &funds = {});
-  // A count of releases of requests in turn (EngineVictims::releases), each
-  // moving its request's oldest pages as its take would: the pages those it
-  // counted move and the requests they give Index pages, so that a page
-  // requests on one prefix share, and a holder's first reads, count once.
-  // Counted for each alone, two lanes on one conversation gave 307 MB more
-  // than their takes free.
-  struct ReleaseCount final {
-    std::unordered_set<uint64_t> blocks;
-    std::unordered_set<uint64_t> holders;
-  };
+  // The free Full pages compaction gathers with a release's moves for
+  // `need`, which complete an extent that the moves alone leave short: those
+  // of the extents that hold pages (an empty extent leaves whole), less
+  // those the need's attempt takes itself (every one for a need of Full
+  // pages, else Need::keptPages). None where the pages only the cache holds
+  // would complete an extent with them, as the cache's reclaims (reach) and
+  // its demotions as they land (returning) count them then, so fewer than an
+  // extent; none under --kv-spill always, whose landings count them. Counted
+  // in whole extents of its own pages, a lane on a finished lane's prefix
+  // gave one extent of its 511 releasable pages beside 3 free ones, and its
+  // 390 MiB hot block floor failed it at a limit where it completes alone,
+  // on Qwen3.8-Flash-Next at 9.38G and 9.43G.
+  [[nodiscard]] uint32_t releaseBeside(const Need &need) const;
   // A Spill request's pages a release moves to the index form, oldest
   // first: Full pages of its own blocks past its dense history and short of
   // its tail window, every holder of which spills and has passed them, that
@@ -557,21 +574,28 @@ public:
   };
   [[nodiscard]] ReleasablePages releasablePages(uint64_t requestId, const ReleaseRule &rule,
                                                 const ReleaseCount &count = {}) const;
-  // Counts in `count` a release of the request's `pages` oldest pages of
+  // What a release for bytes moves of `pages` pages: whole extents of them,
+  // and where they run short the rest, should the free pages beside that
+  // `count` leaves complete an extent with them; and the Full extents those
+  // empty, each of which leaves and pays for the next runway, every page of
+  // them freeing its Full bytes less an Index page's. None unless its first
+  // runway's moves into free Index pages, with the Full pages free already,
+  // fill one. Compaction empties only extents that hold pages and none in
+  // transfer, so as many as those beyond the extents `count` counted: moves
+  // past them would empty none, yet refill the runway and give the lanes
+  // Index pages and reads. With `landing`, as the extents stand once the
+  // transfers land, which a release of pages whose copies land waits for.
+  struct ReleaseMoves final {
+    uint32_t pages = 0;
+    uint32_t extents = 0;
+  };
+  [[nodiscard]] ReleaseMoves releaseMoves(uint32_t pages, bool landing, const ReleaseCount &count = {}) const;
+  // Counts in `count` a release's `moves` of the request's oldest pages of
   // those releasablePages finds with it, clean or, with `landing`, landing
-  // too: the pages, and the holders of the oldest.
-  void countRelease(uint64_t requestId, uint32_t pages, bool landing, const ReleaseRule &rule,
+  // too: the pages, the holders of the oldest, the extents they empty and
+  // the free pages beside those take.
+  void countRelease(uint64_t requestId, const ReleaseMoves &moves, bool landing, const ReleaseRule &rule,
                     ReleaseCount &count) const;
-  // The pages of `pages` a release for bytes moves: whole extents of them,
-  // each emptying a Full extent, which leaves and pays for the next runway,
-  // and none unless its first runway's moves into free Index pages, with
-  // the Full pages free already, fill one. Compaction empties only extents
-  // that hold pages and none in transfer, so as many as those beyond the
-  // whole extents of pages `count` counted: moves past them would empty
-  // none, yet refill the runway and give the lanes Index pages and reads.
-  // With `landing`, as the extents stand once the transfers land, which a
-  // release of pages whose copies land waits for.
-  [[nodiscard]] uint32_t releaseMoves(uint32_t pages, bool landing, const ReleaseCount &count = {}) const;
   // The pages a release freeing `pages` Full pages in place moves, of a
   // request's `clean` ones, so that an extent of free Index pages stays, the
   // runway the next release moves into: those pages where free Index pages
@@ -584,16 +608,16 @@ public:
   // Between commands: moves the request's `pages` oldest clean pages
   // (releasablePages, by the same rule) to the index form, as spillWritten
   // moves landed pages: into free Index pages; for a need of bytes its
-  // releaseMoves, the Full extents they empty then leave, the Full
-  // pages left first gathered in the fewest extents, their bytes told to
-  // `funds`, and the runway refills from them, a runway at a time; for a
-  // need of pages in place (`inPlace`) its inPlaceMoves, an extent past
-  // `pages` moving as for bytes, the `pages` Full pages staying free for the
-  // claim. A refused refill ends it with what it moved. Returns the pages
-  // moved; a release counts (KvSpillSnapshot::releases) where it freed what
-  // it was for.
+  // releaseMoves beside the `beside` free pages (releaseBeside), the Full
+  // extents they empty then leave, the Full pages left first gathered in
+  // the fewest extents, their bytes told to `funds`, and the runway refills
+  // from them, a runway at a time; for a need of pages in place (`inPlace`)
+  // its inPlaceMoves, an extent past `pages` moving as for bytes, the
+  // `pages` Full pages staying free for the claim. A refused refill ends it
+  // with what it moved. Returns the pages moved; a release counts
+  // (KvSpillSnapshot::releases) where it freed what it was for.
   uint32_t releasePages(uint64_t requestId, uint32_t pages, bool inPlace, const ReleaseRule &rule,
-                        const std::function<void(uint64_t bytes)> &funds = {});
+                        const std::function<void(uint64_t bytes)> &funds = {}, uint32_t beside = 0);
   // Whether a Spill request owes copies no write has started: the SSD
   // cache takes no more of its KV, for the quota, the write budget or a
   // closed tier, or writes other requests' first.
