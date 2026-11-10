@@ -591,13 +591,15 @@ void testFlashNextOnTheThreeMacs() {
               requirePlan(kFlashNext.inputs(kStudio)).expertBytes,
           "a larger Mac did not stream more experts");
   // The floors hold the larger of the hot cache's floor and the staging,
-  // both buffers where there are two: beside them the M5 Max's and the M5
-  // Pro's floors of one context are the same.
+  // both buffers where there are two, and the readers' tables, a second
+  // buffer's 278,528 bytes more where there are two: beside them the M5
+  // Max's and the M5 Pro's floors of one context are the same.
   const KvSpillPlan max = requirePlan(kFlashNext.inputs(kStudio)).spill, pro = requirePlan(kFlashNext.inputs(kM5Pro)).spill;
   require(max.floorTokens == pro.floorTokens && max.stagingBuffers == 1 && pro.stagingBuffers == 2 &&
-              max.floorBytes - std::max(max.stagingBytes, max.hotFloorBytes) ==
-                  pro.floorBytes - std::max(pro.stagingBytes, pro.hotFloorBytes),
-          "the floors did not hold both staging buffers where there are two");
+              pro.tableBytes - max.tableBytes == 278'528 &&
+              max.floorBytes - max.tableBytes - std::max(max.stagingBytes, max.hotFloorBytes) ==
+                  pro.floorBytes - pro.tableBytes - std::max(pro.stagingBytes, pro.hotFloorBytes),
+          "the floors did not hold both staging buffers and their tables where there are two");
 }
 
 // --ple-memory auto streams Flash-Next's table through its share however
@@ -776,7 +778,9 @@ void testArenasFollowWhatStreams() {
 // smallest store is refused by name. A loaded store is exactly its size.
 // --sparse-kv-memory raises the hot cache's target, and takes from the
 // experts only what it adds to the readers, which hold the larger of it and
-// the history staging (a buffer of 0.98 GiB on the Studio); it is refused
+// the history staging (a buffer of 0.98 GiB on the Studio), and to their
+// tables: the hot cache's, an entry for each page of its target, and that of
+// the second staging buffer a target past two buffers holds; it is refused
 // below its floor and past what the floors leave. An automatic part whose
 // smallest store takes all it would loads whole.
 void testOverridesAndRefusals() {
@@ -837,8 +841,11 @@ void testOverridesAndRefusals() {
   require(within.spill.hotTargetBytes == 900 * kMiB && within.expertBytes == automatic.expertBytes &&
               within.spill.readerBytes() == staging && raised.spill.hotTargetBytes == staging + kGiB &&
               raised.spill.hotFloorBytes == automatic.spill.hotFloorBytes &&
-              automatic.expertBytes - raised.expertBytes == kGiB && raised.spill.readerBytes() == staging + kGiB,
-          "--sparse-kv-memory did not take from the experts exactly what it adds to the readers");
+              raised.spill.tableBytes > automatic.spill.tableBytes &&
+              automatic.expertBytes - raised.expertBytes ==
+                  kGiB + raised.spill.tableBytes - automatic.spill.tableBytes &&
+              raised.spill.readerBytes() == staging + kGiB,
+          "--sparse-kv-memory did not take from the experts exactly what it adds to the readers and their tables");
   // Below its floor, or beyond what the floors leave, it is refused by name
   // as a setting, never as floors the budget cannot hold.
   for (const auto &[bytes, refusal] : {std::pair<uint64_t, std::string>{300 * kMiB, "is less than"},
@@ -942,14 +949,15 @@ void testDiskBoundsTheSpilledContext() {
 }
 
 // A second staging buffer goes where the readers' memory holds it already,
-// and costs the plan nothing then: on a tight M6 with a 128K-token context,
-// whose two buffers the hot cache's floor holds, also where the limit holds
-// the stores at their smallest, and beside a hot cache target that holds
-// them. Otherwise one buffer where a store binds, which keeps the
-// second's room, also where the table's share above its smallest would hold
-// it (the M6 at a 256K-token context), and two where none does, the second
-// taking its room from the KV kept resident beyond the first 64K tokens: on
-// the M5 Pro under --max-memory 44G, which loads the experts whole.
+// and costs the plan only its page table then: on a tight M6 with a
+// 128K-token context, whose two buffers the hot cache's floor holds, also
+// where the limit holds the stores at their smallest, and beside a hot cache
+// target that holds them. Otherwise one buffer where a store binds, which
+// keeps the second's room, also where the table's share above its smallest
+// would hold it (the M6 at a 256K-token context), and two where none does,
+// the second taking its room from the KV kept resident beyond the first 64K
+// tokens: on the M5 Pro under --max-memory 44G, which loads the experts
+// whole.
 void testSecondStagingBufferOnlyWhereFree() {
   StreamedMemoryInputs inputs = kFlashNext.inputs(kM6);
   inputs.hardBudgetBytes = 14 * kGiB;
@@ -1082,6 +1090,38 @@ void testEnginePlanServesTheSpilledContext() {
           "a request's KV is not its pages, Full or Index");
 }
 
+// The resident context is the one a lone start takes: one request's KV in
+// whole extents beside its lane's state and what a target that spills holds
+// from its start whatever its requests, the Index runway (6,291,456 bytes on
+// Flash-Next) and the readers' page tables as they allocate them, the hot
+// block cache's 32,768 bytes and 278,528 for each staging buffer. Across the
+// budgets that leave the room past eight extents beside the state anything
+// from nothing to an extent less a byte, Flash-Next keeps its eighth extent
+// exactly where that room holds what it holds: beside the state alone, the
+// plan advertised the extent there too, which no lone start could take.
+void testResidentContextIsWhatALoneStartTakes() {
+  const kv::Layout layout = test::sparseKvLayout();
+  for (const Mac &mac : {kStudio, kM5Pro}) {
+    const StreamedMemoryPlan streamed = requirePlan(kFlashNext.inputs(mac));
+    const KvSpillPlan &spill = streamed.spill;
+    const uint64_t held = 6'291'456 + 32'768 + spill.stagingBuffers * 278'528;
+    require(spill.enabled && spill.indexRunwayBytes + spill.tableBytes == held,
+            std::string("the spill plan on the ") + mac.name + " does not count what its start holds");
+    const ModelMemoryProfile profile = kFlashNext.profile(streamed.expertBytes, streamed.tableBytes, spill);
+    const uint64_t extent = 256 * layout.bytesPerModelPage();
+    const uint64_t eight = profile.fixedRuntimeBytes() + kFlashNext.chunk.laneStatePlannedAllocatedBytes + 8 * extent;
+    for (const uint64_t room : {uint64_t{0}, held - 1, held, extent / 2, extent - 1}) {
+      const EngineMemoryBreakdown budget =
+          test::requireMemoryPlan(deviceOf(mac), profile, eight + room).breakdown();
+      const uint64_t extents = room < held ? 7 : 8;
+      require(budget.hardBudgetBytes == eight + room && budget.contextBounds.resident == extents * 8'192 - 7,
+              std::string("Flash-Next on the ") + mac.name + " with " + std::to_string(room) +
+                  " bytes past eight extents beside its state advertised " +
+                  std::to_string(budget.contextBounds.resident) + " resident tokens, not what a lone start takes");
+    }
+  }
+}
+
 // A disk bound below the resident context leaves the resident context, and
 // names what bounds the maximum.
 void testContextBoundNames() {
@@ -1186,6 +1226,7 @@ int main() {
     testServedPlanStagesAsTheSizedPlan();
     testPlanSetsTheStoresFloor();
     testEnginePlanServesTheSpilledContext();
+    testResidentContextIsWhatALoneStartTakes();
     testContextBoundNames();
     testDeviceValidationNamesTheMacosFloor();
     testDeviceValidationNamesTheThreadgroupWidth();

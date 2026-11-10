@@ -767,6 +767,39 @@ void testALoneStartMemoryCannotHoldTakesTheQuotasBound() {
               (spill.events.failureDetails.empty() ? std::string() : spill.events.failureDetails.front().first));
 }
 
+// A start alone within the context the memory plan advertises starts. At the resident bound
+// (ContextBounds::resident: 65,529 tokens, eight of Flash-Next's Full extents), in the room the plan
+// leaves those extents past its lane's buffers, which a warmup left pooled, and its Index runway, and in
+// that room and up to an extent less a byte more, a prompt with 32 tokens of output that fills it and
+// cannot spill (its quota short, its tier closed or its write budget spent) starts Resident and decodes
+// its output: its claim counts what the plan counts, its KV in whole extents and the lane buffers the
+// pool lacks, and no state its prefill captures, which takes buffers only where memory has them.
+// Charged a captured state's 118.75 MB beside its KV, a lone start on Qwen3.8-Flash-Next was refused an
+// extent of the context the plan advertised.
+void testALoneStartWithinTheResidentContextStarts() {
+  constexpr uint64_t extent = 256 * FlashNextLanes::kPages.fullBytes, lane = 276'496'384;
+  for (const uint64_t slack : {uint64_t{0}, extent / 2, extent - 1})
+    for (const Unspillable way : kUnspillable) {
+      Spilling spill{1'000, false, 0, 65'529, Spilling::Extent{256}, {}, {}, true, FlashNextLanes::kPages};
+      spill.model.laneFootprintBytes = lane;
+      spill.host.memory.hold("states", lane);
+      spill.model.heldStateBytes = lane;
+      spill.model.pooledLaneBytes = lane;
+      const uint64_t limit = test::GovernorLimits{}.limitBytes;
+      spill.host.memory.hold("limit", limit - std::min(limit, spill.host.memory.total() + 8 * extent + slack));
+      cannotSpill(spill, way);
+      EngineRequest alone = request(1, std::vector<uint32_t>(65'497, 1));
+      alone.maxNewTokens = 32;
+      spill.engine.submit(std::move(alone));
+      spill.runUntilIdle();
+      const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+      require(spill.events.completedCount == 1 && spill.events.failures.empty() && counts.resident == 1 &&
+                  counts.spill == 0 && spill.events.usage.at(1).second == 32 && spill.events.boundedIds.empty(),
+              "a start alone at the resident context in room for its extents and " + std::to_string(slack) +
+                  " B did not start Resident and decode its output" + unspillable(way) + failureDetail(spill.events));
+    }
+}
+
 // Beside a lane in service, a start that cannot spill, its quota short, its tier closed or its write
 // budget spent, and whose Resident KV that lane keeps memory from holding waits for it to end, then starts
 // and decodes: it never prefills beside it.
@@ -4193,11 +4226,11 @@ void testPlacementCountsWholeExtentsAndTheLanesStates() {
 // frees memory. Beside three cached conversations' states and a lane's
 // buffers in the pool, a 20-page prompt prefilled a page a command spills in
 // a room short of what its start takes, and runs Resident in that room plus
-// the lane's buffers and a state. Counted against the pool before the start,
-// it started Resident in the first room and failed at its KV.
+// the lane's buffers. Counted against the pool before the start, it started
+// Resident in the first room and failed at its KV.
 void testPlacementCountsTheLanesBuffersAStartTakesFromThePool() {
   constexpr uint64_t lane = 128, state = 64, shortRoom = 1'100;
-  for (const uint64_t room : {shortRoom, shortRoom + lane + state}) {
+  for (const uint64_t room : {shortRoom, shortRoom + lane}) {
     Spilling spill(Spilling::Governed{}, 1024, false, Spilling::Extent{4}, test::commandShape(KvCache::pageTokens));
     spill.model.laneFootprintBytes = lane;
     spill.model.decodeFinishes = true;
@@ -4220,13 +4253,15 @@ void testPlacementCountsTheLanesBuffersAStartTakesFromThePool() {
 }
 
 // A conversation's next turn starts from the pool its last turn left, a
-// lane's buffers, and its claims evict no state: placement charges it the
-// state it captures alone, and counts as room only the idle buffers beyond
-// those its start takes. A 20-page next turn prefilled a page a command,
-// beside no idle buffers and beside a second lane's, runs Resident in room
-// for its pages and that state, and spills in room for its pages alone.
-// Charged the lane's buffers whole, it spilled in both rooms; counting the
-// idle buffers its start takes as room, it started Resident in the second.
+// lane's buffers, and its claims evict no state: placement charges its start
+// nothing, as the memory plan charges a request its lane's buffers once, nor
+// the states its prefill captures, and counts as room only the idle buffers
+// beyond those its start takes. A 20-page next turn prefilled a page a
+// command, beside no idle buffers and beside a second lane's, runs Resident
+// in room for its pages, and spills in room a state's 64 bytes short of
+// them. Charged the lane's buffers whole, or the state its prefill captures,
+// it spilled in the first room; counting the idle buffers its start takes as
+// room, it started Resident in the second.
 void testPlacementCountsANextTurnsStartAtWhatItAllocates() {
   constexpr uint64_t lane = 128, state = 64;
   for (const uint64_t idle : {uint64_t{0}, lane})
@@ -4241,14 +4276,14 @@ void testPlacementCountsANextTurnsStartAtWhatItAllocates() {
       spill.host.memory.hold("states", idle);
       spill.model.heldStateBytes += idle;
       spill.model.reclaimableIdleStateBytes = idle;
-      spill.limit(spill.held() + 20 * spill.pool.bytesPerPage() + (fits ? state : 0));
+      spill.limit(spill.held() + 20 * spill.pool.bytesPerPage() - (fits ? 0 : state));
       spill.engine.submit(Spilling::prompt(1, 2, 20, 1));
       spill.runUntil([&] { return std::ranges::find(spill.events.startIds, 1) != spill.events.startIds.end(); },
                      "the next turn did not start");
       const SpillRequestsSnapshot placed = spill.engine.snapshot().spill;
       spill.runUntilIdle();
       const std::string name =
-          std::string(fits ? "the next turn in room for its state" : "the next turn without room for its state") +
+          std::string(fits ? "the next turn in room for its pages" : "the next turn short of room for its pages") +
           (idle ? " beside idle buffers" : "");
       require(spill.events.failedCount == 0 && spill.events.completedCount == 2, name + " failed");
       require(placed.spill == (fits ? 0U : 1U), name + (fits ? " spilled" : " started Resident"));
@@ -4259,12 +4294,11 @@ void testPlacementCountsANextTurnsStartAtWhatItAllocates() {
 // in whole extents past the free pages, as their claims take both from the
 // same extents: beside a lane that projects 6 pages more, a prompt that
 // fills whole extents spills in room half an extent short of the extents
-// both take, and runs Resident in room for them, each beside the state its
-// start captures. Counted in pages beside the prompt's extents, the lane's
-// growth fit the first room.
+// both take, and runs Resident in room for them. Counted in pages beside the
+// prompt's extents, the lane's growth fit the first room.
 void testPlacementCountsTheLanesGrowthInTheSameExtents() {
-  constexpr uint64_t state = 64, shortRoom = 4'600 + state;
-  for (const uint64_t room : {shortRoom, 4'800 + state}) {
+  constexpr uint64_t shortRoom = 4'600;
+  for (const uint64_t room : {shortRoom, uint64_t{4'800}}) {
     Spilling spill(Spilling::Governed{}, 1024, false);
     spill.model.time(test::passingTarget());
     EngineRequest lane = Spilling::prompt(3, 3, 7, 200);
@@ -4380,6 +4414,7 @@ std::span<const test::TestCase> spillTests() {
       {"testALoneStartTakesMemorysBound", testALoneStartTakesMemorysBound},
       {"testAResumeKeepsMemorysBound", testAResumeKeepsMemorysBound},
       {"testALoneStartMemoryCannotHoldTakesTheQuotasBound", testALoneStartMemoryCannotHoldTakesTheQuotasBound},
+      {"testALoneStartWithinTheResidentContextStarts", testALoneStartWithinTheResidentContextStarts},
       {"testAStartMemoryCannotHoldBesideALaneWaitsForIt", testAStartMemoryCannotHoldBesideALaneWaitsForIt},
       {"testAStartMemoryNeverHoldsIsDecidedOnceTheLaneEnds", testAStartMemoryNeverHoldsIsDecidedOnceTheLaneEnds},
       {"testAStartMemoryCannotHoldBesideALowerLaneMakesItYield",

@@ -117,12 +117,12 @@ struct ClaimId final {
 // buffers is stateBuffers that cached states return to the model's pool, or
 // one no cached state holds (unheldStateBuffer), which their states meet only
 // by the bytes their buffers free. afterStart: a need that counts a lane's
-// start and the state it captures, which take their buffers from the model's
-// pool before any unit's return to it (Model::startStateBytes); a buffer a
-// unit returns that they then take, not allocate, gives the need its bytes
-// as one the pool releases does, and a pooled one released that they would
-// have taken gives it none. kv: a need of KV pages (a TokenAdmission's),
-// whatever measure lacks them.
+// start, which takes its buffers from the model's pool before any unit's
+// return to it (Model::startStateBytes); a buffer a unit returns that it
+// then takes, not allocates, gives the need its bytes as one the pool
+// releases does, and a pooled one released that it would have taken gives
+// it none. kv: a need of KV pages (a TokenAdmission's), whatever measure
+// lacks them.
 struct Need final {
   uint64_t bytes = 0;
   bool hostRefused = false;
@@ -560,10 +560,10 @@ private:
   // to what it released before the run.
   [[nodiscard]] uint64_t pooledBytes(const VictimQuery &query, const Lacking &lack, uint32_t states,
                                      bool keepLane = true) const;
-  // What a lane's start and the state it captures take from the model's
-  // pool, for a need afterStart: what the pool releases without keeping a
-  // lane, less what it releases once they took theirs. What they lack of it
-  // they allocate (Model::startStateBytes).
+  // What a lane's start takes from the model's pool, for a need afterStart:
+  // what the pool releases without keeping a lane, less what it releases
+  // once the start took its buffers. What it lacks of them it allocates
+  // (Model::startStateBytes).
   [[nodiscard]] uint64_t startPooledBytes(const VictimQuery &query) const;
   // The query a claim's count and takes walk the sources with: its rights,
   // need and kept chain, and the free pages the sources' units move pages
