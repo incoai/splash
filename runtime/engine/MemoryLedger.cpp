@@ -43,6 +43,10 @@ const char *outcomeName(FreeOutcome outcome) noexcept {
 constexpr uint8_t decisionBit(FreeOutcome outcome) noexcept { return uint8_t(1U << static_cast<unsigned>(outcome)); }
 constexpr uint8_t kMetPastTheHost = 1U << 3U, kRefusedAfterMet = 1U << 4U;
 constexpr uint8_t kWaits = decisionBit(FreeOutcome::Pending) | decisionBit(FreeOutcome::Short);
+// How long a request's claim waits before its wait logs: past a copy's landing
+// and the tick after it, which is all each next page off the cache waits, and
+// short enough that a wait someone would ask about still shows.
+constexpr double kQuietWaitSeconds = 1.0;
 
 // Whether `decision` on `need` is new to request claim `claim` since its
 // last grant, which it marks: a kind of need is what it lacks, not how much.
@@ -809,10 +813,14 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
   // lines in one second, and one whose pages came a page at a time a pair
   // of lines a page (5,216 of a run's 5,812). Nor does a met at no cost: a
   // decode that took each next page from the cache logged a line a page,
-  // 1-2 a second through a whole reply. The grant after a logged wait says
-  // the wait ended (granted). A claim of no request logs each take.
-  const bool logs = spec.requestId ? !metAtNoCost && newDecision(claim, need, exempted ? kMetPastTheHost
-                                                                                         : decisionBit(result.outcome))
+  // 1-2 a second through a whole reply. Nor does a wait until it has lasted:
+  // the same pages, waiting a tick each for their copies to land, logged a
+  // pending and a granted a page. The grant after a logged wait says the wait
+  // ended (granted). A claim of no request logs each take.
+  const bool briefWait =
+      result.outcome == FreeOutcome::Pending && nowSeconds_ - claim.waitingSinceSeconds < kQuietWaitSeconds;
+  const bool logs = spec.requestId ? !metAtNoCost && !briefWait &&
+                                         newDecision(claim, need, exempted ? kMetPastTheHost : decisionBit(result.outcome))
                                    : run.has_value();
   if (logs)
     log(spec, need, run ? &*run : nullptr, result, exempted);
