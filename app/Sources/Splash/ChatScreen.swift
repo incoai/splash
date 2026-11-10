@@ -475,10 +475,17 @@ private struct ConversationView: View {
                     // a web view isn't to it.
                     .overlay(alignment: .top) { Rectangle().fill(.separator).frame(height: 1 / displayScale) }
             } else {
-                // A new chat: the mark, showing what the Server does, over the composer.
+                // A new chat: the mark, showing what the Server does, over the composer, and while a
+                // start warms up why it can take long, in the room under the mark, so that the
+                // composer stays in its place.
                 Spacer()
                 StatusMark(look: state.serverStatus.look, since: state.server.since, size: 44)
-                    .padding(.bottom, 28)
+                Text(state.serverStatus.note ?? "")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .padding(.horizontal, 32)
+                    .frame(height: 28)
             }
             // One composer either way, so that its text view, and what the input method composes
             // in it, stays when a chat gets its first message or a new chat opens.

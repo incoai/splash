@@ -53,8 +53,9 @@ struct MainViewTests {
 
     /// The Server button names the model while it starts, runs and answers, and says Server
     /// while none runs: its title holds no step or speed, so its width, and the place of the
-    /// toolbar's buttons beside it, stay while the server starts and answers. A server that
-    /// stops restarting its engine exits, failed in the words of its record, and the app's
+    /// toolbar's buttons beside it, stay while the server starts and answers. The status says
+    /// how far a warm-up is, as the record counts its steps, and why it can take long. A server
+    /// that stops restarting its engine exits, failed in the words of its record, and the app's
     /// status says it ran into a problem.
     @Test func theServerButtonSaysWhatTheServerDoes() async throws {
         let server = try FakeServer()
@@ -72,6 +73,9 @@ struct MainViewTests {
         server.signal("loaded")
         try await waitFor(state.server.step == .warming)
         #expect(state.serverTitle == name)
+        #expect(state.server.warmup == ServeRecord.Warmup(steps_done: 3, steps: 10))
+        #expect(state.status == "\(state.displayName(of: model)) · Warming up · 3 of 10")
+        #expect(state.serverStatus.note == Server.Step.warming.note)
         server.signal("warm")
         try await waitFor(state.server.phase == .ready)
         #expect(state.serverTitle == name)

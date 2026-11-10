@@ -51,12 +51,13 @@ private struct ServerSections: View {
         }
         let first = state.installed.isEmpty
         let failed = if case .failed = state.server.phase { true } else { false }
+        let warming = state.server.phase == .starting && state.server.step == .warming
         Group {
             if state.server.phase == .ready {
                 ActivitySection(advanced: advanced)
             }
-            if first || failed || state.installer.failure != nil || state.installer.finished != nil || state.installer.running
-                || state.keyProblem != nil {
+            if first || failed || warming || state.installer.failure != nil || state.installer.finished != nil
+                || state.installer.running || state.keyProblem != nil {
                 GroupedSection {
                     if let problem = state.keyProblem {
                         NoticeRow(title: "Splash can’t use its API key",
@@ -71,6 +72,7 @@ private struct ServerSections: View {
                                   log: .server, dismiss: state.server.dismissFailure,
                                   action: state.server.remedy.map { remedy in (remedy.title, { state.retry(model, with: remedy) }) })
                     }
+                    if warming { WarmupRow() }
                     if let failure = state.installer.failure {
                         let name = state.displayName(of: failure.model)
                         switch state.installer.work {
@@ -120,18 +122,19 @@ private struct ServerSections: View {
             }
         }
         .animation(Motion.settle, value: Layout(installed: state.installed.map(\.id), downloading: state.installer.running,
-                                                failure: state.installer.failure?.message, keyProblem: state.keyProblem,
-                                                finding: state.findingCachedModels, options: state.options,
-                                                family: state.family(of: state.selection)))
+                                                warming: warming, failure: state.installer.failure?.message,
+                                                keyProblem: state.keyProblem, finding: state.findingCachedModels,
+                                                options: state.options, family: state.family(of: state.selection)))
         .animation(Motion.settle, value: state.server.stage)
     }
 
-    /// What the screen holds besides the server's stage: the models, a download or a problem, and
-    /// the launch options, those the family of the model picked uses; the model picked is not in
-    /// it, so that picking one of the same family is immediate.
+    /// What the screen holds besides the server's stage: the models, a download, a start's warm-up
+    /// or a problem, and the launch options, those the family of the model picked uses; the model
+    /// picked is not in it, so that picking one of the same family is immediate.
     private struct Layout: Equatable {
         var installed: [String]
         var downloading: Bool
+        var warming: Bool
         var failure: String?
         var keyProblem: String?
         var finding: Bool
@@ -248,7 +251,7 @@ private struct ControlBar: View {
                 let seconds = Int(context.date.timeIntervalSince(server.stepSince))
                 Text(seconds < 3 ? "\(step)…" : "\(step) · \(seconds)s").monospacedDigit()
             }
-            .help(server.step == .warming ? "Running the model once so that its first answer comes quickly. The first start after an update also prepares its GPU programs, which can take a minute." : "")
+            .help(server.step.note ?? "")
         case .ready where !server.recovering:
             HStack(spacing: 4) {
                 Text(verbatim: "\(server.serving.rawValue) · Port \(server.settings.port)")
@@ -597,6 +600,32 @@ private struct DownloadRow: View {
         if remaining < .seconds(60) { return "\(amount) — less than a minute left" }
         let time = remaining.formatted(.units(allowed: [.hours, .minutes], width: .wide, maximumUnitCount: 1))
         return "\(amount) — about \(time) left"
+    }
+}
+
+/// A start's warm-up: how far it is, as the engine counts its steps (`Server.warmup`), and why it
+/// can take long. A step is one of the commands it runs, so the bar moves by them, not by time.
+private struct WarmupRow: View {
+    @Environment(AppState.self) private var state
+
+    var body: some View {
+        let server = state.server
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Warming up \(server.model.map(state.displayName(of:)) ?? "")").font(.headline)
+                Spacer()
+                if let warmup = server.warmup {
+                    Text("\(warmup.steps_done) of \(warmup.steps) steps").foregroundStyle(.secondary).monospacedDigit()
+                }
+            }
+            if let warmup = server.warmup {
+                ProgressView(value: Double(warmup.steps_done), total: Double(warmup.steps))
+            } else {
+                ProgressView().progressViewStyle(.linear)
+            }
+            Text(server.step.note ?? "").font(.callout).foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 4)
     }
 }
 

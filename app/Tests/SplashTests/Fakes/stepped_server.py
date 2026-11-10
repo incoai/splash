@@ -33,7 +33,7 @@ record("loading")
 after("loaded")
 if (root / "refused").exists():
     sys.exit(1)  # as the engine refuses a model it cannot serve
-record("warming")
+record("warming", warmup={"steps_done": 3, "steps": 10})
 after("warm")
 
 

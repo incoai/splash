@@ -847,6 +847,10 @@ struct ServerTests {
         let failure = try #require(record.failure)
         #expect(Server.problem(failure, port: 8000)
             == "It needs 10.1 GB of memory but the memory limit is 1 GB. Raise the memory limit in Launch Options.")
+        // A warm-up, with its steps done of all.
+        let warming = try JSONDecoder().decode(ServeRecord.self, from: Data(contentsOf: Self.goldens.appending(
+            path: "server/serve_record_warming_golden.json")))
+        #expect(warming.phase == .warming && warming.warmup == ServeRecord.Warmup(steps_done: 3, steps: 9))
     }
 
     @Test func wordsAnExitByItsOwnRecord() throws {

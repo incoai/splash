@@ -41,11 +41,17 @@ final class Server {
     /// What a start does, as the server's serve record gives it: the server starts, reads the
     /// model's weights into memory, then runs the model once at full size so that its first answer
     /// comes quickly; the first start after an update also prepares the GPU's programs then, which
-    /// can take a minute.
+    /// can take a couple of minutes.
     enum Step: String {
         case starting = "Starting"
         case loading = "Loading weights"
         case warming = "Warming up"
+
+        /// Why the step can take long, which the window says while it runs; nil for a step that
+        /// doesn't.
+        var note: String? {
+            self == .warming ? "The first start after an update prepares the GPU and can take a couple of minutes." : nil
+        }
 
         /// The step of a start at `phase`; nil once the start has ended.
         init?(_ phase: ServeRecord.Phase) {
@@ -74,6 +80,14 @@ final class Server {
     /// While starting: what the start does, and since when.
     private(set) var step = Step.starting
     private(set) var stepSince = Date.now
+    /// While warming: how far the engine's warm-up is, as the serve record last gave it; nil until
+    /// it says.
+    private(set) var warmup: ServeRecord.Warmup?
+    /// While starting: its step as the window words it, with how far the warm-up is once it says.
+    var stepPhrase: String {
+        guard step == .warming, let warmup else { return "\(step.rawValue)…" }
+        return "\(step.rawValue) · \(warmup.steps_done) of \(warmup.steps)"
+    }
     /// The model starting, served or last failed.
     private(set) var model: String?
     /// The start to make once the model stopping has stopped.
@@ -260,6 +274,7 @@ final class Server {
         since = .now
         step = .starting
         stepSince = .now
+        warmup = nil
         phase = .starting
         do {
             // It stops as SIGTERM stops it once this app has ended, a crash too, giving its memory
@@ -402,6 +417,8 @@ final class Server {
     private func follow(_ pid: pid_t) async {
         while !Task.isCancelled, phase == .starting {
             if let record = runtime.serveRecord(port: settings.port), record.pid == pid {
+                // Kept through the ready record, which has none, until the start ends.
+                if let counted = record.warmup, counted != warmup { warmup = counted }
                 if let next = Step(record.phase), next != step {
                     step = next
                     stepSince = .now

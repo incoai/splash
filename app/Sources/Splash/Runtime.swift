@@ -319,14 +319,21 @@ private final class PipeOutput: @unchecked Sendable {
 }
 
 /// What a launcher writes of its start, as itself or as the server it runs as: the process, the
-/// phase of its start, and, for a server that ended on a failure, at its start or once ready,
-/// why: the class of the failure, with what it needed against what it had for a shortfall, and
-/// its message.
+/// phase of its start, while warming how far the warm-up is, and, for a server that ended on a
+/// failure, at its start or once ready, why: the class of the failure, with what it needed against
+/// what it had for a shortfall, and its message.
 struct ServeRecord: Decodable, Equatable {
     /// Starting; loading the model's weights; running the model once (warming); answering; or
     /// failed.
     enum Phase: String, Decodable {
         case starting, loading, warming, ready, failed
+    }
+
+    /// The steps of the engine's warm-up done, of all, as it begins and as each step ends: a step
+    /// is one of the commands it runs, not a share of its time.
+    struct Warmup: Decodable, Equatable {
+        let steps_done: Int
+        let steps: Int
     }
 
     struct Failure: Decodable, Equatable {
@@ -344,6 +351,7 @@ struct ServeRecord: Decodable, Equatable {
 
     let pid: Int32
     let phase: Phase
+    let warmup: Warmup?
     let failure: Failure?
 }
 

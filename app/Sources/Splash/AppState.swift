@@ -156,11 +156,12 @@ final class AppState {
     /// Whether the models the Hugging Face cache holds are still being looked for.
     var findingCachedModels: Bool { cachedInstaller != nil }
 
-    /// What the server does: the look of its mark, and the phrase most views say of the model
-    /// that runs.
+    /// What the server does: the look of its mark, the phrase most views say of the model that
+    /// runs, and why a start's step can take long, which views say under it where there is room.
     struct ServerStatus {
         let look: MarkLook
         let phrase: String
+        var note: String?
     }
 
     var serverStatus: ServerStatus {
@@ -168,7 +169,7 @@ final class AppState {
         case .stopped:
             return ServerStatus(look: .off, phrase: "Not running")
         case .starting:
-            return ServerStatus(look: .loading, phrase: "\(server.step.rawValue)…")
+            return ServerStatus(look: .loading, phrase: server.stepPhrase, note: server.step.note)
         case .stopping:
             guard let next = server.next else { return ServerStatus(look: .off, phrase: "Stopping…") }
             return ServerStatus(look: .off, phrase: next == server.model ? "Restarting…" : "Switching to \(displayName(of: next))…")

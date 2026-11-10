@@ -28,6 +28,11 @@ struct MenuBarPanel: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
+            // While warming, why the start can take long.
+            if let note = state.serverStatus.note {
+                Text(note).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 10).padding(.bottom, 6)
+            }
             if server.phase == .ready {
                 totals(server.activity)
             }
