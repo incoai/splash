@@ -1499,6 +1499,25 @@ const MemoryAccountSnapshot *accountOf(const MemoryGovernorSnapshot &memory, std
   return found == memory.accounts.end() ? nullptr : &*found;
 }
 
+// At Ready the plan counts every buffer the backend allocates: the memory
+// audit finds none outside its categories. The governor charges each buffer
+// whole beside the runtime reserves, so a byte the plan leaves out is a byte
+// one request's KV lacks: the decode arena's scratch counted short of its
+// whole pages left Qwen3.8-Flash-Next's context at --max-memory 9.4G a KV
+// extent more than one request could use.
+void testThePlanCountsEveryBuffer(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-plan-buffers");
+  std::string log;
+  const std::unique_ptr<ServingRuntime> bootstrap =
+      bootstrapOf(loadableConfig(metallibPath, root.path(), "plan-buffers"), log);
+  RuntimeResources &resources = bootstrap->resources();
+  const MemoryAuditResult audit = auditActualMemory(
+      resources.memoryPlan(), resources.actualMemoryReport(bootstrap->modelRuntime().actualRuntimeMemory()));
+  require(audit.valid && !audit.backendUnclassifiedBytes,
+          "the backend holds " + std::to_string(audit.backendUnclassifiedBytes) +
+              " bytes of buffers the memory plan does not count");
+}
+
 // The ledger's accounts sum to what the governor charges: at Ready a start of
 // streamed experts books the KV pages and the lane states as their storage
 // counts them and the expert store as its pool reports it, and the fixed
@@ -1888,6 +1907,7 @@ int main(int argc, char **argv) {
       testTableShareHoldsAPromptsIds(argv[1]);
       testTheTableIgnoresTheHostsSpareMemory(argv[1]);
       testEngineFollowsTheGovernor(argv[1]);
+      testThePlanCountsEveryBuffer(argv[1]);
       testDenseRuntimeBoundary(argv[1]);
       testSpilledRuntimeBoundary(argv[1]);
       {

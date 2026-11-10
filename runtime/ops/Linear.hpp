@@ -170,7 +170,6 @@ struct PrefillFfnBuffers final {
 };
 struct LinearScratchSize final {
   uint64_t input = 0, sums = 0, partials = 0, counters = 0, rotated = 0;
-  [[nodiscard]] uint64_t bytes() const noexcept { return input + sums + partials + counters + rotated; }
   // Grows each field to hold `other`'s too.
   LinearScratchSize &include(const LinearScratchSize &other) noexcept {
     input = std::max(input, other.input);

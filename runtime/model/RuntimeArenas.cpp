@@ -351,11 +351,18 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
 
 uint64_t decodeArenaBytes(const RuntimeGeometry &geometry,
                          const ops::ExecutionPlans &operators) {
-  return checkedAdd(decodeArenaBaseBytes(geometry, operators),
-                    checkedAdd(DecodeArena::gateScratchBytes(geometry, operators),
-                               DecodeArena::linearScratchSize(geometry, operators).bytes(),
-                               "linear decode scratch"),
-                    "planned gate scratch");
+  // Metal allocates a buffer in whole host pages and the memory ledger
+  // charges what it allocates, so the arena allocates each scratch buffer
+  // beside its base in whole pages and the plan counts them so: counted as
+  // the fields' sum, Qwen3.8-Flash-Next's 122,880 bytes of linear sums took
+  // 131,072, and the 8,192 bytes the plan left out cost one request's KV a
+  // whole extent, 8,192 tokens of its context at --max-memory 9.4G.
+  const ops::LinearScratchSize linear = DecodeArena::linearScratchSize(geometry, operators);
+  uint64_t bytes = decodeArenaBaseBytes(geometry, operators);
+  for (const uint64_t scratch : {DecodeArena::gateScratchBytes(geometry, operators), linear.input, linear.sums,
+                                 linear.partials, linear.counters, linear.rotated})
+    bytes = checkedAdd(bytes, alignUp(scratch), "decode scratch");
+  return bytes;
 }
 
 uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
