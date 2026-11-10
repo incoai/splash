@@ -2,6 +2,7 @@
 #include "TestChecks.hpp"
 #include "ops/GDN.hpp"
 #include "ops/Linear.hpp"
+#include "ops/KernelSelection.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PagedAttention.hpp"
 #include "metal/abi/ExecutionGeometry.h"
@@ -77,6 +78,24 @@ Projection blockProjection(uint32_t n, uint32_t k, uint32_t segments, uint32_t f
 // destination keeps the configuration, input table and scratch of its bf16
 // plan on every family and core count, and only plain decode workloads take
 // one. ggufProjectionMatrix checks the fp32 kernel it encodes.
+// Table16 is a physical eight-row format, independent of request geometry.
+void tablePackingGeometry() {
+  constexpr uint32_t width = 6144;
+  static_assert(GGUF_TABLE16_ROWS == 8);
+  static_assert(GGUF_REGISTER_MAXIMUM_TILES == 4);
+  for (uint32_t rows : {8U, 16U, 24U, 32U, 48U, 64U}) {
+    const uint64_t expected = uint64_t{rows} * (width / 16 + width / 32) * sizeof(float);
+    require(tableSumsBytes(LinearInput::Table16, width, rows) == expected,
+            "Table16 sums must be allocated per physical eight-row tile");
+    const KernelCalibration calibration = KernelCalibration::of(simulatedDevice(9, 40));
+    const auto plan = selectProjection(calibration, {{128, 5120}, rows},
+                                       {.formatClass = FormatClass::FourBitsOrMore,
+                                        .registerTakes = true, .weightBits16 = 72});
+    require(plan.tile == (rows <= 32 ? LinearTile::GgufRegister : LinearTile::GgufStaged),
+            "register selection must reject unavailable fifth through eighth table tiles");
+  }
+}
+
 void floatOutputPlans() {
   const auto fp32 = [](Projection p) {
     p.destination = FloatOutput::Float32;
@@ -1358,6 +1377,7 @@ void registerSplitUnits(metal::MetalBackend &backend) {
 int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: linear-plan <production.metallib|--cpu>");
+    tablePackingGeometry();
     ggufPlans();
     scratchBoundsRotated();
     ggufCoreLaws();

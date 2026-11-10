@@ -363,7 +363,7 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
   const LinearWorkload w = plan.workload();
   const LinearConfig config = plan.configuration();
   const auto [n, k] = w.matrix;
-  const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
+  const uint32_t tableTiles = w.rows / GGUF_TABLE16_ROWS;
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
   for (const Projection *q : {&p, gate})
     if (q)
@@ -379,9 +379,9 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
       }
   if (b.prepared.layout != LinearInput::Table16 || !b.prepared.source.sameView(b.input))
     graph.add("decode_linear_gguf_prepare", {b.input, b.scratch.input, b.scratch.sums}, k,
-              {k / 32, lanes, 1}, {128, 1, 1});
+              {k / 32, tableTiles, 1}, {128, 1, 1});
   const metal::DispatchSize grid{segmentColumns(p) / GGUF_TILE_COLUMNS, config.splits, 1};
-  const std::string suffix = "_l" + std::to_string(lanes);
+  const std::string suffix = "_l" + std::to_string(tableTiles);
   const auto [partials, counters] = splitScratch(b, config.splits);
   if (segments.size() > 1) {
     std::vector<const QuantizedSegment *> order;

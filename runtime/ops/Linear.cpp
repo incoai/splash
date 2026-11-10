@@ -102,12 +102,12 @@ Projection Projection::leadingInputs(uint32_t inputs) const {
 // Table16 holds its sums per eight-row tile (metal/abi/Gguf.h), a lane's rows.
 uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept {
   return layout == LinearInput::Table16
-             ? rows / SPLASH_TARGET_VERIFY_ROWS * table16_sums_per_tile(width) * sizeof(float)
+             ? rows / GGUF_TABLE16_ROWS * table16_sums_per_tile(width) * sizeof(float)
              : 0;
 }
 
 void requireTableScratch(const LinearScratch &scratch, LinearInput layout, uint32_t width, uint32_t rows) {
-  if (layout == LinearInput::Plain || !rows || rows % SPLASH_TARGET_VERIFY_ROWS || width % 64)
+  if (layout == LinearInput::Plain || !rows || rows % GGUF_TABLE16_ROWS || width % 64)
     throw std::invalid_argument("invalid linear table geometry");
   requireBytes(scratch.input, tableBytes(width, rows), "linear table");
   requireBytes(scratch.sums, tableSumsBytes(layout, width, rows), "linear table sums");

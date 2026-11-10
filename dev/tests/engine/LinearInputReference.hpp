@@ -25,7 +25,7 @@ inline void addReferencePreparation(metal::CommandGraph &graph, ops::LinearInput
                                     uint32_t lanes) {
   if (layout == ops::LinearInput::Plain)
     throw std::invalid_argument("a plain input has no table to prepare");
-  graph.add("decode_linear_gguf_prepare", {input, table, sums}, width, {width / 32, lanes, 1}, {128, 1, 1});
+  graph.add("decode_linear_gguf_prepare", {input, table, sums}, width, {width / 32, lanes * SPLASH_TARGET_VERIFY_ROWS / GGUF_TABLE16_ROWS, 1}, {128, 1, 1});
 }
 
 } // namespace splash::test

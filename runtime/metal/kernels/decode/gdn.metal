@@ -394,9 +394,12 @@ inline void gdn_decode_batch_phase(
     for (uint g = 0; g < HeadDim / 64; ++g) {
       const uint column = head * HeadDim + g * 64 + 2 * lane;
       const uint local = simd_group * HeadDim + g * 64 + 2 * lane;
-      Table::write(table + ulong(batch) * ValueWidth * Rows,
-                   sums + ulong(batch) * Table::sums_per_tile(ValueWidth), ValueWidth,
-                   column / 64, simd_group, lane, shared.rows[local], shared.rows[local + 1]);
+      // Table16 packs eight rows independently of the request verify width.
+      const uint table_row = batch * Rows + simd_group;
+      const uint table_tile = table_row / gguf_sg::kRows;
+      Table::write(table + ulong(table_tile) * ValueWidth * gguf_sg::kRows,
+                   sums + ulong(table_tile) * Table::sums_per_tile(ValueWidth), ValueWidth,
+                   column / 64, table_row % gguf_sg::kRows, lane, shared.rows[local], shared.rows[local + 1]);
     }
   }
 }

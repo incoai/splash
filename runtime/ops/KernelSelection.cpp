@@ -114,6 +114,7 @@ SplitChoice waveSplits(const WaveLaw &law, uint32_t n, uint32_t k, uint32_t rows
 // `columnTiles` column tiles of a unit of `formatClass` (RegisterBoundary).
 bool registers(const RegisterBoundary &boundary, FormatClass formatClass, uint32_t lanes, uint64_t columnTiles,
                uint32_t cores) {
+  if (!lanes || lanes > GGUF_REGISTER_MAXIMUM_TILES) return false;
   return 4 * columnTiles * lanes < uint64_t{boundary.belowQuarters[size_t(formatClass)][lanes - 1]} * cores;
 }
 
@@ -183,7 +184,7 @@ LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorklo
   const bool gateUp = w.epilogue == LinearEpilogue::GateUp,
              onePass = gateUp && unit.oneFormat && cores >= p.onePassFromCores;
   if (unit.registerTakes &&
-      registers(p.decodeRegister, unit.formatClass, lanes, (onePass ? 2 : 1) * uint64_t{n / GGUF_TILE_COLUMNS},
+      registers(p.decodeRegister, unit.formatClass, w.rows / GGUF_TABLE16_ROWS, (onePass ? 2 : 1) * uint64_t{n / GGUF_TILE_COLUMNS},
                 cores))
     return {.tile = LinearTile::GgufRegister,
             .splits = splitsFor(p.registerSplits, n, k, w.rows, unit.weightBits16, cores).splits};
@@ -213,7 +214,7 @@ std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibrat
   const uint32_t cores = calibration.cores, n = w.matrix.outputSize, k = w.matrix.inputSize;
   std::vector<LinearConfig> configurations{
       selectProjection(calibration, w, {.registerTakes = registerTakes})};
-  if (registers(p.decodeRegister, FormatClass::FourBitsOrMore, w.rows / SPLASH_TARGET_VERIFY_ROWS,
+  if (registers(p.decodeRegister, FormatClass::FourBitsOrMore, w.rows / GGUF_TABLE16_ROWS,
                 n / GGUF_TILE_COLUMNS, cores))
     configurations.push_back(staged(p, n, k, w.rows, 0, cores, Passes::Two));
   if (w.epilogue == LinearEpilogue::GateUp && cores >= p.onePassFromCores)
