@@ -113,7 +113,7 @@ TakeRights takeRights(const ClaimSpec &spec, const Need &need, MemoryPressure pr
           .storeAboveFloor = !belowALane && ((inService && waits) || hostCritical),
           .passCommand = inService && waits && spec.supersedes,
           .convertLane = inService && waits && spec.kvGrowth ? spec.requestId : 0,
-          .lanes = need.hostRefused                                        ? Lanes::Own
+          .lanes = need.hostRefused || spec.laneNeeds                      ? Lanes::Own
                    : host && pressure != MemoryPressure::Normal            ? Lanes::All
                    : waits && (inService || spec.cls == ClaimClass::Start) ? Lanes::AtOrBelow
                                                                            : Lanes::None,

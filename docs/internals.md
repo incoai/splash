@@ -1561,6 +1561,7 @@ every source of units reads (`MemoryLedger::Order`, `Cache::walkFor`):
 | `InService`, immediate | yes | no | yes | no | no | no | yes | yes | no | no |
 | `Start` | yes | yes | yes | no | its priority's or lower | no | yes | no | no | no |
 | `Optional` of a request | yes | no | yes | no | no | no | yes | no | no | no |
+| `Optional` KV its lane takes anyway (`laneNeeds`) | yes | no | yes | no | its own | no | yes | no | no | no |
 | `Optional` of the engine's own, of no request | no | no | no | no | no | no | no | no | no | no |
 | `Growth` | yes | no | no | no | no | no | no | no | no | no |
 | `Host` with a deficit | yes | yes | yes | no | every lane's under warning pressure; none at normal | no | no | no | no | no |
@@ -1574,6 +1575,13 @@ macOS's pressure is above normal: under warning its pass for its deficit
 releases them, the lowest-ranked lane's first, as its pass under critical
 pressure does, which gives the host what a lane gave back as its copies landed
 before lanes kept their pages; at normal pressure its deficit leaves them Full.
+
+The KV past a prefill command's first boundary is the `Optional` claim its lane
+takes anyway (`ClaimSpec::laneNeeds`): refused, it cuts the command there, and
+the lane's next command takes that KV, releasing the lane's landed pages. So it
+releases its own lane's pages itself: a cut costs the command's fixed work
+again, on Qwen3.8-Flash-Next a pass of the routed experts, which stream, and 14
+cuts made a 237K-token prompt past the memory wall 8% slower to its first token.
 
 The resume point is the newest ordinary state in RAM (`StateCache::resumePoint`),
 the one a conversation's next turn most likely resumes from. A claim of no
