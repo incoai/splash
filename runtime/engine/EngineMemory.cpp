@@ -974,7 +974,7 @@ std::vector<Victim> Engine::EngineVictims::releases(const VictimQuery &query) co
   // first reads, extents and free pages beside those before it leave: a
   // page lanes share counts once (ReleaseCount).
   const bool forBytes = query.need.bytes && !query.need.hostRefused;
-  ReleaseCount count{.beside = forBytes ? engine.cache_.releaseBeside(query.need) : 0};
+  ReleaseCount count{.beside = forBytes ? engine.cache_.releaseBeside(query) : 0};
   const uint64_t extentPages = engine.cache_.extentPages();
   const auto offer = [&](uint64_t id, uint32_t pages, uint64_t reads, bool landing) {
     const Cache::ReleaseMoves moves =
@@ -1166,7 +1166,7 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
     }();
     const uint32_t moved = engine.cache_.releasePages(
         victim.key, pages, inPlace, rule, [&](uint64_t bytes) { engine.governor().fund(bytes); },
-        inPlace ? 0 : engine.cache_.releaseBeside(query.need));
+        engine.cache_.releaseBeside(query));
     if (!moved)
       return {};
     // Critical pressure refuses a lane's first reads at its next prepare:
