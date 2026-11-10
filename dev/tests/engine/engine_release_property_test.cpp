@@ -273,6 +273,72 @@ void placeBesideTwoLanes(bool shared, uint32_t pages) {
 void testAStartPlacedResidentOnTwoLanesReleasesPrefillsWithoutAYield() { placeBesideTwoLanes(false, 4'100); }
 void testAStartPlacedResidentOnALanesConversationPrefillsWithoutAYield() { placeBesideTwoLanes(true, 2'300); }
 
+// Invariant 2 for a page in place: a lone Spill lane decodes at the wall, with no free Full page and no room, beside
+// the two empty Index extents a lane's end left, the runway and one more. Its growth lacks a Full extent's bytes or a
+// Full page in place, and its count covers the page: a reclaim releases the empty Index extent past the runway
+// (Cache::releaseExtent), and the lane's release moves its oldest page whose copy landed into those free Index pages,
+// beside the runway (Cache::inPlaceMoves): fewer than an extent and a page of such pages move no extent more. Taken in
+// turn, the reclaim went first, the release found only the runway and moved nothing, and the lane ended at its length
+// after 24 of its 400 tokens. Its page now moves beside the runway into an extent of the room the reclaim left: the
+// run frees what it counted, and the lane decodes on.
+void testAReleaseInPlaceAfterAReclaimOfItsIndexPagesFreesWhatItCounted() {
+  constexpr uint32_t kExtentPages = 16;
+  Wall lanes(kExtentPages, kPageIds);
+  Spilling &spill = lanes.spill;
+  lanes.startSpill(Spilling::prompt(1, 1, 200, 400));
+  lanes.decode(1, 4);
+  lanes.quiet();
+  // An earlier wall's release: the lane's pages whose copies landed in whole extents, which leaves it fewer than an
+  // extent of them; then its hot block floor, while the room holds it.
+  const ReleaseRule every{.takesFrom = [](uint64_t) { return true; }};
+  {
+    const test::ClaimScope scope(spill.host.governor, ClaimSpec{.cls = ClaimClass::InService, .requestId = 1});
+    const uint32_t clean = spill.cache.releasablePages(1, every).clean;
+    require(spill.cache.releasePages(1, clean / kExtentPages * kExtentPages, false, every) != 0,
+            "the lane released none of its pages");
+  }
+  spill.allowSpillWrites(true);
+  lanes.decode(1, 8);
+  lanes.quiet();
+  // The Index extents a lane's end left empty, and no free Full page.
+  {
+    const test::ClaimScope scope(spill.host.governor, ClaimSpec{.cls = ClaimClass::InService, .requestId = 1});
+    const KvPageAcquisition index = spill.pool.acquirePages(2 * kExtentPages, kv::PageForm::Index);
+    require(index.granted(), "the Index extents were not allocated");
+    for (const uint32_t page : index.pages)
+      spill.pool.releasePage(page, false);
+  }
+  const KvPageAcquisition held = spill.pool.acquirePages(spill.pool.freePageCount());
+  const uint32_t clean = spill.cache.releasablePages(1, every).clean;
+  require(held.granted() && spill.pool.emptyExtents(kv::PageForm::Index) == 2 && clean != 0 && clean <= kExtentPages,
+          "the lane held " + std::to_string(clean) + " pages whose copies landed beside " +
+              std::to_string(spill.pool.emptyExtents(kv::PageForm::Index)) + " empty Index extents: " + lanes.pool());
+  lanes.wall();
+  spill.allowSpillWrites(true);
+  const MemoryLedger::CountChecks before = spill.host.governor.snapshot().countChecks;
+  const uint32_t indexPages = spill.cache.indexPages(1);
+  spill.runUntil(
+      [&] {
+        return spill.events.usage.contains(1) || spill.engine.snapshot().resourceSuspensions != 0 ||
+               spill.cache.indexPages(1) > indexPages;
+      },
+      "the lane neither moved a page in place nor ended");
+  const MemoryLedger::CountChecks after = spill.host.governor.snapshot().countChecks;
+  const bool ended = spill.events.usage.contains(1);
+  require(after.coveredRuns != before.coveredRuns && after.overcountedRuns == before.overcountedRuns && !ended &&
+              spill.engine.snapshot().resourceSuspensions == 0,
+          "at the wall " + std::to_string(after.coveredRuns - before.coveredRuns) + " counts covered the lane's page, " +
+              std::to_string(after.overcountedRuns - before.overcountedRuns) + " of them freed less, and the lane " +
+              (ended ? "ended after " + std::to_string(spill.events.outputs[1].size()) + " tokens"
+                     : spill.engine.snapshot().resourceSuspensions ? std::string("yielded")
+                                                                   : std::string("moved its page in place")));
+  for (const uint32_t page : held.pages)
+    spill.pool.releasePage(page, false);
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(spill.events.failures.empty() && spill.events.usage.at(1).second == 400, "the lane did not complete");
+}
+
 // A conversation's prompt: `pages` whole pages of tokens from `first` on, and a token more.
 std::vector<uint32_t> conversation(uint32_t first, uint32_t pages) {
   std::vector<uint32_t> tokens(pages * KvCache::pageTokens + 1);
@@ -834,6 +900,8 @@ std::span<const test::TestCase> releaseTests() {
        testAStartPlacedResidentOnTwoLanesReleasesPrefillsWithoutAYield},
       {"testAStartPlacedResidentOnALanesConversationPrefillsWithoutAYield",
        testAStartPlacedResidentOnALanesConversationPrefillsWithoutAYield},
+      {"testAReleaseInPlaceAfterAReclaimOfItsIndexPagesFreesWhatItCounted",
+       testAReleaseInPlaceAfterAReclaimOfItsIndexPagesFreesWhatItCounted},
       {"testAReleaseBesideWritesInFlightFreesWhatItCounts", testAReleaseBesideWritesInFlightFreesWhatItCounts},
       {"testRandomConversationTreesKeepTheReleaseCounts", testRandomConversationTreesKeepTheReleaseCounts},
   };
