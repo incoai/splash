@@ -888,6 +888,9 @@ public:
   // written through or copied ahead that spills once its copy lands. A
   // walk's takes wait for those that return to it (transfersInFlight(walk)).
   [[nodiscard]] bool transfersInFlight() const noexcept;
+  // A write of any class is in flight, a page's written through among them,
+  // whose landing lets a release free the page, or the one state write.
+  [[nodiscard]] bool writesInFlight() const noexcept;
   // The most pages of the form a page need's evictions can leave free: every
   // allocated page of the form no request holds, but with Ordinary not the
   // idle KV that states in use restore through.

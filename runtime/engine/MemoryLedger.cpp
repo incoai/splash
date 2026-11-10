@@ -676,10 +676,11 @@ uint64_t MemoryLedger::takeUnsized(const VictimQuery &query) {
 // a claim that can wait (never the host's, whose pass's target is net of what
 // lands) waits when what is landing, with its own lanes' owed copies, meets its
 // need (or would, but for claims ranked above it). Else, when the most the
-// order gives (bound) meets the rest, its units are taken one at a time until
-// what they freed now and later meets it (take), and the claim waits for what
-// lands unless they meet it alone; one they do not meet waits while what it
-// reached or started lands, else is Short. Else nothing is taken, and it waits
+// order gives (bound) meets the rest, or the claim is lone and lacks bytes, its
+// units are taken one at a time until what they freed now and later meets it
+// (take), and the claim waits for what lands unless they meet it alone; one
+// they do not meet waits while what it reached or started lands, or, lone,
+// while it took something, else is Short. Else nothing is taken, and it waits
 // when every copy in flight or owed would meet it. A claim refused bytes lacks
 // what admission asks beyond the room: its need plus the room held against it.
 // A need met in place lacks no bytes. A need the host refused counts only units
@@ -754,11 +755,21 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
     const Run most = bound(query, lack);
     if (most.uncopied)
       uncopiedReachedSeconds_ = nowSeconds_;
-    if (most.covered) {
+    // Short only by the room waiting claims ranked above it hold, it waits
+    // for them: Short would end a lone lane as if at its capacity
+    // (Engine::judge).
+    const bool heldAbove = canWait && lackingBytes && held &&
+                           saturatingAdd(saturatingAdd(most.bytes, creditBytes), held) >= lackingBytes;
+    // A lone claim (ClaimSpec::lone) lacking bytes takes what the order gives
+    // whatever the count: no lane yields for it, and the count adds up each
+    // unit in whole extents of its own, so their takes can free more together
+    // (316.5 MiB where a lane alone in decode counted 219 MiB).
+    const bool lone = spec.lone && canWait && lack.bytes && most.bytes;
+    if (most.covered || lone) {
       const uint64_t refusals = refusals_;
       run = take(query, lack);
-      ++checks_.coveredRuns;
-      checks_.overcountedRuns += !run->covered && !run->pending && refusals_ == refusals;
+      checks_.coveredRuns += most.covered;
+      checks_.overcountedRuns += most.covered && !run->covered && !run->pending && refusals_ == refusals;
       if (run->uncopied)
         uncopiedReachedSeconds_ = nowSeconds_;
       FreeResult taken = run->freed;
@@ -772,18 +783,15 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
                          (lackingPages && run->pages >= lackingPages) ||
                          (need.stateBuffers && run->buffers >= need.stateBuffers);
       // Not met, it waits while what it reached or started lands, or as
-      // every copy in flight or owed would meet it.
-      const bool landing = run->pending || taken.laterBytes || waits(true);
+      // every copy in flight or owed would meet it, or, lone, while it took
+      // something or what is held above it would.
+      const bool landing = run->pending || taken.laterBytes || waits(true) ||
+                           (lone && (!run->took.empty() || heldAbove));
       const FreeOutcome outcome = !run->covered ? (landing ? FreeOutcome::Pending : FreeOutcome::Short)
                                   : alone        ? taken.outcome
                                                  : FreeOutcome::Pending;
       result = {outcome, saturatingAdd(result.nowBytes, taken.nowBytes), taken.laterBytes, run->pages, run->buffers};
     } else {
-      // Short only by the room waiting claims ranked above it hold, it waits
-      // for them and takes nothing: Short would end a lone lane as if at its
-      // capacity (Engine::judge).
-      const bool heldAbove = canWait && lackingBytes && held &&
-                             saturatingAdd(saturatingAdd(most.bytes, creditBytes), held) >= lackingBytes;
       result.outcome = waits(true) || heldAbove ? FreeOutcome::Pending : FreeOutcome::Short;
     }
   }

@@ -973,10 +973,10 @@ bool Engine::admit(Request &active, double now) {
   };
   auto state = allocate(begin, spec, Refusal::Waits);
   // The request's own lease goes only when nothing else can free memory
-  // (judge() says Fail: no other lane is resident, nothing is pending, the
-  // host is not refusing). It then starts without the pin rather than wait
-  // for ever, and looks up again once it holds its lane, so a state the
-  // ledger wrote to disk is restored, not recomputed.
+  // (judge() says Fail: no other lane is resident, nothing is pending or in
+  // flight, the host is not refusing). It then starts without the pin rather
+  // than wait for ever, and looks up again once it holds its lane, so a state
+  // the ledger wrote to disk is restored, not recomputed.
   bool droppedLease = false;
   if (!state.admission.granted() && lookup.state && memoryDenied(state.admission) &&
       judge(state.denial, active.request.id) == Verdict::Fail) {

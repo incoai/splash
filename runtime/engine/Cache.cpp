@@ -1747,6 +1747,8 @@ bool Cache::transfersInFlight() const noexcept {
   return transfersInFlight(Walk{.scope = {.upTo = ReclaimClass::InUse}});
 }
 
+bool Cache::writesInFlight() const noexcept { return !writes_.empty() || states_.writing(); }
+
 bool Cache::transfersInFlight(const Walk &walk) const noexcept {
   // A write counts by what its landing frees: a page written through or
   // copied ahead returns something only where, under --kv-spill always, it

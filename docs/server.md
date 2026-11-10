@@ -351,8 +351,10 @@ aliases. Clients can impose a smaller limit. This is a capacity limit, not a
 guarantee of a fast first token for a long uncached prompt. If the model cannot
 fit, startup prints a memory budget breakdown and stops.
 
-A request that cannot fit even alone, after every cached prefix was evicted
-and the expert store shrank to its floor, fails with `capacity_exhausted`. Its
+A request fails with `capacity_exhausted` only alone and once nothing else
+holds memory it could get: every cached prefix it may take evicted, the expert
+store at its floor and no write to the SSD cache in flight. Short of that it
+waits, and beside other requests one of them yields instead. Its
 message names what it could not allocate, its lane's KV mode (`Resident`, its
 KV in memory, or `Spill`, its KV partly [on the SSD](#kv-on-the-ssd)), its
 phase and its tokens, and the Metal memory outside the server's buffers then

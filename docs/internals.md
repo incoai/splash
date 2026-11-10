@@ -1566,8 +1566,12 @@ take is skipped, not a stop:
    them.
 9. The engine: it waits for copies in flight that cover the need. Else, when
    no lane's growth fits, the lane that yields first is suspended; while other
-   lanes fit, a refused lane waits for them, resident. A lane alone that
-   nothing meets fails with `capacity_exhausted` (`Engine::judge`).
+   lanes fit, a refused lane waits for them, resident. A lane alone, or a
+   start with no lane in service, waits while its claim takes something
+   ([below](#what-a-refused-claim-takes)) or any write is in flight, and fails
+   with `capacity_exhausted` only once nothing else holds memory it could get:
+   no other request's KV or state in memory, no cached unit it may take, no
+   write in flight, and the store at its floor (`Engine::judge`).
 
 Once a unit the claim reached waits for a transfer, it takes nothing past
 step 4.
@@ -1862,7 +1866,15 @@ The ledger first counts the most the order gives, taking nothing
 Unless that covers what the claim lacks, nothing is taken. Otherwise it takes
 the units one at a time, each found again from the head of its source as it
 stands, until what they freed now and as their transfers land covers the need
-(`MemoryLedger::take`). A unit whose take frees nothing is passed over: a
+(`MemoryLedger::take`). A lone claim (`ClaimSpec::lone`), an `InService` claim
+that can wait and lacks bytes with no other lane in service, its lane's or a
+start's, takes them whatever the count, and waits while it takes something: no
+lane yields for it, and the count adds up each unit in whole extents of its
+own, so their takes can free more together. Of two distinct prompts at the
+wall, the shorter, alone in decode once the other yielded, counted 219 MiB of
+the 290 MiB its hot block floor lacked in the pages the other left cached and
+its own release, where their takes free 316.5 MiB, and it failed having taken
+nothing. A unit whose take frees nothing is passed over: a
 transfer in flight may hold it, or nothing of it is left. A claim met only by
 units that land later (a write it started, a conversion's copies, a lane's pages
 whose copies land) waits for them (`Pending`) and is retried as they land; one
