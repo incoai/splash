@@ -609,7 +609,7 @@ int streamedLoneBlockSize(MetalBackend &backend, const MoeShape &shape, const st
   for (const Step &step : steps) {
     if (step.restores) {
       store.release();
-      require(store.restore(splash::test::admitAll) && store.stats().resident == shape.experts,
+      require(store.restore(splash::test::admitAll, {}) && store.stats().resident == shape.experts,
               "a restored store does not hold every expert of a size of one block");
     }
     const Model &m = step.block == 2 ? head : trunk;
@@ -675,7 +675,7 @@ int streamedRounds(MetalBackend &backend, const MoeShape &shape, const std::file
   for (const Step &step : steps) {
     if (step.releases) {
       store.release();
-      require(store.restore(splash::test::admitAll), "the store was not restored");
+      require(store.restore(splash::test::admitAll, {}), "the store was not restored");
     }
     const MoePlan &plan = step.prefill ? chunk : decode;
     if (step.prefill) {
@@ -899,7 +899,7 @@ int streamedChunks(MetalBackend &backend, const MoeShape &shape, const std::file
     if (restored) {
       // The restore takes the floor chunk back; regrows take the rest.
       store.release();
-      require(store.restore(splash::test::admitAll), "the chunked store did not restore");
+      require(store.restore(splash::test::admitAll, {}), "the chunked store did not restore");
       while (store.stats().growUnitBytes)
         require(static_cast<bool>(store.growTowardCap(splash::test::admitAll)), "a regrow after a restore was refused");
     }
@@ -1109,7 +1109,7 @@ int streamedElastic(MetalBackend &backend, const MoeShape &shape, const std::fil
     allocate();
     return {};
   };
-  require(store.restore(counted), "the shrunk store did not restore");
+  require(store.restore(counted, {}), "the shrunk store did not restore");
   stats = store.stats();
   if (admissions != 1 || stats.chunks != 1 || stats.slots != floorSlots || stats.liveBytes != stats.floorBytes ||
       store.stats().growUnitBytes != arenaBytes(m, slotsOf(2) - floorSlots))
@@ -1545,7 +1545,7 @@ int streamedElasticSizes(MetalBackend &backend, const MoeShape &shape, const std
     allocate();
     return {};
   };
-  require(store.restore(admit), "a restore at the floors did not end");
+  require(store.restore(admit, {}), "a restore at the floors did not end");
   if (needed != 1 || liveOf(0) != layouts[0].floorChunks || liveOf(1) != layouts[1].floorChunks ||
       loneChunks.liveChunks() != 1 || store.stats().resident < shape.experts)
     fail("a restore took " + std::to_string(needed) + " admissions, not one for the floors alone");

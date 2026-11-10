@@ -183,6 +183,10 @@ void Engine::setCompletionNotifier(std::function<void()> notifier) {
 }
 
 bool Engine::flushRestorePoints() {
+  // The restore points wait for a part of the weights being written, which
+  // may run commands beside them, as a tick does.
+  if (weightsWriting())
+    return false;
   static_cast<void>(cache_.pollTransfers());
   return writeBehind_.flush();
 }
@@ -214,6 +218,15 @@ bool Engine::tick(double now) {
   }
   if (now >= drainEndMilliseconds_)
     drainEndMilliseconds_ = 0.0;
+  // A part of the weights being written may allocate and run commands on the
+  // backend, which takes them from one thread at a time, and a KV extent's
+  // release or copy refuses any command in flight (kv::PageStorage): the rest
+  // of the tick waits for the write's end, which wakes the loop, and so does
+  // the control pass (commandInFlight). Frames are answered meanwhile.
+  if (weightsWriting()) {
+    sweepTerminal(now);
+    return progressed;
+  }
   if (cache_.pollTransfers()) {
     // Demoted pages and written states are back; waiting lanes retry now,
     // and candidates are placed again. The tier's share for Spill
@@ -537,6 +550,14 @@ void Engine::decodeGap(Request &active, const model::CommandSample &sample, doub
 
 std::optional<double> Engine::nextWakeupMilliseconds() const {
   std::optional<double> result;
+  // While a part of the weights is written, a tick only ends requests at
+  // their deadlines (tick): the write's end wakes the loop for the rest.
+  if (weightsWriting()) {
+    for (const auto &[_, active] : requests_)
+      if (!active.finalized && !active.pendingEnd && (!result || active.request.deadlineMilliseconds < *result))
+        result = active.request.deadlineMilliseconds;
+    return result;
+  }
   if (pending_)
     result = nextHealthCheckMilliseconds_;
   const bool draining = drainingForRecovery();
@@ -2198,7 +2219,7 @@ bool Engine::advanceWeights(double now) {
     claim.id = governor().ledger().open(
         {.cls = waiting.empty() ? ClaimClass::Start : ClaimClass::Floor, .timing = NeedTiming::Immediate});
     const MemoryGovernor::Scope scope(governor(), claim.id);
-    return weights_->restore(now);
+    return weights_->restore(now, completionNotifier_);
   }();
   if (step.kind != WeightResidency::Step::Kind::Refused) {
     // A part that came back ends each waiting request's wait for memory: its

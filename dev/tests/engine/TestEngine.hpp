@@ -7,7 +7,9 @@
 #include "model/WeightMemory.hpp"
 #include "ops/PagedKv.hpp"
 
+#include <atomic>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 
@@ -35,39 +37,73 @@ inline engine::MemoryGovernor *(*ampleGovernor)() = nullptr;
 // The weights of a native loop under test: three images of a gibibyte that
 // count what the loop does with them, each restored under the admission the
 // loop passes; with `memory`, which holds the images in memory as "weights",
-// restored through it.
+// restored through it. With `writes`, each image restore() takes back is
+// written on a thread of its own, as model::WeightImages writes it, until the
+// test calls endWrite(), which another thread may call while the loop runs,
+// as it may read writing() and `restores`.
 class Weights final : public model::WeightMemory {
 public:
   static constexpr uint32_t kImages = 3;
   static constexpr uint64_t kImageBytes = 1ULL << 30;
   [[nodiscard]] bool released() const noexcept override {
-    return restored_ < kImages;
+    return restored_ < kImages || taken_.load(std::memory_order_acquire);
   }
   void release() override {
+    require(!writing(), "weights were released while an image was written");
     if (memory)
       memory->release("weights", uint64_t{restored_} * kImageBytes);
     restored_ = 0;
+    taken_ = false;
   }
-  bool restore(const metal::AllocationAdmission &admit) override {
+  bool restore(const metal::AllocationAdmission &admit, const std::function<void()> &written) override {
     if (failRestore)
       throw std::runtime_error("weights restore test");
     require(released(), "held weights were restored");
+    require(!writing(), "weights were restored while an image was written");
+    taken_ = false;
+    if (restored_ == kImages)
+      return true;
     if (const metal::AllocationResult admitted =
             memory ? memory->allocate(admit, "weights", kImageBytes) : admit(kImageBytes, [] {});
         !admitted)
       throw metal::MetalAllocationError("weights restore test refused", admitted.failure);
     ++restores;
-    return ++restored_ == kImages;
+    ++restored_;
+    if (writes) {
+      written_ = written;
+      ended_ = false;
+      taken_.store(true, std::memory_order_release);
+    }
+    return !released();
+  }
+  [[nodiscard]] bool writing() const noexcept override {
+    return taken_.load(std::memory_order_acquire) && !ended_.load(std::memory_order_acquire);
+  }
+  // Ends the write of the image restore() took back last, and calls the
+  // `written` it was given.
+  void endWrite() {
+    require(writing(), "no image was being written");
+    // A copy: once the write has ended, the loop's next restore() replaces
+    // written_, maybe while it is still being called.
+    const std::function<void()> written = written_;
+    ended_.store(true, std::memory_order_release);
+    if (written)
+      written();
   }
   // The images in memory.
   [[nodiscard]] uint32_t held() const noexcept { return restored_; }
   bool failRestore = false;
+  bool writes = false;
   FakeMemory *memory = nullptr;
   // The images written back.
-  uint32_t restores = 0;
+  std::atomic<uint32_t> restores{0};
 
 private:
   uint32_t restored_ = kImages;
+  // The last image taken back is written until endWrite() while `taken_`
+  // holds, which the next restore() clears; `written_` is its restore()'s.
+  std::atomic<bool> taken_{false}, ended_{false};
+  std::function<void()> written_;
 };
 
 } // namespace splash::test

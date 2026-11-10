@@ -2,6 +2,8 @@
 
 #include "metal/Allocation.hpp"
 
+#include <functional>
+
 namespace splash::model {
 
 // Memory the engine gives back while idle and takes again before it runs the
@@ -25,7 +27,15 @@ public:
   // (model::ExpertStore), does not come back: the store grows it again as
   // memory allows. On any other failure the weights are unusable: the engine
   // stops.
-  [[nodiscard]] virtual bool restore(const metal::AllocationAdmission &admit) = 0;
+  // A part may go on being written on a thread of its own once the call
+  // returns (WeightImages), which calls `written` as it ends: writing() is
+  // true until then, and the next call, which may come only after it,
+  // throws that write's failure as the call that wrote the part would have.
+  [[nodiscard]] virtual bool restore(const metal::AllocationAdmission &admit,
+                                     const std::function<void()> &written) = 0;
+  // A part restore() took back is still being written on its thread, which
+  // may allocate and run commands on the backend meanwhile.
+  [[nodiscard]] virtual bool writing() const noexcept { return false; }
 };
 
 } // namespace splash::model

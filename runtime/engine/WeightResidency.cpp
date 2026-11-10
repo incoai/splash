@@ -19,12 +19,12 @@ bool WeightResidency::held() const noexcept {
   return !config_.weights->released() && !restoringSince_;
 }
 
-WeightResidency::Step WeightResidency::restore(double now) {
+WeightResidency::Step WeightResidency::restore(double now, const std::function<void()> &written) {
   if (!restoringSince_)
     restoringSince_ = now;
   bool restored = false;
   try {
-    restored = config_.weights->restore(config_.admit);
+    restored = config_.weights->restore(config_.admit, written);
   } catch (const metal::MetalAllocationError &refusal) {
     if (!refusedSince_) {
       refusedSince_ = now;

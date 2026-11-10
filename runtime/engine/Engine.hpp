@@ -275,10 +275,14 @@ public:
   // on inside a Start claim's scope, as the host's margins admit it, and a
   // refused part ends it:
   // the weights give back what came back. No request runs until they are
-  // back.
+  // back. While a part is written on its thread (weightsWriting), a tick
+  // only ends the requests whose deadlines passed: the write's end wakes the
+  // loop (the completion notifier).
   [[nodiscard]] bool tick(double nowMilliseconds);
+  // A command, or a part of the weights being written, whose writer may run
+  // commands of its own: the control pass waits for its end (FdTransport).
   [[nodiscard]] bool commandInFlight() const noexcept {
-    return pending_.has_value();
+    return pending_.has_value() || weightsWriting();
   }
   // No request is waiting, running or draining.
   [[nodiscard]] bool idle() const noexcept {
@@ -309,10 +313,15 @@ public:
   // Neither released nor being restored; true for an engine with no weights
   // to release.
   [[nodiscard]] bool weightsHeld() const noexcept { return !weights_ || weights_->held(); }
+  // A part of the weights is being written on a thread of its own
+  // (model::WeightImages), which may allocate and run commands meanwhile:
+  // the engine leaves memory and the backend alone until it ends.
+  [[nodiscard]] bool weightsWriting() const noexcept { return weights_ && weights_->writing(); }
   // At a clean stop, once tick() has stopped: makes every restore point a
   // persistent tier has waiting durable, the newest first, as the writes it
-  // starts land (WriteBehind::flush). True once none is left. The requests
-  // and the command in flight stay as they are, for teardown.
+  // starts land (WriteBehind::flush), once no part of the weights is being
+  // written. True once none is left. The requests and the command in flight
+  // stay as they are, for teardown.
   [[nodiscard]] bool flushRestorePoints();
 
 private:

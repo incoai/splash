@@ -1353,7 +1353,7 @@ void ExpertStore::release() {
   impl.publish();
 }
 
-bool ExpertStore::restore(const metal::AllocationAdmission &admit) {
+bool ExpertStore::restore(const metal::AllocationAdmission &admit, const std::function<void()> &) {
   std::lock_guard lock(impl_->mutex);
   Impl &impl = *impl_;
   if (!impl.released) throw std::logic_error("expert memory is not released");
