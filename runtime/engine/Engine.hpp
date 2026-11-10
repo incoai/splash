@@ -429,8 +429,9 @@ private:
     // Turned to Spill by its own conversion (convertToSpill).
     bool converted = false;
     // Where its KV goes if it starts now (placement), as found in the state
-    // of the memory placementState names (ledgerChanges_), which an attempt
-    // to start it in that state takes; none before the first.
+    // of the memory placementState names (ledgerChanges_), which planning
+    // reads in that state; none before the first. An attempt to start it
+    // places it again (admit).
     std::optional<KvMode> placement;
     uint64_t placementState = 0;
     // The most tokens it may generate, which the model is given at each
