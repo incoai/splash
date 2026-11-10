@@ -92,7 +92,7 @@ Engine::ResidentRoom Engine::residentRoom(const Request &active, const ClaimSpec
   const auto pages = static_cast<uint32_t>((tokens + KvCache::pageTokens - 1) / KvCache::pageTokens);
   // Its pages less the restored chain's pages in memory, which its start
   // takes in place; the claim keeps that chain for the start to reuse.
-  // Counted as the claims take it: its and the Resident lanes' KV from the
+  // Counted as the claims take it: its KV and the lanes' Full pages from the
   // free pages the walk keeps, then in whole extents, plus what its lane and
   // the state it captures allocate, with what the claim frees counted
   // against the pool they leave.
@@ -104,7 +104,7 @@ Engine::ResidentRoom Engine::residentRoom(const Request &active, const ClaimSpec
     held = cache_.residentChainPages(chain);
   }
   const LaneDemand lanes = laneDemand();
-  Need need = cache_.growthNeed(pages - std::min(pages, held) + lanes.residentPages);
+  Need need = cache_.growthNeed(pages - std::min(pages, held) + lanes.fullPages);
   const uint64_t beside = model_.startStateBytes() + lanes.bytes;
   need.bytes += beside;
   need.afterStart = true;
@@ -114,14 +114,14 @@ Engine::ResidentRoom Engine::residentRoom(const Request &active, const ClaimSpec
   uint64_t heldPages = 0;
   if (available >= beside) {
     const uint64_t allocated = cache_.growthPages(available - beside);
-    heldPages = held + allocated - std::min<uint64_t>(allocated, lanes.residentPages);
+    heldPages = held + allocated - std::min<uint64_t>(allocated, lanes.fullPages);
   }
   return {.needed = need.bytes, .available = available, .heldTokens = heldPages * KvCache::pageTokens};
 }
 
 uint64_t Engine::laneDemandBytes() const {
   const LaneDemand lanes = laneDemand();
-  return uint64_t{lanes.residentPages} * cache_.bytesPerPage(kv::PageForm::Full) + lanes.bytes;
+  return uint64_t{lanes.fullPages} * cache_.bytesPerPage(kv::PageForm::Full) + lanes.bytes;
 }
 
 Engine::LaneDemand Engine::laneDemand() const {
@@ -137,19 +137,31 @@ Engine::LaneDemand Engine::laneDemand() const {
   for (const auto &[id, peer] : requests_) {
     if (!peer.lane || peer.pendingEnd)
       continue;
+    const bool prefill = scheduler_.phase(id) == Phase::Prefill;
     if (cache_.holdsIndexPages(id)) {
       readers.push_back(id);
-      if (scheduler_.phase(id) == Phase::Prefill)
+      if (prefill)
         demand.bytes += model_.stagingShortfall(id, nextCommandPages(peer));
     }
     const uint64_t projection = projectedTokens(peer);
     const uint64_t held = kvCapacity(id);
     if (peer.kvMode == KvMode::Spill) {
-      const uint64_t floor = geometry.spillFloorBytes(held);
+      // Its floor grows, up to its projection. But a prefill command writes
+      // its rows to Full pages, which no release returns until their copies
+      // land: its next command's pages count Full, as a Resident lane's do,
+      // and the floor grows from their end. Priced at the floor, a 225-page
+      // command right after a start placed Resident beside the lane took
+      // the room the start counted, and the start converted itself to Spill
+      // in its prefill. A decode step adds a page as its tail window lets go
+      // of one whose copy landed long since, which keeps the floor's count.
+      const uint64_t command =
+          prefill ? std::max<uint64_t>(nextCommandPages(peer), pages(held)) - pages(held) : 0;
+      const uint64_t floor = geometry.spillFloorBytes(held + command * KvCache::pageTokens);
       const uint64_t projected = geometry.spillFloorBytes(projection);
+      demand.fullPages += static_cast<uint32_t>(command);
       demand.bytes += projected > floor ? projected - floor : 0;
     } else if (pages(projection) > pages(held)) {
-      demand.residentPages += static_cast<uint32_t>(pages(projection) - pages(held));
+      demand.fullPages += static_cast<uint32_t>(pages(projection) - pages(held));
     }
   }
   demand.bytes += model_.hotFloorShortfall(readers);
