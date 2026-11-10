@@ -252,9 +252,9 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   plan.expertFloorShare = experts.sized ? 1.0 : expertFloorShare(spill.enabled);
   plan.tableBytes = table.streams ? table.charged : 0;
   if (table.automatic) {
-    const int64_t kept = rest - allowance(expertsStream);
-    if (table.all > in.tableShareBytes || kept < static_cast<int64_t>(table.all - table.charged))
-      plan.tableBytes = table.charged + static_cast<uint64_t>(std::clamp<int64_t>(kept, 0, tableShare));
+    const uint64_t take =
+        table.charged + static_cast<uint64_t>(std::clamp<int64_t>(rest - allowance(expertsStream), 0, tableShare));
+    plan.tableBytes = take < table.all ? take : 0;
   }
   // A second buffer of staged history lets the next layer's reads overlap
   // this layer's attention. It is planned where the readers' memory holds it
