@@ -137,7 +137,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--max-context` | Auto | Set the context limit, e.g. `100K` or `1M` (K = 1024 tokens, M = 1,000,000), up to the model's limit; past the 256K native window a model with YaRN turns it on. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
-| `--ple-memory` | Auto | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`; `off` loads the whole table. Auto loads it where memory holds it, else streams it through its share of the budget. See [PLE table streaming](#ple-table-streaming). |
+| `--ple-memory` | Auto | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`; `off` loads the whole table. Auto streams it through a cache of at most the rows of a 128K-token prompt, less where memory is short. See [PLE table streaming](#ple-table-streaming). |
 | `--expert-memory` | Auto | MoE targets: the memory routed experts keep, e.g. `16G`; they stream through a store of exactly this size, which neither grows nor gives memory back, and read the other experts from the SSD when a step routes them; a size that holds every expert, or `off`, loads them all. Auto loads them all where memory holds them, else gives them what the context leaves, given back down to their floor while requests need it. See [streamed experts](#streamed-experts). |
 | `--sparse-kv-memory` | Auto | Qwen3.8-Flash-Next: memory for the KV blocks read back from the SSD for requests whose KV is there, e.g. `1200M`; never below its floor, which auto keeps. See [KV on the SSD](#kv-on-the-ssd). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](internals.md#weight-loading). |
@@ -257,11 +257,10 @@ target the floors of a request whose KV is on the SSD
 target's routed experts load with their layers where that leaves KV its
 allowance, and otherwise stream through a store of all that the allowance and
 the PLE table's share leave ([streamed experts](#streamed-experts)); the PLE
-table too keeps the allowance first: it loads where the rest holds it beside
-the allowance, and otherwise streams through a row cache of what the allowance
-leaves, up to its share, at most the rows of every id a 128K-token prompt
-stages ([PLE table streaming](#ple-table-streaming)); KV and the states take
-what remains. The allowance is the KV of a context, in the fewest pages whose
+table streams through a row cache of what the allowance leaves, up to its
+share, at most the rows of every id a 128K-token prompt stages, however much
+memory the budget has ([PLE table streaming](#ple-table-streaming)); KV and
+the states take what remains. The allowance is the KV of a context, in the fewest pages whose
 extents hold it as one request's KV capacity rounds them: a block-sparse
 target's first 64K tokens, kept in memory, or `--max-context` where that is
 less. A dense target's allowance is `--max-context`, so that its experts load
@@ -370,10 +369,10 @@ cache](#kv-on-the-ssd) holds it names its lane, tokens and
 Qwen3.8-Flash-Next's PLE n-gram table (`per_layer_token_embd.weight`, 320M rows
 of 160 values, 28.8 GB in IQ4_NL; other row widths come from GGUF metadata)
 is read by a handful of rows per token: 16 per position, eight heads each of
-the 2- and 3-gram hashes of the token and the tokens before it. Where memory
-cannot hold it beside everything else (`--ple-memory auto`, the default,
-[memory and context](#memory-and-context)), or with `--ple-memory SIZE`, such
-as `--ple-memory 2G`, the table stays in its GGUF on the SSD: no `ple.bin`
+the 2- and 3-gram hashes of the token and the tokens before it. With
+`--ple-memory auto`, the default ([memory and context](#memory-and-context)),
+or with `--ple-memory SIZE`, such as `--ple-memory 2G`, the table stays in its
+GGUF on the SSD: no `ple.bin`
 image is written, and the weights shrink by the stored table size. Startup
 memory requirements also include the cache and Metal staging buffers. The
 rows each command gathers are read through a host cache with a SIZE-byte
@@ -385,7 +384,8 @@ count, reserves about 1.9 times the bytes of a Q8_0 table. The cache hits only r
 reads few distinct rows (a 128K-token prompt about 1.1M): caches from
 256 MiB, which no run filled, to 2 GiB hit as often, while each GiB more of
 the expert store makes a 24 GB Mac decode 11-23% faster, so the experts take
-the rest.
+the rest, and the KV and its caches what they leave: auto streams the table
+however much memory the Mac has.
 The engine refuses a SIZE that holds no row, and a SIZE that holds the
 whole table loads it with the weights instead, as `--ple-memory off` does. A
 table whose rows the GGUF does not store as the gathers read them (NVFP4,

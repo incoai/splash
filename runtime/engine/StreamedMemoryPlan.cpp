@@ -31,13 +31,13 @@ uint64_t extentsBytes(uint64_t pages, uint64_t extentPages, uint64_t pageBytes) 
 }
 
 // A streamed part as its setting leaves it to the planner: the bytes the
-// floors charge it, and all of it. An automatic part loads whole where the
-// budget holds it beside the KV allowance, and otherwise streams through
-// what the floors charge it and as much more as the budget allows. A part
-// given a size (`sized`) streams through a store of exactly that size, which
-// the floors charge and which is all its floor, so it neither grows nor gives
-// memory back. Any other part loads whole. An Auto part whose smallest store
-// takes all it would loads whole.
+// floors charge it, and all of it. An automatic part, but a table larger than
+// its share, loads whole where the budget holds it beside the KV allowance,
+// and otherwise streams through what the floors charge it and as much more as
+// the budget allows. A part given a size (`sized`) streams through a store of
+// exactly that size, which the floors charge and which is all its floor, so
+// it neither grows nor gives memory back. Any other part loads whole. An Auto
+// part whose smallest store takes all it would loads whole.
 struct Part final {
   uint64_t charged = 0;
   uint64_t all = 0;
@@ -253,7 +253,7 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   plan.tableBytes = table.streams ? table.charged : 0;
   if (table.automatic) {
     const int64_t kept = rest - allowance(expertsStream);
-    if (kept < static_cast<int64_t>(table.all - table.charged))
+    if (table.all > in.tableShareBytes || kept < static_cast<int64_t>(table.all - table.charged))
       plan.tableBytes = table.charged + static_cast<uint64_t>(std::clamp<int64_t>(kept, 0, tableShare));
   }
   // A second buffer of staged history lets the next layer's reads overlap
