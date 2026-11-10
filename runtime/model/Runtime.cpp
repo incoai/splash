@@ -1730,6 +1730,11 @@ struct Runtime::Impl {
         sequence.chunk = chunkParams(part.logicalPosition, part.tokenCount, sequence.attentionStride, item.pageTable);
         sequence.tables = tables;
         sequence.captures = activeDraftCaptures(entry, part);
+        if (getenv("SPLASH_DEBUG_CAPTURES"))
+          std::cerr << "splash: dispatch " << part.logicalPosition << ".."
+                    << part.logicalPosition + part.tokenCount << ": "
+                    << sequence.captures.size() << " spans, captureRows "
+                    << captureRows(sequence.captures) << '\n';
         sequence.stateCaptures = stateCaptures(part, sequence.captures, lengths);
         for (PrefillStateCapture &capture : sequence.stateCaptures) capture.atEnd = capture.lengths.targetTokens == end;
         chunk.rows += part.tokenCount;

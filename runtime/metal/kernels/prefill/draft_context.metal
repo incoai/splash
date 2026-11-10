@@ -94,7 +94,7 @@ inline void draft_context_store_phase(
       uchar(code.x | (code.y << 4));
   if (lane == 0) {
     device half2 *groups = reinterpret_cast<device half2 *>(
-        window + draft_context_codes_bytes(params.width));
+        window + draft_context_codes_bytes(params.width, Window));
     groups[ulong(at.slot) * at.groups + at.group] = half2(scale, minimum);
   }
 }
@@ -108,7 +108,7 @@ inline void draft_context_load_phase(
   if (!draft_context_group<Window>(params, threadgroup_index, simd_group, at))
     return;
   device const half2 *groups = reinterpret_cast<device const half2 *>(
-      window + draft_context_codes_bytes(params.width));
+      window + draft_context_codes_bytes(params.width, Window));
   const half2 group = groups[ulong(at.slot) * at.groups + at.group];
   const uchar byte = window[ulong(at.slot) * (params.width / 2) +
                             at.group * (SPLASH_DRAFT_CONTEXT_GROUP / 2) + lane];

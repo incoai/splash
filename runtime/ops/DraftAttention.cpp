@@ -55,7 +55,7 @@ void requireContextInputs(const metal::MetalBuffer &contextKv,
 // 64-value group, after checking its buffers.
 metal::DispatchSize windowGroups(const metal::MetalBuffer &context, const metal::MetalBuffer &window,
                                  uint32_t rows, uint32_t width, uint32_t ring) {
-  const uint64_t windowBytes = DraftAttention::contextWindowBytes(width);
+  const uint64_t windowBytes = DraftAttention::contextWindowBytes(width, ring);
   if (!rows || rows > ring)
     throw std::invalid_argument("a context window holds one ring's rows");
   requireBytes(context, uint64_t{rows} * width * 2, "draft context rows");
@@ -285,10 +285,12 @@ void DraftAttention::addContextCommit(
              1});
 }
 
-uint64_t DraftAttention::contextWindowBytes(uint32_t width) {
+uint64_t DraftAttention::contextWindowBytes(uint32_t width, uint32_t window) {
   if (!width || width % SPLASH_DRAFT_CONTEXT_GROUP)
     throw std::invalid_argument("draft context rows are whole 64-value groups");
-  return draft_context_window_bytes(width);
+  if (!window)
+    throw std::invalid_argument("draft context window holds no slots");
+  return draft_context_window_bytes(width, window);
 }
 
 void DraftAttention::addWindowStore(metal::CommandGraph &graph,

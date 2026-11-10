@@ -130,7 +130,7 @@ public:
   // `width` values the slot's keys and values are computed from, in 4-bit
   // codes of 64-value groups with each group's fp16 scale and minimum
   // (metal/abi/DraftAttention.h). Positions map to slots as in the rings.
-  [[nodiscard]] static uint64_t contextWindowBytes(uint32_t width);
+  [[nodiscard]] static uint64_t contextWindowBytes(uint32_t width, uint32_t window);
   // Stores `rows` context rows in the slots of positions startPosition on.
   static void addWindowStore(metal::CommandGraph &graph,
                              metal::MetalBuffer context,

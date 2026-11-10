@@ -1491,11 +1491,11 @@ void ropeRangeMatchesPositions(metal::MetalBackend &backend) {
   }
   metal::CommandGraph invalid;
   rejects([&] { ops::RoPE::addDraftRangeTables(invalid, inverse, inverse, inverse, 0, 0, kMaximumRows); },
-          "invalid RoPE table row count", "an empty draft RoPE range was accepted");
+          "invalid draft RoPE table row count", "an empty draft RoPE range was accepted");
   rejects([&] {
             ops::RoPE::addDraftRangeTables(invalid, inverse, inverse, inverse, kMaximumRows + 1, 0, kMaximumRows);
           },
-          "invalid RoPE table row count", "a draft RoPE range past its rows was accepted");
+          "invalid draft RoPE table row count", "a draft RoPE range past its rows was accepted");
   require(invalid.empty(), "an invalid draft RoPE range encoded a dispatch");
 }
 

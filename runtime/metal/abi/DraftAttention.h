@@ -133,12 +133,12 @@ static_assert(sizeof(DraftContextBatchParams) == 16,
 // group, SPLASH_DRAFT_CONTEXT_SIMDGROUPS to a threadgroup.
 #define SPLASH_DRAFT_CONTEXT_GROUP 64u
 #define SPLASH_DRAFT_CONTEXT_SIMDGROUPS 8u
-inline constexpr uint64_t draft_context_codes_bytes(uint32_t width) {
-  return uint64_t(SPLASH_DRAFT_SLIDING_WINDOW) * (width / 2);
+inline constexpr uint64_t draft_context_codes_bytes(uint32_t width, uint32_t window) {
+  return uint64_t(window) * (width / 2);
 }
-inline constexpr uint64_t draft_context_window_bytes(uint32_t width) {
-  return draft_context_codes_bytes(width) +
-         uint64_t(SPLASH_DRAFT_SLIDING_WINDOW) * (width / SPLASH_DRAFT_CONTEXT_GROUP) * 4;
+inline constexpr uint64_t draft_context_window_bytes(uint32_t width, uint32_t window) {
+  return draft_context_codes_bytes(width, window) +
+         uint64_t(window) * (width / SPLASH_DRAFT_CONTEXT_GROUP) * 4;
 }
 
 struct DraftContextWindowParams {

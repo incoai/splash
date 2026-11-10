@@ -836,7 +836,7 @@ StateSamples sampleCommittedState(const metal::MetalBackend &backend,
       const uint64_t offset = index % rowBytes;
       samples.push_back(bytes[offset < codeBytes
                                   ? slot * codeBytes + offset
-                                  : draft_context_codes_bytes(layout.contextWidth) +
+                                  : draft_context_codes_bytes(layout.contextWidth, window) +
                                         slot * groupBytes + (offset - codeBytes)]);
     }
     result.emplace_back("context_window", std::move(samples));
@@ -1275,7 +1275,7 @@ std::vector<uint8_t> windowRows(const std::vector<uint8_t> &window, uint32_t wid
                                 uint64_t slots) {
   const uint64_t codeBytes = width / 2;
   const uint64_t groupBytes = uint64_t{width} / SPLASH_DRAFT_CONTEXT_GROUP * 4;
-  const uint64_t parameters = draft_context_codes_bytes(width);
+  const uint64_t parameters = draft_context_codes_bytes(width, width);
   std::vector<uint8_t> rows;
   for (uint64_t position = boundary - std::min(boundary, slots); position < boundary; ++position) {
     const auto codes = window.begin() + static_cast<std::ptrdiff_t>((position % slots) * codeBytes);
@@ -1298,7 +1298,7 @@ uint64_t requireCapturedWindow(const std::vector<uint8_t> &captured, const std::
   const uint64_t codeBytes = width / 2;
   const uint64_t groupBytes = uint64_t{width} / SPLASH_DRAFT_CONTEXT_GROUP * 4;
   // Every slot's codes come first, then every slot's group parameters.
-  const uint64_t parameters = draft_context_codes_bytes(width);
+  const uint64_t parameters = draft_context_codes_bytes(width, width);
   uint64_t found = 0;
   for (uint64_t position = boundary - std::min(boundary, window); position < boundary; ++position) {
     const uint64_t slot = position % window;

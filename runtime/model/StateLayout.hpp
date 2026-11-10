@@ -96,7 +96,7 @@ struct DraftStateLayout final {
     return uint64_t{layers} * 2 * tensorBytes();
   }
   [[nodiscard]] constexpr uint64_t windowBytes() const noexcept {
-    return draft_context_window_bytes(contextWidth);
+    return draft_context_window_bytes(contextWidth, window);
   }
 
   bool operator==(const DraftStateLayout &) const = default;
