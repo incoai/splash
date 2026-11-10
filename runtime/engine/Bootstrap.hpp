@@ -129,6 +129,7 @@ struct RuntimeBootstrapConfig {
 };
 
 using ActualMemoryReporter = std::function<ActualMemoryReport()>;
+using WarmupProgress = std::function<void(const protocol::WarmingEvent &)>;
 
 // The serving runtime: start() returns it built, warmed up and audited, and
 // it serves once announceReady() has sent Ready. Everything that can refuse
@@ -146,12 +147,14 @@ public:
     // kvPool's runway (model::ExecutionLimits::warmupKvPages) and holds its
     // pages while it runs (KvPool::RunwayHold): a prefill of the most rows,
     // one of each of `prefillRowClasses` (ops::ExecutionPlans), each decode
-    // width that fits and a state restore.
+    // width that fits and a state restore. `progress` takes the steps done of
+    // all (protocol::WarmingEvent) as it begins and as each step ends.
     [[nodiscard]] static RuntimeBootstrapReport requireWarmup(
         const EngineMemoryPlan &memoryPlan,
         std::span<const uint32_t> prefillRowClasses,
         model::RuntimeModel &modelRuntime,
         KvPool &kvPool,
+        WarmupProgress progress,
         ActualMemoryReporter memoryReporter);
 
     ServingRuntime(const ServingRuntime &) = delete;

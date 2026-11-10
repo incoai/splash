@@ -245,8 +245,18 @@ void ServingRuntime::sampleThermalState() {
 
 RuntimeBootstrapReport ServingRuntime::requireWarmup(
     const EngineMemoryPlan &memoryPlan, std::span<const uint32_t> prefillRowClasses,
-    model::RuntimeModel &modelRuntime, KvPool &kvPool, ActualMemoryReporter memoryReporter) {
+    model::RuntimeModel &modelRuntime, KvPool &kvPool, WarmupProgress progress,
+    ActualMemoryReporter memoryReporter) {
   RuntimeBootstrapReport report = reportForPlan(memoryPlan);
+  // Its steps: the prefill of the most rows, one of each row class, each
+  // decode width and the state restore, each counted done as it ends.
+  protocol::WarmingEvent warming{.steps = static_cast<uint32_t>(prefillRowClasses.size()) +
+                                          model::ExecutionLimits::maximumBatchWidth + 2};
+  progress(warming);
+  const auto ended = [&] {
+    ++warming.stepsDone;
+    progress(warming);
+  };
   auto run = [&](RuntimeBootstrapStage stage, WarmupStepStatus &status,
                  auto &&operation, bool optional = false) {
     model::WarmupStepResult result;
@@ -255,6 +265,7 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
     } catch (const metal::MetalAllocationError &error) {
       if (optional) {
         status = WarmupStepStatus::MemoryLimited;
+        ended();
         return model::WarmupStepResult{};
       }
       report.resourceFailure = resourceAllocationFailure(error.failure());
@@ -284,6 +295,7 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
       fail(report, stage, std::move(message));
     }
     status = WarmupStepStatus::Complete;
+    ended();
     return result;
   };
 
@@ -317,6 +329,7 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
           (width > 1 && report.warmup.decodeBatches[width - 2] ==
                             WarmupStepStatus::MemoryLimited)) {
         report.warmup.decodeBatches[width - 1] = WarmupStepStatus::MemoryLimited;
+        ended();
         continue;
       }
       run(RuntimeBootstrapStage::DecodeWarmup,
@@ -482,13 +495,13 @@ std::unique_ptr<ServingRuntime> ServingRuntime::start(
          std::string("native loop creation failed: ") + error.what());
   }
 
-  nativeLoop->announceWarming();
   RuntimeResources *resourcesPointer = resources.get();
   model::RuntimeModel *modelPointer = modelRuntime.get();
   NativeRuntime *loopPointer = nativeLoop.get();
   RuntimeBootstrapReport report = requireWarmup(
       resources->memoryPlan(), resources->modelContext().operators.prefillRowClasses(),
       *modelRuntime, resources->kvPool(),
+      [loopPointer](const protocol::WarmingEvent &event) { loopPointer->announceWarming(event); },
       [resourcesPointer, modelPointer, loopPointer, pressure = config.resources.memoryPressure] {
         // Audit every attempted warmup before reclaiming idle buffers.
         // Wider batches and cache memory grow on demand after Ready.

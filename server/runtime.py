@@ -564,11 +564,11 @@ class MultiplexedRuntime:
         # thread that saw the failure, before the engine's calls end, and
         # must not block.
         self.on_engine_failure: FailureListener | None = None
-        # Called once the first engine holds its weights and begins its
-        # warm-up runs (WarmingEvent), on the reader thread, without locks;
-        # it must not block. A relaunched engine's warm-up is a recovery,
-        # which status reports.
-        self.on_warming: Callable[[], None] | None = None
+        # Called with each WarmingEvent of the first engine, once it holds its
+        # weights: as its warm-up begins and as each step ends; on the reader
+        # thread, without locks; it must not block. A relaunched engine's
+        # warm-up is a recovery, which status reports.
+        self.on_warming: Callable[[wire.WarmingEvent], None] | None = None
 
         if eager_start:
             self._ensure_process()
@@ -1261,7 +1261,7 @@ class MultiplexedRuntime:
                     raise ProtocolFatal("native warming arrived after ReadyEvent")
                 listener = self.on_warming if self._first_ready is None else None
             if listener is not None:
-                listener()
+                listener(message)
             return
         if isinstance(message, wire.ReadyEvent):
             with self._state_lock:

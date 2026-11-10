@@ -19,8 +19,11 @@ repository and variant, `OWNER/REPO:VARIANT`, such as
 Splash identifies the model from its own metadata and pairs the DFlash2 draft
 trained for it. The first serve sets up Python dependencies and downloads the
 model and its draft; each start loads the weights into memory
-([Weight loading](internals.md#weight-loading)) and follows the model's revision
-([Revisions](#revisions)). Splash packages, the prebuilt format of earlier
+([Weight loading](internals.md#weight-loading)), follows the model's revision
+([Revisions](#revisions)) and warms up, the console counting the steps
+(`Warming up · 3 of 11 steps`): the first start after an update also prepares
+the GPU's programs then, which takes a couple of minutes
+([Warmup and pipelines](internals.md#warmup-and-pipelines)). Splash packages, the prebuilt format of earlier
 releases, are no longer loaded ([Splash packages](models.md#splash-packages)). Public
 repositories need no login; private or gated ones need `HF_TOKEN` or `hf auth login`, and a gated
 one its terms accepted on its Hub page. Ctrl+C
