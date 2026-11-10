@@ -28,14 +28,18 @@ public:
   // memory allows. On any other failure the weights are unusable: the engine
   // stops.
   // A part may go on being written on a thread of its own once the call
-  // returns (WeightImages), which calls `written` as it ends: writing() is
-  // true until then, and the next call, which may come only after it,
-  // throws that write's failure as the call that wrote the part would have.
-  [[nodiscard]] virtual bool restore(const metal::AllocationAdmission &admit,
-                                     const std::function<void()> &written) = 0;
+  // returns (WeightImages), which calls the completion notifier as it ends:
+  // writing() is true until then, and the next call, which may come only
+  // after it, throws that write's failure as the call that wrote the part
+  // would have.
+  [[nodiscard]] virtual bool restore(const metal::AllocationAdmission &admit) = 0;
   // A part restore() took back is still being written on its thread, which
   // may allocate and run commands on the backend meanwhile.
   [[nodiscard]] virtual bool writing() const noexcept { return false; }
+  // Wakes the engine's loop as the write of a part on its thread ends, for
+  // the writes restore() starts from then on; a part written before restore()
+  // returns never calls it.
+  virtual void setCompletionNotifier(std::function<void()>) {}
 };
 
 } // namespace splash::model

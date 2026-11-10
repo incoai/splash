@@ -26,7 +26,7 @@ inline void awaitWritten(const model::WeightMemory &weights) {
 // Takes every part of `weights` back under `admit`, as the engine does: each
 // restore() once the part before it is written.
 inline void restoreWeights(model::WeightMemory &weights, const metal::AllocationAdmission &admit = admitAll) {
-  for (awaitWritten(weights); !weights.restore(admit, {}); awaitWritten(weights)) {
+  for (awaitWritten(weights); !weights.restore(admit); awaitWritten(weights)) {
   }
 }
 

@@ -80,9 +80,11 @@ public:
   void release() override;
   // Ends the write of the last image it took back, then takes back the next
   // and starts writing it on a thread of its own.
-  [[nodiscard]] bool restore(const metal::AllocationAdmission &admit,
-                             const std::function<void()> &written) override;
+  [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override;
   [[nodiscard]] bool writing() const noexcept override;
+  // The writes restore() starts from then on call `notifier` on their thread
+  // as they end.
+  void setCompletionNotifier(std::function<void()> notifier) override { written_ = std::move(notifier); }
 
   struct Contents final {
     std::string_view component;
@@ -118,6 +120,8 @@ private:
   // or release() ends it.
   size_t restored_ = 0;
   std::unique_ptr<Writing> writing_;
+  // The completion notifier, which each write copies as it starts.
+  std::function<void()> written_;
 };
 
 // The threads that read and convert weights while images are written: one

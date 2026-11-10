@@ -12,6 +12,7 @@
 #include <functional>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace splash::test {
 
@@ -55,7 +56,7 @@ public:
     restored_ = 0;
     taken_ = false;
   }
-  bool restore(const metal::AllocationAdmission &admit, const std::function<void()> &written) override {
+  bool restore(const metal::AllocationAdmission &admit) override {
     if (failRestore)
       throw std::runtime_error("weights restore test");
     require(released(), "held weights were restored");
@@ -70,7 +71,6 @@ public:
     ++restores;
     ++restored_;
     if (writes) {
-      written_ = written;
       ended_ = false;
       taken_.store(true, std::memory_order_release);
     }
@@ -79,16 +79,14 @@ public:
   [[nodiscard]] bool writing() const noexcept override {
     return taken_.load(std::memory_order_acquire) && !ended_.load(std::memory_order_acquire);
   }
+  void setCompletionNotifier(std::function<void()> notifier) override { written_ = std::move(notifier); }
   // Ends the write of the image restore() took back last, and calls the
-  // `written` it was given.
+  // completion notifier.
   void endWrite() {
     require(writing(), "no image was being written");
-    // A copy: once the write has ended, the loop's next restore() replaces
-    // written_, maybe while it is still being called.
-    const std::function<void()> written = written_;
     ended_.store(true, std::memory_order_release);
-    if (written)
-      written();
+    if (written_)
+      written_();
   }
   // The images in memory.
   [[nodiscard]] uint32_t held() const noexcept { return restored_; }
@@ -101,7 +99,8 @@ public:
 private:
   uint32_t restored_ = kImages;
   // The last image taken back is written until endWrite() while `taken_`
-  // holds, which the next restore() clears; `written_` is its restore()'s.
+  // holds, which the next restore() clears; `written_` is the completion
+  // notifier, set before the loop runs.
   std::atomic<bool> taken_{false}, ended_{false};
   std::function<void()> written_;
 };

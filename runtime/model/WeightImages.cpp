@@ -51,7 +51,7 @@ bool WeightImages::writing() const noexcept {
   return writing_ && !writing_->ended.load(std::memory_order_acquire);
 }
 
-bool WeightImages::restore(const metal::AllocationAdmission &admit, const std::function<void()> &written) {
+bool WeightImages::restore(const metal::AllocationAdmission &admit) {
   if (!released_) throw std::logic_error("weights are not released");
   if (writing()) throw std::logic_error("weights restored while an image is being written");
   if (const std::exception_ptr failure = endWrite()) {
@@ -75,7 +75,7 @@ bool WeightImages::restore(const metal::AllocationAdmission &admit, const std::f
     // The image stays in place: load(), the only call that adds one, refuses
     // released weights.
     auto writing = std::make_unique<Writing>();
-    writing->thread = std::thread([&image, &state = *writing, written] {
+    writing->thread = std::thread([&image, &state = *writing, written = written_] {
       try {
         image.write(contentsOf(image.buffer), image.buffer);
       } catch (...) {
