@@ -273,6 +273,41 @@ void placeBesideTwoLanes(bool shared, uint32_t pages) {
 void testAStartPlacedResidentOnTwoLanesReleasesPrefillsWithoutAYield() { placeBesideTwoLanes(false, 4'100); }
 void testAStartPlacedResidentOnALanesConversationPrefillsWithoutAYield() { placeBesideTwoLanes(true, 2'300); }
 
+// Invariant 3 at a start: a start is placed in the memory it starts in. A Normal start of 600 pages beside a Resident
+// lane in service backs off from a state the model refused (Engine::waitForResources), placed Resident while the room
+// holds its KV. The room then falls to half its Resident KV, which holds its prefill as a Spill lane's: a move of the
+// memory outside the engine's buffers that no ledger state names. Started on the placement of the state before the
+// move, it went on Resident and converted itself in its prefill; placed again at its start, it starts Spill, and no
+// lane converts or yields in its prefill.
+void testAStartIsPlacedInTheMemoryItStartsIn() {
+  Wall lanes(16, kPageIds);
+  Spilling &spill = lanes.spill;
+  spill.engine.submit(Spilling::prompt(1, 1, 8, 400));
+  lanes.decode(1, 4);
+  require(lanes.kvMode(1) == KvMode::Resident, "the lane did not start Resident");
+  spill.model.deniedBegins = 1;
+  spill.engine.submit(Spilling::prompt(2, 2, 600, 8));
+  spill.runUntil([&] { return spill.model.deniedBegins == 0; }, "the start's state was not refused");
+  // A tick of its backoff places it again in the state its refusal left.
+  static_cast<void>(spill.engine.tick(spill.now++));
+  spill.tier.complete();
+  require(lanes.phase(2) == Phase::WaitingResources, "the start did not back off");
+  spill.host.leaveRoom(600 * kFullPageBytes / 2);
+  spill.runUntil([&] { return std::ranges::count(spill.events.startIds, 2) != 0; }, "the start did not start");
+  const KvMode placed = lanes.kvMode(2);
+  spill.runUntil([&] { return lanes.phase(2) != Phase::Prefill && !spill.engine.commandInFlight(); },
+                 "the start did not leave its prefill");
+  const EngineSnapshot prefilled = spill.engine.snapshot();
+  spill.host.leaveRoom(std::nullopt);
+  spill.runUntilIdle();
+  require(placed == KvMode::Spill && prefilled.spill.converted == 0 && prefilled.resourceSuspensions == 0 &&
+              spill.events.failures.empty() && spill.events.completedCount == 2,
+          std::string("the start was placed ") + (placed == KvMode::Spill ? "Spill" : "Resident") + " at the wall; " +
+              std::to_string(prefilled.spill.converted) + " lanes converted and " +
+              std::to_string(prefilled.resourceSuspensions) + " yielded in its prefill, and " +
+              std::to_string(spill.events.completedCount) + " requests completed");
+}
+
 // Invariant 2 for a page in place: a lone Spill lane decodes at the wall, with no free Full page and no room, beside
 // the two empty Index extents a lane's end left, the runway and one more. Its growth lacks a Full extent's bytes or a
 // Full page in place, and its count covers the page: a reclaim releases the empty Index extent past the runway
@@ -900,6 +935,7 @@ std::span<const test::TestCase> releaseTests() {
        testAStartPlacedResidentOnTwoLanesReleasesPrefillsWithoutAYield},
       {"testAStartPlacedResidentOnALanesConversationPrefillsWithoutAYield",
        testAStartPlacedResidentOnALanesConversationPrefillsWithoutAYield},
+      {"testAStartIsPlacedInTheMemoryItStartsIn", testAStartIsPlacedInTheMemoryItStartsIn},
       {"testAReleaseInPlaceAfterAReclaimOfItsIndexPagesFreesWhatItCounted",
        testAReleaseInPlaceAfterAReclaimOfItsIndexPagesFreesWhatItCounted},
       {"testAReleaseBesideWritesInFlightFreesWhatItCounts", testAReleaseBesideWritesInFlightFreesWhatItCounts},

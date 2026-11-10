@@ -942,11 +942,14 @@ bool Engine::admit(Request &active, double now) {
   // the SSD cache's quota for the pages it publishes once it holds its lane.
   if (!resuming || active.kvMode == KvMode::Spill)
     active.outputLimit = active.request.maxNewTokens;
+  // A start is placed in the memory as it is now, not as a placement of
+  // the same ledger state found it (placeCandidates): the room under the
+  // limit moves with the memory outside the engine's buffers between the
+  // control passes that change that state, and a start placed Resident on
+  // room that had gone yielded in its prefill.
   if (!resuming) {
-    if (!active.placement || active.placementState != ledgerChanges_) {
-      active.placement = placement(active);
-      active.placementState = ledgerChanges_;
-    }
+    active.placement = placement(active);
+    active.placementState = ledgerChanges_;
     active.kvMode = *active.placement;
   }
   // A request is in service when no other lane is resident
