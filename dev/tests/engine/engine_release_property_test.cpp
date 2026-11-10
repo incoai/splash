@@ -499,6 +499,7 @@ public:
       lanes_.start(engineRequest(requests_[index]));
       lanes_.decode(requests_[index].id, 1);
       started_.insert(requests_[index].id);
+      admitted_.insert(requests_[index].id);
     }
     room_ = rooms()[pick(0, 3)];
     lanes_.wall(room_);
@@ -517,7 +518,7 @@ public:
       if (chance(2)) {
         room_ = rooms()[pick(0, 3)];
         lanes_.wall(room_);
-        ++epoch_;
+        memoryMoved();
         if (verbose_)
           std::cout << where() << ": the wall leaves " << room_ << " B\n";
       }
@@ -615,7 +616,7 @@ private:
     // A suspended lane resumes, below a running priority too (Engine::admitQueued): its replay takes memory no
     // placement counted, which counts the lanes in service alone (Engine::laneDemand), as a move of the wall does.
     if (spill.model.resumptions != resumptions) {
-      ++epoch_;
+      memoryMoved();
       if (verbose_)
         std::cout << where() << ": a suspended lane resumed\n";
     }
@@ -631,8 +632,16 @@ private:
     noteStarts();
   }
 
+  // The host or the wall moved, or a suspended lane resumed: memory no count held.
+  void memoryMoved() {
+    ++epoch_;
+    placed_.clear();
+  }
+
   // The starts placed Resident beside a lane at normal pressure only on a Start claim's count, the lanes' releases
-  // among it (Wall::residentOnTheCount), and the host's and the wall's moves at each placement.
+  // among it (Wall::residentOnTheCount), judged while their counts hold. A start is placed as admission gives it its
+  // lane and model state (Engine::admit), which for one that restores its chain from the SSD comes commands of the
+  // other lanes before its start (Engine::completeAdmission).
   void noteStarts() {
     Spilling &spill = lanes_.spill;
     for (const uint64_t id : spill.events.startIds) {
@@ -642,34 +651,63 @@ private:
         spill.tier.writableFile = true;
         closedFor_ = 0;
       }
-      const bool beside = std::ranges::any_of(spill.model.requests, [&](const auto &entry) {
-        return entry.first != id && entry.second.resident;
-      });
-      const Planned &planned = requests_.at(id - 1);
-      const uint64_t tokens = planned.tokens.size() + std::min<uint64_t>(planned.output, kProjectedOutputTokens);
       if (verbose_)
         std::cout << where() << ": request " << id << " started "
                   << (lanes_.kvMode(id) == KvMode::Resident ? "Resident" : "Spill") << "\n";
+    }
+    for (const Planned &planned : requests_) {
+      const uint64_t id = planned.id;
+      // An attempt that left the model before its start places the request again at the next.
+      if (!spill.model.requests.contains(id)) {
+        if (!started_.contains(id))
+          admitted_.erase(id);
+        continue;
+      }
+      if (!admitted_.insert(id).second)
+        continue;
+      placed_.erase(id);
+      const bool beside = std::ranges::any_of(spill.model.requests, [&](const auto &entry) {
+        return entry.first != id && entry.second.resident;
+      });
+      const uint64_t tokens = planned.tokens.size() + std::min<uint64_t>(planned.output, kProjectedOutputTokens);
+      // A start of a higher priority than the starts placed Resident before it takes memory before theirs, which
+      // their counts did not hold: its claims rank above theirs, and they are the lanes that yield first
+      // (ClaimRank, Engine::laneToYield), or convert first where they can.
+      std::erase_if(placed_, [&](uint64_t placed) { return requests_.at(placed - 1).priority > planned.priority; });
       if (lanes_.kvMode(id) == KvMode::Resident && beside && host_ == Host::Normal &&
           lanes_.residentOnTheCount(id, tokens)) {
-        placed_[id] = epoch_;
+        placed_.insert(id);
         ++totals_.residentStarts;
       }
     }
-    // A start placed Resident yields (but to a start of a higher priority), goes short or converts itself to Spill in
-    // its own prefill only where the host or the wall moved since, or a suspended lane resumed. Only its own growth
-    // converts it, never the test's claims (Engine::EngineVictims::conversions).
+    // A Spill lane's prefill command writes its rows Full beyond the floor the lanes' projected growth prices it at
+    // (Engine::laneDemand), until claims release them once their copies land (Engine::EngineVictims::releases): memory
+    // no placement counted, as a resumed lane's replay. A start placed Resident beside one whose pages grew may find
+    // what it counted taken, and then converts or the lane that yields first yields.
+    for (const ActiveRequestSnapshot &active : spill.engine.snapshot().activeRequests) {
+      if (active.kvMode != KvMode::Spill || active.phase != Phase::Prefill || !spill.model.requests.contains(active.id) ||
+          !spill.model.requests.at(active.id).resident)
+        continue;
+      const size_t pages = spill.cache.pageTable(active.id).pages.size();
+      if (pages > std::exchange(prefillPages_[active.id], pages))
+        std::erase_if(placed_, [&](uint64_t placed) { return placed != active.id; });
+    }
+    // A start placed Resident yields, goes short or converts itself to Spill in its own prefill only where the host or
+    // the wall moved since, a suspended lane resumed, a start of a higher priority began or a Spill lane's prefill took
+    // pages. Only its own growth converts it, never the test's claims (Engine::EngineVictims::conversions).
     for (auto entry = placed_.begin(); entry != placed_.end();) {
-      const auto [id, epoch] = *entry;
+      const uint64_t id = *entry;
       const std::optional<Phase> phase = lanes_.phase(id);
       const bool suspended = std::ranges::count(spill.model.suspendedIds, id) != 0 && !preempted_.contains(id);
       const bool converted = lanes_.kvMode(id) == KvMode::Spill;
       const bool refused = suspended || converted || shortClaims_.contains(id);
-      if (refused && epoch == epoch_)
+      if (refused)
         totals_.placement.add(where() + ": request " + std::to_string(id) + " placed Resident " +
                               (suspended ? "yielded" : converted ? "converted" : "went short") + " in its prefill; " +
                               lanes_.pool() + "; " + lastLog());
-      if (refused || !phase || *phase != Phase::Prefill)
+      // Judged through its restore (queued until it lands) and its prefill, while it holds its lane.
+      if (refused || !spill.model.requests.contains(id) || !phase ||
+          (*phase != Phase::Queued && *phase != Phase::Prefill))
         entry = placed_.erase(entry);
       else
         ++entry;
@@ -724,7 +762,7 @@ private:
       spill.host.pause(true);
       break;
     }
-    ++epoch_;
+    memoryMoved();
     if (verbose_)
       std::cout << where() << ": the host is "
                 << (host_ == Host::Normal ? "normal" : host_ == Host::Critical ? "critical" : "refusing") << "\n";
@@ -855,10 +893,15 @@ private:
   Wall lanes_;
   std::vector<Planned> requests_;
   std::set<uint64_t> started_;
-  // The starts placed Resident beside a lane on the count, and the moves of the host and the wall, a suspended lane's
-  // resume among them, when each was placed.
-  std::map<uint64_t, uint64_t> placed_;
+  // The requests admission placed and gave a lane (noteStarts), the first starts among them.
+  std::set<uint64_t> admitted_;
+  // The starts placed Resident beside a lane on the count whose counts hold: no memory they did not count moved since
+  // their placement (noteStarts).
+  std::set<uint64_t> placed_;
+  // The moves of the host and the wall, a suspended lane's resume among them.
   uint64_t epoch_ = 0;
+  // The pages of each Spill lane in prefill at the last check (noteStarts).
+  std::map<uint64_t, size_t> prefillPages_;
   // The wall's and the host's moves at the last check that found the runway short.
   std::optional<uint64_t> runwayShortAt_;
   std::set<uint64_t> shortClaims_;
@@ -884,8 +927,8 @@ void report(std::string_view name, const Violations &violations, std::string &fa
 // own runs in the engine's ticks too, and what a met claim keeps of the room beside the first reads its releases
 // created holds its need; a release taken first frees what it counted; between commands at normal pressure the Index
 // runway holds an extent where the room does; a start placed Resident beside the lanes on their count prefills with
-// no yield, no short claim and no conversion while the host and the wall stay and no suspended lane resumes. With
-// transfers in flight they are counted apart.
+// no yield, no short claim and no conversion while the host and the wall stay, no suspended lane resumes, no start of
+// a higher priority begins and no Spill lane's prefill takes pages. With transfers in flight they are counted apart.
 void testRandomConversationTreesKeepTheReleaseCounts() {
   const char *seeds = std::getenv("SPLASH_RELEASE_SEEDS");
   const char *one = std::getenv("SPLASH_RELEASE_SEED");
