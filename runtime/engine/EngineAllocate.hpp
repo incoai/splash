@@ -136,7 +136,6 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, Refusal refusal)
     }
     const bool exempt = ledger.claim(claim.id).hostExempt;
     const FreeResult freed = governor.free(claim.id, need);
-    ++ledgerChanges_;
     denial.pending = freed.outcome == FreeOutcome::Pending;
     // Past its hold's limit a request's claim waits holding nothing
     // (syncClaims), whatever this retry found.

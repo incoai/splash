@@ -428,12 +428,11 @@ private:
     KvMode kvMode = KvMode::Resident;
     // Turned to Spill by its own conversion (convertToSpill).
     bool converted = false;
-    // Where its KV goes if it starts now (placement), as found in the state
-    // of the memory placementState names (ledgerChanges_), which planning
-    // reads in that state; none before the first. An attempt to start it
-    // places it again (admit).
+    // Where its KV goes if it starts at the attempt admission makes in this
+    // pass, placed in the memory as that attempt finds it (admitQueued):
+    // whether it competes for the quota and where its start puts its KV
+    // read it (competesForQuota, admit). None before its first attempt.
     std::optional<KvMode> placement;
-    uint64_t placementState = 0;
     // The most tokens it may generate, which the model is given at each
     // start, a resume's too: maxNewTokens, or fewer when the SSD cache's
     // quota, or memory for a start the cache cannot take, bounds its output
@@ -598,8 +597,12 @@ private:
   // open while they work, as every lane submitted before it does (tick).
   [[nodiscard]] bool competesForQuota(const Request &request) const;
   // The tokens the request's KV is projected to hold: those it holds and
-  // the output it may still generate, at most kProjectedOutputTokens.
-  [[nodiscard]] static uint64_t projectedTokens(const Request &request) noexcept;
+  // the output it may still generate under `outputLimit`, its own unless
+  // given, at most kProjectedOutputTokens.
+  [[nodiscard]] static uint64_t projectedTokens(const Request &request, uint32_t outputLimit) noexcept;
+  [[nodiscard]] static uint64_t projectedTokens(const Request &request) noexcept {
+    return projectedTokens(request, request.outputLimit);
+  }
   // Where the KV of a request that starts now lives: on a target that can
   // spill, Spill only when its projection's Resident KV is more than its
   // Spill peak (its floor, and the larger of the staging its prompt's
@@ -615,7 +618,14 @@ private:
   // lane starts from among it, which Spill, taking less memory, leaves to
   // the requests that follow; a start the SSD cache cannot take has no such
   // choice and goes on as the claim its admission makes finds memory
-  // (inMemory). Its outputs never depend on the mode.
+  // (inMemory). Its outputs never depend on the mode. It projects the whole
+  // output, which each attempt bounds afresh (admit): a bound an attempt
+  // that did not start left counts for no placement. A placement holds for
+  // the memory it was made in alone: planning places every candidate in
+  // each pass (laneShapes) and each attempt places its start again
+  // (admitQueued), since the room under the limit moves with the memory
+  // outside the engine's buffers, which no change of the engine's own state
+  // names.
   [[nodiscard]] KvMode placement(const Request &request) const;
   // What `tokens` of a start's Resident KV need now beside every lane's
   // projected growth, as placement prices it, and how much of it what `spec`
@@ -628,9 +638,6 @@ private:
     [[nodiscard]] bool holds() const noexcept { return available >= needed; }
   };
   [[nodiscard]] ResidentRoom residentRoom(const Request &request, const ClaimSpec &spec, uint64_t tokens) const;
-  // Places every candidate whose placement is older than the memory's state
-  // now (ledgerChanges_), once per candidate and state.
-  void placeCandidates(std::span<const PrefillAdmission> candidates);
   // The lanes' projected growth that has not happened yet: a Resident lane's
   // pages up to its projection beyond those it holds, a Spill lane's floor
   // up to its projection beyond its floor now; none for a lane that ended.
@@ -713,8 +720,8 @@ private:
   // The shapes planning reads (PlanInputs::shapes): every resident prefill
   // lane's, with its Index pages, whether it gains them, its row cap this
   // tick, whether it reads spilled history and whether it ended
-  // (Request::pendingEnd), and each candidate's, from the placement found for
-  // it in the memory's current state (placeCandidates).
+  // (Request::pendingEnd), and each candidate's, from its placement in the
+  // memory as it is now.
   [[nodiscard]] std::vector<LaneShape> laneShapes(std::span<const PrefillAdmission> candidates = {}) const;
   // Whether a resident Spill request's prompt goes on: its next commands
   // take Full pages, written through, which under --kv-spill always spill
@@ -1304,13 +1311,6 @@ private:
   // suspension itself met a limit that only freed memory lifts, unlike a
   // host pause.
   bool allocationFailed_ = false;
-  // Counts what changes the memory a placement reads: what the ledger takes
-  // for an allocation, a lane that starts (its projected growth) or ends,
-  // a claim that stops holding room for a start waiting for scheduling
-  // (deferWait), and every landing, the tick's and those the control pass
-  // collects (Request::placementState). A grant of a lane's growth leaves the room
-  // beside the lanes' projections where it was.
-  uint64_t ledgerChanges_ = 1;
   EngineSnapshot counters_;
   // EngineSnapshot::tickHostMilliseconds.
   model::LatencyHistogram tickHosts_;

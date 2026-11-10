@@ -230,11 +230,9 @@ bool Engine::tick(double now) {
     return progressed;
   }
   if (cache_.pollTransfers()) {
-    // Demoted pages and written states are back; waiting lanes retry now,
-    // and candidates are placed again. The tier's share for Spill
-    // requests' writes has room again.
+    // Demoted pages and written states are back; waiting lanes retry now.
+    // The tier's share for Spill requests' writes has room again.
     signalResourceProgress();
-    ++ledgerChanges_;
     progressed = true;
     if (config_.spill.capable)
       static_cast<void>(cache_.writeThrough());
@@ -715,11 +713,10 @@ bool Engine::admitQueued(double now) {
   }
   // The starts the scheduler wants in this pass
   // (Scheduler::prefillAdmissionOrder), in its lead order, each candidate
-  // placed once in each state of the memory it reads. The others wait for
-  // scheduling, and hold back nothing.
+  // shaped by its placement in the memory as it is now (laneShapes). The
+  // others wait for scheduling, and hold back nothing.
   std::vector<uint64_t> wanted;
   if (!candidates.empty()) {
-    placeCandidates(candidates);
     const std::vector<LaneShape> shapes = laneShapes(candidates);
     std::vector<PrefillAdmission> restoring;
     for (const auto &[id, active] : requests_)
@@ -746,10 +743,12 @@ bool Engine::admitQueued(double now) {
   bool progressed = false;
   for (const uint64_t id : wanted) {
     Request &active = request(id);
-    // Placed in the memory's current state, which a start before it in this
-    // pass may have changed.
-    const PrefillAdmission start{.requestId = id};
-    placeCandidates({&start, 1});
+    // One placement for its attempt, in the memory as it is now: since
+    // planning placed it, a start before it in this pass may have taken
+    // room and a candidate the pass left waiting freed some (deferWait).
+    // Whether it competes for the quota and where its start puts its KV
+    // both read it (competesForQuota, admit).
+    active.placement = placement(active);
     std::optional<uint64_t> behind = refused;
     if (!behind && refusedQuota && competesForQuota(active))
       behind = refusedQuota;
@@ -936,23 +935,16 @@ bool Engine::admit(Request &active, double now) {
   }
   // A prefix wait is not an attempt: a refusal stands until the next one.
   active.refusedResources = false;
-  // Each attempt to start a request decides where its KV lives, and a resume
-  // keeps it; each bounds its output afresh, so a bound an attempt that did
-  // not start set does not outlive it. A Resident resume meets no bound
-  // again, and keeps the one memory set at its start. A Spill request commits
-  // the SSD cache's quota for the pages it publishes once it holds its lane.
+  // Each attempt to start a request decides where its KV lives, the
+  // placement admission made for it (admitQueued), and a resume keeps it;
+  // each bounds its output afresh, so a bound an attempt that did not start
+  // set does not outlive it. A Resident resume meets no bound again, and
+  // keeps the one memory set at its start. A Spill request commits the SSD
+  // cache's quota for the pages it publishes once it holds its lane.
   if (!resuming || active.kvMode == KvMode::Spill)
     active.outputLimit = active.request.maxNewTokens;
-  // A start is placed in the memory as it is now, not as a placement of
-  // the same ledger state found it (placeCandidates): the room under the
-  // limit moves with the memory outside the engine's buffers between the
-  // control passes that change that state, and a start placed Resident on
-  // room that had gone yielded in its prefill.
-  if (!resuming) {
-    active.placement = placement(active);
-    active.placementState = ledgerChanges_;
+  if (!resuming)
     active.kvMode = *active.placement;
-  }
   // A request is in service when no other lane is resident
   // (anotherResident): the host exempts it once nothing in place meets it,
   // and it takes up to what is in use. Beside a resident lane it is a start,
@@ -1012,8 +1004,6 @@ bool Engine::admit(Request &active, double now) {
   cache_.beginRequest(requestId, active.kvMode);
   active.lane = *state.admission.lane;
   active.admission = ++admissions_;
-  // Its projected growth is the lanes' now (laneDemandBytes).
-  ++ledgerChanges_;
   if (droppedLease)
     lookup = cache_.lookup(modelRequest.prompt, promptIdentity(active.request));
   // The commitment covers the chain it restores too, once the lookup is
@@ -1738,7 +1728,7 @@ std::vector<LaneShape> Engine::laneShapes(std::span<const PrefillAdmission> cand
                         .ended = active.pendingEnd.has_value()});
   for (const PrefillAdmission &candidate : candidates) {
     const Request &active = requests_.at(candidate.requestId);
-    const KvMode mode = *active.placement;
+    const KvMode mode = placement(active);
     const bool restored = mode == KvMode::Spill && active.admissionProbe && !active.skipCache &&
                           cache_.restoresIndexPages(active.admissionProbe->restoredChain());
     shapes.push_back({.requestId = candidate.requestId,
@@ -2143,8 +2133,6 @@ void Engine::vacateLane(Request &active, bool keepContinuation) {
     model_.end(id);
   cache_.endRequest(id);
   active.lane.reset();
-  // Its KV is the cache's now, and its projected growth no lane's.
-  ++ledgerChanges_;
 }
 
 void Engine::release(Request &active) {
