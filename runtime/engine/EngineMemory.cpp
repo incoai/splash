@@ -95,14 +95,11 @@ Engine::ResidentRoom Engine::residentRoom(const Request &active, const ClaimSpec
   // Counted as the claims take it: its and the Resident lanes' KV from the
   // free pages the walk keeps, then in whole extents, plus what its lane and
   // the state it captures allocate, with what the claim frees counted
-  // against the pool they leave. The chain is its probe's as far as the
-  // cache still has it (Cache::matchableChain): a start backing off from a
-  // refusal is placed with its last probe, whose chain a reclaim may have
-  // taken since, and the walk follows the chain up from its last block.
+  // against the pool they leave.
   RestoredChains own;
   uint32_t held = 0;
   if (active.admissionProbe && !active.skipCache) {
-    const std::span<const uint64_t> chain = cache_.matchableChain(active.admissionProbe->restoredChain());
+    const std::span<const uint64_t> chain = active.admissionProbe->restoredChain();
     own.add(chain);
     held = cache_.residentChainPages(chain);
   }

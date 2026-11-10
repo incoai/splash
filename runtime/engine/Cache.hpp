@@ -59,15 +59,20 @@ class Cache;
 class CacheProbe final {
 public:
   [[nodiscard]] uint32_t cachedTokens() const noexcept { return cachedTokens_; }
-  // The chain a start from it restores: its blocks up to the one whose
-  // state it resumes from, none without a state.
-  [[nodiscard]] std::span<const uint64_t> restoredChain() const noexcept {
-    return std::span<const uint64_t>(blocks_).first(cachedTokens_ / KvCache::pageTokens);
-  }
+  // The chain a start from it restores, as far as its cache still has it
+  // (matchableChain): its blocks up to the one whose state it resumes from,
+  // none without a state. Every reader reads a probe's chain here, so none
+  // meets a block a reclaim took ("unknown KV cache block").
+  [[nodiscard]] std::span<const uint64_t> restoredChain() const noexcept;
 
 private:
   friend class Cache;
 
+  // The part of `chain` its cache still has: all of it while the KV graph is
+  // as the probe last matched it, else up to its first block no longer
+  // matchable (KvCache's generation). A start backing off from a refusal
+  // keeps its probe while a reclaim may take its chain, leaf first.
+  [[nodiscard]] std::span<const uint64_t> matchableChain(std::span<const uint64_t> chain) const noexcept;
   std::vector<uint64_t> blocks_;
   const Cache *owner_ = nullptr;
   uint64_t kvGeneration_ = 0;
@@ -517,9 +522,9 @@ public:
   // claim's to release (releasePages). It allocates nothing; false, changing
   // nothing, when spilling cannot relieve it.
   [[nodiscard]] bool convertToSpill(uint64_t requestId, uint32_t pages);
-  // Whether a start that restores this chain, as far as the cache still has
-  // it (matchableChain), would take some of the quota of active KV
-  // (spillRoom): a copy on it no request holds (takesQuota).
+  // Whether a start that restores `chain` (CacheProbe::restoredChain) would
+  // take some of the quota of active KV (spillRoom): a copy on it no
+  // request holds (takesQuota).
   [[nodiscard]] bool restoreTakesQuota(std::span<const uint64_t> chain) const;
   // Whether the request holds some of the quota of active KV by its own
   // count: a Spill request's commitment, or a block of its chain it holds
@@ -640,17 +645,9 @@ public:
   [[nodiscard]] uint32_t convertiblePages(uint64_t requestId) const;
   // The pool's free pages of `form`.
   [[nodiscard]] uint32_t freePages(kv::PageForm form) const noexcept { return pool_.freePageCount(form); }
-  // The part of `chain`, the blocks a start restores as a probe found them,
-  // that the cache still has: up to its first block no longer matchable. A
-  // probe's chain may have changed since it was made, and a reclaim takes a
-  // chain leaf first, so every reader of one reads it through this
-  // (refresh, residentChainPages, restoreTakesQuota, restoresIndexPages,
-  // Engine::residentRoom).
-  [[nodiscard]] std::span<const uint64_t> matchableChain(std::span<const uint64_t> chain) const noexcept;
-  // The pages of `chain`, the blocks a start restores, as far as the cache
-  // still has it (matchableChain), that are in memory in a form its start
-  // takes in place (restoreRequest): any but the Index form, which a
-  // Resident start moves to Full pages.
+  // The pages of `chain`, a start's (CacheProbe::restoredChain), that are in
+  // memory in a form its start takes in place (restoreRequest): any but the
+  // Index form, which a Resident start moves to Full pages.
   [[nodiscard]] uint32_t residentChainPages(std::span<const uint64_t> chain) const;
   // The need `pages` more Full pages of the lanes make, as ensureTokens
   // takes them (KvPool::takeFreePages): the free pages first, which a walk
@@ -675,10 +672,9 @@ public:
   // holds.
   [[nodiscard]] uint32_t indexPages(uint64_t requestId) const;
   [[nodiscard]] bool holdsIndexPages(uint64_t requestId) const;
-  // Whether a Spill start that restores `chain`, as far as the cache still
-  // has it (matchableChain), holds Index pages once it has (restoreRequest):
-  // a block of it past the dense history that only the SSD cache holds, or
-  // one on an Index page.
+  // Whether a Spill start that restores `chain` (CacheProbe::restoredChain)
+  // holds Index pages once it has (restoreRequest): a block of it past the
+  // dense history that only the SSD cache holds, or one on an Index page.
   [[nodiscard]] bool restoresIndexPages(std::span<const uint64_t> chain) const;
   // The block's copy could not be read (ModelStepResult::unreadableKvBlocks):
   // it matches nothing any more, and its copy goes with the block.
@@ -915,6 +911,8 @@ public:
   void checkReaches(bool check) noexcept { kv_.checkReaches(check); }
 
 private:
+  // A probe reads the KV graph to cut its chain (CacheProbe::matchableChain).
+  friend class CacheProbe;
   // Matches the prompt's pages on from blocks.back() (from the root when
   // empty) and appends each block found; returns the pages it hashed.
   size_t extendMatch(std::vector<uint64_t> &blocks, std::span<const uint32_t> prompt,

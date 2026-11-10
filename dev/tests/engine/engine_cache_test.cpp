@@ -4999,7 +4999,8 @@ void testARestoreReadsAChainOnlyAsFarAsItMatches() {
   // fails.
   CacheLookup lookup = spill.cache.lookup(prompt, {});
   spill.cache.poisonCopy(chain.front());
-  require(spill.cache.chainCopies(chain.back()).unheld == 3 && !spill.cache.restoreTakesQuota(chain),
+  require(spill.cache.chainCopies(chain.back()).unheld == 3 &&
+              !spill.cache.restoreTakesQuota(probe.restoredChain()),
           "a start's chain took quota for copies past a block that no longer matches");
   lookup = {};
 }
@@ -6694,10 +6695,10 @@ void testAReleaseOfWhatALandingCompletesCountsOnce() {
   require(claimBytes(ledger, 100).laterBytes == 400 && store.units, "the leaf's demotion did not complete an extent");
   cache.beginRequest(2);
   require(admitTokens(cache, 2, 3 * KvCache::pageTokens).granted(), "the request's pages were denied");
-  const uint64_t dead = cacheConversation(cache, 3, 1);
+  static_cast<void>(cacheConversation(cache, 3, 1));
   require(pool.freePageCount() == 3 && cache.returning().landingBytes == 400, "fixture geometry changed");
   static_cast<void>(claimBytes(ledger, 800));
-  require(!cache.residentChainPages({&dead, 1}) && !store.units,
+  require(pool.freePageCount() == 0 && !store.units,
           "a claim counted the free pages a landing completes an extent with twice");
   cache.endRequest(2);
   cache.checkInvariants();

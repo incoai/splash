@@ -262,6 +262,17 @@ uint32_t Cache::stateTokens(std::span<const uint64_t> blocks) const {
   return 0;
 }
 
+std::span<const uint64_t> CacheProbe::restoredChain() const noexcept {
+  return matchableChain(std::span<const uint64_t>(blocks_).first(cachedTokens_ / KvCache::pageTokens));
+}
+
+std::span<const uint64_t> CacheProbe::matchableChain(std::span<const uint64_t> chain) const noexcept {
+  if (kvGeneration_ == owner_->kv_.generation())
+    return chain;
+  const auto end = std::ranges::find_if(chain, [&](uint64_t block) { return !owner_->kv_.matchable(block); });
+  return chain.first(static_cast<size_t>(end - chain.begin()));
+}
+
 CacheProbe Cache::probe(std::span<const uint32_t> prompt, PromptIdentity identity) {
   CacheProbe result;
   result.owner_ = this;
@@ -277,7 +288,7 @@ void Cache::refresh(CacheProbe &probe, std::span<const uint32_t> prompt,
     throw std::logic_error("a scheduling probe belongs to another cache");
   if (probe.kvGeneration_ != kv_.generation()) {
     // See KvCache's generation.
-    probe.blocks_.resize(matchableChain(probe.blocks_).size());
+    probe.blocks_.resize(probe.matchableChain(probe.blocks_).size());
     lookup_.probeHashedBlocks += extendMatch(probe.blocks_, prompt, identity);
     probe.kvGeneration_ = kv_.generation();
   }
@@ -643,14 +654,9 @@ uint32_t Cache::convertiblePages(uint64_t requestId) const {
   return pages;
 }
 
-std::span<const uint64_t> Cache::matchableChain(std::span<const uint64_t> chain) const noexcept {
-  const auto end = std::ranges::find_if(chain, [&](uint64_t block) { return !kv_.matchable(block); });
-  return chain.first(static_cast<size_t>(end - chain.begin()));
-}
-
 uint32_t Cache::residentChainPages(std::span<const uint64_t> chain) const {
   uint32_t pages = 0;
-  for (const uint64_t block : matchableChain(chain)) {
+  for (const uint64_t block : chain) {
     const uint32_t page = kv_.page(block);
     pages += page != KvCache::noPage && pool_.form(page) != kv::PageForm::Index;
   }
@@ -1852,7 +1858,7 @@ bool Cache::holdsCopy(const Request &active, uint32_t index) const {
 bool Cache::restoreTakesQuota(std::span<const uint64_t> chain) const {
   if (!spill_)
     return false;
-  for (const uint64_t block : matchableChain(chain))
+  for (const uint64_t block : chain)
     if (takesQuota(block))
       return true;
   return false;
@@ -2256,9 +2262,8 @@ bool Cache::holdsIndexPages(uint64_t requestId) const { return indexPages(reques
 bool Cache::restoresIndexPages(std::span<const uint64_t> chain) const {
   if (!spill_)
     return false;
-  const std::span<const uint64_t> kept = matchableChain(chain);
-  for (uint32_t position = 0; position < kept.size(); ++position) {
-    const uint32_t page = kv_.page(kept[position]);
+  for (uint32_t position = 0; position < chain.size(); ++position) {
+    const uint32_t page = kv_.page(chain[position]);
     if (page == KvCache::noPage ? position >= spill_->densePages : pool_.form(page) == kv::PageForm::Index)
       return true;
   }
