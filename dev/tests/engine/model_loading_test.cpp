@@ -301,7 +301,7 @@ void testRestoreAdmission(MetalBackend &backend, const std::filesystem::path &ro
 
     images.release();
     require(holdsNone(), "released images hold memory");
-    require(!images.restore(splash::test::admitAll, {}) && !images.contents()[0].bytes.empty() &&
+    require(!images.restore(splash::test::admitAll) && !images.contents()[0].bytes.empty() &&
                 images.contents()[1].bytes.empty(),
             "a restore did not write back the first image alone");
     const uint64_t firstBack = backend.memoryStats().allocatedBytes;
@@ -313,7 +313,7 @@ void testRestoreAdmission(MetalBackend &backend, const std::filesystem::path &ro
         return splash::metal::AllocationResult{splash::metal::AllocationFailure::HostPressure};
     };
     splash::test::awaitWritten(images);
-    rejects([&] { static_cast<void>(images.restore(refuse, {})); }, "host memory reserve protected",
+    rejects([&] { static_cast<void>(images.restore(refuse)); }, "host memory reserve protected",
             "an image admission refused was restored");
     require(keepsTheFirst(), "an image admission refused holds memory, or the image before it went");
     writerRefused = true;
@@ -334,10 +334,10 @@ void testRestoreAdmission(MetalBackend &backend, const std::filesystem::path &ro
 // A restore writes each image on a thread of its own, so that the engine's
 // loop goes on answering while one is written: restore() returns while the
 // writer runs, and until it ends the images stay released, writing() holds and
-// no restore() may follow. The writer's thread calls `written` once the write
-// is over, so that the restore() it wakes the loop for goes on; a writer's
-// failure comes from that restore(). A release during a write waits for it
-// and gives its image back too.
+// no restore() may follow. The writer's thread calls the completion notifier
+// once the write is over, so that the restore() it wakes the loop for goes
+// on; a writer's failure comes from that restore(). A release during a write
+// waits for it and gives its image back too.
 void testRestoreWritesEachImageOnItsThread(MetalBackend &backend, const std::filesystem::path &root) {
     const uint64_t baseline = backend.memoryStats().allocatedBytes;
     const std::array<uint64_t, 1> sections{kWeightFileAlignment};
@@ -377,41 +377,41 @@ void testRestoreWritesEachImageOnItsThread(MetalBackend &backend, const std::fil
     std::atomic<int> writtenCalls{0};
     std::atomic<bool> writtenAfterEnd{false}, writtenOnItsThread{false}, writtenSeen{false};
     const std::thread::id caller = std::this_thread::get_id();
-    const std::function<void()> written = [&] {
+    images.setCompletionNotifier([&] {
         writtenAfterEnd = !images.writing();
         writtenOnItsThread = std::this_thread::get_id() != caller;
         ++writtenCalls;
         writtenSeen = true;
-    };
+    });
 
     images.release();
     hold = true;
-    const bool restoredAtOnce = images.restore(splash::test::admitAll, written);
+    const bool restoredAtOnce = images.restore(splash::test::admitAll);
     returned = true;
     require(!restoredAtOnce && images.writing() && images.released(),
             "restore() waited for the image's write, or did not report it under way");
-    rejects([&] { static_cast<void>(images.restore(splash::test::admitAll, written)); },
+    rejects([&] { static_cast<void>(images.restore(splash::test::admitAll)); },
             "while an image is being written", "a restore went on while an image was written");
     go = true;
     require(await(writtenSeen) && returnedFirst && writtenCalls == 1 && writtenAfterEnd && writtenOnItsThread,
-            "the write did not run after restore() returned, or did not call `written` on its thread once over");
-    require(images.restore(splash::test::admitAll, written) && !images.released() &&
+            "the write did not run after restore() returned, or did not call the notifier on its thread once over");
+    require(images.restore(splash::test::admitAll) && !images.released() &&
                 std::ranges::equal(images.contents()[0].bytes, loaded) && writtenCalls == 1,
             "the restore after the write did not end with the image as it was loaded");
 
     hold = false;
     fail = true;
     images.release();
-    require(!images.restore(splash::test::admitAll, {}), "a restore wrote its image before it returned");
+    require(!images.restore(splash::test::admitAll), "a restore wrote its image before it returned");
     splash::test::awaitWritten(images);
-    rejects([&] { static_cast<void>(images.restore(splash::test::admitAll, {})); }, "the writer failed",
+    rejects([&] { static_cast<void>(images.restore(splash::test::admitAll)); }, "the writer failed",
             "a writer's failure did not come from the restore after it");
     fail = false;
 
     images.release();
     hold = true;
     go = false;
-    require(!images.restore(splash::test::admitAll, {}) && images.writing(), "the image was not being written");
+    require(!images.restore(splash::test::admitAll) && images.writing(), "the image was not being written");
     std::thread opener([&] {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         go = true;
@@ -715,7 +715,7 @@ void testSyntheticModel(MetalBackend &backend,
                         declaredBytes(model.draft.files) - declaredBytes(model.vision.files),
                 "released weights remain in backend accounting");
         // They come back an image at a time, in load order.
-        require(!model.images->restore(splash::test::admitAll, {}) &&
+        require(!model.images->restore(splash::test::admitAll) &&
                     !model.images->contents()[0].bytes.empty() && model.images->contents()[1].bytes.empty(),
                 "a restore wrote back other than the next image");
         splash::test::restoreWeights(*model.images);

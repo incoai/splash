@@ -185,12 +185,10 @@ public:
   // The live chunks and the staging, while no command is in flight;
   // restore() takes the floor chunks and the staging back in one part under
   // `admit`, leaves the elastic chunks to growTowardCap(), and reads the
-  // experts of the sizes of one block again, all before it returns: it never
-  // calls `written`.
+  // experts of the sizes of one block again.
   [[nodiscard]] bool released() const noexcept override;
   void release() override;
-  [[nodiscard]] bool restore(const metal::AllocationAdmission &admit,
-                             const std::function<void()> &written) override;
+  [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override;
   // While memory is short: gives back the last live elastic chunk of the
   // streamed size with the largest share of its slots above its floor. The
   // experts it holds move to free slots below it, after as many of the

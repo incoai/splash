@@ -180,6 +180,8 @@ void Engine::provideMask(uint64_t id, std::span<const uint32_t> words) {
 void Engine::setCompletionNotifier(std::function<void()> notifier) {
   completionNotifier_ = std::move(notifier);
   cache_.setCompletionNotifier(completionNotifier_);
+  if (weights_)
+    weights_->setCompletionNotifier(completionNotifier_);
 }
 
 bool Engine::flushRestorePoints() {
@@ -552,17 +554,17 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
   std::optional<double> result;
   // While a part of the weights is written, a tick only ends requests at
   // their deadlines (tick): the write's end wakes the loop for the rest.
-  if (weightsWriting()) {
-    for (const auto &[_, active] : requests_)
-      if (!active.finalized && !active.pendingEnd && (!result || active.request.deadlineMilliseconds < *result))
-        result = active.request.deadlineMilliseconds;
-    return result;
-  }
-  if (pending_)
-    result = nextHealthCheckMilliseconds_;
+  const bool writing = weightsWriting();
   const bool draining = drainingForRecovery();
-  if (draining && (!result || drainEndMilliseconds_ < *result))
-    result = drainEndMilliseconds_;
+  if (!writing) {
+    if (pending_)
+      result = nextHealthCheckMilliseconds_;
+    if (draining && (!result || drainEndMilliseconds_ < *result))
+      result = drainEndMilliseconds_;
+    // Copies ahead wait while a claim waits, which a step of the engine shows.
+    if (const std::optional<double> persist = writeBehind_.nextWakeup(); persist && (!result || *persist < *result))
+      result = persist;
+  }
   // Admission retries run only between commands, and only for the requests
   // admission tries; those held behind one refused memory have no retry time
   // (admitQueued). Other retry times would wake the loop with nothing to do;
@@ -573,6 +575,8 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
       continue;
     if (!result || active.request.deadlineMilliseconds < *result)
       result = active.request.deadlineMilliseconds;
+    if (writing)
+      continue;
     if (active.maskRequestedMilliseconds) {
       const double limit =
           *active.maskRequestedMilliseconds + kMaskWaitMilliseconds;
@@ -591,9 +595,6 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
     if (!result || wakeup < *result)
       result = wakeup;
   }
-  // Copies ahead wait while a claim waits, which a step of the engine shows.
-  if (const std::optional<double> persist = writeBehind_.nextWakeup(); persist && (!result || *persist < *result))
-    result = persist;
   return result;
 }
 
@@ -2222,7 +2223,7 @@ bool Engine::advanceWeights(double now) {
     claim.id = governor().ledger().open(
         {.cls = waiting.empty() ? ClaimClass::Start : ClaimClass::Floor, .timing = NeedTiming::Immediate});
     const MemoryGovernor::Scope scope(governor(), claim.id);
-    return weights_->restore(now, completionNotifier_);
+    return weights_->restore(now);
   }();
   if (step.kind != WeightResidency::Step::Kind::Refused) {
     // A part that came back ends each waiting request's wait for memory: its

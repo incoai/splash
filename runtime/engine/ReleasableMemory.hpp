@@ -49,21 +49,23 @@ public:
     if (!splitReleased_)
       splitReleased_ = split_ && split_->release();
   }
-  [[nodiscard]] bool restore(const metal::AllocationAdmission &admit,
-                             const std::function<void()> &written) override {
+  [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override {
     // Every part, then the program. With nothing released, the first part
     // refuses the restore. A part stays released while its last image is
     // written, so the next part waits for that write.
     auto part = std::ranges::find_if(parts_, &model::WeightMemory::released);
     if (part == parts_.end() && !splitReleased_) part = parts_.begin();
     if (part != parts_.end())
-      return (*part)->restore(admit, written) && !released() && !splitReleased_;
+      return (*part)->restore(admit) && !released() && !splitReleased_;
     splitReleased_ = false;
     split_->restore();
     return true;
   }
   [[nodiscard]] bool writing() const noexcept override {
     return std::ranges::any_of(parts_, &model::WeightMemory::writing);
+  }
+  void setCompletionNotifier(std::function<void()> notifier) override {
+    for (model::WeightMemory *part : parts_) part->setCompletionNotifier(notifier);
   }
 
 private:

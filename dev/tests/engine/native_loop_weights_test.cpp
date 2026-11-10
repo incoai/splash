@@ -163,7 +163,7 @@ void testReleasableMemoryRestoresTheExpertsAfterTheImages() {
     uint32_t restores = 0;
     [[nodiscard]] bool released() const noexcept override { return !held; }
     void release() override { held = false; }
-    bool restore(const metal::AllocationAdmission &, const std::function<void()> &) override {
+    bool restore(const metal::AllocationAdmission &) override {
       require(!held, "a held arena was restored");
       held = true;
       ++restores;
@@ -179,13 +179,13 @@ void testReleasableMemoryRestoresTheExpertsAfterTheImages() {
   require(memory.released() && weights.released() && experts.released(),
           "the release kept the images or the arena");
   for (uint32_t image = 0; image < Weights::kImages; ++image)
-    require(!memory.restore(admit, {}) && experts.released(),
+    require(!memory.restore(admit) && experts.released(),
             "the arena came back before the last image");
   require(!weights.released() && memory.released(), "the restore ended without the arena");
-  require(memory.restore(admit, {}) && !memory.released() && experts.restores == 1,
+  require(memory.restore(admit) && !memory.released() && experts.restores == 1,
           "the arena did not come back in one restore after the images");
   memory.release();
-  require(!memory.restore(admit, {}) && weights.held() == 1,
+  require(!memory.restore(admit) && weights.held() == 1,
           "a restore did not write the first image back");
   memory.release();
   require(weights.held() == 0 && experts.released() && experts.restores == 1,
@@ -864,7 +864,7 @@ void testARestoredRequestWaitsAfreshAtItsStart() {
 struct StoreMemory final : model::WeightMemory {
   [[nodiscard]] bool released() const noexcept override { return out; }
   void release() override { out = true; }
-  bool restore(const metal::AllocationAdmission &admit, const std::function<void()> &) override {
+  bool restore(const metal::AllocationAdmission &admit) override {
     if (const metal::AllocationResult admitted = admit(kFloorBytes, [] {}); !admitted)
       throw metal::MetalAllocationError("the store's floor was refused", admitted.failure);
     ++floors;

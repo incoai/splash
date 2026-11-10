@@ -68,10 +68,10 @@ void testReleaseOnlyHeldWeightsOfAnIdleEngine() {
   require(residency.release(1100.0, true, true) && weights.released() && !residency.held(),
           "the idle release did not release the weights after the idle time");
   require(!residency.release(1100.0, true, false), "released weights were released again");
-  require(residency.restore(1200.0, {}).kind == Kind::Progress && !residency.release(5000.0, true, false) &&
+  require(residency.restore(1200.0).kind == Kind::Progress && !residency.release(5000.0, true, false) &&
               weights.held() == 1,
           "a release request released the weights during a restore");
-  while (residency.restore(1300.0, {}).kind == Kind::Progress) {
+  while (residency.restore(1300.0).kind == Kind::Progress) {
   }
   require(residency.held() && !residency.release(2299.0, true, true),
           "the idle period did not begin when the weights were restored");
@@ -92,7 +92,7 @@ void testRestoreTakesBackAPartACall() {
           "the snapshot of released weights is wrong");
   std::vector<Kind> steps;
   for (double now = 10.0; !residency.held(); now += 10.0) {
-    steps.push_back(residency.restore(now, {}).kind);
+    steps.push_back(residency.restore(now).kind);
     snapshot = residency.snapshot();
     require(snapshot.restoring == !residency.held() && residency.restoring() == snapshot.restoring,
             "the snapshot did not report the restore under way");
@@ -123,17 +123,17 @@ void testARefusedRestoreGivesTheFailure() {
     WeightResidency residency(
         {.weights = &weights, .admit = admission.admit(), .idleReleaseMilliseconds = 1000.0});
     require(residency.release(0.0, true, false), "the weights were not released");
-    require(residency.restore(1.0, {}).kind == Kind::Progress, "the first image did not come back");
+    require(residency.restore(1.0).kind == Kind::Progress, "the first image did not come back");
     admission.refuse = true;
-    const WeightResidency::Step refused = residency.restore(2.0, {});
+    const WeightResidency::Step refused = residency.restore(2.0);
     require(refused.kind == Kind::Refused && refused.failure == metal::AllocationFailure::HostPressure &&
                 weights.held() == 1 && residency.restoring(),
             "a refused image did not give the failure, or gave back what came back");
     admission.refuse = false;
-    require(residency.restore(3.0, {}).kind == Kind::Progress && weights.held() == 2,
+    require(residency.restore(3.0).kind == Kind::Progress && weights.held() == 2,
             "the image refused was not taken back once admitted");
     admission.refuse = true;
-    require(residency.restore(4.0, {}).kind == Kind::Refused, "the third image was not refused");
+    require(residency.restore(4.0).kind == Kind::Refused, "the third image was not refused");
     if (waiterFailed)
       residency.waiterFailed();
     residency.abandon();
@@ -142,7 +142,7 @@ void testARefusedRestoreGivesTheFailure() {
                 snapshot.restoreFailures == (waiterFailed ? 1U : 0U) && !snapshot.restores,
             "an abandoned restore kept what came back, or counted a failure no waiter's");
     admission.refuse = false;
-    while (residency.restore(5.0, {}).kind == Kind::Progress) {
+    while (residency.restore(5.0).kind == Kind::Progress) {
     }
     require(residency.held() && weights.restores == 2 + Weights::kImages &&
                 residency.snapshot().restoreFailures == (waiterFailed ? 1U : 0U),
@@ -157,7 +157,7 @@ struct Store final : model::WeightMemory {
   bool held = true;
   [[nodiscard]] bool released() const noexcept override { return !held; }
   void release() override { held = false; }
-  bool restore(const metal::AllocationAdmission &admit, const std::function<void()> &) override {
+  bool restore(const metal::AllocationAdmission &admit) override {
     if (const metal::AllocationResult admitted = admit(kFloorBytes, [] {}); !admitted)
       throw metal::MetalAllocationError("the floor was refused", admitted.failure);
     held = true;
@@ -178,7 +178,7 @@ void testTheStorePartComesBackInOneAdmissionAfterTheImages() {
           "the release kept the images or the store");
   std::vector<Kind> steps;
   while (!residency.held())
-    steps.push_back(residency.restore(1.0, {}).kind);
+    steps.push_back(residency.restore(1.0).kind);
   require(steps == std::vector<Kind>{Kind::Progress, Kind::Progress, Kind::Progress, Kind::Restored} &&
               admission.granted == std::vector<uint64_t>{Weights::kImageBytes, Weights::kImageBytes,
                                                          Weights::kImageBytes, Store::kFloorBytes},
@@ -187,8 +187,9 @@ void testTheStorePartComesBackInOneAdmissionAfterTheImages() {
 
 // An image written on its thread (model::WeightImages) is a step of the
 // restore until the call after its end: the residency reports it written,
-// through ReleasableMemory too, its restore() hands it `written`, and the
-// store after the images comes back only once the last image's write ended.
+// through ReleasableMemory too, the completion notifier set on the residency
+// reaches it, and the store after the images comes back only once the last
+// image's write ended.
 void testAnImageWrittenOnItsThreadEndsBeforeTheNextPart() {
   Weights weights;
   weights.writes = true;
@@ -197,9 +198,10 @@ void testAnImageWrittenOnItsThreadEndsBeforeTheNextPart() {
   WeightResidency residency({.weights = &memory, .admit = test::admitAll});
   require(residency.release(0.0, true, false), "the weights were not released");
   uint32_t ends = 0;
+  residency.setCompletionNotifier([&ends] { ++ends; });
   std::vector<Kind> steps;
   while (!residency.held()) {
-    steps.push_back(residency.restore(1.0, [&ends] { ++ends; }).kind);
+    steps.push_back(residency.restore(1.0).kind);
     require(residency.writing() == weights.writing() && memory.writing() == weights.writing(),
             "the residency did not report the image being written");
     if (residency.writing()) {

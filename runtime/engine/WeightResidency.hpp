@@ -52,8 +52,12 @@ public:
   // From the first restore() after a release until the restore ends.
   [[nodiscard]] bool restoring() const noexcept { return restoringSince_.has_value(); }
   // A part taken back is still being written on its thread, which calls the
-  // `written` its restore() was given once it ends (WeightMemory::writing).
+  // completion notifier once it ends (WeightMemory::writing).
   [[nodiscard]] bool writing() const noexcept { return config_.weights->writing(); }
+  // Called on a part's thread as its write ends (WeightMemory).
+  void setCompletionNotifier(const std::function<void()> &notifier) {
+    config_.weights->setCompletionNotifier(notifier);
+  }
   struct Step final {
     enum class Kind : uint8_t { Progress, Restored, Refused } kind;
     metal::AllocationFailure failure = metal::AllocationFailure::None;
@@ -64,7 +68,7 @@ public:
   // Restored: the last came back and was written, which begins an idle
   // period. Refused: admission or the driver refused the part, which stays
   // released, for `failure`; what came back stays.
-  [[nodiscard]] Step restore(double nowMilliseconds, const std::function<void()> &written);
+  [[nodiscard]] Step restore(double nowMilliseconds);
   // A request waiting for the restore failed at its resource wait limit: the
   // restore counts a failure if it is abandoned.
   void waiterFailed() noexcept;
