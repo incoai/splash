@@ -1,3 +1,4 @@
+#include "metal/abi/KernelEntry.h"
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/gdn_primitives.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
@@ -22,7 +23,7 @@
 // state a step writes is the one before its rows: it leaves the rows on the
 // lane's tape, and the lane's next step folds the retained ones into the
 // state before its own rows. A step reads and writes the state once.
-constant uint kDecodeSimdgroups = 8;
+constant uint kDecodeSimdgroups = SPLASH_TARGET_VERIFY_ROWS;
 
 // The threadgroup operands of one value head: the rows' prepared q/k, the
 // head's v, the gates and the recurrent output rows, and the k, v and gates
@@ -427,13 +428,13 @@ inline void gdn_decode_batch_phase(
         table, sums);
 // Entries without a table pass null pointers, which skip the write; their Layout only completes the template.
 #define GDN_DECODE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W, State) \
-  kernel void Name(GDN_DECODE_BUFFERS(W), \
+  SPLASH_KERNEL(Name)(GDN_DECODE_BUFFERS(W), \
       constant GDNDecodeBatchParams &params [[buffer(15)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, nullptr, nullptr, gguf_sg::Table16, W, State) \
   }
 // The out-projection's table (Layout: gguf_sg::Table16).
 #define GDN_DECODE_TABLE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W, State) \
-  kernel void Name(GDN_DECODE_BUFFERS(W), \
+  SPLASH_KERNEL(Name)(GDN_DECODE_BUFFERS(W), \
       device bfloat *table [[buffer(15)]], device float *sums [[buffer(16)]], \
       constant GDNDecodeBatchParams &params [[buffer(17)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout, W, State) \

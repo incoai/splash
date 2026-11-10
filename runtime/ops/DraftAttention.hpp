@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/CommandGraph.hpp"
+#include "ops/DecodeGeometry.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 
 #include <cstdint>
@@ -18,6 +19,7 @@ struct DraftAttentionShape final {
   uint32_t headDimension = 0;
   uint32_t contextTokens = SPLASH_DRAFT_SLIDING_WINDOW;
   bool causal = false;
+  DecodeGeometry geometry{};
 
   bool operator==(const DraftAttentionShape &) const = default;
 };

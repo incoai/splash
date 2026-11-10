@@ -299,7 +299,7 @@ public:
   // before its own rows, `retainedRows` (1 to 8) of which wait on the tape.
   void updateLengths(uint32_t lane, QwenLogicalLengths lengths);
   void swapParity(uint32_t lane);
-  void swapDecodeParity(uint32_t lane, uint32_t retainedRows);
+  void swapDecodeParity(uint32_t lane, uint32_t retainedRows, ops::DecodeGeometry geometry = {});
 
   // Copies committed state into a pooled or newly admitted cache slot while
   // the lane retains its own cells; it throws for a lane with pending rows,

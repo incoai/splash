@@ -669,7 +669,7 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
   // A cycle counts the proposals each lane verified: seven, or fewer once the
   // lane's output budget leaves less than its block to retain.
   if (draftedTokens > uint64_t{width} * decodeBatches *
-                          model::ExecutionLimits::draftProposalTokens ||
+                          (executor.decodeRows() - 1) ||
       acceptedDraftTokens > draftedTokens) {
     throw std::runtime_error("decode throughput DFlash accounting is invalid");
   }
@@ -914,7 +914,7 @@ int main(int argc, char **argv) {
   try {
     if (argc < 3) {
       std::cerr << "usage: backend-benchmark METALLIB MODEL_ROOT "
-                   "[--samples COUNT] [--progress PATH] "
+                   "[--samples COUNT] [--progress PATH] [--draft-block-size 8|16] "
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
                    "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
                    "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
@@ -939,6 +939,7 @@ int main(int argc, char **argv) {
     std::optional<double> aneFfnShare;
     std::optional<uint32_t> aneFfnMinimumRows;
     uint32_t maxContext = 0;
+    uint32_t draftBlockSize = 8;
     std::optional<std::filesystem::path> logitsDirectory, logitsFrom;
     uint32_t logitsWidth = 1;
     bool logitsOptions = false;
@@ -946,7 +947,11 @@ int main(int argc, char **argv) {
       if (index + 1 >= argc)
         throw std::invalid_argument("benchmark option requires a value");
       const std::string_view option(argv[index]);
-      if (option == "--samples") {
+      if (option == "--draft-block-size") {
+        const std::string_view value(argv[index + 1]);
+        if (value != "8" && value != "16") throw std::invalid_argument("--draft-block-size takes 8 or 16");
+        draftBlockSize = value == "16" ? 16 : 8;
+      } else if (option == "--samples") {
         samples = parseSamples(argv[index + 1]);
       } else if (option == "--progress") {
         progressPath = std::filesystem::path(argv[index + 1]);
@@ -991,6 +996,7 @@ int main(int argc, char **argv) {
     // round to round: every cycle verifies every row (--verify-rows all), and
     // the times measure the backend, not the budget.
     config.verifyRows = model::VerifyRows::All;
+    config.draftBlockSize = draftBlockSize;
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
@@ -1606,7 +1612,7 @@ int main(int argc, char **argv) {
               << ",\"ane_ffn_minimum_rows\":" << ranAneFfnMinimumRows
               << ",\"geometry\":{\"prefill_rows\":"
               << model::ExecutionLimits::prefillTokenBudget
-              << ",\"verify_rows\":" << model::ExecutionLimits::targetVerifyRows
+              << ",\"verify_rows\":" << executor->decodeRows()
               << ",\"batch_width\":" << model::ExecutionLimits::maximumBatchWidth
               << ",\"kv_block_tokens\":"
               << kv::kPageTokens

@@ -1,3 +1,4 @@
+#include "metal/abi/KernelEntry.h"
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/split_reduce.h"
 
@@ -134,7 +135,7 @@ inline void shard_mass(TargetRow row, uint shard,
 }
 
 // One shard of each selected row of the sampled lanes.
-kernel void decode_sample_mass_sharded(
+SPLASH_KERNEL(decode_sample_mass_sharded)(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
     device TargetShardMass *partial_masses [[buffer(2)]],
@@ -856,7 +857,7 @@ inline void search_row(TargetRow row, device const TargetShardMass *masses,
 
 // Where the distribution of each selected row of the sampled lanes ends, one
 // group per row.
-kernel void decode_sample_vocabulary_search(
+SPLASH_KERNEL(decode_sample_vocabulary_search)(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
     device const TargetShardMass *partial_masses [[buffer(2)]],
@@ -880,7 +881,7 @@ kernel void decode_sample_vocabulary_search(
 // groups per row: the first token after a prompt, a verify row's draft
 // token's probability and the correction a rejection takes or, for the last
 // verify row, which follows the whole draft, its bonus token.
-kernel void decode_sample_vocabulary_draw(
+SPLASH_KERNEL(decode_sample_vocabulary_draw)(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
     device TargetVocabularyRow *vocabulary_rows [[buffer(2)]],
@@ -981,7 +982,7 @@ inline void penalize_token(device float *logits, device const uint *words,
 
 // One thread per vocabulary token and penalized entry, over the rows the
 // first token after a prompt is selected from.
-kernel void decode_sample_penalize(device float *logits [[buffer(0)]],
+SPLASH_KERNEL(decode_sample_penalize)(device float *logits [[buffer(0)]],
                                    device const uint *words [[buffer(1)]],
                                    constant SamplingPenaltyParams &params
                                    [[buffer(2)]],
@@ -992,7 +993,7 @@ kernel void decode_sample_penalize(device float *logits [[buffer(0)]],
 
 // The verify rows of each penalized lane, whose contexts add the lane's
 // draft tokens (verify input rows 1..7) one row at a time.
-kernel void decode_sample_penalize_verify(
+SPLASH_KERNEL(decode_sample_penalize_verify)(
     device float *logits [[buffer(0)]], device const uint *words [[buffer(1)]],
     device const uint *input_tokens [[buffer(2)]],
     constant SamplingPenaltyParams &params [[buffer(3)]],
@@ -1056,7 +1057,7 @@ inline void simd_best_head(float value, uint token, thread float &best,
 // only runs for the few survivors. The group then pops its best sixteen in
 // rank order. The (value desc, id asc) order is total, so the partial is the
 // same set in the same order whatever the thread partition.
-kernel void draft_select_top16_sharded(
+SPLASH_KERNEL(draft_select_top16_sharded)(
     device const float *logits [[buffer(0)]],
     device uint *partial_ids [[buffer(1)]],
     device float *partial_values [[buffer(2)]],
@@ -1221,7 +1222,7 @@ inline void top16_merge_shards(device const uint *partial_ids,
 
 // DSpine refines this fixed top-16 support. Keep token-id order for ties and
 // the serial sampler's cumulative distribution.
-kernel void dspine_select_candidates(device const uint *partial_ids [[buffer(0)]],
+SPLASH_KERNEL(dspine_select_candidates)(device const uint *partial_ids [[buffer(0)]],
     device const float *partial_values [[buffer(1)]], device uint *candidates [[buffer(2)]],
     uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
   float value;
@@ -1238,7 +1239,7 @@ kernel void dspine_select_candidates(device const uint *partial_ids [[buffer(0)]
 // remaining simdgroups score the 16 x 16 predecessor/candidate edge table in
 // fixed per-lane reduction order. The table follows the shard partials in
 // partial-values scratch.
-kernel void draft_select_edges(
+SPLASH_KERNEL(draft_select_edges)(
     device const uint *partial_ids [[buffer(0)]],
     device float *partial_values [[buffer(1)]],
     device uint *candidates [[buffer(2)]],
@@ -1329,7 +1330,7 @@ kernel void draft_select_edges(
 // from the table draft_select_edges left in the partial-values scratch. It
 // writes the lane's confidence at each position (VerifyRowsParams) as it
 // walks.
-kernel void draft_select_dflash(
+SPLASH_KERNEL(draft_select_dflash)(
     device const uint *candidates [[buffer(0)]],
     device const float *unary [[buffer(1)]],
     device const float *partial_values [[buffer(2)]],
@@ -1407,7 +1408,7 @@ kernel void draft_select_dflash(
 // position first among equal ones, so that a lane's chosen rows are always the
 // first of its block, and takes as many as maximize the expected tokens over
 // the cost of the rows verified in all.
-kernel void draft_verify_rows(device const float *confidence [[buffer(0)]],
+SPLASH_KERNEL(draft_verify_rows_abi2)(device const float *confidence [[buffer(0)]],
                               device uint *verify_rows [[buffer(1)]],
                               constant VerifyRowsParams &params [[buffer(2)]],
                               uint index [[thread_position_in_grid]]) {
@@ -1568,7 +1569,7 @@ inline void argmax_shard(TargetRow row, uint shard, device float &partial_value,
 }
 
 // One shard of each selected row of the greedy lanes.
-kernel void decode_sample_argmax_sharded(
+SPLASH_KERNEL(decode_sample_argmax_sharded)(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
     device float *partial_values [[buffer(2)]],
@@ -1601,7 +1602,7 @@ inline uint argmax_reduce(device const float *partial_values,
 }
 
 // The token of each selected row of the greedy lanes.
-kernel void decode_sample_argmax_reduce(
+SPLASH_KERNEL(decode_sample_argmax_reduce)(
     device const float *partial_values [[buffer(0)]],
     device const uint *partial_indices [[buffer(1)]],
     device uint *tokens [[buffer(2)]],
@@ -1619,7 +1620,7 @@ kernel void decode_sample_argmax_reduce(
 // (ThinkingCutoffParams): its rows from its row on select its end tokens, or
 // where its end waits for its mask, its rows from the first of those whose
 // mask admits the end's first token. Draft token r is verify input row r + 1.
-kernel void decode_sample_thinking_cutoff(
+SPLASH_KERNEL(decode_sample_thinking_cutoff_abi2)(
     device const uint *input_tokens [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
     device uint *tokens [[buffer(2)]],
@@ -1663,7 +1664,7 @@ kernel void decode_sample_thinking_cutoff(
 // (ThinkingCutoffParams) and whose end does not wait for its mask, which
 // only the verify reads, drafts the end tokens its verify rows will select:
 // its draft token r is its row r's.
-kernel void decode_draft_thinking_cutoff(
+SPLASH_KERNEL(decode_draft_thinking_cutoff_abi2)(
     device uint *proposed_tokens [[buffer(0)]],
     constant ThinkingCutoffParams &params [[buffer(1)]],
     uint lane [[threadgroup_position_in_grid]]) {
@@ -1688,7 +1689,7 @@ inline void accept_greedy_lane(device const uint *draft_tokens,
                     accepted_count);
 }
 
-kernel void decode_accept_dflash(
+SPLASH_KERNEL(decode_accept_dflash)(
     device const uint *draft_tokens [[buffer(0)]],
     device const uint *draft_ids [[buffer(1)]],
     device const float *draft_probs [[buffer(2)]],

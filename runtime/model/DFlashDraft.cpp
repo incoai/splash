@@ -144,7 +144,7 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
                          metal::MetalBackend &backend,
                          const ops::ExecutionPlans &operators)
     : weights_(weights), backend_(backend), operators_(operators),
-      selector_(weights.layout.vocabularySize),
+      selector_(weights.layout.vocabularySize, operators.geometry()),
       contextKvProjections_(contextKvRows(backend, weights)) {}
 
 void DFlashDraft::addSelection(
@@ -157,7 +157,7 @@ void DFlashDraft::addSelection(
     const auto &layout = weights_.layout;
     ops::DSpine::addRefinement(graph, weights_.bridge, weights_.finalNorm, *vocabularyProjection, bridge, buffers,
         {layout.hiddenSize, layout.bridgeCodeSize, layout.bridgeRank,
-         static_cast<uint32_t>(anchors.size()) * ExecutionLimits::draftQueryRows}, anchors, policies);
+         static_cast<uint32_t>(anchors.size()) * operators_.geometry().rows()}, anchors, policies, operators_.geometry());
     return;
   }
   selector_.add(graph, buffers,
@@ -232,14 +232,14 @@ void DFlashDraft::addContextKv(metal::CommandGraph &graph,
           backend_.view(buffers.ropeSin, ropeOffset,
                         uint64_t{span.rows} * (layout.attentionHeadDimension / 2) * sizeof(float)),
           span.ring[layer].keys, span.ring[layer].values, span.rows,
-          span.startPosition, layout.attentionShape());
+          span.startPosition, layout.attentionShape(operators_.geometry()));
     }
   }
 }
 
 uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
   const ops::Linear &linear = operators_.linear();
-  const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
+  const uint32_t rows = lanes * operators_.geometry().rows();
   uint32_t storageRows = rows;
   const auto include = [&](const ops::Projection &p) {
     if (p.outputSize) storageRows = std::max(storageRows, linear.decodeStorageRows(rows, p.shape()));
@@ -257,7 +257,7 @@ uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
     include(weights_.bridge.packed);
   }
   for (const ops::Projection &p : contextKvProjections_) include(p);
-  return storageRows / ExecutionLimits::draftQueryRows;
+  return storageRows / operators_.geometry().rows();
 }
 
 void DFlashDraft::addDecode(
@@ -275,9 +275,9 @@ void DFlashDraft::addDecode(
     return;
   }
   const DFlashDraftLayout &layout = weights_.layout;
-  const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
+  const uint32_t rows = lanes * operators_.geometry().rows();
   const auto attentionPlan =
-      operators_.draftAttention(layout.attentionShape(), lanes);
+      operators_.draftAttention(layout.attentionShape(operators_.geometry()), lanes);
   const ops::Linear &linear = operators_.linear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
 
@@ -367,7 +367,7 @@ void DFlashDraft::addDecode(
 void DFlashDraft::addMaskRows(metal::CommandGraph &graph, metal::MetalBuffer rows, uint32_t lanes) const {
   if (!weights_.maskEmbedding) return;
   ops::Embedding::addDraftMaskRows(graph, weights_.maskEmbedding, std::move(rows), weights_.layout.hiddenSize,
-                                   lanes);
+                                   lanes, operators_.geometry());
 }
 
 void DFlashDraft::addContextCommit(
@@ -380,7 +380,7 @@ void DFlashDraft::addContextCommit(
     throw std::invalid_argument("invalid draft context batch");
   }
   const DFlashDraftLayout &layout = weights_.layout;
-  const uint32_t rows = lanes * ExecutionLimits::targetVerifyRows;
+  const uint32_t rows = lanes * operators_.geometry().rows();
   const ops::Linear &linear = operators_.linear();
   const ops::LinearScratch &scratch = buffers.linearScratch;
   linear.add(graph, {.input = buffers.capturedTargetHidden, .output = buffers.projected, .scratch = scratch},
@@ -403,7 +403,7 @@ void DFlashDraft::addContextCommit(
         graph, buffers.contextKv, weights_.layers[layer].keyNorm, buffers.ropeCos,
         buffers.ropeSin, buffers.persistentKeys[layer],
         buffers.persistentValues[layer], buffers.retainedCounts,
-        startPositions, layout.attentionShape());
+        startPositions, layout.attentionShape(operators_.geometry()));
   }
 }
 

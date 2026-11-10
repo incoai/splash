@@ -109,7 +109,7 @@ inline constexpr auto kStartupMemoryRecoveryPoll = std::chrono::seconds(1);
 // mask row per draft query and the anchor.
 [[nodiscard]] protocol::ProtocolLimits
 protocolLimitsFor(const model::ModelCapabilities &capabilities,
-                  uint32_t maxContext) noexcept;
+                  uint32_t maxContext, uint32_t draftBlockSize = 8) noexcept;
 
 // What a model served under `engine` and `limits` (protocolLimitsFor)
 // announces in Ready.

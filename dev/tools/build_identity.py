@@ -28,7 +28,7 @@ def production_input_paths(root: Path = ROOT) -> tuple[str, ...]:
         sources.extend(source_root.rglob(suffix))
     sources.extend((source_root / "metal" / "kernels").rglob("*.metal"))
     relative_sources = {path.relative_to(root).as_posix() for path in sources}
-    return tuple(sorted(relative_sources | {"dev/tools/build_identity.py"}))
+    return tuple(sorted(relative_sources | {"dev/tools/build_identity.py", "dev/tools/metal_verify_variant.py"}))
 
 
 def _record(hasher, kind: bytes, name: bytes, value: bytes) -> None:

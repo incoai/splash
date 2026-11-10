@@ -1,3 +1,4 @@
+#include "metal/abi/KernelEntry.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/attention_gate.h"
@@ -32,7 +33,7 @@ inline void full_qkv_decode_phase(
 // HeadDim, RotaryPairs and Gated: full_qkv_storage_phase's.
 #define VERIFY_ATTENTION_QKV(Name, QHeads, KHeads, HeadDim, RotaryPairs,      \
                              Gated, W)                                        \
-  kernel void Name(                                                           \
+  SPLASH_KERNEL(Name)(                                                           \
       device const bfloat *qkv [[buffer(0)]],                                 \
       device const W *q_norm [[buffer(1)]],                                   \
       device const W *k_norm [[buffer(2)]],                                   \
@@ -53,7 +54,7 @@ inline void full_qkv_decode_phase(
 
 // A layer without RoPE (NoPE) binds no tables.
 #define VERIFY_ATTENTION_QKV_NOPE(Name, QHeads, KHeads, HeadDim, Gated, W)    \
-  kernel void Name(                                                           \
+  SPLASH_KERNEL(Name)(                                                           \
       device const bfloat *qkv [[buffer(0)]],                                 \
       device const W *q_norm [[buffer(1)]],                                   \
       device const W *k_norm [[buffer(2)]],                                   \
@@ -111,7 +112,7 @@ inline void full_attention_output_decode_phase(
 }
 
 #define VERIFY_ATTENTION_GATE(Name, QHeads, KHeads, HeadDim)                   \
-  kernel void Name(device const bfloat *packed_qkv [[buffer(0)]],              \
+  SPLASH_KERNEL(Name)(device const bfloat *packed_qkv [[buffer(0)]],              \
                    device const bfloat *attention [[buffer(1)]],               \
                    device bfloat *hidden [[buffer(2)]],                        \
                    constant FullDecodeBatchParams &params [[buffer(3)]],       \
@@ -129,7 +130,7 @@ VERIFY_ATTENTION_GATE(verify_attention_gate_kv2_g16, 32, 2, 256)
 // A layer without an output gate gathers its attention rows into the
 // out-projection's input rows as they are.
 #define VERIFY_ATTENTION_GATHER(Name, QHeads, KHeads, HeadDim)                 \
-  kernel void Name(device const bfloat *attention [[buffer(0)]],               \
+  SPLASH_KERNEL(Name)(device const bfloat *attention [[buffer(0)]],               \
                    device bfloat *hidden [[buffer(1)]],                        \
                    constant FullDecodeBatchParams &params [[buffer(2)]],       \
                    uint index [[thread_position_in_grid]],                     \
@@ -141,7 +142,7 @@ VERIFY_ATTENTION_GATHER(verify_attention_gather_kv4_g8_d128, 32, 4, 128)
 #undef VERIFY_ATTENTION_GATHER
 
 #define ATTENTION_GATE_TABLE(Name, QHeads, KHeads, HeadDim, Layout) \
-  kernel void Name( \
+  SPLASH_KERNEL(Name)( \
       device const bfloat *packed [[buffer(0)]], \
       device const bfloat *attention [[buffer(1)]], \
       device bfloat *hidden [[buffer(2)]], \
@@ -165,7 +166,7 @@ ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv2_g16, 32, 2, 256, gguf_sg:
 
 // The gather's rows written as the out-projection's table too.
 #define ATTENTION_GATHER_TABLE(Name, QHeads, KHeads, HeadDim, Layout) \
-  kernel void Name( \
+  SPLASH_KERNEL(Name)( \
       device const bfloat *attention [[buffer(0)]], \
       device bfloat *hidden [[buffer(1)]], \
       device bfloat *table [[buffer(2)]], device float *sums [[buffer(3)]], \

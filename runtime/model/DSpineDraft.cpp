@@ -10,7 +10,7 @@ void DSpineDraft::addDecode(metal::CommandGraph &graph, const DFlashDraftWeights
       weights.bridge.write.size() != layout.layers)
     throw std::invalid_argument("DSpine bridge layers do not match the checkpoint layout");
   const uint32_t lanes = static_cast<uint32_t>(cacheLengths.size());
-  const uint32_t rows = lanes * ExecutionLimits::draftQueryRows;
+  const uint32_t rows = lanes * operators.geometry().rows();
   const DSpineParams shape{layout.hiddenSize, layout.bridgeCodeSize, layout.bridgeRank, rows};
   const auto attention = operators.draftAttention(layout.attentionShape(), lanes);
   const auto &linear = operators.linear();
@@ -39,13 +39,13 @@ void DSpineDraft::addDecode(metal::CommandGraph &graph, const DFlashDraftWeights
     project(b.intermediate, w.downProjection, b.projected);
     ops::DSpine::addResidual(graph, b.projected, b.residual, b.hidden[next], layout.hiddenSize, rows);
 
-    ops::DSpine::addReadInput(graph, b.hidden[next], b.normalized, b.bridge, shape);
+    ops::DSpine::addReadInput(graph, b.hidden[next], b.normalized, b.bridge, shape, operators.geometry());
     project(b.normalized, weights.bridge.read[layer], b.bridge.codes);
-    ops::DSpine::addCodes(graph, b.inputTokens, weights.bridge, b.bridge, shape);
+    ops::DSpine::addCodes(graph, b.inputTokens, weights.bridge, b.bridge, shape, operators.geometry());
     project(b.bridge.codes, weights.bridge.packed, b.bridge.packed);
-    ops::DSpine::addMessage(graph, weights.bridge, b.bridge, shape);
+    ops::DSpine::addMessage(graph, weights.bridge, b.bridge, shape, operators.geometry());
     project(b.bridge.message, weights.bridge.write[layer], b.projected);
-    ops::DSpine::addWrite(graph, b.projected, b.hidden[next], b.bridge, shape);
+    ops::DSpine::addWrite(graph, b.projected, b.hidden[next], b.bridge, shape, operators.geometry());
   }
   const auto headPlan = linear.decodePlan(head, lanes);
   const auto prepared = ops::Normalization::addRms(graph, b.hidden[layout.layers & 1], weights.finalNorm,

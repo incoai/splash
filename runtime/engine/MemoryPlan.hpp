@@ -168,6 +168,7 @@ struct ModelMemoryProfile final {
   // its routed experts stream (model::kPrefillGroupChunks chunks), zero for
   // a chunk's. A windowed layout's lane keeps them Full (kvWindowFloorPages).
   uint32_t commandPages = 0;
+  uint32_t speculativeScratchTokens = model::ExecutionLimits::speculativeScratchTokens;
 
   [[nodiscard]] std::optional<std::string> validationError() const;
   [[nodiscard]] uint64_t fixedRuntimeBytes() const;

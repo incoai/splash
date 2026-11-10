@@ -430,10 +430,10 @@ void QwenStateStorage::swapParity(uint32_t index) {
   current.metadata.activeParity ^= 1;
 }
 
-void QwenStateStorage::swapDecodeParity(uint32_t index, uint32_t retainedRows) {
+void QwenStateStorage::swapDecodeParity(uint32_t index, uint32_t retainedRows, ops::DecodeGeometry geometry) {
   Lane &current = lane(index);
   requireAssigned(current);
-  if (!retainedRows || retainedRows > ExecutionLimits::targetVerifyRows)
+  if (!retainedRows || retainedRows > geometry.rows())
     throw std::invalid_argument("a decode step retains one to all of its rows");
   current.metadata.activeParity ^= 1;
   current.metadata.pendingRows = retainedRows;

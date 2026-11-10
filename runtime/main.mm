@@ -237,6 +237,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.kvSpillAlways = arguments.kvSpillAlways;
   config.resources.kvWindowTrim = arguments.kvWindowTrim;
   config.resources.verifyRows = arguments.verifyRows;
+  config.resources.draftBlockSize = arguments.draftBlockSize;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   return config;

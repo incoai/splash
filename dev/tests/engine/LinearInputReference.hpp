@@ -22,10 +22,10 @@ inline void addReferencePreparation(metal::CommandGraph &graph, ops::LinearInput
                                     const metal::MetalBuffer &input,
                                     const metal::MetalBuffer &table,
                                     const metal::MetalBuffer &sums, uint32_t width,
-                                    uint32_t lanes) {
+                                    uint32_t lanes, ops::DecodeGeometry geometry = {}) {
   if (layout == ops::LinearInput::Plain)
     throw std::invalid_argument("a plain input has no table to prepare");
-  graph.add("decode_linear_gguf_prepare", {input, table, sums}, width, {width / 32, lanes * SPLASH_TARGET_VERIFY_ROWS / GGUF_TABLE16_ROWS, 1}, {128, 1, 1});
+  graph.add("decode_linear_gguf_prepare", {input, table, sums}, width, {width / 32, lanes * geometry.rows() / GGUF_TABLE16_ROWS, 1}, {128, 1, 1});
 }
 
 } // namespace splash::test

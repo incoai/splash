@@ -1,0 +1,172 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-10",
+  "scope": "Experimental opt-in eight/sixteen-row dense DSpine execution; functional checkpoint before controlled performance qualification. Eight remains the default.",
+  "baseline_commit": "425ad7400f3a00d2a1e6745bdacfa2881922d544",
+  "source_patch_sha256": "57ba45d88b0f095ff0fff0743655aabbce9c7ffec1081c33b1b99fca86ed2161",
+  "source_manifest_sha256": "40531cc81ea9498afd39af36f1d504506862a892f440c9bf9679271e601d0c11",
+  "implementation": {
+    "per_model_widths": [
+      8,
+      16
+    ],
+    "default_width": 8,
+    "table16_physical_rows": 8,
+    "register_maximum_physical_tiles": 4,
+    "metal_library": "One library, namespaced explicitly named sixteen-row variants of eight row-sensitive source files",
+    "control_parameter_abi": "ThinkingCutoffParams and VerifyRowsParams are fixed 348-byte layouts; three _abi2 entry points reject mismatched older control layouts",
+    "protocol_token_batch_limits": {
+      "8": 9,
+      "16": 17
+    },
+    "state_cache_widths_isolated": true,
+    "unsupported": "Sixteen-row DFlash2, routed MoE, sparse KV and auxiliary-state targets are rejected"
+  },
+  "validation": {
+    "build-runtime16-v10": {
+      "receipt_sha256": "0cd5c73e6d74fe1f6e09370a1deab748e7ace8967901999dd484819520c54fc0",
+      "exit_code": 0,
+      "elapsed_seconds": 186.31409333400006
+    },
+    "runtime16-v10-target-sampling16-shader": {
+      "receipt_sha256": "0ed2c4099fe1bedc36813ff2748b228322f426aa09dbd37200bae80d1d177a55",
+      "exit_code": 0,
+      "elapsed_seconds": 42.84783725000034
+    },
+    "runtime16-v10-draft-selector16-shader": {
+      "receipt_sha256": "c5c3ea59548d0ac8650b2952e744469486fae608691ac6f4d2fd7616de4ec52f",
+      "exit_code": 0,
+      "elapsed_seconds": 3.6050249580002856
+    },
+    "runtime16-v10-gdn-decode16-shader": {
+      "receipt_sha256": "fc057b1482bfff4f116d73f3d785738c59ce0f4d01d8cf35820d0b30814633b0",
+      "exit_code": 0,
+      "elapsed_seconds": 63.58860754200032
+    },
+    "runtime16-v10-attention-variants16-shader": {
+      "receipt_sha256": "7c5bb27c2c93ea919777967dbb26c14bd894cdc043dbfa082f6add4a19a40e08",
+      "exit_code": 0,
+      "elapsed_seconds": 12.470550332999665
+    },
+    "runtime16-v10-dspine16-shader": {
+      "receipt_sha256": "4bbb72384dcce36e950ac40207a424c5c89dcf6bdc8a3507496c3502196948ff",
+      "exit_code": 0,
+      "elapsed_seconds": 2.475529207999898
+    },
+    "runtime16-v10-draft-attention16-shader": {
+      "receipt_sha256": "d17c2726dba70d09d7feff29bd9dfa2482465d5b5b235fc0d305e6c6d722f146",
+      "exit_code": 0,
+      "elapsed_seconds": 4.615430875000129
+    },
+    "runtime16-v10-target-sampling-shader": {
+      "receipt_sha256": "825ce36dece7eb1d152160fad8d3482b7b057ea8f84ca6cbe823fff95d9a9be3",
+      "exit_code": 0,
+      "elapsed_seconds": 22.832024416999957
+    },
+    "runtime16-v10-draft-selector-shader": {
+      "receipt_sha256": "f0ff96ac365cd5f88fbcf23257fce7b5e5a342398aec2cb2e973f2f5d1cbf10e",
+      "exit_code": 0,
+      "elapsed_seconds": 3.1952548750005008
+    },
+    "runtime16-v10-gdn-decode-shader": {
+      "receipt_sha256": "b248565143d8a4cfe1cf1453b47a3e18c347121071d56040628d27ead9ddb0c2",
+      "exit_code": 0,
+      "elapsed_seconds": 36.16346212500048
+    },
+    "runtime16-v10-attention-variants-shader": {
+      "receipt_sha256": "b50bae45a2e9b9f8558314ea31527b33d8721b9053a291d6d0bfbcc7ff9cc22f",
+      "exit_code": 0,
+      "elapsed_seconds": 11.109344583000166
+    },
+    "runtime16-v10-dspine-shader": {
+      "receipt_sha256": "7c7396cbdc16dc71da56c7c411a2a49388504f71e35c343585a93f4a410797fc",
+      "exit_code": 0,
+      "elapsed_seconds": 1.3371371249995718
+    },
+    "runtime16-v10-draft-attention-shader": {
+      "receipt_sha256": "f403b660e6c843b690ba0ad7fba04094e51e176d1fcaf181927420fff32d2135",
+      "exit_code": 0,
+      "elapsed_seconds": 3.036939958000403
+    },
+    "runtime16-v10-linear-plan-shader": {
+      "receipt_sha256": "34689cf5f5a6826bd007ffd7db5e3a4be94d7223995c318958093f0fc9e2236a",
+      "exit_code": 0,
+      "elapsed_seconds": 1.9794035830000212
+    },
+    "python-family-status-v10": {
+      "receipt_sha256": "714e63c08a122cbcaff251d7526aa208b0c2a6b2a32b2ec4c8a19d5e786d5872",
+      "exit_code": 0,
+      "elapsed_seconds": 7.845097916999293
+    },
+    "control-abi-entries-v1": {
+      "receipt_sha256": "3d12765a9c7afcb3aadaf32549e564e5ffc9cf5b061b93865c3a8de104911f31",
+      "exit_code": 0,
+      "elapsed_seconds": 0.5726976249998188
+    },
+    "control-abi-entries-v2": {
+      "receipt_sha256": "e82a69aca5bc7102dcc7d08d843f87c0c965716dab889437616a5021fee7d351",
+      "exit_code": 0,
+      "elapsed_seconds": 0.020200792000650836
+    },
+    "native-smoke-dspine16-v10": {
+      "receipt_sha256": "aae5adc1402230dce260f1c39f7e9558c8c73ae897b60f7d7b98d66981703c14",
+      "exit_code": 0,
+      "elapsed_seconds": 17.19895912500033
+    }
+  },
+  "cold_native_three_prompts_64_tokens_each_match_baseline": {
+    "calibration-candidate8-smoke3-v9": true,
+    "calibration-candidate16-smoke3-v9": true,
+    "calibration-dflash8-smoke3-v9": true,
+    "native-smoke-dspine16-v10": true
+  },
+  "dynamic_budget_bytes_at_32k_context": {
+    "baseline8": 20551060608,
+    "candidate8": 20551060608,
+    "candidate16": 20279430272,
+    "dflash8": 20854099072
+  },
+  "additional_sixteen_row_arena_bytes": 271630336,
+  "additional_sixteen_row_arena_MiB": 259.046875,
+  "library_bytes": {
+    "control": 50964549,
+    "runtime16-v10": 54812595
+  },
+  "long_prefix_calibration": [
+    {
+      "mode": "baseline8",
+      "cache_status": "prefix_hit",
+      "matched_tokens": 8128,
+      "cold_output_match": false,
+      "first_cold_warm_difference": 34
+    },
+    {
+      "mode": "candidate8",
+      "cache_status": "prefix_hit",
+      "matched_tokens": 8128,
+      "cold_output_match": false,
+      "first_cold_warm_difference": 34
+    },
+    {
+      "mode": "candidate16",
+      "cache_status": "prefix_hit",
+      "matched_tokens": 8128,
+      "cold_output_match": false,
+      "first_cold_warm_difference": 34
+    },
+    {
+      "mode": "dflash8",
+      "cache_status": "prefix_hit",
+      "matched_tokens": 8128,
+      "cold_output_match": false,
+      "first_cold_warm_difference": 34
+    }
+  ],
+  "limitations": [
+    "These are finite functional checks, not distributional equivalence or a performance qualification.",
+    "A long-prefix cold/warm mismatch is reproduced by the committed baseline, the new eight-row runtime, sixteen-row runtime and DFlash2. No cold/warm exactness claim is made.",
+    "Sixteen rows select different target projection shapes and may produce different greedy arrays on long contexts; wider lifecycle and held-out qualification are still under investigation.",
+    "Initial diagnostic profile on this M5 Pro puts the M64 fused gate/up at roughly 64% of B3/B4 sixteen-row GPU time. It needs separate optimization/qualification."
+  ],
+  "raw_evidence": "Retained in the thirteen-hour study root; the final publication will include portable sources, protocols, receipts and compressed raw evidence."
+}

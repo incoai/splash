@@ -114,7 +114,7 @@ struct GdnTapeLane final {
   uint32_t pendingRows = 0;
 };
 
-[[nodiscard]] uint64_t gdnTapeLayerBytes(const GdnShape &shape) noexcept;
+[[nodiscard]] uint64_t gdnTapeLayerBytes(const GdnShape &shape, DecodeGeometry geometry = {}) noexcept;
 
 struct GdnDecodeBuffers final {
   metal::MetalBuffer packed;
@@ -148,7 +148,7 @@ public:
                                  GdnShape shape, uint32_t lanes, uint32_t layer,
                                  GdnStateStrides state,
                                  GdnHeadOrder order,
-                                 LinearInput input);
+                                 LinearInput input, DecodeGeometry geometry = {});
 };
 
 } // namespace splash::ops

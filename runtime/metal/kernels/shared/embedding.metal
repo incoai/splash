@@ -1,3 +1,4 @@
+#include "metal/abi/KernelEntry.h"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/gguf_embedding_formats.h"
@@ -17,7 +18,7 @@ __attribute__((always_inline)) inline void gguf_embedding(device const uint *tok
 }
 
 #define GGUF_GATHER(Name, F, T) \
-  kernel void Name(device const uint *tokens [[buffer(0)]], device const uchar *table [[buffer(1)]], \
+  SPLASH_KERNEL(Name)(device const uint *tokens [[buffer(0)]], device const uchar *table [[buffer(1)]], \
                    device T *output [[buffer(2)]], constant GgufEmbedParams &p [[buffer(3)]], \
                    uint index [[thread_position_in_grid]]) { \
     gguf_embedding<F>(tokens, table, output, p, index); \
@@ -32,7 +33,7 @@ GGUF_EMBEDDING_FORMATS(GGUF_EMBEDDING_FORMAT)
 // A verify step's input tokens, SPLASH_TARGET_VERIFY_ROWS per lane: the
 // lane's anchor, row 0 of its draft input, then the draft's proposals, each
 // clamped into the vocabulary.
-kernel void verify_input_tokens(
+SPLASH_KERNEL(verify_input_tokens)(
     device const uint *draft_input [[buffer(0)]],
     device const uint *draft_tokens [[buffer(1)]],
     device uint *verify_input [[buffer(2)]],
@@ -50,7 +51,7 @@ kernel void verify_input_tokens(
 // Each lane's mask rows of its draft input, rows 1 to SPLASH_TARGET_VERIFY_ROWS - 1 (the
 // rows after its anchor), set to the mask embedding the draft's checkpoint ships
 // (ops/Embedding.cpp addDraftMaskRows): x a span of 256 columns, y the mask row, z the lane.
-kernel void draft_mask_rows(
+SPLASH_KERNEL(draft_mask_rows)(
     device const bfloat *mask [[buffer(0)]],
     device bfloat *rows [[buffer(1)]],
     constant DraftMaskRowsParams &params [[buffer(2)]],

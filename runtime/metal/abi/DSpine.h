@@ -1,7 +1,7 @@
 #pragma once
 #include "metal/abi/Sampling.h"
 
-// The experimental backend executes the first eight rows of a trained block.
+// The experimental backend executes eight or sixteen rows of a trained block.
 // Bridge weights and activations stay BF16; refinement accumulates in FP32.
 struct DSpineParams {
   uint32_t hidden;

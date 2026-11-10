@@ -1,3 +1,4 @@
+#include "metal/abi/KernelEntry.h"
 #include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/paged_store_row.h"
 
@@ -37,7 +38,7 @@ inline void splash_store_verify_phase(
 }
 
 #define PAGED_VERIFY_STORE(Name, Heads, HeadDim, CacheElement, ValuesTokenMajor) \
-  kernel void Name(                                                            \
+  SPLASH_KERNEL(Name)(                                                            \
       device const bfloat *chunk_keys [[buffer(0)]],                           \
       device const bfloat *chunk_values [[buffer(1)]],                         \
       device const SplashKvPage *page_table0 [[buffer(2)]],                    \

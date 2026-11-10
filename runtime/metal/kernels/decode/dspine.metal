@@ -1,3 +1,4 @@
+#include "metal/abi/KernelEntry.h"
 // DSpine's adjacent causal injection and serial final-write refinement.
 // Equations follow Tencent/DSpine's Apache-2.0 reference implementation.
 #pragma clang fp reassociate(off)
@@ -17,14 +18,14 @@ inline float dspine_sum(float x, threadgroup float *scratch, uint tid, uint lane
   return scratch[0];
 }
 
-kernel void dspine_residual(device const bfloat *input [[buffer(0)]],
+SPLASH_KERNEL(dspine_residual)(device const bfloat *input [[buffer(0)]],
                             device const bfloat *residual [[buffer(1)]],
                             device bfloat *output [[buffer(2)]],
                             constant DSpineParams &p [[buffer(3)]], uint i [[thread_position_in_grid]]) {
   if (i < p.rows * p.hidden) output[i] = bfloat(float(input[i]) + float(residual[i]));
 }
 
-kernel void dspine_read_input(device const bfloat *input [[buffer(0)]],
+SPLASH_KERNEL(dspine_read_input)(device const bfloat *input [[buffer(0)]],
                               device bfloat *normalized [[buffer(1)]],
                               device bfloat *raw [[buffer(2)]], device float *rms [[buffer(3)]],
                               constant DSpineParams &p [[buffer(4)]],
@@ -45,7 +46,7 @@ kernel void dspine_read_input(device const bfloat *input [[buffer(0)]],
   }
 }
 
-kernel void dspine_codes(device bfloat *codes [[buffer(0)]], device const bfloat *book [[buffer(1)]],
+SPLASH_KERNEL(dspine_codes)(device bfloat *codes [[buffer(0)]], device const bfloat *book [[buffer(1)]],
                          device const uint *tokens [[buffer(2)]], constant DSpineParams &p [[buffer(3)]],
                          uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
@@ -65,7 +66,7 @@ kernel void dspine_codes(device bfloat *codes [[buffer(0)]], device const bfloat
   }
 }
 
-kernel void dspine_message(device const bfloat *packed [[buffer(0)]], device const bfloat *bias [[buffer(1)]],
+SPLASH_KERNEL(dspine_message)(device const bfloat *packed [[buffer(0)]], device const bfloat *bias [[buffer(1)]],
                            device bfloat *message [[buffer(2)]], constant DSpineParams &p [[buffer(3)]],
                            uint i [[thread_position_in_grid]]) {
   if (i >= p.rows * p.rank) return;
@@ -80,7 +81,7 @@ kernel void dspine_message(device const bfloat *packed [[buffer(0)]], device con
   message[i] = bfloat(value);
 }
 
-kernel void dspine_write(device const bfloat *raw [[buffer(0)]], device const float *rms [[buffer(1)]],
+SPLASH_KERNEL(dspine_write)(device const bfloat *raw [[buffer(0)]], device const float *rms [[buffer(1)]],
                          device const bfloat *delta [[buffer(2)]], device bfloat *output [[buffer(3)]],
                          constant DSpineParams &p [[buffer(4)]], uint i [[thread_position_in_grid]]) {
   if (i >= p.rows * p.hidden) return;
@@ -91,7 +92,7 @@ kernel void dspine_write(device const bfloat *raw [[buffer(0)]], device const fl
 // Each simdgroup reduces one message coordinate. Matrix rows are read
 // contiguously, and independent coordinates run across many threadgroups.
 // The preceding score dispatch supplies the selected predecessor token.
-kernel void dspine_refine_message(device const bfloat *packed [[buffer(0)]],
+SPLASH_KERNEL(dspine_refine_message)(device const bfloat *packed [[buffer(0)]],
     device const bfloat *book [[buffer(1)]], device const bfloat *pred_gate [[buffer(2)]],
     device const bfloat *previous [[buffer(3)]], device const bfloat *bias [[buffer(4)]],
     device const uint *tokens [[buffer(5)]], device float *message [[buffer(6)]],
@@ -120,7 +121,7 @@ kernel void dspine_refine_message(device const bfloat *packed [[buffer(0)]],
 // One simdgroup per hidden coordinate spreads the final write over the GPU.
 // Keep the state in FP32 until normalization and candidate scoring, as in
 // the direct refinement equations, without an intermediate BF16 rounding.
-kernel void dspine_refine_state(device const bfloat *raw [[buffer(0)]], device const float *rms [[buffer(1)]],
+SPLASH_KERNEL(dspine_refine_state)(device const bfloat *raw [[buffer(0)]], device const float *rms [[buffer(1)]],
     device const float *message [[buffer(2)]], device const bfloat *write [[buffer(3)]],
     device float *state [[buffer(4)]], constant DSpineRefineParams &params [[buffer(5)]],
     uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
@@ -139,7 +140,7 @@ kernel void dspine_refine_state(device const bfloat *raw [[buffer(0)]], device c
 // One group scores a position's candidate support and records the actual
 // conditional q used by rejection sampling. The next message dispatch
 // reads its chosen token; all positions remain in one ordered GPU command.
-kernel void dspine_refine_score(device const float *state [[buffer(0)]], device const bfloat *norm [[buffer(1)]],
+SPLASH_KERNEL(dspine_refine_score)(device const float *state [[buffer(0)]], device const bfloat *norm [[buffer(1)]],
     device const bfloat *head [[buffer(2)]], device const uint *candidates [[buffer(3)]],
     device const float *uniforms [[buffer(4)]], device uint *tokens [[buffer(5)]],
     device float *probabilities [[buffer(6)]], device float *confidence [[buffer(7)]],

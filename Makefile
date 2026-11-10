@@ -52,6 +52,17 @@ PRODUCTION_KERNEL_NAMES := \
 	$(patsubst runtime/metal/kernels/%.metal,%,$(PRODUCTION_KERNEL_SOURCES))
 PRODUCTION_AIRS := $(addprefix $(METAL_BUILD)/, \
 	$(addsuffix .air,$(PRODUCTION_KERNEL_NAMES)))
+# Row-sensitive kernels use isolated, explicitly named sixteen-row variants.
+# Shared ABI capacity is fixed; large runtime arenas still use the model's width.
+VERIFY16_TOOL := dev/tools/metal_verify_variant.py
+VERIFY16_KERNEL_NAMES := $(filter $(PRODUCTION_KERNEL_NAMES), \
+	decode/gdn decode/dspine decode/draft decode/paged_attention \
+	decode/paged_attention_store decode/sampling decode/attention_qkv shared/embedding)
+VERIFY16_WRAPPERS := $(addprefix $(METAL_BUILD)/verify16/, \
+	$(addsuffix .metal,$(VERIFY16_KERNEL_NAMES)))
+VERIFY16_AIRS := $(VERIFY16_WRAPPERS:.metal=.air)
+PRODUCTION_AIRS += $(VERIFY16_AIRS)
+.SECONDARY: $(VERIFY16_WRAPPERS)
 KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
 	runtime/metal/kernels/common/*.h))
 # macOS 26.4 is the tested floor: the engine refuses older systems at
@@ -195,6 +206,16 @@ $(METAL_BUILD)/%.air: runtime/metal/kernels/%.metal $(KERNEL_HEADERS) \
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $< -o $@
 
+$(METAL_BUILD)/verify16/%.metal: runtime/metal/kernels/%.metal $(VERIFY16_TOOL)
+	$(BUILD_ID_PYTHON) $(VERIFY16_TOOL) $< $@
+
+# Depend directly on the included source too: unchanged wrapper text must not
+# hide a changed kernel behind its timestamp.
+$(METAL_BUILD)/verify16/%.air: runtime/metal/kernels/%.metal \
+		$(METAL_BUILD)/verify16/%.metal $(KERNEL_HEADERS) $(VERIFY16_TOOL) | $(METAL_BUILD)
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $(@:.air=.metal) -o $@
+
 $(LIB): $(PRODUCTION_AIRS)
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
 
@@ -213,7 +234,7 @@ BUILD_CONFIG_TOOL := dev/tools/build_config.py
 # Production outputs record only the production rules and their own tools'
 # flags: a test rule in dev/native.mk or a C++ flag does not rebuild the
 # kernels, nor a Metal flag the engine objects.
-BUILD_RULES_DIGEST := $(shell shasum -a 256 Makefile $(BUILD_CONFIG_TOOL) \
+BUILD_RULES_DIGEST := $(shell shasum -a 256 Makefile $(BUILD_CONFIG_TOOL) $(VERIFY16_TOOL) \
 	| shasum -a 256 | cut -c1-16)
 shell-quote = '$(subst ','"'"',$(1))'
 CONFIG_DIGEST := $(shell printf '%s\0' $(BUILD_RULES_DIGEST) \
@@ -235,11 +256,12 @@ PRODUCTION_ENGINE_INPUTS := $(sort $(shell find runtime -type f \
 		-o -name '*.hpp' -o -name '*.m' -o -name '*.mm' \) \
 	-print))
 BUILD_ID_CONSTANT_ARGS = \
-	--constant 'runtime=qwen-hybrid-dflash8' \
+	--constant 'runtime=qwen-hybrid-draft8-16' \
 	--constant 'engine_cxxflags=$(ENGINE_CXXFLAGS)' \
 	--constant 'engine_objcxxflags=$(ENGINE_OBJCXXFLAGS)' \
 	--constant 'engine_linkflags=$(ENGINE_LINKFLAGS)' \
-	--constant 'production_metalflags=$(PROD_METALFLAGS)'
+	--constant 'production_metalflags=$(PROD_METALFLAGS)' \
+	--constant 'verify16_kernels=$(VERIFY16_KERNEL_NAMES)'
 ENGINE_MAIN_OBJECT := $(ENGINE_BUILD)/main.o
 ENGINE_METAL_RUNTIME_OBJECT := $(ENGINE_BUILD)/metal/MetalBackend.o
 # MetalBackend with the test seam metal/BackendInstrumentation.hpp declares.
@@ -435,7 +457,7 @@ force-build-config:
 # while source-set changes only relink the production metallib.
 KERNEL_HEADER_NAMES_DIGEST := $(shell printf '%s\0' $(sort $(KERNEL_HEADERS)) \
 	| shasum -a 256 | cut -c1-16)
-KERNEL_SOURCE_NAMES_DIGEST := $(shell printf '%s\0' $(sort $(PRODUCTION_KERNEL_SOURCES)) \
+KERNEL_SOURCE_NAMES_DIGEST := $(shell printf '%s\0' $(sort $(PRODUCTION_KERNEL_SOURCES) $(VERIFY16_KERNEL_NAMES)) \
 	| shasum -a 256 | cut -c1-16)
 PRODUCTION_AIR_CONFIG := $(METAL_CONFIG_DIGEST)-$(KERNEL_HEADER_NAMES_DIGEST)
 PRODUCTION_LIB_CONFIG := $(PRODUCTION_AIR_CONFIG)-$(KERNEL_SOURCE_NAMES_DIGEST)

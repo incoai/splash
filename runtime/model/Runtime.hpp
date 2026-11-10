@@ -16,6 +16,7 @@ public:
   explicit Runtime(RuntimeContext context);
   ~Runtime() override;
   void checkHealth() override;
+  [[nodiscard]] uint32_t decodeRows() const noexcept override;
   [[nodiscard]] std::optional<uint32_t> statesToActivate() const noexcept override;
   [[nodiscard]] uint64_t idleBufferBytes(uint32_t evictedStates, bool afterStart,
                                          bool keepLane) const noexcept override;

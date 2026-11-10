@@ -83,6 +83,7 @@ OPTIONS = {
         "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
     ),
     "--disable-ane": ([(["--disable-ane"], True)], []),
+    "--draft-block-size": values("--draft-block-size", {"8": 8, "16": 16}, ("7", "32", "auto")),
     "--verify-rows": values(
         "--verify-rows",
         {"auto": "auto", "all": "all"},

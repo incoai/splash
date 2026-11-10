@@ -404,8 +404,14 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit \
   --draft-model tencent/Qwen3.8-27B-DSpine-b16
 ```
 
-The backend uses the first eight rows of the checkpoint's trained 16-row
-block: an anchor and seven proposals. It preserves the full 8,192-token
+By default the backend uses eight rows of the checkpoint's trained 16-row
+block: an anchor and seven proposals. Pass `--draft-block-size 16` to opt into
+the full block of an anchor and fifteen proposals. This experimental setting
+requires a dense DSpine runtime. Each model owns its execution width; DFlash2
+keeps its eight-row default and allocations. Restart to change the width;
+the persistent state cache separates the two widths.
+
+Both widths preserve the full 8,192-token
 sliding context, including prefix-cache restore. Each draft layer uses causal
 attention and passes predecessor features through a learned code bridge;
 the final write is refined against the selected predecessor token. Greedy

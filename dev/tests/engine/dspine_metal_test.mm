@@ -11,6 +11,11 @@
 #include <numeric>
 
 namespace {
+
+#ifndef SPLASH_TEST_VERIFY_ROWS
+#define SPLASH_TEST_VERIFY_ROWS 8
+#endif
+constexpr splash::ops::DecodeGeometry kGeometry(SPLASH_TEST_VERIFY_ROWS);
 using namespace splash;
 using namespace splash::ops;
 using test::require;
@@ -18,7 +23,7 @@ using test::floatToBf16;
 using test::bf16ToFloat;
 using metal::MetalBuffer;
 constexpr uint32_t V = 128;
-constexpr uint32_t Rows = SPLASH_DRAFT_QUERY_ROWS, Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
+constexpr uint32_t Rows = kGeometry.rows(), Positions = kGeometry.proposals();
 constexpr uint32_t K = SPLASH_DRAFT_CANDIDATES;
 
 float bf(float x) { return bf16ToFloat(floatToBf16(x)); }
@@ -72,10 +77,10 @@ void run(metal::MetalBackend &backend, uint32_t lanes, bool sampleAll = false) {
   std::vector<float> originalCodes(rows * C);
   for (uint32_t i = 0; i < rows * C; ++i) originalCodes[i] = value(b.codes, i);
   metal::CommandGraph graph;
-  DSpine::addReadInput(graph, input, normalized, b, shape);
-  DSpine::addCodes(graph, tokens, weights, b, shape);
-  DSpine::addMessage(graph, weights, b, shape);
-  DSpine::addWrite(graph, delta, output, b, shape);
+  DSpine::addReadInput(graph, input, normalized, b, shape, kGeometry);
+  DSpine::addCodes(graph, tokens, weights, b, shape, kGeometry);
+  DSpine::addMessage(graph, weights, b, shape, kGeometry);
+  DSpine::addWrite(graph, delta, output, b, shape, kGeometry);
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   for (uint32_t row = 0; row < rows; ++row) {
     double square = 0, codeSquare = 0;
@@ -119,8 +124,8 @@ void run(metal::MetalBackend &backend, uint32_t lanes, bool sampleAll = false) {
   s.proposedTokens = allocate(backend, lanes * Positions * 4);
   s.proposalProbabilities = allocate(backend, ws.proposalProbabilitiesBytes);
   s.confidence = allocate(backend, lanes * Positions * 4);
-  s.uniforms = allocate(backend, lanes * SPLASH_SAMPLING_UNIFORMS * 4);
-  for (uint32_t i = 0; i < lanes * SPLASH_SAMPLING_UNIFORMS; ++i)
+  s.uniforms = allocate(backend, lanes * kGeometry.uniformCount() * 4);
+  for (uint32_t i = 0; i < lanes * kGeometry.uniformCount(); ++i)
     static_cast<float *>(s.uniforms.contents())[i] = (i % 13 + 0.5f) / 13;
   std::vector<uint32_t> anchors(lanes);
   std::vector<SamplingPolicy> policies(lanes);
@@ -129,7 +134,7 @@ void run(metal::MetalBackend &backend, uint32_t lanes, bool sampleAll = false) {
     policies[lane].temperature = !sampleAll && lane % 3 == 0 ? 0 : 0.5f + 0.4f * lane;
   }
   metal::CommandGraph refine;
-  DSpine::addRefinement(refine, weights, {norm, false}, projection(head, V, H), b, s, shape, anchors, policies);
+  DSpine::addRefinement(refine, weights, {norm, false}, projection(head, V, H), b, s, shape, anchors, policies, kGeometry);
   static_cast<void>(backend.submitCommandAsync(refine.dispatches()).wait());
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     uint32_t predecessor = anchors[lane];
@@ -175,7 +180,7 @@ void run(metal::MetalBackend &backend, uint32_t lanes, bool sampleAll = false) {
         double cumulative = 0;
         choice = K - 1;
         bool found = false;
-        const float uniform = static_cast<const float *>(s.uniforms.contents())[lane * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_PROPOSALS + pos];
+        const float uniform = static_cast<const float *>(s.uniforms.contents())[lane * kGeometry.uniformCount() + SPLASH_UNIFORM_PROPOSALS + pos];
         for (uint32_t k = 0; k < K; ++k) {
           close(static_cast<const float *>(s.proposalProbabilities.contents())[at * K + k], score[k] / total, 2e-5, "conditional DSpine q");
           cumulative += score[k] / total;

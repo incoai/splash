@@ -787,6 +787,8 @@ std::string runtimeStatusJson(const StatusStart &start, const StatusSample &samp
     // budget chooses them, all where they are every row up to each lane's
     // retention limit.
     w.field("verify_rows", executorTelemetry.verifyBudget ? "auto" : "all");
+    if (start.cacheIdentity.draftBlockSize != 8)
+      w.field("draft_block_size", start.cacheIdentity.draftBlockSize);
     w.key("model_timing");
     writeModelTiming(w, executorTelemetry);
     w.object("constraint_masks", [&] {

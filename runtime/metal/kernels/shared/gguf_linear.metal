@@ -113,7 +113,7 @@ using GgufDecodeKernel = void(device bfloat *, device uchar *, device uchar *, d
 // Prefill chunks of 33 to 64 rows run the 64-row tile (ops::Linear), whose bf16 epilogues prefill takes.
 #define GGUF_DECODE_ROWS64(F, f, ep, Ep) GGUF_DECODE_ROWS(F, f, ep, Ep, bfloat) GGUF_DECODE(F, f, 64, ep, Ep, bfloat)
 #define GGUF_DECODE_FORMAT(F, f)                                                                                  \
-  GGUF_DECODE_ROWS64(F, f, a, EpNone) GGUF_DECODE_ROWS(F, f, a_f32, EpNone, float)                                \
+  GGUF_DECODE_ROWS64(F, f, a, EpNone) GGUF_DECODE_ROWS(F, f, a_f32, EpNone, float) GGUF_DECODE(F, f, 64, a_f32, EpNone, float)                                \
   GGUF_DECODE_ROWS64(F, f, r, EpResidual) GGUF_DECODE_ROWS64(F, f, g, EpUpWithGate)
 QUANT_FORMATS(GGUF_DECODE_FORMAT)
 #undef GGUF_DECODE_FORMAT
@@ -187,7 +187,7 @@ using GgufDecodeGateUpKernel = void(device bfloat *, device uchar *, device ucha
                                     device atomic_uint *, constant GgufDecodeParams &, uint2, uint);
 #define GGUF_DECODE_GATE_UP(F, f, R) \
   template [[host_name("gguf_decode_" #f "_m" #R "_gate_up")]] kernel GgufDecodeGateUpKernel gguf_decode_gate_up<F, R>;
-#define GGUF_DECODE_GATE_UP_FORMAT(F, f) GGUF_DECODE_GATE_UP(F, f, 8) GGUF_DECODE_GATE_UP(F, f, 16) GGUF_DECODE_GATE_UP(F, f, 32)
+#define GGUF_DECODE_GATE_UP_FORMAT(F, f) GGUF_DECODE_GATE_UP(F, f, 8) GGUF_DECODE_GATE_UP(F, f, 16) GGUF_DECODE_GATE_UP(F, f, 32) GGUF_DECODE_GATE_UP(F, f, 64)
 QUANT_FORMATS(GGUF_DECODE_GATE_UP_FORMAT)
 #undef GGUF_DECODE_GATE_UP_FORMAT
 #undef GGUF_DECODE_GATE_UP

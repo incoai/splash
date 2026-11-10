@@ -462,7 +462,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       .window = model.maximumContextTokens,
       .resident = static_cast<uint32_t>(std::min<uint64_t>(
           model.maximumContextTokens,
-          saturatingSubtract(breakdown.kvCapacityTokens, model::ExecutionLimits::speculativeScratchTokens))),
+          saturatingSubtract(breakdown.kvCapacityTokens, model.speculativeScratchTokens))),
       .spilled = spill.memoryTokens,
       .disk = spill.diskTokens};
   if (!breakdown.kvExtentPages ||

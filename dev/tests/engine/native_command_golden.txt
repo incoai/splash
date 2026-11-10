@@ -42,3 +42,5 @@ expert_memory | --expert-memory 16G | auto auto --expert-memory 17179869184
 expert_memory_off | --expert-memory off | auto auto --expert-memory off
 expert_memory_auto | --expert-memory auto --ple-memory auto | auto auto
 sparse_kv_memory | --sparse-kv-memory 1200M | auto auto --sparse-kv-memory 1258291200
+draft_block_size_16 | --draft-block-size 16 | auto auto --draft-block-size 16
+draft_block_size_8 | --draft-block-size 8 | auto auto

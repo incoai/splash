@@ -60,6 +60,7 @@ struct StreamedMemoryInputs final {
   uint64_t activeLimitBytes = 0;
   // The pages of a prefill group's rows (model::kPrefillGroupChunks chunks).
   uint32_t groupPages = 0;
+  uint32_t speculativeScratchTokens = model::ExecutionLimits::speculativeScratchTokens;
 };
 
 // The stores the plan streams the parts through, zero for a part that loads

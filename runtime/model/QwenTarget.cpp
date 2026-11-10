@@ -19,8 +19,6 @@
 namespace splash::model {
 namespace {
 
-// The rows a decode step verifies of each of its lanes.
-constexpr uint32_t kVerifyRows = ExecutionLimits::targetVerifyRows;
 
 // A prefill sequence binds every GDN layer's state cells, in and out, and so
 // does each state it captures; with auxiliary state, its cells too.
@@ -64,7 +62,7 @@ void includeDenseFfn(QwenTargetGeometry &geometry, ops::SwiGluProjections ffn) {
 QwenTarget::QwenTarget(const QwenTargetWeightsBase &weights, const QwenTargetGeometry &geometry,
                        metal::MetalBackend &backend, const ops::ExecutionPlans &operators)
     : weightsBase_(weights), geometry_(geometry), backend_(backend), operators_(operators) {
-  if (!geometry_.valid()) throw std::invalid_argument("Qwen target weights do not match execution geometry");
+  if (!geometry_.valid() || geometry_.execution != operators_.geometry()) throw std::invalid_argument("Qwen target weights do not match execution geometry");
   if (!ops::PagedAttention::compiles(geometry_.attentionQueryHeads, geometry_.kvLayout, geometry_.attentionGate,
                                      geometry_.rotaryPairs))
     throw std::invalid_argument("no attention kernel for the target's output gate and RoPE");
@@ -79,11 +77,11 @@ const ops::Projection &QwenTarget::vocabularyProjection() const noexcept {
 }
 
 uint32_t QwenTarget::decodeStorageLanes(uint32_t lanes) const {
-  const uint32_t rows = lanes * kVerifyRows;
+  const uint32_t rows = lanes * geometry_.execution.rows();
   uint32_t storageRows = rows;
   for (const auto &shape : geometry_.decodeProjections)
     storageRows = std::max(storageRows, operators_.linear().decodeStorageRows(rows, shape));
-  return storageRows / kVerifyRows;
+  return storageRows / geometry_.execution.rows();
 }
 
 void QwenTarget::prepareVerifyLane(uint32_t, uint64_t, const QwenTargetRequest &) {}
@@ -94,7 +92,7 @@ void QwenTarget::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer d
                                 metal::MetalBuffer proposals, metal::MetalBuffer verifyInput,
                                 uint32_t lanes) const {
   ops::Embedding::addVerifyInput(graph, std::move(draftInput), std::move(proposals), std::move(verifyInput),
-                                 geometry_.vocabularySize, lanes);
+                                 geometry_.vocabularySize, lanes, geometry_.execution);
 }
 
 void QwenTarget::addEmbedding(metal::CommandGraph &graph,
@@ -178,7 +176,7 @@ QwenTarget::VerifyStep QwenTarget::verifyStep(metal::CommandGraph &graph, const 
       throw std::invalid_argument("Qwen verify lane without its auxiliary state");
     histories[lane] = chunks[lane].committed_tokens;
   }
-  VerifyStep step{graph, buffers, kvLayers, spilled, chunks, lanes, lanes * kVerifyRows,
+  VerifyStep step{graph, buffers, kvLayers, spilled, chunks, lanes, lanes * geometry_.execution.rows(),
                   operators_.verifyAttention(lanes, geometry_.attentionQueryHeads, geometry_.kvLayout,
                                              std::span(histories).first(lanes))};
   if (const uint32_t window = geometry_.kvLayout.windowTokens)
@@ -321,7 +319,7 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, o
        std::span(b.gdnTapeLanes).first(step.lanes), mixer.decay, mixer.timeBias, mixer.mixerNorm, b.gdnHidden,
        b.linearScratch},
       geometry_.gdnShape(), step.lanes, layer, geometry_.stateLayout.strides(),
-      mixer.outputHeadOrder, outputPlan.input());
+      mixer.outputHeadOrder, outputPlan.input(), geometry_.execution);
   linear.add(step.graph,
              {.input = b.gdnHidden, .output = std::move(output.rows), .residual = std::move(output.residual),
               .scratch = b.linearScratch, .prepared = hidden},
@@ -342,7 +340,7 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
                       std::move(normalized));
   ops::PagedAttention::addVerifyProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos,
                                            b.ropeSin, b.fullQueries, b.chunkKeys[layer], b.chunkValues[layer],
-                                           geometry_.attentionQueryHeads, geometry_.kvLayout, step.lanes, variant);
+                                           geometry_.attentionQueryHeads, geometry_.kvLayout, step.lanes, variant, geometry_.execution);
   ops::AttentionBlocks attended = blocks;
   if (step.spilled.active()) {
     if (!blocks.stride) throw std::logic_error("a verify over spilled K/V attends without block lists");
@@ -357,7 +355,7 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
       mixer.outputProjection, step.lanes, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
   const ops::PreparedInput hidden = ops::PagedAttention::addVerifyGate(
       step.graph, b.fullPacked, b.fullAttention, b.attentionHidden, geometry_.attentionQueryHeads,
-      geometry_.kvLayout, step.lanes, b.linearScratch, outputPlan.input());
+      geometry_.kvLayout, step.lanes, b.linearScratch, outputPlan.input(), geometry_.execution);
   linear.add(step.graph,
              {.input = b.attentionHidden, .output = std::move(output.rows), .residual = std::move(output.residual),
               .scratch = b.linearScratch, .prepared = hidden},
@@ -417,7 +415,7 @@ void QwenTarget::addNormalizedHead(metal::CommandGraph &graph, const ops::NormWe
                                    metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const {
   const ops::PreparedInput normalized =
       ops::Normalization::addRms(graph, std::move(hidden), finalNorm, finalHidden, geometry_.hiddenSize,
-                                 lanes * kVerifyRows, scratch, decodeInput(vocabularyProjection(), lanes));
+                                 lanes * geometry_.execution.rows(), scratch, decodeInput(vocabularyProjection(), lanes));
   addDecodeProjection(graph, std::move(finalHidden), vocabularyProjection(), std::move(logits), lanes, scratch,
                       normalized);
 }

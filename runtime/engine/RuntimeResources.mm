@@ -519,7 +519,7 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
                          std::string_view targetManifestSha256,
                          std::string_view buildId,
                          kv::Layout targetKvLayout,
-                         model::RopeScaling ropeScaling) {
+                         model::RopeScaling ropeScaling, ops::DecodeGeometry geometry) {
   if (buildId.empty()) {
     throw std::invalid_argument("runtime build id is required");
   }
@@ -534,6 +534,7 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
   result.kvLayout = targetKvLayout;
   result.ropeScaling = ropeScaling;
   result.targetModelSha256 = model::digestHex(parseSha256(targetManifestSha256));
+  result.draftBlockSize = geometry.rows();
   return result;
 }
 
@@ -577,6 +578,8 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
             << "draft " << draft.layers << ' ' << draft.kvHeads << ' ' << draft.headDimension << ' '
             << draft.windowTokens << '\n'
             << "context " << draft.contextWidth << " q4 " << SPLASH_DRAFT_CONTEXT_GROUP << '\n';
+  if (identity.draftBlockSize != 8)
+    canonical << "draft-block " << identity.draftBlockSize << '\n';
   // Without YaRN the line is left out, so the caches written before it
   // existed stay valid. The factor takes the digits that read back as the
   // same double, so no two factors share a namespace.
@@ -648,6 +651,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         "host memory and volume probes, build id and a merge-aligned image "
         "patch limit no larger than the protocol's are required");
   }
+  if (config.draftBlockSize != 8 && config.draftBlockSize != 16)
+    throw RuntimeResourcesError(RuntimeResourceStage::Configuration, "draft block size requires eight or sixteen rows");
+  if (config.draftBlockSize == 16 &&
+      (!config.model.draft.isDSpine() || config.model.stateLayout.target.auxiliaryBytes ||
+       !std::visit([](const auto &layout) { return layout.ffnKind == model::QwenFfnKind::Dense; }, config.model.target)))
+    throw RuntimeResourcesError(RuntimeResourceStage::Configuration, "sixteen-row execution requires a dense DSpine runtime");
   std::unique_ptr<metal::MetalBackend> backend;
   try {
     backend = std::make_unique<metal::MetalBackend>(config.metallibPath.string(),
@@ -799,7 +808,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .kvSlotBytes = kvSlotBytes,
          .stateSlotBytes = model::SlotFile::slotBytesFor(stateBytes),
          .activeLimitBytes = activeLimitBytes,
-         .groupPages = groupPages});
+         .groupPages = groupPages,
+         .speculativeScratchTokens = config.draftBlockSize - 1});
   };
   // The plan of the parts as configured, which sizes their stores.
   const auto sizingPlan = [&](uint64_t stagingBytes) {
@@ -887,7 +897,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
 
   // One plan owner is used both before allocation and during encoding. The
   // engine lends it to model execution without inspecting its plans.
-  ops::ExecutionPlans operators(device);
+  ops::ExecutionPlans operators(device, ops::DecodeGeometry(config.draftBlockSize));
   model::LoadedModel loaded;
   // The runtime's lane state and arenas as the model loaded, with its K/V in
   // memory and where it spills.
@@ -910,7 +920,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       logLine("Weights loaded ", again ? "again " : "", "in ", std::fixed, std::setprecision(2), loading.count(),
               " s.");
       if (loaded.draft.layout.isDSpine())
-        logLine("Experimental DSpine draft: ", model::ExecutionLimits::draftQueryRows,
+        logLine("Experimental DSpine draft: ", operators.geometry().rows(),
                 " rows, ", loaded.draft.layout.contextTokens, " context tokens.");
     } catch (const metal::MetalAllocationError &error) {
       throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
@@ -983,7 +993,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     const uint32_t commandPages = loadOptions.expertMemoryBytes ? groupPages : 0;
     ModelMemoryProfile modelProfile{
         loaded.name(), loaded.maximumContextTokens(), loaded.targetKvLayout(config.kvFormat), footprint,
-        config.stateFormat, streamed.plan ? streamed.plan->spill : KvSpillPlan{}, commandPages};
+        config.stateFormat, streamed.plan ? streamed.plan->spill : KvSpillPlan{}, commandPages, config.draftBlockSize - 1};
     EngineMemoryPlanResult result = evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
     if (streamed.plan || !result.plan)
       return result;
@@ -1101,7 +1111,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     cacheIdentity = makeRuntimeCacheIdentity(
         loaded.manifestFingerprintSha256,
         loaded.targetManifestFingerprint(), config.buildId,
-        loaded.targetKvLayout(config.kvFormat), loaded.descriptor.ropeScaling);
+        loaded.targetKvLayout(config.kvFormat), loaded.descriptor.ropeScaling, operators.geometry());
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                 error.what(),

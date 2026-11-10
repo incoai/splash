@@ -111,10 +111,10 @@ struct DFlashDraftLayout final {
   }
   // A row of the target rows it reads: one of hiddenSize values per layer.
   [[nodiscard]] constexpr uint32_t targetHiddenSize() const noexcept { return hiddenSize * targetLayerCount; }
-  [[nodiscard]] constexpr ops::DraftAttentionShape attentionShape() const noexcept {
+  [[nodiscard]] constexpr ops::DraftAttentionShape attentionShape(ops::DecodeGeometry geometry = {}) const noexcept {
     return {hiddenSize, dynamicSize, qkvSize, attentionSize,
             attentionSize / attentionHeadDimension, kvHeads,
-            attentionHeadDimension, contextTokens, isDSpine()};
+            attentionHeadDimension, contextTokens, isDSpine(), geometry};
   }
   // The key and value columns of the fused QKV projection, all the context
   // writers read.

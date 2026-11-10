@@ -91,6 +91,7 @@ template <class Layout, class Layer> struct QwenTargetWeights final : QwenTarget
 // loaded weights add. It describes semantics only; operators remain
 // responsible for choosing device-specific Metal pipelines and compute tiles.
 struct QwenTargetGeometry final : QwenTargetDimensions {
+  ops::DecodeGeometry execution{};
   QwenTargetGeometry() = default;
   // A target of `dimensions` whose DFlash2 draft reads the output rows of
   // `captureLayers` (DFlashDraftLayout::targetLayerIds); more than the

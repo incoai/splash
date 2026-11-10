@@ -1,3 +1,4 @@
+#include "metal/abi/KernelEntry.h"
 #include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/paged_attention_tile.h"
 
@@ -9,7 +10,7 @@
 // INT8 and BF16 entries share one signature: pages are reached through the
 // tables, so no entry binds KV storage.
 #define PAGED_VERIFY_SPLIT_SIGNATURE(Name)                                     \
-  kernel void Name(                                                            \
+  SPLASH_KERNEL(Name)(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
       device float *partials [[buffer(1)]],                                    \
       device float *statistics [[buffer(2)]],                                  \
@@ -23,7 +24,7 @@
 
 #define PAGED_VERIFY_SCRATCH(Group)                                            \
   constexpr uint M =                                                           \
-      Group * SPLASH_TARGET_VERIFY_ROWS / SPLASH_ATTENTION_TILE_PARTS(Group);  \
+      Group * SPLASH_TARGET_VERIFY_ROWS / SPLASH_VERIFY_ATTENTION_TILE_PARTS(Group);  \
   constexpr uint N = SplashKvPageTokens;                                       \
   alignas(16) threadgroup float scores[M * N];                                 \
   alignas(16) threadgroup bfloat probabilities[M * N];                         \
@@ -36,7 +37,7 @@
 // group.y the history split and group.z the lane, whose parameters select the
 // page table and the query tile.
 #define PAGED_VERIFY_TILE_AT(Heads, Group, HeadDim)                            \
-  constexpr uint Parts = SPLASH_ATTENTION_TILE_PARTS(Group);                   \
+  constexpr uint Parts = SPLASH_VERIFY_ATTENTION_TILE_PARTS(Group);                   \
   const uint kv_head = group.x / Parts;                                        \
   const SplashAttentionTile tile =                                             \
       splash_attention_tile_part<Group, SPLASH_TARGET_VERIFY_ROWS, Parts,      \
@@ -99,7 +100,7 @@ inline void splash_verify_attention_reduce_phase(
   if (!tile.active || fused_row >= M || thread_index >= D)
     return;
   splash_attention_reduce_row<QueryHeadsPerKVHead, SPLASH_TARGET_VERIFY_ROWS,
-                              SPLASH_ATTENTION_TILE_PARTS(QueryHeadsPerKVHead), HeadDim,
+                              SPLASH_VERIFY_ATTENTION_TILE_PARTS(QueryHeadsPerKVHead), HeadDim,
                               Window>(
       partials, statistics, output, tile, params[group.z].slot_splits,
       fused_row, thread_index, weights, group_values,
@@ -107,7 +108,7 @@ inline void splash_verify_attention_reduce_phase(
 }
 
 #define PAGED_VERIFY_REDUCE(Name, Heads, Group, HeadDim, Window)               \
-  kernel void Name(                                                            \
+  SPLASH_KERNEL(Name)(                                                            \
       device const float *partials [[buffer(0)]],                              \
       device const float *statistics [[buffer(1)]],                            \
       device bfloat *output [[buffer(2)]],                                     \
@@ -124,7 +125,7 @@ inline void splash_verify_attention_reduce_phase(
 // A reduce with learned sinks binds the layer's, an F32 per query head,
 // before its parameters.
 #define PAGED_VERIFY_SINK_REDUCE(Name, Heads, Group, HeadDim, Window)          \
-  kernel void Name(                                                            \
+  SPLASH_KERNEL(Name)(                                                            \
       device const float *partials [[buffer(0)]],                              \
       device const float *statistics [[buffer(1)]],                            \
       device bfloat *output [[buffer(2)]],                                     \

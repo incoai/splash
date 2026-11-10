@@ -33,11 +33,12 @@ PrefillAttentionPlan ExecutionPlans::prefillAttention(
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
     std::span<const uint32_t> historyTokens, AttentionVariant variant) const {
-  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, variant);
+  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, variant, geometry());
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
                                                  uint32_t lanes) const {
+  shape.geometry = geometry();
   return DraftAttention::plan(shape, lanes);
 }
 
@@ -62,13 +63,14 @@ AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(
 // The verify bound is linear in the lanes: one lane's is every width's share.
 AttentionWorkspace ExecutionPlans::verifyAttentionWorkspacePerLane(
     uint32_t queryHeads, kv::Layout layout) const {
-  return PagedAttention::verifyWorkspace(1, queryHeads, layout);
+  return PagedAttention::verifyWorkspace(1, queryHeads, layout, geometry());
 }
 
 // The draft workspace is linear in the lanes: one lane's is every width's
 // share.
 DraftAttentionWorkspace ExecutionPlans::draftAttentionWorkspacePerLane(
     DraftAttentionShape shape) const {
+  shape.geometry = geometry();
   return DraftAttention::plan(shape, 1).workspace();
 }
 

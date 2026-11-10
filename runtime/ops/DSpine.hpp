@@ -37,18 +37,18 @@ public:
                           metal::MetalBuffer residual, metal::MetalBuffer output,
                           uint32_t width, uint32_t rows);
   static void addReadInput(metal::CommandGraph &graph, metal::MetalBuffer input,
-                           metal::MetalBuffer normalized, const DSpineBuffers &buffers, DSpineParams params);
+                           metal::MetalBuffer normalized, const DSpineBuffers &buffers, DSpineParams params, DecodeGeometry geometry = {});
   static void addCodes(metal::CommandGraph &graph, metal::MetalBuffer tokens,
-                       const DSpineWeights &weights, const DSpineBuffers &buffers, DSpineParams params);
+                       const DSpineWeights &weights, const DSpineBuffers &buffers, DSpineParams params, DecodeGeometry geometry = {});
   static void addMessage(metal::CommandGraph &graph, const DSpineWeights &weights,
-                         const DSpineBuffers &buffers, DSpineParams params);
+                         const DSpineBuffers &buffers, DSpineParams params, DecodeGeometry geometry = {});
   static void addWrite(metal::CommandGraph &graph, metal::MetalBuffer delta,
-                       metal::MetalBuffer output, const DSpineBuffers &buffers, DSpineParams params);
+                       metal::MetalBuffer output, const DSpineBuffers &buffers, DSpineParams params, DecodeGeometry geometry = {});
   static void addRefinement(metal::CommandGraph &graph, const DSpineWeights &weights,
                             const NormWeights &norm, const Projection &head,
                             const DSpineBuffers &buffers, const DraftSelectorBuffers &selection,
                             DSpineParams shape, std::span<const uint32_t> anchors,
-                            std::span<const SamplingPolicy> policies);
+                            std::span<const SamplingPolicy> policies, DecodeGeometry geometry = {});
 };
 
 } // namespace splash::ops

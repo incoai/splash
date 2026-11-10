@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 
 namespace splash::ops {
 
@@ -14,7 +13,7 @@ namespace splash::ops {
 // physical eight-row packing and of any maximum-capacity ABI arrays.
 class DecodeGeometry final {
 public:
-  static constexpr uint32_t maximumRows = 16;
+  static constexpr uint32_t maximumRows = SPLASH_MAXIMUM_VERIFY_ROWS;
   constexpr DecodeGeometry() noexcept = default;
   explicit constexpr DecodeGeometry(uint32_t rows) : rows_(rows) {
     if (rows != 8 && rows != 16)
@@ -23,10 +22,16 @@ public:
   [[nodiscard]] constexpr uint32_t rows() const noexcept { return rows_; }
   [[nodiscard]] constexpr uint32_t proposals() const noexcept { return rows_ - 1; }
   [[nodiscard]] constexpr uint32_t maximumStepTokens() const noexcept { return rows_ + 1; }
-  // Eight-row entry names remain unchanged. Sixteen-row row-sensitive
+  [[nodiscard]] constexpr uint32_t proposalUniform() const noexcept { return 1; }
+  [[nodiscard]] constexpr uint32_t acceptanceUniform() const noexcept { return 1 + proposals(); }
+  [[nodiscard]] constexpr uint32_t correctionUniform() const noexcept { return 1 + 2 * proposals(); }
+  [[nodiscard]] constexpr uint32_t uniformCount() const noexcept { return correctionUniform() + 1; }
+  // Eight-row row-sensitive entry names use no geometry suffix. ABI
+  // revisions are explicit in the base name. Sixteen-row row-sensitive
   // kernels are explicit compile-time variants in the same library.
-  [[nodiscard]] std::string kernel(std::string_view name) const {
-    return std::string(name) + (rows_ == 16 ? "_v16" : "");
+  [[nodiscard]] std::string kernel(std::string name) const {
+    if (rows_ == 16) name += "_v16";
+    return name;
   }
   auto operator<=>(const DecodeGeometry &) const = default;
 

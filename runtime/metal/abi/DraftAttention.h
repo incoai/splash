@@ -109,3 +109,6 @@ struct DraftContextWindowParams {
 
 static_assert(sizeof(DraftContextWindowParams) == 16,
               "Draft context window parameters are 16 bytes on both sides");
+
+// Partition complete query heads into groups of at most 32 fused query rows.
+#define SPLASH_DRAFT_ATTENTION_PARTS (SPLASH_DRAFT_QUERY_ROWS / 8u)

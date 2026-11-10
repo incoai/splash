@@ -46,26 +46,26 @@ static_assert(sizeof(GDNGatePrefillParams) == 4,
 // bf16), their k then v rows ([key_width + value_width] bf16), decay
 // ([value_heads] fp32) and beta ([value_heads] bf16). The lane's next step
 // folds the rows it retained into the state before its own (GDN::addDecode).
-inline constexpr uint64_t gdn_tape_kv_offset(uint32_t conv_dim) {
-  return uint64_t(SPLASH_TARGET_VERIFY_ROWS) * conv_dim * 2;
+inline constexpr uint64_t gdn_tape_kv_offset(uint32_t conv_dim, uint32_t rows = SPLASH_TARGET_VERIFY_ROWS) {
+  return uint64_t(rows) * conv_dim * 2;
 }
 inline constexpr uint64_t gdn_tape_decay_offset(uint32_t conv_dim,
-                                                uint32_t kv_width) {
-  return gdn_tape_kv_offset(conv_dim) +
-         uint64_t(SPLASH_TARGET_VERIFY_ROWS) * kv_width * 2;
+                                                uint32_t kv_width, uint32_t rows = SPLASH_TARGET_VERIFY_ROWS) {
+  return gdn_tape_kv_offset(conv_dim, rows) +
+         uint64_t(rows) * kv_width * 2;
 }
 inline constexpr uint64_t gdn_tape_beta_offset(uint32_t conv_dim,
                                                uint32_t kv_width,
-                                               uint32_t value_heads) {
-  return gdn_tape_decay_offset(conv_dim, kv_width) +
-         uint64_t(SPLASH_TARGET_VERIFY_ROWS) * value_heads * 4;
+                                               uint32_t value_heads, uint32_t rows = SPLASH_TARGET_VERIFY_ROWS) {
+  return gdn_tape_decay_offset(conv_dim, kv_width, rows) +
+         uint64_t(rows) * value_heads * 4;
 }
 // One layer's tape, a multiple of 16 bytes.
 inline constexpr uint64_t gdn_tape_layer_bytes(uint32_t conv_dim,
                                                uint32_t kv_width,
-                                               uint32_t value_heads) {
-  return (gdn_tape_beta_offset(conv_dim, kv_width, value_heads) +
-          uint64_t(SPLASH_TARGET_VERIFY_ROWS) * value_heads * 2 + 15) /
+                                               uint32_t value_heads, uint32_t rows = SPLASH_TARGET_VERIFY_ROWS) {
+  return (gdn_tape_beta_offset(conv_dim, kv_width, value_heads, rows) +
+          uint64_t(rows) * value_heads * 2 + 15) /
          16 * 16;
 }
 

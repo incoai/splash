@@ -216,7 +216,7 @@ uint64_t Engine::copyDemandBytes() const {
     if (!active.lane || active.pendingEnd)
       continue;
     const Phase phase = scheduler_.phase(id);
-    uint64_t end = active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
+    uint64_t end = active.exactTokens.size() + model_.decodeRows();
     if (phase == Phase::Prefill)
       end = std::min<uint64_t>(scheduler_.promptProcessed(id) + rows, active.promptTokens);
     else if (phase != Phase::Decode)

@@ -175,3 +175,11 @@ struct SplashKvStageParams {
 
 static_assert(sizeof(SplashKvStageParams) == 28,
               "KV stage parameters are 28 bytes on both sides");
+
+// Verify16 needs smaller GQA query parts; prefill keeps its existing geometry.
+#if SPLASH_TARGET_VERIFY_ROWS == 16
+#define SPLASH_VERIFY_ATTENTION_TILE_PARTS(group) \
+  ((group) <= 4u ? 1u : (group) <= 8u ? 2u : (group) <= 16u ? 4u : 8u)
+#else
+#define SPLASH_VERIFY_ATTENTION_TILE_PARTS(group) SPLASH_ATTENTION_TILE_PARTS(group)
+#endif

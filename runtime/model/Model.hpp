@@ -887,6 +887,7 @@ public:
   // chunk's rows in one pass over one layer, one lane past a chunk and no
   // lane whose history holds Index pages, as a model without readers of
   // spilled K/V keeps its K/V in memory; at one rate a row from one row.
+  [[nodiscard]] virtual uint32_t decodeRows() const noexcept { return ExecutionLimits::targetVerifyRows; }
   [[nodiscard]] virtual CommandLimits commandLimits() const noexcept {
     return {.commandRows = ExecutionLimits::prefillTokenBudget, .lanesPastChunk = 1};
   }
