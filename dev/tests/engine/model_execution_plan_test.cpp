@@ -238,6 +238,28 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
     }
 }
 
+// The decode arena's plan counts each buffer it allocates in whole host
+// pages, as Metal allocates them and the memory ledger charges them: one
+// request's KV capacity rests on it, and a plan of the scratch fields' sum
+// left Qwen3.8-Flash-Next's context a KV extent more than a request could
+// use (RuntimeArenas.cpp, decodeArenaBytes).
+void checkDecodeArenaPages(const model::LoadedModel &loaded) {
+  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  for (uint32_t family : {9U, 10U, 11U}) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = family;
+    device.gpuCoreCount = 20;
+    const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+    const ops::LinearScratchSize linear = model::DecodeArena::linearScratchSize(geometry, plans);
+    uint64_t pages = model::decodeArenaBaseBytes(geometry, plans);
+    for (const uint64_t scratch : {model::DecodeArena::gateScratchBytes(geometry, plans), linear.input, linear.sums,
+                                   linear.partials, linear.counters, linear.rotated})
+      pages += alignUp(scratch);
+    require(model::decodeArenaBytes(geometry, plans) == pages,
+            "the decode arena's plan does not count each of its buffers in whole host pages");
+  }
+}
+
 // A model served with YaRN reaches the runtime's geometry with its scaling
 // and the window it serves, which everything sized by the context follows; a
 // descriptor whose window is not the one its scaling serves is refused.
@@ -448,6 +470,8 @@ int main() {
     checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
+    checkDecodeArenaPages(loadedModel<model::Qwen3_8Weights>());
+    checkDecodeArenaPages(loadedModel<model::Qwen3_6MoeWeights>());
     std::cout << "model execution plans: PASS (three paired geometries)\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

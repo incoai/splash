@@ -479,7 +479,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
 // holes; only whole tensor boundaries are aligned.
 [[nodiscard]] uint64_t decodeArenaBaseBytes(const RuntimeGeometry &geometry,
                                             const ops::ExecutionPlans &operators);
-// The arena's base, its gate and linear scratch.
+// The arena's base and its gate and linear scratch buffers, each in whole
+// host pages.
 [[nodiscard]] uint64_t decodeArenaBytes(const RuntimeGeometry &geometry,
                                         const ops::ExecutionPlans &operators);
 // The arena's and the target's own decode scratch (qwenTargetScratchBytes).
@@ -518,17 +519,15 @@ public:
         batchSlice(DecodeTensor::TargetVocabularyArrivals, kLaneCount);
     std::memset(arrivals.contents(), 0, arrivals.sizeBytes());
 
-    const uint64_t denseScratchBytes = gateScratchBytes(geometry_, operators);
-    if (denseScratchBytes) {
-      gateScratch_ = backend_.allocateBuffer(
-          denseScratchBytes, metal::BufferStorage::Private, "qwen-gate-scratch");
-    }
+    // Each scratch buffer takes whole host pages (decodeArenaBytes).
+    const auto allocate = [&](uint64_t bytes, metal::BufferStorage storage, const char *label) {
+      return bytes ? backend_.allocateBuffer(alignUp(bytes), storage, label) : metal::MetalBuffer{};
+    };
+    gateScratch_ = allocate(gateScratchBytes(geometry_, operators), metal::BufferStorage::Private,
+                            "qwen-gate-scratch");
     // Each field exists only when some plan uses it (split-only plans have
     // partials and counters but no activation table).
     const auto linearSize = linearScratchSize(geometry_, operators);
-    const auto allocate = [&](uint64_t bytes, metal::BufferStorage storage, const char *label) {
-      return bytes ? backend_.allocateBuffer(bytes, storage, label) : metal::MetalBuffer{};
-    };
     linearScratch_.input = allocate(linearSize.input, metal::BufferStorage::Private, "linear-input");
     linearScratch_.sums = allocate(linearSize.sums, metal::BufferStorage::Private, "linear-sums");
     linearScratch_.partials =
