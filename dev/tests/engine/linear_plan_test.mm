@@ -97,6 +97,41 @@ void decodeGeometryPlans() {
     rejects([&] { (void)DecodeGeometry(rows); }, "eight or sixteen", "invalid decode geometry");
 }
 
+// The measured wide 27B pair changes only its pass count, at the K split
+// selected by the same calibration. Default eight-row execution and the
+// surrounding device/shape/format domain keep their choices.
+void wideGateUpPolicy() {
+  DeviceCapabilities matched = simulatedDevice(10, 20);
+  matched.deviceName = "Apple M5 Pro";
+  DeviceCapabilities other = matched;
+  other.deviceName = "uncalibrated";
+  const Projection weights = blockProjection(17408, 5120, 1, GGUF_FMT_AF4G64);
+  for (uint32_t rows : {8U, 16U}) {
+    const Linear calibrated(matched, DecodeGeometry(rows)), control(other, DecodeGeometry(rows));
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+      const auto baseline = control.decodePlan(weights, lanes, LinearEpilogue::GateUp, &weights);
+      const auto candidate = calibrated.decodePlan(weights, lanes, LinearEpilogue::GateUp, &weights);
+      auto expected = baseline.configuration();
+      if (rows == 16 && lanes >= 3) {
+        require(expected.oneGateUpPass, "the control no longer exercises the measured one-pass choice");
+        expected.oneGateUpPass = false;
+      }
+      require(candidate.configuration() == expected && candidate.storageRows() == baseline.storageRows(),
+              "wide gate/up changed a K split, tile, storage row or unselected domain");
+    }
+  }
+  for (const auto &[n, k, format] : {std::tuple{17408U, 5120U, GGUF_FMT_AF4G32},
+                                    std::tuple{17408U, 5120U, GGUF_FMT_Q4K},
+                                    std::tuple{17280U, 5120U, GGUF_FMT_AF4G64},
+                                    std::tuple{17408U, 4096U, GGUF_FMT_AF4G64}}) {
+    const Projection p = blockProjection(n, k, 1, format);
+    const Linear a(matched, DecodeGeometry(16)), b(other, DecodeGeometry(16));
+    require(a.decodePlan(p, 4, LinearEpilogue::GateUp, &p).configuration() ==
+                b.decodePlan(p, 4, LinearEpilogue::GateUp, &p).configuration(),
+            "wide gate/up policy escaped its measured shape or format");
+  }
+}
+
 // Table16 is a physical eight-row format, independent of request geometry.
 void tablePackingGeometry() {
   constexpr uint32_t width = 6144;
@@ -1406,6 +1441,7 @@ int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: linear-plan <production.metallib|--cpu>");
     decodeGeometryPlans();
+    wideGateUpPolicy();
     tablePackingGeometry();
     ggufPlans();
     scratchBoundsRotated();

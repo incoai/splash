@@ -140,7 +140,9 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
 }
 
 Linear::Linear(const DeviceCapabilities &device, DecodeGeometry geometry) noexcept
-    : geometry_(geometry), calibration_(KernelCalibration::of(device)) {}
+    : geometry_(geometry), calibration_(KernelCalibration::of(device)),
+      wideGateUpTwoPass_(device.appleGpuFamily == 10 && device.gpuCoreCount == 20 &&
+                        device.deviceName == "Apple M5 Pro") {}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
   // The None and Residual plans share a tile; a gate/up pair of one format
@@ -172,10 +174,21 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
   std::array<UnitFormats, 2> tensors{};
   const bool pair = w.epilogue == LinearEpilogue::GateUp && gate;
   if (pair) tensors = {unitFormats(std::span(&projections[0], 1)), unitFormats(std::span(&projections[1], 1))};
-  LinearPlan plan(w,
-                  selectProjection(calibration_, w, unitFormats(projections),
-                                   pair ? std::span<const UnitFormats>(tensors) : std::span<const UnitFormats>{}),
-                  p.destination);
+  LinearConfig config = selectProjection(calibration_, w, unitFormats(projections),
+      pair ? std::span<const UnitFormats>(tensors) : std::span<const UnitFormats>{});
+  // The 27B AF4G64 M64 pair spends most of a wide sixteen-row cycle in its
+  // fused pass on this GPU. Keep its selected K split and arithmetic, and
+  // run the existing gate and up passes separately. Other devices, shapes,
+  // formats and eight-row execution retain their calibrated choice.
+  const auto af4 = [](const Projection &projection) {
+    const auto &segments = projection.blocks().segments;
+    return segments.size() == 1 && segments.front().formatId == GGUF_FMT_AF4G64;
+  };
+  if (wideGateUpTwoPass_ && w.phase == LinearPhase::Decode && geometry_.rows() == 16 &&
+      w.rows > 32 && w.matrix.outputSize == 17408 && w.matrix.inputSize == 5120 &&
+      config.tile == LinearTile::GgufStaged && config.oneGateUpPass && pair && af4(p) && af4(*gate))
+    config.oneGateUpPass = false;
+  LinearPlan plan(w, config, p.destination);
   plan.rotated_ = static_cast<bool>(p.rotation);
   return plan;
 }

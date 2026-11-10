@@ -315,6 +315,7 @@ private:
                             const Projection &projection, const LinearPlan &plan) const;
   DecodeGeometry geometry_;
   KernelCalibration calibration_;
+  bool wideGateUpTwoPass_ = false;
 };
 
 } // namespace splash::ops
