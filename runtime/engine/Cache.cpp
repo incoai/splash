@@ -2122,19 +2122,33 @@ uint32_t Cache::releasePages(uint64_t requestId, uint32_t pages, bool inPlace, c
   // only those compaction can empty, whose bytes pay for the next runway:
   // past them the moves would cost the lane the reads of its blocks and
   // free nothing (releaseMoves). In place an extent more leaves so, past
-  // the claim's pages (inPlaceMoves).
-  const auto found =
-      static_cast<uint32_t>(landedPages(active, pages + (inPlace ? pool_.extentPages() : 0), rule).size());
-  const uint32_t wanted =
-      inPlace ? inPlaceMoves(pages, found) : releaseMoves(found, false, {.beside = beside}).pages;
-  if (!wanted)
-    return 0;
-  const uint32_t claimed = inPlace ? pool_.freePageCount(kv::PageForm::Full) + pages : 0;
+  // the claim's pages, where inPlaceMoves moves one; otherwise the claim's
+  // pages move beside the runway, into the free Index pages past an extent
+  // of them or into an extent allocated for them where those do not hold
+  // them, and refused that extent none moves (KvPool::movePages). Its count
+  // found such free pages, but a reclaim the claim took before this release
+  // may have released them since, their extent left as room
+  // (releaseExtent): taken first, a reclaim of the empty Index extent past
+  // the runway left a lone lane at the wall only the runway, and the lane
+  // ended at its length.
+  const uint32_t extent = pool_.extentPages();
+  const auto found = static_cast<uint32_t>(landedPages(active, pages + (inPlace ? extent : 0), rule).size());
   const uint64_t moves = spilled_.spillMoves;
   const uint64_t before = pool_.allocatedBytes();
-  static_cast<void>(moveLandedPages(
-      [&] { return landedPages(active, wanted - static_cast<uint32_t>(spilled_.spillMoves - moves), rule); },
-      inPlace && wanted == pages ? std::nullopt : std::optional(SpilledExtents::Released), funds, claimed));
+  if (inPlace && inPlaceMoves(pages, found) != pages + extent) {
+    if (found < pages)
+      return 0;
+    const KvPageMoveResult result = pool_.movePages(landedPages(active, pages, rule), kv::PageForm::Index, extent);
+    followMoves(result.moves);
+    spilled_.spillMoves += result.moves.moved.size();
+  } else {
+    const uint32_t wanted = inPlace ? pages + extent : releaseMoves(found, false, {.beside = beside}).pages;
+    if (!wanted)
+      return 0;
+    static_cast<void>(moveLandedPages(
+        [&] { return landedPages(active, wanted - static_cast<uint32_t>(spilled_.spillMoves - moves), rule); },
+        SpilledExtents::Released, funds, inPlace ? pool_.freePageCount(kv::PageForm::Full) + pages : 0));
+  }
   const auto moved = static_cast<uint32_t>(spilled_.spillMoves - moves);
   // A release counts where it freed what it was for: Full pages in place,
   // or bytes.
@@ -2190,19 +2204,17 @@ std::vector<uint32_t> Cache::landedPages(Request &active, uint32_t most, const R
   return pages;
 }
 
-TokenAdmission Cache::moveLandedPages(const std::function<std::vector<uint32_t>()> &landed,
-                                      std::optional<SpilledExtents> extents,
+TokenAdmission Cache::moveLandedPages(const std::function<std::vector<uint32_t>()> &landed, SpilledExtents extents,
                                       const std::function<void(uint64_t)> &funds, uint32_t claimed) {
   // Free Index pages take the landed pages first, the runway's among them,
-  // so a spill never waits for an allocation; without `extents` the rest
-  // stays Full. With them the pages move a runway at a time: the Full
-  // extents each runway's moves empty leave as `extents` says (released,
-  // the Full pages left first gather in the fewest extents), past the
-  // `claimed` Full pages a claim takes in place, and their bytes pay for the
-  // Index extent the runway refills with next (`funds`): where they cover
-  // it, it passes the engine's limit and the host, under critical pressure
-  // too, since on Qwen3.8-Flash-Next a Full extent returns 17 times an Index
-  // one's bytes. The pages that wait are
+  // so a spill never waits for an allocation. The pages move a runway at a
+  // time: the Full extents each runway's moves empty leave as `extents`
+  // says (released, the Full pages left first gather in the fewest
+  // extents), past the `claimed` Full pages a claim takes in place, and
+  // their bytes pay for the Index extent the runway refills with next
+  // (`funds`): where they cover it, it passes the engine's limit and the
+  // host, under critical pressure too, since on Qwen3.8-Flash-Next a Full
+  // extent returns 17 times an Index one's bytes. The pages that wait are
   // found again for each runway, since gathering moves them. The runway then
   // stands for the next spill, at the memory wall too, where a lane's
   // release moves its pages through it.
@@ -2212,17 +2224,15 @@ TokenAdmission Cache::moveLandedPages(const std::function<std::vector<uint32_t>(
       followMoves(pool_.movePages(std::span<const uint32_t>(pages).first(count), kv::PageForm::Index).moves);
       spilled_.spillMoves += count;
     }
-    if (!extents)
-      return {};
     if (!pages.empty()) {
-      if (*extents == SpilledExtents::Released)
+      if (extents == SpilledExtents::Released)
         while (compactExtent(kv::PageForm::Full)) {
         }
       // The pages that wait free theirs too.
       const uint64_t freeing = uint64_t{pool_.freePageCount(kv::PageForm::Full)} + pages.size() - count;
       const auto past = static_cast<uint32_t>(freeing > claimed ? (freeing - claimed) / pool_.extentPages() : 0);
       const uint64_t released =
-          pool_.reclaimEmptyExtents(*extents == SpilledExtents::KeepRunway, past, kv::PageForm::Full);
+          pool_.reclaimEmptyExtents(extents == SpilledExtents::KeepRunway, past, kv::PageForm::Full);
       if (released && funds)
         funds(released);
     }
