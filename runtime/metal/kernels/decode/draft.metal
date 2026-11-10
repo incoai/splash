@@ -672,13 +672,13 @@ SPLASH_DRAFT_REORDER_KERNEL(draft_attention_reorder, SPLASH_DRAFT_QUERY_HEADS, S
 // Ripple's draft's kernels: 80 query heads over the 8 KV heads, a 4096-slot
 // ring, four-tap convolutions, and head groups of five query heads (two
 // threadgroups per KV head, 40 rows each).
-SPLASH_DRAFT_CONV_KERNEL(draft_conv_kv8_h2_d128_w4096_s8, 4, 16)
-SPLASH_DRAFT_QKV_KERNEL(draft_attention_qkv_kv8_h2_d128_w4096_s8, 80, 16)
+SPLASH_DRAFT_CONV_KERNEL(draft_conv_kv8_h2_d128_w4096_s8, 4, 8)
+SPLASH_DRAFT_QKV_KERNEL(draft_attention_qkv_kv8_h2_d128_w4096_s8, 80, 8)
 SPLASH_DRAFT_COMMIT_KERNEL(draft_context_kv_commit_kv8_h2_d128_w4096_s8, 4096)
 SPLASH_DRAFT_SPLIT_KERNEL(draft_attention_bf16_split_kv8_h2_d128_w4096_s4, 80, 2,
-                          4, 4096, 16)
-SPLASH_DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_kv8_h2_d128_s4, 80, 2, 4, 16)
+                          4, 4096, 8)
+SPLASH_DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_kv8_h2_d128_s4, 80, 2, 4, 8)
 SPLASH_DRAFT_SPLIT_KERNEL(draft_attention_bf16_split_kv8_h2_d128_w4096_s8, 80, 2,
-                          8, 4096, 16)
-SPLASH_DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_kv8_h2_d128_w4096_s8, 80, 2, 8, 16)
-SPLASH_DRAFT_REORDER_KERNEL(draft_attention_reorder_kv8_h2_d128_w4096_s8, 80, 16)
+                          8, 4096, 8)
+SPLASH_DRAFT_REDUCE_KERNEL(draft_attention_bf16_reduce_kv8_h2_d128_w4096_s8, 80, 2, 8, 8)
+SPLASH_DRAFT_REORDER_KERNEL(draft_attention_reorder_kv8_h2_d128_w4096_s8, 80, 8)
