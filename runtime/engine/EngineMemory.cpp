@@ -93,9 +93,14 @@ Engine::ResidentRoom Engine::residentRoom(const Request &active, const ClaimSpec
   // Its pages less the restored chain's pages in memory, which its start
   // takes in place; the claim keeps that chain for the start to reuse.
   // Counted as the claims take it: its KV and the lanes' Full pages from the
-  // free pages the walk keeps, then in whole extents, plus what its lane and
-  // the state it captures allocate, with what the claim frees counted
-  // against the pool they leave.
+  // free pages the walk keeps, then in whole extents, plus what its lane
+  // allocates, with what the claim frees counted against the pool it leaves.
+  // Alone, that is what the memory plan holds one request (ContextBounds::
+  // resident): its KV in whole extents beside its lane's buffers, a warmup's
+  // in the pool or allocated now. No state its prefill captures, which takes
+  // buffers only where memory has them, or else is written from the lane to
+  // the SSD cache or not kept: counted, a Qwen3.8-Flash-Next state's 118.75 MB
+  // refused lone starts the plan's context held.
   RestoredChains own;
   uint32_t held = 0;
   if (active.admissionProbe && !active.skipCache) {

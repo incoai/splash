@@ -1601,6 +1601,40 @@ std::unique_ptr<model::Runtime> runtimeOf(RuntimeResources &resources) {
   return runtime;
 }
 
+// The plan counts every buffer of a start whose KV spills too
+// (testThePlanCountsEveryBuffer): the page tables its readers allocate, the
+// hot block cache's and one for each staging buffer, are the plan's
+// (KvSpillPlan::tableBytes), which holds them beside one request's KV, as a
+// lone start's claim finds them held (ContextBounds::resident). Left out,
+// Qwen3.8-Flash-Next's 589,824 bytes of them and its Index runway cost a lone
+// start the last KV extent the plan advertised wherever the room past it was
+// short of them.
+void testThePlanCountsTheSpilledKvReadersTables(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-plan-spill-tables");
+  RuntimeResourcesConfig config = flashNextConfig(metallibPath, root.path());
+  config.cacheDisk = {.automatic = true};
+  config.diskVolume = reading(localVolume(500 * kGiB));
+  config.maximumMemoryBytes = startStreamed(config).minimumRequired + 512 * kMiB;
+  const std::unique_ptr<RuntimeResources> resources = RuntimeResources::create(config, 0);
+  const std::unique_ptr<model::Runtime> runtime = runtimeOf(*resources);
+  // A lane, whose state the audit counts as a warmup's.
+  const std::vector<uint32_t> prompt(64, 7);
+  ModelRequest request;
+  request.id = 1;
+  request.prompt = prompt;
+  request.maxNewTokens = 1;
+  runtime->beginColdRequest(request, 0);
+  const ActualMemoryReport report = resources->actualMemoryReport(runtime->actualRuntimeMemory());
+  const MemoryAuditResult audit = auditActualMemory(resources->memoryPlan(), report);
+  const KvSpillPlan &spill = resources->memoryPlan().breakdown().kvSpill;
+  require(spill.enabled && spill.tableBytes && report.spilledKvTableBytes == spill.tableBytes && audit.valid &&
+              !audit.backendUnclassifiedBytes,
+          "a start that spills holds " + std::to_string(report.spilledKvTableBytes) +
+              " bytes of its readers' tables where its plan counts " + std::to_string(spill.tableBytes) +
+              ", and " + std::to_string(audit.backendUnclassifiedBytes) + " bytes the plan does not count (" +
+              audit.message + ")");
+}
+
 // The bound of one attention layer's pairs a command may compute: a full
 // chunk's at the end of the native window of 262,144 tokens of every family
 // (Bootstrap.mm's former EngineConfig::maximumPrefillAttentionPairs).
@@ -1910,6 +1944,7 @@ int main(int argc, char **argv) {
       testThePlanCountsEveryBuffer(argv[1]);
       testDenseRuntimeBoundary(argv[1]);
       testSpilledRuntimeBoundary(argv[1]);
+      testThePlanCountsTheSpilledKvReadersTables(argv[1]);
       {
         const test::TemporaryDirectory root("splash-moe");
         const RuntimeResourcesConfig moe = moeConfig(argv[1], root.path());

@@ -1682,12 +1682,14 @@ returning memory.
 start's projection is its tokens plus up to 4096 output tokens. It runs
 Resident when that fits its dense history or costs no more than Spill's peak
 (its floors and the larger of its history staging and its hot block floor);
-else Resident when what a `Start` claim may take covers its Resident KV, its
-state buffers and the lanes' projected growth (`Engine::residentRoom`); else
-Spill. A Spill start the SSD cache cannot take (closed, its write budget
-spent, or its room short of the projection) goes on in memory only where its
-projection fits one request's resident context (`Engine::inMemory`). There
-it starts Resident where the claim its admission makes covers its Resident
+else Resident when what a `Start` claim may take covers its Resident KV, the
+buffers its lane takes that the pool lacks and the lanes' projected growth
+(`Engine::residentRoom`), as the memory plan counts one request
+(`ContextBounds::resident`), not the states its prefill captures, which take
+buffers only where memory has them; else Spill. A Spill start the SSD cache
+cannot take (closed, its write budget spent, or its room short of the
+projection) goes on in memory only where its projection fits one request's
+resident context (`Engine::inMemory`). There it starts Resident where the claim its admission makes covers its Resident
 KV now, as placement prices it. Beside another lane in service that claim
 is a `Start`'s, whose test placed it Spill unless every request spills;
 short of it the start waits for memory, and a lane of a lower priority yields

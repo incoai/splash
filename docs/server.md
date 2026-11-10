@@ -309,8 +309,11 @@ the bounds under `memory_plan.budget.context_bounds`: the model's `window`,
 one request's KV in memory (`resident`), the longest context the floors hold
 (`spilled`) and the room the SSD cache has for active KV beside every lane's
 state (`disk`), and in `bound` which one sets the limit (`model`, `memory` or
-`disk`). Its context therefore follows the free space of the cache's volume
-at a first start; a dense target's never does, nor does a block-sparse one's
+`disk`). The resident context is one a lone request takes: its KV in whole
+extents beside its lane's state and what a target whose KV spills holds from
+its start, the Index runway and the page tables the readers of spilled KV
+allocate. A block-sparse target's context therefore follows the free space of
+the cache's volume at a first start; a dense target's never does, nor does a block-sparse one's
 with `--max-cache-disk 0`. A relaunch keeps its first engine's context
 whatever room the volume has left since: where its plan spills, the cache
 opens however little room the volume has, and each request's commitment

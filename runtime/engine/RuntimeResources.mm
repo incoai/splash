@@ -1472,10 +1472,16 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
     throw std::logic_error("the KV pool and its storage disagree on allocated extents");
   }
   report.kvAllocatedBytes = kvPool_->allocatedBytes();
-  if (blockCache_)
-    report.spilledKvHotBytes = blockCache_->stats().bytes;
-  if (historyStream_)
-    report.spilledKvStagingBytes = historyStream_->stats().stagingBytes;
+  if (blockCache_) {
+    const model::KvBlockCacheStats hot = blockCache_->stats();
+    report.spilledKvHotBytes = hot.bytes;
+    report.spilledKvTableBytes += hot.tableBytes;
+  }
+  if (historyStream_) {
+    const model::KvHistoryStreamStats staging = historyStream_->stats();
+    report.spilledKvStagingBytes = staging.stagingBytes;
+    report.spilledKvTableBytes += staging.tableBytes;
+  }
   report.stateStagingBytes = modelMemory.stateStagingBytes;
   report.aneFfnBytes = aneFfn_ ? aneFfn_->allocatedBytes() : 0;
   if (const auto table = streamedTableStats()) report.streamedTableBytes = table->cacheBytes;
