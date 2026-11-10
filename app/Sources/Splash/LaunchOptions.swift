@@ -121,7 +121,7 @@ private struct OptionLabeled<Content: View>: View {
 
 /// One launch option, with the control its kind takes; dimmed where the others leave it no effect,
 /// a switch then off, and with what to beware of under it: why the model picked doesn't take the
-/// value kept, too.
+/// value kept, too, or that YaRN stretches its window to the value.
 private struct OptionRow: View {
     @Environment(AppState.self) private var state
     let option: LaunchOption
@@ -142,9 +142,9 @@ private struct OptionRow: View {
                                          set: { value.wrappedValue = $0 == on ? "true" : nil })) {
                         OptionLabel(title: option.title, help: option.help)
                     }
-                case .choice(let standard, let choices, let custom):
-                    ChoicePicker(title: option.title, help: option.help, standard: standard, choices: choices, custom: custom,
-                                 family: family, takes: takes, value: value)
+                case .choice(let standard, _, let custom):
+                    ChoicePicker(title: option.title, help: option.help, standard: standard, choices: option.choices(for: family),
+                                 custom: custom, family: family, takes: takes, value: value)
                 case .text(let custom, _):
                     TextRow(title: option.title, help: option.help, custom: custom, takes: takes, value: value)
                 case .folder:
@@ -160,7 +160,8 @@ private struct OptionRow: View {
             .environment(\.optionRowNeeds, option.lacks(state.options))
             .contentShape(.rect)
             .onHover { hovered = $0 }
-            if let warning = option.warning(state.options) ?? value.wrappedValue.flatMap({ family.refusal(option.flag, $0) }) {
+            if let warning = option.warning(state.options)
+                ?? value.wrappedValue.flatMap({ family.refusal(option.flag, $0) ?? family.caution(option.flag, $0) }) {
                 Label(warning, systemImage: "exclamationmark.triangle.fill")
                     .font(.callout)
                     .foregroundStyle(.secondary)

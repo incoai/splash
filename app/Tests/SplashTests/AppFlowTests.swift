@@ -117,7 +117,7 @@ final class AppFlowTests {
                     PopupItem(id: "medium", title: "Medium"), PopupItem(id: "low", title: "Low"),
                     PopupItem(id: "none", title: "No Thinking")],
             chosen: "xhigh", highlighted: .constant("medium")) { _ in })
-        await Snapshot.save("popup-context", size: CGSize(width: 260, height: 320), PopupList(
+        await Snapshot.save("popup-context", size: CGSize(width: 260, height: 360), PopupList(
             header: nil,
             items: [PopupItem(id: "", title: "Auto", badge: "Default")]
                 + ContextLength.lengths.map { PopupItem(id: String($0), title: ContextLength.title($0)) }

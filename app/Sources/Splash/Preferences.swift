@@ -254,6 +254,12 @@ struct LaunchOption: Identifiable, Sendable {
         }
     }
 
+    /// The choices its menu offers for a model of `family`: those its models take.
+    func choices(for family: ModelFamily) -> [(value: String, title: String)] {
+        guard case .choice(_, let choices, _) = kind else { return [] }
+        return choices.filter { family.takes(flag, $0.value) }
+    }
+
     /// Whether `value` is one this option takes: a choice, or a value typed in as its field shows it.
     func accepts(_ value: String) -> Bool {
         switch kind {
@@ -303,6 +309,14 @@ struct ModelFamily: Decodable, Equatable, Sendable {
     func refusal(_ flag: String, _ value: String) -> String? {
         guard flag == "--max-context", let tokens = Int(value), let most = maxContextTokens, tokens > most else { return nil }
         return "The model picked serves at most \(ContextLength.title(most)); it starts on Auto."
+    }
+
+    /// What to beware of with `value` for the option `flag`, which its models take: a context
+    /// length past their own window, which YaRN stretches; nil for any other.
+    func caution(_ flag: String, _ value: String) -> String? {
+        guard flag == "--max-context", let tokens = Int(value), let window = contextTokens, tokens > window,
+              refusal(flag, value) == nil else { return nil }
+        return "Past the model’s own window, \(ContextLength.figure(window)), it stretches it with YaRN, which changes answers at every length."
     }
 }
 
@@ -534,8 +548,9 @@ extension LaunchOption {
 /// How long a model's context may grow, in tokens, as `--max-context` takes it; the server fits
 /// it to memory on Auto.
 enum ContextLength {
-    /// The lengths the menu offers besides Auto and one typed in.
-    static let lengths = [16, 32, 64, 128, 256].map { $0 * 1024 }
+    /// The lengths the menu offers besides Auto and one typed in, those the model picked serves
+    /// (`LaunchOption.choices`): 1M tokens where YaRN stretches its window that far.
+    static let lengths = [16, 32, 64, 128, 256].map { $0 * 1024 } + [1_000_000]
 
     /// A length as the menu names it: 32K tokens, 1M tokens, 100,000 tokens.
     static func title(_ tokens: Int) -> String {

@@ -231,6 +231,18 @@ struct ServeSettingsTests {
         #expect(ContextLength.message(.unknown).contains("YaRN"))
     }
 
+    /// The context menu offers the lengths the model picked serves, 1M tokens where YaRN stretches
+    /// its window that far, and a length past its window says so under it.
+    @Test func theContextMenuOffersTheLengthsTheModelServes() throws {
+        let context = try #require(LaunchOption.all.first { $0.flag == "--max-context" })
+        #expect(context.choices(for: Self.moe).last?.title == "1M tokens")
+        #expect(context.choices(for: .unknown).last?.title == "1M tokens")
+        #expect(context.choices(for: Self.flint).last?.title == "256K tokens")
+        #expect(Self.moe.caution("--max-context", "1000000")
+            == "Past the model’s own window, 256K, it stretches it with YaRN, which changes answers at every length.")
+        #expect(Self.moe.caution("--max-context", "262144") == nil && Self.flint.caution("--max-context", "1000000") == nil)
+    }
+
     @Test func readsAndNamesContextLengths() {
         #expect(ContextLength.parse("100K") == 102_400)
         #expect(ContextLength.parse(" 1m ") == 1_000_000)
