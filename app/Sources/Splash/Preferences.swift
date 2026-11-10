@@ -316,7 +316,7 @@ struct ModelFamily: Decodable, Equatable, Sendable {
     func caution(_ flag: String, _ value: String) -> String? {
         guard flag == "--max-context", let tokens = Int(value), let window = contextTokens, tokens > window,
               refusal(flag, value) == nil else { return nil }
-        return "Past the model’s own window, \(ContextLength.figure(window)), it stretches it with YaRN, which changes answers at every length."
+        return ContextLength.yarn(window)
     }
 }
 
@@ -574,10 +574,16 @@ enum ContextLength {
     static let message: @Sendable (ModelFamily) -> String = { family in
         let units = "Tokens, with K for 1024 or M for a million"
         guard let window = family.contextTokens, let most = family.maxContextTokens else {
-            return "\(units), such as 100K or 1M. Past the model’s own window it stretches it with YaRN, which changes answers at every length."
+            return "\(units), such as 100K or 1M. \(yarn(nil))"
         }
         guard most > window else { return "\(units), such as 100K; at most \(figure(window)), the model’s own window." }
-        return "\(units), such as 100K or 1M; at most \(figure(most)). Past the model’s own window, \(figure(window)), it stretches it with YaRN, which changes answers at every length."
+        return "\(units), such as 100K or 1M; at most \(figure(most)). \(yarn(window))"
+    }
+
+    /// What a length past a model's own window `window`, which YaRN stretches, costs: one sentence,
+    /// the window named where it is known.
+    static func yarn(_ window: Int?) -> String {
+        "Past the model’s own window\(window.map { ", \(figure($0))," } ?? "") it stretches it with YaRN, which changes answers at every length."
     }
 
     /// The most context `splash serve` takes, its MAX_YARN_CONTEXT_TOKENS, which a test holds this
