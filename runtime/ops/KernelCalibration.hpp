@@ -188,6 +188,10 @@ inline constexpr uint32_t kApple10OnePassFromCores = 16;
 // the traffic. An unsplit gate/up pair runs it where both its tensors' own
 // plans do.
 inline constexpr uint32_t kApple10SixteenRowBelowBits16 = 72;
+// The M5's (GPU family 10) 4.5-bit lanes run it too: on a 16-core M5 Pro,
+// AF4G64 and Q4_K lanes of the 4B's, 27B's and 35B's shapes take 3.5-15%
+// less time, and Q5_K's (5.5 bits) up to 7% more (gguf-projection-benchmark).
+inline constexpr uint32_t kM5SixteenRowBelowBits16 = 73;
 
 // Prefill: 128-row tiles. A chunk of up to 32 rows runs the staged tile of its
 // rows with the decode split law (the prefill tile's outputs up to fp32
@@ -227,6 +231,11 @@ inline constexpr ProjectionCalibration kApple10Projection{
     .sixteenRowBelowBits16 = kApple10SixteenRowBelowBits16,
     .stagedPrefillRows = kApple10StagedPrefillRows,
 };
+inline constexpr ProjectionCalibration kM5Projection = [] {
+  ProjectionCalibration row = kApple10Projection;
+  row.sixteenRowBelowBits16 = kM5SixteenRowBelowBits16;
+  return row;
+}();
 
 // ---- Float projections ----------------------------------------------------
 
@@ -275,7 +284,8 @@ inline constexpr AttentionCalibration kApple9SmallAttention{64};
 inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device) noexcept {
   const uint32_t cores = device.plannedGpuCores();
   if (device.gpuClass() == GpuClass::Apple10)
-    return {cores, kApple10Projection, kApple10FloatTile, kApple10Moe, kAttention};
+    return {cores, device.appleGpuFamily == 10 ? kM5Projection : kApple10Projection, kApple10FloatTile, kApple10Moe,
+            kAttention};
   const bool small = cores <= kApple9SmallGpuCores;
   return {cores, small ? kApple9SmallProjection : kApple9Projection, kApple9FloatTile,
           small ? kApple9SmallMoe : kApple9Moe, small ? kApple9SmallAttention : kAttention};

@@ -31,7 +31,10 @@ or Qwen3.8-27B and Qwen3.5-4B (`qwen3_5_text`, GGUF `qwen35`), are told apart
 by their sizes, and a fine-tune of one, such as Ornith-1.5-35B-A3B or
 Ornith-1.5-122B, is its family. Qwen3.5-4B's head is its token table
 (`tie_word_embeddings`, `QwenTargetDimensions::tiedEmbeddings`), whose tensor its
-head's image is planned from; its vision tower is smaller than the one the
+head's image is planned from. The table is stored once: where the head's format
+is one `ops::Embedding::gathersPlanes` names (the linear formats of four bits or
+more and Q8_0), no `embedding.bin` is planned and the token gather reads the
+head's planes (`gguf::tableInHead`). Its vision tower is smaller than the one the
 vision kernels are built for, so its family serves text only
 (`families.ModelFamily.vision`). A layout type
 (`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp` in

@@ -190,6 +190,12 @@ struct PlanOptions {
 [[nodiscard]] std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers);
 // The bytes an image takes once loaded: none for a table whose rows stream.
 [[nodiscard]] uint64_t loadedBytes(const Image &image);
+// Whether a target's token table is its head's planes: a tied head
+// (QwenTargetDimensions::tiedEmbeddings) of one tensor of a format
+// ops::Embedding gathers from planes. Its embedding.bin is then not planned,
+// and the loader gathers from the head (readQwenTargetHead).
+[[nodiscard]] bool tableInHead(const QwenTargetDimensions &g, uint32_t headFormat) noexcept;
+[[nodiscard]] bool tableInHead(const QwenTargetDimensions &g, const Image &head) noexcept;
 
 // The destination bytes of `sourceBytes` bytes of rows copied with
 // `conversion`: halved when narrowed, doubled when widened (and for the decay

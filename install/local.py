@@ -55,7 +55,7 @@ def prepare_local_model(
     tokenizer files and a safetensors checkpoint) or else GGUF targets of
     one name, the name's whole file before its split parts, beside any
     vision projector named mmproj.
-    draft: the directory of a DFlash2 draft (config.json and safetensors
+    draft: the directory of a DFlash draft (config.json and safetensors
     weights) trained for the target's family. Without one, the draft
     released for the family is taken from the Hugging Face cache
     (HF_HUB_CACHE), at the commit last recorded there for its default

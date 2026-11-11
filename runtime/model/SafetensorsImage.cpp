@@ -412,9 +412,11 @@ std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, con
   Builder head(checkpoint, geometry, names, "head.bin", geometry.layers, 2);
   walkHead(head, geometry, names);
   images.push_back(head.finish());
-  Builder embedding(checkpoint, geometry, names, "embedding.bin", geometry.vocabularySize, geometry.hiddenSize);
-  walkEmbedding(embedding, names);
-  images.push_back(embedding.finish());
+  if (!gguf::tableInHead(geometry, images.back())) {
+    Builder embedding(checkpoint, geometry, names, "embedding.bin", geometry.vocabularySize, geometry.hiddenSize);
+    walkEmbedding(embedding, names);
+    images.push_back(embedding.finish());
+  }
   return images;
 }
 

@@ -533,7 +533,9 @@ per core unsplit, in four or eight partitions) the 16-row tile takes 4-36% more 
 8-row tile at the same split on a 32-core M5 Max (IQ3_XXS, IQ2_XS and Q2_K, and IQ4_XS where it
 stages), against 2-8% less at 4 to 20 threadgroups per core on the M6 and 7% less to 2% more on
 the 27B's 5120-column projections in four on the M5 Max. Q4_K's 4.5 bits take more time on it on
-the M6. Prefill runs the staged kernels on both families: the 128-row prefill tile
+the M6, but less on the M5 (GPU family 10, whose row `kM5Projection` takes 4.5 bits too): on a
+16-core M5 Pro the 4B's, 27B's and 35B's unsplit AF4G64 and Q4_K lanes take 3.5-15% less time,
+Q5_K's up to 7% more. Prefill runs the staged kernels on both families: the 128-row prefill tile
 (`LinearTile::GgufPrefill`), and the staged tile for chunks of up to 32 rows. On Apple10 and on
 Apple9 GPUs of 10 cores or fewer chunks of 33 to 64 rows run the staged tile's 64-row height too,
 which reads the weights once where the prefill tile costs about as much for 33 rows as for 64 (on

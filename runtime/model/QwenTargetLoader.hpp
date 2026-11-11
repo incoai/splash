@@ -83,7 +83,9 @@ struct MoeExperts final {
                                                 const MoeExperts &experts, uint32_t block);
 
 // Reads, into `result`, the head of a target whose last layer's rows read a
-// final norm, then its token embedding: the images after its layers'.
+// final norm, then its token embedding: the images after its layers'. A
+// table that is the head's planes (gguf::tableInHead) has no image of its
+// own: the gather reads the head's.
 template <class Weights, class Layout, class Files>
 void readQwenTargetHead(Weights &result, const Layout &layout, Files &&files, const BlockTargetFormat &format) {
   {
@@ -96,6 +98,11 @@ void readQwenTargetHead(Weights &result, const Layout &layout, Files &&files, co
     result.logitsProjection.destination = ops::FloatOutput::Float32;
     file.finish();
     result.files.push_back(file.record());
+  }
+  const std::vector<ops::QuantizedSegment> &head = result.logitsProjection.blocks().segments;
+  if (head.size() == 1 && !head.front().isFloat() && gguf::tableInHead(layout, head.front().formatId)) {
+    result.tokenEmbedding = ops::EmbeddingWeights(layout.vocabularySize, layout.hiddenSize, head.front());
+    return;
   }
   {
     WeightFile file = files.embedding();

@@ -68,6 +68,7 @@ StreamedBlocks GgufTargetLoader::streamedExperts() const {
 }
 
 const gguf::Image *GgufTargetLoader::tablePlan() const noexcept {
+  // A family with a table plans its embedding.bin (gguf::tableInHead holds for none).
   const size_t index = planned_->layers + 2;
   return index < planned_->images.size() ? &planned_->images[index] : nullptr;
 }
@@ -105,6 +106,10 @@ WeightFile GgufTargetLoader::layer(uint32_t index) {
 
 WeightFile GgufTargetLoader::head() { return open(planned_->layers); }
 
-WeightFile GgufTargetLoader::embedding() { return open(planned_->layers + 1); }
+WeightFile GgufTargetLoader::embedding() {
+  if (planned_->images.size() <= planned_->layers + 1 || planned_->images[planned_->layers + 1].name != "embedding.bin")
+    throw GgufError("the target's token table is its head");
+  return open(planned_->layers + 1);
+}
 
 } // namespace splash::model

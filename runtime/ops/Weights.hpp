@@ -6,6 +6,7 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -232,8 +233,13 @@ public:
   EmbeddingWeights() = default;
   EmbeddingWeights(uint32_t output, uint32_t input, StoredRows rows)
       : outputSize(output), inputSize(input), rows_(std::move(rows)) {}
+  // A tied head's table: the rows of its projection's planes, a format
+  // Embedding::gathersPlanes names, which the gather reads in place.
+  EmbeddingWeights(uint32_t output, uint32_t input, QuantizedSegment planes)
+      : outputSize(output), inputSize(input), planes_(std::move(planes)) {}
 
   [[nodiscard]] const StoredRows &rows() const noexcept { return rows_; }
+  [[nodiscard]] const QuantizedSegment *planes() const noexcept { return planes_ ? &*planes_ : nullptr; }
 
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
@@ -242,6 +248,7 @@ public:
 
 private:
   StoredRows rows_;
+  std::optional<QuantizedSegment> planes_;
 };
 
 } // namespace splash::ops

@@ -1,4 +1,5 @@
 #include "model/GgufImage.hpp"
+#include "ops/Embedding.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/QuantFormat.h"
@@ -709,7 +710,8 @@ std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions
   images.push_back(head.finish());
   Builder embedding(file, g, problems, "embedding.bin", g.vocabularySize, g.hiddenSize);
   embedding.embeddingRows("token_embd.weight");
-  images.push_back(embedding.finish());
+  // Planned whether or not it loads, so the token table counts as read.
+  if (!tableInHead(g, images.back())) images.push_back(embedding.finish());
   Family::tables(file, g, options, problems, images);
   const GgufMetadata &metadata = file.metadata();
   problems.addUnread(file, g.layers,
@@ -741,6 +743,14 @@ void requireRotation(const GgufFile &file, const QwenTargetDimensions &g, const 
 }
 
 } // namespace
+
+bool tableInHead(const QwenTargetDimensions &g, uint32_t headFormat) noexcept {
+  return g.tiedEmbeddings && ops::Embedding::gathersPlanes(headFormat);
+}
+
+bool tableInHead(const QwenTargetDimensions &g, const Image &head) noexcept {
+  return head.repacks.size() == 1 && tableInHead(g, head.repacks.front().format);
+}
 
 std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers) {
   std::vector<StreamedExperts> result;
