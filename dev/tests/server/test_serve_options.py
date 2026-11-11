@@ -86,6 +86,9 @@ OPTIONS = {
     "--draft-block-size": values(
         "--draft-block-size", {"8": 8, "16": 16}, ("7", "32", "auto")
     ),
+    "--activations": values(
+        "--activations", {"auto": "auto", "bf16": "bf16"}, ("", "on", "off", "BF16")
+    ),
     "--verify-rows": values(
         "--verify-rows",
         {"auto": "auto", "all": "all"},

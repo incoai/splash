@@ -3,6 +3,7 @@ handler; each API's handlers, request conversion and answers live in its
 module in dialects/."""
 
 import argparse
+import errno
 import json
 import math
 import os
@@ -44,7 +45,7 @@ from .constraints import (
     check_capabilities,
     validate_tokenizer,
 )
-from .diagnostics import log_unexpected, print_request, print_status
+from .diagnostics import console_stats, log_unexpected, print_request, print_status
 from .errors import (
     OPENAI_ERRORS,
     RETRY_STATUSES,
@@ -87,7 +88,21 @@ ANSWERED_LINGER_SECONDS = 2.0
 # lingering after a burst and the engine's pipes and files can need. 10240 is
 # macOS's OPEN_MAX.
 DESCRIPTOR_LIMIT = 10240
+# The status of a server that stopped restarting its engine, apart from a
+# stop's 0 and a failed start's 1: what supervises the server, as launchd's
+# KeepAlive does, decides whether to start it again. 69 is sysexits'
+# EX_UNAVAILABLE.
+ENGINE_STOPPED_STATUS = os.EX_UNAVAILABLE
 SSE_KEEPALIVE_SECONDS = 2.0
+# A client gone without a FIN or RST (a Mac asleep, off its network) sends
+# nothing a non-streaming request reads; keepalive probes the idle connection
+# and drops it once its peer stops answering, 60 s after its last data.
+TCP_KEEPALIVE_OPTIONS = (
+    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 30),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3),
+)
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
 CHAT_ASSETS = {
@@ -217,6 +232,16 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._allow_origin = None
         self._unread_body = 0
         self._last_sse_write = time.monotonic()
+        try:
+            for level, option, value in TCP_KEEPALIVE_OPTIONS:
+                self.request.setsockopt(level, option, value)
+        except OSError as error:
+            # macOS refuses options on a connection its client reset before
+            # it was served (EINVAL): it ends as any reset does. Any other
+            # refusal is the server's to report.
+            if error.errno != errno.EINVAL:
+                raise
+            raise ConnectionResetError from error
         super().setup()
         self.connection.settimeout(HTTP_IO_TIMEOUT)
 
@@ -724,7 +749,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
         except BlockingIOError:
             return False
-        except ConnectionError:
+        except (ConnectionError, TimeoutError):
+            # A connection keepalive dropped fails its read with ETIMEDOUT.
             return True
 
     def _finalize_content(self, content, job, result, projector, cut_in_call):
@@ -1055,6 +1081,7 @@ class FrontendServer(HTTPServer):
             "token_counts": self.token_counts.stats(),
             "connections": self.connections.stats(),
         }
+        status["console"] = console_stats()
         return status
 
     def server_activate(self):
@@ -1112,10 +1139,12 @@ class FrontendServer(HTTPServer):
         self.connections.idle.wait(min(2.0, HTTP_IO_TIMEOUT))
 
     def handle_error(self, request, client_address):
+        # A client that left is no error. Any other is one console line, as a
+        # request's unexpected error is: socketserver's own writes a traceback
+        # straight to stderr, on the connection worker.
         error = sys.exc_info()[1]
-        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
-            return
-        super().handle_error(request, client_address)
+        if not isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            log_unexpected(error)
 
 
 def parse_args(argv=None):
@@ -1219,6 +1248,14 @@ def main():
     server = None
     runtime = None
     backend = None
+    # Why the backend stopped restarting the engine, once it has.
+    stopped = None
+
+    def stop_serving(reason):
+        nonlocal stopped
+        stopped = reason
+        os.kill(os.getpid(), signal.SIGTERM)
+
     # A server started in the background from a non-interactive shell inherits
     # SIGINT as ignored and Python then leaves it alone; install both stop
     # signals explicitly so scripts and supervisors can interrupt it.
@@ -1303,13 +1340,27 @@ def main():
             ),
             pending_limit=args.queue_size,
         )
-        runtime.on_warming = lambda: serve_record.entered(args.serve_record, "warming")
+
+        def warming(event):
+            # As the warm-up begins and as each of its steps ends: it can take
+            # minutes on the first start after an update, so the console and
+            # the record, which the app shows, say how far it is. It runs on
+            # the reader thread, which must not block (on_warming):
+            # print_status only queues the line for the console's one writer,
+            # which drops it once 1024 lines wait (diagnostics.CONSOLE_LINES).
+            print_status(f"Warming up · {event.steps_done} of {event.steps} steps")
+            serve_record.warming(args.serve_record, event.steps_done, event.steps)
+
+        runtime.on_warming = warming
         backend = NativeBackend(
             runtime,
             tokenizer,
             request_logger=print_request,
             thinking_end=thinking_end,
         )
+        # A server that serves nothing more stops as on SIGTERM and exits
+        # ENGINE_STOPPED_STATUS below.
+        backend.on_stopped = stop_serving
         if not runtime.wait_ready():
             raise engine_runtime.EngineUnhealthy("native runtime did not become ready")
         # The engine is authoritative for what it serves: it refuses a
@@ -1403,6 +1454,11 @@ def main():
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             if server is not None:
                 server.server_close()
+    if stopped is not None:
+        serve_record.failed(
+            args.serve_record, serve_record.failure(serve_record.STOPPED, stopped)
+        )
+        raise SystemExit(ENGINE_STOPPED_STATUS)
 
 
 if __name__ == "__main__":

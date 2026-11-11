@@ -285,18 +285,19 @@ public:
   // context window to the pool (QwenBufferPool::give), at the layout's
   // sizes, which each allocation covers: with keepLane a lane keeps two
   // cells, the draft rings and a window, and cells of no bytes count none.
-  // With `afterStart`, of the pool a lane's activation and a state reserved
-  // beside it leave once they took their buffers from it first (startBytes).
+  // With `afterStart`, of the pool a lane's activation leaves once it took
+  // its buffers from it first (startBytes).
   [[nodiscard]] uint64_t idleBytes(uint32_t evictedStates, bool afterStart, bool keepLane) const noexcept;
-  // What a lane's activation and a state reserved beside it allocate: their
-  // buffers (kStartBuffers) that the idle pool lacks.
+  // What a lane's activation allocates: its buffers that the idle pool
+  // lacks.
   [[nodiscard]] uint64_t startBytes() const noexcept;
 
   // Hot-path metadata operations; none performs a buffer copy. A step makes
   // next() current. swapParity: a prefill step's, which read the lane's
   // whole state (no pending rows) and holds its every row. swapDecodeParity:
   // a decode step's, which folded the pending rows in and holds the state
-  // before its own rows, `retainedRows` (1 to 8) of which wait on the tape.
+  // before its own rows, `retainedRows` (1 to the active block width) of
+  // which wait on the tape.
   void updateLengths(uint32_t lane, QwenLogicalLengths lengths);
   void swapParity(uint32_t lane);
   void swapDecodeParity(uint32_t lane, uint32_t retainedRows, ops::DecodeGeometry geometry = {});
@@ -370,16 +371,12 @@ private:
     Buffers cells;
   };
   // Counts of the pool's buffers: a lane takes two GDN cells, the draft
-  // rings and a context window, a cached state a cell and a window, and a
-  // lane's start the lane's and those of the state it captures.
+  // rings and a context window, and a cached state a cell and a window.
   struct BufferCounts final {
     uint32_t cells = 0, rings = 0, windows = 0;
   };
   static constexpr BufferCounts kLaneBuffers{CompositeStateLayout::kLaneGdnCells, 1, 1};
   static constexpr BufferCounts kStateBuffers{1, 0, 1};
-  static constexpr BufferCounts kStartBuffers{kLaneBuffers.cells + kStateBuffers.cells,
-                                              kLaneBuffers.rings + kStateBuffers.rings,
-                                              kLaneBuffers.windows + kStateBuffers.windows};
 
   [[nodiscard]] Lane &lane(uint32_t index);
   [[nodiscard]] const Lane &lane(uint32_t index) const;

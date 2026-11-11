@@ -127,6 +127,9 @@ struct GdnDecodeBuffers final {
   metal::MetalBuffer timeBias;
   NormWeights mixerNorm;
   metal::MetalBuffer hidden;
+  // Each lane's verify rows (ops::DraftSelector::addVerifyRows): the step's
+  // rows past them get zero recurrent output.
+  metal::MetalBuffer verifyRows;
   LinearScratch linearScratch{};
 };
 

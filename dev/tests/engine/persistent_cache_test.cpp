@@ -110,7 +110,8 @@ TokenAdmission admitTokens(engine::Cache &cache, uint64_t requestId, uint64_t to
 }
 
 // One process's cache over eight pages, a KV tier and a shelf, persistent or not, with an optional
-// spill policy (Index pages beside the eight) or window policy (Slim pages of 30 bytes).
+// spill policy (Index pages beside the eight; the tests spill under --kv-spill always, pages moving as
+// their copies land) or window policy (Slim pages of 30 bytes).
 struct Process final {
   test::TestKvStorage storage{16, 100, 1, 10, 30};
   KvPool pool{storage, 8};
@@ -969,7 +970,7 @@ void testCopiesWaitForWritesNeededNow() {
   for (const bool persistent : {true, false}) {
     // The tier's slots draw on the quota, as a slot file's do.
     const auto budget = std::make_shared<model::DiskBudget>(1600);
-    Process process(persistent, budget, CacheSpillPolicy{1, 1});
+    Process process(persistent, budget, CacheSpillPolicy{1, 1, true});
     process.tier.budget = budget;
     const uint64_t demoted = process.cachePrompt(1, promptOf(1000, 1))[0];
     process.publish(demoted);
@@ -1052,7 +1053,7 @@ void testTemporaryCopiesTakeOnlyFreeRoom() {
   }
   // Room Spill requests committed is no room for copies.
   const auto budget = std::make_shared<model::DiskBudget>(600);
-  Process process(false, budget, CacheSpillPolicy{1, 1});
+  Process process(false, budget, CacheSpillPolicy{1, 1, true});
   process.tier.budget = budget;
   const uint64_t point = process.cachePrompt(1, promptOf(1000, 2))[1];
   process.publish(point);
@@ -1212,7 +1213,7 @@ void testPointsWaitForTheTier() {
 // for them and is free once they land.
 void testCopiesAheadOfSpilledPagesArePending() {
   const auto budget = std::make_shared<model::DiskBudget>(1600);
-  Process process(true, budget, CacheSpillPolicy{1, 1});
+  Process process(true, budget, CacheSpillPolicy{1, 1, true});
   process.tier.budget = budget;
   // Room for an Index extent beside the eight Full pages.
   process.storage.budgetPages = 9;
@@ -1442,7 +1443,7 @@ void testCopyDemandCountsOnlyWhatGoesAtOnce() {
 // writes only the state.
 void testWriteThroughCopiesAreRestorePoints() {
   const std::vector<uint32_t> prompt = promptOf(1000, 4);
-  Process earlier(true, std::make_shared<model::DiskBudget>(1600), CacheSpillPolicy{1, 1});
+  Process earlier(true, std::make_shared<model::DiskBudget>(1600), CacheSpillPolicy{1, 1, true});
   // Room for an Index extent beside the eight Full pages.
   earlier.storage.budgetPages = 9;
   earlier.cache.beginRequest(1, KvMode::Spill);
@@ -1471,7 +1472,7 @@ void testRecomputedChainsStayWhole() {
   const std::vector<uint32_t> prompt = promptOf(1000, 4);
   for (const KvMode mode : {KvMode::Resident, KvMode::Spill}) {
     const auto budget = std::make_shared<model::DiskBudget>(1600);
-    Process process(true, budget, CacheSpillPolicy{1, 1});
+    Process process(true, budget, CacheSpillPolicy{1, 1, true});
     process.tier.budget = budget;
     // Room for an Index extent beside the eight Full pages.
     process.storage.budgetPages = 9;
@@ -1514,7 +1515,7 @@ void testRecomputedChainsStayWhole() {
 // takes it, the state first.
 void testCommittedPagesTakeTheSpilledChainOfAStateInRam() {
   const auto budget = std::make_shared<model::DiskBudget>(400);
-  Process process(true, budget, CacheSpillPolicy{1, 1});
+  Process process(true, budget, CacheSpillPolicy{1, 1, true});
   process.tier.budget = budget;
   // Room for an Index extent beside the eight Full pages.
   process.storage.budgetPages = 9;
@@ -1555,7 +1556,7 @@ void testAPrefixWithoutOwnCopiesHoldsBackNoSpill() {
   tier.transferLimit = 1024;
   const auto shelf = std::make_shared<Shelf>();
   shelf->capacity = 100;
-  engine::Cache cache(pool, &tier, budget, CacheSpillPolicy{1, 1});
+  engine::Cache cache(pool, &tier, budget, CacheSpillPolicy{1, 1, true});
   require(cache.spillWritten(SpilledExtents::KeepRunway).granted(), "the Index runway was not allocated");
   const auto publish = [&](uint64_t block) {
     cache.publishCompositeState(block, std::make_shared<ShelvedState>(shelf, false), false);

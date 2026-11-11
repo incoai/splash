@@ -10,6 +10,7 @@
 #include <limits>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace splash::engine {
@@ -80,21 +81,27 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, Refusal refusal)
   MemoryGovernor &governor = this->governor();
   MemoryLedger &ledger = governor.ledger();
   // A request's allocations are its one claim's, the engine's own a claim
-  // of this allocation alone.
+  // of this allocation alone. Its refusal ends its lane where its work waits
+  // for the memory (Waits) and no other lane is in service: then the claim
+  // is lone. A refusal its caller settles goes on without the memory.
+  ClaimSpec claimed = spec;
+  claimed.lone = spec.cls == ClaimClass::InService && refusal == Refusal::Waits && !anotherResident(spec.requestId);
   ClaimHandle transient;
   ClaimHandle &claim = spec.requestId ? request(spec.requestId).claim : transient;
   if (claim.id) {
-    ledger.update(claim.id, spec);
+    ledger.update(claim.id, claimed);
   } else {
     claim.governor = &governor;
-    claim.id = ledger.open(spec);
+    claim.id = ledger.open(claimed);
   }
   ledger.setLanes(laneDemandBytes(), highestLanePriority());
-  // Each attempt runs in the claim's scope, from a need the scope's refusal
-  // records afresh; what a waiting claim holds stays held.
+  // The allocation runs in the claim's one scope, so what an attempt's work
+  // released pays for the later attempts' allocations too (fund); each
+  // attempt starts from a need the scope's refusal records afresh, and what
+  // a waiting claim holds stays held.
+  const MemoryGovernor::Scope scope(governor, claim.id);
   const auto tryOnce = [&] {
     ledger.refused(claim.id, {});
-    const MemoryGovernor::Scope scope(governor, claim.id);
     return attempt();
   };
   Allocation<Admission> result{tryOnce(), {}};
@@ -106,8 +113,9 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, Refusal refusal)
   // one the host refuses after exempting the claim (critical pressure), or a
   // need the ledger already freed for once in this allocation. The claim
   // then waits if the ledger's latest decision was to wait.
-  std::vector<Need> met;
-  const auto metBefore = [&](const Need &need) { return std::ranges::find(met, need) != met.end(); };
+  // The needs it freed for in this allocation, each with whether free() met
+  // it.
+  std::vector<std::pair<Need, bool>> freedFor;
   while (refusal != Refusal::SettledOnce && memoryDenied(admission)) {
     std::optional<Need> part;
     if constexpr (std::is_same_v<Admission, StateAdmission>) {
@@ -118,12 +126,20 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, Refusal refusal)
     }
     const Need need = governor.need(claim.id, part);
     if ((!need.bytes && !need.hostRefused && !need.pages && !need.lacksStateBuffers()) ||
-        (need.hostRefused && ledger.claim(claim.id).hostExempt) ||
-        metBefore(need))
+        (need.hostRefused && ledger.claim(claim.id).hostExempt))
       break;
+    // Freed for once in this allocation and refused again. Where free() met
+    // the need, the ledger counted room the attempt did not find, which the
+    // log says, a met at no cost logging nothing; a need free() found pending
+    // or short, as it took what it could, logged that.
+    if (const auto before = std::ranges::find(freedFor, need, &std::pair<Need, bool>::first);
+        before != freedFor.end()) {
+      if (before->second)
+        ledger.refusedAfterMet(claim.id, need);
+      break;
+    }
     const bool exempt = ledger.claim(claim.id).hostExempt;
     const FreeResult freed = governor.free(claim.id, need);
-    ++ledgerChanges_;
     denial.pending = freed.outcome == FreeOutcome::Pending;
     // Past its hold's limit a request's claim waits holding nothing
     // (syncClaims), whatever this retry found.
@@ -131,16 +147,11 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, Refusal refusal)
       ledger.setWaiting(claim.id, false);
     // What it freed now, the units that cost nothing among them, the
     // attempt may fit in.
-    if (freed.outcome != FreeOutcome::Met && !freed.nowBytes) {
-      // A conversion frees later, and at once the pages whose copies landed
-      // before (Cache::convertToSpill), which one more attempt may fit in.
-      if (freed.laterBytes)
-        admission = tryOnce();
+    if (freed.outcome != FreeOutcome::Met && !freed.nowBytes)
       break;
-    }
     // The host's exemption takes nothing for it.
     result.freed = result.freed || exempt || !ledger.claim(claim.id).hostExempt;
-    met.push_back(need);
+    freedFor.emplace_back(need, freed.outcome == FreeOutcome::Met);
     signalResourceProgress();
     admission = tryOnce();
   }

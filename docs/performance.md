@@ -47,8 +47,8 @@ tokens are a median 0.03–0.10 nats apart, against 2.6–2.7 nats over all
 positions. Splash's perplexity is 0.1–0.4% (27B) and 0.1–0.9% (35B) above
 llama.cpp's; llama.cpp's CPU backend is 1.7–1.8% above its Metal on the 27B.
 Splash's figures cover an M5 Pro and an M3 Max with `--kv-format bf16` and
-`--disable-ane`; the default INT8 cache gives 99.23–99.25% and 97.92–97.94% on
-the M5 Pro.
+`--disable-ane`; the INT8 cache with bf16 queries (`--activations bf16`)
+gives 99.23–99.25% and 97.92–97.94% on the M5 Pro.
 
 Speed uses the selected SPEED-Bench coding prompts described above, with
 greedy sampling. llama-server runs with its default settings, which do not
