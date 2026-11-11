@@ -82,7 +82,14 @@ private struct Scroller<Content: View>: NSViewRepresentable {
         override class var isCompatibleWithResponsiveScrolling: Bool { true }
     }
 
-    /// The content at the scroll view's width and as tall as it is, which it says as it changes.
+    /// The content at the scroll view's width and as tall as it is, which it says as it changes,
+    /// held to the document's top. The document takes a new height of the content's only after the
+    /// update that changed it, and a hosting view centers a root view of another height than its
+    /// own: a change of the content's height moved the whole page by half of it and slid it back as
+    /// the document caught up, as picking a model whose family uses other launch options did. So the
+    /// root view is the document's height whatever the content's (a least height of 0, as one of
+    /// the content's own would take a taller content's), the content at its top, past its bottom
+    /// until the document grows.
     struct Measured: View {
         let content: Content
         let height: (CGFloat) -> Void
@@ -90,8 +97,8 @@ private struct Scroller<Content: View>: NSViewRepresentable {
         var body: some View {
             content
                 .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .top)
                 .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height($0) }
+                .frame(maxWidth: .infinity, minHeight: 0, maxHeight: .infinity, alignment: .top)
         }
     }
 

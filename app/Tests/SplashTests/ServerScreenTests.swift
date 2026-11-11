@@ -252,11 +252,13 @@ extension ServerScreenTests {
     /// An app launched on `fake` with the models of a Mac that has a few, named and sized as Splash
     /// suggests them, of the families the runtime serves, so that the Server screen is taller than
     /// the window, and two speech models, of families the runtime doesn't serve, which a newer or
-    /// development build installs.
-    static func launchedWithModels(_ fake: FakeRuntime) async throws -> AppState {
+    /// development build installs. `families` is what the runtime reports of their families, as JSON.
+    static func launchedWithModels(
+        _ fake: FakeRuntime,
+        families: String = #"{"Qwen3.8-27B": {"unusable": []}, "Qwen3.6-35B-A3B": {"unusable": []}, "Flint": {"unusable": []}}"#
+    ) async throws -> AppState {
         try FileManager.default.copyItem(at: Showcase.runtime.suggestedModels, to: Runtime(root: fake.root).suggestedModels)
-        try #"print('{"Qwen3.8-27B": {"unusable": []}, "Qwen3.6-35B-A3B": {"unusable": []}, "Flint": {"unusable": []}}')"#
-            .write(to: fake.root.appending(path: "install/families.py"), atomically: true, encoding: .utf8)
+        try "print('\(families)')".write(to: fake.root.appending(path: "install/families.py"), atomically: true, encoding: .utf8)
         let models = [("mlx-community/Qwen3.8-27B-4bit", "Qwen3.8-27B", 20), ("unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M", "Qwen3.6-35B-A3B", 24),
                       ("unsloth/flint-GGUF:UD-Q4_K_XL", "Flint", 26),
                       ("mlx-community/Qwen3-ASR-1.7B-4bit", "Qwen3-ASR", 1), ("mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit", "Qwen3-TTS", 2)]
@@ -336,6 +338,48 @@ extension ServerScreenTests {
         #expect(bar(switching.before) != bar(switching.after))
         #expect(switching.drawn.allSatisfy { bar($0) == bar(switching.before) || bar($0) == bar(switching.after) },
                 "switching to \(qwen)")
+    }
+
+    /// Picking a model whose family uses other launch options changes the page's height below the
+    /// models, and moves nothing above: the page's document took the new height an update late, and
+    /// its hosting view centered the content meanwhile, which moved the whole page by half the
+    /// change and slid it back, the rows under the pointer passing it as they went.
+    @Test func pickingAnotherFamilyMovesNothingAboveItsOptions() async throws {
+        let fake = try FakeRuntime("splash-family-pick", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        // Flint's family as the runtime reports it (`ServeSettingsTests.flint`): without Text only, which
+        // the Qwen families' models use, among the options of the page's first card.
+        let unusable = ServeSettingsTests.flint.unusable.sorted().map { "\"\($0)\"" }.joined(separator: ", ")
+        let state = try await Self.launchedWithModels(
+            fake, families: #"{"Qwen3.8-27B": {"unusable": []}, "Qwen3.6-35B-A3B": {"unusable": []}, "Flint": {"unusable": [\#(unusable)]}}"#)
+        defer { state.quit() }
+        let flint = "unsloth/flint-GGUF:UD-Q4_K_XL", qwen = "mlx-community/Qwen3.8-27B-4bit"
+        #expect(LaunchOptions.options(.main, for: state.family(of: flint)).map(\.flag)
+                != LaunchOptions.options(.main, for: state.family(of: qwen)).map(\.flag))
+        state.options["--port"] = String(fake.port)
+        for step in ["loaded", "warm"] { FileManager.default.createFile(atPath: fake.root.appending(path: step).path, contents: nil) }
+        state.start(flint)
+        try await waitFor(state.server.phase == .ready, "\(flint) ready")
+        let window = await Snapshot.window(MainView().environment(state), size: ServerPictures.size, appearance: .aqua)
+        defer { window.orderOut(nil) }
+        pump(0.5)
+        /// The page's first 140 points under the toolbar, Activity's card, as drawn now.
+        func top() async throws -> Data {
+            let picture = try #require(await Snapshot.picture(of: window))
+            let scale = CGFloat(picture.pixelsHigh) / window.frame.height
+            let first = Int(((window.frame.height - window.contentLayoutRect.maxY) * scale).rounded(.up))
+            return Data(bytes: try #require(picture.bitmapData) + first * picture.bytesPerRow, count: Int(140 * scale) * picture.bytesPerRow)
+        }
+        for model in [qwen, flint] {
+            let before = try await top()
+            state.selection = model
+            var moved = 0
+            for _ in 0..<12 {
+                pump(0.02)
+                if try await top() != before { moved += 1 }
+            }
+            #expect(moved == 0, "picking \(model) moved the page's top in \(moved) of 12 frames")
+        }
     }
 }
 
