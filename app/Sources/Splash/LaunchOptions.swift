@@ -165,6 +165,11 @@ private struct OptionRow: View {
             .environment(\.optionRowNeeds, option.lacks(state.options))
             .contentShape(.rect)
             .onHover { hovered = $0 }
+            // Its value changes at once, as a control's does: animated with the page, the value
+            // before and the value chosen cross-faded in the field, one over the other. The control
+            // moves with the page as one (`geometryGroup`), laid out in it at once.
+            .transaction { $0.animation = nil }
+            .geometryGroup()
             if let warning = option.warning(state.options)
                 ?? value.wrappedValue.flatMap({ family.refusal(option.flag, $0) ?? family.caution(option.flag, $0) }) {
                 // As a row of the page comes and goes, a warning in place of another too: it faded

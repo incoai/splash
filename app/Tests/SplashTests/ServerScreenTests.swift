@@ -470,6 +470,27 @@ extension ServerScreenTests {
         #expect(between == 0, "\(between) of \(start.drawn.count) frames drew the phrase between none and Starting…")
     }
 
+    /// A launch option's value changes at once, as a control's does: every frame of the page shows
+    /// the value before or the value chosen, never one faded over the other.
+    @Test func anOptionsValueChangesAtOnce() async throws {
+        let fake = try FakeRuntime("splash-option-value", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await Self.launchedWithModels(fake, families: Self.realisticFamilies)
+        defer { state.quit() }
+        // Restore Defaults showing before, so that only the value changes.
+        state.options["--port"] = String(fake.port)
+        let window = await Self.serverWindow(state, picked: "mlx-community/Qwen3.8-27B-4bit")
+        defer { window.orderOut(nil) }
+        let limit = try #require(ServeSettings.memoryLimits(memory: Catalog.memory).first)
+        for value in ["\(limit)G", nil] {
+            let change = try await Self.pictures(of: window) { state.options["--max-memory"] = value }
+            let before = Self.page(change.before, of: window), after = Self.page(change.after, of: window)
+            #expect(before != after)
+            let between = change.drawn.filter { Self.page($0.picture, of: window) != before && Self.page($0.picture, of: window) != after }.count
+            #expect(between == 0, "\(between) of \(change.drawn.count) frames drew the memory limit between the value before and \(value ?? "Auto")")
+        }
+    }
+
     /// A launch option's warning comes and goes as a row of the page does: a context past the
     /// model's window shows YaRN's caution only once the rows under it have moved down, and set
     /// back to Auto, the caution goes at once, the rows under it moving up into its place. It
