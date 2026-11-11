@@ -235,6 +235,22 @@ final class AppState {
         installed.first { $0.id == model }?.family.flatMap { families[$0] } ?? .unknown
     }
 
+    /// First-use guidance ends with the first message, without a separate onboarding preference.
+    var isFirstUse: Bool { !chats.conversations.contains(where: { !$0.messages.isEmpty }) }
+
+    var firstUseStage: FirstUseStage? {
+        guard keyProblem == nil, isFirstUse else { return nil }
+        switch server.phase {
+        case .starting: return .starting
+        case .ready: return server.recovering ? .starting : .chat
+        case .stopped:
+            if installed.isEmpty { return installer.running ? .downloading : .download }
+            guard let selection, installed.contains(where: { $0.id == selection && !$0.missing }) else { return nil }
+            return .start
+        case .stopping, .failed: return nil
+        }
+    }
+
     /// The name to show for model `id`; its variant tells installed variants of a model apart.
     func displayName(of id: String) -> String {
         let name = catalog.name(of: id)

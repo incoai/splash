@@ -517,6 +517,10 @@ private struct ConversationView: View {
                         .frame(height: 28)
                 }
                 .transition(Motion.comingAndGoing)
+                ChatWelcome()
+                    .frame(maxWidth: column)
+                    .padding(.horizontal, 32)
+                    .padding(.bottom, 20)
             }
             // One composer either way, so that its text view, and what the input method composes
             // in it, stays when a chat gets its first message or a new chat opens.
@@ -560,5 +564,74 @@ private struct LiveTranscript: View {
         TranscriptView(transcript: state.transcript, page: page, reply: reply.map {
             TranscriptMessage($0.message, live: $0.live, asleep: state.server.asleep, name: state.displayName(of:))
         })
+    }
+}
+
+/// An empty conversation should offer a first message, or a clear route to getting a model ready.
+private struct ChatWelcome: View {
+    @Environment(AppState.self) private var state
+
+    // Reserve the ready guidance's space through start/stop and draft edits,
+    // keeping the composer in place while the server's status changes.
+    private var ready: some View {
+        VStack(spacing: 10) {
+            Text("How can I help?").font(.title2.weight(.semibold))
+            Text("Ask a question, write something, or explore an idea.")
+                .font(.callout).foregroundStyle(.secondary)
+            Group {
+                HStack(spacing: 8) {
+                    ForEach(ChatExample.allCases) { example in
+                        Button { state.draft.suggest(example.text) } label: {
+                            Label(example.rawValue, systemImage: example.symbol)
+                                .font(.callout)
+                                .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+                        }
+                        .buttonStyle(HoverStyle(padding: EdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10),
+                                                shape: AnyShape(.rect(cornerRadius: 10))))
+                        .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 10))
+                        .help(example.text)
+                        .accessibilityHint("Adds an example you can edit before sending")
+                    }
+                }
+                .padding(.top, 6)
+                Text("Choose an example, edit it below, then send.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .opacity(state.draft.isEmpty ? 1 : 0)
+            .allowsHitTesting(state.draft.isEmpty)
+            .accessibilityHidden(!state.draft.isEmpty)
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            ready.hidden().accessibilityHidden(true)
+            VStack(spacing: 10) {
+                if state.server.answers {
+                    ready
+                } else if state.server.phase == .starting || state.server.phase == .stopping || state.server.recovering {
+                    Text("Getting ready to chat").font(.title2.weight(.semibold))
+                    Text("You can write your message below while your model gets ready.")
+                        .font(.callout).foregroundStyle(.secondary)
+                } else if case .failed = state.server.phase {
+                    Text("Your model needs attention").font(.title2.weight(.semibold))
+                    Text("Open Server to see what happened and try again.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Button("Open Server") { state.section = .server }
+                        .buttonStyle(.borderedProminent)
+                        .padding(.top, 4)
+                } else {
+                    Text("Let’s get you ready to chat").font(.title2.weight(.semibold))
+                    Text(state.installed.isEmpty
+                         ? "Download an AI model, then start it to get replies here."
+                         : "Start a model on this Mac to get replies here.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Button(state.installed.isEmpty ? "Choose a Model" : "Open Server") { state.section = .server }
+                        .buttonStyle(.borderedProminent)
+                        .padding(.top, 4)
+                }
+            }
+        }
+        .multilineTextAlignment(.center)
     }
 }

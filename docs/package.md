@@ -81,8 +81,12 @@ where models download, start and switch, beside the Chat; the menu bar's panel
 and the Chat's composer start and switch them too. The toolbar's switch
 opens the Chat, whose sidebar of conversations ⌘B hides, and the Server's
 button at its end the Server: it shows the model that runs, a spinner while
-one starts and a ring for a download's progress. Models, locks and
-downloads are the ones a packaged `splash` uses, in `~/Library/Application
+one starts and a ring for a download's progress. Before the first message, a
+short guide follows Download a model, Start Model and Open Chat; download
+sizes are labeled as downloads. Empty chats offer examples that fill the
+draft for editing, preserve existing text and attachments, and leave Send to
+the user. Models, locks and downloads are the ones a packaged `splash` uses,
+in `~/Library/Application
 Support/Splash` and the Hugging Face cache, where the user's login shell has it:
 as it launches, the app reads that shell's Hugging Face variables, the cache's
 and the token's among them, for every program it runs. The app offers
