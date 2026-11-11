@@ -105,6 +105,11 @@ def prepare(app, body, *, deadline, reserve_input, flags=wire.RequestFlag(0)):
         # The items stay charged to the request body budget until the job is
         # released.
         job.retained_input = conversation.items
+        instructions = (body.get("instructions") or "").lower()
+        job.is_compaction = (
+            "compact" in instructions
+            or "compaction" in instructions
+        )
         return job, conversation
 
 
@@ -327,12 +332,36 @@ def normalize_input(instructions, items):
                 }
             )
         else:
-            raise APIError(
-                400,
-                "only message, reasoning, function_call, function_call_output, "
-                "custom_tool_call and custom_tool_call_output input items are "
-                "supported",
-            )
+            # Tolerant fallback for agentic harness input items
+            # (e.g. commandExecution, mcpToolCall, contextCompaction, item_reference)
+            call_id = item.get("call_id") or item.get("id")
+            output = item.get("output")
+            content = item.get("content")
+            if call_id and output is not None:
+                output = output.get("content") if isinstance(output, dict) else output
+                flush()
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": str(call_id),
+                        "content": _content(output),
+                    }
+                )
+            elif content is not None:
+                flush()
+                extracted = (
+                    _text(content)
+                    if not isinstance(content, str)
+                    else content
+                )
+                if extracted:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": extracted,
+                        }
+                    )
+            # Metadata-only, checkpoint, or non-semantic items are safely skipped
     flush()
     return messages
 
@@ -794,6 +823,7 @@ _ITEM_PREFIXES = {
     "text": "msg",
     "tool": "fc",
     "custom": "ctc",
+    "compaction": "cmp",
 }
 
 
@@ -876,4 +906,16 @@ def output_item(job, block, index):
 
 
 def output_items(job, blocks):
+    if getattr(job, "is_compaction", False):
+        full_text = "".join(b.text for b in blocks if getattr(b, "text", None))
+        return [
+            {
+                "id": output_item_id(job, "compaction", 0),
+                "type": "compaction",
+                "status": "completed",
+                "summary": [{"type": "summary_text", "text": full_text}],
+                "content": [{"type": "output_text", "text": full_text, "annotations": []}],
+                "encrypted_content": None,
+            }
+        ]
     return [output_item(job, block, index) for index, block in enumerate(blocks)]
