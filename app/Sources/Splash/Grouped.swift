@@ -23,7 +23,7 @@ enum Grouped {
 ///
 /// Its labeled controls and toggles lay out as a grouped form lays them out. The sections are a
 /// SwiftUI hierarchy of their own, with the app's state: what they show and how it animates is up to
-/// them, as a view of their own.
+/// them, as a view of their own. The page ends at the toolbar, under its line.
 struct GroupedPage<Content: View>: View {
     /// The column's width, the cards inset in it.
     let column: CGFloat
@@ -40,6 +40,7 @@ struct GroupedPage<Content: View>: View {
                 .toggleStyle(GroupedSwitch())
                 .environment(state)
         }
+        .toolbarLine()
     }
 }
 

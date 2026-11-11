@@ -1,3 +1,4 @@
+import AppKit
 import Darwin
 import Foundation
 import Testing
@@ -29,6 +30,25 @@ func freePort() -> Int {
         }
     }
     return Int(UInt16(bigEndian: address.sin_port))
+}
+
+extension NSView {
+    /// The scroll view of the page this view shows (`AppKitScroll`): of those in it, the one whose
+    /// content is the tallest.
+    var pageScroll: NSScrollView? {
+        func scrollViews(in view: NSView) -> [NSScrollView] {
+            view.subviews.flatMap { ($0 as? NSScrollView).map { [$0] } ?? scrollViews(in: $0) }
+        }
+        return scrollViews(in: self).max { ($0.documentView?.frame.height ?? 0) < ($1.documentView?.frame.height ?? 0) }
+    }
+}
+
+extension NSScrollView {
+    /// Scrolls its content up by `distance` from where it is.
+    func scroll(by distance: CGFloat) {
+        contentView.scroll(to: NSPoint(x: contentView.bounds.minX, y: contentView.bounds.minY + distance))
+        reflectScrolledClipView(contentView)
+    }
 }
 
 extension UserDefaults {

@@ -464,16 +464,13 @@ private struct ChatRow<Actions: View>: View {
 /// The open conversation, its transcript a web page (`Transcript`), over the composer.
 private struct ConversationView: View {
     @Environment(AppState.self) private var state
-    @Environment(\.displayScale) private var displayScale
 
     var body: some View {
         let shown = state.chats.current.flatMap { $0.messages.isEmpty ? nil : $0 }
         VStack(spacing: 0) {
             if let conversation = shown {
                 LiveTranscript(page: page(conversation))
-                    // The line the window draws under its toolbar over a scroll view there, which
-                    // a web view isn't to it.
-                    .overlay(alignment: .top) { Rectangle().fill(.separator).frame(height: 1 / displayScale) }
+                    .toolbarLine()
             } else {
                 // A new chat: the mark, showing what the Server does, over the composer, and while a
                 // start warms up why it can take long, in the room under the mark, so that the

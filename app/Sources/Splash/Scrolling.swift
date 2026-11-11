@@ -8,24 +8,25 @@ import SwiftUI
 /// views of AppKit's in it (text fields, switches, menus); on the Server screen that update ran past
 /// a frame at 120 Hz often enough that the screen scrolled at 60.
 ///
-/// The content scrolls under the safe area around it, as under the toolbar and a bar at the bottom,
-/// and starts at the top. It is a SwiftUI hierarchy of its own: it takes no environment and no
-/// `animation` modifier from around it.
+/// The content starts at the top and scrolls under a bar at the bottom, the safe area there, but not
+/// under the toolbar, the safe area at the top: the toolbar has no band of its own (`MainView`), and
+/// what scrolled under it would read through its controls. It is a SwiftUI hierarchy of its own: it
+/// takes no environment and no `animation` modifier from around it.
 struct AppKitScroll<Content: View>: View {
     @ViewBuilder let content: Content
 
     var body: some View {
         GeometryReader { proxy in
-            Scroller(insets: proxy.safeAreaInsets, content: content)
-                .ignoresSafeArea()
+            Scroller(bottom: proxy.safeAreaInsets.bottom, content: content)
+                .ignoresSafeArea(edges: .bottom)
         }
     }
 }
 
 /// The scroll view of an `AppKitScroll`, its document the content's hosting view.
 private struct Scroller<Content: View>: NSViewRepresentable {
-    /// The safe area's insets, which the content starts and ends inside of.
-    let insets: EdgeInsets
+    /// The safe area's height at the bottom, which the content ends above.
+    let bottom: CGFloat
     let content: Content
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -41,13 +42,13 @@ private struct Scroller<Content: View>: NSViewRepresentable {
         document.frame = NSRect(x: 0, y: 0, width: scroll.contentSize.width, height: 1)
         scroll.documentView = document
         context.coordinator.scroll = scroll
-        context.coordinator.inset(insets)
+        context.coordinator.inset(bottom)
         return scroll
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         (scroll.documentView as? Document)?.rootView = Measured(content: content, height: context.coordinator.measured)
-        context.coordinator.inset(insets)
+        context.coordinator.inset(bottom)
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -97,7 +98,6 @@ private struct Scroller<Content: View>: NSViewRepresentable {
     @MainActor
     final class Coordinator {
         weak var scroll: NSScrollView?
-        private var applied: EdgeInsets?
 
         /// Makes the document as tall as its content.
         func measured(_ height: CGFloat) {
@@ -106,13 +106,10 @@ private struct Scroller<Content: View>: NSViewRepresentable {
             if document.frame.size != size { document.setFrameSize(size) }
         }
 
-        /// Starts and ends the content inside `insets`, at the top at first.
-        func inset(_ insets: EdgeInsets) {
-            guard let scroll, applied != insets else { return }
-            let first = applied == nil
-            applied = insets
-            scroll.contentInsets = NSEdgeInsets(top: insets.top, left: 0, bottom: insets.bottom, right: 0)
-            if first { scroll.contentView.scroll(to: NSPoint(x: 0, y: -insets.top)) }
+        /// Ends the content `bottom` above the scroll view's bottom edge.
+        func inset(_ bottom: CGFloat) {
+            guard let scroll, scroll.contentInsets.bottom != bottom else { return }
+            scroll.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: bottom, right: 0)
         }
     }
 }

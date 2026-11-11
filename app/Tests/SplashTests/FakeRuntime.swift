@@ -37,12 +37,15 @@ struct FakeRuntime {
         port = freePort()
     }
 
-    /// Lists `model` as installed, of `family` where one is given: an assembly record of no files.
-    func install(_ model: String, family: String? = nil) throws {
+    /// Lists `model` as installed, of `family` where one is given: an assembly record of no files,
+    /// or, given `bytes`, of one that takes them, the launcher's.
+    func install(_ model: String, family: String? = nil, bytes: Int64? = nil) throws {
         let link = Runtime(root: root).models.appending(path: model)
         try FileManager.default.createDirectory(at: link, withIntermediateDirectories: true)
         let family = family.map { #", "family": "\#($0)""# } ?? ""
-        try #"{"model": "\#(model)"\#(family), "files": {}}"#.write(to: link.appending(path: "model.json"), atomically: true, encoding: .utf8)
+        let launcher = root.appending(path: "install/launcher.py").path(percentEncoded: false)
+        let files = bytes.map { #"{"target": {"path": "\#(launcher)", "bytes": \#($0)}}"# } ?? "{}"
+        try #"{"model": "\#(model)"\#(family), "files": \#(files)}"#.write(to: link.appending(path: "model.json"), atomically: true, encoding: .utf8)
     }
 
     /// The folder of the chats of `state`.

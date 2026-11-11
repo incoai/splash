@@ -849,13 +849,13 @@ struct TranscriptPictures {
         Snapshot.drawsOffScreen(try #require(state.transcript.page.webView))
         await Snapshot.save("transcript", ChatScreen().environment(state))
         for (name, top) in [("transcript-top", 0), ("transcript-middle", 700)] {
-            await Snapshot.save(name, ChatScreen().environment(state)) {
+            await Snapshot.save(name, ChatScreen().environment(state)) { _ in
                 _ = try? await state.transcript.page.webView?.evaluateJavaScript("scrollTo(0, \(top))")
                 try? await Task.sleep(for: .seconds(0.5))
             }
         }
         // The first reply's thinking, opened, set apart by its rule.
-        await Snapshot.save("transcript-thought", ChatScreen().environment(state)) {
+        await Snapshot.save("transcript-thought", ChatScreen().environment(state)) { _ in
             _ = try? await state.transcript.page.webView?.evaluateJavaScript("document.querySelector('.line:not(.open) .toggle')?.click(); scrollTo(0, 0)")
             try? await Task.sleep(for: .seconds(0.5))
         }

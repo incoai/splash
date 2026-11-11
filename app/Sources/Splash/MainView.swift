@@ -20,8 +20,9 @@ struct MainView: View {
             .navigationTitle("Splash")
             .toolbar(removing: .title)
             // No band of its own behind the toolbar, which the window puts there once a transcript
-            // scrolls under it, over the sidebar too: the sidebar runs up to the window's top,
-            // and a transcript draws its own line under the toolbar.
+            // scrolls under it, over the sidebar too: the sidebar runs up to the window's top. A
+            // page that scrolls ends at the toolbar instead, under its line (`toolbarLine`), so
+            // that nothing it scrolls reads through the toolbar's controls.
             .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
             .toolbar {
                 if state.available {
@@ -73,6 +74,23 @@ struct MainView: View {
             case .chat: ChatScreen()
             }
         }
+    }
+}
+
+extension View {
+    /// The line under the window's toolbar, over the top of a page that scrolls and ends there: the
+    /// line the window draws over a scroll view that reaches under its toolbar, which no page does
+    /// (`MainView`).
+    func toolbarLine() -> some View {
+        overlay(alignment: .top) { ToolbarLine() }
+    }
+}
+
+private struct ToolbarLine: View {
+    @Environment(\.displayScale) private var displayScale
+
+    var body: some View {
+        Rectangle().fill(.separator).frame(height: 1 / displayScale)
     }
 }
 

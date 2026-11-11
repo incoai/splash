@@ -1,4 +1,6 @@
+import AppKit
 import Foundation
+import SwiftUI
 import Testing
 
 @testable import Splash
@@ -214,5 +216,76 @@ extension ServerScreenTests {
         try await waitFor(state.serverStatus.look == .failed && state.server.since > failed, "the start without them")
         #expect(state.server.settings.projector == nil && state.server.settings.draft == nil)
         #expect(state.server.remedy == .removeFromList)
+    }
+}
+
+extension ServerScreenTests {
+    /// The toolbar has no band of its own (`MainView`): the Server screen, scrolled so that its first
+    /// rows would be where the toolbar is, shows nothing of them there, in either appearance; the
+    /// toolbar's band draws as it does at the screen's top.
+    @Test func theServerScrolledShowsNothingUnderTheToolbar() async throws {
+        let fake = try FakeRuntime("splash-scrolled", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await Self.launchedWithModels(fake)
+        defer { state.quit() }
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            let window = await Snapshot.window(MainView().environment(state), size: ServerPictures.size, appearance: appearance)
+            defer { window.orderOut(nil) }
+            let scroll = try #require(window.contentView?.pageScroll)
+            let top = try #require(await Snapshot.picture(of: window))
+            let start = scroll.contentView.bounds.minY
+            scroll.scroll(by: 90)
+            #expect(scroll.contentView.bounds.minY == start + 90, "the screen is taller than its window")
+            let scrolled = try #require(await Snapshot.picture(of: window))
+            #expect(try Self.toolbarBand(of: scrolled, in: window) == Self.toolbarBand(of: top, in: window), "\(appearance.rawValue)")
+        }
+    }
+
+    /// The rows of `picture`, of `window` drawn whole, that its title bar and toolbar take: those
+    /// above its content's layout rect.
+    static func toolbarBand(of picture: NSBitmapImageRep, in window: NSWindow) throws -> Data {
+        let points = window.frame.height - window.contentLayoutRect.maxY
+        let rows = Int((points * CGFloat(picture.pixelsHigh) / window.frame.height).rounded(.down))
+        return Data(bytes: try #require(picture.bitmapData), count: rows * picture.bytesPerRow)
+    }
+
+    /// An app launched on `fake` with the models of a Mac that has a few, named and sized as Splash
+    /// suggests them, of the families the runtime serves, so that the Server screen is taller than
+    /// the window.
+    static func launchedWithModels(_ fake: FakeRuntime) async throws -> AppState {
+        try FileManager.default.copyItem(at: Showcase.runtime.suggestedModels, to: Runtime(root: fake.root).suggestedModels)
+        try #"print('{"Qwen3.8-27B": {"unusable": []}, "Qwen3.6-35B-A3B": {"unusable": []}, "Flint": {"unusable": []}}')"#
+            .write(to: fake.root.appending(path: "install/families.py"), atomically: true, encoding: .utf8)
+        let models = [("mlx-community/Qwen3.8-27B-4bit", "Qwen3.8-27B", 20), ("unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M", "Qwen3.6-35B-A3B", 24),
+                      ("unsloth/flint-GGUF:UD-Q4_K_XL", "Flint", 26)]
+        for (model, family, gigabytes) in models {
+            try fake.install(model, family: family, bytes: Format.gigabytes(gigabytes))
+        }
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        await state.launch()
+        return state
+    }
+}
+
+/// The Server screen drawn to `server-*.png` in `SPLASH_APP_SNAPSHOTS`, light and dark, for people
+/// to review its look with the models of a Mac that has a few: at its top, and scrolled so that its
+/// first rows would be where the toolbar is.
+@MainActor
+@Suite(.serialized, .enabled(if: Snapshot.directory != nil))
+struct ServerPictures {
+    /// About the window's least size, at which the column the screen's cards are in reaches under
+    /// the toolbar's controls at its start.
+    static let size = CGSize(width: 820, height: 620)
+
+    @Test func atItsTopAndScrolled() async throws {
+        let fake = try FakeRuntime("splash-server-pictures", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await ServerScreenTests.launchedWithModels(fake)
+        defer { state.quit() }
+        await Snapshot.save("server-top", size: Self.size, MainView().environment(state))
+        await Snapshot.save("server-scrolled", size: Self.size, MainView().environment(state)) { window in
+            window.contentView?.pageScroll?.scroll(by: 90)
+            try? await Task.sleep(for: .seconds(0.3))
+        }
     }
 }
