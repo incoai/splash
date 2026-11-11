@@ -38,18 +38,21 @@ LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilog
   return {matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
 }
 
-// LinearScratch::rotated bytes of `rows` bf16 rows of `width` inputs.
+// LinearScratch::rotated bytes of `rows` bf16 rows of `width` inputs, which
+// also hold the int8 rows' byte per input and fp32 scale per rotation block
+// (gguf_rotate_int8).
 constexpr uint64_t rotatedBytes(uint32_t width, uint64_t rows) noexcept { return uint64_t{width} * rows * 2; }
 
 // Throws if `p` is a view of the leading inputs of wider weight rows
 // (Projection::leadingInputs) that `plan` has no kernel instance for: only the
-// prefill residual tile of quantized segments (GgufPrefill), unrotated, reads
-// one (leadingInputsInstance).
+// prefill residual tiles of quantized segments (GgufPrefill's
+// leadingInputsInstance, GgufPrefillInt8's plane stride), unrotated, read one.
 void requireLeadingInputs(const LinearPlan &plan, const Projection &p) {
   if (!p.planeInputs()) return;
   const LinearWorkload w = plan.workload();
+  const LinearTile tile = plan.configuration().tile;
   if (w.phase != LinearPhase::Prefill || w.epilogue != LinearEpilogue::Residual ||
-      plan.configuration().tile != LinearTile::GgufPrefill || p.rotation)
+      (tile != LinearTile::GgufPrefill && tile != LinearTile::GgufPrefillInt8) || p.rotation)
     throw std::invalid_argument("a view of leading inputs runs only the quantized prefill residual tiles");
 }
 
@@ -139,7 +142,8 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   requireConfiguration();
 }
 
-Linear::Linear(const DeviceCapabilities &device) noexcept : calibration_(KernelCalibration::of(device)) {}
+Linear::Linear(const DeviceCapabilities &device, Int8Activations int8Activations) noexcept
+    : calibration_(KernelCalibration::of(device)), int8Activations_(int8Activations) {}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
   // The None and Residual plans share a tile; a gate/up pair of one format
@@ -150,14 +154,14 @@ uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
     const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, epilogue};
     validate(w);
     unit.oneFormat = epilogue == LinearEpilogue::GateUp;
-    storage = std::max(storage, LinearPlan(w, selectProjection(calibration_, w, unit)).storageRows());
+    storage = std::max(storage, LinearPlan(w, selectProjection(calibration_, int8Activations_, w, unit)).storageRows());
   }
   return storage;
 }
 
 LinearPlan Linear::plan(LinearWorkload workload) const {
   validate(workload);
-  return LinearPlan(workload, selectProjection(calibration_, workload, {}));
+  return LinearPlan(workload, selectProjection(calibration_, int8Activations_, workload, {}));
 }
 LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config, FloatOutput destination) {
   return LinearPlan(workload, config, destination);
@@ -170,7 +174,7 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
   const bool pair = w.epilogue == LinearEpilogue::GateUp && gate;
   if (pair) tensors = {unitFormats(std::span(&projections[0], 1)), unitFormats(std::span(&projections[1], 1))};
   LinearPlan plan(w,
-                  selectProjection(calibration_, w, unitFormats(projections),
+                  selectProjection(calibration_, int8Activations_, w, unitFormats(projections),
                                    pair ? std::span<const UnitFormats>(tensors) : std::span<const UnitFormats>{}),
                   p.destination);
   plan.rotated_ = static_cast<bool>(p.rotation);
@@ -181,8 +185,15 @@ LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogu
                               const Projection *gate) const {
   return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p, gate);
 }
-LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue) const {
-  return plan({{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue}, p);
+LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue,
+                               uint32_t chunkRows) const {
+  const LinearWorkload w{{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue};
+  if (!chunkRows || chunkRows == rows) return plan(w, p);
+  if (rows > chunkRows) throw std::invalid_argument("a prefill plan takes rows of its chunk");
+  const LinearPlan chunk = plan({w.matrix, chunkRows, LinearPhase::Prefill, epilogue}, p);
+  LinearPlan part(w, chunk.configuration(), chunk.destination());
+  part.rotated_ = chunk.rotated_;
+  return part;
 }
 
 LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
@@ -206,6 +217,13 @@ LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
   // Every prefill plan stores at most the token budget.
   static_assert(SPLASH_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, SPLASH_PREFILL_TOKEN_BUDGET);
+  // A full chunk's, which the int8 prefill tile holds where it takes the
+  // shape's formats.
+  const LinearWorkload chunk{
+      {shape.outputSize, shape.inputSize}, SPLASH_PREFILL_TOKEN_BUDGET, LinearPhase::Prefill, LinearEpilogue::None};
+  validate(chunk);
+  bound.include(
+      LinearPlan(chunk, selectProjection(calibration_, int8Activations_, chunk, unitFormats(shape))).scratchSize());
   return bound;
 }
 
@@ -235,8 +253,10 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   if (p.rotation) requireBytes(b.scratch.rotated, rotatedBytes(k, rows), "projection rotated input");
   addGguf(graph, b, p, selected, gate);
   // A rotated projection's plan prepares its table, if any, from the rotated
-  // rows, which no other plan reads.
+  // rows, which no other plan reads. The int8 prefill tile leaves its codes
+  // and scales of the input in the table, for a next plan over the same rows.
   if (p.rotation) return {};
+  if (selected.configuration().tile == LinearTile::GgufPrefillInt8) return {b.input, LinearInput::PrefillInt8};
   // Only quantized segments run the plan's tile: float segments alone leave
   // the scratch table as it was.
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
@@ -246,27 +266,26 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
 }
 
 void Linear::addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
-                        metal::MetalBuffer output, uint32_t rows, LinearScratch scratch) const {
-  add(graph, {.input = input, .output = output, .scratch = scratch}, p, prefillPlan(p, rows, LinearEpilogue::None));
+                        metal::MetalBuffer output, uint32_t rows, LinearScratch scratch, uint32_t chunkRows) const {
+  add(graph, {.input = input, .output = output, .scratch = scratch}, p,
+      prefillPlan(p, rows, LinearEpilogue::None, chunkRows));
 }
 void Linear::addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
                                 metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
-                                LinearScratch scratch) const {
+                                LinearScratch scratch, uint32_t chunkRows) const {
   add(graph, {.input = input, .output = output, .residual = residual, .scratch = scratch}, p,
-      prefillPlan(p, rows, LinearEpilogue::Residual));
+      prefillPlan(p, rows, LinearEpilogue::Residual, chunkRows));
 }
 void Linear::addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn,
                               const PrefillFfnBuffers &b, metal::MetalBuffer residual, metal::MetalBuffer output,
-                              uint32_t rows) const {
-  addPrefill(graph, b.normalized, *ffn.gate, b.gateScratch, rows, b.scratch);
-  addPrefillUpWithGate(graph, b.normalized, *ffn.up, b.gateScratch, b.intermediate, rows, b.scratch);
-  addPrefillResidual(graph, b.intermediate, *ffn.down, residual, output, rows, b.scratch);
-}
-void Linear::addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
-                                  metal::MetalBuffer gateScratch, metal::MetalBuffer output, uint32_t rows,
-                                  LinearScratch scratch) const {
-  add(graph, {.input = input, .output = output, .gateScratch = gateScratch, .scratch = scratch}, up,
-      prefillPlan(up, rows, LinearEpilogue::UpWithGate));
+                              uint32_t rows, uint32_t chunkRows) const {
+  const PreparedInput normalized = add(graph, {.input = b.normalized, .output = b.gateScratch, .scratch = b.scratch},
+                                       *ffn.gate, prefillPlan(*ffn.gate, rows, LinearEpilogue::None, chunkRows));
+  add(graph,
+      {.input = b.normalized, .output = b.intermediate, .gateScratch = b.gateScratch, .scratch = b.scratch,
+       .prepared = normalized},
+      *ffn.up, prefillPlan(*ffn.up, rows, LinearEpilogue::UpWithGate, chunkRows));
+  addPrefillResidual(graph, b.intermediate, *ffn.down, residual, output, rows, b.scratch, chunkRows);
 }
 
 } // namespace splash::ops

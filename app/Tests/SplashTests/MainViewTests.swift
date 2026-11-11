@@ -53,9 +53,10 @@ struct MainViewTests {
 
     /// The Server button names the model while it starts, runs and answers, and says Server
     /// while none runs: its title holds no step or speed, so its width, and the place of the
-    /// toolbar's buttons beside it, stay while the server starts and answers. An engine stopped
-    /// under a server that runs on marks it failed, and the app's status says it no longer
-    /// responds.
+    /// toolbar's buttons beside it, stay while the server starts and answers. The status says
+    /// how far a warm-up is, as the record counts its steps, and why it can take long. A server
+    /// that stops restarting its engine exits, failed in the words of its record, and the app's
+    /// status says it ran into a problem.
     @Test func theServerButtonSaysWhatTheServerDoes() async throws {
         let server = try FakeServer()
         defer { server.remove() }
@@ -72,6 +73,9 @@ struct MainViewTests {
         server.signal("loaded")
         try await waitFor(state.server.step == .warming)
         #expect(state.serverTitle == name)
+        #expect(state.server.warmup == ServeRecord.Warmup(steps_done: 3, steps: 10))
+        #expect(state.status == "\(state.displayName(of: model)) · Warming up · 3 of 10")
+        #expect(state.serverStatus.note == Server.Step.warming.note)
         server.signal("warm")
         try await waitFor(state.server.phase == .ready)
         #expect(state.serverTitle == name)
@@ -80,20 +84,42 @@ struct MainViewTests {
         #expect(state.serverTitle == name)
         server.signal("broken")
         try await waitFor(state.server.phase == .failed("x"))
-        #expect(state.server.running)
+        #expect(!state.server.running)
         #expect(state.serverStatus.look == .failed)
-        #expect(state.status == "\(state.displayName(of: model)) · Not responding")
+        #expect(state.status == "\(state.displayName(of: model)) · Ran into a problem")
         #expect(state.serverTitle == "Server")
-        state.server.stop()
-        #expect(state.serverTitle == name)
-        try await waitFor(state.server.phase == .stopped)
+        state.server.dismissFailure()
+        #expect(state.server.phase == .stopped)
         #expect(state.serverTitle == "Server")
     }
 }
 
+extension MainViewTests {
+    /// A request is one row from its start to its end: its Started line adds it, the status
+    /// moves it on, its Done line ends it in its place, and a status that still has it, as one
+    /// answered from an earlier snapshot, leaves it ended.
+    @Test func aRequestIsOneRowFromItsStartToItsEnd() async throws {
+        let server = try FakeServer()
+        defer { server.remove() }
+        let state = server.state
+        state.server.start("example/Model", settings: ServeSettings(values: ["--port": String(server.port)]))
+        server.signal("loaded")
+        server.signal("warm")
+        try await waitFor(state.server.phase == .ready)
+        server.signal("answering")
+        try await waitFor(state.server.requests.first?.stage == .answering(1))
+        #expect(state.server.requests.map(\.id) == [1] && state.server.requests[0].input == 13 && state.server.requests[0].end == nil)
+        server.signal("finished")
+        try await waitFor(state.server.requests.first?.end != nil)
+        // Past the next status, which still reports it running.
+        try await Task.sleep(for: .seconds(2.5))
+        #expect(state.server.requests.map(\.id) == [1] && state.server.requests[0].end?.output == 1)
+    }
+}
+
 /// A runtime whose launcher starts as `splash serve` does, one step at a time as the test signals
-/// it, then answers as a ready server; its status reports a request running, then its engine
-/// stopped, once signalled so.
+/// it, then answers as a ready server; its status reports a request running, and once signalled
+/// so it stops restarting its engine as a server does: its record says why, and it exits.
 @MainActor
 private final class FakeServer {
     let root: URL
@@ -116,5 +142,56 @@ private final class FakeServer {
     func remove() {
         state.server.stop()
         try? FileManager.default.removeItem(at: root)
+    }
+}
+
+extension MainViewTests {
+    /// The menu bar panel's Model rows come and go at once, as a menu's do: each frame drawn as they
+    /// open, close and open again shows the panel as it was or as it is to be, its window's height
+    /// with it; never rows fading where the rows under them slide, the check under a chevron.
+    @Test func thePanelsModelRowsComeAndGoAtOnce() async throws {
+        let fake = try FakeRuntime("splash-panel-rows", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await ServerScreenTests.launchedWithModels(fake)
+        defer { state.quit() }
+        state.options["--port"] = String(fake.port)
+        for step in ["loaded", "warm"] { FileManager.default.createFile(atPath: fake.root.appending(path: step).path, contents: nil) }
+        state.start("unsloth/flint-GGUF:UD-Q4_K_XL")
+        try await waitFor(state.server.phase == .ready, "ready")
+        let window = await Snapshot.window(MenuBarPanel().environment(state), size: CGSize(width: 300, height: 400), appearance: .aqua)
+        defer { window.orderOut(nil) }
+        pump(0.5)
+        /// The window drawn now, at once, so that the frames come some 20 ms apart.
+        func picture() throws -> Data {
+            let frame = try #require(window.contentView?.superview)
+            let bitmap = try #require(frame.bitmapImageRepForCachingDisplay(in: frame.bounds))
+            frame.cacheDisplay(in: frame.bounds, to: bitmap)
+            return Data(bytes: try #require(bitmap.bitmapData), count: bitmap.bytesPerRow * bitmap.pixelsHigh)
+        }
+        let closed = window.frame.height
+        /// Clicks the Model row, above its rows while they show, then Stop, Coding Agents and Quit,
+        /// and gives the frames drawn after, and the one once the panel has stopped changing.
+        func toggle() throws -> (before: Data, drawn: [Data], after: Data) {
+            let before = try picture()
+            let row = NSPoint(x: 150, y: 106 + window.frame.height - closed)
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                window.sendEvent(try #require(NSEvent.mouseEvent(
+                    with: type, location: row, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                    windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)))
+            }
+            var drawn: [Data] = []
+            for _ in 0..<15 {
+                pump(0.02)
+                drawn.append(try picture())
+            }
+            pump(1)
+            return (before, drawn, try picture())
+        }
+        for change in ["opening", "closing", "opening again"] {
+            let height = window.frame.height
+            let frames = try toggle()
+            #expect(window.frame.height != height && frames.after != frames.before, "\(change)")
+            #expect(frames.drawn.allSatisfy { $0 == frames.before || $0 == frames.after }, "\(change)")
+        }
     }
 }

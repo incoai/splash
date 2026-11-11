@@ -814,12 +814,14 @@ void testAResidentLaneHoldingSpilledBlocksRunsPrefillGroups() {
                  {.limitBytes = 120 * 100});
   spill.model.time(test::heavyHistoryTarget());
   // Eight pages and 4,096 tokens of output project 136 pages: it spills,
-  // and decodes below the next request's priority.
+  // and decodes below the next request's priority, its pages released at
+  // the wall.
   EngineRequest spilling = Spilling::prompt(1, 1, 8, 4'096);
   spilling.priority = RequestPriority::Background;
   spill.engine.submit(std::move(spilling));
   spill.runUntil([&] { return spill.events.outputs[1].size() >= 10; },
                  "the Spill request did not decode");
+  spill.releaseAtTheWall(1);
   // Its eight pages, then 64 pages and a token, two chunks or a group: 73
   // pages in all with its output, which memory holds.
   std::vector<uint32_t> prompt(8 * KvCache::pageTokens, 1);
@@ -874,8 +876,8 @@ void testASpilledReadsRefusalFollowsTheRuleForLanesThatEnded() {
     std::vector<Lanes> prefills;
     setUp(spill, prefills);
     spill.engine.submit(Spilling::prompt(1, 1, 80, 4096));
-    spill.runUntil([&] { return spill.events.outputs.contains(1) && spill.cache.holdsIndexPages(1); },
-                   "the Spill lane did not decode with Index pages");
+    spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the Spill lane did not decode");
+    spill.releaseAtTheWall(1);
     spill.engine.submit(Spilling::prompt(2, 2, 9, 1));
     spill.engine.submit(Spilling::prompt(3, 3, 9, 1));
     spill.runUntil([&] { return sharing(spill, prefills); }, "the two prompts did not share a command in passes");

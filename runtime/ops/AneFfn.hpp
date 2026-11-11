@@ -44,15 +44,17 @@ public:
   static_assert(kMaximumRows >= kMinimumRows && (kMaximumRows - kMinimumRows) % kProgramStep == 0,
                 "the functions cover the chunks the split takes");
   // The GPU part's down projection is a view of leading inputs, which only
-  // the prefill residual tile runs: no chunk the split takes stages.
-  static_assert(kMinimumRows > kMaximumStagedPrefillRows, "the split's chunks run the prefill residual tile");
+  // the prefill residual tiles (GgufPrefill, GgufPrefillInt8) run: no chunk
+  // the split takes stages.
+  static_assert(kMinimumRows > kMaximumStagedPrefillRows, "the split's chunks run the prefill residual tiles");
 
-  // The ANE takes `aneUnits` of the units() of intermediate channels. The
-  // program is compiled and loaded here, and the wait for the ANE's service
-  // ends with ane::Interrupted once `interrupted` returns true. The split
-  // takes every chunk its functions hold until setMinimumRows().
-  AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
-         std::function<bool()> interrupted);
+  // The ANE takes `aneUnits` of the units() of intermediate channels, and
+  // the GPU the rest through `linear`'s prefill plans. The program is
+  // compiled and loaded here, and the wait for the ANE's service ends with
+  // ane::Interrupted once `interrupted` returns true. The split takes every
+  // chunk its functions hold until setMinimumRows().
+  AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
+         uint32_t aneUnits, std::function<bool()> interrupted);
   AneFfn(const AneFfn &) = delete;
   AneFfn &operator=(const AneFfn &) = delete;
 
@@ -64,6 +66,12 @@ public:
   [[nodiscard]] static uint32_t units(std::span<const SwiGluProjections> layers);
   // The Metal memory of the split of `layers` with the ANE taking `aneUnits`.
   [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
+  // What tells this Mac's calibrations of a split of `layers` apart for one
+  // macOS version, engine build and most units its plan holds: the layers'
+  // shapes and formats, and the Int8Activations of `linear`, whose plans run
+  // the GPU's part and so move the units the split takes (Qwen3.8-27B MLX
+  // 4-bit's takes 10 of 34 with them on, 15 off, on a 20-core M5 Pro).
+  [[nodiscard]] static std::string calibrationKey(std::span<const SwiGluProjections> layers, const Linear &linear);
 
   // The fraction of intermediate channels the ANE takes.
   [[nodiscard]] double share() const noexcept;
@@ -222,8 +230,8 @@ private:
   };
 
   // The split with a function of each of `functionRows` rows, ascending.
-  AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
-         std::function<bool()> interrupted, std::span<const uint32_t> functionRows);
+  AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
+         uint32_t aneUnits, std::function<bool()> interrupted, std::span<const uint32_t> functionRows);
   [[nodiscard]] static Shape shapeOf(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
   // Every allocation of the split, which `buffer` and `surface` make:
   // plannedBytes() counts them and the constructor allocates them.

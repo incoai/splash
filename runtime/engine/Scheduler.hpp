@@ -50,12 +50,14 @@ struct PrefillAdmission final {
 };
 
 // A prefill lane as the engine knows it when the scheduler plans: the pages
-// of its history only the SSD cache holds now, whether it may gain such pages
-// between a command's passes (a Spill lane past its dense history and
-// window), the most rows a state capture prepare cut this tick leaves it,
-// whether it is a Spill lane, and whether its request ended between its
-// command's passes (a cancel, its deadline), so that it runs to the
-// command's last pass for no one.
+// of its history only the SSD cache holds now, whether it may gain such
+// pages between a command's passes (a Spill lane past its dense history and
+// window under --kv-spill always), the most rows a state capture prepare cut
+// this tick leaves it, whether it reads spilled history (it holds such
+// pages, a candidate's restore brings them, or it spills under --kv-spill
+// always), and whether its request ended between its command's passes (a
+// cancel, its deadline), so that it runs to the command's last pass for no
+// one.
 struct LaneShape final {
   uint64_t requestId = 0;
   uint32_t indexPages = 0;

@@ -11,16 +11,18 @@
 namespace splash::ops::ane_ffn {
 
 // Times the prefill FFN's Neural Engine split of `layers` (AneFfn) on this
-// device, with chunks in `ffn` and the residual and output of alternate
-// layers in `hidden`, all of which it overwrites, through the split's path:
-// begin(), its layers as add() encodes them, commit() and its completion
-// check (layer() in AneFfnMeasurement.cpp). A program it compiles waits for
-// the ANE's service until `interrupted` returns true. Each duration passes
-// usable() where it is measured.
+// device, the GPU's part through `linear`, with chunks in `ffn` and the
+// residual and output of alternate layers in `hidden`, all of which it
+// overwrites, through the split's path: begin(), its layers as add() encodes
+// them, commit() and its completion check (layer() in
+// AneFfnMeasurement.cpp). A program it compiles waits for the ANE's service
+// until `interrupted` returns true. Each duration passes usable() where it is
+// measured.
 class Measurement final {
 public:
-  Measurement(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, const PrefillFfnBuffers &ffn,
-              const std::array<metal::MetalBuffer, 2> &hidden, std::function<bool()> interrupted);
+  Measurement(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
+              const PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden,
+              std::function<bool()> interrupted);
 
   // The split's GPU part alone and its split layer of full chunks with the
   // ANE taking the channel units nearest two shares, and the GPU's FFN
