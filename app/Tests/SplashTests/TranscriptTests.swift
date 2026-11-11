@@ -13,7 +13,9 @@ struct TranscriptTests {
 
     @Test func sendsMessagesAsThePageReadsThem() throws {
         let conversation = Conversation(messages: [
-            ChatMessage(role: .user, text: "What is this?", images: [Showcase.picture]),
+            ChatMessage(role: .user, text: "What is this?",
+                        attachments: [Showcase.pictureAttachment,
+                                      Splash.Attachment(kind: .pdf, type: "application/pdf", bytes: 900, name: "Plan.pdf", pages: 1)]),
             ChatMessage(role: .assistant, text: "A cat.", reasoning: "Whiskers.", model: "a/Big-GGUF:Q4", tokensPerSecond: 38.4,
                         thinkingTime: 3.2, reasoningTokens: 1_200, stopped: true),
             ChatMessage(role: .user, text: "Sure?"),
@@ -29,9 +31,12 @@ struct TranscriptTests {
         let messages = try #require(json["messages"] as? [[String: Any]])
         #expect(messages.map { $0["role"] as? String } == ["user", "assistant", "user", "assistant"])
         // Every key there, null for none.
-        #expect(messages.allSatisfy { Set($0.keys) == ["id", "role", "text", "reasoning", "images", "error", "line", "live", "details"] })
-        // Images as the addresses the page loads them from, which the app serves.
+        #expect(messages.allSatisfy { Set($0.keys) == ["id", "role", "text", "reasoning", "images", "documents", "error", "line", "live", "details"] })
+        // Images as the addresses the page loads them from, which the app serves; PDFs as their
+        // chips say them.
         #expect(messages[0]["images"] as? [String] == ["chat-image://\(conversation.messages[0].id.uuidString)/0"])
+        #expect(messages[0]["documents"] as? [[String: String]] == [["name": "Plan.pdf", "details": "1 page · \(Format.size(900))"]])
+        #expect(messages[2]["documents"] as? [[String: String]] == [])
         #expect(messages[0]["line"] is NSNull && messages[0]["error"] is NSNull && messages[0]["details"] as? String == "")
         #expect(messages[1]["line"] as? [String: AnyHashable] == ["verb": "Thinking", "facts": "1.2K tokens · 3.2s", "since": NSNull()])
         #expect(messages[1]["details"] as? String == "Name of a/Big-GGUF:Q4 · 38 tok/s · Stopped")
@@ -100,14 +105,16 @@ struct TranscriptTests {
 
     @Test func thePageDrawsRepliesSafelyAndAsksAgain() async throws {
         try Showcase.requireScripts()
-        let transcript = Transcript(runtime: Showcase.runtime)
+        let transcript = Transcript(runtime: Showcase.runtime, attachments: Showcase.attachments)
         var askedAgain = 0
         transcript.askAgain = { askedAgain += 1 }
         transcript.page.load()
         let webView = try #require(transcript.page.webView)
         try await waitFor(transcript.page.loaded)
         let conversation = Conversation(messages: [
-            ChatMessage(role: .user, text: "<b>Hi</b>", images: [Showcase.picture]),
+            ChatMessage(role: .user, text: "<b>Hi</b>",
+                        attachments: [Showcase.pictureAttachment,
+                                      Splash.Attachment(kind: .pdf, type: "application/pdf", bytes: 2_048, name: "<i>Plan</i>.pdf", pages: 2)]),
             ChatMessage(role: .assistant, text: """
                 [web](https://a.b) [mail](mailto:a@b.c) [file](file:///Applications) [script](javascript:alert(1)) \
                 ![cat](https://a.b/cat.png) <b>bold</b>
@@ -132,10 +139,15 @@ struct TranscriptTests {
         // Raw HTML stays text.
         #expect(try await run("return document.querySelector('.bubble').textContent") == "<b>Hi</b>")
         // The user's image, which the app serves.
-        let loaded = try await settled({ try await run("const image = document.querySelector('.images img'); return image.complete ? String(image.naturalWidth) : ''") }) {
+        let loaded = try await settled({ try await run("const image = document.querySelector('.attachments img'); return image.complete ? String(image.naturalWidth) : ''") }) {
             !$0.isEmpty
         }
         #expect(loaded == "240")
+        // The PDF's chip after the images: its glyph, name and details, as text.
+        #expect(try await run("return document.querySelector('.attachments :last-child').className") == "pdf")
+        #expect(try await run("return document.querySelector('.pdf-name').textContent") == "<i>Plan</i>.pdf")
+        #expect(try await run("return document.querySelector('.pdf-details').textContent") == "2 pages · \(Format.size(2_048))")
+        #expect(try await run("return getComputedStyle(document.querySelector('.pdf .glyph')).width") != "0px")
         #expect(try await run("return document.querySelector('.markdown p').innerHTML").contains("&lt;b&gt;bold&lt;/b&gt;"))
         // Web and mail links stay links; others keep their text; an image is a link to it.
         #expect(try await run("return [...document.querySelectorAll('.markdown a')].map(a => a.getAttribute('href')).join(' ')")
@@ -188,7 +200,7 @@ struct TranscriptTests {
     }
 
     @Test func followsTheLatestUntilTheReaderScrollsUp() async throws {
-        let transcript = Transcript(runtime: Showcase.runtime)
+        let transcript = Transcript(runtime: Showcase.runtime, attachments: Showcase.attachments)
         transcript.page.load()
         let webView = try #require(transcript.page.webView)
         _ = NSApplication.shared
@@ -492,7 +504,7 @@ struct TranscriptTests {
 
     /// Without Markdown a reply shows as it came, as it streams too.
     @Test func withoutMarkdownAReplyStreamsAsItCame() async throws {
-        let transcript = Transcript(runtime: Runtime(root: URL(filePath: "/nonexistent")))
+        let transcript = Transcript(runtime: Runtime(root: URL(filePath: "/nonexistent")), attachments: Showcase.attachments)
         transcript.page.load()
         let webView = try #require(transcript.page.webView)
         try await waitFor(transcript.page.loaded)
@@ -759,7 +771,7 @@ struct TranscriptTests {
     /// holds back the animation frames of a page it can't see.
     private func shownPage() async throws -> (Transcript, WKWebView, NSWindow) {
         try Showcase.requireScripts()
-        let transcript = Transcript(runtime: Showcase.runtime)
+        let transcript = Transcript(runtime: Showcase.runtime, attachments: Showcase.attachments)
         transcript.page.load()
         let webView = try #require(transcript.page.webView)
         _ = NSApplication.shared
@@ -796,7 +808,7 @@ struct TranscriptTests {
 @MainActor
 struct WebPageTests {
     @Test func aPageWhoseProcessKeepsEndingLoadsAgainThreeTimesAMinute() async throws {
-        let transcript = Transcript(runtime: Showcase.runtime)
+        let transcript = Transcript(runtime: Showcase.runtime, attachments: Showcase.attachments)
         let page = transcript.page
         page.load()
         let webView = try #require(page.webView)
@@ -837,13 +849,13 @@ struct TranscriptPictures {
         Snapshot.drawsOffScreen(try #require(state.transcript.page.webView))
         await Snapshot.save("transcript", ChatScreen().environment(state))
         for (name, top) in [("transcript-top", 0), ("transcript-middle", 700)] {
-            await Snapshot.save(name, ChatScreen().environment(state)) {
+            await Snapshot.save(name, ChatScreen().environment(state)) { _ in
                 _ = try? await state.transcript.page.webView?.evaluateJavaScript("scrollTo(0, \(top))")
                 try? await Task.sleep(for: .seconds(0.5))
             }
         }
         // The first reply's thinking, opened, set apart by its rule.
-        await Snapshot.save("transcript-thought", ChatScreen().environment(state)) {
+        await Snapshot.save("transcript-thought", ChatScreen().environment(state)) { _ in
             _ = try? await state.transcript.page.webView?.evaluateJavaScript("document.querySelector('.line:not(.open) .toggle')?.click(); scrollTo(0, 0)")
             try? await Task.sleep(for: .seconds(0.5))
         }
@@ -851,7 +863,7 @@ struct TranscriptPictures {
 
     @Test func whileAReplyStreams() async throws {
         try Showcase.requireScripts()
-        let transcript = Transcript(runtime: Showcase.runtime)
+        let transcript = Transcript(runtime: Showcase.runtime, attachments: Showcase.attachments)
         // Loaded first, as the app loads it with its window, so that each picture shows its state,
         // and drawn as on screen from the first, whose Reading shows half a second in.
         transcript.page.load()

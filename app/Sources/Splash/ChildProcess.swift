@@ -4,8 +4,9 @@ import Foundation
 /// A program run as a terminal runs a foreground job: in a process group of its own, so a signal
 /// reaches it and every program it starts (the installer, the engine), the way Ctrl+C does. Its
 /// output goes to a log file rather than a pipe, so it never waits on this app, and keeps working
-/// if the app quits or crashes. Every program the app runs but the drawer's shells, which need a
-/// terminal of their own, runs as one.
+/// if the app quits or crashes; but for output only this app may read, which no file may hold,
+/// as the login shell's settings (`Runtime.readShellSettings`). Every program the app runs but the
+/// drawer's shells, which need a terminal of their own, runs as one.
 final class ChildProcess: @unchecked Sendable {
     let pid: pid_t
     /// When it started (`processStart`), which tells it apart from a later process given its ID.
@@ -18,7 +19,7 @@ final class ChildProcess: @unchecked Sendable {
     /// Starts `command` with `environment`, standard input from /dev/null and standard output and
     /// error appended to `log`. `exited` gets the exit status, as a shell reports it, on the main
     /// queue once the program has ended.
-    init(
+    convenience init(
         command: [String],
         environment: [String: String],
         log: URL,
@@ -27,7 +28,17 @@ final class ChildProcess: @unchecked Sendable {
         let output = open(log.path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0o644)
         guard output >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
         defer { close(output) }
+        try self.init(command: command, environment: environment, output: output, exited: exited)
+    }
 
+    /// Starts `command` as `init(command:environment:log:exited:)` does, but with standard output
+    /// and error to `output`, an open descriptor, as a pipe's writing end, which stays open here.
+    init(
+        command: [String],
+        environment: [String: String],
+        output: Int32,
+        exited: @escaping @MainActor (Int32) -> Void
+    ) throws {
         var actions: posix_spawn_file_actions_t?
         posix_spawn_file_actions_init(&actions)
         defer { posix_spawn_file_actions_destroy(&actions) }
@@ -164,7 +175,8 @@ struct LogLines {
     }
 }
 
-/// Follows a log file as it grows, one call per complete line, on the main queue.
+/// Follows a log file as it grows, from `offset`, where the run it follows starts, one call per
+/// complete line, on the main queue.
 @MainActor
 final class LogTail {
     private let handle: FileHandle
@@ -172,10 +184,11 @@ final class LogTail {
     private let line: (String) -> Void
     private var lines = LogLines()
 
-    init?(_ url: URL, line: @escaping (String) -> Void) {
+    init?(_ url: URL, from offset: UInt64 = 0, line: @escaping (String) -> Void) {
         let descriptor = open(url.path, O_RDONLY | O_CLOEXEC)
         guard descriptor >= 0 else { return nil }
         handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        try? handle.seek(toOffset: offset)
         self.line = line
         source = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: descriptor, eventMask: [.extend, .write], queue: .main)
@@ -223,15 +236,15 @@ struct ChildRecord {
     /// Starts `command` as `ChildProcess` does and keeps it as the program this record names until
     /// it exits, giving `line` each line of `log` as it is written; `exited` gets its status once
     /// the log has been read to its end.
-    func start(_ command: [String], environment: [String: String], log: URL, line: @escaping (String) -> Void,
-               exited: @escaping @MainActor (Int32) -> Void) throws -> ChildProcess {
+    func start(_ command: [String], environment: [String: String], log: URL, from offset: UInt64 = 0,
+               line: @escaping (String) -> Void, exited: @escaping @MainActor (Int32) -> Void) throws -> ChildProcess {
         var tail: LogTail?
         let child = try ChildProcess(command: command, environment: environment, log: log) { status in
             tail?.finish()
             forget()
             exited(status)
         }
-        tail = LogTail(log, line: line)
+        tail = LogTail(log, from: offset, line: line)
         keep(child)
         return child
     }
@@ -250,16 +263,22 @@ struct ChildRecord {
     /// running stays kept, for the launch after. A record of the ID alone, as an app before 1.6
     /// kept it, gives no start to tell its program from a later process given the ID: that
     /// program is stopped only where `olderApps` shows the ID is still its own, and the record is
-    /// forgotten.
-    func stopLeftover(olderApps: (pid_t) -> Bool) async {
+    /// forgotten. `stopping` runs as the stop of a program that runs begins, which can take long.
+    func stopLeftover(olderApps: (pid_t) -> Bool, stopping: () -> Void = {}) async {
         if let older = defaults.object(forKey: key) as? Int, let pid = pid_t(exactly: older) {
-            if olderApps(pid) { await stopProcessGroup(pid, with: stop, killAfter: killAfter) }
+            if olderApps(pid) {
+                stopping()
+                await stopProcessGroup(pid, with: stop, killAfter: killAfter)
+            }
             return forget()
         }
         guard let kept = defaults.array(forKey: key) as? [Int], kept.count == 2,
               let pid = pid_t(exactly: kept[0])
         else { return forget() }
-        if processStart(pid) == kept[1] { await stopProcessGroup(pid, with: stop, killAfter: killAfter) }
+        if processStart(pid) == kept[1] {
+            stopping()
+            await stopProcessGroup(pid, with: stop, killAfter: killAfter)
+        }
         if processStart(pid) != kept[1] { forget() }
     }
 }
@@ -333,4 +352,49 @@ func portInUse(_ port: Int) -> Bool {
 func resetLog(_ url: URL) {
     try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
     FileManager.default.createFile(atPath: url.path, contents: nil)
+}
+
+/// Begins a run in `url`'s log, after the runs before it and a blank line, with `heading`, a line
+/// that names the run, and returns where the run's own lines start. The log keeps its last `kept`
+/// bytes, from the start of a line: 8 MiB, 16 times what the drawer shows at first, keeps earlier
+/// starts' failures and is written again in a moment. It is made, with its folder, where there is
+/// none. Only its end is read, however long a run grew it: a log past `kept` is written again from
+/// its last `kept` bytes, and one within it has the heading added.
+@discardableResult
+func beginLog(_ url: URL, heading: String, kept: Int = 8 << 20) -> UInt64 {
+    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let file = try? FileHandle(forUpdating: url)
+    defer { try? file?.close() }
+    let size = (try? file?.seekToEnd()) ?? 0
+    let trims = size > UInt64(kept)
+    // Its last `kept` bytes, from the start of a line, where it trims; otherwise its last byte,
+    // which says whether its last line ended.
+    var tail = Data()
+    if let file, size > 0 {
+        try? file.seek(toOffset: trims ? size - UInt64(kept) : size - 1)
+        tail = (try? file.readToEnd()) ?? Data()
+        if trims, let newline = tail.firstIndex(of: 0x0A) { tail = Data(tail[tail.index(after: newline)...]) }
+    }
+    var added = Data()
+    if !tail.isEmpty {
+        if tail.last != 0x0A { added.append(0x0A) }
+        added.append(0x0A)
+    }
+    added.append(Data((heading + "\n").utf8))
+    guard let file, !trims else {
+        let log = (trims ? tail : Data()) + added
+        try? log.write(to: url, options: .atomic)
+        return UInt64(log.count)
+    }
+    _ = try? file.seekToEnd()
+    try? file.write(contentsOf: added)
+    return size + UInt64(added.count)
+}
+
+/// Adds `line` at the end of `url`'s log.
+func appendLog(_ url: URL, _ line: String) {
+    guard let handle = try? FileHandle(forWritingTo: url) else { return }
+    defer { try? handle.close() }
+    _ = try? handle.seekToEnd()
+    try? handle.write(contentsOf: Data((line + "\n").utf8))
 }

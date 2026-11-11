@@ -3917,14 +3917,16 @@ void testReplacementKeepsTheExtentItEmpties() {
           "releasing the empty extents did not release the reused one");
 }
 
-// A cache whose requests may spill: its pool's extents hold four
-// pages, 100 bytes a Full page and 10 an Index page, one extent of each form
-// allocated from the start (the Index one the runway spilling draws on, as
-// the cache's first spill pass allocates it), and its tier's slots of 100
-// bytes draw on a quota of `slots` of them. The dense history and the tail
-// window are a page each unless a test says otherwise.
+// A cache whose requests may spill, under --kv-spill always: their pages
+// move to the index form as their copies land (Cache::spillWritten). Its
+// pool's extents hold four pages, 100 bytes a Full page and 10 an Index
+// page, one extent of each form allocated from the start (the Index one the
+// runway spilling draws on, as the cache's first spill pass allocates it),
+// and its tier's slots of 100 bytes draw on a quota of `slots` of them. The
+// dense history and the tail window are a page each unless a test says
+// otherwise.
 struct Spilling {
-  explicit Spilling(CacheSpillPolicy policy = {1, 1}, uint32_t slots = 64)
+  explicit Spilling(CacheSpillPolicy policy = {1, 1, true}, uint32_t slots = 64)
       : budget(std::make_shared<model::DiskBudget>(uint64_t{slots} * 100)),
         cache(pool, &tier, budget, policy) {
     tier.budget = budget;
@@ -4177,6 +4179,24 @@ void testFullShortfallReleasesEmptyIndexExtents() {
           "a Full shortfall did not release the empty Index extents past the runway first");
 }
 
+// Under critical pressure the host's pass takes the empty Full extent the next request would start from, never the
+// Index runway: a spill's moves land there without an allocation.
+void testCriticalKeepsTheIndexRunway() {
+  Spilling spill;
+  engine::MemoryLedger ledger;
+  ledger.addSource(spill.cache);
+  // As the host's pass asks (MemoryGovernor::hostPass): what it finds of
+  // all the cache holds, a Full and an Index extent, both empty.
+  const ClaimSpec host{.cls = ClaimClass::Host};
+  const uint64_t found = ledger.available(host, {.bytes = spill.storage.allocatedBytes()}, 0, MemoryPressure::Critical);
+  const engine::ClaimId claim = ledger.open(host);
+  const FreeResult freed = ledger.free(claim, {.bytes = found}, 0, MemoryPressure::Critical);
+  ledger.close(claim);
+  require(freed.nowBytes == 4 * spill.storage.bytesPerPage(kv::PageForm::Full) &&
+              !spill.pool.allocatedExtents(kv::PageForm::Full) && spill.pool.freePageCount(kv::PageForm::Index) == 4,
+          "under critical pressure the host's pass took the Index runway, or kept the empty Full extent");
+}
+
 // An Index shortfall empties only Full extents; moving Index pages frees nothing it can grow by.
 void testIndexShortfallCompactsOnlyFullExtents() {
   Spilling spill;
@@ -4193,6 +4213,37 @@ void testIndexShortfallCompactsOnlyFullExtents() {
           "an Index shortfall compacted an Index extent");
   for (uint32_t page : std::span(index.pages).last(2))
     spill.pool.releasePage(page, false);
+}
+
+// A need of bytes and pages takes its pages in place: each take ends once it has a page more there
+// (Cache::takeReclaim), which the next keeps with the other free ones, so neither its takes nor its count empty an
+// extent of its form. A prefix's eight pages in two extents, none free, give a KV need of an extent's bytes and twelve
+// pages eight pages in place and no bytes: short, it takes nothing and the prefix stays. Counted as the two extents
+// those pages fill, the bytes were covered, the takes freed the eight pages one at a time, no extent, and the run was
+// overcounted.
+void testANeedInPlaceEmptiesNoExtentOfItsForm() {
+  test::TestKvStorage storage{8, 100, 4};
+  KvPool pool{storage, 0};
+  engine::Cache cache(pool, nullptr, nullptr);
+  cache.beginRequest(1);
+  require(cache.ensureTokens(1, 8 * KvCache::pageTokens).granted(), "the prefix's pages were denied");
+  cache.publishCommittedBlocks(1, Spilling::prompt(1000, 8), 8 * KvCache::pageTokens, {});
+  cache.endRequest(1);
+  require(pool.allocatedExtents(kv::PageForm::Full) == 2 && !pool.freePageCount(kv::PageForm::Full),
+          "the prefix did not fill two extents");
+  MemoryLedger ledger;
+  ledger.addSource(cache);
+  const ClaimId claim = ledger.open(test::kInServiceGrowth);
+  const FreeResult freed = ledger.free(claim, {.bytes = 400, .pages = 12, .kv = true}, 0, MemoryPressure::Normal);
+  ledger.close(claim);
+  MemoryGovernorSnapshot snapshot;
+  ledger.fill(snapshot, 0);
+  require(freed.outcome == FreeOutcome::Short && !freed.pages && !pool.freePageCount(kv::PageForm::Full) &&
+              !snapshot.countChecks.overcountedRuns,
+          "a need of an extent's bytes and twelve pages, of eight pages in place, freed " +
+              std::to_string(freed.pages) + " pages, left " +
+              std::to_string(pool.freePageCount(kv::PageForm::Full)) + " free, and was overcounted " +
+              std::to_string(snapshot.countChecks.overcountedRuns) + " times");
 }
 
 // A page need of a form the cache holds none of gets no eviction offered.
@@ -4551,10 +4602,55 @@ void testWritersMoveOntoPagesBeingWritten() {
   spill.cache.endRequest(3);
 }
 
+// A block whose restore failed keeps a page of whatever the pool held, and with no request holding
+// that page it gives up its copy too. A writer that kept pages of its own beside the blocks a
+// restore was filling goes on below them, and nothing writes that page as the block's: a persistent
+// tier's next process would take it for the K/V.
+void testAFailedRestoresPageIsNeverWritten() {
+  for (const bool spills : {false, true}) {
+    Spilling spill;
+    const std::vector<uint32_t> prompt = Spilling::prompt(1000, 4);
+    spill.start(1, prompt, 3);
+    require(spill.cache.writeThrough() == 3, "the pages were not written through");
+    spill.publishState(spill.block(1, 2));
+    spill.tier.complete();
+    static_cast<void>(spill.cache.pollTransfers());
+    spill.cache.endRequest(1);
+    spill.toDisk();
+    CacheLookup lookup = spill.cache.lookup(std::span<const uint32_t>(prompt).first(3 * KvCache::pageTokens + 1), {});
+    spill.cache.beginRequest(2);
+    require(admitRestore(spill.cache, 2, lookup).granted() &&
+                spill.cache.kvRestoreStatus(2) == KvRestoreStatus::Pending,
+            "the chain's restore did not start");
+    spill.start(3, prompt, 3, KvMode::Resident);
+    lookup = {};
+    spill.cache.endRequest(2);
+    spill.tier.complete(false);
+    static_cast<void>(spill.cache.pollTransfers());
+    require(spill.cache.snapshot().kvTier.restoreFailures == 3, "the reads did not fail");
+    spill.grow(3, prompt, 4);
+    const uint64_t point = spill.block(3, 3);
+    spill.publishState(point);
+    const size_t before = spill.tier.writes.size();
+    if (spills) {
+      require(spill.cache.convertToSpill(3, 4), "the writer did not convert to Spill");
+      static_cast<void>(spill.cache.writeThrough());
+      require(spill.tier.writes.size() == before + 1, "a Spill request wrote a page whose restore failed");
+    } else {
+      require(spill.cache.persist(point) == PersistStatus::Unneeded && spill.tier.writes.size() == before,
+              "a point's copies wrote a page whose restore failed");
+    }
+    spill.cache.checkInvariants();
+    spill.tier.complete();
+    static_cast<void>(spill.cache.pollTransfers());
+    spill.cache.endRequest(3);
+  }
+}
+
 // Quota never gives up a copy a running request reads; its slots return once the command's cut
 // goes.
 void testQuotaGivesUpOnlyCopiesNothingReads() {
-  Spilling spill({1, 1}, 64);
+  Spilling spill({1, 1, true}, 64);
   const std::vector<uint32_t> prompt = Spilling::prompt(1000, 5);
   spill.start(1, prompt, 5);
   static_cast<void>(test::spillRound(spill.cache, spill.tier));
@@ -4610,7 +4706,7 @@ void testQuotaKeepsTheSpilledLeafOfAStateInRam() {
 // A committed page's slot comes before any cached copy, the spilled chain of a state in RAM
 // included.
 void testCommittedPagesTakeTheSpilledChainOfAStateInRam() {
-  Spilling spill({1, 1}, 6);
+  Spilling spill({1, 1, true}, 6);
   const std::vector<uint32_t> prompt = Spilling::prompt(1000, 6);
   spill.start(1, prompt, 6);
   static_cast<void>(test::spillRound(spill.cache, spill.tier));
@@ -4663,7 +4759,7 @@ void testUnreadableCopyLeavesBeforeTheCommandThatReadIt() {
 // A commitment locks quota until its pages are written; a lower active limit drops the newest
 // commitment first.
 void testCommitmentsLockQuotaUntilWritten() {
-  Spilling spill({1, 1}, 10);
+  Spilling spill({1, 1, true}, 10);
   const std::vector<uint32_t> cached = Spilling::prompt(1000, 4);
   spill.start(1, cached, 4);
   static_cast<void>(test::spillRound(spill.cache, spill.tier));
@@ -4735,7 +4831,7 @@ void testCommitmentsLockQuotaUntilWritten() {
 // cached copy up.
 void testWriteThroughResumesBesideCopiesThatFillTheRoom() {
   // Every page stays Full, so that each cached copy is a redundant one.
-  Spilling spill({8, 1}, 10);
+  Spilling spill({8, 1, true}, 10);
   spill.start(1, Spilling::prompt(5000, 4), 4);
   require(spill.cache.writeThrough() == 4, "the cached copies were not written");
   spill.tier.complete();
@@ -4903,7 +4999,8 @@ void testARestoreReadsAChainOnlyAsFarAsItMatches() {
   // fails.
   CacheLookup lookup = spill.cache.lookup(prompt, {});
   spill.cache.poisonCopy(chain.front());
-  require(spill.cache.chainCopies(chain.back()).unheld == 3 && !spill.cache.restoreTakesQuota(chain),
+  require(spill.cache.chainCopies(chain.back()).unheld == 3 &&
+              !spill.cache.restoreTakesQuota(probe.restoredChain()),
           "a start's chain took quota for copies past a block that no longer matches");
   lookup = {};
 }
@@ -4972,8 +5069,9 @@ void testPagesPastTheCommitmentCommitTheirSlots() {
   spill.cache.endRequest(1);
 }
 
-// A conversion whose history already has copies spills those pages at once, without an allocation.
-void testConversionSpillsTheHistoryWithCopiesAtOnce() {
+// A conversion whose history already has copies writes none of them again and moves nothing: its claim releases
+// those pages at once, into free Index pages without an allocation (Cache::releasePages).
+void testAConversionsHistoryWithCopiesIsReleasedAtOnce() {
   Spilling spill;
   const std::vector<uint32_t> prompt = Spilling::prompt(1000, 6);
   spill.start(1, prompt, 6);
@@ -4995,12 +5093,16 @@ void testConversionSpillsTheHistoryWithCopiesAtOnce() {
           "the fixture's growth was not denied");
   const uint32_t writes = static_cast<uint32_t>(spill.tier.writes.size());
   const uint32_t allocations = spill.storage.allocationAttempts;
+  const ReleaseRule every{.takesFrom = [](uint64_t) { return true; }};
   require(spill.cache.convertToSpill(2, 0) && spill.tier.writes.size() == writes &&
+              spill.spilled(2) == std::vector<bool>(6, false) && spill.cache.releasablePages(2, every).clean == 4,
+          "the conversion wrote its history's pages again, moved them, or left them no release's");
+  require(spill.cache.releasePages(2, 4, true, every) == 4 &&
               spill.spilled(2) == std::vector<bool>{false, true, true, true, true, false} &&
-              spill.storage.allocationAttempts == allocations,
-          "the conversion did not spill the pages whose copies had landed at once, or wrote or allocated");
+              spill.storage.allocationAttempts == allocations && spill.cache.spillSnapshot().releasedPages == 4,
+          "a release of the pages whose copies had landed did not move them at once, or allocated");
   require(spill.cache.ensureTokens(2, tokens).granted(),
-          "the converted request did not grow into the pages its spill freed");
+          "the converted request did not grow into the pages its release freed");
   spill.cache.checkInvariants();
   lookup = {};
   spill.cache.endRequest(2);
@@ -5008,7 +5110,7 @@ void testConversionSpillsTheHistoryWithCopiesAtOnce() {
 
 // A page spills only once every holder spills and holds it past its dense history and window.
 void testEveryHolderDecidesWhetherAPageSpills() {
-  Spilling spill({2, 2});
+  Spilling spill({2, 2, true});
   const std::vector<uint32_t> prompt = Spilling::prompt(1000, 8);
   spill.start(1, prompt, 8);
   spill.start(2, prompt, 5);
@@ -5050,7 +5152,7 @@ void testBlocksAreWrittenOnce() {
 // A Spill request's owed copies count as returning Full pages while any of its copies is written.
 void testOwedCopiesReturnWhileAnyIsWritten() {
   // A dense history of four pages; one write at a time.
-  Spilling spill(CacheSpillPolicy{4, 1});
+  Spilling spill(CacheSpillPolicy{4, 1, true});
   spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 1;
   const std::vector<uint32_t> tokens = Spilling::prompt(1, 12);
   spill.start(1, tokens, 12);
@@ -5134,9 +5236,9 @@ void testPoisonedBlockLeavesOnceItsWriteLands() {
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false);
-  fixture.cache.poisonCopy(fixture.blocks[1]);
   require(fixture.cache.persist(fixture.blocks[3]) == PersistStatus::Started && tier.writes.size() == 4,
-          "the point's copies did not go on through the poisoned block");
+          "the point's copies did not start");
+  fixture.cache.poisonCopy(fixture.blocks[1]);
   fixture.cache.endRequest(1);
   tier.transfers[2]->ready = tier.transfers[3]->ready = true;
   static_cast<void>(fixture.cache.pollTransfers());
@@ -5534,7 +5636,7 @@ void testImmediateEvictionCountsNoLandingPage() {
 // What spilling returns splits into landing (in-flight writes that spill) and owed (copies not
 // started); per request.
 void testReturningSplitsLandingAndOwed() {
-  Spilling spill(CacheSpillPolicy{1, 1});
+  Spilling spill(CacheSpillPolicy{1, 1, true});
   spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 2;
   spill.start(1, Spilling::prompt(1000, 8), 8);
   spill.start(2, Spilling::prompt(5000, 4), 4);
@@ -5936,11 +6038,11 @@ void testARefusedRequestWaitsForThePageOnItsWayBack() {
                         [&cache](std::span<const uint64_t> requestIds) { return cache.returningFor(requestIds); });
     if (heldAbove) {
       const engine::ClaimId above = ledger.open({.cls = ClaimClass::InService, .requestId = 3, .rank = {.priority = 2}});
-      require(ledger.free(above, {.pages = 1}, 0, false).outcome == FreeOutcome::Pending,
+      require(ledger.free(above, {.pages = 1}, 0, MemoryPressure::Normal).outcome == FreeOutcome::Pending,
               "the claim above did not wait for the page on its way back");
     }
     const engine::ClaimId below = ledger.open({.cls = ClaimClass::InService, .requestId = 2, .rank = {.priority = 1}});
-    const FreeOutcome outcome = ledger.free(below, {.pages = 1}, 0, false).outcome;
+    const FreeOutcome outcome = ledger.free(below, {.pages = 1}, 0, MemoryPressure::Normal).outcome;
     require(outcome == FreeOutcome::Pending && tier.demotions == 1,
             heldAbove ? "a request below a claim that takes the page first did not wait as its hold ends"
                       : "a request did not wait for the page on its way back");
@@ -6465,7 +6567,7 @@ private:
 // A claim of `bytes` that can wait, for in-service work that reaches what is in use.
 FreeResult claimBytes(engine::MemoryLedger &ledger, uint64_t bytes) {
   const engine::ClaimId id = ledger.open(test::kInServiceGrowth);
-  const FreeResult freed = ledger.free(id, {.bytes = bytes}, 0, false);
+  const FreeResult freed = ledger.free(id, {.bytes = bytes}, 0, MemoryPressure::Normal);
   ledger.close(id);
   return freed;
 }
@@ -6593,10 +6695,10 @@ void testAReleaseOfWhatALandingCompletesCountsOnce() {
   require(claimBytes(ledger, 100).laterBytes == 400 && store.units, "the leaf's demotion did not complete an extent");
   cache.beginRequest(2);
   require(admitTokens(cache, 2, 3 * KvCache::pageTokens).granted(), "the request's pages were denied");
-  const uint64_t dead = cacheConversation(cache, 3, 1);
+  static_cast<void>(cacheConversation(cache, 3, 1));
   require(pool.freePageCount() == 3 && cache.returning().landingBytes == 400, "fixture geometry changed");
   static_cast<void>(claimBytes(ledger, 800));
-  require(!cache.residentChainPages({&dead, 1}) && !store.units,
+  require(pool.freePageCount() == 0 && !store.units,
           "a claim counted the free pages a landing completes an extent with twice");
   cache.endRequest(2);
   cache.checkInvariants();
@@ -6658,7 +6760,7 @@ void testGrowthCountsNoPageInTransfer() {
   engine::MemoryLedger ledger;
   ledger.addSource(cache);
   const engine::ClaimId claim = ledger.open({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate});
-  const FreeResult freed = ledger.free(claim, {.bytes = 300}, 0, false);
+  const FreeResult freed = ledger.free(claim, {.bytes = 300}, 0, MemoryPressure::Normal);
   ledger.close(claim);
   require(freed.outcome == FreeOutcome::Short && !freed.nowBytes && cache.residentChainPages({&dead, 1}),
           "growth took the dead leaf for a unit only copies in flight could fund");
@@ -6684,7 +6786,7 @@ void testGrowthCountsNoStateThatWaitsForAWrite() {
   ledger.addSource(cache);
   ledger.setBufferBytes([&control](uint32_t states, bool, bool) { return control->poolBytes(states); });
   const engine::ClaimId claim = ledger.open({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate});
-  const FreeResult freed = ledger.free(claim, {.bytes = 200}, 0, false);
+  const FreeResult freed = ledger.free(claim, {.bytes = 200}, 0, MemoryPressure::Normal);
   ledger.close(claim);
   require(freed.outcome == FreeOutcome::Short && !freed.nowBytes && cache.residentChainPages({&dead, 1}),
           "growth took the dead leaf for a unit only a state's write could fund");
@@ -6731,7 +6833,7 @@ void testStagedStateFreesItsCopiedChain() {
   const engine::ClaimId claim = ledger.open({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate});
   // Both states' buffers and two of the chain's three extents, the third
   // the runway growth keeps.
-  const FreeResult freed = ledger.free(claim, {.bytes = 400}, 0, false);
+  const FreeResult freed = ledger.free(claim, {.bytes = 400}, 0, MemoryPressure::Normal);
   ledger.close(claim);
   require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 200 && !cache.stateResident(earlier) &&
               cache.snapshot().stateCache.offloads == 2 && tier.demotions == 3,
@@ -6852,7 +6954,9 @@ int main() {
     testSpillAtTheMemoryWall();
     testFullReclaimReachesAnIdleSpilledChain();
     testFullShortfallReleasesEmptyIndexExtents();
+    testCriticalKeepsTheIndexRunway();
     testIndexShortfallCompactsOnlyFullExtents();
+    testANeedInPlaceEmptiesNoExtentOfItsForm();
     testAPageNeedOfAFormTheCacheHoldsNoneOfCountsNothing();
     testReusablePagesCountTheirForm();
     testPendingPagesCountWritesThatSpill();
@@ -6864,6 +6968,7 @@ int main() {
     testUnspillOnlyAsTheOnlyHolder();
     testAnUnspillLeavesTheHeldFreePages();
     testWritersMoveOntoPagesBeingWritten();
+    testAFailedRestoresPageIsNeverWritten();
     testQuotaGivesUpOnlyCopiesNothingReads();
     testQuotaKeepsTheSpilledLeafOfAStateInRam();
     testCommittedPagesTakeTheSpilledChainOfAStateInRam();
@@ -6876,7 +6981,7 @@ int main() {
     testWriteThroughResumesBesideCopiesThatFillTheRoom();
     testFailedWritesKeepTheirCommitment();
     testPagesPastTheCommitmentCommitTheirSlots();
-    testConversionSpillsTheHistoryWithCopiesAtOnce();
+    testAConversionsHistoryWithCopiesIsReleasedAtOnce();
     testEveryHolderDecidesWhetherAPageSpills();
     testBlocksAreWrittenOnce();
     testOwedCopiesReturnWhileAnyIsWritten();

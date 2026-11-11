@@ -42,6 +42,8 @@ struct ActualMemoryReport {
     // through; zero for another.
     uint64_t spilledKvHotBytes = 0;
     uint64_t spilledKvStagingBytes = 0;
+    // Their page tables (KvSpillPlan::tableBytes); zero for another.
+    uint64_t spilledKvTableBytes = 0;
     // The buffer state writes to the disk tier stage through; zero without
     // the tier.
     uint64_t stateStagingBytes = 0;

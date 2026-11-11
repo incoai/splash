@@ -17,15 +17,11 @@ final class Installer {
         /// The progress a line of the installer's output reports, if it is a download event.
         init?(line: String) {
             struct Event: Decodable {
-                let event: String
                 let repo: String
                 let done: Int64
                 let total: Int64
             }
-            guard line.hasPrefix("{"),
-                  let event = try? JSONDecoder().decode(Event.self, from: Data(line.utf8)),
-                  event.event == "download"
-            else { return nil }
+            guard let event: Event = Installer.event("download", in: line) else { return nil }
             (repo, done, total) = (event.repo, event.done, event.total)
         }
     }
@@ -39,16 +35,65 @@ final class Installer {
 
         /// The failure a line of the installer's output reports, if it is an error event.
         init?(line: String) {
-            struct Event: Decodable {
-                let event: String
-                let kind: String?
-                let message: String
-            }
-            guard line.hasPrefix("{"),
-                  let event = try? JSONDecoder().decode(Event.self, from: Data(line.utf8)),
-                  event.event == "error"
-            else { return nil }
-            (kind, message) = (event.kind, event.message)
+            guard let failure: Failure = Installer.event("error", in: line) else { return nil }
+            self = failure
+        }
+    }
+
+    /// What a check for updates found, as the installer reports it last (`prepared`,
+    /// install/upstream.py).
+    enum Outcome: String, Decodable {
+        /// It downloaded what had moved on, which the next start uses.
+        case updated
+        /// Hugging Face has nothing newer.
+        case upToDate = "up_to_date"
+        /// It couldn't check: Hugging Face didn't answer, or wasn't asked (HF_HUB_OFFLINE).
+        case unreachable
+        /// What had moved on couldn't be installed, and the installed version stays.
+        case kept
+
+        /// The outcome a line of the installer's output reports, if it is a `prepared` event.
+        init?(line: String) {
+            struct Event: Decodable { let outcome: Outcome }
+            guard let event: Event = Installer.event("prepared", in: line) else { return nil }
+            self = event.outcome
+        }
+    }
+
+    /// What a check for updates or a deletion that ended did, which the Server shows until read.
+    enum Result: Equatable {
+        case checked(Outcome)
+        /// A deletion, and the bytes it freed: none where other models or tools use the files.
+        case deleted(freed: Int64)
+    }
+
+    /// The bytes a line of the installer's output says a removal freed, if it is a `removed`
+    /// event.
+    nonisolated static func freed(line: String) -> Int64? {
+        struct Event: Decodable { let bytes: Int64 }
+        let event: Event? = Installer.event("removed", in: line)
+        return event?.bytes
+    }
+
+    private struct Named: Decodable { let event: String }
+
+    /// What a line of the installer's output reports, if it is its JSON event `name`.
+    nonisolated private static func event<Event: Decodable>(_ name: String, in line: String) -> Event? {
+        let data = Data(line.utf8)
+        guard line.hasPrefix("{"), (try? JSONDecoder().decode(Named.self, from: data))?.event == name else { return nil }
+        return try? JSONDecoder().decode(Event.self, from: data)
+    }
+
+    /// What the Server says of `result` for the model `name`: a title, the line under it, and
+    /// whether it did what was asked.
+    nonisolated static func words(_ result: Result, name: String) -> (title: String, detail: String, done: Bool) {
+        switch result {
+        case .checked(.updated): ("\(name) is updated", "Its next start uses the new files.", true)
+        case .checked(.upToDate): ("\(name) is up to date", "Hugging Face has nothing newer.", true)
+        case .checked(.unreachable): ("Splash couldn’t check \(name) for updates", "Hugging Face was not reachable.", false)
+        case .checked(.kept): ("Splash couldn’t update \(name)", "It kept the installed version.", false)
+        case .deleted(let freed) where freed > 0: ("Deleted \(name)", "Freed \(Format.size(freed)).", true)
+        case .deleted: ("Deleted \(name)", "Its files stayed: other models or tools use them.", true)
         }
     }
 
@@ -75,9 +120,31 @@ final class Installer {
     private(set) var progress: Progress?
     /// The last installation that failed: its model and why.
     private(set) var failure: (model: String, message: String)?
+    /// What the installer does with a model: downloads it, checks an installed one for updates,
+    /// which downloads only what has moved on, if anything, or removes an installed one.
+    enum Work {
+        case download, check, removal
 
-    /// Gets each model once it is installed.
+        /// What it does to the model `name`: a check, once it finds something to download,
+        /// downloads it.
+        func phrase(_ name: String, downloading: Bool) -> String {
+            switch self {
+            case .download: "Downloading \(name)"
+            case .check: downloading ? "Downloading \(name)" : "Checking \(name) for updates"
+            case .removal: "Deleting \(name)"
+            }
+        }
+    }
+    /// What the installation running does, or else what the last one did.
+    private(set) var work = Work.download
+    /// The last check for updates or deletion that ended, as the installer reported it: its model,
+    /// and what it found or freed.
+    private(set) var finished: (model: String, result: Result)?
+
+    /// Gets each model once it is downloaded.
     @ObservationIgnored var installed: (String) -> Void = { _ in }
+    /// Called once a check ended or a deletion ran, which may have changed a model's files.
+    @ObservationIgnored var changed: () -> Void = {}
 
     /// The downloads' log, which each download begins again.
     let log: URL
@@ -87,6 +154,9 @@ final class Installer {
     let record: ChildRecord
     private var cancelled = false
     private var reported: Failure?
+    /// What the check running found, or the bytes the deletion running freed, as reported.
+    private var outcome: Outcome?
+    private var freed: Int64?
     private var activity: NSObjectProtocol?
     /// When and at how many bytes the model's own download was first reported.
     private var began: (date: Date, done: Int64)?
@@ -107,28 +177,44 @@ final class Installer {
         return .seconds(Double(progress.total - progress.done) * elapsed / Double(progress.done - began.done))
     }
 
-    func install(_ model: String) {
+    /// Downloads `model`, or checks it for updates (`Work`).
+    func install(_ model: String, _ work: Work = .download) {
+        run(model, work)
+    }
+
+    /// Removes `model`, an installed one, with the files of it that no other installation uses
+    /// (`install/models.py remove`), which a server serving it refuses.
+    func remove(_ model: String) {
+        run(model, .removal)
+    }
+
+    private func run(_ model: String, _ work: Work) {
         guard child == nil else { return }
         self.model = model
+        self.work = work
         progress = nil
         began = nil
         failure = nil
+        finished = nil
         reported = nil
+        outcome = nil
+        freed = nil
         cancelled = false
         resetLog(log)
         do {
             child = try record.start(
-                runtime.installCommand(model),
+                work == .removal ? runtime.removeCommand(model) : runtime.installCommand(model),
                 environment: runtime.environment,
                 log: log,
                 line: { [weak self] in self?.received($0) },
                 exited: { [weak self] in self?.exited($0) }
             )
         } catch {
-            failure = (model, "The download couldn’t start: \(error.localizedDescription)")
+            failure = (model, "Splash couldn’t start: \(error.localizedDescription)")
             self.model = nil
             return
         }
+        guard work != .removal else { return }
         // A download takes long; the Mac must not sleep through it.
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .idleSystemSleepDisabled], reason: "Downloading \(model)")
@@ -147,17 +233,30 @@ final class Installer {
         failure = nil
     }
 
+    /// Clears what a check found or a deletion freed, once read.
+    func dismissFinished() {
+        finished = nil
+    }
+
     /// Stops the download this app started before it quit or crashed, if it still runs; its record
     /// stays until then, for the next launch should this one end first. An app before 1.6 kept its
     /// download's ID alone: the process that still runs the installer under the ID as an app
     /// starts it is that download.
-    func stopLeftover() async {
-        await record.stopLeftover(olderApps: runtime.runsInstaller)
+    func stopLeftover(stopping: () -> Void = {}) async {
+        await record.stopLeftover(olderApps: runtime.runsInstaller, stopping: stopping)
     }
 
     private func received(_ line: String) {
         if let reported = Failure(line: line) {
             self.reported = reported
+            return
+        }
+        if let outcome = Outcome(line: line) {
+            self.outcome = outcome
+            return
+        }
+        if let freed = Self.freed(line: line) {
+            self.freed = freed
             return
         }
         guard let event = Progress(line: line) else { return }
@@ -173,11 +272,19 @@ final class Installer {
         guard let model else { return }
         self.model = nil
         progress = nil
+        // A removal that failed may have removed the model all the same: the list says.
+        if work == .removal { changed() }
         if status == 0 {
-            installed(model)
+            switch work {
+            case .download: installed(model)
+            case .check:
+                finished = outcome.map { (model, .checked($0)) }
+                changed()
+            case .removal: finished = freed.map { (model, .deleted(freed: $0)) }
+            }
         } else if !cancelled {
             failure = (model, reported.map { Self.problem($0, model: model) }
-                ?? "The download stopped unexpectedly. The log has the details.")
+                ?? "It stopped unexpectedly. The log has the details.")
         }
     }
 }

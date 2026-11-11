@@ -53,6 +53,33 @@ inline uint staged_first_step(uint tile, uint step_begin, uint step_end, uint sp
   return step_begin + uint(ulong((tile * 40503u) & 0xFFFFu) * (step_end - step_begin) >> 16);
 }
 
+// The walk of a staged tile over steps [step_begin, step_end) of K from step_first, wrapping: two runs, [step_first,
+// step_end) then [step_begin, step_first), the stages alternating per step walked. step(s, next, more, buffer) runs
+// step s on stage `buffer` (0 or 1) and loads `next`, the step walked after it, when `more`: the last step of the
+// first run loads step_begin. The one-pass gate/up pairs walk so, with one copy of the step's body: a second, for
+// walks from step_begin, took them up to 27% more time (int8, 32 rows; bf16 1-5%; 32-core M5 Max).
+template <class Step>
+__attribute__((always_inline)) inline void gguf_staged_walk(uint step_begin, uint step_end, uint step_first, Step step) {
+  uint walked = 0;
+  for (uint run = 0; run < 2; ++run) {
+    const uint from = run ? step_begin : step_first, to = run ? step_first : step_end;
+    for (uint s = from; s < to; ++s, ++walked)
+      step(s, s + 1 < to ? s + 1 : step_begin, walked + 1 < step_end - step_begin, walked & 1);
+  }
+}
+// The walk of a one-tensor tile: a lockstep walk (spread 0: the prefill and MoE tiles') as one loop, without the
+// wrap's bookkeeping, any other as gguf_staged_walk. The int8 decode tile without the loop of its own took up to 10%
+// more time at 32 rows in 8 partitions (32-core M5 Max).
+template <class Step>
+__attribute__((always_inline)) inline void gguf_staged_tile_walk(uint step_begin, uint step_end, uint step_first,
+                                                                Step step) {
+  if (step_first == step_begin) {
+    for (uint s = step_begin; s < step_end; ++s) step(s, s + 1, s + 1 < step_end, s & 1);
+    return;
+  }
+  gguf_staged_walk(step_begin, step_end, step_first, step);
+}
+
 // The staged tile loop without the store, over steps [step_begin, step_end) of K from step_first, wrapping: the
 // Threads threads (thread_index among them) dequantize one KS-input step of the Cols columns into the stage, meet at a
 // barrier (a simdgroup's when one simdgroup stages alone, the threadgroup's otherwise), and, when `matmuls`, run the
@@ -115,18 +142,7 @@ inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uch
       if (buffer) operation.run(a_slice, b1, acc); else operation.run(a_slice, b0, acc);
     }
   };
-  if (step_first == step_begin) {
-    for (uint step = step_begin; step < step_end; ++step) run_step(step, step + 1, step + 1 < step_end, step & 1);
-    return;
-  }
-  // A walk from step_first wraps: two runs, [step_first, step_end) then [step_begin, step_first), the stages
-  // alternating per step walked; the last step of the first run loads step_begin's payload.
-  uint walked = 0;
-  for (uint run = 0; run < 2; ++run) {
-    const uint from = run ? step_begin : step_first, to = run ? step_first : step_end;
-    for (uint step = from; step < to; ++step, ++walked)
-      run_step(step, step + 1 < to ? step + 1 : step_begin, walked + 1 < step_end - step_begin, walked & 1);
-  }
+  gguf_staged_tile_walk(step_begin, step_end, step_first, run_step);
 }
 
 // The decode tile loop of one simdgroup without the store: its Cols columns over steps [step_begin, step_end) of K
@@ -173,7 +189,7 @@ template <class F> struct StagedColumn {
 };
 
 // A gate/up pair's decode tile in one simdgroup: the gate's and the up's same GGUF_STAGED_COLUMNS columns over steps
-// [step_begin, step_end) of K from step_first, wrapping as gguf_staged_steps walks. Each step dequantizes both tensors
+// [step_begin, step_end) of K from step_first, wrapping (gguf_staged_walk). Each step dequantizes both tensors
 // into their stages (one each), meets at a barrier, loads both tensors' next payloads, runs both matmuls on the step's
 // input and meets again before the stages are rewritten. Each tensor sums its steps in the order of its own decode
 // tile, so gate and up hold the bits of the gate and up passes over the same steps.
@@ -192,7 +208,8 @@ inline void gguf_staged_pair_steps(device bfloat *input, device uchar *gw0, devi
   StagedColumn<F> g, u;
   g.begin(gw0, gw1, gmeta, input_size, origin, lane, step_first, step_begin < step_end);
   u.begin(uw0, uw1, umeta, input_size, origin, lane, step_first, step_begin < step_end);
-  const auto run_step = [&](uint step, uint next, bool more) __attribute__((always_inline)) {
+  // One stage per tensor, rewritten after the step's second barrier, whatever stage the walk names.
+  const auto run_step = [&](uint step, uint next, bool more, uint) __attribute__((always_inline)) {
     g.stage(step, tl, stage, lane);
     u.stage(step, tl, stage + KS * Cols, lane);
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -202,21 +219,21 @@ inline void gguf_staged_pair_steps(device bfloat *input, device uchar *gw0, devi
     operation.run(a_slice, bu, up);
     simdgroup_barrier(mem_flags::mem_threadgroup);
   };
-  uint walked = 0;
-  for (uint run = 0; run < 2; ++run) {
-    const uint from = run ? step_begin : step_first, to = run ? step_first : step_end;
-    for (uint step = from; step < to; ++step, ++walked)
-      run_step(step, step + 1 < to ? step + 1 : step_begin, walked + 1 < step_end - step_begin);
-  }
+  gguf_staged_walk(step_begin, step_end, step_first, run_step);
 }
 
+// Any format's switch (quant_format_switch), the one staged_accumulate_any takes unless given another.
+struct any_quant_format {
+  template <class Body> void operator()(uint format, Body body) const { quant_format_switch(format, body); }
+};
+
 // runtime dequantizer selection (uniform per threadgroup): the format's pair table, which every thread of the
-// threadgroup fills, then its tile loop
-template <ushort Rows, ushort Cols, ushort KS, class Acc>
+// threadgroup fills, then its tile loop, for each format `formats` switches to
+template <ushort Rows, ushort Cols, ushort KS, class Acc, class Formats = any_quant_format>
 inline void staged_accumulate_any(uint fmt, device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint origin,
                            threadgroup half *stage, threadgroup half2 *tl, uint thread_index, uint simd_lane, uint sb, uint se,
-                           uint sf, thread Acc &acc) {
-  quant_format_switch(fmt, [&](auto format) {
+                           uint sf, thread Acc &acc, Formats formats = Formats()) {
+  formats(fmt, [&](auto format) {
     typedef decltype(format) F;
     quant_pair_table<F>(tl, thread_index, GGUF_STAGED_THREADS);
     staged_accumulate<F, Rows, Cols, KS>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, sf, acc);

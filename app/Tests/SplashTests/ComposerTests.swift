@@ -29,6 +29,24 @@ struct ComposerTests {
         #expect(state.draft.text == "你好再次")
     }
 
+    /// The composer takes the keyboard back from the drawer as it closes, by ⌘J or as its last
+    /// terminal closes.
+    @Test func theComposerTakesTheKeyboardBackFromTheDrawer() async throws {
+        let (state, window, folder) = try chat(drawer: true)
+        defer { window.orderOut(nil); state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        let composer = try await focusedComposer(in: window)
+        state.toggleDrawer()
+        let terminal = try #require(state.drawer.terminals.first)
+        try await waitFor(window.firstResponder === terminal.view)
+        state.toggleDrawer()
+        try await waitFor(window.firstResponder === composer)
+        state.toggleDrawer()
+        try await waitFor(window.firstResponder === terminal.view)
+        state.drawer.close(terminal.id)
+        #expect(!state.showsDrawer)
+        try await waitFor(window.firstResponder === composer)
+    }
+
     /// A new chat, and a chat's first message, keep the composer's text view, and the keyboard in it.
     @Test func aNewChatKeepsTheComposer() async throws {
         let (state, window, folder) = try chat()
@@ -48,20 +66,30 @@ struct ComposerTests {
 
     /// A new chat moves the composer from the conversation's foot to the middle in one animation:
     /// its text view travels with its controls, rather than being there at once; with Reduce
-    /// Motion it is there at once.
+    /// Motion it is there at once. The middle is where a new chat drawn without animation has it,
+    /// and the composer reaches it however long a slow Mac, as a virtual one is, takes to draw the
+    /// animation's frames: one there drew a single frame in the first second.
     @Test func aNewChatMovesTheWholeComposer() async throws {
         let (state, window, folder) = try chat()
         defer { window.orderOut(nil); try? FileManager.default.removeItem(at: folder) }
         let field = try #require(try await focusedComposer(in: window).enclosingScrollView)
         func height() -> CGFloat { field.convert(field.bounds, to: nil).minY }
+        let conversation = try #require(state.chats.selection)
+        var instant = Transaction()
+        instant.disablesAnimations = true
         Self.update(window)
         let foot = height()
+        withTransaction(instant) { state.chats.newChat() }
+        Self.update(window)
+        let middle = height()
+        #expect(middle > foot + 100)
+        withTransaction(instant) { state.chats.selection = conversation }
+        Self.update(window)
+        #expect(height() == foot)
         state.chats.newChat()
         Self.update(window)
         let start = height()
-        try await Task.sleep(for: .seconds(1))
-        let middle = height()
-        #expect(middle > foot + 100)
+        try await waitFor({ Self.update(window); return height() == middle }(), "the composer in the middle", seconds: 15)
         if Motion.reduced {
             #expect(start == middle)
         } else {
@@ -70,11 +98,13 @@ struct ComposerTests {
     }
 
     /// A model becoming ready changes the composer's controls in one animation: Attach Images and
-    /// Thinking fade in as the mark and the model's name move along beside them, none of them in
-    /// its place at once while the others move; with Reduce Motion all of them are in their places
-    /// at once, the mark taking its color within `quick`.
+    /// Thinking fade in as the mark, the model's name and its menu's chevron move along beside them,
+    /// none of them in its place at once while the others move; with Reduce Motion all of them are
+    /// in their places at once, the mark taking its color within `quick`.
     @Test func theComposersControlsChangeWithTheServerAsOne() async throws {
         let fake = try FakeRuntime("splash-composer-stage", launcher: "stepped_server")
+        // Installed, as a model that runs is, so that its name opens the models' menu.
+        try fake.install("example/Model")
         let state = fake.state(keychain: Keychain(service: "Splash Tests"))
         defer {
             state.quit()
@@ -108,19 +138,28 @@ struct ComposerTests {
         #expect(state.server.phase == .ready)
         Self.update(window)
         let start = try Self.picture(row, in: window)
-        try await Task.sleep(for: .seconds(1))
-        Self.update(window)
-        let settled = try Self.picture(row, in: window)
+        // The row once it has changed and stopped changing, which a slow Mac, as a virtual one is,
+        // reaches long after the animation's length.
+        var settled = start
+        for _ in 0..<30 {
+            try await Task.sleep(for: .milliseconds(500))
+            Self.update(window)
+            let next = try Self.picture(row, in: window)
+            let whole = 0..<next.pixelsWide
+            let stopped = Self.difference(settled, next, in: whole) == 0 && Self.difference(before, next, in: whole) > 0
+            settled = next
+            if stopped { break }
+        }
 
         // The controls as they settle, each a run of columns drawn on the composer: Attach Images,
-        // the mark, the model's name, Thinking and Send.
+        // the mark, the model's name, its menu's chevron, Thinking and Send.
         let controls = Self.runs(in: settled)
         print("The row's controls before \(Self.runs(in: before)), at the start \(Self.runs(in: start)), settled \(controls)")
-        try #require(controls.count >= 4, "the row's controls: \(controls)")
+        try #require(controls.count >= 5, "the row's controls: \(controls)")
         if Motion.reduced {
             #expect(Self.runs(in: start) == controls, "every control in its place at once")
         }
-        let named = ["Attach Images", "the mark", "the model's name", "Thinking"]
+        let named = ["Attach Images", "the mark", "the model's name", "the chevron", "Thinking"]
         for (control, columns) in zip(named, controls) {
             let change = Self.difference(before, settled, in: columns)
             let left = Self.difference(start, settled, in: columns)
@@ -138,15 +177,25 @@ struct ComposerTests {
     /// join the draft in the order they were attached, a photo before a small image attached after
     /// it, which is encoded sooner.
     @Test func imagesAttachAwayFromTheMainThreadInTheirOrder() async throws {
-        let draft = Draft()
+        let files = FileManager.default.temporaryDirectory.appending(path: "splash-draft-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: files) }
+        let draft = Draft(files: files)
         let photo = try #require(NSImage(data: Self.photo(width: 4032, height: 3024)))
         let picture = try #require(NSImage(data: Showcase.picture))
         draft.attach([photo])
         draft.attach([picture])
-        #expect(draft.images.isEmpty)
-        try await waitFor(draft.images.count == 2)
-        let widths = draft.images.map { NSBitmapImageRep(data: $0)?.pixelsWide }
-        #expect(widths == [2048, 240])
+        #expect(draft.attachments.isEmpty)
+        try await waitFor(draft.attachments.count == 2)
+        let kept = try draft.attachments.map { try Data(contentsOf: files.appending(path: $0.file)) }
+        #expect(kept.map { NSBitmapImageRep(data: $0)?.pixelsWide } == [2048, 240])
+        #expect(draft.attachments.map(\.type) == ["image/jpeg", "image/png"] && draft.thumbnails.count == 2)
+        // One taken off goes, with its file; those taken with the message stay, the message's.
+        let first = draft.attachments[0]
+        draft.remove(at: 0)
+        try await waitFor(!FileManager.default.fileExists(atPath: files.appending(path: first.file).path))
+        let message = draft.take()
+        #expect(message.attachments.count == 1 && draft.attachments.isEmpty && draft.thumbnails.isEmpty)
+        #expect(FileManager.default.fileExists(atPath: files.appending(path: message.attachments[0].file).path))
     }
 
     /// A new line grows the field in the layout that follows it, before the window shows it: its
@@ -207,15 +256,20 @@ struct ComposerTests {
     }
 
     /// A window showing the Chat of a conversation with one exchange.
-    private func chat() throws -> (AppState, NSWindow, URL) {
+    /// A window of the Chat, open on a conversation; with the drawer under it where `drawer`.
+    private func chat(drawer: Bool = false) throws -> (AppState, NSWindow, URL) {
         let folder = FileManager.default.temporaryDirectory.appending(path: "splash-composer-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let conversation = Conversation(messages: [ChatMessage(role: .user, text: "Hi"), ChatMessage(role: .assistant, text: "Hello.")])
         try JSONEncoder().encode(conversation).write(to: folder.appending(path: "\(conversation.id.uuidString).json"))
         let state = AppState.forTests(in: folder)
         state.chats.selection = conversation.id
+        state.section = .chat
         _ = NSApplication.shared
-        let window = NSWindow(contentViewController: NSHostingController(rootView: ChatScreen().environment(state)))
+        let chat = ChatScreen().environment(state)
+        let window = NSWindow(contentViewController: drawer
+            ? NSHostingController(rootView: AnyView(WithDrawer { ChatScreen() }.environment(state)))
+            : NSHostingController(rootView: AnyView(chat)))
         window.setContentSize(CGSize(width: 900, height: 600))
         window.setFrameOrigin(NSPoint(x: -30000, y: -30000))
         window.orderFrontRegardless()

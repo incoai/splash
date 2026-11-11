@@ -3,6 +3,7 @@
 #include "StderrLine.hpp"
 
 #include <fcntl.h>
+#include <sys/mount.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -18,13 +19,14 @@ namespace {
 constexpr uint64_t kGiB = uint64_t{1} << 30;
 constexpr uint64_t kFloorBytes = 10 * kGiB;
 
-} // namespace
-
-DiskVolume DiskVolume::of(const struct statfs &status) {
+// The volume fstatfs describes.
+DiskVolume volumeFrom(const struct statfs &status) {
   const uint64_t block = status.f_bsize;
   return {status.f_mntonname, uint64_t{status.f_bavail} * block,
           uint64_t{status.f_blocks} * block, (status.f_flags & MNT_LOCAL) != 0};
 }
+
+} // namespace
 
 std::optional<DiskVolume> volumeOf(const std::filesystem::path &path) {
   std::filesystem::path directory = path;
@@ -34,7 +36,7 @@ std::optional<DiskVolume> volumeOf(const std::filesystem::path &path) {
       struct statfs status {};
       const bool measured = ::fstatfs(descriptor, &status) == 0;
       ::close(descriptor);
-      return measured ? std::optional(DiskVolume::of(status)) : std::nullopt;
+      return measured ? std::optional(volumeFrom(status)) : std::nullopt;
     }
     if (!directory.has_relative_path())
       return std::nullopt;
@@ -90,22 +92,19 @@ std::string gibibytes(uint64_t bytes) {
 
 DiskSpace::DiskSpace(std::shared_ptr<model::DiskBudget> budget, bool automatic,
                      std::vector<std::shared_ptr<model::SlotFile>> files,
+                     std::function<std::optional<DiskVolume>()> readVolume,
                      std::vector<CacheDirectory::Idle> others)
     : budget_(std::move(budget)), automatic_(automatic), files_(std::move(files)),
+      readVolume_(std::move(readVolume)),
       others_(std::make_move_iterator(others.begin()), std::make_move_iterator(others.end())) {
-  if (!budget_ || files_.empty())
-    throw std::invalid_argument("a disk tier's space needs its budget and a file");
+  if (!budget_ || files_.empty() || !readVolume_)
+    throw std::invalid_argument("a disk tier's space needs its budget, a file and its volume's reader");
   measure();
 }
 
 void DiskSpace::measure() {
-  const std::optional<struct statfs> status = files_.front()->volume();
-  measure(status ? std::optional(DiskVolume::of(*status)) : std::nullopt);
-}
-
-void DiskSpace::measure(std::optional<DiskVolume> volume) {
   const bool full = budget_->takeFullReport();
-  volume_ = std::move(volume);
+  volume_ = readVolume_();
   uint64_t own = 0;
   for (const std::shared_ptr<model::SlotFile> &file : files_)
     own += file->allocatedBytes();
