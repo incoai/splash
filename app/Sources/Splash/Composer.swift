@@ -215,6 +215,9 @@ struct Composer: View {
                         .transition(Motion.comingAndGoing)
                 }
                 EffortMenu()
+                // Send turns into Stop at once, as a control's title changes, or as the composer moves
+                // with a new chat's first message: on an animation of its own, the button moved
+                // apart from the composer, ahead of it.
                 Button { if streaming { state.chats.stop() } else { state.sendDraft() } } label: {
                     Image(systemName: streaming ? "stop.fill" : "arrow.up")
                         .font(.system(size: streaming ? 10 : 13, weight: streaming ? .bold : .semibold))
@@ -225,7 +228,6 @@ struct Composer: View {
                 .keyboardShortcut(streaming ? KeyboardShortcut(".", modifiers: .command) : nil)
                 .help(streaming ? "Stop" : help)
                 .accessibilityLabel(streaming ? "Stop" : "Send")
-                .animation(Motion.quick, value: streaming)
             }
             .buttonStyle(.hover)
             // The first control's glyph on the text's edge.
