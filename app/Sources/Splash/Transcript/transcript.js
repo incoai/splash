@@ -13,12 +13,12 @@ const transcript = (() => {
   const firstScreen = 6000;
   // How the page lays out a message's text, for the room one not drawn yet keeps (page.estimator):
   // the user's words in their bubble, 22 px a row, which leaves the column's first 80 px clear and
-  // pads them 16 px at either side, under their images (page.css, transcript.css); a reply's
+  // pads them 16 px at either side, under their attachments (page.css, transcript.css); a reply's
   // Markdown across the column, 24 px a paragraph's row, its blocks 14 px apart less the 5 px their
   // rows leave over and under them (markdown.css), over its actions and under its line and why it
   // stopped short (transcript.css).
   const estimate = page.estimator(messages);
-  const userText = images => ({inset: 112, row: 22, gap: null, around: 17 + (images ? 128 : 0)});
+  const userText = attached => ({inset: 112, row: 22, gap: null, around: 17 + (attached ? 128 : 0)});
   const replyText = (line, error) => ({inset: 0, row: 24, gap: 9, around: 26 + (line ? 31 : 0) + (error ? 25 : 0)});
 
   // The messages drawn, by id: their element, the message as last given, and of a reply, its
@@ -46,7 +46,7 @@ const transcript = (() => {
       const element = document.createElement('article');
       element.className = message.role === 'user' ? 'user' : 'reply';
       element.dataset.id = message.id;
-      element.innerHTML = message.role === 'user' ? '<div class="images"></div><p class="bubble"></p>' : replyMarkup;
+      element.innerHTML = message.role === 'user' ? '<div class="attachments"></div><p class="bubble"></p>' : replyMarkup;
       follow.keep(element);
       view = {element, message: null, shown: null};
       if (message.role !== 'user') {
@@ -67,22 +67,36 @@ const transcript = (() => {
   function same(a, b) {
     return a !== null && a.text === b.text && a.reasoning === b.reasoning && a.error === b.error && a.live === b.live &&
       a.details === b.details && a.line?.verb === b.line?.verb && a.line?.facts === b.line?.facts &&
-      a.line?.since === b.line?.since && sameImages(a, b);
+      a.line?.since === b.line?.since && sameAttachments(a, b);
   }
 
-  const sameImages = (a, b) => a.images.length === b.images.length && a.images.every((image, index) => image === b.images[index]);
+  const sameAttachments = (a, b) => a.images.length === b.images.length && a.images.every((image, index) => image === b.images[index]) &&
+    a.documents.length === b.documents.length &&
+    a.documents.every((pdf, index) => pdf.name === b.documents[index].name && pdf.details === b.documents[index].details);
 
-  // The user's images over their text, at the column's end.
+  // A PDF the user attached: its glyph, name, and its pages and size.
+  function documentChip(pdf) {
+    const chip = document.createElement('div');
+    chip.className = 'pdf';
+    chip.innerHTML = '<span class="glyph document"></span><span class="pdf-about"><span class="pdf-name"></span><span class="pdf-details"></span></span>';
+    chip.querySelector('.pdf-name').textContent = pdf.name;
+    chip.querySelector('.pdf-details').textContent = pdf.details;
+    return chip;
+  }
+
+  // The user's images and PDFs over their text, at the column's end.
   function drawUser(element, message, previous) {
-    const images = element.querySelector('.images');
-    if (!previous || !sameImages(previous, message)) {
-      images.replaceChildren(...message.images.map(url => Object.assign(document.createElement('img'), {src: url, alt: ''})));
+    const attachments = element.querySelector('.attachments');
+    if (!previous || !sameAttachments(previous, message)) {
+      attachments.replaceChildren(...message.images.map(url => Object.assign(document.createElement('img'), {src: url, alt: ''})),
+        ...message.documents.map(documentChip));
     }
-    images.hidden = message.images.length === 0;
+    const attached = message.images.length > 0 || message.documents.length > 0;
+    attachments.hidden = !attached;
     const bubble = element.querySelector('.bubble');
     bubble.textContent = message.text;
     bubble.hidden = message.text === '';
-    estimate(element, message.text, userText(message.images.length > 0));
+    estimate(element, message.text, userText(attached));
   }
 
   // A reply: its line, its Markdown, why it stopped short, and its actions, which keep their place

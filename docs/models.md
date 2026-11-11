@@ -214,14 +214,13 @@ BF16, and other publishers keep alpha and beta, GDN projections, experts or
 the token table in F16. Their planes hold the values as stored, with an FP32
 scale of 1 per 256 values; the staged tiles round each value once to half, the
 Apple9 register tile reads BF16 exactly and takes no F16, so a projection with
-an F16 weight stages there, as do all of a model's experts when any expert
-weight is F16. Whole-BF16 and F16 models are not a target: before any weight
-download, and before the engine's model check, the installer refuses a GGUF
-whose BF16, F16 and F32 tensors hold more of its values than its quantized
-ones (`gguf.require_quantized`), with one message that asks for a quantized
-variant. A whole-BF16 file with its token table quantized is still refused;
-these files pass, and so does a MoE whose routed experts alone are quantized.
-The native loader does not check this.
+an F16 weight stages there. Whole-BF16 and F16 models are not a target: before
+any weight download, and before the engine's model check, the installer
+refuses a GGUF whose BF16, F16 and F32 tensors hold more of its values than
+its quantized ones (`gguf.require_quantized`), with one message that asks for
+a quantized variant. A whole-BF16 file with its token table quantized is still
+refused; these files pass, and so does a MoE whose routed experts alone are
+quantized. The native loader does not check this.
 
 Of Unsloth's files in September 2026 that covers every file of Qwen3.8-27B and
 Qwen3.6-35B-A3B from UD-IQ1_S to UD-Q8_K_XL. llama-quantize's default type
@@ -288,6 +287,12 @@ dense targets whose rotation names exactly the tensors the planner repacks
 PQ2_0 token table, and GDN value heads in grouped order (`GgufFile` checks the
 parameters and the planner the rest, both before any download through the
 engine's model check).
+
+On M5 and later Macs, whose GPUs multiply int8 at twice their bf16 rate, such a
+model decodes in int8 activations, one scale per row and block of 1024 rotated
+inputs (next-token KL 2.8e-4 against bf16, 13-16% less time a decode cycle on a
+20-core M5 Pro), which `--activations bf16` turns off
+([server options](server.md#server-options)).
 
 ## Drafts
 
@@ -369,8 +374,10 @@ fallen. The log notes, at most once a minute, the cycles counted at under half
 their time (`Verify budget: a cycle of`). A fixed shorter block would do worse:
 in agentic use about one cycle in six accepts all seven proposals and one in
 five accepts none. Rows past a lane's verify rows still run the target's
-layers, whose kernels take eight rows a lane, but their MoE steps route no expert (`moe_group_routes_verified`) and acceptance
-retains none of them. The budget's costs follow wall time and its acceptance
+layers, whose kernels take eight rows a lane, but their MoE steps route no
+expert (`moe_group_routes_verified`), their GDN recurrence is skipped and its
+output left zero (`verify_gdn_fused`), and acceptance retains none of them.
+The budget's costs follow wall time and its acceptance
 model every request's labels, so the rows a cycle verifies depend on the
 machine's timing and on what the server served before, and a MoE row's result
 depends on which rows share its expert tiles ([Kernels](internals.md#kernels)): under the
@@ -425,11 +432,11 @@ use are rejected.
 A prefill command encodes the images whose rows begin in it, from no cached
 rows, in a command of its own, and is submitted once that command has
 completed: an encode takes about 0.3 s for a 1000 x 1400 page on an M5 Max
-and seconds for a 4-megapixel image on a small GPU, which Metal would count
-against the 5 s it gives the prefill command's first host step or Neural
-Engine wait ([Host steps](internals.md#host-steps)). The scheduler counts the encodes'
-time in what the prefill owes decoding requests, and leaves it out of the
-measured time it sizes later prefill commands by.
+and seconds for a 4-megapixel image on a small GPU, which the scheduler,
+timing it apart, counts in what the prefill owes decoding requests and
+leaves out of the measured time it sizes later prefill commands by, and
+which Metal would count against the 5 s it gives the prefill command's first
+Neural Engine wait ([Host steps](internals.md#host-steps)).
 
 `--language-only` links and loads no vision weights and removes them from
 memory accounting. It skips a GGUF's mmproj download and an MLX shard that

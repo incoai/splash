@@ -12,7 +12,7 @@ struct LaunchOptions: View {
 
     var body: some View {
         let family = state.family(of: state.selection)
-        Section {
+        GroupedSection {
             ForEach(Self.options(.main, for: family)) { OptionRow(option: $0, family: family) }
             DisclosureRow(title: "Advanced", open: $advanced)
                 .background(ViewAnchor { row.view = $0 })
@@ -38,15 +38,20 @@ struct LaunchOptions: View {
             HStack(alignment: .firstTextBaseline) {
                 SectionTitle(text: LaunchOption.Section.main.rawValue)
                 Spacer()
-                // For the options the card shows.
+                // For the options the card shows. Laid out while hidden, so that the header keeps
+                // its height: the button is taller than the title, and as it came and went the card
+                // under it moved. It shows within `settle` and goes at once.
                 let defaults = state.options.defaults(for: family)
-                if state.options != defaults {
-                    Button("Restore Defaults") { state.options = defaults }
-                        .buttonStyle(.hover)
-                        .foregroundStyle(.tint)
-                        .font(.callout)
-                        .padding(.trailing, -6)
-                }
+                let changed = state.options != defaults
+                Button("Restore Defaults") { state.options = defaults }
+                    .buttonStyle(.hover)
+                    .foregroundStyle(.tint)
+                    .font(.callout)
+                    .padding(.trailing, -6)
+                    .opacity(changed ? 1 : 0)
+                    .animation(changed ? Motion.settle : nil, value: changed)
+                    .disabled(!changed)
+                    .accessibilityHidden(!changed)
             }
         }
     }
@@ -121,7 +126,7 @@ private struct OptionLabeled<Content: View>: View {
 
 /// One launch option, with the control its kind takes; dimmed where the others leave it no effect,
 /// a switch then off, and with what to beware of under it: why the model picked doesn't take the
-/// value kept, too.
+/// value kept, too, or that YaRN stretches its window to the value.
 private struct OptionRow: View {
     @Environment(AppState.self) private var state
     let option: LaunchOption
@@ -142,16 +147,16 @@ private struct OptionRow: View {
                                          set: { value.wrappedValue = $0 == on ? "true" : nil })) {
                         OptionLabel(title: option.title, help: option.help)
                     }
-                case .choice(let standard, let choices, let custom):
-                    ChoicePicker(title: option.title, help: option.help, standard: standard, choices: choices, custom: custom,
-                                 family: family, takes: takes, value: value)
+                case .choice(let standard, _, let custom):
+                    ChoicePicker(title: option.title, help: option.help, standard: standard, choices: option.choices(for: family),
+                                 custom: custom, family: family, takes: takes, value: value)
                 case .text(let custom, _):
                     TextRow(title: option.title, help: option.help, custom: custom, takes: takes, value: value)
                 case .folder:
                     FolderRow(title: option.title, help: option.help, value: value)
                 case .secret:
                     TextRow(title: option.title, help: option.help, custom: LaunchOption.Value(prompt: "None", message: "", parse: { $0.isEmpty ? nil : $0 }),
-                            takes: takes, secure: true, value: $state.options.apiKey)
+                            takes: takes, secure: true, value: $state.options.apiKey, left: state.keepKey)
                         .disabled(state.keyProblem != nil)
                 }
             }
@@ -160,11 +165,22 @@ private struct OptionRow: View {
             .environment(\.optionRowNeeds, option.lacks(state.options))
             .contentShape(.rect)
             .onHover { hovered = $0 }
-            if let warning = option.warning(state.options) ?? value.wrappedValue.flatMap({ family.refusal(option.flag, $0) }) {
+            // Its value changes at once, as a control's does: animated with the page, the value
+            // before and the value chosen cross-faded in the field, one over the other. The control
+            // moves with the page as one (`geometryGroup`), laid out in it at once.
+            .transaction { $0.animation = nil }
+            .geometryGroup()
+            if let warning = option.warning(state.options)
+                ?? value.wrappedValue.flatMap({ family.refusal(option.flag, $0) ?? family.caution(option.flag, $0) }) {
+                // As a row of the page comes and goes, a warning in place of another too: it faded
+                // in over the rows moving down to make room for it, and out under those moving up
+                // into its place.
                 Label(warning, systemImage: "exclamationmark.triangle.fill")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .symbolRenderingMode(.multicolor)
+                    .id(warning)
+                    .transition(Motion.comingAndGoing)
             }
         }
     }
@@ -230,6 +246,8 @@ private struct TextRow: View {
     let takes: (String) -> Bool
     var secure = false
     @Binding var value: String?
+    /// What the field's leaving does besides, as an API key's reaching the Keychain.
+    var left: () -> Void = {}
     @State private var text = ""
     @FocusState private var focused: Bool
 
@@ -246,7 +264,10 @@ private struct TextRow: View {
             .textFieldStyle(.plain)
             .multilineTextAlignment(.trailing)
             .focused($focused)
-            .onSubmit(show)
+            .onSubmit {
+                show()
+                left()
+            }
             .optionField(focused: focused, invalid: taken(text) == nil)
             .frame(maxWidth: 220)
         }
@@ -254,7 +275,12 @@ private struct TextRow: View {
         .onChange(of: text) { if let taken = taken(text) { value = taken } }
         // Changed elsewhere, as by Restore Defaults.
         .onChange(of: value) { if taken(text) != .some(value) { show() } }
-        .onChange(of: focused) { if !focused { show() } }
+        .onChange(of: focused) {
+            if !focused {
+                show()
+                left()
+            }
+        }
     }
 
     /// The value `text` sets: none for empty text, the value parsed, or nil for text the option or

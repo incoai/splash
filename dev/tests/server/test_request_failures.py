@@ -17,6 +17,7 @@ from dev.tests.server_fixtures import (
     anthropic_body,
     byte_backend,
     chat_body,
+    console_written,
     response_events,
     responses_body,
 )
@@ -299,7 +300,7 @@ class RequestFailureTests(HarnessTestCase):
             "POST", "/v1/chat/completions", chat_body()
         )
         error = json.loads(payload)["error"]
-        # Retrying fails the same way, and memory is not what it lacks.
+        # Retrying fails the same way while memory and the quota stay as they are.
         self.assertEqual(status, 400)
         self.assertEqual(error["code"], "kv_disk_quota")
         self.assertEqual(error["message"], native)
@@ -363,6 +364,45 @@ class RequestFailureTests(HarnessTestCase):
             "plain answer\n",
         )
 
+    def test_a_failure_the_backend_logged_has_one_console_line(self):
+        """A request the engine took ends in one line, the backend's, which
+        names its id; the HTTP handler does not add an id-less one."""
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                records = []
+                harness = self.harness(
+                    FakeRuntime(Plan(exception=RuntimeError("boom"))),
+                    request_logger=records.append,
+                )
+                with mock.patch.object(api, "print_status") as console:
+                    status, _, _ = harness.request(
+                        "POST", "/v1/chat/completions", chat_body(stream=stream)
+                    )
+                self.assertEqual(status, 200 if stream else 500)
+                (end,) = [r for r in records if r["outcome"] != "started"]
+                self.assertEqual(
+                    (end["outcome"], end["error_code"], end["request_id"]),
+                    ("error", "runtime_error", 1),
+                )
+                console.assert_not_called()
+
+    def test_a_failure_after_the_engine_took_the_request_names_it(self):
+        """The handler's own failure of a request the engine took, as its
+        deadline, names the engine's id, as the backend's lines do."""
+        blocking = Plan([[4]], block=True)
+        harness = self.harness(FakeRuntime(blocking))
+        with mock.patch.object(api, "print_status") as console:
+            status, _, _ = harness.request(
+                "POST", "/v1/chat/completions", chat_body(timeout=0.03)
+            )
+        blocking.release.set()
+        self.assertEqual(status, 504)
+        console.assert_called_once()
+        self.assertEqual(
+            console.call_args.args[0],
+            "Error · request 1 · request_timeout · POST /v1/chat/completions",
+        )
+
     def test_unexpected_handler_error_cancels_and_is_structured(self):
         harness = self.harness(FakeRuntime(Plan([[4]], block=True)))
         stderr = io.StringIO()
@@ -381,6 +421,7 @@ class RequestFailureTests(HarnessTestCase):
         self.assertEqual(status, 500, payload)
         self.assertEqual(json.loads(payload)["error"]["code"], "internal_server_error")
         cancel.assert_called_once()
+        console_written()
         # Where the server, in a subpackage too, last had the error, and not
         # its message.
         self.assertRegex(
@@ -458,6 +499,7 @@ class RequestFailureTests(HarnessTestCase):
         )
         cancel.assert_called_once()
         self.assertTrue(plan.ended.is_set())
+        console_written()
         self.assertRegex(
             stderr.getvalue(),
             r"^\d{2}:\d{2}:\d{2} Error · internal_server_error · RuntimeError · "

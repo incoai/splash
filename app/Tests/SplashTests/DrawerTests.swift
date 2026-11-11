@@ -113,6 +113,71 @@ struct DrawerTests {
         #expect(try String(contentsOf: typed, encoding: .utf8) == "|\n")
     }
 
+    /// A terminal runs a program while one other than its shell has it, not at its prompt, and one
+    /// closed runs nothing; the drawer counts them for what a quit would cut off.
+    @Test func aTerminalRunsAProgramWhileOneHasIt() async throws {
+        let (state, folder) = AppState.forTests()
+        defer { state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        state.newTerminal()
+        state.newTerminal()
+        let busy = try #require(state.drawer.terminals.first)
+        let idle = try #require(state.drawer.terminals.last)
+        #expect(state.drawer.runningPrograms == 0 && state.quitCost.message == nil)
+        _ = try await Self.run("sleep 1000", in: busy)
+        try await waitFor(busy.runsProgram, "the program to have the terminal")
+        #expect(!idle.runsProgram && state.drawer.runningPrograms == 1)
+        #expect(state.quitCost.message == "A terminal is running a program.")
+        // Its close asks first, as closing ends what runs; the other's closes at once.
+        state.drawer.askToClose(busy.id)
+        #expect(state.drawer.closing == busy.id && !busy.ended)
+        state.drawer.closing = nil
+        state.drawer.askToClose(idle.id)
+        #expect(state.drawer.closing == nil && idle.ended && state.drawer.terminals.map(\.id) == [busy.id])
+        state.drawer.close(busy.id)
+        #expect(!busy.runsProgram && state.drawer.runningPrograms == 0)
+    }
+
+    /// The drawer showing terminals closes as its last one does; showing logs, it stays.
+    @Test func closingTheLastTerminalClosesTheDrawer() throws {
+        let (state, folder) = AppState.forTests()
+        defer { state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        state.toggleDrawer()
+        let only = try #require(state.drawer.terminals.first)
+        state.drawer.close(only.id)
+        #expect(!state.showsDrawer)
+        state.newTerminal()
+        state.showDrawer(.logs)
+        state.drawer.close(try #require(state.drawer.terminals.first).id)
+        #expect(state.showsDrawer && state.drawer.part == .logs)
+    }
+
+    /// A shell that exits cleanly, as `exit` ends it, takes its tab with it, as in Terminal; one
+    /// that fails stays, ended, with what it said.
+    @Test func aShellThatExitsCleanlyTakesItsTab() async throws {
+        let (state, folder) = AppState.forTests()
+        defer { state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        state.newTerminal()
+        state.newTerminal()
+        let (clean, failing) = (state.drawer.terminals[0], state.drawer.terminals[1])
+        clean.view.send(txt: "exit\n")
+        failing.view.send(txt: "exit 3\n")
+        try await waitFor(failing.ended && clean.ended, seconds: 10)
+        try await waitFor(state.drawer.terminals.map(\.id) == [failing.id])
+    }
+
+    /// A line typed into a terminal as it starts, as an agent's command is, waits for the shell's
+    /// prompt: it runs, and shows once, at the prompt, rather than echoed ahead of it too.
+    @Test func aLineTypedAsATerminalStartsShowsOnceAtThePrompt() async throws {
+        let (state, folder) = AppState.forTests()
+        defer { state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        let session = TerminalSession(shell: .bare, environment: ["HOME": NSHomeDirectory(), "PATH": "/usr/bin:/bin"],
+                                      typing: "echo typed-$((6 * 7))")
+        state.drawer.add(session)
+        func screen() -> String { String(decoding: session.view.getTerminal().getBufferAsData(), as: UTF8.self) }
+        try await waitFor(screen().contains("typed-42"), seconds: 10)
+        #expect(screen().components(separatedBy: "echo typed-").count == 2)
+    }
+
     /// Quitting ends every shell.
     @Test func quittingEndsEveryShell() async throws {
         let (state, folder) = AppState.forTests()
@@ -141,6 +206,51 @@ struct DrawerTests {
         #expect(user["SPLASH_API_KEY"] == nil && user["SPLASH_RUNTIME"] == nil && user["PYTHONNOUSERSITE"] == nil)
         #expect(user["HOME"] == ProcessInfo.processInfo.environment["HOME"])
         #expect(runtime.environment["SPLASH_API_KEY"] == nil && runtime.environment["PYTHONNOUSERSITE"] == "1")
+    }
+
+    /// The programs the app runs get the Hugging Face settings of the user's login shell, as its
+    /// startup files make them, an app getting none: the variables the app takes alone, whatever
+    /// else the shell prints; none from a shell that doesn't answer in time. No other variable
+    /// leaves the shell, whatever its value holds.
+    @Test func theProgramsGetTheLoginShellsHuggingFaceSettings() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-zdotdir-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let zsh = Shell(path: "/bin/zsh", arguments: [], name: "zsh")
+        var environment = ProcessInfo.processInfo.environment.filter { !Runtime.takesShellSetting($0.key) }
+        environment["ZDOTDIR"] = folder.path
+        try """
+            echo a greeting
+            export HF_HUB_CACHE=/Volumes/Models/hub HUGGINGFACE_HUB_VERBOSITY=info OTHER=1
+            export HUGGING_FACE_HUB_TOKEN=hf_fake XDG_CACHE_HOME=/Volumes/Cache SECRET=fake-secret
+            export NOTES=$'a line\\nHF_LEAK=fake-leak'
+
+            """.write(to: folder.appending(path: ".zshrc"), atomically: true, encoding: .utf8)
+        let settings = await Runtime.readShellSettings(zsh, environment: environment)
+        #expect(settings == ["HF_HUB_CACHE": "/Volumes/Models/hub", "HUGGINGFACE_HUB_VERBOSITY": "info",
+                             "HUGGING_FACE_HUB_TOKEN": "hf_fake", "XDG_CACHE_HOME": "/Volumes/Cache"])
+        let runtime = Runtime(root: folder)
+        runtime.shellSettings.set(settings)
+        #expect(runtime.environment["HF_HUB_CACHE"] == "/Volumes/Models/hub" && runtime.environment["OTHER"] == nil)
+        // What the shell gives: the variables taken, a value's newline and all, and nothing else.
+        let filter = Process()
+        filter.executableURL = URL(filePath: "/bin/sh")
+        filter.arguments = ["-c", Runtime.shellSettingsCommand]
+        filter.environment = ["HF_TOKEN": "hf_fake", "HF_NOTE": "one\ntwo", "SECRET": "fake-secret",
+                              "NOTES": "a line\nHF_LEAK=fake-leak", "XDG_CACHE_HOMES": "/elsewhere"]
+        let given = Pipe()
+        filter.standardOutput = given
+        try filter.run()
+        let records = given.fileHandleForReading.readDataToEndOfFile().split(separator: 0).map { String(decoding: $0, as: UTF8.self) }
+        filter.waitUntilExit()
+        #expect(Set(records) == ["HF_TOKEN=hf_fake", "HF_NOTE=one\ntwo"] && records.count == 2)
+        // A shell that hangs is stopped at the limit.
+        try "sleep 30\n".write(to: folder.appending(path: ".zshrc"), atomically: true, encoding: .utf8)
+        let start = ContinuousClock.now
+        #expect(await Runtime.readShellSettings(zsh, environment: environment, limit: .milliseconds(500)).isEmpty)
+        #expect(ContinuousClock.now - start < .seconds(5))
+        let output = Data("motd\0SPLASH-SHELL-SETTINGS\0HF_HOME=/h\0PATH=/bin\0HF_TOKEN=a=b\0XDG_CACHE_HOME=/c\0SPLASH-SHELL-SETTINGS\0after".utf8)
+        #expect(Runtime.shellSettings(in: output, between: "SPLASH-SHELL-SETTINGS") == ["HF_HOME": "/h", "HF_TOKEN": "a=b", "XDG_CACHE_HOME": "/c"])
     }
 
     /// A terminal runs the login shell the user database names; where it names none, the one
@@ -196,8 +306,8 @@ struct DrawerTests {
     }
 
     /// The terminal shown takes the keyboard: one added, one picked, the drawer opened on it. One
-    /// hidden, as another is picked, the logs show or the drawer closes, gives it up, and so does
-    /// a log as the drawer closes.
+    /// hidden, as another is picked or the drawer closes, gives it up; the logs shown take it, and
+    /// give it up as the drawer closes.
     @Test func theTerminalShownHasTheKeyboardAndWhatHidesGivesItUp() async throws {
         let (state, folder) = AppState.forTests()
         let window = Self.window(WithDrawer { Color.clear }.environment(state))
@@ -215,14 +325,55 @@ struct DrawerTests {
         state.toggleDrawer()
         try await waitFor(window.firstResponder === first.view)
         state.showDrawer(.logs)
-        try await waitFor(window.firstResponder === window)
         try await waitFor(Self.textView(in: window) != nil)
         let log = try #require(Self.textView(in: window))
-        window.makeFirstResponder(log)
-        // SwiftUI sees where the keyboard went, as it does before the user's next key.
-        Self.update(window)
+        try await waitFor(window.firstResponder === log)
         state.toggleDrawer()
         try await waitFor(window.firstResponder === window)
+    }
+
+    /// The drawer has the keyboard to give the composer as it hides where a terminal or the log
+    /// has it, or nothing does, as when the terminal that had it has closed; not where a field
+    /// elsewhere has it, as chat search or a rename field.
+    @Test func theDrawerHasTheKeyboardOnlyWhereItsViewsOrNothingHaveIt() async throws {
+        let (state, folder) = AppState.forTests()
+        let window = Self.window(WithDrawer { Color.clear }.environment(state))
+        defer { Self.close(window); state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        state.toggleDrawer()
+        let terminal = try #require(state.drawer.terminals.first)
+        try await waitFor(window.firstResponder === terminal.view)
+        #expect(state.drawer.hasKeyboard(in: window))
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 120, height: 22))
+        window.contentView?.addSubview(field)
+        #expect(window.makeFirstResponder(field))
+        #expect(!state.drawer.hasKeyboard(in: window))
+        #expect(window.makeFirstResponder(nil))
+        #expect(state.drawer.hasKeyboard(in: window))
+        state.showDrawer(.logs)
+        try await waitFor(Self.textView(in: window) != nil)
+        let log = try #require(Self.textView(in: window))
+        try await waitFor(window.firstResponder === log)
+        #expect(state.drawer.hasKeyboard(in: window))
+    }
+
+    /// Find… shows the find bar of what the drawer shows, whose field takes the keyboard, the
+    /// keyboard elsewhere.
+    @Test func findShowsTheFindBarOfTheLogTheDrawerShows() async throws {
+        let (state, folder) = AppState.forTests()
+        let window = Self.window(WithDrawer { Color.clear }.environment(state))
+        defer { Self.close(window); state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        // Open before the logs show: off the screen, the window may not run the drawer's slide.
+        state.toggleDrawer()
+        let terminal = try #require(state.drawer.terminals.first)
+        try await waitFor(window.firstResponder === terminal.view)
+        state.showDrawer(.logs)
+        try await waitFor(Self.textView(in: window) != nil)
+        let log = try #require(Self.textView(in: window))
+        try await waitFor(window.firstResponder === log)
+        window.makeFirstResponder(nil)
+        state.drawer.find()
+        #expect(log.enclosingScrollView?.isFindBarVisible == true)
+        #expect((window.firstResponder as? NSTextView)?.isFieldEditor == true)
     }
 
     /// A log shows the lines that start in its last 512 KB, then what is written to it.
@@ -282,6 +433,47 @@ struct DrawerTests {
         try await waitFor(lines.count == 2)
         tail.finish()
         #expect(lines == ["first", "Started · a/b", "last"])
+    }
+
+    /// The server's log goes on under the starts before the one that begins: from a blank line and
+    /// a line that names it, its oldest lines going past what it keeps; the start's tail gives only
+    /// the start's own lines.
+    @Test func aStartsLogGoesOnUnderTheStartsBeforeIt() async throws {
+        let (folder, file) = try Self.log("an earlier start\nits failure")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let start = beginLog(file, heading: "── Starting a/b")
+        #expect(try String(contentsOf: file, encoding: .utf8) == "an earlier start\nits failure\n\n── Starting a/b\n")
+        var lines: [String] = []
+        let tail = try #require(LogTail(file, from: start) { lines.append($0) })
+        try Self.append("its first line\n", to: file)
+        try await waitFor(lines == ["its first line"])
+        tail.finish()
+        #expect(lines == ["its first line"])
+        beginLog(file, heading: "── Starting c/d", kept: 24)
+        #expect(try String(contentsOf: file, encoding: .utf8) == "its first line\n\n── Starting c/d\n")
+    }
+
+    /// A start reads only the end of the log before it, however long a run grew it: one past what
+    /// it keeps is cut to its last lines there, and one within it has the start's line added, the
+    /// file kept.
+    @Test func aStartReadsOnlyTheEndOfALongLog() throws {
+        let (folder, file) = try Self.log("")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        // 4 GiB, all but its last line a hole, which reading would fill.
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.truncate(atOffset: 4 << 30)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("\nthe run's last line\n".utf8))
+        try handle.close()
+        let start = beginLog(file, heading: "── Starting a/b", kept: 1 << 20)
+        #expect(try Data(contentsOf: file) == Data("the run's last line\n\n── Starting a/b\n".utf8))
+        #expect(start == UInt64(try Data(contentsOf: file).count))
+        let number = try FileManager.default.attributesOfItem(atPath: file.path)[.systemFileNumber] as? Int
+        let next = beginLog(file, heading: "── Starting c/d", kept: 1 << 20)
+        #expect(try String(contentsOf: file, encoding: .utf8)
+            == "the run's last line\n\n── Starting a/b\n\n── Starting c/d\n")
+        #expect(next == UInt64(try Data(contentsOf: file).count))
+        #expect(try FileManager.default.attributesOfItem(atPath: file.path)[.systemFileNumber] as? Int == number)
     }
 
     /// As a log grows, its oldest lines go: past 512 K characters, it keeps the lines that start
@@ -522,5 +714,93 @@ struct DrawerTests {
     /// Whether process `pid` has ended and been waited for.
     private static func gone(_ pid: pid_t) -> Bool {
         kill(pid, 0) != 0 && errno == ESRCH
+    }
+}
+
+extension DrawerTests {
+    /// The drawer slides with what is above it and what is in it: each frame drawn as it opens and
+    /// closes over the Server screen has the screen's control bar and the drawer's tabs as they show
+    /// once it has opened, together, moved as one with the drawer's edge; not the bar's words where
+    /// the drawer is going, ahead of the drawer and of the bar's own background, nor the tab of the
+    /// terminal it opens with fading in under the New Terminal button.
+    @Test func theDrawerSlidesWithWhatIsAboveItAndInIt() async throws {
+        let fake = try FakeRuntime("splash-drawer-slide", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await ServerScreenTests.launchedWithModels(fake)
+        defer { state.quit() }
+        state.options["--port"] = String(fake.port)
+        for step in ["loaded", "warm"] { FileManager.default.createFile(atPath: fake.root.appending(path: step).path, contents: nil) }
+        state.start("unsloth/flint-GGUF:UD-Q4_K_XL")
+        try await waitFor(state.server.phase == .ready, "ready")
+        let window = await Snapshot.window(MainView().environment(state), size: CGSize(width: 1120, height: 780), appearance: .aqua)
+        defer { window.orderOut(nil); state.drawer.endAll() }
+        pump(0.5)
+        /// The window drawn now, each row of its pixels as a hash, from the top: drawn at once,
+        /// so that the frames come some 20 ms apart.
+        func rows() throws -> [Int] {
+            let frame = try #require(window.contentView?.superview)
+            let bitmap = try #require(frame.bitmapImageRepForCachingDisplay(in: frame.bounds))
+            frame.cacheDisplay(in: frame.bounds, to: bitmap)
+            let data = try #require(bitmap.bitmapData)
+            return (0..<bitmap.pixelsHigh).map { Data(bytes: data + $0 * bitmap.bytesPerRow, count: bitmap.bytesPerRow).hashValue }
+        }
+        /// The frames drawn through `change` that differ from the one before it, and the one once
+        /// it has stopped changing.
+        func frames(of change: () -> Void) throws -> (drawn: [[Int]], after: [Int]) {
+            let before = try rows()
+            change()
+            var drawn: [[Int]] = []
+            for _ in 0..<15 {
+                pump(0.02)
+                drawn.append(try rows())
+            }
+            pump(1)
+            return (drawn.filter { $0 != before }, try rows())
+        }
+        let scale = CGFloat(try rows().count) / window.frame.height
+        let opening = try frames { state.toggleDrawer() }
+        // Opened: the drawer's edge, 280 points up from the window's bottom; the band from the bar's
+        // last 60 points to the drawer's tabs and the divider under them.
+        let edge = Int((window.frame.height - min(state.drawerHeight, 280)) * scale)
+        let band = Array(opening.after[(edge - Int(60 * scale))..<(edge + Int(38 * scale))])
+        /// How much of the band `frame` shows whole, moved down as far as it shows most of it.
+        func shown(in frame: [Int]) -> Double {
+            let start = edge - Int(60 * scale)
+            return (0...Int(300 * scale)).map { offset in
+                let compared = band.indices.filter { start + offset + $0 < frame.count }
+                guard compared.count >= Int(20 * scale) else { return 0 }
+                return Double(compared.count { band[$0] == frame[start + offset + $0] }) / Double(compared.count)
+            }.max() ?? 0
+        }
+        #expect(!opening.drawn.isEmpty && opening.drawn.allSatisfy { shown(in: $0) >= 0.9 },
+                "opening: \(opening.drawn.map { shown(in: $0) })")
+        let closing = try frames { state.toggleDrawer() }
+        #expect(!closing.drawn.isEmpty && closing.drawn.allSatisfy { shown(in: $0) >= 0.9 },
+                "closing: \(closing.drawn.map { shown(in: $0) })")
+    }
+}
+
+extension DrawerTests {
+    /// The tab picked shows, past the tabs that fill the drawer's width: one added, the last, with
+    /// New Terminal after it, at the strip's end, and the first, picked again, at its start.
+    @Test func theTabPickedShowsPastTheTabsThatFillTheDrawer() async throws {
+        let (state, folder) = AppState.forTests()
+        let window = Self.window(WithDrawer { Color.clear }.environment(state))
+        defer { Self.close(window); state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        state.toggleDrawer()
+        for _ in 0..<11 { state.newTerminal() }
+        /// The tabs' strip, once they are wider than it.
+        func strip() -> NSScrollView? {
+            func scrollViews(in view: NSView) -> [NSScrollView] {
+                view.subviews.flatMap { ($0 as? NSScrollView).map { [$0] } ?? scrollViews(in: $0) }
+            }
+            return window.contentView.flatMap { scrollViews(in: $0).first { ($0.documentView?.frame.width ?? 0) > $0.contentView.bounds.width + 100 } }
+        }
+        try await waitFor(strip() != nil, "the tabs wider than their strip")
+        let scroll = try #require(strip())
+        let document = try #require(scroll.documentView)
+        try await waitFor(scroll.contentView.bounds.maxX >= document.frame.width - 1, "the strip's end")
+        state.drawer.terminal = state.drawer.terminals.first?.id
+        try await waitFor(scroll.contentView.bounds.minX <= 1, "the strip's start")
     }
 }

@@ -4,6 +4,7 @@
 #include "model/WeightMemory.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <optional>
 
@@ -39,8 +40,8 @@ struct WeightResidencyConfig final {
 
 // The weights' release and restore, on the engine's clock. A restore takes
 // back a part per call (WeightMemory::restore), so that the engine answers
-// frames and runs its timed checks between them; the engine runs no request
-// until it ends.
+// frames and runs its timed checks between them, and while a part is written
+// on its thread; the engine runs no request until it ends.
 class WeightResidency final {
 public:
   // Throws std::invalid_argument without the weights or their admission, or
@@ -50,15 +51,23 @@ public:
   [[nodiscard]] bool held() const noexcept;
   // From the first restore() after a release until the restore ends.
   [[nodiscard]] bool restoring() const noexcept { return restoringSince_.has_value(); }
+  // A part taken back is still being written on its thread, which calls the
+  // completion notifier once it ends (WeightMemory::writing).
+  [[nodiscard]] bool writing() const noexcept { return config_.weights->writing(); }
+  // Called on a part's thread as its write ends (WeightMemory).
+  void setCompletionNotifier(const std::function<void()> &notifier) {
+    config_.weights->setCompletionNotifier(notifier);
+  }
   struct Step final {
     enum class Kind : uint8_t { Progress, Restored, Refused } kind;
     metal::AllocationFailure failure = metal::AllocationFailure::None;
   };
-  // Takes back the next part under the admission; the first call starts the
-  // restore. Progress: a part came back and others remain. Restored: the
-  // last came back, which begins an idle period. Refused: admission or the
-  // driver refused the part, which stays released, for `failure`; what came
-  // back stays.
+  // Takes back the next part under the admission, once the part before it is
+  // written (!writing()); the first call starts the restore. Progress: a
+  // part came back and others remain, or it is still to be written.
+  // Restored: the last came back and was written, which begins an idle
+  // period. Refused: admission or the driver refused the part, which stays
+  // released, for `failure`; what came back stays.
   [[nodiscard]] Step restore(double nowMilliseconds);
   // A request waiting for the restore failed at its resource wait limit: the
   // restore counts a failure if it is abandoned.

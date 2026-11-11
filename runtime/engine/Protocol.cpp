@@ -38,6 +38,7 @@ constexpr uint64_t kDoneFixedBytes = 62;
 constexpr uint64_t kErrorFixedBytes = 22;
 constexpr uint64_t kStatusJsonFixedBytes = 8;
 constexpr uint64_t kStartFailedFixedBytes = 26;
+constexpr uint64_t kWarmingFixedBytes = 8;
 
 struct PayloadBounds {
   uint64_t minimum = 0;
@@ -415,6 +416,12 @@ ProtocolIssue invalidEvent(IssueCode code, uint64_t requestId,
                    std::move(message));
 }
 
+std::optional<ProtocolIssue> validateWarming(const WarmingEvent &event) {
+  if (!event.steps || event.stepsDone > event.steps)
+    return invalidEvent(IssueCode::InvalidCount, 0, "warming steps are invalid");
+  return std::nullopt;
+}
+
 std::optional<ProtocolIssue> validateReady(const ReadyEvent &event) {
   if (!event.maxConcurrentRequests || !event.maxContextTokens ||
       !event.vocabularySize || !event.maskRows || event.stopTokens.empty())
@@ -597,8 +604,13 @@ std::optional<ProtocolIssue> validateStatusJson(const StatusJsonEvent &event,
 
 using EncodedEvent = ProtocolResult<std::vector<uint8_t>>;
 
-EncodedEvent encodeWarming() {
-  return success(frameWriter(FrameType::Warming, 0).take());
+EncodedEvent encodeWarming(const WarmingEvent &event) {
+  if (auto issue = validateWarming(event))
+    return failure<std::vector<uint8_t>>(std::move(*issue));
+  Writer writer = frameWriter(FrameType::Warming, kWarmingFixedBytes);
+  writer.u32(event.stepsDone);
+  writer.u32(event.steps);
+  return success(writer.take());
 }
 
 EncodedEvent encodeReady(const ReadyEvent &event) {
@@ -1109,7 +1121,7 @@ serializeEvent(const EngineEvent &event, const ProtocolLimits &limits) {
           } else if constexpr (std::is_same_v<T, StartFailedEvent>) {
             return encodeStartFailed(value, limits);
           } else if constexpr (std::is_same_v<T, WarmingEvent>) {
-            return encodeWarming();
+            return encodeWarming(value);
           } else {
             return encodeStatusJson(value, limits);
           }

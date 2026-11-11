@@ -680,6 +680,60 @@ void testTransfersLandWhileTheWeightsAreRestored() {
           "the request ran before the weights were back");
 }
 
+// While a part of the weights is written on its thread (model::WeightImages),
+// the loop answers frames and ends requests, cancelled or past their
+// deadlines, and the rest of each tick waits for the write's end: no other
+// part comes back, the control pass waits as for a command in flight, and the
+// loop wakes for nothing but a request's deadline and the write's end, which
+// the part's thread signals through the loop's completion notifier. The
+// request runs once every part is written back.
+void testTheLoopAnswersWhileAPartIsWritten() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  Weights &weights = fixture.weights;
+  weights.writes = true;
+  uint32_t wakes = 0;
+  loop.setCompletionNotifier([&wakes] { ++wakes; });
+  loop.announceReady(protocol::peer::kTestReady);
+  require(!releaseAnswer(fixture, 1).restoring && weights.released(), "the weights were not released");
+  constexpr double kDeadline = 200.0;
+  protocol::RequestFrame shortLived = request(2);
+  shortLived.remainingDeadlineMicros = static_cast<uint64_t>(1000.0 * kDeadline);
+  require(loop.receive(protocol::peer::serialize(request(1))) &&
+              loop.receive(protocol::peer::serialize(shortLived)) && loop.tick() && weights.writing() &&
+              weights.held() == 1,
+          "the restore did not start writing its first image");
+  require(!loop.tick() && weights.restores == 1 && loop.commandInFlight() &&
+              loop.millisecondsUntilNextWakeup() == kDeadline,
+          "the loop went on, or woke for more than the requests' deadlines, while an image was written");
+  require(loop.receive(protocol::peer::serialize(protocol::StatusRequestFrame{77})) &&
+              answeredStatus(fixture, 77) && loop.weightsSnapshot().restoring,
+          "the loop did not answer status while an image was written");
+  require(loop.receive(protocol::peer::serialize(request(3))) &&
+              loop.receive(protocol::peer::serialize(protocol::CancelFrame{3})) &&
+              loop.statusSnapshot().cancelled == 1,
+          "a request cancelled while an image was written did not end at once");
+  fixture.monotonic += kDeadline;
+  require(loop.tick() && errorOf(fixture, 2) && errorOf(fixture, 2)->code == "deadline_exceeded" &&
+              weights.restores == 1 && weights.writing(),
+          "a request whose deadline passed while an image was written did not end then");
+  weights.endWrite();
+  require(wakes == 1 && !loop.commandInFlight(), "the write's end did not wake the loop");
+  while (weights.released()) {
+    require(loop.tick(), "the restore did not go on once the image was written");
+    if (weights.writing()) {
+      weights.endWrite();
+      require(wakes == weights.restores, "the end of a later image's write did not wake the loop");
+    }
+  }
+  require(weights.restores == Weights::kImages && loop.weightsSnapshot().restores == 1,
+          "the restore did not take every image back, each once");
+  runUntilIdle(loop);
+  require(loop.statusSnapshot().completed == 1, "the request did not run once every image was written back");
+}
+
 // Each request waiting for the weights waits for memory on its own clock, as
 // a start refused memory does: the engine's resource wait counts it from its
 // first refusal, and one that came later fails at its own limit, not at the
@@ -887,6 +941,7 @@ std::span<const test::TestCase> weightsTests() {
       {"testHoldingRequestsSpansFirstToLastRequest", testHoldingRequestsSpansFirstToLastRequest},
       {"testDeadlineEndsARequestWaitingForTheWeights", testDeadlineEndsARequestWaitingForTheWeights},
       {"testTransfersLandWhileTheWeightsAreRestored", testTransfersLandWhileTheWeightsAreRestored},
+      {"testTheLoopAnswersWhileAPartIsWritten", testTheLoopAnswersWhileAPartIsWritten},
       {"testRequestsWaitForTheWeightsEachOnItsOwnClock", testRequestsWaitForTheWeightsEachOnItsOwnClock},
       {"testRestoreTriesAgainAtTheLimit", testRestoreTriesAgainAtTheLimit},
       {"testARestoredRequestWaitsAfreshAtItsStart", testARestoredRequestWaitsAfreshAtItsStart},

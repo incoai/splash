@@ -166,7 +166,7 @@ def engine_events():
             0,
             b"a start command ran out of GPU memory",
         ),
-        "warming": p.WarmingEvent(),
+        "warming": p.WarmingEvent(3, 9),
         "start": p.StartEvent(91, 2, 4096),
         "prompt_progress": p.PromptProgressEvent(91, 2048, 123456),
         "tokens": p.TokensEvent(91, 17, (10, 11, 12)),
@@ -332,8 +332,16 @@ class ProtocolPythonTests(unittest.TestCase):
         )
 
     def test_ready_and_start_failure_validation(self):
-        """Ready names its tokens and the start failure its class, each
-        within what the engine may send."""
+        """Warming counts its steps, Ready names its tokens and the start
+        failure its class, each within what the engine may send."""
+        # A warm-up has steps, and no more of them done than it has.
+        for event in (p.WarmingEvent(0, 0), p.WarmingEvent(10, 9)):
+            with self.subTest(event=event):
+                self.assert_fatal_event(p.IssueCode.INVALID_COUNT, event)
+        # A warming payload without its counts is below the minimum.
+        warming = native_peer.serialize_event(p.WarmingEvent(3, 9))
+        empty = mutate_u64(warming[: p.FRAME_HEADER_BYTES], 8, 0)
+        self.assertEqual(parser_issue(empty).code, p.IssueCode.INVALID_PAYLOAD_LENGTH)
         for event in (
             p.ReadyEvent(4, 4096, False, 64, 9, ()),
             p.ReadyEvent(4, 4096, False, 64, 9, (1, 64)),
