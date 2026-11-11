@@ -44,9 +44,8 @@ inline constexpr uint32_t kPrefillGroupChunks = 4;
 inline constexpr uint32_t kTileRows = kv::kPageTokens;
 inline constexpr uint32_t kRaggedAttentionRows =
     kPrefillRows + kLaneCount * (kTileRows - 1);
-inline constexpr uint32_t kDraftCacheStride = ExecutionLimits::draftContextTokens;
 inline constexpr uint32_t kMaximumPageTableEntries =
-    (kv::kMaximumPhysicalTokens + kv::kPageTokens - 1) / kv::kPageTokens;
+    (kv::kMaximumSupportedPhysicalTokens + kv::kPageTokens - 1) / kv::kPageTokens;
 
 struct RuntimeGeometry final {
   QwenTargetGeometry target;
@@ -69,16 +68,20 @@ struct RuntimeGeometry final {
   // reads spilled K/V.
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model,
                                             kv::Format kvFormat,
-                                            ops::GdnStateFormat stateFormat) {
-    return from(model, kvFormat, stateFormat, StreamedParts::loaded(model));
+                                            ops::GdnStateFormat stateFormat, ops::DecodeGeometry execution = {}) {
+    return from(model, kvFormat, stateFormat, StreamedParts::loaded(model), execution);
   }
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model, kv::Format kvFormat,
-                                            ops::GdnStateFormat stateFormat, StreamedParts parts) {
+                                            ops::GdnStateFormat stateFormat, StreamedParts parts, ops::DecodeGeometry execution = {}) {
     RuntimeGeometry result;
     result.draft = model.draft.layout;
     result.target = std::visit(
         [&](const auto &weights) { return qwenTargetGeometry(weights, result.draft.targetLayerIds()); },
         model.target);
+    result.target.execution = execution;
+    if (execution.rows() == 16 && (!result.draft.isDSpine() || result.target.ffnKind != QwenFfnKind::Dense ||
+                                  parts.kv || model.stateLayout(stateFormat).target.auxiliaryBytes))
+      throw std::invalid_argument("sixteen-row execution requires a dense DSpine runtime");
     result.target.kvLayout = model.targetKvLayout(kvFormat);
     result.target.stateLayout = model.stateLayout(stateFormat).target;
     result.target.ropeScaling = model.descriptor.ropeScaling;
@@ -100,6 +103,15 @@ struct RuntimeGeometry final {
         },
         model.target);
     return result;
+  }
+
+  // The longest verify startup may prepare within both the model's window
+  // and the operators' served-context scratch bound. A smaller context than
+  // one fixed verify block warms a block with no prior history.
+  [[nodiscard]] uint32_t warmupVerifyHistory(const ops::ExecutionPlans &operators) const noexcept {
+    const uint32_t bound = operators.maximumHistoryTokens();
+    const uint32_t context = bound ? std::min(target.contextTokens(), bound) : target.contextTokens();
+    return context > target.execution.rows() ? context - target.execution.rows() : 0;
   }
 
   [[nodiscard]] uint32_t draftRotaryPairs() const noexcept {
@@ -425,6 +437,14 @@ enum class DecodeTensor : uint32_t {
   DraftResidual,
   DraftIntermediate,
   DraftFinalHidden,
+  BridgeRaw,
+  BridgeRms,
+  BridgeCodes,
+  BridgePacked,
+  BridgeMessage,
+  BridgeCandidateHead,
+  BridgeRefineMessage,
+  BridgeRefineState,
   SelectorHidden,
   Candidates,
   Unary,

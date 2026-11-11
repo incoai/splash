@@ -25,17 +25,17 @@ void validate(LinearWorkload w) {
         w.epilogue == LinearEpilogue::GateUp)
       throw std::invalid_argument("invalid linear prefill workload");
   } else {
-    if (!w.rows || w.rows % SPLASH_TARGET_VERIFY_ROWS ||
-        w.rows > SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH ||
+    if (!w.rows || w.rows % w.geometry.rows() ||
+        w.rows > w.geometry.rows() * SPLASH_MAXIMUM_BATCH_WIDTH ||
         w.epilogue == LinearEpilogue::UpWithGate)
       throw std::invalid_argument("invalid linear decode workload");
   }
 }
 
-LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue) {
+LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue, DecodeGeometry geometry) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid linear decode batch width");
-  return {matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
+  return {matrix, lanes * geometry.rows(), LinearPhase::Decode, epilogue, geometry};
 }
 
 // LinearScratch::rotated bytes of `rows` bf16 rows of `width` inputs, which
@@ -60,6 +60,22 @@ void requireLeadingInputs(const LinearPlan &plan, const Projection &p) {
 void requirePlaneViews(const Projection &p) {
   if (p.takesPlaneViews()) return;
   throw std::invalid_argument("views of a projection's planes take one unrotated quantized tensor, not a view");
+}
+
+// The measured 27B full-attention input is packed Q, K and V, in that order.
+// Other partitions of the same output width do not inherit its reduction.
+bool measuredAttentionLayout(const Projection &p) noexcept {
+  const auto &segments = p.blocks().segments;
+  if (p.outputSize != 14336 || p.inputSize != 5120 || p.rotation || p.planeInputs() || segments.size() != 3)
+    return false;
+  constexpr std::array<uint32_t, 3> widths{12288, 1024, 1024}, offsets{0, 12288, 13312};
+  for (uint32_t i = 0; i < segments.size(); ++i) {
+    const auto &s = segments[i];
+    if (s.isFloat() || s.formatId != GGUF_FMT_AF4G64 || s.inputSize != 5120 ||
+        s.outputSize != widths[i] || s.columnOffset != offsets[i])
+      return false;
+  }
+  return true;
 }
 
 } // namespace
@@ -105,12 +121,12 @@ Projection Projection::leadingInputs(uint32_t inputs) const {
 // Table16 holds its sums per eight-row tile (metal/abi/Gguf.h), a lane's rows.
 uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept {
   return layout == LinearInput::Table16
-             ? rows / SPLASH_TARGET_VERIFY_ROWS * table16_sums_per_tile(width) * sizeof(float)
+             ? rows / GGUF_TABLE16_ROWS * table16_sums_per_tile(width) * sizeof(float)
              : 0;
 }
 
 void requireTableScratch(const LinearScratch &scratch, LinearInput layout, uint32_t width, uint32_t rows) {
-  if (layout == LinearInput::Plain || !rows || rows % SPLASH_TARGET_VERIFY_ROWS || width % 64)
+  if (layout == LinearInput::Plain || !rows || rows % GGUF_TABLE16_ROWS || width % 64)
     throw std::invalid_argument("invalid linear table geometry");
   requireBytes(scratch.input, tableBytes(width, rows), "linear table");
   requireBytes(scratch.sums, tableSumsBytes(layout, width, rows), "linear table sums");
@@ -142,8 +158,12 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   requireConfiguration();
 }
 
-Linear::Linear(const DeviceCapabilities &device, Int8Activations int8Activations) noexcept
-    : calibration_(KernelCalibration::of(device)), int8Activations_(int8Activations) {}
+Linear::Linear(const DeviceCapabilities &device, DecodeGeometry geometry) noexcept
+    : Linear(device, Int8Activations::Off, geometry) {}
+Linear::Linear(const DeviceCapabilities &device, Int8Activations int8Activations, DecodeGeometry geometry) noexcept
+    : geometry_(geometry), calibration_(KernelCalibration::of(device)),
+      measuredM5Pro20_(device.appleGpuFamily == 10 && device.gpuCoreCount == 20 &&
+                        device.deviceName == "Apple M5 Pro"), int8Activations_(int8Activations) {}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
   // The None and Residual plans share a tile; a gate/up pair of one format
@@ -151,7 +171,7 @@ uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
   UnitFormats unit = unitFormats(shape);
   uint32_t storage = 0;
   for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::GateUp}) {
-    const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, epilogue};
+    const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, epilogue, geometry_};
     validate(w);
     unit.oneFormat = epilogue == LinearEpilogue::GateUp;
     storage = std::max(storage, LinearPlan(w, selectProjection(calibration_, int8Activations_, w, unit)).storageRows());
@@ -160,6 +180,7 @@ uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
 }
 
 LinearPlan Linear::plan(LinearWorkload workload) const {
+  workload.geometry = geometry_;
   validate(workload);
   return LinearPlan(workload, selectProjection(calibration_, int8Activations_, workload, {}));
 }
@@ -167,27 +188,59 @@ LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config, FloatOutpu
   return LinearPlan(workload, config, destination);
 }
 LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection *gate) const {
+  w.geometry = geometry_;
   validate(w);
   const std::array<const Projection *, 2> projections{&p, gate};
   // A gate/up pair's 16-row tile follows its tensors' own formats.
   std::array<UnitFormats, 2> tensors{};
   const bool pair = w.epilogue == LinearEpilogue::GateUp && gate;
   if (pair) tensors = {unitFormats(std::span(&projections[0], 1)), unitFormats(std::span(&projections[1], 1))};
-  LinearPlan plan(w,
-                  selectProjection(calibration_, int8Activations_, w, unitFormats(projections),
-                                   pair ? std::span<const UnitFormats>(tensors) : std::span<const UnitFormats>{}),
-                  p.destination);
+  LinearConfig config = selectProjection(calibration_, int8Activations_, w, unitFormats(projections),
+      pair ? std::span<const UnitFormats>(tensors) : std::span<const UnitFormats>{});
+  // The 27B AF4G64 M64 pair spends most of a wide sixteen-row cycle in its
+  // fused pass on this GPU. Keep its selected K split and arithmetic, and
+  // run the existing gate and up passes separately. Other devices, shapes,
+  // formats and eight-row execution retain their calibrated choice.
+  const auto af4 = [](const Projection &projection) {
+    const auto &segments = projection.blocks().segments;
+    return segments.size() == 1 && segments.front().formatId == GGUF_FMT_AF4G64;
+  };
+  if (measuredM5Pro20_ && w.phase == LinearPhase::Decode && geometry_.rows() == 16 &&
+      w.rows > 32 && w.matrix.outputSize == 17408 && w.matrix.inputSize == 5120 &&
+      config.tile == LinearTile::GgufStaged && config.oneGateUpPass && pair && af4(p) && af4(*gate))
+    config.oneGateUpPass = false;
+  const auto wholeAf4 = [&](const Projection &projection) {
+    const auto &segments = projection.blocks().segments;
+    return af4(projection) && !segments.front().isFloat() && !projection.rotation && !projection.planeInputs() &&
+           segments.front().columnOffset == 0 && segments.front().outputSize == w.matrix.outputSize &&
+           segments.front().inputSize == w.matrix.inputSize;
+  };
+  if (measuredM5Pro20_ && w.phase == LinearPhase::Decode && geometry_.rows() == 16 && w.rows == 48 &&
+      w.matrix.outputSize == 17408 && w.matrix.inputSize == 5120 && config.tile == LinearTile::GgufStaged &&
+      !config.oneGateUpPass && pair && p.destination == FloatOutput::BFloat16 &&
+      gate->destination == FloatOutput::BFloat16 && wholeAf4(p) && wholeAf4(*gate))
+    config.computeRows = 48;
+  // Preserve the eight-row path's two-partition attention reduction at one
+  // sixteen-row lane. Its changed reduction at one partition can change
+  // target logits and speculative acceptance. Keep this measured correction
+  // local to the actual Q/K/V layout; other shapes and widths keep the law.
+  if (measuredM5Pro20_ && w.phase == LinearPhase::Decode && geometry_.rows() == 16 && w.rows == 16 &&
+      w.epilogue == LinearEpilogue::None && !gate && w.matrix.outputSize == 14336 &&
+      w.matrix.inputSize == 5120 && config.tile == LinearTile::GgufStaged && config.splits == 1 &&
+      p.destination == FloatOutput::BFloat16 && measuredAttentionLayout(p))
+    config.splits = 2;
+  LinearPlan plan(w, config, p.destination);
   plan.rotated_ = static_cast<bool>(p.rotation);
   return plan;
 }
 
 LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogue epilogue,
                               const Projection *gate) const {
-  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p, gate);
+  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue, geometry_), p, gate);
 }
 LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue,
                                uint32_t chunkRows) const {
-  const LinearWorkload w{{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue};
+  const LinearWorkload w{{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue, geometry_};
   if (!chunkRows || chunkRows == rows) return plan(w, p);
   if (rows > chunkRows) throw std::invalid_argument("a prefill plan takes rows of its chunk");
   const LinearPlan chunk = plan({w.matrix, chunkRows, LinearPhase::Prefill, epilogue}, p);
@@ -201,9 +254,9 @@ LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
   for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
       bound.include(
-          ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue), shape.registerFormats));
+          ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue, geometry_), shape.registerFormats));
   // Decode plans store at most every lane's rows.
-  if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, kMaximumDecodeTileRows);
+  if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, geometry_.rows() * SPLASH_MAXIMUM_BATCH_WIDTH);
   return bound;
 }
 

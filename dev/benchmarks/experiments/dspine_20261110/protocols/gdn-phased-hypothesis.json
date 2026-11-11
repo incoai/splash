@@ -1,0 +1,24 @@
+{
+  "frozen_utc": "2026-11-10T07:01:22.243291+00:00",
+  "name": "GDN phased shared-memory lifetime reuse",
+  "status": "Implementedin2isolatedworktrees; queuedbuild/oracles/profiles/modelparityaftersamplingandbeforethenewnativeABBAgroups. No resultsyet.",
+  "motivation": "Fullcompact8rowkernel removes sharedpendingK/V butpairedB4fullpending8is~9%slower inall3groups(noise3.7..4.2%). Keep pendingkeys/values insharedmemory duringtheirhotrecurrence instead of rereading device pervaluebatch. Reduce peak live sharedspacebyseparating pendingcommit and currentqueryscan.",
+  "algorithm": [
+    "Phase1loadpendingK/V+gates into shared union; foldallpendingrowsintostateout, preservingoriginalper-state FP32arithmeticorder.",
+    "Barrier(mem_device|mem_threadgroup), endingpendingoperandlifetime.",
+    "Phase2overwriteunionwithcurrentQ/K/V/rows; runoriginalconv/query/keyprepare, storecurrentgates instepTape. Barrierdevice+threadgroup.",
+    "Reload FP32committedstateout andscan currentrows, same arithmeticandRowsInFlight2;writerecurrentrows tosharedunion. Barrierthreadgroup thenoriginalgate.",
+    "Useunionmax4*Rows*128*2bytes=8192for8,16384for16. Pendingphase2arrays+gates is smaller. Noextrabuffer/GPUcommand;anextra FP32state read andbarrierare realcost."
+  ],
+  "correctness_scope": "Base48valueheads/BF16norm/FP32state/plainentryonly. Othernorm/state/layout/shape pathsremainlegacy. BF16state cannotreloadroundedstateoutwhilepreserving originalF32currentstartstate, so excludeit. Modeldescriptors/quantization/outputsunchanged.",
+  "risk": "Extra state read (144MiB percycle/B1 at48layers,4x atB4) may negate lowerthreadgroupmemory. It may hitGPUcache but no hardwarecounterclaim. Unionreuse requires everythreadgroupwrite tofinish before reuse. Preserve all tapelifetime/aliasguards and operation order.",
+  "validation_plan": "New isolated8M16and16wide worktrees; unchangedfull8rowGDNsuite andplain16oracle; bitwiselegacy/newstate/hidden/tape, actualdeviceTGbytes, same-libraryoperatorABBA, profiles and31caseoutput/cycleparity. No newstatisticalnomination or tuningfromsampledoutputs. Ifnonbeneficialretainnegativefinding.",
+  "implementation_amendment_utc": "2026-11-10T07:06:50.012643+00:00",
+  "implementation": "FourtypedBF16arrays reusedwithchangedphasemeaning, no unionorpointercasts. Phase1queries/keys holdpendingK/V;scalarpendinggatesreadstabletape. Afterwhole-groupdevice+TGbarrier, Phase2overwritesarrayswithcurrentQ/K/V/rows andreads currentgatesfromstepTape. ExtraFP32committedstateoutreload; BF16state stayslegacy.",
+  "operator_protocol": "Same-librarylegacy/phased8or16, B1..B4,pending0/1/Rows/2/Rows. Bitwiseallhidden/state/tapebytes checkbeforetiming. Pipelinespreparedfirst,3untimedpairs,exactly3ABBAgroups,512logicalopspercommand. Longerthan64-opcompactstudytoimprovecommadtimestampresolution;notwholemodelqualification. Allfailuresretained.",
+  "prebuild_control_amendment_utc": "2026-11-10T07:08:44.112850+00:00",
+  "same_binary_control": "Research-onlySPLASH_GDN_PHASED defaults1(newkernel),0selectslegacyalias onlyforbase48headsBF16norm/FP32state/plainentry. Otherpathsuntouched. Allowsfixedsame-binarywhole-modelcomparisonifnominatedafteroperator/model screens. Allqueuedcandidatechecks/profilesexplicitlyset1. No productionenvswitchorcrossdeviceclaim.",
+  "empty_pending_prebuild_amendment_utc": "2026-11-10T07:22:59.804116+00:00",
+  "empty_pending_fast_path": "Beforeanyphasedbuild/results, skipseparatecommitwhenpending==0. Current scan usesoriginalstateIn, copiescommittedFP32stateOutpervaluebatchbeforecurrentqueryscan, asoriginalsingle-readflow. Withpending>0,thephasedcommit/reloadremains. Branchandbarriersareuniformperthreadgroup. NoBF16statechange.",
+  "resource_interpretation": "MTLDevice.maxThreadgroupMemoryLength=32768 is a per-threadgroup limit. It is not the per-core shared-memory budget. SmallerstaticTGfootprint alone doesnot establish residentgroupcount or occupancygain; those remainhypotheses withoutGPUcounters. Newgate/uppartitioned kernelsactuallyincreasestaticsharedmemorywhileloweringperSIMDaccumulatorrows."
+}

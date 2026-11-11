@@ -52,6 +52,7 @@ inline constexpr uint32_t kProjectedOutputTokens = 4096;
 struct EngineConfig final {
   uint32_t maxContext = 0;
   uint32_t vocabularySize = 0;
+  uint32_t draftContextTokens = model::ExecutionLimits::draftContextTokens;
   // Patches per image the server's --max-image-pixels allows; zero rejects
   // images.
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
@@ -1100,8 +1101,8 @@ private:
   // The KV a lane's command takes before it runs. A prefill command's KV
   // reaches its first state boundary first; what lies past it follows once
   // that state has its buffers (reserveCaptures).
-  [[nodiscard]] static uint64_t workEndOf(const Request &active, const BatchItem &scheduled,
-                                          bool prefill) noexcept;
+  [[nodiscard]] uint64_t workEndOf(const Request &active, const BatchItem &scheduled,
+                                          bool prefill) const noexcept;
   // Beside a lane of its command that ended, a lane gives that command up in
   // place of its suspension; the next tick plans again either way.
   [[nodiscard]] Prepared yieldLane(Request &lane, uint64_t workEnd,

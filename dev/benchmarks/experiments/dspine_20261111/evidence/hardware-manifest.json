@@ -1,0 +1,14 @@
+{
+  "kind": "hardware",
+  "created_utc": "2026-11-11T01:25:26.857548+00:00",
+  "archive": "hardware.jsonl.gz",
+  "archive_bytes": 13036861,
+  "archive_sha256": "59e449418652f127ad7c2e12ee06adc2e12c46a9a86c428995352ef72c072f90",
+  "files": {
+    "results/hardware.jsonl": {
+      "bytes": 123134364,
+      "sha256": "3de69ebafe85f3a8bdce637ab094b9fab7ab2ea1767183364a3691e103acb784"
+    }
+  },
+  "scope": "Original bytes and relative layout. Absolute provenance keys inside receipts are unchanged. No compiled artifacts, model weights, physical HTTP cache payloads or Apple documents. The logit archive contains derived pre-policy outputs; the hardware archive contains raw telemetry."
+}

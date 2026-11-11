@@ -1,0 +1,11 @@
+{
+  "utc": "2026-11-11T10:50:01.792695+00:00",
+  "old_head": "37bdd4f8710319bfad43709de2725df89ef776d3",
+  "frozen_source_commit": "fa62be81f2e9c48959f10a96ae3866a30c824075",
+  "upstream": "767c646ed91eb45a1e13a59525da7373123ac4cf",
+  "integration_tree": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/integration",
+  "main_state": "Frozen tested core committed; only two review documentation edits remain tracked and uncommitted. Working tree bytes preserved; user desktop remains untracked.",
+  "core_patch_sha256": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d",
+  "docs_patch_sha256": "df67a5499127469afd6b41af9489287e643772d1dce1f2b5731c7a285c0a2200",
+  "integration_status": "Separate real merge in progress; agents edit disjoint scopes; parent owns staging/builds/GPU. Benchmarks remain tied to frozen source and will not be relabeled as integrated-head evidence."
+}

@@ -312,6 +312,13 @@ void testInvalidInputs() {
 
 int main() {
   try {
+    const auto wider = planDraftContext(0, 20000, {}, 8192);
+    require(wider.captureSpans.size() == 1 && wider.captureSpans[0].begin == 11808 &&
+        wider.captureSpans[0].end == 20000 && wider.captureSpans[0].resetDraftState,
+        "DSpine cold replay did not capture its 8192-token window");
+    const auto resumed = planDraftContext(12288, 16000, {}, 8192);
+    require(resumed.restoresDraftState && resumed.captureSpans[0].begin == 12288 &&
+        !resumed.captureSpans[0].resetDraftState, "DSpine short suffix lost its restored window");
     testColdLengths();
     testPartialHit();
     testFinalFullBlockBound();

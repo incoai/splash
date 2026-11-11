@@ -159,6 +159,9 @@ struct Measurement final {
   uint64_t junctionMaterializations = 0;
   std::vector<uint32_t> outputTokens;
   std::optional<bool> coldOutputMatch;
+  // Opt-in single-request acceptance trace. A batch's accepted count is a
+  // prefix length; the final cycle can be censored by EOS or the token cap.
+  std::vector<BatchObservation> draftCycles;
 };
 
 struct DecodeThroughputMeasurement final {
@@ -408,7 +411,7 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
                        ProgressJournal *progress, uint64_t requestId,
                        std::string scenario, uint32_t sample,
                        std::vector<uint32_t> tokens,
-                       uint32_t maxNewTokens = 1) {
+                       uint32_t maxNewTokens = 1, bool traceDrafts = false) {
   const uint32_t promptTokens = static_cast<uint32_t>(tokens.size());
   const uint64_t inputTokenHash = tokenSequenceHash(tokens);
   if (progress)
@@ -427,11 +430,17 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
   std::vector<uint32_t> prefillBatchRows;
   prefillBatchRows.reserve(
       promptTokens / model::ExecutionLimits::prefillTokenBudget + 3);
+  std::vector<BatchObservation> draftCycles;
   const auto began = Clock::now();
   engine.submit(std::move(request));
   driver.untilIdle([&](const BatchObservation &batch) {
     if (batch.kind == WorkKind::Prefill)
       prefillBatchRows.push_back(batch.inputTokens);
+    else if (traceDrafts) {
+      if (batch.width != 1)
+        throw std::runtime_error("acceptance tracing requires one request per batch");
+      draftCycles.push_back(batch);
+    }
   });
   const auto ended = Clock::now();
   const model::ModelTelemetry after = executor.telemetry();
@@ -467,6 +476,7 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
   result.junctionMaterializations = engineAfter.junctionMaterializations -
                                     engineBefore.junctionMaterializations;
   result.outputTokens = observed.outputTokens;
+  result.draftCycles = std::move(draftCycles);
   if (progress) {
     progress->complete(
         "request", result.scenario, result.sample, result.promptTokens, 0,
@@ -659,7 +669,7 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
   // A cycle counts the proposals each lane verified: seven, or fewer once the
   // lane's output budget leaves less than its block to retain.
   if (draftedTokens > uint64_t{width} * decodeBatches *
-                          model::ExecutionLimits::draftProposalTokens ||
+                          (executor.decodeRows() - 1) ||
       acceptedDraftTokens > draftedTokens) {
     throw std::runtime_error("decode throughput DFlash accounting is invalid");
   }
@@ -711,6 +721,16 @@ void emitMeasurement(const Measurement &value, bool first) {
     std::cout << value.outputTokens[index];
   }
   std::cout << ']';
+  if (!value.draftCycles.empty()) {
+    std::cout << ",\"draft_cycles\":[";
+    for (size_t i = 0; i < value.draftCycles.size(); ++i) {
+      const auto &cycle = value.draftCycles[i];
+      std::cout << (i ? "," : "") << "{\"drafted_tokens\":" << cycle.draftedTokens
+                << ",\"accepted_draft_tokens\":" << cycle.acceptedDraftTokens
+                << ",\"output_tokens\":" << cycle.outputTokens << '}';
+    }
+    std::cout << ']';
+  }
   if (value.coldOutputMatch)
     std::cout << ",\"cold_output_match\":"
               << (*value.coldOutputMatch ? "true" : "false");
@@ -802,10 +822,11 @@ struct BenchmarkScenarios final {
   bool exact = false;
   bool logits = false;
   bool resume = false;
+  bool acceptance = false;
 };
 
 BenchmarkScenarios parseScenarios(std::string_view value) {
-  BenchmarkScenarios selected{false, false, false, false, false, false, false, false};
+  BenchmarkScenarios selected{false, false, false, false, false, false, false, false, false};
   for (;;) {
     const size_t comma = value.find(',');
     const std::string_view name = value.substr(0, comma);
@@ -817,6 +838,7 @@ BenchmarkScenarios parseScenarios(std::string_view value) {
                      : name == "exact"       ? &selected.exact
                      : name == "logits"      ? &selected.logits
                      : name == "resume"      ? &selected.resume
+                     : name == "acceptance"  ? &selected.acceptance
                                              : nullptr;
     if (!scenario)
       throw std::invalid_argument("unknown benchmark scenario");
@@ -899,12 +921,12 @@ int main(int argc, char **argv) {
   try {
     if (argc < 3) {
       std::cerr << "usage: backend-benchmark METALLIB MODEL_ROOT "
-                   "[--samples COUNT] [--progress PATH] "
+                   "[--samples COUNT] [--progress PATH] [--draft-block-size 8|16] "
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
                    "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
                    "[--activations auto|bf16] "
                    "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
-                   "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
+                   "  NAME: decode, partial, short, transcripts, context, exact, logits, resume or acceptance "
                    "(default: decode,partial,context)\n"
                    "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
                    "to run instead of calibrating one (0: GPU alone)\n"
@@ -926,6 +948,7 @@ int main(int argc, char **argv) {
     std::optional<double> aneFfnShare;
     std::optional<uint32_t> aneFfnMinimumRows;
     uint32_t maxContext = 0;
+    uint32_t draftBlockSize = 8;
     ops::Int8Activations int8Activations = ops::Int8Activations::On;
     std::optional<std::filesystem::path> logitsDirectory, logitsFrom;
     uint32_t logitsWidth = 1;
@@ -934,7 +957,11 @@ int main(int argc, char **argv) {
       if (index + 1 >= argc)
         throw std::invalid_argument("benchmark option requires a value");
       const std::string_view option(argv[index]);
-      if (option == "--samples") {
+      if (option == "--draft-block-size") {
+        const std::string_view value(argv[index + 1]);
+        if (value != "8" && value != "16") throw std::invalid_argument("--draft-block-size takes 8 or 16");
+        draftBlockSize = value == "16" ? 16 : 8;
+      } else if (option == "--samples") {
         samples = parseSamples(argv[index + 1]);
       } else if (option == "--progress") {
         progressPath = std::filesystem::path(argv[index + 1]);
@@ -982,6 +1009,7 @@ int main(int argc, char **argv) {
     // round to round: every cycle verifies every row (--verify-rows all), and
     // the times measure the backend, not the budget.
     config.verifyRows = model::VerifyRows::All;
+    config.draftBlockSize = draftBlockSize;
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
@@ -1081,6 +1109,7 @@ int main(int argc, char **argv) {
     engine::EngineConfig engineConfig;
     engineConfig.maxContext = bootstrap->nativeLoop().statusSnapshot().maximumContextTokens;
     engineConfig.vocabularySize = capabilities.vocabularySize;
+    engineConfig.draftContextTokens = config.model.draft.contextTokens;
     engine::connectToGovernor(engineConfig, resources->memoryGovernor());
     engine::Engine engine(engineConfig, resources->cache(),
                                   *executor, events);
@@ -1438,6 +1467,22 @@ int main(int argc, char **argv) {
       }
     }
 
+    // The same four Qwen-tokenized coding prompts as draft_comparison.py.
+    // Record each single-lane cycle's accepted prefix for position survival
+    // analysis, leaving the other scenarios' timings and output unchanged.
+    if (selected.acceptance) {
+      for (uint32_t sample = 0; sample < samples; ++sample) {
+        for (uint32_t index = 0; index < benchmark::kDraftComparisonPrompts.size(); ++index) {
+          const auto question = benchmark::kDraftComparisonPrompts[index];
+          evictAllCache(resources->cache());
+          measurements.push_back(runRequest(
+              engine, driver, *executor, events, progress.get(), requestId++,
+              "acceptance_" + std::to_string(index), sample,
+              std::vector<uint32_t>(question.begin(), question.end()), 256, true));
+        }
+      }
+    }
+
     // The full-vocabulary logits after prefixes of greedy transcripts of the
     // real requests (TranscriptPrompts.hpp), 256 answer tokens each, 16
     // prefixes into each answer, or after the prefixes an earlier dump
@@ -1580,7 +1625,7 @@ int main(int argc, char **argv) {
               << ",\"ane_ffn_minimum_rows\":" << ranAneFfnMinimumRows
               << ",\"geometry\":{\"prefill_rows\":"
               << model::ExecutionLimits::prefillTokenBudget
-              << ",\"verify_rows\":" << model::ExecutionLimits::targetVerifyRows
+              << ",\"verify_rows\":" << executor->decodeRows()
               << ",\"batch_width\":" << model::ExecutionLimits::maximumBatchWidth
               << ",\"kv_block_tokens\":"
               << kv::kPageTokens

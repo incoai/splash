@@ -18,7 +18,15 @@ namespace splash::ops {
 // changes after creation.
 class ExecutionPlans final {
 public:
-  explicit ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations);
+  // A nonzero history bound sizes verify scratch for the served context;
+  // zero preserves the global maximum for standalone plans and automatic starts.
+  explicit ExecutionPlans(const DeviceCapabilities &device, DecodeGeometry geometry = {},
+                           uint32_t maximumHistoryTokens = 0);
+  explicit ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations,
+                           DecodeGeometry geometry = {}, uint32_t maximumHistoryTokens = 0);
+  [[nodiscard]] DecodeGeometry geometry() const noexcept { return linear_.geometry(); }
+  [[nodiscard]] uint32_t maximumHistoryTokens() const noexcept { return maximumHistoryTokens_; }
+  [[nodiscard]] uint32_t maximumVerifySplits() const noexcept { return maximumVerifySplits_; }
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
   // A DFlash2 draft's plans: linear()'s in bf16 activations
   // (Int8Activations::Off), so no prefill chunk runs the int8 prefill tile.
@@ -66,6 +74,8 @@ public:
 private:
   Linear linear_;
   Linear draftLinear_;
+  uint32_t maximumHistoryTokens_ = 0;
+  uint32_t maximumVerifySplits_ = kv::kVerifyMaximumSplits;
 };
 
 } // namespace splash::ops

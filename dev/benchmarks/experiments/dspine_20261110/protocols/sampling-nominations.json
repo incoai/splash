@@ -1,0 +1,47 @@
+{
+  "frozen_utc": "2026-11-10T06:19:56.207884+00:00",
+  "control": {
+    "name": "stock8",
+    "jobs": [
+      "sampling-control-c0",
+      "sampling-control-c1",
+      "sampling-control-c2"
+    ],
+    "seed_start": 0
+  },
+  "candidates": [
+    {
+      "name": "DSpine16-existing-wide-two-pass",
+      "jobs": [
+        "sampling-wide-twopass64-c0",
+        "sampling-wide-twopass64-c1",
+        "sampling-wide-twopass64-c2"
+      ],
+      "seed_start": 100000,
+      "source_base": "33a488d4bbb3978b32b34e8bfc6cefa92e350d7f",
+      "source_patch_sha256": "da6072796a475bd37c6e60aa90678c13e75d5b42321264942e996eac8d82f3d7",
+      "runtime_env": {
+        "SPLASH_GATE_UP_TWO_PASS64": "1"
+      },
+      "scope": "Original16-row shaders; host-only wide-gate/up pass change, noSGrowpartitionkernel.",
+      "source_patch_path": "/Users/linson/Documents/ai/splash-dspine-investigation-20261110/patches/wide-policy-frozen.patch",
+      "artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-investigation-20261110/artifacts/study-wide-policy/study-driver": "9b7a35f20a8daa89c8bb90d7b05bb360f9959cf18781cb8078d8e2a3f0fd5643",
+        "/Users/linson/Documents/ai/splash-dspine-investigation-20261110/artifacts/study-wide-policy/splash.metallib": "3cb1d5e7ed7bf343aa1cc22460ced3dec2bcbb628437bce2ea6a2f6b6a03ffb9",
+        "/Users/linson/Documents/ai/splash-dspine-investigation-20261110/artifacts/study-wide-policy/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+        "/Users/linson/Documents/ai/splash-dspine-investigation-20261110/notes/sampling3-v2.txt": "9a1fe0d91ffe7356166efe284535e36ff1d37d2e83bc6086fe8fe817b18051f1",
+        "/Users/linson/Documents/ai/splash-dspine-investigation-20261110/patches/wide-policy-frozen.patch": "da6072796a475bd37c6e60aa90678c13e75d5b42321264942e996eac8d82f3d7"
+      }
+    }
+  ],
+  "sampling_dataset_outputs_seen_before_nomination": false,
+  "functional_smoke_note": "A separate original16HTTPsmoke on Fibonacci/schema/concurrency was observed earlier. These are disjoint from the3registered sampling contexts and were not distribution tests. Nomination follows greedy/operator screens; no candidate sampling3 dataset has run.",
+  "other_candidates": "GDNcompact is excluded from statistical nomination: preliminary whole-model screen is slower despite shared-memory reduction. SG2notnominated: existingtwo-pass has smaller implementation and better unpaired profiles. No choice will be revised from sampled results.",
+  "final_configuration_frozen_utc": "2026-11-10T08:00:15.193763+00:00",
+  "additional_candidate_decision": {
+    "shared8": "Notnominated:predeclaredunpairedwholemodelscreenfailedB3/B4>=3%gainandB1/B2regressionlimits. No claimofcausalslowdownfromthatscreen. Numericalanddefault31paritypassed.",
+    "shared16": "Researchonly;noteligibleunderthepredeclaredadditional8rowarmrule.",
+    "gdn_phased": "Researchonly;pairedoperatornegative,notnominated.",
+    "positive_candidate_dataset_outputs_seen": false
+  }
+}

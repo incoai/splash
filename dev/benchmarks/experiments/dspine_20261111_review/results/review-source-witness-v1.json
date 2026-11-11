@@ -1,0 +1,140 @@
+{
+  "created_utc": "2026-11-11T06:44:16.913557+00:00",
+  "status": "pass",
+  "base_commit": "37bdd4f8710319bfad43709de2725df89ef776d3",
+  "patch_sha256": {
+    "qkv-narrow-v1.patch": "6a830fd355f3373d006ef4debf7081ff7305654fce9538ee8ae91b4438959325",
+    "combined-v2.patch": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d"
+  },
+  "apply_checks": [
+    {
+      "patch": "qkv-narrow-v1.patch",
+      "base": "37bdd4f8710319bfad43709de2725df89ef776d3",
+      "temporary_index_check_passed": true
+    },
+    {
+      "patch": "combined-v2.patch",
+      "base": "37bdd4f8710319bfad43709de2725df89ef776d3",
+      "temporary_index_check_passed": true
+    }
+  ],
+  "combined_live_diff_exact_final_patch": true,
+  "tracked_changed_files": [
+    "dev/native.mk",
+    "dev/tests/engine/gguf_projection_test.mm",
+    "dev/tests/engine/linear_plan_test.mm",
+    "runtime/metal/kernels/shared/gguf_linear.metal",
+    "runtime/ops/Linear.cpp",
+    "runtime/ops/Linear.hpp",
+    "runtime/ops/LinearGguf.cpp"
+  ],
+  "real_index_unchanged": true,
+  "tracked_worktree_unchanged": true,
+  "untracked_and_ignored_build_outputs_excluded_from_diff": true,
+  "bundle_manifests": {
+    "control": {
+      "build_manifest": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/build.json",
+      "sha256": "6dfd89f8ddded01f648b51f4cbc5b3b9253ca3263b0588d08017f5b430162c93",
+      "verified_inputs": 6
+    },
+    "candidate": {
+      "build_manifest": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/build.json",
+      "sha256": "3b286493d52645d50bdc6280174765e842495442dc40ac8ad4fbadeac4f30d79",
+      "verified_inputs": 6
+    }
+  },
+  "bundle_artifact_copies_match_current_build_outputs": {
+    "splash": "build/splash",
+    "splash.metallib": "build/splash.metallib",
+    "host-step.metallib": "build/host-step.metallib",
+    "linear-plan": "build/engine-tests/linear-plan",
+    "gguf-projection": "build/engine-tests/gguf-projection",
+    "production-and-test.metallib": "build/engine-tests/production-and-test.metallib"
+  },
+  "source_guards": {
+    "checked_predicates": [
+      "exact_device",
+      "qkv_layout",
+      "qkv_planes",
+      "qkv_one_lane",
+      "qkv_split",
+      "m48_planes",
+      "m48_live_rows",
+      "m48_both_tensors",
+      "m48_plan_domain",
+      "partial_allocation_storage_stride",
+      "compact_dispatch_compute_rows",
+      "m48_gate_kernel_partial_stride64",
+      "m48_up_kernel_partial_stride64",
+      "old_kernel_default_partial_stride"
+    ],
+    "explicit_compact_domain_checked_before_float_rotation_or_dispatch": true,
+    "interpretation": "Static source witnesses, supported by exact patch hashes; these checks are not execution or performance tests."
+  },
+  "documentation_review": {
+    "path": "/Users/linson/Documents/ai/splash/docs/performance.md",
+    "historical_cutoff_statements_to_preserve": [
+      "The next numerical probe compares target logits at the first divergent token.",
+      "Its statistical screen is incomplete.",
+      "The fresh agent and separate M48 whole-model protocols remain unrun."
+    ],
+    "recommendation": "Append a dated supplement; do not overwrite the original cutoff, failed timing gates or source-specific sampling verdicts.",
+    "proposed_dated_append": "### November 11 final-review supplement\n\nThe preceding section preserves the thirteen-hour study's cutoff. A separately frozen numerical follow-up restores the measured full-attention QKV reduction at one sixteen-row lane on the 20-core M5 Pro. Its 31 historical greedy arrays match eight-row execution; on the selected earliest-divergence prompt, all 18 captured full-vocabulary target-logit rows match bitwise. This is finite numerical evidence, not a throughput qualification.\n\nThe new M48 candidate computes 48 live gate/up rows while retaining 64-row storage and split-partial strides. Eight rows remain the default. Add the final frozen source and artifact identities and all controlled M48, agent, mixed-serving and candidate-sampling verdicts here when complete, retaining failed or inconclusive endpoints.\n\nA separate recovery completes the original sampling seed ranges using retained outputs and only the missing control tail: 280 reserved Holm-corrected tests, zero rejections. The original cutoff report remains incomplete. This recovered historical screen does not test the new QKV/M48 candidate and non-rejection does not establish distribution equality.\n",
+    "main_document_edited": false
+  },
+  "source_sha256": {
+    "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/config.json": "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85",
+    "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/draft/config.json": "c2aa9e3ff22766ea7df0fa5b5f5f7d2035ae722671c6b7eb58b65578705e6815",
+    "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/model.json": "6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+    "/Users/linson/Documents/ai/splash/docs/performance.md": "a1b642e682e896285920e32119a42d8340f42ee8cf34d06ba87e4b828f81e542",
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/kernel-smoke3-cap256-v1.txt": "4197b200cd24e583b19b973c032e33beda6026dc406ffe6331559329406a3246",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/operating-state": "3e182e43a749fee5cc65c1075a44a4ba1b83f4de797c2e46f1c4b31c3354cad9",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/build.json": "3b286493d52645d50bdc6280174765e842495442dc40ac8ad4fbadeac4f30d79",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/gguf-projection": "d1032fc1384ad043764348380e5d6f4faabe025f4629f283e2c58b8f5af0d049",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/linear-plan": "d494808b1c6cc27881f8a8e979feb0e1161c4e189bd6598488cd125a0a85a1a7",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/production-and-test.metallib": "219e64a24607764fd507aa11ee1479623242ecb9d7d2e77a29cec10078efa2a7",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash": "a7f86544957aa7ea3dec41dd4b2038d61dbc9f2310f1aae1fb2da1212b40800b",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/build.json": "6dfd89f8ddded01f648b51f4cbc5b3b9253ca3263b0588d08017f5b430162c93",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/splash.metallib": "f60d2e950c6a6c69ec7472b5ec7778de437edae81a57834b9cc2c08af0bac039",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/study-driver": "4b5edac62e62beacbe80acd8f21c9dcac5126634e22ef73f91651b82976f1fda",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/BuildIdentity.hpp": "a144e898bcc1d547db5c1e241c30d8d4950e17032c775dcf77e5272ce0f979d7",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/libsplash.a": "a2748249b0e79d9ac80235cbb2f0372ed5741a2bf74234ff3280662c65fb246c",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/gguf-projection": "d1032fc1384ad043764348380e5d6f4faabe025f4629f283e2c58b8f5af0d049",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/linear-plan": "d494808b1c6cc27881f8a8e979feb0e1161c4e189bd6598488cd125a0a85a1a7",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/production-and-test.metallib": "219e64a24607764fd507aa11ee1479623242ecb9d7d2e77a29cec10078efa2a7",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/splash": "a7f86544957aa7ea3dec41dd4b2038d61dbc9f2310f1aae1fb2da1212b40800b",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/benchmarks/PrefillWork.hpp": "7d9abd447e972002a53633ff202dae3a4eb2f1178d81cb28677264c81e5d7d29",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/benchmarks/TranscriptPrompts.hpp": "2c56f82c9048bf3de0eeae016d95db3b2f954d0ad6ae56af1f8cea87609ecdb6",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/native.mk": "8656d6abc425f0e0dce088bce77d57a39266ce569e2f14671973f6a62a17c805",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/tests/engine/gguf_projection_test.mm": "16e8a286ee55cf71d9895e8619b3cccf1daca63ef6885071b2c4c73a807082e9",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/tests/engine/linear_plan_test.mm": "9bffdc130f06ea14c849616404531dd03a6f8dee52c16e3a33c549013bc20ff0",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/runtime/metal/kernels/shared/gguf_linear.metal": "e27bd1397316b89b847b6fab67730c04fa34f414ef645782df2577aa7877a60e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/runtime/ops/Linear.cpp": "f1883984baae90cc72d72ff27ccf509f889670fe47fb11656d03553bbcf43ff7",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/runtime/ops/Linear.hpp": "0cc59a565c650c53040f6204428220cc527ccbf2a3262dfaf58e7b65e4ca0155",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/runtime/ops/LinearGguf.cpp": "1d158980d2b14b5220dd41079d7120d5fd0ed9a7ee7647f5b1046927fab927d0",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/combined-final-regression-v1.protocol.json": "c3f61dc79008848b320bbd810c9c6a271f605943fdbb95df4af775cdcd18ae59",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/m48-clean-b3-v2.artifact-barrier.json": "861cf11625550aef6bced699cbc84a17f2ec17e720d851f26712ea208f6c8500",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/m48-clean-b3-v2.protocol.json": "9d35ca0282927e9ae5c269f36b2e22ccd54155ec666fa246a13ad8e04c67627c",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/qkv-narrow-v1.patch": "6a830fd355f3373d006ef4debf7081ff7305654fce9538ee8ae91b4438959325",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/engine/BuildIdentity.hpp": "80a9bb74c8ace104c7a466cb2a1c3c223a9041a3a791e95602cc57a3ef23f6f7",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/engine/libsplash.a": "f2fb01bbffa95a31925d9733985024bbfc421337646481b02ed362e7ae3e001e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/splash.metallib": "f60d2e950c6a6c69ec7472b5ec7778de437edae81a57834b9cc2c08af0bac039",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/dev/benchmarks/PrefillWork.hpp": "7d9abd447e972002a53633ff202dae3a4eb2f1178d81cb28677264c81e5d7d29",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/dev/benchmarks/TranscriptPrompts.hpp": "2c56f82c9048bf3de0eeae016d95db3b2f954d0ad6ae56af1f8cea87609ecdb6",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/abba.py": "7afc7b4fa24916acfc41745fc29cc659b5edada0bfa1ce55e19a685808475c0d",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/analyze_abba_v2.py": "e2c3f42e4e5fce41d89251399beb7339bf9bdc4c4af51e15435cf984390da634",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/controlled_round.py": "4bde430207a362eab510fe8ffd393fa2aa76c543eaa5821c7073e95e454d0f58",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prepare_native_comparison_v1.py": "269eb1b394f9a83a8338ac0c18f02fb6b4dc346d10cc76dccb04ded9a637f97a",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/review_source_witness_v1.py": "d7f37d75947f221f6bbbe1c2509e8e616df58da12f7aeb5b7e011d0a612b431b",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/run_frozen_abba_round_v1.py": "f062f66b89052d1bff3eb1510ffe93a3f8e805b110eced7e34f60d75c83b0a7d",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/study_driver_v2.mm": "2b0b3898db9bee8941e169d8852c8f6659f256f7d00e9de9f01a2a054783879d"
+  },
+  "scope": "CPU-only current consistency witness. Temporary Git indexes checked both patches against the pinned base without checkout mutation. Frozen nomination/build inputs and artifact copies were rehashed; no compiler, native executable, GPU job, benchmark or independent reproducible-build claim is involved. Timed results remain governed by their own frozen protocols and receipts."
+}

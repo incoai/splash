@@ -1,0 +1,39 @@
+{
+  "main_head": "24bc6f439da3074ea1fd8e218ab9dee84a201d3b",
+  "scope": "Directly observed main source checks after merge. Archived frozen scripts are SHA-pinned and excluded narrowly from lint/format; compileall still checks their syntax. No production source changes follow these checks.",
+  "commands": [
+    {
+      "command": [
+        ".venv/bin/ruff",
+        "check",
+        "--config",
+        "dev/ruff.toml",
+        "server",
+        "install/*.py",
+        "dev/tools",
+        "dev/tests",
+        "dev/benchmarks"
+      ],
+      "exit_code": 0,
+      "stdout": "All checks passed!"
+    },
+    {
+      "command": [
+        ".venv/bin/ruff",
+        "format",
+        "--check",
+        "--config",
+        "dev/ruff.toml",
+        "server",
+        "install/*.py",
+        "dev/tools",
+        "dev/tests",
+        "dev/benchmarks"
+      ],
+      "exit_code": 0,
+      "stdout": "203 files already formatted"
+    }
+  ],
+  "ruff_version": "ruff 0.16.4",
+  "ruff_config_sha256": "9c3732cfecef0a0cb3b4946d7ad9e5bbf09d79ebf3c9284b6ea24999b6c2a1f8"
+}

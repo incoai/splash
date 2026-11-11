@@ -164,12 +164,12 @@ uint64_t plannedPrefillBytes(const RuntimeGeometry &geometry,
 }
 
 static uint64_t gdnPackedStride(const RuntimeGeometry &geometry) noexcept {
-  return bytesFor<uint16_t>(uint64_t{kDecodeRows} *
+  return bytesFor<uint16_t>(uint64_t{geometry.target.execution.rows()} *
                             geometry.target.packedGdnWidth);
 }
 uint64_t gdnTapeSlotBytes(const RuntimeGeometry &geometry) noexcept {
   return uint64_t{geometry.target.stateLayout.layers} *
-         ops::gdnTapeLayerBytes(geometry.target.gdnShape());
+         ops::gdnTapeLayerBytes(geometry.target.gdnShape(), geometry.target.execution);
 }
 static uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept {
   return bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
@@ -183,13 +183,13 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   std::array<uint64_t, decodeTensorCount> result{};
   const auto draftWorkspace =
       operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape());
-  const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
-  const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
+  const auto samplingWorkspace = ops::Sampling::workspace(geometry.target.execution.rows());
+  const auto selectorWorkspace = ops::DraftSelector::workspace(geometry.target.execution.proposals());
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
     auto &size = result[static_cast<uint32_t>(tensor)];
     size = std::max(size, bytes);
   };
-  const uint64_t r = kDecodeRows;
+  const uint64_t r = geometry.target.execution.rows();
   // As in prefill, no GDN scratch without GDN layers.
   const uint64_t gdnRows = geometry.target.stateLayout.layers ? r : 0;
   put(DecodeTensor::Hidden0,
@@ -258,15 +258,15 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       samplingWorkspace.vocabularyRangesBytes);
   put(DecodeTensor::TargetVocabularyArrivals,
       samplingWorkspace.vocabularyArrivalsBytes);
-  put(DecodeTensor::SamplingUniforms, bytesFor<float>(kSamplingUniformCount));
+  put(DecodeTensor::SamplingUniforms, bytesFor<float>(geometry.target.execution.uniformCount()));
   put(DecodeTensor::ConstraintMasks,
-      bytesFor<uint32_t>(uint64_t{ExecutionLimits::maximumStepTokens} *
+      bytesFor<uint32_t>(uint64_t{geometry.target.execution.maximumStepTokens()} *
                          geometry.maskWords()));
   put(DecodeTensor::OutputTokens, bytesFor<uint32_t>(r));
   put(DecodeTensor::RetainedCount, sizeof(uint32_t));
   put(DecodeTensor::AcceptedCount, sizeof(uint32_t));
   put(DecodeTensor::VerifyRows, sizeof(uint32_t));
-  put(DecodeTensor::VerifyConfidence, bytesFor<float>(kDraftProposalTokens));
+  put(DecodeTensor::VerifyConfidence, bytesFor<float>(geometry.target.execution.proposals()));
   put(DecodeTensor::DraftInputTokens, bytesFor<uint32_t>(r));
   for (uint32_t index = 0; index < 2; ++index) {
     put(static_cast<DecodeTensor>(
@@ -288,6 +288,17 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(r * geometry.draft.intermediateSize));
   put(DecodeTensor::DraftFinalHidden,
       bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
+  if (geometry.draft.isDSpine()) {
+    put(DecodeTensor::BridgeRaw, bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
+    put(DecodeTensor::BridgeRms, bytesFor<float>(r));
+    put(DecodeTensor::BridgeCodes, bytesFor<uint16_t>(r * geometry.draft.bridgeCodeSize));
+    put(DecodeTensor::BridgePacked, bytesFor<uint16_t>(r * 3 * geometry.draft.bridgeRank));
+    put(DecodeTensor::BridgeMessage, bytesFor<uint16_t>(r * geometry.draft.bridgeRank));
+    put(DecodeTensor::BridgeCandidateHead,
+        bytesFor<uint16_t>(uint64_t{geometry.target.execution.proposals()} * SPLASH_DRAFT_CANDIDATES * geometry.draft.hiddenSize));
+    put(DecodeTensor::BridgeRefineMessage, bytesFor<float>(geometry.draft.bridgeRank));
+    put(DecodeTensor::BridgeRefineState, bytesFor<float>(geometry.draft.hiddenSize));
+  }
   put(DecodeTensor::SelectorHidden,
       bytesFor<uint16_t>(r * geometry.draft.selectorRank));
   put(DecodeTensor::Candidates, selectorWorkspace.candidatesBytes);
@@ -295,7 +306,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::TopPartialIds, selectorWorkspace.partialIdsBytes);
   put(DecodeTensor::TopPartialValues, selectorWorkspace.partialValuesBytes);
   put(DecodeTensor::ProposalProbs, selectorWorkspace.proposalProbabilitiesBytes);
-  put(DecodeTensor::ProposedTokens, bytesFor<uint32_t>(kDraftProposalTokens));
+  put(DecodeTensor::ProposedTokens, bytesFor<uint32_t>(geometry.target.execution.proposals()));
   put(DecodeTensor::PageTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));
   if (geometry.target.kvLayout.indexDimension)
     put(DecodeTensor::IndexTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));
@@ -346,6 +357,10 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
        {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}})
     result.include(operators.draftLinear().decodeScratchSize(shape));
+  if (d.isDSpine())
+    for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.bridgeCodeSize, d.hiddenSize},
+         {3 * d.bridgeRank, d.bridgeCodeSize}, {d.hiddenSize, d.bridgeRank}})
+      result.include(operators.draftLinear().decodeScratchSize(shape));
   return result;
 }
 

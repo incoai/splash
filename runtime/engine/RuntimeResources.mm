@@ -7,6 +7,7 @@
 #include "engine/DiskLabels.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/PagedAttention.h"
+#include "model/CacheLayout.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/ModelSizing.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -519,7 +520,7 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
                          std::string_view targetManifestSha256,
                          std::string_view buildId,
                          kv::Layout targetKvLayout,
-                         model::RopeScaling ropeScaling) {
+                         model::RopeScaling ropeScaling, ops::DecodeGeometry geometry) {
   if (buildId.empty()) {
     throw std::invalid_argument("runtime build id is required");
   }
@@ -534,55 +535,18 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
   result.kvLayout = targetKvLayout;
   result.ropeScaling = ropeScaling;
   result.targetModelSha256 = model::digestHex(parseSha256(targetManifestSha256));
+  result.draftBlockSize = geometry.rows();
   return result;
 }
 
 std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
                                      const model::CompositeStateLayout &states) {
-  const kv::Layout &kv = identity.kvLayout;
-  const model::GdnStateLayout &gdn = states.target;
-  const model::DraftStateLayout &draft = states.draft;
   std::ostringstream canonical;
   canonical << "splash-persistent-cache-v" << kPersistentCacheFormat << '\n'
             << identity.modelLayoutSha256 << '\n'
-            << "kv " << kv::kPageTokens << ' ' << kv.attentionLayers << ' ' << kv.kvHeads << ' '
-            << kv.headDimension << ' ' << kv::formatName(kv.format)
-            // Dimension-major values add nothing, so dense layouts keep the
-            // caches they wrote.
-            << (kv.valuesTokenMajor ? " values-token-major" : "");
-  // A block index's pooled keys (kv::Layout::indexDimension), bf16, one a
-  // block of SPLASH_ATTENTION_BLOCK_TOKENS tokens. A change to how a block's
-  // key is pooled, normalized or rotated changes this line.
-  if (kv.indexDimension)
-    canonical << " index " << kv.indexDimension << " bf16 block " << SPLASH_ATTENTION_BLOCK_TOKENS;
-  // A sliding window (kv::Layout::windowTokens), which also orders a page's
-  // regions in its slot (kv::Layout::region) and labels a slot with its
-  // page's form (KvSlotLabel). A layout without one keeps the line it had.
-  if (kv.windowedLayers)
-    canonical << " window " << kv.windowTokens << " layers 0x" << std::hex << kv.windowedLayers << std::dec;
-  // How a slot holds a page; nothing for the spans' order, so the caches
-  // written before slots had another order stay valid.
-  canonical << KvPageTier::slotFormatToken(kv) << '\n'
-            << "gdn " << gdn.layers << ' ' << gdn.convolutionHistory << ' '
-            << gdn.convolutionChannels << ' ' << gdn.recurrentGroups << ' ' << gdn.recurrentRows
-            << ' ' << gdn.recurrentColumns
-            // fp32 states keep the line they had before states had a format,
-            // so the caches they wrote stay valid; without GDN layers the
-            // format stores nothing.
-            << (gdn.layers && gdn.format == ops::GdnStateFormat::BFloat16 ? " bf16" : "");
-  // A family's state after the GDN layers' (Qwen3.8-Flash-Next's PLE history
-  // and QSA pending keys, model::QwenHybridLayout::gdnStateLayout).
-  if (gdn.auxiliaryBytes) canonical << " auxiliary " << gdn.auxiliaryBytes;
-  canonical << '\n'
-            << "draft " << draft.layers << ' ' << draft.kvHeads << ' ' << draft.headDimension << ' '
-            << SPLASH_DRAFT_SLIDING_WINDOW << '\n'
-            << "context " << draft.contextWidth << " q4 " << SPLASH_DRAFT_CONTEXT_GROUP << '\n';
-  // Without YaRN the line is left out, so the caches written before it
-  // existed stay valid. The factor takes the digits that read back as the
-  // same double, so no two factors share a namespace.
-  if (const model::RopeScaling &rope = identity.ropeScaling; rope.yarn())
-    canonical << "rope yarn " << std::setprecision(std::numeric_limits<double>::max_digits10) << rope.factor
-              << ' ' << rope.originalContextTokens << '\n';
+            << model::persistentKvLayoutRecord(identity.kvLayout)
+            << KvPageTier::slotFormatToken(identity.kvLayout) << '\n'
+            << model::persistentStateLayoutRecord(states, identity.draftBlockSize, identity.ropeScaling);
   // 128 bits name it.
   return model::weightDigest(canonical.str()).substr(0, CacheDirectory::kNamespaceDigits);
 }
@@ -648,6 +612,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         "host memory and volume probes, build id and a merge-aligned image "
         "patch limit no larger than the protocol's are required");
   }
+  if (config.draftBlockSize != 8 && config.draftBlockSize != 16)
+    throw RuntimeResourcesError(RuntimeResourceStage::Configuration, "draft block size requires eight or sixteen rows");
+  if (config.draftBlockSize == 16 &&
+      (!config.model.draft.isDSpine() || config.model.stateLayout.target.auxiliaryBytes ||
+       !std::visit([](const auto &layout) { return layout.ffnKind == model::QwenFfnKind::Dense; }, config.model.target)))
+    throw RuntimeResourcesError(RuntimeResourceStage::Configuration, "sixteen-row execution requires a dense DSpine runtime");
   std::unique_ptr<metal::MetalBackend> backend;
   try {
     backend = std::make_unique<metal::MetalBackend>(config.metallibPath.string(),
@@ -799,7 +769,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .kvSlotBytes = kvSlotBytes,
          .stateSlotBytes = model::SlotFile::slotBytesFor(stateBytes),
          .activeLimitBytes = activeLimitBytes,
-         .groupPages = groupPages});
+         .groupPages = groupPages,
+         .speculativeScratchTokens = config.draftBlockSize - 1});
   };
   // The plan of the parts as configured, which sizes their stores.
   const auto sizingPlan = [&](uint64_t stagingBytes) {
@@ -887,7 +858,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
 
   // One plan owner is used both before allocation and during encoding. The
   // engine lends it to model execution without inspecting its plans.
-  ops::ExecutionPlans operators(device, config.int8Activations);
+  ops::ExecutionPlans operators(device, config.int8Activations, ops::DecodeGeometry(config.draftBlockSize),
+      requestedContextTokens ? std::min(requestedContextTokens, config.model.capabilities.maximumContextTokens) : 0);
   model::LoadedModel loaded;
   // The runtime's lane state and arenas as the model loaded, with its K/V in
   // memory and where it spills.
@@ -909,6 +881,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       const std::chrono::duration<double> loading = AwakeClock::now() - started;
       logLine("Weights loaded ", again ? "again " : "", "in ", std::fixed, std::setprecision(2), loading.count(),
               " s.");
+      if (loaded.draft.layout.isDSpine())
+        logLine("Experimental DSpine draft: ", operators.geometry().rows(),
+                " rows, ", loaded.draft.layout.contextTokens, " context tokens.");
     } catch (const metal::MetalAllocationError &error) {
       throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                   error.what(), {},
@@ -980,7 +955,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     const uint32_t commandPages = loadOptions.expertMemoryBytes ? groupPages : 0;
     ModelMemoryProfile modelProfile{
         loaded.name(), loaded.maximumContextTokens(), loaded.targetKvLayout(config.kvFormat), footprint,
-        config.stateFormat, streamed.plan ? streamed.plan->spill : KvSpillPlan{}, commandPages};
+        config.stateFormat, streamed.plan ? streamed.plan->spill : KvSpillPlan{}, commandPages, config.draftBlockSize - 1};
     EngineMemoryPlanResult result = evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
     if (streamed.plan || !result.plan)
       return result;
@@ -1098,7 +1073,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     cacheIdentity = makeRuntimeCacheIdentity(
         loaded.manifestFingerprintSha256,
         loaded.targetManifestFingerprint(), config.buildId,
-        loaded.targetKvLayout(config.kvFormat), loaded.descriptor.ropeScaling);
+        loaded.targetKvLayout(config.kvFormat), loaded.descriptor.ropeScaling, operators.geometry());
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                 error.what(),

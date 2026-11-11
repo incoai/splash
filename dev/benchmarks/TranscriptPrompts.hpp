@@ -49,4 +49,29 @@ inline constexpr uint32_t kTranscriptPrompt5[] = {
 inline constexpr std::array<std::span<const uint32_t>, 6> kTranscriptPrompts{
     kTranscriptPrompt0, kTranscriptPrompt1, kTranscriptPrompt2, kTranscriptPrompt3, kTranscriptPrompt4, kTranscriptPrompt5};
 
+// The HTTP ABBA coding prompts (draft_comparison.py), with the same Qwen
+// chat template, an empty thinking block, and a 256-token generation cap.
+// 0 Write a Python function that returns the nth Fibonacci number using iteration. Return only the function.
+inline constexpr uint32_t kDraftComparisonPrompt0[] = {
+    248045, 846, 198, 7734, 264, 12654, 709, 421, 4523, 279, 53277, 76938, 1324, 1608, 18971, 13,
+    3301, 1132, 279, 709, 13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271,
+};
+// 1 Implement a stable merge sort in Python. Include a short explanation of its complexity.
+inline constexpr uint32_t kDraftComparisonPrompt1[] = {
+    248045, 846, 198, 60856, 264, 14733, 10562, 3269, 303, 12654, 13, 28763, 264, 2716, 15673, 314,
+    1141, 22373, 13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271,
+};
+// 2 Write a Python LRU cache using a doubly linked list and a dictionary. Explain invariants briefly.
+inline constexpr uint32_t kDraftComparisonPrompt2[] = {
+    248045, 846, 198, 7734, 264, 12654, 436, 34810, 6297, 1608, 264, 90651, 10278, 1103, 321, 264,
+    10675, 13, 79091, 303, 52778, 25899, 13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271,
+};
+// 3 Write a TypeScript function that retries an asynchronous operation with exponential backoff.
+inline constexpr uint32_t kDraftComparisonPrompt3[] = {
+    248045, 846, 198, 7734, 264, 84441, 709, 421, 58558, 449, 37715, 5488, 440, 56768, 1142, 1783,
+    13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271,
+};
+inline constexpr std::array<std::span<const uint32_t>, 4> kDraftComparisonPrompts{
+    kDraftComparisonPrompt0, kDraftComparisonPrompt1, kDraftComparisonPrompt2, kDraftComparisonPrompt3};
+
 } // namespace splash::benchmark

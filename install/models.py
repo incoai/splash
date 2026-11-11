@@ -177,7 +177,7 @@ def parse_draft_model(value: str) -> str:
         return validate_repo_id(value)
     except ModelError:
         raise argparse.ArgumentTypeError(
-            "must be a local DFlash2 draft directory or a Hugging Face "
+            "must be a local DFlash2 or DSpine draft directory or a Hugging Face "
             "repository ID (owner/repo)"
         ) from None
 
@@ -374,7 +374,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--draft-model",
         type=parse_draft_model,
-        help="the DFlash2 draft's repository or local directory, in place of the "
+        help="a compatible DFlash2 or experimental DSpine draft repository or local directory, in place of the "
         "family's released one",
     )
     parser.add_argument(

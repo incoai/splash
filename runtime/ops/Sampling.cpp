@@ -75,7 +75,7 @@ ThinkingCutoffs thinkingCutoffs(std::span<const SamplingPolicy> policies, uint32
     params.close[lane] = cutoff->end.back();
     params.also_ends[lane] = cutoff->alsoEnds;
     cutoffs.cutLanes = lane + 1;
-    if (cutoff->replacedProposals())
+    if (cutoff->replacedProposals(draftedRows))
       cutoffs.draftingLanes = lane + 1;
   }
   return cutoffs;
@@ -128,8 +128,8 @@ void Sampling::countPenaltyTokens(std::span<uint32_t> words,
     ++words[token];
 }
 
-Sampling::Sampling(uint32_t vocabulary)
-    : vocabulary_(vocabulary), maskWords_((vocabulary + 31) / 32) {
+Sampling::Sampling(uint32_t vocabulary, DecodeGeometry geometry)
+    : geometry_(geometry), vocabulary_(vocabulary), maskWords_((vocabulary + 31) / 32) {
   if (!vocabulary)
     throw std::invalid_argument("invalid sampling geometry");
 }
@@ -141,7 +141,7 @@ void Sampling::addPenalties(metal::CommandGraph &graph,
                             bool verify) const {
   SamplingPenaltyParams params{};
   params.vocabulary = vocabulary_;
-  params.rows = verify ? SPLASH_TARGET_VERIFY_ROWS : 1;
+  params.rows = verify ? geometry_.rows() : 1;
   params.row_offset = rowOffset;
   const uint64_t rowBytes = uint64_t{vocabulary_} * sizeof(uint32_t);
   for (uint32_t lane = 0; lane < policies.size(); ++lane) {
@@ -167,15 +167,15 @@ void Sampling::addPenalties(metal::CommandGraph &graph,
   // Entries follow the lanes, so the last one's lane is the highest.
   const uint64_t lanes = uint64_t{params.logits_lane[params.entries - 1]} + 1;
   if (verify)
-    requireBytes(buffers.inputTokens, lanes * SPLASH_TARGET_VERIFY_ROWS * sizeof(uint32_t), "verify input token");
+    requireBytes(buffers.inputTokens, lanes * geometry_.rows() * sizeof(uint32_t), "verify input token");
   const metal::DispatchSize groups{
       (vocabulary_ + kPenaltyThreads - 1) / kPenaltyThreads, params.entries, 1};
   if (!verify) {
-    graph.add("decode_sample_penalize", {buffers.logits, table.words}, params,
+    graph.add(geometry_.kernel("decode_sample_penalize"), {buffers.logits, table.words}, params,
               groups, {kPenaltyThreads, 1, 1});
     return;
   }
-  graph.add("decode_sample_penalize_verify",
+  graph.add(geometry_.kernel("decode_sample_penalize_verify"),
             {buffers.logits, table.words, buffers.inputTokens}, params, groups,
             {kPenaltyThreads, 1, 1});
 }
@@ -187,7 +187,7 @@ void Sampling::addInitial(metal::CommandGraph &graph,
                           const PenaltyTable &penalties) const {
   if (policies.empty() || policies.size() > kMaximumLanes)
     throw std::invalid_argument("invalid sampling batch width");
-  if (rowOffset >= SPLASH_TARGET_VERIFY_ROWS)
+  if (rowOffset >= geometry_.rows())
     throw std::invalid_argument("invalid initial sampling row");
   const TargetSamplingParams params =
       selection(policies, buffers, {1, rowOffset, 0, SPLASH_UNIFORM_INITIAL, 0}, stopTokens);
@@ -206,7 +206,7 @@ void Sampling::addVerify(metal::CommandGraph &graph,
   // uniform.
   const TargetSamplingParams params =
       selection(policies, buffers,
-                {SPLASH_TARGET_VERIFY_ROWS, 0, 1, SPLASH_UNIFORM_CORRECTION, SPLASH_DRAFT_PROPOSAL_TOKENS},
+                {geometry_.rows(), 0, 1, geometry_.correctionUniform(), geometry_.proposals()},
                 stopTokens);
   addPenalties(graph, policies, buffers, penalties, 0, true);
   addSelection(graph, params, policies, buffers);
@@ -251,11 +251,11 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
   };
   const SamplingWorkspace greedy = rowsWorkspace(greedyLanes), sampled = rowsWorkspace(sampledLanes);
   requireBytes(buffers.logits,
-               ((lanes - 1) * SPLASH_TARGET_VERIFY_ROWS + rows.logitsRow + rows.rows) * vocabulary_ * sizeof(float),
+               ((lanes - 1) * geometry_.rows() + rows.logitsRow + rows.rows) * vocabulary_ * sizeof(float),
                "sampling logits");
   if (constrainedLanes)
     requireBytes(buffers.constraintMasks,
-                 ((constrainedLanes - 1) * (SPLASH_TARGET_VERIFY_ROWS + 1) + rows.maskRow + rows.rows) * maskWords_ *
+                 ((constrainedLanes - 1) * (geometry_.rows() + 1) + rows.maskRow + rows.rows) * maskWords_ *
                      sizeof(uint32_t),
                  "constraint mask");
   requireBytes(buffers.outputTokens, lanes * rows.rows * sizeof(uint32_t), "sampled token");
@@ -267,13 +267,13 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
   requireBytes(buffers.vocabularyArrivals, sampled.vocabularyArrivalsBytes, "sampling arrival");
   if (sampledLanes) {
     const uint64_t last = sampledLanes - 1, drafted = std::min(rows.rows, rows.draftedRows);
-    requireBytes(buffers.uniforms, (last * SPLASH_SAMPLING_UNIFORMS + rows.uniform + 1) * sizeof(float),
+    requireBytes(buffers.uniforms, (last * geometry_.uniformCount() + rows.uniform + 1) * sizeof(float),
                  "sampling uniform");
     // A drafted row reads its draft token, the next verify input row, and
     // its proposal position's candidates.
     if (drafted) {
       requireBytes(buffers.inputTokens, (last * rows.rows + drafted + 1) * sizeof(uint32_t), "verify input token");
-      const uint64_t candidates = (last * SPLASH_DRAFT_PROPOSAL_TOKENS + drafted) * SPLASH_DRAFT_CANDIDATES;
+      const uint64_t candidates = (last * geometry_.proposals() + drafted) * SPLASH_DRAFT_CANDIDATES;
       requireBytes(buffers.draftCandidates, candidates * sizeof(uint32_t), "draft candidate");
       requireBytes(buffers.draftProbabilities, candidates * sizeof(float), "draft probability");
     }
@@ -288,24 +288,24 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
   const uint32_t lanes = static_cast<uint32_t>(policies.size());
   const uint64_t selected = uint64_t{lanes} * params.rows;
   if (params.sampling_mask != (uint32_t{1} << lanes) - 1) {
-    graph.add("decode_sample_argmax_sharded",
+    graph.add(geometry_.kernel("decode_sample_argmax_sharded"),
               {buffers.logits, buffers.constraintMasks, buffers.argmaxValues,
                buffers.argmaxIndices},
               params, {selected * kTargetShards, 1, 1});
-    graph.add("decode_sample_argmax_reduce",
+    graph.add(geometry_.kernel("decode_sample_argmax_reduce"),
               {buffers.argmaxValues, buffers.argmaxIndices,
                buffers.outputTokens},
               params, {selected, 1, 1}, {32, 1, 1});
   }
   if (params.sampling_mask) {
-    graph.add("decode_sample_mass_sharded",
+    graph.add(geometry_.kernel("decode_sample_mass_sharded"),
               {buffers.logits, buffers.constraintMasks, buffers.partialMasses},
               params, {selected * kTargetShards, 1, 1});
-    graph.add("decode_sample_vocabulary_search",
+    graph.add(geometry_.kernel("decode_sample_vocabulary_search"),
               {buffers.logits, buffers.constraintMasks, buffers.partialMasses,
                buffers.vocabularyRows},
               params, {selected, 1, 1}, {kVocabularyThreads, 1, 1});
-    graph.add("decode_sample_vocabulary_draw",
+    graph.add(geometry_.kernel("decode_sample_vocabulary_draw"),
               {buffers.logits, buffers.constraintMasks, buffers.vocabularyRows,
                buffers.inputTokens, buffers.draftCandidates,
                buffers.draftProbabilities, buffers.uniforms,
@@ -325,7 +325,7 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
   requireBytes(buffers.inputTokens,
                (uint64_t{cutoffs.cutLanes - 1} * params.rows + params.drafted_rows + 1) * sizeof(uint32_t),
                "verify input token");
-  graph.add("decode_sample_thinking_cutoff",
+  graph.add(geometry_.kernel("decode_sample_thinking_cutoff_abi2"),
             {buffers.inputTokens, buffers.constraintMasks, buffers.outputTokens, buffers.vocabularyRows},
             cutoffs.params, {lanes, 1, 1}, {1, 1, 1});
 }
@@ -337,13 +337,13 @@ void Sampling::addThinkingDrafts(metal::CommandGraph &graph, std::span<const Sam
   // The cutoffs of the verify that follows (addVerify), whose masks the
   // drafts do not read.
   const ThinkingCutoffs cutoffs =
-      thinkingCutoffs(policies, vocabulary_, SPLASH_TARGET_VERIFY_ROWS, SPLASH_DRAFT_PROPOSAL_TOKENS, 1);
+      thinkingCutoffs(policies, vocabulary_, geometry_.rows(), geometry_.proposals(), 1);
   if (!cutoffs.draftingLanes)
     return;
   // Such a lane writes its own proposals.
-  requireBytes(proposedTokens, uint64_t{cutoffs.draftingLanes} * SPLASH_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t),
+  requireBytes(proposedTokens, uint64_t{cutoffs.draftingLanes} * geometry_.proposals() * sizeof(uint32_t),
                "proposed token");
-  graph.add("decode_draft_thinking_cutoff", {std::move(proposedTokens)}, cutoffs.params, {policies.size(), 1, 1},
+  graph.add(geometry_.kernel("decode_draft_thinking_cutoff_abi2"), {std::move(proposedTokens)}, cutoffs.params, {policies.size(), 1, 1},
             {1, 1, 1});
 }
 
@@ -360,7 +360,7 @@ void Sampling::addAcceptance(
   std::ranges::copy(stopTokens.ids, params.stop_tokens);
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (!maximumRetained[lane] ||
-        maximumRetained[lane] > SPLASH_TARGET_VERIFY_ROWS)
+        maximumRetained[lane] > geometry_.rows())
       throw std::invalid_argument("invalid DFlash retention limit");
     params.remaining[lane] = maximumRetained[lane];
     if (policies[lane].samples())
@@ -370,10 +370,10 @@ void Sampling::addAcceptance(
   // up to the longer of the draft and its retention limit; a sampling lane
   // also its draft's candidates and their probabilities, its rows' target
   // probabilities and its acceptance uniforms (metal/abi/Sampling.h).
-  constexpr uint64_t kProposals = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  const uint64_t kProposals = geometry_.proposals();
   requireBytes(buffers.proposedTokens, lanes * kProposals * sizeof(uint32_t), "proposed token");
   requireBytes(buffers.outputTokens,
-               (uint64_t{lanes - 1} * SPLASH_TARGET_VERIFY_ROWS + std::max<uint64_t>(kProposals, maximumRetained.back())) *
+               (uint64_t{lanes - 1} * geometry_.rows() + std::max<uint64_t>(kProposals, maximumRetained.back())) *
                    sizeof(uint32_t),
                "target token");
   requireBytes(buffers.retainedCounts, lanes * sizeof(uint32_t), "retained count");
@@ -384,14 +384,14 @@ void Sampling::addAcceptance(
     requireBytes(buffers.candidates, candidates * sizeof(uint32_t), "draft candidate");
     requireBytes(buffers.proposalProbabilities, candidates * sizeof(float), "draft probability");
     requireBytes(buffers.targetVocabularyRows,
-                 ((sampledLanes - 1) * SPLASH_TARGET_VERIFY_ROWS + kProposals) * sizeof(TargetVocabularyRow),
+                 ((sampledLanes - 1) * geometry_.rows() + kProposals) * sizeof(TargetVocabularyRow),
                  "target vocabulary row");
     requireBytes(buffers.uniforms,
-                 ((sampledLanes - 1) * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_ACCEPTANCE + kProposals) *
+                 ((sampledLanes - 1) * geometry_.uniformCount() + geometry_.acceptanceUniform() + kProposals) *
                      sizeof(float),
                  "acceptance uniform");
   }
-  graph.add("decode_accept_dflash",
+  graph.add(geometry_.kernel("decode_accept_dflash"),
             {buffers.proposedTokens, buffers.candidates,
              buffers.proposalProbabilities, buffers.targetVocabularyRows,
              buffers.uniforms, buffers.outputTokens, buffers.retainedCounts,

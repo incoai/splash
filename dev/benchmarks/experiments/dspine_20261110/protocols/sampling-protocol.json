@@ -1,0 +1,69 @@
+{
+  "frozen_utc": "2026-11-10T04:26:05.564609+00:00",
+  "contexts": "sampling3-v2.txt: same3frozencontexts,18outputtoken cap",
+  "per_arm_seeds": 1500,
+  "baseline_seed_range": [
+    0,
+    1499
+  ],
+  "candidate_seed_ranges": [
+    [
+      100000,
+      101499
+    ],
+    [
+      200000,
+      201499
+    ],
+    [
+      300000,
+      301499
+    ]
+  ],
+  "nomination": "At most3 source configurations; nominate and freeze all before inspecting any positive-temperature candidate outputs. Failed or nonbeneficial greedy screens do not need nomination.",
+  "settings": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "context_limit": 32768,
+    "ane_ffn_share": 0
+  },
+  "tests": "For each of3contexts:18singlepositions plus8adjacentpairs;78tests/comparison. AbsorbingSTOP for ended sequences; no conditioning on survival.",
+  "statistics": "Pearson chi-square contingency test, no Yates correction, numerical chi-square survival via SciPy1.18.0. This is an asymptotic test, not Fisher exact. Symmetric pooled rare categories, expected cells>=5; degenerate tests uninformativep1. Holm correction across reserved234tests, unused comparisons paddedp1.",
+  "interpretation": "Regression screen for gross sampling-distribution errors; no rejection is not proof of equivalence. Small/rare differences have limited power. Independent seed arms, rather than treating same-seed output equality as the correctness test. Greedy equality and independent operator equations remain separate checks.",
+  "source": "SciPy official chi2_contingency documentation, observed2026-11-10, v1.18.0; modern statistical result replaces the archived study Wilson-Hilferty approximation.",
+  "pre_data_amendment_utc": "2026-11-10T06:19:56.207884+00:00",
+  "pre_data_amendment_reason": "Fourteen output tokens cannot cover every position of a trained16-row block. Before any sampling dataset starts, expand output cap to18 and add single positions14..17 and adjacent pairs14/15,15/16. All earlier settings and independent1500seeds remain; reserve234tests for up to3arms.",
+  "output_cap": 18,
+  "positions": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17
+  ],
+  "adjacent_pair_starts": [
+    0,
+    1,
+    5,
+    6,
+    11,
+    12,
+    14,
+    15
+  ],
+  "family_size_reserved": 234
+}

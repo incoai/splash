@@ -582,6 +582,9 @@ void testProtocolLimitsFollowTheModel() {
               limits.maxTokenBatch == 9 && limits.maxPromptTokens == 4096 &&
               limits.maxLogicalOutputTokens == 4096,
           "the protocol limits do not follow the model and the served context");
+  const auto wide = protocolLimitsFor(capabilities, 4096, 16);
+  require(wide.maxMaskWords == 7760 * 17 && wide.maxSimulationTokens == 16 && wide.maxTokenBatch == 17,
+          "sixteen-row protocol limits did not follow the runtime width");
 }
 
 // Ready says what the start serves: the engine's lanes, the context it

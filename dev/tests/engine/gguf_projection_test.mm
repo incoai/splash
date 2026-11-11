@@ -29,6 +29,9 @@
 //   hyper-connection projections of Qwen3.8-Flash-Next take 320 inputs in Q8_0), decoded on both tiles and walks at
 //   every K split each tile takes there, and prefilled; and Q8_0 decoded at K 192, three of the register tile's
 //   64-input coefficient units, which two partitions split into one and two.
+// --m48 covers the 48-row AF4 gate/up tile inside 64-row storage, including
+// same-split M64 equality, independent fp64 bounds, poisoned partial padding
+// and unwritten output rows.
 // Every run leaves the padding columns past its segments, the guard bands past its buffers and its counters as they
 // were. The token gather (ops::Embedding) of every format's rows as stored is checked here too.
 #include "GgufFormatReference.hpp"
@@ -61,6 +64,7 @@
 #include <span>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 using namespace splash;
@@ -356,6 +360,17 @@ Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan,
   scratch.poison(poison);
   CommandGraph graph;
   static_cast<void>(linear.add(graph, o.bindings(plan, scratch), p, plan, gate));
+  if (plan.computeRows() < plan.storageRows()) {
+    const auto dispatches = graph.dispatches();
+    if (dispatches.size() != 2 || dispatches[0].pipelineName != "gguf_decode_af4g64_m48_a" ||
+        dispatches[1].pipelineName != "gguf_decode_af4g64_m48_g")
+      fail(label + ": compact gate/up selected a different kernel");
+    for (const ComputeDispatch &dispatch : dispatches)
+      if (dispatch.threadgroups.x != plan.workload().matrix.outputSize / GGUF_TILE_COLUMNS ||
+          dispatch.threadgroups.y != plan.configuration().splits || dispatch.threadgroups.z != 1 ||
+          dispatch.threadsPerThreadgroup.x != GGUF_STAGED_THREADS)
+        fail(label + ": compact gate/up changed the column or split grid");
+  }
   // A spread plan's dispatches past a rotated projection's rotation are staged decode tiles, each binding its
   // parameters with spread set.
   if (plan.configuration().spread)
@@ -372,10 +387,25 @@ Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan,
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   if (!scratch.intact() || !o.input.intact() || !o.aux.intact() || !o.output.intact() || !o.gate.intact())
     fail(label + ": a counter is not reset or a write past a buffer");
+  if (plan.computeRows() < plan.storageRows() && plan.configuration().splits > 1) {
+    const auto *partials = static_cast<const uint32_t *>(scratch.partials.view.contents());
+    const uint32_t columns = plan.workload().matrix.outputSize;
+    for (uint32_t split = 0; split < plan.configuration().splits; ++split) {
+      const uint64_t first = (uint64_t{split} * plan.storageRows() + plan.computeRows()) * columns;
+      const uint64_t count = uint64_t{plan.storageRows() - plan.computeRows()} * columns;
+      if (!std::all_of(partials + first, partials + first + count, [&](uint32_t value) { return value == poison; }))
+        fail(label + ": compact split partials changed the 64-row padding");
+    }
+  }
   Outcome out{o.output.halves(),
               plan.workload().epilogue == LinearEpilogue::GateUp ? o.gate.halves() : std::vector<uint16_t>{}, {}};
   for (const ComputeDispatch &dispatch : graph.dispatches()) out.pipelines.push_back(dispatch.pipelineName);
   const uint32_t columns = plan.workload().matrix.outputSize;
+  if (plan.computeRows() < plan.storageRows())
+    for (const std::vector<uint16_t> *rows : {&out.output, &out.gate})
+      if (!std::all_of(rows->begin() + uint64_t{plan.computeRows()} * columns, rows->end(),
+                       [](uint16_t value) { return value == kUnwritten; }))
+        fail(label + ": compact tile wrote a padding row");
   for (const std::vector<uint16_t> *rows : {&out.output, &out.gate})
     for (uint64_t i = 0; i < rows->size(); ++i)
       if (i % columns >= covered && (*rows)[i] != kUnwritten) {
@@ -476,8 +506,8 @@ std::string walkName(LinearTile tile, bool spread) { return std::string(tileName
 // and 9 steps: tiles start inside them and wrap past their ends, and at 9 the walk wraps from an even step to an even
 // one, so the stages alternate per step walked, not by the step's parity.
 uint32_t decodeInputs(bool spread) { return spread ? 2304 : 2048; }
-LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue) {
-  return {matrix, lanes * kLaneRows, LinearPhase::Decode, epilogue};
+LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue, DecodeGeometry geometry = {}) {
+  return {matrix, lanes * geometry.rows(), LinearPhase::Decode, epilogue, geometry};
 }
 
 // ---------------------------------------------------------------- decode
@@ -485,8 +515,10 @@ LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilog
 // at every lane count, K split the tile takes and epilogue, on dense and sparse inputs, every output within fp64 and
 // each lane's rows equal to a one-lane projection of them, on the staged tile's 16-row tile too.
 void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bool spread, uint32_t K,
-                const std::vector<Fmt> &formats) {
+                const std::vector<Fmt> &formats, DecodeGeometry geometry = {}) {
   constexpr uint32_t N = 512, columns = N + kPadding;
+  const uint32_t laneRows = geometry.rows(), maximumLanes = kMaximumRows / laneRows;
+  if (linear.geometry() != geometry) throw std::logic_error("projection oracle geometry differs");
   const bool staged = tile == LinearTile::GgufStaged;
   uint32_t mostSplits = 1;
   for (size_t i = 0; i < formats.size(); ++i) {
@@ -506,20 +538,20 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bo
                                    " S=" + std::to_string(splits);
           const Projection *gated = epilogue == LinearEpilogue::GateUp ? &gate : nullptr;
           std::vector<Outcome> lanesAlone;
-          for (uint32_t lane = 0; lane < kMaximumLanes; ++lane) {
-            const std::vector<float> rows(x.begin() + uint64_t{lane} * kLaneRows * K,
-                                          x.begin() + uint64_t{lane + 1} * kLaneRows * K);
-            const std::vector<float> aux(residual.begin() + uint64_t{lane} * kLaneRows * columns,
-                                         residual.begin() + uint64_t{lane + 1} * kLaneRows * columns);
-            const LinearWorkload one = decode({columns, K}, 1, epilogue);
+          for (uint32_t lane = 0; lane < maximumLanes; ++lane) {
+            const std::vector<float> rows(x.begin() + uint64_t{lane} * laneRows * K,
+                                          x.begin() + uint64_t{lane + 1} * laneRows * K);
+            const std::vector<float> aux(residual.begin() + uint64_t{lane} * laneRows * columns,
+                                         residual.begin() + uint64_t{lane + 1} * laneRows * columns);
+            const LinearWorkload one = decode({columns, K}, 1, epilogue, geometry);
             const LinearPlan plan = Linear::plan(one, config(tile, one, splits, spread), FloatOutput::BFloat16);
-            lanesAlone.push_back(run(backend, linear, plan, up, gated, storageRows(rows, K, kLaneRows, kLaneRows),
-                                     storageRows(aux, columns, kLaneRows, kLaneRows), kPoisonNaN, N,
+            lanesAlone.push_back(run(backend, linear, plan, up, gated, storageRows(rows, K, laneRows, laneRows),
+                                     storageRows(aux, columns, laneRows, laneRows), kPoisonNaN, N,
                                      what + " lane " + std::to_string(lane) + " alone"));
           }
           // The first lane on the 16-row tile, over a padding lane of NaN rows: the 8-row tile's bits, and the fp32
           // plain outputs rounding to them.
-          if (staged) {
+          if (staged && geometry.rows() == 8) {
             const LinearWorkload one = decode({columns, K}, 1, epilogue);
             LinearConfig sixteen = config(tile, one, splits, spread);
             sixteen.sixteenRows = true;
@@ -533,8 +565,8 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bo
               floatOutput(backend, linear, Linear::plan(one, sixteen, FloatOutput::Float32), up, rows, out,
                           within(dots, staged), N, label);
           }
-          for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
-            const LinearWorkload wl = decode({columns, K}, lanes, epilogue);
+          for (uint32_t lanes = 1; lanes <= maximumLanes; ++lanes) {
+            const LinearWorkload wl = decode({columns, K}, lanes, epilogue, geometry);
             const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits, spread), FloatOutput::BFloat16);
             const uint32_t storage = plan.storageRows(), rows = wl.rows;
             const std::string label = what + " L=" + std::to_string(lanes);
@@ -546,16 +578,17 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bo
               floatOutput(backend, linear, Linear::plan(wl, config(tile, wl, splits, spread), FloatOutput::Float32), up,
                           storageRows(x, K, rows, storage), out, within(dots, staged), N, label);
             for (uint32_t lane = 0; lane < lanes; ++lane)
-              if (!sameRows(out.output, lane * kLaneRows, lanesAlone[lane].output, 0, kLaneRows, columns))
+              if (!sameRows(out.output, lane * laneRows, lanesAlone[lane].output, 0, laneRows, columns))
                 fail(label + ": lane " + std::to_string(lane) + " differs from its one-lane projection");
           }
         }
     }
   }
   section(walkName(tile, spread) + " decode: " + std::to_string(formats.size()) + " formats, K " + std::to_string(K) +
-          ", 1-4 lanes, S 1-" + std::to_string(mostSplits) +
+          ", 1-" + std::to_string(maximumLanes) + " lanes, S 1-" + std::to_string(mostSplits) +
           ", plain/residual/gate-up, dense and sparse inputs within fp64, lanes equal to one-lane projections" +
-          (staged ? " (one lane on the 16-row tile too)" : "") + ", fp32 plain outputs rounding to bf16's");
+          (staged && geometry.rows() == 8 ? " (one lane on the 16-row tile too)" : "") +
+          ", fp32 plain outputs rounding to bf16's");
 }
 
 // One fused projection of three segments of different formats ([512 | 256 | 256, K]) on one tile and walk, each format
@@ -563,9 +596,13 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bo
 // all three, within fp64 and equal to the projections of each segment alone; one lane on the staged 16-row tile equal
 // to the 8-row tile. The register tile's K holds a 256-input unit per partition at the most splits, so that every
 // triple takes every split.
-void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, bool spread) {
+void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, bool spread,
+                 std::span<const Fmt> selectedFormats = {}, DecodeGeometry geometry = {}) {
   const uint32_t K = tile == LinearTile::GgufRegister ? 256 * LinearConfig::kMaximumSplits : decodeInputs(spread);
-  const std::vector<Fmt> formats = tileFormats(tile);
+  const std::vector<Fmt> formats = selectedFormats.empty()
+      ? tileFormats(tile) : std::vector<Fmt>(selectedFormats.begin(), selectedFormats.end());
+  const uint32_t maximumLanes = kMaximumRows / geometry.rows();
+  if (linear.geometry() != geometry) throw std::logic_error("projection oracle geometry differs");
   uint32_t mostSplits = 1;
   for (size_t i = 0; i < formats.size(); ++i) {
     const Tensor a = tensor(backend, formats[i], 512, K),
@@ -582,8 +619,8 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, b
                        [&](const Tensor *part) { return takesSplits(tile, part->format, K, splits); }))
         continue;
       mostSplits = std::max(mostSplits, splits);
-      for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
-        const LinearWorkload wl = decode({columns, K}, lanes, LinearEpilogue::None);
+      for (uint32_t lanes = 1; lanes <= maximumLanes; ++lanes) {
+        const LinearWorkload wl = decode({columns, K}, lanes, LinearEpilogue::None, geometry);
         const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits, spread), FloatOutput::BFloat16);
         const uint32_t storage = plan.storageRows(), rows = wl.rows;
         const std::string label = formats + " S=" + std::to_string(splits) + " L=" + std::to_string(lanes);
@@ -591,7 +628,7 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, b
                                 kPoisonNaN, covered, label);
         checkValues(out, within(dots, tile == LinearTile::GgufStaged), {}, {}, wl, rows, covered, label);
         // One lane on the 16-row tile, over a padding lane of NaN rows: the 8-row tile's bits.
-        if (lanes == 1 && tile == LinearTile::GgufStaged) {
+        if (lanes == 1 && tile == LinearTile::GgufStaged && geometry.rows() == 8) {
           LinearConfig sixteen = config(tile, wl, splits, spread);
           sixteen.sixteenRows = true;
           const Outcome wide = run(backend, linear, Linear::plan(wl, sixteen, FloatOutput::BFloat16), fused, nullptr,
@@ -603,7 +640,7 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, b
         uint32_t offset = 0;
         for (const Tensor *part : parts) {
           const Projection alone = projection({part}, part->N);
-          const LinearWorkload one = decode({part->N, K}, lanes, LinearEpilogue::None);
+          const LinearWorkload one = decode({part->N, K}, lanes, LinearEpilogue::None, geometry);
           const Outcome single =
               run(backend, linear, Linear::plan(one, config(tile, one, splits, spread), FloatOutput::BFloat16), alone,
                   nullptr, storageRows(x, K, rows, storage), {}, kPoisonNaN, part->N, label + " alone");
@@ -619,9 +656,11 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, b
     }
   }
   section(walkName(tile, spread) + " fused: three segments in " + std::to_string(formats.size()) +
-          " format triples, K " + std::to_string(K) + ", 1-4 lanes, S 1-" + std::to_string(mostSplits) +
+          " format triples, K " + std::to_string(K) + ", 1-" + std::to_string(maximumLanes) +
+          " lanes, S 1-" + std::to_string(mostSplits) +
           " within fp64 and equal to each segment's projection" +
-          (tile == LinearTile::GgufStaged ? ", one lane on the 16-row tile equal to the 8-row tile" : ""));
+          (tile == LinearTile::GgufStaged && geometry.rows() == 8
+               ? ", one lane on the 16-row tile equal to the 8-row tile" : ""));
 }
 
 // Gate/up on one tile for the gate of each format it takes with the up of the next one ([256, 1024]), so that every
@@ -1668,14 +1707,146 @@ void gatherExtents(MetalBackend &backend) {
           "extent and refused one element short");
 }
 
+void compactProductionBounds(const Outcome &out, const Tensor &up, const Tensor &gate,
+                             const std::vector<float> &inputs, const std::string &label) {
+  std::vector<float> upValues(up.K), gateValues(gate.K);
+  for (const uint32_t column : {0U, 31U, 64U, up.N - 1}) {
+    rowValues(up.format, up.native.data() + uint64_t{column} * rowBytes(up.format, up.K), up.K, upValues.data());
+    rowValues(gate.format, gate.native.data() + uint64_t{column} * rowBytes(gate.format, gate.K),
+              gate.K, gateValues.data());
+    for (const uint32_t row : {0U, 23U, 47U}) {
+      const float *input = inputs.data() + uint64_t{row} * up.K;
+      const uint64_t index = uint64_t{row} * up.N + column;
+      const Interval gateBound = projected(dot(input, gateValues.data(), gate.K), true);
+      const Interval outputBound = withGate(projected(dot(input, upValues.data(), up.K), true),
+                                           bf16ToFloat(out.gate[index]));
+      if (!inside(out.gate[index], gateBound) || !inside(out.output[index], outputBound))
+        fail(label + ": production row " + std::to_string(row) + " column " +
+             std::to_string(column) + " differs from the independent fp64 bound");
+    }
+  }
+}
+
+void compactGateUp(MetalBackend &backend) {
+  const DecodeGeometry geometry(16);
+  const Linear linear(backend.capabilities(), geometry);
+  constexpr uint32_t live = 48, storage = 64;
+  {
+    // Real, fully backed projections and correctly sized buffers reach the
+    // dispatch-time format/layout check, rather than an extent or pipeline error.
+    constexpr uint32_t n = 128, k = 512;
+    const Tensor af4Tensor = tensor(backend, Fmt(GGUF_FMT_AF4G64), n, k);
+    const Tensor q4Tensor = tensor(backend, Q4K, n, k);
+    const Tensor first = tensor(backend, Fmt(GGUF_FMT_AF4G64), n / 2, k);
+    const Tensor second = tensor(backend, Fmt(GGUF_FMT_AF4G64), n / 2, k);
+    const Projection af4 = projection({&af4Tensor}, n), q4 = projection({&q4Tensor}, n);
+    const Projection segmented = projection({&first, &second}, n);
+    const LinearPlan forced = Linear::plan(
+        {{n, k}, live, LinearPhase::Decode, LinearEpilogue::GateUp, geometry},
+        {.tile = LinearTile::GgufStaged, .splits = 2, .computeRows = live}, FloatOutput::BFloat16);
+    const std::vector<uint16_t> packed = storageRows(activations(Inputs::Dense, live, k), k, live, storage);
+    const Scratch scratch(backend, forced.scratchSize());
+    const Operands operands(backend, forced, packed, {});
+    for (const auto &[up, gate] : {
+             std::pair{&q4, &af4}, std::pair{&af4, &q4},
+             std::pair{&segmented, &af4}, std::pair{&af4, &segmented}}) {
+      CommandGraph graph;
+      test::rejects([&] { static_cast<void>(linear.add(graph, operands.bindings(forced, scratch), *up, forced, gate)); },
+                    "compact staged tile takes whole unrotated AF4G64 gate/up projections with bf16 output",
+                    "forced M48 admitted an unsupported format or segmented projection");
+      test::require(graph.empty(), "forced M48 encoded a dispatch before rejecting its projection layout");
+    }
+  }
+  {
+    // Rotation is a supported ordinary staged path. A compact plan must
+    // reject it before even encoding the upstream input-transform node.
+    constexpr uint32_t n = 128, k = 1024;
+    const Tensor t = tensor(backend, Fmt(GGUF_FMT_AF4G64), n, k);
+    Projection rotated = projection({&t}, n);
+    rotated.rotation.signs = test::sharedBuffer(backend, k);
+    std::memset(rotated.rotation.signs.contents(), 1, k);
+    const LinearWorkload workload{{n, k}, live, LinearPhase::Decode, LinearEpilogue::GateUp, geometry};
+    const LinearPlan compact = Linear::plan(workload, {.splits = 2, .computeRows = live}, FloatOutput::BFloat16);
+    const auto packed = storageRows(activations(Inputs::Dense, live, k), k, live, storage);
+    const Scratch scratch(backend, compact.scratchSize());
+    const Operands operands(backend, compact, packed, {});
+    auto buffers = operands.bindings(compact, scratch);
+    buffers.scratch.rotated = test::sharedBuffer(backend, uint64_t{storage} * k * 2);
+    CommandGraph refused;
+    test::rejects([&] { static_cast<void>(linear.add(refused, buffers, rotated, compact, &rotated)); },
+                  "compact staged tile takes whole unrotated AF4G64 gate/up projections with bf16 output",
+                  "a compact rotated projection reached its input transform");
+    test::require(refused.empty(), "compact rejection encoded an input transform before failing");
+    const LinearPlan ordinary = Linear::plan(workload, {.splits = 2}, FloatOutput::BFloat16);
+    CommandGraph supported;
+    static_cast<void>(linear.add(supported, buffers, rotated, ordinary, &rotated));
+    test::require(supported.dispatches().size() == 3 && supported.dispatches().front().pipelineName == "gguf_rotate",
+                  "the compact negative fixture no longer exercises a valid ordinary rotated projection");
+  }
+  for (const auto &[n, k] : {std::pair{128U, 512U}, std::pair{192U, 1024U}, std::pair{17408U, 5120U}}) {
+    const Tensor upTensor = tensor(backend, Fmt(GGUF_FMT_AF4G64), n, k);
+    const Tensor gateTensor = tensor(backend, Fmt(GGUF_FMT_AF4G64), n, k);
+    const Projection up = projection({&upTensor}, n), gate = projection({&gateTensor}, n);
+    const LinearWorkload workload{{n, k}, live, LinearPhase::Decode, LinearEpilogue::GateUp, geometry};
+    for (const Inputs kind : {Inputs::Dense, Inputs::Sparse}) {
+      if (n > 512 && kind == Inputs::Sparse) continue;
+      const std::vector<float> inputs = activations(kind, live, k);
+      const std::vector<uint16_t> packed = storageRows(inputs, k, live, storage);
+      const auto upDots = n <= 512 ? products({&upTensor}, n, inputs, live) : std::vector<Dot>{};
+      const auto gateDots = n <= 512 ? products({&gateTensor}, n, inputs, live) : std::vector<Dot>{};
+      for (const uint32_t splits : {1U, 2U})
+        for (const bool spread : {false, true}) {
+          const LinearConfig fullConfig{.tile = LinearTile::GgufStaged, .splits = splits, .spread = spread};
+          auto compactConfig = fullConfig;
+          compactConfig.computeRows = live;
+          const LinearPlan full = Linear::plan(workload, fullConfig, FloatOutput::BFloat16);
+          const LinearPlan compact = Linear::plan(workload, compactConfig, FloatOutput::BFloat16);
+          const std::string label = "M48 " + std::to_string(n) + "x" + std::to_string(k) +
+                                    " split " + std::to_string(splits) + (spread ? " spread" : " lockstep") +
+                                    (kind == Inputs::Sparse ? " sparse" : " dense");
+          const Outcome expected = run(backend, linear, full, up, &gate, packed, {}, kPoisonNaN, n, label + " M64");
+          for (const uint32_t poison : {kPoisonNaN, kPoisonFinite}) {
+            const Outcome actual = run(backend, linear, compact, up, &gate, packed, {}, poison, n, label);
+            if (!sameRows(actual.output, 0, expected.output, 0, live, n) ||
+                !sameRows(actual.gate, 0, expected.gate, 0, live, n))
+              fail(label + ": live output or gate differs from M64 at the same split");
+            if (n <= 512)
+              checkValues(actual, within(upDots, true), within(gateDots, true), {}, workload, live, n, label);
+            else
+              compactProductionBounds(actual, upTensor, gateTensor, inputs, label);
+          }
+        }
+    }
+  }
+  section("M48 gate/up: 48 live rows in 64-row storage, small dense/sparse and production shapes, "
+          "split 1/2 and both walks, fp64 bounds, M64 bits, padding, poison and released counters");
+}
+
 int main(int argc, char **argv) {
   @autoreleasepool {
-    if (argc != 2) {
-      std::cerr << "usage: gguf-projection <production-and-test.metallib>\n";
+    if (argc != 2 && (argc != 3 || (std::string(argv[2]) != "--register16" && std::string(argv[2]) != "--m48"))) {
+      std::cerr << "usage: gguf-projection <production-and-test.metallib> [--register16|--m48]\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
+      if (argc == 3 && std::string(argv[2]) == "--m48") {
+        compactGateUp(backend);
+        std::cout << "gguf-projection m48: " << (failures ? "FAIL" : "PASS") << '\n';
+        return failures ? 1 : 0;
+      }
+      if (argc == 3) {
+        // Two physical eight-row tables per sixteen-row lane, up to the
+        // register tile's four tables. Keep the independent fp64, padding,
+        // poisoned-partial, counter and lane-equality checks above.
+        const DecodeGeometry geometry(16);
+        const Linear linear16(backend.capabilities(), geometry);
+        const std::vector<Fmt> formats{Fmt(GGUF_FMT_AF4G64), Q4K, IQ4XS, Fmt(GGUF_FMT_BF16)};
+        decodeTile(backend, linear16, LinearTile::GgufRegister, false, 2048, formats, geometry);
+        fusedDecode(backend, linear16, LinearTile::GgufRegister, false, formats, geometry);
+        std::cout << "gguf-projection register16: " << (failures ? "FAIL" : "PASS") << '\n';
+        return failures ? 1 : 0;
+      }
       const Linear linear(backend.capabilities(), Int8Activations::On);
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
         decodeTile(backend, linear, tile, false, decodeInputs(false), tileFormats(tile));

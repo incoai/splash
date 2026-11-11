@@ -1,0 +1,6 @@
+{
+  "rule": "Keep QKV split correction. Select combined-v2 with M48 only if all three registered m48-clean-b3-v2 ABBA groups qualify a consistent whole-model decode improvement, functional output and operating gates pass, and independent review finds no defect. Otherwise select QKV-only and retain M48 as research. No threshold or cohort changes after outputs.",
+  "fresh_comparisons": "After selection, nominate selected bundle for both DFlash8 control and DSpine16 candidate so target runtime/build is shared. Run agent12 serial and heterogeneous HTTP cold/warm as separate three-ABBA comparisons. These quantify workload tradeoffs; preserve default8 and DFlash2 default absent broader support.",
+  "sampling": "Nominate new selected DSpine16 candidate before new sampling output, compare 4,000 requests with independent seed4400000..4400999 against recovered frozen8 control in separate140-test family. Full prior280-test supplemental remains separate.",
+  "created_utc": "2026-11-11T06:40:47.891115+00:00"
+}

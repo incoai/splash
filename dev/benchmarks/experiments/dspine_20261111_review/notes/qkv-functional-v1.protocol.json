@@ -1,0 +1,108 @@
+{
+  "prepared_utc": "2026-11-11T06:22:35.514270+00:00",
+  "purpose": "Validate narrow measured QKVsplit2 correction independently of broadpolicy diagnostic, including plan/scratch/actualdispatch and exact31historical arrays. Functional diagnostics have no qualifiedtiming claim.",
+  "cpu": {
+    "id": "qkv-linear-cpu-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/engine-tests/linear-plan",
+      "--cpu"
+    ],
+    "env": {},
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/engine-tests/linear-plan",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/qkv-narrow-v1.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/engine-tests/linear-plan": "9781ccda7ed02e55f5debed9180a32c5722b03e81a1e37bf585f2ea6fae8b2e1",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/qkv-narrow-v1.patch": "6a830fd355f3373d006ef4debf7081ff7305654fce9538ee8ae91b4438959325"
+    },
+    "timeout_seconds": 1800
+  },
+  "gpu": {
+    "id": "qkv-linear-gpu-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/engine-tests/linear-plan",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/splash.metallib"
+    ],
+    "env": {
+      "MTL_SHADER_VALIDATION": "1"
+    },
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/engine-tests/linear-plan",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/qkv-narrow-v1.patch",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/splash.metallib"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/engine-tests/linear-plan": "9781ccda7ed02e55f5debed9180a32c5722b03e81a1e37bf585f2ea6fae8b2e1",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/qkv-narrow-v1.patch": "6a830fd355f3373d006ef4debf7081ff7305654fce9538ee8ae91b4438959325",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/splash.metallib": "f60d2e950c6a6c69ec7472b5ec7778de437edae81a57834b9cc2c08af0bac039"
+    },
+    "timeout_seconds": 1800
+  },
+  "historical": {
+    "id": "qkv-historical31-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/splash.metallib",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "--draft-block-size",
+      "16",
+      "--cohort",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "--samples",
+      "1",
+      "--ane-ffn-share",
+      "0",
+      "--max-context",
+      "32768",
+      "--progress",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/qkv-historical31-v1.progress.jsonl"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/splash.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/host-step.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/qkv-narrow-v1.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/study-driver": "4b5edac62e62beacbe80acd8f21c9dcac5126634e22ef73f91651b82976f1fda",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/splash.metallib": "f60d2e950c6a6c69ec7472b5ec7778de437edae81a57834b9cc2c08af0bac039",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/qkv-narrow-v1.patch": "6a830fd355f3373d006ef4debf7081ff7305654fce9538ee8ae91b4438959325"
+    },
+    "timeout_seconds": 1800
+  },
+  "probe": {
+    "id": "width-probe-qkv16-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-qkv-v1/width-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-qkv-v1/splash.metallib",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "japanese_lru_notes",
+      "16",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/width-probes/width-probe-qkv16-v1"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-qkv-v1/width-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-qkv-v1/splash.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-qkv-v1/host-step.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-qkv-v1/build.json",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/width_probe_driver_v1.mm",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/qkv-narrow-v1.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-qkv-v1/width-probe": "df684602e28da3cfbf1c7916ce5e865741017dcf68921de416c31970308c4a53",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-qkv-v1/splash.metallib": "f60d2e950c6a6c69ec7472b5ec7778de437edae81a57834b9cc2c08af0bac039",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-qkv-v1/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-qkv-v1/build.json": "a1864fc786dd9c41218b6d575167c4a0fee4187211a9ff781af6a0b234ab9a46",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/width_probe_driver_v1.mm": "865ce950d0f8b5016a4c0ad970223d1cc6aad1c5b711521789f47bde37242ddd",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/qkv-narrow-v1.patch": "6a830fd355f3373d006ef4debf7081ff7305654fce9538ee8ae91b4438959325"
+    },
+    "timeout_seconds": 900
+  }
+}

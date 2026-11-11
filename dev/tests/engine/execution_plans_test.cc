@@ -142,27 +142,36 @@ void int8ActivationsSetting() {
   const kv::Layout layout{1, 2, 256};
   const std::array<uint32_t, 1> history{131072};
   const auto int8Queries = [](const std::string &pipeline) { return pipeline.find("q8q") != std::string::npos; };
-  for (uint32_t family : {9U, 10U, 11U}) {
-    const ExecutionPlans on(device(family), Int8Activations::On), off(device(family), Int8Activations::Off);
-    const ProjectionCalibration &row = on.calibration().projection, &offRow = off.calibration().projection;
-    require(on.linear().int8Activations() == Int8Activations::On &&
-                off.linear().int8Activations() == Int8Activations::Off && row.prefillInt8 == (family >= 10) &&
-                offRow.prefillInt8 == row.prefillInt8 && offRow.decodeInt8FromRows == row.decodeInt8FromRows &&
-                off.calibration().attention.int8QueriesFromPages == on.calibration().attention.int8QueriesFromPages,
-            "the int8-activation setting did not reach the plans' Linear, or moved the device's row");
-    const bool int8 = family >= 10;
-    const auto tile = [&](const ExecutionPlans &plans) {
-      return plans.linear().prefillPlan(af4, 2048, LinearEpilogue::Residual).configuration().tile;
-    };
-    require(tile(on) == (int8 ? LinearTile::GgufPrefillInt8 : LinearTile::GgufPrefill) &&
-                tile(off) == LinearTile::GgufPrefill,
-            "the int8 prefill tile does not follow the int8-activation setting");
-    require(int8Queries(on.prefillAttention(64, 32768, 16, layout).splitPipeline) == int8 &&
-                !int8Queries(off.prefillAttention(64, 32768, 16, layout).splitPipeline) &&
-                int8Queries(on.verifyAttention(1, 16, layout, history).splitPipeline) == int8 &&
-                !int8Queries(off.verifyAttention(1, 16, layout, history).splitPipeline),
-            "INT8 attention queries do not follow the int8-activation setting");
-  }
+  for (uint32_t family : {9U, 10U, 11U})
+    for (const uint32_t rowsPerLane : {8U, 16U}) {
+      const DecodeGeometry geometry(rowsPerLane);
+      const ExecutionPlans on(device(family), Int8Activations::On, geometry),
+                           off(device(family), Int8Activations::Off, geometry);
+      const ProjectionCalibration &row = on.calibration().projection, &offRow = off.calibration().projection;
+      require(on.linear().int8Activations() == Int8Activations::On &&
+                  off.linear().int8Activations() == Int8Activations::Off && row.prefillInt8 == (family >= 10) &&
+                  offRow.prefillInt8 == row.prefillInt8 && offRow.decodeInt8FromRows == row.decodeInt8FromRows &&
+                  off.calibration().attention.int8QueriesFromPages == on.calibration().attention.int8QueriesFromPages &&
+                  on.geometry() == geometry && off.geometry() == geometry,
+              "the int8-activation setting did not reach the plans' Linear, or moved the device's row");
+      const bool int8 = family >= 10;
+      const auto tile = [&](const ExecutionPlans &plans) {
+        return plans.linear().prefillPlan(af4, 2048, LinearEpilogue::Residual).configuration().tile;
+      };
+      require(tile(on) == (int8 ? LinearTile::GgufPrefillInt8 : LinearTile::GgufPrefill) &&
+                  tile(off) == LinearTile::GgufPrefill,
+              "the int8 prefill tile does not follow the int8-activation setting");
+      require(int8Queries(on.prefillAttention(64, 32768, 16, layout).splitPipeline) == int8 &&
+                  !int8Queries(off.prefillAttention(64, 32768, 16, layout).splitPipeline) &&
+                  int8Queries(on.verifyAttention(1, 16, layout, history).splitPipeline) == int8 &&
+                  !int8Queries(off.verifyAttention(1, 16, layout, history).splitPipeline),
+              "INT8 attention queries do not follow the int8-activation setting");
+      const std::string suffix = rowsPerLane == 16 ? "_v16" : "";
+      require(on.verifyAttention(1, 16, layout, history).splitPipeline ==
+                  std::string("verify_attention_") + (int8 ? "q8q" : "q8") + "_split_kv2_g8" + suffix &&
+                  off.verifyAttention(1, 16, layout, history).splitPipeline == "verify_attention_q8_split_kv2_g8" + suffix,
+              "the activation setting or geometry selected another attention kernel");
+    }
 }
 
 // A DFlash2 draft's plans (draftLinear) keep bf16 activations, int8
@@ -174,22 +183,26 @@ void draftPlans() {
   const Projection context(5120, 25600,
                            BlockWeights{{QuantizedSegment::planes(GGUF_FMT_AF4G64, 5120, 25600, {}, {}, {})}});
   for (uint32_t family : {9U, 10U, 11U})
-    for (const Int8Activations setting : {Int8Activations::On, Int8Activations::Off}) {
-      const ExecutionPlans plans(device(family), setting);
-      const Linear &draft = plans.draftLinear(), &target = plans.linear();
-      require(draft.int8Activations() == Int8Activations::Off, "a draft's plans took int8 activations");
-      for (uint32_t rows : {1U, 64U, 2048U}) {
-        const LinearConfig own = draft.prefillPlan(context, rows, LinearEpilogue::None).configuration(),
-                           targets = target.prefillPlan(context, rows, LinearEpilogue::None).configuration();
-        const bool int8 = family >= 10 && setting == Int8Activations::On && rows == 2048;
-        require((targets.tile == LinearTile::GgufPrefillInt8) == int8 &&
-                    own == (int8 ? LinearConfig{.tile = LinearTile::GgufPrefill} : targets),
-                "a draft's prefill chunk took the int8 prefill tile or left the target's bf16 plan");
+    for (const Int8Activations setting : {Int8Activations::On, Int8Activations::Off})
+      for (const uint32_t rowsPerLane : {8U, 16U}) {
+        const DecodeGeometry geometry(rowsPerLane);
+        const ExecutionPlans plans(device(family), setting, geometry);
+        const Linear &draft = plans.draftLinear(), &target = plans.linear();
+        require(draft.int8Activations() == Int8Activations::Off && draft.geometry() == geometry &&
+                    target.geometry() == geometry && plans.geometry() == geometry,
+                "a draft's plans took int8 activations or another execution geometry");
+        for (uint32_t rows : {1U, 64U, 2048U}) {
+          const LinearConfig own = draft.prefillPlan(context, rows, LinearEpilogue::None).configuration(),
+                             targets = target.prefillPlan(context, rows, LinearEpilogue::None).configuration();
+          const bool int8 = family >= 10 && setting == Int8Activations::On && rows == 2048;
+          require((targets.tile == LinearTile::GgufPrefillInt8) == int8 &&
+                      own == (int8 ? LinearConfig{.tile = LinearTile::GgufPrefill} : targets),
+                  "a draft's prefill chunk took the int8 prefill tile or left the target's bf16 plan");
+        }
+        for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+          require(draft.decodePlan(context, lanes).configuration() == target.decodePlan(context, lanes).configuration(),
+                  "a draft's decode plan departed from the target's");
       }
-      for (uint32_t lanes = 1; lanes <= 4; ++lanes)
-        require(draft.decodePlan(context, lanes).configuration() == target.decodePlan(context, lanes).configuration(),
-                "a draft's decode plan departed from the target's");
-    }
 }
 
 // MoE plans run the three expert passes on staged tiles on every GPU: 8-row
@@ -349,11 +362,75 @@ void invalidLookupsAndContextEdges() {
           "verify attention history exceeds physical context",
           "verify rows past the physical context were accepted");
 }
+void physicalContextFollowsGeometry() {
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  constexpr uint32_t pages = (kv::kMaximumSupportedPhysicalTokens + kv::kPageTokens - 1) / kv::kPageTokens;
+  static_assert(kv::kMaximumPhysicalTokens == kv::kMaximumLogicalTokens + 7);
+  static_assert(kv::kMaximumSupportedPhysicalTokens == kv::kMaximumLogicalTokens + 15);
+  for (uint32_t rows : {8U, 16U}) {
+    const DecodeGeometry geometry(rows);
+    const ExecutionPlans plans(device, geometry);
+    std::array<uint32_t, 1> history{kv::kMaximumLogicalTokens - 1};
+    (void)plans.verifyAttention(1, 24, attentionShapes[0].layout, history);
+    const auto chunk = PagedAttention::verifyParams(history[0], pages, geometry);
+    require(kv::chunkedPrefillValidationError(chunk, rows).empty(),
+            "the active geometry rejected its final physical rows");
+    auto past = chunk;
+    ++past.committed_tokens;
+    require(kv::chunkedPrefillValidationError(past, rows) == "context_out_of_range",
+            "an active geometry admitted a history beyond the logical ceiling");
+    ++history[0];
+    rejects([&] { (void)plans.verifyAttention(1, 24, attentionShapes[0].layout, history); },
+            "verify attention history exceeds physical context", "verify used another geometry's scratch allowance");
+    rejects([&] { (void)PagedAttention::verifyParams(history[0], pages, geometry); },
+            "context_out_of_range", "verify parameters used another geometry's scratch allowance");
+  }
+}
+
+// Verify scratch follows an explicit served context, while dispatch splits
+// and pipeline names remain those of the actual lane histories.
+void boundedVerifyScratch() {
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  const kv::Layout layout{16, 4, 256, kv::Format::Int8};
+  for (uint32_t rows : {8U, 16U}) {
+    const DecodeGeometry geometry(rows);
+    const ExecutionPlans unbounded(device, geometry);
+    for (uint32_t limit : {8192U, 32768U, 65536U, 262144U}) {
+      const ExecutionPlans bounded(device, geometry, limit);
+      const uint32_t capacity = kv::verifyAttentionSplits(limit, 0, rows);
+      const auto workspace = bounded.verifyAttentionWorkspacePerLane(24, layout);
+      require(bounded.maximumVerifySplits() == capacity &&
+                  workspace.partialsBytes == uint64_t{capacity} * rows * 24 * 256 * 4 &&
+                  workspace.statisticsBytes == uint64_t{capacity} * rows * 24 * 2 * 4,
+              "verify scratch did not follow the context and geometry");
+      const std::array<uint32_t, 4> histories{0, limit / 2, limit - 1, limit};
+      const auto a = bounded.verifyAttention(4, 24, layout, histories);
+      const auto b = unbounded.verifyAttention(4, 24, layout, histories);
+      require(a.splits == b.splits && a.laneSplits == b.laneSplits &&
+                  a.splitPipeline == b.splitPipeline && a.reducePipeline == b.reducePipeline &&
+                  a.workspace.partialsBytes == 4 * workspace.partialsBytes &&
+                  a.workspace.partialsBytes <= b.workspace.partialsBytes,
+              "the allocation bound changed attention arithmetic or its dispatch");
+      if (capacity < kv::kVerifyMaximumSplits) {
+        const uint32_t beyond = capacity * kv::kVerifyPagesPerSplit * kv::kPageTokens;
+        rejects([&] { (void)bounded.verifyAttention(1, 24, layout, std::array{beyond}); },
+                "verify attention splits exceed the scratch bound", "a plan exceeding its scratch was accepted");
+      }
+    }
+  }
+  rejects([&] { (void)ExecutionPlans(device, {}, SPLASH_MAXIMUM_CONTEXT_TOKENS + 1); },
+          "verify history bound exceeds", "a context past the kernel limit was accepted");
+}
 } // namespace
 
 int main() {
   try {
     baselinePlans();
+    boundedVerifyScratch();
     int8ActivationsSetting();
     draftPlans();
     ggufMoePlans();
@@ -361,8 +438,9 @@ int main() {
     prefillSplitsFollowTheDeviceRow();
     workspaceBounds();
     invalidLookupsAndContextEdges();
+    physicalContextFollowsGeometry();
     std::cout << "PASS execution plans: device policies, int8 activations on and off, the draft's bf16 prefill, "
-                 "device MoE tiles, B1-B4 and prefill workspace bounds (CPU only)\n";
+                 "device MoE tiles, B1-B4, eight/sixteen-row geometry and bounded workspace (CPU only)\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "FAIL execution plans: " << error.what() << '\n';

@@ -35,6 +35,11 @@
 
 namespace {
 
+#ifndef SPLASH_TEST_VERIFY_ROWS
+#define SPLASH_TEST_VERIFY_ROWS 8
+#endif
+constexpr splash::ops::DecodeGeometry kGeometry(SPLASH_TEST_VERIFY_ROWS);
+
 using splash::metal::BufferStorage;
 using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
@@ -43,8 +48,8 @@ using namespace splash::ops;
 using splash::test::bf16ToFloat;
 using splash::test::floatToBf16;
 
-constexpr uint32_t kRows = SPLASH_DRAFT_QUERY_ROWS;
-constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
+constexpr uint32_t kRows = kGeometry.rows();
+constexpr uint32_t kPositions = kGeometry.proposals();
 constexpr uint32_t kCandidates = SPLASH_DRAFT_CANDIDATES;
 constexpr uint32_t kRank = SPLASH_DRAFT_SELECTOR_RANK;
 constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
@@ -145,7 +150,7 @@ void runCase(MetalBackend &backend, const Case &c) {
   const uint32_t rows = c.lanes * kRows;
   const uint32_t positions = c.lanes * kPositions;
   const auto workspace = DraftSelector::workspace(positions);
-  const DraftSelector selector(c.vocabulary);
+  const DraftSelector selector(c.vocabulary, kGeometry);
 
   MetalBuffer logits = allocate(backend, uint64_t{rows} * c.vocabulary * sizeof(float));
   auto *logitRows = static_cast<float *>(logits.contents());
@@ -167,12 +172,12 @@ void runCase(MetalBackend &backend, const Case &c) {
       allocate(backend, workspace.unaryBytes),
       selectorHidden,
       allocate(backend,
-               uint64_t{c.lanes} * SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
+               uint64_t{c.lanes} * kGeometry.uniformCount() * sizeof(float)),
       allocate(backend, uint64_t{positions} * sizeof(uint32_t)),
       allocate(backend, workspace.proposalProbabilitiesBytes),
       allocate(backend, uint64_t{positions} * sizeof(float))};
   auto *uniforms = static_cast<float *>(buffers.uniforms.contents());
-  for (uint32_t index = 0; index < c.lanes * SPLASH_SAMPLING_UNIFORMS; ++index)
+  for (uint32_t index = 0; index < c.lanes * kGeometry.uniformCount(); ++index)
     uniforms[index] = (random.unit() + 1.0F) * 0.5F;
   std::vector<uint32_t> anchors(c.lanes);
   std::vector<SamplingPolicy> policies(c.lanes);
@@ -250,7 +255,7 @@ void runCase(MetalBackend &backend, const Case &c) {
           reference[rank] = std::exp((scores[rank] - maximum) / 0.8);
           sum += reference[rank];
         }
-        const float uniform = uniforms[lane * SPLASH_SAMPLING_UNIFORMS +
+        const float uniform = uniforms[lane * kGeometry.uniformCount() +
                                        SPLASH_UNIFORM_PROPOSALS + position];
         std::array<double, kCandidates> cumulative{};
         uint32_t expectedSelection = kCandidates - 1;
@@ -298,7 +303,7 @@ void confidenceIgnoresDraws(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003;
   Random random(0xd2a35);
   const auto workspace = DraftSelector::workspace(kPositions);
-  const DraftSelector selector(vocabulary);
+  const DraftSelector selector(vocabulary, kGeometry);
   MetalBuffer logits = allocate(backend, uint64_t{kRows} * vocabulary * sizeof(float));
   for (uint32_t row = 0; row < kRows; ++row)
     fillRow(static_cast<float *>(logits.contents()) + uint64_t{row} * vocabulary, vocabulary, Pattern::Uniform,
@@ -309,7 +314,7 @@ void confidenceIgnoresDraws(MetalBackend &backend) {
                                      allocate(backend, workspace.candidatesBytes),
                                      allocate(backend, workspace.unaryBytes),
                                      randomBfloat(backend, uint64_t{kRows} * kRank, random, 0.1F),
-                                     allocate(backend, SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
+                                     allocate(backend, kGeometry.uniformCount() * sizeof(float)),
                                      allocate(backend, kPositions * sizeof(uint32_t)),
                                      allocate(backend, workspace.proposalProbabilitiesBytes),
                                      allocate(backend, kPositions * sizeof(float))};
@@ -319,7 +324,7 @@ void confidenceIgnoresDraws(MetalBackend &backend) {
   const std::array policies{SamplingPolicy{16, 1.0F, 1.0F, false}};
   const auto run = [&](uint32_t position, float uniform) {
     auto *uniforms = static_cast<float *>(buffers.uniforms.contents());
-    std::fill_n(uniforms, SPLASH_SAMPLING_UNIFORMS, 0.5F);
+    std::fill_n(uniforms, kGeometry.uniformCount(), 0.5F);
     uniforms[SPLASH_UNIFORM_PROPOSALS + position] = uniform;
     CommandGraph graph;
     selector.add(graph, buffers, codebooks, anchors, policies);
@@ -359,11 +364,11 @@ void verifyRowsChoice(MetalBackend &backend) {
       q[index] = kind == 0 ? 0.0F : kind == 1 ? 1.0F : (random.unit() + 1.0F) * 0.5F;
     }
     VerifyRowsModel model;
-    model.everyRow = trial % 50 == 49;
+    model.everyRow = kRows == 16 || trial % 50 == 49;
     model.slope = 0.3F + 0.5F * (random.unit() + 1.0F);
     for (float &intercept : model.intercepts)
       intercept = 1.5F * random.unit();
-    for (uint32_t rows = lanes; rows <= lanes * kRows; ++rows) {
+    for (uint32_t rows = lanes; kRows == 8 && rows <= lanes * kRows; ++rows) {
       const double r = rows;
       switch (trial % 4) {
       case 0: model.costs[rows] = static_cast<float>(10.0 + 5.0 * std::sqrt(r)); break;
@@ -376,7 +381,7 @@ void verifyRowsChoice(MetalBackend &backend) {
     for (uint32_t &maximum : maximumRows)
       maximum = 1 + random.next() % kRows;
     CommandGraph graph;
-    DraftSelector::addVerifyRows(graph, confidence, verifyRows, model, maximumRows);
+    DraftSelector::addVerifyRows(graph, confidence, verifyRows, model, maximumRows, kGeometry);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     const auto *chosen = static_cast<const uint32_t *>(verifyRows.contents());
     if (model.everyRow) {
@@ -435,7 +440,7 @@ void verifyRowsChoice(MetalBackend &backend) {
 // uniforms and probabilities up to the second lane's.
 void bufferExtents(MetalBackend &backend) {
   constexpr uint32_t vocabulary = 1003, lanes = 3, sampledLanes = 2;
-  const DraftSelector selector(vocabulary);
+  const DraftSelector selector(vocabulary, kGeometry);
   const auto workspace = DraftSelector::workspace(lanes * kPositions);
   const DraftSelectorBuffers buffers{
       allocate(backend, uint64_t{lanes} * kRows * vocabulary * sizeof(float)),
@@ -444,7 +449,7 @@ void bufferExtents(MetalBackend &backend) {
       allocate(backend, workspace.candidatesBytes),
       allocate(backend, workspace.unaryBytes),
       allocate(backend, uint64_t{lanes} * kRows * kRank * 2),
-      allocate(backend, uint64_t{lanes} * SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
+      allocate(backend, uint64_t{lanes} * kGeometry.uniformCount() * sizeof(float)),
       allocate(backend, uint64_t{lanes} * kPositions * sizeof(uint32_t)),
       allocate(backend, workspace.proposalProbabilitiesBytes),
       allocate(backend, uint64_t{lanes} * kPositions * sizeof(float))};
@@ -465,7 +470,7 @@ void bufferExtents(MetalBackend &backend) {
            {&DraftSelectorBuffers::selectorHidden, uint64_t{lanes} * kRows * kRank * 2, 2, "draft selector hidden"},
            {&DraftSelectorBuffers::proposedTokens, uint64_t{lanes} * kPositions * 4, 4, "proposed token"},
            {&DraftSelectorBuffers::uniforms,
-            ((sampledLanes - 1) * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_PROPOSALS + kPositions) * 4, 4,
+            ((sampledLanes - 1) * kGeometry.uniformCount() + SPLASH_UNIFORM_PROPOSALS + kPositions) * 4, 4,
             "proposal uniform"},
            {&DraftSelectorBuffers::proposalProbabilities, uint64_t{sampledLanes} * kPositions * kCandidates * 4, 4,
             "proposal probability"},
@@ -489,18 +494,18 @@ void bufferExtents(MetalBackend &backend) {
   const MetalBuffer verifyRows = allocate(backend, uint64_t{lanes} * sizeof(uint32_t));
   requireExtent(backend, buffers.confidence, uint64_t{lanes} * kPositions * 4, 4, "proposal confidence",
                 [&](CommandGraph &graph, const MetalBuffer &buffer) {
-                  DraftSelector::addVerifyRows(graph, buffer, verifyRows, VerifyRowsModel{}, maximumRows);
+                  DraftSelector::addVerifyRows(graph, buffer, verifyRows, VerifyRowsModel{}, maximumRows, kGeometry);
                 });
   requireExtent(backend, verifyRows, uint64_t{lanes} * 4, 4, "verify rows",
                 [&](CommandGraph &graph, const MetalBuffer &buffer) {
-                  DraftSelector::addVerifyRows(graph, buffers.confidence, buffer, VerifyRowsModel{}, maximumRows);
+                  DraftSelector::addVerifyRows(graph, buffers.confidence, buffer, VerifyRowsModel{}, maximumRows, kGeometry);
                 });
 }
 
 void invalidRequests(MetalBackend &backend) {
   rejects([] { DraftSelector(0); }, "invalid draft selector vocabulary",
           "a selector over no vocabulary was accepted");
-  const DraftSelector selector(1024);
+  const DraftSelector selector(1024, kGeometry);
   const auto workspace = DraftSelector::workspace(kPositions);
   const DraftSelectorBuffers buffers{
       allocate(backend, uint64_t{kRows} * 1024 * sizeof(float)),
@@ -509,7 +514,7 @@ void invalidRequests(MetalBackend &backend) {
       allocate(backend, workspace.candidatesBytes),
       allocate(backend, workspace.unaryBytes),
       allocate(backend, uint64_t{kRows} * kRank * 2),
-      allocate(backend, SPLASH_SAMPLING_UNIFORMS * sizeof(float)),
+      allocate(backend, kGeometry.uniformCount() * sizeof(float)),
       allocate(backend, kPositions * sizeof(uint32_t)),
       allocate(backend, workspace.proposalProbabilitiesBytes),
       allocate(backend, kPositions * sizeof(float))};
@@ -522,13 +527,20 @@ void invalidRequests(MetalBackend &backend) {
           "invalid draft selector batch", "anchors without a policy each were accepted");
   const MetalBuffer verifyRows = allocate(backend, kLanes * sizeof(uint32_t));
   const MetalBuffer confidence = allocate(backend, kLanes * kPositions * sizeof(float));
-  rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, {}, {}); },
+  rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, {}, {}, kGeometry); },
           "invalid draft verify rows batch", "verify rows of no lane were encoded");
-  rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, {}, std::array<uint32_t, 5>{8, 8, 8, 8, 8}); },
+  rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, {}, std::array<uint32_t, 5>{8, 8, 8, 8, 8}, kGeometry); },
           "invalid draft verify rows batch", "verify rows of five lanes were encoded");
   for (const uint32_t maximum : {0U, kRows + 1})
-    rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, {}, std::array{maximum}); },
+    rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, {}, std::array{maximum}, kGeometry); },
             "invalid draft verify rows maximum", "a maximum of verify rows outside a block was accepted");
+  if (kRows == 16) {
+    VerifyRowsModel budget; budget.everyRow = false;
+    rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, budget, std::array{kRows}, kGeometry); },
+            "sixteen-row decode requires every verify row", "sixteen-row budget was accepted");
+    require(graph.empty(), "invalid selector request encoded a graph");
+    return;
+  }
   VerifyRowsModel valid;
   valid.everyRow = false;
   valid.slope = 0.7F;
@@ -544,12 +556,12 @@ void invalidRequests(MetalBackend &backend) {
                                        std::pair{intercept, "invalid draft verify rows model"},
                                        std::pair{zero, "invalid draft verify rows cost"},
                                        std::pair{negative, "invalid draft verify rows cost"}})
-    rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, model, two); }, message,
+    rejects([&] { DraftSelector::addVerifyRows(graph, confidence, verifyRows, model, two, kGeometry); }, message,
             "an invalid verify rows model was accepted");
   require(graph.empty(), "invalid draft selector request encoded a graph");
   // Costs outside the totals the lanes may verify are not read.
   CommandGraph encoded;
-  DraftSelector::addVerifyRows(encoded, confidence, verifyRows, valid, two);
+  DraftSelector::addVerifyRows(encoded, confidence, verifyRows, valid, two, kGeometry);
   require(!encoded.empty(), "a valid verify rows model was not encoded");
 }
 

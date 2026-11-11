@@ -1,0 +1,23 @@
+{
+  "main_head": "24bc6f439da3074ea1fd8e218ab9dee84a201d3b",
+  "integration_commit": "5855e24b8a903f0c1ff9af6b1d41467cfcdaba55",
+  "build_id": "src-7e9d0622992dd15b5d3731bac0f4770a7239fe48bd9624cf6e905e3114a419a7",
+  "artifacts": {
+    "splash": {
+      "main_sha256": "5c8fb12cbba4a688cf59b0110c92aa2345155720c13ffa48b6edacb141154923",
+      "tested_bundle_sha256": "5c8fb12cbba4a688cf59b0110c92aa2345155720c13ffa48b6edacb141154923",
+      "equal": true
+    },
+    "splash.metallib": {
+      "main_sha256": "2081107a80e35076eafe8fb90260bad995aa179c1b7da8f1453599d37da48a99",
+      "tested_bundle_sha256": "2081107a80e35076eafe8fb90260bad995aa179c1b7da8f1453599d37da48a99",
+      "equal": true
+    },
+    "host-step.metallib": {
+      "main_sha256": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "tested_bundle_sha256": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "equal": true
+    }
+  },
+  "conclusion": "Normal main build native executable and both libraries match immutable integrated-v1 bundle byte-for-byte. Functional and new performance receipts name that bundle; frozen pre1.6.1 sourceA remains separate."
+}

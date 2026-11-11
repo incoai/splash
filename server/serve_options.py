@@ -765,6 +765,18 @@ SERVE_OPTIONS = (
         needs="dense_ffn",
     ),
     ServeOption(
+        "--draft-block-size",
+        "requests",
+        dict(
+            type=int,
+            choices=(8, 16),
+            default=8,
+            help="draft block rows (default: 8); 16 is experimental and requires a dense DSpine draft",
+        ),
+        engine=EngineArgument("--draft-block-size"),
+        needs="dense_ffn",
+    ),
+    ServeOption(
         "--activations",
         "requests",
         dict(

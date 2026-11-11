@@ -1,0 +1,25 @@
+{
+  "created_utc": "2026-11-11T10:36:37.552673+00:00",
+  "main_validation_sha256": "3f8819d97df798c7d75828d3f1e6e0925a322df42aced960be7e47806cdcaa9b",
+  "nomination_protocol_sha256": "89d44384f40112f16f7c6dad1209040c372bce84ebaecebc420ef4fc60c092a4",
+  "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283",
+  "all_bytes_match": true,
+  "artifacts": {
+    "splash": {
+      "main_sha256": "a7f86544957aa7ea3dec41dd4b2038d61dbc9f2310f1aae1fb2da1212b40800b",
+      "selected_sha256": "a7f86544957aa7ea3dec41dd4b2038d61dbc9f2310f1aae1fb2da1212b40800b",
+      "equal": true
+    },
+    "splash.metallib": {
+      "main_sha256": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+      "selected_sha256": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+      "equal": true
+    },
+    "host-step.metallib": {
+      "main_sha256": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "selected_sha256": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "equal": true
+    }
+  },
+  "scope": "Readback hashes captured after successful main rebuild compared to the immutable nominated serving bundle. Three runtime artifacts only; all source/test/rule bytes separately witnessed."
+}

@@ -1,0 +1,20 @@
+{
+  "frozen_utc": "2026-11-10T10:16:31.806992+00:00",
+  "reason": "Static audit of retained Table16 OOB reveals fixed8row packing vsrequestwidth16. Diagnostic repair of producer/allocation and referencecoverage, no new performance candidate or sampling nomination.",
+  "changes": [
+    "Host sum allocation rows/8 rather than rows/verifyRows",
+    "GDN writer uses globalrow=lane*activeRows+simdGroup, fixed8tile and localrow",
+    "Independent preparation dispatch in existing full suite covers two8rowtiles per16rowlane"
+  ],
+  "unchanged": [
+    "All register-path selections remain disabled",
+    "Existing native/HTTP comparison protocols and configurations",
+    "Full GDN equations/tolerances and buffer-extent checks"
+  ],
+  "jobs": [
+    "build-table16-layout-followup-v1",
+    "table16-layout-full-gdn-shader-v1"
+  ],
+  "order": "Only after all twelve long comparison rounds and their analysis; no builds or extra GPU work interleaved with timing groups.",
+  "scope": "If full GDN passes, only Table16 packing/producer is repaired. Register consumer tile count/selection and per-model geometry remain separate required work; no performance improvement claimed."
+}

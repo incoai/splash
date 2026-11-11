@@ -79,6 +79,7 @@ class BuildIdentityTests(unittest.TestCase):
         self.assertIn("runtime/metal/abi/KernelABI.h", inputs)
         self.assertIn("runtime/metal/kernels/common/paged_attention_tile.h", inputs)
         self.assertIn("dev/tools/build_identity.py", inputs)
+        self.assertIn("dev/tools/metal_verify_variant.py", inputs)
         self.assertFalse(any(path.startswith("dev/tests/") for path in inputs))
         self.assertFalse(any(path.startswith("dev/benchmarks/") for path in inputs))
         self.assertFalse(any(path.startswith("install/models/") for path in inputs))
@@ -93,6 +94,9 @@ class BuildIdentityTests(unittest.TestCase):
             tool = root / "dev/tools/build_identity.py"
             tool.parent.mkdir(parents=True)
             tool.write_text("fixture tool")
+            (tool.parent / "metal_verify_variant.py").write_text(
+                "fixture variant generator"
+            )
             first = build_identity.build_id(root)
             geometry.write_text("#define SPLASH_DFLASH_QUERY_ROWS 7\n")
             self.assertNotEqual(first, build_identity.build_id(root))
@@ -103,6 +107,10 @@ class BuildIdentityTests(unittest.TestCase):
             tool = root / "dev/tools/build_identity.py"
             tool.parent.mkdir(parents=True)
             shutil.copy2(build_identity.ROOT / "dev/tools/build_identity.py", tool)
+            shutil.copy2(
+                build_identity.ROOT / "dev/tools/metal_verify_variant.py",
+                tool.parent / "metal_verify_variant.py",
+            )
             shader = root / "runtime/metal/kernels/shared/alternate.metal"
             shader.parent.mkdir(parents=True)
             header = root / "generated/BuildIdentity.hpp"
@@ -211,6 +219,7 @@ class CompileConfigurationTests(unittest.TestCase):
             "dev/native.mk",
             "dev/tools/build_config.py",
             "dev/tools/build_identity.py",
+            "dev/tools/metal_verify_variant.py",
         ):
             destination = root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -411,6 +420,15 @@ class CompileConfigurationTests(unittest.TestCase):
                 )
                 for source in (*q8_sources, residency_source, removed_source)
             }
+            production_airs.update(
+                str(
+                    build
+                    / "metal/verify16"
+                    / source.relative_to(kernel_root).with_suffix(".air")
+                )
+                for source in q8_sources
+                if source.parts[-2] == "decode"
+            )
             test_airs = {
                 str(
                     build

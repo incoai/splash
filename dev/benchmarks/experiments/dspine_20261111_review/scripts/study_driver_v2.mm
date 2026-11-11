@@ -1,0 +1,1842 @@
+#include "engine/Engine.hpp"
+#include "engine/Bootstrap.hpp"
+#include "engine/Json.hpp"
+#include "engine/RuntimeResources.hpp"
+#include "model/Runtime.hpp"
+#include "Supervision.hpp"
+#include "PrefillWork.hpp"
+#include "TranscriptPrompts.hpp"
+
+#include <algorithm>
+#include <iterator>
+#include <array>
+#include <charconv>
+#include <chrono>
+#include <thread>
+#include <condition_variable>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <cctype>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <numeric>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+#ifndef SPLASH_BUILD_ID
+#error "backend_benchmark requires the production SPLASH_BUILD_ID"
+#endif
+
+using namespace splash;
+using namespace splash::engine;
+using splash::benchmark::expectedDraftContextRows;
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+// Compile identical measurement code against the committed baseline and the
+// per-model geometry candidate; only the candidate exposes the new setting.
+template<class Config> void setDraftBlock(Config &config, uint32_t rows) {
+  if constexpr (requires { config.draftBlockSize = rows; }) config.draftBlockSize = rows;
+  else if (rows != 8) throw std::invalid_argument("baseline supports eight rows only");
+}
+template<class Executor> uint32_t activeRows(const Executor &executor) {
+  if constexpr (requires { executor.decodeRows(); }) return executor.decodeRows();
+  else return model::ExecutionLimits::targetVerifyRows;
+}
+
+
+double milliseconds(Clock::time_point value) {
+  return std::chrono::duration<double, std::milli>(value.time_since_epoch())
+      .count();
+}
+
+struct Observation final {
+  std::string cacheStatus;
+  uint32_t matchedTokens = 0;
+  std::vector<uint32_t> outputTokens;
+  std::optional<Clock::time_point> firstToken;
+  bool completed = false;
+  std::string failure;
+  // A score-only request's logits at its score tokens.
+  std::vector<float> optionLogits;
+};
+
+struct BatchObservation final {
+  WorkKind kind = WorkKind::Decode;
+  uint32_t width = 0;
+  uint32_t inputTokens = 0;
+  uint32_t outputTokens = 0;
+  uint32_t draftedTokens = 0;
+  uint32_t acceptedDraftTokens = 0;
+};
+
+class Events final : public EngineEventSink {
+public:
+  void batchCompleted(WorkKind kind, uint32_t width, uint32_t inputTokens,
+                      uint32_t outputTokens,
+                      uint32_t draftedTokens, uint32_t acceptedDraftTokens,
+                      double, double) override {
+    lastBatch_ = {kind, width, inputTokens, outputTokens, draftedTokens,
+                  acceptedDraftTokens};
+    ++batchSequence_;
+  }
+
+  void started(uint64_t requestId, uint32_t matchedTokens,
+               uint32_t) override {
+    Observation &value = observations_[requestId];
+    value.cacheStatus = matchedTokens ? "prefix_hit" : "miss";
+    value.matchedTokens = matchedTokens;
+  }
+
+  void tokens(uint64_t requestId, std::span<const uint32_t> values) override {
+    Observation &value = observations_[requestId];
+    if (!value.firstToken)
+      value.firstToken = Clock::now();
+    value.outputTokens.insert(value.outputTokens.end(), values.begin(),
+                              values.end());
+  }
+
+  void maskRequested(uint64_t, std::span<const uint32_t>) override {
+    throw std::logic_error("unconstrained benchmark requested a token mask");
+  }
+
+  void completed(uint64_t requestId, EngineFinishReason, bool, uint32_t,
+                 uint32_t, uint32_t, std::span<const float> optionLogits,
+                 const SpeculativeCounts &) override {
+    Observation &value = observations_[requestId];
+    value.completed = true;
+    value.optionLogits.assign(optionLogits.begin(), optionLogits.end());
+  }
+
+  void failed(uint64_t requestId, LaneOutcome outcome, std::string message,
+              uint32_t) override {
+    observations_[requestId].failure =
+        std::string(laneOutcomeWire(outcome).code) + ":" + message;
+  }
+
+  [[nodiscard]] const Observation &get(uint64_t requestId) const {
+    auto found = observations_.find(requestId);
+    if (found == observations_.end())
+      throw std::logic_error("request produced no events");
+    return found->second;
+  }
+
+  // A completed score-only request's logits, which no longer stay here.
+  [[nodiscard]] std::vector<float> takeOptionLogits(uint64_t requestId) {
+    auto found = observations_.find(requestId);
+    if (found == observations_.end() || !found->second.completed ||
+        !found->second.failure.empty())
+      throw std::runtime_error("score request " + std::to_string(requestId) +
+                               " did not complete");
+    return std::move(found->second.optionLogits);
+  }
+
+  [[nodiscard]] uint64_t batchSequence() const noexcept {
+    return batchSequence_;
+  }
+
+  [[nodiscard]] const BatchObservation &lastBatch() const noexcept {
+    return lastBatch_;
+  }
+
+private:
+  std::unordered_map<uint64_t, Observation> observations_;
+  BatchObservation lastBatch_;
+  uint64_t batchSequence_ = 0;
+};
+
+struct StudyCase final { std::string name; uint32_t cap; std::vector<uint32_t> tokens; };
+std::vector<StudyCase> readStudy(const std::filesystem::path &path) {
+  std::ifstream stream(path);
+  if (!stream) throw std::runtime_error("cannot open study cohort");
+  std::vector<StudyCase> cases;
+  for (std::string line; std::getline(stream, line);) {
+    if (line.empty() || line[0] == '#') continue;
+    std::istringstream row(line);
+    StudyCase c;
+    uint64_t cap, token;
+    if (!(row >> c.name >> cap) || !cap || cap > 8192 ||
+        !std::all_of(c.name.begin(), c.name.end(), [](unsigned char v) { return std::isalnum(v) || v == '_'; }))
+      throw std::runtime_error("invalid cohort name/cap");
+    c.cap = static_cast<uint32_t>(cap);
+    while (row >> token) {
+      if (token > UINT32_MAX) throw std::runtime_error("cohort token overflow");
+      c.tokens.push_back(static_cast<uint32_t>(token));
+    }
+    if (!row.eof() || c.tokens.empty()) throw std::runtime_error("invalid cohort token list");
+    cases.push_back(std::move(c));
+  }
+  if (cases.empty()) throw std::runtime_error("empty cohort");
+  return cases;
+}
+
+struct Measurement final {
+  std::string scenario;
+  uint32_t sample = 0;
+  uint32_t promptTokens = 0;
+  std::string cacheStatus;
+  uint32_t matchedTokens = 0;
+  double wallMilliseconds = 0.0;
+  double ttftMilliseconds = 0.0;
+  double prefillGpuMilliseconds = 0.0;
+  double decodeGpuMilliseconds = 0.0;
+  uint64_t targetPrefillRows = 0;
+  uint64_t draftContextRows = 0;
+  uint64_t draftContextRowsAvoided = 0;
+  uint64_t draftStateRestoreSkipped = 0;
+  uint64_t junctionMaterializations = 0;
+  std::vector<uint32_t> outputTokens;
+  std::optional<bool> coldOutputMatch;
+  // Opt-in single-request acceptance trace. A batch's accepted count is a
+  // prefix length; the final cycle can be censored by EOS or the token cap.
+  std::vector<BatchObservation> draftCycles;
+};
+
+struct DecodeThroughputMeasurement final {
+  std::string scenario = "decode";
+  uint32_t promptTokens = 0;
+  uint32_t outputCap = 64;
+  uint64_t inputTokenHash = 0;
+  std::vector<std::vector<uint32_t>> laneOutputs;
+  uint32_t width = 0;
+  uint32_t sample = 0;
+  uint32_t outputTokens = 0;
+  uint64_t decodeOutputTokens = 0;
+  uint64_t decodeBatches = 0;
+  uint64_t draftedTokens = 0;
+  uint64_t acceptedDraftTokens = 0;
+  double requestWallMilliseconds = 0.0;
+  double prefillWallMilliseconds = 0.0;
+  double prefillGpuMilliseconds = 0.0;
+  double decodeWallMilliseconds = 0.0;
+  double decodeGpuMilliseconds = 0.0;
+  double aggregateRequestWallTokensPerSecond = 0.0;
+  double aggregateDecodeWallTokensPerSecond = 0.0;
+  double aggregateGpuTokensPerSecond = 0.0;
+  double outputTokensPerLaneBatch = 0.0;
+  double draftAcceptanceRate = 0.0;
+  std::vector<uint32_t> firstLaneOutputTokens;
+};
+
+uint64_t tokenSequenceHash(std::span<const uint32_t> tokens) noexcept {
+  uint64_t hash = 1469598103934665603ULL;
+  for (uint32_t token : tokens) {
+    for (uint32_t shift = 0; shift != 32; shift += 8) {
+      hash ^= static_cast<uint8_t>(token >> shift);
+      hash *= 1099511628211ULL;
+    }
+  }
+  return hash;
+}
+
+// JSONL is intentional: every flushed line is independently readable, so a
+// crash during a long 128K run preserves all completed samples.
+class ProgressJournal final {
+public:
+  ProgressJournal(const std::filesystem::path &path, uint32_t samples)
+      : output_(path, std::ios::out | std::ios::trunc) {
+    if (!output_)
+      throw std::runtime_error("cannot open benchmark progress journal");
+    output_ << std::setprecision(10)
+            << "{\"event\":\"started\",\"build_id\":\""
+            << SPLASH_BUILD_ID << "\",\"samples_requested\":" << samples
+            << "}\n";
+    flush();
+  }
+
+  void identity(std::string_view value) {
+    output_ << "{\"event\":\"identity\",\"identity\":" << value << "}\n";
+    flush();
+  }
+
+  void begin(std::string_view phase, std::string_view scenario, uint32_t sample,
+             uint32_t promptTokens = 0, uint32_t width = 0,
+             std::optional<uint64_t> inputTokenHash = std::nullopt) {
+    output_ << "{\"event\":\"begin\",\"phase\":\"" << phase
+            << "\",\"scenario\":\"" << scenario << "\",\"sample\":"
+            << sample << ",\"prompt_tokens\":" << promptTokens
+            << ",\"width\":" << width;
+    if (inputTokenHash)
+      output_ << ",\"input_token_hash\":\"" << *inputTokenHash << '"';
+    output_ << "}\n";
+    flush();
+    std::cerr << "backend-benchmark: start phase=" << phase
+              << " scenario=" << scenario << " sample=" << sample
+              << " prompt_tokens=" << promptTokens << " width=" << width
+              << '\n';
+  }
+
+  void complete(std::string_view kind, std::string_view scenario,
+                uint32_t sample, uint32_t promptTokens, uint32_t width,
+                double wallMilliseconds, double gpuMilliseconds,
+                double ttftMilliseconds, std::string_view cacheStatus = {},
+                uint32_t matchedTokens = 0, uint64_t targetRows = 0,
+                uint64_t draftRows = 0,
+                std::optional<uint64_t> decodeBatches = std::nullopt,
+                std::optional<uint64_t> draftedTokens = std::nullopt,
+                std::optional<uint64_t> acceptedDraftTokens = std::nullopt,
+                std::optional<uint64_t> inputTokenHash = std::nullopt,
+                std::span<const uint32_t> outputTokens = {},
+                std::span<const uint32_t> prefillBatchRows = {}) {
+    output_ << "{\"event\":\"complete\",\"kind\":\"" << kind
+            << "\",\"scenario\":\"" << scenario << "\",\"sample\":"
+            << sample << ",\"prompt_tokens\":" << promptTokens
+            << ",\"width\":" << width << ",\"wall_ms\":"
+            << wallMilliseconds << ",\"gpu_ms\":" << gpuMilliseconds
+            << ",\"ttft_ms\":" << ttftMilliseconds
+            << ",\"cache_status\":\"" << cacheStatus
+            << "\",\"matched_tokens\":" << matchedTokens
+            << ",\"target_prefill_rows\":" << targetRows
+            << ",\"draft_context_rows\":" << draftRows;
+    if (decodeBatches)
+      output_ << ",\"decode_batches\":" << *decodeBatches;
+    if (draftedTokens)
+      output_ << ",\"drafted_tokens\":" << *draftedTokens;
+    if (acceptedDraftTokens)
+      output_ << ",\"accepted_draft_tokens\":" << *acceptedDraftTokens;
+    if (inputTokenHash) {
+      output_ << ",\"input_token_hash\":\"" << *inputTokenHash
+              << "\",\"output_token_hash\":\"" << tokenSequenceHash(outputTokens)
+              << "\",\"output_tokens\":[";
+      for (size_t index = 0; index < outputTokens.size(); ++index) {
+        if (index)
+          output_ << ',';
+        output_ << outputTokens[index];
+      }
+      output_ << "],\"prefill_batch_rows\":[";
+      for (size_t index = 0; index < prefillBatchRows.size(); ++index) {
+        if (index)
+          output_ << ',';
+        output_ << prefillBatchRows[index];
+      }
+      output_ << ']';
+    }
+    output_ << "}\n";
+    flush();
+    std::cerr << "backend-benchmark: done kind=" << kind
+              << " scenario=" << scenario << " sample=" << sample
+              << " wall_ms=" << wallMilliseconds
+              << " gpu_ms=" << gpuMilliseconds
+              << " ttft_ms=" << ttftMilliseconds << '\n';
+  }
+
+  void finish(size_t failureCount) {
+    output_ << "{\"event\":\"finished\",\"result\":\""
+            << (failureCount ? "fail" : "pass")
+            << "\",\"performance_failure_count\":" << failureCount
+            << "}\n";
+    flush();
+  }
+
+  void fail() noexcept {
+    try {
+      output_ << "{\"event\":\"finished\",\"result\":\"fail\"}\n";
+      flush();
+    } catch (...) {
+    }
+  }
+
+private:
+  void flush() {
+    output_.flush();
+    if (!output_)
+      throw std::runtime_error("cannot write benchmark progress journal");
+  }
+
+  std::ofstream output_;
+};
+
+class Driver final {
+public:
+  Driver(engine::Engine &engine, Events &events)
+      : engine_(engine), events_(events) {
+    // A failing scenario destroys Driver before Engine drains its outstanding
+    // command. The completion callback must keep its own wake state alive.
+    engine_.setCompletionNotifier([wake = wake_] {
+      {
+        std::lock_guard lock(wake->mutex);
+        wake->notified = true;
+      }
+      wake->condition.notify_one();
+    });
+  }
+
+  void untilIdle(
+      const std::function<void(const BatchObservation &)> &observer =
+          {}) {
+    const auto deadline = Clock::now() + std::chrono::hours(2);
+    uint64_t observedBatchSequence = events_.batchSequence();
+    while (!drained()) {
+      if (engine_.tick(milliseconds(Clock::now()))) {
+        const uint64_t sequence = events_.batchSequence();
+        if (sequence != observedBatchSequence) {
+          if (sequence != observedBatchSequence + 1)
+            throw std::logic_error("benchmark skipped a completed batch");
+          observedBatchSequence = sequence;
+          if (observer)
+            observer(events_.lastBatch());
+        }
+        continue;
+      }
+      if (Clock::now() >= deadline)
+        throw std::runtime_error("backend benchmark timed out");
+      auto wakeup = deadline;
+      if (auto next = engine_.nextWakeupMilliseconds()) {
+        wakeup = std::min(wakeup, Clock::time_point{
+            std::chrono::duration_cast<Clock::duration>(
+                std::chrono::duration<double, std::milli>(*next))});
+      }
+      std::unique_lock lock(wake_->mutex);
+      wake_->condition.wait_until(lock, wakeup, [this] {
+        if (!wake_->notified)
+          return false;
+        wake_->notified = false;
+        return true;
+      });
+    }
+  }
+
+private:
+  struct WakeState final {
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool notified = false;
+  };
+
+  // Every submitted request has ended and no command is in flight.
+  [[nodiscard]] bool drained() const {
+    const engine::EngineSnapshot counts = engine_.snapshot();
+    return counts.submitted ==
+               counts.completed + counts.cancelled + counts.failed &&
+           !engine_.commandInFlight();
+  }
+
+  engine::Engine &engine_;
+  Events &events_;
+  std::shared_ptr<WakeState> wake_ = std::make_shared<WakeState>();
+};
+
+std::vector<uint32_t> prompt(uint32_t length, uint64_t salt) {
+  std::vector<uint32_t> result(length);
+  uint64_t state = salt ^ 0x9e3779b97f4a7c15ULL;
+  for (uint32_t &token : result) {
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    token = 100 + static_cast<uint32_t>((state >> 17) % 200000);
+  }
+  return result;
+}
+
+// What each lookup of a cache check found, for its failure: under host
+// memory pressure the engine evicts the cached prefixes the checks reuse.
+std::string lookups(
+    std::initializer_list<std::reference_wrapper<const Measurement>> requests,
+    uint32_t expectedTokens) {
+  std::string found;
+  for (const Measurement &request : requests)
+    found += request.scenario + "=" + request.cacheStatus + "/" +
+             std::to_string(request.matchedTokens) + " ";
+  return found + "(expected a " + std::to_string(expectedTokens) +
+         "-token hit)";
+}
+
+Measurement runRequest(engine::Engine &engine, Driver &driver,
+                       model::RuntimeModel &executor, Events &events,
+                       ProgressJournal *progress, uint64_t requestId,
+                       std::string scenario, uint32_t sample,
+                       std::vector<uint32_t> tokens,
+                       uint32_t maxNewTokens = 1, bool traceDrafts = false, const SamplingParameters *policy = nullptr) {
+  const uint32_t promptTokens = static_cast<uint32_t>(tokens.size());
+  const uint64_t inputTokenHash = tokenSequenceHash(tokens);
+  if (progress)
+    progress->begin("prefill", scenario, sample, promptTokens, 0, inputTokenHash);
+  EngineRequest request;
+  request.id = requestId;
+  request.prompt = std::move(tokens);
+  request.maxNewTokens = maxNewTokens;
+  request.sampling.temperature = 0.0F;
+  request.sampling.topP = 1.0F;
+  if (policy) request.sampling = *policy;
+  request.deadlineMilliseconds =
+      milliseconds(Clock::now() + std::chrono::hours(2));
+
+  const model::ModelTelemetry before = executor.telemetry();
+  const engine::EngineSnapshot engineBefore = engine.snapshot();
+  std::vector<uint32_t> prefillBatchRows;
+  prefillBatchRows.reserve(
+      promptTokens / model::ExecutionLimits::prefillTokenBudget + 3);
+  std::vector<BatchObservation> draftCycles;
+  const auto began = Clock::now();
+  engine.submit(std::move(request));
+  driver.untilIdle([&](const BatchObservation &batch) {
+    if (batch.kind == WorkKind::Prefill)
+      prefillBatchRows.push_back(batch.inputTokens);
+    else if (traceDrafts) {
+      if (batch.width != 1)
+        throw std::runtime_error("acceptance tracing requires one request per batch");
+      draftCycles.push_back(batch);
+    }
+  });
+  const auto ended = Clock::now();
+  const model::ModelTelemetry after = executor.telemetry();
+  const engine::EngineSnapshot engineAfter = engine.snapshot();
+  const Observation &observed = events.get(requestId);
+  if (!observed.completed || !observed.failure.empty()) {
+    throw std::runtime_error("request failed: " + observed.failure);
+  }
+
+  Measurement result;
+  result.scenario = std::move(scenario);
+  result.sample = sample;
+  result.promptTokens = promptTokens;
+  result.cacheStatus = observed.cacheStatus;
+  result.matchedTokens = observed.matchedTokens;
+  result.wallMilliseconds = milliseconds(ended) - milliseconds(began);
+  result.ttftMilliseconds =
+      observed.firstToken
+          ? milliseconds(*observed.firstToken) - milliseconds(began)
+          : result.wallMilliseconds;
+  result.prefillGpuMilliseconds =
+      (after.totalPrefillGpuSeconds - before.totalPrefillGpuSeconds) * 1000.0;
+  result.decodeGpuMilliseconds =
+      (after.totalDecodeGpuSeconds - before.totalDecodeGpuSeconds) * 1000.0;
+  result.targetPrefillRows = after.targetPrefillRows - before.targetPrefillRows;
+  result.draftContextRows =
+      after.draftContextRowsActive + after.draftContextRowsMaterialization -
+      before.draftContextRowsActive - before.draftContextRowsMaterialization;
+  result.draftContextRowsAvoided =
+      after.draftContextRowsAvoided - before.draftContextRowsAvoided;
+  result.draftStateRestoreSkipped =
+      after.draftStateRestoreSkipped - before.draftStateRestoreSkipped;
+  result.junctionMaterializations = engineAfter.junctionMaterializations -
+                                    engineBefore.junctionMaterializations;
+  result.outputTokens = observed.outputTokens;
+  result.draftCycles = std::move(draftCycles);
+  if (progress) {
+    progress->complete(
+        "request", result.scenario, result.sample, result.promptTokens, 0,
+        result.wallMilliseconds,
+        result.prefillGpuMilliseconds + result.decodeGpuMilliseconds,
+        result.ttftMilliseconds, result.cacheStatus, result.matchedTokens,
+        result.targetPrefillRows, result.draftContextRows,
+        std::nullopt, std::nullopt, std::nullopt, inputTokenHash,
+        result.outputTokens, prefillBatchRows);
+  }
+  return result;
+}
+
+// In-service work's claim of the cache (MemoryLedger::free) for `need`:
+// whether it took something.
+bool claimCache(engine::Cache &resources, const engine::Need &need) {
+  engine::MemoryLedger ledger;
+  ledger.addSource(resources);
+  const engine::ClaimId claim =
+      ledger.open({.cls = engine::ClaimClass::InService, .reach = engine::ReclaimClass::InUse});
+  const engine::FreeResult freed = ledger.free(claim, need, 0, false);
+  ledger.close(claim);
+  return freed.gave();
+}
+
+// Claims of an extent's bytes until none takes anything: every unpinned
+// entry goes and the extents leave.
+void evictAllCache(engine::Cache &resources) {
+  while (claimCache(resources, {.bytes = 1})) {
+  }
+  static_cast<void>(resources.releaseEmptyExtents(false));
+  const engine::CacheSnapshot snapshot = resources.snapshot();
+  if (snapshot.stateCache.entries || snapshot.pool.pagesPrefix)
+    throw std::logic_error("native benchmark cache did not drain");
+}
+
+// Evicts every cached state, one at a time, and leaves the KV graph intact.
+void evictAllCompositeState(engine::Cache &resources) {
+  while (resources.snapshot().stateCache.entries) {
+    if (!claimCache(resources, {.stateBuffers = 1}))
+      throw std::logic_error("native benchmark state cache made no progress");
+  }
+}
+
+DecodeThroughputMeasurement
+runDecodeThroughput(engine::Engine &engine, Driver &driver,
+                    model::RuntimeModel &executor, Events &events,
+                    ProgressJournal *progress, uint64_t &requestId,
+                    uint32_t width, uint32_t sample,
+                    std::span<const uint32_t> tokens, uint32_t outputCap = 64, std::string scenario = "decode") {
+  if (!outputCap) throw std::invalid_argument("clone output cap is zero");
+  if (!width || width > model::ExecutionLimits::maximumBatchWidth) {
+    throw std::invalid_argument("invalid decode throughput width");
+  }
+  if (progress)
+    progress->begin("decode_throughput", "decode", sample, tokens.size(), width);
+
+  // The lanes share one prompt. The first request to reach a Page32 boundary
+  // publishes the composite state there and splits its prefill around it, so
+  // it would start decoding one command after the deduplicated lanes. Warm
+  // the prefix with a one-token request; every lane then resumes from the
+  // published prefix in a single ragged prefill and decodes in lockstep.
+  {
+    EngineRequest warm;
+    warm.id = requestId++;
+    warm.prompt.assign(tokens.begin(), tokens.end());
+    warm.maxNewTokens = 1;
+    warm.sampling.temperature = 0.0F;
+    warm.sampling.topP = 1.0F;
+    warm.deadlineMilliseconds =
+        milliseconds(Clock::now() + std::chrono::hours(2));
+    engine.submit(std::move(warm));
+    driver.untilIdle();
+    const Observation &observed = events.get(requestId - 1);
+    if (!observed.completed || !observed.failure.empty()) {
+      throw std::runtime_error("decode throughput warm-up failed: " +
+                               observed.failure);
+    }
+  }
+
+  const model::ModelTelemetry telemetryBefore =
+      executor.telemetry();
+  const engine::SchedulerSnapshot schedulerBefore = engine.snapshot().scheduler;
+  std::vector<uint64_t> requestIds;
+  requestIds.reserve(width);
+  uint64_t decodeBatches = 0;
+  uint64_t decodeOutputTokens = 0;
+  uint64_t draftedTokens = 0;
+  uint64_t acceptedDraftTokens = 0;
+  const auto began = Clock::now();
+  for (uint32_t lane = 0; lane < width; ++lane) {
+    EngineRequest request;
+    request.id = requestId++;
+    request.prompt.assign(tokens.begin(), tokens.end());
+    request.maxNewTokens = outputCap;
+    request.sampling.temperature = 0.0F;
+    request.sampling.topP = 1.0F;
+    request.deadlineMilliseconds =
+        milliseconds(began + std::chrono::hours(2));
+    requestIds.push_back(request.id);
+    engine.submit(std::move(request));
+  }
+  driver.untilIdle([&](const BatchObservation &batch) {
+    if (batch.kind != WorkKind::Decode)
+      return;
+    if (batch.width != width) {
+      throw std::runtime_error(
+          "decode throughput batch used the wrong physical width");
+    }
+    ++decodeBatches;
+    decodeOutputTokens += batch.outputTokens;
+    draftedTokens += batch.draftedTokens;
+    acceptedDraftTokens += batch.acceptedDraftTokens;
+  });
+  const auto ended = Clock::now();
+  const model::ModelTelemetry telemetryAfter = executor.telemetry();
+  const engine::SchedulerSnapshot schedulerAfter = engine.snapshot().scheduler;
+
+  uint32_t completedTokens = 0;
+  const Observation *reference = nullptr;
+  for (uint64_t id : requestIds) {
+    const Observation &observed = events.get(id);
+    if (!observed.completed || !observed.failure.empty() ||
+        (observed.outputTokens.empty() || observed.outputTokens.size() > outputCap)) {
+      throw std::runtime_error(
+          "decode throughput request returned no tokens or exceeded its cap");
+    }
+    if (reference && reference->outputTokens != observed.outputTokens) {
+      throw std::runtime_error("decode throughput lanes diverged");
+    }
+    reference = &observed;
+    completedTokens += static_cast<uint32_t>(observed.outputTokens.size());
+  }
+
+  for (uint32_t candidate = 1;
+       candidate <= model::ExecutionLimits::maximumBatchWidth; ++candidate) {
+    const uint64_t delta =
+        schedulerAfter.decodeBatchesByWidth[candidate - 1] -
+        schedulerBefore.decodeBatchesByWidth[candidate - 1];
+    if ((candidate == width && !delta) || (candidate != width && delta)) {
+      throw std::runtime_error(
+          "decode throughput request used a different physical batch width");
+    }
+  }
+
+  DecodeThroughputMeasurement result;
+  result.width = width;
+  result.scenario = std::move(scenario);
+  result.promptTokens = static_cast<uint32_t>(tokens.size());
+  result.outputCap = outputCap;
+  result.inputTokenHash = tokenSequenceHash(tokens);
+  for (uint64_t id : requestIds) result.laneOutputs.push_back(events.get(id).outputTokens);
+  result.sample = sample;
+  result.outputTokens = completedTokens;
+  result.decodeOutputTokens = decodeOutputTokens;
+  result.decodeBatches = decodeBatches;
+  result.draftedTokens = draftedTokens;
+  result.acceptedDraftTokens = acceptedDraftTokens;
+  result.requestWallMilliseconds = milliseconds(ended) - milliseconds(began);
+  result.prefillWallMilliseconds =
+      (telemetryAfter.totalPrefillWallSeconds -
+       telemetryBefore.totalPrefillWallSeconds) *
+      1000.0;
+  result.prefillGpuMilliseconds =
+      (telemetryAfter.totalPrefillGpuSeconds -
+       telemetryBefore.totalPrefillGpuSeconds) *
+      1000.0;
+  result.decodeWallMilliseconds =
+      (telemetryAfter.totalDecodeWallSeconds -
+       telemetryBefore.totalDecodeWallSeconds) *
+      1000.0;
+  result.decodeGpuMilliseconds =
+      (telemetryAfter.totalDecodeGpuSeconds -
+       telemetryBefore.totalDecodeGpuSeconds) *
+      1000.0;
+  if (!(result.requestWallMilliseconds > 0.0) ||
+      !(result.prefillWallMilliseconds > 0.0) ||
+      !(result.prefillGpuMilliseconds > 0.0) ||
+      !(result.decodeWallMilliseconds > 0.0) ||
+      !(result.decodeGpuMilliseconds > 0.0)) {
+    throw std::runtime_error("decode throughput timing is not positive");
+  }
+  result.aggregateRequestWallTokensPerSecond =
+      static_cast<double>(completedTokens) * 1000.0 /
+      result.requestWallMilliseconds;
+  result.aggregateDecodeWallTokensPerSecond =
+      static_cast<double>(decodeOutputTokens) * 1000.0 /
+      result.decodeWallMilliseconds;
+  result.aggregateGpuTokensPerSecond =
+      static_cast<double>(decodeOutputTokens) * 1000.0 /
+      result.decodeGpuMilliseconds;
+  if (!result.decodeBatches || !decodeOutputTokens ||
+      decodeOutputTokens > completedTokens) {
+    throw std::runtime_error("decode throughput work accounting is invalid");
+  }
+  // A cycle counts the proposals each lane verified: seven, or fewer once the
+  // lane's output budget leaves less than its block to retain.
+  if (draftedTokens > uint64_t{width} * decodeBatches *
+                          (activeRows(executor) - 1) ||
+      acceptedDraftTokens > draftedTokens) {
+    throw std::runtime_error("decode throughput DFlash accounting is invalid");
+  }
+  result.outputTokensPerLaneBatch =
+      static_cast<double>(decodeOutputTokens) /
+      static_cast<double>(width * result.decodeBatches);
+  result.draftAcceptanceRate =
+      result.draftedTokens
+          ? static_cast<double>(result.acceptedDraftTokens) /
+                static_cast<double>(result.draftedTokens)
+          : 0.0;
+  result.firstLaneOutputTokens = reference->outputTokens;
+  if (progress) {
+    progress->complete("decode_throughput", "B" + std::to_string(width),
+                       sample, tokens.size(), width,
+                       result.requestWallMilliseconds,
+                       result.prefillGpuMilliseconds +
+                           result.decodeGpuMilliseconds,
+                       0.0, {}, 0, 0, 0,
+                       result.decodeBatches, result.draftedTokens,
+                       result.acceptedDraftTokens);
+  }
+  return result;
+}
+
+void emitMeasurement(const Measurement &value, bool first) {
+  if (!first)
+    std::cout << ',';
+  std::cout << "{\"scenario\":\"" << value.scenario
+            << "\",\"sample\":" << value.sample
+            << ",\"prompt_tokens\":" << value.promptTokens
+            << ",\"target_prefill_rows\":" << value.targetPrefillRows
+            << ",\"cache_status\":\"" << value.cacheStatus
+            << "\",\"matched_tokens\":" << value.matchedTokens
+            << ",\"wall_ms\":" << value.wallMilliseconds
+            << ",\"ttft_ms\":" << value.ttftMilliseconds
+            << ",\"prefill_gpu_ms\":" << value.prefillGpuMilliseconds
+            << ",\"decode_gpu_ms\":" << value.decodeGpuMilliseconds
+            << ",\"draft_context_rows\":" << value.draftContextRows
+            << ",\"draft_context_rows_avoided\":"
+            << value.draftContextRowsAvoided
+            << ",\"draft_state_restore_skipped\":"
+            << value.draftStateRestoreSkipped
+            << ",\"junction_materializations\":"
+            << value.junctionMaterializations << ",\"output_tokens\":[";
+  for (size_t index = 0; index < value.outputTokens.size(); ++index) {
+    if (index)
+      std::cout << ',';
+    std::cout << value.outputTokens[index];
+  }
+  std::cout << ']';
+  if (!value.draftCycles.empty()) {
+    std::cout << ",\"draft_cycles\":[";
+    for (size_t i = 0; i < value.draftCycles.size(); ++i) {
+      const auto &cycle = value.draftCycles[i];
+      std::cout << (i ? "," : "") << "{\"drafted_tokens\":" << cycle.draftedTokens
+                << ",\"accepted_draft_tokens\":" << cycle.acceptedDraftTokens
+                << ",\"output_tokens\":" << cycle.outputTokens << '}';
+    }
+    std::cout << ']';
+  }
+  if (value.coldOutputMatch)
+    std::cout << ",\"cold_output_match\":"
+              << (*value.coldOutputMatch ? "true" : "false");
+  std::cout << '}';
+}
+
+uint32_t parseSamples(std::string_view value) {
+  uint64_t parsed = 0;
+  for (char character : value) {
+    if (character < '0' || character > '9')
+      throw std::invalid_argument("samples must be a positive integer");
+    parsed = parsed * 10 + static_cast<uint64_t>(character - '0');
+    if (parsed > 2000)
+      throw std::invalid_argument("samples must not exceed 2000");
+  }
+  if (!parsed)
+    throw std::invalid_argument("samples must be a positive integer");
+  return static_cast<uint32_t>(parsed);
+}
+
+// A context limit, as serve's --max-context: a positive token count.
+uint32_t parseMaxContext(std::string_view value) {
+  uint32_t tokens = 0;
+  const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), tokens);
+  if (error != std::errc{} || end != value.data() + value.size() || !tokens)
+    throw std::invalid_argument("--max-context takes a positive token count");
+  return tokens;
+}
+
+// --ane-ffn-minimum-rows: the least rows of a chunk the prefill FFN's Neural
+// Engine split takes, a positive count.
+uint32_t parseAneFfnMinimumRows(std::string_view value) {
+  uint32_t rows = 0;
+  const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), rows);
+  if (error != std::errc{} || end != value.data() + value.size() || !rows)
+    throw std::invalid_argument("--ane-ffn-minimum-rows takes a positive row count");
+  return rows;
+}
+
+// --ane-ffn-share: the prefill FFN's Neural Engine share, in [0, 1).
+double parseAneFfnShare(std::string_view value) {
+  double share = 0.0;
+  const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), share);
+  if (error != std::errc{} || end != value.data() + value.size() || !(share >= 0.0 && share < 1.0))
+    throw std::invalid_argument("--ane-ffn-share takes a share in [0, 1)");
+  return share;
+}
+
+double median(std::vector<double> values) {
+  if (values.empty())
+    throw std::invalid_argument("cannot take the median of no samples");
+  std::sort(values.begin(), values.end());
+  const size_t middle = values.size() / 2;
+  return values.size() & 1 ? values[middle]
+                           : (values[middle - 1] + values[middle]) / 2.0;
+}
+
+// The aggregate wall decode throughput of each sample at one width.
+std::vector<double> decodeWallThroughputs(
+    std::span<const DecodeThroughputMeasurement> measurements,
+    uint32_t width) {
+  std::vector<double> values;
+  for (const DecodeThroughputMeasurement &measurement : measurements) {
+    if (measurement.width == width)
+      values.push_back(measurement.aggregateDecodeWallTokensPerSecond);
+  }
+  if (values.empty())
+    throw std::invalid_argument("no decode throughput samples at this width");
+  return values;
+}
+
+// The scenarios one run measures: decode, partial and context by default, or
+// the comma-separated set --scenario names. exact measures the context
+// lengths as repeated restores instead, so it excludes context.
+struct BenchmarkScenarios final {
+  bool decode = true;
+  bool partial = true;
+  // The short scenario; short is a keyword.
+  bool shortPrompts = false;
+  bool transcripts = false;
+  bool context = true;
+  bool exact = false;
+  bool logits = false;
+  bool resume = false;
+  bool acceptance = false;
+  bool study = false;
+};
+
+BenchmarkScenarios parseScenarios(std::string_view value) {
+  BenchmarkScenarios selected{false, false, false, false, false, false, false, false, false, false};
+  for (;;) {
+    const size_t comma = value.find(',');
+    const std::string_view name = value.substr(0, comma);
+    bool *scenario = name == "decode"        ? &selected.decode
+                     : name == "partial"     ? &selected.partial
+                     : name == "short"       ? &selected.shortPrompts
+                     : name == "transcripts" ? &selected.transcripts
+                     : name == "context"     ? &selected.context
+                     : name == "exact"       ? &selected.exact
+                     : name == "logits"      ? &selected.logits
+                     : name == "resume"      ? &selected.resume
+                     : name == "acceptance"  ? &selected.acceptance
+                     : name == "study"       ? &selected.study
+                                             : nullptr;
+    if (!scenario)
+      throw std::invalid_argument("unknown benchmark scenario");
+    if (*scenario)
+      throw std::invalid_argument("benchmark scenario named twice");
+    *scenario = true;
+    if (comma == std::string_view::npos)
+      break;
+    value.remove_prefix(comma + 1);
+  }
+  if (selected.context && selected.exact)
+    throw std::invalid_argument("exact and context scenarios exclude each other");
+  return selected;
+}
+
+// The logits scenario's dump (dev/benchmarks/logit_compare.py compares two):
+// sequences.txt, one token sequence per line; records.txt, one scored prefix
+// per line, its sequence's index and its length; and logits.f32, the
+// vocabulary's fp32 logits after each record's prefix in record order, as
+// numpy's tofile writes them (little-endian).
+struct LogitDump final {
+  std::vector<std::vector<uint32_t>> sequences;
+  std::vector<std::pair<uint32_t, uint32_t>> records;
+};
+
+// The lines of a dump's text file, each its whitespace-separated numbers.
+std::vector<std::vector<uint32_t>> readNumberLines(const std::filesystem::path &path) {
+  std::ifstream input(path);
+  if (!input)
+    throw std::runtime_error("cannot read " + path.string());
+  std::vector<std::vector<uint32_t>> lines;
+  for (std::string line; std::getline(input, line);) {
+    std::vector<uint32_t> &numbers = lines.emplace_back();
+    for (std::string_view rest(line); !rest.empty();) {
+      const size_t start = rest.find_first_not_of(" \t\n\v\f\r");
+      if (start == std::string_view::npos)
+        break;
+      rest.remove_prefix(start);
+      uint32_t number = 0;
+      const auto [end, error] = std::from_chars(rest.data(), rest.data() + rest.size(), number);
+      if (error != std::errc{})
+        throw std::runtime_error("malformed line in " + path.string());
+      numbers.push_back(number);
+      rest.remove_prefix(end - rest.data());
+    }
+  }
+  return lines;
+}
+
+// The sequences and records of an earlier dump, whose prefixes a run scores
+// again (--logits-from), each a proper, nonempty prefix of its sequence.
+LogitDump readLogitDump(const std::filesystem::path &directory) {
+  LogitDump dump{readNumberLines(directory / "sequences.txt"), {}};
+  for (const std::vector<uint32_t> &record : readNumberLines(directory / "records.txt")) {
+    if (record.size() < 2 || record[0] >= dump.sequences.size() || !record[1] ||
+        record[1] >= dump.sequences[record[0]].size())
+      throw std::runtime_error("a logits record names no proper prefix of its sequences");
+    dump.records.emplace_back(record[0], record[1]);
+  }
+  return dump;
+}
+
+void writeLogitDump(const std::filesystem::path &directory, const LogitDump &dump) {
+  std::ofstream sequences(directory / "sequences.txt"), records(directory / "records.txt");
+  for (const std::vector<uint32_t> &sequence : dump.sequences) {
+    for (size_t index = 0; index < sequence.size(); ++index)
+      sequences << (index ? " " : "") << sequence[index];
+    sequences << '\n';
+  }
+  for (const auto &[sequence, prefix] : dump.records)
+    records << sequence << ' ' << prefix << '\n';
+  if (!sequences || !records)
+    throw std::runtime_error("cannot write the logits dump in " + directory.string());
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+  std::unique_ptr<ProgressJournal> progress;
+  try {
+    if (argc < 3) {
+      std::cerr << "usage: backend-benchmark METALLIB MODEL_ROOT "
+                   "[--samples COUNT] [--progress PATH] "
+                   "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
+                   "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
+                   "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
+                   "  NAME: decode, partial, short, transcripts, context, exact, logits, resume or acceptance "
+                   "(default: decode,partial,context)\n"
+                   "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
+                   "to run instead of calibrating one (0: GPU alone)\n"
+                   "  ROWS: the least rows of a chunk that share takes "
+                   "(default: 512)\n"
+                   "  TOKENS: the context the engine serves, as serve's "
+                   "--max-context, with YaRN past the model's native window "
+                   "(default: what memory holds)\n"
+                   "  DIR: the logits scenario's dump, and the earlier dump whose "
+                   "prefixes it scores (default: its own greedy transcripts')\n"
+                   "  LANES: the score requests the logits scenario runs at once "
+                   "(default: 1)\n";
+      return 2;
+    }
+    uint32_t samples = 1;
+    BenchmarkScenarios selected;
+    std::optional<std::filesystem::path> progressPath;
+    std::optional<double> aneFfnShare;
+    std::optional<uint32_t> aneFfnMinimumRows;
+    uint32_t maxContext = 0;
+    uint32_t draftBlockSize = 8;
+    uint32_t studyWidth = 1, prefixSuffix = 0;
+    std::optional<std::filesystem::path> logitsDirectory, logitsFrom;
+    uint32_t logitsWidth = 1;
+    bool logitsOptions = false;
+    std::optional<std::filesystem::path> cohort;
+    float studyTemperature = 0;
+    uint64_t seedBase = 20261110;
+    for (int index = 3; index < argc; index += 2) {
+      if (index + 1 >= argc)
+        throw std::invalid_argument("benchmark option requires a value");
+      const std::string_view option(argv[index]);
+      if (option == "--study-width") {
+        studyWidth = parseSamples(argv[index + 1]);
+        if (studyWidth > 4) throw std::invalid_argument("study width must be one through four");
+      } else if (option == "--prefix-suffix") {
+        prefixSuffix = parseSamples(argv[index + 1]);
+      } else if (option == "--draft-block-size") {
+        const std::string_view value(argv[index + 1]);
+        if (value != "8" && value != "16") throw std::invalid_argument("block size must be 8 or 16");
+        draftBlockSize = value == "16" ? 16 : 8;
+      } else if (option == "--samples") {
+        samples = parseSamples(argv[index + 1]);
+      } else if (option == "--cohort") {
+        cohort = std::filesystem::path(argv[index + 1]);
+      } else if (option == "--temperature") {
+        size_t used = 0;
+        const std::string value(argv[index + 1]);
+        studyTemperature = std::stof(value, &used);
+        if (used != value.size() || !std::isfinite(studyTemperature) || studyTemperature < 0)
+          throw std::invalid_argument("invalid study temperature");
+      } else if (option == "--seed-base") {
+        size_t used = 0;
+        const std::string value(argv[index + 1]);
+        seedBase = std::stoull(value, &used);
+        if (used != value.size() || seedBase > UINT64_MAX - samples)
+          throw std::invalid_argument("invalid study seed base");
+      } else if (option == "--progress") {
+        progressPath = std::filesystem::path(argv[index + 1]);
+      } else if (option == "--scenario") {
+        selected = parseScenarios(argv[index + 1]);
+      } else if (option == "--ane-ffn-share") {
+        aneFfnShare = parseAneFfnShare(argv[index + 1]);
+      } else if (option == "--ane-ffn-minimum-rows") {
+        aneFfnMinimumRows = parseAneFfnMinimumRows(argv[index + 1]);
+      } else if (option == "--max-context") {
+        maxContext = parseMaxContext(argv[index + 1]);
+      } else if (option == "--logits") {
+        logitsDirectory = std::filesystem::path(argv[index + 1]);
+      } else if (option == "--logits-from") {
+        logitsFrom = std::filesystem::path(argv[index + 1]);
+        logitsOptions = true;
+      } else if (option == "--logits-width") {
+        logitsWidth = parseSamples(argv[index + 1]);
+        logitsOptions = true;
+        if (logitsWidth > model::ExecutionLimits::maximumBatchWidth)
+          throw std::invalid_argument("--logits-width exceeds the batch width");
+      } else {
+        throw std::invalid_argument("unknown benchmark option");
+      }
+    }
+    if (prefixSuffix && studyWidth != 1) throw std::invalid_argument("prefix study is serial");
+    if (cohort) selected = parseScenarios("study");
+    if (selected.logits != logitsDirectory.has_value())
+      throw std::invalid_argument("the logits scenario and --logits go together");
+    if (logitsOptions && !logitsDirectory)
+      throw std::invalid_argument("--logits-from and --logits-width need --logits");
+    if (progressPath)
+      progress = std::make_unique<ProgressJournal>(*progressPath, samples);
+
+    engine::RuntimeBootstrapConfig bootstrapConfig;
+    auto &config = bootstrapConfig.resources;
+    config.metallibPath = std::filesystem::path(argv[1]);
+    config.modelRoot = std::filesystem::path(argv[2]);
+    config.model = model::servedFor(model::inspectModelRoot(config.modelRoot), maxContext);
+    config.buildId = SPLASH_BUILD_ID;
+    config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
+    // The verify budget's rows follow the wall times and acceptance of the
+    // cycles before them, so a MoE target's outputs would not repeat from
+    // round to round: every cycle verifies every row (--verify-rows all), and
+    // the times measure the backend, not the budget.
+    config.verifyRows = model::VerifyRows::All;
+    setDraftBlock(config, draftBlockSize);
+    bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
+    const std::string modelRoot = config.modelRoot.string();
+    const auto &capabilities = config.model.capabilities;
+    // Complete production warmup and memory audit before measuring. A start
+    // refused memory the host or Metal may give back, as while the previous
+    // engine's memory settles, retries as serve's does (main.mm): within the
+    // same window, opened at its first such refusal.
+    std::unique_ptr<engine::ServingRuntime> bootstrap;
+    engine::StartupRetryWindow recovery(supervision::kStartRetryWindow);
+    std::optional<AwakeClock::time_point> firstRefusal;
+    while (!bootstrap) {
+      try {
+        bootstrap = engine::ServingRuntime::start(
+            bootstrapConfig, [](std::span<const uint8_t>) {}, [] { return 0.0; });
+      } catch (const engine::RuntimeBootstrapError &error) {
+        const auto now = AwakeClock::now();
+        const auto retryUntil = recovery.retryUntil(error.report(), now);
+        if (!retryUntil)
+          throw;
+        if (!firstRefusal) {
+          std::cerr << "backend-benchmark: waiting for host memory to settle "
+                       "before loading the model\n";
+          firstRefusal = now;
+        }
+        std::this_thread::sleep_until(
+            std::min(now + engine::kStartupMemoryRecoveryPoll, *retryUntil));
+      }
+    }
+    // How long the start waited for memory (0 without a refusal), which the
+    // report records: a wait near the window says the window is short.
+    const double startWaitMilliseconds =
+        firstRefusal ? std::chrono::duration<double, std::milli>(AwakeClock::now() - *firstRefusal).count()
+                     : 0.0;
+    bootstrap->announceReady();
+    if (!bootstrap->nativeLoop().engineHealthy() ||
+        bootstrap->nativeLoop().commandInFlight())
+      throw std::runtime_error("benchmark production bootstrap did not finish idle and ready");
+    // Non-owning borrows. This scope never feeds or ticks the bootstrap loop;
+    // its Engine stays empty. The later benchmark Engine is the sole request
+    // driver and is destroyed before the bootstrap owner/model/shared cache.
+    auto *resources = &bootstrap->resources();
+    // The Neural Engine split startup calibrated, or the one given.
+    const double ranAneFfnShare = resources->aneFfnShare();
+    const uint32_t ranAneFfnMinimumRows = resources->aneFfnMinimumRows();
+    auto *executor = &bootstrap->modelRuntime();
+    const auto &cacheIdentity = resources->cacheIdentity();
+    json::Writer writer;
+    writer.object([&] {
+      writer.field("model_root", modelRoot)
+          .field("loaded_model_layout_sha256", cacheIdentity.modelLayoutSha256)
+          .field("device", resources->backend().capabilities().deviceName);
+    });
+    const std::string identity = writer.str();
+    if (progress)
+      progress->identity(identity);
+
+    // These warmups run after serving began, and widths 2-4 each add a lane.
+    // They are lanes alone in service, which the engine passes through the
+    // host's margins allocation by allocation once nothing in place meets
+    // one; a warmup retries none, so like a start's warmup they run inside a
+    // Floor claim: only the engine's limit and macOS's critical pressure
+    // refuse what they allocate. Like a start's warmup too, they hold the KV
+    // runway they run on.
+    MemoryGovernor &governor = resources->memoryGovernor();
+    const ClaimId warmups = governor.ledger().open({.cls = ClaimClass::Floor});
+    std::optional<MemoryGovernor::Scope> warmupScope(std::in_place, governor, warmups);
+    std::optional<engine::KvPool::RunwayHold> runway(std::in_place, resources->kvPool());
+    if (progress)
+      progress->begin("warmup", "prefill_2048", 0,
+                      model::ExecutionLimits::prefillTokenBudget);
+    const model::WarmupStepResult prefillWarmup =
+        executor->warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
+    const double prefillWarmupGpuMilliseconds =
+        executor->telemetry().lastPrefillGpuSeconds * 1000.0;
+    if (progress) {
+      progress->complete("prefill_warmup", "prefill_2048", 0,
+                         model::ExecutionLimits::prefillTokenBudget, 0,
+                         prefillWarmup.wallSeconds * 1000.0,
+                         prefillWarmupGpuMilliseconds, 0.0);
+    }
+    std::array<double, model::ExecutionLimits::maximumBatchWidth>
+        decodeWarmupWall{};
+    std::array<double, model::ExecutionLimits::maximumBatchWidth>
+        decodeWarmupGpu{};
+    std::vector<std::string> performanceFailures;
+    for (uint32_t width = 1; width <= decodeWarmupWall.size(); ++width) {
+      decodeWarmupWall[width - 1] =
+          executor->warmupDecodeBatch(width).wallSeconds * 1000.0;
+      decodeWarmupGpu[width - 1] =
+          executor->telemetry().lastDecodeGpuSeconds * 1000.0;
+    }
+    runway.reset();
+    warmupScope.reset();
+    governor.ledger().close(warmups);
+
+    Events events;
+    engine::EngineConfig engineConfig;
+    engineConfig.maxContext = bootstrap->nativeLoop().statusSnapshot().maximumContextTokens;
+    engineConfig.vocabularySize = capabilities.vocabularySize;
+    engineConfig.draftContextTokens = config.model.draft.contextTokens;
+    engine::connectToGovernor(engineConfig, resources->memoryGovernor());
+    engine::Engine engine(engineConfig, resources->cache(),
+                                  *executor, events);
+    Driver driver(engine, events);
+
+    // All four widths receive the same production-token payload. Different
+    // batch kernels may round differently; report their actual output hashes
+    // and acceptance counts rather than require a batch-invariant transcript.
+    // Historical throughput is intentionally not embedded here: frequency
+    // state changes it materially even on one Mac.
+    // This executable characterizes one source identity and checks internal
+    // invariants; a source-regression claim requires a separately captured
+    // baseline report and an explicit comparison outside this process.
+    constexpr std::array<uint32_t, 39> decodeThroughputPrompt{
+        248045, 846,   198,   2427, 38453, 494,   220,   16,
+        11,     4237,  1754,  1324, 321,   1141,  6163,  803,
+        383,    264,   491,   1500, 13,    14569, 2980,  488,
+        5372,   220,   17,    15,   15,    13,    248046, 198,
+        248045, 74455, 198,   248068, 271,  248069, 271};
+    constexpr std::string_view decodeThroughputPromptSha256 =
+        "8c9bac848ac2e727f235beda84f06bac1a9320cc7a014d72da24263d07a3d982";
+    std::vector<DecodeThroughputMeasurement> decodeThroughput;
+    decodeThroughput.reserve(model::ExecutionLimits::maximumBatchWidth * samples);
+    uint64_t requestId = 1;
+    if (selected.decode) {
+      for (uint32_t sample = 0; sample < samples; ++sample) {
+        for (uint32_t offset = 0;
+             offset < model::ExecutionLimits::maximumBatchWidth; ++offset) {
+          const uint32_t width =
+              1 + (sample + offset) % model::ExecutionLimits::maximumBatchWidth;
+          evictAllCache(resources->cache());
+          decodeThroughput.push_back(runDecodeThroughput(
+              engine, driver, *executor, events, progress.get(), requestId,
+              width, sample, decodeThroughputPrompt));
+        }
+      }
+      // A wider batch must not lose aggregate throughput. A dense model can
+      // fill the GPU by width 3, leaving B3 within B2's noise, so the gate
+      // fails only when every B3 sample falls below every B2 sample; how far
+      // widths scale is for a comparison with a baseline build.
+      const std::vector<double> b2 = decodeWallThroughputs(decodeThroughput, 2);
+      const std::vector<double> b3 = decodeWallThroughputs(decodeThroughput, 3);
+      if (*std::max_element(b3.begin(), b3.end()) <
+          *std::min_element(b2.begin(), b2.end())) {
+        performanceFailures.push_back(
+            "B3 aggregate decode throughput fell below B2");
+      }
+      // Nor may a B3 step take longer than a B1 step and a B2 step, which
+      // would decode the three lanes sooner apart. Every width is timed over
+      // its own run of steps here. A warmup command is not comparable across
+      // widths: it follows one setup prefill per lane, so where sustained
+      // load lowers the GPU clock (an M3 Max in Low Power Mode) a wider one
+      // runs at a lower clock.
+      const auto stepGpuMilliseconds = [&](uint32_t width) {
+        std::vector<double> values;
+        for (const DecodeThroughputMeasurement &measurement : decodeThroughput) {
+          if (measurement.width == width)
+            values.push_back(measurement.decodeGpuMilliseconds /
+                             static_cast<double>(measurement.decodeBatches));
+        }
+        return median(std::move(values));
+      };
+      if (stepGpuMilliseconds(3) >
+          stepGpuMilliseconds(1) + stepGpuMilliseconds(2)) {
+        performanceFailures.push_back(
+            "a B3 decode step takes longer than a B1 step and a B2 step");
+      }
+    }
+
+    constexpr std::array<uint32_t, 4> lengths{2048, 10000, 50000, 128000};
+    // The rolling request, a length's longest, appends this many tokens.
+    constexpr uint32_t rollingSuffixTokens = 256;
+    std::vector<Measurement> measurements;
+    // Lengths the memory plan cannot hold, on a Mac with less memory.
+    std::vector<uint32_t> skippedLengths;
+    for (uint32_t length : selected.context || selected.exact
+                               ? std::span<const uint32_t>{lengths}
+                               : std::span<const uint32_t>{}) {
+      // Every request generates at least one token beyond its prompt.
+      if (length + (selected.exact ? 0 : rollingSuffixTokens) >=
+          engineConfig.maxContext) {
+        skippedLengths.push_back(length);
+        continue;
+      }
+      // Repeat short contexts for timing; run the costly 50K/128K cases once.
+      const uint32_t lengthSamples =
+          !selected.exact && length <= 10000 ? samples : 1;
+      for (uint32_t sample = 0; sample < lengthSamples; ++sample) {
+        evictAllCache(resources->cache());
+        // Every cache prompt ends with the chat-formatted decode prompt so the
+        // answer request below produces a real multi-block greedy answer.
+        std::vector<uint32_t> cold = prompt(
+            length - static_cast<uint32_t>(decodeThroughputPrompt.size()),
+            uint64_t{length} << 32 | sample);
+        cold.insert(cold.end(), decodeThroughputPrompt.begin(),
+                    decodeThroughputPrompt.end());
+        Measurement coldResult =
+            runRequest(engine, driver, *executor, events, progress.get(),
+                       requestId++, "cold", sample, cold);
+        Measurement exactResult =
+            runRequest(engine, driver, *executor, events, progress.get(),
+                       requestId++, "exact", sample, cold);
+        const uint32_t expectedBoundary =
+            ((length - 1) / kv::kPageTokens) *
+            kv::kPageTokens;
+        if (coldResult.cacheStatus != "miss" ||
+            exactResult.cacheStatus != "prefix_hit" ||
+            exactResult.matchedTokens != expectedBoundary) {
+          throw std::runtime_error("cold/exact cache oracle failed: " +
+                                   lookups({coldResult, exactResult},
+                                           expectedBoundary));
+        }
+        // Cache reuse changes chunking and reduction order. Output agreement
+        // is diagnostic; the runtime/Metal oracles validate state and numerics.
+        exactResult.coldOutputMatch = coldResult.outputTokens == exactResult.outputTokens;
+        if (selected.exact) {
+          // Retain one cold seed and every hit, including the first. Repeated
+          // long-context restore timing must not require repeated cold prefill.
+          for (uint32_t hit = 0; hit < samples; ++hit) {
+            if (hit)
+              exactResult = runRequest(engine, driver, *executor, events,
+                                       progress.get(), requestId++, "exact", hit, cold);
+            if (exactResult.cacheStatus != "prefix_hit" ||
+                exactResult.matchedTokens != expectedBoundary ||
+                exactResult.targetPrefillRows != length - expectedBoundary)
+              throw std::runtime_error("repeated exact cache oracle failed: " +
+                                       lookups({exactResult}, expectedBoundary));
+            exactResult.coldOutputMatch = coldResult.outputTokens == exactResult.outputTokens;
+            if (exactResult.ttftMilliseconds * 2 >= coldResult.ttftMilliseconds)
+              performanceFailures.push_back("repeated exact TTFT did not improve twofold");
+            measurements.push_back(std::move(exactResult));
+          }
+          measurements.push_back(std::move(coldResult));
+          continue;
+        }
+        // An agent turn appends the previous answer and a new message. The
+        // continuation must reuse the prompt; its actual restoration boundary
+        // and agreement with a cold evaluation are reported separately.
+        constexpr uint32_t answerTokens = 96;
+        Measurement answerResult = runRequest(
+            engine, driver, *executor, events, progress.get(), requestId++,
+            "answer", sample, cold, answerTokens);
+        std::vector<uint32_t> continuation = cold;
+        continuation.insert(continuation.end(),
+                            answerResult.outputTokens.begin(),
+                            answerResult.outputTokens.end());
+        std::vector<uint32_t> turn =
+            prompt(64, (uint64_t{length} << 32 | sample) ^ 0x5a5a5a5aULL);
+        continuation.insert(continuation.end(), turn.begin(), turn.end());
+        Measurement continuationResult =
+            runRequest(engine, driver, *executor, events, progress.get(),
+                       requestId++, "continuation", sample, continuation);
+        if (answerResult.cacheStatus != "prefix_hit" ||
+            answerResult.outputTokens.size() <=
+                kv::kPageTokens) {
+          throw std::runtime_error(
+              "answer did not reuse its prompt or stopped after " +
+              std::to_string(answerResult.outputTokens.size()) + " tokens");
+        }
+        std::vector<uint32_t> rolling = cold;
+        std::vector<uint32_t> suffix =
+            prompt(rollingSuffixTokens,
+                   (uint64_t{length} << 32 | sample) ^ 0xa5a5a5a5ULL);
+        rolling.insert(rolling.end(), suffix.begin(), suffix.end());
+        Measurement rollingResult =
+            runRequest(engine, driver, *executor, events, progress.get(),
+                       requestId++, "rolling", sample, std::move(rolling));
+        evictAllCache(resources->cache());
+        std::vector<uint32_t> rollingReference = cold;
+        rollingReference.insert(rollingReference.end(), suffix.begin(),
+                                suffix.end());
+        Measurement rollingCold = runRequest(
+            engine, driver, *executor, events, progress.get(), requestId++,
+            "rolling_cold", sample, std::move(rollingReference));
+        if (rollingResult.cacheStatus != "prefix_hit" ||
+            rollingCold.cacheStatus != "miss" ||
+            rollingResult.matchedTokens != expectedBoundary) {
+          throw std::runtime_error("rolling cache oracle failed: " +
+                                   lookups({rollingResult, rollingCold},
+                                           expectedBoundary));
+        }
+        rollingResult.coldOutputMatch = rollingResult.outputTokens == rollingCold.outputTokens;
+        evictAllCache(resources->cache());
+        Measurement continuationCold = runRequest(
+            engine, driver, *executor, events, progress.get(), requestId++,
+            "continuation_cold", sample, std::move(continuation));
+        if (continuationResult.cacheStatus != "prefix_hit" ||
+            continuationCold.cacheStatus != "miss") {
+          throw std::runtime_error(
+              "continuation cache status oracle failed: hit=" +
+              continuationResult.cacheStatus +
+              " cold=" + continuationCold.cacheStatus);
+        }
+        continuationResult.coldOutputMatch =
+            continuationResult.outputTokens == continuationCold.outputTokens;
+        if (coldResult.draftContextRows != expectedDraftContextRows(
+                length, engine::kPrefillCheckpointTokens)) {
+          throw std::runtime_error(
+              "cold prefill performed unnecessary draft-context work");
+        }
+        if (exactResult.ttftMilliseconds * 2.0 >=
+            coldResult.ttftMilliseconds) {
+          performanceFailures.push_back(
+              std::to_string(length) + "-token exact sample " +
+              std::to_string(sample) +
+              " did not improve TTFT by at least two times");
+        }
+        measurements.push_back(std::move(coldResult));
+        measurements.push_back(std::move(exactResult));
+        measurements.push_back(std::move(rollingResult));
+        measurements.push_back(std::move(rollingCold));
+        measurements.push_back(std::move(answerResult));
+        measurements.push_back(std::move(continuationResult));
+        measurements.push_back(std::move(continuationCold));
+      }
+    }
+
+    // A 4K suffix rebuilds the windows required by its recovery boundaries.
+    // Compare against the same prompt evaluated cold, then recreate its 10K
+    // prefix so the second evaluation is a real partial state-backed hit.
+    if (selected.partial) {
+      std::vector<uint32_t> partialBase = prompt(10000, 0x5041525449414cULL);
+      std::vector<uint32_t> partialPrompt = partialBase;
+      std::vector<uint32_t> partialSuffix = prompt(4096, 0x535546464958ULL);
+      partialPrompt.insert(partialPrompt.end(), partialSuffix.begin(),
+                           partialSuffix.end());
+      for (uint32_t sample = 0; sample < samples; ++sample) {
+        evictAllCache(resources->cache());
+        Measurement partialCold =
+            runRequest(engine, driver, *executor, events, progress.get(),
+                       requestId++, "partial_4k_cold", sample, partialPrompt);
+        evictAllCache(resources->cache());
+        Measurement partialSeed =
+            runRequest(engine, driver, *executor, events, progress.get(),
+                       requestId++, "partial_4k_seed", sample, partialBase);
+        Measurement partialHit =
+            runRequest(engine, driver, *executor, events, progress.get(),
+                       requestId++, "partial_4k_hit", sample, partialPrompt);
+        const uint32_t partialBoundary =
+            ((partialBase.size() - 1) / kv::kPageTokens) *
+            kv::kPageTokens;
+        const uint64_t expectedPartialRows = expectedDraftContextRows(
+            partialPrompt.size(), engine::kPrefillCheckpointTokens,
+            partialBoundary);
+        if (partialSeed.cacheStatus != "miss" ||
+            partialHit.cacheStatus != "prefix_hit" ||
+            partialHit.matchedTokens != partialBoundary ||
+            partialHit.draftStateRestoreSkipped != 1 ||
+            partialHit.draftContextRows != expectedPartialRows) {
+          throw std::runtime_error(
+              "4K partial-hit draft-window oracle failed: seed_status=" +
+              partialSeed.cacheStatus + " hit_status=" +
+              partialHit.cacheStatus +
+              " matched=" + std::to_string(partialHit.matchedTokens) +
+              " expected_matched=" + std::to_string(partialBoundary) +
+              " restore_skipped=" +
+              std::to_string(partialHit.draftStateRestoreSkipped) +
+              " draft_rows=" + std::to_string(partialHit.draftContextRows) +
+              " expected_draft_rows=" +
+              std::to_string(expectedPartialRows));
+        }
+        partialHit.coldOutputMatch = partialCold.outputTokens == partialHit.outputTokens;
+        measurements.push_back(std::move(partialCold));
+        measurements.push_back(std::move(partialSeed));
+        measurements.push_back(std::move(partialHit));
+      }
+    }
+
+    // Resumes of a cached prefix that re-read a few rows, as a conversation's
+    // next turn does from the replay state of the turn before: a seed of a
+    // page and one token keeps its state at the page boundary, so a prompt of
+    // the seed and `suffix` more tokens re-reads suffix + 1 rows over the
+    // context of that boundary, 2K and 32K. Each context is seeded once; a
+    // resume's own states lie past the seed's last token, where the next
+    // resume's tokens differ.
+    if (selected.resume) {
+      constexpr std::array<uint32_t, 2> resumeContexts{2048, 32768};
+      constexpr std::array<uint32_t, 8> resumeSuffixes{4, 19, 31, 32, 35, 47, 55, 63};
+      for (const uint32_t context : resumeContexts) {
+        // The longest resume, and the token it generates, past what the
+        // memory plan holds on a Mac with less memory.
+        if (context + 1 + resumeSuffixes.back() + 1 >= engineConfig.maxContext) {
+          skippedLengths.push_back(context);
+          continue;
+        }
+        const std::vector<uint32_t> seed = prompt(context + 1, uint64_t{context} << 32 | 0x524553554dULL);
+        evictAllCache(resources->cache());
+        const Measurement seeded = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                                              "resume_seed_" + std::to_string(context), 0, seed);
+        if (seeded.cacheStatus != "miss")
+          throw std::runtime_error("resume seed was not a cold miss: " + seeded.cacheStatus);
+        for (uint32_t sample = 0; sample < samples; ++sample)
+          for (const uint32_t suffix : resumeSuffixes) {
+            std::vector<uint32_t> tokens = seed;
+            const std::vector<uint32_t> more =
+                prompt(suffix, (uint64_t{suffix} << 40) ^ (uint64_t{sample} << 32) ^ context ^ 0x5355464658ULL);
+            tokens.insert(tokens.end(), more.begin(), more.end());
+            Measurement result = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                                            "resume_" + std::to_string(context) + "_r" + std::to_string(suffix + 1),
+                                            sample, std::move(tokens));
+            if (result.cacheStatus != "prefix_hit" || result.matchedTokens != context)
+              throw std::runtime_error("resume of " + std::to_string(suffix + 1) + " rows matched " +
+                                       std::to_string(result.matchedTokens) + " tokens: " + result.cacheStatus);
+            measurements.push_back(std::move(result));
+          }
+      }
+    }
+
+    // Cold prefills of one chunk of these rows, around where the prefill
+    // FFN's Neural Engine split starts and where its program's functions step
+    // (ops::AneFfn): a prompt of these tokens runs as one chunk, which
+    // captures its replay point, the last 32-token page boundary before its
+    // last token, inside it. Each prompt is unique and runs on an empty
+    // cache.
+    if (selected.shortPrompts) {
+      constexpr std::array<uint32_t, 8> shortRows{480, 512, 544, 640, 672, 1024, 1536, 2016};
+      for (uint32_t sample = 0; sample < samples; ++sample) {
+        for (uint32_t rows : shortRows) {
+          evictAllCache(resources->cache());
+          Measurement result = runRequest(
+              engine, driver, *executor, events, progress.get(), requestId++, "short", sample,
+              prompt(rows, (uint64_t{rows} << 32 | sample) ^ 0x53484f5254ULL));
+          if (result.cacheStatus != "miss")
+            throw std::runtime_error("short prompt of a " + std::to_string(rows) +
+                                     "-row chunk was not a cold miss: " + result.cacheStatus);
+          measurements.push_back(std::move(result));
+        }
+      }
+    }
+
+    // Greedy answers of 512 tokens to real requests (TranscriptPrompts.hpp),
+    // alone and after long contexts of random tokens, each on an empty cache.
+    // Their output tokens, unlike the other scenarios' counting or single
+    // tokens after random ones, move with any change in the target's
+    // arithmetic; backend_regression holds them identical between builds.
+    if (selected.transcripts) {
+      // Each case: a request and the random context tokens before it.
+      constexpr std::array<std::pair<uint32_t, uint32_t>, 8> transcriptCases{
+          {{0, 0}, {1, 0}, {2, 0}, {3, 0}, {4, 0}, {5, 0}, {0, 8192}, {3, 16384}}};
+      for (uint32_t sample = 0; sample < samples; ++sample) {
+        for (uint32_t index = 0; index < transcriptCases.size(); ++index) {
+          const auto [request, context] = transcriptCases[index];
+          std::vector<uint32_t> tokens = prompt(context, uint64_t{index} << 32 | 0x5452414e53ULL);
+          const std::span<const uint32_t> question = benchmark::kTranscriptPrompts[request];
+          tokens.insert(tokens.end(), question.begin(), question.end());
+          evictAllCache(resources->cache());
+          Measurement result =
+              runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                         "transcript_" + std::to_string(index), sample, std::move(tokens), 512);
+          if (result.cacheStatus != "miss")
+            throw std::runtime_error("transcript request " + std::to_string(index) +
+                                     " was not a cold miss: " + result.cacheStatus);
+          measurements.push_back(std::move(result));
+        }
+      }
+    }
+
+    // The same four Qwen-tokenized coding prompts as draft_comparison.py.
+    // Record each single-lane cycle's accepted prefix for position survival
+    // analysis, leaving the other scenarios' timings and output unchanged.
+    if (selected.acceptance) {
+      for (uint32_t sample = 0; sample < samples; ++sample) {
+        for (uint32_t index = 0; index < benchmark::kDraftComparisonPrompts.size(); ++index) {
+          const auto question = benchmark::kDraftComparisonPrompts[index];
+          evictAllCache(resources->cache());
+          measurements.push_back(runRequest(
+              engine, driver, *executor, events, progress.get(), requestId++,
+              "acceptance_" + std::to_string(index), sample,
+              std::vector<uint32_t>(question.begin(), question.end()), 256, true));
+        }
+      }
+    }
+
+    if (selected.study) {
+      if (!cohort) throw std::invalid_argument("study requires --cohort");
+      const auto cases = readStudy(*cohort);
+      for (uint32_t sample = 0; sample < samples; ++sample) {
+        SamplingParameters policy;
+        policy.temperature = studyTemperature;
+        policy.topP = studyTemperature > 0 ? 0.95f : 1.0f;
+        policy.topK = studyTemperature > 0 ? 20 : 0;
+        policy.seed = seedBase + sample;
+        if (const auto error = policy.validationError()) throw std::invalid_argument(std::string(*error));
+        for (const auto &c : cases) {
+          evictAllCache(resources->cache());
+          if (studyWidth > 1) {
+            if (studyTemperature != 0) throw std::invalid_argument("clone study is greedy");
+            decodeThroughput.push_back(runDecodeThroughput(engine, driver, *executor, events, progress.get(),
+                requestId, studyWidth, sample, c.tokens, c.cap, c.name));
+          } else if (prefixSuffix) {
+            if (c.tokens.size() <= prefixSuffix + kv::kPageTokens)
+              throw std::invalid_argument("prefix study prompt is shorter than its fixed suffix and one page");
+            Measurement cold = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                c.name + "_cold", sample, c.tokens, c.cap, true, &policy);
+            evictAllCache(resources->cache());
+            std::vector<uint32_t> prefix(c.tokens.begin(), c.tokens.end() - prefixSuffix);
+            Measurement seed = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                c.name + "_seed", sample, std::move(prefix), 1, false, &policy);
+            Measurement hit = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                c.name + "_hit", sample, c.tokens, c.cap, true, &policy);
+            hit.coldOutputMatch = cold.outputTokens == hit.outputTokens;
+            measurements.push_back(std::move(cold)); measurements.push_back(std::move(seed));
+            measurements.push_back(std::move(hit));
+          } else {
+            measurements.push_back(runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                c.name, sample, c.tokens, c.cap, true, &policy));
+          }
+        }
+      }
+    }
+
+    // The full-vocabulary logits after prefixes of greedy transcripts of the
+    // real requests (TranscriptPrompts.hpp), 256 answer tokens each, 16
+    // prefixes into each answer, or after the prefixes an earlier dump
+    // scored: score-only requests whose score tokens are the vocabulary, each
+    // cold, logitsWidth at once so that they prefill beside each other.
+    if (selected.logits) {
+      constexpr uint32_t kAnswerTokens = 256, kPrefixes = 16;
+      LogitDump dump;
+      if (logitsFrom) {
+        dump = readLogitDump(*logitsFrom);
+      } else {
+        for (const std::span<const uint32_t> question : benchmark::kTranscriptPrompts) {
+          evictAllCache(resources->cache());
+          const Measurement answer =
+              runRequest(engine, driver, *executor, events, progress.get(), requestId++, "logits_answer", 0,
+                         std::vector<uint32_t>(question.begin(), question.end()), kAnswerTokens);
+          std::vector<uint32_t> &sequence = dump.sequences.emplace_back(question.begin(), question.end());
+          sequence.insert(sequence.end(), answer.outputTokens.begin(), answer.outputTokens.end());
+        }
+        // Prefix by prefix across the sequences, so a group of score requests
+        // holds as many sequences.
+        for (uint32_t prefix = 0; prefix < kPrefixes; ++prefix)
+          for (uint32_t sequence = 0; sequence < dump.sequences.size(); ++sequence) {
+            const uint32_t question = static_cast<uint32_t>(benchmark::kTranscriptPrompts[sequence].size());
+            const uint32_t answered = static_cast<uint32_t>(dump.sequences[sequence].size()) - question;
+            if (answered)
+              dump.records.emplace_back(sequence, question + prefix * answered / kPrefixes);
+          }
+      }
+      std::filesystem::create_directories(*logitsDirectory);
+      writeLogitDump(*logitsDirectory, dump);
+      std::vector<uint32_t> vocabulary(capabilities.vocabularySize);
+      std::iota(vocabulary.begin(), vocabulary.end(), 0u);
+      std::ofstream logits(*logitsDirectory / "logits.f32", std::ios::binary | std::ios::trunc);
+      for (size_t first = 0; first < dump.records.size(); first += logitsWidth) {
+        const size_t count = std::min<size_t>(logitsWidth, dump.records.size() - first);
+        evictAllCache(resources->cache());
+        for (size_t offset = 0; offset < count; ++offset) {
+          const auto [sequence, prefix] = dump.records[first + offset];
+          EngineRequest request;
+          request.id = requestId + offset;
+          request.prompt.assign(dump.sequences[sequence].begin(), dump.sequences[sequence].begin() + prefix);
+          request.maxNewTokens = 0;
+          request.scoreTokens = vocabulary;
+          request.deadlineMilliseconds = milliseconds(Clock::now() + std::chrono::hours(2));
+          engine.submit(std::move(request));
+        }
+        driver.untilIdle();
+        for (size_t offset = 0; offset < count; ++offset) {
+          const std::vector<float> row = events.takeOptionLogits(requestId + offset);
+          if (row.size() != vocabulary.size())
+            throw std::runtime_error("a score request returned no row of the vocabulary");
+          logits.write(reinterpret_cast<const char *>(row.data()),
+                       static_cast<std::streamsize>(row.size() * sizeof(float)));
+        }
+        requestId += count;
+      }
+      if (!logits.flush())
+        throw std::runtime_error("cannot write " + (*logitsDirectory / "logits.f32").string());
+      std::cerr << "backend-benchmark: " << dump.records.size() << " logits rows in "
+                << logitsDirectory->string() << '\n';
+    }
+
+    // A request lazily materializes a KV junction where its match ends past
+    // its state at a branch point: another branch goes on below and holds a
+    // state there, and the junction lies a draft window or more past the
+    // state the request resumes from. Two prompts share a 7K prefix and then
+    // diverge. State eviction deliberately leaves the Page32 graph intact.
+    if (selected.context) {
+      evictAllCache(resources->cache());
+      const std::vector<uint32_t> lazyShared = prompt(7168, 0x4c415a594b56ULL);
+      const auto lazyBranch = [&](uint64_t salt) {
+        std::vector<uint32_t> branch = lazyShared;
+        const std::vector<uint32_t> tail = prompt(2048, salt);
+        branch.insert(branch.end(), tail.begin(), tail.end());
+        return branch;
+      };
+      const std::vector<uint32_t> lazyPrompt = lazyBranch(0x4c415a5941ULL);
+      Measurement lazySeed =
+          runRequest(engine, driver, *executor, events, progress.get(),
+                     requestId++, "lazy_seed", 0, lazyPrompt);
+      evictAllCompositeState(resources->cache());
+      // The repeat's match ends where its own chain does, so it plans no
+      // junction: it replays the prompt and rebuilds its replay point, which
+      // the next repeat restores.
+      Measurement lazyChainEnd =
+          runRequest(engine, driver, *executor, events, progress.get(),
+                     requestId++, "lazy_chain_end", 0, lazyPrompt);
+      Measurement lazyRepeat =
+          runRequest(engine, driver, *executor, events, progress.get(),
+                     requestId++, "lazy_repeat", 0, lazyPrompt);
+      const uint32_t lazyReplayBoundary =
+          ((lazyPrompt.size() - 1) / kv::kPageTokens) * kv::kPageTokens;
+      if (lazySeed.cacheStatus != "miss" ||
+          lazyChainEnd.cacheStatus != "miss" ||
+          lazyChainEnd.junctionMaterializations != 0 ||
+          lazyRepeat.matchedTokens != lazyReplayBoundary ||
+          lazyRepeat.junctionMaterializations != 0) {
+        throw std::runtime_error(
+            "chain-end KV junction oracle failed: junctions=" +
+            std::to_string(lazyChainEnd.junctionMaterializations) + "," +
+            std::to_string(lazyRepeat.junctionMaterializations) + " " +
+            lookups({lazySeed, lazyChainEnd, lazyRepeat}, lazyReplayBoundary));
+      }
+      // The other branch's match ends at the shared prefix, above the first
+      // branch's replay point: it materializes the junction there, and a
+      // third branch off the prefix restores from it.
+      Measurement lazyMaterialize =
+          runRequest(engine, driver, *executor, events, progress.get(),
+                     requestId++, "lazy_materialize", 0,
+                     lazyBranch(0x4c415a5942ULL));
+      Measurement lazyReuse =
+          runRequest(engine, driver, *executor, events, progress.get(),
+                     requestId++, "lazy_reuse", 0, lazyBranch(0x4c415a5943ULL));
+      const auto lazyBranchPoint = static_cast<uint32_t>(lazyShared.size());
+      if (lazyMaterialize.junctionMaterializations != 1 ||
+          lazyReuse.matchedTokens != lazyBranchPoint ||
+          lazyReuse.junctionMaterializations != 0) {
+        throw std::runtime_error(
+            "branch KV junction oracle failed: junctions=" +
+            std::to_string(lazyMaterialize.junctionMaterializations) + "," +
+            std::to_string(lazyReuse.junctionMaterializations) + " " +
+            lookups({lazyMaterialize, lazyReuse}, lazyBranchPoint));
+      }
+      lazyChainEnd.coldOutputMatch = lazySeed.outputTokens == lazyChainEnd.outputTokens;
+      lazyRepeat.coldOutputMatch = lazySeed.outputTokens == lazyRepeat.outputTokens;
+      measurements.push_back(std::move(lazySeed));
+      measurements.push_back(std::move(lazyChainEnd));
+      measurements.push_back(std::move(lazyRepeat));
+      measurements.push_back(std::move(lazyMaterialize));
+      measurements.push_back(std::move(lazyReuse));
+    }
+
+    // Shortest form that reads back as the same share.
+    std::array<char, 32> share{};
+    const auto written = std::to_chars(share.data(), share.data() + share.size(), ranAneFfnShare);
+    std::cout << "{\"study_temperature\":" << studyTemperature << ",\"study_seed_base\":" << seedBase << ",\"schema_version\":2,\"build_id\":\"" << SPLASH_BUILD_ID
+              << "\",\"identity\":" << identity
+              << ",\"ane_ffn_share\":" << std::string_view(share.data(), written.ptr - share.data())
+              << ",\"ane_ffn_minimum_rows\":" << ranAneFfnMinimumRows
+              << ",\"geometry\":{\"prefill_rows\":"
+              << model::ExecutionLimits::prefillTokenBudget
+              << ",\"verify_rows\":" << activeRows(*executor)
+              << ",\"batch_width\":" << model::ExecutionLimits::maximumBatchWidth
+              << ",\"kv_block_tokens\":"
+              << kv::kPageTokens
+              << "},\"start_wait_ms\":" << startWaitMilliseconds
+              << ",\"warmup\":{\"prefill_2048_wall_ms\":"
+              << prefillWarmup.wallSeconds * 1000.0
+              << ",\"prefill_2048_gpu_ms\":"
+              << prefillWarmupGpuMilliseconds
+              << ",\"decode_wall_ms\":[";
+    for (size_t index = 0; index < decodeWarmupWall.size(); ++index) {
+      if (index)
+        std::cout << ',';
+      std::cout << decodeWarmupWall[index];
+    }
+    std::cout << "],\"decode_gpu_ms\":[";
+    for (size_t index = 0; index < decodeWarmupGpu.size(); ++index) {
+      if (index)
+        std::cout << ',';
+      std::cout << decodeWarmupGpu[index];
+    }
+    std::cout << "]},\"decode_throughput\":{\"prompt_tokens\":"
+              << decodeThroughputPrompt.size()
+              << ",\"prompt_sha256\":\"" << decodeThroughputPromptSha256
+              << "\",\"output_tokens_per_lane\":64,\"samples\":[";
+    for (size_t index = 0; index < decodeThroughput.size(); ++index) {
+      if (index)
+        std::cout << ',';
+      const DecodeThroughputMeasurement &value = decodeThroughput[index];
+      std::cout << "{\"scenario\":\"" << value.scenario << "\",\"prompt_tokens\":" << value.promptTokens
+                << ",\"output_cap\":" << value.outputCap << ",\"input_token_hash\":\"" << value.inputTokenHash << "\""
+                << ",\"width\":" << value.width
+                << ",\"sample\":" << value.sample
+                << ",\"output_tokens\":" << value.outputTokens
+                << ",\"decode_output_tokens\":" << value.decodeOutputTokens
+                << ",\"decode_batches\":" << value.decodeBatches
+                << ",\"drafted_tokens\":" << value.draftedTokens
+                << ",\"accepted_draft_tokens\":"
+                << value.acceptedDraftTokens
+                << ",\"output_tokens_per_lane_batch\":"
+                << value.outputTokensPerLaneBatch
+                << ",\"draft_acceptance_rate\":"
+                << value.draftAcceptanceRate
+                << ",\"output_token_hash\":\""
+                << tokenSequenceHash(value.firstLaneOutputTokens) << '"';
+      std::cout << ",\"lane_outputs\":[";
+      for (size_t lane = 0; lane < value.laneOutputs.size(); ++lane) {
+        if (lane) std::cout << ',';
+        std::cout << '[';
+        for (size_t t = 0; t < value.laneOutputs[lane].size(); ++t) {
+          if (t) std::cout << ',';
+          std::cout << value.laneOutputs[lane][t];
+        }
+        std::cout << ']';
+      }
+      std::cout << ']'
+                << ",\"request_wall_ms\":"
+                << value.requestWallMilliseconds
+                << ",\"prefill_wall_ms\":"
+                << value.prefillWallMilliseconds
+                << ",\"prefill_gpu_ms\":"
+                << value.prefillGpuMilliseconds
+                << ",\"decode_wall_ms\":" << value.decodeWallMilliseconds
+                << ",\"decode_gpu_ms\":"
+                << value.decodeGpuMilliseconds
+                << ",\"aggregate_request_wall_tokens_per_second\":"
+                << value.aggregateRequestWallTokensPerSecond
+                << ",\"aggregate_decode_wall_tokens_per_second\":"
+                << value.aggregateDecodeWallTokensPerSecond
+                << ",\"aggregate_gpu_tokens_per_second\":"
+                << value.aggregateGpuTokensPerSecond << '}';
+    }
+    // The context the engine served, the automatic one whatever split the
+    // round ran (engine::AneFfnOutcome::context) unless --max-context gave
+    // it, and the one its memory plan holds without the Neural Engine split,
+    // and its elastic state/KV budget and the split's.
+    const engine::EngineMemoryBreakdown &plan = resources->memoryPlan().breakdown();
+    std::cout << "]},\"max_context_tokens\":" << engineConfig.maxContext
+              << ",\"no_ane_context_tokens\":" << resources->aneFfnOutcome().contextWithout
+              << ",\"dynamic_budget_bytes\":" << plan.dynamicBudgetBytes
+              << ",\"ane_ffn_bytes\":" << plan.aneFfnBytes
+              << ",\"skipped_context_lengths\":[";
+    for (size_t index = 0; index < skippedLengths.size(); ++index)
+      std::cout << (index ? "," : "") << skippedLengths[index];
+    std::cout << "],\"measurements\":[";
+    for (size_t index = 0; index < measurements.size(); ++index)
+      emitMeasurement(measurements[index], index == 0);
+    const engine::EngineSnapshot snapshot = engine.snapshot();
+    std::cout << "],\"performance_pass\":"
+              << (performanceFailures.empty() ? "true" : "false")
+              << ",\"performance_failures\":[";
+    for (size_t index = 0; index < performanceFailures.size(); ++index) {
+      if (index)
+        std::cout << ',';
+      std::cout << '"' << performanceFailures[index] << '"';
+    }
+    std::cout << "],\"final\":{\"cache_hits\":" << snapshot.cacheHits
+              << ",\"cold_misses\":" << snapshot.coldMisses
+              << ",\"reused_tokens\":" << snapshot.reusedTokens
+              << ",\"kv_pages_cache\":" << snapshot.resources.pool.pagesPrefix
+              << ",\"state_entries\":" << snapshot.resources.stateCache.entries
+              << "}}\n";
+    if (progress)
+      progress->finish(performanceFailures.size());
+    return performanceFailures.empty() ? 0 : 1;
+  } catch (const std::exception &error) {
+    if (progress)
+      progress->fail();
+    std::cerr << "backend-benchmark: " << error.what() << '\n';
+    return 1;
+  }
+}

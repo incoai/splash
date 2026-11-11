@@ -1,0 +1,7 @@
+{
+  "recorded_utc": "2026-11-11T06:49:08.417167+00:00",
+  "job": "combined-final-default-v1",
+  "observation": "A one-second native sample at8m29s shows main thread in prefill oracle -> MetalBackend::newPipeline -> Metal debug shader compiler. Process is compiling previously uncached validated pipeline variants, not blocked in DSpine execution. No test source or artifacts altered.",
+  "sample": "logs/combined-final-default-v1.sample.txt",
+  "comparability": "Old full-metal default projection started23:51:17 and register16 started23:52:39 on old cached library. New library identity requires compilation. Functional timing unused."
+}

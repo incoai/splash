@@ -5,6 +5,7 @@
 #include "metal/abi/Sampling.h"
 #include "metal/MetalBackend.hpp"
 #include "ops/StopTokens.hpp"
+#include "ops/DecodeGeometry.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -45,10 +46,10 @@ struct ThinkingCutoff final {
 
   // How many of the draft's proposals, from the first, the end replaces:
   // tokens the draft did not propose.
-  [[nodiscard]] uint32_t replacedProposals() const noexcept {
+  [[nodiscard]] uint32_t replacedProposals(uint32_t maximum = SPLASH_DRAFT_PROPOSAL_TOKENS) const noexcept {
     return row || waitsForMask
                ? 0
-               : static_cast<uint32_t>(std::min<size_t>(end.size(), SPLASH_DRAFT_PROPOSAL_TOKENS));
+               : static_cast<uint32_t>(std::min<size_t>(end.size(), maximum));
   }
 };
 
@@ -148,7 +149,7 @@ struct AcceptanceBuffers final {
 // stop tokens. The draft's own selector is ops::DraftSelector.
 class Sampling final {
 public:
-  explicit Sampling(uint32_t vocabulary);
+  explicit Sampling(uint32_t vocabulary, DecodeGeometry geometry = {});
 
   // Exact scratch/output bytes for the fixed precompiled sampling ABI.
   // Counts may cover one lane or a batch of lanes; the operator owns sharding.
@@ -236,6 +237,7 @@ private:
   void addSelection(metal::CommandGraph &graph, const TargetSamplingParams &selection,
                     std::span<const SamplingPolicy> policies, const SamplingBuffers &buffers) const;
 
+  DecodeGeometry geometry_;
   uint32_t vocabulary_ = 0;
   uint32_t maskWords_ = 0;
 };

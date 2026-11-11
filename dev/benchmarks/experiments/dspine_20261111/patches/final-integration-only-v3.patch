@@ -1,0 +1,85 @@
+diff --git a/app/Sources/Splash/Preferences.swift b/app/Sources/Splash/Preferences.swift
+index c3536277..a984317b 100644
+--- a/app/Sources/Splash/Preferences.swift
++++ b/app/Sources/Splash/Preferences.swift
+@@ -120,7 +120,7 @@ struct ServeSettings: Equatable {
+ /// A `splash serve` option the Server screen offers: its flag, its words, its part of the screen,
+ /// and how its value is chosen. `all` holds every option `splash serve` takes but those the app
+ /// sets itself (`--model`, `--model-dir`, `--offline`) and those of one model rather than every
+-/// start (`--revision`, `--draft-model`, `--mmproj`).
++/// start (`--revision`, `--draft-model`, `--draft-block-size`, `--mmproj`).
+ struct LaunchOption: Identifiable, Sendable {
+     enum Section: String, CaseIterable {
+         case main = "Launch Options", memory = "Memory", cache = "SSD Cache"
+diff --git a/app/Tests/SplashTests/SplashTests.swift b/app/Tests/SplashTests/SplashTests.swift
+index 55d021bc..985f68a8 100644
+--- a/app/Tests/SplashTests/SplashTests.swift
++++ b/app/Tests/SplashTests/SplashTests.swift
+@@ -190,7 +190,8 @@ struct ServeSettingsTests {
+     @Test func theContextHintIsTheModels() {
+         #expect(ContextLength.message(Self.flint).contains("at most 256K, the model’s own window"))
+         #expect(!ContextLength.message(Self.flint).contains("YaRN"))
+-        #expect(ContextLength.message(Self.moe).contains("at most 1,010,000. Past the model’s own window, 256K, it stretches it with YaRN"))
++        let maximum = NumberFormatter.localizedString(from: 1_010_000, number: .decimal)
++        #expect(ContextLength.message(Self.moe).contains("at most \(maximum). Past the model’s own window, 256K, it stretches it with YaRN"))
+         #expect(ContextLength.message(.unknown).contains("YaRN"))
+     }
+ 
+@@ -201,7 +202,8 @@ struct ServeSettingsTests {
+         #expect(ContextLength.parse("0") == nil && ContextLength.parse("12.5K") == nil && ContextLength.parse("lots") == nil)
+         #expect(ContextLength.title(32768) == "32K tokens")
+         #expect(ContextLength.title(1_000_000) == "1M tokens")
+-        #expect(ContextLength.title(100_000) == "100,000 tokens")
++        let hundredThousand = NumberFormatter.localizedString(from: 100_000, number: .decimal)
++        #expect(ContextLength.title(100_000) == "\(hundredThousand) tokens")
+         // As typed, read back alike.
+         #expect([32768, 1_000_000, 100_000].map { ContextLength.parse(ContextLength.text($0)) } == [32768, 1_000_000, 100_000])
+     }
+diff --git a/dev/tests/install/test_launcher.py b/dev/tests/install/test_launcher.py
+index a3ad1ae8..ae397258 100644
+--- a/dev/tests/install/test_launcher.py
++++ b/dev/tests/install/test_launcher.py
+@@ -601,6 +601,7 @@ class LauncherTests(unittest.TestCase):
+             "--offline",
+             "--revision",
+             "--draft-model",
++            "--draft-block-size",
+             "--mmproj",
+         }
+         self.assertIn("--max-memory", flags)
+diff --git a/dev/tests/server_fixtures.py b/dev/tests/server_fixtures.py
+index cfae4667..31acf441 100644
+--- a/dev/tests/server_fixtures.py
++++ b/dev/tests/server_fixtures.py
+@@ -874,6 +874,7 @@ def main_args(**overrides):
+             "cache_dir": None,
+             "decode_share": None,
+             "disable_ane": False,
++            "draft_block_size": 8,
+             "verify_rows": "auto",
+             "max_image_pixels": images.MAX_PIXELS,
+             "request_timeout": None,
+diff --git a/docs/api.md b/docs/api.md
+index 0d4f6135..3bef3bc5 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -675,6 +675,7 @@ fields; additional fields may be added:
+ | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](internals.md#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
+ | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
+ | `verify_rows` | The rows of a draft block decode cycles verify ([drafts](models.md#drafts), `--verify-rows`): `auto` where the verify budget chooses them (a MoE target under the default), `all` where they verify every row the output limit leaves (a dense target, or `--verify-rows all`) |
++| `draft_block_size` | Present as `16` when the runtime opts into the experimental sixteen-row DSpine block; omitted for the default eight-row layout. See [DSpine](models.md#experimental-dspine) |
+ | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk's image encodes, a command of their own ahead of it, add theirs, as a chunk run again adds the rerun's |
+ | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
+ | `metrics.decode_wall_ms` | Total wall time of the decode commands on the GPU, from submission to completion |
+diff --git a/docs/server.md b/docs/server.md
+index 4eea5588..b1d76f2d 100644
+--- a/docs/server.md
++++ b/docs/server.md
+@@ -132,6 +132,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
+ | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
+ | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
+ | `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](internals.md#neural-engine-prefill). |
++| `--draft-block-size` | `8` | Draft block rows, `8` or `16`. The experimental sixteen-row setting needs a supported dense target and a DSpine draft trained for sixteen rows. Restart to change it; the SSD cache separates the widths. See [DSpine](models.md#experimental-dspine). |
+ | `--verify-rows` | `auto` | The rows of each draft block decode cycles verify: `auto` lets the verify budget choose a MoE target's rows, which is faster but makes its greedy and seeded outputs vary from run to run, and verifies every row of a dense target; `all` verifies every row the output limit leaves on every target, so those outputs repeat when a request runs alone with the same cached prefixes. See [drafts](models.md#drafts) and [sampling](api.md#sampling). |
+ | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
+ 

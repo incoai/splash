@@ -51,10 +51,9 @@ struct DraftConvBatchParams {
 static_assert(sizeof(DraftConvBatchParams) == 8,
               "Draft convolution parameters are 8 bytes on both sides");
 
-// The attention core's split count (SPLASH_DRAFT_ATTENTION_SPLITS) and its
-// rings' slots per KV head (SPLASH_DRAFT_SLIDING_WINDOW) are compiled in.
-// value_stride, the values ring's stride between head dimensions, is the
-// window too (the op passes nothing else) but stays a run-time value: with it
+// The split count (SPLASH_DRAFT_ATTENTION_SPLITS) is compiled in. value_stride
+// is the ring capacity and the values' stride between head dimensions:
+// 2048 for DFlash2, 8192 for DSpine. It stays a run-time value: with it
 // compiled into the value tiles, the split kernel returns wrong rows at
 // random, and reports no error, on an M5 Max under full
 // MTL_SHADER_VALIDATION; without validation its output is bitwise that of
@@ -63,25 +62,28 @@ struct DraftAttentionBatchParams {
   uint32_t value_stride;
   uint32_t lanes;
   uint32_t cache_length[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t causal = 0;
 };
 
-static_assert(sizeof(DraftAttentionBatchParams) == 24,
-              "Draft attention parameters are 24 bytes on both sides");
+static_assert(sizeof(DraftAttentionBatchParams) == 28,
+              "Draft attention parameters are 28 bytes on both sides");
 
 struct DraftContextParams {
   uint32_t tokens;
   uint32_t start_position;
+  uint32_t window = SPLASH_DRAFT_SLIDING_WINDOW;
 };
 
-static_assert(sizeof(DraftContextParams) == 8,
-              "Draft context prefill parameters are 8 bytes on both sides");
+static_assert(sizeof(DraftContextParams) == 12,
+              "Draft context prefill parameters are 12 bytes on both sides");
 
 struct DraftContextBatchParams {
   uint32_t start_position[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t window = SPLASH_DRAFT_SLIDING_WINDOW;
 };
 
-static_assert(sizeof(DraftContextBatchParams) == 16,
-              "Draft context commit parameters are 16 bytes on both sides");
+static_assert(sizeof(DraftContextBatchParams) == 20,
+              "Draft context commit parameters are 20 bytes on both sides");
 
 // A context window holds, per ring slot, the draft's context row, from which
 // every layer's ring keys and values are computed: 4-bit codes over groups of
@@ -90,19 +92,23 @@ static_assert(sizeof(DraftContextBatchParams) == 16,
 // group, SPLASH_DRAFT_CONTEXT_SIMDGROUPS to a threadgroup.
 #define SPLASH_DRAFT_CONTEXT_GROUP 64u
 #define SPLASH_DRAFT_CONTEXT_SIMDGROUPS 8u
-inline constexpr uint64_t draft_context_codes_bytes(uint32_t width) {
-  return uint64_t(SPLASH_DRAFT_SLIDING_WINDOW) * (width / 2);
+inline constexpr uint64_t draft_context_codes_bytes(uint32_t width, uint32_t window = SPLASH_DRAFT_SLIDING_WINDOW) {
+  return uint64_t(window) * (width / 2);
 }
-inline constexpr uint64_t draft_context_window_bytes(uint32_t width) {
-  return draft_context_codes_bytes(width) +
-         uint64_t(SPLASH_DRAFT_SLIDING_WINDOW) * (width / SPLASH_DRAFT_CONTEXT_GROUP) * 4;
+inline constexpr uint64_t draft_context_window_bytes(uint32_t width, uint32_t window = SPLASH_DRAFT_SLIDING_WINDOW) {
+  return draft_context_codes_bytes(width, window) +
+         uint64_t(window) * (width / SPLASH_DRAFT_CONTEXT_GROUP) * 4;
 }
 
 struct DraftContextWindowParams {
   uint32_t rows;
   uint32_t start_position;
   uint32_t width;
+  uint32_t window = SPLASH_DRAFT_SLIDING_WINDOW;
 };
 
-static_assert(sizeof(DraftContextWindowParams) == 12,
-              "Draft context window parameters are 12 bytes on both sides");
+static_assert(sizeof(DraftContextWindowParams) == 16,
+              "Draft context window parameters are 16 bytes on both sides");
+
+// Partition complete query heads into groups of at most 32 fused query rows.
+#define SPLASH_DRAFT_ATTENTION_PARTS (SPLASH_DRAFT_QUERY_ROWS / 8u)

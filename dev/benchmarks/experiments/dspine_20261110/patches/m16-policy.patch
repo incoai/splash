@@ -1,0 +1,326 @@
+diff --git a/dev/benchmarks/backend_benchmark.mm b/dev/benchmarks/backend_benchmark.mm
+index 5f5fb35e..aa669607 100644
+--- a/dev/benchmarks/backend_benchmark.mm
++++ b/dev/benchmarks/backend_benchmark.mm
+@@ -1090,6 +1090,7 @@ int main(int argc, char **argv) {
+     engine::EngineConfig engineConfig;
+     engineConfig.maxContext = bootstrap->nativeLoop().statusSnapshot().maximumContextTokens;
+     engineConfig.vocabularySize = capabilities.vocabularySize;
++    engineConfig.draftContextTokens = config.model.draft.contextTokens;
+     engine::connectToGovernor(engineConfig, resources->memoryGovernor());
+     engine::Engine engine(engineConfig, resources->cache(),
+                                   *executor, events);
+diff --git a/dev/tests/engine/kernel_selection_golden.txt b/dev/tests/engine/kernel_selection_golden.txt
+index 50d83aaa..b6c16b77 100644
+--- a/dev/tests/engine/kernel_selection_golden.txt
++++ b/dev/tests/engine/kernel_selection_golden.txt
+@@ -918,43 +918,43 @@
+ 11,20 moe-workspace Qwen3.8-Flash-Next 65fa63e300342869
+ 11,20 projection-decode 27b-attention-input 16a20dc588ef6c40
+ 11,20 projection-decode 27b-down 04cb4025331d282b
+-11,20 projection-decode 27b-gate-up 9610ab37efc2edb9
+-11,20 projection-decode 27b-gdn-input f526b2048b9bcf13
+-11,20 projection-decode 27b-head e35eaac6eaf11389
++11,20 projection-decode 27b-gate-up 1254470b53ddef33
++11,20 projection-decode 27b-gdn-input b87bc0c3d78bb8db
++11,20 projection-decode 27b-head 6b1df65461772833
+ 11,20 projection-decode 27b-out 9d5f880f0b2938af
+-11,20 projection-decode 35b-gdn-input 88dda1b7d04b6f41
+-11,20 projection-decode 35b-head e35eaac6eaf11389
++11,20 projection-decode 35b-gdn-input bb8872d4b7454aaf
++11,20 projection-decode 35b-head 6b1df65461772833
+ 11,20 projection-decode 35b-output ebc99a6643e553e9
+-11,20 projection-decode 35b-shared-down 40709eaa022aa58d
++11,20 projection-decode 35b-shared-down 1de0ff46da9bff0f
+ 11,20 projection-decode 35b-shared-gate-up 1b5bebbb23f54bfa
+ 11,20 projection-decode Flint-attention-input e5a03a2f99dba9b8
+ 11,20 projection-decode Flint-attention-input-fused b1dc1e4171941bc5
+ 11,20 projection-decode Flint-ffn-down c81df0d3f4465a4d
+ 11,20 projection-decode Flint-ffn-gate-up 890a6cdc1a7aef73
+-11,20 projection-decode Flint-head a82021f7acd6bc47
++11,20 projection-decode Flint-head 406b406b70c9c1e5
+ 11,20 projection-decode Flint-shared-down 5286e2b2e8557795
+ 11,20 projection-decode Flint-shared-gate-up 10f116fdacf7766d
+-11,20 projection-decode Qwen3.5-122B-A10B-attention-input 9610ab37efc2edb9
+-11,20 projection-decode Qwen3.5-122B-A10B-attention-input-fused 8b23d50bbefe7295
+-11,20 projection-decode Qwen3.5-122B-A10B-gdn-input 96c6932491e539f9
+-11,20 projection-decode Qwen3.5-122B-A10B-gdn-input-fused 96c6932491e539f9
++11,20 projection-decode Qwen3.5-122B-A10B-attention-input 1254470b53ddef33
++11,20 projection-decode Qwen3.5-122B-A10B-attention-input-fused f940ea8e45d06223
++11,20 projection-decode Qwen3.5-122B-A10B-gdn-input 1f1acd4ec5eff4a7
++11,20 projection-decode Qwen3.5-122B-A10B-gdn-input-fused 00650cfa3ec9681b
+ 11,20 projection-decode Qwen3.5-122B-A10B-gdn-output f39994df6f1e219c
+-11,20 projection-decode Qwen3.5-122B-A10B-head e35eaac6eaf11389
++11,20 projection-decode Qwen3.5-122B-A10B-head 6b1df65461772833
+ 11,20 projection-decode Qwen3.5-122B-A10B-shared-down a3a5c2fefec91ff1
+-11,20 projection-decode Qwen3.6-35B-A3B-attention-input 5380ba10f17ec637
+-11,20 projection-decode Qwen3.6-35B-A3B-attention-input-fused 867b7c15dfae82ab
+-11,20 projection-decode Qwen3.6-35B-A3B-gdn-input fe10c190145f4339
+-11,20 projection-decode Qwen3.6-35B-A3B-gdn-input-fused 5a27776f539a6d79
++11,20 projection-decode Qwen3.6-35B-A3B-attention-input ec1545c0bb0a563d
++11,20 projection-decode Qwen3.6-35B-A3B-attention-input-fused 2f5cfb6b190e39cd
++11,20 projection-decode Qwen3.6-35B-A3B-gdn-input 6a0da26d58a7a87f
++11,20 projection-decode Qwen3.6-35B-A3B-gdn-input-fused 469b00f1e38e5efd
+ 11,20 projection-decode Qwen3.8-27B-attention-input b13885c9777999bb
+-11,20 projection-decode Qwen3.8-27B-gdn-input c7e691bc374bbb2b
++11,20 projection-decode Qwen3.8-27B-gdn-input d8cd598b34c54629
+ 11,20 projection-decode Qwen3.8-Flash-Next-attention-input 3e2a96d4f1084330
+ 11,20 projection-decode Qwen3.8-Flash-Next-attention-input-fused 86117823827fe544
+-11,20 projection-decode Qwen3.8-Flash-Next-gdn-input fe15a5aea01a69f9
+-11,20 projection-decode Qwen3.8-Flash-Next-gdn-input-fused 4476364b8da47fe9
++11,20 projection-decode Qwen3.8-Flash-Next-gdn-input e028de13b0fc7ebb
++11,20 projection-decode Qwen3.8-Flash-Next-gdn-input-fused 50ed6a69b7b201b5
+ 11,20 projection-decode Qwen3.8-Flash-Next-gdn-output 74a5181929a73315
+-11,20 projection-decode Qwen3.8-Flash-Next-head e35eaac6eaf11389
+-11,20 projection-decode Qwen3.8-Flash-Next-hyper-up fbadb44355082ccb
+-11,20 projection-decode Qwen3.8-Flash-Next-shared-down 5fdb9c923e2421a7
++11,20 projection-decode Qwen3.8-Flash-Next-head 6b1df65461772833
++11,20 projection-decode Qwen3.8-Flash-Next-hyper-up b6893fdb578aff41
++11,20 projection-decode Qwen3.8-Flash-Next-shared-down 049cd2c7b58edc95
+ 11,20 projection-decode Qwen3.8-Flash-Next-shared-gate-up ccb3aa487633e3a7
+ 11,20 projection-decode flash-next-hyper-down c6609a9ac7a94e5d
+ 11,20 projection-decode fused-two ce6f608c6f67f12d
+@@ -1059,43 +1059,43 @@
+ 11,20 projection-prefill narrow-512x5120 fc32ecf31c0639c7
+ 11,20 projection-shape 27b-attention-input 4267daeb66aeef5f
+ 11,20 projection-shape 27b-down f0255cb78f498cff
+-11,20 projection-shape 27b-gate-up 3c8db064be9caf15
+-11,20 projection-shape 27b-gdn-input 2c4b415e48f03447
+-11,20 projection-shape 27b-head ccc2f567782d528f
++11,20 projection-shape 27b-gate-up 57a3005a41c2e5cb
++11,20 projection-shape 27b-gdn-input 3b89660e9ac40ea5
++11,20 projection-shape 27b-head 056e960f4682563d
+ 11,20 projection-shape 27b-out beb3ae27cceaaec3
+-11,20 projection-shape 35b-gdn-input 5668c2bbda9e6d85
+-11,20 projection-shape 35b-head 3b274aaf7ca5da87
++11,20 projection-shape 35b-gdn-input a996b19c3fd68239
++11,20 projection-shape 35b-head 9394a5d87df224e9
+ 11,20 projection-shape 35b-output 8ee6019f732abd49
+-11,20 projection-shape 35b-shared-down 7f557490fb0d9195
++11,20 projection-shape 35b-shared-down 3796f824b5b662bf
+ 11,20 projection-shape 35b-shared-gate-up f7ec785f0f751825
+ 11,20 projection-shape Flint-attention-input 7d65eb13c80ed72b
+ 11,20 projection-shape Flint-attention-input-fused 7d65eb13c80ed72b
+ 11,20 projection-shape Flint-ffn-down 8295c2979f3aa2f5
+ 11,20 projection-shape Flint-ffn-gate-up 3ec8acec1785523d
+-11,20 projection-shape Flint-head 2f0d889c859d9bf1
++11,20 projection-shape Flint-head 29fe14007e5c4ddf
+ 11,20 projection-shape Flint-shared-down e93cd7448feab18d
+ 11,20 projection-shape Flint-shared-gate-up c5b7139f34b87d4b
+-11,20 projection-shape Qwen3.5-122B-A10B-attention-input e9f6bb5ea98a0ecd
+-11,20 projection-shape Qwen3.5-122B-A10B-attention-input-fused e9f6bb5ea98a0ecd
+-11,20 projection-shape Qwen3.5-122B-A10B-gdn-input 4fe52e6cb579abdb
+-11,20 projection-shape Qwen3.5-122B-A10B-gdn-input-fused 4fe52e6cb579abdb
++11,20 projection-shape Qwen3.5-122B-A10B-attention-input f68a462f16b681b3
++11,20 projection-shape Qwen3.5-122B-A10B-attention-input-fused 061ee5d1d7592d51
++11,20 projection-shape Qwen3.5-122B-A10B-gdn-input b3792a9111cca831
++11,20 projection-shape Qwen3.5-122B-A10B-gdn-input-fused b2111136abef621d
+ 11,20 projection-shape Qwen3.5-122B-A10B-gdn-output 56aeae54aaea3d27
+-11,20 projection-shape Qwen3.5-122B-A10B-head fd19faed85c8a457
++11,20 projection-shape Qwen3.5-122B-A10B-head 65b9eb775c73379d
+ 11,20 projection-shape Qwen3.5-122B-A10B-shared-down 579c97b14cdc8b8f
+-11,20 projection-shape Qwen3.6-35B-A3B-attention-input 3fa709e7c7c8ee55
+-11,20 projection-shape Qwen3.6-35B-A3B-attention-input-fused 3fa709e7c7c8ee55
+-11,20 projection-shape Qwen3.6-35B-A3B-gdn-input cdda5c1ede140e2b
+-11,20 projection-shape Qwen3.6-35B-A3B-gdn-input-fused cdda5c1ede140e2b
++11,20 projection-shape Qwen3.6-35B-A3B-attention-input 79c009b877da214b
++11,20 projection-shape Qwen3.6-35B-A3B-attention-input-fused 93058f86793202e5
++11,20 projection-shape Qwen3.6-35B-A3B-gdn-input 6d17bb5ff653b815
++11,20 projection-shape Qwen3.6-35B-A3B-gdn-input-fused 4e9915b67fb88049
+ 11,20 projection-shape Qwen3.8-27B-attention-input 4267daeb66aeef5f
+-11,20 projection-shape Qwen3.8-27B-gdn-input 2c4b415e48f03447
++11,20 projection-shape Qwen3.8-27B-gdn-input 6c0c2bd5086be4cd
+ 11,20 projection-shape Qwen3.8-Flash-Next-attention-input 2c0fc0d72d119c83
+ 11,20 projection-shape Qwen3.8-Flash-Next-attention-input-fused 2c0fc0d72d119c83
+-11,20 projection-shape Qwen3.8-Flash-Next-gdn-input 002a57c4b42b5cad
+-11,20 projection-shape Qwen3.8-Flash-Next-gdn-input-fused 002a57c4b42b5cad
++11,20 projection-shape Qwen3.8-Flash-Next-gdn-input 5f361637ca462aab
++11,20 projection-shape Qwen3.8-Flash-Next-gdn-input-fused 254c5d33663bcdbd
+ 11,20 projection-shape Qwen3.8-Flash-Next-gdn-output 82ef8cef47691eed
+-11,20 projection-shape Qwen3.8-Flash-Next-head 4c31b1e7ea2d5627
+-11,20 projection-shape Qwen3.8-Flash-Next-hyper-up 75a9f8a92f02e90b
+-11,20 projection-shape Qwen3.8-Flash-Next-shared-down c64cd91087a1a31d
++11,20 projection-shape Qwen3.8-Flash-Next-head 5835ff897a3f1759
++11,20 projection-shape Qwen3.8-Flash-Next-hyper-up a9a7a115ac5f4cd5
++11,20 projection-shape Qwen3.8-Flash-Next-shared-down e21bfdeda8019173
+ 11,20 projection-shape Qwen3.8-Flash-Next-shared-gate-up eb26d7751203a27d
+ 11,20 projection-shape flash-next-hyper-down 49697144040701bb
+ 11,20 projection-shape fused-two d77fc2145b688819
+diff --git a/dev/tests/engine/linear_plan_test.mm b/dev/tests/engine/linear_plan_test.mm
+index 281f57ca..1897824e 100644
+--- a/dev/tests/engine/linear_plan_test.mm
++++ b/dev/tests/engine/linear_plan_test.mm
+@@ -73,6 +73,45 @@ Projection blockProjection(uint32_t n, uint32_t k, uint32_t segments, uint32_t f
+   return blockProjection(n, k, std::vector<uint32_t>(segments, format));
+ }
+ 
++// Allocation without the live weights must reserve the tile dispatch uses,
++// including the 27B's fused GDN input with trailing output padding.
++void fourAndHalfBitStorage() {
++  const Linear device = gpu(10, 20);
++  for (const bool lastFloat : {false, true}) {
++    BlockWeights weights;
++    uint32_t offset = 0;
++    for (const uint32_t n : {10240U, 6144U, 128U}) {
++      QuantizedSegment part = lastFloat && n == 128
++          ? QuantizedSegment::floats(n, 5120, {})
++          : QuantizedSegment::planes(GGUF_FMT_AF4G64, n, 5120, {}, {}, {});
++      part.columnOffset = offset;
++      offset += n;
++      weights.segments.push_back(part);
++    }
++    const Projection p(16640, 5120, std::move(weights));
++    const LinearPlan plan = device.decodePlan(p, 1);
++    require(p.shape().weightBits16 == 72 && plan.configuration().sixteenRows && plan.storageRows() == 16 &&
++                device.decodeStorageRows(8, p.shape()) == plan.storageRows(),
++            "4.5-bit fused input allocation and dispatch agree");
++  }
++  // The stored-bit boundary is exact; absent format information does not
++  // opt an allocation into the measured policy.
++  for (const uint32_t bits16 : {0U, 71U, 72U, 73U})
++    require(device.decodeStorageRows(8, {.outputSize = 17408, .inputSize = 5120, .weightBits16 = bits16}) ==
++                (bits16 == 71 || bits16 == 72 ? 16U : 8U),
++            "4.5-bit storage boundary");
++  // The pair can run unsplit although each tensor's own plan splits. An
++  // override after selectProjection would choose M16 over an M8 allocation.
++  for (const uint32_t format : {GGUF_FMT_Q4K, GGUF_FMT_AF4G64}) {
++    const Projection p = blockProjection(14336, 5120, 1, format);
++    const LinearPlan pair = device.decodePlan(p, 1, LinearEpilogue::GateUp, &p);
++    require(pair.configuration().oneGateUpPass && pair.configuration().splits == 1 &&
++                !pair.configuration().sixteenRows && pair.storageRows() == 8 &&
++                device.decodeStorageRows(8, p.shape()) == 8,
++            "an unsplit 4.5-bit gate/up pair must fit its tensors' allocations");
++  }
++}
++
+ // fp32 destinations (the logits): the plan of a projection with an fp32
+ // destination keeps the configuration, input table and scratch of its bf16
+ // plan on every family and core count, and only plain decode workloads take
+@@ -578,7 +617,8 @@ void ggufPlans() {
+     for (const uint32_t family : {9U, 10U, 11U})
+       for (uint32_t cores = 0; cores <= 128; ++cores) {
+         const Linear device = gpu(family, cores);
+-        for (const auto [n, k] : {std::pair{17408U, 5120U}, {5120U, 17408U}, {16384U, 5120U}, {248320U, 5120U},
++        for (const auto [n, k] : {std::pair{17408U, 5120U}, {14336U, 5120U}, {16640U, 5120U},
++                                  {5120U, 17408U}, {16384U, 5120U}, {248320U, 5120U},
+                                   {1024U, 5120U}})
+           for (const Formats &formats : kFormats) {
+             const Projection plain = blockProjection(n, k, formats), mixed = withFloat(n, k, formats),
+@@ -594,15 +634,21 @@ void ggufPlans() {
+               const LinearPlan one = device.plan({{n, k}, 8, LinearPhase::Decode, epilogue}, *p, gate),
+                                two = device.plan({{n, k}, 16, LinearPhase::Decode, epilogue}, *p, gate);
+               LinearConfig config = one.configuration();
+-              const bool sixteen = gate ? alone(*p) && alone(*gate)
++              const uint32_t bits16 = p->shape().weightBits16;
++              const bool sixteen = gate ? config.splits == 1 && alone(*p) && alone(*gate)
+                                         : family >= 10 && config.tile == LinearTile::GgufStaged &&
+-                                              config.splits == 1 && underFourAndHalfBits(p->shape());
++                                              config.splits == 1 && (underFourAndHalfBits(p->shape()) ||
++                                                                    (cores == 20 && bits16 == 72));
+               uint32_t storage = device.decodeStorageRows(8, p->shape());
+               if (gate) storage = std::max(storage, device.decodeStorageRows(8, gate->shape()));
+               require(config.sixteenRows == sixteen && one.storageRows() == (sixteen ? 16U : 8U) &&
+                           (gate ? one.storageRows() <= storage : one.storageRows() == storage),
+                       "one lane on the 16-row tile: family " + std::to_string(family) + ", " +
+-                          std::to_string(cores) + " cores, " + std::to_string(n) + " x " + std::to_string(k));
++                          std::to_string(cores) + " cores, " + std::to_string(n) + " x " + std::to_string(k) +
++                          ", bits16 " + std::to_string(bits16) + ", gate " + std::to_string(gate != nullptr) +
++                          ", splits " + std::to_string(config.splits) + ", actual/expected M16 " +
++                          std::to_string(config.sixteenRows) + "/" + std::to_string(sixteen) +
++                          ", plan/allocation rows " + std::to_string(one.storageRows()) + "/" + std::to_string(storage));
+               config.sixteenRows = false;
+               require(!sixteen || config == two.configuration(), "one lane on the 16-row tile took another plan");
+             }
+@@ -746,8 +792,8 @@ void scratchBoundsRotated() {
+ // - every batch width runs the register tile's plan (Apple9; Apple10 where
+ //   the grid of column tiles and lanes, a one-pass pair's of both tensors,
+ //   holds fewer than 1.5 per core) or the staged tile's, over its tile's
+-//   rows, one unsplit lane of IQ4_XS on Apple10 its 16-row tile at the
+-//   two-lane plan;
++//   rows, one unsplit lane of IQ4_XS on Apple10 (also Q4_K on 20 cores)
++//   its 16-row tile at the two-lane plan;
+ //   the register tile and Apple9's staged tile take one split at every width,
+ //   so a request's sums there do not depend on the requests batched with it;
+ // - a split count is a power of two up to the maximum whose partitions keep
+@@ -757,8 +803,9 @@ void scratchBoundsRotated() {
+ //   never, and only a spreading staged gate/up pair may run in one pass;
+ // - it depends on the grid per core only: doubling the width and the core
+ //   count keeps it (and a pair's passes, where both core counts spread or
+-//   neither does); on the tiers (the register tile, Apple9's staged tile) more
+-//   cores never lower it and a wider grid never raises it, and on Apple10's
++//   neither does), except the 20-core 4.5-bit height; on the tiers (the
++//   register tile, Apple9's staged tile) more cores never lower it and a
++//   wider grid never raises it, and on Apple10's
+ //   staged tile, whose split law weighs each split's partials of the tile's
+ //   rows, more rows never raise it;
+ // - the arena bound (of the shape without formats) covers every segment
+@@ -792,10 +839,12 @@ void ggufCoreLaws() {
+                   return family == 9 || 2 * uint64_t{width / 64} * lanes < uint64_t{3} * planned;
+                 };
+                 // One lane may run the 16-row tile unsplit: Apple10, fewer than
+-                // 4.5 bits per weight, staged, a pair where its tensors' own
+-                // plans run it.
++                // 4.5 bits per weight (also exactly 4.5 on 20 cores), staged,
++                // a pair where both its tensors' own plans run it.
+                 const LinearWorkload own{{n, k}, 8, LinearPhase::Decode, LinearEpilogue::None};
+-                const bool sixteen = family >= 10 && underFourAndHalfBits(p.shape()) && !registers(1, columns) &&
++                const bool sixteen = family >= 10 &&
++                                     (underFourAndHalfBits(p.shape()) || (planned == 20 && p.shape().weightBits16 == 72)) &&
++                                     !registers(1, columns) &&
+                                      (!gateUp || linear.plan(own, gate).configuration().sixteenRows);
+                 // Every batch width takes its tile and binds its tile's rows; the
+                 // tiers' tiles take one configuration at every width, and on
+@@ -835,9 +884,12 @@ void ggufCoreLaws() {
+                     // the core count (kApple10SpreadFromCores), and with it whether
+                     // a pair may run in one pass.
+                     const LinearConfig doubled = plan(twice, 2 * n, rows).configuration();
++                    const bool measuredHeight = family >= 10 && p.shape().weightBits16 == 72 &&
++                                                (planned == 20 || simulatedDevice(family, 2 * cores).plannedGpuCores() == 20);
+                     require((gateUp && spreads != twiceSpreads) ||
+                                 (doubled.tile == at.tile && doubled.splits == at.splits &&
+-                                 doubled.oneGateUpPass == at.oneGateUpPass && doubled.sixteenRows == at.sixteenRows),
++                                 doubled.oneGateUpPass == at.oneGateUpPass &&
++                                 (measuredHeight || doubled.sixteenRows == at.sixteenRows)),
+                             "GGUF decode plan depends on more than the grid per core");
+                     if (at.tile == LinearTile::GgufStaged && family >= 10) continue;
+                     const LinearConfig withMore = plan(more, n, rows).configuration(),
+@@ -1359,6 +1411,7 @@ int main(int argc, char **argv) {
+   try {
+     require(argc == 2, "usage: linear-plan <production.metallib|--cpu>");
+     ggufPlans();
++    fourAndHalfBitStorage();
+     scratchBoundsRotated();
+     ggufCoreLaws();
+     floatOutputPlans();
+diff --git a/runtime/ops/KernelCalibration.hpp b/runtime/ops/KernelCalibration.hpp
+index d0e8eb80..be5802fc 100644
+--- a/runtime/ops/KernelCalibration.hpp
++++ b/runtime/ops/KernelCalibration.hpp
+@@ -228,6 +228,17 @@ inline constexpr ProjectionCalibration kApple10Projection{
+     .stagedPrefillRows = kApple10StagedPrefillRows,
+ };
+ 
++// The archived 20-core M5 Pro experiment also favored M16 at exactly 4.5
++// stored bits per weight. Keep the same allocation/dispatch and gate/up
++// guards; fresh paired performance qualification remains pending. Other
++// core counts keep the strict 4.5-bit boundary above.
++inline constexpr uint32_t kApple10TwentyCoreGpuCores = 20;
++inline constexpr ProjectionCalibration kApple10TwentyCoreProjection = [] {
++  ProjectionCalibration row = kApple10Projection;
++  row.sixteenRowBelowBits16 = 73;
++  return row;
++}();
++
+ // ---- Float projections ----------------------------------------------------
+ 
+ // The neural accelerator tile needs one (Apple9's matrix operations share the
+@@ -275,7 +286,8 @@ inline constexpr AttentionCalibration kApple9SmallAttention{64};
+ inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device) noexcept {
+   const uint32_t cores = device.plannedGpuCores();
+   if (device.gpuClass() == GpuClass::Apple10)
+-    return {cores, kApple10Projection, kApple10FloatTile, kApple10Moe, kAttention};
++    return {cores, cores == kApple10TwentyCoreGpuCores ? kApple10TwentyCoreProjection : kApple10Projection,
++            kApple10FloatTile, kApple10Moe, kAttention};
+   const bool small = cores <= kApple9SmallGpuCores;
+   return {cores, small ? kApple9SmallProjection : kApple9Projection, kApple9FloatTile,
+           small ? kApple9SmallMoe : kApple9Moe, small ? kApple9SmallAttention : kAttention};

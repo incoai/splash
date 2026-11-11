@@ -1,0 +1,12 @@
+{
+  "upstream": "767c646ed91eb45a1e13a59525da7373123ac4cf",
+  "integration_commit": "5855e24b8a903f0c1ff9af6b1d41467cfcdaba55",
+  "branch_runtime_commit": "24bc6f439da3074ea1fd8e218ab9dee84a201d3b",
+  "production_build_id": "src-7e9d0622992dd15b5d3731bac0f4770a7239fe48bd9624cf6e905e3114a419a7",
+  "upstream_control_build_id": "src-c7f58a32e5c11bde7a6737fec627e0ed190abafd1091a34cabc524cec74f759b",
+  "m64_control_build_id": "src-c4d987425c98770b19ba7b83512c48ad2666ff038004fd9ed86cfb68feaba213",
+  "shared_study_driver_sha256": "235ee46030758c86879cdb959f8809c7e29a94d7bd6f4fa2b92c5121ce4473c5",
+  "m64_control_patch_sha256": "8fdc7cad212ba6941624bab4780f737bbb732dfa8dfc084fd509d4ee231941dc",
+  "qualification_release": "https://github.com/linson007/splash/releases/tag/dspine-integration-review-20261111-v1",
+  "scope": "Distinct engine1.6.1 sourceB qualification. Documentation-only descendants preserve these production source/artifact identities. Earlier sourceA measurements do not qualify this source."
+}

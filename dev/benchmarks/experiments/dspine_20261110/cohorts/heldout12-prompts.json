@@ -1,0 +1,62 @@
+[
+  [
+    "held_python_parser",
+    512,
+    "Write a Python standard-library function that parses a sequence of quoted CSV records from an iterator of text chunks. Chunks may split quoted fields and escaped quotes. Explain the state transitions briefly and include two tests."
+  ],
+  [
+    "held_rust_ring",
+    512,
+    "Implement a generic bounded ring buffer in safe Rust using Vec<Option<T>>. Include push, pop, capacity validation, and a test that wraps around. Return code only."
+  ],
+  [
+    "held_go_deadline",
+    512,
+    "Write Go code for a bounded worker pool that respects context cancellation and returns each task result with its original index. Explain how the result channel is closed without leaking goroutines."
+  ],
+  [
+    "held_ts_abort",
+    512,
+    "Implement an abortable timeout wrapper for a Promise-returning TypeScript operation. The operation receives an AbortSignal, caller cancellation must propagate, and all timers and event listeners must be cleaned up. Include usage."
+  ],
+  [
+    "held_cpp_intervals",
+    512,
+    "Write C++20 code that merges overlapping half-open integer intervals, rejects reversed intervals, preserves touching intervals separately, and tests empty input, duplicates and touching boundaries. Return code only."
+  ],
+  [
+    "held_sql_sessions",
+    512,
+    "Given events(user_id, event_time, event_id), write a PostgreSQL query assigning session numbers per user whenever the gap from the previous event is more than 30 minutes. Order tied timestamps by event_id. Explain the window frames."
+  ],
+  [
+    "held_json_unicode",
+    256,
+    "Return only a JSON object with keys cities and total. cities is an array with Tokyo population 14, Paris population 2, and Cairo population 10. Each city also has its local-script name. total is their population sum. No markdown."
+  ],
+  [
+    "held_yaml_pipeline",
+    384,
+    "Return only valid YAML for a three-stage build, test and package pipeline. Each stage needs a name, a list of dependencies, two shell steps, and an integer timeout in seconds. Use anchors to share a retry policy with attempts 3 and backoff_seconds 5."
+  ],
+  [
+    "held_french_bucket",
+    384,
+    "Expliquez en français la différence entre un seau de jetons et une fenêtre glissante pour limiter le débit. Donnez un petit exemple numérique et un compromis pour chacun."
+  ],
+  [
+    "held_hindi_atomicity",
+    384,
+    "हिन्दी में समझाइए कि डेटाबेस लेनदेन की atomicity और isolation में क्या अंतर है। बैंक हस्तांतरण का एक उदाहरण और rollback का प्रभाव बताइए।"
+  ],
+  [
+    "held_arabic_conflicts",
+    384,
+    "اشرح بالعربية كيف يختلف القفل المتفائل عن القفل المتشائم عند تحديث مخزون متجر. قدم مثالا على تعارض وكيف يعاد تنفيذ العملية بأمان."
+  ],
+  [
+    "held_japanese_pressure",
+    384,
+    "非同期ストリームでバックプレッシャーが必要な理由を日本語で説明してください。キューの上限、キャンセル、遅い消費者の扱いを小さな例で示してください。"
+  ]
+]

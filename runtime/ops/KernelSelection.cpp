@@ -121,6 +121,7 @@ SplitChoice waveSplits(const WaveLaw &law, uint32_t n, uint32_t k, uint32_t rows
 // `columnTiles` column tiles of a unit of `formatClass` (RegisterBoundary).
 bool registers(const RegisterBoundary &boundary, FormatClass formatClass, uint32_t lanes, uint64_t columnTiles,
                uint32_t cores) {
+  if (!lanes || lanes > GGUF_REGISTER_MAXIMUM_TILES) return false;
   return 4 * columnTiles * lanes < uint64_t{boundary.belowQuarters[size_t(formatClass)][lanes - 1]} * cores;
 }
 
@@ -164,21 +165,21 @@ LinearConfig bf16Projection(const KernelCalibration &calibration, LinearWorkload
     if (w.rows <= p.stagedPrefillRows) return staged(p, n, k, w.rows, unit.weightBits16, cores, Passes::Two);
     return {.tile = LinearTile::GgufPrefill};
   }
-  const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
+  const uint32_t lanes = w.rows / w.geometry.rows();
   const bool gateUp = w.epilogue == LinearEpilogue::GateUp,
              onePass = gateUp && unit.oneFormat && cores >= p.onePassFromCores;
   if (unit.registerTakes &&
-      registers(p.decodeRegister, unit.formatClass, lanes, (onePass ? 2 : 1) * uint64_t{n / GGUF_TILE_COLUMNS},
+      registers(p.decodeRegister, unit.formatClass, w.rows / GGUF_TABLE16_ROWS, (onePass ? 2 : 1) * uint64_t{n / GGUF_TILE_COLUMNS},
                 cores))
     return {.tile = LinearTile::GgufRegister,
             .splits = splitsFor(p.registerSplits, n, k, w.rows, unit.weightBits16, cores).splits};
   LinearConfig config = staged(p, n, k, w.rows, unit.weightBits16, cores, onePass ? Passes::Either : Passes::Two);
   config.spread = cores >= p.spreadFromCores;
   config.sixteenRows =
-      lanes == 1 && config.splits == 1 &&
+      w.geometry.rows() == GGUF_TABLE16_ROWS && lanes == 1 && config.splits == 1 &&
       (gateUp ? !pairTensors.empty() && std::all_of(pairTensors.begin(), pairTensors.end(),
                                                     [&](const UnitFormats &tensor) {
-                                                      return bf16Projection(calibration, {w.matrix, w.rows}, tensor, {})
+                                                      return bf16Projection(calibration, {w.matrix, w.rows, w.phase, LinearEpilogue::None, w.geometry}, tensor, {})
                                                           .sixteenRows;
                                                     })
               : sixteenRowLane(p, n / GGUF_TILE_COLUMNS, unit.weightBits16, cores));
@@ -240,7 +241,8 @@ SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows
 // prefillInt8 and the tile takes the unit, and a staged decode plan of at
 // least decodeInt8FromRows rows (one lane's 16-row plan counts 16) whose K
 // splits keep whole PQ2_0 blocks runs the int8 decode tiles where they take
-// the unit, at the plan's rows, splits and passes.
+// the unit, at the plan's rows, splits and passes. Only M16/M32 have int8
+// instances; sixteen-row runtimes keep their M64 plans in bf16.
 LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activations int8Activations,
                               LinearWorkload w, const UnitFormats &unit, std::span<const UnitFormats> pairTensors) {
   LinearConfig config = bf16Projection(calibration, w, unit, pairTensors);
@@ -250,7 +252,8 @@ LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activati
     config.tile = LinearTile::GgufPrefillInt8;
   config.decodeInt8 = w.phase == LinearPhase::Decode && config.tile == LinearTile::GgufStaged &&
                       unit.decodeInt8Takes && decodeInt8TakesSplits(w.matrix.inputSize, config.splits) &&
-                      stagedStorageRows(w.rows, config.sixteenRows) >= p.decodeInt8FromRows;
+                      stagedStorageRows(w.rows, config.sixteenRows) >= p.decodeInt8FromRows &&
+                      stagedStorageRows(w.rows, config.sixteenRows) <= 32;
   return config;
 }
 
@@ -266,7 +269,7 @@ std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibrat
   const ProjectionCalibration &p = calibration.projection;
   const uint32_t cores = calibration.cores, n = w.matrix.outputSize, k = w.matrix.inputSize;
   std::vector<LinearConfig> configurations{bf16Projection(calibration, w, {.registerTakes = registerTakes}, {})};
-  if (registers(p.decodeRegister, FormatClass::FourBitsOrMore, w.rows / SPLASH_TARGET_VERIFY_ROWS,
+  if (registers(p.decodeRegister, FormatClass::FourBitsOrMore, w.rows / GGUF_TABLE16_ROWS,
                 n / GGUF_TILE_COLUMNS, cores))
     configurations.push_back(staged(p, n, k, w.rows, 0, cores, Passes::Two));
   if (w.epilogue == LinearEpilogue::GateUp && cores >= p.onePassFromCores)

@@ -10,7 +10,6 @@ namespace splash::ops {
 namespace {
 
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-constexpr uint32_t kDecodeRows = SPLASH_TARGET_VERIFY_ROWS;
 
 template <typename Workspace, size_t N>
 void include(Workspace &bound, const Workspace &required,
@@ -25,8 +24,18 @@ void include(Workspace &bound, const Workspace &required,
 
 } // namespace
 
-ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations)
-    : linear_(device, int8Activations), draftLinear_(device, Int8Activations::Off) {}
+ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, DecodeGeometry geometry,
+                                 uint32_t maximumHistoryTokens)
+    : ExecutionPlans(device, Int8Activations::Off, geometry, maximumHistoryTokens) {}
+ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations,
+                                 DecodeGeometry geometry, uint32_t maximumHistoryTokens)
+    : linear_(device, int8Activations, geometry), draftLinear_(device, Int8Activations::Off, geometry),
+      maximumHistoryTokens_(maximumHistoryTokens),
+      maximumVerifySplits_(maximumHistoryTokens ? kv::verifyAttentionSplits(maximumHistoryTokens, 0, geometry.rows())
+                                                : kv::kVerifyMaximumSplits) {
+  if (maximumHistoryTokens > SPLASH_MAXIMUM_CONTEXT_TOKENS)
+    throw std::invalid_argument("verify history bound exceeds the logical context limit");
+}
 
 // A chunk's rows pick its projections' tile, and a staged tile's height names
 // its kernels (gguf_decode_<format>_m<rows>_*), so each height a chunk takes
@@ -61,11 +70,12 @@ VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
     std::span<const uint32_t> historyTokens, AttentionVariant variant) const {
   return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, calibration().attention,
-                                    linear_.int8Activations(), variant);
+                                    linear_.int8Activations(), variant, geometry(), maximumVerifySplits_);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
                                                  uint32_t lanes) const {
+  shape.geometry = geometry();
   return DraftAttention::plan(shape, lanes);
 }
 
@@ -74,11 +84,12 @@ MoePlan ExecutionPlans::moePrefill(MoeShape shape, uint32_t routerFormat, uint32
 }
 
 MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t routerFormat, uint32_t lanes) const {
+  if (geometry().rows() != 8) throw std::invalid_argument("sixteen-row MoE execution is unsupported");
   // Validate before multiplying an untrusted width into the plan's rows.
   if (!lanes || lanes > kMaximumLanes)
     throw std::invalid_argument("invalid MoE decode width");
   return MoE::decodePlan(shape, lanes,
-                         selectMoe(calibration(), shape, routerFormat, lanes * kDecodeRows, MoePhase::Decode));
+                         selectMoe(calibration(), shape, routerFormat, lanes * geometry().rows(), MoePhase::Decode));
 }
 
 AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(
@@ -89,13 +100,14 @@ AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(
 // The verify bound is linear in the lanes: one lane's is every width's share.
 AttentionWorkspace ExecutionPlans::verifyAttentionWorkspacePerLane(
     uint32_t queryHeads, kv::Layout layout) const {
-  return PagedAttention::verifyWorkspace(1, queryHeads, layout);
+  return PagedAttention::verifyWorkspace(1, queryHeads, layout, geometry(), maximumVerifySplits_);
 }
 
 // The draft workspace is linear in the lanes: one lane's is every width's
 // share.
 DraftAttentionWorkspace ExecutionPlans::draftAttentionWorkspacePerLane(
     DraftAttentionShape shape) const {
+  shape.geometry = geometry();
   return DraftAttention::plan(shape, 1).workspace();
 }
 
@@ -119,8 +131,8 @@ MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape, uint32_t 
 uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape) const {
   uint64_t bound = 0;
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
-    const LinearWorkload workload{{shape.outputSize, shape.inputSize}, lanes * kDecodeRows,
-                                  LinearPhase::Decode, LinearEpilogue::GateUp};
+    const LinearWorkload workload{{shape.outputSize, shape.inputSize}, lanes * geometry().rows(),
+                                  LinearPhase::Decode, LinearEpilogue::GateUp, geometry()};
     bound = std::max(bound, linear_.plan(workload).gateScratchBytes());
   }
   return bound;

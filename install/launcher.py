@@ -679,7 +679,7 @@ def parse_args(argv=None):
                 parser.error("--revision cannot be used with --model-dir")
             if args.draft_model is not None and not Path(args.draft_model).is_dir():
                 parser.error(
-                    "--draft-model must be a local DFlash2 draft directory with --model-dir"
+                    "--draft-model must be a local DFlash2 or DSpine draft directory with --model-dir"
                 )
         elif args.mmproj is not None:
             parser.error("--mmproj requires --model-dir")

@@ -1,0 +1,19 @@
+{
+  "frozen_utc": "2026-11-10T09:36:13.895551+00:00",
+  "reason": "Newexternalpaired-tracefeedbackmotivatesdirectnativeDF8versusDS8matched-anchorcheck. No changes to any alreadyfrozenperformancecomparison,source,nominations,orheldoutdata.",
+  "cohort": "Same71previouslyfrozenprefixes;67primaryplus4countcontrols. Overlappingcontextsfrom31historicaltasks,notindependentsamples. Max429prompttokens,bothdraftwindowscoverentireprefix.",
+  "jobs": [
+    "fixed-prefix-dflash8-v1"
+  ],
+  "compared_existing": [
+    "fixed-prefix-8m16-v1",
+    "fixed-prefix-16twopass-v1"
+  ],
+  "endpoint": "Firstfull7proposalcycleacceptedprefixlength,mean1+accepted;requirecomplete18-tokenoutputagreementtoensurecommoncontinuation. Excludecountcontrolsfromprimary. Descriptivepairedcounts,notTPSorageneralranking/CI.",
+  "source_url": "https://github.com/incoai/splash/pull/731#issuecomment-6761876716",
+  "pre_data_ordering_amendment": {
+    "utc": "2026-11-10T09:38:07.021718+00:00",
+    "order": "Afterall3shortnativeABBAgroups/analysisandbeforefirstlongnativeABBAgroup. No comparison/groupinterleaving. Alloriginalgroupsretained;longcomparisonusesunchangedcoolinggates.",
+    "reason": "Obtainmatched-anchorcountswhilelongperformancegroupsrun,andensurethisshortdiagnosticfits8hwindow. Nooutcomesusedtochangecohorts/candidates."
+  }
+}

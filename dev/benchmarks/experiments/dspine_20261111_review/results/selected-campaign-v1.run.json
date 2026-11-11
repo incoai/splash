@@ -1,0 +1,96 @@
+{
+  "created_utc": "2026-11-11T11:20:41.464627+00:00",
+  "status": "execution_and_analysis_complete",
+  "campaign_sha256": "7410533f5bfdb97e57d2a1fdefbd24cefb760a0b8e5d6d9f534b175bfda836b5",
+  "outcomes": {
+    "default8-review-nonreg-v1": {
+      "primary_reportable": true,
+      "cross_group_output_gate": true,
+      "all_group_directions_consistent": false,
+      "direction": null
+    },
+    "agent12-dflash8-vs-review16-v1": {
+      "primary_reportable": false,
+      "cross_group_output_gate": true,
+      "all_group_directions_consistent": true,
+      "direction": "candidate faster"
+    },
+    "historical31-dflash8-vs-review16-v1": {
+      "primary_reportable": true,
+      "cross_group_output_gate": true,
+      "all_group_directions_consistent": true,
+      "direction": "candidate faster"
+    },
+    "mixed-serving-final-v2": {
+      "primary_endpoints": {
+        "cold": {
+          "groups_with_endpoint": 3,
+          "all_three_qualified": false,
+          "directions": [
+            "control faster"
+          ],
+          "consistent_direction": true,
+          "reportable_effect": false,
+          "candidate_rate_change_percent_by_group": [
+            -2.152975091827647,
+            -1.3692623560744521,
+            -1.3930273998631892
+          ],
+          "candidate_time_change_percent_by_group": [
+            2.2003480369977346,
+            1.3882714342234204,
+            1.4127067925633119
+          ]
+        },
+        "warm": {
+          "groups_with_endpoint": 3,
+          "all_three_qualified": false,
+          "directions": [
+            "control faster"
+          ],
+          "consistent_direction": true,
+          "reportable_effect": false,
+          "candidate_rate_change_percent_by_group": [
+            -19.182353532065843,
+            -18.377188508841,
+            -18.477250407391566
+          ],
+          "candidate_time_change_percent_by_group": [
+            23.73535282257544,
+            22.514770286773977,
+            22.665146231852408
+          ]
+        }
+      },
+      "all_warm_prefix_outputs_match_cold": false
+    },
+    "candidate-sampling-v1": {
+      "status": "complete",
+      "tests_observed": 140,
+      "informative_tests": 98,
+      "rejections": 0
+    }
+  },
+  "analysis_sha256": {
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/default8-review-nonreg-v1.comparison.json": "34bdb33fb47403759d031a705d2d0a2f9d8503ddb9df15604254a927a807e1ce",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/default8-review-nonreg-v1.review.json": "4c66b4539d568622807a4de4720f0b454f5a4238a1d99604e897a1ea3f867895",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1.comparison.json": "dc8ec017e5930333a48b6896deef6f0cff0d515ca4e19bb6dcde8467a6dbfaa5",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1.review.json": "4c99962f43c812a9028181f94064ffdc5b9a291b726fe2e51b6037e60097489e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/historical31-dflash8-vs-review16-v1.comparison.json": "e163b0083101b722f2a1d4976b180982a14a037d70bb889a263f056c2210bf34",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/historical31-dflash8-vs-review16-v1.review.json": "2ac116abd4843cd20d908fac4d6185aed4c65816ed97d7dc465e18c9bb12dd45",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/mixed-serving-final-v2.comparison.json": "718de22bd7b8b7c25826451570a4fa51e30ef471da332321a3cd7963b199d945",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/candidate-sampling-v1.comparison.json": "d80b1649ad1b329fb90a64c8e7845489baa8cbcc42b1d53bb54ae200b93151fe"
+  },
+  "runner_sources_sha256": {
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/selected-campaign-v1.json": "7410533f5bfdb97e57d2a1fdefbd24cefb760a0b8e5d6d9f534b175bfda836b5",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/run_selected_campaign_v1.py": "6d7fc05b038f9e22ac36c7f680fc35a6892805a1fe0b709c4ee90a949f00dc2f",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/run_abba_jobs_v1.py": "b6540206e622e8a7717d3c89952bb472373fa3af5644b3cf5319918360ed29f3",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/run_registered_job_v1.py": "0d929b8506e4053222594c23da10c0bbf0c48b0a6b0ca218416e266f6de13fbe",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/analyze_abba_v2.py": "e2c3f42e4e5fce41d89251399beb7339bf9bdc4c4af51e15435cf984390da634",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/review_native_abba_v2.py": "658d1a80df95db935d17dc8aa787e61d48efb02053e708c746bb2b716baafcd5",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/analyze_mixed_serving_v2.py": "23ff672964139c7ff5e7196d94d00a56028dc6010cf748cc94240a3d34cb2489",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/candidate_sampling_v1.py": "ce47cbdbe34304e567d59d1b59ca05054ddb5127a9703df80dbf9576d3b4654a"
+  },
+  "journal": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/logs/selected-campaign-v1-run-20261111T073429392399Z.jsonl",
+  "scope": "All independent studies completed serially. Qualification failures are preserved outcomes, not process failures. Completion does not mean that any throughput or statistical equivalence claim qualified."
+}

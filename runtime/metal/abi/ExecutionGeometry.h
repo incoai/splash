@@ -3,17 +3,28 @@
 // C/Metal ABI constants shared by host and shader compilation. Compile-time
 // static assertions, beside the model's ExecutionLimits (model/Model.hpp)
 // and the operators sized by these, check the contracts between them.
+#ifndef SPLASH_DRAFT_QUERY_ROWS
 #define SPLASH_DRAFT_QUERY_ROWS 8u
+#endif
+#ifndef SPLASH_DRAFT_PROPOSAL_TOKENS
 #define SPLASH_DRAFT_PROPOSAL_TOKENS 7u
+#endif
+#ifndef SPLASH_TARGET_VERIFY_ROWS
 #define SPLASH_TARGET_VERIFY_ROWS 8u
+#endif
 // The KV ceiling: four times the targets' native window of 262,144 tokens,
 // which holds the most context YaRN serves them
 // (QwenTargetDimensions::yarnContextTokens).
+#define SPLASH_MAXIMUM_VERIFY_ROWS 16u
+#define SPLASH_MAXIMUM_DRAFT_PROPOSAL_TOKENS (SPLASH_MAXIMUM_VERIFY_ROWS - 1u)
 #define SPLASH_MAXIMUM_CONTEXT_TOKENS 1048576u
 #define SPLASH_SPECULATIVE_SCRATCH_TOKENS                                  \
   (SPLASH_TARGET_VERIFY_ROWS - 1u)
 #define SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS                                  \
   (SPLASH_MAXIMUM_CONTEXT_TOKENS + SPLASH_SPECULATIVE_SCRATCH_TOKENS)
+// Host allocations cover either per-model instance; validation uses its active width.
+#define SPLASH_MAXIMUM_SUPPORTED_PHYSICAL_KV_TOKENS \
+  (SPLASH_MAXIMUM_CONTEXT_TOKENS + SPLASH_MAXIMUM_VERIFY_ROWS - 1u)
 #define SPLASH_MAXIMUM_BATCH_WIDTH 4u
 #define SPLASH_PREFILL_TOKEN_BUDGET 2048u
 #define SPLASH_DRAFT_SLIDING_WINDOW 2048u

@@ -913,6 +913,7 @@ def main_args(**overrides):
             "cache_dir": None,
             "decode_share": None,
             "disable_ane": False,
+            "draft_block_size": 8,
             "activations": "auto",
             "verify_rows": "auto",
             "max_image_pixels": images.MAX_PIXELS,

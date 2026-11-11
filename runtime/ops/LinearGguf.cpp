@@ -131,10 +131,16 @@ void LinearPlan::requireConfiguration() const {
     throw std::invalid_argument("only the staged block tile spreads its walks");
   if (c.oneGateUpPass && (c.tile != LinearTile::GgufStaged || !decode || workload_.epilogue != LinearEpilogue::GateUp))
     throw std::invalid_argument("only a staged block gate/up decode runs gate and up in one pass");
-  if (c.sixteenRows && (c.tile != LinearTile::GgufStaged || !decode || workload_.rows != SPLASH_TARGET_VERIFY_ROWS))
+  if (c.sixteenRows && (c.tile != LinearTile::GgufStaged || !decode || workload_.rows != GGUF_TABLE16_ROWS))
     throw std::invalid_argument("only a staged one-lane block decode runs the 16-row tile");
+  if (c.computeRows &&
+      (c.computeRows != 48 || !decode || workload_.rows != 48 || workload_.geometry.rows() != 16 ||
+       c.tile != LinearTile::GgufStaged || c.oneGateUpPass || c.decodeInt8 || workload_.epilogue != LinearEpilogue::GateUp ||
+       destination_ != FloatOutput::BFloat16 || storageRows() != 64))
+    throw std::invalid_argument("a compact staged tile takes 48 live gate/up rows within 64-row storage");
   if (c.decodeInt8 &&
-      (c.tile != LinearTile::GgufStaged || !decode || !decodeInt8TakesSplits(k, c.splits) || storageRows() < 16))
+      (c.tile != LinearTile::GgufStaged || !decode || !decodeInt8TakesSplits(k, c.splits) ||
+       storageRows() < 16 || storageRows() > 32))
     throw std::invalid_argument("only a staged block decode of 16 or 32 rows and whole PQ2_0 blocks per split runs "
                                 "int8 activations");
   if (c.tile == LinearTile::GgufRegister) {
@@ -142,6 +148,8 @@ void LinearPlan::requireConfiguration() const {
     // (quant_register_unit); addGgufRegister checks each segment's.
     if (!decode || !c.validSplits() || k / 64 < c.splits)
       throw std::invalid_argument("the register block decode tile takes a K unit per split");
+    if (workload_.rows / GGUF_TABLE16_ROWS > GGUF_REGISTER_MAXIMUM_TILES)
+      throw std::invalid_argument("the register block tile holds at most four physical table tiles");
     return;
   }
   if (c.tile == LinearTile::GgufPrefill || c.tile == LinearTile::GgufPrefillInt8) {
@@ -211,6 +219,20 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
       !unitFormats(std::array<const Projection *, 2>{&p, gate}).decodeInt8Takes)
     throw std::invalid_argument("only a rotated PQ2_0 projection takes int8 activations");
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
+  if (plan.configuration().computeRows) {
+    // A forced plan knows its shape but not its formats. Only these two
+    // whole-tensor AF4G64 epilogues have a compact kernel instance.
+    const auto takesCompact = [](const Projection &projection) {
+      const auto &parts = projection.blocks().segments;
+      return !projection.rotation && !projection.planeInputs() &&
+             projection.destination == FloatOutput::BFloat16 && parts.size() == 1 &&
+             !parts.front().isFloat() && parts.front().formatId == GGUF_FMT_AF4G64 &&
+             parts.front().columnOffset == 0 && parts.front().outputSize == projection.outputSize &&
+             parts.front().inputSize == projection.inputSize;
+    };
+    if (!gate || !takesCompact(p) || !takesCompact(*gate))
+      throw std::invalid_argument("a compact staged tile takes whole unrotated AF4G64 gate/up projections with bf16 output");
+  }
   // The fused kernels have no fp32 instance.
   if (plan.destination() == FloatOutput::Float32 && segments.size() > 1)
     throw std::invalid_argument("an fp32 destination takes a single-tensor block projection");
@@ -281,7 +303,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   const LinearConfig config = plan.configuration();
   const auto [n, k] = w.matrix;
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
-  const uint32_t rows = plan.storageRows(), splits = config.splits;
+  const uint32_t rows = plan.computeRows(), splits = config.splits;
   const auto [partials, counters] = splitScratch(b, splits);
   if (config.decodeInt8)
     for (const Projection *q : {&p, gate})
@@ -457,7 +479,7 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
   const LinearWorkload w = plan.workload();
   const LinearConfig config = plan.configuration();
   const auto [n, k] = w.matrix;
-  const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
+  const uint32_t tableTiles = w.rows / GGUF_TABLE16_ROWS;
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
   for (const Projection *q : {&p, gate})
     if (q)
@@ -473,9 +495,9 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
       }
   if (b.prepared.layout != LinearInput::Table16 || !b.prepared.source.sameView(b.input))
     graph.add("decode_linear_gguf_prepare", {b.input, b.scratch.input, b.scratch.sums}, k,
-              {k / 32, lanes, 1}, {128, 1, 1});
+              {k / 32, tableTiles, 1}, {128, 1, 1});
   const metal::DispatchSize grid{segmentColumns(p) / GGUF_TILE_COLUMNS, config.splits, 1};
-  const std::string suffix = "_l" + std::to_string(lanes);
+  const std::string suffix = "_l" + std::to_string(tableTiles);
   const auto [partials, counters] = splitScratch(b, config.splits);
   if (segments.size() > 1) {
     std::vector<const QuantizedSegment *> order;

@@ -1,0 +1,132 @@
+{
+  "protocol": {
+    "frozen_utc": "2026-11-10T20:29:48.415017+00:00",
+    "prefix": "m48-b3-research-v1",
+    "groups": 3,
+    "order_each_group": [
+      "control",
+      "candidate",
+      "candidate",
+      "control"
+    ],
+    "arms": {
+      "control": {
+        "variant": "production-final-v1",
+        "rows": 16,
+        "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+        "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07"
+      },
+      "candidate": {
+        "variant": "m48-research-v1",
+        "rows": 16,
+        "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+        "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07"
+      }
+    },
+    "cohort": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/kernel-smoke3-cap256-v1.txt",
+    "cohort_sha256": "4197b200cd24e583b19b973c032e33beda6026dc406ffe6331559329406a3246",
+    "cases": 3,
+    "samples_per_round": 3,
+    "criterion": "improvement",
+    "context_tokens": 32768,
+    "temperature": 0,
+    "ane_ffn_share": 0,
+    "verify_rows": "all",
+    "clone_width": 3,
+    "primary_endpoint": "decode",
+    "primary_metric": "Fixed three shared-prompt cloned lanes; token-weighted aggregate decode wall/output work. Prefix warmup outside the request wall. Not heterogeneous HTTP latency.",
+    "gates": "Exactly3ABBAgroups; complete arrays match; every case and aggregate spread<=5%; throughput improvement exceeds the existing max(2%,twice spread) latency-effect bound. Sampled AC/no swap/no serious or critical thermal state and idle launch gates. No repeat-to-pass.",
+    "artifact_nomination": {
+      "production-final-v1": {
+        "source_root": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/production-final-v1",
+        "patch": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/patches/production-final-v1.patch",
+        "patch_sha256": "ec4254095b3f16ed843de824622d727164005cd70c6844c3f180c0278f752736",
+        "build_manifest": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/production-final-v1/build.json",
+        "driver": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/study-driver",
+        "library": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/splash.metallib",
+        "host_step": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/host-step.metallib"
+      },
+      "m48-research-v1": {
+        "source_root": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/m48-research-v1",
+        "patch": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/patches/m48-research-v1.patch",
+        "patch_sha256": "b405166a6fb0939f5aac14268a40139b592a5a98ac0a2821e8a47599bfefa84b",
+        "build_manifest": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/m48-research-v1/build.json",
+        "driver": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-m48-research-v1-v2/study-driver",
+        "library": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-m48-research-v1-v2/splash.metallib",
+        "host_step": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-m48-research-v1-v2/host-step.metallib"
+      }
+    },
+    "required_receipts": [
+      "af4-m48-oracle-v3",
+      "af4-m48-diagnostic-v3",
+      "build-m48-research-v1",
+      "build-study-m48-research-v1-v2",
+      "m48-research-b3-functional-v1",
+      "m48-research-activity-v1",
+      "final-clone-b3-v1",
+      "validate-m48-research-v1",
+      "final-host-sanitizers-v1"
+    ],
+    "operating_script_sha256": "4bde430207a362eab510fe8ffd393fa2aa76c543eaa5821c7073e95e454d0f58",
+    "analyzer_file": "analyze_abba_v2.py",
+    "analyzer_sha256": "e2c3f42e4e5fce41d89251399beb7339bf9bdc4c4af51e15435cf984390da634",
+    "abba_sha256": "7afc7b4fa24916acfc41745fc29cc659b5edada0bfa1ce55e19a685808475c0d",
+    "eligibility_sha256": "d8675677c0272e96b18f26dd7156daea48b211b1a5bafa150c434288aab70aaf",
+    "scope": "Historical calibration prompts. Separate research candidate chosen from its prospective operator screen; already frozen final serving source and agent12/sampling4 arms are unchanged. This candidate does not run those fresh cohorts. Entire comparison is last, after all registered final production experiments; deadline may leave it incomplete."
+  },
+  "qualified": false,
+  "groups": [
+    {
+      "group": 1,
+      "rounds": [
+        "m48-b3-research-v1-g1-a1",
+        "m48-b3-research-v1-g1-b1",
+        "m48-b3-research-v1-g1-b2",
+        "m48-b3-research-v1-g1-a2"
+      ],
+      "sources": [],
+      "problems": [
+        "m48-b3-research-v1-g1-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g1-a1.receipt.json'",
+        "m48-b3-research-v1-g1-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g1-b1.receipt.json'",
+        "m48-b3-research-v1-g1-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g1-b2.receipt.json'",
+        "m48-b3-research-v1-g1-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g1-a2.receipt.json'"
+      ],
+      "qualified": false
+    },
+    {
+      "group": 2,
+      "rounds": [
+        "m48-b3-research-v1-g2-a1",
+        "m48-b3-research-v1-g2-b1",
+        "m48-b3-research-v1-g2-b2",
+        "m48-b3-research-v1-g2-a2"
+      ],
+      "sources": [],
+      "problems": [
+        "m48-b3-research-v1-g2-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g2-a1.receipt.json'",
+        "m48-b3-research-v1-g2-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g2-b1.receipt.json'",
+        "m48-b3-research-v1-g2-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g2-b2.receipt.json'",
+        "m48-b3-research-v1-g2-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g2-a2.receipt.json'"
+      ],
+      "qualified": false
+    },
+    {
+      "group": 3,
+      "rounds": [
+        "m48-b3-research-v1-g3-a1",
+        "m48-b3-research-v1-g3-b1",
+        "m48-b3-research-v1-g3-b2",
+        "m48-b3-research-v1-g3-a2"
+      ],
+      "sources": [],
+      "problems": [
+        "m48-b3-research-v1-g3-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g3-a1.receipt.json'",
+        "m48-b3-research-v1-g3-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g3-b1.receipt.json'",
+        "m48-b3-research-v1-g3-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g3-b2.receipt.json'",
+        "m48-b3-research-v1-g3-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g3-a2.receipt.json'"
+      ],
+      "qualified": false
+    }
+  ],
+  "scope": "Exactly the registered groups and complete cohort; all failures retained. Top-level qualification concerns the primary decode endpoint. Cold request wall, TTFT and predeclared categories each retain their own output/noise/effect gates. Medians of registered internal repetitions precede per-case ABBA. Aggregate decode rate weights cases by output tokens. AC and thermal state sampled every five seconds. A failure is not rerun into a pass."
+}

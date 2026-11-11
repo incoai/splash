@@ -1,0 +1,139 @@
+{
+  "created_utc": "2026-11-11T05:57:02.912364+00:00",
+  "study_kind": "Supplemental completion of seed ranges interrupted at the original fixed time cutoff",
+  "source_study_root": "/Users/linson/Documents/ai/splash-dspine-13h-20261110",
+  "original_screen_status": "incomplete",
+  "retained_files_sha256": {
+    "cohorts/sampling4-v1.txt": "76d956e14f016bb067e310433bdaa9df95b266b691be4e1c499404445bbe61c3",
+    "notes/sampling4-nominations-v1.json": "ed0f70c42db83fb34f8d7ff4f6cc4418d9d2cd5a27c3527f166801ed10e19e44",
+    "notes/sampling4-protocol-v1.json": "219f1e5d553fbe686b77c2978d4b9a06fba9cfdb3cc032657929f6faf2330b88",
+    "notes/sampling4-v1.artifact-barrier.json": "504e2eaaba579e9b7a1ab559b0b4dccc7b41b65509501fefc26e6dffb4d4b777",
+    "results/sampling4-DFlash8_candidate-chunk0-v1.progress.jsonl": "55ec5718418211c6782623623aa6074258cd4b72e2e009c9aaad30eacff675e8",
+    "results/sampling4-DFlash8_candidate-chunk0-v1.receipt.json": "95bde837180418c65562859459d62b632b2a63ab98256dfbc27f0e2c7dd17a51",
+    "results/sampling4-DFlash8_candidate-chunk0-v1.stdout": "000b4d86277af60b5b21e00f8157e75bb00224944769f359479e62e7695d13d1",
+    "results/sampling4-DFlash8_candidate-chunk1-v1.progress.jsonl": "2f75096452603ed8dc39328676ff3e88bf9154e12b6d1832e0f2dffcded46b7e",
+    "results/sampling4-DFlash8_candidate-chunk1-v1.receipt.json": "96ce95161f98e02228e5d3d41b46a507a1741de0094246a6d797ad2385a2f475",
+    "results/sampling4-DFlash8_candidate-chunk1-v1.stdout": "0e1cf08e918f09e7fc16088a3881950e19aa002908228629282f7ebac270c71d",
+    "results/sampling4-DSpine16_candidate-chunk0-v1.progress.jsonl": "cafff380cea4e26cb81384876d03ee5cbadd940878c18993281e19bb8fbe1bf7",
+    "results/sampling4-DSpine16_candidate-chunk0-v1.receipt.json": "a2e6898f48286446185a4fef2cf82eb75e3f93675ee213f7dc468731b5e2adca",
+    "results/sampling4-DSpine16_candidate-chunk0-v1.stdout": "952aedfafcc7698644fdd8e264ffaaad8d4b646edf27878d756f7283eed61ea9",
+    "results/sampling4-DSpine16_candidate-chunk1-v1.progress.jsonl": "dac35217b8eb550ee9df669239cb565c0733c07c4b91d35c8be90d432b341365",
+    "results/sampling4-DSpine16_candidate-chunk1-v1.receipt.json": "5c45c4ce9333ff2a44a8733c9939e8f6132d415723568c45d2bbe572c9ac21b5",
+    "results/sampling4-DSpine16_candidate-chunk1-v1.stdout": "9cb894fa86d66384f0e5a0cca200f32bcec4ecd9621bf9f538d7d1d225824e3e",
+    "results/sampling4-DSpine8_control-chunk0-v1.progress.jsonl": "26ea938c6446dd3d31d40fd94bb37e26420975ff0595e905af465b52d5457624",
+    "results/sampling4-DSpine8_control-chunk0-v1.receipt.json": "549cf165fa6b74c65e2d98aec573c7b22666c9870d258d323651e1b198c8a644",
+    "results/sampling4-DSpine8_control-chunk0-v1.stdout": "8fee43306851ff1710304e2a0704ecfd8d7be4344df3a098edf64bcf63c7868c",
+    "results/sampling4-DSpine8_control-chunk1-v1.progress.jsonl": "7542902b86ed2cd9daae3bfa73d0d53499585580e788ef9acbf4485b0c8f5b0f",
+    "results/sampling4-DSpine8_control-chunk1-v1.receipt.json": "134f9a4ba53bf7e2624363f64ed93617beb92d7f0c2412161044c9cd9d72d7bb",
+    "results/sampling4-comparison-v1.json": "5ad9b41766750516a1eb5625e84f0573f2e7a0dba45465616a162d3c25c5bdfe",
+    "scripts/analyze_sampling4_v1.py": "66babc7961c3ef7d37b61777dd57b1906b6e6060edd05a264c1d073e2c7b5c35"
+  },
+  "recovery_analyzer_sha256": "927c06bc0650175d2bda342a556ae8b0c9cc857295c261d98926455094ff9eca",
+  "retained_validation": [
+    {
+      "job": "sampling4-DSpine8_control-chunk0-v1",
+      "kind": "retained_complete_stdout_and_matching_journal",
+      "requests": 2000,
+      "canonical_arrays_sha256": "f574effda7acb1711806ffc7af149e7d598df7c5c98795925ae8b78cfc5e4021"
+    },
+    {
+      "job": "sampling4-DSpine8_control-chunk1-v1",
+      "kind": "retained_partial_journal",
+      "requests": 1604,
+      "canonical_arrays_sha256": "df65d4a72635f1097b96643a5f86015323f1ca7711a8efa9305b64ffebaf3a71"
+    },
+    {
+      "job": "sampling4-DSpine16_candidate-chunk0-v1",
+      "kind": "retained_complete_stdout_and_matching_journal",
+      "requests": 2000,
+      "canonical_arrays_sha256": "869af86e3df03962e82aebc42e1009567674eecc427f6357b7e08e08011c9576"
+    },
+    {
+      "job": "sampling4-DSpine16_candidate-chunk1-v1",
+      "kind": "retained_complete_stdout_and_matching_journal",
+      "requests": 2000,
+      "canonical_arrays_sha256": "103d093dbdfa48630493a0e4827e340fccda4338d40f53475099cde5e6b207d0"
+    },
+    {
+      "job": "sampling4-DFlash8_candidate-chunk0-v1",
+      "kind": "retained_complete_stdout_and_matching_journal",
+      "requests": 2000,
+      "canonical_arrays_sha256": "199e75849f9e428849f584c9e9e99fc879500683ffeff099484cfa3363a91072"
+    },
+    {
+      "job": "sampling4-DFlash8_candidate-chunk1-v1",
+      "kind": "retained_complete_stdout_and_matching_journal",
+      "requests": 2000,
+      "canonical_arrays_sha256": "5510420a68ee92bc280c877ff6402641ba3d20ba5983152c2a683513ded91d56"
+    }
+  ],
+  "control_identity": {
+    "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+    "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+    "device": "Apple M5 Pro"
+  },
+  "control_build_id": "src-e237afcf9837870527676df3de068ac7d1f615783c9f6092ae96a86271eec455",
+  "tail": {
+    "id": "sampling-recovery-tail-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-control-v2/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-control-v2/splash.metallib",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "--draft-block-size",
+      "8",
+      "--cohort",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/sampling4-v1.txt",
+      "--samples",
+      "99",
+      "--temperature",
+      "1",
+      "--seed-base",
+      "4100901",
+      "--ane-ffn-share",
+      "0",
+      "--max-context",
+      "32768",
+      "--progress",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/sampling-recovery-tail-v1.progress.jsonl"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-control-v2/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-control-v2/splash.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-control-v2/host-step.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/sampling4-v1.txt"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-control-v2/study-driver": "bf1cfaf18bafea101dd22f95522d67d301646afad9b1e293ce2e956b850a9a43",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-control-v2/splash.metallib": "8a276f6420a02590e5c3456fb65bda16e83faeafe2f59ca78435df986a920c93",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-control-v2/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/sampling4-v1.txt": "76d956e14f016bb067e310433bdaa9df95b266b691be4e1c499404445bbe61c3"
+    },
+    "timeout_seconds": 1800,
+    "stdout": "results/sampling-recovery-tail-v1.stdout",
+    "receipt": "results/sampling-recovery-tail-v1.receipt.json",
+    "progress": "results/sampling-recovery-tail-v1.progress.jsonl",
+    "seed_start": 4100901,
+    "samples": 99,
+    "requests": 396
+  },
+  "analysis": {
+    "family_size": 280,
+    "samples_per_arm_per_context": 1000,
+    "method": "Execute the original frozen analyzer feature/test functions and unchanged analysis body via AST, with a provenance-checked recovered load function.",
+    "complete_seed_ranges": {
+      "DSpine8_control": [
+        4100000,
+        4100999
+      ],
+      "DSpine16_candidate": [
+        4200000,
+        4200999
+      ],
+      "DFlash8_candidate": [
+        4300000,
+        4300999
+      ]
+    }
+  },
+  "scope": "The original timeout receipt, incomplete result and 13-hour report stay immutable. This separately named supplemental screen restores every prespecified seed without repeating an observed request or changing sources, settings, tests or family size. It adds no throughput claim."
+}

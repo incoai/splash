@@ -61,6 +61,7 @@ struct RuntimeCacheIdentity {
   model::RopeScaling ropeScaling;
   // The target model's manifest.
   std::string targetModelSha256;
+  uint32_t draftBlockSize = 8;
 };
 
 [[nodiscard]] RuntimeCacheIdentity
@@ -68,7 +69,7 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
                          std::string_view targetManifestSha256,
                          std::string_view buildId,
                          kv::Layout targetKvLayout,
-                         model::RopeScaling ropeScaling);
+                         model::RopeScaling ropeScaling, ops::DecodeGeometry geometry = {});
 
 // The name of the directory a persistent cache tier keeps its files in:
 // what its copies hold, from the models that computed them, the KV and
@@ -164,6 +165,8 @@ struct RuntimeResourcesConfig {
   // (model::budgetsVerifyRows); a benchmark round verifies every row so that
   // rounds repeat one another.
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // The model's fixed draft block width; sixteen requires dense DSpine.
+  uint32_t draftBlockSize = 8;
   // --activations: whether the plans may round activations to int8
   // where an int8-activation path takes them, or keep every activation bf16
   // (ops::Int8Activations), for the life of the engine (ops::ExecutionPlans).

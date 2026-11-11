@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-10",
+  "change": "Size verify attention scratch for the explicitly served context while preserving per-lane split counts and shader strides. Automatic starts retain the global capacity.",
+  "default_context_tokens": 32768,
+  "physical_workspace_saving_bytes": {
+    "8": 49932288,
+    "16": 99864576
+  },
+  "actual_dynamic_budget_increase_bytes": {
+    "8": 49922048,
+    "16": 99860480
+  },
+  "validation": {
+    "native_cpu": "pass",
+    "native_short_greedy": "all three 64-token cases match at both widths",
+    "small_context256": "production startup, 2048-row warmup, and three 64-token requests pass",
+    "context_boundaries": [
+      {
+        "jobs": [
+          "scratch-boundary-runtime16-v10-r8",
+          "scratch-boundary-attention-bound-v1-r8"
+        ],
+        "width": 8,
+        "all_arrays_match": true,
+        "cases": 2,
+        "output_tokens_per_arm": 64
+      },
+      {
+        "jobs": [
+          "scratch-boundary-runtime16-v10-r16",
+          "scratch-boundary-attention-bound-v1-r16"
+        ],
+        "width": 16,
+        "all_arrays_match": true,
+        "cases": 2,
+        "output_tokens_per_arm": 64
+      },
+      {
+        "jobs": [
+          "unaligned-tail-runtime16-v12-r8",
+          "unaligned-tail-attention-bound-v1-r8"
+        ],
+        "width": 8,
+        "all_arrays_match": true,
+        "cases": 1,
+        "output_tokens_per_arm": 2
+      },
+      {
+        "jobs": [
+          "unaligned-tail-runtime16-v12-r16",
+          "unaligned-tail-attention-bound-v1-r16"
+        ],
+        "width": 16,
+        "all_arrays_match": true,
+        "cases": 1,
+        "output_tokens_per_arm": 2
+      }
+    ]
+  },
+  "scope": "Memory saving, not a measured throughput improvement. Raw receipts and arrays retained in the thirteen-hour investigation."
+}

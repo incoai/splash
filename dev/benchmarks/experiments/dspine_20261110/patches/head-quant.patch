@@ -1,0 +1,269 @@
+diff --git a/dev/benchmarks/backend_benchmark.mm b/dev/benchmarks/backend_benchmark.mm
+index 5f5fb35e..aa669607 100644
+--- a/dev/benchmarks/backend_benchmark.mm
++++ b/dev/benchmarks/backend_benchmark.mm
+@@ -1090,6 +1090,7 @@ int main(int argc, char **argv) {
+     engine::EngineConfig engineConfig;
+     engineConfig.maxContext = bootstrap->nativeLoop().statusSnapshot().maximumContextTokens;
+     engineConfig.vocabularySize = capabilities.vocabularySize;
++    engineConfig.draftContextTokens = config.model.draft.contextTokens;
+     engine::connectToGovernor(engineConfig, resources->memoryGovernor());
+     engine::Engine engine(engineConfig, resources->cache(),
+                                   *executor, events);
+diff --git a/runtime/model/DFlashDraft.cpp b/runtime/model/DFlashDraft.cpp
+index 8ebecf55..595b488f 100644
+--- a/runtime/model/DFlashDraft.cpp
++++ b/runtime/model/DFlashDraft.cpp
+@@ -53,10 +53,11 @@ std::vector<ops::Projection> contextKvRows(metal::MetalBackend &backend,
+       return backend.view(plane, uint64_t{layout.attentionSize} * rowBytes,
+                           uint64_t{layout.contextKvSize()} * rowBytes);
+     };
+-    result.emplace_back(layout.contextKvSize(), layout.hiddenSize,
+-                        ops::BlockWeights{{ops::QuantizedSegment::planes(
+-                            fused.formatId, layout.contextKvSize(), layout.hiddenSize, rows(fused.plane0),
+-                            rows(fused.plane1), rows(fused.meta))}});
++    const auto segment = fused.isFloat()
++        ? ops::QuantizedSegment::rows(fused.formatId, layout.contextKvSize(), layout.hiddenSize, rows(fused.plane0))
++        : ops::QuantizedSegment::planes(fused.formatId, layout.contextKvSize(), layout.hiddenSize,
++                                       rows(fused.plane0), rows(fused.plane1), rows(fused.meta));
++    result.emplace_back(layout.contextKvSize(), layout.hiddenSize, ops::BlockWeights{{segment}});
+   }
+   return result;
+ }
+@@ -251,6 +252,7 @@ uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
+       include(*p);
+   include(weights_.contextProjection);
+   include(weights_.selectorProjection);
++  include(weights_.proposalHead);
+   if (weights_.layout.isDSpine()) {
+     for (const auto &p : weights_.bridge.read) include(p);
+     for (const auto &p : weights_.bridge.write) include(p);
+diff --git a/runtime/model/DFlashDraft.hpp b/runtime/model/DFlashDraft.hpp
+index 84c5805f..edf17d3a 100644
+--- a/runtime/model/DFlashDraft.hpp
++++ b/runtime/model/DFlashDraft.hpp
+@@ -235,6 +235,9 @@ struct DFlashDraftWeights final {
+   metal::MetalBuffer predecessorCodebook;
+   metal::MetalBuffer successorCodebook;
+   ops::DSpineWeights bridge;
++  // Research-only approximation for the initial top-16 shortlist. The
++  // verifier and conditional refinement continue using the target head.
++  ops::Projection proposalHead;
+   // The mask token's BF16 embedding the checkpoint ships, or none
+   // (kDraftMaskEmbedding).
+   metal::MetalBuffer maskEmbedding;
+diff --git a/runtime/model/DSpineDraft.cpp b/runtime/model/DSpineDraft.cpp
+index f24e11f9..2b924d29 100644
+--- a/runtime/model/DSpineDraft.cpp
++++ b/runtime/model/DSpineDraft.cpp
+@@ -47,11 +47,12 @@ void DSpineDraft::addDecode(metal::CommandGraph &graph, const DFlashDraftWeights
+     project(b.bridge.message, weights.bridge.write[layer], b.projected);
+     ops::DSpine::addWrite(graph, b.projected, b.hidden[next], b.bridge, shape);
+   }
+-  const auto headPlan = linear.decodePlan(head, lanes);
++  const auto &proposalHead = weights.proposalHead.outputSize ? weights.proposalHead : head;
++  const auto headPlan = linear.decodePlan(proposalHead, lanes);
+   const auto prepared = ops::Normalization::addRms(graph, b.hidden[layout.layers & 1], weights.finalNorm,
+       b.finalHidden, layout.hiddenSize, rows, b.linearScratch, headPlan.input());
+   linear.add(graph, {.input = b.finalHidden, .output = b.logits, .scratch = b.linearScratch, .prepared = prepared},
+-              head, headPlan);
++              proposalHead, headPlan);
+ }
+ 
+ } // namespace splash::model
+diff --git a/runtime/model/DraftCheckpoint.cpp b/runtime/model/DraftCheckpoint.cpp
+index e912b55b..e674601e 100644
+--- a/runtime/model/DraftCheckpoint.cpp
++++ b/runtime/model/DraftCheckpoint.cpp
+@@ -4,6 +4,9 @@
+ #include "model/GgufPreparation.hpp"
+ 
+ #include <initializer_list>
++#include <cstdlib>
++#include <stdexcept>
++#include <string_view>
+ #include <algorithm>
+ #include <string>
+ #include <utility>
+@@ -38,7 +41,46 @@ public:
+ 
+   // A projection of `columns` inputs: its parts' rows in order, af4g64 planes.
+   void projection(std::initializer_list<std::pair<std::string, uint64_t>> parts, uint64_t columns) {
+-    const QuantFormat &format = kQuantFormats[GGUF_FMT_AF4G64];
++    // Isolated research controls. They change draft storage precision only;
++    // the target and the BF16 code bridge retain their original images.
++    static const uint32_t bits = [] {
++      const char *value = std::getenv("SPLASH_DSPINE_DRAFT_BITS");
++      if (!value) return 4u;
++      const std::string_view text(value);
++      for (uint32_t n : {2u,3u,4u,5u,6u,8u,16u}) if (text == std::to_string(n)) return n;
++      throw std::invalid_argument("invalid research draft precision");
++    }();
++    static const std::string scope = [] {
++      const char *value = std::getenv("SPLASH_DSPINE_DRAFT_SCOPE");
++      const std::string text = value ? value : "all";
++      if (text != "all" && text != "mlp" && text != "attention" && text != "fc")
++        throw std::invalid_argument("invalid research draft precision scope");
++      return text;
++    }();
++    const std::string first = parts.begin()->first;
++    const bool selected = scope == "all" || (scope == "mlp" && first.find(".mlp.") != std::string::npos) ||
++        (scope == "attention" && first.find(".self_attn.") != std::string::npos) || (scope == "fc" && first == "fc");
++    const uint32_t chosen = selected ? bits : 4;
++    if (chosen == 16) {
++      // Native BF16 planes preserve the checkpoint values and carry g=1.
++      // They use the existing staged gate/up epilogues, unlike raw float
++      // segments whose execution deliberately permits no fused epilogue.
++      std::vector<gguf::TensorRows> raw;
++      uint64_t count = 0;
++      for (const auto &[name, rows] : parts) {
++        const auto &tensor = require(name + ".weight", {rows, columns});
++        raw.push_back({name, ggml::kBF16, tensor.offset, rows, tensor.bytes / rows, {}, tensor.file});
++        count += rows;
++      }
++      auto repack = image_.planes(GGUF_FMT_BF16, count, columns, first);
++      repack.sources = std::move(raw);
++      image_.repack(std::move(repack));
++      return;
++    }
++    const uint32_t id = quant_affine_format_of(chosen, 64);
++    if (id == GGUF_FMT_COUNT) throw WeightStoreError("unsupported research affine precision");
++    const QuantFormat &format = kQuantFormats[id];
++
+     std::vector<gguf::TensorRows> sources;
+     uint64_t rows = 0;
+     for (const auto &[name, count] : parts) {
+@@ -47,7 +89,7 @@ public:
+                          {.bfloat16 = &tensor}});
+       rows += count;
+     }
+-    gguf::Repack repack = image_.planes(GGUF_FMT_AF4G64, rows, columns, parts.begin()->first);
++    gguf::Repack repack = image_.planes(id, rows, columns, parts.begin()->first);
+     repack.sources = std::move(sources);
+     image_.repack(std::move(repack));
+   }
+diff --git a/runtime/model/GgufPreparation.cpp b/runtime/model/GgufPreparation.cpp
+index dc2cc638..df6bdf8d 100644
+--- a/runtime/model/GgufPreparation.cpp
++++ b/runtime/model/GgufPreparation.cpp
+@@ -161,7 +161,8 @@ uint16_t nearestBfloat16(float value) {
+ // scale and bias are stored as BF16. The loops have no early exit, so they
+ // vectorize; the sign of a zero minimum or maximum, which the order of a
+ // vector reduction may change, does not reach any output.
+-void quantizeGroup(const uint8_t *weights, uint8_t *block) {
++void quantizeGroup(const uint8_t *weights, uint8_t *block, uint32_t bits) {
++  const float levels = float((1u << bits) - 1u);
+   std::array<float, 64> w;
+   bool finite = true;
+   for (size_t i = 0; i < w.size(); ++i) {
+@@ -178,7 +179,7 @@ void quantizeGroup(const uint8_t *weights, uint8_t *block) {
+   }
+   maximum = std::max(0.0F, maximum);
+   const bool minimumEdge = std::fabs(minimum) > std::fabs(maximum);
+-  float step = std::max((maximum - minimum) / 15.0F, 1e-7F);
++  float step = std::max((maximum - minimum) / levels, 1e-7F);
+   if (!minimumEdge) step = -step;
+   const float edge = minimumEdge ? minimum : maximum;
+   const float q0 = std::round(edge / step);
+@@ -189,11 +190,18 @@ void quantizeGroup(const uint8_t *weights, uint8_t *block) {
+   }
+   std::array<uint8_t, 64> code;
+   for (size_t i = 0; i < w.size(); ++i)
+-    code[i] = static_cast<uint8_t>(std::clamp(std::round((w[i] - offset) / step), 0.0F, 15.0F));
++    code[i] = static_cast<uint8_t>(std::clamp(std::round((w[i] - offset) / step), 0.0F, levels));
+   const uint16_t scale = nearestBfloat16(step), bias = nearestBfloat16(offset);
+   std::memcpy(block, &scale, 2);
+   std::memcpy(block + 2, &bias, 2);
+-  for (size_t i = 0; i < w.size(); i += 2) block[4 + i / 2] = static_cast<uint8_t>(code[i] | code[i + 1] << 4);
++  std::memset(block + 4, 0, w.size() * bits / 8);
++  for (size_t i = 0; i < w.size(); ++i) {
++    const size_t at = i * bits / 8;
++    const uint32_t shift = uint32_t(i * bits % 8);
++    block[4 + at] |= static_cast<uint8_t>(uint32_t(code[i]) << shift);
++    if (shift + bits > 8)
++      block[4 + at + 1] |= static_cast<uint8_t>(uint32_t(code[i]) >> (8 - shift));
++  }
+ }
+ 
+ // Native af4g64 bytes [column, column + span) of `count` rows of a BF16
+@@ -202,16 +210,17 @@ void quantizeGroup(const uint8_t *weights, uint8_t *block) {
+ // read whole, else per row.
+ void quantizeRows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column, uint64_t span,
+                   uint8_t *to) {
+-  const QuantFormat &format = kQuantFormats[GGUF_FMT_AF4G64];
+-  if (gguf_format_of(rows.type) != GGUF_FMT_AF4G64 || column % format.block_bytes || span % format.block_bytes)
+-    throw GgufError("a BF16 weight is quantized into whole af4g64 groups: " + rows.name);
++  const uint32_t id = gguf_format_of(rows.type);
++  const QuantFormat &format = kQuantFormats[id];
++  if (!quant_affine_format(id) || format.block_elements != 64 || column % format.block_bytes || span % format.block_bytes)
++    throw GgufError("a lab BF16 weight is quantized into whole affine groups of 64: " + rows.name);
+   const uint64_t groupBytes = format.block_elements * 2, groups = rows.rowBytes / format.block_bytes;
+   const uint64_t perRead = span == rows.rowBytes ? count : 1, spanGroups = span / format.block_bytes;
+   std::vector<uint8_t> weights(perRead * spanGroups * groupBytes);
+   for (uint64_t row = 0; row < count; row += perRead) {
+     rows.safetensors.bfloat16->read(((start + row) * groups + column / format.block_bytes) * groupBytes, weights);
+     for (uint64_t group = 0; group < perRead * spanGroups; ++group)
+-      quantizeGroup(weights.data() + group * groupBytes, to + row * span + group * format.block_bytes);
++      quantizeGroup(weights.data() + group * groupBytes, to + row * span + group * format.block_bytes, quant_affine_bits(id));
+   }
+ }
+ 
+diff --git a/runtime/model/ModelFactory.cpp b/runtime/model/ModelFactory.cpp
+index caacdfb0..404ba950 100644
+--- a/runtime/model/ModelFactory.cpp
++++ b/runtime/model/ModelFactory.cpp
+@@ -4,7 +4,9 @@
+ #include "model/QwenTargetLoader.hpp"
+ #include "model/SafetensorsTarget.hpp"
+ #include "model/VisionLoader.hpp"
++#include "model/GgufPreparation.hpp"
+ 
++#include <cstdlib>
+ #include <functional>
+ #include <stdexcept>
+ #include <string_view>
+@@ -40,6 +42,36 @@ QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &
+ 
+ namespace {
+ 
++void loadResearchProposalHead(metal::MetalBackend &backend, WeightImages &images, DFlashDraftWeights &draft) {
++  const char *directory = std::getenv("SPLASH_DSPINE_HEAD_CHECKPOINT");
++  if (!directory || !*directory) return;
++  if (!draft.layout.isDSpine()) throw WeightStoreError("research proposal head requires DSpine");
++  const char *option = std::getenv("SPLASH_DSPINE_HEAD_BITS");
++  const std::string bitsText = option ? option : "3";
++  if (bitsText != "2" && bitsText != "3" && bitsText != "4" && bitsText != "6" && bitsText != "8")
++    throw WeightStoreError("research proposal head bits must be 2, 3, 4, 6 or 8");
++  const uint32_t bits = static_cast<uint32_t>(std::stoul(bitsText));
++  const uint32_t formatId = quant_affine_format_of(bits, 64);
++  const auto checkpoint = std::make_shared<SafetensorsCheckpoint>(directory);
++  const auto &tensor = checkpoint->require("lm_head.weight");
++  const uint32_t rows = draft.layout.vocabularySize, columns = draft.layout.hiddenSize;
++  if (tensor.dtype != "BF16" || tensor.shape != std::vector<uint64_t>{rows, columns})
++    throw WeightStoreError("research proposal head has the wrong type or shape");
++  gguf::ImageBuilder builder("proposal-head.bin", draft.layout.layers + 1, 2);
++  auto repack = builder.planes(formatId, rows, columns, "proposal-head");
++  repack.sources.push_back({"lm_head", kQuantFormats[formatId].ggml_type, 0, rows,
++      ggufRowBytes(kQuantFormats[formatId], columns), {}, tensor.file, {.bfloat16 = &tensor}});
++  builder.repack(std::move(repack));
++  const auto plan = std::make_shared<const gguf::Image>(builder.finish());
++  const auto before = backend.memoryStats().allocatedBytes;
++  auto file = loadImage(backend, images, "draft/", plan, [checkpoint] { checkpoint->checkUnchanged(); });
++  draft.proposalHead = readBlockProjection(file, rows, columns, "proposal-head");
++  draft.proposalHead.destination = ops::FloatOutput::Float32;
++  file.finish();
++  draft.files.push_back(file.record());
++  draft.actualAllocatedBytes += metal::allocationDelta(before, backend.memoryStats().allocatedBytes);
++}
++
+ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_8Layout &layout,
+                          const QwenTargetFiles &files) {
+   return loadQwen3_8Weights(backend, layout, files);
+@@ -114,6 +146,7 @@ LoadedModel loadModel(metal::MetalBackend &backend,
+       },
+       result.descriptor.target);
+   result.draft = loadDFlashDraftWeights(backend, draft, result.descriptor.draft);
++  loadResearchProposalHead(backend, images, result.draft);
+   result.vision = loadVisionWeights(backend, images, vision.get());
+ 
+   std::vector<WeightFileRecord> records(result.targetFiles().begin(),

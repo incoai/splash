@@ -153,6 +153,12 @@ void testServerCommandLines(const char *path) {
        [](NativeArguments &read) { read.maxImagePatches = 16384; }},
       {"idle_sleep", [](NativeArguments &read) { read.preventIdleSleep = false; }},
       {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
+      {"draft_block_size_16", [](NativeArguments &read) { read.draftBlockSize = 16; }},
+      {"draft_block_size_8", [](NativeArguments &read) { read.draftBlockSize = 8; }},
+      {"draft_block_size_16_bf16", [](NativeArguments &read) {
+         read.draftBlockSize = 16;
+         read.int8Activations = ops::Int8Activations::Off;
+       }},
       {"activations_bf16", [](NativeArguments &read) { read.int8Activations = ops::Int8Activations::Off; }},
       {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
       // The defaults the server leaves out are the engine's: each meaning
@@ -211,7 +217,8 @@ void testServerCommandLines(const char *path) {
            read.neuralEngine == meant.neuralEngine && read.pleMemory == meant.pleMemory &&
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
            read.kvSpillAlways == meant.kvSpillAlways && read.kvWindowTrim == meant.kvWindowTrim &&
-           read.verifyRows == meant.verifyRows && read.int8Activations == meant.int8Activations;
+           read.verifyRows == meant.verifyRows && read.draftBlockSize == meant.draftBlockSize &&
+           read.int8Activations == meant.int8Activations;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -250,6 +257,9 @@ void testInt8Activations() {
 // --verify-rows auto, which the server never writes, is the engine's rule.
 void testVerifyRows() {
   const ModelDirectory model;
+  require(parse(model, {"auto", "auto"}).draftBlockSize == 8 &&
+              parse(model, {"auto", "auto", "--draft-block-size", "16"}).draftBlockSize == 16,
+          "draft block size did not preserve the default or select sixteen");
   require(parse(model, {"auto", "auto"}).verifyRows == model::VerifyRows::Auto &&
               parse(model, {"auto", "auto", "--verify-rows", "auto"}).verifyRows == model::VerifyRows::Auto,
           "--verify-rows auto was not the engine's rule");
@@ -310,6 +320,8 @@ void testRefusals() {
     refuses({"auto", "auto", "--activations", value}, "--activations requires auto or bf16");
   for (const char *rows : {"budget", "every", "ALL", ""})
     refuses({"auto", "auto", "--verify-rows", rows}, "--verify-rows requires auto or all");
+  for (const char *rows : {"0", "7", "32", "auto", ""})
+    refuses({"auto", "auto", "--draft-block-size", rows}, "--draft-block-size requires 8 or 16");
   // The server passes bytes, auto or off.
   for (const char *size : {"0", "2G", "OFF", ""})
     refuses({"auto", "auto", "--ple-memory", size}, "--ple-memory requires a positive byte count, auto or off");

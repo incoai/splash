@@ -160,7 +160,7 @@ class LocalServeTests(unittest.TestCase):
             ),
             (
                 ["--model-dir", "model", "--draft-model", "owner/draft"],
-                "--draft-model must be a local DFlash2 draft directory",
+                "--draft-model must be a local DFlash2 or DSpine draft directory",
             ),
             (
                 ["--model-dir", "model", "--mmproj", "tower.gguf", "--language-only"],

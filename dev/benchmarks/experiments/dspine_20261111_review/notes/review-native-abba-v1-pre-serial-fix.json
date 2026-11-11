@@ -1,0 +1,5 @@
+{
+  "snapshot": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/snapshots/review_native_abba_v1.pre_serial_fix.py",
+  "sha256": "864b9a849a9354c76354dff4daca2a20bbf835ee10e9c557c5ab387bd107b567",
+  "reason": "Preserve original reviewer before correcting its expectation of the registrar explicit --study-width 1 option."
+}

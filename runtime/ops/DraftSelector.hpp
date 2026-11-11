@@ -65,7 +65,7 @@ struct DraftCodebooks final {
 // confidence at each position as it walks.
 class DraftSelector final {
 public:
-  explicit DraftSelector(uint32_t vocabulary);
+  explicit DraftSelector(uint32_t vocabulary, DecodeGeometry geometry = {});
 
   // Exact scratch/output bytes for that many proposal positions.
   [[nodiscard]] static DraftSelectorWorkspace workspace(uint32_t positions);
@@ -77,9 +77,10 @@ public:
   // `model` from its confidences, at most maximumRows[lane] of them.
   static void addVerifyRows(metal::CommandGraph &graph, const metal::MetalBuffer &confidence,
                             const metal::MetalBuffer &verifyRows, const VerifyRowsModel &model,
-                            std::span<const uint32_t> maximumRows);
+                            std::span<const uint32_t> maximumRows, DecodeGeometry geometry = {});
 
 private:
+  DecodeGeometry geometry_;
   uint32_t vocabulary_ = 0;
 };
 

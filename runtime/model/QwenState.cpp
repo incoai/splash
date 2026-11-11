@@ -430,10 +430,10 @@ void QwenStateStorage::swapParity(uint32_t index) {
   current.metadata.activeParity ^= 1;
 }
 
-void QwenStateStorage::swapDecodeParity(uint32_t index, uint32_t retainedRows) {
+void QwenStateStorage::swapDecodeParity(uint32_t index, uint32_t retainedRows, ops::DecodeGeometry geometry) {
   Lane &current = lane(index);
   requireAssigned(current);
-  if (!retainedRows || retainedRows > ExecutionLimits::targetVerifyRows)
+  if (!retainedRows || retainedRows > geometry.rows())
     throw std::invalid_argument("a decode step retains one to all of its rows");
   current.metadata.activeParity ^= 1;
   current.metadata.pendingRows = retainedRows;
@@ -616,7 +616,7 @@ std::shared_ptr<const CompositeState> QwenStateStorage::adopt(const SlotRecord &
                                                               uint32_t tokens) {
   if (!file_)
     throw std::logic_error("Qwen states are taken back only from a disk tier");
-  const uint32_t window = std::min(tokens, ExecutionLimits::draftContextTokens);
+  const uint32_t window = std::min(tokens, layout_.draft.windowTokens);
   const QwenLogicalLengths lengths{tokens, tokens - window, window, tokens};
   validateLengths(lengths, true);
   if (record.payloadBytes != layout_.cachedBytes())
@@ -641,14 +641,14 @@ const QwenStateStorage::Lane &QwenStateStorage::lane(uint32_t index) const {
 
 void QwenStateStorage::validateLengths(const QwenLogicalLengths &lengths,
                                        bool cacheSnapshot) const {
-  if (lengths.draftLength > ExecutionLimits::draftContextTokens ||
+  if (lengths.draftLength > layout_.draft.windowTokens ||
       lengths.draftEnd() > lengths.targetTokens ||
       lengths.windowEnd > lengths.draftEnd()) {
     throw std::invalid_argument("invalid draft ring metadata");
   }
   if (cacheSnapshot &&
       (!lengths.targetTokens ||
-       !lengths.hasCompleteDraftWindow(ExecutionLimits::draftContextTokens) ||
+       !lengths.hasCompleteDraftWindow(layout_.draft.windowTokens) ||
        lengths.targetTokens % kv::kPageTokens)) {
     throw std::invalid_argument(
         "composite snapshot requires equal page-aligned committed lengths");

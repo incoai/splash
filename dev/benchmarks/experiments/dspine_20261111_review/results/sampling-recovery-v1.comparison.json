@@ -1,0 +1,6304 @@
+{
+  "protocol": {
+    "frozen_utc": "2026-11-10T14:38:39.716105+00:00",
+    "cohort": "sampling4-v1.txt",
+    "cohort_sha256": "76d956e14f016bb067e310433bdaa9df95b266b691be4e1c499404445bbe61c3",
+    "contexts": 4,
+    "output_cap": 24,
+    "samples_per_arm_per_context": 1000,
+    "chunks_per_arm": 2,
+    "samples_per_chunk": 500,
+    "arms_reserved": {
+      "DS8_control": {
+        "seed_start": 4100000
+      },
+      "DS16_candidate": {
+        "seed_start": 4200000
+      },
+      "DF8_candidate": {
+        "seed_start": 4300000
+      }
+    },
+    "settings": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "ane_ffn_share": 0,
+      "context_limit": 32768
+    },
+    "positions": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+    ],
+    "adjacent_pair_starts": [
+      0,
+      1,
+      5,
+      6,
+      11,
+      12,
+      14,
+      15,
+      16,
+      22
+    ],
+    "additional_features": [
+      "complete_output_length"
+    ],
+    "family_size_reserved": 280,
+    "arithmetic": "4 contexts * (24 single positions + 10 adjacent pairs + 1 output length) * 2 candidate comparisons = 280 tests. Unrun comparisons remain p=1 in the reserved family.",
+    "statistics": "Pearson chi-square without Yates correction, SciPy survival probability; symmetric label-blind pooled categories with expected cells >=5, degenerate tests p=1/uninformative. Holm correction over all 280 reserved tests. Post-end positions use absorbing STOP (-1), never condition on surviving to that position.",
+    "nomination_rule": "Freeze all three source/runtime/binary/shader/cohort configurations before any positive-temperature output on these contexts. At most the two reserved candidates, including failed or nonbeneficial outcomes. Independent seed arms and complete 1000-seed ranges required. No repeat-to-pass, source substitution or dropping a context.",
+    "scope": "Finite regression screen for gross sampling mistakes, not equivalence, rare-event safety or upstream BF16 quality. Report empirical pooled total variation, Cramers V, informativeness and every rejection. Greedy and independent numerical operator checks are separate.",
+    "provenance": "Four original software/fantasy prompts; no generated outputs consulted. The short naming case intentionally checks early EOS as well as two-block coverage in the longer cases."
+  },
+  "nomination": {
+    "frozen_utc": "2026-11-10T20:29:48.395202+00:00",
+    "prefix": "sampling4-v1",
+    "cohort": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/sampling4-v1.txt",
+    "cohort_sha256": "76d956e14f016bb067e310433bdaa9df95b266b691be4e1c499404445bbe61c3",
+    "control": {
+      "variant": "control",
+      "rows": 8,
+      "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+      "name": "DSpine8_control",
+      "verify_rows": 8,
+      "seed_start": 4100000,
+      "jobs": [
+        "sampling4-DSpine8_control-chunk0-v1",
+        "sampling4-DSpine8_control-chunk1-v1"
+      ]
+    },
+    "candidates": [
+      {
+        "variant": "production-final-v1",
+        "rows": 16,
+        "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+        "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+        "name": "DSpine16_candidate",
+        "verify_rows": 16,
+        "seed_start": 4200000,
+        "jobs": [
+          "sampling4-DSpine16_candidate-chunk0-v1",
+          "sampling4-DSpine16_candidate-chunk1-v1"
+        ]
+      },
+      {
+        "variant": "production-final-v1",
+        "rows": 8,
+        "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+        "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf",
+        "name": "DFlash8_candidate",
+        "verify_rows": 8,
+        "seed_start": 4300000,
+        "jobs": [
+          "sampling4-DFlash8_candidate-chunk0-v1",
+          "sampling4-DFlash8_candidate-chunk1-v1"
+        ]
+      }
+    ],
+    "artifact_nomination": {
+      "production-final-v1": {
+        "source_root": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/production-final-v1",
+        "patch": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/patches/production-final-v1.patch",
+        "patch_sha256": "ec4254095b3f16ed843de824622d727164005cd70c6844c3f180c0278f752736",
+        "build_manifest": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/production-final-v1/build.json",
+        "driver": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/study-driver",
+        "library": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/splash.metallib",
+        "host_step": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/host-step.metallib"
+      },
+      "control": {
+        "source_root": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/control",
+        "patch": null,
+        "patch_sha256": null,
+        "build_manifest": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/control/build.json",
+        "driver": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-control-v2/study-driver",
+        "library": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-control-v2/splash.metallib",
+        "host_step": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-control-v2/host-step.metallib"
+      }
+    },
+    "operating_script_sha256": "4bde430207a362eab510fe8ffd393fa2aa76c543eaa5821c7073e95e454d0f58",
+    "analyzer_file": "analyze_sampling4_v1.py",
+    "analyzer_sha256": "66babc7961c3ef7d37b61777dd57b1906b6e6060edd05a264c1d073e2c7b5c35",
+    "abba_sha256": "7afc7b4fa24916acfc41745fc29cc659b5edada0bfa1ce55e19a685808475c0d",
+    "required_receipts": [
+      "build-production-final-v1",
+      "build-study-production-final-v1-v2",
+      "build-priority-production-final-v1-v1",
+      "full-metal-production-final-v1",
+      "python-contracts-production-final-v1",
+      "final-smoke-dspine8-v1",
+      "final-smoke-dspine16-v1",
+      "final-smoke-dflash8-v1",
+      "final-clone-b3-v1",
+      "final-clone-b4-v1",
+      "final-unaligned-tail16-v1",
+      "final-priority16-v1",
+      "final-http16-v1",
+      "final-cache-isolation-v2",
+      "final-historical31-control-r8-v1",
+      "final-historical31-production-final-v1-r8-v1",
+      "final-architecture-v1",
+      "final-python-full-v2",
+      "final-native-tools-build-v1",
+      "final-host-sanitizers-v1",
+      "final-app-tests-v2",
+      "final-python-static-v1",
+      "final-metal-tsan-v1"
+    ],
+    "settings": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "ane_ffn_share": 0,
+      "context_limit": 32768
+    },
+    "chunk_order": [
+      "DSpine8_0",
+      "DSpine16_0",
+      "DFlash8_0",
+      "DFlash8_1",
+      "DSpine16_1",
+      "DSpine8_1"
+    ],
+    "scope": "Independent-seed functional distribution screen, never throughput evidence. All three source/runtime arms frozen before first positive-temperature output; no source substitution or retry-to-pass."
+  },
+  "baseline_sources": [
+    {
+      "job": "sampling4-DSpine8_control-chunk0-v1",
+      "kind": "retained_complete_stdout_and_matching_journal",
+      "requests": 2000,
+      "canonical_arrays_sha256": "f574effda7acb1711806ffc7af149e7d598df7c5c98795925ae8b78cfc5e4021"
+    },
+    {
+      "job": "sampling4-DSpine8_control-chunk1-v1",
+      "kind": "retained_partial_journal",
+      "requests": 1604,
+      "canonical_arrays_sha256": "df65d4a72635f1097b96643a5f86015323f1ca7711a8efa9305b64ffebaf3a71"
+    },
+    {
+      "job": "sampling-recovery-tail-v1",
+      "kind": "new_missing_seed_tail",
+      "requests": 396,
+      "receipt_sha256": "af842804b9f1f1c0408b57f7c84ca68c949f1d9b4a28f65aeec4140e6292674e",
+      "stdout_sha256": "2587422898a17e4c51b8cff78017748e411a14c28c35ffbe7ada2119965e93ff",
+      "journal_sha256": "a1b1163a24a8562d4ca221d982870719bff95cff1990f55eb42b1d75c2e6561c"
+    }
+  ],
+  "candidate_sources": {
+    "DSpine16_candidate": [
+      {
+        "job": "sampling4-DSpine16_candidate-chunk0-v1",
+        "kind": "retained_complete_stdout_and_matching_journal",
+        "requests": 2000,
+        "canonical_arrays_sha256": "869af86e3df03962e82aebc42e1009567674eecc427f6357b7e08e08011c9576"
+      },
+      {
+        "job": "sampling4-DSpine16_candidate-chunk1-v1",
+        "kind": "retained_complete_stdout_and_matching_journal",
+        "requests": 2000,
+        "canonical_arrays_sha256": "103d093dbdfa48630493a0e4827e340fccda4338d40f53475099cde5e6b207d0"
+      }
+    ],
+    "DFlash8_candidate": [
+      {
+        "job": "sampling4-DFlash8_candidate-chunk0-v1",
+        "kind": "retained_complete_stdout_and_matching_journal",
+        "requests": 2000,
+        "canonical_arrays_sha256": "199e75849f9e428849f584c9e9e99fc879500683ffeff099484cfa3363a91072"
+      },
+      {
+        "job": "sampling4-DFlash8_candidate-chunk1-v1",
+        "kind": "retained_complete_stdout_and_matching_journal",
+        "requests": 2000,
+        "canonical_arrays_sha256": "5510420a68ee92bc280c877ff6402641ba3d20ba5983152c2a683513ded91d56"
+      }
+    ]
+  },
+  "family_size_reserved": 280,
+  "tests_observed": 280,
+  "status": "complete",
+  "errors": {},
+  "unobserved_reserved_tests": 0,
+  "rejections": 0,
+  "results": [
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        0
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        1
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        2
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        3
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        4
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        5
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        6
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        7
+      ],
+      "pvalue": 0.04100870040077099,
+      "statistic": 8.255901983263307,
+      "degrees_of_freedom": 3,
+      "minimum_expected_count": 38.5,
+      "bins": 4,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.06424913222473634,
+      "empirical_pooled_total_variation": 0.03999999999999995,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        8
+      ],
+      "pvalue": 0.03948390023184225,
+      "statistic": 8.33997732185252,
+      "degrees_of_freedom": 3,
+      "minimum_expected_count": 7.0,
+      "bins": 4,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.06457544936681633,
+      "empirical_pooled_total_variation": 0.039999999999999966,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        9
+      ],
+      "pvalue": 0.03948390023184225,
+      "statistic": 8.33997732185252,
+      "degrees_of_freedom": 3,
+      "minimum_expected_count": 7.0,
+      "bins": 4,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.06457544936681633,
+      "empirical_pooled_total_variation": 0.039999999999999966,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        10
+      ],
+      "pvalue": 0.0746860943872236,
+      "statistic": 8.506643988519187,
+      "degrees_of_freedom": 4,
+      "minimum_expected_count": 7.0,
+      "bins": 5,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.06521749760807749,
+      "empirical_pooled_total_variation": 0.039999999999999966,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        11
+      ],
+      "pvalue": 0.03948390023184225,
+      "statistic": 8.33997732185252,
+      "degrees_of_freedom": 3,
+      "minimum_expected_count": 7.0,
+      "bins": 4,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.06457544936681633,
+      "empirical_pooled_total_variation": 0.039999999999999966,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        12
+      ],
+      "pvalue": 0.004407728541246938,
+      "statistic": 18.85943606315135,
+      "degrees_of_freedom": 6,
+      "minimum_expected_count": 6.5,
+      "bins": 7,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.09710673525340904,
+      "empirical_pooled_total_variation": 0.048999999999999946,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        13
+      ],
+      "pvalue": 0.022117658090271462,
+      "statistic": 14.770636688783915,
+      "degrees_of_freedom": 6,
+      "minimum_expected_count": 14.5,
+      "bins": 7,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.08593787491200813,
+      "empirical_pooled_total_variation": 0.045999999999999965,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        14
+      ],
+      "pvalue": 0.1164184858559079,
+      "statistic": 10.201510212738642,
+      "degrees_of_freedom": 6,
+      "minimum_expected_count": 6.5,
+      "bins": 7,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.07141957089180333,
+      "empirical_pooled_total_variation": 0.04299999999999996,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        15
+      ],
+      "pvalue": 0.013279129383718852,
+      "statistic": 16.08996876807399,
+      "degrees_of_freedom": 6,
+      "minimum_expected_count": 10.0,
+      "bins": 7,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.08969383693452407,
+      "empirical_pooled_total_variation": 0.05300000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        16
+      ],
+      "pvalue": 0.015592939799369095,
+      "statistic": 17.294470258607706,
+      "degrees_of_freedom": 7,
+      "minimum_expected_count": 9.0,
+      "bins": 8,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.09299051096377443,
+      "empirical_pooled_total_variation": 0.06100000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        17
+      ],
+      "pvalue": 0.025442852022592024,
+      "statistic": 23.279728701668997,
+      "degrees_of_freedom": 12,
+      "minimum_expected_count": 5.0,
+      "bins": 13,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.10788820301976718,
+      "empirical_pooled_total_variation": 0.06800000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        18
+      ],
+      "pvalue": 0.029872625758710136,
+      "statistic": 19.93509145325639,
+      "degrees_of_freedom": 10,
+      "minimum_expected_count": 5.5,
+      "bins": 11,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.09983759675907766,
+      "empirical_pooled_total_variation": 0.06400000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        19
+      ],
+      "pvalue": 0.05288432604284503,
+      "statistic": 19.48752195457288,
+      "degrees_of_freedom": 11,
+      "minimum_expected_count": 5.0,
+      "bins": 12,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.0987104907154576,
+      "empirical_pooled_total_variation": 0.06199999999999996,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        20
+      ],
+      "pvalue": 0.18126717762483802,
+      "statistic": 15.026934411559017,
+      "degrees_of_freedom": 11,
+      "minimum_expected_count": 5.5,
+      "bins": 12,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.08668025845473414,
+      "empirical_pooled_total_variation": 0.049000000000000016,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        21
+      ],
+      "pvalue": 0.2506739289218721,
+      "statistic": 11.378187619424226,
+      "degrees_of_freedom": 9,
+      "minimum_expected_count": 5.5,
+      "bins": 10,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.07542608176030433,
+      "empirical_pooled_total_variation": 0.043000000000000024,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        22
+      ],
+      "pvalue": 0.22213268699486224,
+      "statistic": 13.02760136719842,
+      "degrees_of_freedom": 10,
+      "minimum_expected_count": 6.0,
+      "bins": 11,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.08070812030768162,
+      "empirical_pooled_total_variation": 0.043999999999999956,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        23
+      ],
+      "pvalue": 0.023395662947428942,
+      "statistic": 26.344348620185258,
+      "degrees_of_freedom": 14,
+      "minimum_expected_count": 5.5,
+      "bins": 15,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.11477009327386917,
+      "empirical_pooled_total_variation": 0.06899999999999998,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        0,
+        1
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        1,
+        2
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        5,
+        6
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        6,
+        7
+      ],
+      "pvalue": 0.04100870040077099,
+      "statistic": 8.255901983263307,
+      "degrees_of_freedom": 3,
+      "minimum_expected_count": 38.5,
+      "bins": 4,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.06424913222473634,
+      "empirical_pooled_total_variation": 0.03999999999999995,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        11,
+        12
+      ],
+      "pvalue": 0.004407728541246937,
+      "statistic": 18.859436063151353,
+      "degrees_of_freedom": 6,
+      "minimum_expected_count": 6.5,
+      "bins": 7,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.09710673525340906,
+      "empirical_pooled_total_variation": 0.04899999999999995,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        12,
+        13
+      ],
+      "pvalue": 0.006978548013997242,
+      "statistic": 19.41630209137674,
+      "degrees_of_freedom": 7,
+      "minimum_expected_count": 8.5,
+      "bins": 8,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.09852994999333131,
+      "empirical_pooled_total_variation": 0.04899999999999996,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        14,
+        15
+      ],
+      "pvalue": 0.02889322331284472,
+      "statistic": 15.613366735065044,
+      "degrees_of_freedom": 7,
+      "minimum_expected_count": 9.0,
+      "bins": 8,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.08835543767948027,
+      "empirical_pooled_total_variation": 0.04699999999999996,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        15,
+        16
+      ],
+      "pvalue": 0.013195336147039117,
+      "statistic": 17.740899785532147,
+      "degrees_of_freedom": 7,
+      "minimum_expected_count": 9.0,
+      "bins": 8,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.09418306584926014,
+      "empirical_pooled_total_variation": 0.061000000000000026,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        16,
+        17
+      ],
+      "pvalue": 0.07171509879022245,
+      "statistic": 22.349368180870144,
+      "degrees_of_freedom": 14,
+      "minimum_expected_count": 5.0,
+      "bins": 15,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.10571037834780023,
+      "empirical_pooled_total_variation": 0.06500000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        22,
+        23
+      ],
+      "pvalue": 0.06701856756069488,
+      "statistic": 22.604431523448344,
+      "degrees_of_freedom": 14,
+      "minimum_expected_count": 6.0,
+      "bins": 15,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.10631187968296005,
+      "empirical_pooled_total_variation": 0.063,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_code",
+      "feature": "complete_output_length",
+      "positions_zero_based": null,
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        0
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        1
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        2
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        3
+      ],
+      "pvalue": 0.6396624271775407,
+      "statistic": 5.166418940271905,
+      "degrees_of_freedom": 7,
+      "minimum_expected_count": 8.5,
+      "bins": 8,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.05082528376837608,
+      "empirical_pooled_total_variation": 0.02600000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        4
+      ],
+      "pvalue": 0.7377777030994924,
+      "statistic": 15.655097069616371,
+      "degrees_of_freedom": 20,
+      "minimum_expected_count": 5.0,
+      "bins": 21,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.08847343406248107,
+      "empirical_pooled_total_variation": 0.052,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        5
+      ],
+      "pvalue": 0.3557467406866606,
+      "statistic": 31.20667416722366,
+      "degrees_of_freedom": 29,
+      "minimum_expected_count": 5.0,
+      "bins": 30,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12491331827956469,
+      "empirical_pooled_total_variation": 0.08900000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        6
+      ],
+      "pvalue": 0.23025021705442472,
+      "statistic": 25.400131452967596,
+      "degrees_of_freedom": 21,
+      "minimum_expected_count": 5.0,
+      "bins": 22,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.11269456830958535,
+      "empirical_pooled_total_variation": 0.07,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        7
+      ],
+      "pvalue": 0.5233852447401008,
+      "statistic": 8.107150000832167,
+      "degrees_of_freedom": 9,
+      "minimum_expected_count": 6.0,
+      "bins": 10,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.06366769196708864,
+      "empirical_pooled_total_variation": 0.024000000000000007,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        8
+      ],
+      "pvalue": 0.4663606015586742,
+      "statistic": 4.601944058360229,
+      "degrees_of_freedom": 5,
+      "minimum_expected_count": 5.5,
+      "bins": 6,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.04796844826737795,
+      "empirical_pooled_total_variation": 0.01800000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        9
+      ],
+      "pvalue": 0.35887038522786474,
+      "statistic": 6.605540884612948,
+      "degrees_of_freedom": 6,
+      "minimum_expected_count": 15.5,
+      "bins": 7,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.057469735011625674,
+      "empirical_pooled_total_variation": 0.041000000000000016,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        10
+      ],
+      "pvalue": 0.3406739986853665,
+      "statistic": 6.79032459150867,
+      "degrees_of_freedom": 6,
+      "minimum_expected_count": 31.0,
+      "bins": 7,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.05826802121021731,
+      "empirical_pooled_total_variation": 0.03700000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        11
+      ],
+      "pvalue": 0.19680239294464913,
+      "statistic": 9.857351502602677,
+      "degrees_of_freedom": 7,
+      "minimum_expected_count": 7.5,
+      "bins": 8,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.07020452799714089,
+      "empirical_pooled_total_variation": 0.044000000000000025,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        12
+      ],
+      "pvalue": 0.2855736022514072,
+      "statistic": 7.398340007557129,
+      "degrees_of_freedom": 6,
+      "minimum_expected_count": 5.5,
+      "bins": 7,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.06082080239341277,
+      "empirical_pooled_total_variation": 0.041000000000000036,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        13
+      ],
+      "pvalue": 0.4811118015009137,
+      "statistic": 14.592995998518914,
+      "degrees_of_freedom": 15,
+      "minimum_expected_count": 7.5,
+      "bins": 16,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.0854195410855119,
+      "empirical_pooled_total_variation": 0.06099999999999999,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        14
+      ],
+      "pvalue": 0.2111202495644865,
+      "statistic": 46.878651035725554,
+      "degrees_of_freedom": 40,
+      "minimum_expected_count": 5.0,
+      "bins": 41,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.1530990709242312,
+      "empirical_pooled_total_variation": 0.112,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        15
+      ],
+      "pvalue": 0.49290423035988634,
+      "statistic": 48.50986617518148,
+      "degrees_of_freedom": 49,
+      "minimum_expected_count": 5.0,
+      "bins": 50,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.15573995340820782,
+      "empirical_pooled_total_variation": 0.11800000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        16
+      ],
+      "pvalue": 0.7177310976186829,
+      "statistic": 32.58300537231812,
+      "degrees_of_freedom": 38,
+      "minimum_expected_count": 5.0,
+      "bins": 39,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.1276381709605675,
+      "empirical_pooled_total_variation": 0.09000000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        17
+      ],
+      "pvalue": 0.6345606321887581,
+      "statistic": 31.56816372033033,
+      "degrees_of_freedom": 35,
+      "minimum_expected_count": 5.0,
+      "bins": 36,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12563471598314363,
+      "empirical_pooled_total_variation": 0.07699999999999999,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        18
+      ],
+      "pvalue": 0.5981772642474945,
+      "statistic": 26.508998736205694,
+      "degrees_of_freedom": 29,
+      "minimum_expected_count": 5.0,
+      "bins": 30,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.1151281866794698,
+      "empirical_pooled_total_variation": 0.07899999999999999,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        19
+      ],
+      "pvalue": 0.7110028431866124,
+      "statistic": 17.00170481308748,
+      "degrees_of_freedom": 21,
+      "minimum_expected_count": 5.0,
+      "bins": 22,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.09220006728058142,
+      "empirical_pooled_total_variation": 0.060999999999999985,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        20
+      ],
+      "pvalue": 0.4879001630830997,
+      "statistic": 10.47880962607999,
+      "degrees_of_freedom": 11,
+      "minimum_expected_count": 5.5,
+      "bins": 12,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.07238373306924696,
+      "empirical_pooled_total_variation": 0.03599999999999999,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        21
+      ],
+      "pvalue": 0.9080409616854791,
+      "statistic": 3.3834973223925533,
+      "degrees_of_freedom": 8,
+      "minimum_expected_count": 5.5,
+      "bins": 9,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.041130872361235866,
+      "empirical_pooled_total_variation": 0.029000000000000005,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        22
+      ],
+      "pvalue": 0.5707837395012059,
+      "statistic": 5.736901897901924,
+      "degrees_of_freedom": 7,
+      "minimum_expected_count": 5.5,
+      "bins": 8,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.05355792143979228,
+      "empirical_pooled_total_variation": 0.025,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        23
+      ],
+      "pvalue": 0.6547758311185288,
+      "statistic": 4.161911290787419,
+      "degrees_of_freedom": 6,
+      "minimum_expected_count": 5.5,
+      "bins": 7,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.04561749275654801,
+      "empirical_pooled_total_variation": 0.022000000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        0,
+        1
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        1,
+        2
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        5,
+        6
+      ],
+      "pvalue": 0.5542988840034053,
+      "statistic": 30.269309140414073,
+      "degrees_of_freedom": 32,
+      "minimum_expected_count": 5.0,
+      "bins": 33,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12302298391035325,
+      "empirical_pooled_total_variation": 0.08800000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        6,
+        7
+      ],
+      "pvalue": 0.3263483055116393,
+      "statistic": 25.473387813591962,
+      "degrees_of_freedom": 23,
+      "minimum_expected_count": 5.0,
+      "bins": 24,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.11285696215473807,
+      "empirical_pooled_total_variation": 0.07100000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        11,
+        12
+      ],
+      "pvalue": 0.32415682925926215,
+      "statistic": 10.33363496571824,
+      "degrees_of_freedom": 9,
+      "minimum_expected_count": 5.5,
+      "bins": 10,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.07188057792518866,
+      "empirical_pooled_total_variation": 0.04600000000000003,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        12,
+        13
+      ],
+      "pvalue": 0.3882652316115588,
+      "statistic": 16.958842190660487,
+      "degrees_of_freedom": 16,
+      "minimum_expected_count": 7.5,
+      "bins": 17,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.09208377216062688,
+      "empirical_pooled_total_variation": 0.061000000000000006,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        14,
+        15
+      ],
+      "pvalue": 0.6417285287216374,
+      "statistic": 34.289797286486,
+      "degrees_of_freedom": 38,
+      "minimum_expected_count": 5.0,
+      "bins": 39,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.130938530017879,
+      "empirical_pooled_total_variation": 0.09700000000000004,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        15,
+        16
+      ],
+      "pvalue": 0.7802780497164933,
+      "statistic": 29.238029787927637,
+      "degrees_of_freedom": 36,
+      "minimum_expected_count": 5.0,
+      "bins": 37,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12090911832431754,
+      "empirical_pooled_total_variation": 0.07799999999999996,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        16,
+        17
+      ],
+      "pvalue": 0.13613311799063693,
+      "statistic": 38.55001332764967,
+      "degrees_of_freedom": 30,
+      "minimum_expected_count": 5.0,
+      "bins": 31,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.13883445776832506,
+      "empirical_pooled_total_variation": 0.07999999999999996,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        22,
+        23
+      ],
+      "pvalue": 0.4033711200826445,
+      "statistic": 5.103574680476239,
+      "degrees_of_freedom": 5,
+      "minimum_expected_count": 7.5,
+      "bins": 6,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.05051521889726025,
+      "empirical_pooled_total_variation": 0.024999999999999988,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_json",
+      "feature": "complete_output_length",
+      "positions_zero_based": null,
+      "pvalue": 0.8666913571196345,
+      "statistic": 3.191993736865898,
+      "degrees_of_freedom": 7,
+      "minimum_expected_count": 11.0,
+      "bins": 8,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.039949929517246324,
+      "empirical_pooled_total_variation": 0.032999999999999995,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        0
+      ],
+      "pvalue": 0.5871994517788452,
+      "statistic": 9.376316736952134,
+      "degrees_of_freedom": 11,
+      "minimum_expected_count": 12.5,
+      "bins": 12,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.06847012756287275,
+      "empirical_pooled_total_variation": 0.04300000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        1
+      ],
+      "pvalue": 0.39526070261318486,
+      "statistic": 30.379126916793556,
+      "degrees_of_freedom": 29,
+      "minimum_expected_count": 6.0,
+      "bins": 30,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.1232459470262482,
+      "empirical_pooled_total_variation": 0.09200000000000003,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        2
+      ],
+      "pvalue": 0.9429129097051924,
+      "statistic": 14.933948679920075,
+      "degrees_of_freedom": 25,
+      "minimum_expected_count": 5.0,
+      "bins": 26,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.08641165627367663,
+      "empirical_pooled_total_variation": 0.04899999999999999,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        3
+      ],
+      "pvalue": 0.9547884947382519,
+      "statistic": 4.4519204214190005,
+      "degrees_of_freedom": 11,
+      "minimum_expected_count": 6.5,
+      "bins": 12,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.04718008277556855,
+      "empirical_pooled_total_variation": 0.023999999999999983,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        4
+      ],
+      "pvalue": 0.1160027390619008,
+      "statistic": 4.308282951103905,
+      "degrees_of_freedom": 2,
+      "minimum_expected_count": 9.0,
+      "bins": 3,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.046412729671416145,
+      "empirical_pooled_total_variation": 0.02,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        5
+      ],
+      "pvalue": 0.05820363327077656,
+      "statistic": 3.587846171095414,
+      "degrees_of_freedom": 1,
+      "minimum_expected_count": 9.0,
+      "bins": 2,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.04235472919931973,
+      "empirical_pooled_total_variation": 0.008000000000000004,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        6
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        7
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        8
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        9
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        10
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        11
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        12
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        13
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        14
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        15
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        16
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        17
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        18
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        19
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        20
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        21
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        22
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        23
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        0,
+        1
+      ],
+      "pvalue": 0.6476364344464223,
+      "statistic": 32.24980547433999,
+      "degrees_of_freedom": 36,
+      "minimum_expected_count": 5.0,
+      "bins": 37,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12698386801940628,
+      "empirical_pooled_total_variation": 0.08800000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        1,
+        2
+      ],
+      "pvalue": 0.20988243777847296,
+      "statistic": 46.921335560335464,
+      "degrees_of_freedom": 40,
+      "minimum_expected_count": 5.0,
+      "bins": 41,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.15316875588764092,
+      "empirical_pooled_total_variation": 0.10400000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        5,
+        6
+      ],
+      "pvalue": 0.05820363327077656,
+      "statistic": 3.587846171095414,
+      "degrees_of_freedom": 1,
+      "minimum_expected_count": 9.0,
+      "bins": 2,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.04235472919931973,
+      "empirical_pooled_total_variation": 0.008000000000000004,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        6,
+        7
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        11,
+        12
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        12,
+        13
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        14,
+        15
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        15,
+        16
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        16,
+        17
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        22,
+        23
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_name",
+      "feature": "complete_output_length",
+      "positions_zero_based": null,
+      "pvalue": 0.22198208017342821,
+      "statistic": 4.393572780623999,
+      "degrees_of_freedom": 3,
+      "minimum_expected_count": 9.0,
+      "bins": 4,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.04686988788456827,
+      "empirical_pooled_total_variation": 0.019999999999999973,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        0
+      ],
+      "pvalue": 0.7608494708312427,
+      "statistic": 0.09263833992094861,
+      "degrees_of_freedom": 1,
+      "minimum_expected_count": 264.0,
+      "bins": 2,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.006805818831005885,
+      "empirical_pooled_total_variation": 0.006000000000000005,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        1
+      ],
+      "pvalue": 0.753949034180118,
+      "statistic": 2.6487237930265506,
+      "degrees_of_freedom": 5,
+      "minimum_expected_count": 12.0,
+      "bins": 6,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.03639178336538724,
+      "empirical_pooled_total_variation": 0.023000000000000007,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        2
+      ],
+      "pvalue": 0.6537095847846592,
+      "statistic": 9.569052036276963,
+      "degrees_of_freedom": 12,
+      "minimum_expected_count": 6.0,
+      "bins": 13,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.0691702683104416,
+      "empirical_pooled_total_variation": 0.05,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        3
+      ],
+      "pvalue": 0.8950373767889492,
+      "statistic": 10.199476749179198,
+      "degrees_of_freedom": 17,
+      "minimum_expected_count": 6.0,
+      "bins": 18,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.07141245251767789,
+      "empirical_pooled_total_variation": 0.054000000000000006,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        4
+      ],
+      "pvalue": 0.4157567007129845,
+      "statistic": 24.817046626149462,
+      "degrees_of_freedom": 24,
+      "minimum_expected_count": 5.5,
+      "bins": 25,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.11139355148784301,
+      "empirical_pooled_total_variation": 0.07500000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        5
+      ],
+      "pvalue": 0.6150338802340236,
+      "statistic": 34.86860294018618,
+      "degrees_of_freedom": 38,
+      "minimum_expected_count": 5.0,
+      "bins": 39,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.1320390149542668,
+      "empirical_pooled_total_variation": 0.104,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        6
+      ],
+      "pvalue": 0.23018650970274462,
+      "statistic": 46.241710826262064,
+      "degrees_of_freedom": 40,
+      "minimum_expected_count": 5.0,
+      "bins": 41,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.15205543532912932,
+      "empirical_pooled_total_variation": 0.11599999999999999,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        7
+      ],
+      "pvalue": 0.6900371454096774,
+      "statistic": 31.334946909584925,
+      "degrees_of_freedom": 36,
+      "minimum_expected_count": 5.0,
+      "bins": 37,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12516977852018618,
+      "empirical_pooled_total_variation": 0.08900000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        8
+      ],
+      "pvalue": 0.3355437432653754,
+      "statistic": 45.312145892102905,
+      "degrees_of_freedom": 42,
+      "minimum_expected_count": 5.0,
+      "bins": 43,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.15051934409254994,
+      "empirical_pooled_total_variation": 0.091,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        9
+      ],
+      "pvalue": 0.40776938336801954,
+      "statistic": 43.48989522844707,
+      "degrees_of_freedom": 42,
+      "minimum_expected_count": 5.0,
+      "bins": 43,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.1474616818506541,
+      "empirical_pooled_total_variation": 0.09999999999999999,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        10
+      ],
+      "pvalue": 0.45886602361620654,
+      "statistic": 36.20964476369065,
+      "degrees_of_freedom": 36,
+      "minimum_expected_count": 5.0,
+      "bins": 37,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.13455416151812372,
+      "empirical_pooled_total_variation": 0.08400000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        11
+      ],
+      "pvalue": 0.5660259101467304,
+      "statistic": 39.84389815249324,
+      "degrees_of_freedom": 42,
+      "minimum_expected_count": 5.0,
+      "bins": 43,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.14114513479481544,
+      "empirical_pooled_total_variation": 0.11000000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        12
+      ],
+      "pvalue": 0.28593245600934303,
+      "statistic": 46.68322661171144,
+      "degrees_of_freedom": 42,
+      "minimum_expected_count": 5.0,
+      "bins": 43,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.15277962333326955,
+      "empirical_pooled_total_variation": 0.10000000000000003,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        13
+      ],
+      "pvalue": 0.5088316162977615,
+      "statistic": 41.13454667830875,
+      "degrees_of_freedom": 42,
+      "minimum_expected_count": 5.0,
+      "bins": 43,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.14341294690213424,
+      "empirical_pooled_total_variation": 0.07800000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        14
+      ],
+      "pvalue": 0.40645545313838854,
+      "statistic": 43.521704098588316,
+      "degrees_of_freedom": 42,
+      "minimum_expected_count": 5.0,
+      "bins": 43,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.14751559934221925,
+      "empirical_pooled_total_variation": 0.08700000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        15
+      ],
+      "pvalue": 0.4118468189409972,
+      "statistic": 42.36680245926941,
+      "degrees_of_freedom": 41,
+      "minimum_expected_count": 5.0,
+      "bins": 42,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.1455451862125117,
+      "empirical_pooled_total_variation": 0.08400000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        16
+      ],
+      "pvalue": 0.3620154334913657,
+      "statistic": 47.73920492922922,
+      "degrees_of_freedom": 45,
+      "minimum_expected_count": 5.0,
+      "bins": 46,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.15449790440201644,
+      "empirical_pooled_total_variation": 0.086,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        17
+      ],
+      "pvalue": 0.7715895150679638,
+      "statistic": 33.10820216196767,
+      "degrees_of_freedom": 40,
+      "minimum_expected_count": 5.0,
+      "bins": 41,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12866274161925756,
+      "empirical_pooled_total_variation": 0.08399999999999999,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        18
+      ],
+      "pvalue": 0.9232924530544849,
+      "statistic": 24.669736793378096,
+      "degrees_of_freedom": 36,
+      "minimum_expected_count": 5.0,
+      "bins": 37,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.11106245268626588,
+      "empirical_pooled_total_variation": 0.064,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        19
+      ],
+      "pvalue": 0.988994837160329,
+      "statistic": 19.433483497468238,
+      "degrees_of_freedom": 36,
+      "minimum_expected_count": 5.0,
+      "bins": 37,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.09857353472780672,
+      "empirical_pooled_total_variation": 0.052000000000000005,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        20
+      ],
+      "pvalue": 0.8217228065005586,
+      "statistic": 30.83000432865648,
+      "degrees_of_freedom": 39,
+      "minimum_expected_count": 5.0,
+      "bins": 40,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12415716718872188,
+      "empirical_pooled_total_variation": 0.07,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        21
+      ],
+      "pvalue": 0.811657562096586,
+      "statistic": 32.01689568142336,
+      "degrees_of_freedom": 40,
+      "minimum_expected_count": 5.0,
+      "bins": 41,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.1265244950225516,
+      "empirical_pooled_total_variation": 0.06,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        22
+      ],
+      "pvalue": 0.45912377048591874,
+      "statistic": 32.154003329114204,
+      "degrees_of_freedom": 32,
+      "minimum_expected_count": 5.0,
+      "bins": 33,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12679511687978012,
+      "empirical_pooled_total_variation": 0.07800000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        23
+      ],
+      "pvalue": 0.6988096686542226,
+      "statistic": 30.20412930067227,
+      "degrees_of_freedom": 35,
+      "minimum_expected_count": 5.0,
+      "bins": 36,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.1228904579303704,
+      "empirical_pooled_total_variation": 0.07200000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        0,
+        1
+      ],
+      "pvalue": 0.753949034180118,
+      "statistic": 2.6487237930265506,
+      "degrees_of_freedom": 5,
+      "minimum_expected_count": 12.0,
+      "bins": 6,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.03639178336538724,
+      "empirical_pooled_total_variation": 0.023000000000000007,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        1,
+        2
+      ],
+      "pvalue": 0.846275652039923,
+      "statistic": 11.194507500279695,
+      "degrees_of_freedom": 17,
+      "minimum_expected_count": 5.5,
+      "bins": 18,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.07481479633160708,
+      "empirical_pooled_total_variation": 0.054000000000000006,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        5,
+        6
+      ],
+      "pvalue": 0.28181784033037127,
+      "statistic": 52.111429563776355,
+      "degrees_of_freedom": 47,
+      "minimum_expected_count": 5.0,
+      "bins": 48,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.16141782671653146,
+      "empirical_pooled_total_variation": 0.12000000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        6,
+        7
+      ],
+      "pvalue": 0.645315913870045,
+      "statistic": 33.2549716866721,
+      "degrees_of_freedom": 37,
+      "minimum_expected_count": 5.0,
+      "bins": 38,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12894760890895204,
+      "empirical_pooled_total_variation": 0.085,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        11,
+        12
+      ],
+      "pvalue": 0.569212012539297,
+      "statistic": 29.000409237468048,
+      "degrees_of_freedom": 31,
+      "minimum_expected_count": 5.0,
+      "bins": 32,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12041679541797325,
+      "empirical_pooled_total_variation": 0.05,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        12,
+        13
+      ],
+      "pvalue": 0.9107172800302259,
+      "statistic": 19.395680814746324,
+      "degrees_of_freedom": 29,
+      "minimum_expected_count": 5.0,
+      "bins": 30,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.0984776137372,
+      "empirical_pooled_total_variation": 0.05500000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        14,
+        15
+      ],
+      "pvalue": 0.44288873627406544,
+      "statistic": 25.350242348383915,
+      "degrees_of_freedom": 25,
+      "minimum_expected_count": 5.0,
+      "bins": 26,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.11258384064417042,
+      "empirical_pooled_total_variation": 0.05699999999999996,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        15,
+        16
+      ],
+      "pvalue": 0.6032856151719276,
+      "statistic": 25.449321161101828,
+      "degrees_of_freedom": 28,
+      "minimum_expected_count": 5.0,
+      "bins": 29,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.11280363726649471,
+      "empirical_pooled_total_variation": 0.041,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        16,
+        17
+      ],
+      "pvalue": 0.5107605702185976,
+      "statistic": 27.137658116521223,
+      "degrees_of_freedom": 28,
+      "minimum_expected_count": 5.0,
+      "bins": 29,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.11648531692132108,
+      "empirical_pooled_total_variation": 0.05400000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        22,
+        23
+      ],
+      "pvalue": 0.8294044015965111,
+      "statistic": 8.213703973165916,
+      "degrees_of_freedom": 13,
+      "minimum_expected_count": 5.0,
+      "bins": 14,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.06408472506442513,
+      "empirical_pooled_total_variation": 0.018000000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DSpine16_candidate",
+      "context": "sample_story",
+      "feature": "complete_output_length",
+      "positions_zero_based": null,
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        0
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        1
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        2
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        3
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        4
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        5
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        6
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        7
+      ],
+      "pvalue": 0.16187558671629354,
+      "statistic": 5.139313349143113,
+      "degrees_of_freedom": 3,
+      "minimum_expected_count": 42.0,
+      "bins": 4,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.05069178113433732,
+      "empirical_pooled_total_variation": 0.02300000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        8
+      ],
+      "pvalue": 0.5381675111172064,
+      "statistic": 2.1685603961414808,
+      "degrees_of_freedom": 3,
+      "minimum_expected_count": 8.5,
+      "bins": 4,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.03292841019652695,
+      "empirical_pooled_total_variation": 0.02000000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        9
+      ],
+      "pvalue": 0.5381675111172064,
+      "statistic": 2.1685603961414808,
+      "degrees_of_freedom": 3,
+      "minimum_expected_count": 8.5,
+      "bins": 4,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.03292841019652695,
+      "empirical_pooled_total_variation": 0.02000000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        10
+      ],
+      "pvalue": 0.6190529064891743,
+      "statistic": 2.643976893500278,
+      "degrees_of_freedom": 4,
+      "minimum_expected_count": 8.5,
+      "bins": 5,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.03635915904899533,
+      "empirical_pooled_total_variation": 0.023000000000000013,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        11
+      ],
+      "pvalue": 0.5381675111172064,
+      "statistic": 2.1685603961414808,
+      "degrees_of_freedom": 3,
+      "minimum_expected_count": 8.5,
+      "bins": 4,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.03292841019652695,
+      "empirical_pooled_total_variation": 0.02000000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        12
+      ],
+      "pvalue": 0.8037696255808399,
+      "statistic": 3.0403190134854716,
+      "degrees_of_freedom": 6,
+      "minimum_expected_count": 8.5,
+      "bins": 7,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.03898922295638547,
+      "empirical_pooled_total_variation": 0.020000000000000004,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        13
+      ],
+      "pvalue": 0.8600136607141255,
+      "statistic": 3.9678362172991966,
+      "degrees_of_freedom": 8,
+      "minimum_expected_count": 5.5,
+      "bins": 9,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.04454119563560904,
+      "empirical_pooled_total_variation": 0.02200000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        14
+      ],
+      "pvalue": 0.8693532353133409,
+      "statistic": 2.4920777540419428,
+      "degrees_of_freedom": 6,
+      "minimum_expected_count": 9.5,
+      "bins": 7,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.03529927587105678,
+      "empirical_pooled_total_variation": 0.021000000000000005,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        15
+      ],
+      "pvalue": 0.5542656817134262,
+      "statistic": 6.837471405985857,
+      "degrees_of_freedom": 8,
+      "minimum_expected_count": 5.0,
+      "bins": 9,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.05846995555832866,
+      "empirical_pooled_total_variation": 0.028000000000000008,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        16
+      ],
+      "pvalue": 0.22074136546798792,
+      "statistic": 10.676006584472145,
+      "degrees_of_freedom": 8,
+      "minimum_expected_count": 5.0,
+      "bins": 9,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.0730616403609724,
+      "empirical_pooled_total_variation": 0.042000000000000016,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        17
+      ],
+      "pvalue": 0.6618019785634845,
+      "statistic": 10.389661775801178,
+      "degrees_of_freedom": 13,
+      "minimum_expected_count": 6.5,
+      "bins": 14,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.07207517525404006,
+      "empirical_pooled_total_variation": 0.042000000000000016,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        18
+      ],
+      "pvalue": 0.5795484232589819,
+      "statistic": 8.505878494833565,
+      "degrees_of_freedom": 10,
+      "minimum_expected_count": 6.0,
+      "bins": 11,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.06521456315438126,
+      "empirical_pooled_total_variation": 0.043000000000000024,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        19
+      ],
+      "pvalue": 0.2700681342425317,
+      "statistic": 13.366164255041992,
+      "degrees_of_freedom": 11,
+      "minimum_expected_count": 6.5,
+      "bins": 12,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.08175012004591184,
+      "empirical_pooled_total_variation": 0.050999999999999955,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        20
+      ],
+      "pvalue": 0.1820657915968771,
+      "statistic": 15.009426391030637,
+      "degrees_of_freedom": 11,
+      "minimum_expected_count": 7.0,
+      "bins": 12,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.08662974775165468,
+      "empirical_pooled_total_variation": 0.05000000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        21
+      ],
+      "pvalue": 0.21988430192799518,
+      "statistic": 9.481877677527482,
+      "degrees_of_freedom": 7,
+      "minimum_expected_count": 5.5,
+      "bins": 8,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.06885447580777694,
+      "empirical_pooled_total_variation": 0.040000000000000015,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        22
+      ],
+      "pvalue": 0.3511123637082204,
+      "statistic": 12.168493317148336,
+      "degrees_of_freedom": 11,
+      "minimum_expected_count": 5.5,
+      "bins": 12,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.07800158112868077,
+      "empirical_pooled_total_variation": 0.04499999999999996,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        23
+      ],
+      "pvalue": 0.16084635637258837,
+      "statistic": 17.913115841386293,
+      "degrees_of_freedom": 13,
+      "minimum_expected_count": 5.5,
+      "bins": 14,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.09463909298325479,
+      "empirical_pooled_total_variation": 0.04600000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        0,
+        1
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        1,
+        2
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        5,
+        6
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        6,
+        7
+      ],
+      "pvalue": 0.16187558671629354,
+      "statistic": 5.139313349143113,
+      "degrees_of_freedom": 3,
+      "minimum_expected_count": 42.0,
+      "bins": 4,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.05069178113433732,
+      "empirical_pooled_total_variation": 0.02300000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        11,
+        12
+      ],
+      "pvalue": 0.80376962558084,
+      "statistic": 3.040319013485471,
+      "degrees_of_freedom": 6,
+      "minimum_expected_count": 8.5,
+      "bins": 7,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.03898922295638547,
+      "empirical_pooled_total_variation": 0.02000000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        12,
+        13
+      ],
+      "pvalue": 0.8647737245280603,
+      "statistic": 4.636519690688552,
+      "degrees_of_freedom": 9,
+      "minimum_expected_count": 5.5,
+      "bins": 10,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.04814831092929716,
+      "empirical_pooled_total_variation": 0.023000000000000003,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        14,
+        15
+      ],
+      "pvalue": 0.7908277377404431,
+      "statistic": 6.284426066631017,
+      "degrees_of_freedom": 10,
+      "minimum_expected_count": 5.0,
+      "bins": 11,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.05605544606294297,
+      "empirical_pooled_total_variation": 0.029000000000000012,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        15,
+        16
+      ],
+      "pvalue": 0.28076367268667723,
+      "statistic": 10.926744735210296,
+      "degrees_of_freedom": 9,
+      "minimum_expected_count": 5.0,
+      "bins": 10,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.07391462891474967,
+      "empirical_pooled_total_variation": 0.04400000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        16,
+        17
+      ],
+      "pvalue": 0.5332349076219821,
+      "statistic": 13.898575843781243,
+      "degrees_of_freedom": 15,
+      "minimum_expected_count": 5.0,
+      "bins": 16,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.08336238913257357,
+      "empirical_pooled_total_variation": 0.047000000000000014,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "tokens",
+      "positions_zero_based": [
+        22,
+        23
+      ],
+      "pvalue": 0.46840904741965017,
+      "statistic": 13.751169050012159,
+      "degrees_of_freedom": 14,
+      "minimum_expected_count": 5.5,
+      "bins": 15,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.082919144502377,
+      "empirical_pooled_total_variation": 0.04400000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_code",
+      "feature": "complete_output_length",
+      "positions_zero_based": null,
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        0
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        1
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        2
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        3
+      ],
+      "pvalue": 0.30435948332860085,
+      "statistic": 8.330442047878835,
+      "degrees_of_freedom": 7,
+      "minimum_expected_count": 8.0,
+      "bins": 8,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.06453852356491754,
+      "empirical_pooled_total_variation": 0.04200000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        4
+      ],
+      "pvalue": 0.1189810007187672,
+      "statistic": 27.609081303071044,
+      "degrees_of_freedom": 20,
+      "minimum_expected_count": 5.5,
+      "bins": 21,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.1174927259515904,
+      "empirical_pooled_total_variation": 0.07400000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        5
+      ],
+      "pvalue": 0.12396184046440431,
+      "statistic": 33.29058686598802,
+      "degrees_of_freedom": 25,
+      "minimum_expected_count": 5.0,
+      "bins": 26,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12901664013992153,
+      "empirical_pooled_total_variation": 0.08600000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        6
+      ],
+      "pvalue": 0.6079888934031472,
+      "statistic": 17.6874511204925,
+      "degrees_of_freedom": 20,
+      "minimum_expected_count": 5.0,
+      "bins": 21,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.09404108442721325,
+      "empirical_pooled_total_variation": 0.05100000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        7
+      ],
+      "pvalue": 0.38223939753750436,
+      "statistic": 8.543670965281462,
+      "degrees_of_freedom": 8,
+      "minimum_expected_count": 5.0,
+      "bins": 9,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.06535928000399585,
+      "empirical_pooled_total_variation": 0.020000000000000004,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        8
+      ],
+      "pvalue": 0.4893273478269634,
+      "statistic": 4.429823569580032,
+      "degrees_of_freedom": 5,
+      "minimum_expected_count": 6.0,
+      "bins": 6,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.04706284930590174,
+      "empirical_pooled_total_variation": 0.02000000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        9
+      ],
+      "pvalue": 0.655534898202408,
+      "statistic": 5.036286243166492,
+      "degrees_of_freedom": 7,
+      "minimum_expected_count": 9.5,
+      "bins": 8,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.05018110323202596,
+      "empirical_pooled_total_variation": 0.019999999999999997,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        10
+      ],
+      "pvalue": 0.2432525184481996,
+      "statistic": 9.132931722537407,
+      "degrees_of_freedom": 7,
+      "minimum_expected_count": 7.0,
+      "bins": 8,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.06757563067607067,
+      "empirical_pooled_total_variation": 0.05199999999999999,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        11
+      ],
+      "pvalue": 0.07309951739123155,
+      "statistic": 14.349456429767201,
+      "degrees_of_freedom": 8,
+      "minimum_expected_count": 5.5,
+      "bins": 9,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.08470376741847792,
+      "empirical_pooled_total_variation": 0.050000000000000024,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        12
+      ],
+      "pvalue": 0.030204742433728428,
+      "statistic": 12.357466107523809,
+      "degrees_of_freedom": 5,
+      "minimum_expected_count": 7.5,
+      "bins": 6,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.07860491749096811,
+      "empirical_pooled_total_variation": 0.05000000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        13
+      ],
+      "pvalue": 0.21712225457208517,
+      "statistic": 20.069150956695257,
+      "degrees_of_freedom": 16,
+      "minimum_expected_count": 5.0,
+      "bins": 17,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.10017272821655417,
+      "empirical_pooled_total_variation": 0.07100000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        14
+      ],
+      "pvalue": 0.028595588362315117,
+      "statistic": 57.45483844173407,
+      "degrees_of_freedom": 39,
+      "minimum_expected_count": 5.0,
+      "bins": 40,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.1694916494133768,
+      "empirical_pooled_total_variation": 0.125,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        15
+      ],
+      "pvalue": 0.014338266669334108,
+      "statistic": 70.67346182372631,
+      "degrees_of_freedom": 47,
+      "minimum_expected_count": 5.0,
+      "bins": 48,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.18798066632465998,
+      "empirical_pooled_total_variation": 0.125,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        16
+      ],
+      "pvalue": 0.09830840651012678,
+      "statistic": 49.6134675702724,
+      "degrees_of_freedom": 38,
+      "minimum_expected_count": 5.0,
+      "bins": 39,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.15750153581834114,
+      "empirical_pooled_total_variation": 0.10000000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        17
+      ],
+      "pvalue": 0.5904795974114707,
+      "statistic": 30.533819807259263,
+      "degrees_of_freedom": 33,
+      "minimum_expected_count": 5.0,
+      "bins": 34,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12355933758170456,
+      "empirical_pooled_total_variation": 0.07199999999999997,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        18
+      ],
+      "pvalue": 0.6146938545200135,
+      "statistic": 27.16310642195569,
+      "degrees_of_freedom": 30,
+      "minimum_expected_count": 5.0,
+      "bins": 31,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.1165399211042201,
+      "empirical_pooled_total_variation": 0.07200000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        19
+      ],
+      "pvalue": 0.2859853853775531,
+      "statistic": 26.320175475873942,
+      "degrees_of_freedom": 23,
+      "minimum_expected_count": 5.0,
+      "bins": 24,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.11471742560717169,
+      "empirical_pooled_total_variation": 0.08399999999999999,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        20
+      ],
+      "pvalue": 0.19721507178727504,
+      "statistic": 18.21382255376584,
+      "degrees_of_freedom": 14,
+      "minimum_expected_count": 5.0,
+      "bins": 15,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.09543013820006194,
+      "empirical_pooled_total_variation": 0.050000000000000024,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        21
+      ],
+      "pvalue": 0.6356943098658574,
+      "statistic": 10.702859876534541,
+      "degrees_of_freedom": 13,
+      "minimum_expected_count": 5.0,
+      "bins": 14,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.07315346839533496,
+      "empirical_pooled_total_variation": 0.03600000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        22
+      ],
+      "pvalue": 0.7795529273487178,
+      "statistic": 5.596195539008954,
+      "degrees_of_freedom": 9,
+      "minimum_expected_count": 5.0,
+      "bins": 10,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.052897048778778544,
+      "empirical_pooled_total_variation": 0.01899999999999999,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        23
+      ],
+      "pvalue": 0.7417633842786981,
+      "statistic": 2.728452816501119,
+      "degrees_of_freedom": 5,
+      "minimum_expected_count": 10.0,
+      "bins": 6,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.036935435671595365,
+      "empirical_pooled_total_variation": 0.018000000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        0,
+        1
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        1,
+        2
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        5,
+        6
+      ],
+      "pvalue": 0.15641260212369792,
+      "statistic": 38.87541045047577,
+      "degrees_of_freedom": 31,
+      "minimum_expected_count": 5.0,
+      "bins": 32,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.1394191709387123,
+      "empirical_pooled_total_variation": 0.10299999999999998,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        6,
+        7
+      ],
+      "pvalue": 0.5722051214480022,
+      "statistic": 18.23083413391733,
+      "degrees_of_freedom": 20,
+      "minimum_expected_count": 5.0,
+      "bins": 21,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.09547469333262436,
+      "empirical_pooled_total_variation": 0.05100000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        11,
+        12
+      ],
+      "pvalue": 0.08801345507203513,
+      "statistic": 13.76810746691592,
+      "degrees_of_freedom": 8,
+      "minimum_expected_count": 5.5,
+      "bins": 9,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.0829701978631964,
+      "empirical_pooled_total_variation": 0.051000000000000024,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        12,
+        13
+      ],
+      "pvalue": 0.051515055142371154,
+      "statistic": 27.47075828134185,
+      "degrees_of_freedom": 17,
+      "minimum_expected_count": 5.0,
+      "bins": 18,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.11719803386009052,
+      "empirical_pooled_total_variation": 0.08000000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        14,
+        15
+      ],
+      "pvalue": 0.15797857040081095,
+      "statistic": 46.670016311136095,
+      "degrees_of_freedom": 38,
+      "minimum_expected_count": 5.0,
+      "bins": 39,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.15275800520944247,
+      "empirical_pooled_total_variation": 0.09700000000000003,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        15,
+        16
+      ],
+      "pvalue": 0.0912582689080959,
+      "statistic": 44.25165219470437,
+      "degrees_of_freedom": 33,
+      "minimum_expected_count": 5.0,
+      "bins": 34,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.1487475246763864,
+      "empirical_pooled_total_variation": 0.07400000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        16,
+        17
+      ],
+      "pvalue": 0.23681457982020912,
+      "statistic": 32.97098358147773,
+      "degrees_of_freedom": 28,
+      "minimum_expected_count": 5.0,
+      "bins": 29,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12839584023923387,
+      "empirical_pooled_total_variation": 0.07400000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "tokens",
+      "positions_zero_based": [
+        22,
+        23
+      ],
+      "pvalue": 0.8312138776817415,
+      "statistic": 2.1276592734678754,
+      "degrees_of_freedom": 5,
+      "minimum_expected_count": 11.5,
+      "bins": 6,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.03261640134554911,
+      "empirical_pooled_total_variation": 0.01899999999999999,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_json",
+      "feature": "complete_output_length",
+      "positions_zero_based": null,
+      "pvalue": 0.49697564563746954,
+      "statistic": 6.372614704301619,
+      "degrees_of_freedom": 7,
+      "minimum_expected_count": 11.0,
+      "bins": 8,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.0564473856981066,
+      "empirical_pooled_total_variation": 0.044999999999999964,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        0
+      ],
+      "pvalue": 0.35007192100584994,
+      "statistic": 12.182648960040027,
+      "degrees_of_freedom": 11,
+      "minimum_expected_count": 11.0,
+      "bins": 12,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.07804693767227522,
+      "empirical_pooled_total_variation": 0.053,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        1
+      ],
+      "pvalue": 0.8439519520246672,
+      "statistic": 22.27241079865342,
+      "degrees_of_freedom": 30,
+      "minimum_expected_count": 5.0,
+      "bins": 31,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.10552822086686911,
+      "empirical_pooled_total_variation": 0.08000000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        2
+      ],
+      "pvalue": 0.9865287831788225,
+      "statistic": 12.004844644611872,
+      "degrees_of_freedom": 25,
+      "minimum_expected_count": 5.0,
+      "bins": 26,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.07747530136957155,
+      "empirical_pooled_total_variation": 0.048000000000000015,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        3
+      ],
+      "pvalue": 0.8787493378576969,
+      "statistic": 6.668033910428781,
+      "degrees_of_freedom": 12,
+      "minimum_expected_count": 5.5,
+      "bins": 13,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.057740946954603974,
+      "empirical_pooled_total_variation": 0.032000000000000015,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        4
+      ],
+      "pvalue": 0.34836445604457633,
+      "statistic": 2.1090121194923883,
+      "degrees_of_freedom": 2,
+      "minimum_expected_count": 7.0,
+      "bins": 3,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.03247315906631497,
+      "empirical_pooled_total_variation": 0.015000000000000012,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        5
+      ],
+      "pvalue": 0.283357995853754,
+      "statistic": 1.1509135376204862,
+      "degrees_of_freedom": 1,
+      "minimum_expected_count": 7.0,
+      "bins": 2,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.023988680013919964,
+      "empirical_pooled_total_variation": 0.004000000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        6
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        7
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        8
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        9
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        10
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        11
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        12
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        13
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        14
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        15
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        16
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        17
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        18
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        19
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        20
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        21
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        22
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        23
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        0,
+        1
+      ],
+      "pvalue": 0.6801740428575729,
+      "statistic": 33.440383793835764,
+      "degrees_of_freedom": 38,
+      "minimum_expected_count": 5.0,
+      "bins": 39,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12930658102709963,
+      "empirical_pooled_total_variation": 0.09800000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        1,
+        2
+      ],
+      "pvalue": 0.9469085311886066,
+      "statistic": 31.656667102670394,
+      "degrees_of_freedom": 46,
+      "minimum_expected_count": 5.0,
+      "bins": 47,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12581070523343868,
+      "empirical_pooled_total_variation": 0.078,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        5,
+        6
+      ],
+      "pvalue": 0.283357995853754,
+      "statistic": 1.1509135376204862,
+      "degrees_of_freedom": 1,
+      "minimum_expected_count": 7.0,
+      "bins": 2,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.023988680013919964,
+      "empirical_pooled_total_variation": 0.004000000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        6,
+        7
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        11,
+        12
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        12,
+        13
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        14,
+        15
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        15,
+        16
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        16,
+        17
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "tokens",
+      "positions_zero_based": [
+        22,
+        23
+      ],
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_name",
+      "feature": "complete_output_length",
+      "positions_zero_based": null,
+      "pvalue": 0.45281937234364933,
+      "statistic": 2.6267490894767462,
+      "degrees_of_freedom": 3,
+      "minimum_expected_count": 7.0,
+      "bins": 4,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.03624050971962692,
+      "empirical_pooled_total_variation": 0.02500000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        0
+      ],
+      "pvalue": 0.6822695300760719,
+      "statistic": 0.1675822593230724,
+      "degrees_of_freedom": 1,
+      "minimum_expected_count": 257.0,
+      "bins": 2,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.00915374948649657,
+      "empirical_pooled_total_variation": 0.008000000000000007,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        1
+      ],
+      "pvalue": 0.466119341167082,
+      "statistic": 4.603779134301662,
+      "degrees_of_freedom": 5,
+      "minimum_expected_count": 15.0,
+      "bins": 6,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.04797801128799349,
+      "empirical_pooled_total_variation": 0.041000000000000016,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        2
+      ],
+      "pvalue": 0.5579009345756938,
+      "statistic": 10.66412784983994,
+      "degrees_of_freedom": 12,
+      "minimum_expected_count": 6.5,
+      "bins": 13,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.07302098277152924,
+      "empirical_pooled_total_variation": 0.04500000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        3
+      ],
+      "pvalue": 0.9326777818513333,
+      "statistic": 9.976280836769995,
+      "degrees_of_freedom": 18,
+      "minimum_expected_count": 5.0,
+      "bins": 19,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.07062676842660294,
+      "empirical_pooled_total_variation": 0.051,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        4
+      ],
+      "pvalue": 0.236305141366878,
+      "statistic": 29.684882929875172,
+      "degrees_of_freedom": 25,
+      "minimum_expected_count": 5.0,
+      "bins": 26,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12182955907716972,
+      "empirical_pooled_total_variation": 0.07,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        5
+      ],
+      "pvalue": 0.8180026752773291,
+      "statistic": 30.937114298316427,
+      "degrees_of_freedom": 39,
+      "minimum_expected_count": 5.0,
+      "bins": 40,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12437265434635626,
+      "empirical_pooled_total_variation": 0.091,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        6
+      ],
+      "pvalue": 0.13710101918784628,
+      "statistic": 44.194857183589455,
+      "degrees_of_freedom": 35,
+      "minimum_expected_count": 5.0,
+      "bins": 36,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.1486520386398879,
+      "empirical_pooled_total_variation": 0.11100000000000003,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        7
+      ],
+      "pvalue": 0.6077159537949328,
+      "statistic": 32.12341583764538,
+      "degrees_of_freedom": 35,
+      "minimum_expected_count": 5.0,
+      "bins": 36,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12673479363940549,
+      "empirical_pooled_total_variation": 0.08200000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        8
+      ],
+      "pvalue": 0.5979711705801072,
+      "statistic": 38.15082094618692,
+      "degrees_of_freedom": 41,
+      "minimum_expected_count": 5.0,
+      "bins": 42,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.1381137591737096,
+      "empirical_pooled_total_variation": 0.09500000000000003,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        9
+      ],
+      "pvalue": 0.608220007552282,
+      "statistic": 38.891092262654325,
+      "degrees_of_freedom": 42,
+      "minimum_expected_count": 5.0,
+      "bins": 43,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.13944728800276884,
+      "empirical_pooled_total_variation": 0.088,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        10
+      ],
+      "pvalue": 0.6544894590443124,
+      "statistic": 32.10379917362139,
+      "degrees_of_freedom": 36,
+      "minimum_expected_count": 5.0,
+      "bins": 37,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12669609144251726,
+      "empirical_pooled_total_variation": 0.07200000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        11
+      ],
+      "pvalue": 0.16884590186300505,
+      "statistic": 46.23069469020382,
+      "degrees_of_freedom": 38,
+      "minimum_expected_count": 5.0,
+      "bins": 39,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.15203732221103444,
+      "empirical_pooled_total_variation": 0.09900000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        12
+      ],
+      "pvalue": 0.9570097478097677,
+      "statistic": 26.02361021155712,
+      "degrees_of_freedom": 40,
+      "minimum_expected_count": 5.5,
+      "bins": 41,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.11406929957608472,
+      "empirical_pooled_total_variation": 0.07100000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        13
+      ],
+      "pvalue": 0.6722526255483309,
+      "statistic": 35.51522320436803,
+      "degrees_of_freedom": 40,
+      "minimum_expected_count": 5.0,
+      "bins": 41,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.13325768871695176,
+      "empirical_pooled_total_variation": 0.07300000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        14
+      ],
+      "pvalue": 0.7779571969642648,
+      "statistic": 39.36133371803065,
+      "degrees_of_freedom": 47,
+      "minimum_expected_count": 5.0,
+      "bins": 48,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.14028780010754793,
+      "empirical_pooled_total_variation": 0.07400000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        15
+      ],
+      "pvalue": 0.8127011501158954,
+      "statistic": 34.69209592593654,
+      "degrees_of_freedom": 43,
+      "minimum_expected_count": 5.0,
+      "bins": 44,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.13170439614139032,
+      "empirical_pooled_total_variation": 0.069,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        16
+      ],
+      "pvalue": 0.9383287470641419,
+      "statistic": 32.21697690472253,
+      "degrees_of_freedom": 46,
+      "minimum_expected_count": 5.0,
+      "bins": 47,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12691922018497145,
+      "empirical_pooled_total_variation": 0.07800000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        17
+      ],
+      "pvalue": 0.8019161976881614,
+      "statistic": 29.584566589493065,
+      "degrees_of_freedom": 37,
+      "minimum_expected_count": 5.0,
+      "bins": 38,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12162353100755845,
+      "empirical_pooled_total_variation": 0.07999999999999999,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        18
+      ],
+      "pvalue": 0.9366500417224893,
+      "statistic": 23.202480269224864,
+      "degrees_of_freedom": 35,
+      "minimum_expected_count": 5.0,
+      "bins": 36,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.10770905316923193,
+      "empirical_pooled_total_variation": 0.054,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        19
+      ],
+      "pvalue": 0.46598651317702117,
+      "statistic": 37.06694631601179,
+      "degrees_of_freedom": 37,
+      "minimum_expected_count": 5.0,
+      "bins": 38,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.13613769925338792,
+      "empirical_pooled_total_variation": 0.07200000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        20
+      ],
+      "pvalue": 0.21547860360063478,
+      "statistic": 41.27062003104391,
+      "degrees_of_freedom": 35,
+      "minimum_expected_count": 5.0,
+      "bins": 36,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.14364995654549276,
+      "empirical_pooled_total_variation": 0.08000000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        21
+      ],
+      "pvalue": 0.28284203172970485,
+      "statistic": 40.378979742219876,
+      "degrees_of_freedom": 36,
+      "minimum_expected_count": 5.0,
+      "bins": 37,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.14208972472036793,
+      "empirical_pooled_total_variation": 0.075,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        22
+      ],
+      "pvalue": 0.9152864083906667,
+      "statistic": 23.354686247250488,
+      "degrees_of_freedom": 34,
+      "minimum_expected_count": 5.0,
+      "bins": 35,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.10806175606395282,
+      "empirical_pooled_total_variation": 0.058,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        23
+      ],
+      "pvalue": 0.08768416372021343,
+      "statistic": 50.281541103529705,
+      "degrees_of_freedom": 38,
+      "minimum_expected_count": 5.0,
+      "bins": 39,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.15855841368960794,
+      "empirical_pooled_total_variation": 0.08100000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        0,
+        1
+      ],
+      "pvalue": 0.4661193411670821,
+      "statistic": 4.603779134301661,
+      "degrees_of_freedom": 5,
+      "minimum_expected_count": 15.0,
+      "bins": 6,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.047978011287993484,
+      "empirical_pooled_total_variation": 0.041000000000000016,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        1,
+        2
+      ],
+      "pvalue": 0.6331765491479091,
+      "statistic": 14.475880871421996,
+      "degrees_of_freedom": 17,
+      "minimum_expected_count": 5.5,
+      "bins": 18,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.08507608615651638,
+      "empirical_pooled_total_variation": 0.060000000000000005,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        5,
+        6
+      ],
+      "pvalue": 0.22145190261699027,
+      "statistic": 46.52888923579955,
+      "degrees_of_freedom": 40,
+      "minimum_expected_count": 5.0,
+      "bins": 41,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.15252686523330825,
+      "empirical_pooled_total_variation": 0.10900000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        6,
+        7
+      ],
+      "pvalue": 0.5749997689202813,
+      "statistic": 32.79471822216237,
+      "degrees_of_freedom": 35,
+      "minimum_expected_count": 5.0,
+      "bins": 36,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12805217339460187,
+      "empirical_pooled_total_variation": 0.08499999999999999,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        11,
+        12
+      ],
+      "pvalue": 0.6223694329648983,
+      "statistic": 31.821023060489292,
+      "degrees_of_freedom": 35,
+      "minimum_expected_count": 5.0,
+      "bins": 36,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12613687617126343,
+      "empirical_pooled_total_variation": 0.06700000000000002,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        12,
+        13
+      ],
+      "pvalue": 0.38548009752034135,
+      "statistic": 29.541146239961854,
+      "degrees_of_freedom": 28,
+      "minimum_expected_count": 5.0,
+      "bins": 29,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.12153424669606887,
+      "empirical_pooled_total_variation": 0.06100000000000001,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        14,
+        15
+      ],
+      "pvalue": 0.9747720349589228,
+      "statistic": 11.705165083407127,
+      "degrees_of_freedom": 23,
+      "minimum_expected_count": 5.0,
+      "bins": 24,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.07650217344431179,
+      "empirical_pooled_total_variation": 0.027000000000000003,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        15,
+        16
+      ],
+      "pvalue": 0.904909103935547,
+      "statistic": 13.902337727631846,
+      "degrees_of_freedom": 22,
+      "minimum_expected_count": 5.0,
+      "bins": 23,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.0833736700872399,
+      "empirical_pooled_total_variation": 0.033,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        16,
+        17
+      ],
+      "pvalue": 0.7193521713351003,
+      "statistic": 18.684934862337084,
+      "degrees_of_freedom": 23,
+      "minimum_expected_count": 5.0,
+      "bins": 24,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.09665644019499446,
+      "empirical_pooled_total_variation": 0.04899999999999996,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "tokens",
+      "positions_zero_based": [
+        22,
+        23
+      ],
+      "pvalue": 0.588260333766986,
+      "statistic": 14.140329207368046,
+      "degrees_of_freedom": 16,
+      "minimum_expected_count": 5.0,
+      "bins": 17,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "informative": true,
+      "cramers_v": 0.08408427084588427,
+      "empirical_pooled_total_variation": 0.023,
+      "note": "Empirical distance includes finite-sample noise and pooling can hide rare-category changes.",
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    },
+    {
+      "candidate": "DFlash8_candidate",
+      "context": "sample_story",
+      "feature": "complete_output_length",
+      "positions_zero_based": null,
+      "pvalue": 1.0,
+      "informative": false,
+      "sample_counts": [
+        1000,
+        1000
+      ],
+      "bins": 1,
+      "holm_adjusted_pvalue": 1.0,
+      "reject_at_family_alpha_0_05": false
+    }
+  ],
+  "interpretation": "A supplemental complete finite regression screen using all original seed ranges. The original 13-hour study remains incomplete. The recovered screen preserves the original 280-test family and statistical code. Non-rejection does not prove distribution equality or rare-event safety.",
+  "study_kind": "supplemental_completion",
+  "original_study_status": "incomplete",
+  "recovery_protocol_sha256": "943932fd0ece2053c4aa229e1341d760260b198de266cde517444dba4420dc92",
+  "recovery_provenance": [
+    {
+      "job": "sampling4-DSpine8_control-chunk0-v1",
+      "kind": "retained_complete_stdout_and_matching_journal",
+      "requests": 2000,
+      "canonical_arrays_sha256": "f574effda7acb1711806ffc7af149e7d598df7c5c98795925ae8b78cfc5e4021"
+    },
+    {
+      "job": "sampling4-DSpine8_control-chunk1-v1",
+      "kind": "retained_partial_journal",
+      "requests": 1604,
+      "canonical_arrays_sha256": "df65d4a72635f1097b96643a5f86015323f1ca7711a8efa9305b64ffebaf3a71"
+    },
+    {
+      "job": "sampling4-DSpine16_candidate-chunk0-v1",
+      "kind": "retained_complete_stdout_and_matching_journal",
+      "requests": 2000,
+      "canonical_arrays_sha256": "869af86e3df03962e82aebc42e1009567674eecc427f6357b7e08e08011c9576"
+    },
+    {
+      "job": "sampling4-DSpine16_candidate-chunk1-v1",
+      "kind": "retained_complete_stdout_and_matching_journal",
+      "requests": 2000,
+      "canonical_arrays_sha256": "103d093dbdfa48630493a0e4827e340fccda4338d40f53475099cde5e6b207d0"
+    },
+    {
+      "job": "sampling4-DFlash8_candidate-chunk0-v1",
+      "kind": "retained_complete_stdout_and_matching_journal",
+      "requests": 2000,
+      "canonical_arrays_sha256": "199e75849f9e428849f584c9e9e99fc879500683ffeff099484cfa3363a91072"
+    },
+    {
+      "job": "sampling4-DFlash8_candidate-chunk1-v1",
+      "kind": "retained_complete_stdout_and_matching_journal",
+      "requests": 2000,
+      "canonical_arrays_sha256": "5510420a68ee92bc280c877ff6402641ba3d20ba5983152c2a683513ded91d56"
+    },
+    {
+      "job": "sampling-recovery-tail-v1",
+      "kind": "new_missing_seed_tail",
+      "requests": 396,
+      "receipt_sha256": "af842804b9f1f1c0408b57f7c84ca68c949f1d9b4a28f65aeec4140e6292674e",
+      "stdout_sha256": "2587422898a17e4c51b8cff78017748e411a14c28c35ffbe7ada2119965e93ff",
+      "journal_sha256": "a1b1163a24a8562d4ca221d982870719bff95cff1990f55eb42b1d75c2e6561c"
+    }
+  ],
+  "requests_by_source": {
+    "retained_complete_chunks": 10000,
+    "retained_interrupted_journal": 1604,
+    "new_missing_tail": 396
+  }
+}

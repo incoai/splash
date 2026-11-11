@@ -1,3 +1,4 @@
+#include "metal/abi/KernelEntry.h"
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/gdn_primitives.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
@@ -24,7 +25,7 @@
 // state before its own rows. A step reads and writes the state once. Its
 // rows past the lane's verify rows are never retained or read: the scan
 // skips them and their recurrent output is zero.
-constant uint kDecodeSimdgroups = 8;
+constant uint kDecodeSimdgroups = SPLASH_TARGET_VERIFY_ROWS;
 
 // The threadgroup operands of one value head: the rows' prepared q/k, the
 // head's v, the gates and the recurrent output rows, and the k, v and gates
@@ -402,9 +403,12 @@ inline void gdn_decode_batch_phase(
     for (uint g = 0; g < HeadDim / 64; ++g) {
       const uint column = head * HeadDim + g * 64 + 2 * lane;
       const uint local = simd_group * HeadDim + g * 64 + 2 * lane;
-      Table::write(table + ulong(batch) * ValueWidth * Rows,
-                   sums + ulong(batch) * Table::sums_per_tile(ValueWidth), ValueWidth,
-                   column / 64, simd_group, lane, shared.rows[local], shared.rows[local + 1]);
+      // Table16 packs eight rows independently of the request verify width.
+      const uint table_row = batch * Rows + simd_group;
+      const uint table_tile = table_row / gguf_sg::kRows;
+      Table::write(table + ulong(table_tile) * ValueWidth * gguf_sg::kRows,
+                   sums + ulong(table_tile) * Table::sums_per_tile(ValueWidth), ValueWidth,
+                   column / 64, table_row % gguf_sg::kRows, lane, shared.rows[local], shared.rows[local + 1]);
     }
   }
 }
@@ -433,13 +437,13 @@ inline void gdn_decode_batch_phase(
         table, sums);
 // Entries without a table pass null pointers, which skip the write; their Layout only completes the template.
 #define GDN_DECODE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W, State) \
-  kernel void Name(GDN_DECODE_BUFFERS(W), \
+  SPLASH_KERNEL(Name)(GDN_DECODE_BUFFERS(W), \
       constant GDNDecodeBatchParams &params [[buffer(16)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, nullptr, nullptr, gguf_sg::Table16, W, State) \
   }
 // The out-projection's table (Layout: gguf_sg::Table16).
 #define GDN_DECODE_TABLE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W, State) \
-  kernel void Name(GDN_DECODE_BUFFERS(W), \
+  SPLASH_KERNEL(Name)(GDN_DECODE_BUFFERS(W), \
       device bfloat *table [[buffer(16)]], device float *sums [[buffer(17)]], \
       constant GDNDecodeBatchParams &params [[buffer(18)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout, W, State) \

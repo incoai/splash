@@ -1,0 +1,14 @@
+{
+  "frozen_utc": "2026-11-10T07:53:36.513776+00:00",
+  "jobs": [
+    "profile-long-dflash8-8192-v1",
+    "profile-long-dspine8-8192-v1",
+    "profile-long-dspine16-8192-v1",
+    "profile-long-dflash8-16384-v1",
+    "profile-long-dspine8-16384-v1",
+    "profile-long-dspine16-16384-v1"
+  ],
+  "method": "Dispatch-attributed diagnostic only: ordinarydecode-profile with8192and16384prompttokens,4fusedcycles/width plus4attributedcycles, B1..4. Repeatedprefill andsamegeneratedchatPrompt perlength. INT8KV/FP32state, noANE. No repeatedqualification/rankingorTPSclaim; kernelschedulingdiffersunderper-dispatchprofiling. Comparecontextattentionanddraftcostscalingwithshort128existingprofiles. AllrunbeforefuturenativeABBAg1.",
+  "arms": "DF8M16 own2048draftwindow;DS8M16/DS16twoPass own8192draftwindow. Same4bit targetsource. Promptpositionsarenotcachewarm/fullrequests; longHTTPcachelifecycleisseparate.",
+  "unmeasured": "No narrowedDSwindowacceptanceorcapacitychangeproposed. Longerwindowmaycostmorebutitsqualitybenefitisnotisolatedbythisprofile."
+}

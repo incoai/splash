@@ -296,10 +296,11 @@ public:
   // next() current. swapParity: a prefill step's, which read the lane's
   // whole state (no pending rows) and holds its every row. swapDecodeParity:
   // a decode step's, which folded the pending rows in and holds the state
-  // before its own rows, `retainedRows` (1 to 8) of which wait on the tape.
+  // before its own rows, `retainedRows` (1 to the active block width) of
+  // which wait on the tape.
   void updateLengths(uint32_t lane, QwenLogicalLengths lengths);
   void swapParity(uint32_t lane);
-  void swapDecodeParity(uint32_t lane, uint32_t retainedRows);
+  void swapDecodeParity(uint32_t lane, uint32_t retainedRows, ops::DecodeGeometry geometry = {});
 
   // Copies committed state into a pooled or newly admitted cache slot while
   // the lane retains its own cells; it throws for a lane with pending rows,

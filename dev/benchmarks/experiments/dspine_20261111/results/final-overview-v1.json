@@ -1,0 +1,1043 @@
+{
+  "created_utc": "2026-11-11T01:24:44.969998+00:00",
+  "research_window": {
+    "start_utc": "2026-11-10T12:24:13+00:00",
+    "deadline_utc": "2026-11-11T01:24:13+00:00"
+  },
+  "comparisons": [
+    {
+      "label": "default8-final-v1",
+      "status": "all_scheduled_rounds_complete",
+      "scheduled_rounds": 12,
+      "retained_round_receipts": [
+        {
+          "id": "default8-final-v1-g1-a1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "default8-final-v1-g1-b1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "default8-final-v1-g1-b2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "default8-final-v1-g1-a2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "default8-final-v1-g2-a1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "default8-final-v1-g2-b1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "default8-final-v1-g2-b2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "default8-final-v1-g2-a2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "default8-final-v1-g3-a1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "default8-final-v1-g3-b1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "default8-final-v1-g3-b2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "default8-final-v1-g3-a2",
+          "state": "complete",
+          "exit_code": 0
+        }
+      ],
+      "successful_rounds": 12,
+      "frozen_primary_decode_qualified": true,
+      "qualified": true,
+      "endpoints": {
+        "decode": {
+          "groups_with_endpoint": 3,
+          "all_three_measurements_qualified": true,
+          "frozen_all_three_effects_qualified": true,
+          "consistent_direction": true,
+          "reportable_effect": true,
+          "directions": [
+            "candidate slower"
+          ],
+          "control_time_by_group": [
+            14.040746268656717,
+            14.061856173677068,
+            14.063484396200815
+          ],
+          "candidate_time_by_group": [
+            14.086666892808683,
+            14.076599728629578,
+            14.071232700135685
+          ],
+          "throughput_change_percent_by_group": [
+            -0.32598644165717783,
+            -0.10473804211768023,
+            -0.05506485536832528
+          ],
+          "latency_change_percent_by_group": [
+            0.3270525887536069,
+            0.10484785771105454,
+            0.055095193456922154
+          ],
+          "frozen_primary_all_case_gate": true
+        },
+        "request_wall": {
+          "groups_with_endpoint": 3,
+          "all_three_measurements_qualified": true,
+          "frozen_all_three_effects_qualified": true,
+          "consistent_direction": true,
+          "reportable_effect": true,
+          "directions": [
+            "candidate slower"
+          ],
+          "control_time_by_group": [
+            10760.015,
+            10781.255000000001,
+            10780.060000000001
+          ],
+          "candidate_time_by_group": [
+            10806.935,
+            10793.2,
+            10788.645
+          ],
+          "throughput_change_percent_by_group": [
+            -0.4341656538139671,
+            -0.11067153392876339,
+            -0.0795744043853408
+          ],
+          "latency_change_percent_by_group": [
+            0.4360588716651348,
+            0.11079415151575844,
+            0.07963777567099317
+          ]
+        },
+        "ttft": {
+          "groups_with_endpoint": 3,
+          "all_three_measurements_qualified": false,
+          "frozen_all_three_effects_qualified": false,
+          "consistent_direction": true,
+          "reportable_effect": false,
+          "directions": [
+            "candidate slower"
+          ],
+          "control_time_by_group": [
+            412.22299999999996,
+            417.66700000000003,
+            415.896
+          ],
+          "candidate_time_by_group": [
+            425.31600000000003,
+            418.746,
+            418.14650000000006
+          ],
+          "throughput_change_percent_by_group": [
+            -3.0784169887801194,
+            -0.2576741031556029,
+            -0.5382084986960467
+          ],
+          "latency_change_percent_by_group": [
+            3.176193468098587,
+            0.2583397778612939,
+            0.5411208571373782
+          ]
+        }
+      },
+      "categories": {},
+      "group_output_agreement": [
+        true,
+        true,
+        true
+      ],
+      "group_decode_noise_gate": [
+        true,
+        true,
+        true
+      ],
+      "problems": [],
+      "protocol_sha256": "882954b1f6c0b1648d31b54f3ac92286699489b12e01d6f318d9c4e50440cdc4",
+      "analysis_sha256": "2fa0a0556bbc18d2e5f1886dba382512abaee49915491bbb1efdab33a08d74a0"
+    },
+    {
+      "label": "dspine16-final-v1",
+      "status": "all_scheduled_rounds_complete",
+      "scheduled_rounds": 12,
+      "retained_round_receipts": [
+        {
+          "id": "dspine16-final-v1-g1-a1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dspine16-final-v1-g1-b1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dspine16-final-v1-g1-b2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dspine16-final-v1-g1-a2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dspine16-final-v1-g2-a1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dspine16-final-v1-g2-b1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dspine16-final-v1-g2-b2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dspine16-final-v1-g2-a2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dspine16-final-v1-g3-a1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dspine16-final-v1-g3-b1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dspine16-final-v1-g3-b2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dspine16-final-v1-g3-a2",
+          "state": "complete",
+          "exit_code": 0
+        }
+      ],
+      "successful_rounds": 12,
+      "frozen_primary_decode_qualified": false,
+      "qualified": false,
+      "endpoints": {
+        "decode": {
+          "groups_with_endpoint": 3,
+          "all_three_measurements_qualified": false,
+          "frozen_all_three_effects_qualified": false,
+          "consistent_direction": true,
+          "reportable_effect": false,
+          "directions": [
+            "candidate faster"
+          ],
+          "control_time_by_group": [
+            15.848546910930551,
+            15.58374494097808,
+            15.557243446267055
+          ],
+          "candidate_time_by_group": [
+            12.599789292882509,
+            12.587005249343832,
+            12.559020071020534
+          ],
+          "throughput_change_percent_by_group": [
+            25.784221803480722,
+            23.808202445855574,
+            23.873067789459213
+          ],
+          "latency_change_percent_by_group": [
+            -20.49877276640052,
+            -19.229907207696918,
+            -19.27220195275624
+          ],
+          "frozen_primary_all_case_gate": false
+        },
+        "request_wall": {
+          "groups_with_endpoint": 3,
+          "all_three_measurements_qualified": false,
+          "frozen_all_three_effects_qualified": false,
+          "consistent_direction": true,
+          "reportable_effect": false,
+          "directions": [
+            "candidate faster"
+          ],
+          "control_time_by_group": [
+            108812.81925,
+            106977.65400000001,
+            106805.67049999998
+          ],
+          "candidate_time_by_group": [
+            86633.74325,
+            86553.45200000002,
+            86339.9975
+          ],
+          "throughput_change_percent_by_group": [
+            25.600966976571215,
+            23.597212506324983,
+            23.70358303519755
+          ],
+          "latency_change_percent_by_group": [
+            -20.382778566781777,
+            -19.092026452552403,
+            -19.16159779175768
+          ]
+        },
+        "ttft": {
+          "groups_with_endpoint": 3,
+          "all_three_measurements_qualified": false,
+          "frozen_all_three_effects_qualified": false,
+          "consistent_direction": true,
+          "reportable_effect": false,
+          "directions": [
+            "candidate faster"
+          ],
+          "control_time_by_group": [
+            5432.747749999999,
+            5324.885750000001,
+            5325.771500000001
+          ],
+          "candidate_time_by_group": [
+            5024.907999999999,
+            5027.419000000002,
+            4995.2245
+          ],
+          "throughput_change_percent_by_group": [
+            8.116362528428356,
+            5.916887969751472,
+            6.617260145164661
+          ],
+          "latency_change_percent_by_group": [
+            -7.50706214916751,
+            -5.586349904314836,
+            -6.206556176884426
+          ]
+        }
+      },
+      "categories": {},
+      "group_output_agreement": [
+        false,
+        false,
+        false
+      ],
+      "group_decode_noise_gate": [
+        false,
+        true,
+        true
+      ],
+      "problems": [],
+      "protocol_sha256": "722fe5b79c13ac1385011c90d5b9f1f7ef3e853ec4bd87fa56c8401f88b1e277",
+      "analysis_sha256": "c9b07a420d257e1de7f0ba9873f8746f0571a5f7ea99b70fb2e7c144f17de1c8"
+    },
+    {
+      "label": "dflash8-vs-dspine16-final-v1",
+      "status": "all_scheduled_rounds_complete",
+      "scheduled_rounds": 12,
+      "retained_round_receipts": [
+        {
+          "id": "dflash8-vs-dspine16-final-v1-g1-a1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-final-v1-g1-b1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-final-v1-g1-b2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-final-v1-g1-a2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-final-v1-g2-a1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-final-v1-g2-b1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-final-v1-g2-b2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-final-v1-g2-a2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-final-v1-g3-a1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-final-v1-g3-b1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-final-v1-g3-b2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-final-v1-g3-a2",
+          "state": "complete",
+          "exit_code": 0
+        }
+      ],
+      "successful_rounds": 12,
+      "frozen_primary_decode_qualified": false,
+      "qualified": false,
+      "endpoints": {
+        "decode": {
+          "groups_with_endpoint": 3,
+          "all_three_measurements_qualified": false,
+          "frozen_all_three_effects_qualified": false,
+          "consistent_direction": true,
+          "reportable_effect": false,
+          "directions": [
+            "candidate faster"
+          ],
+          "control_time_by_group": [
+            15.748196803617965,
+            15.76341150544228,
+            15.757195117277327
+          ],
+          "candidate_time_by_group": [
+            12.550010730276362,
+            12.578995098039217,
+            12.544187857032576
+          ],
+          "throughput_change_percent_by_group": [
+            25.483532580781908,
+            25.31534818627477,
+            25.6135135798645
+          ],
+          "latency_change_percent_by_group": [
+            -20.30826838922192,
+            -20.201314964743833,
+            -20.39073094120525
+          ],
+          "frozen_primary_all_case_gate": false
+        },
+        "request_wall": {
+          "groups_with_endpoint": 3,
+          "all_three_measurements_qualified": false,
+          "frozen_all_three_effects_qualified": false,
+          "consistent_direction": true,
+          "reportable_effect": false,
+          "directions": [
+            "candidate faster"
+          ],
+          "control_time_by_group": [
+            108038.63225,
+            108147.08549999999,
+            108091.12725
+          ],
+          "candidate_time_by_group": [
+            86283.37350000002,
+            86483.78325000001,
+            86241.29425
+          ],
+          "throughput_change_percent_by_group": [
+            25.213732226174468,
+            25.04897616166668,
+            25.335696999932257
+          ],
+          "latency_change_percent_by_group": [
+            -20.136555134887857,
+            -20.031332467114872,
+            -20.214270639868825
+          ]
+        },
+        "ttft": {
+          "groups_with_endpoint": 3,
+          "all_three_measurements_qualified": false,
+          "frozen_all_three_effects_qualified": false,
+          "consistent_direction": true,
+          "reportable_effect": false,
+          "directions": [
+            "candidate faster"
+          ],
+          "control_time_by_group": [
+            5313.144500000001,
+            5322.35225,
+            5306.943499999999
+          ],
+          "candidate_time_by_group": [
+            4996.954,
+            5009.6320000000005,
+            4992.589500000001
+          ],
+          "throughput_change_percent_by_group": [
+            6.327664813404366,
+            6.2423796797848485,
+            6.29641191209489
+          ],
+          "latency_change_percent_by_group": [
+            -5.951099203117883,
+            -5.875602277169822,
+            -5.9234472724271185
+          ]
+        }
+      },
+      "categories": {},
+      "group_output_agreement": [
+        false,
+        false,
+        false
+      ],
+      "group_decode_noise_gate": [
+        true,
+        true,
+        true
+      ],
+      "problems": [],
+      "protocol_sha256": "2ccac5a7c8a9e719b30261bf2d3b2e93c66bd5e4b10b25ac1f4dfe27e3a5b78e",
+      "analysis_sha256": "9ecc21aedd673316e8211048bb52d965b883c170492743322b123100234572df"
+    },
+    {
+      "label": "dflash8-vs-dspine16-b4-final-v1",
+      "status": "all_scheduled_rounds_complete",
+      "scheduled_rounds": 12,
+      "retained_round_receipts": [
+        {
+          "id": "dflash8-vs-dspine16-b4-final-v1-g1-a1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-b4-final-v1-g1-b1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-b4-final-v1-g1-b2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-b4-final-v1-g1-a2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-b4-final-v1-g2-a1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-b4-final-v1-g2-b1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-b4-final-v1-g2-b2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-b4-final-v1-g2-a2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-b4-final-v1-g3-a1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-b4-final-v1-g3-b1",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-b4-final-v1-g3-b2",
+          "state": "complete",
+          "exit_code": 0
+        },
+        {
+          "id": "dflash8-vs-dspine16-b4-final-v1-g3-a2",
+          "state": "complete",
+          "exit_code": 0
+        }
+      ],
+      "successful_rounds": 12,
+      "frozen_primary_decode_qualified": true,
+      "qualified": true,
+      "endpoints": {
+        "decode": {
+          "groups_with_endpoint": 3,
+          "all_three_measurements_qualified": true,
+          "frozen_all_three_effects_qualified": true,
+          "consistent_direction": true,
+          "reportable_effect": true,
+          "directions": [
+            "candidate slower"
+          ],
+          "control_time_by_group": [
+            4.155532094594594,
+            4.156863175675676,
+            4.164445945945946
+          ],
+          "candidate_time_by_group": [
+            6.641682432432432,
+            6.684219594594595,
+            6.681640202702702
+          ],
+          "throughput_change_percent_by_group": [
+            -37.4325385642884,
+            -37.81079276573656,
+            -37.673298477498975
+          ],
+          "latency_change_percent_by_group": [
+            59.82748493440242,
+            60.79960566679248,
+            60.444877648303354
+          ],
+          "frozen_primary_all_case_gate": true
+        },
+        "request_wall": {
+          "groups_with_endpoint": 3,
+          "all_three_measurements_qualified": true,
+          "frozen_all_three_effects_qualified": true,
+          "consistent_direction": true,
+          "reportable_effect": true,
+          "directions": [
+            "candidate slower"
+          ],
+          "control_time_by_group": [
+            12898.11,
+            12904.515,
+            12923.23
+          ],
+          "candidate_time_by_group": [
+            20271.455,
+            20397.305,
+            20389.385000000002
+          ],
+          "throughput_change_percent_by_group": [
+            -36.37304278355945,
+            -36.73421562309335,
+            -36.61785286804875
+          ],
+          "latency_change_percent_by_group": [
+            57.16608867500743,
+            58.063321248415775,
+            57.77313411585185
+          ]
+        },
+        "ttft": {
+          "groups_with_endpoint": 0,
+          "all_three_measurements_qualified": false,
+          "frozen_all_three_effects_qualified": false,
+          "consistent_direction": false,
+          "reportable_effect": false,
+          "directions": [],
+          "control_time_by_group": [],
+          "candidate_time_by_group": [],
+          "throughput_change_percent_by_group": [],
+          "latency_change_percent_by_group": []
+        }
+      },
+      "categories": {},
+      "group_output_agreement": [
+        true,
+        true,
+        true
+      ],
+      "group_decode_noise_gate": [
+        true,
+        true,
+        true
+      ],
+      "problems": [],
+      "protocol_sha256": "8e405f2bfe548f6713cceb4ce2f6bf9802f46dd0cf861d4a361e0bce921d0a74",
+      "analysis_sha256": "35262662c80d1383f80139da34bb045bfe71932a9a6b380a290d5b36066db32d"
+    },
+    {
+      "label": "agent12-dflash8-vs-dspine16-final-v1",
+      "status": "interrupted_or_unrun",
+      "scheduled_rounds": 12,
+      "retained_round_receipts": [],
+      "successful_rounds": 0,
+      "frozen_primary_decode_qualified": false,
+      "qualified": false,
+      "endpoints": {
+        "decode": {
+          "groups_with_endpoint": 0,
+          "all_three_measurements_qualified": false,
+          "frozen_all_three_effects_qualified": false,
+          "consistent_direction": false,
+          "reportable_effect": false,
+          "directions": [],
+          "control_time_by_group": [],
+          "candidate_time_by_group": [],
+          "throughput_change_percent_by_group": [],
+          "latency_change_percent_by_group": [],
+          "frozen_primary_all_case_gate": false
+        },
+        "request_wall": {
+          "groups_with_endpoint": 0,
+          "all_three_measurements_qualified": false,
+          "frozen_all_three_effects_qualified": false,
+          "consistent_direction": false,
+          "reportable_effect": false,
+          "directions": [],
+          "control_time_by_group": [],
+          "candidate_time_by_group": [],
+          "throughput_change_percent_by_group": [],
+          "latency_change_percent_by_group": []
+        },
+        "ttft": {
+          "groups_with_endpoint": 0,
+          "all_three_measurements_qualified": false,
+          "frozen_all_three_effects_qualified": false,
+          "consistent_direction": false,
+          "reportable_effect": false,
+          "directions": [],
+          "control_time_by_group": [],
+          "candidate_time_by_group": [],
+          "throughput_change_percent_by_group": [],
+          "latency_change_percent_by_group": []
+        }
+      },
+      "categories": {
+        "short": {
+          "decode": {
+            "groups_with_endpoint": 0,
+            "all_three_measurements_qualified": false,
+            "frozen_all_three_effects_qualified": false,
+            "consistent_direction": false,
+            "reportable_effect": false,
+            "directions": [],
+            "control_time_by_group": [],
+            "candidate_time_by_group": [],
+            "throughput_change_percent_by_group": [],
+            "latency_change_percent_by_group": []
+          },
+          "request_wall": {
+            "groups_with_endpoint": 0,
+            "all_three_measurements_qualified": false,
+            "frozen_all_three_effects_qualified": false,
+            "consistent_direction": false,
+            "reportable_effect": false,
+            "directions": [],
+            "control_time_by_group": [],
+            "candidate_time_by_group": [],
+            "throughput_change_percent_by_group": [],
+            "latency_change_percent_by_group": []
+          },
+          "ttft": {
+            "groups_with_endpoint": 0,
+            "all_three_measurements_qualified": false,
+            "frozen_all_three_effects_qualified": false,
+            "consistent_direction": false,
+            "reportable_effect": false,
+            "directions": [],
+            "control_time_by_group": [],
+            "candidate_time_by_group": [],
+            "throughput_change_percent_by_group": [],
+            "latency_change_percent_by_group": []
+          }
+        },
+        "medium": {
+          "decode": {
+            "groups_with_endpoint": 0,
+            "all_three_measurements_qualified": false,
+            "frozen_all_three_effects_qualified": false,
+            "consistent_direction": false,
+            "reportable_effect": false,
+            "directions": [],
+            "control_time_by_group": [],
+            "candidate_time_by_group": [],
+            "throughput_change_percent_by_group": [],
+            "latency_change_percent_by_group": []
+          },
+          "request_wall": {
+            "groups_with_endpoint": 0,
+            "all_three_measurements_qualified": false,
+            "frozen_all_three_effects_qualified": false,
+            "consistent_direction": false,
+            "reportable_effect": false,
+            "directions": [],
+            "control_time_by_group": [],
+            "candidate_time_by_group": [],
+            "throughput_change_percent_by_group": [],
+            "latency_change_percent_by_group": []
+          },
+          "ttft": {
+            "groups_with_endpoint": 0,
+            "all_three_measurements_qualified": false,
+            "frozen_all_three_effects_qualified": false,
+            "consistent_direction": false,
+            "reportable_effect": false,
+            "directions": [],
+            "control_time_by_group": [],
+            "candidate_time_by_group": [],
+            "throughput_change_percent_by_group": [],
+            "latency_change_percent_by_group": []
+          }
+        },
+        "long": {
+          "decode": {
+            "groups_with_endpoint": 0,
+            "all_three_measurements_qualified": false,
+            "frozen_all_three_effects_qualified": false,
+            "consistent_direction": false,
+            "reportable_effect": false,
+            "directions": [],
+            "control_time_by_group": [],
+            "candidate_time_by_group": [],
+            "throughput_change_percent_by_group": [],
+            "latency_change_percent_by_group": []
+          },
+          "request_wall": {
+            "groups_with_endpoint": 0,
+            "all_three_measurements_qualified": false,
+            "frozen_all_three_effects_qualified": false,
+            "consistent_direction": false,
+            "reportable_effect": false,
+            "directions": [],
+            "control_time_by_group": [],
+            "candidate_time_by_group": [],
+            "throughput_change_percent_by_group": [],
+            "latency_change_percent_by_group": []
+          },
+          "ttft": {
+            "groups_with_endpoint": 0,
+            "all_three_measurements_qualified": false,
+            "frozen_all_three_effects_qualified": false,
+            "consistent_direction": false,
+            "reportable_effect": false,
+            "directions": [],
+            "control_time_by_group": [],
+            "candidate_time_by_group": [],
+            "throughput_change_percent_by_group": [],
+            "latency_change_percent_by_group": []
+          }
+        }
+      },
+      "group_output_agreement": [
+        null,
+        null,
+        null
+      ],
+      "group_decode_noise_gate": [
+        null,
+        null,
+        null
+      ],
+      "problems": [
+        "agent12-dflash8-vs-dspine16-final-v1-g1-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g1-a1.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g1-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g1-b1.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g1-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g1-b2.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g1-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g1-a2.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g2-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g2-a1.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g2-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g2-b1.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g2-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g2-b2.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g2-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g2-a2.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g3-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g3-a1.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g3-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g3-b1.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g3-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g3-b2.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g3-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g3-a2.receipt.json'"
+      ],
+      "protocol_sha256": "2c6f18ea4c14b6b46d9eaf8deac680b44872d0b4298034e12cd157d1d4e0b251",
+      "analysis_sha256": "8bdf7cd99ef5e1660d089489588682b58901f6c5900d282c83bd69f63d78a53a"
+    },
+    {
+      "label": "m48-b3-research-v1",
+      "status": "interrupted_or_unrun",
+      "scheduled_rounds": 12,
+      "retained_round_receipts": [],
+      "successful_rounds": 0,
+      "frozen_primary_decode_qualified": false,
+      "qualified": false,
+      "endpoints": {
+        "decode": {
+          "groups_with_endpoint": 0,
+          "all_three_measurements_qualified": false,
+          "frozen_all_three_effects_qualified": false,
+          "consistent_direction": false,
+          "reportable_effect": false,
+          "directions": [],
+          "control_time_by_group": [],
+          "candidate_time_by_group": [],
+          "throughput_change_percent_by_group": [],
+          "latency_change_percent_by_group": [],
+          "frozen_primary_all_case_gate": false
+        },
+        "request_wall": {
+          "groups_with_endpoint": 0,
+          "all_three_measurements_qualified": false,
+          "frozen_all_three_effects_qualified": false,
+          "consistent_direction": false,
+          "reportable_effect": false,
+          "directions": [],
+          "control_time_by_group": [],
+          "candidate_time_by_group": [],
+          "throughput_change_percent_by_group": [],
+          "latency_change_percent_by_group": []
+        },
+        "ttft": {
+          "groups_with_endpoint": 0,
+          "all_three_measurements_qualified": false,
+          "frozen_all_three_effects_qualified": false,
+          "consistent_direction": false,
+          "reportable_effect": false,
+          "directions": [],
+          "control_time_by_group": [],
+          "candidate_time_by_group": [],
+          "throughput_change_percent_by_group": [],
+          "latency_change_percent_by_group": []
+        }
+      },
+      "categories": {},
+      "group_output_agreement": [
+        null,
+        null,
+        null
+      ],
+      "group_decode_noise_gate": [
+        null,
+        null,
+        null
+      ],
+      "problems": [
+        "m48-b3-research-v1-g1-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g1-a1.receipt.json'",
+        "m48-b3-research-v1-g1-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g1-b1.receipt.json'",
+        "m48-b3-research-v1-g1-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g1-b2.receipt.json'",
+        "m48-b3-research-v1-g1-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g1-a2.receipt.json'",
+        "m48-b3-research-v1-g2-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g2-a1.receipt.json'",
+        "m48-b3-research-v1-g2-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g2-b1.receipt.json'",
+        "m48-b3-research-v1-g2-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g2-b2.receipt.json'",
+        "m48-b3-research-v1-g2-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g2-a2.receipt.json'",
+        "m48-b3-research-v1-g3-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g3-a1.receipt.json'",
+        "m48-b3-research-v1-g3-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g3-b1.receipt.json'",
+        "m48-b3-research-v1-g3-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g3-b2.receipt.json'",
+        "m48-b3-research-v1-g3-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g3-a2.receipt.json'"
+      ],
+      "protocol_sha256": "d5b8b149d0f7206faaff6b52460555d3ddf6e48e1fb99e8c58e0b34d63bebdbb",
+      "analysis_sha256": "47780957c74b323aba73511a5163fdc16a0d8d0c8023eec1151790a0fdab4966"
+    }
+  ],
+  "sampling": {
+    "status": "incomplete",
+    "errors": {
+      "DSpine8_control": ""
+    },
+    "family_size_reserved": 280,
+    "tests_observed": 0,
+    "unobserved_reserved_tests": 280,
+    "rejections": 0,
+    "informative_tests": 0,
+    "rejections_by_candidate": {},
+    "analysis_sha256": "5ad9b41766750516a1eb5625e84f0573f2e7a0dba45465616a162d3c25c5bdfe",
+    "chunk_status": [
+      {
+        "arm": "DSpine8_control",
+        "job": "sampling4-DSpine8_control-chunk0-v1",
+        "state": "complete",
+        "exit_code": 0,
+        "registered_requests": 2000,
+        "request_completions_in_journal": 2000,
+        "malformed_progress_lines": 0
+      },
+      {
+        "arm": "DSpine8_control",
+        "job": "sampling4-DSpine8_control-chunk1-v1",
+        "state": "timeout",
+        "exit_code": -2,
+        "registered_requests": 2000,
+        "request_completions_in_journal": 1604,
+        "malformed_progress_lines": 0
+      },
+      {
+        "arm": "DSpine16_candidate",
+        "job": "sampling4-DSpine16_candidate-chunk0-v1",
+        "state": "complete",
+        "exit_code": 0,
+        "registered_requests": 2000,
+        "request_completions_in_journal": 2000,
+        "malformed_progress_lines": 0
+      },
+      {
+        "arm": "DSpine16_candidate",
+        "job": "sampling4-DSpine16_candidate-chunk1-v1",
+        "state": "complete",
+        "exit_code": 0,
+        "registered_requests": 2000,
+        "request_completions_in_journal": 2000,
+        "malformed_progress_lines": 0
+      },
+      {
+        "arm": "DFlash8_candidate",
+        "job": "sampling4-DFlash8_candidate-chunk0-v1",
+        "state": "complete",
+        "exit_code": 0,
+        "registered_requests": 2000,
+        "request_completions_in_journal": 2000,
+        "malformed_progress_lines": 0
+      },
+      {
+        "arm": "DFlash8_candidate",
+        "job": "sampling4-DFlash8_candidate-chunk1-v1",
+        "state": "complete",
+        "exit_code": 0,
+        "registered_requests": 2000,
+        "request_completions_in_journal": 2000,
+        "malformed_progress_lines": 0
+      }
+    ],
+    "request_completions_in_journals": 11604,
+    "termination_audit": {
+      "status": "incomplete",
+      "requests_from_complete_chunks": 10000,
+      "requests_below_cap": 4310,
+      "zero_output_requests": 0,
+      "specific_stop_reason_saved": false,
+      "sha256": "ef22cca3d7eef63b878de4d94a8309062bb70730a25e54d5317070fc2d7e6c01"
+    }
+  },
+  "scope": "All registered groups/endpoints retained. Directional reporting additionally requires consistent direction across all three qualified groups, as documented before fresh data. Nonregression retains its original criterion. No endpoint or category transfers qualification to another. Incomplete sampling is not a smaller complete screen."
+}

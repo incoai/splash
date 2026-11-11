@@ -1,0 +1,65 @@
+diff --git a/dev/benchmarks/backend_benchmark.mm b/dev/benchmarks/backend_benchmark.mm
+index 5f5fb35e..aa669607 100644
+--- a/dev/benchmarks/backend_benchmark.mm
++++ b/dev/benchmarks/backend_benchmark.mm
+@@ -1090,6 +1090,7 @@ int main(int argc, char **argv) {
+     engine::EngineConfig engineConfig;
+     engineConfig.maxContext = bootstrap->nativeLoop().statusSnapshot().maximumContextTokens;
+     engineConfig.vocabularySize = capabilities.vocabularySize;
++    engineConfig.draftContextTokens = config.model.draft.contextTokens;
+     engine::connectToGovernor(engineConfig, resources->memoryGovernor());
+     engine::Engine engine(engineConfig, resources->cache(),
+                                   *executor, events);
+diff --git a/runtime/metal/kernels/decode/dspine.metal b/runtime/metal/kernels/decode/dspine.metal
+index 67170245..02a1b327 100644
+--- a/runtime/metal/kernels/decode/dspine.metal
++++ b/runtime/metal/kernels/decode/dspine.metal
+@@ -197,3 +197,19 @@ kernel void dspine_refine_score(device const float *state [[buffer(0)]], device
+     tokens[candidate_row] = candidates[candidate_row * K + choice];
+   }
+ }
++
++// Research candidate matching upstream DSpine bridge.py: the normalized
++// activation rounds to BF16 before multiplication by the learned gamma.
++#include "metal/kernels/common/rms_inverse.h"
++kernel void dspine_bridge_norm(device const bfloat *input [[buffer(0)]],
++    device const bfloat *weight [[buffer(1)]], device bfloat *output [[buffer(2)]],
++    constant uint &width [[buffer(3)]], uint row [[threadgroup_position_in_grid]],
++    uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
++    uint sg [[simdgroup_index_in_threadgroup]]) {
++  threadgroup float reductions[8];
++  float inverse = rms_inverse(input + ulong(row) * width, width, reductions, tid, lane, sg);
++  for (uint h = tid; h < width; h += 256) {
++    bfloat y = bfloat(float(input[ulong(row) * width + h]) * inverse);
++    output[ulong(row) * width + h] = bfloat(float(y) * float(weight[h]));
++  }
++}
+diff --git a/runtime/model/DSpineDraft.cpp b/runtime/model/DSpineDraft.cpp
+index f24e11f9..f988ad32 100644
+--- a/runtime/model/DSpineDraft.cpp
++++ b/runtime/model/DSpineDraft.cpp
+@@ -22,7 +22,11 @@ void DSpineDraft::addDecode(metal::CommandGraph &graph, const DFlashDraftWeights
+   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+     const uint32_t current = layer & 1, next = current ^ 1;
+     const auto &w = weights.layers[layer];
+-    ops::Normalization::addRms(graph, b.hidden[current], w.inputNorm, b.normalized, layout.hiddenSize, rows);
++    if (layer == 0)
++      ops::Normalization::addRms(graph, b.hidden[current], w.inputNorm, b.normalized, layout.hiddenSize, rows);
++    else
++      graph.add("dspine_bridge_norm", {b.hidden[current], w.inputNorm.buffer, b.normalized}, layout.hiddenSize,
++                {rows, 1, 1});
+     project(b.normalized, w.qkvProjection, b.proposalQkv);
+     ops::DraftAttention::addPrepare(graph, {b.proposalQkv, b.attention, w.queryNorm, w.keyNorm,
+         b.ropeCos, b.ropeSin, b.queryKeys, b.queryValues}, attention);
+@@ -48,8 +52,9 @@ void DSpineDraft::addDecode(metal::CommandGraph &graph, const DFlashDraftWeights
+     ops::DSpine::addWrite(graph, b.projected, b.hidden[next], b.bridge, shape);
+   }
+   const auto headPlan = linear.decodePlan(head, lanes);
+-  const auto prepared = ops::Normalization::addRms(graph, b.hidden[layout.layers & 1], weights.finalNorm,
+-      b.finalHidden, layout.hiddenSize, rows, b.linearScratch, headPlan.input());
++  graph.add("dspine_bridge_norm", {b.hidden[layout.layers & 1], weights.finalNorm.buffer, b.finalHidden},
++            layout.hiddenSize, {rows, 1, 1});
++  const ops::PreparedInput prepared{};
+   linear.add(graph, {.input = b.finalHidden, .output = b.logits, .scratch = b.linearScratch, .prepared = prepared},
+               head, headPlan);
+ }

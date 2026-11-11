@@ -190,12 +190,12 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
 
 PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                              GdnShape shape, uint32_t lanes, uint32_t layer,
-                             GdnStateStrides state, GdnHeadOrder order, LinearInput input) {
+                             GdnStateStrides state, GdnHeadOrder order, LinearInput input, DecodeGeometry geometry) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid() || buffers.tapeLanes.size() < lanes)
     throw std::invalid_argument("invalid GDN decode geometry");
   const CompiledGdn &kernel = compiledGdn(shape);
   // Lane l's rows of the packed and hidden rows are rows [8 l, 8 l + 8).
-  const uint64_t rows = uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS;
+  const uint64_t rows = uint64_t{lanes} * geometry.rows();
   requireBytes(buffers.packed, packedBytes(shape, rows), "GDN packed");
   requireMixerWeights(shape, buffers.convolutionWeights, buffers.decayWeights, buffers.timeBias);
   requireBytes(buffers.hidden, rows * valueWidth(shape) * 2, "GDN hidden");
@@ -211,7 +211,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   // Each lane reads its pending rows' tape of this layer and writes its
   // step's; no step's tape may overlap a tape another lane, or the step's own
   // lane, reads or writes.
-  const uint64_t tapeBytes = gdnTapeLayerBytes(shape);
+  const uint64_t tapeBytes = gdnTapeLayerBytes(shape, geometry);
   // Validate the complete layer extent before adding the slot offset. An
   // overflowing offset could otherwise wrap past both the overlap and
   // buffer-extent checks below.
@@ -225,7 +225,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
     params.pending_tape[lane] = tape.pendingSlot + layerOffset;
     params.step_tape[lane] = tape.stepSlot + layerOffset;
     params.pending_rows[lane] = tape.pendingRows;
-    if (tape.pendingRows > SPLASH_TARGET_VERIFY_ROWS || params.pending_tape[lane] % 16 ||
+    if (tape.pendingRows > geometry.rows() || params.pending_tape[lane] % 16 ||
         params.step_tape[lane] % 16)
       throw std::invalid_argument("invalid GDN decode tape");
     for (uint32_t other = 0; other <= lane; ++other)
@@ -240,7 +240,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   const bool prepare = input != LinearInput::Plain;
   if (prepare)
     requireTableScratch(buffers.linearScratch, input, shape.valueHeads * shape.headDimension,
-                        lanes * SPLASH_TARGET_VERIFY_ROWS);
+                        lanes * geometry.rows());
   bindings.reserve(prepare ? 18 : 16);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   requireStates(shape, state, layer, lanes, buffers.currentStates, buffers.nextStates);
@@ -250,16 +250,16 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   if (prepare)
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
   const std::string name = std::string("verify_gdn_fused") + tableSuffix(input) + std::string(kernel.suffix);
-  graph.add(stateKernel(normKernel(name, buffers.mixerNorm, shape.headDimension), state.format),
-            std::move(bindings), params, {shape.valueHeads, lanes, 1});
+  graph.add(geometry.kernel(stateKernel(normKernel(name, buffers.mixerNorm, shape.headDimension), state.format)),
+            std::move(bindings), params, {shape.valueHeads, lanes, 1}, {geometry.rows() * 32, 1, 1});
   if (!prepare) return {};
   return {buffers.hidden, input};
 }
 
-uint64_t gdnTapeLayerBytes(const GdnShape &shape) noexcept {
+uint64_t gdnTapeLayerBytes(const GdnShape &shape, DecodeGeometry geometry) noexcept {
   return gdn_tape_layer_bytes(shape.convolutionDimension,
                               (shape.keyHeads + shape.valueHeads) * shape.headDimension,
-                              shape.valueHeads);
+                              shape.valueHeads, geometry.rows());
 }
 
 } // namespace splash::ops

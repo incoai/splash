@@ -1036,6 +1036,43 @@ void testFlint(const std::filesystem::path &fixtures) {
           "a Flint config under text_config was accepted");
 }
 
+void testDSpine(const std::filesystem::path &fixtures) {
+  auto source = mlxModel(fixtures, "qwen3.8-27b");
+  source.draft = text(fixtures / "qwen3.8-27b" / "dspine" / "config.json");
+  const auto model = inspect(source);
+  require(model.draft.isDSpine() && model.draft.contextTokens == 8192 && model.draft.bridgeCodeSize == 1024 &&
+      model.draft.bridgeRank == 512 && model.stateLayout.draft.windowTokens == 8192 &&
+      model.draft.targetLayerIds()[0] == 1 && model.valid(), "DSpine checkpoint made the wrong descriptor");
+  for (const uint32_t context : {0u, 1u, 256u, 2048u, 2049u, 8192u, 32768u}) {
+    const auto served = model::servedFor(model, context);
+    const uint32_t window = context && context <= 2048 ? 2048 : 8192;
+    require(served.valid() && served.draft.contextTokens == window &&
+        served.stateLayout.draft == served.draft.stateLayout() &&
+        served.target == model.target && served.targetKvLayout == model.targetKvLayout &&
+        served.draft.bridgeCodeSize == model.draft.bridgeCodeSize &&
+        served.draft.bridgeRank == model.draft.bridgeRank,
+        "short served context changed the wrong DSpine dimensions");
+    if (window == 2048) {
+      require(model.stateLayout.draft.ringBytes() - served.stateLayout.draft.ringBytes() == 125829120 &&
+          model.stateLayout.draft.windowBytes() - served.stateLayout.draft.windowBytes() == 17694720,
+          "short DSpine state saving differs from its physical window");
+    }
+  }
+  for (const uint32_t context : {0u, 2049u, 8192u, 32768u}) {
+    const auto restored = model::servedFor(model::servedFor(model, 2048), context);
+    require(restored.draft == model.draft && restored.stateLayout == model.stateLayout,
+        "re-serving a short-context model failed to restore its checkpoint window");
+  }
+  refuses(source.with(&SourceModel::draft, R"("rank": 512)", R"("rank": 256)"),
+      "DSpine code bridge", "unsupported DSpine rank accepted");
+  refuses(source.with(&SourceModel::draft, R"("draft_block_causal": true)", R"("draft_block_causal": false)"),
+      "draft_block_causal", "noncausal DSpine block accepted");
+  refuses(source.with(&SourceModel::draft, R"("selected_prefix_terminal": false)", R"("selected_prefix_terminal": true)"),
+      "selected_prefix_terminal", "terminal-enabled DSpine accepted");
+  refuses(source.with(&SourceModel::draft, R"("mode": "serial_table")", R"("mode": "other")"),
+      "DSpine refinement mode", "unknown DSpine refinement accepted");
+}
+
 int main(int argc, char **argv) {
   try {
     if (argc != 2) throw std::invalid_argument("usage: model-configuration FIXTURES");
@@ -1048,6 +1085,7 @@ int main(int argc, char **argv) {
     testConfigurationCheck(argv[1]);
     testYarn(argv[1]);
     testFlint(argv[1]);
+    testDSpine(argv[1]);
     std::cout << "model configuration: every family, sources, one rule per value, quantization, vision, pruned "
                  "experts, the installer's check, YaRN, Flint PASS\n";
   } catch (const std::exception &error) {

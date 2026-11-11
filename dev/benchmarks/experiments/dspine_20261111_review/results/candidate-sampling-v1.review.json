@@ -1,0 +1,168 @@
+{
+  "schema": "candidate_sampling_independent_review_v1",
+  "reviewed_utc": "2026-11-11T11:28:39.145426+00:00",
+  "status": "passed",
+  "scope": "Read-only independent completion, candidate-array, receipt-provenance and multiplicity-adjustment audit of the frozen preintegration combined-v2 candidate screen.",
+  "checked_files": [
+    {
+      "path": "notes/candidate-sampling-v1.nomination.json",
+      "sha256": "8e16b22b810ada96e8125c0ec7e84a527282d7b58e0347527b0c2cc22f3c8768",
+      "bytes": 3229
+    },
+    {
+      "path": "notes/candidate-sampling-v1.protocol.json",
+      "sha256": "2d580c8590efccd20062e5d6be07a778650007d323f5be874d5a5d6017365ded",
+      "bytes": 23395
+    },
+    {
+      "path": "results/candidate-sampling-v1-chunk0.progress.jsonl",
+      "sha256": "377ada01f6d2e901d4222a7d1b012c9e649c916f721ac6a08f9b00f7eefeaa8b",
+      "bytes": 1231098
+    },
+    {
+      "path": "results/candidate-sampling-v1-chunk0.receipt.json",
+      "sha256": "f742be3cdb4e6ff9a66d63e8776b61c8336cd4cf69bc102c7f8a30d6d224c9d3",
+      "bytes": 11047
+    },
+    {
+      "path": "results/candidate-sampling-v1-chunk0.stdout",
+      "sha256": "5d07f35b17b0d57c43603d5ff7ec84a149c3c0cfb4a5eeddeb817a057427a8d2",
+      "bytes": 1682425
+    },
+    {
+      "path": "results/candidate-sampling-v1-chunk1.progress.jsonl",
+      "sha256": "c88be32df54c8f642ab122d92533db172b62587f8fb0a57ac980f2fb799102b9",
+      "bytes": 1230560
+    },
+    {
+      "path": "results/candidate-sampling-v1-chunk1.receipt.json",
+      "sha256": "a949812515b541a712a2e68a58be8b03c93dbb9c181bf869f13a238eb238c892",
+      "bytes": 11047
+    },
+    {
+      "path": "results/candidate-sampling-v1-chunk1.stdout",
+      "sha256": "063896bad9761723be41f9e9fdfb57406cc817c813bafbe051a5a1fb4fa7f56b",
+      "bytes": 1679480
+    },
+    {
+      "path": "results/candidate-sampling-v1.comparison.json",
+      "sha256": "d80b1649ad1b329fb90a64c8e7845489baa8cbcc42b1d53bb54ae200b93151fe",
+      "bytes": 101571
+    }
+  ],
+  "method": [
+    "Read the frozen protocol, nomination, completed comparison, both candidate stdouts and receipts; hash both progress journals.",
+    "Check registration and nomination hashes, exact receipt job/protocol identity, successful completion and the recorded artifact hashes before and after execution against frozen job expectations.",
+    "Independently enumerate candidate outputs, reject duplicate case/sample pairs, validate integer nonnegative token IDs and the 24-token cap, and require all 1000 nominated seeds for each of 4 contexts.",
+    "Recompute the canonical candidate-array SHA256 using sorted(case,seed,tokens) records and compact JSON encoding.",
+    "Independently recompute Holm step-down adjusted p-values from all 140 saved raw p-values: sort ascending, multiply p_(i) by (140-i), cap at 1, and take the cumulative maximum. Compare every saved adjusted value and rejection decision.",
+    "Verify all saved test sample counts are 1000 per arm and every informative test reports pooled expected cells of at least 5."
+  ],
+  "candidate": {
+    "name": "DSpine16_final_review",
+    "source_label": "combined-v2-f27dc90a",
+    "source_patch_sha256": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d",
+    "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283",
+    "verify_rows": 16,
+    "requests": 4000,
+    "contexts": {
+      "sample_code": {
+        "requests": 1000,
+        "seed_start": 4400000,
+        "seed_end_inclusive": 4400999,
+        "full_nominated_seed_coverage": true
+      },
+      "sample_json": {
+        "requests": 1000,
+        "seed_start": 4400000,
+        "seed_end_inclusive": 4400999,
+        "full_nominated_seed_coverage": true
+      },
+      "sample_name": {
+        "requests": 1000,
+        "seed_start": 4400000,
+        "seed_end_inclusive": 4400999,
+        "full_nominated_seed_coverage": true
+      },
+      "sample_story": {
+        "requests": 1000,
+        "seed_start": 4400000,
+        "seed_end_inclusive": 4400999,
+        "full_nominated_seed_coverage": true
+      }
+    },
+    "canonical_arrays_sha256": "b3646870844f663469ab1e94a8be4260557bf3f6108c028b1d4ea857c0ad040d",
+    "canonical_arrays_match_analysis": true
+  },
+  "chunks": [
+    {
+      "job": "candidate-sampling-v1-chunk0",
+      "state": "complete",
+      "exit_code": 0,
+      "requests": 2000,
+      "requests_per_context": {
+        "sample_code": 500,
+        "sample_json": 500,
+        "sample_name": 500,
+        "sample_story": 500
+      },
+      "seed_start": 4400000,
+      "seed_end_inclusive": 4400499,
+      "receipt_job_and_protocol_match": true,
+      "recorded_artifacts_before_after_match_frozen_job": true,
+      "candidate_stdout_receipt_progress_hashes_match_analysis": true
+    },
+    {
+      "job": "candidate-sampling-v1-chunk1",
+      "state": "complete",
+      "exit_code": 0,
+      "requests": 2000,
+      "requests_per_context": {
+        "sample_code": 500,
+        "sample_json": 500,
+        "sample_name": 500,
+        "sample_story": 500
+      },
+      "seed_start": 4400500,
+      "seed_end_inclusive": 4400999,
+      "receipt_job_and_protocol_match": true,
+      "recorded_artifacts_before_after_match_frozen_job": true,
+      "candidate_stdout_receipt_progress_hashes_match_analysis": true
+    }
+  ],
+  "statistics_audit": {
+    "reserved_family_size": 140,
+    "observed_tests": 140,
+    "tests_by_context": {
+      "sample_code": 35,
+      "sample_json": 35,
+      "sample_name": 35,
+      "sample_story": 35
+    },
+    "tests_by_feature": {
+      "complete_output_length": 4,
+      "tokens": 136
+    },
+    "informative_tests": 98,
+    "degenerate_uninformative_tests": 42,
+    "sample_counts_every_test": [
+      1000,
+      1000
+    ],
+    "minimum_reported_expected_cell_in_informative_tests": 5.0,
+    "minimum_saved_raw_p": 0.00971251525556622,
+    "minimum_recomputed_holm_adjusted_p": 1.0,
+    "maximum_adjustment_difference": 0.0,
+    "rejections_at_family_alpha_0_05": 0,
+    "recomputed_adjustments_and_decisions_match": true
+  },
+  "limitations": [
+    "The audit does not independently recompute Pearson chi-square raw p-values from categorical counts.",
+    "The recovered control observations and their seed coverage were not re-audited here; the existing recovery and candidate analyzers retain that provenance.",
+    "Progress journals were hashed against the completed analysis; journal records were not independently compared with stdout arrays in this audit.",
+    "Artifact receipt records were checked for before/after equality against the frozen registration; compiled artifacts and model files were not read or rehashed in this audit.",
+    "Zero multiplicity-adjusted rejections is a finite regression-screen outcome, not proof of equal distributions or output quality.",
+    "This review applies only to the nominated preintegration combined-v2 source and activation regime. It supplies no throughput claim and does not qualify upstream-integrated activation/math paths."
+  ],
+  "original_files_modified": false
+}

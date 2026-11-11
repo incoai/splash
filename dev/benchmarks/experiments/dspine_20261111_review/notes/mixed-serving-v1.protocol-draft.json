@@ -1,0 +1,87 @@
+{
+  "created_utc": "2026-11-11T06:05:54.837282+00:00",
+  "status": "workload and driver frozen before arm nomination",
+  "cohort": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/cohorts/mixed-serving-v1.json",
+  "cohort_sha256": "f3621e20352340206a09bdaef51c516599d3061a047d2b1f195def12a0b3cb4b",
+  "script": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/mixed_serving_v1.py",
+  "script_sha256": "84cd288befa2a1316f3642bb84e330eef724b1f0cec38e0d665ba2ef046ba8da",
+  "source_nomination": "Parent records exact arm artifact hashes and build IDs after functional diagnostics and before compared outputs. This workload cannot select a source and then qualify that same choice as held-out data.",
+  "cases": [
+    {
+      "name": "short_async",
+      "source_prompt_tokens": 67,
+      "cap": 64,
+      "arrival_seconds": 0.0
+    },
+    {
+      "name": "short_sql",
+      "source_prompt_tokens": 72,
+      "cap": 128,
+      "arrival_seconds": 0.05
+    },
+    {
+      "name": "medium_router",
+      "source_prompt_tokens": 4172,
+      "cap": 192,
+      "arrival_seconds": 0.1
+    },
+    {
+      "name": "long_checkpoint",
+      "source_prompt_tokens": 16471,
+      "cap": 256,
+      "arrival_seconds": 0.15
+    }
+  ],
+  "scenarios": [
+    "cold",
+    "warm"
+  ],
+  "server_settings": {
+    "context": 32768,
+    "target_kv": "int8",
+    "recurrent_state": "fp32",
+    "ane": "off",
+    "verify_rows": "all",
+    "draft_block_size": "explicit8or16 per nominated arm",
+    "persistent_cache": true,
+    "disk_bytes": 4294967296,
+    "one_fresh_server_and_cache_directory_per_round": true
+  },
+  "request_settings": {
+    "temperature": 0,
+    "seed": 42,
+    "reasoning_effort": "none",
+    "same_case_salt_across_cold_and_warm": true,
+    "case_salts_unique_per_round": true,
+    "status_poll_seconds": 0.25,
+    "request_timeout_seconds": 600
+  },
+  "primary_metrics": [
+    "cold aggregate returned completion tokens divided by full client scenario makespan",
+    "warm aggregate returned completion tokens divided by full client scenario makespan"
+  ],
+  "secondary_metrics": [
+    "per-request HTTP wall, native TTFT, queue_to_start, stream tokens/sec",
+    "scheduler decode-batch counts at each actual lane width",
+    "per-request prefix matched and deduplicated tokens",
+    "cold/warm assistant text hashes and completion counts"
+  ],
+  "validation": {
+    "request_count": 4,
+    "no_http_errors": true,
+    "source_and_artifacts_constant": true,
+    "server_pid_build_identity_width_and_runtime_settings_checked": true,
+    "clean_server_and_native_children_shutdown": true,
+    "cold_prefix_expectation": "Every case has matched_tokens0",
+    "warm_prefix_expectation": "Each repeated case has matched_tokens>0",
+    "changing_concurrency_claim": "Require at least two positive actual width counters over the round; retain actual counters in every case",
+    "comparison_outputs": "Complete HTTP assistant text and completion counts. The API does not expose native output-token arrays."
+  },
+  "comparison_gates": "Parent freezes ABBA groups, operating criteria, output consistency and separate cold/warm endpoint gates before compared data. Preserve failed or noisy trials.",
+  "reused_helpers": {
+    "server_lifecycle": "dev.benchmarks.serving.run.Server",
+    "http_and_runtime_contracts": "dev.tests.smoke_real.request/chat_body/validate_status"
+  },
+  "parser_contract_check": "Existing Server helper uses its ordinary build/splash default and an explicit later --binary override for the nominated bundle. The normal server parser was verified to choose the nominated binary and explicit16 setting without launching a server.",
+  "scope": "Four original synthetic software-agent tasks at heterogeneous prompt lengths and output caps, scheduled through normal HTTP with staggered arrivals, then repeated with their cached prefixes. This is a finite client throughput and scheduling comparison."
+}

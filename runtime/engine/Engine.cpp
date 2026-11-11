@@ -1252,7 +1252,7 @@ bool Engine::addStateBoundary(Request &active, uint32_t after, uint32_t tokens,
   // boundary before it, from `after` when the lane's draft state is
   // complete there, or whole past `after` (planDraftContext).
   if (!completeAfter && found == remaining &&
-      tokens - after < model::ExecutionLimits::draftContextTokens)
+      tokens - after < config_.draftContextTokens)
     return false;
   active.stateBoundaries.insert(found, {tokens, disposable});
   return true;
@@ -1280,7 +1280,7 @@ DraftContextPlan Engine::pendingDraftStatePlan(const Request &active,
   boundaries.reserve(active.stateBoundaries.size() - active.stateBoundaryCursor);
   for (size_t i = active.stateBoundaryCursor; i < active.stateBoundaries.size(); ++i)
     boundaries.push_back(active.stateBoundaries[i].tokens);
-  return planDraftContext(stateBoundary, active.replayTokens, boundaries);
+  return planDraftContext(stateBoundary, active.replayTokens, boundaries, config_.draftContextTokens);
 }
 
 void Engine::discardPendingStateBoundaries(Request &active) noexcept {
@@ -1739,8 +1739,8 @@ std::vector<LaneShape> Engine::laneShapes(std::span<const PrefillAdmission> cand
 }
 
 uint64_t Engine::workEndOf(const Request &active, const BatchItem &scheduled,
-                           bool prefill) noexcept {
-  uint64_t workEnd = active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
+                           bool prefill) const noexcept {
+  uint64_t workEnd = active.exactTokens.size() + model_.decodeRows();
   if (prefill) {
     workEnd = scheduled.promptOffset + scheduled.tokenCount;
     if (active.stateBoundaryCursor < active.stateBoundaries.size())

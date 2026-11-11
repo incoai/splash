@@ -7,6 +7,7 @@
 
 #include "metal/DeviceCapabilities.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Gguf.h"
 #include "ops/Weights.hpp"
 
 #include <array>
@@ -69,7 +70,7 @@ using SplitLaw = std::variant<TierLaw, WaveLaw>;
 // belowQuarters * cores (in quarter threadgroups per core); kAlways where it
 // takes the formats whatever the grid, 0 never.
 struct RegisterBoundary final {
-  std::array<std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH>, kFormatClasses> belowQuarters;
+  std::array<std::array<uint32_t, GGUF_REGISTER_MAXIMUM_TILES>, kFormatClasses> belowQuarters;
 };
 
 struct ProjectionCalibration final {

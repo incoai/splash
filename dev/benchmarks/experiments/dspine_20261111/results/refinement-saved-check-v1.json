@@ -1,0 +1,292 @@
+{
+  "cases": [
+    {
+      "rows": 8,
+      "conditional_positions": [
+        {
+          "position": 0,
+          "native_predecessor": 71093,
+          "native_token": 12305,
+          "reference_token_same_uniform": 12305,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 4.0536763461640263e-08,
+          "max_probability_error": 5.378595901994743e-08,
+          "native_mass": 1.000000026498391,
+          "reference_top_probability": 0.9999947010053007
+        },
+        {
+          "position": 1,
+          "native_predecessor": 12305,
+          "native_token": 198,
+          "reference_token_same_uniform": 198,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 5.709962947582779e-08,
+          "max_probability_error": 1.049661653151901e-07,
+          "native_mass": 1.0000000957330715,
+          "reference_top_probability": 0.9999988221502287
+        },
+        {
+          "position": 2,
+          "native_predecessor": 198,
+          "native_token": 1445,
+          "reference_token_same_uniform": 1445,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 6.604896159259716e-05,
+          "max_probability_error": 6.601976112829977e-05,
+          "native_mass": 0.9999999415990715,
+          "reference_top_probability": 0.9322644693975021
+        },
+        {
+          "position": 3,
+          "native_predecessor": 1445,
+          "native_token": 14856,
+          "reference_token_same_uniform": 14856,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 1.0481956516948236e-05,
+          "max_probability_error": 1.0613705407891416e-05,
+          "native_mass": 1.0000002634977818,
+          "reference_top_probability": 0.9901121217949278
+        },
+        {
+          "position": 4,
+          "native_predecessor": 14856,
+          "native_token": 1120,
+          "reference_token_same_uniform": 1120,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 1.7128471558942994e-08,
+          "max_probability_error": 2.6619176640707565e-08,
+          "native_mass": 1.0000000189814104,
+          "reference_top_probability": 0.999999019706507
+        },
+        {
+          "position": 5,
+          "native_predecessor": 1120,
+          "native_token": 51425,
+          "reference_token_same_uniform": 51425,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 2.007819989796866e-05,
+          "max_probability_error": 2.009642717437643e-05,
+          "native_mass": 1.0000000364545527,
+          "reference_top_probability": 0.9925717614829819
+        },
+        {
+          "position": 6,
+          "native_predecessor": 51425,
+          "native_token": 198,
+          "reference_token_same_uniform": 198,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 8.63809660981511e-05,
+          "max_probability_error": 8.410466419095375e-05,
+          "native_mass": 1.0000000149741153,
+          "reference_top_probability": 0.536263940208093
+        }
+      ],
+      "maximum_total_variation": 8.63809660981511e-05,
+      "all_same_uniform_tokens_agree": true,
+      "all_argmaxes_agree": true,
+      "original_json_sha256": "1f21836427e3c5a7eddbc900e5030dfb1387a8345768bc9284071751c3421048",
+      "derived_reference_table_sha256": "886b9ef24c67f82fbfae4706a90529e6550abc553df774dabce56d7348eec8d0",
+      "receipt_sha256": "aa370af00130ee2922084d28b7627d26981473c729fe0f641b4c42164aba7da8"
+    },
+    {
+      "rows": 16,
+      "conditional_positions": [
+        {
+          "position": 0,
+          "native_predecessor": 71093,
+          "native_token": 12305,
+          "reference_token_same_uniform": 12305,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 5.901199467738396e-08,
+          "max_probability_error": 9.45216591663467e-08,
+          "native_mass": 1.000000071019329,
+          "reference_top_probability": 0.9999950178974693
+        },
+        {
+          "position": 1,
+          "native_predecessor": 12305,
+          "native_token": 198,
+          "reference_token_same_uniform": 198,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 6.053680353585845e-08,
+          "max_probability_error": 1.1343268169206056e-07,
+          "native_mass": 1.0000001057917562,
+          "reference_top_probability": 0.9999988136837124
+        },
+        {
+          "position": 2,
+          "native_predecessor": 198,
+          "native_token": 1445,
+          "reference_token_same_uniform": 1445,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 3.77386567849667e-05,
+          "max_probability_error": 3.76561622049687e-05,
+          "native_mass": 0.9999998350108399,
+          "reference_top_probability": 0.9338544150848959
+        },
+        {
+          "position": 3,
+          "native_predecessor": 1445,
+          "native_token": 14856,
+          "reference_token_same_uniform": 14856,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 2.889131252642443e-05,
+          "max_probability_error": 2.892093547945951e-05,
+          "native_mass": 1.000000059245906,
+          "reference_top_probability": 0.9902813307773196
+        },
+        {
+          "position": 4,
+          "native_predecessor": 14856,
+          "native_token": 1120,
+          "reference_token_same_uniform": 1120,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 1.4403813823425467e-08,
+          "max_probability_error": 2.0996030802855614e-08,
+          "native_mass": 1.000000013184434,
+          "reference_top_probability": 0.9999990253296528
+        },
+        {
+          "position": 5,
+          "native_predecessor": 1120,
+          "native_token": 51425,
+          "reference_token_same_uniform": 51425,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 8.862610522331786e-06,
+          "max_probability_error": 8.873904567607838e-06,
+          "native_mass": 1.0000000225880905,
+          "reference_top_probability": 0.9927553010336343
+        },
+        {
+          "position": 6,
+          "native_predecessor": 51425,
+          "native_token": 198,
+          "reference_token_same_uniform": 198,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 7.232722193562531e-05,
+          "max_probability_error": 5.572217103039234e-05,
+          "native_mass": 1.000000034482926,
+          "reference_top_probability": 0.5352878362774302
+        },
+        {
+          "position": 7,
+          "native_predecessor": 198,
+          "native_token": 1445,
+          "reference_token_same_uniform": 1445,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 3.757571972523709e-05,
+          "max_probability_error": 3.758978319523543e-05,
+          "native_mass": 1.0000000281269399,
+          "reference_top_probability": 0.9543205707125628
+        },
+        {
+          "position": 8,
+          "native_predecessor": 1445,
+          "native_token": 18904,
+          "reference_token_same_uniform": 18904,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 1.30554343166012e-06,
+          "max_probability_error": 1.2725621236775453e-06,
+          "native_mass": 0.9999999340373842,
+          "reference_top_probability": 0.9997749119967447
+        },
+        {
+          "position": 9,
+          "native_predecessor": 18904,
+          "native_token": 1120,
+          "reference_token_same_uniform": 1120,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 1.2953166115723244e-06,
+          "max_probability_error": 1.30460708724911e-06,
+          "native_mass": 1.0000000185809512,
+          "reference_top_probability": 0.9997807212069691
+        },
+        {
+          "position": 10,
+          "native_predecessor": 1120,
+          "native_token": 51425,
+          "reference_token_same_uniform": 51425,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 1.6175207190832992e-05,
+          "max_probability_error": 1.6181692023775618e-05,
+          "native_mass": 1.000000012969666,
+          "reference_top_probability": 0.9948278377209706
+        },
+        {
+          "position": 11,
+          "native_predecessor": 51425,
+          "native_token": 1358,
+          "reference_token_same_uniform": 1358,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 6.829599457146653e-05,
+          "max_probability_error": 6.829281392173314e-05,
+          "native_mass": 0.9999999936387006,
+          "reference_top_probability": 0.9743703744834415
+        },
+        {
+          "position": 12,
+          "native_predecessor": 1358,
+          "native_token": 1005,
+          "reference_token_same_uniform": 1005,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 1.2554775622251502e-07,
+          "max_probability_error": 1.8521114708569542e-07,
+          "native_mass": 1.0000001193267818,
+          "reference_top_probability": 0.9999899204178202
+        },
+        {
+          "position": 13,
+          "native_predecessor": 1005,
+          "native_token": 198,
+          "reference_token_same_uniform": 198,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 0.00035926757776498925,
+          "max_probability_error": 0.0003592391724264177,
+          "native_mass": 0.999999943189323,
+          "reference_top_probability": 0.8793891052489603
+        },
+        {
+          "position": 14,
+          "native_predecessor": 198,
+          "native_token": 262,
+          "reference_token_same_uniform": 262,
+          "same_uniform_token_agrees": true,
+          "argmax_agrees": true,
+          "total_variation": 1.05179155493242e-06,
+          "max_probability_error": 1.1261973297260752e-06,
+          "native_mass": 1.0000001488115495,
+          "reference_top_probability": 0.9998696509327972
+        }
+      ],
+      "maximum_total_variation": 0.00035926757776498925,
+      "all_same_uniform_tokens_agree": true,
+      "all_argmaxes_agree": true,
+      "original_json_sha256": "968a995a42ee2766fe427212d60828742c21c35a2b27f45619264230138dfb0c",
+      "derived_reference_table_sha256": "60fc37c8e5c66df7b6e3f6def289e5c2e14a8de204e173a1cbd79406e4c51646",
+      "receipt_sha256": "e8dd4718712fcb087ae5599fb7ac668ac49996e8280dec16f73fa2111c5dd638"
+    }
+  ],
+  "all_original_metrics_reproduced": true,
+  "scope": "Reanalysis of saved derived reference scores, native probabilities/support/tokens/uniforms. Uses no model weights or MLX. It verifies saved arithmetic, not the original upstream implementation or a full model. Float report comparison uses 1e-12 tolerance; no retrospective numerical equivalence threshold is introduced."
+}

@@ -1,0 +1,16 @@
+{
+  "registered_utc": "2026-11-11T07:23:34.594616+00:00",
+  "rationale": "Shared gguf staged template refactor preserves arithmetic by construction and oracles, but warrants direct default-eight throughput nonregression confirmation. This declaration precedes any new default8 performance output.",
+  "prefix": "default8-review-nonreg-v1",
+  "control": "Frozen old native runtime src-06965, immutableR1study-production-final-v1-v2, corebyteequivalentto37bdd4f8",
+  "candidate": "Selected frozen source per M48 selection rule",
+  "model": "DSpine same root botharms",
+  "rows": 8,
+  "cohort": "cohorts/kernel-smoke3-cap256-v1.txt",
+  "samples": 3,
+  "clone_width": 1,
+  "groups": 3,
+  "order": "ABBA",
+  "criterion": "nonregression",
+  "gates": "Unchanged native analyzer and independent full-array/provenance review; allfailed/noisygroupsretained. Arithmetic preservation alone makes no throughput claim."
+}

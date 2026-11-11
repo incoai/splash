@@ -1,0 +1,710 @@
+{
+  "scope": "Descriptive work accounting of every round accepted as a source by the frozen analyzer. Primary cases only, with all internal repetitions pooled within each ABBA arm. Token and GPU sums are separate from the registered wall endpoints. Requests ending at different outputs do different work. Incomplete groups have no pooled cross-arm ratio. No additional gate.",
+  "comparisons": [
+    {
+      "label": "dspine16-final-v1",
+      "frozen_qualified": false,
+      "groups": [
+        {
+          "group": 1,
+          "frozen_qualified": false,
+          "frozen_problems": [],
+          "sources": [
+            {
+              "job": "dspine16-final-v1-g1-a1",
+              "sha256": "406d4698a8fce629148cb1bc9ad5db3dc180358f65fdff8dcb9c688f59191161"
+            },
+            {
+              "job": "dspine16-final-v1-g1-b1",
+              "sha256": "8e458bb0ff749f7fcfc3d629787bd35a724aeca9f0c6166bbe6f8be025c5a1e5"
+            },
+            {
+              "job": "dspine16-final-v1-g1-b2",
+              "sha256": "c2c0b6d7fcc6b75eb96520d5aa5f44ec09467f9b71b33d3f320d85da2fca8950"
+            },
+            {
+              "job": "dspine16-final-v1-g1-a2",
+              "sha256": "a0955f19ec6295c633d4884060bb4c044a249b0a5c22a38290e5ae0655b850de"
+            }
+          ],
+          "arms": {
+            "control": {
+              "requests": 120,
+              "lanes": 1,
+              "totals": {
+                "batches": 5212,
+                "emitted": 26212,
+                "returned": 26212,
+                "drafted": 36408,
+                "accepted": 20892,
+                "gpu_ms": 410220.7089999999,
+                "prefill_gpu_ms": 20946.153000000002
+              },
+              "gpu_ms_per_batch": 78.70696642363774,
+              "emitted_tokens_per_lane_batch": 5.029163468917882,
+              "gpu_emitted_tokens_per_second": 63.8973104597701,
+              "accepted_fraction": 0.5738299274884641,
+              "mean_prefill_gpu_ms": 174.551275
+            },
+            "candidate": {
+              "requests": 120,
+              "lanes": 1,
+              "totals": {
+                "batches": 4168,
+                "emitted": 26028,
+                "returned": 26028,
+                "drafted": 62192,
+                "accepted": 21752,
+                "gpu_ms": 323794.3,
+                "prefill_gpu_ms": 19298.306999999997
+              },
+              "gpu_ms_per_batch": 77.6857725527831,
+              "emitted_tokens_per_lane_batch": 6.244721689059501,
+              "gpu_emitted_tokens_per_second": 80.38436748268886,
+              "accepted_fraction": 0.3497555955749936,
+              "mean_prefill_gpu_ms": 160.819225
+            }
+          },
+          "candidate_divided_by_control": {
+            "gpu_ms_per_batch": 0.9870253686902619,
+            "emitted_tokens_per_lane_batch": 1.241701871027702,
+            "gpu_emitted_tokens_per_second": 1.258024272137386,
+            "mean_prefill_gpu_ms": 0.9213294202520147
+          }
+        },
+        {
+          "group": 2,
+          "frozen_qualified": false,
+          "frozen_problems": [],
+          "sources": [
+            {
+              "job": "dspine16-final-v1-g2-a1",
+              "sha256": "215ad0d1fb100ae21405503de7bc2af52a942650e6b9e1c08f390a7e36b5c22f"
+            },
+            {
+              "job": "dspine16-final-v1-g2-b1",
+              "sha256": "56acbd65dbdbb9b42e727d18fb26a3b4f39e09a9fee25446469778a77d37b395"
+            },
+            {
+              "job": "dspine16-final-v1-g2-b2",
+              "sha256": "4560ac8d3e36af47f1409ebdd09db372c1d0129b3e0c61e2bcb37f84267cf009"
+            },
+            {
+              "job": "dspine16-final-v1-g2-a2",
+              "sha256": "20af580657620ae3831fae9ac8fe3beb8c8d2f9e3d010c980841e2e5cd85f447"
+            }
+          ],
+          "arms": {
+            "control": {
+              "requests": 120,
+              "lanes": 1,
+              "totals": {
+                "batches": 5212,
+                "emitted": 26212,
+                "returned": 26212,
+                "drafted": 36408,
+                "accepted": 20892,
+                "gpu_ms": 403363.5969999999,
+                "prefill_gpu_ms": 20465.276999999995
+              },
+              "gpu_ms_per_batch": 77.39132712970067,
+              "emitted_tokens_per_lane_batch": 5.029163468917882,
+              "gpu_emitted_tokens_per_second": 64.98355378361029,
+              "accepted_fraction": 0.5738299274884641,
+              "mean_prefill_gpu_ms": 170.54397499999996
+            },
+            "candidate": {
+              "requests": 120,
+              "lanes": 1,
+              "totals": {
+                "batches": 4168,
+                "emitted": 26028,
+                "returned": 26028,
+                "drafted": 62192,
+                "accepted": 21752,
+                "gpu_ms": 323465.234,
+                "prefill_gpu_ms": 19333.793
+              },
+              "gpu_ms_per_batch": 77.60682197696737,
+              "emitted_tokens_per_lane_batch": 6.244721689059501,
+              "gpu_emitted_tokens_per_second": 80.46614369691427,
+              "accepted_fraction": 0.3497555955749936,
+              "mean_prefill_gpu_ms": 161.11494166666668
+            }
+          },
+          "candidate_divided_by_control": {
+            "gpu_ms_per_batch": 1.0027844831618606,
+            "emitted_tokens_per_lane_batch": 1.241701871027702,
+            "gpu_emitted_tokens_per_second": 1.238253973687861,
+            "mean_prefill_gpu_ms": 0.9447120114719193
+          }
+        },
+        {
+          "group": 3,
+          "frozen_qualified": false,
+          "frozen_problems": [],
+          "sources": [
+            {
+              "job": "dspine16-final-v1-g3-a1",
+              "sha256": "33bc5ab1d25215b64307e3fd16924f1931f600ddb8ff9b635b1ed7974fdd73cc"
+            },
+            {
+              "job": "dspine16-final-v1-g3-b1",
+              "sha256": "6e86634acb164f8c4d6ca908fb59d2b56eb7db77af644d0aa88a74bae35f89a1"
+            },
+            {
+              "job": "dspine16-final-v1-g3-b2",
+              "sha256": "8ee5b103e3311186038fb2404b58d3e4b3b2d2ba2c08a8e735007bc657e166e7"
+            },
+            {
+              "job": "dspine16-final-v1-g3-a2",
+              "sha256": "c3e938ffc8a20d253acd4af99c5629862a2593fe442d8b9941535639f7dc130e"
+            }
+          ],
+          "arms": {
+            "control": {
+              "requests": 120,
+              "lanes": 1,
+              "totals": {
+                "batches": 5212,
+                "emitted": 26212,
+                "returned": 26212,
+                "drafted": 36408,
+                "accepted": 20892,
+                "gpu_ms": 402678.6940000001,
+                "prefill_gpu_ms": 20497.127
+              },
+              "gpu_ms_per_batch": 77.25991826554107,
+              "emitted_tokens_per_lane_batch": 5.029163468917882,
+              "gpu_emitted_tokens_per_second": 65.09408218156184,
+              "accepted_fraction": 0.5738299274884641,
+              "mean_prefill_gpu_ms": 170.80939166666667
+            },
+            "candidate": {
+              "requests": 120,
+              "lanes": 1,
+              "totals": {
+                "batches": 4168,
+                "emitted": 26028,
+                "returned": 26028,
+                "drafted": 62192,
+                "accepted": 21752,
+                "gpu_ms": 322733.1419999999,
+                "prefill_gpu_ms": 19221.491999999995
+              },
+              "gpu_ms_per_batch": 77.4311761036468,
+              "emitted_tokens_per_lane_batch": 6.244721689059501,
+              "gpu_emitted_tokens_per_second": 80.64867412966224,
+              "accepted_fraction": 0.3497555955749936,
+              "mean_prefill_gpu_ms": 160.17909999999995
+            }
+          },
+          "candidate_divided_by_control": {
+            "gpu_ms_per_batch": 1.0022166453440595,
+            "emitted_tokens_per_lane_batch": 1.241701871027702,
+            "gpu_emitted_tokens_per_second": 1.238955545985197,
+            "mean_prefill_gpu_ms": 0.9377651804567535
+          }
+        }
+      ]
+    },
+    {
+      "label": "dflash8-vs-dspine16-final-v1",
+      "frozen_qualified": false,
+      "groups": [
+        {
+          "group": 1,
+          "frozen_qualified": false,
+          "frozen_problems": [],
+          "sources": [
+            {
+              "job": "dflash8-vs-dspine16-final-v1-g1-a1",
+              "sha256": "c8f06da660bf0a11ed09a4b00e0d7c98676428cbf5c99eee37acd577c28f8344"
+            },
+            {
+              "job": "dflash8-vs-dspine16-final-v1-g1-b1",
+              "sha256": "fad3fe7442b2fe97439f59375756a1ad1717059c142a4b62e33d45098bf9b7e3"
+            },
+            {
+              "job": "dflash8-vs-dspine16-final-v1-g1-b2",
+              "sha256": "9500f4450809529f9e0cdcfd20d60acb51c962000a9006093a2daa3d2aab9084"
+            },
+            {
+              "job": "dflash8-vs-dspine16-final-v1-g1-a2",
+              "sha256": "08c0d1f42c58c9ea983ab6206d0654da74a774b4d064573014aaea5cf5686f0d"
+            }
+          ],
+          "arms": {
+            "control": {
+              "requests": 120,
+              "lanes": 1,
+              "totals": {
+                "batches": 5356,
+                "emitted": 26212,
+                "returned": 26212,
+                "drafted": 37408,
+                "accepted": 20748,
+                "gpu_ms": 407582.74500000005,
+                "prefill_gpu_ms": 20463.238
+              },
+              "gpu_ms_per_batch": 76.09834671396565,
+              "emitted_tokens_per_lane_batch": 4.89395070948469,
+              "gpu_emitted_tokens_per_second": 64.31086772331345,
+              "accepted_fraction": 0.5546407185628742,
+              "mean_prefill_gpu_ms": 170.52698333333333
+            },
+            "candidate": {
+              "requests": 120,
+              "lanes": 1,
+              "totals": {
+                "batches": 4168,
+                "emitted": 26028,
+                "returned": 26028,
+                "drafted": 62192,
+                "accepted": 21752,
+                "gpu_ms": 322495.147,
+                "prefill_gpu_ms": 19180.437
+              },
+              "gpu_ms_per_batch": 77.37407557581574,
+              "emitted_tokens_per_lane_batch": 6.244721689059501,
+              "gpu_emitted_tokens_per_second": 80.70819124605308,
+              "accepted_fraction": 0.3497555955749936,
+              "mean_prefill_gpu_ms": 159.83697500000002
+            }
+          },
+          "candidate_divided_by_control": {
+            "gpu_ms_per_batch": 1.0167642125872356,
+            "emitted_tokens_per_lane_batch": 1.2760082926370628,
+            "gpu_emitted_tokens_per_second": 1.2549697135682623,
+            "mean_prefill_gpu_ms": 0.9373119249260553
+          }
+        },
+        {
+          "group": 2,
+          "frozen_qualified": false,
+          "frozen_problems": [],
+          "sources": [
+            {
+              "job": "dflash8-vs-dspine16-final-v1-g2-a1",
+              "sha256": "6df18171411b954438960c50a22c70f25bb0881167d19e9115304d4219aa5536"
+            },
+            {
+              "job": "dflash8-vs-dspine16-final-v1-g2-b1",
+              "sha256": "a223720826577ef7158480031d846531ac4bee2c4b192b41289c3fd83253f994"
+            },
+            {
+              "job": "dflash8-vs-dspine16-final-v1-g2-b2",
+              "sha256": "bff6b331f9a42691fd7c3e12bd09f60c50cb03fa7a75b7ebd5233fc02dc1a1be"
+            },
+            {
+              "job": "dflash8-vs-dspine16-final-v1-g2-a2",
+              "sha256": "89fd7120831f1fb24dc83030ea0716040ebb49a9f771ccc6122b10605734d5ec"
+            }
+          ],
+          "arms": {
+            "control": {
+              "requests": 120,
+              "lanes": 1,
+              "totals": {
+                "batches": 5356,
+                "emitted": 26212,
+                "returned": 26212,
+                "drafted": 37408,
+                "accepted": 20748,
+                "gpu_ms": 407987.7909999999,
+                "prefill_gpu_ms": 20527.870000000006
+              },
+              "gpu_ms_per_batch": 76.17397143390588,
+              "emitted_tokens_per_lane_batch": 4.89395070948469,
+              "gpu_emitted_tokens_per_second": 64.24702056831893,
+              "accepted_fraction": 0.5546407185628742,
+              "mean_prefill_gpu_ms": 171.0655833333334
+            },
+            "candidate": {
+              "requests": 120,
+              "lanes": 1,
+              "totals": {
+                "batches": 4168,
+                "emitted": 26028,
+                "returned": 26028,
+                "drafted": 62192,
+                "accepted": 21752,
+                "gpu_ms": 323239.088,
+                "prefill_gpu_ms": 19248.180999999982
+              },
+              "gpu_ms_per_batch": 77.55256429942418,
+              "emitted_tokens_per_lane_batch": 6.244721689059501,
+              "gpu_emitted_tokens_per_second": 80.52243978611894,
+              "accepted_fraction": 0.3497555955749936,
+              "mean_prefill_gpu_ms": 160.4015083333332
+            }
+          },
+          "candidate_divided_by_control": {
+            "gpu_ms_per_batch": 1.018097951827475,
+            "emitted_tokens_per_lane_batch": 1.2760082926370628,
+            "gpu_emitted_tokens_per_second": 1.2533256651254834,
+            "mean_prefill_gpu_ms": 0.9376608971120713
+          }
+        },
+        {
+          "group": 3,
+          "frozen_qualified": false,
+          "frozen_problems": [],
+          "sources": [
+            {
+              "job": "dflash8-vs-dspine16-final-v1-g3-a1",
+              "sha256": "459bd004022d81a2097fdbcbb804d14abdd6ff441ce0afb306c636a650cc6347"
+            },
+            {
+              "job": "dflash8-vs-dspine16-final-v1-g3-b1",
+              "sha256": "30c64f144c8ba0bbf8d159e6abde58aa6ff3783ef97621b673fe8c4efdd42d1c"
+            },
+            {
+              "job": "dflash8-vs-dspine16-final-v1-g3-b2",
+              "sha256": "cd9a45d3813ca95fe6b925fceb643ec6d62e1caa20d438cd26f6141a3acc79ce"
+            },
+            {
+              "job": "dflash8-vs-dspine16-final-v1-g3-a2",
+              "sha256": "b7e5cf97633b3d2613fd507dac3d9ce94735387259053f87f8487f9e55ea0d4a"
+            }
+          ],
+          "arms": {
+            "control": {
+              "requests": 120,
+              "lanes": 1,
+              "totals": {
+                "batches": 5356,
+                "emitted": 26212,
+                "returned": 26212,
+                "drafted": 37408,
+                "accepted": 20748,
+                "gpu_ms": 407849.327,
+                "prefill_gpu_ms": 20473.881999999994
+              },
+              "gpu_ms_per_batch": 76.14811930545183,
+              "emitted_tokens_per_lane_batch": 4.89395070948469,
+              "gpu_emitted_tokens_per_second": 64.2688322984532,
+              "accepted_fraction": 0.5546407185628742,
+              "mean_prefill_gpu_ms": 170.6156833333333
+            },
+            "candidate": {
+              "requests": 120,
+              "lanes": 1,
+              "totals": {
+                "batches": 4168,
+                "emitted": 26028,
+                "returned": 26028,
+                "drafted": 62192,
+                "accepted": 21752,
+                "gpu_ms": 322358.1779999998,
+                "prefill_gpu_ms": 19181.263999999996
+              },
+              "gpu_ms_per_batch": 77.34121353166981,
+              "emitted_tokens_per_lane_batch": 6.244721689059501,
+              "gpu_emitted_tokens_per_second": 80.74248390869121,
+              "accepted_fraction": 0.3497555955749936,
+              "mean_prefill_gpu_ms": 159.84386666666663
+            }
+          },
+          "candidate_divided_by_control": {
+            "gpu_ms_per_batch": 1.0156680721349418,
+            "emitted_tokens_per_lane_batch": 1.2760082926370628,
+            "gpu_emitted_tokens_per_second": 1.256324115766368,
+            "mean_prefill_gpu_ms": 0.9368650263784856
+          }
+        }
+      ]
+    },
+    {
+      "label": "dflash8-vs-dspine16-b4-final-v1",
+      "frozen_qualified": true,
+      "groups": [
+        {
+          "group": 1,
+          "frozen_qualified": true,
+          "frozen_problems": [],
+          "sources": [
+            {
+              "job": "dflash8-vs-dspine16-b4-final-v1-g1-a1",
+              "sha256": "ce5bb57918acabc191ebb6342002a29c3049e29bd9306ca348f704e18324b4a1"
+            },
+            {
+              "job": "dflash8-vs-dspine16-b4-final-v1-g1-b1",
+              "sha256": "5b8069f605d865d1df8bd570d32747fc80b8fed89be2e4fe4105f460dc793a1a"
+            },
+            {
+              "job": "dflash8-vs-dspine16-b4-final-v1-g1-b2",
+              "sha256": "30ce55b1264e15f0ba44f0348be9d95d56b9a9da075062ad260128c229d53f39"
+            },
+            {
+              "job": "dflash8-vs-dspine16-b4-final-v1-g1-a2",
+              "sha256": "9fee4d8c7813b4cdc4fd3581acdf2ec36f2bb02105521a8401bb1afdbde867f3"
+            }
+          ],
+          "arms": {
+            "control": {
+              "requests": 6,
+              "lanes": 4,
+              "totals": {
+                "batches": 290,
+                "emitted": 5920,
+                "returned": 5920,
+                "drafted": 8072,
+                "accepted": 4752,
+                "gpu_ms": 24501.579999999998,
+                "prefill_gpu_ms": 990.8530000000001
+              },
+              "gpu_ms_per_batch": 84.48820689655172,
+              "emitted_tokens_per_lane_batch": 5.103448275862069,
+              "gpu_emitted_tokens_per_second": 241.61707122561077,
+              "accepted_fraction": 0.5887016848364718,
+              "mean_prefill_gpu_ms": 165.14216666666667
+            },
+            "candidate": {
+              "requests": 6,
+              "lanes": 4,
+              "totals": {
+                "batches": 250,
+                "emitted": 5920,
+                "returned": 5920,
+                "drafted": 14928,
+                "accepted": 4912,
+                "gpu_ms": 39222.86,
+                "prefill_gpu_ms": 1009.945
+              },
+              "gpu_ms_per_batch": 156.89144,
+              "emitted_tokens_per_lane_batch": 5.92,
+              "gpu_emitted_tokens_per_second": 150.93238993790865,
+              "accepted_fraction": 0.3290460878885316,
+              "mean_prefill_gpu_ms": 168.32416666666668
+            }
+          },
+          "candidate_divided_by_control": {
+            "gpu_ms_per_batch": 1.8569625958815719,
+            "emitted_tokens_per_lane_batch": 1.16,
+            "gpu_emitted_tokens_per_second": 0.6246760180160242,
+            "mean_prefill_gpu_ms": 1.019268246652127
+          }
+        },
+        {
+          "group": 2,
+          "frozen_qualified": true,
+          "frozen_problems": [],
+          "sources": [
+            {
+              "job": "dflash8-vs-dspine16-b4-final-v1-g2-a1",
+              "sha256": "9654fb3229f01d484599d33788e34cdbb46cfa314e46e84fb2487533dc3e6478"
+            },
+            {
+              "job": "dflash8-vs-dspine16-b4-final-v1-g2-b1",
+              "sha256": "4764006fa07c6e0264916ee649893282a681d9582682c9fa685e2065518ef061"
+            },
+            {
+              "job": "dflash8-vs-dspine16-b4-final-v1-g2-b2",
+              "sha256": "a292b31c0c07e00f612b83bfb22286714e00595b1dd396abe540ea006aa61c48"
+            },
+            {
+              "job": "dflash8-vs-dspine16-b4-final-v1-g2-a2",
+              "sha256": "55aaff20af0e2aab2b29c1b29da7f3d33a9429863959742358916187f6968709"
+            }
+          ],
+          "arms": {
+            "control": {
+              "requests": 6,
+              "lanes": 4,
+              "totals": {
+                "batches": 290,
+                "emitted": 5920,
+                "returned": 5920,
+                "drafted": 8072,
+                "accepted": 4752,
+                "gpu_ms": 24508.179999999997,
+                "prefill_gpu_ms": 994.4650000000001
+              },
+              "gpu_ms_per_batch": 84.51096551724137,
+              "emitted_tokens_per_lane_batch": 5.103448275862069,
+              "gpu_emitted_tokens_per_second": 241.55200426959493,
+              "accepted_fraction": 0.5887016848364718,
+              "mean_prefill_gpu_ms": 165.7441666666667
+            },
+            "candidate": {
+              "requests": 6,
+              "lanes": 4,
+              "totals": {
+                "batches": 250,
+                "emitted": 5920,
+                "returned": 5920,
+                "drafted": 14928,
+                "accepted": 4912,
+                "gpu_ms": 39474.869999999995,
+                "prefill_gpu_ms": 1008.235
+              },
+              "gpu_ms_per_batch": 157.89947999999998,
+              "emitted_tokens_per_lane_batch": 5.92,
+              "gpu_emitted_tokens_per_second": 149.96882826973211,
+              "accepted_fraction": 0.3290460878885316,
+              "mean_prefill_gpu_ms": 168.03916666666666
+            }
+          },
+          "candidate_divided_by_control": {
+            "gpu_ms_per_batch": 1.8683904394369553,
+            "emitted_tokens_per_lane_batch": 1.16,
+            "gpu_emitted_tokens_per_second": 0.6208552428418382,
+            "mean_prefill_gpu_ms": 1.0138466411588138
+          }
+        },
+        {
+          "group": 3,
+          "frozen_qualified": true,
+          "frozen_problems": [],
+          "sources": [
+            {
+              "job": "dflash8-vs-dspine16-b4-final-v1-g3-a1",
+              "sha256": "ba1b155c77cb5a9b4d847f426b0e806bdf2c134c09b209cb7fb73e35555c8533"
+            },
+            {
+              "job": "dflash8-vs-dspine16-b4-final-v1-g3-b1",
+              "sha256": "8c05faef1cb7db6ba07e16716190c0bf1b4f5e6dba12e59174552679e128d72b"
+            },
+            {
+              "job": "dflash8-vs-dspine16-b4-final-v1-g3-b2",
+              "sha256": "45bd1051d01d1190959ee62325a342832cb9a4c60248be175f6e58e160e66d09"
+            },
+            {
+              "job": "dflash8-vs-dspine16-b4-final-v1-g3-a2",
+              "sha256": "305b6696a79aa4ffe5637ae183d2148ccdb10804da8665bff3709b533ddbcdec"
+            }
+          ],
+          "arms": {
+            "control": {
+              "requests": 6,
+              "lanes": 4,
+              "totals": {
+                "batches": 290,
+                "emitted": 5920,
+                "returned": 5920,
+                "drafted": 8072,
+                "accepted": 4752,
+                "gpu_ms": 24555.07,
+                "prefill_gpu_ms": 987.9750000000001
+              },
+              "gpu_ms_per_batch": 84.6726551724138,
+              "emitted_tokens_per_lane_batch": 5.103448275862069,
+              "gpu_emitted_tokens_per_second": 241.09074012006482,
+              "accepted_fraction": 0.5887016848364718,
+              "mean_prefill_gpu_ms": 164.66250000000002
+            },
+            "candidate": {
+              "requests": 6,
+              "lanes": 4,
+              "totals": {
+                "batches": 250,
+                "emitted": 5920,
+                "returned": 5920,
+                "drafted": 14928,
+                "accepted": 4912,
+                "gpu_ms": 39459.79,
+                "prefill_gpu_ms": 1008.47
+              },
+              "gpu_ms_per_batch": 157.83916,
+              "emitted_tokens_per_lane_batch": 5.92,
+              "gpu_emitted_tokens_per_second": 150.0261405344529,
+              "accepted_fraction": 0.3290460878885316,
+              "mean_prefill_gpu_ms": 168.07833333333335
+            }
+          },
+          "candidate_divided_by_control": {
+            "gpu_ms_per_batch": 1.8641101980161325,
+            "emitted_tokens_per_lane_batch": 1.16,
+            "gpu_emitted_tokens_per_second": 0.6222808078806298,
+            "mean_prefill_gpu_ms": 1.0207444520357296
+          }
+        }
+      ]
+    },
+    {
+      "label": "agent12-dflash8-vs-dspine16-final-v1",
+      "frozen_qualified": false,
+      "groups": [
+        {
+          "group": 1,
+          "frozen_qualified": false,
+          "frozen_problems": [
+            "agent12-dflash8-vs-dspine16-final-v1-g1-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g1-a1.receipt.json'",
+            "agent12-dflash8-vs-dspine16-final-v1-g1-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g1-b1.receipt.json'",
+            "agent12-dflash8-vs-dspine16-final-v1-g1-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g1-b2.receipt.json'",
+            "agent12-dflash8-vs-dspine16-final-v1-g1-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g1-a2.receipt.json'"
+          ],
+          "sources": [],
+          "arms": {}
+        },
+        {
+          "group": 2,
+          "frozen_qualified": false,
+          "frozen_problems": [
+            "agent12-dflash8-vs-dspine16-final-v1-g2-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g2-a1.receipt.json'",
+            "agent12-dflash8-vs-dspine16-final-v1-g2-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g2-b1.receipt.json'",
+            "agent12-dflash8-vs-dspine16-final-v1-g2-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g2-b2.receipt.json'",
+            "agent12-dflash8-vs-dspine16-final-v1-g2-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g2-a2.receipt.json'"
+          ],
+          "sources": [],
+          "arms": {}
+        },
+        {
+          "group": 3,
+          "frozen_qualified": false,
+          "frozen_problems": [
+            "agent12-dflash8-vs-dspine16-final-v1-g3-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g3-a1.receipt.json'",
+            "agent12-dflash8-vs-dspine16-final-v1-g3-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g3-b1.receipt.json'",
+            "agent12-dflash8-vs-dspine16-final-v1-g3-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g3-b2.receipt.json'",
+            "agent12-dflash8-vs-dspine16-final-v1-g3-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g3-a2.receipt.json'"
+          ],
+          "sources": [],
+          "arms": {}
+        }
+      ]
+    },
+    {
+      "label": "m48-b3-research-v1",
+      "frozen_qualified": false,
+      "groups": [
+        {
+          "group": 1,
+          "frozen_qualified": false,
+          "frozen_problems": [
+            "m48-b3-research-v1-g1-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g1-a1.receipt.json'",
+            "m48-b3-research-v1-g1-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g1-b1.receipt.json'",
+            "m48-b3-research-v1-g1-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g1-b2.receipt.json'",
+            "m48-b3-research-v1-g1-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g1-a2.receipt.json'"
+          ],
+          "sources": [],
+          "arms": {}
+        },
+        {
+          "group": 2,
+          "frozen_qualified": false,
+          "frozen_problems": [
+            "m48-b3-research-v1-g2-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g2-a1.receipt.json'",
+            "m48-b3-research-v1-g2-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g2-b1.receipt.json'",
+            "m48-b3-research-v1-g2-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g2-b2.receipt.json'",
+            "m48-b3-research-v1-g2-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g2-a2.receipt.json'"
+          ],
+          "sources": [],
+          "arms": {}
+        },
+        {
+          "group": 3,
+          "frozen_qualified": false,
+          "frozen_problems": [
+            "m48-b3-research-v1-g3-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g3-a1.receipt.json'",
+            "m48-b3-research-v1-g3-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g3-b1.receipt.json'",
+            "m48-b3-research-v1-g3-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g3-b2.receipt.json'",
+            "m48-b3-research-v1-g3-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/m48-b3-research-v1-g3-a2.receipt.json'"
+          ],
+          "sources": [],
+          "arms": {}
+        }
+      ]
+    }
+  ]
+}

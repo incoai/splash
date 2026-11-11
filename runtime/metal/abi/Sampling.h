@@ -1,6 +1,8 @@
 #pragma once
 
 // Parameter layouts shared by host dispatch code and Metal kernels.
+// The maximum-capacity ThinkingCutoffParams and VerifyRowsParams are ABI 2;
+// their kernel entry points carry _abi2 to reject mismatched older libraries.
 #include "metal/abi/ExecutionGeometry.h"
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
@@ -159,11 +161,11 @@ struct ThinkingCutoffParams {
   // The token that closes thinking, the last of the lane's end.
   uint32_t close[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t also_ends[SPLASH_MAXIMUM_BATCH_WIDTH];
-  uint32_t tokens[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_TARGET_VERIFY_ROWS];
+  uint32_t tokens[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_MAXIMUM_VERIFY_ROWS];
 };
 
-static_assert(sizeof(ThinkingCutoffParams) == 220,
-              "Thinking cutoff parameters are 220 bytes on both sides");
+static_assert(sizeof(ThinkingCutoffParams) == 348,
+              "Thinking cutoff parameters are 348 bytes on both sides");
 
 // The batched selector and acceptance kernels' grids cover exactly the
 // dispatch's lanes: per-lane arrays hold those lanes, and entries past them
@@ -197,15 +199,15 @@ static_assert(sizeof(SelectorBatchParams) == 44,
 // most that many tokens.
 struct VerifyRowsParams {
   float slope;
-  float intercept[SPLASH_DRAFT_PROPOSAL_TOKENS];
-  float cost[SPLASH_DRAFT_QUERY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH + 1];
+  float intercept[SPLASH_MAXIMUM_DRAFT_PROPOSAL_TOKENS];
+  float cost[SPLASH_MAXIMUM_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH + 1];
   uint32_t lanes;
   uint32_t every_row;
   uint32_t maximum[SPLASH_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(VerifyRowsParams) == 188,
-              "Verify rows parameters are 188 bytes on both sides");
+static_assert(sizeof(VerifyRowsParams) == 348,
+              "Verify rows parameters are 348 bytes on both sides");
 
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];

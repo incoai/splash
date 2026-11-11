@@ -263,7 +263,7 @@ uint32_t Engine::nextCommandPages(const Request &active) const {
   const uint64_t end =
       scheduler_.phase(id) == Phase::Prefill
           ? std::min<uint64_t>(scheduler_.promptProcessed(id) + model_.commandLimits().commandRows, active.promptTokens)
-          : active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
+          : active.exactTokens.size() + model_.decodeRows();
   return static_cast<uint32_t>((end + KvCache::pageTokens - 1) / KvCache::pageTokens);
 }
 
@@ -313,8 +313,9 @@ Engine::InMemory Engine::inMemory(const Request &active, const ClaimSpec &spec) 
     return {.admission = SpillAdmission::Waiting};
   // Alone, the KV memory holds bounds its output where it holds a token past
   // the prompt and the rows past it that the decode step verifies
-  // (workEndOf): a lane of T tokens takes the KV of T + 7 at its last step.
-  const uint64_t rows = model::ExecutionLimits::targetVerifyRows - 1;
+  // (workEndOf): a lane of T tokens takes the KV of T plus the proposal
+  // rows at its last step.
+  const uint64_t rows = model_.decodeRows() - 1;
   if (room.heldTokens > active.exactTokens.size() + rows)
     return {.admission = SpillAdmission::Resident, .tokens = room.heldTokens - rows};
   return {.room = residentRoom(active, spec, active.exactTokens.size() + rows + 1)};

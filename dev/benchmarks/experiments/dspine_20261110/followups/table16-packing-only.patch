@@ -1,0 +1,40 @@
+--- a/runtime/ops/Linear.cpp
++++ b/runtime/ops/Linear.cpp
+@@ -102,7 +102,7 @@
+ // Table16 holds its sums per eight-row tile (metal/abi/Gguf.h), a lane's rows.
+ uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept {
+   return layout == LinearInput::Table16
+-             ? rows / SPLASH_TARGET_VERIFY_ROWS * table16_sums_per_tile(width) * sizeof(float)
++             ? rows / 8 * table16_sums_per_tile(width) * sizeof(float)
+              : 0;
+ }
+ 
+--- a/runtime/metal/kernels/decode/gdn.metal
++++ b/runtime/metal/kernels/decode/gdn.metal
+@@ -394,9 +394,12 @@
+     for (uint g = 0; g < HeadDim / 64; ++g) {
+       const uint column = head * HeadDim + g * 64 + 2 * lane;
+       const uint local = simd_group * HeadDim + g * 64 + 2 * lane;
+-      Table::write(table + ulong(batch) * ValueWidth * Rows,
+-                   sums + ulong(batch) * Table::sums_per_tile(ValueWidth), ValueWidth,
+-                   column / 64, simd_group, lane, shared.rows[local], shared.rows[local + 1]);
++      // Table16 packs eight rows independently of the request verify width.
++      const uint table_row = batch * Rows + simd_group;
++      const uint table_tile = table_row / gguf_sg::kRows;
++      Table::write(table + ulong(table_tile) * ValueWidth * gguf_sg::kRows,
++                   sums + ulong(table_tile) * Table::sums_per_tile(ValueWidth), ValueWidth,
++                   column / 64, table_row % gguf_sg::kRows, lane, shared.rows[local], shared.rows[local + 1]);
+     }
+   }
+ }
+--- a/dev/tests/engine/LinearInputReference.hpp
++++ b/dev/tests/engine/LinearInputReference.hpp
+@@ -25,7 +25,7 @@
+                                     uint32_t lanes) {
+   if (layout == ops::LinearInput::Plain)
+     throw std::invalid_argument("a plain input has no table to prepare");
+-  graph.add("decode_linear_gguf_prepare", {input, table, sums}, width, {width / 32, lanes, 1}, {128, 1, 1});
++  graph.add("decode_linear_gguf_prepare", {input, table, sums}, width, {width / 32, lanes * SPLASH_TARGET_VERIFY_ROWS / 8, 1}, {128, 1, 1});
+ }
+ 
+ } // namespace splash::test

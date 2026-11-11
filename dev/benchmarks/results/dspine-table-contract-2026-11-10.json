@@ -1,0 +1,176 @@
+{
+  "source_base": "425ad7400f3a00d2a1e6745bdacfa2881922d544",
+  "patch_sha256": "c4f75b68543b1d883a6571f7051d4793a8ef2c01e9b1e461b8dfa9f08b324254",
+  "scope": "Table16 packing and register dispatch use fixed8-row tiles independently of request verify width. Existing execution remains8rows. No performance improvement claim. The new CPU selection test covers48/64-row fallback beyond four register tiles; this is not yet runtime16support.",
+  "builds": {
+    "control": {
+      "base": "425ad7400f3a00d2a1e6745bdacfa2881922d544",
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "patch": null,
+      "patch_sha256": null,
+      "command": [
+        "make",
+        "-C",
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/control",
+        "-j6",
+        "all",
+        "test-engine-cpu",
+        "build/engine-tests/backend-benchmark",
+        "build/engine-tests/weight-digests",
+        "build/engine-tests/decode-profile",
+        "build/engine-tests/dspine",
+        "build/engine-tests/draft-attention",
+        "build/engine-tests/gdn-decode",
+        "build/engine-tests/linear-plan",
+        "build/engine-tests/target-sampling",
+        "build/engine-tests/draft-selector",
+        "build/engine-tests/attention-variants"
+      ],
+      "artifacts": {
+        "linear-plan": "79fc89d16662c6ffabd14a6d4922ba817d6262c74992570cf900124b46d6df83",
+        "splash": "1e95f88fb20b299b396095d4c8f024f56ee3dd252ea437f095bdc4681a650b31",
+        "host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+        "target-sampling": "e7effef349973a72c613aec4ee0835046161e557e33da4fe3d5502e4c220ac2b",
+        "draft-attention": "c389d7bf9745c96d13212de2e467a203522ab3248fb1ae4a8a7b4e4a596b8a82",
+        "gdn-decode": "6780b42855e92639f1350a407d571af376c5b98a46b20fd502fe0301fc788f0d",
+        "dspine": "7055ae5af3dbb185b8c4f82a8ca807b6a23ffaae2a8ecd5eaa8bb0617d3e7a93",
+        "weight-digests": "87caf668b056dcb81d457079b448dc72a9f2c0b2b0cf49d53f3c190b428f8fdb",
+        "splash.metallib": "8a276f6420a02590e5c3456fb65bda16e83faeafe2f59ca78435df986a920c93",
+        "decode-profile": "944bd77f9c31bf5d983a62cbd9305fa9b4b3e20dd6f51e406f5effb0aa9d28ef",
+        "draft-selector": "6b43ec2a412c52505fee1773be10ad64c6049cc3fcf35235c31fe9c527e4e69d",
+        "backend-benchmark": "4bc17671848623a71c2c1922dc9dd7e43a16dbb10e567fb7abec214d4e944572",
+        "attention-variants": "9afaeb6fbc908d4ac558f2b8cd24799f18eef975324b2e9b804451717234ea1d"
+      }
+    },
+    "table-contract": {
+      "base": "425ad7400f3a00d2a1e6745bdacfa2881922d544",
+      "source_diff_sha256": "c4f75b68543b1d883a6571f7051d4793a8ef2c01e9b1e461b8dfa9f08b324254",
+      "patch": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/patches/table-contract-v1.patch",
+      "patch_sha256": "c4f75b68543b1d883a6571f7051d4793a8ef2c01e9b1e461b8dfa9f08b324254",
+      "command": [
+        "make",
+        "-C",
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/table-contract",
+        "-j6",
+        "all",
+        "test-engine-cpu",
+        "build/engine-tests/backend-benchmark",
+        "build/engine-tests/weight-digests",
+        "build/engine-tests/decode-profile",
+        "build/engine-tests/dspine",
+        "build/engine-tests/draft-attention",
+        "build/engine-tests/gdn-decode",
+        "build/engine-tests/linear-plan",
+        "build/engine-tests/target-sampling",
+        "build/engine-tests/draft-selector",
+        "build/engine-tests/attention-variants"
+      ],
+      "artifacts": {
+        "linear-plan": "bf7aa6740ee7fb9658f16b465ea08f43348a1a6074acaf319987042ffdb1e1ae",
+        "splash": "d1d85335aa7d78615f21f1b38ef679d2e0dc0390b182c81922e733792f019e98",
+        "host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+        "target-sampling": "e7effef349973a72c613aec4ee0835046161e557e33da4fe3d5502e4c220ac2b",
+        "draft-attention": "c389d7bf9745c96d13212de2e467a203522ab3248fb1ae4a8a7b4e4a596b8a82",
+        "gdn-decode": "f1c2a65936778e091d1383bedb9c44a96de2ed8ce3068b9892c3573d3913736b",
+        "dspine": "b8a90fe9b64ab6f8eb9d3d06160286ceea3cb84b49cc788d2bf92ee1c7283f80",
+        "weight-digests": "c398d1a503bee6e50374d4c6ab5c99d6f14c7a15af01f2162af6d54bb4e53499",
+        "splash.metallib": "2f0ec0e26e5a06bfae70f4613b2d638672d544b59d211dc1fc3e2cc57884a295",
+        "decode-profile": "d5cb0f510b5bdc2ba1f12f5f5412db7836ac5bdec71c6e366fa33b1a0a99afa1",
+        "draft-selector": "6b43ec2a412c52505fee1773be10ad64c6049cc3fcf35235c31fe9c527e4e69d",
+        "backend-benchmark": "369bfd4ca5552888b763fac6213e6fb1b328010b90637bbeb26ec1c385c2a3a6",
+        "attention-variants": "774faec226d35270981462ac5ea9882a1669006b6ca93715b2d881aa27591da3"
+      }
+    }
+  },
+  "checks": [
+    {
+      "id": "build-control-v1",
+      "state": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 180.22447487500006,
+      "source_artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/scripts/build_frozen.py": "ab38106ffdad6b9bbc45dbec0a68d5a0c997a79edce1352e2a604627b9cf19b5"
+      }
+    },
+    {
+      "id": "build-table-contract-v1",
+      "state": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 171.44172833300001,
+      "source_artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/scripts/build_frozen.py": "ab38106ffdad6b9bbc45dbec0a68d5a0c997a79edce1352e2a604627b9cf19b5",
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/patches/table-contract-v1.patch": "c4f75b68543b1d883a6571f7051d4793a8ef2c01e9b1e461b8dfa9f08b324254"
+      }
+    },
+    {
+      "id": "table-contract-linear-plan-shader-v1",
+      "state": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 1.7167493339999282,
+      "source_artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/table-contract/linear-plan": "bf7aa6740ee7fb9658f16b465ea08f43348a1a6074acaf319987042ffdb1e1ae",
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/table-contract/splash.metallib": "2f0ec0e26e5a06bfae70f4613b2d638672d544b59d211dc1fc3e2cc57884a295"
+      }
+    },
+    {
+      "id": "table-contract-gdn-decode-shader-v1",
+      "state": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 35.665288499999974,
+      "source_artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/table-contract/gdn-decode": "f1c2a65936778e091d1383bedb9c44a96de2ed8ce3068b9892c3573d3913736b",
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/table-contract/splash.metallib": "2f0ec0e26e5a06bfae70f4613b2d638672d544b59d211dc1fc3e2cc57884a295"
+      }
+    },
+    {
+      "id": "table-contract-dspine-shader-v1",
+      "state": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 1.3834832080000297,
+      "source_artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/table-contract/dspine": "b8a90fe9b64ab6f8eb9d3d06160286ceea3cb84b49cc788d2bf92ee1c7283f80",
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/table-contract/splash.metallib": "2f0ec0e26e5a06bfae70f4613b2d638672d544b59d211dc1fc3e2cc57884a295"
+      }
+    },
+    {
+      "id": "table-contract-draft-attention-shader-v1",
+      "state": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 3.2537730839999313,
+      "source_artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/table-contract/draft-attention": "c389d7bf9745c96d13212de2e467a203522ab3248fb1ae4a8a7b4e4a596b8a82",
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/table-contract/splash.metallib": "2f0ec0e26e5a06bfae70f4613b2d638672d544b59d211dc1fc3e2cc57884a295"
+      }
+    },
+    {
+      "id": "table-contract-target-sampling-shader-v1",
+      "state": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 22.686577333999935,
+      "source_artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/table-contract/target-sampling": "e7effef349973a72c613aec4ee0835046161e557e33da4fe3d5502e4c220ac2b",
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/table-contract/splash.metallib": "2f0ec0e26e5a06bfae70f4613b2d638672d544b59d211dc1fc3e2cc57884a295"
+      }
+    },
+    {
+      "id": "table-contract-draft-selector-shader-v1",
+      "state": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 3.0819849590000103,
+      "source_artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/table-contract/draft-selector": "6b43ec2a412c52505fee1773be10ad64c6049cc3fcf35235c31fe9c527e4e69d",
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/table-contract/splash.metallib": "2f0ec0e26e5a06bfae70f4613b2d638672d544b59d211dc1fc3e2cc57884a295"
+      }
+    },
+    {
+      "id": "table-contract-attention-variants-shader-v1",
+      "state": "complete",
+      "exit_code": 0,
+      "elapsed_seconds": 11.184276958000055,
+      "source_artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/table-contract/attention-variants": "774faec226d35270981462ac5ea9882a1669006b6ca93715b2d881aa27591da3",
+        "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/table-contract/splash.metallib": "2f0ec0e26e5a06bfae70f4613b2d638672d544b59d211dc1fc3e2cc57884a295"
+      }
+    }
+  ]
+}

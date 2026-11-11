@@ -320,7 +320,7 @@ int main(int argc, char **argv) {
     try {
       if (argc < 3) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
-                     "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
+                     "[--prompt-tokens N] [--cycles K] [--draft-block-size 8|16] [--kv-format int8|bf16] "
                      "[--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE] "
                      "[--dispatch-list FILE] [--verify-rows auto|all]\n"
                      "       decode-profile METALLIB MODEL_ROOT "
@@ -329,6 +329,7 @@ int main(int argc, char **argv) {
       }
       uint32_t promptTokens = 512;
       uint32_t cycles = 4;
+      uint32_t draftBlockSize = 8;
       kv::Format format = kv::Format::Int8;
       ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
       std::vector<ops::ImageGrid> grids;
@@ -341,7 +342,12 @@ int main(int argc, char **argv) {
         const std::string_view option(argv[index]);
         if (index + 1 >= argc)
           throw std::invalid_argument(std::string(option) + " requires a value");
-        if (option == "--prompt-tokens") {
+        if (option == "--draft-block-size") {
+          const std::string_view value(argv[index + 1]);
+          if (value != "8" && value != "16") throw std::invalid_argument("--draft-block-size takes 8 or 16");
+          draftBlockSize = value == "16" ? 16 : 8;
+          textOptions = true;
+        } else if (option == "--prompt-tokens") {
           promptTokens = parseCount(argv[index + 1], "--prompt-tokens");
           textOptions = true;
         } else if (option == "--cycles")
@@ -389,11 +395,12 @@ int main(int argc, char **argv) {
       loadOptions.readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
       model::LoadedModel model =
           model::loadModel(backend, root, model::inspectModelRoot(root), loadOptions);
-      ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
+      ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On,
+                                     ops::DecodeGeometry(draftBlockSize));
 
       // Enough Page32 pages for four lanes of prompt plus generated rows.
       const uint32_t pagesPerLane =
-          (promptTokens + 256 + model::ExecutionLimits::targetVerifyRows) /
+          (promptTokens + 256 + draftBlockSize) /
               kv::kPageTokens +
           2;
       // Whole extents of the largest size the pool rule picks, as a large

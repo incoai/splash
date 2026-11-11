@@ -1,0 +1,193 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-10",
+  "change": "On the 20-core Apple10 calibration, sixteen-row AF4G64 decode gate/up at 17408 x 5120 and physical M64 uses the existing separate passes. K partitioning and traversal remain unchanged; workspace follows the existing two-pass contract.",
+  "numerical_validation": "Same-split guarded oracle: 12 cases, 401,408 bitwise comparisons and 1,728 independent FP64 checks. Initial 64-token native calibration matches at B3 and B4; each complete controlled group retains matching complete arrays.",
+  "controlled": {
+    "3": {
+      "qualified": true,
+      "groups": [
+        {
+          "group": 1,
+          "rounds": [
+            "wide-gateup-b3-v1-g1-a1",
+            "wide-gateup-b3-v1-g1-b1",
+            "wide-gateup-b3-v1-g1-b2",
+            "wide-gateup-b3-v1-g1-a2"
+          ],
+          "problems": [],
+          "qualified": true,
+          "primary_decode_abba": {
+            "rounds": [
+              15.546513513513512,
+              9.091103603603603,
+              9.034828828828829,
+              15.977040540540541
+            ],
+            "baseline": 15.761777027027026,
+            "candidate": 9.062966216216216,
+            "noise": 0.02731462488581053,
+            "regression": -0.4250035258920507,
+            "bound": 0.05462924977162106,
+            "verdict": "pass",
+            "pass": true
+          },
+          "primary_throughput_change": 0.7391410991717853,
+          "all_output_arrays_match": true,
+          "all_case_noise_within_five_percent": true,
+          "cold_warm_gate_passed": true,
+          "effect_gate_passed": true
+        },
+        {
+          "group": 2,
+          "rounds": [
+            "wide-gateup-b3-v1-g2-a1",
+            "wide-gateup-b3-v1-g2-b1",
+            "wide-gateup-b3-v1-g2-b2",
+            "wide-gateup-b3-v1-g2-a2"
+          ],
+          "problems": [],
+          "qualified": true,
+          "primary_decode_abba": {
+            "rounds": [
+              15.73299099099099,
+              9.01995045045045,
+              9.037144144144143,
+              15.96013063063063
+            ],
+            "baseline": 15.84656081081081,
+            "candidate": 9.028547297297298,
+            "noise": 0.014333686807593062,
+            "regression": -0.43025193888519586,
+            "bound": 0.028667373615186124,
+            "verdict": "pass",
+            "pass": true
+          },
+          "primary_throughput_change": 0.755161742969934,
+          "all_output_arrays_match": true,
+          "all_case_noise_within_five_percent": true,
+          "cold_warm_gate_passed": true,
+          "effect_gate_passed": true
+        },
+        {
+          "group": 3,
+          "rounds": [
+            "wide-gateup-b3-v1-g3-a1",
+            "wide-gateup-b3-v1-g3-b1",
+            "wide-gateup-b3-v1-g3-b2",
+            "wide-gateup-b3-v1-g3-a2"
+          ],
+          "problems": [],
+          "qualified": true,
+          "primary_decode_abba": {
+            "rounds": [
+              15.74842792792793,
+              9.027531531531531,
+              9.041477477477478,
+              15.888121621621623
+            ],
+            "baseline": 15.818274774774777,
+            "candidate": 9.034504504504504,
+            "noise": 0.008831158623977238,
+            "regression": -0.42885651987081896,
+            "bound": 0.02,
+            "verdict": "pass",
+            "pass": true
+          },
+          "primary_throughput_change": 0.7508735279159979,
+          "all_output_arrays_match": true,
+          "all_case_noise_within_five_percent": true,
+          "cold_warm_gate_passed": true,
+          "effect_gate_passed": true
+        }
+      ],
+      "complete_comparison_sha256": "5775309f3a9e6ab937da6ee1d42f1f4b20c6a3de82edc6f9af0164ffdf93e0ae"
+    },
+    "4": {
+      "qualified": false,
+      "groups": [
+        {
+          "group": 1,
+          "rounds": [
+            "wide-gateup-b4-v1-g1-a1",
+            "wide-gateup-b4-v1-g1-b1",
+            "wide-gateup-b4-v1-g1-b2",
+            "wide-gateup-b4-v1-g1-a2"
+          ],
+          "problems": [],
+          "qualified": true,
+          "primary_decode_abba": {
+            "rounds": [
+              11.93591554054054,
+              6.836202702702702,
+              6.880084459459459,
+              12.064756756756758
+            ],
+            "baseline": 12.00033614864865,
+            "candidate": 6.85814358108108,
+            "noise": 0.01073646726393798,
+            "regression": -0.42850404387602326,
+            "bound": 0.02147293452787596,
+            "verdict": "pass",
+            "pass": true
+          },
+          "primary_throughput_change": 0.7497936587027509,
+          "all_output_arrays_match": true,
+          "all_case_noise_within_five_percent": true,
+          "cold_warm_gate_passed": true,
+          "effect_gate_passed": true
+        },
+        {
+          "group": 2,
+          "rounds": [
+            "wide-gateup-b4-v1-g2-a1",
+            "wide-gateup-b4-v1-g2-b1",
+            "wide-gateup-b4-v1-g2-b2",
+            "wide-gateup-b4-v1-g2-a2"
+          ],
+          "problems": [],
+          "qualified": true,
+          "primary_decode_abba": {
+            "rounds": [
+              11.987777027027027,
+              6.829581081081081,
+              6.8471486486486475,
+              12.115881756756757
+            ],
+            "baseline": 12.051829391891893,
+            "candidate": 6.8383648648648645,
+            "noise": 0.01062948416909341,
+            "regression": -0.4325869838926272,
+            "bound": 0.02125896833818682,
+            "verdict": "pass",
+            "pass": true
+          },
+          "primary_throughput_change": 0.762384667980136,
+          "all_output_arrays_match": true,
+          "all_case_noise_within_five_percent": true,
+          "cold_warm_gate_passed": true,
+          "effect_gate_passed": true
+        },
+        {
+          "group": 3,
+          "rounds": [
+            "wide-gateup-b4-v1-g3-a1",
+            "wide-gateup-b4-v1-g3-b1",
+            "wide-gateup-b4-v1-g3-b2",
+            "wide-gateup-b4-v1-g3-a2"
+          ],
+          "problems": [
+            "wide-gateup-b4-v1-g3-b2: ac_throughout_measurement failed",
+            "wide-gateup-b4-v1-g3-a2: receipt failed"
+          ],
+          "qualified": false
+        }
+      ],
+      "complete_comparison_sha256": "75c209a66995ba6984bdc1c536c3a683bfc7edef025f422ce589a1dff12a8f92"
+    }
+  },
+  "scope": "Three historical software prompts, 256 outputs per lane, three internal repetitions and three registered ABBA groups per width. B3 qualifies at +73.9% to +75.5%. B4 has two clean groups at +75.0% and +76.2%, but the third lost AC and its final baseline could not launch: the full B4 comparison is unqualified and not repeated. This does not establish a DSpine/DFlash2 ranking or heterogeneous HTTP performance.",
+  "selection": "Adopt the same measured M64 kernel policy for the opt-in sixteen-row runtime. Complete B3 qualification, numerical equivalence and two clean B4 groups support this engineering choice. B4 performance remains explicitly unqualified; final integration and direct drafter comparisons are separate gates.",
+  "unproven_mechanism": "Large accumulator working set is a register-pressure hypothesis. No hardware spill/occupancy counter was measured.",
+  "patch_sha256": "d3394c6a36c73ed7b83f62cd51426943f15bfdb2af5b9b9ed1c3de8dea8eb1ab"
+}

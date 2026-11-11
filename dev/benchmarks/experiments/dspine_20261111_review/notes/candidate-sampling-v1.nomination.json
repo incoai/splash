@@ -1,0 +1,43 @@
+{
+  "frozen_utc": "2026-11-11T07:30:33.274507+00:00",
+  "prefix": "candidate-sampling-v1",
+  "control": {
+    "name": "DSpine8_recovered_control",
+    "rows": 8,
+    "seed_start": 4100000,
+    "build_id": "src-e237afcf9837870527676df3de068ac7d1f615783c9f6092ae96a86271eec455",
+    "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+    "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+    "kind": "Reused original complete chunk, retained partial journal and registered recovery tail",
+    "canonical_arrays_sha256": "5d06ac9da5486e9934989d19383aebaf9d311d0db846f0b48b3fb12b42cf782a",
+    "recovery_report_sha256": "cdd2e5bfd68b8e4e63e60701ef42154af891028da7d52d4cba67685414f4e8cb"
+  },
+  "candidates": [
+    {
+      "name": "DSpine16_final_review",
+      "rows": 16,
+      "seed_start": 4400000,
+      "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+      "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283",
+      "source_label": "combined-v2-f27dc90a",
+      "source_patch": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch",
+      "source_patch_sha256": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d",
+      "build_manifest": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/build.json",
+      "build_manifest_sha256": "3b286493d52645d50bdc6280174765e842495442dc40ac8ad4fbadeac4f30d79",
+      "sampling_driver_source_sha256": "2b0b3898db9bee8941e169d8852c8f6659f256f7d00e9de9f01a2a054783879d",
+      "bundle": {
+        "driver": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver",
+        "library": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib",
+        "host_step": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib"
+      },
+      "bundle_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb"
+      }
+    }
+  ],
+  "baseline_reuse": "This original control also appears in the historical 280-test supplemental screen. Candidate observations use a new independent seed range and frozen source.",
+  "scope": "The two candidate chunks belong to this nominated bundle only. Changed binaries require a new registration and new candidate observations."
+}

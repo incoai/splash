@@ -1,0 +1,457 @@
+{
+  "case": "japanese_lru_notes",
+  "control_rows": 8,
+  "candidate_rows": 16,
+  "control_build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba",
+  "candidate_build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba",
+  "same_build_id": true,
+  "sources": {
+    "control": {
+      "result.json": "465632f02abcc51ac88c59f5b6d707ba0f8ba87e17e611bd90762381e1e1397c",
+      "rows.jsonl": "b7ae4966637cd64bc9fb326cd8fa20a39bf1d1b305963e5b5514c76f7be36025",
+      "logits.f32": "aecb3ba2a2266c0bd60ec54db6ed420aea45bfb5e53ecbd88482334a10049bca"
+    },
+    "candidate": {
+      "result.json": "80a594562dff9c0bb99dab7cb2e280bc08ca74110fcd30dd9e4f9f45cb7d9f45",
+      "rows.jsonl": "e4492398d19b182ab896dabe8443db0c6171ccd8f274df3b9191b6b65d29eb5c",
+      "logits.f32": "6c4fa4e97543125e21e3d13328b358395616b705e1f9b6da84d7ce6a092c41c5"
+    }
+  },
+  "prompt_tokens": [
+    248045,
+    846,
+    198,
+    19504,
+    52,
+    239228,
+    15303,
+    195946,
+    18602,
+    5205,
+    100457,
+    97420,
+    24950,
+    122768,
+    96090,
+    152255,
+    177474,
+    150619,
+    19054,
+    220821,
+    99222,
+    28452,
+    5205,
+    247359,
+    15685,
+    217384,
+    246874,
+    96233,
+    176910,
+    95986,
+    56657,
+    159524,
+    247206,
+    172808,
+    1710,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+  ],
+  "historical_expected_first_difference": 42,
+  "actual_first_difference": 42,
+  "complete_output_arrays_equal": false,
+  "output_lengths": [
+    127,
+    122
+  ],
+  "first_difference_capture_available": true,
+  "rows_with_identical_conditional_prefix": {
+    "0": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          9,
+          21.886980056762695
+        ],
+        [
+          12,
+          21.094572067260742
+        ]
+      ],
+      "b_top2": [
+        [
+          9,
+          21.886980056762695
+        ],
+        [
+          12,
+          21.094572067260742
+        ]
+      ],
+      "a_top2_margin": 0.7924079895019531,
+      "b_top2_margin": 0.7924079895019531
+    },
+    "32": {
+      "bitwise_equal": false,
+      "raw_rms_delta": 0.02284110608156062,
+      "mean_delta": -0.0028619988726859445,
+      "maximum_absolute_delta": 0.11597263813018799,
+      "centered_relative_rms_delta": 0.01188153721873146,
+      "temperature1_full_vocabulary_total_variation": 0.0003579741299831049,
+      "temperature1_full_vocabulary_kl_a_to_b": 3.6310152169323484e-06,
+      "a_top2": [
+        [
+          96397,
+          23.387977600097656
+        ],
+        [
+          217014,
+          19.582319259643555
+        ]
+      ],
+      "b_top2": [
+        [
+          96397,
+          23.419775009155273
+        ],
+        [
+          217014,
+          19.601163864135742
+        ]
+      ],
+      "a_top2_margin": 3.8056583404541016,
+      "b_top2_margin": 3.8186111450195312
+    },
+    "33": {
+      "bitwise_equal": false,
+      "raw_rms_delta": 0.022076635675499667,
+      "mean_delta": -0.004427113732961834,
+      "maximum_absolute_delta": 0.1169426441192627,
+      "centered_relative_rms_delta": 0.01111917059590392,
+      "temperature1_full_vocabulary_total_variation": 0.00021313691685608335,
+      "temperature1_full_vocabulary_kl_a_to_b": 1.5598788968438021e-06,
+      "a_top2": [
+        [
+          28452,
+          21.91416358947754
+        ],
+        [
+          219057,
+          20.578125
+        ]
+      ],
+      "b_top2": [
+        [
+          28452,
+          21.90768814086914
+        ],
+        [
+          219057,
+          20.570693969726562
+        ]
+      ],
+      "a_top2_margin": 1.336038589477539,
+      "b_top2_margin": 1.3369941711425781
+    },
+    "34": {
+      "bitwise_equal": false,
+      "raw_rms_delta": 0.022632363347479992,
+      "mean_delta": -0.01000406782594715,
+      "maximum_absolute_delta": 0.12153685092926025,
+      "centered_relative_rms_delta": 0.010260471791838276,
+      "temperature1_full_vocabulary_total_variation": 0.0017826604412300956,
+      "temperature1_full_vocabulary_kl_a_to_b": 2.5699645828043292e-05,
+      "a_top2": [
+        [
+          105880,
+          20.892982482910156
+        ],
+        [
+          200227,
+          18.991975784301758
+        ]
+      ],
+      "b_top2": [
+        [
+          105880,
+          20.88013458251953
+        ],
+        [
+          200227,
+          18.963485717773438
+        ]
+      ],
+      "a_top2_margin": 1.9010066986083984,
+      "b_top2_margin": 1.9166488647460938
+    },
+    "35": {
+      "bitwise_equal": false,
+      "raw_rms_delta": 0.024554141454260867,
+      "mean_delta": -0.004295903062082982,
+      "maximum_absolute_delta": 0.12473165988922119,
+      "centered_relative_rms_delta": 0.012719460590914134,
+      "temperature1_full_vocabulary_total_variation": 0.006149359121230548,
+      "temperature1_full_vocabulary_kl_a_to_b": 8.139673822481868e-05,
+      "a_top2": [
+        [
+          160198,
+          24.303550720214844
+        ],
+        [
+          173435,
+          23.767841339111328
+        ]
+      ],
+      "b_top2": [
+        [
+          160198,
+          24.319074630737305
+        ],
+        [
+          173435,
+          23.757226943969727
+        ]
+      ],
+      "a_top2_margin": 0.5357093811035156,
+      "b_top2_margin": 0.5618476867675781
+    },
+    "36": {
+      "bitwise_equal": false,
+      "raw_rms_delta": 0.026664178307167698,
+      "mean_delta": -0.011709181096799493,
+      "maximum_absolute_delta": 0.1594858169555664,
+      "centered_relative_rms_delta": 0.01252735945316167,
+      "temperature1_full_vocabulary_total_variation": 0.00034586734136844683,
+      "temperature1_full_vocabulary_kl_a_to_b": 4.360102383906277e-06,
+      "a_top2": [
+        [
+          31370,
+          22.696531295776367
+        ],
+        [
+          160198,
+          17.795303344726562
+        ]
+      ],
+      "b_top2": [
+        [
+          31370,
+          22.659147262573242
+        ],
+        [
+          155531,
+          17.76340103149414
+        ]
+      ],
+      "a_top2_margin": 4.901227951049805,
+      "b_top2_margin": 4.895746231079102
+    },
+    "37": {
+      "bitwise_equal": false,
+      "raw_rms_delta": 0.023831474016911904,
+      "mean_delta": 0.005104466134221137,
+      "maximum_absolute_delta": 0.12133002281188965,
+      "centered_relative_rms_delta": 0.013899969600314564,
+      "temperature1_full_vocabulary_total_variation": 0.00018745062166416104,
+      "temperature1_full_vocabulary_kl_a_to_b": 2.5919547696102585e-06,
+      "a_top2": [
+        [
+          1710,
+          27.317411422729492
+        ],
+        [
+          198,
+          22.305469512939453
+        ]
+      ],
+      "b_top2": [
+        [
+          1710,
+          27.28999137878418
+        ],
+        [
+          198,
+          22.25040054321289
+        ]
+      ],
+      "a_top2_margin": 5.011941909790039,
+      "b_top2_margin": 5.039590835571289
+    },
+    "38": {
+      "bitwise_equal": false,
+      "raw_rms_delta": 0.6461225598797227,
+      "mean_delta": -0.03737074588433333,
+      "maximum_absolute_delta": 5.791679829359055,
+      "centered_relative_rms_delta": 0.3858147944526851,
+      "temperature1_full_vocabulary_total_variation": 0.00016325800482884994,
+      "temperature1_full_vocabulary_kl_a_to_b": 5.554713949818541e-05,
+      "a_top2": [
+        [
+          198,
+          24.40715789794922
+        ],
+        [
+          271,
+          16.927444458007812
+        ]
+      ],
+      "b_top2": [
+        [
+          198,
+          24.48931312561035
+        ],
+        [
+          271,
+          17.04549789428711
+        ]
+      ],
+      "a_top2_margin": 7.479713439941406,
+      "b_top2_margin": 7.443815231323242
+    },
+    "39": {
+      "bitwise_equal": false,
+      "raw_rms_delta": 0.09462644080859933,
+      "mean_delta": 0.01658218009257869,
+      "maximum_absolute_delta": 0.6077322065830231,
+      "centered_relative_rms_delta": 0.05313352685100208,
+      "temperature1_full_vocabulary_total_variation": 8.688073136438349e-05,
+      "temperature1_full_vocabulary_kl_a_to_b": 4.301300814362477e-06,
+      "a_top2": [
+        [
+          9,
+          24.872114181518555
+        ],
+        [
+          262,
+          17.83427619934082
+        ]
+      ],
+      "b_top2": [
+        [
+          9,
+          24.835657119750977
+        ],
+        [
+          262,
+          17.886486053466797
+        ]
+      ],
+      "a_top2_margin": 7.037837982177734,
+      "b_top2_margin": 6.94917106628418
+    },
+    "40": {
+      "bitwise_equal": false,
+      "raw_rms_delta": 0.19627724260969615,
+      "mean_delta": -0.016884435214933078,
+      "maximum_absolute_delta": 3.769767463207245,
+      "centered_relative_rms_delta": 0.10193637421851548,
+      "temperature1_full_vocabulary_total_variation": 2.0605028566676365e-05,
+      "temperature1_full_vocabulary_kl_a_to_b": 1.0858294441770952e-06,
+      "a_top2": [
+        [
+          256,
+          25.363506317138672
+        ],
+        [
+          220,
+          17.616533279418945
+        ]
+      ],
+      "b_top2": [
+        [
+          256,
+          25.332380294799805
+        ],
+        [
+          220,
+          17.540496826171875
+        ]
+      ],
+      "a_top2_margin": 7.746973037719727,
+      "b_top2_margin": 7.79188346862793
+    },
+    "41": {
+      "bitwise_equal": false,
+      "raw_rms_delta": 0.1456954250282508,
+      "mean_delta": -0.03879376253244868,
+      "maximum_absolute_delta": 2.070126533508301,
+      "centered_relative_rms_delta": 0.07822940792230822,
+      "temperature1_full_vocabulary_total_variation": 0.047841486386002934,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.01108952662606777,
+      "a_top2": [
+        [
+          220,
+          18.11478042602539
+        ],
+        [
+          76249,
+          17.26325035095215
+        ]
+      ],
+      "b_top2": [
+        [
+          220,
+          18.213102340698242
+        ],
+        [
+          76249,
+          17.296539306640625
+        ]
+      ],
+      "a_top2_margin": 0.8515300750732422,
+      "b_top2_margin": 0.9165630340576172
+    },
+    "42": {
+      "bitwise_equal": false,
+      "raw_rms_delta": 0.11834399785732985,
+      "mean_delta": -0.006788660230502257,
+      "maximum_absolute_delta": 1.7316935062408447,
+      "centered_relative_rms_delta": 0.06057164259251348,
+      "temperature1_full_vocabulary_total_variation": 0.07057305254928117,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.016667975639107414,
+      "a_top2": [
+        [
+          122768,
+          16.157377243041992
+        ],
+        [
+          100457,
+          15.999539375305176
+        ]
+      ],
+      "b_top2": [
+        [
+          100457,
+          16.105649948120117
+        ],
+        [
+          122768,
+          15.78032112121582
+        ]
+      ],
+      "a_top2_margin": 0.1578378677368164,
+      "b_top2_margin": 0.3253288269042969
+    }
+  },
+  "excluded_captured_indices": [
+    43,
+    44,
+    45,
+    46,
+    47,
+    48
+  ],
+  "scope": "One selected historical prompt with its original output cap and cold serial decode. Each captured argmax is validated against returned tokens. Metrics compare only rows with identical prior output tokens. No tolerance or distribution-equivalence verdict is applied, and host-copy timing is unused."
+}

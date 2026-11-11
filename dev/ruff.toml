@@ -1,4 +1,7 @@
 target-version = "py313"
+# Frozen measurement sources are SHA-pinned by their reproduction manifests.
+# Formatting them would invalidate the published source and evidence identities.
+extend-exclude = ["dev/benchmarks/experiments/dspine_20261111_review/scripts/**"]
 
 [lint]
 select = ["E4", "E7", "E9", "F", "I"]

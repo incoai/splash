@@ -1,0 +1,8 @@
+{
+  "frozen_utc": "2026-11-10T04:11:07.663762+00:00",
+  "cohort": "heldout12.txt",
+  "sha256": "991c0b93d77f7afab93b4b0be4e4ec2217b2a3d0482e5fa9094f6c14cfc808bb",
+  "cases": 12,
+  "selection": "New prompts fixed before seeing final candidate quality or performance. Use once after candidate nomination; no tuning or repeat-to-pass on this cohort. Checks target-output agreement and held-out performance, not independent human model-quality grading.",
+  "format": "Same explicit empty-thinking Qwen chat prefix as historical cohort; tokenizer from unchanged target installation."
+}

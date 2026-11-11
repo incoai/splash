@@ -1,0 +1,37 @@
+{
+  "recorded_utc": "2026-11-10T20:00:02.443217+00:00",
+  "cases": [
+    {
+      "rows": 8,
+      "positions": 7,
+      "maximum_total_variation": 8.63809660981511e-05,
+      "maximum_probability_error": 8.410466419095375e-05,
+      "maximum_native_mass_error": 2.634977818161133e-07,
+      "all_same_uniform_choices_agree": true,
+      "all_argmaxes_agree": true,
+      "json_sha256": "1f21836427e3c5a7eddbc900e5030dfb1387a8345768bc9284071751c3421048",
+      "receipt": "refinement-mlx-r8-v3.receipt.json",
+      "result": "refinement-mlx-r8-v2.json"
+    },
+    {
+      "rows": 16,
+      "positions": 15,
+      "maximum_total_variation": 0.00035926757776498925,
+      "maximum_probability_error": 0.0003592391724264177,
+      "maximum_native_mass_error": 1.6498916011187248e-07,
+      "all_same_uniform_choices_agree": true,
+      "all_argmaxes_agree": true,
+      "json_sha256": "968a995a42ee2766fe427212d60828742c21c35a2b27f45619264230138dfb0c",
+      "receipt": "refinement-mlx-r16-v3.receipt.json",
+      "result": "refinement-mlx-r16-v2.json"
+    }
+  ],
+  "upstream_commit": "321b0fc1388c4cdf03483ab73856975f7c0c0be7",
+  "upstream_config_accepted": false,
+  "scope": "22 conditional predecessor rows from the first sampled block of one historical coding prompt at each width. Identical captured stash/support/BF16 bridge/head rows, temperature1 and unfiltered16support. Descriptive numerical diagnostic, not preregistered tolerance pass or full model equivalence. Captured model weights are excluded from publication.",
+  "failure_history": [
+    "capture buildv1 local-include fixture failed before capture",
+    "reference scriptv1 omitted k=16 constructor member; no reference table/JSON produced; corrected scriptv2 uses same capturev2 inputs with jobreceiptsv3"
+  ],
+  "m48_research_commit": "5f873426be3d8bedaba0d3dac3db1e20b18805b9"
+}

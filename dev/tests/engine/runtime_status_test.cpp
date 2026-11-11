@@ -384,6 +384,10 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   const std::string expected{std::istreambuf_iterator<char>(golden), {}};
   require(golden && json + '\n' == expected,
           std::string(goldenPath) + " is not the status document, which is now:\n" + json);
+  StatusInputs wide = status;
+  wide.identity.draftBlockSize = 16;
+  require(wide.json().find("\"draft_block_size\":16") != std::string::npos,
+          "sixteen-row status did not report its block width");
   StatusInputs bf16 = status;
   bf16.identity.kvLayout = kv::Layout{16, 4, 256, kv::Format::BFloat16};
   const std::string bf16Status = bf16.json();

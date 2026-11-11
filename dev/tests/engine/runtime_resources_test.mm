@@ -418,6 +418,14 @@ void testPersistentCacheNamespace() {
   require(persistentCacheNamespace(identity('a', "another build", kv::Format::Int8),
                                    model.stateLayout) == name,
           "the build changed the cache namespace");
+  auto wide = identity('a', "build", kv::Format::Int8);
+  wide.draftBlockSize = 16;
+  require(persistentCacheNamespace(wide, model.stateLayout) != name,
+          "different draft block widths shared a persistent cache namespace");
+  auto longWindow = model.stateLayout;
+  longWindow.draft.windowTokens = 8192;
+  require(persistentCacheNamespace(identity('a', "build", kv::Format::Int8), longWindow) != name,
+          "different draft context windows shared a persistent cache namespace");
   model::CompositeStateLayout states = model.stateLayout, bfloatStates = model.stateLayout;
   ++states.draft.layers;
   bfloatStates.target.format = ops::GdnStateFormat::BFloat16;

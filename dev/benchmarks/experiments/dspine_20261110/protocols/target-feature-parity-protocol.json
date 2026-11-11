@@ -1,0 +1,13 @@
+{
+  "frozen_utc": "2026-11-10T06:53:04.603499+00:00",
+  "input_tokens_sha256": "5661d8c1cba43fbefac35127f841f2c8e18322ebb46e63bf78629f1c1a790195",
+  "selection": "PythonLRU frozenhistoricalprompt+greedytranscript,160tokens. Nativewindow128:32 gives96coldprefillrows capturedat1/16/31/46/61post-layer indices. No heldout12 or sampling outputs used.",
+  "arms": "Native8M16and16widepolicy, BF16KV andINT8KV, FP32state. MLX0.32.4/MLX-LM0.32.2 ordinary4bit targetforwardwithBF16KV, same source files asserted byfilesystem identity. Capture adjacentlayersasindexcheck.",
+  "scope": "Diagnostic numericalfeatureparity andlayeralignment; not humanquality, drafterprecision comparison, targetBF16trainingcomparison, or causalattributionofacceptance gap. Native captures onlyprefill, notdecodefeatures. Report perlayer absolute/relativeRMS/cosine, exactgeometryagreement andKVformatdrift withoutinventing a pass tolerance.",
+  "isolation": "All nativebuildsandMLXGPUwork queued afterbothHTTPtiminggroups andsampling/lifecycle, serialoneGPUjob; no model loaded concurrently.",
+  "pre_data_forced_decode_amendment": {
+    "utc": "2026-11-10T08:01:59.343727+00:00",
+    "scope": "BeforeanynativeorMLXcapturejobruns,extendMLXreferencewith32cachedsingle-tokenforcedforwardsfromsame96prefix. Compareall33logitrowsvsnative8/16teacher-forcedoutputs,INT8/BF16KV separately. No thresholdorqualification claim; index/roundingdiagnostic.",
+    "source_v1_retained": true
+  }
+}

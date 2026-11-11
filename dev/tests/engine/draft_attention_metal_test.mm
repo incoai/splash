@@ -37,7 +37,10 @@ using splash::test::bf16ToFloat;
 using splash::test::floatToBf16;
 using splash::test::ulpBf16;
 
-constexpr uint32_t kRows = 8;
+#ifndef SPLASH_TEST_VERIFY_ROWS
+#define SPLASH_TEST_VERIFY_ROWS 8
+#endif
+constexpr uint32_t kRows = SPLASH_TEST_VERIFY_ROWS;
 constexpr uint32_t kKvHeads = 8;
 constexpr uint32_t kQueryHeadsPerKv = 4;
 constexpr uint32_t kHeadDim = 128;
@@ -46,7 +49,8 @@ constexpr uint32_t kLanes = 4;
 // The shipped split count and the fp32 partial one split leaves per (lane,
 // head) behind the grouped queries: 32 rows x (128 + max + sum).
 constexpr uint32_t kSplits = SPLASH_DRAFT_ATTENTION_SPLITS;
-constexpr uint64_t kPartialBytes = uint64_t{32} * 130 * sizeof(float);
+constexpr uint64_t kPartialBytes =
+    uint64_t{kQueryHeadsPerKv} * kRows * 130 * sizeof(float);
 constexpr uint32_t kAttention = kKvHeads * kQueryHeadsPerKv * kHeadDim;
 constexpr uint32_t kGroupRows = kQueryHeadsPerKv * kRows;
 constexpr float kScale = 0.08838834765F;
@@ -54,10 +58,10 @@ constexpr float kScale = 0.08838834765F;
 // The drafts of Qwen3.8-27B, Qwen3.8-Flash-Next, Qwen3.6-35B-A3B and
 // Qwen3.5-122B-A10B: one convolution kernel takes every hidden width.
 constexpr std::array kShapes{
-    DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128},
-    DraftAttentionShape{2560, 640, 6144, 4096, 32, 8, 128},
-    DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128},
-    DraftAttentionShape{3072, 768, 6144, 4096, 32, 8, 128}};
+    DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128, kWindow, false, DecodeGeometry(kRows)},
+    DraftAttentionShape{2560, 640, 6144, 4096, 32, 8, 128, kWindow, false, DecodeGeometry(kRows)},
+    DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128, kWindow, false, DecodeGeometry(kRows)},
+    DraftAttentionShape{3072, 768, 6144, 4096, 32, 8, 128, kWindow, false, DecodeGeometry(kRows)}};
 
 using splash::test::rejects;
 using splash::test::require;
@@ -86,11 +90,12 @@ MetalBuffer randomBfloat(MetalBackend &backend, uint64_t count, Random &random,
 }
 
 // Reference for one lane and kv head: every row attends to the ring window it
-// can see plus all eight current rows, exactly as the kernel's mask defines.
+// can see plus all current rows, exactly as the kernel's mask defines.
 void referenceRows(const uint16_t *queries, const uint16_t *keys,
                    const uint16_t *values, const uint16_t *queryKeys,
                    const uint16_t *queryValues, uint32_t cacheLength,
-                   std::vector<float> &output) {
+                   std::vector<float> &output, uint32_t window = kWindow, bool causal = false) {
+  const uint32_t kWindow = window;
   const uint32_t commonStart =
       cacheLength >= kWindow - 1 ? cacheLength - (kWindow - 1) : 0;
   const uint32_t oldCount = cacheLength - commonStart;
@@ -106,7 +111,7 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
     double best = -INFINITY;
     for (uint32_t key = 0; key < oldCount + kRows; ++key) {
       double score = -INFINITY;
-      if (key >= oldCount) {
+      if (key >= oldCount && (!causal || key - oldCount <= proposal)) {
         const uint32_t current = key - oldCount;
         double dot = 0.0;
         for (uint32_t d = 0; d < kHeadDim; ++d) {
@@ -114,7 +119,7 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
                  bf16ToFloat(queryKeys[current * kHeadDim + d]);
         }
         score = dot * kScale;
-      } else if (key >= hiddenPrefix) {
+      } else if (key < oldCount && key >= hiddenPrefix) {
         const uint32_t slot = (commonStart + key) % kWindow;
         double dot = 0.0;
         for (uint32_t d = 0; d < kHeadDim; ++d) {
@@ -149,6 +154,7 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
 
 void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
              const std::array<uint32_t, kLanes> &cacheLengths) {
+  const uint32_t kWindow = shape.contextTokens;
   Random random(0x5eed0000ULL + cacheLengths[0]);
   const uint64_t ringElements = uint64_t{kKvHeads} * kWindow * kHeadDim;
   // The grouped-queries tensor is sized by the plan so the split partials
@@ -189,10 +195,10 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
       std::span(cacheLengths).first(lanes), DraftAttention::plan(shape, lanes));
   const auto dispatches = graph.dispatches();
   require(dispatches.size() == 2 &&
-              dispatches[0].threadgroups.x == kKvHeads &&
+              dispatches[0].threadgroups.x == kKvHeads * (kRows / 8) &&
               dispatches[0].threadgroups.y == lanes &&
               dispatches[0].threadgroups.z == kSplits &&
-              dispatches[1].threadgroups.x == kKvHeads &&
+              dispatches[1].threadgroups.x == kKvHeads * (kRows / 8) &&
               dispatches[1].threadgroups.y == lanes &&
               dispatches[1].threadgroups.z == 1,
           "draft attention core dispatch changed");
@@ -228,7 +234,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
               (uint64_t{lane} * kKvHeads + head) * kRows * kHeadDim,
           static_cast<const uint16_t *>(queryValues.contents()) +
               (uint64_t{lane} * kKvHeads + head) * kHeadDim * kRows,
-          cacheLengths[lane], reference);
+          cacheLengths[lane], reference, shape.contextTokens, shape.causal);
       for (uint64_t index = 0; index < reference.size(); ++index) {
         const float actual = bf16ToFloat(output[queryOffset + index]);
         const float expected = reference[index];
@@ -273,7 +279,7 @@ void planGeometry() {
           "unsupported compiled draft attention shape",
           "a draft shape without a compiled kernel was accepted");
   // A hidden width of a partial convolution group.
-  const DraftAttentionShape partialGroup{2056, 512, 6144, 4096, 32, 8, 128};
+  const DraftAttentionShape partialGroup{2056, 512, 6144, 4096, 32, 8, 128, kWindow, false, DecodeGeometry(kRows)};
   rejects([&] { (void)DraftAttention::plan(partialGroup, 1); },
           "unsupported compiled draft attention shape",
           "a draft of a partial convolution group was accepted");
@@ -444,6 +450,7 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
 // its rows from a start position, the commit each lane's retained verify
 // rows (at most eight). The buffers hold exactly what the writers read.
 void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
+  const uint32_t kWindow = shape.contextTokens;
   // A context row holds its keys, then its values.
   constexpr uint32_t kRowWidth = 2048, kKeyColumn = 0, kValueColumn = 1024;
   constexpr uint16_t kUntouched = 0xC2C2;
@@ -520,7 +527,8 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   };
 
   // Prefill: 37 rows from position 6130 (slot 2034), across the ring's end.
-  constexpr uint32_t kTokens = 37, kStart = 6130;
+  constexpr uint32_t kTokens = 37;
+  const uint32_t kStart = 3 * kWindow - 14;
   const MetalBuffer kv = randomBfloat(backend, uint64_t{kTokens} * kRowWidth,
                                       random, "draft context kv");
   const MetalBuffer ropeCos = table(kTokens, false),
@@ -534,10 +542,10 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
         static_cast<const float *>(ropeCos.contents()),
         static_cast<const float *>(ropeSin.contents()), kTokens, kStart);
 
-  // Commit: three lanes retaining 8, 3 and (clamped) 8 of their verify rows.
+  // Commit: three lanes retaining all, a prefix and a clamped excess of their verify rows.
   constexpr uint32_t kCommitLanes = 3;
-  const std::array<uint32_t, kCommitLanes> starts{2044, 0, 4101};
-  const uint32_t retained[kCommitLanes] = {8, 3, 12};
+  const std::array<uint32_t, kCommitLanes> starts{kWindow - 4, 0, 2 * kWindow + 5};
+  const uint32_t retained[kCommitLanes] = {kRows, kRows - 5, kRows + 4};
   const MetalBuffer laneKv =
       randomBfloat(backend, uint64_t{kCommitLanes} * kRows * kRowWidth, random,
                    "draft lane kv");
@@ -881,6 +889,12 @@ int main(int argc, char **argv) {
       runCase(backend, 4, shape, {2046, 2049, 4095, 4096});
       runCase(backend, 2, shape, {8191, 262144, 0, 0});
     }
+    auto dspine = kShapes[0];
+    dspine.contextTokens = 8192;
+    dspine.causal = true;
+    contextWriters(backend, dspine);
+    runCase(backend, 1, dspine, {0, 0, 0, 0});
+    runCase(backend, 4, dspine, {31, 8191, 8192, 16389});
     std::cout << "draft_attention_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

@@ -1,0 +1,156 @@
+{
+  "protocol": {
+    "frozen_utc": "2026-11-10T20:29:48.376721+00:00",
+    "prefix": "agent12-dflash8-vs-dspine16-final-v1",
+    "groups": 3,
+    "order_each_group": [
+      "control",
+      "candidate",
+      "candidate",
+      "control"
+    ],
+    "arms": {
+      "control": {
+        "variant": "production-final-v1",
+        "rows": 8,
+        "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+        "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf"
+      },
+      "candidate": {
+        "variant": "production-final-v1",
+        "rows": 16,
+        "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+        "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07"
+      }
+    },
+    "cohort": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/agent12-v1.txt",
+    "cohort_sha256": "c031bed7becd33daca47dacf2ee2cad79bc60681c319706a8d90879b986c29c4",
+    "cases": 12,
+    "samples_per_round": 1,
+    "criterion": "comparison",
+    "context_tokens": 32768,
+    "temperature": 0,
+    "ane_ffn_share": 0,
+    "verify_rows": "all",
+    "clone_width": 1,
+    "primary_endpoint": "decode",
+    "primary_metric": "Per-case median (wall-TTFT)/(returned tokens-1), then token-weighted aggregate.",
+    "gates": "Exactly3ABBA groups. All complete arrays match; all per-case and aggregate decode spreads<=5%. Improvement exceeds max(2%,twice spread); nonregression requires aggregate and every case to pass its allowance. Cold request wall and TTFT each retain independent gates. Sampled AC, no swap and no serious/critical thermal state throughout each saved round. No repeat-to-pass.",
+    "artifact_nomination": {
+      "production-final-v1": {
+        "source_root": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/production-final-v1",
+        "patch": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/patches/production-final-v1.patch",
+        "patch_sha256": "ec4254095b3f16ed843de824622d727164005cd70c6844c3f180c0278f752736",
+        "build_manifest": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/production-final-v1/build.json",
+        "driver": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/study-driver",
+        "library": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/splash.metallib",
+        "host_step": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/host-step.metallib"
+      }
+    },
+    "operating_script_sha256": "4bde430207a362eab510fe8ffd393fa2aa76c543eaa5821c7073e95e454d0f58",
+    "analyzer_file": "analyze_abba_v2.py",
+    "analyzer_sha256": "e2c3f42e4e5fce41d89251399beb7339bf9bdc4c4af51e15435cf984390da634",
+    "abba_sha256": "7afc7b4fa24916acfc41745fc29cc659b5edada0bfa1ce55e19a685808475c0d",
+    "required_receipts": [
+      "build-production-final-v1",
+      "build-study-production-final-v1-v2",
+      "build-priority-production-final-v1-v1",
+      "full-metal-production-final-v1",
+      "python-contracts-production-final-v1",
+      "final-smoke-dspine8-v1",
+      "final-smoke-dspine16-v1",
+      "final-smoke-dflash8-v1",
+      "final-clone-b3-v1",
+      "final-clone-b4-v1",
+      "final-unaligned-tail16-v1",
+      "final-priority16-v1",
+      "final-http16-v1",
+      "final-cache-isolation-v2",
+      "final-historical31-control-r8-v1",
+      "final-historical31-production-final-v1-r8-v1",
+      "final-architecture-v1",
+      "final-python-full-v2",
+      "final-native-tools-build-v1",
+      "final-host-sanitizers-v1",
+      "final-app-tests-v2",
+      "final-python-static-v1",
+      "final-metal-tsan-v1"
+    ],
+    "categories": {
+      "short": [
+        "short_async",
+        "short_arena",
+        "short_sql",
+        "short_rust"
+      ],
+      "medium": [
+        "medium_cancel",
+        "medium_cache",
+        "medium_stream",
+        "medium_router"
+      ],
+      "long": [
+        "long_checkpoint",
+        "long_budget",
+        "long_replay",
+        "long_tooljson"
+      ]
+    },
+    "scope": "Fresh twelve original synthetic software-agent prompts, four each at short/~4K/~16K context. Performance/exact-output fixtures, not scored agent task success. Source nomination is frozen before first output; no performance-driven candidate changes afterwards."
+  },
+  "qualified": false,
+  "groups": [
+    {
+      "group": 1,
+      "rounds": [
+        "agent12-dflash8-vs-dspine16-final-v1-g1-a1",
+        "agent12-dflash8-vs-dspine16-final-v1-g1-b1",
+        "agent12-dflash8-vs-dspine16-final-v1-g1-b2",
+        "agent12-dflash8-vs-dspine16-final-v1-g1-a2"
+      ],
+      "sources": [],
+      "problems": [
+        "agent12-dflash8-vs-dspine16-final-v1-g1-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g1-a1.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g1-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g1-b1.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g1-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g1-b2.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g1-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g1-a2.receipt.json'"
+      ],
+      "qualified": false
+    },
+    {
+      "group": 2,
+      "rounds": [
+        "agent12-dflash8-vs-dspine16-final-v1-g2-a1",
+        "agent12-dflash8-vs-dspine16-final-v1-g2-b1",
+        "agent12-dflash8-vs-dspine16-final-v1-g2-b2",
+        "agent12-dflash8-vs-dspine16-final-v1-g2-a2"
+      ],
+      "sources": [],
+      "problems": [
+        "agent12-dflash8-vs-dspine16-final-v1-g2-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g2-a1.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g2-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g2-b1.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g2-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g2-b2.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g2-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g2-a2.receipt.json'"
+      ],
+      "qualified": false
+    },
+    {
+      "group": 3,
+      "rounds": [
+        "agent12-dflash8-vs-dspine16-final-v1-g3-a1",
+        "agent12-dflash8-vs-dspine16-final-v1-g3-b1",
+        "agent12-dflash8-vs-dspine16-final-v1-g3-b2",
+        "agent12-dflash8-vs-dspine16-final-v1-g3-a2"
+      ],
+      "sources": [],
+      "problems": [
+        "agent12-dflash8-vs-dspine16-final-v1-g3-a1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g3-a1.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g3-b1: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g3-b1.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g3-b2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g3-b2.receipt.json'",
+        "agent12-dflash8-vs-dspine16-final-v1-g3-a2: [Errno 2] No such file or directory: '/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/agent12-dflash8-vs-dspine16-final-v1-g3-a2.receipt.json'"
+      ],
+      "qualified": false
+    }
+  ],
+  "scope": "Exactly the registered groups and complete cohort; all failures retained. Top-level qualification concerns the primary decode endpoint. Cold request wall, TTFT and predeclared categories each retain their own output/noise/effect gates. Medians of registered internal repetitions precede per-case ABBA. Aggregate decode rate weights cases by output tokens. AC and thermal state sampled every five seconds. A failure is not rerun into a pass."
+}

@@ -36,19 +36,22 @@
 #define GGUF_PREFILL_THREADS (GGUF_PREFILL_SIMDGROUPS * 32u)
 // Apple9 register tile: four simdgroups of GGUF_REGISTER_COLUMNS columns.
 #define GGUF_REGISTER_COLUMNS 16u
+// Register-kernel specializations cover one through four fixed eight-row tiles.
+#define GGUF_REGISTER_MAXIMUM_TILES 4u
 #define GGUF_REGISTER_THREADS (GGUF_TILE_COLUMNS / GGUF_REGISTER_COLUMNS * 32u)
 
 // The register tile's activations, Table16 (kernels/common/gguf_sgmatrix.h):
 // per eight-row tile of `width` inputs, the X^T table of width * 8 bfloat,
 // then the fp32 chain seeds [width / 16][8 rows] and sums [width / 32][8
 // rows]. Each 64-input span holds these values, seeds and sums per tile.
+#define GGUF_TABLE16_ROWS 8u
 #define GGUF_TABLE16_SPAN_INPUTS 64u
 #define GGUF_TABLE16_SPAN_VALUES 512u
 #define GGUF_TABLE16_SPAN_SEEDS 32u
 #define GGUF_TABLE16_SPAN_SUMS 16u
-inline constexpr uint64_t table16_sums32_offset(uint32_t width) { return uint64_t(width) / 16 * 8; }
+inline constexpr uint64_t table16_sums32_offset(uint32_t width) { return uint64_t(width) / 16 * GGUF_TABLE16_ROWS; }
 inline constexpr uint64_t table16_sums_per_tile(uint32_t width) {
-  return table16_sums32_offset(width) + uint64_t(width) / 32 * 8;
+  return table16_sums32_offset(width) + uint64_t(width) / 32 * GGUF_TABLE16_ROWS;
 }
 
 // Prefill tiles: the grid covers whole GGUF_PREFILL_ROWS-row tiles of the

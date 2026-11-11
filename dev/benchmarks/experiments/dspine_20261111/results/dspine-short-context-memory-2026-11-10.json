@@ -1,0 +1,121 @@
+{
+  "scope": "Functional and allocated-state memory screen. Explicit served contexts up to 2,048 use the already compiled 2,048-token draft window; larger or automatic contexts restore 8,192, including a descriptor round trip. State usage falls inside an unchanged elastic budget. No throughput claim.",
+  "checks": [
+    {
+      "jobs": [
+        "short-context-check-runtime16-v12-r8-c256",
+        "short-context-check-short-context-v2-r8-c256"
+      ],
+      "width": 8,
+      "context": 256,
+      "all_arrays_match": true,
+      "cases": 3,
+      "dynamic_budget_increase_bytes": 0,
+      "control_dynamic_budget_bytes": 20551060608,
+      "candidate_dynamic_budget_bytes": 20551060608
+    },
+    {
+      "jobs": [
+        "short-context-check-runtime16-v12-r8-c2048",
+        "short-context-check-short-context-v2-r8-c2048"
+      ],
+      "width": 8,
+      "context": 2048,
+      "all_arrays_match": true,
+      "cases": 3,
+      "dynamic_budget_increase_bytes": 0,
+      "control_dynamic_budget_bytes": 20551060608,
+      "candidate_dynamic_budget_bytes": 20551060608
+    },
+    {
+      "jobs": [
+        "short-context-tail-runtime16-v12-r8",
+        "short-context-tail-short-context-v2-r8"
+      ],
+      "width": 8,
+      "context": 2048,
+      "prompt_tokens": 2046,
+      "output_tokens": 2,
+      "all_arrays_match": true,
+      "shader_validation": true
+    },
+    {
+      "jobs": [
+        "short-context-check-runtime16-v12-r16-c256",
+        "short-context-check-short-context-v2-r16-c256"
+      ],
+      "width": 16,
+      "context": 256,
+      "all_arrays_match": true,
+      "cases": 3,
+      "dynamic_budget_increase_bytes": 0,
+      "control_dynamic_budget_bytes": 20279430272,
+      "candidate_dynamic_budget_bytes": 20279430272
+    },
+    {
+      "jobs": [
+        "short-context-check-runtime16-v12-r16-c2048",
+        "short-context-check-short-context-v2-r16-c2048"
+      ],
+      "width": 16,
+      "context": 2048,
+      "all_arrays_match": true,
+      "cases": 3,
+      "dynamic_budget_increase_bytes": 0,
+      "control_dynamic_budget_bytes": 20279430272,
+      "candidate_dynamic_budget_bytes": 20279430272
+    },
+    {
+      "jobs": [
+        "short-context-tail-runtime16-v12-r16",
+        "short-context-tail-short-context-v2-r16"
+      ],
+      "width": 16,
+      "context": 2048,
+      "prompt_tokens": 2046,
+      "output_tokens": 2,
+      "all_arrays_match": true,
+      "shader_validation": true
+    }
+  ],
+  "raw_state_layout_saving_bytes": {
+    "per_lane_rings": 125829120,
+    "per_lane_window": 17694720,
+    "four_lane_total": 574095360
+  },
+  "fresh_full_native_cpu": "pass",
+  "superseded_source_v1": "Not executed; static review corrected re-serving short model at larger/auto context. All canceled job receipts retained.",
+  "actual_four_lane_state_memory": {
+    "jobs": [
+      "actual-state-memory-runtime16-v12-r16-b4-c2048-v1",
+      "actual-state-memory-short-context-v2-r16-b4-c2048-v1"
+    ],
+    "width": 16,
+    "physical_lanes": 4,
+    "served_context": 2048,
+    "all_twelve_lane_arrays_match": true,
+    "state_allocated_bytes": [
+      2176319488,
+      1584529408
+    ],
+    "state_bytes_freed": 591790080,
+    "state_MiB_freed": 564.375,
+    "idle_buffer_counts": [
+      {
+        "idle_gdn_cells": 8,
+        "idle_draft_rings": 4,
+        "idle_context_windows": 4
+      },
+      {
+        "idle_gdn_cells": 8,
+        "idle_draft_rings": 4,
+        "idle_context_windows": 4
+      }
+    ],
+    "dynamic_budget_bytes": [
+      20279430272,
+      20279430272
+    ],
+    "interpretation": "State allocations are charged inside the elastic budget, so capacity stays fixed while used state memory falls. This endpoint includes pooled and cached state, rather than just four lane buffers. Functional/memory evidence on battery, no throughput claim."
+  }
+}

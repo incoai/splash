@@ -1,0 +1,208 @@
+{
+  "prepared_utc": "2026-11-11T06:28:41.233434+00:00",
+  "purpose": "Functional nomination of composed narrowQKVsplit2 and genericM48 compute48/storage64, before broad throughput/source selection. No functional timings are qualified effects.",
+  "cpu": {
+    "id": "combined-linear-cpu-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/linear-plan",
+      "--cpu"
+    ],
+    "env": {},
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/linear-plan",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/linear-plan": "c0dbc500ff4dff64918fed4537a704ca8a261d0cdc4e351dd046b2135763f4ad",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch": "4bab304674804fb8e1d70d42f29752feea98e6160a0735b83e8d7725ee4a68e2"
+    },
+    "timeout_seconds": 1800
+  },
+  "gpu": {
+    "id": "combined-linear-gpu-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/linear-plan",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/splash.metallib"
+    ],
+    "env": {
+      "MTL_SHADER_VALIDATION": "1"
+    },
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/linear-plan",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/splash.metallib"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/linear-plan": "c0dbc500ff4dff64918fed4537a704ca8a261d0cdc4e351dd046b2135763f4ad",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch": "4bab304674804fb8e1d70d42f29752feea98e6160a0735b83e8d7725ee4a68e2",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74"
+    },
+    "timeout_seconds": 1800
+  },
+  "oracle": {
+    "id": "combined-m48-oracle-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/gguf-projection",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/production-and-test.metallib",
+      "--m48"
+    ],
+    "env": {
+      "MTL_SHADER_VALIDATION": "1"
+    },
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/gguf-projection",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/production-and-test.metallib"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/gguf-projection": "ba2a476f86de87b35c2d2b68f4602763d64637d5696dc961dfb6a9fedaeda099",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch": "4bab304674804fb8e1d70d42f29752feea98e6160a0735b83e8d7725ee4a68e2",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/production-and-test.metallib": "219e64a24607764fd507aa11ee1479623242ecb9d7d2e77a29cec10078efa2a7"
+    },
+    "timeout_seconds": 1800
+  },
+  "historical16": {
+    "id": "combined-historical16-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/splash.metallib",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "--draft-block-size",
+      "16",
+      "--cohort",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "--samples",
+      "1",
+      "--ane-ffn-share",
+      "0",
+      "--max-context",
+      "32768",
+      "--progress",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/combined-historical16-v1.progress.jsonl"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/splash.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/host-step.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/study-driver": "98f2dc0fbf1818ae98542c12d43e552eeae1924ad84e39a02bf2fff94687401e",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch": "4bab304674804fb8e1d70d42f29752feea98e6160a0735b83e8d7725ee4a68e2"
+    },
+    "timeout_seconds": 1800
+  },
+  "historical8": {
+    "id": "combined-historical8-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/splash.metallib",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "--draft-block-size",
+      "8",
+      "--cohort",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "--samples",
+      "1",
+      "--ane-ffn-share",
+      "0",
+      "--max-context",
+      "32768",
+      "--progress",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/combined-historical8-v1.progress.jsonl"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/splash.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/host-step.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/study-driver": "98f2dc0fbf1818ae98542c12d43e552eeae1924ad84e39a02bf2fff94687401e",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch": "4bab304674804fb8e1d70d42f29752feea98e6160a0735b83e8d7725ee4a68e2"
+    },
+    "timeout_seconds": 1800
+  },
+  "clone3": {
+    "id": "combined-clone3-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/splash.metallib",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "--draft-block-size",
+      "16",
+      "--cohort",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/calibration-smoke3-v1.txt",
+      "--samples",
+      "1",
+      "--ane-ffn-share",
+      "0",
+      "--max-context",
+      "32768",
+      "--progress",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/combined-clone3-v1.progress.jsonl",
+      "--study-width",
+      "3"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/splash.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/host-step.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/calibration-smoke3-v1.txt",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/study-driver": "98f2dc0fbf1818ae98542c12d43e552eeae1924ad84e39a02bf2fff94687401e",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/calibration-smoke3-v1.txt": "0f833f16d7aa2b9f18bfc7d41d243a94f4bcd63d8f5e13fd147fdf5d4555142b",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch": "4bab304674804fb8e1d70d42f29752feea98e6160a0735b83e8d7725ee4a68e2"
+    },
+    "timeout_seconds": 1800
+  },
+  "clone4": {
+    "id": "combined-clone4-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/splash.metallib",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "--draft-block-size",
+      "16",
+      "--cohort",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/kernel-smoke3-cap256-v1.txt",
+      "--samples",
+      "1",
+      "--ane-ffn-share",
+      "0",
+      "--max-context",
+      "32768",
+      "--progress",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/combined-clone4-v1.progress.jsonl",
+      "--study-width",
+      "4"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/splash.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/host-step.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/kernel-smoke3-cap256-v1.txt",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/study-driver": "98f2dc0fbf1818ae98542c12d43e552eeae1924ad84e39a02bf2fff94687401e",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v2/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/kernel-smoke3-cap256-v1.txt": "4197b200cd24e583b19b973c032e33beda6026dc406ffe6331559329406a3246",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch": "4bab304674804fb8e1d70d42f29752feea98e6160a0735b83e8d7725ee4a68e2"
+    },
+    "timeout_seconds": 1800
+  }
+}

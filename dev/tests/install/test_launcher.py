@@ -610,6 +610,7 @@ class LauncherTests(unittest.TestCase):
             "--offline",
             "--revision",
             "--draft-model",
+            "--draft-block-size",
             "--mmproj",
         }
         self.assertIn("--max-memory", flags)
@@ -1378,7 +1379,7 @@ class LauncherTests(unittest.TestCase):
                     )
                 self.assertEqual(failed.exception.code, 2)
                 self.assertIn(
-                    "argument --draft-model: must be a local DFlash2 draft "
+                    "argument --draft-model: must be a local DFlash2 or DSpine draft "
                     "directory or a Hugging Face repository ID",
                     error.getvalue(),
                 )

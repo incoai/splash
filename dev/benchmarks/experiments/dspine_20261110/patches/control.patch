@@ -1,0 +1,12 @@
+diff --git a/dev/benchmarks/backend_benchmark.mm b/dev/benchmarks/backend_benchmark.mm
+index 5f5fb35e..aa669607 100644
+--- a/dev/benchmarks/backend_benchmark.mm
++++ b/dev/benchmarks/backend_benchmark.mm
+@@ -1090,6 +1090,7 @@ int main(int argc, char **argv) {
+     engine::EngineConfig engineConfig;
+     engineConfig.maxContext = bootstrap->nativeLoop().statusSnapshot().maximumContextTokens;
+     engineConfig.vocabularySize = capabilities.vocabularySize;
++    engineConfig.draftContextTokens = config.model.draft.contextTokens;
+     engine::connectToGovernor(engineConfig, resources->memoryGovernor());
+     engine::Engine engine(engineConfig, resources->cache(),
+                                   *executor, events);

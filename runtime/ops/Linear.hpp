@@ -4,6 +4,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/KernelCalibration.hpp"
+#include "ops/DecodeGeometry.hpp"
 #include "ops/Weights.hpp"
 
 #include <algorithm>
@@ -87,7 +88,7 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // tile's storage rows.
 enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister, GgufPrefillInt8 };
 // The decode tiles hold at most a full decode batch.
-inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
+inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * DecodeGeometry::maximumRows;
 // The staged tile's tallest height, which holds prefill chunks of up to this
 // many rows (ProjectionCalibration::stagedPrefillRows).
 inline constexpr uint32_t kMaximumStagedPrefillRows = 64;
@@ -110,6 +111,7 @@ struct LinearWorkload final {
   uint32_t rows = 0;
   LinearPhase phase = LinearPhase::Decode;
   LinearEpilogue epilogue = LinearEpilogue::None;
+  DecodeGeometry geometry{};
   auto operator<=>(const LinearWorkload &) const = default;
 };
 
@@ -136,6 +138,10 @@ struct LinearConfig final {
   // (gguf_rotate_int8), into the int8 tiles (gguf_decode_int8_pq20_m<rows>_*)
   // at the plan's storage rows, splits, spread and passes.
   bool decodeInt8 = false;
+  // A smaller staged compute tile within the plan's storage. Zero uses the
+  // storage height. The 48-row gate/up tile keeps 64-row allocation and
+  // split-partial strides while skipping the padding rows of three lanes.
+  uint32_t computeRows = 0;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }
@@ -217,6 +223,9 @@ public:
   [[nodiscard]] LinearConfig configuration() const noexcept { return config_; }
   [[nodiscard]] FloatOutput destination() const noexcept { return destination_; }
   [[nodiscard]] uint32_t storageRows() const noexcept;
+  [[nodiscard]] uint32_t computeRows() const noexcept {
+    return config_.computeRows ? config_.computeRows : storageRows();
+  }
   // The layout the producer of this plan's input writes. A rotated
   // projection prepares its table from the rotated rows itself
   // (LinearGguf.cpp), so its producer writes plain rows.
@@ -261,7 +270,10 @@ enum class Int8Activations : uint8_t { Off, On };
 // which ExecutionPlans also gives its attention plans.
 class Linear final {
 public:
-  explicit Linear(const DeviceCapabilities &device, Int8Activations int8Activations) noexcept;
+  explicit Linear(const DeviceCapabilities &device, DecodeGeometry geometry = {}) noexcept;
+  explicit Linear(const DeviceCapabilities &device, Int8Activations int8Activations,
+                   DecodeGeometry geometry = {}) noexcept;
+  [[nodiscard]] DecodeGeometry geometry() const noexcept { return geometry_; }
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return calibration_; }
   [[nodiscard]] Int8Activations int8Activations() const noexcept { return int8Activations_; }
 
@@ -346,7 +358,9 @@ private:
                        const Projection *gate) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
+  DecodeGeometry geometry_;
   KernelCalibration calibration_;
+  bool measuredM5Pro20_ = false;
   Int8Activations int8Activations_;
 };
 

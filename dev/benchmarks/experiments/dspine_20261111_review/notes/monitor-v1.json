@@ -1,0 +1,13 @@
+{
+  "started_utc": "2026-11-11T06:00:11.924968+00:00",
+  "monitor_pid": 39881,
+  "hardware_pid": 39889,
+  "awake_pid": 39890,
+  "hardware_command": [
+    "/Users/linson/Documents/ai/splash-inference-lab-20261031/tools/macmon",
+    "pipe",
+    "-i",
+    "2000"
+  ],
+  "hardware_sha256": "57259ce6845d0904be247c8e860fcc923300bab52e28a01f476c22c852051286"
+}

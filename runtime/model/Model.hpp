@@ -297,7 +297,8 @@ struct DispatchDraftCapturePlan final {
 // there.
 [[nodiscard]] DraftContextPlan
 planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
-                 std::span<const uint32_t> materializationBoundaries);
+                 std::span<const uint32_t> materializationBoundaries,
+                 uint32_t window = SPLASH_DRAFT_SLIDING_WINDOW);
 
 [[nodiscard]] DispatchDraftCapturePlan
 draftCaptureSpansForDispatch(const DraftContextPlan &plan,
@@ -597,11 +598,11 @@ maskWordsPerToken(uint32_t vocabularySize) noexcept {
   return static_cast<uint32_t>((uint64_t{vocabularySize} + 31) / 32);
 }
 
-// Compile-time ceiling of the one native DFlash execution contract: the
+// Compile-time ceiling of the native eight-row draft execution contract: the
 // kernels' ABI values (metal/abi/ExecutionGeometry.h) under the runtime's
 // names, and limits of the runtime's own. A draft must have been trained for
-// blocks of draftQueryRows rows over draftContextTokens context tokens, which
-// inspectModelRoot checks a DFlash2 checkpoint's config for. Cache-page and
+// at least draftQueryRows rows. draftContextTokens is DFlash2's default;
+// each checkpoint's layout supplies its context capacity. Cache-page and
 // attention-kernel geometry live with their operators.
 struct ExecutionLimits final {
   static constexpr uint32_t maximumBatchWidth = SPLASH_MAXIMUM_BATCH_WIDTH;
@@ -882,6 +883,8 @@ public:
   // The state bytes a lane's start allocates: the buffers the idle pool
   // lacks for its lane. Zero by default.
   [[nodiscard]] virtual uint64_t startStateBytes() const noexcept { return 0; }
+  // The fixed number of target rows a decode cycle verifies for each lane.
+  [[nodiscard]] virtual uint32_t decodeRows() const noexcept { return ExecutionLimits::targetVerifyRows; }
   // What one prefill command may hold (commandViolation): by default a
   // chunk's rows in one pass over one layer, one lane past a chunk and no
   // lane whose history holds Index pages, as a model without readers of

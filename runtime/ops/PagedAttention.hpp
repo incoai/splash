@@ -50,8 +50,8 @@ static_assert(kVerifySplits <= kVerifyMaximumSplits);
 // prefill tile's) reads with a window of windowTokens keys before each row:
 // its keys span windowTokens + kVerifyRows tokens, which may straddle a page
 // boundary at either end.
-[[nodiscard]] constexpr uint32_t windowAttentionPages(uint32_t windowTokens) noexcept {
-  return (windowTokens + kVerifyRows - 1 + kPageTokens - 1) / kPageTokens + 1;
+[[nodiscard]] constexpr uint32_t windowAttentionPages(uint32_t windowTokens, uint32_t verifyRows = kVerifyRows) noexcept {
+  return (windowTokens + verifyRows - 1 + kPageTokens - 1) / kPageTokens + 1;
 }
 
 // One lane's verify split count of the page loop: one split per
@@ -64,14 +64,14 @@ static_assert(kVerifySplits <= kVerifyMaximumSplits);
 // (kernels/common/sparse_attention_tile.h). Whether a lane's queries score
 // as INT8 follows the batch's longest lane (ops::PagedAttention::verifyPlan).
 [[nodiscard]] constexpr uint32_t
-verifyAttentionSplits(uint32_t committedTokens, uint32_t windowTokens = 0) noexcept {
-  const uint64_t visible = uint64_t{committedTokens} + kVerifyRows;
+verifyAttentionSplits(uint32_t committedTokens, uint32_t windowTokens = 0, uint32_t verifyRows = kVerifyRows) noexcept {
+  const uint64_t visible = uint64_t{committedTokens} + verifyRows;
   const uint64_t pages = (visible + kPageTokens - 1) / kPageTokens;
   const uint64_t scaled =
       (pages + kVerifyPagesPerSplit - 1) / kVerifyPagesPerSplit;
   const uint32_t splits = static_cast<uint32_t>(std::min<uint64_t>(
       std::max<uint64_t>(kVerifySplits, scaled), kVerifyMaximumSplits));
-  return windowTokens ? std::min(splits, windowAttentionPages(windowTokens)) : splits;
+  return windowTokens ? std::min(splits, windowAttentionPages(windowTokens, verifyRows)) : splits;
 }
 
 inline constexpr uint32_t kChunkedPrefillMaximumRows =
@@ -91,11 +91,12 @@ chunkedPrefillRequiredPages(const ChunkedPrefillParams &params) noexcept {
 }
 
 [[nodiscard]] constexpr std::string_view
-chunkedPrefillValidationError(const ChunkedPrefillParams &params) noexcept {
+chunkedPrefillValidationError(const ChunkedPrefillParams &params, uint32_t verifyRows = kVerifyRows) noexcept {
+  if (verifyRows != 8 && verifyRows != 16) return "verify_rows_out_of_range";
   if (!params.chunk_tokens || params.chunk_tokens > kChunkedPrefillMaximumRows)
     return "chunk_tokens_out_of_range";
   if (uint64_t{params.committed_tokens} + params.chunk_tokens >
-      kMaximumPhysicalTokens)
+      uint64_t{kMaximumLogicalTokens} + verifyRows - 1)
     return "context_out_of_range";
   if (params.chunk_stride < params.chunk_tokens ||
       params.chunk_stride > kChunkedPrefillMaximumRows ||
@@ -163,6 +164,7 @@ private:
 };
 
 struct VerifyAttentionPlan final {
+  const DecodeGeometry geometry;
   const kv::Layout layout;
   const uint32_t queryHeads;
   const uint32_t lanes;
@@ -197,8 +199,8 @@ private:
                       metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
                       bool sparse, bool sinks, std::string locatedSplitPipeline, std::string storePipeline,
                       metal::DispatchSize storeGroups, metal::DispatchSize storeThreads, kv::Layout layout,
-                      uint32_t queryHeads)
-      : layout(layout), queryHeads(queryHeads), lanes(lanes), laneSplits(laneSplits),
+                      uint32_t queryHeads, DecodeGeometry geometry)
+      : geometry(geometry), layout(layout), queryHeads(queryHeads), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
         splitPipeline(std::move(splitPipeline)), reducePipeline(std::move(reducePipeline)),
         splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse), sinks(sinks),
@@ -302,7 +304,8 @@ public:
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
              std::span<const uint32_t> historyTokens, const AttentionCalibration &calibration,
-             Int8Activations int8Activations, AttentionVariant variant = {});
+             Int8Activations int8Activations, AttentionVariant variant = {}, DecodeGeometry geometry = {},
+             uint32_t maximumSplits = kv::kVerifyMaximumSplits);
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences
@@ -312,7 +315,8 @@ public:
   prefillWorkspace(uint32_t maximumRows, uint32_t queryHeads,
                    kv::Layout layout);
   [[nodiscard]] static AttentionWorkspace
-  verifyWorkspace(uint32_t lanes, uint32_t queryHeads, kv::Layout layout);
+  verifyWorkspace(uint32_t lanes, uint32_t queryHeads, kv::Layout layout, DecodeGeometry geometry = {},
+                  uint32_t maximumSplits = kv::kVerifyMaximumSplits);
   // Whether the compiled geometry of `queryHeads` over a layout's KV heads
   // (kCompiledAttention) computes attention as a target's layout states it:
   // gated or not, rotating `rotaryPairs` pairs. Throws for a geometry with
@@ -347,7 +351,7 @@ public:
                       metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
                       metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
                       metal::MetalBuffer chunkValues, uint32_t queryHeads,
-                      kv::Layout layout, uint32_t lanes, AttentionVariant variant = {});
+                      kv::Layout layout, uint32_t lanes, AttentionVariant variant = {}, DecodeGeometry geometry = {});
   // Also writes the out-projection's `input` table into `scratch` when it is
   // not Plain, and throws when `scratch` cannot hold it.
   static PreparedInput addVerifyGate(metal::CommandGraph &graph,
@@ -356,17 +360,17 @@ public:
                                      metal::MetalBuffer hidden,
                                      uint32_t queryHeads, kv::Layout layout,
                                      uint32_t lanes, LinearScratch scratch,
-                                     LinearInput input);
+                                     LinearInput input, DecodeGeometry geometry = {});
 
   // A lane's parameters; each layer's encoding adds the layer's place in
   // the extents.
   [[nodiscard]] static kv::ChunkedPrefillParams
   prefillParams(uint64_t logicalPosition, uint32_t chunkTokens,
-                uint32_t chunkStride, uint32_t pageTableEntries);
+                uint32_t chunkStride, uint32_t pageTableEntries, DecodeGeometry geometry = {});
   // A verify lane's chunk: its verify rows in kVerifyChunkStride rows of
   // staging, the only parameters addVerify attends.
   [[nodiscard]] static kv::ChunkedPrefillParams
-  verifyParams(uint64_t logicalPosition, uint32_t pageTableEntries);
+  verifyParams(uint64_t logicalPosition, uint32_t pageTableEntries, DecodeGeometry geometry = {});
 
   static void addPrefillStore(metal::CommandGraph &graph, SplashKvLayer layer,
                               metal::MetalBuffer chunkKeys,

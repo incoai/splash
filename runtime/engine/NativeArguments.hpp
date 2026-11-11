@@ -87,6 +87,8 @@ struct NativeArguments final {
   // --verify-rows auto|all: the rows of the draft's block a decode
   // cycle verifies (RuntimeResourcesConfig::verifyRows).
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // The model's fixed draft block width; sixteen requires dense DSpine.
+  uint32_t draftBlockSize = 8;
   // --activations auto|bf16: whether activations may round to int8 where
   // an int8-activation path takes them
   // (RuntimeResourcesConfig::int8Activations).

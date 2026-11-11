@@ -664,19 +664,20 @@ void requireQuantization(NSDictionary *config, const QwenTargetDimensions &geome
 DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimensions &target) {
   NSArray *architectures =
       requireArray(draft, @"architectures", "draft architectures");
+  const bool dspine = architectures.count == 1 && [architectures[0] isEqual:@"DFlashDraftModel"];
   if (architectures.count != 1 ||
-      ![architectures[0] isEqual:@"DFlash2DraftModel"])
-    throw std::invalid_argument("draft is not a DFlash2 model");
+      (!dspine && ![architectures[0] isEqual:@"DFlash2DraftModel"]))
+    throw std::invalid_argument("draft is not a DFlash2 or DSpine model");
   requireNumbers(draft, "checkpoint", "draft config",
                  {{"hidden_size", target.hiddenSize},
                   {"vocab_size", target.vocabularySize},
                   {"num_attention_heads", SPLASH_DRAFT_QUERY_HEADS},
                   {"num_key_value_heads", SPLASH_DRAFT_KV_HEADS},
                   {"head_dim", SPLASH_DRAFT_HEAD_DIMENSION},
-                  {"sliding_window", ExecutionLimits::draftContextTokens},
+                  {"sliding_window", dspine ? 8192u : ExecutionLimits::draftContextTokens},
                   {"rms_norm_eps", SPLASH_RMS_EPSILON}});
   requireBooleans(draft, "draft config",
-                  {{"is_causal", false},
+                  {{"is_causal", dspine},
                    {"attention_bias", false},
                    {"tie_word_embeddings", false}});
   requireEqual(requireString(draft, @"hidden_act", "draft config hidden_act"),
@@ -688,7 +689,8 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                "default", "checkpoint", "draft config rope_parameters rope_type");
   NSDictionary *flash =
       requireObject(draft, @"dflash_config", "draft config dflash_config");
-  requireNumbers(flash, "checkpoint", "draft config dflash_config",
+  if (!dspine) {
+    requireNumbers(flash, "checkpoint", "draft config dflash_config",
                  {{"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
                   {"conv_kernel_size", SPLASH_DRAFT_CONVOLUTION_TAPS},
                   {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
@@ -701,6 +703,38 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
       ExecutionLimits::draftQueryRows)
     throw std::invalid_argument("draft config dflash_config block_size is less than the " +
                                 std::to_string(ExecutionLimits::draftQueryRows) + " rows a cycle drafts");
+  } else {
+    requireNumbers(draft, "checkpoint", "DSpine config", {{"block_size", 16}, {"num_hidden_layers", 5}});
+    requireNumbers(flash, "checkpoint", "DSpine config", {{"mask_token_id", target.maskToken}});
+    requireBooleans(flash, "DSpine config", {{"draft_block_causal", true},
+        {"selected_prefix_terminal", false}, {"selected_prefix_feature_writes", true}});
+    requireEqual(requireString(flash, @"selected_prefix_decode_mode", "DSpine decode mode"),
+                 "serial", "checkpoint", "DSpine decode mode");
+    requireEqual(requireString(flash, @"selected_prefix_feature_write_mode", "DSpine write mode"),
+                 "independent", "checkpoint", "DSpine write mode");
+    NSDictionary *bridge = requireObject(flash, @"selected_prefix_code_bridge", "DSpine code bridge");
+    requireNumbers(bridge, "checkpoint", "DSpine code bridge", {{"code_size", 1024}, {"rank", 512}, {"eps", 1e-6}});
+    NSArray *writes = requireArray(flash, @"selected_prefix_feature_layers", "DSpine feature layers");
+    if (![writes isEqualToArray:@[@1, @2, @3, @4, @5]])
+      throw std::invalid_argument("DSpine requires a bridge write after every draft layer");
+    NSDictionary *second = requireObject(draft, @"code_bridge_second_pass", "DSpine refinement");
+    requireNumbers(second, "checkpoint", "DSpine refinement", {{"first_exact", 4}, {"head_topk", 16}});
+    requireEqual(requireString(second, @"mode", "DSpine refinement mode"),
+                 "serial_table", "checkpoint", "DSpine refinement mode");
+    NSDictionary *refine = requireObject(flash, @"selected_prefix_last_write_refine", "DSpine last write");
+    requireNumbers(refine, "checkpoint", "DSpine last write", {{"head_topk", 16}, {"version", 1}});
+    requireEqual(requireString(refine, @"kind", "DSpine last write kind"),
+                 "exact_sender", "checkpoint", "DSpine last write kind");
+    for (NSString *key in @[@"conv_group_size", @"conv_kernel_size", @"selector_rank", @"selector_top_k"])
+      if (flash[key] && requireWhole(flash[key], "DSpine unsupported field") != 0)
+        throw std::invalid_argument("DSpine does not use grouped convolutions or the DFlash2 selector");
+    if (flash[@"selected_prefix_feature_next_token_rows"])
+      requireBooleans(flash, "DSpine config", {{"selected_prefix_feature_next_token_rows", false}});
+    if (flash[@"selected_prefix_terminal_residual_rank"])
+      requireNumbers(flash, "checkpoint", "DSpine config", {{"selected_prefix_terminal_residual_rank", 0}});
+    if (flash[@"selected_prefix_feature_reliability"] && flash[@"selected_prefix_feature_reliability"] != [NSNull null])
+      throw std::invalid_argument("DSpine feature reliability probes are not supported");
+  }
   // How a target layer's output row becomes the hidden values the draft reads
   // of it, as the draft was trained (target_hidden_reduction): a
   // hyper-connected target's streams by their mean (Qwen4ExpTarget's
@@ -718,12 +752,18 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
     if (targetLayers.back() >= target.layers)
       throw std::invalid_argument("draft config target_layer_ids names a layer past the target's");
   }
-  const DFlashDraftLayout layout =
+  DFlashDraftLayout layout =
       draftLayout(target.hiddenSize, target.vocabularySize,
                   requireWhole(draft[@"num_hidden_layers"], "draft config num_hidden_layers"),
                   requireWhole(draft[@"intermediate_size"], "draft config intermediate_size"),
                   requireNumber(rope[@"rope_theta"], "draft config rope_parameters rope_theta").floatValue,
                   targetLayers);
+  if (dspine) {
+    layout.architecture = DraftArchitecture::DSpine;
+    layout.contextTokens = 8192;
+    layout.bridgeCodeSize = 1024;
+    layout.bridgeRank = 512;
+  }
   return layout;
 }
 
@@ -899,6 +939,13 @@ ModelDescriptor servedFor(ModelDescriptor model, uint32_t contextTokens) {
         model.capabilities.maximumContextTokens = layout.servedContextTokens(model.ropeScaling);
       },
       model.target);
+  // A request within the compiled 2K window cannot consume any of the
+  // checkpoint's later keys. Keep the full checkpoint window otherwise.
+  if (model.draft.isDSpine()) {
+    model.draft.contextTokens = contextTokens && contextTokens <= SPLASH_DRAFT_SLIDING_WINDOW
+                                  ? SPLASH_DRAFT_SLIDING_WINDOW : 8192;
+    model.stateLayout.draft = model.draft.stateLayout();
+  }
   return model;
 }
 

@@ -1,0 +1,18 @@
+{
+  "candidate": "Archived PR653 M16 dispatch policy on current native8 DSpine; no precision, draft width, model or target changes.",
+  "frozen_utc": "2026-11-10T04:18:21.278269+00:00",
+  "cohort_sha256": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf",
+  "wrapper_sha256": "f8dd4022ef72425991ce9382b341984e0c607617de25eafc40c80298901de224",
+  "groups": 3,
+  "rounds_per_group": [
+    "control",
+    "candidate",
+    "candidate",
+    "control"
+  ],
+  "samples_per_case_per_round": 1,
+  "operating_gate": "Before each round, three consecutive observations thermal nominal, GPU<=70C, CPU active<=15%, telemetry age<=8s. Wait at most300s and retain failures. During round, serious/critical thermal state or swap invalidates qualification.",
+  "primary": "Sum decode time divided by decode tokens over the30 predeclared primary cases. Keep count_secondary as control.",
+  "threshold": "Every primary group latency improvement must exceed max(2%,2x aggregate endpoint spread); every included case/control endpoint spread <=5%; all greedy output arrays must match; all3 groups required. No repeat-to-pass.",
+  "scope": "Single Mac, native serial requests, these frozen cases. Independent heldout12 only after nomination; HTTP/concurrency/lifecycle remain separate."
+}

@@ -1,0 +1,18 @@
+{
+  "frozen_utc": "2026-11-10T06:54:18.545151+00:00",
+  "prefix": "native-dflash-vs-dspine16-abba",
+  "groups": 3,
+  "order": [
+    "DF8M16",
+    "DS16twoPass",
+    "DS16twoPass",
+    "DF8M16"
+  ],
+  "cohort_sha256": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf",
+  "primary": "Samepredeclared30historicalcode/prose/structuredcases,6523decodeoutputtokensinDSscreens;count_secondaryretainedcontrolandexcludedprimary. Differentcohortandnativeendpointfromthefailed4promptHTTPexperiment. No measurementsyetforthiscomparison.",
+  "endpoint": "Nativecoldserialdecodewallmpt=(wall-ttft)/(outputtokens-1), aggregate sums, samequalify_abba output/noise/positiveeffectgates as earlierDS8-vs16. All3groupsrequired, norepeat-to-pass. Recordpercaseeffects.",
+  "operating": "Newcontrolled_round_v2 start includesminimum60sidle,3freshnominalobservationsGPU<=65C,CPU<=15%,GPUpower<1W;300smaximum. Runtimecritical/serious andswapinvalidate. CaptureGPUfrequencywithoutposthocfrequencyexclusions.",
+  "motivation": "Userasksbothdrafterscompared. Broad30caseserialendpointwasnotyetdirectlytestedagainstDF8. ShortHTTPDF-vsDS16 timingfailednoisegate;thisdifferentbenchmarkdoesnotreplaceorrepairthatresult.",
+  "source": "Existingimmutable8M16and16hostonlywidepolicy artifacts, unchangedtargetsourcefiles. No new optimizationchosenfromheldoutor sampling outcomes.",
+  "position": "Afterallsampling/lifecycle/featurebuildsandGPUscreens, so no heavybuildsinterleave the12timedrounds."
+}

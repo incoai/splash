@@ -1,0 +1,22 @@
+{
+  "frozen_utc": "2026-11-10T07:59:11.212791+00:00",
+  "cohort_sha256": "7af1cfc754940891e752efdd4181f86dcfdbe1216c17d9ace854a0b15370782b",
+  "lengths": [
+    31,
+    32,
+    33,
+    8191,
+    8192,
+    8193,
+    16383,
+    16384,
+    16385
+  ],
+  "output_cap": 48,
+  "purpose": "Cold native exactPage32and8192draftwindowboundary probes atsameinputs8vs16. Chatframingandquestiontokenskept;fillerisfixedtokenrepetitiontruncatedtoexactlength,notanatural-languagequalitybenchmark. Fulloutputarraysandfailuresretained. ShaderoraclesandlongHTTPdisklifecycleareseparate.",
+  "jobs": [
+    "geometry-boundaries-dspine8-v1",
+    "geometry-boundaries-dspine16-v1"
+  ],
+  "interpretation": "Functionalgeometrycheckonly;unpairedtimingnotqualified. No tuningfromresults."
+}

@@ -1,0 +1,35 @@
+{
+  "verified_utc": "2026-11-10T20:56:44.159356+00:00",
+  "runtime_source_commit": "17a0ae2454ef567a599ccd64373d25fc7df9313b",
+  "integration_commit": "fb429642850299f81def93e730b84131fb075cde",
+  "frozen_build_manifest_sha256": "272e84e33c13b3930ae11fb3a9a3f0dbfa948983c91b3c239d2134be27e831eb",
+  "allowed_differences": {
+    "app/Sources/Splash/Preferences.swift": {
+      "frozen": "6cd3043f5c5a435b69c25237aa45cbe4b786e40be1c041f7eac36a3528bad0bd",
+      "integrated": "9ee903ba05ba6eeff0e5209bcc3bcb7e17ebcf47c70566828b6bee3e721b1461"
+    },
+    "app/Tests/SplashTests/SplashTests.swift": {
+      "frozen": "3d17f0de5ec6ca00d8a9007b41dd90476710a7baf2638f574e568707b63ab70f",
+      "integrated": "103dbdf042fb0c340d5bca71825986995d2a61eb13088254f98af22292f89797"
+    },
+    "dev/tests/install/test_launcher.py": {
+      "frozen": "71338597d1faa3a2e339db33226f3d5f4059240358c25fdb44d254a50e67f05a",
+      "integrated": "30a4f94053b0734b20e93d7cb9b37265eacbe19d1061e073c3263f62cfa79fb2"
+    },
+    "dev/tests/server_fixtures.py": {
+      "frozen": "0a5a218bc9bc60d1e811c4596298fe59b8ab125a678325a99cf39f1eb395350b",
+      "integrated": "ef3421a0b625f99f9487938f73f820a7d974b4d279e9737d2fd50107d369519c"
+    },
+    "docs/api.md": {
+      "frozen": "76f26b444dea0d2339c6628c8afc84fb05fb08cca9bdc0d3a5684d3ae59b1adf",
+      "integrated": "ec486dbf53729bd8aea18b374e3442f947a2209128eb90ed7e79786bb5684c16"
+    },
+    "docs/server.md": {
+      "frozen": "8d86ac863fa30e8892c5801b1cfb84f3ff29ae2976c60a42a3b51744b96d4666",
+      "integrated": "01af568049242152d532bdf1fc840cc548e1354a2d507ba7bc747f852f475cd7"
+    }
+  },
+  "all_other_manifest_source_bytes_match": true,
+  "production_binary_unchanged": true,
+  "production_library_unchanged": true
+}

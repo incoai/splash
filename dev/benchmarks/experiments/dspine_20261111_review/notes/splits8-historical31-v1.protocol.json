@@ -1,0 +1,40 @@
+{
+  "prepared_utc": "2026-11-11T05:59:46.118842+00:00",
+  "base": "37bdd4f8710319bfad43709de2725df89ef776d3",
+  "purpose": "Isolate staged split/pass selection based on eight-row policy at fixed sixteen-row runtime. Complete historical arrays compare against retained final8 and final16. Functional numerical diagnostic; request timings are exploratory. No source nomination from fresh agent/mixed-serving cohorts.",
+  "job": {
+    "id": "splits8-historical31-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-splits8-v2/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-splits8-v2/splash.metallib",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "--draft-block-size",
+      "16",
+      "--cohort",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "--samples",
+      "1",
+      "--ane-ffn-share",
+      "0",
+      "--max-context",
+      "32768",
+      "--progress",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/splits8-historical31-v1.progress.jsonl"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-splits8-v2/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-splits8-v2/splash.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-splits8-v2/host-step.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/splits8-diagnostic-v1.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-splits8-v2/study-driver": "2b58acc13262049dc6d7d74d57bc8856dbf51d53350fe3fdf63756471eb7278a",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-splits8-v2/splash.metallib": "f60d2e950c6a6c69ec7472b5ec7778de437edae81a57834b9cc2c08af0bac039",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-splits8-v2/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/splits8-diagnostic-v1.patch": "5909a4e4cd1f915f449ea49544aeabbd1358dcf6326d31fef12f5f1b8d85c9c1"
+    },
+    "timeout_seconds": 1800
+  }
+}

@@ -369,6 +369,37 @@ void checkArenasWithoutGdnLayers() {
           "the decode arena without GDN layers is not a hybrid's without its GDN scratch");
 }
 
+// Refinement scratch is one FP32 message/state per lane, reused across
+// positions. It belongs to the accounted arena only for the DSpine graph.
+void checkDSpineRefinementScratch() {
+  using model::DecodeTensor;
+  const auto sizes = [&](model::DFlashDraftLayout draft, ops::Int8Activations activations,
+                         ops::DecodeGeometry execution = {}) {
+    const ops::ExecutionPlans plans(DeviceCapabilities{}, activations, execution);
+    const auto loaded = loadedModel<model::Qwen3_8Weights>({}, draft);
+    const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, execution);
+    return model::decodeTensorBytes(geometry, plans);
+  };
+  auto draft = test::qwen3_8Draft();
+  const auto at = [](DecodeTensor tensor) { return static_cast<uint32_t>(tensor); };
+  for (const auto activations : {ops::Int8Activations::On, ops::Int8Activations::Off}) {
+    const auto dflash = sizes(draft, activations);
+    require(!dflash[at(DecodeTensor::BridgeRefineMessage)] && !dflash[at(DecodeTensor::BridgeRefineState)],
+            "DFlash2 reserves DSpine refinement scratch");
+    auto dspineDraft = draft;
+    dspineDraft.architecture = model::DraftArchitecture::DSpine;
+    dspineDraft.contextTokens = 8192;
+    dspineDraft.bridgeCodeSize = 1024;
+    dspineDraft.bridgeRank = 512;
+    for (const uint32_t rows : {8U, 16U}) {
+      const auto dspine = sizes(dspineDraft, activations, ops::DecodeGeometry(rows));
+      require(dspine[at(DecodeTensor::BridgeRefineMessage)] == uint64_t{dspineDraft.bridgeRank} * sizeof(float) &&
+                  dspine[at(DecodeTensor::BridgeRefineState)] == uint64_t{dspineDraft.hiddenSize} * sizeof(float),
+              "DSpine refinement scratch does not reserve one FP32 message/state per lane");
+    }
+  }
+}
+
 // Arenas are sized from the projections the weights hold, so each must have
 // sizes; an empty one would drop its workspace from the bound silently.
 void checkUnsizedProjection() {
@@ -455,8 +486,58 @@ void checkPrefillAttentionHistory() {
   require(splitsAfter(65'536) > splitsAfter(0), "a chunk's attention plan does not follow its history");
 }
 
+// Startup prepares a longest-history verify without executing it. Its
+// history must fit the same served-context scratch bound as real requests,
+// even when the loaded descriptor retains its larger native window.
+void checkWarmupVerifyHistoryBound() {
+  auto draft = test::qwen3_8Draft();
+  draft.architecture = model::DraftArchitecture::DSpine;
+  draft.contextTokens = 8192;
+  draft.bridgeCodeSize = 1024;
+  draft.bridgeRank = 512;
+  const auto loaded = loadedModel<model::Qwen3_8Weights>({}, draft);
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  for (const auto activations : {ops::Int8Activations::On, ops::Int8Activations::Off}) {
+    for (const uint32_t rows : {8U, 16U}) {
+      const ops::DecodeGeometry execution(rows);
+      const auto geometry = model::RuntimeGeometry::from(
+          loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, execution);
+      require(geometry.target.contextTokens() == 262'144,
+              "warmup fixture lost the target's larger native window");
+      const auto check = [&](uint32_t bound, uint32_t expectedHistory) {
+        const ops::ExecutionPlans plans(device, activations, execution, bound);
+        const uint32_t history = geometry.warmupVerifyHistory(plans);
+        require(history == expectedHistory, "verify warmup did not respect its served-context history bound");
+        const auto sizes = model::decodeTensorBytes(geometry, plans);
+        std::array<uint32_t, model::kLaneCount> histories;
+        histories.fill(history);
+        for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes) {
+          const auto plan = plans.verifyAttention(lanes, geometry.target.attentionQueryHeads,
+              geometry.target.kvLayout, std::span(histories).first(lanes));
+          require(plan.workspace.partialsBytes <= lanes * sizes[uint32_t(model::DecodeTensor::AttentionPartials)] &&
+                      plan.workspace.statisticsBytes <= lanes * sizes[uint32_t(model::DecodeTensor::AttentionStatistics)] &&
+                      plan.splits <= plans.maximumVerifySplits(),
+                  "longest warmup verify exceeds the decode arena's served-context scratch");
+        }
+      };
+      check(16'384, 16'384 - rows);
+      check(0, 262'144 - rows);
+      check(rows, 0);
+      check(rows - 1, 0);
+      auto shorter = geometry;
+      shorter.target.nativeContextTokens = 4096;
+      const ops::ExecutionPlans largerBound(device, activations, execution, 16'384);
+      require(shorter.warmupVerifyHistory(largerBound) == 4096 - rows,
+              "verify warmup exceeded a model window shorter than the plan's bound");
+    }
+  }
+}
+
 int main() {
   try {
+    checkWarmupVerifyHistoryBound();
     checkPrefillAttentionHistory();
     checkUnsizedProjection();
     checkCaptureLayers();
@@ -466,6 +547,7 @@ int main() {
     checkIndexTables();
     checkSpilledKvGeometry();
     checkArenasWithoutGdnLayers();
+    checkDSpineRefinementScratch();
     checkPrefillInt8Scratch();
     checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());

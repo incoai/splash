@@ -16,7 +16,7 @@ prefill_draft_context_kv(device const bfloat *context_kv [[buffer(0)]],
   threadgroup float reductions[8];
   threadgroup bfloat normalized[SPLASH_DRAFT_HEAD_DIMENSION];
   draft_context_kv_phase(context_kv, k_norm, rope_cos, rope_sin, keys, values,
-                         params.start_position, params.tokens, task,
+                         params.start_position, params.tokens, task, params.window,
                          thread_index, lane, simd_group, reductions,
                          normalized);
 }
@@ -40,7 +40,7 @@ inline bool draft_context_group(constant DraftContextWindowParams &params,
   result.row = task / result.groups;
   result.group = task % result.groups;
   result.slot =
-      (params.start_position + result.row) % SPLASH_DRAFT_SLIDING_WINDOW;
+      (params.start_position + result.row) % params.window;
   return result.row < params.rows;
 }
 
@@ -75,7 +75,7 @@ prefill_draft_context_store(device const bfloat *context [[buffer(0)]],
       uchar(code.x | (code.y << 4));
   if (lane == 0) {
     device half2 *groups = reinterpret_cast<device half2 *>(
-        window + draft_context_codes_bytes(params.width));
+        window + draft_context_codes_bytes(params.width, params.window));
     groups[ulong(at.slot) * at.groups + at.group] = half2(scale, minimum);
   }
 }
@@ -94,7 +94,7 @@ prefill_draft_context_load(device const uchar *window [[buffer(0)]],
   if (!draft_context_group(params, threadgroup_index, simd_group, at))
     return;
   device const half2 *groups = reinterpret_cast<device const half2 *>(
-      window + draft_context_codes_bytes(params.width));
+      window + draft_context_codes_bytes(params.width, params.window));
   const half2 group = groups[ulong(at.slot) * at.groups + at.group];
   const uchar byte = window[ulong(at.slot) * (params.width / 2) +
                             at.group * (SPLASH_DRAFT_CONTEXT_GROUP / 2) + lane];
