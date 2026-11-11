@@ -44,7 +44,11 @@ struct MenuBarPanel: View {
             PanelRow(title: "Open Chat") { show(.chat) }
             Divider().padding(.horizontal, 8).padding(.vertical, 4)
             if !state.installed.isEmpty {
-                PanelRow(title: "Model", open: models) { withAnimation(Motion.settle) { models.toggle() } }
+                // Its rows, as Coding Agents' do, come and go at once, as a menu's items do: the
+                // panel's window takes its new height at once. Faded and slid in, they drew over
+                // the rows moving past them, a check under a chevron, the panel's content laid out
+                // off its window's middle until the animation ended.
+                PanelRow(title: "Model", open: models) { models.toggle() }
                 if models {
                     let checked = state.checkedModel
                     // As high as the rows up to some ten of them, then scrolling, so that a long
@@ -70,7 +74,7 @@ struct MenuBarPanel: View {
                     .disabled(!stop.enabled)
             }
             if server.phase == .ready {
-                PanelRow(title: "Coding Agents", open: agents) { withAnimation(Motion.settle) { agents.toggle() } }
+                PanelRow(title: "Coding Agents", open: agents) { agents.toggle() }
                 if agents {
                     // In the window's drawer, which comes forward; a folder is asked for first.
                     ForEach(Agent.allCases) { agent in
