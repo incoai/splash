@@ -383,9 +383,8 @@ private struct EngineSlot: View {
             } label: {
                 HStack(spacing: 6) {
                     mark
-                    // In place, as a control's title changes, while the slot moves with the
-                    // controls beside it: cross-faded as the server's stage changed, the words of a
-                    // switch drew over those of the model before.
+                    // In place, as a control's title changes: cross-faded as the server's stage
+                    // changed, the words of a switch drew over those of the model before.
                     Text(words).foregroundStyle(.secondary).contentTransition(.identity)
                     MenuChevron()
                 }
@@ -394,6 +393,14 @@ private struct EngineSlot: View {
                 .truncationMode(.middle)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
+                // The mark, the words and the chevron change places within the slot at once as
+                // the words change, while the slot moves whole with the controls beside it: on the
+                // server's stage's animation, the chevron trailed words that grew and drew over
+                // them, and the mark trailed words that moved and drew over their first letter.
+                // Only then, so that the mark's pose, which follows in an update of its own, keeps
+                // its animation.
+                .transaction(value: words) { $0.animation = nil }
+                .geometryGroup()
             }
             .help("Start or Switch Models")
             .accessibilityLabel("Model")

@@ -37,6 +37,48 @@ struct ChatScreenTests {
 }
 
 extension ChatScreenTests {
+    /// The composer's mark moves with its words as a switch of models moves them, its pose alone
+    /// changing on an animation of its own: in every frame the slot's ink, from the mark's start to
+    /// the chevron's end, spans what it does once settled. With its look's animation moving it
+    /// too, the mark trailed the words and drew over their first letter.
+    @Test func theComposersMarkMovesWithItsWords() async throws {
+        let fake = try FakeRuntime("splash-chat-mark", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await ServerScreenTests.launchedWithModels(fake)
+        defer { state.quit() }
+        state.options["--port"] = String(fake.port)
+        let steps = ["loaded", "warm"].map { fake.root.appending(path: $0) }
+        for step in steps { FileManager.default.createFile(atPath: step.path, contents: nil) }
+        state.start("mlx-community/Qwen3.8-27B-4bit")
+        try await waitFor(state.server.phase == .ready, "ready")
+        // The next model stays starting.
+        for step in steps { try FileManager.default.removeItem(at: step) }
+        state.section = .chat
+        let window = await Snapshot.window(MainView().environment(state), size: ServerPictures.size, appearance: .aqua)
+        defer { window.orderOut(nil) }
+        pump(0.5)
+        let field = try Self.field(in: window)
+        // The row under the text, from Attach Images to well short of the controls at its end.
+        let row = CGRect(x: field.minX - 10, y: window.frame.height - field.minY + 8, width: 330, height: 30)
+        /// How wide the ink in the row is, in points: whatever is not the composer's white.
+        func span(_ picture: NSBitmapImageRep) -> CGFloat {
+            let scale = CGFloat(picture.pixelsHigh) / window.frame.height, color = Self.colors(of: picture)
+            let inked = (Int(row.minX * scale)..<Int(row.maxX * scale)).filter { x in
+                (Int(row.minY * scale)..<Int(row.maxY * scale)).contains { y in
+                    let (r, g, b) = color(x, y)
+                    return (r + g + b) / 3 < 0.8 || max(r, g, b) - min(r, g, b) > 0.15
+                }
+            }
+            return CGFloat((inked.last ?? 0) - (inked.first ?? 0)) / scale
+        }
+        let frames = try await Self.frames(of: window) { state.choose("unsloth/flint-GGUF:UD-Q4_K_XL") }
+        let settled = span(frames.after)
+        let drawn = frames.drawn.map(span)
+        #expect(drawn.allSatisfy { abs($0 - settled) <= 2 }, "the slot's span per frame \(drawn), settled \(settled)")
+    }
+}
+
+extension ChatScreenTests {
     /// The first message of a new chat moves the composer to the foot with its Send button, which
     /// turns into Stop as it goes: in every frame the button keeps its place in the composer's row
     /// of controls, level with the mark at its start, as the change of its glyph moved it on a
