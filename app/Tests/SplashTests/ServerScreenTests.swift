@@ -729,21 +729,14 @@ extension ServerScreenTests {
         let end = try #require(scroll.documentView).frame.height - scroll.contentView.bounds.height + scroll.contentInsets.bottom
         scroll.scroll(by: end - scroll.contentView.bounds.minY)
         pump(0.3)
-        // The disclosure's row: its chevron at the row's start, a gap, then its title.
-        let picture = try #require(await Snapshot.picture(of: window))
-        let scale = CGFloat(picture.pixelsHigh) / window.frame.height, bytes = picture.bitsPerPixel / 8
-        func dark(_ x: CGFloat, _ y: Int) -> Bool {
-            let p = picture.bitmapData! + y * picture.bytesPerRow + Int(x * scale) * bytes
-            return (Int(p[0]) + Int(p[1]) + Int(p[2])) / 3 < 170
+        // The Advanced row, by the plain view in its background (`ViewAnchor`, which opening it
+        // scrolls to the top), so that the click doesn't depend on how a Mac draws its chevron.
+        func plainViews(in view: NSView) -> [NSView] {
+            view.subviews.flatMap { (type(of: $0) == NSView.self ? [$0] : []) + plainViews(in: $0) }
         }
-        func any(_ from: CGFloat, _ to: CGFloat, _ y: Int) -> Bool { stride(from: from, through: to, by: 1 / scale).contains { dark($0, y) } }
-        let matching = (0..<picture.pixelsHigh).filter { any(119, 127, $0) && !any(129, 133, $0) && any(135, 142, $0) }
-        // Bands of rows at least 4 points tall; the last one's middle.
-        let bands = matching.reduce(into: [[Int]]()) { bands, y in
-            if let last = bands.last?.last, last == y - 1 { bands[bands.count - 1].append(y) } else { bands.append([y]) }
-        }.filter { $0.count >= Int(4 * scale) }
-        let chevron = try #require(bands.last.map { $0[$0.count / 2] })
-        let point = NSPoint(x: 170, y: window.frame.height - CGFloat(chevron) / scale)
+        let row = try #require(plainViews(in: scroll.documentView!).last { $0.frame.width >= 300 })
+        let frame = row.convert(row.bounds, to: nil)
+        let point = NSPoint(x: frame.minX + 40, y: frame.midY)
         let closed = scroll.documentView!.frame.height
         let change = try await Self.pictures(of: window) {
             for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
