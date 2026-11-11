@@ -62,7 +62,8 @@ release-app: install-environment all
 
 # The app's own tests; the Python ones cover what packages it.
 check-app:
-	swift test --package-path app
+	# AppKit tests share NSApplication and window focus across suites.
+	swift test --package-path app --no-parallel
 
 # Uploads the built RELEASE_VERSION archive, its checksum, the tester installer
 # and the `latest` pointer to the private Hugging Face repo testers install
@@ -132,11 +133,11 @@ test-python: install-development $(TARGET)
 
 check-python: install-development test-python
 	$(PYTHON) -m compileall -q server install/*.py \
-		dev/tools dev/tests dev/benchmarks
+		dev/tools dev/tests dev/benchmarks draft_training
 	$(PYTHON) -m ruff check --config dev/ruff.toml server \
-		install/*.py dev/tools dev/tests dev/benchmarks
+		install/*.py dev/tools dev/tests dev/benchmarks draft_training
 	$(PYTHON) -m ruff format --check --config dev/ruff.toml server \
-		install/*.py dev/tools dev/tests dev/benchmarks
+		install/*.py dev/tools dev/tests dev/benchmarks draft_training
 
 # It parses the server's sources, which need the environment's Python
 # (3.12-3.14); BUILD_ID_PYTHON, the build tools' python3, may be Xcode's 3.9.
