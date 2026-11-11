@@ -1,6 +1,7 @@
 # A launcher that serves as a ready `splash serve` of a model that sees images and thinks: it reads
 # a prompt for 0.3 s, then streams a reply in parts over 0.7 s, and titles a chat after 0.4 s
-# (ChatScreenTests).
+# (ChatScreenTests). While a file `hold` is in the runtime's folder, a reply waits to start, so
+# that a test can draw what sending changes before the reply changes the window again.
 import json
 import os
 import runpy
@@ -49,6 +50,8 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(0.4)
             title = {"choices": [{"message": {"content": "A Title"}, "finish_reason": "stop"}]}
             return self.reply(title)
+        while (root / "hold").exists():
+            time.sleep(0.01)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()

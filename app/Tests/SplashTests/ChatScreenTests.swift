@@ -121,12 +121,18 @@ extension ChatScreenTests {
             return button - mark
         }
         let start = try Self.field(in: window).minY
+        // The reply waits while the frames are drawn: on a loaded Mac they took long enough for
+        // its first words to change the mark, which then matched no color.
+        let hold = fake.root.appending(path: "hold")
+        FileManager.default.createFile(atPath: hold.path, contents: nil)
+        defer { try? FileManager.default.removeItem(at: hold) }
         state.sendDraft()
         var places: [CGFloat?] = []
         for _ in 0..<10 {
             pump(0.025)
             places.append(try await button())
         }
+        try FileManager.default.removeItem(at: hold)
         #expect(try Self.field(in: window).minY < start - 100, "the composer moved to the foot")
         let end = try #require(places.last ?? nil)
         #expect(places.allSatisfy { $0.map { abs($0 - end) <= 2 } ?? false }, "the button against the mark: \(places)")
