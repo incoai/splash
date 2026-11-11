@@ -24,11 +24,18 @@ class PromptTokenizer:
     """Encodes prompts reusing a cached prompt's tokens up to its last
     `marker`, the chat template's special token at a message boundary
     (ChatFormat.message_boundary), where the tokenizer splits its input.
-    It keeps CAPACITY prompts of up to `max_context` tokens, the served
-    context."""
+    It keeps up to CAPACITY prompts, in storage for BUDGET_PROMPTS of
+    `max_context` tokens, the served context."""
 
     MIN_PREFIX_CHARS = 4096
-    CAPACITY = 4
+    # A conversation keeps one prompt, its newest, so the count bounds the
+    # conversations whose next turn reuses it, and agents interleave more of
+    # them than there are lanes: with 4, eight coding agents on 4 lanes
+    # reused 6% of their 44K-token prompts, each miss encoding one in 27 ms;
+    # with 16 every turn found its prompt, 1.8 ms a request.
+    CAPACITY = 16
+    # The storage, which bounds the memory however many prompts it holds.
+    BUDGET_PROMPTS = 4
     # The bytes a kept prompt takes per token, at most: the token's 4 and its
     # text, up to about 5 characters (code's; prose's are 4) at the 4 bytes
     # CPython stores each of a text that holds any past U+FFFF, as an emoji.
@@ -42,9 +49,9 @@ class PromptTokenizer:
             tokenizer.backend_tokenizer.token_to_id(marker) if self.enabled else None
         )
         self.entries = LRUCache(
-            self.CAPACITY * max_context * self.BYTES_PER_TOKEN, self.CAPACITY
+            self.BUDGET_PROMPTS * max_context * self.BYTES_PER_TOKEN, self.CAPACITY
         )
-        self.hits = self.reused_tokens = 0
+        self.hits = self.misses = self.reused_tokens = 0
         self.lock = threading.Lock()
 
     @staticmethod
@@ -114,6 +121,8 @@ class PromptTokenizer:
             if cached is not None:
                 self.hits += 1
                 self.reused_tokens += len(cached) // array("I").itemsize
+            else:
+                self.misses += 1
         tokens = array("I", cached).tolist() if cached is not None else []
         if key != prefix:
             tokens.extend(self._encode(prefix[len(key) :]))
@@ -154,5 +163,7 @@ class PromptTokenizer:
                 "budget_bytes": self.entries.budget_bytes,
                 "capacity": self.entries.capacity,
                 "hits": self.hits,
+                "misses": self.misses,
+                "evictions": self.entries.evictions,
                 "reused_tokens": self.reused_tokens,
             }

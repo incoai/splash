@@ -148,9 +148,7 @@ void Qwen4ExpTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
           f32Rows(h.streams, sequence.rowBegin, sequence.rows, ps.width()), ps, sequence.rows);
       // A state captured inside the command holds the history after its row.
       for (const QwenTargetStateCapture &capture : sequence.stateCaptures)
-        ops::NgramEmbedding::addHistory(step.graph,
-                                        u16Rows(h.pleConvolution, sequence.rowBegin, capture.row, ps.width()),
-                                        sequence.auxiliaryIn, capture.auxiliary, ps, capture.row);
+        addCaptureHistory(step.graph, h, sequence.rowBegin, sequence.auxiliaryIn, capture);
     }
   }
   addPrefillMix(step, layer.mixerHyper, b.normalized);
@@ -247,6 +245,18 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &ste
     ops::PagedAttention::addBlockLists(step.graph, h.qsaMask, h.maskWords, sparseRows,
                                        {h.qsaLists, h.qsaListCounts, h.listStride, 0});
   return blocks;
+}
+
+void Qwen4ExpTarget::addCaptureHistory(metal::CommandGraph &graph, const Qwen4Scratch &scratch, uint32_t rowBegin,
+                                       metal::MetalBuffer auxiliaryIn, const QwenTargetStateCapture &capture) const {
+  const ops::NgramShape ps = ngramShape(geometry_);
+  ops::NgramEmbedding::addHistory(graph, rowsOf<uint16_t>(scratch.pleConvolution, rowBegin, capture.row, ps.width()),
+                                  std::move(auxiliaryIn), capture.auxiliary, ps, capture.row);
+}
+
+void Qwen4ExpTarget::addInsideCapture(metal::CommandGraph &graph, metal::MetalBuffer auxiliaryIn,
+                                      metal::MetalBuffer captured) const {
+  addCaptureHistory(graph, steps_.prefillScratch(0), 0, std::move(auxiliaryIn), {.row = 1, .auxiliary = captured});
 }
 
 void Qwen4ExpTarget::prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request) {

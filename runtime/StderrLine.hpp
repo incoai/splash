@@ -4,18 +4,24 @@
 
 #include <cerrno>
 #include <ctime>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
 
 namespace splash {
 
-// The server and this runtime write to the same stderr. Each line goes out
-// in one write, newline included, so that lines written at once stay whole.
+// The server reads this stderr from a pipe, line by line, and writes each
+// line to its console. A pipe that fills keeps a write whole beside another
+// thread's only up to PIPE_BUF, 512 bytes on macOS, and lines run longer, so
+// the runtime's threads take turns, each line in one write, continued if the
+// pipe takes part of it: every line arrives whole.
 inline void writeStderrLine(std::string_view text) noexcept {
   try {
     std::string line(text);
     line += '\n';
+    static std::mutex writing;
+    const std::lock_guard<std::mutex> hold(writing);
     for (std::string_view rest = line; !rest.empty();) {
       const ssize_t written = ::write(STDERR_FILENO, rest.data(), rest.size());
       if (written < 0 && errno == EINTR)

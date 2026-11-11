@@ -4409,7 +4409,7 @@ int main(int argc, char **argv) {
         model::loadModel(backend, modelRoot, descriptor, loadOptions);
     if (loadOptions.streamedTableBytes)
       std::cout << "ple_memory=" << (model.streamedTable() ? "streamed" : "ignored") << '\n';
-    ops::ExecutionPlans operators(backend.capabilities());
+    ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(model, operators, format, stateFormat, model::StreamedParts::loaded(model));
     // The memory plan with `aneFfnBytes` set aside for the prefill FFN's

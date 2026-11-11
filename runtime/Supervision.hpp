@@ -29,12 +29,14 @@ using std::chrono::milliseconds;
 
 // Metal fails an event wait still unmet this long after its queue reached it
 // ("Caused GPU Timeout Error"), and the command with it: the work between two
-// waits of a command, with the host step's or the Neural Engine's part, must
-// end within it (metal::EventStep). Metal's limit, not ours.
+// waits of a command, with the Neural Engine's part, must end within it
+// (metal::EventStep). No wait spans a host step, which may take longer (an
+// expert load from a slow disk). Metal's limit, not ours.
 inline constexpr milliseconds kGpuWaitLimit{5'000};
 // A command that makes no progress this long fails the engine
-// (metal::CommandWatchdog): a GPU hang or a lost completion, since Metal fails
-// a slow host step or Neural Engine wait first.
+// (metal::CommandWatchdog): a GPU hang, a lost completion, or a host step
+// that does not return (a disk that stopped answering), since Metal fails a
+// slow Neural Engine wait first.
 inline constexpr milliseconds kCommandTimeout{120'000};
 // The longest one iteration of the native loop takes (FdTransport::run): its
 // input, a control pass and a tick. A frame waits at most this long before

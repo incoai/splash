@@ -1,6 +1,8 @@
 #include "engine/StreamedMemoryPlan.hpp"
 #include "Checked.hpp"
 #include "metal/abi/PagedAttention.h"
+#include "model/KvBlockCache.hpp"
+#include "model/KvHistoryStream.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -25,19 +27,22 @@ uint64_t pagesOf(uint64_t tokens) noexcept { return (tokens + kv::kPageTokens - 
 // The KV of a context of `tokens` tokens holds its speculative rows too.
 uint64_t kvTokens(uint64_t tokens) noexcept { return tokens + model::ExecutionLimits::speculativeScratchTokens; }
 
-// `pages` pages of `pageBytes` bytes in whole extents of `extentPages`.
-uint64_t extentsBytes(uint64_t pages, uint64_t extentPages, uint64_t pageBytes) noexcept {
-  return (pages + extentPages - 1) / extentPages * extentPages * pageBytes;
+// `pages` pages of `pageBytes` bytes in whole extents of whichever size a
+// pool of `layout` takes (kv::Layout::mostOverExtents): the plan is made
+// before the pool's extent is.
+uint64_t extentsBytes(const kv::Layout &layout, uint64_t pages, uint64_t pageBytes) {
+  return layout.mostOverExtents(
+      [&](uint32_t extentPages) { return (pages + extentPages - 1) / extentPages * extentPages * pageBytes; });
 }
 
 // A streamed part as its setting leaves it to the planner: the bytes the
-// floors charge it, and all of it. An automatic part loads whole where the
-// budget holds it beside the KV allowance, and otherwise streams through
-// what the floors charge it and as much more as the budget allows. A part
-// given a size (`sized`) streams through a store of exactly that size, which
-// the floors charge and which is all its floor, so it neither grows nor gives
-// memory back. Any other part loads whole. An Auto part whose smallest store
-// takes all it would loads whole.
+// floors charge it, and all of it. An automatic part, but a table larger than
+// its share, loads whole where the budget holds it beside the KV allowance,
+// and otherwise streams through what the floors charge it and as much more as
+// the budget allows. A part given a size (`sized`) streams through a store of
+// exactly that size, which the floors charge and which is all its floor, so
+// it neither grows nor gives memory back. Any other part loads whole. An Auto
+// part whose smallest store takes all it would loads whole.
 struct Part final {
   uint64_t charged = 0;
   uint64_t all = 0;
@@ -70,22 +75,31 @@ std::optional<Part> resolve(const StreamedPart &part, std::string_view option, s
   return Part{};
 }
 
+// The page tables of a spill-capable target's readers (KvSpillPlan::
+// tableBytes), as they allocate them: the hot block cache's at a target of
+// `hotTargetBytes` and one for each of `buffers` buffers of staged history.
+uint64_t readerTableBytes(const StreamedMemoryInputs &in, uint64_t hotTargetBytes, uint32_t buffers) {
+  return model::KvBlockCache::tableBytes(in.kvLayout, static_cast<uint32_t>(in.sparseKv->laneSlots()),
+                                         hotTargetBytes) +
+         buffers * model::KvHistoryStream::tableBytes(in.kvLayout);
+}
+
 // What a spill-capable target's floors take, by the context they hold a
-// Spill request of: the request's pages, the Index runway, and the larger of
-// the hot block cache's floor and `buffers` buffers of staged history.
+// Spill request of: the request's pages, the Index runway, the readers'
+// tables, and the larger of the hot block cache's floor and `buffers`
+// buffers of staged history.
 struct SpillFloors final {
-  kv::Layout layout;
+  const StreamedMemoryInputs &in;
   SpillGeometry geometry;
-  uint64_t extentPages = 0;
   uint64_t hotFloorBytes = 0;
   uint64_t indexRunwayBytes = 0;
 
-  [[nodiscard]] uint64_t stagingBytes(uint64_t tokens, uint32_t buffers) const noexcept {
-    return buffers * extentsBytes(pagesOf(kvTokens(tokens)), extentPages, layout.bytesPerLayerPage());
+  [[nodiscard]] uint64_t stagingBytes(uint64_t tokens, uint32_t buffers) const {
+    return buffers * extentsBytes(in.kvLayout, pagesOf(kvTokens(tokens)), in.kvLayout.bytesPerLayerPage());
   }
-  [[nodiscard]] uint64_t bytes(uint64_t tokens, uint32_t buffers) const noexcept {
+  [[nodiscard]] uint64_t bytes(uint64_t tokens, uint32_t buffers) const {
     return geometry.spillFloorBytes(kvTokens(tokens)) + indexRunwayBytes +
-           std::max(stagingBytes(tokens, buffers), hotFloorBytes);
+           readerTableBytes(in, hotFloorBytes, buffers) + std::max(stagingBytes(tokens, buffers), hotFloorBytes);
   }
 };
 
@@ -97,19 +111,17 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
   const kv::Layout &layout = in.kvLayout;
   if (!in.sparseKv || !layout.spillable() || !in.tierWritable) return spill;
   const model::SparseKvShape &shape = *in.sparseKv;
-  const uint32_t extentPages = layout.maximumExtentPages();
   const SpillFloors spillFloors{
-      .layout = layout,
+      .in = in,
       .geometry = {.fullPageBytes = layout.bytesPerModelPage(),
                    .indexPageBytes = layout.indexBytesPerModelPage(),
                    .densePages = static_cast<uint32_t>(pagesOf(shape.denseHistoryTokens)),
                    .windowPages = kSpillWindowPages,
                    .groupPages = in.groupPages},
-      .extentPages = extentPages,
-      .hotFloorBytes =
-          extentsBytes(shape.requiredSlots(1) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS, extentPages,
-                       layout.kvBytesPerModelPage()),
-      .indexRunwayBytes = uint64_t{extentPages} * layout.indexBytesPerModelPage()};
+      .hotFloorBytes = extentsBytes(layout, shape.requiredSlots(1) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS,
+                                    layout.kvBytesPerModelPage()),
+      .indexRunwayBytes = layout.mostOverExtents(
+          [&](uint32_t extentPages) { return uint64_t{extentPages} * layout.indexBytesPerModelPage(); })};
   const uint64_t room = saturatingSubtract(in.hardBudgetBytes, floors);
   const auto fits = [&](uint32_t tokens) { return spillFloors.bytes(tokens, 1) <= room; };
   if (!fits(0)) return spill;
@@ -146,10 +158,11 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
   spill.laneSlots = shape.laneSlots();
   spill.hotFloorBytes = spill.hotTargetBytes = spillFloors.hotFloorBytes;
   spill.hotLimitBytes = extentsBytes(
-      shape.requiredSlots(model::ExecutionLimits::maximumBatchWidth) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS,
-      extentPages, layout.kvBytesPerModelPage());
+      layout, shape.requiredSlots(model::ExecutionLimits::maximumBatchWidth) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS,
+      layout.kvBytesPerModelPage());
   spill.indexRunwayBytes = spillFloors.indexRunwayBytes;
   spill.stagingBytes = spillFloors.stagingBytes(spill.floorTokens, spill.stagingBuffers);
+  spill.tableBytes = readerTableBytes(in, spill.hotTargetBytes, spill.stagingBuffers);
   spill.floorBytes = spillFloors.bytes(spill.floorTokens, spill.stagingBuffers);
   return spill;
 }
@@ -187,14 +200,16 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   // An explicit hot cache target takes what it adds to the readers first,
   // of what the floors leave: the floors hold the larger of the hot cache's
   // floor and the history staging, and the readers the larger of its target
-  // and the staging.
+  // and the staging; and the cache's table its target's extents.
   if (spill.enabled && in.hotCacheBytes) {
     const uint64_t target = *in.hotCacheBytes;
     if (target < spill.hotFloorBytes)
       return {std::nullopt, "--sparse-kv-memory of " + std::to_string(target / kMiB) +
                                 " MiB is less than the hot block cache's floor, " +
                                 std::to_string(spill.hotFloorBytes / kMiB) + " MiB"};
-    const uint64_t readers = spill.readerBytes(), added = saturatingSubtract(target, readers);
+    const uint64_t readers = spill.readerBytes(),
+                   added = saturatingSubtract(target, readers) +
+                           readerTableBytes(in, target, spill.stagingBuffers) - spill.tableBytes;
     if (added > in.hardBudgetBytes - floors)
       return {std::nullopt, "--sparse-kv-memory of " + std::to_string(target / kMiB) +
                                 " MiB is more than the readers' floor, the larger of the hot block cache's floor "
@@ -203,7 +218,32 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
                                 std::to_string((in.hardBudgetBytes - floors) / kMiB) + " MiB the floors leave"};
     spill.hotTargetBytes = target;
     spill.hotLimitBytes = std::max(spill.hotLimitBytes, target);
+    spill.tableBytes = readerTableBytes(in, target, spill.stagingBuffers);
     floors += added;
+  }
+  // A second buffer of staged history lets the next layer's reads overlap
+  // this layer's attention. Where the readers' memory holds it already
+  // (readerBytes) it adds only its page table, 278,528 bytes on
+  // Qwen3.8-Flash-Next, which it takes here, of what the floors leave,
+  // before the stores: taken after them, the table would come out of the KV
+  // allowance wherever a store binds. Otherwise it is planned where what the
+  // stores and the allowance leave holds it and its table (below): that is
+  // nothing where a store binds, which keeps the room, and otherwise KV kept
+  // resident beyond the allowance.
+  const auto readersAdded = [&] {
+    return std::max(spill.hotTargetBytes, 2 * spill.stagingBytes) - spill.readerBytes();
+  };
+  const auto tableAdded = [&] { return readerTableBytes(in, spill.hotTargetBytes, 2) - spill.tableBytes; };
+  const auto stageTwice = [&] {
+    const uint64_t one = spill.stagingBytes, table = tableAdded();
+    spill.floorBytes += std::max(2 * one, spill.hotFloorBytes) - std::max(one, spill.hotFloorBytes) + table;
+    spill.tableBytes += table;
+    spill.stagingBuffers = 2;
+    spill.stagingBytes = 2 * one;
+  };
+  if (spill.enabled && !readersAdded() && tableAdded() <= in.hardBudgetBytes - floors) {
+    floors += tableAdded();
+    stageTwice();
   }
 
   // Then the priorities, out of what the floors leave: the experts first,
@@ -252,26 +292,18 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   plan.expertFloorShare = experts.sized ? 1.0 : expertFloorShare(spill.enabled);
   plan.tableBytes = table.streams ? table.charged : 0;
   if (table.automatic) {
-    const int64_t kept = rest - allowance(expertsStream);
-    if (kept < static_cast<int64_t>(table.all - table.charged))
-      plan.tableBytes = table.charged + static_cast<uint64_t>(std::clamp<int64_t>(kept, 0, tableShare));
+    const uint64_t take =
+        table.charged + static_cast<uint64_t>(std::clamp<int64_t>(rest - allowance(expertsStream), 0, tableShare));
+    plan.tableBytes = take < table.all ? take : 0;
   }
-  // A second buffer of staged history lets the next layer's reads overlap
-  // this layer's attention. It is planned where the readers' memory holds it
-  // already (readerBytes), or where what the stores and the KV allowance
-  // leave holds it: that is nothing where a store binds, which keeps the
-  // room, and otherwise KV kept resident beyond the allowance.
-  if (spill.enabled) {
-    const uint64_t one = spill.stagingBytes;
-    const uint64_t added = std::max(spill.hotTargetBytes, 2 * one) - spill.readerBytes();
+  // The second buffer of staged history the readers' memory does not hold
+  // (above), where what the stores and the KV allowance leave holds it.
+  if (spill.enabled && spill.stagingBuffers == 1) {
     const uint64_t tableAbove =
         table.automatic ? (plan.tableBytes ? plan.tableBytes : table.all) - table.charged : 0;
     const int64_t left = rest - allowance(expertsStream) - static_cast<int64_t>(tableAbove);
-    if (!added || left >= static_cast<int64_t>(added)) {
-      spill.stagingBuffers = 2;
-      spill.stagingBytes = 2 * one;
-      spill.floorBytes += std::max(2 * one, spill.hotFloorBytes) - std::max(one, spill.hotFloorBytes);
-    }
+    if (left >= static_cast<int64_t>(readersAdded() + tableAdded()))
+      stageTwice();
   }
   return {plan, {}};
 }

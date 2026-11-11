@@ -272,6 +272,7 @@ public:
     entry.resident = false;
     entry.position = 0;
     ++suspensions;
+    suspendedIds.push_back(id);
     if (laneReleased)
       laneReleased();
     if (kvGrowthBlocked && unblockGrowthOnSuspend)
@@ -652,13 +653,8 @@ public:
   std::optional<uint32_t> statesToActivate() const noexcept override {
     return statesLacked ? statesLacked() : std::optional<uint32_t>{0};
   }
-  // What a lane's start (takeLaneState) and the state it captures
-  // (takeStateBuffers) allocate. Nothing without `memory`.
-  uint64_t startStateBytes() const noexcept override {
-    if (!memory)
-      return 0;
-    return laneTake().allocated + (stateReused() ? 0 : State().bytes());
-  }
+  // What a lane's start allocates (takeLaneState). Nothing without `memory`.
+  uint64_t startStateBytes() const noexcept override { return memory ? laneTake().allocated : 0; }
   // The production model's pool releases the buffers beyond a lane's with
   // keepLane, else all of them (QwenStateStorage::idleBytes); the fake's are
   // those of the states the cache let go of and of `evictedStates` more (none
@@ -671,8 +667,7 @@ public:
     const LaneTake lane = afterStart ? laneTake() : LaneTake{};
     const uint64_t pooled = pooledLaneBytes - lane.pooled;
     const uint64_t each = keptTier ? 0 : State().bytes();
-    const uint64_t returned = *evictedStateBytes - (afterStart && stateReused() ? State().bytes() : 0) +
-                              uint64_t{evictedStates} * each;
+    const uint64_t returned = *evictedStateBytes + uint64_t{evictedStates} * each;
     if (!keepLane)
       return reclaimableIdleStateBytes - lane.idle + pooled + returned;
     const uint64_t refill = std::min(returned, laneFootprintBytes - std::min(laneFootprintBytes, pooled));
@@ -852,6 +847,8 @@ public:
   // Begins the budget refuses, and resumes the host refuses.
   uint32_t deniedBegins = 0;
   uint32_t suspensions = 0;
+  // The request of each suspension, in order.
+  std::vector<uint64_t> suspendedIds;
   uint32_t resumptions = 0;
   uint32_t resumeAttempts = 0;
   // Requests the engine ended (end()).

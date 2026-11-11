@@ -2,7 +2,7 @@ import io
 import unittest
 from unittest import mock
 
-from dev.tests.server_fixtures import READY, unprepared_hold
+from dev.tests.server_fixtures import READY, console_written, unprepared_hold
 from server import constraints as generation_constraints
 from server import server
 from server.chat_format import QWEN
@@ -97,6 +97,7 @@ class TokenizerContractTests(unittest.TestCase):
         ):
             server.main()
         self.assertEqual(raised.exception.code, 1)
+        console_written()
         self.assertIn("tokenizer must encode", stderr.getvalue())
         native.assert_not_called()
         http.server_activate.assert_not_called()
