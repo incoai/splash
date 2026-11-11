@@ -372,7 +372,8 @@ arrays, failed experiments, operator results and reproduction commands.
 These measurements qualify the frozen `fa62be81` source, build
 `src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283`,
 before upstream engine 1.6.1 (`767c646e`). The later integration changes
-activation and kernel selection and needs separate validation and measurements.
+activation and kernel selection; its [source-specific qualification](../dev/benchmarks/experiments/dspine_20261111_integration/README.md)
+is separate from the measurements below.
 
 The later November 11 review keeps DFlash2 as the default drafter and eight
 rows as the default DSpine width. On the measured 20-core M5 Pro, the
