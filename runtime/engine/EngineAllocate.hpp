@@ -81,14 +81,18 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, Refusal refusal)
   MemoryGovernor &governor = this->governor();
   MemoryLedger &ledger = governor.ledger();
   // A request's allocations are its one claim's, the engine's own a claim
-  // of this allocation alone.
+  // of this allocation alone. Its refusal ends its lane where its work waits
+  // for the memory (Waits) and no other lane is in service: then the claim
+  // is lone. A refusal its caller settles goes on without the memory.
+  ClaimSpec claimed = spec;
+  claimed.lone = spec.cls == ClaimClass::InService && refusal == Refusal::Waits && !anotherResident(spec.requestId);
   ClaimHandle transient;
   ClaimHandle &claim = spec.requestId ? request(spec.requestId).claim : transient;
   if (claim.id) {
-    ledger.update(claim.id, spec);
+    ledger.update(claim.id, claimed);
   } else {
     claim.governor = &governor;
-    claim.id = ledger.open(spec);
+    claim.id = ledger.open(claimed);
   }
   ledger.setLanes(laneDemandBytes(), highestLanePriority());
   // The allocation runs in the claim's one scope, so what an attempt's work
