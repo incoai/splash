@@ -158,12 +158,12 @@ struct DeepSeek41MixWeights final {
   metal::MetalBuffer base;
 };
 
-// A compressor layer's projections of its inputs into a group's latent, BF16
-// as the GGUF stores them, which the float projection runs in fp32: the
-// latents [head dimension, hidden], on a layer of groups of 2 tokens the
-// gate whose softmax over a group weighs them, the latent's norm; then the
-// indexer's key [indexer head dimension, head dimension] of a group's
-// latent and its norm.
+// A compressor layer's projections of its inputs into a group's latent, F32,
+// BF16 or Q8_0 as the GGUF stores them, which the float projection runs in
+// fp32: the latents [head dimension, hidden], on a layer of groups of 2
+// tokens the gate whose softmax over a group weighs them, the latent's norm;
+// then the indexer's key [indexer head dimension, head dimension] of a
+// group's latent and its norm.
 struct DeepSeek41CompressorWeights final {
   ops::Projection kv;
   std::optional<ops::Projection> gate;
@@ -173,7 +173,8 @@ struct DeepSeek41CompressorWeights final {
 };
 
 // An indexer layer's queries [heads * head dimension, query rank] of the
-// query latent and the weights [heads, hidden] of its heads' scores, BF16.
+// query latent and the weights [heads, hidden] of its heads' scores, as the
+// compressor's are stored.
 struct DeepSeek41IndexerWeights final {
   ops::Projection query;
   ops::Projection weights;

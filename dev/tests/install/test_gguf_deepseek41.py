@@ -235,6 +235,23 @@ class DeepSeek41GgufTests(unittest.TestCase):
     def test_the_engine_plans_every_tensor_of_the_real_files(self):
         self.assertIs(self.check(tensor_table()), DEEPSEEK)
 
+    def test_the_engine_plans_q8_0_compressors_and_indexers(self):
+        # llama.cpp's quantizations of the family store the compressors' and
+        # indexers' projections as Q8_0, which the float projection decodes.
+        qsa = (
+            ".attn_compressor_kv.weight",
+            ".attn_compressor_gate.weight",
+            ".indexer.attn_k.weight",
+            ".indexer.attn_q_b.weight",
+            ".indexer.proj.weight",
+        )
+        table = [
+            (name, extents, GGML["Q8_0"] if name.endswith(qsa) else kind)
+            for name, extents, kind in tensor_table()
+        ]
+        self.assertTrue(any(name.endswith(qsa) for name, _, _ in table))
+        self.assertIs(self.check(table), DEEPSEEK)
+
     def test_the_engine_refuses_what_it_does_not_read(self):
         table = tensor_table()
         without_gate = [t for t in table if t[0] != "blk.2.attn_compressor_gate.weight"]

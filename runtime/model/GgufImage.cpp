@@ -77,6 +77,10 @@ bool routerType(uint32_t type) { return floatProjectionType(type) || (quantizedT
 // A tensor of F32 rows (floatRows): F32, or BF16 or Q8_0, which widen or
 // decode to it.
 bool floatRowType(uint32_t type) { return floatProjectionType(type) || type == ggml::kQ8_0; }
+// A DeepSeek-V4.1 QSA projection (qsaProjection), which the float projection
+// runs in fp32 as stored: a float projection's type, or Q8_0, whose native
+// rows it decodes, as llama.cpp's GGUFs of the family store them.
+bool qsaProjectionType(uint32_t type) { return floatProjectionType(type) || type == ggml::kQ8_0; }
 
 // The header type of the image of a table a family adds (planImages), beside
 // the layers' 0 and 1 (GDN and full attention) and the head's 2.
@@ -335,12 +339,25 @@ public:
   }
 
   // An F32 or BF16 tensor [rows, columns] as stored, which the float
-  // projection runs in fp32 (the QSA indexer's projections).
+  // projection runs in fp32 (Flash-Next's QSA indexer, DSpark's Markov head;
+  // DeepSeek-V4.1's compressors and indexers are qsaProjection's).
   void floatTensor(const std::string &name, uint64_t rows, uint64_t columns) {
     const GgufTensor *tensor = find(name, floatProjectionType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns)
       throw GgufError("expected an F32 or BF16 [" + std::to_string(rows) + ", " + std::to_string(columns) +
+                      "] tensor: " + name);
+    copiedRows(*tensor, storedRowBytes(*tensor));
+  }
+
+  // A DeepSeek-V4.1 compressor or indexer projection [rows, columns] as
+  // stored, which the float projection runs in fp32: F32 or BF16, or Q8_0's
+  // native rows, of whose decoded values it gives the outputs bit for bit.
+  void qsaProjection(const std::string &name, uint64_t rows, uint64_t columns) {
+    const GgufTensor *tensor = find(name, qsaProjectionType);
+    if (!tensor) return;
+    if (tensor->rows() != rows || tensor->columns() != columns)
+      throw GgufError("expected an F32, BF16 or Q8_0 [" + std::to_string(rows) + ", " + std::to_string(columns) +
                       "] tensor: " + name);
     copiedRows(*tensor, storedRowBytes(*tensor));
   }
@@ -815,15 +832,15 @@ struct DeepSeek41Gguf final {
     b.floatNorm(p + "attn_kv_a_norm.weight", latent);
     b.floatNorm(p + "attn_sinks.weight", g.attentionQueryHeads);
     if (d.has(d.compressorLayers, index)) {
-      b.floatTensor(p + "attn_compressor_kv.weight", latent, g.hiddenSize);
-      if (d.has(d.pairedLayers, index)) b.floatTensor(p + "attn_compressor_gate.weight", latent, g.hiddenSize);
+      b.qsaProjection(p + "attn_compressor_kv.weight", latent, g.hiddenSize);
+      if (d.has(d.pairedLayers, index)) b.qsaProjection(p + "attn_compressor_gate.weight", latent, g.hiddenSize);
       b.floatNorm(p + "attn_compressor_norm.weight", latent);
-      b.floatTensor(p + "indexer.attn_k.weight", d.indexerHeadDimension, latent);
+      b.qsaProjection(p + "indexer.attn_k.weight", d.indexerHeadDimension, latent);
       b.floatNorm(p + "indexer.k_norm.weight", d.indexerHeadDimension);
     }
     if (d.has(d.indexerLayers, index)) {
-      b.floatTensor(p + "indexer.attn_q_b.weight", uint64_t{d.indexerHeads} * d.indexerHeadDimension, d.queryRank);
-      b.floatTensor(p + "indexer.proj.weight", d.indexerHeads, g.hiddenSize);
+      b.qsaProjection(p + "indexer.attn_q_b.weight", uint64_t{d.indexerHeads} * d.indexerHeadDimension, d.queryRank);
+      b.qsaProjection(p + "indexer.proj.weight", d.indexerHeads, g.hiddenSize);
     }
     b.quantizedGroups(p + "attn_output_a.weight", d.outputGroups, d.outputRank, d.groupWidth(g.attentionWidth));
     b.quantized(p + "attn_output_b.weight", g.hiddenSize, uint64_t{d.outputGroups} * d.outputRank);

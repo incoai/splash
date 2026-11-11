@@ -541,16 +541,24 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
 // (model/DeepSeek41.cpp) in the order the planner lays its images out
 // (GgufImage.cpp DeepSeek41Gguf): each layer's parts of its roles alone, its
 // output groups block projections of their own, its compressor's and
-// indexer's BF16 projections into fp32, its Engram gate's F32 weights, the
+// indexer's projections into fp32, BF16 or Q8_0 (`qsa`) rows as stored,
+// which the float projection runs, its Engram gate's F32 weights, the
 // head's logits into fp32 and the Engram hash the metadata states, each
 // Engram layer's offsets from its first row in the tables. The loader reads
 // every section of every image, or throws.
-void checkDeepSeekTarget(MetalBackend &backend, const std::filesystem::path &directory) {
+void checkDeepSeekTarget(MetalBackend &backend, const std::filesystem::path &directory, uint32_t qsa) {
   const model::QwenTargetDimensions g = deepseekGeometry();
   const model::DeepSeek41Layout layout{model::QwenHybridLayout{g, "DeepSeek-V4.1-Flash"}};
   const model::DeepSeek41Dimensions &d = layout.deepseek;
-  const std::vector<Tensor> tensors = deepseekTensors(g);
-  const auto target = directory / "deepseek41";
+  const std::vector<Tensor> tensors = deepseekTensors(g, qsa);
+  const auto target = directory / ("deepseek41-" + std::to_string(qsa));
+  // The rows of a compressor or indexer projection as stored, into fp32.
+  const uint32_t qsaFormat = qsa == model::ggml::kQ8_0 ? GGUF_FMT_Q80 : GGUF_FMT_BF16;
+  const auto qsaRows = [&](const ops::Projection &projection) {
+    const auto &segments = projection.blocks().segments;
+    return projection.destination == ops::FloatOutput::Float32 && segments.size() == 1 &&
+           segments.front().isFloat() && segments.front().formatId == qsaFormat;
+  };
   std::filesystem::create_directory(target);
   splash::test::writeFile(target / "target.gguf", test_gguf::file(deepseekMetadata(g), tensors));
   model::WeightImages images(backend, "fixture");
@@ -576,15 +584,15 @@ void checkDeepSeekTarget(MetalBackend &backend, const std::filesystem::path &dir
     check(groups && blockProjection(layer.outputB, hidden, d.outputGroups * d.outputRank, {hidden}),
           at + "output groups block projections of their own, then theirs");
     if (layer.compressor)
-      check(layer.compressor->kv.destination == ops::FloatOutput::Float32 && layer.compressor->kv.outputSize == latent &&
-                layer.compressor->indexKey.destination == ops::FloatOutput::Float32 &&
-                layer.compressor->indexKey.inputSize == latent,
-            at + "compressor and index key into fp32");
+      check(qsaRows(layer.compressor->kv) && layer.compressor->kv.outputSize == latent &&
+                (!layer.compressor->gate || qsaRows(*layer.compressor->gate)) &&
+                qsaRows(layer.compressor->indexKey) && layer.compressor->indexKey.inputSize == latent,
+            at + "compressor and index key rows as stored into fp32");
     if (layer.indexer)
-      check(layer.indexer->query.destination == ops::FloatOutput::Float32 &&
+      check(qsaRows(layer.indexer->query) && qsaRows(layer.indexer->weights) &&
                 layer.indexer->query.outputSize == d.indexerHeads * d.indexerHeadDimension &&
                 layer.indexer->weights.outputSize == d.indexerHeads,
-            at + "indexer queries and head weights into fp32");
+            at + "indexer queries and head weights rows as stored into fp32");
     if (layer.engram)
       check(blockProjection(layer.engram->kv, (MHC_STREAMS + 1) * hidden, d.engramWidth(), {(MHC_STREAMS + 1) * hidden}) &&
                 layer.engram->gate.sizeBytes() == uint64_t{MHC_STREAMS} * hidden * 4,
@@ -1036,7 +1044,10 @@ int main(int argc, char **argv) {
     guarded("preparation of quantized alpha/beta", [&] { checkQuantizedAlphaBeta(backend, directory.path()); });
     guarded("llama.cpp NVFP4", [&] { checkGgufNvfp4(backend, directory.path()); });
     guarded("the target loader", [&] { checkDenseTarget(backend, directory.path()); });
-    guarded("the DeepSeek-V4.1 target loader", [&] { checkDeepSeekTarget(backend, directory.path()); });
+    guarded("the DeepSeek-V4.1 target loader",
+            [&] { checkDeepSeekTarget(backend, directory.path(), model::ggml::kBF16); });
+    guarded("the DeepSeek-V4.1 target loader, Q8_0 compressors and indexers",
+            [&] { checkDeepSeekTarget(backend, directory.path(), model::ggml::kQ8_0); });
     guarded("MLX sources", [&] { checkMlxSources(backend, directory.path(), argv[3]); });
     guarded("NVFP4 and FP8 sources", [&] { checkFloatSources(backend, directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF preparation tests FAILED" : "GGUF preparation tests passed",

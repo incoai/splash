@@ -23,11 +23,22 @@ DeepSeek41MixWeights readMix(WeightFile &file, const DeepSeek41Layout &layout, c
   return mix;
 }
 
-// A float projection (BF16 or F32 as the GGUF stores it) that writes fp32,
-// as the compressor, the indexer and their scores read it.
+// A block projection that writes fp32, as the logits are read.
 ops::Projection floatProjection(WeightFile &file, const BlockTargetFormat &format, uint32_t outputSize,
                                 uint32_t inputSize, std::string_view label) {
   ops::Projection projection = format.projection(file, outputSize, inputSize, label);
+  projection.destination = ops::FloatOutput::Float32;
+  return projection;
+}
+
+// A compressor or indexer projection as the GGUF stores it, F32, BF16 or
+// Q8_0's native rows (GgufImage.cpp qsaProjection), which the float
+// projection runs into fp32.
+ops::Projection qsaProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize, std::string_view label) {
+  ops::QuantizedSegment segment = readFloatSegment(file, label);
+  if (segment.outputSize != outputSize || segment.inputSize != inputSize)
+    throw WeightStoreError("GGUF tensor does not match the layout: " + std::string(label));
+  ops::Projection projection{outputSize, inputSize, ops::BlockWeights{{std::move(segment)}}};
   projection.destination = ops::FloatOutput::Float32;
   return projection;
 }
@@ -56,18 +67,17 @@ DeepSeek41LayerWeights readDeepSeek41Layer(WeightFile &file, const BlockTargetFo
   layer.sinks = file.section(uint64_t{layout.attentionQueryHeads} * kFloat32Bytes, "attention-sinks");
   if (has(d.compressorLayers)) {
     DeepSeek41CompressorWeights compressor;
-    compressor.kv = floatProjection(file, format, latent, hidden, "compressor-kv");
-    if (has(d.pairedLayers)) compressor.gate = floatProjection(file, format, latent, hidden, "compressor-gate");
+    compressor.kv = qsaProjection(file, latent, hidden, "compressor-kv");
+    if (has(d.pairedLayers)) compressor.gate = qsaProjection(file, latent, hidden, "compressor-gate");
     compressor.norm = format.norm(file, latent, "compressor-norm");
-    compressor.indexKey = floatProjection(file, format, d.indexerHeadDimension, latent, "index-key");
+    compressor.indexKey = qsaProjection(file, d.indexerHeadDimension, latent, "index-key");
     compressor.indexKeyNorm = format.norm(file, d.indexerHeadDimension, "index-key-norm");
     layer.compressor = std::move(compressor);
   }
   if (has(d.indexerLayers)) {
     DeepSeek41IndexerWeights indexer;
-    indexer.query = floatProjection(file, format, d.indexerHeads * d.indexerHeadDimension, d.queryRank,
-                                    "indexer-query");
-    indexer.weights = floatProjection(file, format, d.indexerHeads, hidden, "indexer-weights");
+    indexer.query = qsaProjection(file, d.indexerHeads * d.indexerHeadDimension, d.queryRank, "indexer-query");
+    indexer.weights = qsaProjection(file, d.indexerHeads, hidden, "indexer-weights");
     layer.indexer = std::move(indexer);
   }
   const uint32_t groupWidth = d.groupWidth(layout.attentionWidth);

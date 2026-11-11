@@ -1096,9 +1096,11 @@ void checkNvfp4InputScale(const std::filesystem::path &directory) {
 // indexer layer's queries and head weights; every layer's output groups as
 // projections of their own, its mixes, sinks and router bias as stored; the
 // head the Engram hash's tables as stored. It streams every layer's experts.
-// Its metadata names each mismatch: another epsilon or RoPE scaling, other
-// layers of a role or ratios, another router or clamp; and its tensors a
-// missing gate and one of groups of one token.
+// Its compressors and indexers may also be Q8_0, as llama.cpp's
+// quantizations store them, and are then copied as stored; another type is
+// refused by name. Its metadata names each mismatch: another epsilon or RoPE
+// scaling, other layers of a role or ratios, another router or clamp; and its
+// tensors a missing gate and one of groups of one token.
 void checkDeepSeek(const std::filesystem::path &directory) {
   const model::QwenTargetDimensions g = deepseekGeometry();
   const model::DeepSeek41Dimensions &d = g.deepseek;
@@ -1153,6 +1155,28 @@ void checkDeepSeek(const std::filesystem::path &directory) {
   check(!streamed.error && streamsExperts(deepseek, streamed) &&
             model::gguf::streamedExperts(std::span(streamed.images).first(g.layers)).size() == g.layers,
         "planner streams every layer's experts");
+
+  const std::vector<std::string> qsa{"attn_compressor_kv.weight", "attn_compressor_gate.weight",
+                                     "indexer.attn_k.weight", "indexer.attn_q_b.weight", "indexer.proj.weight"};
+  const std::vector<Tensor> q8Tensors = deepseekTensors(g, model::ggml::kQ8_0);
+  const Plan q8 = planned(deepseekMetadata(g), q8Tensors);
+  check(!q8.error && q8.images.size() == g.layers + 2,
+        "planner plans Q8_0 compressors and indexers" + (q8.error ? ": " + *q8.error : ""));
+  if (!q8.error) {
+    uint32_t copied = 0, expected = 0;
+    for (const Tensor &tensor : q8Tensors)
+      for (const std::string &suffix : qsa)
+        if (tensor.name.ends_with("." + suffix)) {
+          ++expected;
+          copied += tensor.type == model::ggml::kQ8_0 && asStored(copyIn(q8, tensor.name), tensor.data);
+        }
+    check(expected == 11 && copied == expected, "planner copies the Q8_0 compressors and indexers as stored");
+  }
+  check(names(planned(deepseekMetadata(g), deepseekTensors(g, ggmlType("Q4_0"))),
+              {"attn_compressor_kv.weight (Q4_0) in 2 layers", "attn_compressor_gate.weight (Q4_0) in 1 layer",
+               "indexer.attn_k.weight (Q4_0) in 2 layers", "indexer.attn_q_b.weight (Q4_0) in 3 layers",
+               "indexer.proj.weight (Q4_0) in 3 layers"}),
+        "planner refuses compressors and indexers of another quantized type");
 
   const auto withKey = [&](const test_gguf::Key &replacement) {
     std::vector<test_gguf::Key> keys = deepseekMetadata(g);

@@ -650,9 +650,11 @@ inline std::vector<uint64_t> deepseekEngramPrimes(const model::QwenTargetDimensi
 
 // Every tensor of the DeepSeek-V4.1 geometry, zero, as the family's GGUFs type
 // them: F32 norms, mixes, biases and Engram gates; Q8_0 projections;
-// BF16 compressors, indexers and routers; Q4_K routed experts; the image
-// router's bias, which text does not read; and the Engram's IQ4_NL tables.
-inline std::vector<Tensor> deepseekTensors(const model::QwenTargetDimensions &g) {
+// compressors and indexers of type `qsa` (BF16, or Q8_0 as llama.cpp's
+// quantizations of the family store them); BF16 routers; Q4_K routed experts; the image router's bias, which text does not
+// read; and the Engram's IQ4_NL tables.
+inline std::vector<Tensor> deepseekTensors(const model::QwenTargetDimensions &g,
+                                           uint32_t qsa = model::ggml::kBF16) {
   const model::DeepSeek41Dimensions &d = g.deepseek;
   std::vector<Tensor> tensors;
   const auto add = [&](std::string name, std::vector<uint64_t> dims, uint32_t type) {
@@ -685,15 +687,15 @@ inline std::vector<Tensor> deepseekTensors(const model::QwenTargetDimensions &g)
     add(p + "attn_kv_a_norm.weight", {latent}, kF32);
     add(p + "attn_sinks.weight", {g.attentionQueryHeads}, kF32);
     if (has(d.compressorLayers, layer)) {
-      add(p + "attn_compressor_kv.weight", {hidden, latent}, kBF16);
-      if (has(d.pairedLayers, layer)) add(p + "attn_compressor_gate.weight", {hidden, latent}, kBF16);
+      add(p + "attn_compressor_kv.weight", {hidden, latent}, qsa);
+      if (has(d.pairedLayers, layer)) add(p + "attn_compressor_gate.weight", {hidden, latent}, qsa);
       add(p + "attn_compressor_norm.weight", {latent}, kF32);
-      add(p + "indexer.attn_k.weight", {latent, d.indexerHeadDimension}, kBF16);
+      add(p + "indexer.attn_k.weight", {latent, d.indexerHeadDimension}, qsa);
       add(p + "indexer.k_norm.weight", {d.indexerHeadDimension}, kF32);
     }
     if (has(d.indexerLayers, layer)) {
-      add(p + "indexer.attn_q_b.weight", {d.queryRank, uint64_t{d.indexerHeads} * d.indexerHeadDimension}, kBF16);
-      add(p + "indexer.proj.weight", {hidden, d.indexerHeads}, kBF16);
+      add(p + "indexer.attn_q_b.weight", {d.queryRank, uint64_t{d.indexerHeads} * d.indexerHeadDimension}, qsa);
+      add(p + "indexer.proj.weight", {hidden, d.indexerHeads}, qsa);
     }
     add(p + "attn_output_a.weight", {d.groupWidth(g.attentionWidth), uint64_t{d.outputGroups} * d.outputRank}, kQ8_0);
     add(p + "attn_output_b.weight", {uint64_t{d.outputGroups} * d.outputRank, hidden}, kQ8_0);
