@@ -110,6 +110,10 @@ struct LinearWorkload final {
   uint32_t rows = 0;
   LinearPhase phase = LinearPhase::Decode;
   LinearEpilogue epilogue = LinearEpilogue::None;
+  // Prefill only: run small chunks without a K split, so each row's output
+  // is the same bits whatever chunk or ragged prefill it is in (scoring reads
+  // final-position logits that must not depend on other requests).
+  bool splitFree = false;
   auto operator<=>(const LinearWorkload &) const = default;
 };
 
@@ -279,7 +283,8 @@ public:
   // staged height of its own rows, which compute each row as the chunk's plan
   // does.
   [[nodiscard]] LinearPlan prefillPlan(const Projection &projection, uint32_t rows,
-                                       LinearEpilogue epilogue, uint32_t chunkRows = 0) const;
+                                       LinearEpilogue epilogue, uint32_t chunkRows = 0,
+                                       bool splitFree = false) const;
   [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
                                       LinearEpilogue epilogue = LinearEpilogue::None,
                                       const Projection *gate = nullptr) const;
@@ -310,18 +315,19 @@ public:
   // a chunk of `chunkRows` rows (prefillPlan). `scratch` holds the partials
   // and counters of split plans (the chunks the staged tile runs,
   // ProjectionCalibration::stagedPrefillRows); reused serially within one
-  // command stream, as in decode.
+  // command stream, as in decode. With splitFree, chunks of up to 32 rows run
+  // unsplit (LinearWorkload).
   void addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
                   metal::MetalBuffer output, uint32_t rows, LinearScratch scratch = {},
-                  uint32_t chunkRows = 0) const;
+                  uint32_t chunkRows = 0, bool splitFree = false) const;
   void addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
                           metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
-                          LinearScratch scratch, uint32_t chunkRows = 0) const;
+                          LinearScratch scratch, uint32_t chunkRows = 0, bool splitFree = false) const;
   // output = residual + down(silu(gate x) * up x) of `rows` normalized rows;
   // up takes what gate's plan leaves of x in the scratch table.
   void addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &buffers,
                         metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
-                        uint32_t chunkRows = 0) const;
+                        uint32_t chunkRows = 0, bool splitFree = false) const;
 
 private:
   // The partials and counters a dispatch of `splits` K partitions binds: the
