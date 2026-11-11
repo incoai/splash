@@ -81,8 +81,8 @@ metadata derived from a GGUF; `families.py` each family's draft repository;
 which inspects them and publishes them as `upstream.py` does a repository's;
 and `models.py` model IDs, selections, the
 installation lock, the command line (`install/models.py --model ID
-prepare|verify|link`, where `link` prints the selection link) and running the
-engine's checks. Since the installer checks a model with the engine, a source
+prepare|verify|link|remove`, where `link` prints the selection link) and
+running the engine's checks. Since the installer checks a model with the engine, a source
 checkout builds the engine before it installs, as `make install` and the first
 `./splash serve` do, and a packaged install ships it. The assembly's
 `model.json` records the resolved sources and selected formats. The native
@@ -100,8 +100,27 @@ that commit and records it in `model.json`, so a repository update cannot mix
 files from different revisions. It pins those snapshots in the Hub cache
 (`refs/splash/<installation>/<commit>`), so pruning the cache cannot remove files
 an installed model links. Publishing a new assembly retires the installation's
-other pins, in the repositories it links and in those its predecessor linked,
-so pruning can free what no installation links any more.
+other pins, in the repositories it links and in those its predecessor linked;
+the assembly it replaces goes, at this publish or, if a server holds it, at the
+next publish or `remove`, with the files of its Hub snapshots no remaining
+assembly links, as for `remove`; a publish leaves whole a snapshot another tool
+has downloaded into, one holding a file no assembly links beyond the JSON
+metadata the installer reads.
+
+`remove` takes an installation away under the installation lock, refusing one
+a server holds; the model named alone takes every selection of it, Text only's
+and a start's own draft's included. Its selection link and pins go, then its
+assembly, which garbage collection finds unlinked and unheld, then the entries
+its record names in Hub snapshots that no remaining assembly links, the blobs
+those named once no snapshot names them, the references to a snapshot that
+went, and a repository folder left empty of all but the Hub's own. A snapshot
+pinned by an installation of another models root, which this root's records
+don't describe, keeps all its files. It reports
+`{"event": "removed", "bytes": FREED}` on stdout; it fails as `prepare` does
+until a link is gone, and a failure to free files after that is a warning.
+`prepare --json-progress` reports what it did last as
+`{"event": "prepared", "outcome": OUTCOME}`, `updated`, `up_to_date`,
+`unreachable` or `kept`.
 
 `hub.Repository.download` first removes the partial files
 (`<blob>.<random>.incomplete`) killed downloads left in the repository's blobs

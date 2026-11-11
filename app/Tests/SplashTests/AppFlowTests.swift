@@ -15,9 +15,9 @@ enum AppFlow {
     static let models = environment["SPLASH_APP_MODELS"]
         .map { $0.split(separator: " ").map(String.init) }.flatMap { $0.isEmpty ? nil : $0 }
     static let port = Int(environment["SPLASH_APP_PORT"] ?? "") ?? freePort()
-    /// The defaults of every test and every run, kept from one to the next as an app's are, apart
-    /// from the user's: each test's launch is a relaunch of one app, which stops the server an
-    /// earlier one left running before it starts its own on the same port.
+    /// The defaults of every test of a run, kept from one to the next as an app's are, apart from
+    /// the user's: each test's launch is a relaunch of one app, which stops the server an earlier
+    /// one left running before it starts its own on the same port.
     @MainActor static let defaults = UserDefaults.kept(in: FileManager.default.temporaryDirectory.appending(path: "splash-app-flow"))
 }
 
@@ -107,7 +107,7 @@ final class AppFlowTests {
         state.chats.flush()
         #expect(ChatStore(folder: folder).conversations.first?.messages == conversation.messages, "saved")
         await Snapshot.save("chat-ready", MainView().environment(state))
-        #expect(state.server.requestLog.contains { $0.outcome == .done && ($0.output ?? 0) > 0 })
+        #expect(state.server.requests.contains { $0.id > 0 && $0.end?.outcome == .done && ($0.end?.output ?? 0) > 0 })
         #expect(state.server.activity.generated > 0)
         await Snapshot.save("server-activity", size: CGSize(width: 1120, height: 1100), ServerView(advanced: true).environment(state))
         await Snapshot.save("menu-bar", size: CGSize(width: 300, height: 400), MenuBarPanel().environment(state))
@@ -117,7 +117,7 @@ final class AppFlowTests {
                     PopupItem(id: "medium", title: "Medium"), PopupItem(id: "low", title: "Low"),
                     PopupItem(id: "none", title: "No Thinking")],
             chosen: "xhigh", highlighted: .constant("medium")) { _ in })
-        await Snapshot.save("popup-context", size: CGSize(width: 260, height: 320), PopupList(
+        await Snapshot.save("popup-context", size: CGSize(width: 260, height: 360), PopupList(
             header: nil,
             items: [PopupItem(id: "", title: "Auto", badge: "Default")]
                 + ContextLength.lengths.map { PopupItem(id: String($0), title: ContextLength.title($0)) }
@@ -176,7 +176,7 @@ final class AppFlowTests {
         try await install(model)
         let file = try #require(Self.gguf(of: model), "no GGUF of \(model) in the Hugging Face cache")
         state.addLocal(file)
-        // The list outlives the run, so that a failed one leaves the next a Mac without the files.
+        // The list outlives the test, so that a failed one leaves the next a Mac without the files.
         defer { state.removeLocal(file.path) }
         await state.listed()
         #expect(state.selection == file.path && state.isInstalled(file.path))

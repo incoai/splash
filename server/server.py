@@ -46,6 +46,7 @@ from .constraints import (
     validate_tokenizer,
 )
 from .diagnostics import console_stats, log_unexpected, print_request, print_status
+from .documents import MAX_PAGES, MAX_PDF_BYTES
 from .errors import (
     OPENAI_ERRORS,
     RETRY_STATUSES,
@@ -62,6 +63,7 @@ from .http_security import (
     authenticate,
     validate_headers,
 )
+from .images import MAX_IMAGE_BYTES
 from .latency import RequestLatency
 from .metrics import prometheus_metrics
 from .origins import ANY_ORIGIN
@@ -70,6 +72,7 @@ from .output import (
     StreamingToolCallProjector,
     validate_response_content,
 )
+from .protocol import MAX_IMAGE_SPANS
 from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
 
 # Request bodies held at once, from upload through preparation and, for what
@@ -231,6 +234,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # passed validate_headers.
         self._allow_origin = None
         self._unread_body = 0
+        # The native job submitted last, which a failure cancels.
+        self._submitted = None
         self._last_sse_write = time.monotonic()
         try:
             for level, option, value in TCP_KEEPALIVE_OPTIONS:
@@ -385,15 +390,23 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _log_api_error(self, code):
         path = "".join(char if char.isprintable() else "?" for char in self.route)
-        print_status(f"Error · {code} · {self.command} {path[:256]}", error=True)
+        # A request the engine took is named as the backend's lines name it,
+        # so that the app joins them.
+        job = self._submitted
+        engine_id = job.engine_request_id if job is not None else None
+        request = "" if engine_id is None else f"request {engine_id} · "
+        print_status(
+            f"Error · {request}{code} · {self.command} {path[:256]}", error=True
+        )
 
     def safe_error(self, error, *, log=True):
         """Answer with `error` as its path's API answers it, unless the
-        response has begun."""
+        response has begun. `log` prints its line unless the backend has:
+        one line ends a request."""
         if self.response_started:
             return
         status, code, payload = self.errors.answer(error)
-        if log:
+        if log and not error.logged:
             self._log_api_error(code)
         try:
             self.send_json(status, payload, error.retry_after)
@@ -552,6 +565,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "context_length": self.app.max_context,
                 "vision": self.app.vision,
                 "input_modalities": self.app.input_modalities,
+                "limits": self._limits(),
                 "reasoning": self.app.reasoning,
                 **(
                     {"root": self.app.response_model}
@@ -561,6 +575,19 @@ class FrontendHandler(BaseHTTPRequestHandler):
             }
             for name in self.app.model_names
         ]
+
+    def _limits(self):
+        """What a request may carry, which a client can check an attachment
+        against before it sends: its bytes (--max-request-size); its images,
+        a PDF's pages counted among them; an image's bytes; a PDF's bytes,
+        which the request's PDFs share, and its pages."""
+        return {
+            "request_bytes": self.server.max_request_bytes,
+            "images": MAX_IMAGE_SPANS,
+            "image_bytes": MAX_IMAGE_BYTES,
+            "pdf_bytes": MAX_PDF_BYTES,
+            "pdf_pages": MAX_PAGES,
+        }
 
     def _get_models(self):
         models = self._models()
@@ -606,8 +633,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
             return
         self._body_reservation = None
-        # The native job submitted last, which a failure cancels.
-        self._submitted = None
         try:
             generation = self._serve(route, started_at)
             if generation is not None:
@@ -620,8 +645,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.safe_error(error, log=self._submitted is None)
         except APIError as error:
             self._cancel_submitted()
-            # The native outcome was already logged; a server-side failure
-            # after submission must still reach the console.
+            # A failure the backend ended the request with is logged, under
+            # the engine's id; another server-side failure after submission
+            # must still reach the console.
             self.safe_error(error, log=self._submitted is None or error.status >= 500)
         except Exception as error:
             self._cancel_submitted()
@@ -900,7 +926,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.app.backend.cancel(job)
             if not self.response_started:
                 raise
-            if error.status >= 500:
+            if error.status >= 500 and not error.logged:
                 self._log_api_error(error.code)
             try:
                 send_error(error)
