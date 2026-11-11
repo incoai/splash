@@ -258,6 +258,106 @@ extension ChatScreenTests {
 }
 
 extension ChatScreenTests {
+    /// The open chat's title shows in the toolbar, after the sidebar's divider, as the Chat shows in a window
+    /// open on the Server, as it does in a window opened on the Chat: it showed faint, 36 points to the left,
+    /// over the sidebar.
+    @Test func theTitleShowsAsTheChatShowsInAnOpenWindow() async throws {
+        let fake = try FakeRuntime("splash-chat-title", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let conversation = Conversation(title: "Kyoto in spring", messages: [
+            ChatMessage(role: .user, text: "Tell me about Kyoto in spring."), ChatMessage(role: .assistant, text: "Blossoms."),
+        ])
+        try JSONEncoder().encode(conversation).write(to: fake.chats.appending(path: "\(conversation.id.uuidString).json"))
+        let state = try await ServerScreenTests.launchedWithModels(fake)
+        defer { state.quit() }
+        state.chats.selection = conversation.id
+        /// The title's ink in the toolbar past the Chat's switch, its dark pixels, and where the first of them
+        /// is, in points from the window's leading edge, once the window has laid out what changed, as one on
+        /// the screen does as it draws.
+        func title(in window: NSWindow) async throws -> (ink: Int, start: CGFloat) {
+            // Waiting, so that the main actor runs what the probe queues for it, as an app's does between events.
+            for _ in 0..<10 {
+                try await Task.sleep(for: .milliseconds(100))
+                window.layoutIfNeeded()
+                window.displayIfNeeded()
+                pump(0.02)
+            }
+            let picture = try #require(await Snapshot.picture(of: window))
+            let scale = CGFloat(picture.pixelsHigh) / window.frame.height, color = Self.colors(of: picture)
+            var ink = 0, start = Int.max
+            for y in Int(10 * scale)..<Int(44 * scale) {
+                for x in Int(210 * scale)..<Int((sidebarWidth + 300) * scale) {
+                    let (r, g, b) = color(x, y)
+                    if (r + g + b) / 3 < 0.4 {
+                        ink += 1
+                        start = min(start, x)
+                    }
+                }
+            }
+            return (ink, CGFloat(start) / scale)
+        }
+        state.section = .chat
+        let opened = await Snapshot.window(MainView().environment(state), size: ServerPictures.size, appearance: .aqua)
+        let shown = try await title(in: opened)
+        opened.orderOut(nil)
+        state.section = .server
+        let window = await Snapshot.window(MainView().environment(state), size: ServerPictures.size, appearance: .aqua)
+        defer { window.orderOut(nil) }
+        pump(0.5)
+        state.section = .chat
+        let swapped = try await title(in: window)
+        #expect(shown.ink > 50 && shown.start > sidebarWidth, "in a window opened on the Chat: \(shown)")
+        #expect(swapped.ink > shown.ink / 2 && swapped.start == shown.start, "in a window open on the Server: \(swapped), opened on the Chat: \(shown)")
+    }
+}
+
+extension ChatScreenTests {
+    /// At the window's least width, a long chat title truncates to the room the toolbar has before its buttons at
+    /// the end at their widest, the Server's naming a model of a long name, sidebar shown or hidden: the title took
+    /// up to 360 points past the sidebar and pushed the Server's button into the toolbar's overflow menu.
+    @Test func aLongTitleLeavesTheToolbarsButtons() async throws {
+        let fake = try FakeRuntime("splash-chat-long-title", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let conversation = Conversation(title: String(repeating: "A long title that goes on ", count: 4), messages: [
+            ChatMessage(role: .user, text: "Hello"), ChatMessage(role: .assistant, text: "Hi."),
+        ])
+        try JSONEncoder().encode(conversation).write(to: fake.chats.appending(path: "\(conversation.id.uuidString).json"))
+        let model = "example/A-Model-Whose-Name-Is-Long-Enough-To-Fill-The-Server-Button-GGUF:Q4"
+        try fake.install(model)
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        await state.launch()
+        for step in ["loaded", "warm"] { FileManager.default.createFile(atPath: fake.root.appending(path: step).path, contents: nil) }
+        state.server.start(model, settings: ServeSettings(values: ["--port": String(fake.port)]))
+        try await waitFor(state.server.phase == .ready, "ready")
+        state.chats.selection = conversation.id
+        state.section = .chat
+        let window = await Snapshot.window(MainView().environment(state), size: CGSize(width: 800, height: 600), appearance: .aqua)
+        defer { window.orderOut(nil) }
+        /// The toolbar's items with a view, each in the toolbar and inside the window, or not, once the window has laid
+        /// out what changed, waiting so that the main actor runs what the title's probe queues for it.
+        func shown() async throws -> [Bool] {
+            for _ in 0..<10 {
+                try await Task.sleep(for: .milliseconds(100))
+                window.layoutIfNeeded()
+                window.displayIfNeeded()
+                pump(0.02)
+            }
+            return (window.toolbar?.items ?? []).compactMap { item in
+                item.view.map { view in
+                    item.isVisible && view.window === window && view.convert(view.bounds, to: nil).maxX <= window.frame.width
+                }
+            }
+        }
+        let withSidebar = try await shown()
+        state.toggleSidebar()
+        let withoutSidebar = try await shown()
+        #expect(withSidebar.count == 5 && withSidebar.allSatisfy { $0 }, "with the sidebar: \(withSidebar)")
+        #expect(withoutSidebar.count == 5 && withoutSidebar.allSatisfy { $0 }, "without the sidebar: \(withoutSidebar)")
+    }
+}
+
+extension ChatScreenTests {
     /// The text view of the composer in `window`, where it lies in the window.
     static func field(in window: NSWindow) throws -> CGRect {
         func textViews(in view: NSView) -> [NSTextView] {

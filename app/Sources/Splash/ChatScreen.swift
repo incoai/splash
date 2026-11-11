@@ -17,9 +17,9 @@ struct ChatScreen: View {
     @State private var deletion: ChatDeletion?
     /// The chats picked to delete while the list picks them, from a chat's Select; nil otherwise.
     @State private var picked: Set<UUID>?
-    /// Where the toolbar puts the open chat's title in the window (`ChatTitle`), kept while a new chat
-    /// has none, so that the next title starts in its place.
-    @State private var titleX: CGFloat?
+    /// Where the toolbar puts the open chat's title in the window, and how wide the window is (`ChatTitle`), kept
+    /// while a new chat has none, so that the next title starts in its place.
+    @State private var titlePlace: TitlePlace?
 
     var body: some View {
         WithSidebar {
@@ -34,7 +34,7 @@ struct ChatScreen: View {
         .toolbar {
             if let open = state.chats.current, !open.messages.isEmpty {
                 ToolbarItem(placement: .navigation) {
-                    ChatTitle(conversation: open, x: $titleX) { actions(for: open) }
+                    ChatTitle(conversation: open, place: $titlePlace) { actions(for: open) }
                 }
                 // Plain text, as a window's title is, not a control on a band of glass.
                 .sharedBackgroundVisibility(.hidden)
@@ -79,33 +79,38 @@ struct ChatScreen: View {
 private struct ChatTitle<Actions: View>: View {
     @Environment(AppState.self) private var state
     let conversation: Conversation
-    /// Where the toolbar puts the title in the window, from which its way to the sidebar's divider is measured; until
-    /// that is known, the title doesn't show.
-    @Binding var x: CGFloat?
+    /// Where the toolbar puts the title in the window, from which its way to the sidebar's divider is measured, and
+    /// how wide the window is; until that is known, the title doesn't show.
+    @Binding var place: TitlePlace?
     @ViewBuilder let actions: () -> Actions
 
     var body: some View {
         // The way from where the toolbar puts the item to the sidebar's divider: room before the separator while
         // the sidebar shows, after the title while it hides, so that the item keeps its size as the sidebar
         // slides, and the toolbar leaves it where it is.
-        let room = max(0, sidebarWidth - (x ?? sidebarWidth))
+        let room = max(0, sidebarWidth - (place?.x ?? sidebarWidth))
         let before = state.showsSidebar ? room : 0
+        // Either way the item ends that far past the sidebar's divider, the separator and the title: the title
+        // truncates to what the window leaves before the toolbar's buttons at its end at their widest, as in the
+        // window's least width before its place is known. Its 360 points in every window pushed the Server's button
+        // into the toolbar's overflow menu in the narrowest, a model running.
+        let window = place?.window ?? leastWindowWidth
         WholePoints {
             HStack(spacing: 8) {
                 Divider().frame(height: 16).accessibilityHidden(true)
-                menu
+                menu.frame(maxWidth: min(360, window - sidebarWidth - 9 - toolbarEnd), alignment: .leading)
             }
             .padding(.leading, before)
             .padding(.trailing, room - before)
         }
-        // At its own size, which the probe follows, and from the item's leading edge, while the toolbar is yet
-        // to size the item to it.
+        // At its own size, which the toolbar sizes the item to as it changes: a frame that took any width offered
+        // kept the item at the width it first had, the title's alone, and the room added once its place was known
+        // drew past the item's edge, where clicks don't reach.
         .fixedSize()
         // Fading in once it has its place, as the toolbar sizes the item to it.
-        .opacity(x == nil ? 0 : 1)
-        .animation(Motion.settle, value: x == nil)
-        .background(ToolbarProbe { x = $0 })
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .opacity(place == nil ? 0 : 1)
+        .animation(Motion.settle, value: place == nil)
+        .background(ToolbarProbe { place = $0 })
         // Along with the sidebar as it slides.
         .animation(Motion.settle, value: state.showsSidebar)
     }
@@ -126,14 +131,26 @@ private struct ChatTitle<Actions: View>: View {
         .menuStyle(.button)
         .buttonStyle(HoverStyle(padding: EdgeInsets()))
         .menuIndicator(.hidden)
-        // The highlight hugs the title, which a long one truncates to the room the toolbar has in the narrowest
-        // window, before the buttons at its end.
-        .frame(maxWidth: 360, alignment: .leading)
         .help("Pin, Rename or Delete This Chat")
         .accessibilityLabel(conversation.title.isEmpty ? "New Chat" : conversation.title)
         .accessibilityHint("Pins, renames or deletes this chat")
     }
 }
+
+/// Where the toolbar puts the open chat's title in its window, and how wide the window is, as the title's probe tells
+/// them (`ToolbarProbe`).
+struct TitlePlace: Equatable {
+    let x: CGFloat
+    let window: CGFloat
+}
+
+/// The toolbar's buttons at its end at their widest, with its gaps: the terminal's, 36 points, and the Server's, 267
+/// with its title at its widest, 220 (`ServerButton`), 8 points apart and from the window's edge, after a flexible
+/// space of at least 8 with a gap of 8 on either side.
+private let toolbarEnd: CGFloat = 8 + 267 + 8 + 36 + 8 + 8 + 8
+
+/// The window's least width (`MainView`).
+private let leastWindowWidth: CGFloat = 800
 
 /// Lays its content out from its leading edge, in whole points. The toolbar centers each item in a slot it rounds up
 /// to whole points, so that an item a fraction of a point wide sits half a point in from where one a point wider
@@ -150,27 +167,28 @@ private struct WholePoints: Layout {
 }
 
 /// Behind a toolbar item's content, at the content's own size. It tells where the item lies along x in its window,
-/// for the content to line up with the window's content under it, which the toolbar lays out apart: as it is first
-/// laid out in a window, and as a window ends going into full screen or out of it, which moves the toolbar's items.
+/// for the content to line up with the window's content under it, which the toolbar lays out apart, and how wide the
+/// window is: as it is first laid out in a window, as a window ends going into full screen or out of it, which moves
+/// the toolbar's items, and as the window is resized.
 /// Nothing else moves an item for good: as the toolbar sizes one, it centers it for a moment in its old place first,
 /// which the probe doesn't follow. As the content's size changes, it lays the toolbar out, which sizes the item to it:
 /// the toolbar lays itself out only as the window's content changes.
 private struct ToolbarProbe: NSViewRepresentable {
-    let report: @MainActor (CGFloat) -> Void
+    let report: @MainActor (TitlePlace) -> Void
 
     func makeNSView(context: Context) -> Probe { Probe(report: report) }
 
     func updateNSView(_ probe: Probe, context: Context) { probe.report = report }
 
     final class Probe: NSView {
-        var report: @MainActor (CGFloat) -> Void
-        private var told: CGFloat?
+        var report: @MainActor (TitlePlace) -> Void
+        private var told: TitlePlace?
 
-        init(report: @escaping @MainActor (CGFloat) -> Void) {
+        init(report: @escaping @MainActor (TitlePlace) -> Void) {
             self.report = report
             super.init(frame: .zero)
             // Observers by selector go as the probe does.
-            for name in [NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification] {
+            for name in [NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification, NSWindow.didResizeNotification] {
                 NotificationCenter.default.addObserver(self, selector: #selector(moved), name: name, object: nil)
             }
         }
@@ -204,11 +222,11 @@ private struct ToolbarProbe: NSViewRepresentable {
         @objc private func moved(_ notification: Notification) { tell() }
 
         private func tell() {
-            guard window != nil else { return }
-            let x = convert(bounds, to: nil).minX
-            guard x != told else { return }
-            told = x
-            Task { @MainActor [report] in report(x) }
+            guard let window else { return }
+            let place = TitlePlace(x: convert(bounds, to: nil).minX, window: window.frame.width)
+            guard place != told else { return }
+            told = place
+            Task { @MainActor [report] in report(place) }
         }
     }
 }
