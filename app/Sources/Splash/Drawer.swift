@@ -267,15 +267,17 @@ struct WithDrawer<Content: View>: View {
         let shown = state.showsDrawer
         let height = min(state.drawerHeight, tallest)
         VStack(spacing: 0) {
+            // Nothing in the content or the drawer animates with the slide (`Slide`).
             content
+                .transaction(value: shown) { $0.animation = nil }
             // Closed, it keeps its place and its height, clipped to none, its terminals and their
             // views with it; the keyboard leaves it. Its tabs keep to its top edge, with no
             // terminal under them too.
             DrawerView(tallest: tallest)
                 .frame(height: height, alignment: .top)
                 .focused($focused)
-                .frame(height: shown ? height : 0, alignment: .top)
-                .clipped()
+                .transaction(value: shown) { $0.animation = nil }
+                .modifier(Slide(shown: shown ? 1 : 0, height: height))
                 .allowsHitTesting(shown)
                 .accessibilityHidden(!shown)
         }
@@ -299,6 +301,31 @@ struct WithDrawer<Content: View>: View {
     /// A view's AppKit view, held by reference: taking it changes no state the view reads.
     private final class Anchor {
         weak var view: NSView?
+    }
+}
+
+/// The drawer's height as it slides, `shown` of `height`: one value SwiftUI animates, laying
+/// the window out again at each frame, so that what is above the drawer and in it moves with
+/// its edge whatever animates in it. Animating the views moved by the change instead moved each
+/// as it would animate: the Server's control bar, whose words change at once, jumped to where
+/// the drawer was going, over the screen, ahead of its own background and the drawer, and the
+/// tab of the terminal the drawer opened with faded in under the New Terminal button sliding
+/// past it.
+private struct Slide: ViewModifier, @preconcurrency Animatable {
+    var shown: CGFloat
+    let height: CGFloat
+
+    var animatableData: CGFloat {
+        get { shown }
+        set { shown = newValue }
+    }
+
+    func body(content: Content) -> some View {
+        content
+            // In whole points, so that the content's bottom and the drawer's edge, each rounded to
+            // the screen's pixels on its own, keep together through the slide.
+            .frame(height: (height * shown).rounded(), alignment: .top)
+            .clipped()
     }
 }
 

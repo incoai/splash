@@ -716,3 +716,66 @@ struct DrawerTests {
         kill(pid, 0) != 0 && errno == ESRCH
     }
 }
+
+extension DrawerTests {
+    /// The drawer slides with what is above it and what is in it: each frame drawn as it opens and
+    /// closes over the Server screen has the screen's control bar and the drawer's tabs as they show
+    /// once it has opened, together, moved as one with the drawer's edge; not the bar's words where
+    /// the drawer is going, ahead of the drawer and of the bar's own background, nor the tab of the
+    /// terminal it opens with fading in under the New Terminal button.
+    @Test func theDrawerSlidesWithWhatIsAboveItAndInIt() async throws {
+        let fake = try FakeRuntime("splash-drawer-slide", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await ServerScreenTests.launchedWithModels(fake)
+        defer { state.quit() }
+        state.options["--port"] = String(fake.port)
+        for step in ["loaded", "warm"] { FileManager.default.createFile(atPath: fake.root.appending(path: step).path, contents: nil) }
+        state.start("unsloth/flint-GGUF:UD-Q4_K_XL")
+        try await waitFor(state.server.phase == .ready, "ready")
+        let window = await Snapshot.window(MainView().environment(state), size: CGSize(width: 1120, height: 780), appearance: .aqua)
+        defer { window.orderOut(nil); state.drawer.endAll() }
+        pump(0.5)
+        /// The window drawn now, each row of its pixels as a hash, from the top: drawn at once,
+        /// so that the frames come some 20 ms apart.
+        func rows() throws -> [Int] {
+            let frame = try #require(window.contentView?.superview)
+            let bitmap = try #require(frame.bitmapImageRepForCachingDisplay(in: frame.bounds))
+            frame.cacheDisplay(in: frame.bounds, to: bitmap)
+            let data = try #require(bitmap.bitmapData)
+            return (0..<bitmap.pixelsHigh).map { Data(bytes: data + $0 * bitmap.bytesPerRow, count: bitmap.bytesPerRow).hashValue }
+        }
+        /// The frames drawn through `change` that differ from the one before it, and the one once
+        /// it has stopped changing.
+        func frames(of change: () -> Void) throws -> (drawn: [[Int]], after: [Int]) {
+            let before = try rows()
+            change()
+            var drawn: [[Int]] = []
+            for _ in 0..<15 {
+                pump(0.02)
+                drawn.append(try rows())
+            }
+            pump(1)
+            return (drawn.filter { $0 != before }, try rows())
+        }
+        let scale = CGFloat(try rows().count) / window.frame.height
+        let opening = try frames { state.toggleDrawer() }
+        // Opened: the drawer's edge, 280 points up from the window's bottom; the band from the bar's
+        // last 60 points to the drawer's tabs and the divider under them.
+        let edge = Int((window.frame.height - min(state.drawerHeight, 280)) * scale)
+        let band = Array(opening.after[(edge - Int(60 * scale))..<(edge + Int(38 * scale))])
+        /// How much of the band `frame` shows whole, moved down as far as it shows most of it.
+        func shown(in frame: [Int]) -> Double {
+            let start = edge - Int(60 * scale)
+            return (0...Int(300 * scale)).map { offset in
+                let compared = band.indices.filter { start + offset + $0 < frame.count }
+                guard compared.count >= Int(20 * scale) else { return 0 }
+                return Double(compared.count { band[$0] == frame[start + offset + $0] }) / Double(compared.count)
+            }.max() ?? 0
+        }
+        #expect(!opening.drawn.isEmpty && opening.drawn.allSatisfy { shown(in: $0) >= 0.9 },
+                "opening: \(opening.drawn.map { shown(in: $0) })")
+        let closing = try frames { state.toggleDrawer() }
+        #expect(!closing.drawn.isEmpty && closing.drawn.allSatisfy { shown(in: $0) >= 0.9 },
+                "closing: \(closing.drawn.map { shown(in: $0) })")
+    }
+}
