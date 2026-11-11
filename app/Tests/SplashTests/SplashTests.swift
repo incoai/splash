@@ -227,7 +227,7 @@ struct ServeSettingsTests {
     @Test func theContextHintIsTheModels() {
         #expect(ContextLength.message(Self.flint).contains("at most 256K, the model’s own window"))
         #expect(!ContextLength.message(Self.flint).contains("YaRN"))
-        #expect(ContextLength.message(Self.moe).contains("at most 1,010,000. Past the model’s own window, 256K, it stretches it with YaRN"))
+        #expect(ContextLength.message(Self.moe).contains("at most \(1_010_000.formatted()). Past the model’s own window, 256K, it stretches it with YaRN"))
         #expect(ContextLength.message(.unknown).contains("YaRN"))
     }
 
@@ -250,7 +250,7 @@ struct ServeSettingsTests {
         #expect(ContextLength.parse("0") == nil && ContextLength.parse("12.5K") == nil && ContextLength.parse("lots") == nil)
         #expect(ContextLength.title(32768) == "32K tokens")
         #expect(ContextLength.title(1_000_000) == "1M tokens")
-        #expect(ContextLength.title(100_000) == "100,000 tokens")
+        #expect(ContextLength.title(100_000) == "\(100_000.formatted()) tokens")
         // As typed, read back alike.
         #expect([32768, 1_000_000, 100_000].map { ContextLength.parse(ContextLength.text($0)) } == [32768, 1_000_000, 100_000])
     }
