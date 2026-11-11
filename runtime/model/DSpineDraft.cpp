@@ -12,8 +12,8 @@ void DSpineDraft::addDecode(metal::CommandGraph &graph, const DFlashDraftWeights
   const uint32_t lanes = static_cast<uint32_t>(cacheLengths.size());
   const uint32_t rows = lanes * operators.geometry().rows();
   const DSpineParams shape{layout.hiddenSize, layout.bridgeCodeSize, layout.bridgeRank, rows};
-  const auto attention = operators.draftAttention(layout.attentionShape(), lanes);
-  const auto &linear = operators.linear();
+  const auto attention = operators.draftAttention(layout.attentionShape(operators.geometry()), lanes);
+  const auto &linear = operators.draftLinear();
   const auto project = [&](const metal::MetalBuffer &input, const ops::Projection &weight,
                             const metal::MetalBuffer &output) {
     linear.add(graph, {.input = input, .output = output, .scratch = b.linearScratch},
@@ -47,10 +47,13 @@ void DSpineDraft::addDecode(metal::CommandGraph &graph, const DFlashDraftWeights
     project(b.bridge.message, weights.bridge.write[layer], b.projected);
     ops::DSpine::addWrite(graph, b.projected, b.hidden[next], b.bridge, shape, operators.geometry());
   }
-  const auto headPlan = linear.decodePlan(head, lanes);
+  // The shared vocabulary head follows the target's activation policy,
+  // matching its scratch accounting; the draft's own weights stay bf16.
+  const auto &target = operators.linear();
+  const auto headPlan = target.decodePlan(head, lanes);
   const auto prepared = ops::Normalization::addRms(graph, b.hidden[layout.layers & 1], weights.finalNorm,
       b.finalHidden, layout.hiddenSize, rows, b.linearScratch, headPlan.input());
-  linear.add(graph, {.input = b.finalHidden, .output = b.logits, .scratch = b.linearScratch, .prepared = prepared},
+  target.add(graph, {.input = b.finalHidden, .output = b.logits, .scratch = b.linearScratch, .prepared = prepared},
               head, headPlan);
 }
 

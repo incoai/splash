@@ -171,8 +171,7 @@ int main(int argc, char **argv) {
         checkGolden(hashes, std::string(image.component), image.bytes, std::string(image.component) + ": golden");
       }
       images.release();
-      while (!images.restore(splash::test::admitAll)) {
-      }
+      splash::test::restoreWeights(images);
       for (size_t index = 0; index < loaded.size(); ++index)
         check(bytesOf(images.contents()[index].bytes) == loaded[index],
               std::string(images.contents()[index].component) + ": restored");

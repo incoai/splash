@@ -185,6 +185,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "8" && value != "16")
         throw UsageError("--draft-block-size requires 8 or 16");
       result.draftBlockSize = value == "16" ? 16 : 8;
+    } else if (option == "--activations") {
+      if (value != "auto" && value != "bf16")
+        throw UsageError("--activations requires auto or bf16");
+      result.int8Activations = value == "auto" ? ops::Int8Activations::On : ops::Int8Activations::Off;
     } else if (option == "--verify-rows") {
       if (value != "auto" && value != "all")
         throw UsageError("--verify-rows requires auto or all");

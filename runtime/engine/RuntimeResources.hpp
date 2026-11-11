@@ -123,7 +123,8 @@ struct RuntimeResourcesConfig {
   // process.
   bool persistentCache = false;
   // The volume a directory lives on (volumeOf), which the automatic quota
-  // reads for each place the tier may keep its files before it opens them.
+  // reads for each place the tier may keep its files before it opens them,
+  // and the tier at each measure for the place they opened in (DiskSpace).
   std::function<std::optional<DiskVolume>(const std::filesystem::path &directory)> diskVolume =
       volumeOf;
   // Patches per image, from --max-image-patches: the engine admits images up
@@ -166,6 +167,10 @@ struct RuntimeResourcesConfig {
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
   // The model's fixed draft block width; sixteen requires dense DSpine.
   uint32_t draftBlockSize = 8;
+  // --activations: whether the plans may round activations to int8
+  // where an int8-activation path takes them, or keep every activation bf16
+  // (ops::Int8Activations), for the life of the engine (ops::ExecutionPlans).
+  ops::Int8Activations int8Activations = ops::Int8Activations::On;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
@@ -418,8 +423,9 @@ private:
 // run on a prefill arena of their own, its programs wait for the ANE's
 // service until `cancelled` returns true, and its calibrations are
 // remembered beside the programs (ane::recall) under its layers' shapes and
-// formats, the device, the macOS version, the engine's `buildId` and the
-// most units the plan holds.
+// formats and the Int8Activations its GPU part plans with
+// (ops::AneFfn::calibrationKey), the device, the macOS version, the engine's
+// `buildId` and the most units the plan holds.
 [[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                                       const ops::ExecutionPlans &operators, kv::Format format,
                                       std::string_view buildId, std::function<bool()> cancelled);

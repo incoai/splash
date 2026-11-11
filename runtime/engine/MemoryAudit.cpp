@@ -60,9 +60,9 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
   // The plan takes the weight categories from what loaded, so they are
   // counted but have no bound of their own. A buffer a loader does not report
   // is unclassified backend memory, which the pipeline and runtime reserves
-  // bound; only the arenas, KV storage, the readers of spilled KV, the disk
-  // tier's state staging, the Neural Engine split and the streamed table have
-  // planned category bounds.
+  // bound; only the arenas, KV storage, the readers of spilled KV and their
+  // tables, the disk tier's state staging, the Neural Engine split and the
+  // streamed table have planned category bounds.
   uint64_t categorized = 0;
   for (const uint64_t weights : {actual.targetWeightsBytes,
                                  actual.draftWeightsBytes,
@@ -83,6 +83,7 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
       {"KV", actual.kvAllocatedBytes, budget.kvCapacityBytes},
       {"hot KV block cache", actual.spilledKvHotBytes, budget.kvSpill.hotLimitBytes},
       {"KV history staging", actual.spilledKvStagingBytes, budget.kvSpill.stagingBytes},
+      {"spilled KV readers' tables", actual.spilledKvTableBytes, budget.kvSpill.tableBytes},
       {"state staging", actual.stateStagingBytes, budget.stateStagingBytes},
       {"Neural Engine split", actual.aneFfnBytes, budget.aneFfnBytes},
   };
@@ -112,7 +113,7 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
       std::min(budget.hardBudgetBytes, actual.streamedTableBytes);
   uint64_t dynamic = 0;
   for (const uint64_t bytes : {actual.stateAllocatedBytes, actual.kvAllocatedBytes, actual.spilledKvHotBytes,
-                               actual.spilledKvStagingBytes})
+                               actual.spilledKvStagingBytes, actual.spilledKvTableBytes})
     if (!checkedAdd(dynamic, bytes, dynamic)) {
       return fail(MemoryAuditError::ArithmeticOverflow,
                   "elastic memory sum overflowed", actual);

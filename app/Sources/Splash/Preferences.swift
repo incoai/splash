@@ -458,6 +458,10 @@ extension LaunchOption {
             help: "Reads long prompts faster on models that can use it.",
             section: .requests, kind: .toggle(on: false)),
         LaunchOption(
+            flag: "--activations", title: "Activations",
+            help: "Auto does some of the GPU’s math in 8 bits where M5 and later Macs run it faster, at a small cost in precision. 16-bit does none.",
+            section: .requests, kind: .choice(standard: "Auto", choices: [("bf16", "16-bit")], custom: nil)),
+        LaunchOption(
             flag: "--allow-idle-sleep", title: "Keep Mac awake while answering",
             help: "The Mac doesn’t sleep in the middle of an answer; the display still may.",
             section: .requests, kind: .toggle(on: false)),

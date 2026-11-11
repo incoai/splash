@@ -430,11 +430,17 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   // Page ids stay 32-bit. One request's KV capacity is the whole extents of
   // the size that leaves the fewest of the budget's pages, priced one by one,
   // unused; a windowed layout's Full and Slim pages take extents of their
-  // own (kvPagesWithin).
+  // own (kvPagesWithin). They are what the budget leaves beside its lane's
+  // state and what a spill-capable target holds from its start
+  // (KvSpillPlan::heldBytes), as a lone start's claim counts them
+  // (Engine::residentRoom), so that the context advertised is one a lone
+  // start takes. Beside the state alone, a Qwen3.8-Flash-Next start that can
+  // spill advertised an extent more than a lone start could take wherever
+  // the room past its last extent was less than its 6,881,280 bytes of Index
+  // runway and tables.
   const uint64_t availableForOneRequestKv =
-      breakdown.dynamicBudgetBytes > breakdown.laneStateBytes
-          ? breakdown.dynamicBudgetBytes - breakdown.laneStateBytes
-          : 0;
+      saturatingSubtract(breakdown.dynamicBudgetBytes,
+                         breakdown.laneStateBytes + (model.spill.enabled ? model.spill.heldBytes() : 0));
   const auto pagesWithin = [&](uint32_t extentPages) {
     return std::min<uint64_t>(
         kvPagesWithin(kvLayout, availableForOneRequestKv, breakdown.kvWindowFloorPages, extentPages),

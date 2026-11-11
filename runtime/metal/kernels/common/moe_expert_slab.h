@@ -92,11 +92,3 @@ inline MoeGgufSegment moe_gguf_segment(uint expert, uint experts, uint input_siz
   const MoeExpertChunk c = moe_expert_chunk(chunks, floor_slots, chunk_slots, slots[expert], projection);
   return moe_gguf_planes(f, routed_format, c.w0, c.w1, c.meta, ulong(c.local) * output_size, input_size / 32);
 }
-template <uint Shared>
-inline MoeGgufSegment moe_gguf_segment(uint expert, constant MoeGgufExpertParams &p, device const uint *slots,
-                                       constant ulong *chunks, device uchar *shared_w0, device uchar *shared_w1,
-                                       device uchar *shared_meta) {
-  return moe_gguf_segment<Shared>(expert, p.experts, p.input_size, p.output_size, p.routed_format, p.shared_format,
-                                  slots, chunks, p.floor_slots, p.chunk_slots, p.projection, shared_w0, shared_w1,
-                                  shared_meta);
-}

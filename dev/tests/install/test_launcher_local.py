@@ -20,7 +20,11 @@ from dev.tests.installer_fixtures import (
     write_gguf,
     write_target,
 )
-from dev.tests.server_fixtures import keep_stop_signals, server_arguments
+from dev.tests.server_fixtures import (
+    console_written,
+    keep_stop_signals,
+    server_arguments,
+)
 from install import assembly, hub, launcher, local
 from server import server as api
 
@@ -182,6 +186,7 @@ class LocalServeTests(unittest.TestCase):
             result, execute = self.serve(self.root / "absent" / ".." / target.name)
         self.assertEqual(result, 1)
         execute.assert_not_called()
+        console_written()
         self.assertEqual(
             error.getvalue(), f"error: cannot prepare {target}: it does not exist\n"
         )

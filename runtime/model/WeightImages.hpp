@@ -4,12 +4,16 @@
 #include "model/WeightMemory.hpp"
 #include "model/WeightStore.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -49,27 +53,46 @@ struct ImagePlan final {
 // of it stays the same handle: a command that binds a view of released memory
 // fails (MetalBackend::releaseMemory). Every image's file records
 // contentIdentity, what the sources hold (ModelDescriptor::sourceIdentity).
+//
+// A restore writes each image on a thread of its own, so that the engine's
+// loop goes on answering the server while one is written: Flash-Next's PLE
+// table loaded whole is one image of 28.8 GB, whose write from a disk slower
+// than about 1 GB/s outlasts the 30 s within which the loop must answer a
+// status request (supervision::kLoopStall), past which the server stops the
+// engine. The writer has the backend to itself meanwhile: the engine leaves
+// memory and the backend alone until the write ends (WeightMemory::writing,
+// engine::Engine::tick).
 class WeightImages final : public WeightMemory {
 public:
   WeightImages(metal::MetalBackend &backend, std::string contentIdentity) noexcept
       : backend_(&backend), contentIdentity_(std::move(contentIdentity)) {}
   WeightImages(const WeightImages &) = delete;
   WeightImages &operator=(const WeightImages &) = delete;
+  // Waits for an image being written.
+  ~WeightImages() override;
 
   // Allocates the image's buffer, writes it and returns its file.
   [[nodiscard]] WeightFile load(ImagePlan image);
   // What every image's file records the sources hold.
   [[nodiscard]] const std::string &contentIdentity() const noexcept { return contentIdentity_; }
   [[nodiscard]] bool released() const noexcept override { return released_; }
+  // An image being written ends first: its memory goes back with the others.
   void release() override;
+  // Ends the write of the last image it took back, then takes back the next
+  // and starts writing it on a thread of its own.
   [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override;
+  [[nodiscard]] bool writing() const noexcept override;
+  // The writes restore() starts from then on call `notifier` on their thread
+  // as they end.
+  void setCompletionNotifier(std::function<void()> notifier) override { written_ = std::move(notifier); }
 
   struct Contents final {
     std::string_view component;
     std::span<const uint8_t> bytes;
   };
   // Each image's component and bytes in load order, its bytes empty while
-  // released, valid until the next load().
+  // released and still being written while writing(), valid until the next
+  // load().
   [[nodiscard]] std::vector<Contents> contents() const;
 
 private:
@@ -78,12 +101,27 @@ private:
     metal::MetalBuffer buffer;
     ImageWriter write;
   };
+  // The write of the last image restore() took back, on its thread: whether
+  // it ended, and how it failed.
+  struct Writing final {
+    std::thread thread;
+    std::atomic<bool> ended{false};
+    std::exception_ptr failure;
+  };
+  // Waits for the write in flight and forgets it; returns how it failed.
+  std::exception_ptr endWrite();
+
   metal::MetalBackend *backend_;
   std::string contentIdentity_;
   std::vector<Image> images_;
   bool released_ = false;
-  // The images restore() has written back since release().
+  // The images restore() has taken back since release(), the last of them
+  // written by writing_'s thread while that is set, until the next restore()
+  // or release() ends it.
   size_t restored_ = 0;
+  std::unique_ptr<Writing> writing_;
+  // The completion notifier, which each write copies as it starts.
+  std::function<void()> written_;
 };
 
 // The threads that read and convert weights while images are written: one
