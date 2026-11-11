@@ -79,7 +79,11 @@ bool routerType(uint32_t type) { return floatProjectionType(type) || (quantizedT
 bool floatRowType(uint32_t type) { return floatProjectionType(type) || type == ggml::kQ8_0; }
 // A DeepSeek-V4.1 QSA projection (qsaProjection), which the float projection
 // runs in fp32 as stored: a float projection's type, or Q8_0, whose native
-// rows it decodes, as llama.cpp's GGUFs of the family store them.
+// rows it decodes. Every published quantization of the family stores them as
+// BF16 or Q8_0 (ggml-org's Q2_K, unsloth's UD-Q4_K_XL); the kernel decodes any
+// format a router's may be (routerType), so another needs only this
+// predicate. These are floatRowType's types, but kept as stored, where
+// floatRows decodes them to F32.
 bool qsaProjectionType(uint32_t type) { return floatProjectionType(type) || type == ggml::kQ8_0; }
 
 // The header type of the image of a table a family adds (planImages), beside

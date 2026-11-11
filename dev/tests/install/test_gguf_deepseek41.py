@@ -9,7 +9,10 @@ the tensor table of all six parts, read from the files' headers, are fixtures
 (dev/tests/fixtures/model-configs/deepseek-v4.1-flash), and so is the
 config.json of the release they were made from,
 deepseek-ai/DeepSeek-V4.1-Flash-1017 (revision
-1bae0e1088993b9b82de08f59de5be5a34e42170)."""
+1bae0e1088993b9b82de08f59de5be5a34e42170). So is the tensor table of the six
+parts of ggml-org/DeepSeek-V4.1-Flash-1017-GGUF's Q2_K (revision
+33ccae11627e538a0df9440caa15cdceace0c185, gguf-tensors-Q2_K.json), whose
+compressors and indexers are Q8_0."""
 
 import contextlib
 import io
@@ -105,12 +108,12 @@ def header_values():
     }
 
 
-def tensor_table():
+def tensor_table(fixture="gguf-tensors.json"):
     """The real files' tensors: name, extents and type, in their order."""
     return [
         (name, extents, GGML[kind])
         for name, (kind, extents) in json.loads(
-            (FIXTURES / "gguf-tensors.json").read_text()
+            (FIXTURES / fixture).read_text()
         ).items()
     ]
 
@@ -236,20 +239,10 @@ class DeepSeek41GgufTests(unittest.TestCase):
         self.assertIs(self.check(tensor_table()), DEEPSEEK)
 
     def test_the_engine_plans_q8_0_compressors_and_indexers(self):
-        # llama.cpp's quantizations of the family store the compressors' and
-        # indexers' projections as Q8_0, which the float projection decodes.
-        qsa = (
-            ".attn_compressor_kv.weight",
-            ".attn_compressor_gate.weight",
-            ".indexer.attn_k.weight",
-            ".indexer.attn_q_b.weight",
-            ".indexer.proj.weight",
-        )
-        table = [
-            (name, extents, GGML["Q8_0"] if name.endswith(qsa) else kind)
-            for name, extents, kind in tensor_table()
-        ]
-        self.assertTrue(any(name.endswith(qsa) for name, _, _ in table))
+        # ggml-org's Q2_K stores the compressors' and indexers' projections
+        # as Q8_0, which the float projection runs as stored.
+        table = tensor_table("gguf-tensors-Q2_K.json")
+        self.assertIn(("blk.2.indexer.attn_k.weight", [512, 128], GGML["Q8_0"]), table)
         self.assertIs(self.check(table), DEEPSEEK)
 
     def test_the_engine_refuses_what_it_does_not_read(self):
