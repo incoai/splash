@@ -61,15 +61,21 @@ struct GroupedSection<Content: View, Header: View, Footer: View>: View {
         Group(subviews: content) { rows in
             Group(subviews: header) { headers in
                 Group(subviews: footer) { footers in
+                    // Its parts come and go as its rows do (`Motion.comingAndGoing`): a card that
+                    // came with its first row, as a download's under the first run's welcome, faded
+                    // in with it over the rows still moving down to make room for it, and a footer
+                    // that went faded out over the rows moving up into its place.
                     if !rows.isEmpty || !headers.isEmpty || !footers.isEmpty {
                         VStack(alignment: .leading, spacing: 0) {
                             if !headers.isEmpty {
                                 VStack(alignment: .leading, spacing: 0) { ForEach(headers) { $0 } }
                                     .padding(.horizontal, Grouped.inset)
                                     .padding(.bottom, Grouped.inset)
+                                    .transition(Motion.comingAndGoing)
                             }
                             if !rows.isEmpty {
                                 card(rows)
+                                    .transition(Motion.comingAndGoing)
                             }
                             if !footers.isEmpty {
                                 VStack(alignment: .leading, spacing: 0) { ForEach(footers) { $0 } }
@@ -77,8 +83,10 @@ struct GroupedSection<Content: View, Header: View, Footer: View>: View {
                                     .foregroundStyle(.secondary)
                                     .padding(.horizontal, Grouped.inset)
                                     .padding(.vertical, Grouped.inset)
+                                    .transition(Motion.comingAndGoing)
                             }
                         }
+                        .transition(Motion.comingAndGoing)
                     }
                 }
             }

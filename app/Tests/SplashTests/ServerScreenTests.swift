@@ -577,6 +577,69 @@ extension ServerScreenTests {
     }
 }
 
+/// Sections of a grouped page whose rows come and go as a test says: a section whose card comes
+/// with its first row, under its header, between two that stay.
+@MainActor @Observable final class GroupedSample {
+    var card = false
+}
+
+private struct GroupedSampleSections: View {
+    let sample: GroupedSample
+
+    var body: some View {
+        Group {
+            GroupedSection { Text("Above") }
+            GroupedSection {
+                if sample.card { Color.red.frame(height: 60) }
+            } header: {
+                Text("Comes")
+            }
+            GroupedSection { Text("Below") }
+        }
+        .animation(Motion.settle, value: sample.card)
+    }
+}
+
+extension ServerScreenTests {
+    /// Whether `picture` shows a tint of the color channel `channel` (0 red, 1 green, 2 blue) over
+    /// the others in the page's part of `window`.
+    static func shows(channel: Int, in picture: NSBitmapImageRep, of window: NSWindow) -> Bool {
+        let bytes = picture.bitsPerPixel / 8
+        return page(picture, of: window).contains { row in
+            stride(from: 0, to: row.count - 2, by: bytes).contains { i in
+                let c = (0..<3).map { Int(row[row.startIndex + i + $0]) }
+                return (0..<3).allSatisfy { $0 == channel || c[channel] - c[$0] > 40 }
+            }
+        }
+    }
+
+    /// A grouped page with the sample's sections, drawn.
+    static func groupedSample(_ sample: GroupedSample) async -> (NSWindow, URL) {
+        let (state, folder) = AppState.forTests()
+        let window = await Snapshot.window(GroupedPage(column: 640) { GroupedSampleSections(sample: sample) }.environment(state),
+                                           size: ServerPictures.size, appearance: .aqua)
+        pump(0.3)
+        return (window, folder)
+    }
+
+    /// A section's card that comes with its first row comes as a row does, once what makes room
+    /// for it has moved: it faded in at once over the rows still moving down, as the download's
+    /// under the first run's welcome.
+    @Test func aSectionsCardComesOnceThereIsRoom() async throws {
+        let sample = GroupedSample()
+        let (window, folder) = await Self.groupedSample(sample)
+        defer {
+            window.orderOut(nil)
+            try? FileManager.default.removeItem(at: folder)
+        }
+        let change = try await Self.pictures(of: window) { sample.card = true }
+        #expect(Self.shows(channel: 0, in: change.after, of: window))
+        let moving = change.drawn.filter { $0.at < .milliseconds(200) }
+        let early = moving.filter { Self.shows(channel: 0, in: $0.picture, of: window) }.count
+        #expect(!moving.isEmpty && early == 0, "the card showed in \(early) of \(moving.count) frames as the rows moved")
+    }
+}
+
 /// The Server screen drawn to `server-*.png` in `SPLASH_APP_SNAPSHOTS`, light and dark, for people
 /// to review its look with the models of a Mac that has a few: at its top, and scrolled so that its
 /// first rows would be where the toolbar is.
