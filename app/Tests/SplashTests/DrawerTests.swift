@@ -779,3 +779,28 @@ extension DrawerTests {
                 "closing: \(closing.drawn.map { shown(in: $0) })")
     }
 }
+
+extension DrawerTests {
+    /// The tab picked shows, past the tabs that fill the drawer's width: one added, the last, with
+    /// New Terminal after it, at the strip's end, and the first, picked again, at its start.
+    @Test func theTabPickedShowsPastTheTabsThatFillTheDrawer() async throws {
+        let (state, folder) = AppState.forTests()
+        let window = Self.window(WithDrawer { Color.clear }.environment(state))
+        defer { Self.close(window); state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        state.toggleDrawer()
+        for _ in 0..<11 { state.newTerminal() }
+        /// The tabs' strip, once they are wider than it.
+        func strip() -> NSScrollView? {
+            func scrollViews(in view: NSView) -> [NSScrollView] {
+                view.subviews.flatMap { ($0 as? NSScrollView).map { [$0] } ?? scrollViews(in: $0) }
+            }
+            return window.contentView.flatMap { scrollViews(in: $0).first { ($0.documentView?.frame.width ?? 0) > $0.contentView.bounds.width + 100 } }
+        }
+        try await waitFor(strip() != nil, "the tabs wider than their strip")
+        let scroll = try #require(strip())
+        let document = try #require(scroll.documentView)
+        try await waitFor(scroll.contentView.bounds.maxX >= document.frame.width - 1, "the strip's end")
+        state.drawer.terminal = state.drawer.terminals.first?.id
+        try await waitFor(scroll.contentView.bounds.minX <= 1, "the strip's start")
+    }
+}

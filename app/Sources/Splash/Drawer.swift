@@ -418,40 +418,53 @@ private struct DrawerView: View {
 private struct TerminalTabs: View {
     @Environment(AppState.self) private var state
 
+    /// The New Terminal button's place in the strip.
+    private static let end = "New Terminal"
+
     var body: some View {
         let drawer = state.drawer
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 4) {
-                ForEach(drawer.terminals) { session in
-                    let picked = drawer.terminal == session.id
-                    HStack(spacing: 6) {
-                        Button { drawer.terminal = session.id } label: {
-                            Text(session.title)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                                .frame(maxWidth: 160)
-                                .foregroundStyle(session.ended ? .tertiary : picked ? .primary : .secondary)
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(drawer.terminals) { session in
+                        let picked = drawer.terminal == session.id
+                        HStack(spacing: 6) {
+                            Button { drawer.terminal = session.id } label: {
+                                Text(session.title)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .frame(maxWidth: 160)
+                                    .foregroundStyle(session.ended ? .tertiary : picked ? .primary : .secondary)
+                            }
+                            .buttonStyle(.plain)
+                            Button { drawer.askToClose(session.id) } label: {
+                                Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
+                            .help("Close Terminal")
+                            .accessibilityLabel("Close Terminal")
                         }
-                        .buttonStyle(.plain)
-                        Button { drawer.askToClose(session.id) } label: {
-                            Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                        .help("Close Terminal")
-                        .accessibilityLabel("Close Terminal")
+                        .font(.callout)
+                        .padding(.horizontal, 10)
+                        .frame(height: 26)
+                        .background(picked ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear), in: .capsule)
+                        .id(session.id)
                     }
-                    .font(.callout)
-                    .padding(.horizontal, 10)
-                    .frame(height: 26)
-                    .background(picked ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear), in: .capsule)
+                    Button { state.newTerminal() } label: {
+                        Image(systemName: "plus")
+                    }
+                    .buttonStyle(.hover)
+                    .help("New Terminal")
+                    .accessibilityLabel("New Terminal")
+                    .id(Self.end)
                 }
-                Button { state.newTerminal() } label: {
-                    Image(systemName: "plus")
-                }
-                .buttonStyle(.hover)
-                .help("New Terminal")
-                .accessibilityLabel("New Terminal")
+            }
+            // The tab picked shows, past the tabs that fill the drawer's width, as one added does,
+            // the last, with New Terminal after it: they stayed out of view at the strip's end.
+            .onChange(of: drawer.terminal, initial: true) { _, id in
+                guard let id else { return }
+                proxy.scrollTo(id == drawer.terminals.last?.id ? AnyHashable(Self.end) : AnyHashable(id))
             }
         }
         .confirmationDialog("Close this terminal?", isPresented: Binding(
