@@ -97,6 +97,17 @@ std::string routingKernel(std::string name, MoeShape shape, std::string_view Com
   return name;
 }
 
+// The formats an expert pass decodes, its pipeline's function constants:
+// each once in ascending order, the last repeated past them, so passes of one
+// format set share a pipeline (moe_gguf.metal, moe_formats).
+template <size_t Count>
+std::array<uint32_t, Count> passFormats(std::array<uint32_t, Count> formats) {
+  std::sort(formats.begin(), formats.end());
+  const auto distinct = std::unique(formats.begin(), formats.end());
+  std::fill(distinct, formats.end(), distinct[-1]);
+  return formats;
+}
+
 // The expert passes over the grouped tiles `range` names (MOE_TILES_*), each
 // on the grid of those live tiles that the grouping wrote (MoeTileCount),
 // within the column tiles of `group` and maximumTiles(), the routed experts in
@@ -134,6 +145,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
             MoeGgufGateUpParams{hidden, intermediate, shape.experts, gate.routed.formatId, gate.shared.formatId,
                                 up.routed.formatId, up.shared.formatId, floorSlots, chunkSlots, range},
             {group.gate_up_columns, tiles, 1}, gateUpGrid, {GGUF_STAGED_THREADS, 1, 1});
+  graph.specialize(passFormats<4>({gate.routed.formatId, gate.shared.formatId, up.routed.formatId, up.shared.formatId}));
   graph.addresses(weights.chunks.planes());
   // Down, projection 2 of the routed experts, which it reaches in the chunks.
   graph.add(kernel + "_down" + slices,
@@ -142,6 +154,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
             MoeGgufExpertParams{intermediate, hidden, shape.experts, down.routed.formatId, down.shared.formatId,
                                 floorSlots, chunkSlots, range},
             {group.down_columns, tiles, 1}, downGrid, {GGUF_STAGED_THREADS, 1, 1});
+  graph.specialize(passFormats<2>({down.routed.formatId, down.shared.formatId}));
   graph.addresses(weights.chunks.planes());
 }
 

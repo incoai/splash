@@ -866,9 +866,10 @@ Apple9 GPUs of 10 cores or fewer, in prefill chunks of 33 to 64 rows (`gguf_deco
 and in longer prefill chunks one `gguf_prefill_<format>_a` per format over that format's
 segments (or, on the int8-activation tile, `gguf_prefill_int8_quantize` and one
 `gguf_prefill_int8_<format>_a` per segment). A `gguf_decode_fused_m<rows>` pipeline decodes
-its segments' formats alone, which specialize it as Metal function constants
+its segments' formats alone, and a `moe_expert_gguf_m<rows>` pipeline its pass's routed and
+shared formats alone, which specialize it as Metal function constants
 (`ComputeDispatch::constants`, a pipeline per name and values), so its first use compiles a
-staged loop for each of those formats rather than for all 44. The norm, GDN, attention-gate and
+loop for each of those formats rather than for all 44. The norm, GDN, attention-gate and
 attention-gather variants that also write the register kernels' input table carry `table16` in
 their names. The epilogue kinds of both GGUF families are in `kernels/common/gguf_tile.h`, the
 SiLU and sigmoid every kernel shares in `kernels/common/activation.h`, and the MMA helpers every
