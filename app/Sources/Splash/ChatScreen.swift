@@ -468,21 +468,29 @@ private struct ConversationView: View {
     var body: some View {
         let shown = state.chats.current.flatMap { $0.messages.isEmpty ? nil : $0 }
         VStack(spacing: 0) {
+            // What the composer leaves goes at once, and what it makes room for fades in once it
+            // has moved (`Motion.comingAndGoing`): the transcript faded out under the composer
+            // moving over it as a new chat opened, and in under the composer moving away as a
+            // chat got its first message, and so did the mark.
             if let conversation = shown {
                 LiveTranscript(page: page(conversation))
                     .toolbarLine()
+                    .transition(Motion.comingAndGoing)
             } else {
                 // A new chat: the mark, showing what the Server does, over the composer, and while a
                 // start warms up why it can take long, in the room under the mark, so that the
                 // composer stays in its place.
                 Spacer()
-                StatusMark(look: state.serverStatus.look, since: state.server.since, size: 44)
-                Text(state.serverStatus.note ?? "")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .padding(.horizontal, 32)
-                    .frame(height: 28)
+                Group {
+                    StatusMark(look: state.serverStatus.look, since: state.server.since, size: 44)
+                    Text(state.serverStatus.note ?? "")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .padding(.horizontal, 32)
+                        .frame(height: 28)
+                }
+                .transition(Motion.comingAndGoing)
             }
             // One composer either way, so that its text view, and what the input method composes
             // in it, stays when a chat gets its first message or a new chat opens.
@@ -492,8 +500,7 @@ private struct ConversationView: View {
                 Spacer()
             }
         }
-        // The composer moves, whole, between a new chat's middle and a conversation's foot, as the
-        // mark and the transcript fade.
+        // The composer moves, whole, between a new chat's middle and a conversation's foot.
         .animation(Motion.settle, value: shown == nil)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.background)

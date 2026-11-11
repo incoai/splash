@@ -92,6 +92,60 @@ extension ChatScreenTests {
 }
 
 extension ChatScreenTests {
+    /// A new chat opened from a conversation takes its transcript away at once, as the composer
+    /// moves to the middle, rather than fading it out under the composer moving over it; a
+    /// conversation opened from a new chat fades it in once the composer has reached the foot,
+    /// rather than under the composer moving away.
+    @Test func aNewChatTakesTheTranscriptAwayAtOnce() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-swap-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let conversation = Conversation(title: "Kyoto in spring", messages: [
+            ChatMessage(role: .user, text: "Tell me about Kyoto in spring."),
+            ChatMessage(role: .assistant, text: String(repeating: "Cherry blossoms line the river in early April. ", count: 40)),
+        ])
+        try JSONEncoder().encode(conversation).write(to: folder.appending(path: "\(conversation.id.uuidString).json"))
+        let state = AppState.forTests(in: folder, runtime: Showcase.runtime)
+        state.chats.selection = conversation.id
+        state.section = .chat
+        state.transcript.page.load()
+        let webView = try #require(state.transcript.page.webView)
+        let window = await Snapshot.window(ChatScreen().environment(state), size: ServerPictures.size, appearance: .aqua)
+        defer { window.orderOut(nil) }
+        try await waitFor(webView.window === window)
+        func shown() -> Double {
+            guard webView.window != nil else { return 0 }
+            var opacity = 1.0, view: NSView? = webView
+            while let next = view {
+                opacity *= Double(next.alphaValue) * Double(next.layer?.presentation()?.opacity ?? next.layer?.opacity ?? 1)
+                view = next.superview
+            }
+            return opacity
+        }
+        // Each frame: how much of the transcript shows, and where the composer is.
+        func frames() throws -> [(shown: Double, composer: CGFloat)] {
+            try (0..<16).map { _ in
+                pump(0.03)
+                return (shown(), try Self.field(in: window).minY)
+            }
+        }
+        state.chats.newChat()
+        let opening = try frames()
+        #expect(opening.allSatisfy { $0.shown == 0 }, "the transcript as a new chat opens: \(opening)")
+        pump(0.5)
+        state.chats.selection = conversation.id
+        let returning = try frames()
+        pump(0.5)
+        let foot = try Self.field(in: window).minY
+        #expect(returning.contains { $0.composer > foot + 50 }, "the composer moves to the foot: \(returning)")
+        // Within the few points the end of its animation takes.
+        #expect(returning.allSatisfy { $0.shown == 0 || abs($0.composer - foot) < 5 },
+                "the transcript before the composer is at the foot: \(returning)")
+        #expect(shown() == 1)
+    }
+}
+
+extension ChatScreenTests {
     /// The text view of the composer in `window`, where it lies in the window.
     static func field(in window: NSWindow) throws -> CGRect {
         func textViews(in view: NSView) -> [NSTextView] {
