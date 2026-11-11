@@ -38,15 +38,20 @@ struct LaunchOptions: View {
             HStack(alignment: .firstTextBaseline) {
                 SectionTitle(text: LaunchOption.Section.main.rawValue)
                 Spacer()
-                // For the options the card shows.
+                // For the options the card shows. Laid out while hidden, so that the header keeps
+                // its height: the button is taller than the title, and as it came and went the card
+                // under it moved. It shows within `settle` and goes at once.
                 let defaults = state.options.defaults(for: family)
-                if state.options != defaults {
-                    Button("Restore Defaults") { state.options = defaults }
-                        .buttonStyle(.hover)
-                        .foregroundStyle(.tint)
-                        .font(.callout)
-                        .padding(.trailing, -6)
-                }
+                let changed = state.options != defaults
+                Button("Restore Defaults") { state.options = defaults }
+                    .buttonStyle(.hover)
+                    .foregroundStyle(.tint)
+                    .font(.callout)
+                    .padding(.trailing, -6)
+                    .opacity(changed ? 1 : 0)
+                    .animation(changed ? Motion.settle : nil, value: changed)
+                    .disabled(!changed)
+                    .accessibilityHidden(!changed)
             }
         }
     }

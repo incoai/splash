@@ -473,6 +473,26 @@ extension ServerScreenTests {
         let shown = going.drawn.filter { Self.showsWarning($0.picture, of: window) }.count
         #expect(shown == 0, "the caution showed in \(shown) of \(going.drawn.count) frames after it went")
     }
+
+    /// Restore Defaults coming and going moves nothing on the page: the launch options' header
+    /// keeps its height. The button is taller than the header's title, and the card under it moved
+    /// as it came and went.
+    @Test func restoreDefaultsComingAndGoingMovesNothing() async throws {
+        let fake = try FakeRuntime("splash-restore-defaults", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await Self.launchedWithModels(fake, families: Self.realisticFamilies)
+        defer { state.quit() }
+        let window = await Self.serverWindow(state, picked: "mlx-community/Qwen3.8-27B-4bit")
+        defer { window.orderOut(nil) }
+        let limit = try #require(ServeSettings.memoryLimits(memory: Catalog.memory).first)
+        for value in ["\(limit)G", nil] {
+            // The page's left part, the options' names: none of it changes.
+            let change = try await Self.pictures(of: window) { state.options["--max-memory"] = value }
+            let before = Self.page(change.before, of: window, right: 400)
+            let moved = (change.drawn.map(\.picture) + [change.after]).filter { Self.page($0, of: window, right: 400) != before }.count
+            #expect(moved == 0, "setting the memory limit to \(value ?? "Auto") moved the page in \(moved) frames")
+        }
+    }
 }
 
 /// The Server screen drawn to `server-*.png` in `SPLASH_APP_SNAPSHOTS`, light and dark, for people
