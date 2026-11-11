@@ -152,7 +152,7 @@ KvBlockCache::Impl::Impl(metal::MetalBackend &backend, metal::AllocationAdmissio
       pages(backend, std::move(admission), withoutIndex(layout),
             static_cast<uint32_t>(KvBlockCache::mostPages(layout, extentPages, options.laneSlots, options.targetBytes)),
             extentPages),
-      locationPages(backend.allocateBuffer(tableBytes(layout, extentPages, options.laneSlots, options.targetBytes),
+      locationPages(backend.allocateBuffer(tableBytes(layout, options.laneSlots, options.targetBytes),
                                            metal::BufferStorage::Shared, "kv-block-cache/location-pages")),
       recordBytes(format.recordBytes()), zeros(recordBytes),
       directory(layout.attentionLayers, SlotRecycler(0)) {}

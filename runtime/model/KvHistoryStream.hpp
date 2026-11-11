@@ -68,13 +68,15 @@ public:
   ~KvHistoryStream();
   KvHistoryStream(const KvHistoryStream &) = delete;
   KvHistoryStream &operator=(const KvHistoryStream &) = delete;
-  // The page table of one buffer, which a stream of extents of `extentPages`
+  // The page table of one buffer, which a stream of a pool's `layout`
   // allocates for each as it is built and holds until it goes: an entry for
-  // each staging page, in whole host pages, as Metal allocates and the
-  // memory plan counts it (KvSpillPlan::tableBytes); 278,528 bytes for
-  // 256-page extents.
-  [[nodiscard]] static constexpr uint64_t tableBytes(uint32_t extentPages) noexcept {
-    return alignUp(stagedPages(extentPages) * sizeof(SplashKvPage));
+  // each staging page, in whole host pages, as Metal allocates them, in
+  // whichever extent size the pool takes (kv::Layout::mostOverExtents), so
+  // that the memory plan, made before the pool's, counts it
+  // (KvSpillPlan::tableBytes); 278,528 bytes for 256-page extents.
+  [[nodiscard]] static constexpr uint64_t tableBytes(const kv::Layout &layout) {
+    return layout.mostOverExtents(
+        [](uint32_t extentPages) { return alignUp(stagedPages(extentPages) * sizeof(SplashKvPage)); });
   }
 
   // Between commands: staging for a sequence of `pages` pages, its history

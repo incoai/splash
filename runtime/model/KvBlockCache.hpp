@@ -75,16 +75,19 @@ public:
   ~KvBlockCache();
   KvBlockCache(const KvBlockCache &) = delete;
   KvBlockCache &operator=(const KvBlockCache &) = delete;
-  // The page table a cache of a pool's `layout` and `extentPages`, of
-  // `laneSlots` and `targetBytes` (KvBlockCacheOptions), maps its pages
-  // through, which it allocates as it is built and holds until it goes: an
-  // entry for each page of the most extents it holds, its target's or the
-  // floors of every lane at once, in whole host pages, as Metal allocates and
-  // the memory plan counts it (KvSpillPlan::tableBytes); 32,768 bytes for
-  // Qwen3.8-Flash-Next's ten 256-page extents.
-  [[nodiscard]] static constexpr uint64_t tableBytes(const kv::Layout &layout, uint32_t extentPages,
-                                                     uint32_t laneSlots, uint64_t targetBytes) noexcept {
-    return alignUp(mostPages(layout, extentPages, laneSlots, targetBytes) * sizeof(SplashKvPage));
+  // The page table a cache of a pool's `layout`, `laneSlots` and
+  // `targetBytes` (KvBlockCacheOptions) maps its pages through, which it
+  // allocates as it is built and holds until it goes: an entry for each page
+  // of the most extents it holds, its target's or the floors of every lane at
+  // once, in whole host pages, as Metal allocates them, in whichever extent
+  // size the pool takes (kv::Layout::mostOverExtents), so that the memory
+  // plan, made before the pool's, counts it (KvSpillPlan::tableBytes);
+  // 32,768 bytes for Qwen3.8-Flash-Next's ten 256-page extents of int8 KV.
+  [[nodiscard]] static constexpr uint64_t tableBytes(const kv::Layout &layout, uint32_t laneSlots,
+                                                     uint64_t targetBytes) {
+    return layout.mostOverExtents([&](uint32_t extentPages) {
+      return alignUp(mostPages(layout, extentPages, laneSlots, targetBytes) * sizeof(SplashKvPage));
+    });
   }
 
   // Between commands. The floor of the lane, whose request decodes over

@@ -126,7 +126,7 @@ KvHistoryStream::Impl::Impl(metal::MetalBackend &backend, metal::AllocationAdmis
   for (uint32_t buffer = 0; buffer < buffers; ++buffer) {
     staging.push_back(std::make_unique<kv::PageStorage>(backend, admission, oneLayer(layout),
                                                         static_cast<uint32_t>(pages), extentPages));
-    tables.push_back(backend.allocateBuffer(tableBytes(extentPages), metal::BufferStorage::Shared,
+    tables.push_back(backend.allocateBuffer(tableBytes(layout), metal::BufferStorage::Shared,
                                             "kv-history/table-" + std::to_string(buffer)));
   }
   counts.buffers = buffers;
