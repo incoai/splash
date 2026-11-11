@@ -23,6 +23,9 @@
 //   hyper-connection projections of Qwen3.8-Flash-Next take 320 inputs in Q8_0), decoded on both tiles and walks at
 //   every K split each tile takes there, and prefilled; and Q8_0 decoded at K 192, three of the register tile's
 //   64-input coefficient units, which two partitions split into one and two.
+// --m48 covers the 48-row AF4 gate/up tile inside 64-row storage, including
+// same-split M64 equality, independent fp64 bounds, poisoned partial padding
+// and unwritten output rows.
 // Every run leaves the padding columns past its segments, the guard bands past its buffers and its counters as they
 // were. The token gather (ops::Embedding) of every format's rows as stored is checked here too.
 #include "GgufFormatReference.hpp"
@@ -51,6 +54,7 @@
 #include <span>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 using namespace splash;
@@ -330,6 +334,17 @@ Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan,
   scratch.poison(poison);
   CommandGraph graph;
   static_cast<void>(linear.add(graph, o.bindings(plan, scratch), p, plan, gate));
+  if (plan.computeRows() < plan.storageRows()) {
+    const auto dispatches = graph.dispatches();
+    if (dispatches.size() != 2 || dispatches[0].pipelineName != "gguf_decode_af4g64_m48_a" ||
+        dispatches[1].pipelineName != "gguf_decode_af4g64_m48_g")
+      fail(label + ": compact gate/up selected a different kernel");
+    for (const ComputeDispatch &dispatch : dispatches)
+      if (dispatch.threadgroups.x != plan.workload().matrix.outputSize / GGUF_TILE_COLUMNS ||
+          dispatch.threadgroups.y != plan.configuration().splits || dispatch.threadgroups.z != 1 ||
+          dispatch.threadsPerThreadgroup.x != GGUF_STAGED_THREADS)
+        fail(label + ": compact gate/up changed the column or split grid");
+  }
   // A spread plan's dispatches are staged decode tiles, each binding its parameters with spread set.
   if (plan.configuration().spread)
     for (const ComputeDispatch &dispatch : graph.dispatches()) {
@@ -344,10 +359,25 @@ Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan,
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   if (!scratch.intact() || !o.input.intact() || !o.aux.intact() || !o.output.intact() || !o.gate.intact())
     fail(label + ": a counter is not reset or a write past a buffer");
+  if (plan.computeRows() < plan.storageRows() && plan.configuration().splits > 1) {
+    const auto *partials = static_cast<const uint32_t *>(scratch.partials.view.contents());
+    const uint32_t columns = plan.workload().matrix.outputSize;
+    for (uint32_t split = 0; split < plan.configuration().splits; ++split) {
+      const uint64_t first = (uint64_t{split} * plan.storageRows() + plan.computeRows()) * columns;
+      const uint64_t count = uint64_t{plan.storageRows() - plan.computeRows()} * columns;
+      if (!std::all_of(partials + first, partials + first + count, [&](uint32_t value) { return value == poison; }))
+        fail(label + ": compact split partials changed the 64-row padding");
+    }
+  }
   Outcome out{o.output.halves(),
               plan.workload().epilogue == LinearEpilogue::GateUp ? o.gate.halves() : std::vector<uint16_t>{},
               graph.dispatches().size()};
   const uint32_t columns = plan.workload().matrix.outputSize;
+  if (plan.computeRows() < plan.storageRows())
+    for (const std::vector<uint16_t> *rows : {&out.output, &out.gate})
+      if (!std::all_of(rows->begin() + uint64_t{plan.computeRows()} * columns, rows->end(),
+                       [](uint16_t value) { return value == kUnwritten; }))
+        fail(label + ": compact tile wrote a padding row");
   for (const std::vector<uint16_t> *rows : {&out.output, &out.gate})
     for (uint64_t i = 0; i < rows->size(); ++i)
       if (i % columns >= covered && (*rows)[i] != kUnwritten) {
@@ -1090,14 +1120,108 @@ void gatherExtents(MetalBackend &backend) {
           "extent and refused one element short");
 }
 
+void compactProductionBounds(const Outcome &out, const Tensor &up, const Tensor &gate,
+                             const std::vector<float> &inputs, const std::string &label) {
+  std::vector<float> upValues(up.K), gateValues(gate.K);
+  for (const uint32_t column : {0U, 31U, 64U, up.N - 1}) {
+    rowValues(up.format, up.native.data() + uint64_t{column} * rowBytes(up.format, up.K), up.K, upValues.data());
+    rowValues(gate.format, gate.native.data() + uint64_t{column} * rowBytes(gate.format, gate.K),
+              gate.K, gateValues.data());
+    for (const uint32_t row : {0U, 23U, 47U}) {
+      const float *input = inputs.data() + uint64_t{row} * up.K;
+      const uint64_t index = uint64_t{row} * up.N + column;
+      const Interval gateBound = projected(dot(input, gateValues.data(), gate.K), true);
+      const Interval outputBound = withGate(projected(dot(input, upValues.data(), up.K), true),
+                                           bf16ToFloat(out.gate[index]));
+      if (!inside(out.gate[index], gateBound) || !inside(out.output[index], outputBound))
+        fail(label + ": production row " + std::to_string(row) + " column " +
+             std::to_string(column) + " differs from the independent fp64 bound");
+    }
+  }
+}
+
+void compactGateUp(MetalBackend &backend) {
+  const DecodeGeometry geometry(16);
+  const Linear linear(backend.capabilities(), geometry);
+  constexpr uint32_t live = 48, storage = 64;
+  {
+    // Real, fully backed projections and correctly sized buffers reach the
+    // dispatch-time format/layout check, rather than an extent or pipeline error.
+    constexpr uint32_t n = 128, k = 512;
+    const Tensor af4Tensor = tensor(backend, Fmt(GGUF_FMT_AF4G64), n, k);
+    const Tensor q4Tensor = tensor(backend, Q4K, n, k);
+    const Tensor first = tensor(backend, Fmt(GGUF_FMT_AF4G64), n / 2, k);
+    const Tensor second = tensor(backend, Fmt(GGUF_FMT_AF4G64), n / 2, k);
+    const Projection af4 = projection({&af4Tensor}, n), q4 = projection({&q4Tensor}, n);
+    const Projection segmented = projection({&first, &second}, n);
+    const LinearPlan forced = Linear::plan(
+        {{n, k}, live, LinearPhase::Decode, LinearEpilogue::GateUp, geometry},
+        {.tile = LinearTile::GgufStaged, .splits = 2, .computeRows = live}, FloatOutput::BFloat16);
+    const std::vector<uint16_t> packed = storageRows(activations(Inputs::Dense, live, k), k, live, storage);
+    const Scratch scratch(backend, forced.scratchSize());
+    const Operands operands(backend, forced, packed, {});
+    for (const auto &[up, gate] : {
+             std::pair{&q4, &af4}, std::pair{&af4, &q4},
+             std::pair{&segmented, &af4}, std::pair{&af4, &segmented}}) {
+      CommandGraph graph;
+      test::rejects([&] { static_cast<void>(linear.add(graph, operands.bindings(forced, scratch), *up, forced, gate)); },
+                    "compact staged tile takes whole unrotated AF4G64 gate/up projections with bf16 output",
+                    "forced M48 admitted an unsupported format or segmented projection");
+      test::require(graph.empty(), "forced M48 encoded a dispatch before rejecting its projection layout");
+    }
+  }
+  for (const auto &[n, k] : {std::pair{128U, 512U}, std::pair{192U, 1024U}, std::pair{17408U, 5120U}}) {
+    const Tensor upTensor = tensor(backend, Fmt(GGUF_FMT_AF4G64), n, k);
+    const Tensor gateTensor = tensor(backend, Fmt(GGUF_FMT_AF4G64), n, k);
+    const Projection up = projection({&upTensor}, n), gate = projection({&gateTensor}, n);
+    const LinearWorkload workload{{n, k}, live, LinearPhase::Decode, LinearEpilogue::GateUp, geometry};
+    for (const Inputs kind : {Inputs::Dense, Inputs::Sparse}) {
+      if (n > 512 && kind == Inputs::Sparse) continue;
+      const std::vector<float> inputs = activations(kind, live, k);
+      const std::vector<uint16_t> packed = storageRows(inputs, k, live, storage);
+      const auto upDots = n <= 512 ? products({&upTensor}, n, inputs, live) : std::vector<Dot>{};
+      const auto gateDots = n <= 512 ? products({&gateTensor}, n, inputs, live) : std::vector<Dot>{};
+      for (const uint32_t splits : {1U, 2U})
+        for (const bool spread : {false, true}) {
+          const LinearConfig fullConfig{.tile = LinearTile::GgufStaged, .splits = splits, .spread = spread};
+          auto compactConfig = fullConfig;
+          compactConfig.computeRows = live;
+          const LinearPlan full = Linear::plan(workload, fullConfig, FloatOutput::BFloat16);
+          const LinearPlan compact = Linear::plan(workload, compactConfig, FloatOutput::BFloat16);
+          const std::string label = "M48 " + std::to_string(n) + "x" + std::to_string(k) +
+                                    " split " + std::to_string(splits) + (spread ? " spread" : " lockstep") +
+                                    (kind == Inputs::Sparse ? " sparse" : " dense");
+          const Outcome expected = run(backend, linear, full, up, &gate, packed, {}, kPoisonNaN, n, label + " M64");
+          for (const uint32_t poison : {kPoisonNaN, kPoisonFinite}) {
+            const Outcome actual = run(backend, linear, compact, up, &gate, packed, {}, poison, n, label);
+            if (!sameRows(actual.output, 0, expected.output, 0, live, n) ||
+                !sameRows(actual.gate, 0, expected.gate, 0, live, n))
+              fail(label + ": live output or gate differs from M64 at the same split");
+            if (n <= 512)
+              checkValues(actual, upDots, gateDots, {}, workload, live, n, true, label);
+            else
+              compactProductionBounds(actual, upTensor, gateTensor, inputs, label);
+          }
+        }
+    }
+  }
+  section("M48 gate/up: 48 live rows in 64-row storage, small dense/sparse and production shapes, "
+          "split 1/2 and both walks, fp64 bounds, M64 bits, padding, poison and released counters");
+}
+
 int main(int argc, char **argv) {
   @autoreleasepool {
-    if (argc != 2 && (argc != 3 || std::string(argv[2]) != "--register16")) {
-      std::cerr << "usage: gguf-projection <production-and-test.metallib> [--register16]\n";
+    if (argc != 2 && (argc != 3 || (std::string(argv[2]) != "--register16" && std::string(argv[2]) != "--m48"))) {
+      std::cerr << "usage: gguf-projection <production-and-test.metallib> [--register16|--m48]\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
+      if (argc == 3 && std::string(argv[2]) == "--m48") {
+        compactGateUp(backend);
+        std::cout << "gguf-projection m48: " << (failures ? "FAIL" : "PASS") << '\n';
+        return failures ? 1 : 0;
+      }
       if (argc == 3) {
         // Two physical eight-row tables per sixteen-row lane, up to the
         // register tile's four tables. Keep the independent fp64, padding,

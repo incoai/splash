@@ -123,6 +123,10 @@ struct LinearConfig final {
   // (LinearPlan::storageRows), whose padding lane's rows it computes and
   // discards, instead of the 8-row tile.
   bool sixteenRows = false;
+  // A smaller staged compute tile within the plan's storage. Zero uses the
+  // storage height. The 48-row gate/up tile keeps 64-row allocation and
+  // split-partial strides while skipping the padding rows of three lanes.
+  uint32_t computeRows = 0;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }
@@ -201,6 +205,9 @@ public:
   [[nodiscard]] LinearConfig configuration() const noexcept { return config_; }
   [[nodiscard]] FloatOutput destination() const noexcept { return destination_; }
   [[nodiscard]] uint32_t storageRows() const noexcept;
+  [[nodiscard]] uint32_t computeRows() const noexcept {
+    return config_.computeRows ? config_.computeRows : storageRows();
+  }
   // The layout the producer of this plan's input writes. A rotated
   // projection prepares its table from the rotated rows itself
   // (LinearGguf.cpp), so its producer writes plain rows.
@@ -315,7 +322,7 @@ private:
                             const Projection &projection, const LinearPlan &plan) const;
   DecodeGeometry geometry_;
   KernelCalibration calibration_;
-  bool wideGateUpTwoPass_ = false;
+  bool measuredM5Pro20_ = false;
 };
 
 } // namespace splash::ops

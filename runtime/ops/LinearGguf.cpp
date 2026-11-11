@@ -116,6 +116,11 @@ void LinearPlan::requireConfiguration() const {
     throw std::invalid_argument("only a staged block gate/up decode runs gate and up in one pass");
   if (c.sixteenRows && (c.tile != LinearTile::GgufStaged || !decode || workload_.rows != GGUF_TABLE16_ROWS))
     throw std::invalid_argument("only a staged one-lane block decode runs the 16-row tile");
+  if (c.computeRows &&
+      (c.computeRows != 48 || !decode || workload_.rows != 48 || workload_.geometry.rows() != 16 ||
+       c.tile != LinearTile::GgufStaged || c.oneGateUpPass || workload_.epilogue != LinearEpilogue::GateUp ||
+       destination_ != FloatOutput::BFloat16 || storageRows() != 64))
+    throw std::invalid_argument("a compact staged tile takes 48 live gate/up rows within 64-row storage");
   if (c.tile == LinearTile::GgufRegister) {
     // Split boundaries fall on coefficient units, of 64 inputs at the fewest
     // (quant_register_unit); addGgufRegister checks each segment's.
@@ -186,6 +191,20 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   requireSegments(p, w.matrix);
   if (gate) requireSegments(*gate, w.matrix);
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
+  if (plan.configuration().computeRows) {
+    // A forced plan knows its shape but not its formats. Only these two
+    // whole-tensor AF4G64 epilogues have a compact kernel instance.
+    const auto takesCompact = [](const Projection &projection) {
+      const auto &parts = projection.blocks().segments;
+      return !projection.rotation && !projection.planeInputs() &&
+             projection.destination == FloatOutput::BFloat16 && parts.size() == 1 &&
+             !parts.front().isFloat() && parts.front().formatId == GGUF_FMT_AF4G64 &&
+             parts.front().columnOffset == 0 && parts.front().outputSize == projection.outputSize &&
+             parts.front().inputSize == projection.inputSize;
+    };
+    if (!gate || !takesCompact(p) || !takesCompact(*gate))
+      throw std::invalid_argument("a compact staged tile takes whole unrotated AF4G64 gate/up projections with bf16 output");
+  }
   // The fused kernels have no fp32 instance.
   if (plan.destination() == FloatOutput::Float32 && segments.size() > 1)
     throw std::invalid_argument("an fp32 destination takes a single-tensor block projection");
@@ -242,7 +261,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   const LinearConfig config = plan.configuration();
   const auto [n, k] = w.matrix;
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
-  const uint32_t rows = plan.storageRows(), splits = config.splits;
+  const uint32_t rows = plan.computeRows(), splits = config.splits;
   const auto [partials, counters] = splitScratch(b, splits);
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {

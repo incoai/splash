@@ -59,6 +59,22 @@ void requirePlaneViews(const Projection &p) {
   throw std::invalid_argument("views of a projection's planes take one unrotated quantized tensor, not a view");
 }
 
+// The measured 27B full-attention input is packed Q, K and V, in that order.
+// Other partitions of the same output width do not inherit its reduction.
+bool measuredAttentionLayout(const Projection &p) noexcept {
+  const auto &segments = p.blocks().segments;
+  if (p.outputSize != 14336 || p.inputSize != 5120 || p.rotation || p.planeInputs() || segments.size() != 3)
+    return false;
+  constexpr std::array<uint32_t, 3> widths{12288, 1024, 1024}, offsets{0, 12288, 13312};
+  for (uint32_t i = 0; i < segments.size(); ++i) {
+    const auto &s = segments[i];
+    if (s.isFloat() || s.formatId != GGUF_FMT_AF4G64 || s.inputSize != 5120 ||
+        s.outputSize != widths[i] || s.columnOffset != offsets[i])
+      return false;
+  }
+  return true;
+}
+
 } // namespace
 
 bool Projection::takesPlaneViews() const noexcept {
@@ -141,7 +157,7 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
 
 Linear::Linear(const DeviceCapabilities &device, DecodeGeometry geometry) noexcept
     : geometry_(geometry), calibration_(KernelCalibration::of(device)),
-      wideGateUpTwoPass_(device.appleGpuFamily == 10 && device.gpuCoreCount == 20 &&
+      measuredM5Pro20_(device.appleGpuFamily == 10 && device.gpuCoreCount == 20 &&
                         device.deviceName == "Apple M5 Pro") {}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
@@ -184,10 +200,30 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
     const auto &segments = projection.blocks().segments;
     return segments.size() == 1 && segments.front().formatId == GGUF_FMT_AF4G64;
   };
-  if (wideGateUpTwoPass_ && w.phase == LinearPhase::Decode && geometry_.rows() == 16 &&
+  if (measuredM5Pro20_ && w.phase == LinearPhase::Decode && geometry_.rows() == 16 &&
       w.rows > 32 && w.matrix.outputSize == 17408 && w.matrix.inputSize == 5120 &&
       config.tile == LinearTile::GgufStaged && config.oneGateUpPass && pair && af4(p) && af4(*gate))
     config.oneGateUpPass = false;
+  const auto wholeAf4 = [&](const Projection &projection) {
+    const auto &segments = projection.blocks().segments;
+    return af4(projection) && !segments.front().isFloat() && !projection.rotation && !projection.planeInputs() &&
+           segments.front().columnOffset == 0 && segments.front().outputSize == w.matrix.outputSize &&
+           segments.front().inputSize == w.matrix.inputSize;
+  };
+  if (measuredM5Pro20_ && w.phase == LinearPhase::Decode && geometry_.rows() == 16 && w.rows == 48 &&
+      w.matrix.outputSize == 17408 && w.matrix.inputSize == 5120 && config.tile == LinearTile::GgufStaged &&
+      !config.oneGateUpPass && pair && p.destination == FloatOutput::BFloat16 &&
+      gate->destination == FloatOutput::BFloat16 && wholeAf4(p) && wholeAf4(*gate))
+    config.computeRows = 48;
+  // Preserve the eight-row path's two-partition attention reduction at one
+  // sixteen-row lane. Its changed reduction at one partition can change
+  // target logits and speculative acceptance. Keep this measured correction
+  // local to the actual Q/K/V layout; other shapes and widths keep the law.
+  if (measuredM5Pro20_ && w.phase == LinearPhase::Decode && geometry_.rows() == 16 && w.rows == 16 &&
+      w.epilogue == LinearEpilogue::None && !gate && w.matrix.outputSize == 14336 &&
+      w.matrix.inputSize == 5120 && config.tile == LinearTile::GgufStaged && config.splits == 1 &&
+      p.destination == FloatOutput::BFloat16 && measuredAttentionLayout(p))
+    config.splits = 2;
   LinearPlan plan(w, config, p.destination);
   plan.rotated_ = static_cast<bool>(p.rotation);
   return plan;
