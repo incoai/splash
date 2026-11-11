@@ -333,6 +333,9 @@ release, on one Mac. Each run starts the tree's own server, so every tree is
 measured through the same OpenAI API whatever its native wire and status
 schema, and the client times what a user sees.
 
+For concurrent coding tasks with complete answers, compiler feedback and
+task validators, use the [coding workload runner](../dev/benchmarks/serving/coding.md).
+
 | Scenario | Requests |
 | --- | --- |
 | `churn` | three clients, each sending 1500-token answers to prompts that grow every round (about 16K tokens, then more; `CHURN_BASE`/`CHURN_STEP` words), every fourth round resending its conversation, the first requests in a fixed arrival order (`--order 2,0,1` or `0,1,2`, 0.6 s apart), for `--minutes`; `/status` every 2 s |
