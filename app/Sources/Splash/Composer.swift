@@ -196,6 +196,9 @@ struct Composer: View {
                           yields: state.terminalShows,
                           placeholder: "Message Splash", submit: state.sendDraft, cancel: stop, acceptsImages: images,
                           attach: { draft.attach($0, unreadable: $1) }, attachPDFs: { draft.attach(pdfs: $0) })
+            // As the server's stage changes them (`MainView`), a control that goes goes at once, and
+            // one that comes fades in once those beside it have moved, as a row of a page does: as
+            // a switch began, the model's words slid over Attach Images fading out.
             HStack(spacing: 6) {
                 // Only for a model that sees images and reads PDFs.
                 if images {
@@ -203,12 +206,13 @@ struct Composer: View {
                         .foregroundStyle(.secondary)
                         .help("Attach Images or PDFs")
                         .accessibilityLabel("Attach Images or PDFs")
+                        .transition(Motion.comingAndGoing)
                 }
                 EngineSlot()
                 Spacer(minLength: 12)
                 if let usage = state.contextUsage {
                     ContextRing(usage: usage)
-                        .transition(.opacity)
+                        .transition(Motion.comingAndGoing)
                 }
                 EffortMenu()
                 Button { if streaming { state.chats.stop() } else { state.sendDraft() } } label: {
@@ -358,7 +362,7 @@ private struct EngineSlot: View {
             Button { state.section = .server } label: {
                 HStack(spacing: 6) {
                     mark
-                    Text(words).foregroundStyle(.secondary)
+                    Text(words).foregroundStyle(.secondary).contentTransition(.identity)
                     Text("Open Server").foregroundStyle(.tint)
                 }
                 .font(.callout)
@@ -376,7 +380,10 @@ private struct EngineSlot: View {
             } label: {
                 HStack(spacing: 6) {
                     mark
-                    Text(words).foregroundStyle(.secondary)
+                    // In place, as a control's title changes, while the slot moves with the
+                    // controls beside it: cross-faded as the server's stage changed, the words of a
+                    // switch drew over those of the model before.
+                    Text(words).foregroundStyle(.secondary).contentTransition(.identity)
                     MenuChevron()
                 }
                 .font(.callout)
@@ -423,6 +430,7 @@ private struct EffortMenu: View {
                 .padding(.vertical, 4)
             }
             .fixedSize()
+            .transition(Motion.comingAndGoing)
             .help("How much the model thinks before it answers")
             .accessibilityLabel("Thinking")
             .accessibilityValue(Self.title(chosen))
