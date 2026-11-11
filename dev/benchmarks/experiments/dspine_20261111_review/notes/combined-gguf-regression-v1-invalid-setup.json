@@ -1,0 +1,6 @@
+{
+  "utc": "2026-11-11T06:38:33.235089+00:00",
+  "id": "combined-gguf-default-v1",
+  "reason": "Parent rebuilt a nominated in-place host test binary while this untimed regression ran; its current artifact hash no longer matches nomination. Stop and retain the invalid setup trial. Final-source test binaries will be copied into immutable bundle before fresh regression registration.",
+  "action": "SIGINT exact owned child PID48207"
+}

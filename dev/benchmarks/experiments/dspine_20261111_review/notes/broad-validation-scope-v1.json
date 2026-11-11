@@ -1,0 +1,29 @@
+{
+  "registered_utc": "2026-11-11T06:45:25.381822+00:00",
+  "source_selection_rule": {
+    "path": "notes/final-selection-rule-v1.json",
+    "sha256": "dddc8d389505885f8d3c8a26660ed9181190182fc9cca6ac97c5a5a064713eea"
+  },
+  "comparisons": [
+    {
+      "prefix": "agent12-dflash8-vs-review16-v1",
+      "cohort": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/agent12-v1.txt",
+      "scope": "12 original synthetic software and tool histories, short/~4K/~16K, cap256; previously unrun holdout performance cohort."
+    },
+    {
+      "prefix": "historical31-dflash8-vs-review16-v1",
+      "cohort": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "scope": "31 reused historical/calibration cases, original caps. Confirmation on corrected selected source; not a holdout."
+    }
+  ],
+  "common": {
+    "control": "DFlash2 eight rows on selected native bundle",
+    "candidate": "DSpine sixteen rows on identical selected native bundle",
+    "groups": 3,
+    "order": "ABBA",
+    "samples_per_case_per_round": 1,
+    "criterion": "comparison",
+    "output_and_noise_gates": "Unchanged analyze_abba_v2.py plus exact cross-group output/provenance review. Every failure retained, no repeat to pass."
+  },
+  "additional": "Three-group mixed HTTP cold/warm protocol and separate new140-test sampling family as already prepared. No further source tuning on these outputs."
+}

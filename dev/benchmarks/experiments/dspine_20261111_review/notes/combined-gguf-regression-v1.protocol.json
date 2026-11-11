@@ -1,0 +1,47 @@
+{
+  "registered_utc": "2026-11-11T06:35:23.340702+00:00",
+  "scope": "Regression coverage for shared staged template change; shader validation on, no timing conclusions.",
+  "default": {
+    "id": "combined-gguf-default-v1",
+    "command": [
+      "/usr/bin/env",
+      "MTL_DEBUG_LAYER=1",
+      "MTL_SHADER_VALIDATION=1",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/gguf-projection",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/production-and-test.metallib"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/gguf-projection",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/production-and-test.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/gguf-projection": "ba2a476f86de87b35c2d2b68f4602763d64637d5696dc961dfb6a9fedaeda099",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/production-and-test.metallib": "219e64a24607764fd507aa11ee1479623242ecb9d7d2e77a29cec10078efa2a7",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch": "4bab304674804fb8e1d70d42f29752feea98e6160a0735b83e8d7725ee4a68e2"
+    },
+    "timeout_seconds": 1800
+  },
+  "register16": {
+    "id": "combined-gguf-register16-v1",
+    "command": [
+      "/usr/bin/env",
+      "MTL_DEBUG_LAYER=1",
+      "MTL_SHADER_VALIDATION=1",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/gguf-projection",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/production-and-test.metallib",
+      "--register16"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/gguf-projection",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/production-and-test.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/gguf-projection": "ba2a476f86de87b35c2d2b68f4602763d64637d5696dc961dfb6a9fedaeda099",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine-tests/production-and-test.metallib": "219e64a24607764fd507aa11ee1479623242ecb9d7d2e77a29cec10078efa2a7",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v1.patch": "4bab304674804fb8e1d70d42f29752feea98e6160a0735b83e8d7725ee4a68e2"
+    },
+    "timeout_seconds": 1800
+  }
+}

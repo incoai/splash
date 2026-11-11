@@ -1,0 +1,20 @@
+{
+  "validated_utc": "2026-11-11T06:56:04.647882+00:00",
+  "final_build_exit_code": 0,
+  "final_build_stdout_sha256": "78f99488544a9fb69e208a7739eec86084612ba30106415c0beae999d5b3031b",
+  "source_patch_sha256": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d",
+  "required_receipts_sha256": {
+    "combined-final-cpu-v1": "803be1ffe06d1b24c4195e7d6de06852b604d9390abcc89501f86c0b6f13b631",
+    "combined-final-gpu-v1": "a68e653cea31cf60b364ffa8d90923d6e612752219d550716fe9d9d6901d7094",
+    "combined-final-oracle-v1": "4f1d33e807f7d15516cf99fc6118aa9324fa387b81757ce589fda4aab8bcde62",
+    "combined-final-register16-v1": "501cf8737175bc9ac56b491bf8870b1ad5892c4e11a5b18512d2b7586deb8a81",
+    "combined-final-default-shader-v1": "6556da037169ac61f1d734ca9f04f418c9f3b1b70c0404bf36f2cfde37e4f40d",
+    "prefill-iq4xs-baseline-api-v1.receipt": "fd4ba4e7d9157d26a3507616cc82064c88db8072b690626cc076a56a38b6c95d",
+    "prefill-iq4xs-baseline-shader-v1.receipt": "5eec32c98a94f382b26d5b2b1b77e2a2185a98c2d4e4399a833c7e1458054951",
+    "prefill-iq4xs-baseline-both-v1.receipt": "ecb27395a852c648ced388e0b9161264076890828108056f10cb6ff00ed96c69",
+    "prefill-iq4xs-combined-api-v1.receipt": "c0a65447b25275bedf683d6161620cb9e2d30eee6072ac6431ea8212f0809be8",
+    "prefill-iq4xs-combined-shader-v1.receipt": "cfce796facbe79009510e2a163bd99dfad2af3db1086d25a29bf13240a96d386",
+    "prefill-iq4xs-combined-both-v1.receipt": "2cf02bc8f7b9a77d4e723843412d7d783e8494256dafa64448d136177ef930b3"
+  },
+  "extra_api_shader_run": "Preserved abort; six-job paired diagnostic independently reproduces same pre-existing validation/resource accounting behavior on baseline and candidate. Standard repository shader-validation recipe passed."
+}

@@ -1,0 +1,64 @@
+{
+  "prepared_utc": "2026-11-11T06:17:05.061168+00:00",
+  "purpose": "Validate clean M48 implementation using existing generic shader, explicit compute48/storage64 partial stride and narrow measuredB3 guard. Original failed test fixtures remain logged; new run follows constructor-valid fixtures.",
+  "cpu": {
+    "id": "m48-linear-cpu-v2",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/m48/build/engine-tests/linear-plan",
+      "--cpu"
+    ],
+    "env": {},
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/m48/build/engine-tests/linear-plan",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/m48-clean-v1.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/m48/build/engine-tests/linear-plan": "d440c8f8bbbe059e8284f52b30ca3df8721d5a8a57c21fc5400f06441cc3210c",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/m48-clean-v1.patch": "2f65b0ac52800ba4e943227036dcb441758b8705238b794593ee269a4a935f9e"
+    },
+    "timeout_seconds": 1800
+  },
+  "gpu": {
+    "id": "m48-linear-gpu-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/m48/build/engine-tests/linear-plan",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/m48/build/splash.metallib"
+    ],
+    "env": {
+      "MTL_SHADER_VALIDATION": "1"
+    },
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/m48/build/engine-tests/linear-plan",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/m48-clean-v1.patch",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/m48/build/splash.metallib"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/m48/build/engine-tests/linear-plan": "d440c8f8bbbe059e8284f52b30ca3df8721d5a8a57c21fc5400f06441cc3210c",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/m48-clean-v1.patch": "2f65b0ac52800ba4e943227036dcb441758b8705238b794593ee269a4a935f9e",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/m48/build/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74"
+    },
+    "timeout_seconds": 1800
+  },
+  "oracle": {
+    "id": "m48-oracle-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/m48/build/engine-tests/gguf-projection",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/m48/build/engine-tests/production-and-test.metallib",
+      "--m48"
+    ],
+    "env": {
+      "MTL_SHADER_VALIDATION": "1"
+    },
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/m48/build/engine-tests/gguf-projection",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/m48-clean-v1.patch",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/m48/build/engine-tests/production-and-test.metallib"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/m48/build/engine-tests/gguf-projection": "e827bce186c07cc96c34bebc73132e33e16fedefb613c6cae8d60d24e855baab",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/m48-clean-v1.patch": "2f65b0ac52800ba4e943227036dcb441758b8705238b794593ee269a4a935f9e",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/m48/build/engine-tests/production-and-test.metallib": "219e64a24607764fd507aa11ee1479623242ecb9d7d2e77a29cec10078efa2a7"
+    },
+    "timeout_seconds": 1800
+  }
+}

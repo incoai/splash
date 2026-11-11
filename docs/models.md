@@ -428,8 +428,10 @@ initial implementation accepts a single unrotated vocabulary projection;
 targets with a rotated vocabulary head require another drafter. DFlash2
 remains the default. Compare throughput on the same target, prompts and Mac:
 the upstream 27B results use CUDA, BF16 and a 16-row draft block.
-See the [local comparison with DFlash2](performance.md#experimental-dspine-against-dflash2)
-for the measured throughput, method and limitations of the eight-row backend.
+The [final local review](performance.md#final-dspine-review) records gains and
+regressions across serial prompts, long contexts and mixed serving. Compare both
+drafters on representative prompts, response caps and concurrency before choosing
+sixteen rows; context length alone does not select the faster drafter.
 
 ## Vision
 

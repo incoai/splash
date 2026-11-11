@@ -1,0 +1,92 @@
+{
+  "prepared_utc": "2026-11-11T06:02:59.230147+00:00",
+  "purpose": "Descriptive pre-policy target-logit comparison on japanese_lru_notes at common output prefixes. Capture index0 and32..48, validate mapping to actual greedy outputs, include exact arrays and actual divergence. Instrumentation perturbs timing. No performance claim or numeric tolerance gate.",
+  "expected_historical_first_difference": 42,
+  "base8": {
+    "id": "width-probe-base8-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/width-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/splash.metallib",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "japanese_lru_notes",
+      "8",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/width-probes/width-probe-base8-v1"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/width-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/splash.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/host-step.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/build.json",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/width_probe_driver_v1.mm"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/width-probe": "f0b496f1e04b8f223bb77c4fb8ff7da63a3edbc5ff4817fbcf3fac7d935a05b7",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/splash.metallib": "f60d2e950c6a6c69ec7472b5ec7778de437edae81a57834b9cc2c08af0bac039",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/build.json": "5a3183c2c3e28273ab83b467a97a1b3ae94a4146b830a2bc7b6753c489a96674",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/width_probe_driver_v1.mm": "865ce950d0f8b5016a4c0ad970223d1cc6aad1c5b711521789f47bde37242ddd"
+    },
+    "timeout_seconds": 900
+  },
+  "base16": {
+    "id": "width-probe-base16-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/width-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/splash.metallib",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "japanese_lru_notes",
+      "16",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/width-probes/width-probe-base16-v1"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/width-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/splash.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/host-step.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/build.json",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/width_probe_driver_v1.mm"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/width-probe": "f0b496f1e04b8f223bb77c4fb8ff7da63a3edbc5ff4817fbcf3fac7d935a05b7",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/splash.metallib": "f60d2e950c6a6c69ec7472b5ec7778de437edae81a57834b9cc2c08af0bac039",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-base-v1/build.json": "5a3183c2c3e28273ab83b467a97a1b3ae94a4146b830a2bc7b6753c489a96674",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/width_probe_driver_v1.mm": "865ce950d0f8b5016a4c0ad970223d1cc6aad1c5b711521789f47bde37242ddd"
+    },
+    "timeout_seconds": 900
+  },
+  "splits16": {
+    "id": "width-probe-splits16-v1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-splits8-v1/width-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-splits8-v1/splash.metallib",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "japanese_lru_notes",
+      "16",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/width-probes/width-probe-splits16-v1"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-splits8-v1/width-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-splits8-v1/splash.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-splits8-v1/host-step.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-splits8-v1/build.json",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/width_probe_driver_v1.mm"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-splits8-v1/width-probe": "7d2cf2d4d2c6511682473d469dcc63478f42b241844729c1c44dec41ec8fc9e0",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-splits8-v1/splash.metallib": "f60d2e950c6a6c69ec7472b5ec7778de437edae81a57834b9cc2c08af0bac039",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-splits8-v1/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/width-probe-splits8-v1/build.json": "aea9d30b11e89c5a6fd144110a1e9b109cd57649d5cd33085db9d4bf242191bb",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/width_probe_driver_v1.mm": "865ce950d0f8b5016a4c0ad970223d1cc6aad1c5b711521789f47bde37242ddd"
+    },
+    "timeout_seconds": 900
+  }
+}

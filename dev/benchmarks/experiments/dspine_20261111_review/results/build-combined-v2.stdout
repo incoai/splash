@@ -1,0 +1,466 @@
+make: `build/engine-tests/production-and-test.metallib' is up to date.
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine/ops/Linear.o' --config 615fe3e505ead9ec -- xcrun -sdk macosx clang++ -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime -mmacosx-version-min=26.4 -MMD -MP -c runtime/ops/Linear.cpp -o build/engine/ops/Linear.o
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine/main.o' --config 615fe3e505ead9ec -- xcrun -sdk macosx clang++ -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime -mmacosx-version-min=26.4 -fobjc-arc -MMD -MP \
+		-include build/engine/BuildIdentity.hpp -c runtime/main.mm -o build/engine/main.o
+rm -f build/engine/libsplash.a
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine/libsplash.a' --config 615fe3e505ead9ec -- xcrun -sdk macosx ar rcs build/engine/libsplash.a build/engine/ops/AneFfn.o build/engine/ops/AneFfnCalibration.o build/engine/ops/AneFfnMeasurement.o build/engine/ops/DraftAttention.o build/engine/ops/DraftSelector.o build/engine/ops/DSpine.o build/engine/ops/Embedding.o build/engine/ops/ExecutionPlans.o build/engine/ops/GDN.o build/engine/ops/Linear.o build/engine/ops/LinearGguf.o build/engine/ops/KernelSelection.o build/engine/ops/MoE.o build/engine/ops/Normalization.o build/engine/ops/HyperConnection.o build/engine/ops/NgramEmbedding.o build/engine/ops/BlockIndexer.o build/engine/ops/PagedAttention.o build/engine/ops/PageStorage.o build/engine/ops/KvSlotFormat.o build/engine/ops/RoPE.o build/engine/ops/RowCopy.o build/engine/ops/Sampling.o build/engine/ops/Vision.o build/engine/metal/DeviceCapabilities.o build/engine/engine/MemoryPlan.o build/engine/engine/StreamedMemoryPlan.o build/engine/engine/AneFfnStartup.o build/engine/engine/Scheduler.o build/engine/engine/Cache.o build/engine/engine/WriteBehind.o build/engine/engine/Engine.o build/engine/engine/EngineMemory.o build/engine/engine/PassCommand.o build/engine/engine/WeightResidency.o build/engine/engine/MemoryGovernor.o build/engine/engine/MemoryLedger.o build/engine/engine/MemoryControl.o build/engine/engine/KvPool.o build/engine/engine/KvCache.o build/engine/engine/KvPageTier.o build/engine/engine/CacheDirectory.o build/engine/engine/DiskSpace.o build/engine/engine/StateCache.o build/engine/model/DraftContextPlan.o build/engine/engine/Protocol.o build/engine/engine/NativeRuntime.o build/engine/engine/NativeArguments.o build/engine/engine/FdTransport.o build/engine/engine/MemoryAudit.o build/engine/engine/Status.o build/engine/model/WeightStore.o build/engine/model/GgufFile.o build/engine/model/GgufImage.o build/engine/model/GgufTarget.o build/engine/model/SafetensorsImage.o build/engine/model/SafetensorsTarget.o build/engine/model/DraftCheckpoint.o build/engine/model/WeightSource.o build/engine/model/SsdReaders.o build/engine/model/SparseRowStore.o build/engine/model/WeightImages.o build/engine/model/GgufPreparation.o build/engine/model/SlotRecycler.o build/engine/model/ExpertStore.o build/engine/model/VerifyBudget.o build/engine/model/Qwen3_6Moe.o build/engine/model/Qwen3_8.o build/engine/model/Qwen4Exp.o build/engine/model/Qwen4Steps.o build/engine/model/Qwen4ExpTarget.o build/engine/model/Flint.o build/engine/model/QwenVision.o build/engine/model/VisionPreparation.o build/engine/model/VisionLoader.o build/engine/model/QwenTarget.o build/engine/model/QwenTargetLoader.o build/engine/model/DFlashDraft.o build/engine/model/DSpineDraft.o build/engine/model/ModelFactory.o build/engine/model/ModelSizing.o build/engine/model/SlotFile.o build/engine/model/KvCopyRead.o build/engine/model/KvBlockCache.o build/engine/model/KvHistoryStream.o build/engine/model/SpilledKvReads.o build/engine/model/QwenState.o build/engine/model/Runtime.o build/engine/model/RuntimeArenas.o build/engine/ane/Handoff.o build/engine/ane/Program.o build/engine/model/SafetensorsCheckpoint.o build/engine/model/ModelDescriptor.o build/engine/engine/ThermalState.o build/engine/engine/RuntimeResources.o build/engine/engine/Bootstrap.o build/engine/metal/MetalBackend.o
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/vision-preparation' --config e9fa7cb9297f2e44 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/vision_preparation_test.cpp build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/vision-preparation
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/safetensors-checkpoint' --config e9fa7cb9297f2e44 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/safetensors_checkpoint_test.cpp build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/safetensors-checkpoint
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/operator-workspace' --config e9fa7cb9297f2e44 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/operator_workspace_test.cc build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/operator-workspace
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/model-configuration' --config e9fa7cb9297f2e44 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fobjc-arc dev/tests/engine/model_configuration_test.mm build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/model-configuration
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/family-values' --config e9fa7cb9297f2e44 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/family_values_test.cpp build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/family-values
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/gguf-reference' --config e9fa7cb9297f2e44 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fobjc-arc dev/tests/engine/gguf_reference_test.mm build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/gguf-reference
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/gguf-planner' --config e9fa7cb9297f2e44 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fobjc-arc dev/tests/engine/gguf_planner_test.mm build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/gguf-planner
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/linear-plan' --config e9fa7cb9297f2e44 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fobjc-arc dev/tests/engine/linear_plan_test.mm build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/linear-plan
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/ane-ffn-startup' --config e9fa7cb9297f2e44 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/ane_ffn_startup_test.cpp build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/ane-ffn-startup
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/execution-plans' --config e9fa7cb9297f2e44 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/execution_plans_test.cc build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/execution-plans
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/kernel-selection' --config e9fa7cb9297f2e44 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/kernel_selection_test.cc build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/kernel-selection
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/model-execution-plans' --config e9fa7cb9297f2e44 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/model_execution_plan_test.cpp build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/model-execution-plans
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/command-limits' --config e9fa7cb9297f2e44 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/command_limits_test.cpp build/engine/libsplash.a -framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/command-limits
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/runtime-bootstrap' --config e9fa7cb9297f2e44 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fobjc-arc dev/tests/engine/runtime_bootstrap_test.mm dev/tests/engine/ProtocolPeer.cpp build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/runtime-bootstrap
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/native-arguments' --config e9fa7cb9297f2e44 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/native_arguments_test.cpp build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/native-arguments
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/attention-sweep' --config e9fa7cb9297f2e44 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fobjc-arc dev/benchmarks/attention_sweep.mm build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/attention-sweep
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/backend-benchmark' --config fb25dba536aeaf6b -- xcrun -sdk macosx clang++ -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime -mmacosx-version-min=26.4 -fobjc-arc -include build/engine/BuildIdentity.hpp dev/benchmarks/backend_benchmark.mm \
+		build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/backend-benchmark
+make: `build/engine-tests/linear-plan' is up to date.
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/engine-tests/gguf-projection' --config e9fa7cb9297f2e44 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fobjc-arc dev/tests/engine/gguf_projection_test.mm build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/gguf-projection
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tools/build_config.py record --output 'build/splash' --config 615fe3e505ead9ec -- xcrun -sdk macosx clang++ -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime -mmacosx-version-min=26.4 -fobjc-arc build/engine/main.o build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/splash
+build/engine-tests/slot-file
+Slot file tests passed
+build/engine-tests/kv-slot-format
+kv_slot_format_test: PASS
+build/engine-tests/kv-page-tier-host
+round trips int8 slot format v0
+teardown int8
+round trips int8 slot format v0
+teardown int8
+round trips int8 slot format v1
+teardown int8
+round trips bf16 slot format v0
+teardown bf16
+round trips bf16 slot format v0
+teardown bf16
+round trips bf16 slot format v1
+teardown bf16
+kv page tier host tests passed
+build/engine-tests/sparse-row-store
+sparse row store tests passed (90- and 170-byte rows)
+build/engine-tests/ssd-readers
+ssd_readers_test: PASS
+build/engine-tests/slot-recycler
+slot_recycler_test: PASS
+build/engine-tests/expert-chunk-layout
+expert_chunk_layout_test: PASS
+build/engine-tests/verify-budget
+verify_budget_test: PASS
+build/engine-tests/cache-directory
+Cache directory tests passed
+build/engine-tests/disk-space
+Disk space tests passed
+build/engine-tests/legacy-weight-cache
+legacy weight cache tests passed
+/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python dev/tests/engine/run_vision_preparation.py build/engine-tests/vision-preparation dev/tests/fixtures/weight-goldens/goldens.json
+Vision layouts from MLX, transformers and GGUF, exact BF16 conversion, rejected sources and zero padding PASS
+build/engine-tests/safetensors-checkpoint
+safetensors checkpoint: bounded reads, metadata, written and malformed sources PASS
+build/engine-tests/model-configuration dev/tests/fixtures/model-configs
+model configuration: every family, sources, one rule per value, quantization, vision, pruned experts, the installer's check, YaRN, Flint PASS
+build/engine-tests/family-values dev/tests/engine/family_values_golden.txt
+family values match dev/tests/engine/family_values_golden.txt
+build/engine-tests/weight-source
+weight source: reads, writes to the open file, replacement and naming PASS
+build/engine-tests/gguf-file
+GGUF parser bounds tests passed
+build/engine-tests/gguf-reference dev/tests/fixtures/weight-goldens/goldens.json dev/tests/fixtures/mlx-quantization/fixture.json
+CPU reference matches the GGML golden hash: q4k                  ok
+CPU reference matches the GGML golden hash: iq4xs                ok
+CPU reference matches the GGML golden hash: iq4nl                ok
+CPU reference matches the GGML golden hash: q5k                  ok
+CPU reference matches the GGML golden hash: q6k                  ok
+CPU reference matches the GGML golden hash: q3k                  ok
+CPU reference matches the GGML golden hash: q80                  ok
+CPU reference matches the GGML golden hash: iq3s                 ok
+CPU reference matches the GGML golden hash: q2k                  ok
+CPU reference matches the GGML golden hash: iq3xxs               ok
+CPU reference matches the GGML golden hash: iq2xxs               ok
+CPU reference matches the GGML golden hash: iq2xs                ok
+CPU reference matches the GGML golden hash: iq2s                 ok
+CPU reference matches the GGML golden hash: iq1s                 ok
+CPU reference matches the GGML golden hash: iq1m                 ok
+CPU reference matches the GGML golden hash: q40                  ok
+CPU reference matches the GGML golden hash: q41                  ok
+CPU reference matches the GGML golden hash: mxfp4                ok
+CPU reference matches the GGML golden hash: pq20                 ok
+CPU reference matches the GGML golden hash: q50                  ok
+CPU reference matches the GGML golden hash: q51                  ok
+CPU reference matches the GGML golden hash: bf16                 ok
+CPU reference matches the GGML golden hash: f16                  ok
+CPU reference matches the GGML golden hash: q20                  ok
+CPU reference matches the GGML golden hash: llama.cpp's NVFP4    ok
+CPU reference matches the golden hash: Q8_0 quantization         ok
+MLX fixture holds every MLX affine format, mxfp4 and nvfp4       ok
+CPU reference reads MLX's codes: af2g32                          ok
+CPU reference matches MLX's values: af2g32                       ok
+CPU reference reads MLX's codes: af2g64                          ok
+CPU reference matches MLX's values: af2g64                       ok
+CPU reference reads MLX's codes: af2g128                         ok
+CPU reference matches MLX's values: af2g128                      ok
+CPU reference reads MLX's codes: af3g32                          ok
+CPU reference matches MLX's values: af3g32                       ok
+CPU reference reads MLX's codes: af3g64                          ok
+CPU reference matches MLX's values: af3g64                       ok
+CPU reference reads MLX's codes: af3g128                         ok
+CPU reference matches MLX's values: af3g128                      ok
+CPU reference reads MLX's codes: af4g32                          ok
+CPU reference matches MLX's values: af4g32                       ok
+CPU reference reads MLX's codes: af4g64                          ok
+CPU reference matches MLX's values: af4g64                       ok
+CPU reference reads MLX's codes: af4g128                         ok
+CPU reference matches MLX's values: af4g128                      ok
+CPU reference reads MLX's codes: af5g32                          ok
+CPU reference matches MLX's values: af5g32                       ok
+CPU reference reads MLX's codes: af5g64                          ok
+CPU reference matches MLX's values: af5g64                       ok
+CPU reference reads MLX's codes: af5g128                         ok
+CPU reference matches MLX's values: af5g128                      ok
+CPU reference reads MLX's codes: af6g32                          ok
+CPU reference matches MLX's values: af6g32                       ok
+CPU reference reads MLX's codes: af6g64                          ok
+CPU reference matches MLX's values: af6g64                       ok
+CPU reference reads MLX's codes: af6g128                         ok
+CPU reference matches MLX's values: af6g128                      ok
+CPU reference reads MLX's codes: af8g32                          ok
+CPU reference matches MLX's values: af8g32                       ok
+CPU reference reads MLX's codes: af8g64                          ok
+CPU reference matches MLX's values: af8g64                       ok
+CPU reference reads MLX's codes: af8g128                         ok
+CPU reference matches MLX's values: af8g128                      ok
+CPU reference matches MLX's values: mxfp4 (MLX mxfp4)            ok
+CPU reference matches MLX's values: nvfp4 (MLX nvfp4)            ok
+GGUF reference tests passed (0 failures)
+build/engine-tests/gguf-planner
+planner plans the dense target                                   ok
+planner keeps F32 values as stored: blk.0.attn_norm.weight       ok
+planner keeps F32 values as stored: blk.0.ssm_norm.weight        ok
+planner keeps F32 values as stored: blk.0.post_attention_norm.weight ok
+planner keeps F32 values as stored: blk.1.attn_norm.weight       ok
+planner keeps F32 values as stored: blk.1.attn_q_norm.weight     ok
+planner keeps F32 values as stored: blk.1.attn_k_norm.weight     ok
+planner keeps F32 values as stored: blk.1.post_attention_norm.weight ok
+planner keeps F32 values as stored: output_norm.weight           ok
+planner narrows the convolution to bf16 and groups its value heads ok
+planner keeps the decay F32 and groups its value heads           ok
+planner narrows the time bias to bf16 and groups its value heads ok
+planner copies a token table as stored: Q4_K                     ok
+planner copies a token table as stored: IQ4_XS                   ok
+planner copies a token table as stored: IQ4_NL                   ok
+planner copies a token table as stored: Q5_K                     ok
+planner copies a token table as stored: Q6_K                     ok
+planner copies a token table as stored: Q3_K                     ok
+planner copies a token table as stored: Q8_0                     ok
+planner copies a token table as stored: IQ3_S                    ok
+planner copies a token table as stored: Q2_K                     ok
+planner copies a token table as stored: IQ3_XXS                  ok
+planner copies a token table as stored: IQ2_XXS                  ok
+planner copies a token table as stored: IQ2_XS                   ok
+planner copies a token table as stored: IQ2_S                    ok
+planner copies a token table as stored: IQ1_S                    ok
+planner copies a token table as stored: IQ1_M                    ok
+planner copies a token table as stored: Q4_0                     ok
+planner copies a token table as stored: Q4_1                     ok
+planner copies a token table as stored: MXFP4                    ok
+planner copies a token table as stored: PQ2_0                    ok
+planner copies a token table as stored: Q5_0                     ok
+planner copies a token table as stored: Q5_1                     ok
+planner copies a token table as stored: BF16                     ok
+planner copies a token table as stored: F16                      ok
+planner copies a token table as stored: Q2_0                     ok
+planner refuses mismatched KV rows by name: blk.1.attn_k.weight rows=256 ok
+planner refuses mismatched KV rows by name: blk.1.attn_k.weight rows=768 ok
+planner refuses mismatched KV rows by name: blk.1.attn_v.weight rows=256 ok
+planner refuses mismatched KV rows by name: blk.1.attn_v.weight rows=768 ok
+planner names a metadata mismatch                                ok
+planner checks the architecture against the model's target       ok
+planner plans the MoE target                                     ok
+planner F32 alpha/beta tensor: beta then alpha rows in grouped order ok
+planner copies the F32 tensor as stored: blk.0.ffn_gate_inp.weight ok
+planner copies the F32 tensor as stored: blk.0.ffn_gate_inp_shexp.weight ok
+planner plans 16-bit float routers, gates and norms              ok
+planner keeps a BF16 router as stored                            ok
+planner widens the BF16 blk.0.ffn_gate_inp_shexp.weight to F32   ok
+planner widens the F16 blk.0.attn_norm.weight to F32             ok
+planner widens the BF16 blk.0.post_attention_norm.weight to F32  ok
+planner decodes a Q8_0 shared-expert scalar gate to F32          ok
+planner refuses an F16 router by name                            ok
+planner keeps a BF16 router of 320 columns as stored             ok
+planner repacks blk.0.attn_qkv.weight as 1024 rows of 512        ok
+planner repacks blk.0.attn_gate.weight as 512 rows of 512        ok
+planner repacks blk.0.ssm_out.weight as 512 rows of 512          ok
+planner repacks blk.0.ffn_gate_exps.weight as 1024 rows of 512   ok
+planner repacks blk.0.ffn_up_exps.weight as 1024 rows of 512     ok
+planner repacks blk.0.ffn_down_exps.weight as 2048 rows of 256   ok
+planner repacks blk.0.ffn_gate_shexp.weight as 256 rows of 512   ok
+planner repacks blk.0.ffn_up_shexp.weight as 256 rows of 512     ok
+planner repacks blk.0.ffn_down_shexp.weight as 512 rows of 256   ok
+planner repacks only the layer's quantized tensors               ok
+planner leaves streamed experts out of the layers' images, as the repacks it would write, and declares the images' bytes with them ok
+planner gives the weights the same manifest whether the experts stream or not ok
+planner splits llama.cpp's fused gate/up experts into each expert's gate and up rows ok
+planner streams fused gate/up experts as each expert's gate and up rows ok
+planner refuses a fused gate/up experts tensor of a type it does not read by name ok
+planner alpha/beta: one plane tile of Q4_K beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ4_XS beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ4_NL beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q5_K beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q6_K beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q3_K beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q8_0 beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ3_S beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q2_K beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ3_XXS beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ2_XXS beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ2_XS beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ2_S beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ1_S beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ1_M beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q4_0 beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q4_1 beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of MXFP4 beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of PQ2_0 beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of NVFP4 beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q5_0 beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q5_1 beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q2_0 beta then alpha rows (qwen35) ok
+planner makes alpha/beta one F32 tensor: IQ4_XS beta, Q8_0 alpha ok
+planner makes alpha/beta one F32 tensor: Q4_K beta, F32 alpha    ok
+planner makes alpha/beta one F32 tensor: BF16 beta, NVFP4 alpha  ok
+planner makes alpha/beta one F32 tensor: F32 beta, BF16 alpha    ok
+planner makes alpha/beta one F32 tensor: F16 beta, Q8_0 alpha    ok
+planner makes alpha/beta one BF16 tensor: BF16 beta, BF16 alpha  ok
+planner makes alpha/beta one F32 tensor: F16 beta, F16 alpha     ok
+planner refuses an alpha of a type it does not read by its name alone ok
+planner alpha/beta: one plane tile of Q4_K beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ4_XS beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ4_NL beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q5_K beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q6_K beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q3_K beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q8_0 beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ3_S beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q2_K beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ3_XXS beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ2_XXS beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ2_XS beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ2_S beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ1_S beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ1_M beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q4_0 beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q4_1 beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of MXFP4 beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of PQ2_0 beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of NVFP4 beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q5_0 beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q5_1 beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q2_0 beta then alpha rows (qwen35moe) ok
+planner makes alpha/beta one F32 tensor: IQ4_XS beta, Q8_0 alpha ok
+planner makes alpha/beta one F32 tensor: Q4_K beta, F32 alpha    ok
+planner makes alpha/beta one F32 tensor: BF16 beta, NVFP4 alpha  ok
+planner makes alpha/beta one F32 tensor: F32 beta, BF16 alpha    ok
+planner makes alpha/beta one F32 tensor: F16 beta, Q8_0 alpha    ok
+planner makes alpha/beta one BF16 tensor: BF16 beta, BF16 alpha  ok
+planner makes alpha/beta one F32 tensor: F16 beta, F16 alpha     ok
+planner refuses an alpha of a type it does not read by its name alone ok
+planner accepts a GGUF that declares no RoPE scaling             ok
+planner refuses RoPE scaling                                     ok
+planner names another rotated width, RoPE base and RMS epsilon   ok
+planner requires the rotary and norm metadata                    ok
+planner plans a rotation of F32 alpha/beta                       ok
+planner plans a rotation of BF16 alpha/beta                      ok
+planner plans a rotation of F16 alpha/beta                       ok
+planner plans a rotation that names Q8_0 alpha/beta              ok
+planner refuses a rotation that leaves out Q8_0 alpha/beta       ok
+planner plans a rotation that names IQ4_XS alpha/beta            ok
+planner refuses a rotation that leaves out IQ4_XS alpha/beta     ok
+planner refuses a rotation whose prism.hadamard.version the kernels do not run ok
+planner refuses a rotation whose prism.hadamard.seed the kernels do not run ok
+planner refuses a rotation whose prism.hadamard.sign_mode the kernels do not run ok
+planner refuses a rotation whose prism.hadamard.gdn_v_grouped the kernels do not run ok
+planner refuses a rotated MoE target                             ok
+an IQ4_NL PLE table streams as 90-byte rows                      ok
+the streamed PLE rows are where the file holds the table         ok
+a Q8_0 PLE table streams as 170-byte rows                        ok
+a BF16 PLE table streams as 320-byte rows                        ok
+a F16 PLE table streams as 320-byte rows                         ok
+an F32 PLE table does not stream                                 ok
+a PLE table of another width does not stream                     ok
+planner plans a target of BF16, F16 and Q8_0 hyper-connections   ok
+planner repacks Q8_0 output_hc_down.weight as stored             ok
+planner repacks Q8_0 output_hc_up.weight as stored               ok
+planner repacks BF16 blk.0.hc_attn_down.weight as the reference Q8_0 of its values ok
+planner repacks BF16 blk.0.hc_attn_up.weight as the reference Q8_0 of its values ok
+planner repacks F16 blk.0.hc_ffn_down.weight as the reference Q8_0 of its values ok
+planner repacks F16 blk.0.hc_ffn_up.weight as the reference Q8_0 of its values ok
+planner repacks BF16 blk.1.hc_attn_down.weight as the reference Q8_0 of its values ok
+planner repacks BF16 blk.1.hc_attn_up.weight as the reference Q8_0 of its values ok
+planner repacks F16 blk.1.hc_ffn_down.weight as the reference Q8_0 of its values ok
+planner repacks F16 blk.1.hc_ffn_up.weight as the reference Q8_0 of its values ok
+planner refuses an F32 hyper-connection projection by name       ok
+planner plans the PLE embedding                                  ok
+planner plans the PLE embedding                                  ok
+planner plans the PLE projections, norms and convolution in the layer they feed ok
+planner copies the PLE table's rows as stored into an image after the embedding's ok
+planner streams the PLE table's rows instead of loading its image, which its record keeps ok
+planner loads an NVFP4 PLE table and refuses by name to stream it ok
+planner loads and streams a BF16 PLE table of 160 values as stored ok
+planner loads and streams a F16 PLE table of 160 values as stored ok
+planner refuses a GGUF that declares another PLE layer           ok
+findTargetGgufs takes a split GGUF's parts in split order        ok
+findTargetGgufs refuses another GGUF beside a split GGUF's parts ok
+findTargetGgufs refuses the parts of a split GGUF of another count ok
+findTargetGgufs refuses the parts of several names               ok
+findTargetGgufs refuses the parts of several names               ok
+planner reads each tensor of a split GGUF from its part into the whole file's images ok
+planner plans the Flint target                                   ok
+planner plans layer 0's queries without a gate                   ok
+planner copies the F32 tensor as stored: blk.0.attn_norm.weight  ok
+planner copies the F32 tensor as stored: blk.0.attn_sinks.weight ok
+planner copies the F32 tensor as stored: blk.0.ffn_norm.weight   ok
+planner plans layer 0's dense FFN                                ok
+planner plans layer 1's queries without a gate                   ok
+planner copies the F32 tensor as stored: blk.1.attn_norm.weight  ok
+planner copies the F32 tensor as stored: blk.1.attn_sinks.weight ok
+planner copies the F32 tensor as stored: blk.1.ffn_norm.weight   ok
+planner plans layer 1's dense FFN                                ok
+planner plans layer 2's queries without a gate                   ok
+planner copies the F32 tensor as stored: blk.2.attn_norm.weight  ok
+planner copies the F32 tensor as stored: blk.2.attn_sinks.weight ok
+planner copies the F32 tensor as stored: blk.2.ffn_norm.weight   ok
+planner plans layer 2's MoE                                      ok
+planner plans layer 2's shared expert as two slices of the routed width ok
+planner plans layer 3's queries without a gate                   ok
+planner copies the F32 tensor as stored: blk.3.attn_norm.weight  ok
+planner copies the F32 tensor as stored: blk.3.attn_sinks.weight ok
+planner copies the F32 tensor as stored: blk.3.ffn_norm.weight   ok
+planner plans layer 3's MoE                                      ok
+planner plans layer 3's shared expert as two slices of the routed width ok
+planner streams the experts of the MoE layers alone              ok
+planner names a RoPE pattern of other layers                     ok
+planner names each missing layer pattern                         ok
+planner refuses a softmax router                                 ok
+planner names other leading dense layers                         ok
+planner refuses scaled routing weights                           ok
+planner plans a Flint GGUF that states its rotated dimensions    ok
+planner names a RoPE over part of the head                       ok
+planner names a missing sink                                     ok
+planner refuses sinks of BF16                                    ok
+planner refuses a router bias no block reads                     ok
+planner leaves the declared prediction block alone and refuses one past it ok
+planner leaves the declared prediction block alone and refuses one past it ok
+planner plans the dense target's NVFP4 weights beside an .input_scale ok
+planner refuses an .input_scale of another count than its .scale: blk.0.ffn_up.input_scale ok
+planner refuses an .input_scale beside a Q4_K weight as unused   ok
+planner refuses an .input_scale with no weight as unused         ok
+planner plans the MoE target's NVFP4 weights beside an .input_scale ok
+planner refuses an .input_scale of another count than its .scale: blk.0.ffn_gate_exps.input_scale ok
+GGUF planner tests passed (0 failures)
+build/engine-tests/linear-plan --cpu
+Linear CPU plans: PASS
+/bin/sh dev/tests/attention_sweep_cli.sh build/engine-tests/attention-sweep
+attention-sweep CLI validation: PASS
+/bin/sh dev/tests/backend_benchmark_cli.sh build/engine-tests/backend-benchmark dev/tests/fixtures/model-configs
+backend-benchmark CLI validation: PASS
+build/engine-tests/operator-workspace
+operator workspace: PASS
+build/engine-tests/ane-ffn-calibration
+ane ffn calibration tests passed
+build/engine-tests/ane-ffn-startup
+ane ffn startup tests passed
+build/engine-tests/execution-plans
+PASS execution plans: device policies, device MoE tiles, B1-B4 and prefill workspace bounds (CPU only)
+build/engine-tests/kernel-selection dev/tests/engine/kernel_selection_golden.txt
+PASS kernel selection: 2873 groups of 13 devices match the golden
+build/engine-tests/model-execution-plans
+model execution plans: PASS (three paired geometries)
+build/engine-tests/command-limits
+command limits tests passed
+build/engine-tests/engine-memory-plan
+elastic memory plan tests passed
+build/engine-tests/kv-page-cache
+KV image identity ok
+KV block identities pinned ok
+pageReach follows its rule: 6000 counts
+KV page cache tests passed
+build/engine-tests/engine-cache
+engine cache tests passed
+build/engine-tests/cache-property
+cache property runs ok: 40 plain seeds, 400 windowed and windowed seed 9454
+cache take runs ok: 40 plain seeds, 400 windowed; 38298 reclaim steps taken as the ledger takes, each that gave something changing the cache and freeing no more than the units through its own counted, every offered unit's first take giving something or waiting; 20454 units freed all peek counted, 3604 less (10201 and 168 of those needing no write, each Pending, Trims or Netted)
+cache property tests passed
+build/engine-tests/persistent-cache
+Persistent cache tests passed
+build/engine-tests/draft-context-plan
+draft context plan tests passed
+build/engine-tests/ragged-scheduler
+ragged-scheduler: 60 passed, 0 failed
+build/engine-tests/model-boundary
+model boundary tests passed
+build/engine-tests/weight-residency
+weight-residency: 5 passed, 0 failed
+build/engine-tests/fake-memory
+fake-memory: 11 passed, 0 failed
+build/engine-tests/timing-profile
+timing-profile: 15 passed, 0 failed
+build/engine-tests/engine
+engine: 394 passed, 0 failed
+build/engine-tests/elastic-kv-pool
+elastic KV pool tests passed
+build/engine-tests/protocol dev/tests/engine/protocol_golden.txt
+native protocol tests passed
+build/engine-tests/native-engine-loop
+native-engine-loop: 52 passed, 0 failed
+build/engine-tests/native-fd-transport
+native fd transport tests passed
+build/engine-tests/runtime-bootstrap
+native bootstrap tests passed
+build/engine-tests/native-arguments dev/tests/engine/native_command_golden.txt dev/tests/fixtures/model-configs
+native arguments tests passed
+build/engine-tests/runtime-metrics
+runtime metrics tests passed
+build/engine-tests/memory-audit
+elastic memory audit tests passed
+build/engine-tests/memory-governor
+memory governor tests passed
+build/engine-tests/memory-ledger
+memory-ledger: 79 passed, 0 failed
+build/engine-tests/runtime-status dev/tests/engine/status_golden.json dev/tests/engine/status_variants_golden.jsonl
+runtime status tests passed
+build/engine-tests/json-writer
+json writer tests passed
+build/engine-tests/q8-paged-kv
+q8_paged_kv_test: ok
+build/engine-tests/engine-sim
+engine-sim: the 27B's 64K prompt prefilled in 275339.798754 ms of its own beside two decoders, 262696.598754 ms alone
+engine-sim: studio-18g: 13 requests, longest decode gap 702.428060 ms of 837.679886
+engine-sim: studio-18g-35b: the burst took a chunk at 18.865637 s, the last request ended at 62.826056 s, the chunk came back at 78.868829 s after 0.000000 MiB of copies while idle
+engine-sim: studio-18g-35b: critical passes took 1061 MiB at 66.500000 s; 1833 MiB at 67.500000 s, the resume point with it;
+engine-sim: the 27B's 1.5K prompt answered 11.014054 s after it arrived beside P's 30K prefill and a refused 45K prompt; P answered at 109.441056 s
+engine-sim: the 35B's cold 38,133-token prompt led 4.522117 s after it arrived, behind 3 commands of 6 cached resends
+engine-sim: 6 passed, 0 failed

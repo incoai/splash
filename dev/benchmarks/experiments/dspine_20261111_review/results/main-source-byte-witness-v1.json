@@ -1,0 +1,15 @@
+{
+  "utc": "2026-11-11T08:23:46.112510+00:00",
+  "source_base": "37bdd4f8710319bfad43709de2725df89ef776d3",
+  "patch_sha256": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d",
+  "files": {
+    "dev/native.mk": "8656d6abc425f0e0dce088bce77d57a39266ce569e2f14671973f6a62a17c805",
+    "dev/tests/engine/gguf_projection_test.mm": "16e8a286ee55cf71d9895e8619b3cccf1daca63ef6885071b2c4c73a807082e9",
+    "dev/tests/engine/linear_plan_test.mm": "9bffdc130f06ea14c849616404531dd03a6f8dee52c16e3a33c549013bc20ff0",
+    "runtime/metal/kernels/shared/gguf_linear.metal": "e27bd1397316b89b847b6fab67730c04fa34f414ef645782df2577aa7877a60e",
+    "runtime/ops/Linear.cpp": "f1883984baae90cc72d72ff27ccf509f889670fe47fb11656d03553bbcf43ff7",
+    "runtime/ops/Linear.hpp": "0cc59a565c650c53040f6204428220cc527ccbf2a3262dfaf58e7b65e4ca0155",
+    "runtime/ops/LinearGguf.cpp": "1d158980d2b14b5220dd41079d7120d5fd0ed9a7ee7647f5b1046927fab927d0"
+  },
+  "scope": "Main checkout now matches tested combined-v2 runtime/test/rule bytes. No builds or benchmark artifacts were replaced; user desktop remains untracked."
+}

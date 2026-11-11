@@ -1,0 +1,1423 @@
+{
+  "created_utc": "2026-11-11T07:29:16.266788+00:00",
+  "status": "complete",
+  "protocol_sha256": "9d35ca0282927e9ae5c269f36b2e22ccd54155ec666fa246a13ad8e04c67627c",
+  "jobs_sha256": "b5a463f3c6e9a8f41bf63120eb387335457d44346f53c71cfe47106202dd5462",
+  "build_ids": {
+    "control": "src-835c6ed26f08e879607172bcdfa8a2f945d6d3990c90d15182bf47b17825d1a1",
+    "candidate": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+  },
+  "provenance_failures": {},
+  "all_registered_jobs_retained": true,
+  "rounds_validated": 12,
+  "registered_rounds": 12,
+  "nonoverlapping_registered_order": true,
+  "cross_group_output_gate": true,
+  "cross_group_case_arrays": {
+    "python_lru": {
+      "all_12_round_arrays_match": true,
+      "matching_rounds": [
+        "g1_a1",
+        "g1_b1",
+        "g1_b2",
+        "g1_a2",
+        "g2_a1",
+        "g2_b1",
+        "g2_b2",
+        "g2_a2",
+        "g3_a1",
+        "g3_b1",
+        "g3_b2",
+        "g3_a2"
+      ],
+      "array_sha256_by_round": {
+        "g1_a1": "f841b744b76dcb734e9e38fbfe8d47bccb98081c8fd0b9568fd5941daf7f5633",
+        "g1_b1": "f841b744b76dcb734e9e38fbfe8d47bccb98081c8fd0b9568fd5941daf7f5633",
+        "g1_b2": "f841b744b76dcb734e9e38fbfe8d47bccb98081c8fd0b9568fd5941daf7f5633",
+        "g1_a2": "f841b744b76dcb734e9e38fbfe8d47bccb98081c8fd0b9568fd5941daf7f5633",
+        "g2_a1": "f841b744b76dcb734e9e38fbfe8d47bccb98081c8fd0b9568fd5941daf7f5633",
+        "g2_b1": "f841b744b76dcb734e9e38fbfe8d47bccb98081c8fd0b9568fd5941daf7f5633",
+        "g2_b2": "f841b744b76dcb734e9e38fbfe8d47bccb98081c8fd0b9568fd5941daf7f5633",
+        "g2_a2": "f841b744b76dcb734e9e38fbfe8d47bccb98081c8fd0b9568fd5941daf7f5633",
+        "g3_a1": "f841b744b76dcb734e9e38fbfe8d47bccb98081c8fd0b9568fd5941daf7f5633",
+        "g3_b1": "f841b744b76dcb734e9e38fbfe8d47bccb98081c8fd0b9568fd5941daf7f5633",
+        "g3_b2": "f841b744b76dcb734e9e38fbfe8d47bccb98081c8fd0b9568fd5941daf7f5633",
+        "g3_a2": "f841b744b76dcb734e9e38fbfe8d47bccb98081c8fd0b9568fd5941daf7f5633"
+      }
+    },
+    "sql_latest": {
+      "all_12_round_arrays_match": true,
+      "matching_rounds": [
+        "g1_a1",
+        "g1_b1",
+        "g1_b2",
+        "g1_a2",
+        "g2_a1",
+        "g2_b1",
+        "g2_b2",
+        "g2_a2",
+        "g3_a1",
+        "g3_b1",
+        "g3_b2",
+        "g3_a2"
+      ],
+      "array_sha256_by_round": {
+        "g1_a1": "7f043255718960875787bb9a44f8e522381298642e1912ceb08d6e0769c03a32",
+        "g1_b1": "7f043255718960875787bb9a44f8e522381298642e1912ceb08d6e0769c03a32",
+        "g1_b2": "7f043255718960875787bb9a44f8e522381298642e1912ceb08d6e0769c03a32",
+        "g1_a2": "7f043255718960875787bb9a44f8e522381298642e1912ceb08d6e0769c03a32",
+        "g2_a1": "7f043255718960875787bb9a44f8e522381298642e1912ceb08d6e0769c03a32",
+        "g2_b1": "7f043255718960875787bb9a44f8e522381298642e1912ceb08d6e0769c03a32",
+        "g2_b2": "7f043255718960875787bb9a44f8e522381298642e1912ceb08d6e0769c03a32",
+        "g2_a2": "7f043255718960875787bb9a44f8e522381298642e1912ceb08d6e0769c03a32",
+        "g3_a1": "7f043255718960875787bb9a44f8e522381298642e1912ceb08d6e0769c03a32",
+        "g3_b1": "7f043255718960875787bb9a44f8e522381298642e1912ceb08d6e0769c03a32",
+        "g3_b2": "7f043255718960875787bb9a44f8e522381298642e1912ceb08d6e0769c03a32",
+        "g3_a2": "7f043255718960875787bb9a44f8e522381298642e1912ceb08d6e0769c03a32"
+      }
+    },
+    "typescript_heap": {
+      "all_12_round_arrays_match": true,
+      "matching_rounds": [
+        "g1_a1",
+        "g1_b1",
+        "g1_b2",
+        "g1_a2",
+        "g2_a1",
+        "g2_b1",
+        "g2_b2",
+        "g2_a2",
+        "g3_a1",
+        "g3_b1",
+        "g3_b2",
+        "g3_a2"
+      ],
+      "array_sha256_by_round": {
+        "g1_a1": "e4c01b86d25c90cfc418f6460c70bd17043f67411482af804f3b0670c32b4727",
+        "g1_b1": "e4c01b86d25c90cfc418f6460c70bd17043f67411482af804f3b0670c32b4727",
+        "g1_b2": "e4c01b86d25c90cfc418f6460c70bd17043f67411482af804f3b0670c32b4727",
+        "g1_a2": "e4c01b86d25c90cfc418f6460c70bd17043f67411482af804f3b0670c32b4727",
+        "g2_a1": "e4c01b86d25c90cfc418f6460c70bd17043f67411482af804f3b0670c32b4727",
+        "g2_b1": "e4c01b86d25c90cfc418f6460c70bd17043f67411482af804f3b0670c32b4727",
+        "g2_b2": "e4c01b86d25c90cfc418f6460c70bd17043f67411482af804f3b0670c32b4727",
+        "g2_a2": "e4c01b86d25c90cfc418f6460c70bd17043f67411482af804f3b0670c32b4727",
+        "g3_a1": "e4c01b86d25c90cfc418f6460c70bd17043f67411482af804f3b0670c32b4727",
+        "g3_b1": "e4c01b86d25c90cfc418f6460c70bd17043f67411482af804f3b0670c32b4727",
+        "g3_b2": "e4c01b86d25c90cfc418f6460c70bd17043f67411482af804f3b0670c32b4727",
+        "g3_a2": "e4c01b86d25c90cfc418f6460c70bd17043f67411482af804f3b0670c32b4727"
+      }
+    }
+  },
+  "all_group_directions_consistent": true,
+  "direction": "candidate faster",
+  "primary_reportable": true,
+  "frozen_analysis": {
+    "protocol": {
+      "frozen_utc": "2026-11-11T06:39:45.576118+00:00",
+      "prefix": "m48-clean-b3-v2",
+      "groups": 3,
+      "order_each_group": [
+        "control",
+        "candidate",
+        "candidate",
+        "control"
+      ],
+      "arms": {
+        "control": {
+          "variant": "control",
+          "rows": 16,
+          "model": "dspine",
+          "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+          "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07"
+        },
+        "candidate": {
+          "variant": "candidate",
+          "rows": 16,
+          "model": "dspine",
+          "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+          "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07"
+        }
+      },
+      "cohort": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/kernel-smoke3-cap256-v1.txt",
+      "cohort_sha256": "4197b200cd24e583b19b973c032e33beda6026dc406ffe6331559329406a3246",
+      "cases": 3,
+      "registered_cases": [
+        {
+          "name": "python_lru",
+          "output_cap": 256,
+          "prompt_tokens": 45,
+          "prompt_tokens_sha256": "77679892d4b0caa91bbc38977f222b040d330884500116a85a98680ee333a376"
+        },
+        {
+          "name": "sql_latest",
+          "output_cap": 256,
+          "prompt_tokens": 56,
+          "prompt_tokens_sha256": "9c95eededc2347c1c36528322b7d80cda43ce72260e97157f58528b50e2ad72f"
+        },
+        {
+          "name": "typescript_heap",
+          "output_cap": 256,
+          "prompt_tokens": 45,
+          "prompt_tokens_sha256": "fca6074566cba6fcd122f46dbd2bed897458de70b700f169e18076398324b896"
+        }
+      ],
+      "case_names": [
+        "python_lru",
+        "sql_latest",
+        "typescript_heap"
+      ],
+      "samples_per_round": 3,
+      "criterion": "improvement",
+      "context_tokens": 32768,
+      "temperature": 0,
+      "ane_ffn_share": 0,
+      "verify_rows": "all",
+      "clone_width": 3,
+      "primary_endpoint": "decode",
+      "primary_metric": "Per-case median clone decode wall/decode output tokens, then token-weighted aggregate.",
+      "gates": "Exactly three complete ABBA groups. Complete arrays must match across arms and repetitions. Every per-case and aggregate decode spread must be <=5%. Improvement requires candidate time reduction beyond max(2%, twice spread); nonregression requires aggregate and every case within that allowance; comparison requires absolute time change beyond the allowance. Cold request wall and TTFT have independent gates. AC throughout measurement, no swap and no serious/critical OS thermal state are required. All groups and failures are retained without repeat-to-pass.",
+      "cross_group_direction_gate": "A directional performance conclusion requires all three groups qualified in the same direction; inspect each group direction in the unchanged analyzer output.",
+      "artifact_nomination": {
+        "control": {
+          "driver": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/study-driver",
+          "library": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/splash.metallib",
+          "host_step": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/host-step.metallib",
+          "bundle_sha256": {
+            "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/study-driver": "4b5edac62e62beacbe80acd8f21c9dcac5126634e22ef73f91651b82976f1fda",
+            "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/splash.metallib": "f60d2e950c6a6c69ec7472b5ec7778de437edae81a57834b9cc2c08af0bac039",
+            "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb"
+          },
+          "model_metadata_sha256": {
+            "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/model.json": "6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/config.json": "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85",
+            "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/draft/config.json": "c2aa9e3ff22766ea7df0fa5b5f5f7d2035ae722671c6b7eb58b65578705e6815"
+          },
+          "source_label": "qkv-narrow-v1-6a830fd3",
+          "bundle": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2",
+          "build_manifest": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/build.json",
+          "build_manifest_sha256": "6dfd89f8ddded01f648b51f4cbc5b3b9253ca3263b0588d08017f5b430162c93",
+          "build_manifest_data": {
+            "variant": "qkv",
+            "command": [
+              "xcrun",
+              "-sdk",
+              "macosx",
+              "clang++",
+              "-std=c++20",
+              "-O3",
+              "-Wall",
+              "-Wextra",
+              "-Werror",
+              "-I/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/runtime",
+              "-I/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/dev/benchmarks",
+              "-mmacosx-version-min=26.4",
+              "-fobjc-arc",
+              "-include",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/engine/BuildIdentity.hpp",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/study_driver_v2.mm",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/engine/libsplash.a",
+              "-framework",
+              "Foundation",
+              "-framework",
+              "Metal",
+              "-framework",
+              "IOKit",
+              "-framework",
+              "IOSurface",
+              "-o",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/study-driver"
+            ],
+            "inputs": {
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/study_driver_v2.mm": "2b0b3898db9bee8941e169d8852c8f6659f256f7d00e9de9f01a2a054783879d",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/engine/libsplash.a": "f2fb01bbffa95a31925d9733985024bbfc421337646481b02ed362e7ae3e001e",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/engine/BuildIdentity.hpp": "80a9bb74c8ace104c7a466cb2a1c3c223a9041a3a791e95602cc57a3ef23f6f7",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/splash.metallib": "f60d2e950c6a6c69ec7472b5ec7778de437edae81a57834b9cc2c08af0bac039",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/dev/benchmarks/PrefillWork.hpp": "7d9abd447e972002a53633ff202dae3a4eb2f1178d81cb28677264c81e5d7d29",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/dev/benchmarks/TranscriptPrompts.hpp": "2c56f82c9048bf3de0eeae016d95db3b2f954d0ad6ae56af1f8cea87609ecdb6"
+            },
+            "binary_sha256": "4b5edac62e62beacbe80acd8f21c9dcac5126634e22ef73f91651b82976f1fda"
+          }
+        },
+        "candidate": {
+          "driver": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver",
+          "library": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib",
+          "host_step": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib",
+          "bundle_sha256": {
+            "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e",
+            "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+            "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb"
+          },
+          "model_metadata_sha256": {
+            "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/model.json": "6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/config.json": "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85",
+            "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/draft/config.json": "c2aa9e3ff22766ea7df0fa5b5f5f7d2035ae722671c6b7eb58b65578705e6815"
+          },
+          "source_label": "combined-v2-f27dc90a",
+          "bundle": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3",
+          "build_manifest": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/build.json",
+          "build_manifest_sha256": "3b286493d52645d50bdc6280174765e842495442dc40ac8ad4fbadeac4f30d79",
+          "build_manifest_data": {
+            "variant": "combined",
+            "command": [
+              "xcrun",
+              "-sdk",
+              "macosx",
+              "clang++",
+              "-std=c++20",
+              "-O3",
+              "-Wall",
+              "-Wextra",
+              "-Werror",
+              "-I/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/runtime",
+              "-I/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/benchmarks",
+              "-mmacosx-version-min=26.4",
+              "-fobjc-arc",
+              "-include",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/BuildIdentity.hpp",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/study_driver_v2.mm",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/libsplash.a",
+              "-framework",
+              "Foundation",
+              "-framework",
+              "Metal",
+              "-framework",
+              "IOKit",
+              "-framework",
+              "IOSurface",
+              "-o",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver"
+            ],
+            "inputs": {
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/study_driver_v2.mm": "2b0b3898db9bee8941e169d8852c8f6659f256f7d00e9de9f01a2a054783879d",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/libsplash.a": "a2748249b0e79d9ac80235cbb2f0372ed5741a2bf74234ff3280662c65fb246c",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/BuildIdentity.hpp": "a144e898bcc1d547db5c1e241c30d8d4950e17032c775dcf77e5272ce0f979d7",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/benchmarks/PrefillWork.hpp": "7d9abd447e972002a53633ff202dae3a4eb2f1178d81cb28677264c81e5d7d29",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/benchmarks/TranscriptPrompts.hpp": "2c56f82c9048bf3de0eeae016d95db3b2f954d0ad6ae56af1f8cea87609ecdb6"
+            },
+            "binary_sha256": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e"
+          }
+        }
+      },
+      "operating_script_sha256": "4bde430207a362eab510fe8ffd393fa2aa76c543eaa5821c7073e95e454d0f58",
+      "analyzer_file": "analyze_abba_v2.py",
+      "analyzer_sha256": "e2c3f42e4e5fce41d89251399beb7339bf9bdc4c4af51e15435cf984390da634",
+      "abba_sha256": "7afc7b4fa24916acfc41745fc29cc659b5edada0bfa1ce55e19a685808475c0d",
+      "frozen_wrapper_sha256": "f062f66b89052d1bff3eb1510ffe93a3f8e805b110eced7e34f60d75c83b0a7d",
+      "source_versions": {
+        "original_root": "/Users/linson/Documents/ai/splash-dspine-13h-20261110",
+        "unchanged_script_sha256": {
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/analyze_abba_v2.py": "e2c3f42e4e5fce41d89251399beb7339bf9bdc4c4af51e15435cf984390da634",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/abba.py": "7afc7b4fa24916acfc41745fc29cc659b5edada0bfa1ce55e19a685808475c0d",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/run_frozen_abba_round_v1.py": "f062f66b89052d1bff3eb1510ffe93a3f8e805b110eced7e34f60d75c83b0a7d",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/controlled_round.py": "4bde430207a362eab510fe8ffd393fa2aa76c543eaa5821c7073e95e454d0f58"
+        },
+        "native_study_driver_source_sha256": "2b0b3898db9bee8941e169d8852c8f6659f256f7d00e9de9f01a2a054783879d"
+      },
+      "preparation_script": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prepare_native_comparison_v1.py",
+      "preparation_script_sha256": "269eb1b394f9a83a8338ac0c18f02fb6b4dc346d10cc76dccb04ded9a637f97a",
+      "execution_python": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python",
+      "required_receipts": [],
+      "scope": "Finite explicitly nominated cohort. This registration adds no observations. Native serial cold requests or explicitly registered same-prompt clone lanes do not establish general serving or agent task success. Existing studies and results remain immutable."
+    },
+    "qualified": true,
+    "groups": [
+      {
+        "group": 1,
+        "rounds": [
+          "m48-clean-b3-v2-g1-a1",
+          "m48-clean-b3-v2-g1-b1",
+          "m48-clean-b3-v2-g1-b2",
+          "m48-clean-b3-v2-g1-a2"
+        ],
+        "sources": [
+          {
+            "job": "m48-clean-b3-v2-g1-a1",
+            "sha256": "0ca970cfe41c17f624dd47c5fa0e2a9beaac805425cdb29e1b8bdf39ac5bf59e",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-835c6ed26f08e879607172bcdfa8a2f945d6d3990c90d15182bf47b17825d1a1"
+          },
+          {
+            "job": "m48-clean-b3-v2-g1-b1",
+            "sha256": "26fab67b9bdd60259fedf1206d6dd44904af87869a18336673f0e55e19c54426",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          },
+          {
+            "job": "m48-clean-b3-v2-g1-b2",
+            "sha256": "6659ba13ee85f7a88020fd98c4aef3a33e5ee774199071ab53a168e8801a3423",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          },
+          {
+            "job": "m48-clean-b3-v2-g1-a2",
+            "sha256": "d26a56b6e9f2d1f0c18633767c8631bc268318922af7b072d4b0d07fc44781c3",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-835c6ed26f08e879607172bcdfa8a2f945d6d3990c90d15182bf47b17825d1a1"
+          }
+        ],
+        "problems": [],
+        "qualified": true,
+        "cases": [
+          {
+            "case": "python_lru",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                7.274427083333333,
+                6.682265624999999,
+                6.5223177083333335,
+                7.375598958333334
+              ],
+              "baseline": 7.3250130208333335,
+              "candidate": 6.602291666666666,
+              "noise": 0.024226120980719974,
+              "regression": -0.09866485590007135,
+              "bound": 0.04845224196143995,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.10946522672052006,
+            "request_wall_abba": {
+              "rounds": [
+                5744.22,
+                5292.73,
+                5167.24,
+                5824.33
+              ],
+              "baseline": 5784.275,
+              "candidate": 5229.985,
+              "noise": 0.023994332679730397,
+              "regression": -0.09582704833362865,
+              "bound": 0.047988665359460794,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": null,
+            "cycles": [
+              [
+                35,
+                35,
+                35
+              ],
+              [
+                35,
+                35,
+                35
+              ],
+              [
+                35,
+                35,
+                35
+              ],
+              [
+                35,
+                35,
+                35
+              ]
+            ]
+          },
+          {
+            "case": "sql_latest",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                11.617997076023391,
+                10.498538011695906,
+                10.32906432748538,
+                11.64890350877193
+              ],
+              "baseline": 11.633450292397661,
+              "candidate": 10.413801169590643,
+              "noise": 0.016273950448123287,
+              "regression": -0.10483984477107766,
+              "bound": 0.032547900896246575,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.11711853365978575,
+            "request_wall_abba": {
+              "rounds": [
+                8204.04,
+                7441.7,
+                7325.25,
+                8228.1
+              ],
+              "baseline": 8216.07,
+              "candidate": 7383.475,
+              "noise": 0.015771706411953697,
+              "regression": -0.10133737906322604,
+              "bound": 0.031543412823907394,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": null,
+            "cycles": [
+              [
+                48,
+                48,
+                48
+              ],
+              [
+                48,
+                48,
+                48
+              ],
+              [
+                48,
+                48,
+                48
+              ],
+              [
+                48,
+                48,
+                48
+              ]
+            ]
+          },
+          {
+            "case": "typescript_heap",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                9.237552083333332,
+                8.312200520833334,
+                8.244388020833332,
+                9.252291666666666
+              ],
+              "baseline": 9.244921875,
+              "candidate": 8.278294270833333,
+              "noise": 0.008191602977792662,
+              "regression": -0.10455768228616491,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.11676651886758305,
+            "request_wall_abba": {
+              "rounds": [
+                7259.65,
+                6550.5,
+                6497.14,
+                7274.29
+              ],
+              "baseline": 7266.969999999999,
+              "candidate": 6523.82,
+              "noise": 0.008179256938419465,
+              "regression": -0.10226407980217334,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": null,
+            "cycles": [
+              [
+                42,
+                42,
+                42
+              ],
+              [
+                42,
+                42,
+                42
+              ],
+              [
+                42,
+                42,
+                42
+              ],
+              [
+                42,
+                42,
+                42
+              ]
+            ]
+          }
+        ],
+        "primary_decode_abba": {
+          "rounds": [
+            9.291851351351351,
+            8.42195945945946,
+            8.29095045045045,
+            9.341472972972973
+          ],
+          "baseline": 9.316662162162162,
+          "candidate": 8.356454954954955,
+          "noise": 0.01567758214640139,
+          "regression": -0.10306343521898909,
+          "bound": 0.03135516429280278,
+          "verdict": "pass",
+          "pass": true
+        },
+        "primary_request_wall_abba": {
+          "rounds": [
+            21207.91,
+            19284.93,
+            18989.63,
+            21326.72
+          ],
+          "baseline": 21267.315000000002,
+          "candidate": 19137.28,
+          "noise": 0.01543061500902946,
+          "regression": -0.10015533225515316,
+          "bound": 0.03086123001805892,
+          "verdict": "pass",
+          "pass": true
+        },
+        "endpoint_summaries": {
+          "decode": {
+            "abba": {
+              "rounds": [
+                9.291851351351351,
+                8.42195945945946,
+                8.29095045045045,
+                9.341472972972973
+              ],
+              "baseline": 9.316662162162162,
+              "candidate": 8.356454954954955,
+              "noise": 0.01567758214640139,
+              "regression": -0.10306343521898909,
+              "bound": 0.03135516429280278,
+              "verdict": "pass",
+              "pass": true
+            },
+            "all_output_arrays_match": true,
+            "measurement_qualified": true,
+            "effect_gate_passed": true,
+            "qualified": true,
+            "direction": "candidate faster"
+          },
+          "request_wall": {
+            "abba": {
+              "rounds": [
+                21207.91,
+                19284.93,
+                18989.63,
+                21326.72
+              ],
+              "baseline": 21267.315000000002,
+              "candidate": 19137.28,
+              "noise": 0.01543061500902946,
+              "regression": -0.10015533225515316,
+              "bound": 0.03086123001805892,
+              "verdict": "pass",
+              "pass": true
+            },
+            "all_output_arrays_match": true,
+            "measurement_qualified": true,
+            "effect_gate_passed": true,
+            "qualified": true,
+            "direction": "candidate faster"
+          }
+        },
+        "registered_categories": {},
+        "measurement_qualified": true,
+        "direction": "candidate faster",
+        "primary_throughput_change": 0.11490604716750763,
+        "all_output_arrays_match": true,
+        "all_case_noise_within_five_percent": true,
+        "cold_warm_gate_passed": true,
+        "effect_gate_passed": true
+      },
+      {
+        "group": 2,
+        "rounds": [
+          "m48-clean-b3-v2-g2-a1",
+          "m48-clean-b3-v2-g2-b1",
+          "m48-clean-b3-v2-g2-b2",
+          "m48-clean-b3-v2-g2-a2"
+        ],
+        "sources": [
+          {
+            "job": "m48-clean-b3-v2-g2-a1",
+            "sha256": "fc67dae5adec875925abda05bf3f74def1f351d8bd77c8598b2d1f58d8984542",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-835c6ed26f08e879607172bcdfa8a2f945d6d3990c90d15182bf47b17825d1a1"
+          },
+          {
+            "job": "m48-clean-b3-v2-g2-b1",
+            "sha256": "be8b5fbb8f47fa7b9ddfaab055c7dc9d50b4f4408f3dc3897e2e0ff7e97b2376",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          },
+          {
+            "job": "m48-clean-b3-v2-g2-b2",
+            "sha256": "101bd9351598e66b0ac7ff195921af6ec325cad8892dd4f213bfad316f5bf8c2",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          },
+          {
+            "job": "m48-clean-b3-v2-g2-a2",
+            "sha256": "24ad4122ef79bee29abc752220a491f876bc9d7b0200af69f0a34dfcde3ea4d8",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-835c6ed26f08e879607172bcdfa8a2f945d6d3990c90d15182bf47b17825d1a1"
+          }
+        ],
+        "problems": [],
+        "qualified": true,
+        "cases": [
+          {
+            "case": "python_lru",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                7.318046875,
+                6.53875,
+                6.520260416666667,
+                7.3690234375
+              ],
+              "baseline": 7.343535156250001,
+              "candidate": 6.529505208333333,
+              "noise": 0.00694169244312996,
+              "regression": -0.11084987415411984,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.12466946911655041,
+            "request_wall_abba": {
+              "rounds": [
+                5777.96,
+                5179.62,
+                5165.37,
+                5818.7
+              ],
+              "baseline": 5798.33,
+              "candidate": 5172.495,
+              "noise": 0.007026160980834099,
+              "regression": -0.10793366365832924,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": null,
+            "cycles": [
+              [
+                35,
+                35,
+                35
+              ],
+              [
+                35,
+                35,
+                35
+              ],
+              [
+                35,
+                35,
+                35
+              ],
+              [
+                35,
+                35,
+                35
+              ]
+            ]
+          },
+          {
+            "case": "sql_latest",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                11.578888888888889,
+                10.368538011695906,
+                10.343304093567252,
+                11.662149122807017
+              ],
+              "baseline": 11.620519005847953,
+              "candidate": 10.35592105263158,
+              "noise": 0.007164932467837998,
+              "regression": -0.1088245673519378,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.12211351813028948,
+            "request_wall_abba": {
+              "rounds": [
+                8178.65,
+                7351.1,
+                7333.98,
+                8237.83
+              ],
+              "baseline": 8208.24,
+              "candidate": 7342.54,
+              "noise": 0.007209828172665553,
+              "regression": -0.10546718906854569,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": null,
+            "cycles": [
+              [
+                48,
+                48,
+                48
+              ],
+              [
+                48,
+                48,
+                48
+              ],
+              [
+                48,
+                48,
+                48
+              ],
+              [
+                48,
+                48,
+                48
+              ]
+            ]
+          },
+          {
+            "case": "typescript_heap",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                9.175690104166668,
+                8.2360546875,
+                8.220364583333334,
+                9.236197916666667
+              ],
+              "baseline": 9.205944010416667,
+              "candidate": 8.228209635416667,
+              "noise": 0.006572689604839398,
+              "regression": -0.10620685655851037,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.11882711043135563,
+            "request_wall_abba": {
+              "rounds": [
+                7211.61,
+                6489.77,
+                6480.1,
+                7259.57
+              ],
+              "baseline": 7235.59,
+              "candidate": 6484.935,
+              "noise": 0.006628346824516043,
+              "regression": -0.10374482246782912,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": null,
+            "cycles": [
+              [
+                42,
+                42,
+                42
+              ],
+              [
+                42,
+                42,
+                42
+              ],
+              [
+                42,
+                42,
+                42
+              ],
+              [
+                42,
+                42,
+                42
+              ]
+            ]
+          }
+        ],
+        "primary_decode_abba": {
+          "rounds": [
+            9.273490990990991,
+            8.305914414414415,
+            8.286315315315315,
+            9.337711711711712
+          ],
+          "baseline": 9.305601351351353,
+          "candidate": 8.296114864864865,
+          "noise": 0.006901297218303357,
+          "regression": -0.10848159601634888,
+          "bound": 0.02,
+          "verdict": "pass",
+          "pass": true
+        },
+        "primary_request_wall_abba": {
+          "rounds": [
+            21168.22,
+            19020.49,
+            18979.45,
+            21316.1
+          ],
+          "baseline": 21242.16,
+          "candidate": 18999.97,
+          "noise": 0.006961627254478705,
+          "regression": -0.10555376666026428,
+          "bound": 0.02,
+          "verdict": "pass",
+          "pass": true
+        },
+        "endpoint_summaries": {
+          "decode": {
+            "abba": {
+              "rounds": [
+                9.273490990990991,
+                8.305914414414415,
+                8.286315315315315,
+                9.337711711711712
+              ],
+              "baseline": 9.305601351351353,
+              "candidate": 8.296114864864865,
+              "noise": 0.006901297218303357,
+              "regression": -0.10848159601634888,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "all_output_arrays_match": true,
+            "measurement_qualified": true,
+            "effect_gate_passed": true,
+            "qualified": true,
+            "direction": "candidate faster"
+          },
+          "request_wall": {
+            "abba": {
+              "rounds": [
+                21168.22,
+                19020.49,
+                18979.45,
+                21316.1
+              ],
+              "baseline": 21242.16,
+              "candidate": 18999.97,
+              "noise": 0.006961627254478705,
+              "regression": -0.10555376666026428,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "all_output_arrays_match": true,
+            "measurement_qualified": true,
+            "effect_gate_passed": true,
+            "qualified": true,
+            "direction": "candidate faster"
+          }
+        },
+        "registered_categories": {},
+        "measurement_qualified": true,
+        "direction": "candidate faster",
+        "primary_throughput_change": 0.12168183576649771,
+        "all_output_arrays_match": true,
+        "all_case_noise_within_five_percent": true,
+        "cold_warm_gate_passed": true,
+        "effect_gate_passed": true
+      },
+      {
+        "group": 3,
+        "rounds": [
+          "m48-clean-b3-v2-g3-a1",
+          "m48-clean-b3-v2-g3-b1",
+          "m48-clean-b3-v2-g3-b2",
+          "m48-clean-b3-v2-g3-a2"
+        ],
+        "sources": [
+          {
+            "job": "m48-clean-b3-v2-g3-a1",
+            "sha256": "3bb92d657d5638098ffa7ba07db86b35232ab46860055f964f2c006d4b1a4fd9",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-835c6ed26f08e879607172bcdfa8a2f945d6d3990c90d15182bf47b17825d1a1"
+          },
+          {
+            "job": "m48-clean-b3-v2-g3-b1",
+            "sha256": "39f42a194487e490f84ee3407c151f3c76ce82f3e64b56df263612e1e40e21e0",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          },
+          {
+            "job": "m48-clean-b3-v2-g3-b2",
+            "sha256": "9363fbd50acdfcdca24709a052d6d1ac509e65914bf4b8b4e1c7879fd24abc38",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          },
+          {
+            "job": "m48-clean-b3-v2-g3-a2",
+            "sha256": "4f80896bb67d9c32a17bce33dfd01b0c3c937fd46d419355f7f34c783990ca4f",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-835c6ed26f08e879607172bcdfa8a2f945d6d3990c90d15182bf47b17825d1a1"
+          }
+        ],
+        "problems": [],
+        "qualified": true,
+        "cases": [
+          {
+            "case": "python_lru",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                7.331236979166667,
+                6.53140625,
+                6.522955729166667,
+                7.3615494791666665
+              ],
+              "baseline": 7.346393229166667,
+              "candidate": 6.527180989583334,
+              "noise": 0.004126174444304495,
+              "regression": -0.11151216849254608,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.1255078173702715,
+            "request_wall_abba": {
+              "rounds": [
+                5791.17,
+                5174.01,
+                5167.66,
+                5811.98
+              ],
+              "baseline": 5801.575,
+              "candidate": 5170.835,
+              "noise": 0.0035869569901275933,
+              "regression": -0.10871875309721923,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": null,
+            "cycles": [
+              [
+                35,
+                35,
+                35
+              ],
+              [
+                35,
+                35,
+                35
+              ],
+              [
+                35,
+                35,
+                35
+              ],
+              [
+                35,
+                35,
+                35
+              ]
+            ]
+          },
+          {
+            "case": "sql_latest",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                11.585994152046784,
+                10.37609649122807,
+                10.3481432748538,
+                11.66874269005848
+              ],
+              "baseline": 11.627368421052632,
+              "candidate": 10.362119883040936,
+              "noise": 0.00711670388476474,
+              "regression": -0.10881641418713661,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.12210325225849328,
+            "request_wall_abba": {
+              "rounds": [
+                8185.3,
+                7358.27,
+                7337.8,
+                8240.66
+              ],
+              "baseline": 8212.98,
+              "candidate": 7348.035,
+              "noise": 0.006740549715206864,
+              "regression": -0.1053143925834471,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": null,
+            "cycles": [
+              [
+                48,
+                48,
+                48
+              ],
+              [
+                48,
+                48,
+                48
+              ],
+              [
+                48,
+                48,
+                48
+              ],
+              [
+                48,
+                48,
+                48
+              ]
+            ]
+          },
+          {
+            "case": "typescript_heap",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                9.182513020833333,
+                8.257356770833333,
+                8.2483203125,
+                9.246067708333333
+              ],
+              "baseline": 9.214290364583334,
+              "candidate": 8.252838541666666,
+              "noise": 0.006897404464730458,
+              "regression": -0.10434355602816348,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.1164995314112256,
+            "request_wall_abba": {
+              "rounds": [
+                7220.1,
+                6505.63,
+                6502.14,
+                7267.73
+              ],
+              "baseline": 7243.915,
+              "candidate": 6503.885,
+              "noise": 0.006575173783789456,
+              "regression": -0.10215884642489592,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": null,
+            "cycles": [
+              [
+                42,
+                42,
+                42
+              ],
+              [
+                42,
+                42,
+                42
+              ],
+              [
+                42,
+                42,
+                42
+              ],
+              [
+                42,
+                42,
+                42
+              ]
+            ]
+          }
+        ],
+        "primary_decode_abba": {
+          "rounds": [
+            9.282603603603604,
+            8.313072072072073,
+            8.29840990990991,
+            9.340572072072073
+          ],
+          "baseline": 9.311587837837838,
+          "candidate": 8.30574099099099,
+          "noise": 0.006225411764136739,
+          "regression": -0.1080209803487614,
+          "bound": 0.02,
+          "verdict": "pass",
+          "pass": true
+        },
+        "primary_request_wall_abba": {
+          "rounds": [
+            21196.57,
+            19037.91,
+            19007.6,
+            21320.37
+          ],
+          "baseline": 21258.47,
+          "candidate": 19022.754999999997,
+          "noise": 0.005823561149979244,
+          "regression": -0.10516819884027417,
+          "bound": 0.02,
+          "verdict": "pass",
+          "pass": true
+        },
+        "endpoint_summaries": {
+          "decode": {
+            "abba": {
+              "rounds": [
+                9.282603603603604,
+                8.313072072072073,
+                8.29840990990991,
+                9.340572072072073
+              ],
+              "baseline": 9.311587837837838,
+              "candidate": 8.30574099099099,
+              "noise": 0.006225411764136739,
+              "regression": -0.1080209803487614,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "all_output_arrays_match": true,
+            "measurement_qualified": true,
+            "effect_gate_passed": true,
+            "qualified": true,
+            "direction": "candidate faster"
+          },
+          "request_wall": {
+            "abba": {
+              "rounds": [
+                21196.57,
+                19037.91,
+                19007.6,
+                21320.37
+              ],
+              "baseline": 21258.47,
+              "candidate": 19022.754999999997,
+              "noise": 0.005823561149979244,
+              "regression": -0.10516819884027417,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "all_output_arrays_match": true,
+            "measurement_qualified": true,
+            "effect_gate_passed": true,
+            "qualified": true,
+            "direction": "candidate faster"
+          }
+        },
+        "registered_categories": {},
+        "measurement_qualified": true,
+        "direction": "candidate faster",
+        "primary_throughput_change": 0.1211026021564916,
+        "all_output_arrays_match": true,
+        "all_case_noise_within_five_percent": true,
+        "cold_warm_gate_passed": true,
+        "effect_gate_passed": true
+      }
+    ],
+    "scope": "Exactly the registered groups and complete cohort; all failures retained. Top-level qualification concerns the primary decode endpoint. Cold request wall, TTFT and predeclared categories each retain their own output/noise/effect gates. Medians of registered internal repetitions precede per-case ABBA. Aggregate decode rate weights cases by output tokens. AC and thermal state sampled every five seconds. A failure is not rerun into a pass."
+  },
+  "scope": "The unchanged frozen analyzer computes each registered ABBA group. This supplement checks full job/registration identity, raw AC/thermal/swap observations, nominated runtime build IDs, cohort/cap/token counts, and exact arrays across every arm and all three groups. Every registered group and failure is retained. Clone journal events contain counters without token arrays; full clone arrays come from complete stdout. Directional primary conclusions require every original group gate plus this cross-group output/provenance gate.",
+  "source_sha256": {
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/kernel-smoke3-cap256-v1.txt": "4197b200cd24e583b19b973c032e33beda6026dc406ffe6331559329406a3246",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/operating-state": "3e182e43a749fee5cc65c1075a44a4ba1b83f4de797c2e46f1c4b31c3354cad9",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/build.json": "3b286493d52645d50bdc6280174765e842495442dc40ac8ad4fbadeac4f30d79",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/build.json": "6dfd89f8ddded01f648b51f4cbc5b3b9253ca3263b0588d08017f5b430162c93",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/splash.metallib": "f60d2e950c6a6c69ec7472b5ec7778de437edae81a57834b9cc2c08af0bac039",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-qkv-v2/study-driver": "4b5edac62e62beacbe80acd8f21c9dcac5126634e22ef73f91651b82976f1fda",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/BuildIdentity.hpp": "a144e898bcc1d547db5c1e241c30d8d4950e17032c775dcf77e5272ce0f979d7",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/m48-clean-b3-v2.artifact-barrier.json": "861cf11625550aef6bced699cbc84a17f2ec17e720d851f26712ea208f6c8500",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/m48-clean-b3-v2.jobs.json": "b5a463f3c6e9a8f41bf63120eb387335457d44346f53c71cfe47106202dd5462",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/m48-clean-b3-v2.protocol.json": "9d35ca0282927e9ae5c269f36b2e22ccd54155ec666fa246a13ad8e04c67627c",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/qkv/build/engine/BuildIdentity.hpp": "80a9bb74c8ace104c7a466cb2a1c3c223a9041a3a791e95602cc57a3ef23f6f7",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g1-a1.operating.json": "c32e69f0418c13571644852691b15ba8fe4615139077ab763ebfe2925a98010e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g1-a1.progress.jsonl": "a33181f8c0cec309cb671d62d0b00ac7747181949d5c32744a1caf6ffaf1b3e0",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g1-a1.receipt.json": "8267f82e290927494d550e3fb3c4914b002b7c9a73e5187dba7f36618551d7cd",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g1-a1.stdout": "0ca970cfe41c17f624dd47c5fa0e2a9beaac805425cdb29e1b8bdf39ac5bf59e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g1-a2.operating.json": "c3ec913139cfd5087e5a80079c3e64f6d7aea5dacad0a1244d7173d23c513a7e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g1-a2.progress.jsonl": "46ecb6e77ea717b205823cfe5f78737180aa425b144241ea8a473180df5a3191",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g1-a2.receipt.json": "eb38bc63a61aeb29d67ad39a9e4603565bab5ffea673ec721ea3bd1fb808338a",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g1-a2.stdout": "d26a56b6e9f2d1f0c18633767c8631bc268318922af7b072d4b0d07fc44781c3",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g1-b1.operating.json": "7d9f8fdedbe44c911db957b139f2fbd9e3fc6647b9f7485b4658da1359016e3b",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g1-b1.progress.jsonl": "33794142d4ab96790f2d261dd112826497d7c2c9e32a3f9a9027db48436b26cd",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g1-b1.receipt.json": "326278fba578452307b3348174708a45c09b86395baf142dd14fbb5fc6b66566",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g1-b1.stdout": "26fab67b9bdd60259fedf1206d6dd44904af87869a18336673f0e55e19c54426",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g1-b2.operating.json": "a8fd88e3fed2d77d65df2ebbe0a8612cc2f6e9082bb60d7e976ef1b805b2163e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g1-b2.progress.jsonl": "4e6931a4d116b10ddbcb72addf05605fb88bd58cf81085b55a7df24f3bae70ef",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g1-b2.receipt.json": "79183ebedcce38efd52ac5f1be508701e086f0d7f8a9ad4d0578786bd2213560",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g1-b2.stdout": "6659ba13ee85f7a88020fd98c4aef3a33e5ee774199071ab53a168e8801a3423",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g2-a1.operating.json": "5a97ad965a6c301935192cad4162a1df6a6d0d6cc177038ecddd92bb9920d385",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g2-a1.progress.jsonl": "12570fa4ba787365c289a1db3860165ee1d62d3bea8de1c0f5ae63622c7fc793",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g2-a1.receipt.json": "52817125a0c0427e3b4f05a39bff7ec9395a628c328e61b91181a84ad80e95e9",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g2-a1.stdout": "fc67dae5adec875925abda05bf3f74def1f351d8bd77c8598b2d1f58d8984542",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g2-a2.operating.json": "9e94e98fe47b557aff58cbdbeb4506b83f24660d014fe5e15e98e52e651c8c8c",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g2-a2.progress.jsonl": "c31e9529ef7b27ada0a46ba819ac169a330bbbb55d10e85d33bdafc87c73544a",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g2-a2.receipt.json": "6269902f3ac638b5602267a90d4a8f7dc85efaf3d4f119cb87ddaf9a351027bf",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g2-a2.stdout": "24ad4122ef79bee29abc752220a491f876bc9d7b0200af69f0a34dfcde3ea4d8",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g2-b1.operating.json": "f8b7946bf7dbfa0745dbdfc8f2fbbbb7d465aed0172f48a24d6ba63d1ad750fa",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g2-b1.progress.jsonl": "90df1d0fb2d16b9ebd8cf6417eea0fad74045e8517ba8634b883ef0be67e9057",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g2-b1.receipt.json": "77b191a418554c46588b4f5ab2f68c53afb05866d4ccf944e3d30ca90f58eb34",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g2-b1.stdout": "be8b5fbb8f47fa7b9ddfaab055c7dc9d50b4f4408f3dc3897e2e0ff7e97b2376",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g2-b2.operating.json": "92bf57e8380254760e43005c968ce1e76bbf6b6b4254aaa20cf2e83c7afce60b",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g2-b2.progress.jsonl": "12b3f6e25a9cb32b412db8590b6251efe2035cb6377d3a2a24f1dab3cca78f93",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g2-b2.receipt.json": "9c829e5c71f7213af3609b3d52f836e82d34b7f7f0bddd8b0b9007b48e322076",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g2-b2.stdout": "101bd9351598e66b0ac7ff195921af6ec325cad8892dd4f213bfad316f5bf8c2",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g3-a1.operating.json": "e53313059cf748afc76da244ab26995ff97c6bb96d9222e1a70e5ed90d8b935a",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g3-a1.progress.jsonl": "0834278d2c8a0a97b8469b1567ef7f0a34c06481c3945d716840a4da0fa8c40f",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g3-a1.receipt.json": "6f46902bd66636f3b7f2e5957baf4de803122bd000680600b8e078216e124e8a",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g3-a1.stdout": "3bb92d657d5638098ffa7ba07db86b35232ab46860055f964f2c006d4b1a4fd9",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g3-a2.operating.json": "e47bcd204e8aa7f3f4a30ef1b1de0cebee9c1909603d3c8cd50caa3b07269298",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g3-a2.progress.jsonl": "7d20ff405e1d3a06c6e60a88abf5130e017e58414621ad52abbc9865beedbad6",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g3-a2.receipt.json": "c173e78f10b2cb9572a779561253368f20d3c4488bec26e168a2b38132989f12",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g3-a2.stdout": "4f80896bb67d9c32a17bce33dfd01b0c3c937fd46d419355f7f34c783990ca4f",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g3-b1.operating.json": "52dabfbf4e366d4bb5b7d0f523e7d8ce1d63c78032eed2ba9d0246d958d9083e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g3-b1.progress.jsonl": "e04ba77d7d162928a3bfacb41eae5af251d0f69b62421da46915c168d35e8968",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g3-b1.receipt.json": "446cf0a11217422890628be96e75748cca636bdc1775a16a0eba5589027b8fa0",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g3-b1.stdout": "39f42a194487e490f84ee3407c151f3c76ce82f3e64b56df263612e1e40e21e0",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g3-b2.operating.json": "7c49527ba150f28b78eaa775ffffe517fa1816cebf69afa81cf794445601d009",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g3-b2.progress.jsonl": "7aa46ccbcec1c3681b44fcc12235c66a15e362e7f0b666cad79682ad90a216a2",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g3-b2.receipt.json": "ff5c9c2130a0555766b7b9981de2a8674da4b0324b3bf28e1e40cfd113c750e7",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/m48-clean-b3-v2-g3-b2.stdout": "9363fbd50acdfcdca24709a052d6d1ac509e65914bf4b8b4e1c7879fd24abc38",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/abba.py": "7afc7b4fa24916acfc41745fc29cc659b5edada0bfa1ce55e19a685808475c0d",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/analyze_abba_v2.py": "e2c3f42e4e5fce41d89251399beb7339bf9bdc4c4af51e15435cf984390da634",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/controlled_round.py": "4bde430207a362eab510fe8ffd393fa2aa76c543eaa5821c7073e95e454d0f58",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prepare_native_comparison_v1.py": "269eb1b394f9a83a8338ac0c18f02fb6b4dc346d10cc76dccb04ded9a637f97a",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/review_native_abba_v1.py": "a2f89e21f776cb3641177e5664fba98133f7714b785fb1b0ec9812dbb31ab2ee",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/run_frozen_abba_round_v1.py": "f062f66b89052d1bff3eb1510ffe93a3f8e805b110eced7e34f60d75c83b0a7d",
+    "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/config.json": "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85",
+    "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/draft/config.json": "c2aa9e3ff22766ea7df0fa5b5f5f7d2035ae722671c6b7eb58b65578705e6815",
+    "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/model.json": "6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65"
+  }
+}

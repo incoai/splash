@@ -1,0 +1,17 @@
+The selected sourceA DSpine16 candidate completed its separately registered finite sampling screen: 4,000 fresh candidate requests and 4,000 reused, provenance-validated DSpine8 control requests, with exactly 1,000 seeds per context and arm. Candidate seeds are 4400000–4400999; reused control seeds are 4100000–4100999. The candidate is combined-v2-f27dc90a, build src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283. Both 2,000-request candidate chunks completed successfully, with full stdout arrays matching their journals.
+
+All 140 prespecified tests were evaluated: 98 informative and 42 degenerate. There were zero Holm-corrected rejections; every adjusted p-value is 1.0. The smallest unadjusted p-value is 0.00971251525556622. The family is four contexts multiplied by 24 single-token positions, 10 adjacent pairs and one complete-output-length feature, for one candidate comparison. The method reuses the frozen Pearson chi-square test without Yates correction, symmetric label-blind rare-category pooling with expected cells at least five, and Holm correction over all 140 reserved tests. Post-termination positions use absorbing STOP (-1); token 0 remains a valid token, and empty outputs remain in every feature.
+
+The workload has four reused short prompts, a 24-token cap, temperature 1, top-p 0.95, top-k 20, ANE off and a 32768-token context limit. It is a serial, single-lane screen. The baseline observations also appear in the earlier 280-test recovered historical screen, which remains separate and unchanged. This sourceA result does not test the upstream-integrated sourceB or the concurrent M48 path. Non-rejection does not establish distributional equivalence, rare-event safety, task quality or generalization.
+
+The independent read-only audit revalidated exact seed coverage, both candidate receipts/artifact identities, complete candidate stdout/journal arrays, reused-control provenance and array hashes, all 140 feature identities/sample counts, and the reported Holm arithmetic. It did not rerun the statistical analyzer or any benchmark.
+
+Canonical comparison: results/candidate-sampling-v1.comparison.json
+Comparison SHA-256: d80b1649ad1b329fb90a64c8e7845489baa8cbcc42b1d53bb54ae200b93151fe
+Protocol SHA-256: 2d580c8590efccd20062e5d6be07a778650007d323f5be874d5a5d6017365ded
+Nomination SHA-256: 8e16b22b810ada96e8125c0ec7e84a527282d7b58e0347527b0c2cc22f3c8768
+Candidate analyzer SHA-256: ce47cbdbe34304e567d59d1b59ca05054ddb5127a9703df80dbf9576d3b4654a
+Frozen original statistical source SHA-256: 66babc7961c3ef7d37b61777dd57b1906b6e6060edd05a264c1d073e2c7b5c35
+Recovered baseline report SHA-256: cdd2e5bfd68b8e4e63e60701ef42154af891028da7d52d4cba67685414f4e8cb
+Canonical candidate arrays SHA-256: b3646870844f663469ab1e94a8be4260557bf3f6108c028b1d4ea857c0ad040d
+Canonical baseline arrays SHA-256: 5d06ac9da5486e9934989d19383aebaf9d311d0db846f0b48b3fb12b42cf782a

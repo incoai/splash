@@ -1,0 +1,13 @@
+{
+  "selected_utc": "2026-11-11T07:30:21.033296+00:00",
+  "selection_rule_sha256": "dddc8d389505885f8d3c8a26660ed9181190182fc9cca6ac97c5a5a064713eea",
+  "decision": "Keep combined-v2: all three M48 groups meet the registered consistent whole-model decode improvement, output, operating, noise and independent provenance gates.",
+  "source_base": "37bdd4f8710319bfad43709de2725df89ef776d3",
+  "source_patch": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch",
+  "source_patch_sha256": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d",
+  "bundle": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3",
+  "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283",
+  "review_sha256": "ee9822478ba15a0d5c51bb960b1f61ecfeb0cc6997cc63c617680320a064f419",
+  "comparison_sha256": "15da2bb27efe9611f3ca73ec193cb8e773d8f9a7dcfc14e0af6adeafc654f1ec",
+  "freeze": "No source or artifact changes during the following default8, agent12, historical31, mixed HTTP and candidate-sampling campaigns. All failures retained. Defaults remain eight rows and DFlash2."
+}

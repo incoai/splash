@@ -1,0 +1,4278 @@
+{
+  "review_contract_version": 2,
+  "created_utc": "2026-11-11T09:09:22.175288+00:00",
+  "status": "complete",
+  "protocol_sha256": "c6659f4cd62d25b2db429a317d2399b3d36d38a568180695b89e629f400071c0",
+  "jobs_sha256": "d47eef916fabca12fc74e4954c3197084cd99ddc4ba4c46a8808f60e9dac5522",
+  "build_ids": {
+    "control": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283",
+    "candidate": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+  },
+  "provenance_failures": {},
+  "all_registered_jobs_retained": true,
+  "rounds_validated": 12,
+  "registered_rounds": 12,
+  "nonoverlapping_registered_order": true,
+  "cross_group_output_gate": true,
+  "cross_group_case_arrays": {
+    "short_async": {
+      "all_12_round_arrays_match": true,
+      "matching_rounds": [
+        "g1_a1",
+        "g1_b1",
+        "g1_b2",
+        "g1_a2",
+        "g2_a1",
+        "g2_b1",
+        "g2_b2",
+        "g2_a2",
+        "g3_a1",
+        "g3_b1",
+        "g3_b2",
+        "g3_a2"
+      ],
+      "array_sha256_by_round": {
+        "g1_a1": "88fcd15ece3e6e89e31fdc8884a7000df20702726f016af55d9404286970f1d1",
+        "g1_b1": "88fcd15ece3e6e89e31fdc8884a7000df20702726f016af55d9404286970f1d1",
+        "g1_b2": "88fcd15ece3e6e89e31fdc8884a7000df20702726f016af55d9404286970f1d1",
+        "g1_a2": "88fcd15ece3e6e89e31fdc8884a7000df20702726f016af55d9404286970f1d1",
+        "g2_a1": "88fcd15ece3e6e89e31fdc8884a7000df20702726f016af55d9404286970f1d1",
+        "g2_b1": "88fcd15ece3e6e89e31fdc8884a7000df20702726f016af55d9404286970f1d1",
+        "g2_b2": "88fcd15ece3e6e89e31fdc8884a7000df20702726f016af55d9404286970f1d1",
+        "g2_a2": "88fcd15ece3e6e89e31fdc8884a7000df20702726f016af55d9404286970f1d1",
+        "g3_a1": "88fcd15ece3e6e89e31fdc8884a7000df20702726f016af55d9404286970f1d1",
+        "g3_b1": "88fcd15ece3e6e89e31fdc8884a7000df20702726f016af55d9404286970f1d1",
+        "g3_b2": "88fcd15ece3e6e89e31fdc8884a7000df20702726f016af55d9404286970f1d1",
+        "g3_a2": "88fcd15ece3e6e89e31fdc8884a7000df20702726f016af55d9404286970f1d1"
+      }
+    },
+    "short_arena": {
+      "all_12_round_arrays_match": true,
+      "matching_rounds": [
+        "g1_a1",
+        "g1_b1",
+        "g1_b2",
+        "g1_a2",
+        "g2_a1",
+        "g2_b1",
+        "g2_b2",
+        "g2_a2",
+        "g3_a1",
+        "g3_b1",
+        "g3_b2",
+        "g3_a2"
+      ],
+      "array_sha256_by_round": {
+        "g1_a1": "4f0b1fa3f3cd0e0338330bc1ba87a70b0415bc53c6bac1ece2101c27144bd2df",
+        "g1_b1": "4f0b1fa3f3cd0e0338330bc1ba87a70b0415bc53c6bac1ece2101c27144bd2df",
+        "g1_b2": "4f0b1fa3f3cd0e0338330bc1ba87a70b0415bc53c6bac1ece2101c27144bd2df",
+        "g1_a2": "4f0b1fa3f3cd0e0338330bc1ba87a70b0415bc53c6bac1ece2101c27144bd2df",
+        "g2_a1": "4f0b1fa3f3cd0e0338330bc1ba87a70b0415bc53c6bac1ece2101c27144bd2df",
+        "g2_b1": "4f0b1fa3f3cd0e0338330bc1ba87a70b0415bc53c6bac1ece2101c27144bd2df",
+        "g2_b2": "4f0b1fa3f3cd0e0338330bc1ba87a70b0415bc53c6bac1ece2101c27144bd2df",
+        "g2_a2": "4f0b1fa3f3cd0e0338330bc1ba87a70b0415bc53c6bac1ece2101c27144bd2df",
+        "g3_a1": "4f0b1fa3f3cd0e0338330bc1ba87a70b0415bc53c6bac1ece2101c27144bd2df",
+        "g3_b1": "4f0b1fa3f3cd0e0338330bc1ba87a70b0415bc53c6bac1ece2101c27144bd2df",
+        "g3_b2": "4f0b1fa3f3cd0e0338330bc1ba87a70b0415bc53c6bac1ece2101c27144bd2df",
+        "g3_a2": "4f0b1fa3f3cd0e0338330bc1ba87a70b0415bc53c6bac1ece2101c27144bd2df"
+      }
+    },
+    "short_sql": {
+      "all_12_round_arrays_match": true,
+      "matching_rounds": [
+        "g1_a1",
+        "g1_b1",
+        "g1_b2",
+        "g1_a2",
+        "g2_a1",
+        "g2_b1",
+        "g2_b2",
+        "g2_a2",
+        "g3_a1",
+        "g3_b1",
+        "g3_b2",
+        "g3_a2"
+      ],
+      "array_sha256_by_round": {
+        "g1_a1": "4a11607114c05edddca522eaf62fb2784755c4167f6cb07a256ae49e21e9be46",
+        "g1_b1": "4a11607114c05edddca522eaf62fb2784755c4167f6cb07a256ae49e21e9be46",
+        "g1_b2": "4a11607114c05edddca522eaf62fb2784755c4167f6cb07a256ae49e21e9be46",
+        "g1_a2": "4a11607114c05edddca522eaf62fb2784755c4167f6cb07a256ae49e21e9be46",
+        "g2_a1": "4a11607114c05edddca522eaf62fb2784755c4167f6cb07a256ae49e21e9be46",
+        "g2_b1": "4a11607114c05edddca522eaf62fb2784755c4167f6cb07a256ae49e21e9be46",
+        "g2_b2": "4a11607114c05edddca522eaf62fb2784755c4167f6cb07a256ae49e21e9be46",
+        "g2_a2": "4a11607114c05edddca522eaf62fb2784755c4167f6cb07a256ae49e21e9be46",
+        "g3_a1": "4a11607114c05edddca522eaf62fb2784755c4167f6cb07a256ae49e21e9be46",
+        "g3_b1": "4a11607114c05edddca522eaf62fb2784755c4167f6cb07a256ae49e21e9be46",
+        "g3_b2": "4a11607114c05edddca522eaf62fb2784755c4167f6cb07a256ae49e21e9be46",
+        "g3_a2": "4a11607114c05edddca522eaf62fb2784755c4167f6cb07a256ae49e21e9be46"
+      }
+    },
+    "short_rust": {
+      "all_12_round_arrays_match": true,
+      "matching_rounds": [
+        "g1_a1",
+        "g1_b1",
+        "g1_b2",
+        "g1_a2",
+        "g2_a1",
+        "g2_b1",
+        "g2_b2",
+        "g2_a2",
+        "g3_a1",
+        "g3_b1",
+        "g3_b2",
+        "g3_a2"
+      ],
+      "array_sha256_by_round": {
+        "g1_a1": "cf6641fb18bd2fda8abfa5b5e5522b93ac56720fdd7c8817ed8c1c819c404f2e",
+        "g1_b1": "cf6641fb18bd2fda8abfa5b5e5522b93ac56720fdd7c8817ed8c1c819c404f2e",
+        "g1_b2": "cf6641fb18bd2fda8abfa5b5e5522b93ac56720fdd7c8817ed8c1c819c404f2e",
+        "g1_a2": "cf6641fb18bd2fda8abfa5b5e5522b93ac56720fdd7c8817ed8c1c819c404f2e",
+        "g2_a1": "cf6641fb18bd2fda8abfa5b5e5522b93ac56720fdd7c8817ed8c1c819c404f2e",
+        "g2_b1": "cf6641fb18bd2fda8abfa5b5e5522b93ac56720fdd7c8817ed8c1c819c404f2e",
+        "g2_b2": "cf6641fb18bd2fda8abfa5b5e5522b93ac56720fdd7c8817ed8c1c819c404f2e",
+        "g2_a2": "cf6641fb18bd2fda8abfa5b5e5522b93ac56720fdd7c8817ed8c1c819c404f2e",
+        "g3_a1": "cf6641fb18bd2fda8abfa5b5e5522b93ac56720fdd7c8817ed8c1c819c404f2e",
+        "g3_b1": "cf6641fb18bd2fda8abfa5b5e5522b93ac56720fdd7c8817ed8c1c819c404f2e",
+        "g3_b2": "cf6641fb18bd2fda8abfa5b5e5522b93ac56720fdd7c8817ed8c1c819c404f2e",
+        "g3_a2": "cf6641fb18bd2fda8abfa5b5e5522b93ac56720fdd7c8817ed8c1c819c404f2e"
+      }
+    },
+    "medium_cancel": {
+      "all_12_round_arrays_match": true,
+      "matching_rounds": [
+        "g1_a1",
+        "g1_b1",
+        "g1_b2",
+        "g1_a2",
+        "g2_a1",
+        "g2_b1",
+        "g2_b2",
+        "g2_a2",
+        "g3_a1",
+        "g3_b1",
+        "g3_b2",
+        "g3_a2"
+      ],
+      "array_sha256_by_round": {
+        "g1_a1": "4e6301aa8d0fa6690196ee628c79276c4bba65201ed0d2cec47c76ea22dff084",
+        "g1_b1": "4e6301aa8d0fa6690196ee628c79276c4bba65201ed0d2cec47c76ea22dff084",
+        "g1_b2": "4e6301aa8d0fa6690196ee628c79276c4bba65201ed0d2cec47c76ea22dff084",
+        "g1_a2": "4e6301aa8d0fa6690196ee628c79276c4bba65201ed0d2cec47c76ea22dff084",
+        "g2_a1": "4e6301aa8d0fa6690196ee628c79276c4bba65201ed0d2cec47c76ea22dff084",
+        "g2_b1": "4e6301aa8d0fa6690196ee628c79276c4bba65201ed0d2cec47c76ea22dff084",
+        "g2_b2": "4e6301aa8d0fa6690196ee628c79276c4bba65201ed0d2cec47c76ea22dff084",
+        "g2_a2": "4e6301aa8d0fa6690196ee628c79276c4bba65201ed0d2cec47c76ea22dff084",
+        "g3_a1": "4e6301aa8d0fa6690196ee628c79276c4bba65201ed0d2cec47c76ea22dff084",
+        "g3_b1": "4e6301aa8d0fa6690196ee628c79276c4bba65201ed0d2cec47c76ea22dff084",
+        "g3_b2": "4e6301aa8d0fa6690196ee628c79276c4bba65201ed0d2cec47c76ea22dff084",
+        "g3_a2": "4e6301aa8d0fa6690196ee628c79276c4bba65201ed0d2cec47c76ea22dff084"
+      }
+    },
+    "medium_cache": {
+      "all_12_round_arrays_match": true,
+      "matching_rounds": [
+        "g1_a1",
+        "g1_b1",
+        "g1_b2",
+        "g1_a2",
+        "g2_a1",
+        "g2_b1",
+        "g2_b2",
+        "g2_a2",
+        "g3_a1",
+        "g3_b1",
+        "g3_b2",
+        "g3_a2"
+      ],
+      "array_sha256_by_round": {
+        "g1_a1": "4400efceaddf469f371641cdce6714a2e9683f4ee9a0c37cc83fcd6214931a7a",
+        "g1_b1": "4400efceaddf469f371641cdce6714a2e9683f4ee9a0c37cc83fcd6214931a7a",
+        "g1_b2": "4400efceaddf469f371641cdce6714a2e9683f4ee9a0c37cc83fcd6214931a7a",
+        "g1_a2": "4400efceaddf469f371641cdce6714a2e9683f4ee9a0c37cc83fcd6214931a7a",
+        "g2_a1": "4400efceaddf469f371641cdce6714a2e9683f4ee9a0c37cc83fcd6214931a7a",
+        "g2_b1": "4400efceaddf469f371641cdce6714a2e9683f4ee9a0c37cc83fcd6214931a7a",
+        "g2_b2": "4400efceaddf469f371641cdce6714a2e9683f4ee9a0c37cc83fcd6214931a7a",
+        "g2_a2": "4400efceaddf469f371641cdce6714a2e9683f4ee9a0c37cc83fcd6214931a7a",
+        "g3_a1": "4400efceaddf469f371641cdce6714a2e9683f4ee9a0c37cc83fcd6214931a7a",
+        "g3_b1": "4400efceaddf469f371641cdce6714a2e9683f4ee9a0c37cc83fcd6214931a7a",
+        "g3_b2": "4400efceaddf469f371641cdce6714a2e9683f4ee9a0c37cc83fcd6214931a7a",
+        "g3_a2": "4400efceaddf469f371641cdce6714a2e9683f4ee9a0c37cc83fcd6214931a7a"
+      }
+    },
+    "medium_stream": {
+      "all_12_round_arrays_match": true,
+      "matching_rounds": [
+        "g1_a1",
+        "g1_b1",
+        "g1_b2",
+        "g1_a2",
+        "g2_a1",
+        "g2_b1",
+        "g2_b2",
+        "g2_a2",
+        "g3_a1",
+        "g3_b1",
+        "g3_b2",
+        "g3_a2"
+      ],
+      "array_sha256_by_round": {
+        "g1_a1": "f61d3ad30a52bab1c617d5de444145b6b447980b6a5f73eafe9b509d33444776",
+        "g1_b1": "f61d3ad30a52bab1c617d5de444145b6b447980b6a5f73eafe9b509d33444776",
+        "g1_b2": "f61d3ad30a52bab1c617d5de444145b6b447980b6a5f73eafe9b509d33444776",
+        "g1_a2": "f61d3ad30a52bab1c617d5de444145b6b447980b6a5f73eafe9b509d33444776",
+        "g2_a1": "f61d3ad30a52bab1c617d5de444145b6b447980b6a5f73eafe9b509d33444776",
+        "g2_b1": "f61d3ad30a52bab1c617d5de444145b6b447980b6a5f73eafe9b509d33444776",
+        "g2_b2": "f61d3ad30a52bab1c617d5de444145b6b447980b6a5f73eafe9b509d33444776",
+        "g2_a2": "f61d3ad30a52bab1c617d5de444145b6b447980b6a5f73eafe9b509d33444776",
+        "g3_a1": "f61d3ad30a52bab1c617d5de444145b6b447980b6a5f73eafe9b509d33444776",
+        "g3_b1": "f61d3ad30a52bab1c617d5de444145b6b447980b6a5f73eafe9b509d33444776",
+        "g3_b2": "f61d3ad30a52bab1c617d5de444145b6b447980b6a5f73eafe9b509d33444776",
+        "g3_a2": "f61d3ad30a52bab1c617d5de444145b6b447980b6a5f73eafe9b509d33444776"
+      }
+    },
+    "medium_router": {
+      "all_12_round_arrays_match": true,
+      "matching_rounds": [
+        "g1_a1",
+        "g1_b1",
+        "g1_b2",
+        "g1_a2",
+        "g2_a1",
+        "g2_b1",
+        "g2_b2",
+        "g2_a2",
+        "g3_a1",
+        "g3_b1",
+        "g3_b2",
+        "g3_a2"
+      ],
+      "array_sha256_by_round": {
+        "g1_a1": "06e91d69856daadfdd3b91c006dee97dd9189eb0e9c89b06db5c7a49fc550167",
+        "g1_b1": "06e91d69856daadfdd3b91c006dee97dd9189eb0e9c89b06db5c7a49fc550167",
+        "g1_b2": "06e91d69856daadfdd3b91c006dee97dd9189eb0e9c89b06db5c7a49fc550167",
+        "g1_a2": "06e91d69856daadfdd3b91c006dee97dd9189eb0e9c89b06db5c7a49fc550167",
+        "g2_a1": "06e91d69856daadfdd3b91c006dee97dd9189eb0e9c89b06db5c7a49fc550167",
+        "g2_b1": "06e91d69856daadfdd3b91c006dee97dd9189eb0e9c89b06db5c7a49fc550167",
+        "g2_b2": "06e91d69856daadfdd3b91c006dee97dd9189eb0e9c89b06db5c7a49fc550167",
+        "g2_a2": "06e91d69856daadfdd3b91c006dee97dd9189eb0e9c89b06db5c7a49fc550167",
+        "g3_a1": "06e91d69856daadfdd3b91c006dee97dd9189eb0e9c89b06db5c7a49fc550167",
+        "g3_b1": "06e91d69856daadfdd3b91c006dee97dd9189eb0e9c89b06db5c7a49fc550167",
+        "g3_b2": "06e91d69856daadfdd3b91c006dee97dd9189eb0e9c89b06db5c7a49fc550167",
+        "g3_a2": "06e91d69856daadfdd3b91c006dee97dd9189eb0e9c89b06db5c7a49fc550167"
+      }
+    },
+    "long_checkpoint": {
+      "all_12_round_arrays_match": true,
+      "matching_rounds": [
+        "g1_a1",
+        "g1_b1",
+        "g1_b2",
+        "g1_a2",
+        "g2_a1",
+        "g2_b1",
+        "g2_b2",
+        "g2_a2",
+        "g3_a1",
+        "g3_b1",
+        "g3_b2",
+        "g3_a2"
+      ],
+      "array_sha256_by_round": {
+        "g1_a1": "fb0b0c2d722de3104b1f8559a9ac802822feec79d820ff14a3a95d09c0062130",
+        "g1_b1": "fb0b0c2d722de3104b1f8559a9ac802822feec79d820ff14a3a95d09c0062130",
+        "g1_b2": "fb0b0c2d722de3104b1f8559a9ac802822feec79d820ff14a3a95d09c0062130",
+        "g1_a2": "fb0b0c2d722de3104b1f8559a9ac802822feec79d820ff14a3a95d09c0062130",
+        "g2_a1": "fb0b0c2d722de3104b1f8559a9ac802822feec79d820ff14a3a95d09c0062130",
+        "g2_b1": "fb0b0c2d722de3104b1f8559a9ac802822feec79d820ff14a3a95d09c0062130",
+        "g2_b2": "fb0b0c2d722de3104b1f8559a9ac802822feec79d820ff14a3a95d09c0062130",
+        "g2_a2": "fb0b0c2d722de3104b1f8559a9ac802822feec79d820ff14a3a95d09c0062130",
+        "g3_a1": "fb0b0c2d722de3104b1f8559a9ac802822feec79d820ff14a3a95d09c0062130",
+        "g3_b1": "fb0b0c2d722de3104b1f8559a9ac802822feec79d820ff14a3a95d09c0062130",
+        "g3_b2": "fb0b0c2d722de3104b1f8559a9ac802822feec79d820ff14a3a95d09c0062130",
+        "g3_a2": "fb0b0c2d722de3104b1f8559a9ac802822feec79d820ff14a3a95d09c0062130"
+      }
+    },
+    "long_budget": {
+      "all_12_round_arrays_match": true,
+      "matching_rounds": [
+        "g1_a1",
+        "g1_b1",
+        "g1_b2",
+        "g1_a2",
+        "g2_a1",
+        "g2_b1",
+        "g2_b2",
+        "g2_a2",
+        "g3_a1",
+        "g3_b1",
+        "g3_b2",
+        "g3_a2"
+      ],
+      "array_sha256_by_round": {
+        "g1_a1": "4e0431e2fdf006d70c6f316ff4cf9df4cf6cdb17b6654bebfa7e460ba936670b",
+        "g1_b1": "4e0431e2fdf006d70c6f316ff4cf9df4cf6cdb17b6654bebfa7e460ba936670b",
+        "g1_b2": "4e0431e2fdf006d70c6f316ff4cf9df4cf6cdb17b6654bebfa7e460ba936670b",
+        "g1_a2": "4e0431e2fdf006d70c6f316ff4cf9df4cf6cdb17b6654bebfa7e460ba936670b",
+        "g2_a1": "4e0431e2fdf006d70c6f316ff4cf9df4cf6cdb17b6654bebfa7e460ba936670b",
+        "g2_b1": "4e0431e2fdf006d70c6f316ff4cf9df4cf6cdb17b6654bebfa7e460ba936670b",
+        "g2_b2": "4e0431e2fdf006d70c6f316ff4cf9df4cf6cdb17b6654bebfa7e460ba936670b",
+        "g2_a2": "4e0431e2fdf006d70c6f316ff4cf9df4cf6cdb17b6654bebfa7e460ba936670b",
+        "g3_a1": "4e0431e2fdf006d70c6f316ff4cf9df4cf6cdb17b6654bebfa7e460ba936670b",
+        "g3_b1": "4e0431e2fdf006d70c6f316ff4cf9df4cf6cdb17b6654bebfa7e460ba936670b",
+        "g3_b2": "4e0431e2fdf006d70c6f316ff4cf9df4cf6cdb17b6654bebfa7e460ba936670b",
+        "g3_a2": "4e0431e2fdf006d70c6f316ff4cf9df4cf6cdb17b6654bebfa7e460ba936670b"
+      }
+    },
+    "long_replay": {
+      "all_12_round_arrays_match": true,
+      "matching_rounds": [
+        "g1_a1",
+        "g1_b1",
+        "g1_b2",
+        "g1_a2",
+        "g2_a1",
+        "g2_b1",
+        "g2_b2",
+        "g2_a2",
+        "g3_a1",
+        "g3_b1",
+        "g3_b2",
+        "g3_a2"
+      ],
+      "array_sha256_by_round": {
+        "g1_a1": "c2d887e6b8dcc5e1ec779b925fbfff56399463c894d73f31b11102a271bf19d8",
+        "g1_b1": "c2d887e6b8dcc5e1ec779b925fbfff56399463c894d73f31b11102a271bf19d8",
+        "g1_b2": "c2d887e6b8dcc5e1ec779b925fbfff56399463c894d73f31b11102a271bf19d8",
+        "g1_a2": "c2d887e6b8dcc5e1ec779b925fbfff56399463c894d73f31b11102a271bf19d8",
+        "g2_a1": "c2d887e6b8dcc5e1ec779b925fbfff56399463c894d73f31b11102a271bf19d8",
+        "g2_b1": "c2d887e6b8dcc5e1ec779b925fbfff56399463c894d73f31b11102a271bf19d8",
+        "g2_b2": "c2d887e6b8dcc5e1ec779b925fbfff56399463c894d73f31b11102a271bf19d8",
+        "g2_a2": "c2d887e6b8dcc5e1ec779b925fbfff56399463c894d73f31b11102a271bf19d8",
+        "g3_a1": "c2d887e6b8dcc5e1ec779b925fbfff56399463c894d73f31b11102a271bf19d8",
+        "g3_b1": "c2d887e6b8dcc5e1ec779b925fbfff56399463c894d73f31b11102a271bf19d8",
+        "g3_b2": "c2d887e6b8dcc5e1ec779b925fbfff56399463c894d73f31b11102a271bf19d8",
+        "g3_a2": "c2d887e6b8dcc5e1ec779b925fbfff56399463c894d73f31b11102a271bf19d8"
+      }
+    },
+    "long_tooljson": {
+      "all_12_round_arrays_match": true,
+      "matching_rounds": [
+        "g1_a1",
+        "g1_b1",
+        "g1_b2",
+        "g1_a2",
+        "g2_a1",
+        "g2_b1",
+        "g2_b2",
+        "g2_a2",
+        "g3_a1",
+        "g3_b1",
+        "g3_b2",
+        "g3_a2"
+      ],
+      "array_sha256_by_round": {
+        "g1_a1": "5bf0a3090d9b03f973adf2b47bd3f38259d6b04d162abd75b04e6b56b806960c",
+        "g1_b1": "5bf0a3090d9b03f973adf2b47bd3f38259d6b04d162abd75b04e6b56b806960c",
+        "g1_b2": "5bf0a3090d9b03f973adf2b47bd3f38259d6b04d162abd75b04e6b56b806960c",
+        "g1_a2": "5bf0a3090d9b03f973adf2b47bd3f38259d6b04d162abd75b04e6b56b806960c",
+        "g2_a1": "5bf0a3090d9b03f973adf2b47bd3f38259d6b04d162abd75b04e6b56b806960c",
+        "g2_b1": "5bf0a3090d9b03f973adf2b47bd3f38259d6b04d162abd75b04e6b56b806960c",
+        "g2_b2": "5bf0a3090d9b03f973adf2b47bd3f38259d6b04d162abd75b04e6b56b806960c",
+        "g2_a2": "5bf0a3090d9b03f973adf2b47bd3f38259d6b04d162abd75b04e6b56b806960c",
+        "g3_a1": "5bf0a3090d9b03f973adf2b47bd3f38259d6b04d162abd75b04e6b56b806960c",
+        "g3_b1": "5bf0a3090d9b03f973adf2b47bd3f38259d6b04d162abd75b04e6b56b806960c",
+        "g3_b2": "5bf0a3090d9b03f973adf2b47bd3f38259d6b04d162abd75b04e6b56b806960c",
+        "g3_a2": "5bf0a3090d9b03f973adf2b47bd3f38259d6b04d162abd75b04e6b56b806960c"
+      }
+    }
+  },
+  "criterion": "comparison",
+  "direction_required": true,
+  "all_group_directions_consistent": true,
+  "direction": "candidate faster",
+  "primary_reportable": false,
+  "conclusion_kind": "registered_directional_effect",
+  "frozen_analysis": {
+    "protocol": {
+      "frozen_utc": "2026-11-11T07:30:32.478264+00:00",
+      "prefix": "agent12-dflash8-vs-review16-v1",
+      "groups": 3,
+      "order_each_group": [
+        "control",
+        "candidate",
+        "candidate",
+        "control"
+      ],
+      "arms": {
+        "control": {
+          "variant": "control",
+          "rows": 8,
+          "model": "dflash",
+          "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+          "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf"
+        },
+        "candidate": {
+          "variant": "candidate",
+          "rows": 16,
+          "model": "dspine",
+          "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+          "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07"
+        }
+      },
+      "cohort": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/cohorts/agent12-v1.txt",
+      "cohort_sha256": "c031bed7becd33daca47dacf2ee2cad79bc60681c319706a8d90879b986c29c4",
+      "cases": 12,
+      "registered_cases": [
+        {
+          "name": "short_async",
+          "output_cap": 256,
+          "prompt_tokens": 67,
+          "prompt_tokens_sha256": "f92ac2cc52016059ba7993b8802c12745c64683c472baf010ca7631c54208d0a"
+        },
+        {
+          "name": "short_arena",
+          "output_cap": 256,
+          "prompt_tokens": 69,
+          "prompt_tokens_sha256": "30c110523166c694935a98c580c0264bc1ec47b299e0fff4d9fcce12d1b7d862"
+        },
+        {
+          "name": "short_sql",
+          "output_cap": 256,
+          "prompt_tokens": 72,
+          "prompt_tokens_sha256": "8b67e68ae6c09579510629b50757c749cab4b6a8ab2f764c5c0ae1ea9e5c01df"
+        },
+        {
+          "name": "short_rust",
+          "output_cap": 256,
+          "prompt_tokens": 70,
+          "prompt_tokens_sha256": "3cffb1c9a41de31ce87cf1ed6baf775f1dc91f3df42e9ec66680c9bb18761cd5"
+        },
+        {
+          "name": "medium_cancel",
+          "output_cap": 256,
+          "prompt_tokens": 4180,
+          "prompt_tokens_sha256": "ad901337b7a8fff414fa48c5ab66075ac30c268376054ffe6d100aa99e98332e"
+        },
+        {
+          "name": "medium_cache",
+          "output_cap": 256,
+          "prompt_tokens": 4176,
+          "prompt_tokens_sha256": "644750d784574b5151f44b8c0cb3adb491d821863509e2808e3854ba63bf6886"
+        },
+        {
+          "name": "medium_stream",
+          "output_cap": 256,
+          "prompt_tokens": 4178,
+          "prompt_tokens_sha256": "aa062910252323bd8b4ba22856f232fdfbbdaa600af300cdbbf3553a280fdc5e"
+        },
+        {
+          "name": "medium_router",
+          "output_cap": 256,
+          "prompt_tokens": 4172,
+          "prompt_tokens_sha256": "7d6247f8e74793a859adfacb9aa4390d8ecdee8ede11e73cf3a0974edec4ea37"
+        },
+        {
+          "name": "long_checkpoint",
+          "output_cap": 256,
+          "prompt_tokens": 16471,
+          "prompt_tokens_sha256": "d7dcc58ae395d80b6fc7f39ba540738999874130649fa785c60c3d106ec8c01e"
+        },
+        {
+          "name": "long_budget",
+          "output_cap": 256,
+          "prompt_tokens": 16494,
+          "prompt_tokens_sha256": "ed7296b7a2b263eee89d998620cf470ea8c409f66a9de6d0361bf9985205052c"
+        },
+        {
+          "name": "long_replay",
+          "output_cap": 256,
+          "prompt_tokens": 16470,
+          "prompt_tokens_sha256": "c9c5fbb84b4196c0e6f77090a95bf237a42e5a72c6fd109d025bd0344b3fcee5"
+        },
+        {
+          "name": "long_tooljson",
+          "output_cap": 256,
+          "prompt_tokens": 16473,
+          "prompt_tokens_sha256": "84aa1472c40cf191f67110fafab2fca0a5ef84548148c0aa69a957ae40491657"
+        }
+      ],
+      "case_names": [
+        "short_async",
+        "short_arena",
+        "short_sql",
+        "short_rust",
+        "medium_cancel",
+        "medium_cache",
+        "medium_stream",
+        "medium_router",
+        "long_checkpoint",
+        "long_budget",
+        "long_replay",
+        "long_tooljson"
+      ],
+      "samples_per_round": 1,
+      "criterion": "comparison",
+      "context_tokens": 32768,
+      "temperature": 0,
+      "ane_ffn_share": 0,
+      "verify_rows": "all",
+      "clone_width": 1,
+      "primary_endpoint": "decode",
+      "primary_metric": "Per-case median (wall-TTFT)/(returned tokens-1), then token-weighted aggregate.",
+      "gates": "Exactly three complete ABBA groups. Complete arrays must match across arms and repetitions. Every per-case and aggregate decode spread must be <=5%. Improvement requires candidate time reduction beyond max(2%, twice spread); nonregression requires aggregate and every case within that allowance; comparison requires absolute time change beyond the allowance. Cold request wall and TTFT have independent gates. AC throughout measurement, no swap and no serious/critical OS thermal state are required. All groups and failures are retained without repeat-to-pass.",
+      "cross_group_direction_gate": "A directional performance conclusion requires all three groups qualified in the same direction; inspect each group direction in the unchanged analyzer output.",
+      "artifact_nomination": {
+        "control": {
+          "driver": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver",
+          "library": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib",
+          "host_step": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib",
+          "bundle_sha256": {
+            "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e",
+            "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+            "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb"
+          },
+          "model_metadata_sha256": {
+            "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4/model.json": "e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+            "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4/config.json": "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85",
+            "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4/draft/config.json": "873e3556509b0da06e29654ba00d4944888d4b5e8a33afde25f7eb27d321e980"
+          },
+          "source_label": "combined-v2-f27dc90a",
+          "bundle": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3",
+          "build_manifest": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/build.json",
+          "build_manifest_sha256": "3b286493d52645d50bdc6280174765e842495442dc40ac8ad4fbadeac4f30d79",
+          "build_manifest_data": {
+            "variant": "combined",
+            "command": [
+              "xcrun",
+              "-sdk",
+              "macosx",
+              "clang++",
+              "-std=c++20",
+              "-O3",
+              "-Wall",
+              "-Wextra",
+              "-Werror",
+              "-I/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/runtime",
+              "-I/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/benchmarks",
+              "-mmacosx-version-min=26.4",
+              "-fobjc-arc",
+              "-include",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/BuildIdentity.hpp",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/study_driver_v2.mm",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/libsplash.a",
+              "-framework",
+              "Foundation",
+              "-framework",
+              "Metal",
+              "-framework",
+              "IOKit",
+              "-framework",
+              "IOSurface",
+              "-o",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver"
+            ],
+            "inputs": {
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/study_driver_v2.mm": "2b0b3898db9bee8941e169d8852c8f6659f256f7d00e9de9f01a2a054783879d",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/libsplash.a": "a2748249b0e79d9ac80235cbb2f0372ed5741a2bf74234ff3280662c65fb246c",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/BuildIdentity.hpp": "a144e898bcc1d547db5c1e241c30d8d4950e17032c775dcf77e5272ce0f979d7",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/benchmarks/PrefillWork.hpp": "7d9abd447e972002a53633ff202dae3a4eb2f1178d81cb28677264c81e5d7d29",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/benchmarks/TranscriptPrompts.hpp": "2c56f82c9048bf3de0eeae016d95db3b2f954d0ad6ae56af1f8cea87609ecdb6"
+            },
+            "binary_sha256": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e"
+          }
+        },
+        "candidate": {
+          "driver": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver",
+          "library": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib",
+          "host_step": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib",
+          "bundle_sha256": {
+            "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e",
+            "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+            "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb"
+          },
+          "model_metadata_sha256": {
+            "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/model.json": "6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/config.json": "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85",
+            "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/draft/config.json": "c2aa9e3ff22766ea7df0fa5b5f5f7d2035ae722671c6b7eb58b65578705e6815"
+          },
+          "source_label": "combined-v2-f27dc90a",
+          "bundle": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3",
+          "build_manifest": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/build.json",
+          "build_manifest_sha256": "3b286493d52645d50bdc6280174765e842495442dc40ac8ad4fbadeac4f30d79",
+          "build_manifest_data": {
+            "variant": "combined",
+            "command": [
+              "xcrun",
+              "-sdk",
+              "macosx",
+              "clang++",
+              "-std=c++20",
+              "-O3",
+              "-Wall",
+              "-Wextra",
+              "-Werror",
+              "-I/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/runtime",
+              "-I/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/benchmarks",
+              "-mmacosx-version-min=26.4",
+              "-fobjc-arc",
+              "-include",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/BuildIdentity.hpp",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/study_driver_v2.mm",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/libsplash.a",
+              "-framework",
+              "Foundation",
+              "-framework",
+              "Metal",
+              "-framework",
+              "IOKit",
+              "-framework",
+              "IOSurface",
+              "-o",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver"
+            ],
+            "inputs": {
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/study_driver_v2.mm": "2b0b3898db9bee8941e169d8852c8f6659f256f7d00e9de9f01a2a054783879d",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/libsplash.a": "a2748249b0e79d9ac80235cbb2f0372ed5741a2bf74234ff3280662c65fb246c",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/BuildIdentity.hpp": "a144e898bcc1d547db5c1e241c30d8d4950e17032c775dcf77e5272ce0f979d7",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/benchmarks/PrefillWork.hpp": "7d9abd447e972002a53633ff202dae3a4eb2f1178d81cb28677264c81e5d7d29",
+              "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/benchmarks/TranscriptPrompts.hpp": "2c56f82c9048bf3de0eeae016d95db3b2f954d0ad6ae56af1f8cea87609ecdb6"
+            },
+            "binary_sha256": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e"
+          }
+        }
+      },
+      "operating_script_sha256": "4bde430207a362eab510fe8ffd393fa2aa76c543eaa5821c7073e95e454d0f58",
+      "analyzer_file": "analyze_abba_v2.py",
+      "analyzer_sha256": "e2c3f42e4e5fce41d89251399beb7339bf9bdc4c4af51e15435cf984390da634",
+      "abba_sha256": "7afc7b4fa24916acfc41745fc29cc659b5edada0bfa1ce55e19a685808475c0d",
+      "frozen_wrapper_sha256": "f062f66b89052d1bff3eb1510ffe93a3f8e805b110eced7e34f60d75c83b0a7d",
+      "source_versions": {
+        "original_root": "/Users/linson/Documents/ai/splash-dspine-13h-20261110",
+        "unchanged_script_sha256": {
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/analyze_abba_v2.py": "e2c3f42e4e5fce41d89251399beb7339bf9bdc4c4af51e15435cf984390da634",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/abba.py": "7afc7b4fa24916acfc41745fc29cc659b5edada0bfa1ce55e19a685808475c0d",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/run_frozen_abba_round_v1.py": "f062f66b89052d1bff3eb1510ffe93a3f8e805b110eced7e34f60d75c83b0a7d",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/controlled_round.py": "4bde430207a362eab510fe8ffd393fa2aa76c543eaa5821c7073e95e454d0f58"
+        },
+        "native_study_driver_source_sha256": "2b0b3898db9bee8941e169d8852c8f6659f256f7d00e9de9f01a2a054783879d"
+      },
+      "preparation_script": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prepare_native_comparison_v1.py",
+      "preparation_script_sha256": "269eb1b394f9a83a8338ac0c18f02fb6b4dc346d10cc76dccb04ded9a637f97a",
+      "execution_python": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python",
+      "required_receipts": [],
+      "scope": "Finite explicitly nominated cohort. This registration adds no observations. Native serial cold requests or explicitly registered same-prompt clone lanes do not establish general serving or agent task success. Existing studies and results remain immutable.",
+      "categories": {
+        "short": [
+          "short_async",
+          "short_arena",
+          "short_sql",
+          "short_rust"
+        ],
+        "medium": [
+          "medium_cancel",
+          "medium_cache",
+          "medium_stream",
+          "medium_router"
+        ],
+        "long": [
+          "long_checkpoint",
+          "long_budget",
+          "long_replay",
+          "long_tooljson"
+        ]
+      },
+      "category_scope": "Registered original agent12 short/~4K/~16K prompt groups; category endpoints retain independent gates."
+    },
+    "qualified": false,
+    "groups": [
+      {
+        "group": 1,
+        "rounds": [
+          "agent12-dflash8-vs-review16-v1-g1-a1",
+          "agent12-dflash8-vs-review16-v1-g1-b1",
+          "agent12-dflash8-vs-review16-v1-g1-b2",
+          "agent12-dflash8-vs-review16-v1-g1-a2"
+        ],
+        "sources": [
+          {
+            "job": "agent12-dflash8-vs-review16-v1-g1-a1",
+            "sha256": "088b4d6175a1e1296900d0fb4d4f8dd6cbf135161bd81780fd77a88f59444fae",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+              "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 8,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          },
+          {
+            "job": "agent12-dflash8-vs-review16-v1-g1-b1",
+            "sha256": "9d585b57f34324499686bcfd971483e9cc6b98489df34005ae0a5b0bca76a3c7",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          },
+          {
+            "job": "agent12-dflash8-vs-review16-v1-g1-b2",
+            "sha256": "ccd9bbc29adce86cabf5d2afc219c6ebd355906ea6d42734b24b0391925f23cd",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          },
+          {
+            "job": "agent12-dflash8-vs-review16-v1-g1-a2",
+            "sha256": "e0461959d86855688cecbd59e1c03df70e07fa2dddb92362b28b31975c577155",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+              "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 8,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          }
+        ],
+        "problems": [],
+        "qualified": false,
+        "cases": [
+          {
+            "case": "long_budget",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                22.96000000000001,
+                23.576862745098033,
+                24.33490196078429,
+                22.90313725490197
+              ],
+              "baseline": 22.931568627450993,
+              "candidate": 23.95588235294116,
+              "noise": 0.03164313484755401,
+              "regression": 0.044668279877896344,
+              "bound": 0.06328626969510802,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": -0.042758338448944944,
+            "request_wall_abba": {
+              "rounds": [
+                44979.4,
+                44439.1,
+                45962.2,
+                44233.9
+              ],
+              "baseline": 44606.65,
+              "candidate": 45200.649999999994,
+              "noise": 0.0336964180824833,
+              "regression": 0.01331640013316382,
+              "bound": 0.0673928361649666,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                39124.6,
+                38427,
+                39756.8,
+                38393.6
+              ],
+              "baseline": 38759.1,
+              "candidate": 39091.9,
+              "noise": 0.03401727723646082,
+              "regression": 0.008586370684561917,
+              "bound": 0.06803455447292164,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                64
+              ],
+              [
+                63
+              ],
+              [
+                63
+              ],
+              [
+                64
+              ]
+            ]
+          },
+          {
+            "case": "long_checkpoint",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                22.484313725490196,
+                23.412156862745093,
+                23.728627450980376,
+                22.120392156862735
+              ],
+              "baseline": 22.302352941176466,
+              "candidate": 23.570392156862734,
+              "noise": 0.016317631130101914,
+              "regression": 0.056856745968947076,
+              "bound": 0.03263526226020383,
+              "verdict": "fail",
+              "pass": false
+            },
+            "throughput_change": -0.05379796853812924,
+            "request_wall_abba": {
+              "rounds": [
+                42002.1,
+                42355.9,
+                42634.1,
+                41749.2
+              ],
+              "baseline": 41875.649999999994,
+              "candidate": 42495.0,
+              "noise": 0.006546652547358444,
+              "regression": 0.01479021818168813,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                36268.6,
+                36385.8,
+                36583.3,
+                36108.5
+              ],
+              "baseline": 36188.55,
+              "candidate": 36484.55,
+              "noise": 0.005413250266208573,
+              "regression": 0.008179382705303162,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                68
+              ],
+              [
+                66
+              ],
+              [
+                66
+              ],
+              [
+                68
+              ]
+            ]
+          },
+          {
+            "case": "long_replay",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                21.21372549019608,
+                20.428627450980404,
+                20.903137254901942,
+                21.83019607843136
+              ],
+              "baseline": 21.52196078431372,
+              "candidate": 20.665882352941175,
+              "noise": 0.028643792933801603,
+              "regression": -0.03977697199395036,
+              "bound": 0.05728758586760321,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.0414247220008348,
+            "request_wall_abba": {
+              "rounds": [
+                47250.2,
+                46661.4,
+                48131.1,
+                47783.2
+              ],
+              "baseline": 47516.7,
+              "candidate": 47396.25,
+              "noise": 0.03100878234037497,
+              "regression": -0.0025348982568232925,
+              "bound": 0.06201756468074994,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                41840.7,
+                41452.1,
+                42800.8,
+                42216.5
+              ],
+              "baseline": 42028.6,
+              "candidate": 42126.45,
+              "noise": 0.03201551519294896,
+              "regression": 0.002328176527412351,
+              "bound": 0.06403103038589791,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                56
+              ],
+              [
+                52
+              ],
+              [
+                52
+              ],
+              [
+                56
+              ]
+            ]
+          },
+          {
+            "case": "long_tooljson",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                27.024705882352926,
+                27.381176470588223,
+                27.439999999999987,
+                28.01294117647057
+              ],
+              "baseline": 27.518823529411748,
+              "candidate": 27.410588235294107,
+              "noise": 0.035911247915864974,
+              "regression": -0.003933136676499305,
+              "bound": 0.07182249583172995,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.0039486673247777215,
+            "request_wall_abba": {
+              "rounds": [
+                49473.1,
+                49610.6,
+                50151.2,
+                50765.6
+              ],
+              "baseline": 50119.35,
+              "candidate": 49880.899999999994,
+              "noise": 0.02578844298659101,
+              "regression": -0.004757643504953779,
+              "bound": 0.05157688597318202,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                42581.8,
+                42628.4,
+                43154,
+                43622.3
+              ],
+              "baseline": 43102.05,
+              "candidate": 42891.2,
+              "noise": 0.02414038311402822,
+              "regression": -0.0048918786925449265,
+              "bound": 0.04828076622805644,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                71
+              ],
+              [
+                69
+              ],
+              [
+                69
+              ],
+              [
+                71
+              ]
+            ]
+          },
+          {
+            "case": "medium_cache",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                21.223019607843142,
+                19.891960784313728,
+                19.930666666666667,
+                21.318235294117645
+              ],
+              "baseline": 21.270627450980392,
+              "candidate": 19.911313725490196,
+              "noise": 0.004476392927003894,
+              "regression": -0.06390567126535529,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.06826840982119742,
+            "request_wall_abba": {
+              "rounds": [
+                13980.5,
+                13603,
+                13759.1,
+                13983.6
+              ],
+              "baseline": 13982.05,
+              "candidate": 13681.05,
+              "noise": 0.011409942950285275,
+              "regression": -0.021527601460443968,
+              "bound": 0.02281988590057055,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                8568.63,
+                8530.55,
+                8676.78,
+                8547.45
+              ],
+              "baseline": 8558.04,
+              "candidate": 8603.665,
+              "noise": 0.016996245204805322,
+              "regression": 0.005331244069903818,
+              "bound": 0.033992490409610644,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                73
+              ],
+              [
+                63
+              ],
+              [
+                63
+              ],
+              [
+                73
+              ]
+            ]
+          },
+          {
+            "case": "medium_cancel",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                18.85478431372549,
+                20.188823529411764,
+                20.167843137254902,
+                18.824745098039216
+              ],
+              "baseline": 18.839764705882352,
+              "candidate": 20.178333333333335,
+              "noise": 0.0015944581132105967,
+              "regression": 0.07105017755519216,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "throughput_change": -0.06633692710585526,
+            "request_wall_abba": {
+              "rounds": [
+                13085.3,
+                13212,
+                13323.5,
+                12878.5
+              ],
+              "baseline": 12981.9,
+              "candidate": 13267.75,
+              "noise": 0.015929871590445104,
+              "regression": 0.022019118927121717,
+              "bound": 0.03185974318089021,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                8277.33,
+                8063.85,
+                8180.7,
+                8078.19
+              ],
+              "baseline": 8177.76,
+              "candidate": 8122.275,
+              "noise": 0.02435141163350359,
+              "regression": -0.006784865293185449,
+              "bound": 0.04870282326700718,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                65
+              ],
+              [
+                64
+              ],
+              [
+                64
+              ],
+              [
+                65
+              ]
+            ]
+          },
+          {
+            "case": "medium_router",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                17.240705882352938,
+                13.930235294117644,
+                14.357254901960786,
+                17.078705882352946
+              ],
+              "baseline": 17.15970588235294,
+              "candidate": 14.143745098039215,
+              "noise": 0.03019141004615117,
+              "regression": -0.17575830290980354,
+              "bound": 0.06038282009230234,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.21323636444295335,
+            "request_wall_abba": {
+              "rounds": [
+                13113.9,
+                12313.8,
+                12514.9,
+                13136.2
+              ],
+              "baseline": 13125.05,
+              "candidate": 12414.349999999999,
+              "noise": 0.016198995517284463,
+              "regression": -0.054148365149085165,
+              "bound": 0.032397991034568925,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                8717.52,
+                8761.59,
+                8853.8,
+                8781.13
+              ],
+              "baseline": 8749.325,
+              "candidate": 8807.695,
+              "noise": 0.010469254441712518,
+              "regression": 0.006671371791538094,
+              "bound": 0.020938508883425036,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                57
+              ],
+              [
+                44
+              ],
+              [
+                44
+              ],
+              [
+                57
+              ]
+            ]
+          },
+          {
+            "case": "medium_stream",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                21.27513725490196,
+                20.557529411764705,
+                20.66298039215686,
+                21.38592156862745
+              ],
+              "baseline": 21.330529411764704,
+              "candidate": 20.610254901960783,
+              "noise": 0.005193697333381074,
+              "regression": -0.03376730581317211,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.034947384844590035,
+            "request_wall_abba": {
+              "rounds": [
+                14095.9,
+                13989.7,
+                14131.1,
+                14240.4
+              ],
+              "baseline": 14168.15,
+              "candidate": 14060.400000000001,
+              "noise": 0.010198932111814175,
+              "regression": -0.007605086055695209,
+              "bound": 0.02039786422362835,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                8670.74,
+                8747.53,
+                8862.04,
+                8786.99
+              ],
+              "baseline": 8728.865,
+              "candidate": 8804.785,
+              "noise": 0.013317882680050614,
+              "regression": 0.008697579811349998,
+              "bound": 0.02663576536010123,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                73
+              ],
+              [
+                65
+              ],
+              [
+                65
+              ],
+              [
+                73
+              ]
+            ]
+          },
+          {
+            "case": "short_arena",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                21.6968,
+                21.36490980392157,
+                21.329686274509804,
+                21.68769019607843
+              ],
+              "baseline": 21.692245098039216,
+              "candidate": 21.347298039215687,
+              "noise": 0.0016500228435026966,
+              "regression": -0.0159018606540966,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.01615881589275836,
+            "request_wall_abba": {
+              "rounds": [
+                5766.76,
+                5681.97,
+                5668.19,
+                5761.82
+              ],
+              "baseline": 5764.29,
+              "candidate": 5675.08,
+              "noise": 0.0024281596030365483,
+              "regression": -0.015476320587617942,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                234.076,
+                233.918,
+                229.12,
+                231.459
+              ],
+              "baseline": 232.76749999999998,
+              "candidate": 231.519,
+              "noise": 0.02072400105390919,
+              "regression": -0.005363721309890712,
+              "bound": 0.04144800210781838,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                77
+              ],
+              [
+                71
+              ],
+              [
+                71
+              ],
+              [
+                77
+              ]
+            ]
+          },
+          {
+            "case": "short_async",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                20.570090196078432,
+                21.714239215686277,
+                21.671109803921567,
+                20.57918431372549
+              ],
+              "baseline": 20.574637254901962,
+              "candidate": 21.692674509803922,
+              "noise": 0.001988201673574998,
+              "regression": 0.05434055731094767,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "throughput_change": -0.05153985297648145,
+            "request_wall_abba": {
+              "rounds": [
+                5478.09,
+                5771.77,
+                5756.91,
+                5480.42
+              ],
+              "baseline": 5479.255,
+              "candidate": 5764.34,
+              "noise": 0.0025779187209638193,
+              "regression": 0.052029883624689965,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "ttft_abba": {
+              "rounds": [
+                232.717,
+                234.639,
+                230.777,
+                232.728
+              ],
+              "baseline": 232.72250000000003,
+              "candidate": 232.708,
+              "noise": 0.01659590559843247,
+              "regression": -6.230596525913512e-05,
+              "bound": 0.03319181119686494,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                73
+              ],
+              [
+                72
+              ],
+              [
+                72
+              ],
+              [
+                73
+              ]
+            ]
+          },
+          {
+            "case": "short_rust",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                18.865423529411764,
+                20.758294117647058,
+                20.716592156862745,
+                18.863698039215688
+              ],
+              "baseline": 18.864560784313724,
+              "candidate": 20.7374431372549,
+              "noise": 0.002010949976248257,
+              "regression": 0.09928046427131854,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "throughput_change": -0.09031404404801169,
+            "request_wall_abba": {
+              "rounds": [
+                5044.47,
+                5526.15,
+                5515.12,
+                5044.46
+              ],
+              "baseline": 5044.465,
+              "candidate": 5520.635,
+              "noise": 0.001997958568171912,
+              "regression": 0.09439454927331248,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "ttft_abba": {
+              "rounds": [
+                233.787,
+                232.785,
+                232.389,
+                234.217
+              ],
+              "baseline": 234.002,
+              "candidate": 232.587,
+              "noise": 0.001837591131699758,
+              "regression": -0.00604695686361667,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                67
+              ],
+              [
+                69
+              ],
+              [
+                69
+              ],
+              [
+                67
+              ]
+            ]
+          },
+          {
+            "case": "short_sql",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                19.673827450980394,
+                18.929,
+                18.93295294117647,
+                19.703811764705883
+              ],
+              "baseline": 19.688819607843136,
+              "candidate": 18.930976470588234,
+              "noise": 0.001522910683459385,
+              "regression": -0.03849103970422951,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.04003190952312008,
+            "request_wall_abba": {
+              "rounds": [
+                5253.03,
+                5061.2,
+                5064.67,
+                5261.2
+              ],
+              "baseline": 5257.115,
+              "candidate": 5062.9349999999995,
+              "noise": 0.0015540843219142197,
+              "regression": -0.03693660876735627,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                236.204,
+                234.305,
+                236.767,
+                236.728
+              ],
+              "baseline": 236.466,
+              "candidate": 235.536,
+              "noise": 0.010452754568303737,
+              "regression": -0.0039329121311308946,
+              "bound": 0.020905509136607475,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                70
+              ],
+              [
+                63
+              ],
+              [
+                63
+              ],
+              [
+                70
+              ]
+            ]
+          }
+        ],
+        "primary_decode_abba": {
+          "rounds": [
+            21.090211111111113,
+            21.011151307189543,
+            21.181312745098033,
+            21.192388235294114
+          ],
+          "baseline": 21.141299673202614,
+          "candidate": 21.096232026143788,
+          "noise": 0.008065963518869877,
+          "regression": -0.002131734933777496,
+          "bound": 0.02,
+          "verdict": "pass",
+          "pass": true
+        },
+        "primary_request_wall_abba": {
+          "rounds": [
+            259522.75,
+            258226.59,
+            262612.08999999997,
+            260318.5
+          ],
+          "baseline": 259920.625,
+          "candidate": 260419.33999999997,
+          "noise": 0.016840147125785555,
+          "regression": 0.001918720378577099,
+          "bound": 0.03368029425157111,
+          "verdict": "pass",
+          "pass": true
+        },
+        "endpoint_summaries": {
+          "decode": {
+            "abba": {
+              "rounds": [
+                21.090211111111113,
+                21.011151307189543,
+                21.181312745098033,
+                21.192388235294114
+              ],
+              "baseline": 21.141299673202614,
+              "candidate": 21.096232026143788,
+              "noise": 0.008065963518869877,
+              "regression": -0.002131734933777496,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "all_output_arrays_match": true,
+            "measurement_qualified": true,
+            "effect_gate_passed": false,
+            "qualified": false,
+            "direction": "candidate faster"
+          },
+          "request_wall": {
+            "abba": {
+              "rounds": [
+                259522.75,
+                258226.59,
+                262612.08999999997,
+                260318.5
+              ],
+              "baseline": 259920.625,
+              "candidate": 260419.33999999997,
+              "noise": 0.016840147125785555,
+              "regression": 0.001918720378577099,
+              "bound": 0.03368029425157111,
+              "verdict": "pass",
+              "pass": true
+            },
+            "all_output_arrays_match": true,
+            "measurement_qualified": true,
+            "effect_gate_passed": false,
+            "qualified": false,
+            "direction": "candidate slower"
+          },
+          "ttft": {
+            "abba": {
+              "rounds": [
+                194986.704,
+                193932.467,
+                197797.27300000002,
+                195469.792
+              ],
+              "baseline": 195228.248,
+              "candidate": 195864.87,
+              "noise": 0.01973200196645785,
+              "regression": 0.003260911300090097,
+              "bound": 0.0394640039329157,
+              "verdict": "pass",
+              "pass": true
+            },
+            "all_output_arrays_match": true,
+            "measurement_qualified": true,
+            "effect_gate_passed": false,
+            "qualified": false,
+            "direction": "candidate slower"
+          }
+        },
+        "registered_categories": {
+          "short": {
+            "decode": {
+              "abba": {
+                "rounds": [
+                  20.201535294117647,
+                  20.691610784313724,
+                  20.662585294117648,
+                  20.208596078431373
+                ],
+                "baseline": 20.20506568627451,
+                "candidate": 20.677098039215686,
+                "noise": 0.001403750668542918,
+                "regression": 0.023362079602732067,
+                "bound": 0.02,
+                "verdict": "fail",
+                "pass": false
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": true,
+              "qualified": true,
+              "direction": "candidate slower"
+            },
+            "request_wall": {
+              "abba": {
+                "rounds": [
+                  21542.35,
+                  22041.09,
+                  22004.89,
+                  21547.9
+                ],
+                "baseline": 21545.125,
+                "candidate": 22022.989999999998,
+                "noise": 0.0016437368404563018,
+                "regression": 0.02217972743253971,
+                "bound": 0.02,
+                "verdict": "fail",
+                "pass": false
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": true,
+              "qualified": true,
+              "direction": "candidate slower"
+            },
+            "ttft": {
+              "abba": {
+                "rounds": [
+                  936.784,
+                  935.647,
+                  929.053,
+                  935.1320000000001
+                ],
+                "baseline": 935.9580000000001,
+                "candidate": 932.35,
+                "noise": 0.007072451332654101,
+                "regression": -0.003854873829808647,
+                "bound": 0.02,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": false,
+              "qualified": false,
+              "direction": "candidate faster"
+            }
+          },
+          "medium": {
+            "decode": {
+              "abba": {
+                "rounds": [
+                  19.64841176470588,
+                  18.64213725490196,
+                  18.779686274509803,
+                  19.651901960784315
+                ],
+                "baseline": 19.6501568627451,
+                "candidate": 18.710911764705884,
+                "noise": 0.007351272954389056,
+                "regression": -0.047798351158200636,
+                "bound": 0.02,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": true,
+              "qualified": true,
+              "direction": "candidate faster"
+            },
+            "request_wall": {
+              "abba": {
+                "rounds": [
+                  54275.6,
+                  53118.5,
+                  53728.6,
+                  54238.7
+                ],
+                "baseline": 54257.149999999994,
+                "candidate": 53423.55,
+                "noise": 0.011420057259392132,
+                "regression": -0.015363873701438213,
+                "bound": 0.022840114518784264,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": false,
+              "qualified": false,
+              "direction": "candidate faster"
+            },
+            "ttft": {
+              "abba": {
+                "rounds": [
+                  34234.22,
+                  34103.520000000004,
+                  34573.32,
+                  34193.76
+                ],
+                "baseline": 34213.990000000005,
+                "candidate": 34338.42,
+                "noise": 0.0136814681630662,
+                "regression": 0.00363681640171154,
+                "bound": 0.0273629363261324,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": false,
+              "qualified": false,
+              "direction": "candidate slower"
+            }
+          },
+          "long": {
+            "decode": {
+              "abba": {
+                "rounds": [
+                  23.4206862745098,
+                  23.699705882352937,
+                  24.10166666666665,
+                  23.716666666666658
+                ],
+                "baseline": 23.56867647058823,
+                "candidate": 23.900686274509795,
+                "noise": 0.016817959940439237,
+                "regression": 0.014086909137044135,
+                "bound": 0.033635919880878475,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": false,
+              "qualified": false,
+              "direction": "candidate slower"
+            },
+            "request_wall": {
+              "abba": {
+                "rounds": [
+                  183704.8,
+                  183067.0,
+                  186878.59999999998,
+                  184531.9
+                ],
+                "baseline": 184118.34999999998,
+                "candidate": 184972.8,
+                "noise": 0.02060627292228899,
+                "regression": 0.004640765029667149,
+                "bound": 0.04121254584457798,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": false,
+              "qualified": false,
+              "direction": "candidate slower"
+            },
+            "ttft": {
+              "abba": {
+                "rounds": [
+                  159815.7,
+                  158893.3,
+                  162294.90000000002,
+                  160340.9
+                ],
+                "baseline": 160078.3,
+                "candidate": 160594.1,
+                "noise": 0.021181350996082888,
+                "regression": 0.003222173149015406,
+                "bound": 0.042362701992165776,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": false,
+              "qualified": false,
+              "direction": "candidate slower"
+            }
+          }
+        },
+        "measurement_qualified": true,
+        "direction": "candidate faster",
+        "primary_throughput_change": 0.002136288935530084,
+        "all_output_arrays_match": true,
+        "all_case_noise_within_five_percent": true,
+        "cold_warm_gate_passed": true,
+        "effect_gate_passed": false
+      },
+      {
+        "group": 2,
+        "rounds": [
+          "agent12-dflash8-vs-review16-v1-g2-a1",
+          "agent12-dflash8-vs-review16-v1-g2-b1",
+          "agent12-dflash8-vs-review16-v1-g2-b2",
+          "agent12-dflash8-vs-review16-v1-g2-a2"
+        ],
+        "sources": [
+          {
+            "job": "agent12-dflash8-vs-review16-v1-g2-a1",
+            "sha256": "faa443e3ca7e2fee4ab996c9dbf764c06ff47f9b1b14cfc6c1e1fc07a344f674",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+              "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 8,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          },
+          {
+            "job": "agent12-dflash8-vs-review16-v1-g2-b1",
+            "sha256": "2bdfe57451d834c8628c227eb0d6abe4047862789d0b8cbee4c103605bd93d9f",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          },
+          {
+            "job": "agent12-dflash8-vs-review16-v1-g2-b2",
+            "sha256": "2bb0c254cef1a63ded40c9aade9d1bf4c7109385761e95f52fe536a0847f3b33",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          },
+          {
+            "job": "agent12-dflash8-vs-review16-v1-g2-a2",
+            "sha256": "a728b8e6b748bb2de356b0b194a7860fe5905d661cbda8d19995d11eaebf611e",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+              "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 8,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          }
+        ],
+        "problems": [],
+        "qualified": false,
+        "cases": [
+          {
+            "case": "long_budget",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                22.97803921568628,
+                24.270980392156858,
+                23.779607843137267,
+                22.79137254901962
+              ],
+              "baseline": 22.88470588235295,
+              "candidate": 24.025294117647064,
+              "noise": 0.02045230108790501,
+              "regression": 0.049840633353896546,
+              "bound": 0.04090460217581002,
+              "verdict": "fail",
+              "pass": false
+            },
+            "throughput_change": -0.04747447543030614,
+            "request_wall_abba": {
+              "rounds": [
+                44358.1,
+                45588.4,
+                44778.8,
+                44289.5
+              ],
+              "baseline": 44323.8,
+              "candidate": 45183.600000000006,
+              "noise": 0.017918005648066962,
+              "regression": 0.019398156295263647,
+              "bound": 0.035836011296133924,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                38498.7,
+                39399.3,
+                38715,
+                38477.7
+              ],
+              "baseline": 38488.2,
+              "candidate": 39057.15,
+              "noise": 0.01752047960488676,
+              "regression": 0.014782452803716595,
+              "bound": 0.03504095920977352,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                64
+              ],
+              [
+                63
+              ],
+              [
+                63
+              ],
+              [
+                64
+              ]
+            ]
+          },
+          {
+            "case": "long_checkpoint",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                22.13490196078432,
+                23.641176470588235,
+                23.56039215686275,
+                22.166274509803927
+              ],
+              "baseline": 22.150588235294123,
+              "candidate": 23.60078431372549,
+              "noise": 0.0034229503838354453,
+              "regression": 0.06546986757311779,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "throughput_change": -0.061446944269050396,
+            "request_wall_abba": {
+              "rounds": [
+                41764.3,
+                42485.5,
+                42337.6,
+                41821.1
+              ],
+              "baseline": 41792.7,
+              "candidate": 42411.55,
+              "noise": 0.003487257598460831,
+              "regression": 0.01480760994144914,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                36119.9,
+                36457,
+                36329.7,
+                36168.7
+              ],
+              "baseline": 36144.3,
+              "candidate": 36393.35,
+              "noise": 0.003497891785175119,
+              "regression": 0.006890436389693333,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                68
+              ],
+              [
+                66
+              ],
+              [
+                66
+              ],
+              [
+                68
+              ]
+            ]
+          },
+          {
+            "case": "long_replay",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                21.74039215686273,
+                21.150588235294123,
+                20.77803921568628,
+                21.37333333333332
+              ],
+              "baseline": 21.556862745098023,
+              "candidate": 20.9643137254902,
+              "noise": 0.017770627957874194,
+              "regression": -0.027487720574858043,
+              "bound": 0.03554125591574839,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.02826465141510215,
+            "request_wall_abba": {
+              "rounds": [
+                47604.2,
+                48236.3,
+                47524.3,
+                47213.5
+              ],
+              "baseline": 47408.85,
+              "candidate": 47880.3,
+              "noise": 0.014870416434316408,
+              "regression": 0.009944345834163926,
+              "bound": 0.029740832868632817,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                42060.4,
+                42842.9,
+                42225.9,
+                41763.3
+              ],
+              "baseline": 41911.850000000006,
+              "candidate": 42534.4,
+              "noise": 0.014505905808004814,
+              "regression": 0.014853794332629011,
+              "bound": 0.029011811616009627,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                56
+              ],
+              [
+                52
+              ],
+              [
+                52
+              ],
+              [
+                56
+              ]
+            ]
+          },
+          {
+            "case": "long_tooljson",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                28.07450980392157,
+                27.927843137254897,
+                27.775294117647046,
+                27.43019607843136
+              ],
+              "baseline": 27.752352941176465,
+              "candidate": 27.851568627450973,
+              "noise": 0.023216544083879524,
+              "regression": 0.003575036916142027,
+              "bound": 0.04643308816775905,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": -0.0035623015565708904,
+            "request_wall_abba": {
+              "rounds": [
+                50805.4,
+                50749.7,
+                50468.1,
+                50081.2
+              ],
+              "baseline": 50443.3,
+              "candidate": 50608.899999999994,
+              "noise": 0.014356713379180274,
+              "regression": 0.0032828938630102833,
+              "bound": 0.028713426758360548,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                43646.4,
+                43628.1,
+                43385.4,
+                43086.5
+              ],
+              "baseline": 43366.45,
+              "candidate": 43506.75,
+              "noise": 0.012910902321956293,
+              "regression": 0.0032352198531353515,
+              "bound": 0.025821804643912587,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                71
+              ],
+              [
+                69
+              ],
+              [
+                69
+              ],
+              [
+                71
+              ]
+            ]
+          },
+          {
+            "case": "medium_cache",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                21.351960784313725,
+                19.889647058823524,
+                19.863215686274504,
+                21.2361568627451
+              ],
+              "baseline": 21.29405882352941,
+              "candidate": 19.876431372549014,
+              "noise": 0.0054383207320092145,
+              "regression": -0.06657384873070582,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.07132203082180322,
+            "request_wall_abba": {
+              "rounds": [
+                13983.2,
+                13634.4,
+                13595.4,
+                13982.7
+              ],
+              "baseline": 13982.95,
+              "candidate": 13614.9,
+              "noise": 0.002864508736751647,
+              "regression": -0.02632134134785591,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                8538.45,
+                8562.54,
+                8530.28,
+                8567.48
+              ],
+              "baseline": 8552.965,
+              "candidate": 8546.41,
+              "noise": 0.003774684341144436,
+              "regression": -0.0007664008913867981,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                73
+              ],
+              [
+                63
+              ],
+              [
+                63
+              ],
+              [
+                73
+              ]
+            ]
+          },
+          {
+            "case": "medium_cancel",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                18.786431372549014,
+                20.138901960784317,
+                20.12298039215686,
+                18.830352941176475
+              ],
+              "baseline": 18.808392156862745,
+              "candidate": 20.13094117647059,
+              "noise": 0.0023352112323665485,
+              "regression": 0.07031696322459324,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "throughput_change": -0.06569732671782202,
+            "request_wall_abba": {
+              "rounds": [
+                12895.8,
+                13229.2,
+                13199.4,
+                12905.7
+              ],
+              "baseline": 12900.75,
+              "candidate": 13214.3,
+              "noise": 0.0022551326971539235,
+              "regression": 0.024304788481289696,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "ttft_abba": {
+              "rounds": [
+                8105.26,
+                8093.78,
+                8068.04,
+                8103.96
+              ],
+              "baseline": 8104.610000000001,
+              "candidate": 8080.91,
+              "noise": 0.00318528482559511,
+              "regression": -0.0029242616239399943,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                65
+              ],
+              [
+                64
+              ],
+              [
+                64
+              ],
+              [
+                65
+              ]
+            ]
+          },
+          {
+            "case": "medium_router",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                17.16862745098039,
+                14.10686274509804,
+                13.922000000000002,
+                17.293647058823534
+              ],
+              "baseline": 17.231137254901963,
+              "candidate": 14.014431372549021,
+              "noise": 0.013190884466432226,
+              "regression": -0.1866798363200226,
+              "bound": 0.026381768932864452,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.22952810548230396,
+            "request_wall_abba": {
+              "rounds": [
+                13146.2,
+                12435.8,
+                12321,
+                13208.1
+              ],
+              "baseline": 13177.150000000001,
+              "candidate": 12378.4,
+              "noise": 0.009274219608349971,
+              "regression": -0.06061629411519198,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                8768.2,
+                8838.55,
+                8770.89,
+                8798.22
+              ],
+              "baseline": 8783.21,
+              "candidate": 8804.72,
+              "noise": 0.007684514669404576,
+              "regression": 0.002448990744841506,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                57
+              ],
+              [
+                44
+              ],
+              [
+                44
+              ],
+              [
+                57
+              ]
+            ]
+          },
+          {
+            "case": "medium_stream",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                21.377803921568628,
+                20.613019607843142,
+                20.574549019607844,
+                21.521490196078428
+              ],
+              "baseline": 21.44964705882353,
+              "candidate": 20.593784313725493,
+              "noise": 0.006698771038784698,
+              "regression": -0.03990101761352616,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.04155927497636336,
+            "request_wall_abba": {
+              "rounds": [
+                14233.7,
+                14039.7,
+                13971.5,
+                14275.4
+              ],
+              "baseline": 14254.55,
+              "candidate": 14005.6,
+              "noise": 0.0048694807791169765,
+              "regression": -0.01746459902276809,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                8782.36,
+                8783.38,
+                8724.99,
+                8787.42
+              ],
+              "baseline": 8784.89,
+              "candidate": 8754.185,
+              "noise": 0.0066699527140447025,
+              "regression": -0.0034952059729831397,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                73
+              ],
+              [
+                65
+              ],
+              [
+                65
+              ],
+              [
+                73
+              ]
+            ]
+          },
+          {
+            "case": "short_arena",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                21.665949019607844,
+                21.369113725490195,
+                21.366929411764705,
+                21.674219607843135
+              ],
+              "baseline": 21.67008431372549,
+              "candidate": 21.368021568627448,
+              "noise": 0.0003816592550151124,
+              "regression": -0.013939158737223734,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.014136205550331793,
+            "request_wall_abba": {
+              "rounds": [
+                5755.31,
+                5680.72,
+                5681.72,
+                5760.36
+              ],
+              "baseline": 5757.835,
+              "candidate": 5681.22,
+              "noise": 0.0008770657721173449,
+              "regression": -0.013306216659560333,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                230.493,
+                231.596,
+                233.153,
+                233.434
+              ],
+              "baseline": 231.9635,
+              "candidate": 232.3745,
+              "noise": 0.012678718850163936,
+              "regression": 0.0017718304819507313,
+              "bound": 0.025357437700327872,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                77
+              ],
+              [
+                71
+              ],
+              [
+                71
+              ],
+              [
+                77
+              ]
+            ]
+          },
+          {
+            "case": "short_async",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                20.588345098039213,
+                21.708501960784314,
+                21.662972549019607,
+                20.581011764705885
+              ],
+              "baseline": 20.58467843137255,
+              "candidate": 21.68573725490196,
+              "noise": 0.0020995095176861516,
+              "regression": 0.053489240903142665,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "throughput_change": -0.05077340975716749,
+            "request_wall_abba": {
+              "rounds": [
+                5479.4,
+                5767.27,
+                5758.39,
+                5478.56
+              ],
+              "baseline": 5478.98,
+              "candidate": 5762.83,
+              "noise": 0.0015409095878240568,
+              "regression": 0.05180708818064694,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "ttft_abba": {
+              "rounds": [
+                229.372,
+                231.602,
+                234.332,
+                230.402
+              ],
+              "baseline": 229.887,
+              "candidate": 232.96699999999998,
+              "noise": 0.011718397884678903,
+              "regression": 0.013397886787856583,
+              "bound": 0.023436795769357806,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                73
+              ],
+              [
+                72
+              ],
+              [
+                72
+              ],
+              [
+                73
+              ]
+            ]
+          },
+          {
+            "case": "short_rust",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                18.870223529411764,
+                20.714466666666667,
+                20.70544705882353,
+                18.828843137254903
+              ],
+              "baseline": 18.849533333333333,
+              "candidate": 20.7099568627451,
+              "noise": 0.0021953006170016623,
+              "regression": 0.09869865192480964,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "throughput_change": -0.08983232276830377,
+            "request_wall_abba": {
+              "rounds": [
+                5043.15,
+                5513.25,
+                5512.29,
+                5032.71
+              ],
+              "baseline": 5037.93,
+              "candidate": 5512.77,
+              "noise": 0.0020722796862996506,
+              "regression": 0.0942529967665291,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "ttft_abba": {
+              "rounds": [
+                231.243,
+                231.061,
+                232.401,
+                231.355
+              ],
+              "baseline": 231.29899999999998,
+              "candidate": 231.731,
+              "noise": 0.005782566855535096,
+              "regression": 0.0018677123550037145,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                67
+              ],
+              [
+                69
+              ],
+              [
+                69
+              ],
+              [
+                67
+              ]
+            ]
+          },
+          {
+            "case": "short_sql",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                19.785254901960784,
+                18.926556862745098,
+                18.91514509803921,
+                19.680345098039215
+              ],
+              "baseline": 19.732799999999997,
+              "candidate": 18.920850980392153,
+              "noise": 0.0053165188884278245,
+              "regression": -0.041147177268702095,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.042912922915003815,
+            "request_wall_abba": {
+              "rounds": [
+                5278.53,
+                5062.95,
+                5061.19,
+                5253.15
+              ],
+              "baseline": 5265.84,
+              "candidate": 5062.07,
+              "noise": 0.004819743858529714,
+              "regression": -0.0386965802227186,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                233.29,
+                236.678,
+                237.828,
+                234.662
+              ],
+              "baseline": 233.976,
+              "candidate": 237.253,
+              "noise": 0.005863849283687276,
+              "regression": 0.01400570998734918,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                70
+              ],
+              [
+                63
+              ],
+              [
+                63
+              ],
+              [
+                70
+              ]
+            ]
+          }
+        ],
+        "primary_decode_abba": {
+          "rounds": [
+            21.210203267973853,
+            21.204804901960784,
+            21.0855477124183,
+            21.11727026143791
+          ],
+          "baseline": 21.16373676470588,
+          "candidate": 21.145176307189544,
+          "noise": 0.005639924104200333,
+          "regression": -0.0008769934025681936,
+          "bound": 0.02,
+          "verdict": "pass",
+          "pass": true
+        },
+        "primary_request_wall_abba": {
+          "rounds": [
+            260347.29,
+            262423.19,
+            260209.69,
+            259301.98
+          ],
+          "baseline": 259824.635,
+          "candidate": 261316.44,
+          "noise": 0.00847057307224911,
+          "regression": 0.0057415841265398004,
+          "bound": 0.02,
+          "verdict": "pass",
+          "pass": true
+        },
+        "endpoint_summaries": {
+          "decode": {
+            "abba": {
+              "rounds": [
+                21.210203267973853,
+                21.204804901960784,
+                21.0855477124183,
+                21.11727026143791
+              ],
+              "baseline": 21.16373676470588,
+              "candidate": 21.145176307189544,
+              "noise": 0.005639924104200333,
+              "regression": -0.0008769934025681936,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "all_output_arrays_match": true,
+            "measurement_qualified": true,
+            "effect_gate_passed": false,
+            "qualified": false,
+            "direction": "candidate faster"
+          },
+          "request_wall": {
+            "abba": {
+              "rounds": [
+                260347.29,
+                262423.19,
+                260209.69,
+                259301.98
+              ],
+              "baseline": 259824.635,
+              "candidate": 261316.44,
+              "noise": 0.00847057307224911,
+              "regression": 0.0057415841265398004,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "all_output_arrays_match": true,
+            "measurement_qualified": true,
+            "effect_gate_passed": false,
+            "qualified": false,
+            "direction": "candidate slower"
+          },
+          "ttft": {
+            "abba": {
+              "rounds": [
+                195444.068,
+                197536.487,
+                195687.914,
+                194683.133
+              ],
+              "baseline": 195063.6005,
+              "candidate": 196612.20049999998,
+              "noise": 0.009402127616185264,
+              "regression": 0.007938949122391348,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "all_output_arrays_match": true,
+            "measurement_qualified": true,
+            "effect_gate_passed": false,
+            "qualified": false,
+            "direction": "candidate slower"
+          }
+        },
+        "registered_categories": {
+          "short": {
+            "decode": {
+              "abba": {
+                "rounds": [
+                  20.2274431372549,
+                  20.67965980392157,
+                  20.662623529411764,
+                  20.191104901960784
+                ],
+                "baseline": 20.209274019607843,
+                "candidate": 20.671141666666667,
+                "noise": 0.001798097015205023,
+                "regression": 0.022854242394392932,
+                "bound": 0.02,
+                "verdict": "fail",
+                "pass": false
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": true,
+              "qualified": true,
+              "direction": "candidate slower"
+            },
+            "request_wall": {
+              "abba": {
+                "rounds": [
+                  21556.39,
+                  22024.190000000002,
+                  22013.59,
+                  21524.78
+                ],
+                "baseline": 21540.585,
+                "candidate": 22018.89,
+                "noise": 0.0014674624667807576,
+                "regression": 0.022204828698942025,
+                "bound": 0.02,
+                "verdict": "fail",
+                "pass": false
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": true,
+              "qualified": true,
+              "direction": "candidate slower"
+            },
+            "ttft": {
+              "abba": {
+                "rounds": [
+                  924.398,
+                  930.937,
+                  937.7139999999999,
+                  929.853
+                ],
+                "baseline": 927.1255,
+                "candidate": 934.3254999999999,
+                "noise": 0.007253360846942452,
+                "regression": 0.007765938915497372,
+                "bound": 0.02,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": false,
+              "qualified": false,
+              "direction": "candidate slower"
+            }
+          },
+          "medium": {
+            "decode": {
+              "abba": {
+                "rounds": [
+                  19.67120588235294,
+                  18.68710784313726,
+                  18.6206862745098,
+                  19.720411764705887
+                ],
+                "baseline": 19.69580882352941,
+                "candidate": 18.65389705882353,
+                "noise": 0.0035607341682010528,
+                "regression": -0.052900176582805214,
+                "bound": 0.02,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": true,
+              "qualified": true,
+              "direction": "candidate faster"
+            },
+            "request_wall": {
+              "abba": {
+                "rounds": [
+                  54258.9,
+                  53339.1,
+                  53087.3,
+                  54371.9
+                ],
+                "baseline": 54315.4,
+                "candidate": 53213.2,
+                "noise": 0.004731908624175874,
+                "regression": -0.020292587369328152,
+                "bound": 0.02,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": true,
+              "qualified": true,
+              "direction": "candidate faster"
+            },
+            "ttft": {
+              "abba": {
+                "rounds": [
+                  34194.270000000004,
+                  34278.25,
+                  34094.2,
+                  34257.08
+                ],
+                "baseline": 34225.675,
+                "candidate": 34186.225,
+                "noise": 0.005383747401182872,
+                "regression": -0.0011526434467692415,
+                "bound": 0.02,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": false,
+              "qualified": false,
+              "direction": "candidate faster"
+            }
+          },
+          "long": {
+            "decode": {
+              "abba": {
+                "rounds": [
+                  23.731960784313724,
+                  24.247647058823528,
+                  23.973333333333336,
+                  23.440294117647056
+                ],
+                "baseline": 23.586127450980392,
+                "candidate": 24.11049019607843,
+                "noise": 0.012366026058022691,
+                "regression": 0.022231828696246625,
+                "bound": 0.024732052116045383,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": false,
+              "qualified": false,
+              "direction": "candidate slower"
+            },
+            "request_wall": {
+              "abba": {
+                "rounds": [
+                  184532.0,
+                  187059.9,
+                  185108.8,
+                  183405.3
+                ],
+                "baseline": 183968.65,
+                "candidate": 186084.34999999998,
+                "noise": 0.010485030041483908,
+                "regression": 0.011500328996271847,
+                "bound": 0.020970060082967815,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": false,
+              "qualified": false,
+              "direction": "candidate slower"
+            },
+            "ttft": {
+              "abba": {
+                "rounds": [
+                  160325.4,
+                  162327.3,
+                  160656.0,
+                  159496.2
+                ],
+                "baseline": 159910.8,
+                "candidate": 161491.65,
+                "noise": 0.010349141890617803,
+                "regression": 0.009885823846794706,
+                "bound": 0.020698283781235605,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": false,
+              "qualified": false,
+              "direction": "candidate slower"
+            }
+          }
+        },
+        "measurement_qualified": true,
+        "direction": "candidate faster",
+        "primary_throughput_change": 0.000877763195099357,
+        "all_output_arrays_match": true,
+        "all_case_noise_within_five_percent": true,
+        "cold_warm_gate_passed": true,
+        "effect_gate_passed": false
+      },
+      {
+        "group": 3,
+        "rounds": [
+          "agent12-dflash8-vs-review16-v1-g3-a1",
+          "agent12-dflash8-vs-review16-v1-g3-b1",
+          "agent12-dflash8-vs-review16-v1-g3-b2",
+          "agent12-dflash8-vs-review16-v1-g3-a2"
+        ],
+        "sources": [
+          {
+            "job": "agent12-dflash8-vs-review16-v1-g3-a1",
+            "sha256": "1a4028c4b06effdfa50616243f3aad379dbb21e77692fa243dc0c7be6165d54f",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+              "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 8,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          },
+          {
+            "job": "agent12-dflash8-vs-review16-v1-g3-b1",
+            "sha256": "f83e1cdb172fd97b760e6c5b46fcf6db031b97259b858187169a762e7103713e",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          },
+          {
+            "job": "agent12-dflash8-vs-review16-v1-g3-b2",
+            "sha256": "2365fa68a14694f0d660d3d8b6a5e8aeab0d6dacc862b41066440090e06fdb33",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+              "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 16,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          },
+          {
+            "job": "agent12-dflash8-vs-review16-v1-g3-a2",
+            "sha256": "d53d4204b98f2b17c4cf0f357d55f98d54dcd887a3b2fc1ce4b2f54917868d0b",
+            "identity": {
+              "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+              "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf",
+              "device": "Apple M5 Pro"
+            },
+            "geometry": {
+              "prefill_rows": 2048,
+              "verify_rows": 8,
+              "batch_width": 4,
+              "kv_block_tokens": 32
+            },
+            "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283"
+          }
+        ],
+        "problems": [],
+        "qualified": false,
+        "cases": [
+          {
+            "case": "long_budget",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                22.92627450980391,
+                23.876078431372555,
+                24.33529411764706,
+                23.107450980392162
+              ],
+              "baseline": 23.016862745098038,
+              "candidate": 24.105686274509807,
+              "noise": 0.019050098016089048,
+              "regression": 0.04730547083979375,
+              "bound": 0.038100196032178096,
+              "verdict": "fail",
+              "pass": false
+            },
+            "throughput_change": -0.04516874222175238,
+            "request_wall_abba": {
+              "rounds": [
+                44367.2,
+                44986.5,
+                45239.9,
+                44823.9
+              ],
+              "baseline": 44595.55,
+              "candidate": 45113.2,
+              "noise": 0.010240932110939417,
+              "regression": 0.011607660405578368,
+              "bound": 0.020481864221878834,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                38521,
+                38898.1,
+                39034.4,
+                38931.5
+              ],
+              "baseline": 38726.25,
+              "candidate": 38966.25,
+              "noise": 0.010600045188986799,
+              "regression": 0.006197346760917988,
+              "bound": 0.021200090377973598,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                64
+              ],
+              [
+                63
+              ],
+              [
+                63
+              ],
+              [
+                64
+              ]
+            ]
+          },
+          {
+            "case": "long_checkpoint",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                22.2,
+                23.357254901960808,
+                23.49882352941175,
+                22.27411764705883
+              ],
+              "baseline": 22.237058823529416,
+              "candidate": 23.42803921568628,
+              "noise": 0.006042700635235257,
+              "regression": 0.053558359565819336,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "throughput_change": -0.05083568373743541,
+            "request_wall_abba": {
+              "rounds": [
+                41737.8,
+                42366.8,
+                42318.1,
+                41964.1
+              ],
+              "baseline": 41850.95,
+              "candidate": 42342.45,
+              "noise": 0.005407284661399458,
+              "regression": 0.01174405837860304,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                36076.8,
+                36410.7,
+                36325.9,
+                36284.2
+              ],
+              "baseline": 36180.5,
+              "candidate": 36368.3,
+              "noise": 0.005732369646632694,
+              "regression": 0.005190641367587512,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                68
+              ],
+              [
+                66
+              ],
+              [
+                66
+              ],
+              [
+                68
+              ]
+            ]
+          },
+          {
+            "case": "long_replay",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                21.657647058823546,
+                21.03843137254903,
+                21.207058823529394,
+                21.868235294117625
+              ],
+              "baseline": 21.762941176470584,
+              "candidate": 21.12274509803921,
+              "noise": 0.009676460253532292,
+              "regression": -0.029416799560324725,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.03030837495126537,
+            "request_wall_abba": {
+              "rounds": [
+                47565.4,
+                47966.3,
+                48205.7,
+                48029.2
+              ],
+              "baseline": 47797.3,
+              "candidate": 48086.0,
+              "noise": 0.009703476974640735,
+              "regression": 0.0060400901306139065,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                42042.7,
+                42601.5,
+                42797.9,
+                42452.8
+              ],
+              "baseline": 42247.75,
+              "candidate": 42699.7,
+              "noise": 0.009707025817943105,
+              "regression": 0.010697611115384698,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                56
+              ],
+              [
+                52
+              ],
+              [
+                52
+              ],
+              [
+                56
+              ]
+            ]
+          },
+          {
+            "case": "long_tooljson",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                27.865490196078447,
+                28.10470588235296,
+                28.254509803921575,
+                28.16000000000001
+              ],
+              "baseline": 28.01274509803923,
+              "candidate": 28.17960784313727,
+              "noise": 0.01051342176180292,
+              "regression": 0.005956672383018891,
+              "bound": 0.02102684352360584,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": -0.005921400539953825,
+            "request_wall_abba": {
+              "rounds": [
+                50596.8,
+                50783.4,
+                51120.6,
+                50901.4
+              ],
+              "baseline": 50749.100000000006,
+              "candidate": 50952.0,
+              "noise": 0.006617993405558116,
+              "regression": 0.003998100458924236,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                43491.1,
+                43616.7,
+                43915.7,
+                43720.6
+              ],
+              "baseline": 43605.85,
+              "candidate": 43766.2,
+              "noise": 0.006831756012630752,
+              "regression": 0.0036772588998952305,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                71
+              ],
+              [
+                69
+              ],
+              [
+                69
+              ],
+              [
+                71
+              ]
+            ]
+          },
+          {
+            "case": "medium_cache",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                21.261921568627454,
+                19.89643137254902,
+                19.889921568627454,
+                21.25537254901961
+              ],
+              "baseline": 21.258647058823534,
+              "candidate": 19.893176470588237,
+              "noise": 0.0003272380321559816,
+              "regression": -0.06423130241811648,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.06864014855818157,
+            "request_wall_abba": {
+              "rounds": [
+                13984.2,
+                13607.4,
+                13600.1,
+                14022.2
+              ],
+              "baseline": 14003.2,
+              "candidate": 13603.75,
+              "noise": 0.002713665447897623,
+              "regression": -0.028525622714808074,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                8562.41,
+                8533.81,
+                8528.17,
+                8602.08
+              ],
+              "baseline": 8582.244999999999,
+              "candidate": 8530.99,
+              "noise": 0.00462233366677368,
+              "regression": -0.00597221356416644,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                73
+              ],
+              [
+                63
+              ],
+              [
+                63
+              ],
+              [
+                73
+              ]
+            ]
+          },
+          {
+            "case": "medium_cancel",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                18.85396078431373,
+                20.113999999999997,
+                20.131803921568626,
+                18.83043137254902
+              ],
+              "baseline": 18.84219607843138,
+              "candidate": 20.12290196078431,
+              "noise": 0.0012487616447025207,
+              "regression": 0.06797009632114781,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "throughput_change": -0.06364419430402157,
+            "request_wall_abba": {
+              "rounds": [
+                12880.7,
+                13219,
+                13206.5,
+                12916.5
+              ],
+              "baseline": 12898.6,
+              "candidate": 13212.75,
+              "noise": 0.0027754950149628077,
+              "regression": 0.024355356395267647,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "ttft_abba": {
+              "rounds": [
+                8072.94,
+                8089.93,
+                8072.89,
+                8114.74
+              ],
+              "baseline": 8093.84,
+              "candidate": 8081.41,
+              "noise": 0.005164421337708699,
+              "regression": -0.0015357358188450299,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                65
+              ],
+              [
+                64
+              ],
+              [
+                64
+              ],
+              [
+                65
+              ]
+            ]
+          },
+          {
+            "case": "medium_router",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                17.191764705882353,
+                13.934549019607841,
+                13.937019607843139,
+                17.141450980392154
+              ],
+              "baseline": 17.166607843137253,
+              "candidate": 13.93578431372549,
+              "noise": 0.002930906673580984,
+              "regression": -0.1882039572951134,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.2318365049773119,
+            "request_wall_abba": {
+              "rounds": [
+                13156.1,
+                12349.4,
+                12329.4,
+                13154.3
+              ],
+              "baseline": 13155.2,
+              "candidate": 12339.4,
+              "noise": 0.0016208243512650534,
+              "regression": -0.06201350036487485,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                8772.2,
+                8796.09,
+                8775.46,
+                8783.23
+              ],
+              "baseline": 8777.715,
+              "candidate": 8785.775,
+              "noise": 0.0023481138544978694,
+              "regression": 0.0009182344152207644,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                57
+              ],
+              [
+                44
+              ],
+              [
+                44
+              ],
+              [
+                57
+              ]
+            ]
+          },
+          {
+            "case": "medium_stream",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                21.35454901960784,
+                20.576470588235296,
+                20.545764705882352,
+                21.400078431372553
+              ],
+              "baseline": 21.377313725490197,
+              "candidate": 20.561117647058822,
+              "noise": 0.002129800420640426,
+              "regression": -0.03818047903082167,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.039696094951731764,
+            "request_wall_abba": {
+              "rounds": [
+                14202.5,
+                14019.9,
+                13969.9,
+                14233.4
+              ],
+              "baseline": 14217.95,
+              "candidate": 13994.9,
+              "noise": 0.003572730065952597,
+              "regression": -0.01568791562778049,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                8757.09,
+                8772.9,
+                8730.73,
+                8776.38
+              ],
+              "baseline": 8766.735,
+              "candidate": 8751.814999999999,
+              "noise": 0.0048184290915655875,
+              "regression": -0.0017018878750186817,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                73
+              ],
+              [
+                65
+              ],
+              [
+                65
+              ],
+              [
+                73
+              ]
+            ]
+          },
+          {
+            "case": "short_arena",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                21.68301960784314,
+                21.329360784313725,
+                21.32261176470588,
+                21.68134117647059
+              ],
+              "baseline": 21.682180392156866,
+              "candidate": 21.325986274509802,
+              "noise": 0.00031646928404488873,
+              "regression": -0.016427965785946075,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.01670235144401322,
+            "request_wall_abba": {
+              "rounds": [
+                5759.55,
+                5672.28,
+                5671.12,
+                5763.3
+              ],
+              "baseline": 5761.425,
+              "candidate": 5671.7,
+              "noise": 0.0006508806415079602,
+              "regression": -0.015573404149147207,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                230.38,
+                233.293,
+                233.854,
+                234.558
+              ],
+              "baseline": 232.469,
+              "candidate": 233.57350000000002,
+              "noise": 0.017972288778288707,
+              "regression": 0.004751171123891895,
+              "bound": 0.035944577556577414,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                77
+              ],
+              [
+                71
+              ],
+              [
+                71
+              ],
+              [
+                77
+              ]
+            ]
+          },
+          {
+            "case": "short_async",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                20.609133333333336,
+                21.655486274509805,
+                21.690584313725488,
+                20.63743137254902
+              ],
+              "baseline": 20.623282352941178,
+              "candidate": 21.673035294117646,
+              "noise": 0.001619433491404356,
+              "regression": 0.05090135135674734,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "throughput_change": -0.048435898660737386,
+            "request_wall_abba": {
+              "rounds": [
+                5486.06,
+                5755.38,
+                5764.94,
+                5494.45
+              ],
+              "baseline": 5490.255,
+              "candidate": 5760.16,
+              "noise": 0.0016596761201076865,
+              "regression": 0.0491607402570553,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "ttft_abba": {
+              "rounds": [
+                230.731,
+                233.231,
+                233.841,
+                231.905
+              ],
+              "baseline": 231.31799999999998,
+              "candidate": 233.536,
+              "noise": 0.00507526435469789,
+              "regression": 0.009588531804701761,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                73
+              ],
+              [
+                72
+              ],
+              [
+                72
+              ],
+              [
+                73
+              ]
+            ]
+          },
+          {
+            "case": "short_rust",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                18.87587450980392,
+                20.70810196078431,
+                20.7274431372549,
+                18.858282352941178
+              ],
+              "baseline": 18.867078431372548,
+              "candidate": 20.717772549019607,
+              "noise": 0.0009335548223066684,
+              "regression": 0.09809118695185415,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "throughput_change": -0.08932881723979713,
+            "request_wall_abba": {
+              "rounds": [
+                5048.03,
+                5515.05,
+                5518.32,
+                5041.74
+              ],
+              "baseline": 5044.885,
+              "candidate": 5516.6849999999995,
+              "noise": 0.0012468074098814866,
+              "regression": 0.0935204667698073,
+              "bound": 0.02,
+              "verdict": "fail",
+              "pass": false
+            },
+            "ttft_abba": {
+              "rounds": [
+                234.682,
+                234.484,
+                232.822,
+                232.878
+              ],
+              "baseline": 233.77999999999997,
+              "candidate": 233.65300000000002,
+              "noise": 0.007716656685772959,
+              "regression": -0.0005432457866367812,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                67
+              ],
+              [
+                69
+              ],
+              [
+                69
+              ],
+              [
+                67
+              ]
+            ]
+          },
+          {
+            "case": "short_sql",
+            "output_arrays_match": true,
+            "cold_output_match": true,
+            "decode_abba": {
+              "rounds": [
+                19.75888235294118,
+                18.894996078431372,
+                18.926019607843138,
+                19.717435294117646
+              ],
+              "baseline": 19.73815882352941,
+              "candidate": 18.910507843137253,
+              "noise": 0.0020998442252944285,
+              "regression": -0.041931518932025846,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "throughput_change": 0.04376672415450322,
+            "request_wall_abba": {
+              "rounds": [
+                5275.1,
+                5054.35,
+                5062.29,
+                5263.24
+              ],
+              "baseline": 5269.17,
+              "candidate": 5058.32,
+              "noise": 0.002250828878172574,
+              "regression": -0.04001578996312516,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "ttft_abba": {
+              "rounds": [
+                236.585,
+                236.126,
+                236.155,
+                235.294
+              ],
+              "baseline": 235.9395,
+              "candidate": 236.1405,
+              "noise": 0.005471741696494214,
+              "regression": 0.000851913308284491,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "cycles": [
+              [
+                70
+              ],
+              [
+                63
+              ],
+              [
+                63
+              ],
+              [
+                70
+              ]
+            ]
+          }
+        ],
+        "primary_decode_abba": {
+          "rounds": [
+            21.186543137254905,
+            21.123822222222227,
+            21.205571241830064,
+            21.2443022875817
+          ],
+          "baseline": 21.215422712418302,
+          "candidate": 21.164696732026144,
+          "noise": 0.0038625178826274353,
+          "regression": -0.0023909955073611044,
+          "bound": 0.02,
+          "verdict": "pass",
+          "pass": true
+        },
+        "primary_request_wall_abba": {
+          "rounds": [
+            260059.44,
+            261295.76,
+            262006.87,
+            261607.73
+          ],
+          "baseline": 260833.58500000002,
+          "candidate": 261651.315,
+          "noise": 0.0059359303749170495,
+          "regression": 0.003135064067765647,
+          "bound": 0.02,
+          "verdict": "pass",
+          "pass": true
+        },
+        "endpoint_summaries": {
+          "decode": {
+            "abba": {
+              "rounds": [
+                21.186543137254905,
+                21.123822222222227,
+                21.205571241830064,
+                21.2443022875817
+              ],
+              "baseline": 21.215422712418302,
+              "candidate": 21.164696732026144,
+              "noise": 0.0038625178826274353,
+              "regression": -0.0023909955073611044,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "all_output_arrays_match": true,
+            "measurement_qualified": true,
+            "effect_gate_passed": false,
+            "qualified": false,
+            "direction": "candidate faster"
+          },
+          "request_wall": {
+            "abba": {
+              "rounds": [
+                260059.44,
+                261295.76,
+                262006.87,
+                261607.73
+              ],
+              "baseline": 260833.58500000002,
+              "candidate": 261651.315,
+              "noise": 0.0059359303749170495,
+              "regression": 0.003135064067765647,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "all_output_arrays_match": true,
+            "measurement_qualified": true,
+            "effect_gate_passed": false,
+            "qualified": false,
+            "direction": "candidate slower"
+          },
+          "ttft": {
+            "abba": {
+              "rounds": [
+                195228.618,
+                196656.864,
+                197117.82200000001,
+                196600.165
+              ],
+              "baseline": 195914.3915,
+              "candidate": 196887.343,
+              "noise": 0.007000746548014675,
+              "regression": 0.00496620739574416,
+              "bound": 0.02,
+              "verdict": "pass",
+              "pass": true
+            },
+            "all_output_arrays_match": true,
+            "measurement_qualified": true,
+            "effect_gate_passed": false,
+            "qualified": false,
+            "direction": "candidate slower"
+          }
+        },
+        "registered_categories": {
+          "short": {
+            "decode": {
+              "abba": {
+                "rounds": [
+                  20.231727450980394,
+                  20.646986274509803,
+                  20.666664705882354,
+                  20.22362254901961
+                ],
+                "baseline": 20.227675,
+                "candidate": 20.656825490196077,
+                "noise": 0.000952635794976844,
+                "regression": 0.021216006792479813,
+                "bound": 0.02,
+                "verdict": "fail",
+                "pass": false
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": true,
+              "qualified": true,
+              "direction": "candidate slower"
+            },
+            "request_wall": {
+              "abba": {
+                "rounds": [
+                  21568.74,
+                  21997.06,
+                  22016.67,
+                  21562.73
+                ],
+                "baseline": 21565.735,
+                "candidate": 22006.864999999998,
+                "noise": 0.0008910855771595339,
+                "regression": 0.020455134035542777,
+                "bound": 0.02,
+                "verdict": "fail",
+                "pass": false
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": true,
+              "qualified": true,
+              "direction": "candidate slower"
+            },
+            "ttft": {
+              "abba": {
+                "rounds": [
+                  932.3779999999999,
+                  937.134,
+                  936.672,
+                  934.635
+                ],
+                "baseline": 933.5065,
+                "candidate": 936.903,
+                "noise": 0.0024177657038275168,
+                "regression": 0.003638432083761689,
+                "bound": 0.02,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": false,
+              "qualified": false,
+              "direction": "candidate slower"
+            }
+          },
+          "medium": {
+            "decode": {
+              "abba": {
+                "rounds": [
+                  19.665549019607845,
+                  18.63036274509804,
+                  18.626127450980395,
+                  19.656833333333335
+                ],
+                "baseline": 19.661191176470588,
+                "candidate": 18.628245098039216,
+                "noise": 0.00044329390809953257,
+                "regression": -0.05253730911622201,
+                "bound": 0.02,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": true,
+              "qualified": true,
+              "direction": "candidate faster"
+            },
+            "request_wall": {
+              "abba": {
+                "rounds": [
+                  54223.5,
+                  53195.7,
+                  53105.9,
+                  54326.4
+                ],
+                "baseline": 54274.95,
+                "candidate": 53150.8,
+                "noise": 0.001895902253249454,
+                "regression": -0.02071213331380306,
+                "bound": 0.02,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": true,
+              "qualified": true,
+              "direction": "candidate faster"
+            },
+            "ttft": {
+              "abba": {
+                "rounds": [
+                  34164.64,
+                  34192.729999999996,
+                  34107.25,
+                  34276.43
+                ],
+                "baseline": 34220.535,
+                "candidate": 34149.99,
+                "noise": 0.0032667519663266767,
+                "regression": -0.0020614815051841484,
+                "bound": 0.02,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": false,
+              "qualified": false,
+              "direction": "candidate faster"
+            }
+          },
+          "long": {
+            "decode": {
+              "abba": {
+                "rounds": [
+                  23.662352941176476,
+                  24.094117647058837,
+                  24.323921568627444,
+                  23.852450980392156
+                ],
+                "baseline": 23.757401960784314,
+                "candidate": 24.20901960784314,
+                "noise": 0.009492491860106379,
+                "regression": 0.0190095553295051,
+                "bound": 0.02,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": false,
+              "qualified": false,
+              "direction": "candidate slower"
+            },
+            "request_wall": {
+              "abba": {
+                "rounds": [
+                  184267.2,
+                  186103.0,
+                  186884.3,
+                  185718.6
+                ],
+                "baseline": 184992.90000000002,
+                "candidate": 186493.65,
+                "noise": 0.007845706510898495,
+                "regression": 0.008112473505739848,
+                "bound": 0.02,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": false,
+              "qualified": false,
+              "direction": "candidate slower"
+            },
+            "ttft": {
+              "abba": {
+                "rounds": [
+                  160131.6,
+                  161527.0,
+                  162073.9,
+                  161389.1
+                ],
+                "baseline": 160760.35,
+                "candidate": 161800.45,
+                "noise": 0.00782220242740203,
+                "regression": 0.006469878922259253,
+                "bound": 0.02,
+                "verdict": "pass",
+                "pass": true
+              },
+              "all_output_arrays_match": true,
+              "measurement_qualified": true,
+              "effect_gate_passed": false,
+              "qualified": false,
+              "direction": "candidate slower"
+            }
+          }
+        },
+        "measurement_qualified": true,
+        "direction": "candidate faster",
+        "primary_throughput_change": 0.0023967260686235115,
+        "all_output_arrays_match": true,
+        "all_case_noise_within_five_percent": true,
+        "cold_warm_gate_passed": true,
+        "effect_gate_passed": false
+      }
+    ],
+    "scope": "Exactly the registered groups and complete cohort; all failures retained. Top-level qualification concerns the primary decode endpoint. Cold request wall, TTFT and predeclared categories each retain their own output/noise/effect gates. Medians of registered internal repetitions precede per-case ABBA. Aggregate decode rate weights cases by output tokens. AC and thermal state sampled every five seconds. A failure is not rerun into a pass."
+  },
+  "scope": "The unchanged frozen analyzer computes each registered ABBA group and its registered criterion. This supplement checks full job/registration identity, raw AC/thermal/swap observations, nominated runtime build IDs, cohort/cap/token counts, and exact arrays across every arm and all three groups. Every registered group and failure is retained. Clone journal events contain counters without token arrays; full clone arrays come from complete stdout. Improvement/comparison require a consistent direction across all three qualified groups. Nonregression requires all original aggregate and per-case allowance gates plus this cross-group output/provenance gate; small mixed signs are descriptive and do not invalidate nonregression. A nonregression pass is not an improvement claim.",
+  "source_sha256": {
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/operating-state": "3e182e43a749fee5cc65c1075a44a4ba1b83f4de797c2e46f1c4b31c3354cad9",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/build.json": "3b286493d52645d50bdc6280174765e842495442dc40ac8ad4fbadeac4f30d79",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/cohorts/agent12-v1.txt": "c031bed7becd33daca47dacf2ee2cad79bc60681c319706a8d90879b986c29c4",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/BuildIdentity.hpp": "a144e898bcc1d547db5c1e241c30d8d4950e17032c775dcf77e5272ce0f979d7",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/agent12-dflash8-vs-review16-v1.artifact-barrier.json": "370365fd60194351f1c59526048458b4e008a1c136f73618df32102afe5e578c",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/agent12-dflash8-vs-review16-v1.jobs.json": "d47eef916fabca12fc74e4954c3197084cd99ddc4ba4c46a8808f60e9dac5522",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/agent12-dflash8-vs-review16-v1.protocol.json": "c6659f4cd62d25b2db429a317d2399b3d36d38a568180695b89e629f400071c0",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g1-a1.operating.json": "8def340b605c1227461ffd713abebbea6b19b9d7588546abcd5fe8829f60c4c9",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g1-a1.progress.jsonl": "7c598a4cc7d410fe2d27e20886a6d5a6c8eaa4e478bf4f643eebfefa92bfb6d8",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g1-a1.receipt.json": "afd64656ab568cc3af33acdf3ac318582b26ec0bf8e6a87c10e83a9e2734b43f",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g1-a1.stdout": "088b4d6175a1e1296900d0fb4d4f8dd6cbf135161bd81780fd77a88f59444fae",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g1-a2.operating.json": "90a2a5357772a3e821e11282e53340cb751b4b79f4fb2e432db8ad68767c70df",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g1-a2.progress.jsonl": "3f8ea4b8dccfed3beaf38945028019a9c1db3cad364ee2f23c9f073f935b7ffb",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g1-a2.receipt.json": "9567c97ff2bcafffd29e5a3d4106745bc0c506f181ce391661d1d77f9cf24ee4",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g1-a2.stdout": "e0461959d86855688cecbd59e1c03df70e07fa2dddb92362b28b31975c577155",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g1-b1.operating.json": "9583cc0302611bd33358ab51a77e68e9713058edc03957a7bfa87beb6bbf3bbe",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g1-b1.progress.jsonl": "8cbb449f429b3b8faa8d561b7bfd2d8518b60144f3e7ed2574d896d0420ecb6c",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g1-b1.receipt.json": "e55d6aaa6d5b5375cdbf3a644ef58dd110cf46170a678fb82388311e6427cbc9",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g1-b1.stdout": "9d585b57f34324499686bcfd971483e9cc6b98489df34005ae0a5b0bca76a3c7",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g1-b2.operating.json": "36c866553f692679b1b6a175a40a1697c4ee36484f2fb884170720ffe68a49bd",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g1-b2.progress.jsonl": "e757ce315b6a5ea070374af039b28160b681887ffa214f3d1c89ee6bbe4872fa",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g1-b2.receipt.json": "524e4978075be14ae64f350d59615e252f8277e466f485587c6bcacf442578f3",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g1-b2.stdout": "ccd9bbc29adce86cabf5d2afc219c6ebd355906ea6d42734b24b0391925f23cd",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g2-a1.operating.json": "7a778779e1431176f22aae3dd721f8a19c4e536dfc04cf74de42bd97f8a8684a",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g2-a1.progress.jsonl": "790fff9a199ed6dc03686039fc917d8c9e65a4ee011514b1963751e449ecab5b",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g2-a1.receipt.json": "79a04c80acf350888f48fde0635b6d5e14be680474b480498f84c1b5d3087c53",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g2-a1.stdout": "faa443e3ca7e2fee4ab996c9dbf764c06ff47f9b1b14cfc6c1e1fc07a344f674",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g2-a2.operating.json": "8bfe729bc3dfe49788feb25c823993d4cec39d4d5d9bacf1be07c336b6f4ecd2",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g2-a2.progress.jsonl": "01119d97cba47a40c236420a4a916dbd0bfbfcfdf3ccd2827cdf520b81d074bd",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g2-a2.receipt.json": "2d9c0798d41f62776780d0cf6dbf48216f6a226cb9ce3f18a0b901bbb6c45910",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g2-a2.stdout": "a728b8e6b748bb2de356b0b194a7860fe5905d661cbda8d19995d11eaebf611e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g2-b1.operating.json": "325999aa90dcd30d631ce21957128656de4228d01b72ff942106b6a21d1367ef",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g2-b1.progress.jsonl": "4917128e091b5f828d14c58df611e6b79db22ffe6b49845310ccc34be7adcd3b",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g2-b1.receipt.json": "346785e0376c2df85469153d90b77070409bda559d507b5593d4402feefaf015",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g2-b1.stdout": "2bdfe57451d834c8628c227eb0d6abe4047862789d0b8cbee4c103605bd93d9f",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g2-b2.operating.json": "484bc19e42d0b5ba9351f8ded241f3b391674aabcdb127353f131d5fbf85d5a2",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g2-b2.progress.jsonl": "b46195c704299478d004ac2d038920c5b69a07ed74682553f4b31b119e28767e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g2-b2.receipt.json": "edd5390a332a7e86e74f7e9b205307a2ff43944a2b140310c0cb658d8338990e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g2-b2.stdout": "2bb0c254cef1a63ded40c9aade9d1bf4c7109385761e95f52fe536a0847f3b33",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g3-a1.operating.json": "5f7eb391efbc60b4801743fdcf97b371195a420978881f58434d51572bc484f4",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g3-a1.progress.jsonl": "a91ef9cecf2b8bd31432c06d56048d0d6a7659e24c377b850981b918e5ba8cac",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g3-a1.receipt.json": "1efcd6a26692edaa0031a7d12fd3436c02d60118e23f392106d8e6b9cfd10c3e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g3-a1.stdout": "1a4028c4b06effdfa50616243f3aad379dbb21e77692fa243dc0c7be6165d54f",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g3-a2.operating.json": "4bc8e74bb573766d4c5456284905138c9071cc086ad9631d45e662cc3c163b65",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g3-a2.progress.jsonl": "e802b111de08a6dbc5ab8d15960db6f4cac87ad53dacdb90f76df9819f188086",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g3-a2.receipt.json": "094e42b463e02b5d7ea78371c9e4437a6d145430382db240fe9fede2acfedd28",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g3-a2.stdout": "d53d4204b98f2b17c4cf0f357d55f98d54dcd887a3b2fc1ce4b2f54917868d0b",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g3-b1.operating.json": "639069be17b00baf4d53be4e4359d970742414a5759f0fa99594dd49379ef12a",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g3-b1.progress.jsonl": "5fa448a10efa284591ff4a03470d08e77fd88192ede9c38955fb803ca7dbda4e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g3-b1.receipt.json": "397b91e6ab1f295d644077c79b47725ac7e0e1cbed1099c7e2f7f9b2644bff2b",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g3-b1.stdout": "f83e1cdb172fd97b760e6c5b46fcf6db031b97259b858187169a762e7103713e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g3-b2.operating.json": "6b9d4fca9240bce03456621169c9580ef312b26a20a0fa6d363af042b00d0ace",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g3-b2.progress.jsonl": "77255d58d5d58d5360f1533db3799f6cfc3b405d8b7ebfcb2dfb304775edf09e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g3-b2.receipt.json": "bae5c8b820f69c3dcaa3ee1e4deca4f0294700a9c2ae121d3ff153467a9386f7",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/agent12-dflash8-vs-review16-v1-g3-b2.stdout": "2365fa68a14694f0d660d3d8b6a5e8aeab0d6dacc862b41066440090e06fdb33",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/abba.py": "7afc7b4fa24916acfc41745fc29cc659b5edada0bfa1ce55e19a685808475c0d",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/analyze_abba_v2.py": "e2c3f42e4e5fce41d89251399beb7339bf9bdc4c4af51e15435cf984390da634",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/controlled_round.py": "4bde430207a362eab510fe8ffd393fa2aa76c543eaa5821c7073e95e454d0f58",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prepare_native_comparison_v1.py": "269eb1b394f9a83a8338ac0c18f02fb6b4dc346d10cc76dccb04ded9a637f97a",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/review_native_abba_v2.py": "658d1a80df95db935d17dc8aa787e61d48efb02053e708c746bb2b716baafcd5",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/run_frozen_abba_round_v1.py": "f062f66b89052d1bff3eb1510ffe93a3f8e805b110eced7e34f60d75c83b0a7d",
+    "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/config.json": "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85",
+    "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/draft/config.json": "c2aa9e3ff22766ea7df0fa5b5f5f7d2035ae722671c6b7eb58b65578705e6815",
+    "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/model.json": "6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+    "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4/config.json": "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85",
+    "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4/draft/config.json": "873e3556509b0da06e29654ba00d4944888d4b5e8a33afde25f7eb27d321e980",
+    "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4/model.json": "e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4"
+  }
+}

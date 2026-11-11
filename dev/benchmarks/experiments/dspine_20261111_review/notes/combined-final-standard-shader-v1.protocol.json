@@ -1,0 +1,24 @@
+{
+  "registered_utc": "2026-11-11T06:50:42.677798+00:00",
+  "scope": "Exact repository test-engine-metal validation environment, MTL_SHADER_VALIDATION=1. Extra API-layer run separately preserved as combined-final-default-v1; API-layer prefill abort remains under baseline/candidate diagnosis. No result reclassification.",
+  "default": {
+    "id": "combined-final-default-shader-v1",
+    "command": [
+      "/usr/bin/env",
+      "MTL_SHADER_VALIDATION=1",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/gguf-projection",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/production-and-test.metallib"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/gguf-projection",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/production-and-test.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/gguf-projection": "d1032fc1384ad043764348380e5d6f4faabe025f4629f283e2c58b8f5af0d049",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/production-and-test.metallib": "219e64a24607764fd507aa11ee1479623242ecb9d7d2e77a29cec10078efa2a7",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d"
+    },
+    "timeout_seconds": 1800
+  }
+}

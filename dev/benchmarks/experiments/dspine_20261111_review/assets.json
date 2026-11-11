@@ -1,0 +1,31 @@
+{
+  "release": "dspine-final-review-20261111-v1",
+  "source_commit": "fa62be81f2e9c48959f10a96ae3866a30c824075",
+  "base_commit": "37bdd4f8710319bfad43709de2725df89ef776d3",
+  "source_patch_sha256": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d",
+  "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283",
+  "scope": "Frozen pre-engine1.6.1 sourceA. These measurements do not qualify the later integration with upstream767c646e.",
+  "assets": [
+    {
+      "name": "dspine-final-review-20261111-v1-evidence.tar.gz",
+      "bytes": 2893453,
+      "sha256": "1432fe799be3c4d8afbfb226fd770d1cf656d0a936f18568d731f65d7bec2938",
+      "url": "https://github.com/linson007/splash/releases/download/dspine-final-review-20261111-v1/dspine-final-review-20261111-v1-evidence.tar.gz",
+      "profile": "evidence"
+    },
+    {
+      "name": "dspine-final-review-20261111-v1-hardware.tar.gz",
+      "bytes": 6096770,
+      "sha256": "ecd1a3775f3e0bcffa99f19426fd2018a5d6055d9eb9069667b5a63b3dad85ea",
+      "url": "https://github.com/linson007/splash/releases/download/dspine-final-review-20261111-v1/dspine-final-review-20261111-v1-hardware.tar.gz",
+      "profile": "hardware"
+    },
+    {
+      "name": "dspine-final-review-20261111-v1-logits.tar.gz",
+      "bytes": 65799448,
+      "sha256": "db3e7bb9795837ea71ab7a7151f82ff5530fd1e9cfa1a835304790fa69025a85",
+      "url": "https://github.com/linson007/splash/releases/download/dspine-final-review-20261111-v1/dspine-final-review-20261111-v1-logits.tar.gz",
+      "profile": "logits"
+    }
+  ]
+}

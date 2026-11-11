@@ -1,0 +1,404 @@
+{
+  "frozen_utc": "2026-11-11T07:30:32.547745+00:00",
+  "prefix": "historical31-dflash8-vs-review16-v1",
+  "groups": 3,
+  "order_each_group": [
+    "control",
+    "candidate",
+    "candidate",
+    "control"
+  ],
+  "arms": {
+    "control": {
+      "variant": "control",
+      "rows": 8,
+      "model": "dflash",
+      "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+      "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf"
+    },
+    "candidate": {
+      "variant": "candidate",
+      "rows": 16,
+      "model": "dspine",
+      "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07"
+    }
+  },
+  "cohort": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/cohorts/historical31-v1.txt",
+  "cohort_sha256": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf",
+  "cases": 31,
+  "registered_cases": [
+    {
+      "name": "python_lru",
+      "output_cap": 512,
+      "prompt_tokens": 45,
+      "prompt_tokens_sha256": "77679892d4b0caa91bbc38977f222b040d330884500116a85a98680ee333a376"
+    },
+    {
+      "name": "sql_latest",
+      "output_cap": 384,
+      "prompt_tokens": 56,
+      "prompt_tokens_sha256": "9c95eededc2347c1c36528322b7d80cda43ce72260e97157f58528b50e2ad72f"
+    },
+    {
+      "name": "typescript_heap",
+      "output_cap": 768,
+      "prompt_tokens": 45,
+      "prompt_tokens_sha256": "fca6074566cba6fcd122f46dbd2bed897458de70b700f169e18076398324b896"
+    },
+    {
+      "name": "chinese_explanation",
+      "output_cap": 512,
+      "prompt_tokens": 39,
+      "prompt_tokens_sha256": "4a01b34599e8c2a70cab61a98b173a21df02251428472eccf7caf764c173dc74"
+    },
+    {
+      "name": "technical_memory",
+      "output_cap": 512,
+      "prompt_tokens": 41,
+      "prompt_tokens_sha256": "6e41d89795cb4cf7b5c1ce0784d1f51afe1105af29e379a2eb64f8654fd46a6b"
+    },
+    {
+      "name": "json_calculation",
+      "output_cap": 384,
+      "prompt_tokens": 61,
+      "prompt_tokens_sha256": "78ace4a053f31c8ea09e092329186d6ce38fcb9faadae0968e747cd6e4e42af8"
+    },
+    {
+      "name": "count_secondary",
+      "output_cap": 1024,
+      "prompt_tokens": 33,
+      "prompt_tokens_sha256": "d3bc237c850e5d51b5438931d7667a99677f1139a4602f28af94fbae1c388690"
+    },
+    {
+      "name": "plain_json_squares",
+      "output_cap": 800,
+      "prompt_tokens": 54,
+      "prompt_tokens_sha256": "a07d8b4826fd245972dcc42d657e8801f97bbed78b37033bc59088eb1db352f9"
+    },
+    {
+      "name": "plain_json_fibonacci",
+      "output_cap": 800,
+      "prompt_tokens": 44,
+      "prompt_tokens_sha256": "14d03c344399a20436899b56027ce43bab8001ace6eff89e46f9a91c17f22feb"
+    },
+    {
+      "name": "plain_csv_inventory",
+      "output_cap": 800,
+      "prompt_tokens": 62,
+      "prompt_tokens_sha256": "88835b9b379376c1d9137f7c07fd8ca9d6a3ba63ccf50646c28da26ff9a19070"
+    },
+    {
+      "name": "plain_yaml_services",
+      "output_cap": 800,
+      "prompt_tokens": 78,
+      "prompt_tokens_sha256": "ab165ccc5609d8109166289473af1f450b4682d446acfe4436616c5349e632f8"
+    },
+    {
+      "name": "plain_sql_schema",
+      "output_cap": 800,
+      "prompt_tokens": 67,
+      "prompt_tokens_sha256": "9b04ce47468ee34000650ae0fe7593af3d2ab945d036f01577b29718a2fbfeab"
+    },
+    {
+      "name": "plain_toml_package",
+      "output_cap": 800,
+      "prompt_tokens": 69,
+      "prompt_tokens_sha256": "b3b7d8d336bfbd8d6b7bffa3f8ce3810f669f0f2988f5a559a756f01149ec93b"
+    },
+    {
+      "name": "plain_html_table",
+      "output_cap": 800,
+      "prompt_tokens": 60,
+      "prompt_tokens_sha256": "8f1a3d6d6f30b8019c15675ccf263536377485067a60d8a3265c01cb06fe3226"
+    },
+    {
+      "name": "plain_xml_catalog",
+      "output_cap": 800,
+      "prompt_tokens": 54,
+      "prompt_tokens_sha256": "67b82e8a5502b63de40674ed69f10b2ebf0440887ee5a6e7f116590b288c26fc"
+    },
+    {
+      "name": "plain_json_nested",
+      "output_cap": 800,
+      "prompt_tokens": 58,
+      "prompt_tokens_sha256": "e16ad123e67dfefa0a848a47dd75d86d201577f285bcb21aa0f8e68b4fa20d4c"
+    },
+    {
+      "name": "plain_markdown_checklist",
+      "output_cap": 800,
+      "prompt_tokens": 45,
+      "prompt_tokens_sha256": "75aad04a57a602334ac547c8171f7220346283644833bc8ef761a212ace7c27a"
+    },
+    {
+      "name": "plain_diff_boundary",
+      "output_cap": 800,
+      "prompt_tokens": 59,
+      "prompt_tokens_sha256": "4dea7b154a7b280535ddfecd0f2329dee240dd5f786b4fe565cf7dae016f6816"
+    },
+    {
+      "name": "plain_json_coordinate_grid",
+      "output_cap": 800,
+      "prompt_tokens": 61,
+      "prompt_tokens_sha256": "63a87091e41b9c2d6e9654e7276a57f53e9829c069dcb17a4f065798d87240f3"
+    },
+    {
+      "name": "python_topological_sort",
+      "output_cap": 800,
+      "prompt_tokens": 58,
+      "prompt_tokens_sha256": "13795750d03844a3f0574d580daf80a0cb398be48d4a426e56d8db53e607737c"
+    },
+    {
+      "name": "rust_roman_numerals",
+      "output_cap": 800,
+      "prompt_tokens": 53,
+      "prompt_tokens_sha256": "862d544147629e8244fe5a80d5d823383d954a7e5f694e0a67faa84199c02359"
+    },
+    {
+      "name": "go_round_robin",
+      "output_cap": 800,
+      "prompt_tokens": 56,
+      "prompt_tokens_sha256": "d292612ca8ae0fde87a81d13b8e08257a46260e346996a609571685152295d2c"
+    },
+    {
+      "name": "cpp_fixed_queue",
+      "output_cap": 800,
+      "prompt_tokens": 56,
+      "prompt_tokens_sha256": "930980ffa9f324d79b342bb3375a0063970c642b562039dc795063ab2bcc2840"
+    },
+    {
+      "name": "typescript_log_parser",
+      "output_cap": 800,
+      "prompt_tokens": 57,
+      "prompt_tokens_sha256": "71b764ef5045c2a7ecafde6200c98f8c8bde879c9038b6f50f6efc2209bce529"
+    },
+    {
+      "name": "shell_largest_files",
+      "output_cap": 800,
+      "prompt_tokens": 56,
+      "prompt_tokens_sha256": "150d50e65676b96ff48788649d4b4732b8a1b0acb1546120d4b3b9fd951901d1"
+    },
+    {
+      "name": "linear_equations",
+      "output_cap": 800,
+      "prompt_tokens": 49,
+      "prompt_tokens_sha256": "06dcf60346af3dab1465599c94c69ea3c2513f85bc298a467deb6887fdce819d"
+    },
+    {
+      "name": "urn_probability",
+      "output_cap": 800,
+      "prompt_tokens": 50,
+      "prompt_tokens_sha256": "81e35f8dad1f6a27dc7cda8fd05f5bcd8912351c8747b9e623b9fb4525010ee6"
+    },
+    {
+      "name": "french_cache_explanation",
+      "output_cap": 800,
+      "prompt_tokens": 48,
+      "prompt_tokens_sha256": "658936f6491e001f655d1adfbdf46dcd6cd6b2af9012430225fee0d180f23c4d"
+    },
+    {
+      "name": "arabic_atomicity",
+      "output_cap": 800,
+      "prompt_tokens": 45,
+      "prompt_tokens_sha256": "38a9bf8b8eb0d9e21b0d2d01c8c95b637a9ae5a92f902944d56ffff7e6f3fcbe"
+    },
+    {
+      "name": "japanese_lru_notes",
+      "output_cap": 800,
+      "prompt_tokens": 44,
+      "prompt_tokens_sha256": "a9ea2bd7b03ec5605203629d9508caa66196b3603b7f640203ff6adb33ff352e"
+    },
+    {
+      "name": "chinese_batch_latency",
+      "output_cap": 800,
+      "prompt_tokens": 46,
+      "prompt_tokens_sha256": "eecbcc56fad4d3f07f2a384fdfe6ade12a144ce8a5219e5d2ebb86f0de03f73e"
+    }
+  ],
+  "case_names": [
+    "python_lru",
+    "sql_latest",
+    "typescript_heap",
+    "chinese_explanation",
+    "technical_memory",
+    "json_calculation",
+    "count_secondary",
+    "plain_json_squares",
+    "plain_json_fibonacci",
+    "plain_csv_inventory",
+    "plain_yaml_services",
+    "plain_sql_schema",
+    "plain_toml_package",
+    "plain_html_table",
+    "plain_xml_catalog",
+    "plain_json_nested",
+    "plain_markdown_checklist",
+    "plain_diff_boundary",
+    "plain_json_coordinate_grid",
+    "python_topological_sort",
+    "rust_roman_numerals",
+    "go_round_robin",
+    "cpp_fixed_queue",
+    "typescript_log_parser",
+    "shell_largest_files",
+    "linear_equations",
+    "urn_probability",
+    "french_cache_explanation",
+    "arabic_atomicity",
+    "japanese_lru_notes",
+    "chinese_batch_latency"
+  ],
+  "samples_per_round": 1,
+  "criterion": "comparison",
+  "context_tokens": 32768,
+  "temperature": 0,
+  "ane_ffn_share": 0,
+  "verify_rows": "all",
+  "clone_width": 1,
+  "primary_endpoint": "decode",
+  "primary_metric": "Per-case median (wall-TTFT)/(returned tokens-1), then token-weighted aggregate.",
+  "gates": "Exactly three complete ABBA groups. Complete arrays must match across arms and repetitions. Every per-case and aggregate decode spread must be <=5%. Improvement requires candidate time reduction beyond max(2%, twice spread); nonregression requires aggregate and every case within that allowance; comparison requires absolute time change beyond the allowance. Cold request wall and TTFT have independent gates. AC throughout measurement, no swap and no serious/critical OS thermal state are required. All groups and failures are retained without repeat-to-pass.",
+  "cross_group_direction_gate": "A directional performance conclusion requires all three groups qualified in the same direction; inspect each group direction in the unchanged analyzer output.",
+  "artifact_nomination": {
+    "control": {
+      "driver": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver",
+      "library": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib",
+      "host_step": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib",
+      "bundle_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb"
+      },
+      "model_metadata_sha256": {
+        "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4/model.json": "e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+        "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4/config.json": "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85",
+        "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4/draft/config.json": "873e3556509b0da06e29654ba00d4944888d4b5e8a33afde25f7eb27d321e980"
+      },
+      "source_label": "combined-v2-f27dc90a",
+      "bundle": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3",
+      "build_manifest": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/build.json",
+      "build_manifest_sha256": "3b286493d52645d50bdc6280174765e842495442dc40ac8ad4fbadeac4f30d79",
+      "build_manifest_data": {
+        "variant": "combined",
+        "command": [
+          "xcrun",
+          "-sdk",
+          "macosx",
+          "clang++",
+          "-std=c++20",
+          "-O3",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/runtime",
+          "-I/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/benchmarks",
+          "-mmacosx-version-min=26.4",
+          "-fobjc-arc",
+          "-include",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/BuildIdentity.hpp",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/study_driver_v2.mm",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/libsplash.a",
+          "-framework",
+          "Foundation",
+          "-framework",
+          "Metal",
+          "-framework",
+          "IOKit",
+          "-framework",
+          "IOSurface",
+          "-o",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver"
+        ],
+        "inputs": {
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/study_driver_v2.mm": "2b0b3898db9bee8941e169d8852c8f6659f256f7d00e9de9f01a2a054783879d",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/libsplash.a": "a2748249b0e79d9ac80235cbb2f0372ed5741a2bf74234ff3280662c65fb246c",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/BuildIdentity.hpp": "a144e898bcc1d547db5c1e241c30d8d4950e17032c775dcf77e5272ce0f979d7",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/benchmarks/PrefillWork.hpp": "7d9abd447e972002a53633ff202dae3a4eb2f1178d81cb28677264c81e5d7d29",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/benchmarks/TranscriptPrompts.hpp": "2c56f82c9048bf3de0eeae016d95db3b2f954d0ad6ae56af1f8cea87609ecdb6"
+        },
+        "binary_sha256": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e"
+      }
+    },
+    "candidate": {
+      "driver": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver",
+      "library": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib",
+      "host_step": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib",
+      "bundle_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb"
+      },
+      "model_metadata_sha256": {
+        "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/model.json": "6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+        "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/config.json": "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85",
+        "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/draft/config.json": "c2aa9e3ff22766ea7df0fa5b5f5f7d2035ae722671c6b7eb58b65578705e6815"
+      },
+      "source_label": "combined-v2-f27dc90a",
+      "bundle": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3",
+      "build_manifest": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/build.json",
+      "build_manifest_sha256": "3b286493d52645d50bdc6280174765e842495442dc40ac8ad4fbadeac4f30d79",
+      "build_manifest_data": {
+        "variant": "combined",
+        "command": [
+          "xcrun",
+          "-sdk",
+          "macosx",
+          "clang++",
+          "-std=c++20",
+          "-O3",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-I/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/runtime",
+          "-I/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/benchmarks",
+          "-mmacosx-version-min=26.4",
+          "-fobjc-arc",
+          "-include",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/BuildIdentity.hpp",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/study_driver_v2.mm",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/libsplash.a",
+          "-framework",
+          "Foundation",
+          "-framework",
+          "Metal",
+          "-framework",
+          "IOKit",
+          "-framework",
+          "IOSurface",
+          "-o",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver"
+        ],
+        "inputs": {
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/study_driver_v2.mm": "2b0b3898db9bee8941e169d8852c8f6659f256f7d00e9de9f01a2a054783879d",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/libsplash.a": "a2748249b0e79d9ac80235cbb2f0372ed5741a2bf74234ff3280662c65fb246c",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/engine/BuildIdentity.hpp": "a144e898bcc1d547db5c1e241c30d8d4950e17032c775dcf77e5272ce0f979d7",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/build/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/benchmarks/PrefillWork.hpp": "7d9abd447e972002a53633ff202dae3a4eb2f1178d81cb28677264c81e5d7d29",
+          "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/combined/dev/benchmarks/TranscriptPrompts.hpp": "2c56f82c9048bf3de0eeae016d95db3b2f954d0ad6ae56af1f8cea87609ecdb6"
+        },
+        "binary_sha256": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e"
+      }
+    }
+  },
+  "operating_script_sha256": "4bde430207a362eab510fe8ffd393fa2aa76c543eaa5821c7073e95e454d0f58",
+  "analyzer_file": "analyze_abba_v2.py",
+  "analyzer_sha256": "e2c3f42e4e5fce41d89251399beb7339bf9bdc4c4af51e15435cf984390da634",
+  "abba_sha256": "7afc7b4fa24916acfc41745fc29cc659b5edada0bfa1ce55e19a685808475c0d",
+  "frozen_wrapper_sha256": "f062f66b89052d1bff3eb1510ffe93a3f8e805b110eced7e34f60d75c83b0a7d",
+  "source_versions": {
+    "original_root": "/Users/linson/Documents/ai/splash-dspine-13h-20261110",
+    "unchanged_script_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/analyze_abba_v2.py": "e2c3f42e4e5fce41d89251399beb7339bf9bdc4c4af51e15435cf984390da634",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/abba.py": "7afc7b4fa24916acfc41745fc29cc659b5edada0bfa1ce55e19a685808475c0d",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/run_frozen_abba_round_v1.py": "f062f66b89052d1bff3eb1510ffe93a3f8e805b110eced7e34f60d75c83b0a7d",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/controlled_round.py": "4bde430207a362eab510fe8ffd393fa2aa76c543eaa5821c7073e95e454d0f58"
+    },
+    "native_study_driver_source_sha256": "2b0b3898db9bee8941e169d8852c8f6659f256f7d00e9de9f01a2a054783879d"
+  },
+  "preparation_script": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prepare_native_comparison_v1.py",
+  "preparation_script_sha256": "269eb1b394f9a83a8338ac0c18f02fb6b4dc346d10cc76dccb04ded9a637f97a",
+  "execution_python": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python",
+  "required_receipts": [],
+  "scope": "Finite explicitly nominated cohort. This registration adds no observations. Native serial cold requests or explicitly registered same-prompt clone lanes do not establish general serving or agent task success. Existing studies and results remain immutable."
+}

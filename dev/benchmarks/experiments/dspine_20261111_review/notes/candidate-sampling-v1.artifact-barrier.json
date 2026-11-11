@@ -1,0 +1,21 @@
+{
+  "created_utc": "2026-11-11T07:30:33.295372+00:00",
+  "protocol_sha256": "2d580c8590efccd20062e5d6be07a778650007d323f5be874d5a5d6017365ded",
+  "nomination_sha256": "8e16b22b810ada96e8125c0ec7e84a527282d7b58e0347527b0c2cc22f3c8768",
+  "sha256": {
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/scripts/analyze_sampling4_v1.py": "66babc7961c3ef7d37b61777dd57b1906b6e6060edd05a264c1d073e2c7b5c35",
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/scripts/study_driver_v2.mm": "2b0b3898db9bee8941e169d8852c8f6659f256f7d00e9de9f01a2a054783879d",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/build.json": "3b286493d52645d50bdc6280174765e842495442dc40ac8ad4fbadeac4f30d79",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/cohorts/candidate-sampling4-v1.txt": "76d956e14f016bb067e310433bdaa9df95b266b691be4e1c499404445bbe61c3",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/candidate-sampling-v1.nomination.json": "8e16b22b810ada96e8125c0ec7e84a527282d7b58e0347527b0c2cc22f3c8768",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/candidate_sampling_v1.py": "ce47cbdbe34304e567d59d1b59ca05054ddb5127a9703df80dbf9576d3b4654a",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/sampling_recovery_v1.py": "927c06bc0650175d2bda342a556ae8b0c9cc857295c261d98926455094ff9eca",
+    "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/config.json": "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85",
+    "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/draft/config.json": "c2aa9e3ff22766ea7df0fa5b5f5f7d2035ae722671c6b7eb58b65578705e6815",
+    "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/model.json": "6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65"
+  }
+}

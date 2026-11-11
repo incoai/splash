@@ -1,0 +1,327 @@
+{
+  "frozen_utc": "2026-11-11T07:30:33.295013+00:00",
+  "prefix": "candidate-sampling-v1",
+  "analysis_protocol": {
+    "contexts": 4,
+    "output_cap": 24,
+    "samples_per_arm_per_context": 1000,
+    "chunks_per_arm": 2,
+    "samples_per_chunk": 500,
+    "settings": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "ane_ffn_share": 0,
+      "context_limit": 32768
+    },
+    "positions": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+    ],
+    "adjacent_pair_starts": [
+      0,
+      1,
+      5,
+      6,
+      11,
+      12,
+      14,
+      15,
+      16,
+      22
+    ],
+    "additional_features": [
+      "complete_output_length"
+    ],
+    "statistics": "Pearson chi-square without Yates correction, SciPy survival probability; symmetric label-blind pooled categories with expected cells >=5, degenerate tests p=1/uninformative. Holm correction over all 140 reserved tests. Post-end positions use absorbing STOP (-1), never condition on surviving to that position.",
+    "frozen_utc": "2026-11-11T07:30:33.274507+00:00",
+    "cohort_sha256": "76d956e14f016bb067e310433bdaa9df95b266b691be4e1c499404445bbe61c3",
+    "family_size_reserved": 140,
+    "arithmetic": "4 contexts * (24 positions + 10 adjacent pairs + 1 length) * 1 new candidate = 140 tests.",
+    "output_feature_encoding": {
+      "valid_token_ids": "Every integer token ID >= 0, including token 0, remains an observed token.",
+      "absorbing_stop": -1,
+      "early_stop_rule": "Every position after sequence termination is STOP; do not condition on surviving to a position.",
+      "empty_output_rule": "A zero-length output has length 0 and STOP at every tested position."
+    },
+    "nomination_rule": "Freeze this single source and artifact bundle before its first new candidate output. Preserve both reserved chunks, all contexts and failed outcomes. Do not substitute a source, shrink the sample or repeat to pass.",
+    "scope": "A distinct finite regression screen for the new nominated source against the reused recovered control."
+  },
+  "nomination_file": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/candidate-sampling-v1.nomination.json",
+  "nomination_sha256": "8e16b22b810ada96e8125c0ec7e84a527282d7b58e0347527b0c2cc22f3c8768",
+  "barrier_file": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/candidate-sampling-v1.artifact-barrier.json",
+  "source_study_root": "/Users/linson/Documents/ai/splash-dspine-13h-20261110",
+  "baseline_pin": {
+    "original_files_sha256": {
+      "cohorts/sampling4-v1.txt": "76d956e14f016bb067e310433bdaa9df95b266b691be4e1c499404445bbe61c3",
+      "notes/sampling4-nominations-v1.json": "ed0f70c42db83fb34f8d7ff4f6cc4418d9d2cd5a27c3527f166801ed10e19e44",
+      "notes/sampling4-protocol-v1.json": "219f1e5d553fbe686b77c2978d4b9a06fba9cfdb3cc032657929f6faf2330b88",
+      "notes/sampling4-v1.artifact-barrier.json": "504e2eaaba579e9b7a1ab559b0b4dccc7b41b65509501fefc26e6dffb4d4b777",
+      "results/sampling4-DFlash8_candidate-chunk0-v1.progress.jsonl": "55ec5718418211c6782623623aa6074258cd4b72e2e009c9aaad30eacff675e8",
+      "results/sampling4-DFlash8_candidate-chunk0-v1.receipt.json": "95bde837180418c65562859459d62b632b2a63ab98256dfbc27f0e2c7dd17a51",
+      "results/sampling4-DFlash8_candidate-chunk0-v1.stdout": "000b4d86277af60b5b21e00f8157e75bb00224944769f359479e62e7695d13d1",
+      "results/sampling4-DFlash8_candidate-chunk1-v1.progress.jsonl": "2f75096452603ed8dc39328676ff3e88bf9154e12b6d1832e0f2dffcded46b7e",
+      "results/sampling4-DFlash8_candidate-chunk1-v1.receipt.json": "96ce95161f98e02228e5d3d41b46a507a1741de0094246a6d797ad2385a2f475",
+      "results/sampling4-DFlash8_candidate-chunk1-v1.stdout": "0e1cf08e918f09e7fc16088a3881950e19aa002908228629282f7ebac270c71d",
+      "results/sampling4-DSpine16_candidate-chunk0-v1.progress.jsonl": "cafff380cea4e26cb81384876d03ee5cbadd940878c18993281e19bb8fbe1bf7",
+      "results/sampling4-DSpine16_candidate-chunk0-v1.receipt.json": "a2e6898f48286446185a4fef2cf82eb75e3f93675ee213f7dc468731b5e2adca",
+      "results/sampling4-DSpine16_candidate-chunk0-v1.stdout": "952aedfafcc7698644fdd8e264ffaaad8d4b646edf27878d756f7283eed61ea9",
+      "results/sampling4-DSpine16_candidate-chunk1-v1.progress.jsonl": "dac35217b8eb550ee9df669239cb565c0733c07c4b91d35c8be90d432b341365",
+      "results/sampling4-DSpine16_candidate-chunk1-v1.receipt.json": "5c45c4ce9333ff2a44a8733c9939e8f6132d415723568c45d2bbe572c9ac21b5",
+      "results/sampling4-DSpine16_candidate-chunk1-v1.stdout": "9cb894fa86d66384f0e5a0cca200f32bcec4ecd9621bf9f538d7d1d225824e3e",
+      "results/sampling4-DSpine8_control-chunk0-v1.progress.jsonl": "26ea938c6446dd3d31d40fd94bb37e26420975ff0595e905af465b52d5457624",
+      "results/sampling4-DSpine8_control-chunk0-v1.receipt.json": "549cf165fa6b74c65e2d98aec573c7b22666c9870d258d323651e1b198c8a644",
+      "results/sampling4-DSpine8_control-chunk0-v1.stdout": "8fee43306851ff1710304e2a0704ecfd8d7be4344df3a098edf64bcf63c7868c",
+      "results/sampling4-DSpine8_control-chunk1-v1.progress.jsonl": "7542902b86ed2cd9daae3bfa73d0d53499585580e788ef9acbf4485b0c8f5b0f",
+      "results/sampling4-DSpine8_control-chunk1-v1.receipt.json": "134f9a4ba53bf7e2624363f64ed93617beb92d7f0c2412161044c9cd9d72d7bb",
+      "results/sampling4-comparison-v1.json": "5ad9b41766750516a1eb5625e84f0573f2e7a0dba45465616a162d3c25c5bdfe",
+      "scripts/analyze_sampling4_v1.py": "66babc7961c3ef7d37b61777dd57b1906b6e6060edd05a264c1d073e2c7b5c35"
+    },
+    "review_files_sha256": {
+      "scripts/sampling_recovery_v1.py": "927c06bc0650175d2bda342a556ae8b0c9cc857295c261d98926455094ff9eca",
+      "notes/sampling-recovery-v1.protocol.json": "943932fd0ece2053c4aa229e1341d760260b198de266cde517444dba4420dc92",
+      "results/sampling-recovery-v1.comparison.json": "cdd2e5bfd68b8e4e63e60701ef42154af891028da7d52d4cba67685414f4e8cb",
+      "results/sampling-recovery-tail-v1.receipt.json": "af842804b9f1f1c0408b57f7c84ca68c949f1d9b4a28f65aeec4140e6292674e",
+      "results/sampling-recovery-tail-v1.stdout": "2587422898a17e4c51b8cff78017748e411a14c28c35ffbe7ada2119965e93ff",
+      "results/sampling-recovery-tail-v1.progress.jsonl": "a1b1163a24a8562d4ca221d982870719bff95cff1990f55eb42b1d75c2e6561c"
+    },
+    "canonical_control_arrays_sha256": "5d06ac9da5486e9934989d19383aebaf9d311d0db846f0b48b3fb12b42cf782a",
+    "recovery_report_sha256": "cdd2e5bfd68b8e4e63e60701ef42154af891028da7d52d4cba67685414f4e8cb",
+    "control_build_id": "src-e237afcf9837870527676df3de068ac7d1f615783c9f6092ae96a86271eec455",
+    "control_identity": {
+      "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+      "device": "Apple M5 Pro"
+    },
+    "source_provenance": [
+      {
+        "job": "sampling4-DSpine8_control-chunk0-v1",
+        "kind": "retained_complete_stdout_and_matching_journal",
+        "requests": 2000,
+        "canonical_arrays_sha256": "f574effda7acb1711806ffc7af149e7d598df7c5c98795925ae8b78cfc5e4021"
+      },
+      {
+        "job": "sampling4-DSpine8_control-chunk1-v1",
+        "kind": "retained_partial_journal",
+        "requests": 1604,
+        "canonical_arrays_sha256": "df65d4a72635f1097b96643a5f86015323f1ca7711a8efa9305b64ffebaf3a71"
+      },
+      {
+        "job": "sampling4-DSpine16_candidate-chunk0-v1",
+        "kind": "retained_complete_stdout_and_matching_journal",
+        "requests": 2000,
+        "canonical_arrays_sha256": "869af86e3df03962e82aebc42e1009567674eecc427f6357b7e08e08011c9576"
+      },
+      {
+        "job": "sampling4-DSpine16_candidate-chunk1-v1",
+        "kind": "retained_complete_stdout_and_matching_journal",
+        "requests": 2000,
+        "canonical_arrays_sha256": "103d093dbdfa48630493a0e4827e340fccda4338d40f53475099cde5e6b207d0"
+      },
+      {
+        "job": "sampling4-DFlash8_candidate-chunk0-v1",
+        "kind": "retained_complete_stdout_and_matching_journal",
+        "requests": 2000,
+        "canonical_arrays_sha256": "199e75849f9e428849f584c9e9e99fc879500683ffeff099484cfa3363a91072"
+      },
+      {
+        "job": "sampling4-DFlash8_candidate-chunk1-v1",
+        "kind": "retained_complete_stdout_and_matching_journal",
+        "requests": 2000,
+        "canonical_arrays_sha256": "5510420a68ee92bc280c877ff6402641ba3d20ba5983152c2a683513ded91d56"
+      },
+      {
+        "job": "sampling-recovery-tail-v1",
+        "kind": "new_missing_seed_tail",
+        "requests": 396,
+        "receipt_sha256": "af842804b9f1f1c0408b57f7c84ca68c949f1d9b4a28f65aeec4140e6292674e",
+        "stdout_sha256": "2587422898a17e4c51b8cff78017748e411a14c28c35ffbe7ada2119965e93ff",
+        "journal_sha256": "a1b1163a24a8562d4ca221d982870719bff95cff1990f55eb42b1d75c2e6561c"
+      }
+    ]
+  },
+  "analyzer_sha256": "ce47cbdbe34304e567d59d1b59ca05054ddb5127a9703df80dbf9576d3b4654a",
+  "original_statistical_source_sha256": "66babc7961c3ef7d37b61777dd57b1906b6e6060edd05a264c1d073e2c7b5c35",
+  "cohort": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/cohorts/candidate-sampling4-v1.txt",
+  "cohort_sha256": "76d956e14f016bb067e310433bdaa9df95b266b691be4e1c499404445bbe61c3",
+  "job_keys": [
+    "chunk0",
+    "chunk1"
+  ],
+  "candidate": {
+    "name": "DSpine16_final_review",
+    "rows": 16,
+    "seed_start": 4400000,
+    "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+    "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+    "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283",
+    "source_label": "combined-v2-f27dc90a",
+    "source_patch": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch",
+    "source_patch_sha256": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d",
+    "build_manifest": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/build.json",
+    "build_manifest_sha256": "3b286493d52645d50bdc6280174765e842495442dc40ac8ad4fbadeac4f30d79",
+    "sampling_driver_source_sha256": "2b0b3898db9bee8941e169d8852c8f6659f256f7d00e9de9f01a2a054783879d",
+    "bundle": {
+      "driver": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver",
+      "library": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib",
+      "host_step": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib"
+    },
+    "bundle_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb"
+    }
+  },
+  "control": {
+    "name": "DSpine8_recovered_control",
+    "rows": 8,
+    "seed_start": 4100000,
+    "build_id": "src-e237afcf9837870527676df3de068ac7d1f615783c9f6092ae96a86271eec455",
+    "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+    "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+    "kind": "Reused original complete chunk, retained partial journal and registered recovery tail",
+    "canonical_arrays_sha256": "5d06ac9da5486e9934989d19383aebaf9d311d0db846f0b48b3fb12b42cf782a",
+    "recovery_report_sha256": "cdd2e5bfd68b8e4e63e60701ef42154af891028da7d52d4cba67685414f4e8cb"
+  },
+  "statistics_execution": "Reuse the original frozen feature/test functions and analysis body via AST with one candidate, a 140-test family and provenance-checked load functions.",
+  "failure_rule": "Every context needs exactly 1000 candidate seeds. A failed or partial chunk produces an incomplete screen. No reduced-sample substitution.",
+  "scope": "This new candidate screen has distinct source identities and independent candidate seeds. Historical studies and recovery records stay immutable. No throughput or distribution-equivalence claim.",
+  "chunk0": {
+    "id": "candidate-sampling-v1-chunk0",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "--draft-block-size",
+      "16",
+      "--cohort",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/cohorts/candidate-sampling4-v1.txt",
+      "--samples",
+      "500",
+      "--temperature",
+      "1",
+      "--seed-base",
+      "4400000",
+      "--ane-ffn-share",
+      "0",
+      "--max-context",
+      "32768",
+      "--progress",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/candidate-sampling-v1-chunk0.progress.jsonl"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/scripts/analyze_sampling4_v1.py",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/scripts/study_driver_v2.mm",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/build.json",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/cohorts/candidate-sampling4-v1.txt",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/candidate-sampling-v1.nomination.json",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/candidate_sampling_v1.py",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/sampling_recovery_v1.py",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/config.json",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/draft/config.json",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/model.json"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/scripts/analyze_sampling4_v1.py": "66babc7961c3ef7d37b61777dd57b1906b6e6060edd05a264c1d073e2c7b5c35",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/scripts/study_driver_v2.mm": "2b0b3898db9bee8941e169d8852c8f6659f256f7d00e9de9f01a2a054783879d",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/build.json": "3b286493d52645d50bdc6280174765e842495442dc40ac8ad4fbadeac4f30d79",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/cohorts/candidate-sampling4-v1.txt": "76d956e14f016bb067e310433bdaa9df95b266b691be4e1c499404445bbe61c3",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/candidate-sampling-v1.nomination.json": "8e16b22b810ada96e8125c0ec7e84a527282d7b58e0347527b0c2cc22f3c8768",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/candidate_sampling_v1.py": "ce47cbdbe34304e567d59d1b59ca05054ddb5127a9703df80dbf9576d3b4654a",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/sampling_recovery_v1.py": "927c06bc0650175d2bda342a556ae8b0c9cc857295c261d98926455094ff9eca",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/config.json": "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/draft/config.json": "c2aa9e3ff22766ea7df0fa5b5f5f7d2035ae722671c6b7eb58b65578705e6815",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/model.json": "6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65"
+    },
+    "timeout_seconds": 3600,
+    "stdout": "results/candidate-sampling-v1-chunk0.stdout"
+  },
+  "chunk1": {
+    "id": "candidate-sampling-v1-chunk1",
+    "command": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "--draft-block-size",
+      "16",
+      "--cohort",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/cohorts/candidate-sampling4-v1.txt",
+      "--samples",
+      "500",
+      "--temperature",
+      "1",
+      "--seed-base",
+      "4400500",
+      "--ane-ffn-share",
+      "0",
+      "--max-context",
+      "32768",
+      "--progress",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/candidate-sampling-v1-chunk1.progress.jsonl"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/scripts/analyze_sampling4_v1.py",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/scripts/study_driver_v2.mm",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/build.json",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/cohorts/candidate-sampling4-v1.txt",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/candidate-sampling-v1.nomination.json",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/candidate_sampling_v1.py",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/sampling_recovery_v1.py",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/config.json",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/draft/config.json",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/model.json"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/scripts/analyze_sampling4_v1.py": "66babc7961c3ef7d37b61777dd57b1906b6e6060edd05a264c1d073e2c7b5c35",
+      "/Users/linson/Documents/ai/splash-dspine-13h-20261110/scripts/study_driver_v2.mm": "2b0b3898db9bee8941e169d8852c8f6659f256f7d00e9de9f01a2a054783879d",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/build.json": "3b286493d52645d50bdc6280174765e842495442dc40ac8ad4fbadeac4f30d79",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/study-driver": "357a9bf8402144e7df2cd3af6748d9370071ed73dad9c9398c123f4ac10b864e",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/cohorts/candidate-sampling4-v1.txt": "76d956e14f016bb067e310433bdaa9df95b266b691be4e1c499404445bbe61c3",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/candidate-sampling-v1.nomination.json": "8e16b22b810ada96e8125c0ec7e84a527282d7b58e0347527b0c2cc22f3c8768",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/candidate_sampling_v1.py": "ce47cbdbe34304e567d59d1b59ca05054ddb5127a9703df80dbf9576d3b4654a",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/sampling_recovery_v1.py": "927c06bc0650175d2bda342a556ae8b0c9cc857295c261d98926455094ff9eca",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/config.json": "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/draft/config.json": "c2aa9e3ff22766ea7df0fa5b5f5f7d2035ae722671c6b7eb58b65578705e6815",
+      "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65/model.json": "6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65"
+    },
+    "timeout_seconds": 3600,
+    "stdout": "results/candidate-sampling-v1-chunk1.stdout"
+  }
+}

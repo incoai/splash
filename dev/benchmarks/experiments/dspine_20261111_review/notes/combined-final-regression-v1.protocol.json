@@ -1,0 +1,109 @@
+{
+  "registered_utc": "2026-11-11T06:39:27.526457+00:00",
+  "scope": "Final combined-v2 source, immutable test and runtime bundle; shader validation on. No timing claims.",
+  "cpu": {
+    "id": "combined-final-cpu-v1",
+    "command": [
+      "/usr/bin/env",
+      "MTL_DEBUG_LAYER=1",
+      "MTL_SHADER_VALIDATION=1",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/linear-plan",
+      "--cpu"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/linear-plan",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/linear-plan": "d494808b1c6cc27881f8a8e979feb0e1161c4e189bd6598488cd125a0a85a1a7",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d"
+    },
+    "timeout_seconds": 1800
+  },
+  "gpu": {
+    "id": "combined-final-gpu-v1",
+    "command": [
+      "/usr/bin/env",
+      "MTL_DEBUG_LAYER=1",
+      "MTL_SHADER_VALIDATION=1",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/linear-plan",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/linear-plan",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/linear-plan": "d494808b1c6cc27881f8a8e979feb0e1161c4e189bd6598488cd125a0a85a1a7",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d"
+    },
+    "timeout_seconds": 1800
+  },
+  "oracle": {
+    "id": "combined-final-oracle-v1",
+    "command": [
+      "/usr/bin/env",
+      "MTL_DEBUG_LAYER=1",
+      "MTL_SHADER_VALIDATION=1",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/gguf-projection",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/production-and-test.metallib",
+      "--m48"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/gguf-projection",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/production-and-test.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/gguf-projection": "d1032fc1384ad043764348380e5d6f4faabe025f4629f283e2c58b8f5af0d049",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/production-and-test.metallib": "219e64a24607764fd507aa11ee1479623242ecb9d7d2e77a29cec10078efa2a7",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d"
+    },
+    "timeout_seconds": 1800
+  },
+  "default": {
+    "id": "combined-final-default-v1",
+    "command": [
+      "/usr/bin/env",
+      "MTL_DEBUG_LAYER=1",
+      "MTL_SHADER_VALIDATION=1",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/gguf-projection",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/production-and-test.metallib"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/gguf-projection",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/production-and-test.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/gguf-projection": "d1032fc1384ad043764348380e5d6f4faabe025f4629f283e2c58b8f5af0d049",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/production-and-test.metallib": "219e64a24607764fd507aa11ee1479623242ecb9d7d2e77a29cec10078efa2a7",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d"
+    },
+    "timeout_seconds": 1800
+  },
+  "register16": {
+    "id": "combined-final-register16-v1",
+    "command": [
+      "/usr/bin/env",
+      "MTL_DEBUG_LAYER=1",
+      "MTL_SHADER_VALIDATION=1",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/gguf-projection",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/production-and-test.metallib",
+      "--register16"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/gguf-projection",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/production-and-test.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/gguf-projection": "d1032fc1384ad043764348380e5d6f4faabe025f4629f283e2c58b8f5af0d049",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-combined-v3/production-and-test.metallib": "219e64a24607764fd507aa11ee1479623242ecb9d7d2e77a29cec10078efa2a7",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/combined-v2.patch": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d"
+    },
+    "timeout_seconds": 1800
+  }
+}

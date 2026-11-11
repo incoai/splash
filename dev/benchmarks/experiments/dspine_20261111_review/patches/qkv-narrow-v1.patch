@@ -1,0 +1,227 @@
+diff --git a/dev/tests/engine/linear_plan_test.mm b/dev/tests/engine/linear_plan_test.mm
+index edd3087e..84f7db77 100644
+--- a/dev/tests/engine/linear_plan_test.mm
++++ b/dev/tests/engine/linear_plan_test.mm
+@@ -132,6 +132,93 @@ void wideGateUpPolicy() {
+   }
+ }
+ 
++Projection attentionProjection(uint32_t k = 5120,
++                               std::array<uint32_t, 3> widths = {12288, 1024, 1024}) {
++  BlockWeights blocks;
++  uint32_t offset = 0;
++  for (const uint32_t width : widths) {
++    auto segment = QuantizedSegment::planes(GGUF_FMT_AF4G64, width, k, {}, {}, {});
++    segment.columnOffset = offset;
++    blocks.segments.push_back(segment);
++    offset += width;
++  }
++  return Projection(14336, k, std::move(blocks));
++}
++
++// Keep the measured target's Q/K/V reduction at one sixteen-row lane without
++// changing the split law for another layout, device, phase or batch width.
++void attentionSplitPolicy() {
++  DeviceCapabilities measured = simulatedDevice(10, 20), uncalibrated = measured;
++  measured.deviceName = "Apple M5 Pro";
++  uncalibrated.deviceName = "uncalibrated";
++  const Projection qkv = attentionProjection();
++  for (const uint32_t rows : {8U, 16U}) {
++    const Linear candidate(measured, DecodeGeometry(rows)), control(uncalibrated, DecodeGeometry(rows));
++    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
++      const LinearPlan base = control.decodePlan(qkv, lanes), selected = candidate.decodePlan(qkv, lanes);
++      auto expected = base.configuration();
++      if (rows == 16 && lanes == 1) {
++        require(expected.tile == LinearTile::GgufStaged && expected.splits == 1,
++                "the attention control no longer exercises the one-partition reduction");
++        expected.splits = 2;
++      }
++      require(selected.configuration() == expected && selected.storageRows() == base.storageRows() &&
++                  selected.input() == base.input() && selected.gateScratchBytes() == base.gateScratchBytes(),
++              "attention split correction changed the tile, walk, storage or an unselected batch width");
++    }
++  }
++  const Linear candidate(measured, DecodeGeometry(16)), control(uncalibrated, DecodeGeometry(16));
++  const LinearPlan selected = candidate.decodePlan(qkv, 1);
++  const LinearPlan forced = Linear::plan(selected.workload(), {.splits = 2, .spread = true}, FloatOutput::BFloat16);
++  const LinearScratchSize needed = forced.scratchSize(), bound = candidate.decodeScratchSize(qkv.shape());
++  require(sameScratch(selected.scratchSize(), needed) && needed.partials == 1835008 && needed.counters == 896 &&
++              bound.input >= needed.input && bound.sums >= needed.sums && bound.partials >= needed.partials &&
++              bound.counters >= needed.counters && sameScratch(bound, control.decodeScratchSize(qkv.shape())) &&
++              candidate.decodeStorageRows(16, qkv.shape()) == selected.storageRows(),
++          "the existing attention arena bound does not cover the corrected two-partition plan");
++  const auto unchanged = [&](const Projection &p, const char *why) {
++    require(candidate.decodePlan(p, 1).configuration() == control.decodePlan(p, 1).configuration(), why);
++  };
++  for (const auto &[family, cores, name] : {
++           std::tuple{9U, 20U, "Apple M5 Pro"}, std::tuple{10U, 16U, "Apple M5 Pro"},
++           std::tuple{10U, 32U, "Apple M5 Pro"}, std::tuple{11U, 20U, "Apple M5 Pro"},
++           std::tuple{10U, 20U, "uncalibrated"}}) {
++    DeviceCapabilities other = simulatedDevice(family, cores), base = other;
++    other.deviceName = name;
++    base.deviceName = "uncalibrated";
++    require(Linear(other, DecodeGeometry(16)).decodePlan(qkv, 1).configuration() ==
++                Linear(base, DecodeGeometry(16)).decodePlan(qkv, 1).configuration(),
++            "attention split correction escaped the measured GPU");
++  }
++  for (const Projection &p : {attentionProjection(4096), attentionProjection(5120, {11264, 2048, 1024}),
++                              attentionProjection(5120, {12288, 1024, 960}),
++                              blockProjection(14336, 5120, 1, GGUF_FMT_AF4G64),
++                              blockProjection(14336, 5120, 4, GGUF_FMT_AF4G64),
++                              blockProjection(14272, 5120, 1, GGUF_FMT_AF4G64),
++                              blockProjection(14336, 6144, 1, GGUF_FMT_AF4G64).leadingInputs(5120)})
++    unchanged(p, "attention split correction escaped the measured matrix or segment layout");
++  for (const bool nativeRows : {false, true}) {
++    BlockWeights blocks = qkv.blocks();
++    blocks.segments[1] = nativeRows ? QuantizedSegment::rows(GGUF_FMT_BF16, 1024, 5120, {})
++                                   : QuantizedSegment::planes(GGUF_FMT_AF4G32, 1024, 5120, {}, {}, {});
++    blocks.segments[1].columnOffset = 12288;
++    unchanged(Projection(14336, 5120, std::move(blocks)),
++              "attention split correction admitted a different format or native-row segment");
++  }
++  Projection fp32 = qkv;
++  fp32.destination = FloatOutput::Float32;
++  unchanged(fp32, "attention split correction changed an fp32 projection");
++  require(candidate.prefillPlan(qkv, 16, LinearEpilogue::None).configuration() ==
++              control.prefillPlan(qkv, 16, LinearEpilogue::None).configuration(),
++          "attention split correction changed prefill");
++  for (const auto epilogue : {LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
++    const Projection *gate = epilogue == LinearEpilogue::GateUp ? &qkv : nullptr;
++    require(candidate.decodePlan(qkv, 1, epilogue, gate).configuration() ==
++                control.decodePlan(qkv, 1, epilogue, gate).configuration(),
++            "attention split correction escaped the plain projection epilogue");
++  }
++}
++
+ // Table16 is a physical eight-row format, independent of request geometry.
+ void tablePackingGeometry() {
+   constexpr uint32_t width = 6144;
+@@ -987,6 +1074,42 @@ QuantizedSegment segmentPlanes(metal::MetalBackend &backend, uint32_t format, ui
+   return s;
+ }
+ 
++void attentionSplitEncoding(metal::MetalBackend &backend) {
++  DeviceCapabilities measured = simulatedDevice(10, 20), uncalibrated = measured;
++  measured.deviceName = "Apple M5 Pro";
++  uncalibrated.deviceName = "uncalibrated";
++  const Linear candidate(measured, DecodeGeometry(16)), control(uncalibrated, DecodeGeometry(16));
++  Projection rotated = attentionProjection();
++  rotated.rotation.signs = test::sharedBuffer(backend, 5120);
++  require(candidate.decodePlan(rotated, 1).configuration() == control.decodePlan(rotated, 1).configuration(),
++          "attention split correction admitted rotated weights");
++  const Projection qkv(14336, 5120,
++                       BlockWeights{{segmentPlanes(backend, GGUF_FMT_AF4G64, 12288, 5120, 0),
++                                     segmentPlanes(backend, GGUF_FMT_AF4G64, 1024, 5120, 12288),
++                                     segmentPlanes(backend, GGUF_FMT_AF4G64, 1024, 5120, 13312)}});
++  const LinearPlan plan = candidate.decodePlan(qkv, 1);
++  const LinearScratchSize bound = candidate.decodeScratchSize(qkv.shape());
++  const LinearBuffers buffers{
++      .input = allocate(backend, uint64_t{plan.storageRows()} * 5120 * 2),
++      .output = allocate(backend, uint64_t{plan.storageRows()} * 14336 * 2),
++      .scratch = {allocate(backend, bound.input), allocate(backend, bound.sums),
++                  allocate(backend, bound.partials), allocate(backend, bound.counters)}};
++  metal::CommandGraph graph;
++  (void)candidate.add(graph, buffers, qkv, plan);
++  require(graph.dispatches().size() == 1, "the attention split correction broke fused Q/K/V encoding");
++  const auto &dispatch = graph.dispatches().front();
++  const GgufDecodeFusedParams expected{5120, 2, 14336, {12288, 1024, 1024},
++                                     {GGUF_FMT_AF4G64, GGUF_FMT_AF4G64, GGUF_FMT_AF4G64},
++                                     {0, 12288, 13312}, plan.configuration().spread};
++  require(dispatch.pipelineName == "gguf_decode_fused_m16" && dispatch.bytes.size() == 1 &&
++              dispatch.bytes.front().sizeBytes == sizeof(expected) &&
++              std::memcmp(dispatch.bytes.front().data, &expected, sizeof(expected)) == 0 &&
++              dispatch.threadgroups.x == 224 && dispatch.threadgroups.y == 2 && dispatch.threadgroups.z == 1 &&
++              dispatch.threadsPerThreadgroup.x == GGUF_STAGED_THREADS &&
++              dispatch.threadsPerThreadgroup.y == 1 && dispatch.threadsPerThreadgroup.z == 1,
++          "the attention correction changed its segment layout, M16 tile, walk or split grid");
++}
++
+ // A block projection dispatches only as the plan's matrix, and each segment
+ // fills whole 64-column tiles, with every buffer the plan needs: the matching
+ // projection encodes its dispatch, so only the projection can reject.
+@@ -1442,6 +1565,7 @@ int main(int argc, char **argv) {
+     require(argc == 2, "usage: linear-plan <production.metallib|--cpu>");
+     decodeGeometryPlans();
+     wideGateUpPolicy();
++    attentionSplitPolicy();
+     tablePackingGeometry();
+     ggufPlans();
+     scratchBoundsRotated();
+@@ -1453,6 +1577,7 @@ int main(int argc, char **argv) {
+       return 0;
+     }
+     metal::MetalBackend backend(argv[1]);
++    attentionSplitEncoding(backend);
+     ggufProjectionMatrix(backend);
+     producerTableContract(backend);
+     rotatedRegisterInput(backend);
+diff --git a/runtime/ops/Linear.cpp b/runtime/ops/Linear.cpp
+index 820b5fec..52dd8182 100644
+--- a/runtime/ops/Linear.cpp
++++ b/runtime/ops/Linear.cpp
+@@ -59,6 +59,22 @@ void requirePlaneViews(const Projection &p) {
+   throw std::invalid_argument("views of a projection's planes take one unrotated quantized tensor, not a view");
+ }
+ 
++// The measured 27B full-attention input is packed Q, K and V, in that order.
++// Other partitions of the same output width do not inherit its reduction.
++bool measuredAttentionLayout(const Projection &p) noexcept {
++  const auto &segments = p.blocks().segments;
++  if (p.outputSize != 14336 || p.inputSize != 5120 || p.rotation || p.planeInputs() || segments.size() != 3)
++    return false;
++  constexpr std::array<uint32_t, 3> widths{12288, 1024, 1024}, offsets{0, 12288, 13312};
++  for (uint32_t i = 0; i < segments.size(); ++i) {
++    const auto &s = segments[i];
++    if (s.isFloat() || s.formatId != GGUF_FMT_AF4G64 || s.inputSize != 5120 ||
++        s.outputSize != widths[i] || s.columnOffset != offsets[i])
++      return false;
++  }
++  return true;
++}
++
+ } // namespace
+ 
+ bool Projection::takesPlaneViews() const noexcept {
+@@ -141,7 +157,7 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
+ 
+ Linear::Linear(const DeviceCapabilities &device, DecodeGeometry geometry) noexcept
+     : geometry_(geometry), calibration_(KernelCalibration::of(device)),
+-      wideGateUpTwoPass_(device.appleGpuFamily == 10 && device.gpuCoreCount == 20 &&
++      measuredM5Pro20_(device.appleGpuFamily == 10 && device.gpuCoreCount == 20 &&
+                         device.deviceName == "Apple M5 Pro") {}
+ 
+ uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
+@@ -184,10 +200,19 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection
+     const auto &segments = projection.blocks().segments;
+     return segments.size() == 1 && segments.front().formatId == GGUF_FMT_AF4G64;
+   };
+-  if (wideGateUpTwoPass_ && w.phase == LinearPhase::Decode && geometry_.rows() == 16 &&
++  if (measuredM5Pro20_ && w.phase == LinearPhase::Decode && geometry_.rows() == 16 &&
+       w.rows > 32 && w.matrix.outputSize == 17408 && w.matrix.inputSize == 5120 &&
+       config.tile == LinearTile::GgufStaged && config.oneGateUpPass && pair && af4(p) && af4(*gate))
+     config.oneGateUpPass = false;
++  // Preserve the eight-row path's two-partition attention reduction at one
++  // sixteen-row lane. Its changed reduction at one partition can change
++  // target logits and speculative acceptance. Keep this measured correction
++  // local to the actual Q/K/V layout; other shapes and widths keep the law.
++  if (measuredM5Pro20_ && w.phase == LinearPhase::Decode && geometry_.rows() == 16 && w.rows == 16 &&
++      w.epilogue == LinearEpilogue::None && !gate && w.matrix.outputSize == 14336 &&
++      w.matrix.inputSize == 5120 && config.tile == LinearTile::GgufStaged && config.splits == 1 &&
++      p.destination == FloatOutput::BFloat16 && measuredAttentionLayout(p))
++    config.splits = 2;
+   LinearPlan plan(w, config, p.destination);
+   plan.rotated_ = static_cast<bool>(p.rotation);
+   return plan;
+diff --git a/runtime/ops/Linear.hpp b/runtime/ops/Linear.hpp
+index 8b4b024b..4cfc4c33 100644
+--- a/runtime/ops/Linear.hpp
++++ b/runtime/ops/Linear.hpp
+@@ -315,7 +315,7 @@ private:
+                             const Projection &projection, const LinearPlan &plan) const;
+   DecodeGeometry geometry_;
+   KernelCalibration calibration_;
+-  bool wideGateUpTwoPass_ = false;
++  bool measuredM5Pro20_ = false;
+ };
+ 
+ } // namespace splash::ops

@@ -1,0 +1,226 @@
+{
+  "classification_supported": true,
+  "classification": "pre-existing API/shader-validation resource-accounting interaction",
+  "observations": [
+    "API-only: both libraries report 17,408 static threadgroup bytes and pass the fp64/buffer oracle.",
+    "Shader-only: both report 34,816 bytes and pass the oracle with the API layer disabled.",
+    "Both layers: both report 34,816 bytes against a 32,768-byte device limit and abort with the same API assertion; these failures remain in the evidence."
+  ],
+  "inference": "Shader validation doubles reported static threadgroup memory for this unchanged prefill kernel; the API layer then rejects that instrumented footprint. The final candidate reproduces the baseline behavior, so this failure is not evidence of an M48/QKV regression.",
+  "jobs": {
+    "baseline_api": {
+      "job": "prefill-iq4xs-baseline-api-v1",
+      "variant": "baseline",
+      "mode": "api",
+      "valid": true,
+      "exit_code": 0,
+      "expected_abort": false,
+      "oracle_passed": true,
+      "resources": {
+        "device": "Apple M5 Pro",
+        "device_max_threadgroup_bytes": 32768,
+        "kernel": "gguf_prefill_iq4xs_a",
+        "kind": "pipeline_resources",
+        "MTL_DEBUG_LAYER": "1",
+        "MTL_SHADER_VALIDATION": "0",
+        "pipeline_static_threadgroup_bytes": 17408,
+        "source_codebook_bytes": 1024,
+        "source_stage_bytes": 16384
+      },
+      "assertion": null,
+      "artifact_identity_before_after_matches": true,
+      "artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/prefill-iq4xs-probe": "e7439dd07d3e3eb8e1b4c4839c8385160512455dde5c11aec89a1890e239d9a5",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/probe.metallib": "d44e2ab46e3addbc1066d235dae215889f311f06127923970d8ee5cc58f9037d",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/build.json": "ef614284026088dfc63db1209b35d8597c613589bf05e209ba046a750e1778bb",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm": "de99368635c0275d214ca86604560d85549cd19dc7ed1bb0b34353d34e603f82"
+      },
+      "elapsed_seconds": 0.848651542008156
+    },
+    "baseline_shader": {
+      "job": "prefill-iq4xs-baseline-shader-v1",
+      "variant": "baseline",
+      "mode": "shader",
+      "valid": true,
+      "exit_code": 0,
+      "expected_abort": false,
+      "oracle_passed": true,
+      "resources": {
+        "device": "Apple M5 Pro",
+        "device_max_threadgroup_bytes": 32768,
+        "kernel": "gguf_prefill_iq4xs_a",
+        "kind": "pipeline_resources",
+        "MTL_DEBUG_LAYER": "0",
+        "MTL_SHADER_VALIDATION": "1",
+        "pipeline_static_threadgroup_bytes": 34816,
+        "source_codebook_bytes": 1024,
+        "source_stage_bytes": 16384
+      },
+      "assertion": null,
+      "artifact_identity_before_after_matches": true,
+      "artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/prefill-iq4xs-probe": "e7439dd07d3e3eb8e1b4c4839c8385160512455dde5c11aec89a1890e239d9a5",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/probe.metallib": "d44e2ab46e3addbc1066d235dae215889f311f06127923970d8ee5cc58f9037d",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/build.json": "ef614284026088dfc63db1209b35d8597c613589bf05e209ba046a750e1778bb",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm": "de99368635c0275d214ca86604560d85549cd19dc7ed1bb0b34353d34e603f82"
+      },
+      "elapsed_seconds": 0.09001695900224149
+    },
+    "baseline_both": {
+      "job": "prefill-iq4xs-baseline-both-v1",
+      "variant": "baseline",
+      "mode": "both",
+      "valid": true,
+      "exit_code": -6,
+      "expected_abort": true,
+      "oracle_passed": false,
+      "resources": {
+        "device": "Apple M5 Pro",
+        "device_max_threadgroup_bytes": 32768,
+        "kernel": "gguf_prefill_iq4xs_a",
+        "kind": "pipeline_resources",
+        "MTL_DEBUG_LAYER": "1",
+        "MTL_SHADER_VALIDATION": "1",
+        "pipeline_static_threadgroup_bytes": 34816,
+        "source_codebook_bytes": 1024,
+        "source_stage_bytes": 16384
+      },
+      "assertion": {
+        "used": 34816,
+        "limit": 32768
+      },
+      "artifact_identity_before_after_matches": true,
+      "artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/prefill-iq4xs-probe": "e7439dd07d3e3eb8e1b4c4839c8385160512455dde5c11aec89a1890e239d9a5",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/probe.metallib": "d44e2ab46e3addbc1066d235dae215889f311f06127923970d8ee5cc58f9037d",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/build.json": "ef614284026088dfc63db1209b35d8597c613589bf05e209ba046a750e1778bb",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm": "de99368635c0275d214ca86604560d85549cd19dc7ed1bb0b34353d34e603f82"
+      },
+      "elapsed_seconds": 0.5101577079913113
+    },
+    "combined_api": {
+      "job": "prefill-iq4xs-combined-api-v1",
+      "variant": "combined",
+      "mode": "api",
+      "valid": true,
+      "exit_code": 0,
+      "expected_abort": false,
+      "oracle_passed": true,
+      "resources": {
+        "device": "Apple M5 Pro",
+        "device_max_threadgroup_bytes": 32768,
+        "kernel": "gguf_prefill_iq4xs_a",
+        "kind": "pipeline_resources",
+        "MTL_DEBUG_LAYER": "1",
+        "MTL_SHADER_VALIDATION": "0",
+        "pipeline_static_threadgroup_bytes": 17408,
+        "source_codebook_bytes": 1024,
+        "source_stage_bytes": 16384
+      },
+      "assertion": null,
+      "artifact_identity_before_after_matches": true,
+      "artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/prefill-iq4xs-probe": "4dbb961cc45f28e9c74e990388c0e788407fd0219fb805fbff8dbbffa094cc7b",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/probe.metallib": "219e64a24607764fd507aa11ee1479623242ecb9d7d2e77a29cec10078efa2a7",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/build.json": "409b3dd5323307c3c8c0d3531fb4bbe9ed4468cef04156393e3d7ab0dc341388",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm": "de99368635c0275d214ca86604560d85549cd19dc7ed1bb0b34353d34e603f82"
+      },
+      "elapsed_seconds": 0.5460070419940166
+    },
+    "combined_shader": {
+      "job": "prefill-iq4xs-combined-shader-v1",
+      "variant": "combined",
+      "mode": "shader",
+      "valid": true,
+      "exit_code": 0,
+      "expected_abort": false,
+      "oracle_passed": true,
+      "resources": {
+        "device": "Apple M5 Pro",
+        "device_max_threadgroup_bytes": 32768,
+        "kernel": "gguf_prefill_iq4xs_a",
+        "kind": "pipeline_resources",
+        "MTL_DEBUG_LAYER": "0",
+        "MTL_SHADER_VALIDATION": "1",
+        "pipeline_static_threadgroup_bytes": 34816,
+        "source_codebook_bytes": 1024,
+        "source_stage_bytes": 16384
+      },
+      "assertion": null,
+      "artifact_identity_before_after_matches": true,
+      "artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/prefill-iq4xs-probe": "4dbb961cc45f28e9c74e990388c0e788407fd0219fb805fbff8dbbffa094cc7b",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/probe.metallib": "219e64a24607764fd507aa11ee1479623242ecb9d7d2e77a29cec10078efa2a7",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/build.json": "409b3dd5323307c3c8c0d3531fb4bbe9ed4468cef04156393e3d7ab0dc341388",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm": "de99368635c0275d214ca86604560d85549cd19dc7ed1bb0b34353d34e603f82"
+      },
+      "elapsed_seconds": 0.08452841697726399
+    },
+    "combined_both": {
+      "job": "prefill-iq4xs-combined-both-v1",
+      "variant": "combined",
+      "mode": "both",
+      "valid": true,
+      "exit_code": -6,
+      "expected_abort": true,
+      "oracle_passed": false,
+      "resources": {
+        "device": "Apple M5 Pro",
+        "device_max_threadgroup_bytes": 32768,
+        "kernel": "gguf_prefill_iq4xs_a",
+        "kind": "pipeline_resources",
+        "MTL_DEBUG_LAYER": "1",
+        "MTL_SHADER_VALIDATION": "1",
+        "pipeline_static_threadgroup_bytes": 34816,
+        "source_codebook_bytes": 1024,
+        "source_stage_bytes": 16384
+      },
+      "assertion": {
+        "used": 34816,
+        "limit": 32768
+      },
+      "artifact_identity_before_after_matches": true,
+      "artifact_sha256": {
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/prefill-iq4xs-probe": "4dbb961cc45f28e9c74e990388c0e788407fd0219fb805fbff8dbbffa094cc7b",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/probe.metallib": "219e64a24607764fd507aa11ee1479623242ecb9d7d2e77a29cec10078efa2a7",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/build.json": "409b3dd5323307c3c8c0d3531fb4bbe9ed4468cef04156393e3d7ab0dc341388",
+        "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm": "de99368635c0275d214ca86604560d85549cd19dc7ed1bb0b34353d34e603f82"
+      },
+      "elapsed_seconds": 0.09027050001895986
+    }
+  },
+  "paired_modes": {
+    "api": {
+      "same_behavior": true
+    },
+    "shader": {
+      "same_behavior": true
+    },
+    "both": {
+      "same_behavior": true
+    }
+  },
+  "problems": [],
+  "inputs_sha256": {
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/prefill-iq4xs-validation-v1.protocol.json": "64573b01e6b7afeac356c6d3b7ac4558b8a889eaf1895bc9b05fd636aeb2c848",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/prefill-iq4xs-baseline-api-v1.receipt.json": "fd4ba4e7d9157d26a3507616cc82064c88db8072b690626cc076a56a38b6c95d",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/prefill-iq4xs-baseline-api-v1.stdout": "8d54322817354f46f5a719c06627b4a92fbb4e022cf13c3a876f8b61bb77517c",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/logs/prefill-iq4xs-baseline-api-v1.stderr": "89b5ec841d81f204976be142d4fd225dcffbdb28e5cdd2b7c513f6da04c32a1a",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/prefill-iq4xs-baseline-shader-v1.receipt.json": "5eec32c98a94f382b26d5b2b1b77e2a2185a98c2d4e4399a833c7e1458054951",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/prefill-iq4xs-baseline-shader-v1.stdout": "8d54322817354f46f5a719c06627b4a92fbb4e022cf13c3a876f8b61bb77517c",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/logs/prefill-iq4xs-baseline-shader-v1.stderr": "04e5ba2de17af4675f110a25320f177d8f6aad76cf3d3fdf8fb7420b38255f91",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/prefill-iq4xs-baseline-both-v1.receipt.json": "ecb27395a852c648ced388e0b9161264076890828108056f10cb6ff00ed96c69",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/prefill-iq4xs-baseline-both-v1.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/logs/prefill-iq4xs-baseline-both-v1.stderr": "d419d1ac71e16b638c3886988cc75b565679befdbdd1d6132a8f1d70c1cf06c1",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/prefill-iq4xs-combined-api-v1.receipt.json": "c0a65447b25275bedf683d6161620cb9e2d30eee6072ac6431ea8212f0809be8",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/prefill-iq4xs-combined-api-v1.stdout": "8d54322817354f46f5a719c06627b4a92fbb4e022cf13c3a876f8b61bb77517c",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/logs/prefill-iq4xs-combined-api-v1.stderr": "9c5b923fcd940c9678a115e3fc5842eb2b23f08b676d2e4f2ca1fc436d2ad4af",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/prefill-iq4xs-combined-shader-v1.receipt.json": "cfce796facbe79009510e2a163bd99dfad2af3db1086d25a29bf13240a96d386",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/prefill-iq4xs-combined-shader-v1.stdout": "8d54322817354f46f5a719c06627b4a92fbb4e022cf13c3a876f8b61bb77517c",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/logs/prefill-iq4xs-combined-shader-v1.stderr": "47e576ae05cd6f4c7bcc6fd7af28a13443216ea29527c4bce15513ddd171c233",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/prefill-iq4xs-combined-both-v1.receipt.json": "2cf02bc8f7b9a77d4e723843412d7d783e8494256dafa64448d136177ef930b3",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/prefill-iq4xs-combined-both-v1.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/logs/prefill-iq4xs-combined-both-v1.stderr": "4ab83c422726477030c235296b1d102b187f6df867ab8031f839832e1eca81ab"
+  },
+  "scope": "Exactly the six registered diagnostic jobs; no timings or throughput conclusions. Artifact provenance is checked against immutable registered before/after execution receipts; this saved-evidence analysis does not reopen the binaries. This is not a Metal-driver root-cause proof or a claim about every kernel/device."
+}

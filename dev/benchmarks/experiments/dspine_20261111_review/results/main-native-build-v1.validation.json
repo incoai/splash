@@ -1,0 +1,46 @@
+{
+  "id": "main-native-build-v1",
+  "start_utc": "2026-11-11T10:31:33.202759+00:00",
+  "source_patch_sha256": "f27dc90a8d0104b7350f03c58a3ad72ff35c3aa7f5c09f29657cf14680e7e60d",
+  "source_before": {
+    "dev/native.mk": "8656d6abc425f0e0dce088bce77d57a39266ce569e2f14671973f6a62a17c805",
+    "dev/tests/engine/gguf_projection_test.mm": "16e8a286ee55cf71d9895e8619b3cccf1daca63ef6885071b2c4c73a807082e9",
+    "dev/tests/engine/linear_plan_test.mm": "9bffdc130f06ea14c849616404531dd03a6f8dee52c16e3a33c549013bc20ff0",
+    "runtime/metal/kernels/shared/gguf_linear.metal": "e27bd1397316b89b847b6fab67730c04fa34f414ef645782df2577aa7877a60e",
+    "runtime/ops/Linear.cpp": "f1883984baae90cc72d72ff27ccf509f889670fe47fb11656d03553bbcf43ff7",
+    "runtime/ops/Linear.hpp": "0cc59a565c650c53040f6204428220cc527ccbf2a3262dfaf58e7b65e4ca0155",
+    "runtime/ops/LinearGguf.cpp": "1d158980d2b14b5220dd41079d7120d5fd0ed9a7ee7647f5b1046927fab927d0"
+  },
+  "command": [
+    "make",
+    "-j2",
+    "all",
+    "BUILD_ID_PYTHON=/Users/linson/Documents/ai/splash-dspine-13h-20261110/validation-venv/bin/python"
+  ],
+  "cwd": "/Users/linson/Documents/ai/splash",
+  "scope": "CPU/offline shader compilation of the main checkout during numerical sampling. No GPU timing claim; tested runtime bundle remains immutable.",
+  "exit_code": 0,
+  "end_utc": "2026-11-11T10:32:18.297299+00:00",
+  "elapsed_seconds": 45.093779375000004,
+  "source_after": {
+    "dev/native.mk": "8656d6abc425f0e0dce088bce77d57a39266ce569e2f14671973f6a62a17c805",
+    "dev/tests/engine/gguf_projection_test.mm": "16e8a286ee55cf71d9895e8619b3cccf1daca63ef6885071b2c4c73a807082e9",
+    "dev/tests/engine/linear_plan_test.mm": "9bffdc130f06ea14c849616404531dd03a6f8dee52c16e3a33c549013bc20ff0",
+    "runtime/metal/kernels/shared/gguf_linear.metal": "e27bd1397316b89b847b6fab67730c04fa34f414ef645782df2577aa7877a60e",
+    "runtime/ops/Linear.cpp": "f1883984baae90cc72d72ff27ccf509f889670fe47fb11656d03553bbcf43ff7",
+    "runtime/ops/Linear.hpp": "0cc59a565c650c53040f6204428220cc527ccbf2a3262dfaf58e7b65e4ca0155",
+    "runtime/ops/LinearGguf.cpp": "1d158980d2b14b5220dd41079d7120d5fd0ed9a7ee7647f5b1046927fab927d0"
+  },
+  "source_unchanged": true,
+  "artifact_sha256": {
+    "splash": "a7f86544957aa7ea3dec41dd4b2038d61dbc9f2310f1aae1fb2da1212b40800b",
+    "splash.metallib": "5c5b1925db0f18b3d94e604f0f25237fb28ab14c4a7eaa1d53c26f118afe7f74",
+    "host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb"
+  },
+  "build_identity_header_sha256": "a144e898bcc1d547db5c1e241c30d8d4950e17032c775dcf77e5272ce0f979d7",
+  "build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283",
+  "expected_build_id": "src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283",
+  "build_id_matches": true,
+  "native_byte_equal_to_selected": true,
+  "state": "complete"
+}

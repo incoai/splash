@@ -1,0 +1,23 @@
+{
+  "copied_utc": "2026-11-11T06:52:09.845129+00:00",
+  "files": [
+    {
+      "name": "historical31-v1.txt",
+      "original_path": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt",
+      "copy": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/cohorts/historical31-v1.txt",
+      "sha256": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf"
+    },
+    {
+      "name": "agent12-v1.txt",
+      "original_path": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/agent12-v1.txt",
+      "copy": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/cohorts/agent12-v1.txt",
+      "sha256": "c031bed7becd33daca47dacf2ee2cad79bc60681c319706a8d90879b986c29c4"
+    },
+    {
+      "name": "kernel-smoke3-cap256-v1.txt",
+      "original_path": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/kernel-smoke3-cap256-v1.txt",
+      "copy": "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/cohorts/kernel-smoke3-cap256-v1.txt",
+      "sha256": "4197b200cd24e583b19b973c032e33beda6026dc406ffe6331559329406a3246"
+    }
+  ]
+}

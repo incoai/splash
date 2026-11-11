@@ -75,9 +75,9 @@ An exploratory comparison of the initial serial refinement implementation
 on November 9, 2026 used an Apple M5 Pro
 (18-core CPU, 20-core GPU, 48 GB), macOS 26.6, and the same
 `mlx-community/Qwen3.8-27B-4bit` target for both drafters. The native DSpine
-backend currently serves **eight rows of its trained sixteen-row block**;
+backend in that study served **eight rows of its trained sixteen-row block**;
 DFlash2 also serves eight rows. Each retains its own draft context window:
-8,192 tokens for DSpine and 2,048 for DFlash2. This measures the current
+8,192 tokens for DSpine and 2,048 for DFlash2. This measured that initial
 implementation, with both backbones prepared as affine 4-bit groups of 64
 and DSpine's bridge kept in BF16.
 
@@ -366,6 +366,69 @@ The follow-up report includes source identities, all validation gates, raw
 arrays, failed experiments, operator results and reproduction commands.
 [Report and evidence](../dev/benchmarks/experiments/dspine_20261111/README.md)
 [Mechanisms and next experiments](../dev/benchmarks/experiments/dspine_20261111/MECHANISMS.md)
+
+### Final DSpine review
+
+These measurements qualify the frozen `fa62be81` source, build
+`src-1c82f6775b84007778a42bac408d53e5b095ac731ed27f479e126f7203fe0283`,
+before upstream engine 1.6.1 (`767c646e`). The later integration changes
+activation and kernel selection and needs separate validation and measurements.
+
+The later November 11 review keeps DFlash2 as the default drafter and eight
+rows as the default DSpine width. On the measured 20-core M5 Pro, the
+sixteen-row target Q/K/V projection retains the eight-row path's two K
+partitions at one lane. This restores all 31 recorded historical outputs;
+18 captured full-vocabulary rows on one previously divergent prompt also
+match bitwise. These are finite numerical checks, not a general equality proof.
+
+At three sixteen-row lanes, the new AF4 gate/up kernel computes 48 live rows
+within the existing 64-row storage and split strides. It avoids computing 16
+padding rows. Its automatic selection is limited to the measured device and
+projection layout. Four lanes have 64 live rows and retain the existing path.
+
+All comparisons below use three ABBA groups, the same quantized target,
+ANE disabled and a 32K served context. Output, operating, per-case noise and
+effect gates are retained; request-wall and TTFT endpoints have separate gates.
+
+| Comparison | Decode result | Scope |
+| --- | --- | --- |
+| Previous → reviewed DSpine, eight rows | Non-regression passes; -0.084% to +0.014% throughput change | Three short software prompts, 256-token caps |
+| Corrected QKV baseline → M48, sixteen rows | Qualified +11.49–12.17%; 107.3–107.5 → 119.7–120.5 aggregate tok/s | Three cloned lanes, three prompts, 256-token caps |
+| DFlash2 eight rows → reviewed DSpine sixteen rows | Qualified +22.96–24.75%; 68.1–68.9 → 84.6–84.9 tok/s | All 31 reused historical prompts, original caps |
+| DFlash2 eight rows → reviewed DSpine sixteen rows | Unqualified +0.088–0.240% observed; below the effect threshold | Twelve original software/tool histories, short/~4K/~16K contexts, 256-token caps |
+
+The new historical aggregate includes `count_secondary`; the preceding study
+used 30 primary cases and a secondary control. All 372 arrays in the new
+historical comparison match. Twenty-five cases improve and six regress,
+including French by 15.41–17.22%. Historical request-wall time improves by
+17.89–19.09%; TTFT remains unqualified.
+
+All 144 arrays in the fresh agent comparison match. Its four-case short
+aggregate favors DFlash2 by 2.08–2.28%, while the four-case ~4K aggregate
+favors DSpine by 5.02–5.59%. These fixed aggregates do not support a
+context-length routing rule: the cancellation case slows by 6.36–6.63%,
+while the router case gains 21.32–23.18%. The long-context aggregate has
+no qualified effect. Every case remains in the primary result.
+
+The cycle traces explain the different aggregate outcomes. In the historical
+cohort, DSpine emits 30.26% more tokens per recorded cycle for 5.42% more
+decode GPU time per cycle. In the fresh agent cohort, the corresponding
+increases are 6.96% and 6.79%. These descriptive totals combine target and
+drafter work; they do not attribute time to an individual kernel.
+
+The normal HTTP fixture uses four staggered requests and separate cold and
+warm phases. Neither aggregate qualifies: some cross-drafter responses differ,
+and 24 of 48 cold-to-warm pairs change text. Token counts and finish reasons
+match. Both configurations reproduce their own phase outputs across all six
+rounds. Cold scheduling reaches batch widths one and two; warm scheduling
+reaches one through four. The failures are retained, and their cause is not
+isolated by this comparison. No aggregate serving-speed claim follows.
+
+The [final review and reproduction files](../dev/benchmarks/experiments/dspine_20261111_review/README.md)
+separate calibration, reused confirmation, fresh workloads, numerical checks
+and sampling screens. The earlier reports above retain their original cutoff
+verdicts. Choose a drafter using representative prompts and concurrency;
+DSpine remains an explicit experimental option.
 
 ## Smaller GGUFs on 24 GB Macs
 

@@ -1,0 +1,636 @@
+{
+  "case": "japanese_lru_notes",
+  "control_rows": 8,
+  "candidate_rows": 16,
+  "control_build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba",
+  "candidate_build_id": "src-835c6ed26f08e879607172bcdfa8a2f945d6d3990c90d15182bf47b17825d1a1",
+  "same_build_id": false,
+  "sources": {
+    "control": {
+      "result.json": "465632f02abcc51ac88c59f5b6d707ba0f8ba87e17e611bd90762381e1e1397c",
+      "rows.jsonl": "b7ae4966637cd64bc9fb326cd8fa20a39bf1d1b305963e5b5514c76f7be36025",
+      "logits.f32": "aecb3ba2a2266c0bd60ec54db6ed420aea45bfb5e53ecbd88482334a10049bca"
+    },
+    "candidate": {
+      "result.json": "cadfe4abf66c902bd481255de6945d78ef0439da3c5dc1ef06db84a1c8805364",
+      "rows.jsonl": "b7ae4966637cd64bc9fb326cd8fa20a39bf1d1b305963e5b5514c76f7be36025",
+      "logits.f32": "aecb3ba2a2266c0bd60ec54db6ed420aea45bfb5e53ecbd88482334a10049bca"
+    }
+  },
+  "prompt_tokens": [
+    248045,
+    846,
+    198,
+    19504,
+    52,
+    239228,
+    15303,
+    195946,
+    18602,
+    5205,
+    100457,
+    97420,
+    24950,
+    122768,
+    96090,
+    152255,
+    177474,
+    150619,
+    19054,
+    220821,
+    99222,
+    28452,
+    5205,
+    247359,
+    15685,
+    217384,
+    246874,
+    96233,
+    176910,
+    95986,
+    56657,
+    159524,
+    247206,
+    172808,
+    1710,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+  ],
+  "historical_expected_first_difference": 42,
+  "actual_first_difference": null,
+  "complete_output_arrays_equal": true,
+  "output_lengths": [
+    127,
+    127
+  ],
+  "first_difference_capture_available": false,
+  "rows_with_identical_conditional_prefix": {
+    "0": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          9,
+          21.886980056762695
+        ],
+        [
+          12,
+          21.094572067260742
+        ]
+      ],
+      "b_top2": [
+        [
+          9,
+          21.886980056762695
+        ],
+        [
+          12,
+          21.094572067260742
+        ]
+      ],
+      "a_top2_margin": 0.7924079895019531,
+      "b_top2_margin": 0.7924079895019531
+    },
+    "32": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          96397,
+          23.387977600097656
+        ],
+        [
+          217014,
+          19.582319259643555
+        ]
+      ],
+      "b_top2": [
+        [
+          96397,
+          23.387977600097656
+        ],
+        [
+          217014,
+          19.582319259643555
+        ]
+      ],
+      "a_top2_margin": 3.8056583404541016,
+      "b_top2_margin": 3.8056583404541016
+    },
+    "33": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          28452,
+          21.91416358947754
+        ],
+        [
+          219057,
+          20.578125
+        ]
+      ],
+      "b_top2": [
+        [
+          28452,
+          21.91416358947754
+        ],
+        [
+          219057,
+          20.578125
+        ]
+      ],
+      "a_top2_margin": 1.336038589477539,
+      "b_top2_margin": 1.336038589477539
+    },
+    "34": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          105880,
+          20.892982482910156
+        ],
+        [
+          200227,
+          18.991975784301758
+        ]
+      ],
+      "b_top2": [
+        [
+          105880,
+          20.892982482910156
+        ],
+        [
+          200227,
+          18.991975784301758
+        ]
+      ],
+      "a_top2_margin": 1.9010066986083984,
+      "b_top2_margin": 1.9010066986083984
+    },
+    "35": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          160198,
+          24.303550720214844
+        ],
+        [
+          173435,
+          23.767841339111328
+        ]
+      ],
+      "b_top2": [
+        [
+          160198,
+          24.303550720214844
+        ],
+        [
+          173435,
+          23.767841339111328
+        ]
+      ],
+      "a_top2_margin": 0.5357093811035156,
+      "b_top2_margin": 0.5357093811035156
+    },
+    "36": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          31370,
+          22.696531295776367
+        ],
+        [
+          160198,
+          17.795303344726562
+        ]
+      ],
+      "b_top2": [
+        [
+          31370,
+          22.696531295776367
+        ],
+        [
+          160198,
+          17.795303344726562
+        ]
+      ],
+      "a_top2_margin": 4.901227951049805,
+      "b_top2_margin": 4.901227951049805
+    },
+    "37": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          1710,
+          27.317411422729492
+        ],
+        [
+          198,
+          22.305469512939453
+        ]
+      ],
+      "b_top2": [
+        [
+          1710,
+          27.317411422729492
+        ],
+        [
+          198,
+          22.305469512939453
+        ]
+      ],
+      "a_top2_margin": 5.011941909790039,
+      "b_top2_margin": 5.011941909790039
+    },
+    "38": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          198,
+          24.40715789794922
+        ],
+        [
+          271,
+          16.927444458007812
+        ]
+      ],
+      "b_top2": [
+        [
+          198,
+          24.40715789794922
+        ],
+        [
+          271,
+          16.927444458007812
+        ]
+      ],
+      "a_top2_margin": 7.479713439941406,
+      "b_top2_margin": 7.479713439941406
+    },
+    "39": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          9,
+          24.872114181518555
+        ],
+        [
+          262,
+          17.83427619934082
+        ]
+      ],
+      "b_top2": [
+        [
+          9,
+          24.872114181518555
+        ],
+        [
+          262,
+          17.83427619934082
+        ]
+      ],
+      "a_top2_margin": 7.037837982177734,
+      "b_top2_margin": 7.037837982177734
+    },
+    "40": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          256,
+          25.363506317138672
+        ],
+        [
+          220,
+          17.616533279418945
+        ]
+      ],
+      "b_top2": [
+        [
+          256,
+          25.363506317138672
+        ],
+        [
+          220,
+          17.616533279418945
+        ]
+      ],
+      "a_top2_margin": 7.746973037719727,
+      "b_top2_margin": 7.746973037719727
+    },
+    "41": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          220,
+          18.11478042602539
+        ],
+        [
+          76249,
+          17.26325035095215
+        ]
+      ],
+      "b_top2": [
+        [
+          220,
+          18.11478042602539
+        ],
+        [
+          76249,
+          17.26325035095215
+        ]
+      ],
+      "a_top2_margin": 0.8515300750732422,
+      "b_top2_margin": 0.8515300750732422
+    },
+    "42": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          122768,
+          16.157377243041992
+        ],
+        [
+          100457,
+          15.999539375305176
+        ]
+      ],
+      "b_top2": [
+        [
+          122768,
+          16.157377243041992
+        ],
+        [
+          100457,
+          15.999539375305176
+        ]
+      ],
+      "a_top2_margin": 0.1578378677368164,
+      "b_top2_margin": 0.1578378677368164
+    },
+    "43": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          96090,
+          23.74161148071289
+        ],
+        [
+          180257,
+          20.958925247192383
+        ]
+      ],
+      "b_top2": [
+        [
+          96090,
+          23.74161148071289
+        ],
+        [
+          180257,
+          20.958925247192383
+        ]
+      ],
+      "a_top2_margin": 2.782686233520508,
+      "b_top2_margin": 2.782686233520508
+    },
+    "44": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          152255,
+          26.5540714263916
+        ],
+        [
+          29342,
+          19.636884689331055
+        ]
+      ],
+      "b_top2": [
+        [
+          152255,
+          26.5540714263916
+        ],
+        [
+          29342,
+          19.636884689331055
+        ]
+      ],
+      "a_top2_margin": 6.917186737060547,
+      "b_top2_margin": 6.917186737060547
+    },
+    "45": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          177474,
+          18.525840759277344
+        ],
+        [
+          179082,
+          17.390705108642578
+        ]
+      ],
+      "b_top2": [
+        [
+          177474,
+          18.525840759277344
+        ],
+        [
+          179082,
+          17.390705108642578
+        ]
+      ],
+      "a_top2_margin": 1.1351356506347656,
+      "b_top2_margin": 1.1351356506347656
+    },
+    "46": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          150619,
+          24.28572654724121
+        ],
+        [
+          155449,
+          19.864639282226562
+        ]
+      ],
+      "b_top2": [
+        [
+          150619,
+          24.28572654724121
+        ],
+        [
+          155449,
+          19.864639282226562
+        ]
+      ],
+      "a_top2_margin": 4.421087265014648,
+      "b_top2_margin": 4.421087265014648
+    },
+    "47": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          27279,
+          16.007417678833008
+        ],
+        [
+          173023,
+          15.684494972229004
+        ]
+      ],
+      "b_top2": [
+        [
+          27279,
+          16.007417678833008
+        ],
+        [
+          173023,
+          15.684494972229004
+        ]
+      ],
+      "a_top2_margin": 0.3229227066040039,
+      "b_top2_margin": 0.3229227066040039
+    },
+    "48": {
+      "bitwise_equal": true,
+      "raw_rms_delta": 0.0,
+      "mean_delta": 0.0,
+      "maximum_absolute_delta": 0.0,
+      "centered_relative_rms_delta": 0.0,
+      "temperature1_full_vocabulary_total_variation": 0.0,
+      "temperature1_full_vocabulary_kl_a_to_b": 0.0,
+      "a_top2": [
+        [
+          101624,
+          16.53448486328125
+        ],
+        [
+          247421,
+          16.48318099975586
+        ]
+      ],
+      "b_top2": [
+        [
+          101624,
+          16.53448486328125
+        ],
+        [
+          247421,
+          16.48318099975586
+        ]
+      ],
+      "a_top2_margin": 0.051303863525390625,
+      "b_top2_margin": 0.051303863525390625
+    }
+  },
+  "excluded_captured_indices": [],
+  "scope": "One selected historical prompt with its original output cap and cold serial decode. Each captured argmax is validated against returned tokens. Metrics compare only rows with identical prior output tokens. No tolerance or distribution-equivalence verdict is applied, and host-copy timing is unused."
+}

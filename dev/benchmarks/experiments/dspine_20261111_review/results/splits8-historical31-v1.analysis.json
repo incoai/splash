@@ -1,0 +1,827 @@
+{
+  "created_utc": "2026-11-11T06:07:46.053080+00:00",
+  "status": "complete",
+  "classification": "Functional numerical diagnostic; no qualified throughput comparison",
+  "counts": {
+    "cases": 31,
+    "original8_vs_original16_different": 9,
+    "splits8_at16_exact_matches_final8": 31,
+    "splits8_at16_exact_matches_final16": 22,
+    "original9_differences_now_equal_final8": 9,
+    "original9_differences_still_equal_final16": 0,
+    "original9_differences_equal_neither": 0,
+    "original22_matching_cases_changed": 0
+  },
+  "all_nine_original_width_differences_disappear_against_final8": true,
+  "all31_splits8_at16_arrays_match_final8": true,
+  "description": "9/9 original cross-width differences now exactly match final8. The fixed-sixteen-row diagnostic matches final8 in 31/31 cases and original final16 in 22/31 cases.",
+  "source_change": {
+    "base_commit": "37bdd4f8710319bfad43709de2725df89ef776d3",
+    "patch_sha256": "5909a4e4cd1f915f449ea49544aeabbd1358dcf6326d31fef12f5f1b8d85c9c1",
+    "scope": "Only staged projection split/pass selection uses half the active row count when runtime geometry is sixteen; actual storage and execution geometry remain sixteen.",
+    "runtime_verify_rows": 16,
+    "metal_libraries_identical_to_original_final": true
+  },
+  "settings": {
+    "identity": {
+      "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+      "device": "Apple M5 Pro"
+    },
+    "context_tokens": 32768,
+    "temperature": 0,
+    "ane_ffn_share": 0,
+    "cohort_sha256": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf",
+    "cold_cache_status": "miss",
+    "matched_tokens": 0,
+    "build_ids": {
+      "final8": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba",
+      "final16": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba",
+      "splits8_at16": "src-ccd528f97fdc24cdbfaba2dade8cc4deca1438d166f48988ed11eaa3aafb9a8c"
+    },
+    "samples": {
+      "final8": 1,
+      "final16": 2,
+      "splits8_at16": 1
+    },
+    "final16_internal_repetitions_exact": true
+  },
+  "cases": [
+    {
+      "case": "python_lru",
+      "prompt_tokens": 45,
+      "output_cap": 512,
+      "lengths": {
+        "final8": 512,
+        "final16": 512,
+        "splits8_at16": 512
+      },
+      "array_sha256": {
+        "final8": "0fa00aa2f48e707468509984061abc7c018cab631633cfd3a8273e3dcda3c9dc",
+        "final16": "a5c4513988a20be00375e2260d458a963bef4c12158f6836c4096809529d5fe9",
+        "splits8_at16": "0fa00aa2f48e707468509984061abc7c018cab631633cfd3a8273e3dcda3c9dc"
+      },
+      "original_width_arrays_equal": false,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": false,
+      "first_difference_original8_vs_original16": {
+        "index_zero_based": 364,
+        "kind": "token",
+        "final8_token": 1455,
+        "final16_token": 318
+      },
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": {
+        "index_zero_based": 364,
+        "kind": "token",
+        "splits8_at16_token": 1455,
+        "final16_token": 318
+      }
+    },
+    {
+      "case": "sql_latest",
+      "prompt_tokens": 56,
+      "output_cap": 384,
+      "lengths": {
+        "final8": 228,
+        "final16": 209,
+        "splits8_at16": 228
+      },
+      "array_sha256": {
+        "final8": "43510781b2c6b13c19ca15009ebde550baabfcf3d7b48f6860ddc8126ab028a2",
+        "final16": "9522c5eb3900dbfd10849d493a2044052211938705bacaabf84af8ce53a95f7f",
+        "splits8_at16": "43510781b2c6b13c19ca15009ebde550baabfcf3d7b48f6860ddc8126ab028a2"
+      },
+      "original_width_arrays_equal": false,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": false,
+      "first_difference_original8_vs_original16": {
+        "index_zero_based": 84,
+        "kind": "token",
+        "final8_token": 30558,
+        "final16_token": 4127
+      },
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": {
+        "index_zero_based": 84,
+        "kind": "token",
+        "splits8_at16_token": 30558,
+        "final16_token": 4127
+      }
+    },
+    {
+      "case": "typescript_heap",
+      "prompt_tokens": 45,
+      "output_cap": 768,
+      "lengths": {
+        "final8": 768,
+        "final16": 768,
+        "splits8_at16": 768
+      },
+      "array_sha256": {
+        "final8": "5f05f93eec442270315ac174d99a4a0b6b79d7f1f498e31ac7400681f6f5a234",
+        "final16": "5f05f93eec442270315ac174d99a4a0b6b79d7f1f498e31ac7400681f6f5a234",
+        "splits8_at16": "5f05f93eec442270315ac174d99a4a0b6b79d7f1f498e31ac7400681f6f5a234"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "chinese_explanation",
+      "prompt_tokens": 39,
+      "output_cap": 512,
+      "lengths": {
+        "final8": 512,
+        "final16": 512,
+        "splits8_at16": 512
+      },
+      "array_sha256": {
+        "final8": "1c9412fcf602950f4d93c0f950f3d733775dfc2edca912b5e35230a17d085819",
+        "final16": "c0a1a9845bcf4352bf62930962857cc68138d6077a86283dc7b9481930932850",
+        "splits8_at16": "1c9412fcf602950f4d93c0f950f3d733775dfc2edca912b5e35230a17d085819"
+      },
+      "original_width_arrays_equal": false,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": false,
+      "first_difference_original8_vs_original16": {
+        "index_zero_based": 404,
+        "kind": "token",
+        "final8_token": 220,
+        "final16_token": 332
+      },
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": {
+        "index_zero_based": 404,
+        "kind": "token",
+        "splits8_at16_token": 220,
+        "final16_token": 332
+      }
+    },
+    {
+      "case": "technical_memory",
+      "prompt_tokens": 41,
+      "output_cap": 512,
+      "lengths": {
+        "final8": 512,
+        "final16": 512,
+        "splits8_at16": 512
+      },
+      "array_sha256": {
+        "final8": "d0d82d4ef522ffe55051bb88f18f48cf8a6214a52bb2f273d414b2e312719d4f",
+        "final16": "d9d39bc6dfc3f4307bde46d6c97643e319506311a1605dd5a75b180a404576c1",
+        "splits8_at16": "d0d82d4ef522ffe55051bb88f18f48cf8a6214a52bb2f273d414b2e312719d4f"
+      },
+      "original_width_arrays_equal": false,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": false,
+      "first_difference_original8_vs_original16": {
+        "index_zero_based": 358,
+        "kind": "token",
+        "final8_token": 1785,
+        "final16_token": 1957
+      },
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": {
+        "index_zero_based": 358,
+        "kind": "token",
+        "splits8_at16_token": 1785,
+        "final16_token": 1957
+      }
+    },
+    {
+      "case": "json_calculation",
+      "prompt_tokens": 61,
+      "output_cap": 384,
+      "lengths": {
+        "final8": 108,
+        "final16": 108,
+        "splits8_at16": 108
+      },
+      "array_sha256": {
+        "final8": "9b5038b333df01a755b01f3d698611b4bf1546ab9bb664ba657347149982b5ff",
+        "final16": "ead361f877d2dd33cb25bd66ed4cb94fcec0f4d608d71c1d0008b0aa6d55955c",
+        "splits8_at16": "9b5038b333df01a755b01f3d698611b4bf1546ab9bb664ba657347149982b5ff"
+      },
+      "original_width_arrays_equal": false,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": false,
+      "first_difference_original8_vs_original16": {
+        "index_zero_based": 104,
+        "kind": "token",
+        "final8_token": 18,
+        "final16_token": 15
+      },
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": {
+        "index_zero_based": 104,
+        "kind": "token",
+        "splits8_at16_token": 18,
+        "final16_token": 15
+      }
+    },
+    {
+      "case": "count_secondary",
+      "prompt_tokens": 33,
+      "output_cap": 1024,
+      "lengths": {
+        "final8": 1024,
+        "final16": 1024,
+        "splits8_at16": 1024
+      },
+      "array_sha256": {
+        "final8": "0b7d98388cd77e7a4f858d04734250dab4880dfae1d662718f562c9c5d30f251",
+        "final16": "0b7d98388cd77e7a4f858d04734250dab4880dfae1d662718f562c9c5d30f251",
+        "splits8_at16": "0b7d98388cd77e7a4f858d04734250dab4880dfae1d662718f562c9c5d30f251"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "plain_json_squares",
+      "prompt_tokens": 54,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 256,
+        "final16": 256,
+        "splits8_at16": 256
+      },
+      "array_sha256": {
+        "final8": "60c7bf9b26f6edd0115b0e201ab703a29b5590b4ff204dd6115b340c98341184",
+        "final16": "60c7bf9b26f6edd0115b0e201ab703a29b5590b4ff204dd6115b340c98341184",
+        "splits8_at16": "60c7bf9b26f6edd0115b0e201ab703a29b5590b4ff204dd6115b340c98341184"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "plain_json_fibonacci",
+      "prompt_tokens": 44,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 101,
+        "final16": 101,
+        "splits8_at16": 101
+      },
+      "array_sha256": {
+        "final8": "fb0079dac47751bb62f469b45e131f756448b41fdbdba918da10f2a235a202ae",
+        "final16": "fb0079dac47751bb62f469b45e131f756448b41fdbdba918da10f2a235a202ae",
+        "splits8_at16": "fb0079dac47751bb62f469b45e131f756448b41fdbdba918da10f2a235a202ae"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "plain_csv_inventory",
+      "prompt_tokens": 62,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 84,
+        "final16": 84,
+        "splits8_at16": 84
+      },
+      "array_sha256": {
+        "final8": "a52814ad3715225466a209d31717e06449df61c2952bb1fbbdbbcfe50e9e9a26",
+        "final16": "a52814ad3715225466a209d31717e06449df61c2952bb1fbbdbbcfe50e9e9a26",
+        "splits8_at16": "a52814ad3715225466a209d31717e06449df61c2952bb1fbbdbbcfe50e9e9a26"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "plain_yaml_services",
+      "prompt_tokens": 78,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 78,
+        "final16": 78,
+        "splits8_at16": 78
+      },
+      "array_sha256": {
+        "final8": "5298a559cd2b3b2b1d736fd0b65b444f9a2489ae8746733cc4b77f075d184183",
+        "final16": "5298a559cd2b3b2b1d736fd0b65b444f9a2489ae8746733cc4b77f075d184183",
+        "splits8_at16": "5298a559cd2b3b2b1d736fd0b65b444f9a2489ae8746733cc4b77f075d184183"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "plain_sql_schema",
+      "prompt_tokens": 67,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 68,
+        "final16": 68,
+        "splits8_at16": 68
+      },
+      "array_sha256": {
+        "final8": "be280137712685b71c6bed6402355318c19cf2255935669716eaabfaeaa4442c",
+        "final16": "be280137712685b71c6bed6402355318c19cf2255935669716eaabfaeaa4442c",
+        "splits8_at16": "be280137712685b71c6bed6402355318c19cf2255935669716eaabfaeaa4442c"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "plain_toml_package",
+      "prompt_tokens": 69,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 97,
+        "final16": 97,
+        "splits8_at16": 97
+      },
+      "array_sha256": {
+        "final8": "36a53a81610d1a21c6a34d13ab5f54813eebf72c21266e61e7fb1cb719e88eb2",
+        "final16": "36a53a81610d1a21c6a34d13ab5f54813eebf72c21266e61e7fb1cb719e88eb2",
+        "splits8_at16": "36a53a81610d1a21c6a34d13ab5f54813eebf72c21266e61e7fb1cb719e88eb2"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "plain_html_table",
+      "prompt_tokens": 60,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 236,
+        "final16": 236,
+        "splits8_at16": 236
+      },
+      "array_sha256": {
+        "final8": "19d8f5a9ca9b26c64d16551c421b36c929add2b69fc25a903ee913d7c003ee3e",
+        "final16": "19d8f5a9ca9b26c64d16551c421b36c929add2b69fc25a903ee913d7c003ee3e",
+        "splits8_at16": "19d8f5a9ca9b26c64d16551c421b36c929add2b69fc25a903ee913d7c003ee3e"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "plain_xml_catalog",
+      "prompt_tokens": 54,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 217,
+        "final16": 217,
+        "splits8_at16": 217
+      },
+      "array_sha256": {
+        "final8": "d582b6747e44237bdbc44d14a9d5d37678695fc115567b569b834a2bf6238c98",
+        "final16": "d582b6747e44237bdbc44d14a9d5d37678695fc115567b569b834a2bf6238c98",
+        "splits8_at16": "d582b6747e44237bdbc44d14a9d5d37678695fc115567b569b834a2bf6238c98"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "plain_json_nested",
+      "prompt_tokens": 58,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 237,
+        "final16": 237,
+        "splits8_at16": 237
+      },
+      "array_sha256": {
+        "final8": "bd0295de959b0d8182519b0694fb16a812979fe19d7fcde06239c945665f1006",
+        "final16": "bd0295de959b0d8182519b0694fb16a812979fe19d7fcde06239c945665f1006",
+        "splits8_at16": "bd0295de959b0d8182519b0694fb16a812979fe19d7fcde06239c945665f1006"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "plain_markdown_checklist",
+      "prompt_tokens": 45,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 125,
+        "final16": 118,
+        "splits8_at16": 125
+      },
+      "array_sha256": {
+        "final8": "5325af9355a0facc2b4ba1169d2b99226a4cd8e1a43ce4be19fe55a673f13eab",
+        "final16": "03cbbf215dc31abab9c4a2b7b7ca4c0b48b8f7d5ed1ef1968ddc8625aa32b504",
+        "splits8_at16": "5325af9355a0facc2b4ba1169d2b99226a4cd8e1a43ce4be19fe55a673f13eab"
+      },
+      "original_width_arrays_equal": false,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": false,
+      "first_difference_original8_vs_original16": {
+        "index_zero_based": 51,
+        "kind": "token",
+        "final8_token": 303,
+        "final16_token": 440
+      },
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": {
+        "index_zero_based": 51,
+        "kind": "token",
+        "splits8_at16_token": 303,
+        "final16_token": 440
+      }
+    },
+    {
+      "case": "plain_diff_boundary",
+      "prompt_tokens": 59,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 68,
+        "final16": 68,
+        "splits8_at16": 68
+      },
+      "array_sha256": {
+        "final8": "ae353c6e83d3bd5a471ef2442e024bd7e8785d5ac73cb074353abbdfebc720c5",
+        "final16": "ae353c6e83d3bd5a471ef2442e024bd7e8785d5ac73cb074353abbdfebc720c5",
+        "splits8_at16": "ae353c6e83d3bd5a471ef2442e024bd7e8785d5ac73cb074353abbdfebc720c5"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "plain_json_coordinate_grid",
+      "prompt_tokens": 61,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 202,
+        "final16": 202,
+        "splits8_at16": 202
+      },
+      "array_sha256": {
+        "final8": "1aa2d725b64b7b769a94a603b3029dd18dba73f0f094d484970e29e40a541ffc",
+        "final16": "1aa2d725b64b7b769a94a603b3029dd18dba73f0f094d484970e29e40a541ffc",
+        "splits8_at16": "1aa2d725b64b7b769a94a603b3029dd18dba73f0f094d484970e29e40a541ffc"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "python_topological_sort",
+      "prompt_tokens": 58,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 167,
+        "final16": 167,
+        "splits8_at16": 167
+      },
+      "array_sha256": {
+        "final8": "6409aef10e46d70dc812f6b60ff52d32e60819547afd51fe2cf33cd4ba228146",
+        "final16": "6409aef10e46d70dc812f6b60ff52d32e60819547afd51fe2cf33cd4ba228146",
+        "splits8_at16": "6409aef10e46d70dc812f6b60ff52d32e60819547afd51fe2cf33cd4ba228146"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "rust_roman_numerals",
+      "prompt_tokens": 53,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 284,
+        "final16": 278,
+        "splits8_at16": 284
+      },
+      "array_sha256": {
+        "final8": "18fa0b17858c2c817d8ff4e3956c1b71e5dfc5811f61ddf93f746a328ddd59d0",
+        "final16": "b47a16d21bfd64d9312a8e99b365c9b62eddf1dc9c1690ec572c39249349bf1a",
+        "splits8_at16": "18fa0b17858c2c817d8ff4e3956c1b71e5dfc5811f61ddf93f746a328ddd59d0"
+      },
+      "original_width_arrays_equal": false,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": false,
+      "first_difference_original8_vs_original16": {
+        "index_zero_based": 247,
+        "kind": "token",
+        "final8_token": 16,
+        "final16_token": 18
+      },
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": {
+        "index_zero_based": 247,
+        "kind": "token",
+        "splits8_at16_token": 16,
+        "final16_token": 18
+      }
+    },
+    {
+      "case": "go_round_robin",
+      "prompt_tokens": 56,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 328,
+        "final16": 328,
+        "splits8_at16": 328
+      },
+      "array_sha256": {
+        "final8": "cee3c4c1295bfbe47cb9557d6f8af00eb0727805c06cee5f71bdd7dc43a16ea1",
+        "final16": "cee3c4c1295bfbe47cb9557d6f8af00eb0727805c06cee5f71bdd7dc43a16ea1",
+        "splits8_at16": "cee3c4c1295bfbe47cb9557d6f8af00eb0727805c06cee5f71bdd7dc43a16ea1"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "cpp_fixed_queue",
+      "prompt_tokens": 56,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 197,
+        "final16": 197,
+        "splits8_at16": 197
+      },
+      "array_sha256": {
+        "final8": "564f734f9ffc688e5001f62db1df598c0f93e8a06b95dd35c36043b388310aab",
+        "final16": "564f734f9ffc688e5001f62db1df598c0f93e8a06b95dd35c36043b388310aab",
+        "splits8_at16": "564f734f9ffc688e5001f62db1df598c0f93e8a06b95dd35c36043b388310aab"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "typescript_log_parser",
+      "prompt_tokens": 57,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 246,
+        "final16": 246,
+        "splits8_at16": 246
+      },
+      "array_sha256": {
+        "final8": "7e5efa572ae23124fe5efbb9b621179641869c724c7747164ec0a855f50ce4da",
+        "final16": "7e5efa572ae23124fe5efbb9b621179641869c724c7747164ec0a855f50ce4da",
+        "splits8_at16": "7e5efa572ae23124fe5efbb9b621179641869c724c7747164ec0a855f50ce4da"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "shell_largest_files",
+      "prompt_tokens": 56,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 264,
+        "final16": 264,
+        "splits8_at16": 264
+      },
+      "array_sha256": {
+        "final8": "50aeee361766d09fe843c58b3594f437188afbe37ce070cabff58a3ad562675f",
+        "final16": "50aeee361766d09fe843c58b3594f437188afbe37ce070cabff58a3ad562675f",
+        "splits8_at16": "50aeee361766d09fe843c58b3594f437188afbe37ce070cabff58a3ad562675f"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "linear_equations",
+      "prompt_tokens": 49,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 80,
+        "final16": 80,
+        "splits8_at16": 80
+      },
+      "array_sha256": {
+        "final8": "c951c329dd88bcfa6c10b318bb7f0b40def7699233a490ab8ae0362c9389878c",
+        "final16": "c951c329dd88bcfa6c10b318bb7f0b40def7699233a490ab8ae0362c9389878c",
+        "splits8_at16": "c951c329dd88bcfa6c10b318bb7f0b40def7699233a490ab8ae0362c9389878c"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "urn_probability",
+      "prompt_tokens": 50,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 70,
+        "final16": 70,
+        "splits8_at16": 70
+      },
+      "array_sha256": {
+        "final8": "c35875cdc4bad416606ab95adcfaa4ae7d15edb5eb758c674f9bc7316cd7ca4a",
+        "final16": "c35875cdc4bad416606ab95adcfaa4ae7d15edb5eb758c674f9bc7316cd7ca4a",
+        "splits8_at16": "c35875cdc4bad416606ab95adcfaa4ae7d15edb5eb758c674f9bc7316cd7ca4a"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "french_cache_explanation",
+      "prompt_tokens": 48,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 151,
+        "final16": 142,
+        "splits8_at16": 151
+      },
+      "array_sha256": {
+        "final8": "942026ccc4ffa2563975ff4730e2a56c3e52eb9077ac0beeb5cf2e9be992892b",
+        "final16": "723a8935b5cba79d118f9f8907e404c87c4257bfa4c8ba41e8a17c20be6f6653",
+        "splits8_at16": "942026ccc4ffa2563975ff4730e2a56c3e52eb9077ac0beeb5cf2e9be992892b"
+      },
+      "original_width_arrays_equal": false,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": false,
+      "first_difference_original8_vs_original16": {
+        "index_zero_based": 81,
+        "kind": "token",
+        "final8_token": 1510,
+        "final16_token": 12129
+      },
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": {
+        "index_zero_based": 81,
+        "kind": "token",
+        "splits8_at16_token": 1510,
+        "final16_token": 12129
+      }
+    },
+    {
+      "case": "arabic_atomicity",
+      "prompt_tokens": 45,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 105,
+        "final16": 105,
+        "splits8_at16": 105
+      },
+      "array_sha256": {
+        "final8": "cb8bf502d6cf320a02d85115e03f40a70450affbb120aeb64cd83df14baaf237",
+        "final16": "cb8bf502d6cf320a02d85115e03f40a70450affbb120aeb64cd83df14baaf237",
+        "splits8_at16": "cb8bf502d6cf320a02d85115e03f40a70450affbb120aeb64cd83df14baaf237"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    },
+    {
+      "case": "japanese_lru_notes",
+      "prompt_tokens": 44,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 127,
+        "final16": 122,
+        "splits8_at16": 127
+      },
+      "array_sha256": {
+        "final8": "9dffbd1bba136a902722ee6e67c90241c2edd34584edcbea4c7422ebf2d016b6",
+        "final16": "1f0d17c4b50c724617c5a7644e8927274f1eaf8910150953de7c0d087daf21f3",
+        "splits8_at16": "9dffbd1bba136a902722ee6e67c90241c2edd34584edcbea4c7422ebf2d016b6"
+      },
+      "original_width_arrays_equal": false,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": false,
+      "first_difference_original8_vs_original16": {
+        "index_zero_based": 42,
+        "kind": "token",
+        "final8_token": 122768,
+        "final16_token": 100457
+      },
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": {
+        "index_zero_based": 42,
+        "kind": "token",
+        "splits8_at16_token": 122768,
+        "final16_token": 100457
+      }
+    },
+    {
+      "case": "chinese_batch_latency",
+      "prompt_tokens": 46,
+      "output_cap": 800,
+      "lengths": {
+        "final8": 125,
+        "final16": 125,
+        "splits8_at16": 125
+      },
+      "array_sha256": {
+        "final8": "7f5af1d0a3822b812b8c9745c7a13873dbfb95053184f6e88f07cfc256e75c9b",
+        "final16": "7f5af1d0a3822b812b8c9745c7a13873dbfb95053184f6e88f07cfc256e75c9b",
+        "splits8_at16": "7f5af1d0a3822b812b8c9745c7a13873dbfb95053184f6e88f07cfc256e75c9b"
+      },
+      "original_width_arrays_equal": true,
+      "splits8_at16_equals_final8": true,
+      "splits8_at16_equals_final16": true,
+      "first_difference_original8_vs_original16": null,
+      "first_difference_splits8_at16_vs_final8": null,
+      "first_difference_splits8_at16_vs_final16": null
+    }
+  ],
+  "scope": "All 31 historical cases and complete returned arrays, with original prompt/output caps. Old studies remain read-only. This comparison localizes the observed historical array change to the registered split-policy diagnostic; it does not establish distributional equivalence, heldout generalization, an exhaustive operator cause, or a throughput improvement. Request timings are deliberately not compared across studies.",
+  "source_sha256": {
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/splash.metallib": "f60d2e950c6a6c69ec7472b5ec7778de437edae81a57834b9cc2c08af0bac039",
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/study-driver": "d83311f02bd9e0924f18032b7b8675f390569751c694809accaef1d32c3161d9",
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-functional-v1.txt": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf",
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/historical31-v1.txt": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf",
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/notes/dspine16-final-v1.artifact-barrier.json": "8e51bb87daf0e9c56b83f707381a33c523c460de71b0eff6b605688f664c91c3",
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/notes/dspine16-final-v1.protocol.json": "722fe5b79c13ac1385011c90d5b9f1f7ef3e853ec4bd87fa56c8401f88b1e277",
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/dspine16-final-v1-g1-b1.progress.jsonl": "5f167fd8dfadb42c06dbcbb55ffd38e0a1fecec6f3e9b1653f063c31765e9f96",
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/dspine16-final-v1-g1-b1.receipt.json": "331a8e72e282c0c707892a4ba81289b4c61ae4fc63ee190dc1b49b8ee673aee6",
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/dspine16-final-v1-g1-b1.stdout": "8e458bb0ff749f7fcfc3d629787bd35a724aeca9f0c6166bbe6f8be025c5a1e5",
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/dspine16-output-divergence-v1.json": "92952e77f6880f328b56c60d1b9d979a6d9e41a95a32543e782cc57205f2aa8f",
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/final-historical31-production-final-v1-r8-v1.progress.jsonl": "8a77511973746abfffd1ca5eb6acf33870c71c97b9b00677af2a343c6a816c45",
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/final-historical31-production-final-v1-r8-v1.receipt.json": "c97fd8f0c4e3fa891d60b72de0e109366e26e664e08ee7750af2e9e1db3a7fa8",
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/results/final-historical31-production-final-v1-r8-v1.stdout": "328dffc559fd71ff1a71536673889eb4ecf44a93f50eea204ff7e749dbb6ca16",
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/scripts/controlled_round.py": "4bde430207a362eab510fe8ffd393fa2aa76c543eaa5821c7073e95e454d0f58",
+    "/Users/linson/Documents/ai/splash-dspine-13h-20261110/scripts/run_frozen_abba_round_v1.py": "f062f66b89052d1bff3eb1510ffe93a3f8e805b110eced7e34f60d75c83b0a7d",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-splits8-v2/build.json": "cfa83cbb34b0bbba8fc58ebd6508dfc9b3cb9817f669d0b85e6a1f04f3d1e97b",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-splits8-v2/host-step.metallib": "9f94af73a1a7ab440d381268281989cb80698b3921ebec95772e2b889fc54ffb",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-splits8-v2/splash.metallib": "f60d2e950c6a6c69ec7472b5ec7778de437edae81a57834b9cc2c08af0bac039",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/study-splits8-v2/study-driver": "2b58acc13262049dc6d7d74d57bc8856dbf51d53350fe3fdf63756471eb7278a",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/notes/splits8-historical31-v1.protocol.json": "5cabc33c276281f1977ce806767cfe420fc3ffe188f05cdaca3aa1da68933576",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/patches/splits8-diagnostic-v1.patch": "5909a4e4cd1f915f449ea49544aeabbd1358dcf6326d31fef12f5f1b8d85c9c1",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/splits8-historical31-v1.progress.jsonl": "98f1df7bee9fddfc76d2de90bbdfe5c423345eaa5c49c066aa76369c07224c5e",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/splits8-historical31-v1.receipt.json": "73ccfea0da933a68f42d2926b05798817c56f871460b6a5e53c78851b9d5196c",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/results/splits8-historical31-v1.stdout": "f969d43921e5eca3b12a18a5e7fea9bba4ee5dc563fecd6075f5f867a1430a49",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/analyze_split_diagnostic_v1.py": "b2db71ca769faacca6fb69868726a1d22dd5be944a115799a912f2e5bc446923",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/study_driver_v2.mm": "2b0b3898db9bee8941e169d8852c8f6659f256f7d00e9de9f01a2a054783879d",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/splits8/build/engine/BuildIdentity.hpp": "8fd21e7c083d755dea9859dc280d4dbbd29620248d9b28322a0c2e64f92b422f",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/splits8/build/engine/libsplash.a": "f76e584d4681ca99d13e996bc2b2c0f8b95b6da84ff39f9bc765243c5e90f4a7",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/splits8/build/splash.metallib": "f60d2e950c6a6c69ec7472b5ec7778de437edae81a57834b9cc2c08af0bac039",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/splits8/dev/benchmarks/PrefillWork.hpp": "7d9abd447e972002a53633ff202dae3a4eb2f1178d81cb28677264c81e5d7d29",
+    "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/splits8/dev/benchmarks/TranscriptPrompts.hpp": "2c56f82c9048bf3de0eeae016d95db3b2f954d0ad6ae56af1f8cea87609ecdb6"
+  }
+}

@@ -1,0 +1,148 @@
+{
+  "registered_utc": "2026-11-11T06:55:28.897218+00:00",
+  "purpose": "Isolate additive API/shader-validation memory accounting on unchanged IQ4XS prefill for baseline37 and finalcombined-v2. One plain168-row oracle each, no timings used, expected failures retained.",
+  "baseline_api": {
+    "id": "prefill-iq4xs-baseline-api-v1",
+    "command": [
+      "/usr/bin/env",
+      "MTL_DEBUG_LAYER=1",
+      "MTL_SHADER_VALIDATION=0",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/prefill-iq4xs-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/probe.metallib"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/prefill-iq4xs-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/probe.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/build.json",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/prefill-iq4xs-probe": "e7439dd07d3e3eb8e1b4c4839c8385160512455dde5c11aec89a1890e239d9a5",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/probe.metallib": "d44e2ab46e3addbc1066d235dae215889f311f06127923970d8ee5cc58f9037d",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/build.json": "ef614284026088dfc63db1209b35d8597c613589bf05e209ba046a750e1778bb",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm": "de99368635c0275d214ca86604560d85549cd19dc7ed1bb0b34353d34e603f82"
+    },
+    "timeout_seconds": 180,
+    "expected_exit": "0"
+  },
+  "baseline_shader": {
+    "id": "prefill-iq4xs-baseline-shader-v1",
+    "command": [
+      "/usr/bin/env",
+      "MTL_DEBUG_LAYER=0",
+      "MTL_SHADER_VALIDATION=1",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/prefill-iq4xs-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/probe.metallib"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/prefill-iq4xs-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/probe.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/build.json",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/prefill-iq4xs-probe": "e7439dd07d3e3eb8e1b4c4839c8385160512455dde5c11aec89a1890e239d9a5",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/probe.metallib": "d44e2ab46e3addbc1066d235dae215889f311f06127923970d8ee5cc58f9037d",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/build.json": "ef614284026088dfc63db1209b35d8597c613589bf05e209ba046a750e1778bb",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm": "de99368635c0275d214ca86604560d85549cd19dc7ed1bb0b34353d34e603f82"
+    },
+    "timeout_seconds": 180,
+    "expected_exit": "0"
+  },
+  "baseline_both": {
+    "id": "prefill-iq4xs-baseline-both-v1",
+    "command": [
+      "/usr/bin/env",
+      "MTL_DEBUG_LAYER=1",
+      "MTL_SHADER_VALIDATION=1",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/prefill-iq4xs-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/probe.metallib"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/prefill-iq4xs-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/probe.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/build.json",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/prefill-iq4xs-probe": "e7439dd07d3e3eb8e1b4c4839c8385160512455dde5c11aec89a1890e239d9a5",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/probe.metallib": "d44e2ab46e3addbc1066d235dae215889f311f06127923970d8ee5cc58f9037d",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-baseline-v1/build.json": "ef614284026088dfc63db1209b35d8597c613589bf05e209ba046a750e1778bb",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm": "de99368635c0275d214ca86604560d85549cd19dc7ed1bb0b34353d34e603f82"
+    },
+    "timeout_seconds": 180,
+    "expected_exit": "-6 API assertion"
+  },
+  "combined_api": {
+    "id": "prefill-iq4xs-combined-api-v1",
+    "command": [
+      "/usr/bin/env",
+      "MTL_DEBUG_LAYER=1",
+      "MTL_SHADER_VALIDATION=0",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/prefill-iq4xs-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/probe.metallib"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/prefill-iq4xs-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/probe.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/build.json",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/prefill-iq4xs-probe": "4dbb961cc45f28e9c74e990388c0e788407fd0219fb805fbff8dbbffa094cc7b",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/probe.metallib": "219e64a24607764fd507aa11ee1479623242ecb9d7d2e77a29cec10078efa2a7",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/build.json": "409b3dd5323307c3c8c0d3531fb4bbe9ed4468cef04156393e3d7ab0dc341388",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm": "de99368635c0275d214ca86604560d85549cd19dc7ed1bb0b34353d34e603f82"
+    },
+    "timeout_seconds": 180,
+    "expected_exit": "0"
+  },
+  "combined_shader": {
+    "id": "prefill-iq4xs-combined-shader-v1",
+    "command": [
+      "/usr/bin/env",
+      "MTL_DEBUG_LAYER=0",
+      "MTL_SHADER_VALIDATION=1",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/prefill-iq4xs-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/probe.metallib"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/prefill-iq4xs-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/probe.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/build.json",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/prefill-iq4xs-probe": "4dbb961cc45f28e9c74e990388c0e788407fd0219fb805fbff8dbbffa094cc7b",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/probe.metallib": "219e64a24607764fd507aa11ee1479623242ecb9d7d2e77a29cec10078efa2a7",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/build.json": "409b3dd5323307c3c8c0d3531fb4bbe9ed4468cef04156393e3d7ab0dc341388",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm": "de99368635c0275d214ca86604560d85549cd19dc7ed1bb0b34353d34e603f82"
+    },
+    "timeout_seconds": 180,
+    "expected_exit": "0"
+  },
+  "combined_both": {
+    "id": "prefill-iq4xs-combined-both-v1",
+    "command": [
+      "/usr/bin/env",
+      "MTL_DEBUG_LAYER=1",
+      "MTL_SHADER_VALIDATION=1",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/prefill-iq4xs-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/probe.metallib"
+    ],
+    "artifacts": [
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/prefill-iq4xs-probe",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/probe.metallib",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/build.json",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm"
+    ],
+    "expected_sha256": {
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/prefill-iq4xs-probe": "4dbb961cc45f28e9c74e990388c0e788407fd0219fb805fbff8dbbffa094cc7b",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/probe.metallib": "219e64a24607764fd507aa11ee1479623242ecb9d7d2e77a29cec10078efa2a7",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/artifacts/prefill-iq4xs-probe-combined-v1/build.json": "409b3dd5323307c3c8c0d3531fb4bbe9ed4468cef04156393e3d7ab0dc341388",
+      "/Users/linson/Documents/ai/splash-dspine-final-review-20261111/scripts/prefill_iq4xs_validation_probe_v1.mm": "de99368635c0275d214ca86604560d85549cd19dc7ed1bb0b34353d34e603f82"
+    },
+    "timeout_seconds": 180,
+    "expected_exit": "-6 API assertion"
+  }
+}
