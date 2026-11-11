@@ -252,8 +252,12 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     event.json = in.rest();
     return event;
   }
-  case FrameType::Warming:
-    return WarmingEvent{};
+  case FrameType::Warming: {
+    WarmingEvent event;
+    event.stepsDone = in.u32();
+    event.steps = in.u32();
+    return event;
+  }
   default:
     throw std::runtime_error("the engine sent a frame that is not an event");
   }

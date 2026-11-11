@@ -20,6 +20,7 @@ from dev.tests.server_fixtures import (
     HarnessTestCase,
     Plan,
     chat_body,
+    console_written,
     main_args,
     make_frontend,
     make_job,
@@ -131,11 +132,13 @@ class ServerRecoveryTests(HarnessTestCase):
     def test_the_sixth_fast_failure_in_a_row_stops(self):
         """Short-lived failures in a row double the backoff, and the sixth,
         whose wait would have reached the cap, stops the relaunches: requests
-        get 500 engine_failed with its reason, which /status reports (they went
-        on every 60 s for good, each loading the weights again)."""
+        get 500 engine_failed with its reason, which /status reports, and the
+        backend tells the server, which exits (they went on every 60 s for
+        good, each loading the weights again)."""
         runtime = RecoveringRuntime()
         harness = self.harness(runtime)
         backend = harness.backend
+        backend.on_stopped = stopped = mock.Mock()
         clock = [100.0]
         with (
             mock.patch.object(supervision, "BACKOFF_BASE_SECONDS", 0.01),
@@ -153,6 +156,7 @@ class ServerRecoveryTests(HarnessTestCase):
                 )
                 self.relaunched(runtime, backend)
             self.assertIsNone(backend.stop_reason)
+            stopped.assert_not_called()
             runtime.fail(backend, served=1.0)
         self.assertEqual(runtime.startup_calls, 5)
         reason = backend.stop_reason
@@ -161,11 +165,12 @@ class ServerRecoveryTests(HarnessTestCase):
             "Splash stopped restarting the engine: it failed 6 times in a row, "
             "each within 60 s of starting (native protocol reached EOF). "
             "Set SPLASH_CRASH_TRACE=1 to record a crash trace. "
-            "Restart the Splash server after fixing the cause.",
+            "Start the Splash server again after fixing the cause.",
         )
         self.assertEqual(
             console.call_args_list[-1].args[0], f"Engine stopped · {reason}"
         )
+        stopped.assert_called_once_with(reason)
         refusal = backend.refusal()
         self.assertEqual(
             (refusal.status, refusal.code, refusal.message),
@@ -314,13 +319,15 @@ class ServerRecoveryTests(HarnessTestCase):
 
     def stopped_by(self, outcome):
         """The stop reason of a backend whose first relaunch ends with
-        `outcome`, and its console lines."""
+        `outcome`, and its console lines; the backend tells the server once."""
         runtime = RecoveringRuntime()
         runtime.outcomes.put(outcome)
         backend = self.backend(runtime)
+        backend.on_stopped = stopped = mock.Mock()
         with mock.patch.object(backend_api, "print_status") as console:
             runtime.fail(backend, served=1.0)
-            self.wait_until(lambda: backend.stop_reason is not None)
+            self.wait_until(lambda: stopped.called)
+        stopped.assert_called_once_with(backend.stop_reason)
         self.assertEqual(runtime.startup_calls, 1)
         refusal = backend.refusal()
         self.assertEqual(
@@ -352,7 +359,7 @@ class ServerRecoveryTests(HarnessTestCase):
             reason,
             "the engine's start ran out of GPU memory another process holds "
             "(another Splash server?); Splash stopped restarting it. Quit that "
-            "process, then restart the Splash server.",
+            "process, then start the Splash server again.",
         )
         self.assertEqual(lines[-1], f"Engine stopped · {reason}")
 
@@ -396,7 +403,7 @@ class ServerRecoveryTests(HarnessTestCase):
             reason,
             "the model's files can no longer be served (MODEL_DIRECTORY must name "
             "an existing directory); Splash stopped restarting the engine. Restore "
-            "or reinstall the model, then restart the Splash server.",
+            "or reinstall the model, then start the Splash server again.",
         )
         self.assertEqual(lines[-1], f"Engine stopped · {reason}")
 
@@ -648,8 +655,8 @@ class ServerRecoveryTests(HarnessTestCase):
 
     def test_a_request_started_at_two_engine_failures_in_a_row_is_refused(self):
         """A request in flight at two engine failures in a row is refused
-        until the server restarts, without reaching the engine; another,
-        started only after the first relaunch, is served."""
+        for an hour, without reaching the engine; another, started only
+        after the first relaunch, is served."""
         poison = (1, 2, 3)
         crash = self.crash(b"engine_execution_failed")
         factory, runtime, backend = self.quarantine_server(
@@ -1245,6 +1252,7 @@ class ServerRecoveryTests(HarnessTestCase):
                     self.assertRaisesRegex(SystemExit, "1"),
                 ):
                     api.main()
+                console_written()
                 (line,) = stderr.getvalue().splitlines()
                 self.assertIn(f"Error · {reason}", line)
                 self.assertNotIn("reached EOF", line)

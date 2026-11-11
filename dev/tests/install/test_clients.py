@@ -7,6 +7,7 @@ import secrets
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import tomllib
@@ -19,6 +20,7 @@ from unittest import mock
 
 import yaml
 
+from dev.tests.server_fixtures import console_written, full_pipe
 from install import clients, launcher
 from server import serve_options
 
@@ -1234,6 +1236,93 @@ class ClientLifecycleTests(unittest.TestCase):
             self.assertEqual(result.exception.code, 0)
             request.assert_not_called()
 
+    def test_the_launch_lines_come_before_the_clients_output(self):
+        # The client the launcher executes replaces it: the launcher's lines
+        # are written before, never dropped with it.
+        with tempfile.TemporaryDirectory() as directory:
+            client = Path(directory) / "claude"
+            client.write_text("#!/bin/sh\necho client\n")
+            client.chmod(0o755)
+            program = "\n".join(
+                (
+                    "from unittest import mock",
+                    "from install import launcher",
+                    "model = {'id': 'm', 'owned_by': 'splash', 'context_length': 8192}",
+                    "listing = {'data': [{**model, 'input_modalities': ['text']}]}",
+                    "with mock.patch.object(launcher, '_request_json') as request:",
+                    "    request.return_value = listing",
+                    "    launcher.main(['claude'])",
+                )
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", program],
+                cwd=launcher.ROOT,
+                env={**os.environ, "PATH": f"{directory}:/usr/bin:/bin"},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "Starting claude: m · 8,192 context tokens",
+                "Claude hosted WebSearch is unavailable. "
+                "WebFetch, local tools and MCP are unchanged.",
+                "client",
+            ],
+            result.stderr,
+        )
+
+    def test_a_stalled_console_holds_up_the_clients_launch_1_s_at_most(self):
+        # The launcher's stdout is a pipe nobody reads, full already: its
+        # lines wait for it until it executes the client, which drops them,
+        # the console's second later.
+        unread, written, filler = full_pipe()
+        self.addCleanup(os.close, unread)
+        with tempfile.TemporaryDirectory() as directory:
+            client = Path(directory) / "claude"
+            client.write_text("#!/bin/sh\nexit 7\n")
+            client.chmod(0o755)
+            elapsed = Path(directory) / "elapsed"
+            program = "\n".join(
+                (
+                    "import os, time",
+                    "from unittest import mock",
+                    "from install import launcher",
+                    "model = {'id': 'm', 'owned_by': 'splash', 'context_length': 8192}",
+                    "listing = {'data': [{**model, 'input_modalities': ['text']}]}",
+                    "execute = os.execvpe",
+                    "def timed(*arguments):",
+                    f"    with open({str(elapsed)!r}, 'w') as seconds:",
+                    "        seconds.write(str(time.monotonic() - started))",
+                    "    execute(*arguments)",
+                    "with (",
+                    "    mock.patch.object(launcher, '_request_json', return_value=listing),",
+                    "    mock.patch.object(os, 'execvpe', timed),",
+                    "):",
+                    "    started = time.monotonic()",
+                    "    launcher.main(['claude'])",
+                )
+            )
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-c", program],
+                    cwd=launcher.ROOT,
+                    env={**os.environ, "PATH": f"{directory}:/usr/bin:/bin"},
+                    stdout=written,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=10,
+                )
+            finally:
+                os.close(written)
+            self.assertEqual(result.returncode, 7, result.stderr)
+            self.assertLess(float(elapsed.read_text()), 3.0)
+        held = b""
+        while chunk := os.read(unread, 65536):
+            held += chunk
+        self.assertEqual(held, b"x" * filler)
+
     def test_missing_client_is_checked_before_connection(self):
         with (
             mock.patch.object(clients.shutil, "which", return_value=None),
@@ -1242,6 +1331,7 @@ class ClientLifecycleTests(unittest.TestCase):
         ):
             self.assertEqual(launcher.main(["claude"]), 1)
         request.assert_not_called()
+        console_written()
         self.assertIn("claude is not installed", error.getvalue())
 
     def test_ready_server_is_source_of_model_and_context(self):
@@ -1325,6 +1415,7 @@ class ClientLifecycleTests(unittest.TestCase):
             if reported is None:
                 # A server started by an older Splash reports only vision.
                 self.assertEqual(result, 1)
+                console_written()
                 self.assertIn(
                     "restart it with this version of Splash", error.getvalue()
                 )
@@ -1390,6 +1481,7 @@ class ClientLifecycleTests(unittest.TestCase):
                 mock.patch("sys.stderr", io.StringIO()) as error,
             ):
                 self.assertEqual(launcher.main(["claude", *payload]), 1)
+            console_written()
             self.assertIn("splash serve", error.getvalue())
             execute.assert_not_called()
             install.assert_not_called()

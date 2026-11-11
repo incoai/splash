@@ -3,8 +3,6 @@
 #include "AwakeClock.hpp"
 #include "Checked.hpp"
 
-#include <sys/mount.h>
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -423,10 +421,7 @@ public:
   // (DiskBudget::admits). Engine thread.
   [[nodiscard]] bool takesWrite(bool inUse) const noexcept;
   [[nodiscard]] bool persistent() const noexcept;
-  // What fstatfs says of the volume the file lives on, linked or not; empty
-  // when it cannot say.
-  [[nodiscard]] std::optional<struct statfs> volume() const noexcept;
-  // The bytes the file's blocks take on that volume, its records' included;
+  // The bytes the file's blocks take on its volume, its records' included;
   // zero when they cannot be measured.
   [[nodiscard]] uint64_t allocatedBytes() const noexcept;
 

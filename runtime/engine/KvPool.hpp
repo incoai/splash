@@ -221,6 +221,9 @@ public:
   // the extent. An extent that holds a page of `fixed` is not emptied.
   [[nodiscard]] KvPageMoves compactExtent(std::span<const uint32_t> fixed,
                                           std::optional<kv::PageForm> form = std::nullopt);
+  // The form's extents that hold pages, none of `fixed`: those
+  // compactExtent() may empty.
+  [[nodiscard]] uint32_t unfixedExtents(std::span<const uint32_t> fixed, kv::PageForm form) const;
   // What compaction and release look at in an extent: its form, whether it
   // is allocated, and its used and free pages.
   struct ExtentCounts final {

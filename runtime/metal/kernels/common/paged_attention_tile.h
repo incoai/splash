@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/abi/PagedAttention.h"
+#include "metal/kernels/common/int8_activations.h"
 #include "metal/kernels/common/kv_extent.h"
 #include "metal/kernels/common/kv_paging.h"
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -157,10 +158,16 @@ template <uint HeadDim> constexpr float splash_attention_scale() {
   return HeadDim == 256 ? 0.0625f : 0.08838834764831845f;
 }
 
-// One Page32 block of one tile: key-scaled scores become value-scaled bf16
-// probabilities and the row statistics advance. Four lanes own one fused row,
-// eight consecutive tokens each, so the row maximum and sum are two xor
-// shuffles instead of a 32-lane reduction per row and the eight bf16
+// The lanes of one fused row in the page loop: the softmax's, eight of a
+// page's tokens each, and the query quantization's, so that each lane holds
+// its own row's query scale.
+constant uint SplashAttentionLanesPerRow = 4;
+
+// One Page32 block of one tile: key-scaled scores (fp32, or the int32
+// products of INT8 queries) times score_scale, the row's, become value-scaled
+// bf16 probabilities and the row statistics advance. Four lanes own one
+// fused row, eight consecutive tokens each, so the row maximum and sum are
+// two xor shuffles instead of a 32-lane reduction per row and the eight bf16
 // probabilities leave as one 16-byte store. Threads past 4 x FusedRows
 // (kv4_g6: simdgroups 6 and 7) only take part in the caller's barriers.
 // The float4 loads need 16-byte aligned slabs (alignas in the entries) and
@@ -171,9 +178,9 @@ template <uint HeadDim> constexpr float splash_attention_scale() {
 // flag. Existing threadgroup barriers separate reset, concurrent set, and
 // read; relaxed atomics make the same-value writes safe without changing
 // arithmetic.
-template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim, uint Window, bool Quantized>
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint Window, bool Quantized, typename Score>
 inline void splash_attention_page_softmax(
-    threadgroup const float *scores, threadgroup bfloat *probabilities,
+    threadgroup const Score *scores, float score_scale, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
     device const float4 *key_scales, device const float4 *value_scales,
@@ -183,9 +190,8 @@ inline void splash_attention_page_softmax(
   constexpr uint N = SplashKvPageTokens;
   constexpr uint FusedRows = RowsPerTile * QueryHeadsPerKVHead;
   constexpr uint TokensPerLane = 8;
-  constexpr uint LanesPerRow = N / TokensPerLane;
-  constexpr float Scale = splash_attention_scale<HeadDim>();
-  static_assert(N == 32, "four lanes of eight tokens span one page");
+  constexpr uint LanesPerRow = SplashAttentionLanesPerRow;
+  static_assert(N == LanesPerRow * TokensPerLane, "four lanes of eight tokens span one page");
   static_assert(LanesPerRow * FusedRows <= 256,
                 "one softmax lane per thread of the 256-thread tile");
   if (thread_index >= LanesPerRow * FusedRows)
@@ -202,19 +208,18 @@ inline void splash_attention_page_softmax(
   const uint start = splash_attention_window_start<Window>(causal_end - 1);
   const uint limit = min(visible_tokens, causal_end) - start;
   const uint token = token_start + column - start;
-  threadgroup const float4 *scores4 =
-      reinterpret_cast<threadgroup const float4 *>(scores + fused_row * N +
-                                                   column);
+  threadgroup const vec<Score, 4> *scores4 =
+      reinterpret_cast<threadgroup const vec<Score, 4> *>(scores + fused_row * N + column);
   const uint vector = column / 4;
   float score[TokensPerLane];
   {
-    float4 low = scores4[0], high = scores4[1];
+    float4 low = float4(scores4[0]), high = float4(scores4[1]);
     if constexpr (Quantized) {
       low *= key_scales[vector];
       high *= key_scales[vector + 1];
     }
-    low *= Scale;
-    high *= Scale;
+    low *= score_scale;
+    high *= score_scale;
     score[0] = low.x, score[1] = low.y, score[2] = low.z, score[3] = low.w;
     score[4] = high.x, score[5] = high.y, score[6] = high.z, score[7] = high.w;
   }
@@ -267,6 +272,43 @@ inline void splash_attention_page_softmax(
   probabilities4[1] = bfloat4(high);
 }
 
+// The tile's queries as INT8 codes with one scale per fused row, by the
+// int8-activation rule (kernels/common/int8_activations.h), for the INT8 x
+// INT8 score product. A row's softmax lanes quantize it, a quarter of its
+// dimensions each, so each returns its own row's scale: NaN for a row holding
+// an infinity or a NaN, whose scores are then NaN, as with bf16 queries.
+// Lanes past those of M rows return 0.
+template <uint M, uint HeadDim>
+inline float splash_attention_query_codes(device const bfloat *queries, device int8_t *codes,
+                                          uint thread_index) {
+  constexpr uint LanesPerRow = SplashAttentionLanesPerRow;
+  static_assert(LanesPerRow == 4, "two xor shuffles reduce a row's four lanes");
+  constexpr uint Quarter = HeadDim / LanesPerRow;
+  if (thread_index >= LanesPerRow * M)
+    return 0.0f;
+  const uint first = thread_index / LanesPerRow * HeadDim + thread_index % LanesPerRow * Quarter;
+  device const bfloat4 *source = reinterpret_cast<device const bfloat4 *>(queries + first);
+  float maximum = 0.0f;
+  uint finite = 1;
+#pragma unroll
+  for (uint i = 0; i < Quarter / 4; ++i) {
+    const bfloat4 query = source[i];
+    finite &= !int8_activation_not_finite(query);
+    const float4 value = abs(float4(query));
+    maximum = max(maximum, max(max(value.x, value.y), max(value.z, value.w)));
+  }
+  maximum = max(maximum, simd_shuffle_xor(maximum, 1));
+  maximum = max(maximum, simd_shuffle_xor(maximum, 2));
+  finite &= simd_shuffle_xor(finite, 1);
+  finite &= simd_shuffle_xor(finite, 2);
+  const Int8Block block = int8_activation_block(maximum);
+  device char4 *target = reinterpret_cast<device char4 *>(codes + first);
+#pragma unroll
+  for (uint i = 0; i < Quarter / 4; ++i)
+    target[i] = char4(int8_activation_code(float4(source[i]), block.inverse));
+  return as_type<float>(int8_activation_bits(block.scale, finite != 0));
+}
+
 // One tile over its split's pages, whose K/V (INT8 with their scales, or
 // BF16) it consumes in place as device tensor operands: the prefill tile of
 // SPLASH_PREFILL_ATTENTION_TILE_ROWS rows and the verify tile of
@@ -276,8 +318,12 @@ inline void splash_attention_page_softmax(
 // entry (kv_extent.h).
 // Three barriers per page order the score store, the softmax and the
 // probability reads of PV.
+// Int8Queries (INT8 K/V only) scores the tile's queries as INT8 codes
+// against the INT8 keys, exact in int32 (|sum| < 2^22 at 256 dimensions);
+// the codes live in the threadgroup's own partials slot, which it writes
+// only after its last page.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim,
-          uint Window, typename CacheElement>
+          uint Window, typename CacheElement, bool Int8Queries>
 inline void splash_paged_attention_tile(
     device bfloat *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
@@ -300,14 +346,28 @@ inline void splash_paged_attention_tile(
   if (page_begin >= pages)
     return;
   uint page_end = min(pages, page_begin + per_split);
+  static_assert(Quantized || !Int8Queries, "INT8 queries take INT8 keys");
+  using QueryElement = conditional_t<Int8Queries, int8_t, bfloat>;
+  using Score = conditional_t<Int8Queries, int, float>;
+  device QueryElement *queries;
+  float score_scale = splash_attention_scale<HeadDim>();
+  if constexpr (Int8Queries) {
+    queries = reinterpret_cast<device int8_t *>(partials + slot * M * D);
+    score_scale *= splash_attention_query_codes<M, HeadDim>(tile_queries, queries, thread_index);
+  } else {
+    queries = tile_queries;
+  }
   if (thread_index < M) {
     row_max[thread_index] = -INFINITY;
     row_sum[thread_index] = 0.0f;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // The query codes are device writes the whole threadgroup reads.
+  threadgroup_barrier(Int8Queries ? mem_flags::mem_threadgroup | mem_flags::mem_device
+                                  : mem_flags::mem_threadgroup);
 
-  auto qt = tensor(tile_queries, dextents<int, 2>{D, M}, array<int, 2>{1, D});
-  auto st = tensor(scores, dextents<int, 2>{N, M}, array<int, 2>{1, N});
+  threadgroup Score *page_score_tile = reinterpret_cast<threadgroup Score *>(scores);
+  auto qt = tensor(queries, dextents<int, 2>{D, M}, array<int, 2>{1, D});
+  auto st = tensor(page_score_tile, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto pt = tensor(probabilities, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto p0 = pt.slice<N, M>(0, 0);
   auto key_type = tensor(static_cast<device CacheElement *>(nullptr),
@@ -315,7 +375,7 @@ inline void splash_paged_attention_tile(
   auto value_type = tensor(static_cast<device CacheElement *>(nullptr),
                            dextents<int, 2>{N, D}, array<int, 2>{1, N});
   const SplashKvAddressing<KVHeads, HeadDim, CacheElement> addressing(kv, kv_head);
-  auto q0 = qt.slice<D, M>(0, 0);
+  auto q0 = qt.template slice<D, M>(0, 0);
   auto k0 = key_type.template slice<D, N>(0, 0);
   auto v0 = value_type.template slice<N, D>(0, 0);
   // QK writes a complete page score tile, the softmax applies an INT8 page's
@@ -350,16 +410,16 @@ inline void splash_paged_attention_tile(
     device const float *value_scales = tensors.value_scales;
 
     auto page_scores = qk.template get_destination_cooperative_tensor<
-        decltype(q0), decltype(k0), float>();
+        decltype(q0), decltype(k0), Score>();
     // One full-dimension product initializes the score CT through MPP.
     auto ks = kt.template slice<D, N>(0, 0);
     qk.run(q0, ks, page_scores);
-    page_scores.store(st.slice<N, M>(0, 0));
+    page_scores.store(st.template slice<N, M>(0, 0));
     if (thread_index == 0)
       atomic_store_explicit(rescale, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    splash_attention_page_softmax<QueryHeadsPerKVHead, RowsPerTile, HeadDim, Window, Quantized>(
-        scores, probabilities, row_max, row_sum, previous_scale, rescale,
+    splash_attention_page_softmax<QueryHeadsPerKVHead, RowsPerTile, Window, Quantized>(
+        page_score_tile, score_scale, probabilities, row_max, row_sum, previous_scale, rescale,
         reinterpret_cast<device const float4 *>(key_scales),
         reinterpret_cast<device const float4 *>(value_scales), token_start,
         visible_tokens, committed_tokens, active_rows, thread_index);

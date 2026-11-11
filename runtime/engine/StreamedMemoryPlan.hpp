@@ -101,16 +101,16 @@ struct StreamedMemoryResult final {
 // size --expert-memory or --ple-memory sets, and the spill floors
 // at the context spilling serves. Then the routed experts load whole where
 // that leaves KV its allowance, and otherwise stream through all that the
-// allowance and the PLE table's share leave; the table too keeps the
-// allowance first: it loads whole where the rest holds it beside the
-// allowance, and otherwise streams through what the allowance leaves, up to
-// its share, tableShareBytes. The allowance is the KV of a context in the
-// fewest pages whose whole extents hold it, as one request's capacity rounds
-// them (kvCapacityPagesFor): a spill-capable target's first 64K tokens, or
-// --max-context where that is less; a dense target's --max-context, or else
-// its first 64K tokens too, so that its context never shrinks as the budget
-// grows. Nothing rests on the host: the stores, the floors, what loads whole
-// and the context follow the engine's limit alone.
+// allowance and the PLE table's share leave; the table streams through what
+// the allowance leaves, up to its share, tableShareBytes, however much the
+// budget holds, and loads whole only where it is no larger than its share
+// and the rest holds it beside the allowance. The allowance is the KV of a
+// context in the fewest pages whose whole extents hold it, as one request's
+// capacity rounds them (kvCapacityPagesFor): a spill-capable target's first
+// 64K tokens, or --max-context where that is less; a dense target's
+// --max-context, or else its first 64K tokens too, so that its context never
+// shrinks as the budget grows. Nothing rests on the host: the stores, the
+// floors, what loads whole and the context follow the engine's limit alone.
 // The arenas are those of the parts that stream: where the plan with the
 // arenas of fewer parts streams more, it plans again with those. An
 // explicit size below all of a part replaces it: the part streams through a

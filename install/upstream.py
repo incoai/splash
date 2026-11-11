@@ -19,7 +19,7 @@ import json
 import os
 import re
 import tempfile
-from contextlib import contextmanager
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,6 +46,13 @@ PROCESSOR_FILES = ("preprocessor_config.json", "processor_config.json")
 # which its draft reads in place of the target's token table row
 # (DraftCheckpoint.hpp kDraftMaskEmbedding; docs/models.md, Drafts).
 DRAFT_MASK_EMBEDDING = "mask_embedding.safetensors"
+# What a prepare did with the model, which `prepare --json-progress` reports
+# last for the app to word (models.main): published a new installation of it;
+# found the Hub to have nothing newer; could not check, the Hub not answering
+# for the target or its draft, or not asked (HF_HUB_OFFLINE, or a commit
+# revision, whose draft is not asked either); or could not install what moved
+# on and kept the installed one.
+UPDATED, UP_TO_DATE, UNREACHABLE, KEPT = "updated", "up_to_date", "unreachable", "kept"
 
 
 @dataclass(frozen=True)
@@ -556,8 +563,8 @@ def prepare(selection):
     """Start selection's model, installing what it needs: the installed
     assembly of the resolved commits, or a new commit installed and published
     atomically, or the verified installation when the Hub cannot answer or the
-    new commit cannot be installed. A Splash package is refused
-    (models.refuse_package)."""
+    new commit cannot be installed; and return what it did (UPDATED and the
+    other outcomes). A Splash package is refused (models.refuse_package)."""
     kind = models.installation_kind(selection.link)
     if kind == models.PACKAGE:
         models.refuse_package(
@@ -583,9 +590,58 @@ def prepare(selection):
             manifest = models.read_json(target.file("manifest.json"))
         models.refuse_package(selection.model, manifest)
     if installed is not None and target.revision == installed_commit:
-        _start_installed(selection, target, installed)
-    else:
-        _install_commit(selection, target, installed)
+        return _start_installed(selection, target, installed)
+    return _install_commit(selection, target, installed)
+
+
+def remove(selection):
+    """Remove selection's installation, and what of its sources nothing else
+    uses, and return the bytes freed in the Hub cache: its selection link,
+    then its pins, and its assembly, which nothing links or holds any more,
+    with the files of its Hub snapshots no remaining installation links
+    (assembly.collect_garbage). The model alone takes every selection of it
+    (_selections_of). An installation a server holds is refused: it is
+    stopped first. Once a link is gone the model is removed, and what follows
+    only frees space: a failure is a warning, and the rest goes on."""
+    root = selection.models_root
+    with models.installation_lock(root):
+        if models.installation_kind(selection.link) != models.ASSEMBLY:
+            raise models.ModelError(f"{selection.model} is not installed in {root}")
+        links = _selections_of(selection)
+        if any(assembly.is_held(link.resolve()) for link in links):
+            raise models.ModelError(
+                f"{selection.model} is being served: stop it, then remove it"
+            )
+        for link in links:
+            # A record that cannot be read names no pins: its snapshots then
+            # keep their files, as another models root's do.
+            record = assembly.recorded(link)
+            link.unlink()
+            for path, _ in assembly.pins(record) if record else ():
+                with models.freeing():
+                    ref = hub.pinned(path, link)
+                    ref.unlink(missing_ok=True)
+                    with suppress(OSError):
+                        ref.parent.rmdir()
+        return assembly.collect_garbage(root)
+
+
+def _selections_of(selection):
+    """The selection links removing selection takes: its own, and for the
+    model alone, named without source options, every selection of that model.
+    A start with Text only or a draft of its own has a link no list shows,
+    whose files nothing could delete once the model's row is gone. Its own
+    comes last, so that a removal cut short can be asked for again."""
+    links = []
+    if not (selection.revision or selection.language_only or selection.draft_model):
+        links = [
+            link
+            for link in models.selection_links(selection.models_root)
+            if link != selection.link
+            and (record := assembly.recorded(link))
+            and record["model"] == selection.model
+        ]
+    return [*links, selection.link]
 
 
 def _start_installed(selection, target, installed):
@@ -608,23 +664,30 @@ def _start_installed(selection, target, installed):
             f"using the installed draft {_at(draft)}.",
             flush=True,
         )
+    answered = _answered(target) and not (draft and draft.unreachable_reason)
     if changes := _changes(installed, family, draft):
         print(f"Updating {selection.model}: {'; '.join(changes)}.", flush=True)
-        with _keeping_installation(
-            selection, installed, f"update it ({'; '.join(changes)})"
+        if not _keeping_installation(
+            selection,
+            installed,
+            f"update it ({'; '.join(changes)})",
+            lambda: _install(
+                selection, assembly.source(installed, "target"), installed, draft
+            ),
         ):
-            _install(selection, assembly.source(installed, "target"), installed, draft)
-        return
+            return KEPT
+        return UPDATED if answered else UNREACHABLE
     if (replaced := _retain_installed(selection)) is None:
         print(
             f"Splash model {selection.model} is already installed in {selection.link}",
             flush=True,
         )
-        return
+        return UP_TO_DATE if answered else UNREACHABLE
     # A concurrent installation replaced or damaged the assembly after it was
     # verified: no verified installation is left to keep.
     print(f"Reinstalling {selection.model}: {replaced}", flush=True)
     _install(selection, assembly.source(installed, "target"), installed, draft)
+    return UPDATED if answered else UNREACHABLE
 
 
 def _install_commit(selection, target, installed):
@@ -645,19 +708,22 @@ def _install_commit(selection, target, installed):
         )
     if installed is None:
         _install(selection, target, None)
-        return
-    with _keeping_installation(
-        selection, installed, f"install {selection.repo_id}@{target.revision}"
+    elif not _keeping_installation(
+        selection,
+        installed,
+        f"install {selection.repo_id}@{target.revision}",
+        lambda: _install(selection, target, installed),
     ):
-        _install(selection, target, installed)
+        return KEPT
+    return UPDATED if _answered(target) else UNREACHABLE
 
 
-@contextmanager
-def _keeping_installation(selection, installed, attempt):
-    """Run the block; if it fails, start the verified installation instead,
-    with a warning naming the attempt that failed."""
+def _keeping_installation(selection, installed, attempt, install):
+    """Run install(), and return whether it succeeded; if it fails, start
+    the verified installation instead, with a warning naming the attempt
+    that failed."""
     try:
-        yield
+        install()
     except (models.ModelError, OSError) as error:
         commit = installed["sources"]["target"]["revision"]
         models.warn(
@@ -666,6 +732,8 @@ def _keeping_installation(selection, installed, attempt):
         )
         if _retain_installed(selection) is not None:
             raise
+        return False
+    return True
 
 
 def _retain_installed(selection):
@@ -764,12 +832,12 @@ def publish(models_root, link, record, files):
         ]
         published = assembly.build(models_root, record, files)
         models.link_selection(link, published)
-        # Published: what follows only frees space; its failures are warnings.
+        # Published: what follows only frees space; its failures are
+        # warnings. The assembly replaced goes once no server holds it, with
+        # the files of its snapshots the new one does not link, where nothing
+        # says another tool shares them.
         hub.retire_other_pins(pins, replaced)
-        try:
-            assembly.collect_garbage(models_root)
-        except OSError as error:
-            models.warn(f"could not remove what no installation uses: {error}")
+        assembly.collect_garbage(models_root, updating=True)
     return published
 
 
