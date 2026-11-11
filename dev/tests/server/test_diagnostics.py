@@ -2,37 +2,97 @@ import errno
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from dev.tests.server_fixtures import FakeRuntime, HarnessTestCase, chat_body
+from dev.tests.server_fixtures import (
+    FakeRuntime,
+    HarnessTestCase,
+    StalledConsole,
+    chat_body,
+    console_written,
+    full_pipe,
+)
 from server import diagnostics
 from server import server as api
 
 
-class DiagnosticsTests(HarnessTestCase):
-    def test_expected_client_disconnect_does_not_print_server_traceback(self):
-        harness = self.harness(FakeRuntime())
-        with mock.patch.object(api.HTTPServer, "handle_error") as parent:
-            with mock.patch.object(
-                api.sys,
-                "exc_info",
-                return_value=(ConnectionResetError, ConnectionResetError(), None),
-            ):
-                harness.server.handle_error(None, ("127.0.0.1", 1))
-            parent.assert_not_called()
+def printed(record):
+    """Print a request's line and wait for the console to write it."""
+    diagnostics.print_request(record)
+    console_written()
 
-            unexpected = RuntimeError("unexpected")
-            with mock.patch.object(
-                api.sys,
-                "exc_info",
-                return_value=(RuntimeError, unexpected, None),
-            ):
-                harness.server.handle_error(None, ("127.0.0.1", 1))
-            parent.assert_called_once()
+
+def dropped_warning(count):
+    """The console's warning that `count` lines were dropped, as a pattern."""
+    return (
+        r"\d{2}:\d{2}:\d{2} Warning · "
+        f"{count:,} console lines dropped while the output stopped draining"
+    )
+
+
+def exited(command, both):
+    """Run `command` from the checkout with its stdout, and its stderr too when
+    `both`, on a pipe nobody reads, full already: its exit status, None once
+    10 s pass first, the seconds it ran and what it wrote on a separate
+    stderr."""
+    unread, written, _ = full_pipe()
+    try:
+        started = time.monotonic()
+        try:
+            child = subprocess.Popen(
+                command,
+                cwd=Path(diagnostics.__file__).resolve().parents[1],
+                stdout=written,
+                stderr=written if both else subprocess.PIPE,
+            )
+        finally:
+            os.close(written)
+        try:
+            status = child.wait(10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+            status = None
+        elapsed = time.monotonic() - started
+        if both:
+            return status, elapsed, b""
+        with child.stderr:
+            return status, elapsed, child.stderr.read()
+    finally:
+        os.close(unread)
+
+
+class DiagnosticsTests(HarnessTestCase):
+    def test_a_failed_connection_is_one_console_line_and_a_disconnect_none(self):
+        # Never socketserver's traceback, which quotes the error's message and
+        # is written straight to stderr, on the connection worker.
+        harness = self.harness(FakeRuntime())
+        for error, written in (
+            (ConnectionResetError(), ""),
+            (BrokenPipeError(), ""),
+            (
+                RuntimeError("private request text"),
+                "14:32:08 Error · internal_server_error · RuntimeError\n",
+            ),
+        ):
+            with self.subTest(error=type(error).__name__):
+                with (
+                    mock.patch.object(api.time, "strftime", return_value="14:32:08"),
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                ):
+                    try:
+                        raise error
+                    except Exception:
+                        harness.server.handle_error(None, ("127.0.0.1", 1))
+                    console_written()
+                self.assertEqual(stderr.getvalue(), written)
 
     def test_http_error_logs_method_and_path_without_query_or_body(self):
         harness = self.harness(FakeRuntime())
@@ -55,7 +115,7 @@ class DiagnosticsTests(HarnessTestCase):
                 "Error · invalid_request_error · POST /v1/messages", error=True
             )
 
-    def test_request_record_contains_metrics_but_console_omits_prompt_and_id(self):
+    def test_request_record_contains_metrics_but_console_omits_the_prompt(self):
         records = []
         harness = self.harness(FakeRuntime(), request_logger=records.append)
         status, _, _ = harness.request(
@@ -72,17 +132,18 @@ class DiagnosticsTests(HarnessTestCase):
         for logged, pattern in (
             (
                 started,
-                r"^\d{2}:\d{2}:\d{2} Started · input \d+ · cached \d+"
+                r"^\d{2}:\d{2}:\d{2} Started · request (\d+) · input \d+ · cached \d+"
                 r" · effort none · thinking off\n$",
             ),
-            (record, r"^\d{2}:\d{2}:\d{2} Done · input [^\n]*\n$"),
+            (record, r"^\d{2}:\d{2}:\d{2} Done · request (\d+) · input [^\n]*\n$"),
         ):
             with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
-                diagnostics.print_request(logged)
+                printed(logged)
             line = output.getvalue()
             self.assertRegex(line, pattern)
-            self.assertNotIn("request_id", line)
             self.assertNotIn("hello", line)
+        # Both lines name the request the engine took, as its own lines do.
+        self.assertEqual(started["request_id"], record["request_id"])
 
     def test_console_request_summary(self):
         record = {
@@ -102,10 +163,10 @@ class DiagnosticsTests(HarnessTestCase):
             mock.patch.object(api.time, "strftime", return_value="14:32:08"),
             mock.patch("sys.stdout", new_callable=io.StringIO) as output,
         ):
-            diagnostics.print_request(record)
+            printed(record)
         self.assertEqual(
             output.getvalue(),
-            "14:32:08 Done · input 10,240 · cached 8,192 · output 320"
+            "14:32:08 Done · request 123 · input 10,240 · cached 8,192 · output 320"
             " · TTFT 0.8s · 85.0 tok/s\n",
         )
 
@@ -122,7 +183,7 @@ class DiagnosticsTests(HarnessTestCase):
             mock.patch.object(api.time, "strftime", return_value="08:02:27"),
             mock.patch("sys.stdout", new_callable=io.StringIO) as output,
         ):
-            diagnostics.print_request(record)
+            printed(record)
         self.assertEqual(
             output.getvalue(),
             "08:02:27 Done · input 168 · cached 0 · deduplicated 64 · output 0\n",
@@ -147,7 +208,7 @@ class DiagnosticsTests(HarnessTestCase):
             mock.patch.object(api.time, "strftime", return_value="08:02:27"),
             mock.patch("sys.stdout", new_callable=io.StringIO) as output,
         ):
-            diagnostics.print_request(record)
+            printed(record)
         self.assertEqual(
             output.getvalue(),
             "08:02:27 Done · input 168 · cached 0 · output 25 · 5.0 tok/cycle\n",
@@ -158,7 +219,7 @@ class DiagnosticsTests(HarnessTestCase):
             mock.patch.object(api.time, "strftime", return_value="19:03:32"),
             mock.patch("sys.stdout", new_callable=io.StringIO) as output,
         ):
-            diagnostics.print_request(
+            printed(
                 {
                     "outcome": "started",
                     "prompt_tokens": 153_545,
@@ -175,7 +236,7 @@ class DiagnosticsTests(HarnessTestCase):
                 mock.patch.object(api.time, "strftime", return_value="19:03:32"),
                 mock.patch("sys.stdout", new_callable=io.StringIO) as output,
             ):
-                diagnostics.print_request(
+                printed(
                     {
                         "outcome": "started",
                         "prompt_tokens": 2_473,
@@ -265,7 +326,7 @@ class DiagnosticsTests(HarnessTestCase):
             mock.patch.object(api.time, "strftime", return_value="14:32:08"),
             mock.patch("sys.stdout", new_callable=io.StringIO) as output,
         ):
-            diagnostics.print_request(record)
+            printed(record)
         self.assertEqual(
             output.getvalue(),
             "14:32:08 Done · input 33,799 · cached 6,656 · output 12"
@@ -274,7 +335,7 @@ class DiagnosticsTests(HarnessTestCase):
 
     def test_console_cancellation_without_tokens_or_latency(self):
         with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
-            diagnostics.print_request({"outcome": "cancelled", "prompt_tokens": 32})
+            printed({"outcome": "cancelled", "prompt_tokens": 32})
         line = output.getvalue()
         self.assertIn("Cancelled · input 32 · cached 0 · output 0", line)
         self.assertNotIn("TTFT", line)
@@ -285,7 +346,7 @@ class DiagnosticsTests(HarnessTestCase):
             mock.patch("sys.stdout", new_callable=io.StringIO) as output,
             mock.patch("sys.stderr", new_callable=io.StringIO) as errors,
         ):
-            diagnostics.print_request(
+            printed(
                 {
                     "outcome": "error",
                     "error_code": "context_length_exceeded",
@@ -294,7 +355,8 @@ class DiagnosticsTests(HarnessTestCase):
                 }
             )
         self.assertRegex(
-            errors.getvalue(), r"^\d{2}:\d{2}:\d{2} Error · context_length_exceeded\n$"
+            errors.getvalue(),
+            r"^\d{2}:\d{2}:\d{2} Error · request 123 · context_length_exceeded\n$",
         )
         self.assertEqual(output.getvalue(), "")
 
@@ -304,7 +366,7 @@ class DiagnosticsTests(HarnessTestCase):
             "which takes no writes"
         )
         with mock.patch("sys.stderr", new_callable=io.StringIO) as errors:
-            diagnostics.print_request(
+            printed(
                 {
                     "outcome": "error",
                     "error_code": "capacity_exhausted",
@@ -319,7 +381,9 @@ class DiagnosticsTests(HarnessTestCase):
 
     def test_concurrent_console_lines_stay_whole(self):
         # Status lines on stdout and errors on stderr, both on one unbuffered
-        # file, as `python -u server.py > log 2>&1` or launchd writes them.
+        # file, as `python -u server.py > log 2>&1` or launchd writes them:
+        # 800 lines, fewer than the console holds waiting, so that none is
+        # dropped however slowly it writes them.
         with tempfile.TemporaryFile() as log:
             streams = [
                 io.TextIOWrapper(
@@ -330,7 +394,7 @@ class DiagnosticsTests(HarnessTestCase):
             self.addCleanup(lambda: [stream.close() for stream in streams])
 
             def write(worker):
-                for line in range(300):
+                for line in range(100):
                     diagnostics.print_status(
                         f"worker {worker} line {line}", error=worker % 2 == 1
                     )
@@ -346,13 +410,14 @@ class DiagnosticsTests(HarnessTestCase):
                     worker.start()
                 for worker in workers:
                     worker.join()
+            console_written()
             log.seek(0)
             lines = log.read().decode().splitlines()
-        self.assertEqual(len(lines), 8 * 300)
+        self.assertEqual(len(lines), 8 * 100)
         for line in lines:
             self.assertRegex(line, r"^\d{2}:\d{2}:\d{2} worker \d line \d+$")
 
-    def test_a_full_log_disk_leaves_the_caller_running(self):
+    def test_a_full_log_disk_leaves_the_caller_and_the_console_running(self):
         class FullDisk(io.StringIO):
             def flush(self):
                 raise OSError(errno.ENOSPC, "No space left on device")
@@ -363,10 +428,182 @@ class DiagnosticsTests(HarnessTestCase):
                 diagnostics.print_request(
                     {"outcome": "error", "error_code": "invalid_request_error"}
                 )
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+            diagnostics.print_status("Ready")
+            console_written()
+        self.assertRegex(output.getvalue(), r"^\d{2}:\d{2}:\d{2} Ready\n$")
+
+    def test_a_console_that_stops_draining_holds_up_no_caller(self):
+        # With a line being written, the next 1024 wait and the 100 after them
+        # are dropped and counted; the waiting ones are written, in order,
+        # once the console drains, and a warning on stderr says how many were
+        # dropped.
+        drained = threading.Event()
+        console = StalledConsole(drained)
+        self.addCleanup(console_written)
+        self.addCleanup(drained.set)
+        dropped = diagnostics.console_stats()["dropped_lines"]
+        kept = diagnostics.CONSOLE_LINES + 1
+        printer = threading.Thread(
+            target=lambda: [
+                diagnostics.print_status(f"line {n}") for n in range(1, kept + 100)
+            ]
+        )
+        with (
+            mock.patch("sys.stdout", console),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as errors,
+        ):
+            diagnostics.print_status("line 0")
+            self.assertTrue(console.writing.wait(5.0))
+            printer.start()
+            printer.join(5.0)
+            self.assertFalse(printer.is_alive())
+            self.assertEqual(
+                diagnostics.console_stats()["dropped_lines"] - dropped, 100
+            )
+            drained.set()
+            console_written()
+        written = [line.split(" ", 1)[1] for line in console.getvalue().splitlines()]
+        self.assertEqual(written, [f"line {n}" for n in range(kept)])
+        self.assertRegex(errors.getvalue(), rf"^{dropped_warning(100)}\n$")
+
+    def test_the_exit_writes_the_last_lines_and_its_engines(self):
+        # An engine writes its last lines, such as the persistent cache's, as
+        # it stops, here once its input ends, while the process exits: the
+        # exit writes them, and keeps the process's status.
+        engine = "import sys; sys.stdin.read(); sys.stderr.write('Stopped\\n')"
+        program = (
+            "import subprocess, sys; from server import diagnostics; "
+            f"engine = subprocess.Popen([sys.executable, '-c', {engine!r}], "
+            "stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0); "
+            "diagnostics.relay_engine_lines(engine.stderr); "
+            "diagnostics.print_status('Stopping'); "
+            "engine.stdin.close(); "
+            "raise SystemExit(69)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", program],
+            cwd=Path(diagnostics.__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 69, result.stderr)
+        self.assertRegex(result.stdout, r"^\d{2}:\d{2}:\d{2} Stopping\n$")
+        self.assertEqual(result.stderr, "Stopped\n")
+
+    def test_an_exit_on_a_console_that_stopped_draining_takes_its_second(self):
+        # Its stdout, or both streams as 2>&1 gives them, on a pipe nobody
+        # reads: the exit gives up on its lines after the console's second
+        # and keeps the process's status, without -u, as docs/models.md
+        # starts the server, as with it.
+        program = (
+            "from server import diagnostics; "
+            "[diagnostics.print_line(f'line {n}') for n in range(10)]; "
+            "raise SystemExit(3)"
+        )
+        for case, options, both in (
+            ("stdout", [], False),
+            ("2>&1", [], True),
+            ("-u 2>&1", ["-u"], True),
+        ):
+            with self.subTest(case=case):
+                status, elapsed, errors = exited(
+                    [sys.executable, *options, "-c", program], both
+                )
+                self.assertEqual(status, 3, errors)
+                self.assertLess(elapsed, 5.0)
+
+    def test_an_uncaught_exception_is_a_console_line(self):
+        # Python's report of an exception nothing caught, in the main thread,
+        # as server.main's of a bug, or in another, comes after the lines
+        # printed before it; on a stderr nobody reads, the process still exits
+        # with its status after the console's second.
+        before = "\n".join(
+            (
+                "import threading",
+                "from server import diagnostics",
+                "for n in range(100):",
+                "    diagnostics.print_line(f'line {n} ' + 'x' * 1000, error=True)",
+            )
+        )
+        lines = [f"line {n} " + "x" * 1000 for n in range(100)]
+        for case, uncaught, status, report in (
+            (
+                "main",
+                "raise RuntimeError('bug')",
+                1,
+                ("Traceback (most recent call last):", "RuntimeError: bug"),
+            ),
+            (
+                "thread",
+                "worker = threading.Thread(target=lambda: 1 / 0, name='worker')\n"
+                "worker.start()\n"
+                "worker.join()",
+                0,
+                ("Exception in thread worker:", "ZeroDivisionError: division by zero"),
+            ),
+        ):
+            program = f"{before}\n{uncaught}\n"
+            with self.subTest(case=case, stderr="read"):
+                result = subprocess.run(
+                    [sys.executable, "-u", "-c", program],
+                    cwd=Path(diagnostics.__file__).resolve().parents[1],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode, status, result.stderr)
+                written = result.stderr.splitlines()
+                self.assertEqual(written[:100], lines)
+                self.assertEqual((written[100], written[-1]), report)
+            with self.subTest(case=case, stderr="unread"):
+                exit_status, elapsed, _ = exited(
+                    [sys.executable, "-u", "-c", program], True
+                )
+                self.assertEqual(exit_status, status)
+                self.assertLess(elapsed, 5.0)
+
+    def test_requests_complete_while_the_console_stops_draining(self):
+        harness = self.harness(FakeRuntime(), request_logger=diagnostics.print_request)
+        drained = threading.Event()
+        console = StalledConsole(drained)
+        self.addCleanup(console_written)
+        self.addCleanup(drained.set)
+        before = diagnostics.console_stats()["dropped_lines"]
+        with mock.patch("sys.stdout", console), mock.patch("sys.stderr", console):
+            for _ in range(2):
+                status, _, payload = harness.request(
+                    "POST", "/v1/chat/completions", chat_body()
+                )
+                self.assertEqual(status, 200, payload)
+            # With the first of their lines being written, the console fills
+            # up; the next request's Started and Done lines are dropped.
+            self.assertTrue(console.writing.wait(5.0))
+            for n in range(diagnostics.CONSOLE_LINES):
+                diagnostics.print_status(f"line {n}")
+            dropped = diagnostics.console_stats()["dropped_lines"]
+            status, _, payload = harness.request(
+                "POST", "/v1/chat/completions", chat_body()
+            )
+            self.assertEqual(status, 200, payload)
+            status, _, payload = harness.request("GET", "/status")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(payload)["console"]["dropped_lines"] - dropped, 2
+            )
+            # Once it drains, a warning after the lines that waited, where the
+            # dropped ones would have been, says how many there were.
+            drained.set()
+            console_written()
+        count = diagnostics.console_stats()["dropped_lines"] - before
+        self.assertRegex(
+            console.getvalue().splitlines()[-1], rf"^{dropped_warning(count)}$"
+        )
 
     def test_request_lines_are_the_ones_the_app_reads(self):
         """The server writes its request lines as log_lines_golden.txt holds
-        them, which the app parses (RequestEntry)."""
+        them, in its order, which the app parses (RequestEntry)."""
         golden = [
             line
             for line in (Path(__file__).parent / "log_lines_golden.txt")
@@ -374,9 +611,10 @@ class DiagnosticsTests(HarnessTestCase):
             .splitlines()
             if line and not line.startswith("#")
         ]
-        records = {
-            "Started": {
+        records = [
+            {
                 "outcome": "started",
+                "request_id": 7,
                 "prompt_tokens": 4096,
                 "cached_tokens": 1024,
                 "reasoning": {
@@ -386,8 +624,9 @@ class DiagnosticsTests(HarnessTestCase):
                     "thinking": False,
                 },
             },
-            "Done": {
+            {
                 "outcome": "stop",
+                "request_id": 7,
                 "prompt_tokens": 4096,
                 "completion_tokens": 574,
                 "metrics": {
@@ -399,27 +638,27 @@ class DiagnosticsTests(HarnessTestCase):
                     "speculation": {"accepted_draft_tokens": 9, "cycles": 10},
                 },
             },
-            "Cancelled": {
+            {
                 "outcome": "cancelled",
+                "request_id": 8,
                 "prompt_tokens": 69,
                 "completion_tokens": 12,
                 "metrics": {"cache": {"matched_tokens": 0}},
             },
-            "Error": {"outcome": "error", "error_code": "invalid_request_error"},
-        }
-        for line in golden:
-            time, kind = line.split()[:2]
-            if kind not in records:
-                continue
+            # A request the engine took, and one refused before it.
+            {"outcome": "error", "request_id": 9, "error_code": "runtime_unavailable"},
+            {"outcome": "error", "error_code": "invalid_request_error"},
+        ]
+        self.assertEqual(len(golden), len(records))
+        for line, record in zip(golden, records):
             with (
-                self.subTest(kind=kind),
-                mock.patch.object(api.time, "strftime", return_value=time),
+                self.subTest(line=line),
+                mock.patch.object(api.time, "strftime", return_value=line.split()[0]),
                 mock.patch("sys.stdout", new_callable=io.StringIO) as output,
                 mock.patch("sys.stderr", new_callable=io.StringIO) as errors,
             ):
-                diagnostics.print_request(records.pop(kind))
+                printed(record)
                 self.assertEqual(output.getvalue() + errors.getvalue(), line + "\n")
-        self.assertEqual(records, {})
 
 
 if __name__ == "__main__":

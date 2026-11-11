@@ -9,6 +9,9 @@ struct PopupItem: Identifiable, Hashable {
     var badge: String?
     /// Set apart from the items before it by a line.
     var separated = false
+    /// Shown faded, as a menu's item that can't be chosen now: the pointer and the arrow keys pass
+    /// it by.
+    var disabled = false
 }
 
 /// A menu in Splash's own style: a rounded panel under the control that opens it, or over it,
@@ -44,9 +47,32 @@ struct PopupList: View {
     let items: [PopupItem]
     let chosen: String?
     @Binding var highlighted: String?
+    /// The height its items scroll in, where they take more room than the panel has; nil where they
+    /// all show.
+    var height: CGFloat?
     let choose: (String) -> Void
 
     var body: some View {
+        Group {
+            if let height {
+                // The item the arrow keys reach scrolls into view.
+                ScrollViewReader { proxy in
+                    ScrollView { rows }
+                        .frame(height: height)
+                        .onChange(of: highlighted) { _, item in if let item { proxy.scrollTo(item) } }
+                }
+            } else {
+                rows
+            }
+        }
+        .padding(5)
+        .frame(minWidth: 200, alignment: .leading)
+        .fixedSize()
+        .background(Self.ground, in: .rect(cornerRadius: 12))
+        .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(.separator) }
+    }
+
+    private var rows: some View {
         VStack(alignment: .leading, spacing: 1) {
             if let header {
                 Text(header)
@@ -61,13 +87,9 @@ struct PopupList: View {
                     Divider().padding(.horizontal, 8).padding(.vertical, 4)
                 }
                 PopupRow(item: item, chosen: item.id == chosen, highlighted: $highlighted) { choose(item.id) }
+                    .id(item.id)
             }
         }
-        .padding(5)
-        .frame(minWidth: 200, alignment: .leading)
-        .fixedSize()
-        .background(Self.ground, in: .rect(cornerRadius: 12))
-        .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(.separator) }
     }
 
     /// What the panel stands on: white, or near black in dark mode, solid.
@@ -111,8 +133,11 @@ private struct PopupRow: View {
             .contentShape(.rect(cornerRadius: 7))
         }
         .buttonStyle(.plain)
+        .disabled(item.disabled)
+        // As `HoverStyle` fades a button disabled.
+        .opacity(item.disabled ? 0.4 : 1)
         .onHover { inside in
-            if inside { highlighted = item.id } else if highlighted == item.id { highlighted = nil }
+            if inside, !item.disabled { highlighted = item.id } else if highlighted == item.id { highlighted = nil }
         }
         .accessibilityAddTraits(chosen ? .isSelected : [])
     }
@@ -141,16 +166,27 @@ final class Popup {
         Self.open?.close()
         guard let anchor, let window = anchor.window else { return }
         (self.items, self.chosen, self.choose, highlighted) = (items, chosen, choose, nil)
-        let list = PopupList(header: header, items: items, chosen: chosen,
+        var list = PopupList(header: header, items: items, chosen: chosen,
                              highlighted: Binding { self.highlighted } set: { self.highlighted = $0 }) { [weak self] in self?.pick($0) }
-        let host = NSHostingView(rootView: list)
-        let size = host.fittingSize
+        var host = NSHostingView(rootView: list)
+        var size = host.fittingSize
         let control = window.convertToScreen(anchor.convert(anchor.bounds, to: nil))
         let screen = window.screen?.visibleFrame ?? .infinite
+        // Taller than the room on the control's roomier side, or than some twelve items, its items
+        // scroll in that height, less the panel's padding.
+        let room = min(max(control.minY - screen.minY, screen.maxY - control.maxY) - 14, 400)
+        if size.height > room {
+            list.height = room - 10
+            host = NSHostingView(rootView: list)
+            size = host.fittingSize
+        }
         let under = control.minY - 6 - size.height, over = control.maxY + 6
         let roomUnder = under >= screen.minY + 8, roomOver = over + size.height <= screen.maxY - 8
         let y = above ? (roomOver || !roomUnder ? over : under) : (roomUnder || !roomOver ? under : over)
-        let origin = NSPoint(x: min(max(control.maxX - size.width, screen.minX + 8), screen.maxX - size.width - 8),
+        // Toward the window's middle: from the control's leading edge in the window's left half,
+        // from its trailing edge in its right half.
+        let x = control.midX < window.frame.midX ? control.minX : control.maxX - size.width
+        let origin = NSPoint(x: min(max(x, screen.minX + 8), screen.maxX - size.width - 8),
                              y: min(max(y, screen.minY + 8), screen.maxY - size.height - 8))
         let panel = NSPanel(contentRect: NSRect(origin: origin, size: size), styleMask: [.borderless, .nonactivatingPanel],
                             backing: .buffered, defer: false)
@@ -220,8 +256,10 @@ final class Popup {
         choose(id)
     }
 
-    /// Moves the highlight `step` items on, starting at the chosen item when none is highlighted.
+    /// Moves the highlight `step` items on, of those that can be chosen, starting at the chosen item
+    /// when none is highlighted.
     private func move(_ step: Int) {
+        let items = self.items.filter { !$0.disabled }
         guard !items.isEmpty else { return }
         let index = if let current = items.firstIndex(where: { $0.id == highlighted }) {
             current + step
