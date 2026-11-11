@@ -51,7 +51,8 @@ exits with status 69 (`EX_UNAVAILABLE`), where a stop exits 0, a failed start
 that lands as the engine stops for good may still exit 69. Until then requests
 get 500 `engine_failed` in the same words. What
 runs the server, such as launchd with `KeepAlive`, decides whether to start it
-again, and a new server counts failures from none; the app shows why it
+again, and a new server counts failures from none, so give it a
+`ThrottleInterval` for a cause the next start meets again; the app shows why it
 stopped. While the engine restarts, generation requests get
 503 `engine_recovering`, whose message names the last failure and whose
 `Retry-After` the time until the next bound on the restart's start: when it
@@ -987,9 +988,12 @@ Each start follows the model's default branch, or the branch or tag
 `--revision` names: one Hub request of at most 5 seconds asks for its current
 commit, and when the Hub answered, another asks for the commit of the draft
 repository's default branch ([Drafts](models.md#drafts)). A new commit downloads only
-the files that changed and replaces the installed model once it is installed.
-There is no update flag; to stay on one commit, pass it as `--revision`. A
-40-hex `--revision` never moves, nor does its draft, and `--offline` (or
+the files that changed and replaces the installed model once it is installed,
+freeing the earlier commit's files, unless another tool's files share its
+snapshot. An older `--revision` downloads them again, as a new commit that then
+fails to load would need. There is no update flag; to stay on one commit,
+pass it as `--revision`. A 40-hex `--revision` never moves, nor does its draft,
+and `--offline` (or
 `HF_HUB_OFFLINE=1`) forbids the Hub: both start the installed model without a
 request.
 
@@ -1093,10 +1097,11 @@ semantics (off when omitted) unless the request's `chat_template_kwargs` set
 built-in chat page offers Auto, the efforts `/v1/models` reports and Off, and
 no menu for a model that decides; it sends no effort unless the user picks one.
 
-The console's Started line shows how each chat request reasons: the effort it
-sent, or `absent` and the default it took, its `enable_thinking` when it set
-one, and whether it thinks, as in
-`Started · input 2,473 · cached 0 · effort absent → low · thinking on`.
+The console's Started line names the request the engine took, by the id its
+Done, Cancelled or Error line names too, and shows how each chat request
+reasons: the effort it sent, or `absent` and the default it took, its
+`enable_thinking` when it set one, and whether it thinks, as in
+`Started · request 12 · input 2,473 · cached 0 · effort absent → low · thinking on`.
 
 A Chat or Messages request's `chat_template_kwargs` are passed to the template
 as variables and outrank the effort, and in Messages `thinking`, so

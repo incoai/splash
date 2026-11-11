@@ -141,6 +141,9 @@ class Job:
     response_format: dict | None = None
     constraint: TokenConstraint | None = None
     cache: CacheInfo = field(default_factory=CacheInfo)
+    # The engine's id of the request once the engine has taken it, by which
+    # the console's lines name it.
+    engine_request_id: int | None = None
     # Image placeholder spans with their grids and digests, plus the
     # concatenated resized pixels the engine encodes during prefill and their
     # charge against the in-flight image budget, held until the frame is
@@ -920,6 +923,7 @@ class NativeBackend:
                 if not state.detached:
                     state.call = call
                 cancel = state.detached or self.closing or job.cancelled.is_set()
+            job.engine_request_id = call.request_id
             if cancel:
                 call.cancel()
         except Exception as error:
@@ -958,6 +962,7 @@ class NativeBackend:
                 job.cache = cache
             record = {
                 "outcome": "started",
+                "request_id": event.request_id,
                 "prompt_tokens": len(job.prompt_tokens),
                 "cached_tokens": cache.matched_tokens,
             }
@@ -1097,7 +1102,7 @@ class NativeBackend:
             # before close() acquires the state lock remains a normal result.
             result = None
             error = APIError(503, "server is shutting down", "server_shutdown")
-        self._record(job, result=result, error=error)
+        self._record(job, result=result, error=error, request_id=call.request_id)
         job.events.put(("error", error) if error else ("done", result))
 
     @staticmethod
@@ -1152,11 +1157,13 @@ class NativeBackend:
             return APIError(504, "request timed out", "request_timeout")
         return APIError(500, str(error), "runtime_error")
 
-    def _record(self, job, result=None, error=None):
+    def _record(self, job, result=None, error=None, request_id=None):
         record = {
             "outcome": result.reason if result else "error",
             "prompt_tokens": len(job.prompt_tokens),
         }
+        if request_id is not None:
+            record["request_id"] = request_id
         if result:
             record["completion_tokens"] = result.completion_tokens
             record["metrics"] = result.metrics
@@ -1169,6 +1176,7 @@ class NativeBackend:
             record["error_code"] = error.code
             if error.code in _ENGINE_RESOURCE_CODES:
                 record["engine_reason"] = error.message
+            error.logged = True
         self._log(record)
 
     def _log(self, record):
@@ -1204,7 +1212,11 @@ class NativeBackend:
                     self._detach_locked(state)
                     stranded.append((state, self._closed_error_locked()))
             for state, error in stranded:
-                self._record(state.job, error=error)
+                self._record(
+                    state.job,
+                    error=error,
+                    request_id=state.call.request_id if state.call else None,
+                )
                 state.job.events.put(("error", error))
             self.terminals.put(None)
             self.finalizer.join()

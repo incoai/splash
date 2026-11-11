@@ -322,10 +322,19 @@ def _reasoning_parts(reasoning):
     return parts
 
 
+def _request(record):
+    """The request a line names, where the engine took it: its id, as the
+    engine's own lines and `/status` give it, so that the lines that start
+    and end it, among those of others running at once, go together."""
+    if record.get("request_id") is None:
+        return []
+    return [f"request {record['request_id']}"]
+
+
 def print_request(record):
     outcome = record["outcome"]
     if outcome == "error":
-        parts = ["Error", record.get("error_code", "runtime_error")]
+        parts = ["Error", *_request(record), record.get("error_code", "runtime_error")]
         # Only the engine's own wording of a resource failure, never the
         # request's error message, which may quote it.
         if record.get("engine_reason"):
@@ -337,6 +346,7 @@ def print_request(record):
         # from here until its Done line.
         parts = [
             "Started",
+            *_request(record),
             f"input {record['prompt_tokens']:,}",
             f"cached {record['cached_tokens']:,}",
         ]
@@ -349,6 +359,7 @@ def print_request(record):
     cache = metrics.get("cache", {})
     parts = [
         "Cancelled" if outcome == "cancelled" else "Done",
+        *_request(record),
         f"input {record['prompt_tokens']:,}",
         f"cached {cache.get('matched_tokens', 0):,}",
     ]
