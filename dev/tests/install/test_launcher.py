@@ -17,7 +17,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
-from dev.tests.server_fixtures import keep_stop_signals, server_arguments
+from dev.tests.server_fixtures import (
+    console_written,
+    keep_stop_signals,
+    server_arguments,
+)
 from install import launcher
 from server import serve_options
 from server import server as api
@@ -177,6 +181,7 @@ class LauncherTests(unittest.TestCase):
                 ),
                 1,
             )
+            console_written()
             self.assertIn("cannot bind http://127.0.0.1:", error.getvalue())
             install.assert_not_called()
             execute.assert_not_called()
@@ -298,6 +303,7 @@ class LauncherTests(unittest.TestCase):
                             ),
                             1,
                         )
+                console_written()
                 self.assertIn(
                     "Splash is being upgraded; wait for the upgrade to finish",
                     error.getvalue(),
@@ -327,6 +333,7 @@ class LauncherTests(unittest.TestCase):
                     mock.patch("sys.stderr", io.StringIO()) as error,
                 ):
                     self.assertEqual(launcher.main(["serve", "--model", MODEL_ID]), 1)
+                console_written()
                 self.assertIn(f"PID {os.getpid()}", error.getvalue())
                 self.assertIn("model mlx-community/Qwen3.8-27B-4bit", error.getvalue())
                 self.assertIn("port 8000", error.getvalue())
@@ -365,6 +372,7 @@ class LauncherTests(unittest.TestCase):
                         self.assertEqual(
                             launcher.main(["serve", "--model", MODEL_ID]), 1
                         )
+                    console_written()
                     self.assertEqual(
                         error.getvalue(),
                         "error: Splash is already serving; stop it with Ctrl+C first\n",
@@ -475,6 +483,7 @@ class LauncherTests(unittest.TestCase):
                         + ["--port", str(port)]
                     )
                 self.assertEqual(result, 1)
+                console_written()
                 self.assertIn(f"cannot bind {host}:{port}: ", error.getvalue())
                 install.assert_not_called()
                 execute.assert_not_called()
@@ -594,7 +603,7 @@ class LauncherTests(unittest.TestCase):
             self.assertRaises(SystemExit),
         ):
             launcher.parse_args(["serve", "--help"])
-        flags = set(re.findall(r"(?m)^  (--[a-z-]+)", output.getvalue())) - {
+        flags = set(re.findall(r"(?m)^  (--[a-z0-9-]+)", output.getvalue())) - {
             "--help",
             "--model",
             "--model-dir",
@@ -607,7 +616,7 @@ class LauncherTests(unittest.TestCase):
         table = Path(launcher.__file__).resolve().parents[1] / (
             "app/Sources/Splash/Preferences.swift"
         )
-        options = set(re.findall(r'flag: "(--[a-z-]+)"', table.read_text()))
+        options = set(re.findall(r'flag: "(--[a-z0-9-]+)"', table.read_text()))
         self.assertEqual(options, flags)
 
     def test_distinct_ports_have_independent_locks_and_same_port_is_rejected(self):
@@ -663,6 +672,7 @@ class LauncherTests(unittest.TestCase):
                         fcntl.flock(released, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.assertEqual(seen, [port, other_port])
             self.assertEqual(install.call_count, 2)
+            console_written()
             self.assertIn(f"port {port}", error.getvalue())
 
     def test_exec_keeps_installation_locked_until_every_server_exits(self):
@@ -833,6 +843,7 @@ class LauncherTests(unittest.TestCase):
                     mock.patch("sys.stderr", io.StringIO()) as error,
                 ):
                     self.assertEqual(launcher.main(["opencode", *arguments]), 1)
+                    console_written()
                     self.assertIn("No ready Splash server", error.getvalue())
                     self.assertEqual(
                         "If --port was meant for opencode itself, put it after --."
@@ -1071,6 +1082,7 @@ class LauncherTests(unittest.TestCase):
                     mock.patch("sys.stdout", Output()) as output,
                 ):
                     launcher._ensure_installed(selection(runtime))
+            console_written()
             self.assertEqual(
                 output.getvalue(), "Another Splash build is running; waiting...\n"
             )
@@ -1254,32 +1266,52 @@ class LauncherTests(unittest.TestCase):
         )
 
     def test_a_stop_the_launcher_takes_ends_the_held_program(self):
-        signal.signal(signal.SIGINT, launcher._interrupt)
-        main = threading.main_thread().ident
-        popen = subprocess.Popen
+        # In a launcher process of its own, with the stop sent to the process,
+        # as Ctrl+C and the app send it: the kernel hands it to any thread that
+        # has it unblocked. It comes as the program is spawned, held until the
+        # program exists, or while the program runs. The 50 ms give a stop
+        # that another thread took the time to be raised in the spawn, where
+        # nothing would end the program.
+        program = "\n".join(
+            (
+                "import os, signal, subprocess, sys, threading, time",
+                "from unittest import mock",
+                "from install import launcher",
+                "signal.signal(signal.SIGINT, launcher._interrupt)",
+                "popen = subprocess.Popen",
+                "programs = []",
+                "stop = (os.getpid(), signal.SIGINT)",
+                "def spawn(*args, **options):",
+                "    programs.append(popen(*args, **options))",
+                "    if sys.argv[1] == 'spawn':",
+                "        os.kill(*stop)",
+                "        time.sleep(0.05)",
+                "    else:",
+                "        threading.Timer(0.2, os.kill, stop).start()",
+                "    return programs[-1]",
+                "held = [sys.executable, '-c', 'import time; time.sleep(10)']",
+                "with mock.patch.object(subprocess, 'Popen', side_effect=spawn):",
+                "    try:",
+                "        launcher._run_held(held)",
+                "    except KeyboardInterrupt:",
+                "        pass",
+                "try:",
+                "    print(programs[0].wait(5))",
+                "except subprocess.TimeoutExpired:",
+                "    programs[0].kill()",
+                "    print('still running')",
+            )
+        )
         for moment in ("spawn", "run"):
             with self.subTest(moment=moment):
-                programs = []
-
-                def spawn(*args, **options):
-                    programs.append(popen(*args, **options))
-                    if moment == "spawn":
-                        # Held: it arrives once the program exists.
-                        signal.pthread_kill(main, signal.SIGINT)
-                    else:
-                        threading.Timer(
-                            0.2, signal.pthread_kill, (main, signal.SIGINT)
-                        ).start()
-                    return programs[-1]
-
-                with (
-                    mock.patch.object(launcher.subprocess, "Popen", side_effect=spawn),
-                    self.assertRaises(KeyboardInterrupt),
-                ):
-                    launcher._run_held(
-                        [sys.executable, "-c", "import time; time.sleep(60)"]
-                    )
-                self.assertEqual(programs[0].wait(timeout=5), -signal.SIGKILL)
+                result = subprocess.run(
+                    [sys.executable, "-c", program, moment],
+                    cwd=launcher.ROOT,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(result.stdout, f"{-signal.SIGKILL}\n", result.stderr)
 
     def test_programs_take_a_stop_held_from_their_start(self):
         home = self.enterContext(tempfile.TemporaryDirectory())
@@ -1621,6 +1653,7 @@ class LauncherTests(unittest.TestCase):
                     json.loads((runtime / "serve-8000.json").read_text()),
                     {"pid": os.getpid(), "phase": "failed", "failure": failure},
                 )
+                console_written()
                 self.assertEqual(error.getvalue(), said)
                 self.assertEqual(relayed.getvalue(), output)
 
@@ -1689,6 +1722,7 @@ class LauncherTests(unittest.TestCase):
                     mock.patch("sys.stderr", io.StringIO()) as error,
                 ):
                     self.assertEqual(launcher.main(["serve", "--model", MODEL_ID]), 1)
+            console_written()
             self.assertIn("Splash is already serving", error.getvalue())
             self.assertEqual(record.read_text(), '{"pid":123,"phase":"starting"}')
 
@@ -1775,6 +1809,7 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(launcher.main(["serve", "--model", MODEL_ID]), 1)
             prepare.assert_not_called()
             execute.assert_not_called()
+            console_written()
             self.assertEqual(
                 error.getvalue(),
                 f"error: cannot write the serve record {record}: Is a directory\n",
@@ -1806,6 +1841,7 @@ class LauncherTests(unittest.TestCase):
             ):
                 fcntl.flock(installation, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 self.assertEqual(launcher.main(["serve", "--model", MODEL_ID]), 1)
+            console_written()
             written, refusal = error.getvalue().splitlines()
             self.assertEqual(
                 refusal,
@@ -1829,6 +1865,7 @@ class LauncherTests(unittest.TestCase):
             mock.patch("sys.stderr", io.StringIO()) as error,
         ):
             self.assertEqual(launcher.main(["serve", "--model", MODEL_ID]), 1)
+            console_written()
             self.assertIn("disk full", error.getvalue())
             with (Path(temporary) / "serve-8000.lock").open("a+") as released:
                 fcntl.flock(released, fcntl.LOCK_EX | fcntl.LOCK_NB)

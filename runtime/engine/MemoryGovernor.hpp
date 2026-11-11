@@ -76,12 +76,6 @@ struct HostTelemetry final {
 // report any part of it.
 [[nodiscard]] std::optional<HostTelemetry> queryHostTelemetry() noexcept;
 
-enum class MemoryPressure : uint8_t {
-  Normal,
-  Warning,
-  Critical,
-};
-
 // One spelling of the levels for status JSON and startup diagnostics.
 [[nodiscard]] inline const char *
 memoryPressureName(MemoryPressure pressure) noexcept {
@@ -160,11 +154,12 @@ struct MemoryGovernorSnapshot {
   // The host's memory as macOS counts it, which /status reports; none when
   // it does not (queryHostTelemetry).
   std::optional<HostTelemetry> hostTelemetry{};
-  // The ledger's accounts, what transfers will return, and the claims that
-  // wait.
+  // The ledger's accounts, what transfers will return, the claims that
+  // wait, and how its takes kept to its counts.
   std::vector<MemoryAccountSnapshot> accounts{};
   OwedBytesSnapshot owed{};
   MemoryClaimsSnapshot claims{};
+  MemoryLedger::CountChecks countChecks{};
 };
 
 // The sole memory admission. It does not allocate, evict or schedule work;
@@ -201,6 +196,7 @@ public:
   // reserves the bytes under the limit, beside the room claims ranked above
   // it hold, while the allocation runs, if the host's rule admits them for
   // the claim (its class's, or a lane's growth's for what the lane needs).
+  // Bytes the scope's work released already pass all three (fund).
   // Otherwise it refuses with the cause: HostPressure when the host refuses,
   // whether or not the limit does too, EngineBudget when only the limit
   // does. A refusal records what the claim lacks (need).
@@ -214,13 +210,19 @@ public:
   // snapshot(), with the host's band moved to its sample, as a
   // reservation's and the control pass's move it.
   MemoryGovernorSnapshot evaluate() noexcept;
+  // Metal memory outside the backend's buffers (pipelines, driver
+  // allocations, whatever else in the process allocates) as the device last
+  // counted it: the quantity memory_audit.device_untracked_bytes measures at
+  // startup, read now. The limit charges it past the untracked reserve.
+  [[nodiscard]] uint64_t untrackedBytes() const noexcept;
 
   // The accounts, claims and victim sources the governor's rule works on.
   [[nodiscard]] MemoryLedger &ledger() noexcept { return ledger_; }
   [[nodiscard]] const MemoryLedger &ledger() const noexcept { return ledger_; }
   // While one lives, admissions are for `claim`, under the host's rule for
   // its class and the room claims ranked above it hold
-  // (MemoryLedger::heldBytes). It restores the scope it replaced.
+  // (MemoryLedger::heldBytes), past both for what its work released (fund).
+  // It restores the scope it replaced.
   class Scope final {
   public:
     Scope(MemoryGovernor &governor, ClaimId claim) noexcept;
@@ -231,7 +233,21 @@ public:
   private:
     MemoryGovernor &governor_;
     ClaimId previousClaim_;
+    uint64_t previousFunded_ = 0;
   };
+  // The scope's work released `bytes`, which its allocations take back
+  // while the scope lives (an allocation's attempts share one,
+  // Engine::allocate): one of no more than is left passes the engine's
+  // limit, the room claims ranked above it hold and the host's rule
+  // (allocationAdmission), since the scope's net change never raises the
+  // charge, and only one that succeeds takes it back. A spill's moves pay
+  // for the Index extents they move into with the Full extents they empty
+  // (Cache::spillWritten, Cache::releasePages), 17 times an Index extent's
+  // bytes on Qwen3.8-Flash-Next, and the refill is what lets the moves go on
+  // returning memory; a pool's growth the cache funds whole returns the
+  // host nothing, and so still waits out critical pressure and a deficit
+  // (growthHost). std::logic_error outside any scope.
+  void fund(uint64_t bytes);
   // The need its scope's refusals recorded, with the caller's in-place part.
   [[nodiscard]] Need need(ClaimId claim, const std::optional<Need> &inPlace = {}) const;
   // MemoryLedger::heldPages beside the room admission grants in-service
@@ -239,8 +255,9 @@ public:
   // beyond its margin at normal pressure, read now, since pages are handed
   // out between the host rule's samples.
   [[nodiscard]] std::array<uint32_t, 3> heldPages(ClaimId claim) const;
-  // Frees what the claim lacks (MemoryLedger::free). A need the host refused
-  // is met in place first, from the pages and state buffers already
+  // Frees what the claim lacks (MemoryLedger::free), in its scope: a lane's
+  // release allocates the Index extents its pages move into. A need the host
+  // refused is met in place first, from the pages and state buffers already
   // allocated; failing that, the retries of an InService claim, or
   // of an Optional one its lane needs (ClaimSpec::laneNeeds), pass the host,
   // and another claim falls short.
@@ -302,7 +319,8 @@ private:
   // exempt claim once nothing in place meets it. A pool's growth the growth
   // pass admitted on its net change (growthHost) passes. Anything else needs
   // h to keep M beyond it outside the band and macOS's warning. macOS's
-  // critical pressure refuses everything.
+  // critical pressure refuses everything. What a scope's work paid for
+  // never asks the rule (fund).
   class HostRule final {
   public:
     void sample(const std::optional<HostMemory> &host, uint64_t spareReserve, uint64_t inFlight,
@@ -321,8 +339,9 @@ private:
     MemoryPressure system_ = MemoryPressure::Normal;
     bool constrained_ = true;
   };
-  // The host claim's pass: up to `target` of what it may take.
-  [[nodiscard]] FreeResult hostPass(uint64_t target, bool critical);
+  // The host claim's pass: up to `target` of what it may take at the
+  // host's pressure now.
+  [[nodiscard]] FreeResult hostPass(uint64_t target);
   // Room under the limit beside what is charged and being allocated.
   [[nodiscard]] uint64_t roomBytes() const noexcept;
   // HostRule::sample at a fresh sample of the host.
@@ -363,8 +382,10 @@ private:
   uint64_t deniedReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;
   MemoryLedger ledger_;
-  // The innermost Scope's claim.
+  // The innermost Scope's claim, and what its work released that its
+  // allocations have not taken back (fund).
   ClaimId scope_;
+  uint64_t fundedBytes_ = 0;
   HostRule hostRule_;
   // The largest unit a pool grows by, as the last pass or evaluation found:
   // how far past the margin the band reaches. Kept, so that an admission a

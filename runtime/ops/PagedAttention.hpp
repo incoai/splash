@@ -3,6 +3,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/PagedAttention.h"
+#include "ops/KernelCalibration.hpp"
 #include "ops/PagedKv.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
@@ -58,9 +59,10 @@ static_assert(kVerifySplits <= kVerifyMaximumSplits);
 // than kVerifySplits and never more than the maximum the partial workspace
 // is sized for, nor, with a window of windowTokens keys before each row,
 // than the pages the window reads (a split each). It depends only on the
-// lane's own history, so batching never changes a lane's arithmetic; a
+// lane's own history, so batching never changes a lane's partition; a
 // sparse lane's splits likewise follow its own block list alone
-// (kernels/common/sparse_attention_tile.h).
+// (kernels/common/sparse_attention_tile.h). Whether a lane's queries score
+// as INT8 follows the batch's longest lane (ops::PagedAttention::verifyPlan).
 [[nodiscard]] constexpr uint32_t
 verifyAttentionSplits(uint32_t committedTokens, uint32_t windowTokens = 0) noexcept {
   const uint64_t visible = uint64_t{committedTokens} + kVerifyRows;
@@ -222,6 +224,31 @@ struct AttentionBlocks final {
   metal::MetalBuffer locationPages{};
 };
 
+// The rows of a prefill chunk from `first`, the first row of a tile, to its
+// last, planned as a chunk of their own after the rows before them
+// (PagedAttention::prefillTail). Row r of the chunk's staged queries and of
+// its attention rows starts offsetBytes(r) into their buffers (a KV head's
+// rows lie apart, at the chunk's stride, so each head's rows from `first` on
+// start there too), chunk(params) gives the tail the chunk's params with the
+// rows before it committed, and blocks(lists) a sparse chunk's block lists
+// from the list of the tail's first tile on.
+struct PrefillAttentionTail final {
+  const uint32_t first;
+  const PrefillAttentionPlan plan;
+  // A staged row: a KV head's group of query heads, bf16.
+  const uint64_t rowBytes;
+  [[nodiscard]] uint64_t offsetBytes(uint32_t row) const noexcept { return row * rowBytes; }
+  [[nodiscard]] kv::ChunkedPrefillParams chunk(kv::ChunkedPrefillParams params) const noexcept {
+    params.committed_tokens += first;
+    params.chunk_tokens -= first;
+    return params;
+  }
+  [[nodiscard]] AttentionBlocks blocks(AttentionBlocks lists) const {
+    if (lists.stride) lists.list += first / kv::kPrefillAttentionTileRows;
+    return lists;
+  }
+};
+
 // Rows whose block masks become block lists (PagedAttention::addBlockLists):
 // `rows` rows from row `maskRow` of the masks, the first at position
 // `firstPosition`, whose tiles take the lists from `list` on.
@@ -257,15 +284,25 @@ public:
   // plan's split count follows its rows and, unless it is sparse, the pages
   // its tiles read of the historyTokens committed before them (with a
   // window, no more than its window's), a split per the device's
-  // `pagesPerSplit` (AttentionCalibration).
+  // `prefillPagesPerSplit` (AttentionCalibration).
+  // With `int8Activations` on, INT8 pages score against INT8 queries (the
+  // dense split kernels' q8q entries) where the longest tile's or lane's
+  // splits read at least the device's `int8QueriesFromPages` pages each: a
+  // verify's lanes share the choice.
   [[nodiscard]] static PrefillAttentionPlan
   prefillPlan(uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
-              uint32_t pagesPerSplit, AttentionVariant variant = {});
+              const AttentionCalibration &calibration, Int8Activations int8Activations,
+              AttentionVariant variant = {});
+  // `chunk`'s rows from the first of the tile that holds `row`: the chunk's
+  // kernels and splits, so each of their tiles computes what it does in the
+  // chunk.
+  [[nodiscard]] static PrefillAttentionTail prefillTail(const PrefillAttentionPlan &chunk, uint32_t row);
   // historyTokens holds each lane's committed tokens before its verify rows,
   // one entry per lane.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-             std::span<const uint32_t> historyTokens, AttentionVariant variant = {});
+             std::span<const uint32_t> historyTokens, const AttentionCalibration &calibration,
+             Int8Activations int8Activations, AttentionVariant variant = {});
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences
@@ -379,6 +416,14 @@ public:
   static void addStageLayer(metal::CommandGraph &graph, SplashKvLayer poolLayer, metal::MetalBuffer poolTable,
                             SplashKvLayer stagedLayer, metal::MetalBuffer stagedTable, uint32_t firstPage,
                             uint32_t pages, kv::Layout layout);
+
+private:
+  // A prefill plan of `rows` rows in `splits` history splits on the split and
+  // reduce kernels named: its tiles' workspace and grids (prefillPlan,
+  // prefillTail).
+  [[nodiscard]] static PrefillAttentionPlan prefillPlanOf(uint32_t rows, uint32_t splits, std::string splitPipeline,
+                                                          std::string reducePipeline, bool sparse, bool sinks,
+                                                          kv::Layout layout, uint32_t queryHeads);
 };
 
 } // namespace splash::ops

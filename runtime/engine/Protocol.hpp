@@ -18,7 +18,7 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 12;
+inline constexpr uint16_t kProtocolVersion = 13;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
@@ -215,7 +215,7 @@ struct RequestFrame {
 //   StatusJson     u64 correlationId, the JSON
 //   StartFailed    u8 kind, u8 bound, u64 requiredBytes, u64 budgetBytes,
 //                  u32 planContextTokens, u32 message bytes, the message
-//   Warming        nothing
+//   Warming        u32 stepsDone, u32 steps
 struct CancelFrame {
   uint64_t requestId = 0;
 
@@ -255,10 +255,15 @@ struct StopFrame {
   bool operator==(const StopFrame &) const = default;
 };
 
-// Sent before Ready once the engine holds its weights: what remains of its
-// start is the warm-up runs, which can take a minute on the first start
-// after an update, when they also prepare the GPU's programs.
+// Sent before Ready once the engine holds its weights, as its warm-up begins and
+// as each step ends (ServingRuntime::requireWarmup): on the first start after an
+// update the warm-up also prepares the GPU's programs, and the 27B's start then
+// took 56 s on a 48 GB M5 Pro.
 struct WarmingEvent {
+  // The steps done, those memory kept from running among them, of all.
+  uint32_t stepsDone = 0;
+  uint32_t steps = 0;
+
   bool operator==(const WarmingEvent &) const = default;
 };
 
