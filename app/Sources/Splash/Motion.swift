@@ -27,9 +27,11 @@ import SwiftUI
 enum Motion {
     static var reduced: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
     static let quick = Animation.easeOut(duration: 0.12)
-    static var settle: Animation? { reduced ? nil : .smooth(duration: settleSeconds) }
+    static var settle: Animation? { reduced ? nil : .spring(settleSpring) }
     static var glide: Animation? { reduced ? nil : .smooth(duration: 0.4) }
-    private static let settleSeconds = 0.24
+    static let settleSeconds = 0.24
+    /// `settle`'s curve, which a page's scroll follows in step with its content (`AppKitScroll`).
+    static let settleSpring = Spring.smooth(duration: settleSeconds)
 
     /// How a section or a row of a page comes and goes as the state changes: one that goes, goes
     /// at once, and one that comes fades in within `settle` once what makes room for it has moved,

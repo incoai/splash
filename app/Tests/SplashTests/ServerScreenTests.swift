@@ -533,6 +533,48 @@ extension ServerScreenTests {
             #expect(moved == 0, "setting the memory limit to \(value ?? "Auto") moved the page in \(moved) frames")
         }
     }
+
+    /// How far the page of `rows` is drawn below where `reference` has it, in points: the shift that
+    /// lines up the most of their rows that aren't one color throughout.
+    static func shift(of rows: [Data], from reference: [Data], scale: CGFloat) -> CGFloat {
+        let drawn = rows.indices.filter { Set(rows[$0]).count > 2 }
+        let best = (-Int(160 * scale)...Int(160 * scale)).max { a, b in
+            func lined(_ d: Int) -> Int { drawn.count { $0 - d >= 0 && $0 - d < reference.count && rows[$0] == reference[$0 - d] } }
+            return lined(a) < lined(b)
+        } ?? 0
+        return CGFloat(best) / scale
+    }
+
+    /// A notice going above while the page shows its end moves nothing in view: the page scrolls to
+    /// its new end with its content. The scroll view clamped its scroll to the shorter content at
+    /// once while the content moved up within `settle`: the page jumped down by the notice's height
+    /// and slid back up.
+    @Test func aNoticeGoingAboveMovesNothingInView() async throws {
+        let fake = try FakeRuntime("splash-notice-above", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await Self.launchedWithModels(fake, families: Self.realisticFamilies)
+        defer { state.quit() }
+        let qwen = "mlx-community/Qwen3.8-27B-4bit"
+        state.options["--port"] = String(fake.port)
+        // A start the engine refuses, whose failure the page shows above the models.
+        for name in ["loaded", "refused"] { FileManager.default.createFile(atPath: fake.root.appending(path: name).path, contents: nil) }
+        state.start(qwen)
+        try await waitFor(state.serverStatus.look == .failed, "the failure")
+        let window = await Self.serverWindow(state, picked: qwen)
+        defer { window.orderOut(nil) }
+        // At the page's end.
+        let scroll = try #require(window.contentView?.pageScroll)
+        let end = try #require(scroll.documentView).frame.height - scroll.contentView.bounds.height + scroll.contentInsets.bottom
+        scroll.scroll(by: end - scroll.contentView.bounds.minY)
+        pump(0.3)
+        let scale = CGFloat(try #require(await Snapshot.picture(of: window)).pixelsHigh) / window.frame.height
+        let dismiss = try await Self.pictures(of: window) { state.server.dismissFailure() }
+        let before = Self.page(dismiss.before, of: window)
+        let shifts = (dismiss.drawn.map(\.picture) + [dismiss.after]).map { Self.shift(of: Self.page($0, of: window), from: before, scale: scale) }
+        // The scroll moves on the display's frames, and a picture is taken between them: less than
+        // a frame of `settle`'s motion at its fastest, some 16 points for a notice's 100.
+        #expect(shifts.allSatisfy { abs($0) <= 16 }, "the page in view moved by \(shifts) points")
+    }
 }
 
 /// The Server screen drawn to `server-*.png` in `SPLASH_APP_SNAPSHOTS`, light and dark, for people

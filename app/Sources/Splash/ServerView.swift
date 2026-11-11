@@ -124,19 +124,22 @@ private struct ServerSections: View {
         .transition(Motion.comingAndGoing)
         .animation(Motion.settle, value: Layout(installed: state.installed.map(\.id), downloading: state.installer.running,
                                                 warming: warming, failure: state.installer.failure?.message,
+                                                finished: state.installer.finished != nil,
                                                 keyProblem: state.keyProblem, finding: state.findingCachedModels,
                                                 options: state.options, family: state.family(of: state.selection)))
         .animation(Motion.settle, value: state.server.stage)
     }
 
-    /// What the screen holds besides the server's stage: the models, a download, a start's warm-up
-    /// or a problem, and the launch options, those the family of the model picked uses; the model
-    /// picked is not in it, so that picking one of the same family is immediate.
+    /// What the screen holds besides the server's stage: the models, a download, a start's warm-up,
+    /// a problem or what a check or a deletion did, and the launch options, those the family of the
+    /// model picked uses; the model picked is not in it, so that picking one of the same family is
+    /// immediate.
     private struct Layout: Equatable {
         var installed: [String]
         var downloading: Bool
         var warming: Bool
         var failure: String?
+        var finished: Bool
         var keyProblem: String?
         var finding: Bool
         var options: ServeSettings

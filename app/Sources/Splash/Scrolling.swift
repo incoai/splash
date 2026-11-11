@@ -103,14 +103,62 @@ private struct Scroller<Content: View>: NSViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator {
+    final class Coordinator: NSObject {
         weak var scroll: NSScrollView?
+        /// The scroll to the content's new end under way (`measured`): from where, to where, the
+        /// content's height, when it began, and where it put the clip last, to tell the reader's
+        /// scrolling.
+        private var glide: (from: CGFloat, to: CGFloat, height: CGFloat, began: CFTimeInterval, placed: CGFloat?)?
+        private var link: CADisplayLink?
 
-        /// Makes the document as tall as its content.
+        /// Makes the document as tall as its content. A content that gets shorter than where the
+        /// page is scrolled to, as a notice going above while the page shows its end, moves up
+        /// within `settle`, and the page scrolls to its new end with it, in step: the scroll view
+        /// clamped its scroll at once, and the page jumped down by what went and slid back up.
+        /// Its width changing, as the window's does, the content changes at once, and so does the
+        /// scroll.
         func measured(_ height: CGFloat) {
             guard let scroll, let document = scroll.documentView else { return }
             let size = NSSize(width: scroll.contentView.bounds.width, height: max(1, height.rounded(.up)))
-            if document.frame.size != size { document.setFrameSize(size) }
+            guard document.frame.size != size else { return }
+            let clip = scroll.contentView
+            let end = max(size.height - clip.bounds.height + scroll.contentInsets.bottom, -scroll.contentInsets.top)
+            if !Motion.reduced, size.width == document.frame.width, clip.bounds.minY > end + 0.5 {
+                glide = (clip.bounds.minY, end, size.height, CACurrentMediaTime(), nil)
+                if link == nil {
+                    link = scroll.displayLink(target: self, selector: #selector(step))
+                    link?.add(to: .main, forMode: .common)
+                }
+                return
+            }
+            stop()
+            document.setFrameSize(size)
+        }
+
+        @objc private func step(_ link: CADisplayLink) {
+            guard let scroll, let document = scroll.documentView, let glide else { return stop() }
+            let clip = scroll.contentView
+            // Scrolled by the reader since: the content takes its height, as far as it goes.
+            if let placed = glide.placed, abs(clip.bounds.minY - placed) > 0.5 {
+                document.setFrameSize(NSSize(width: document.frame.width, height: glide.height))
+                return stop()
+            }
+            let time = link.targetTimestamp - glide.began
+            let done = time >= Motion.settleSeconds * 2
+            let y = done ? glide.to : glide.from + (glide.to - glide.from) * Motion.settleSpring.value(target: 1.0, time: time)
+            // The document keeps room for the clip until the scroll ends.
+            let visible = clip.bounds.height - scroll.contentInsets.bottom
+            document.setFrameSize(NSSize(width: document.frame.width, height: done ? glide.height : max(glide.height, (y + visible).rounded(.up))))
+            clip.setBoundsOrigin(NSPoint(x: clip.bounds.minX, y: y))
+            scroll.reflectScrolledClipView(clip)
+            self.glide?.placed = clip.bounds.minY
+            if done { stop() }
+        }
+
+        private func stop() {
+            link?.invalidate()
+            link = nil
+            glide = nil
         }
 
         /// Ends the content `bottom` above the scroll view's bottom edge.
