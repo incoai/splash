@@ -19,10 +19,12 @@ import errno
 import hashlib
 import json
 import os
+import shutil
+import stat
 import sys
 import tempfile
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 from . import models
@@ -203,6 +205,149 @@ def pin(path: Path, repo_id: str, installation: Path) -> Path:
     return ref
 
 
+def release(entries, kept, owners, *, keep_shared=False) -> int:
+    """Remove the Hub cache files an assembly that went linked, entries (the
+    snapshot files its record names), and return the bytes freed: each entry
+    no remaining installation links, kept naming the files the remaining
+    assemblies link, compared as entries, not as the blobs they name; then
+    the blobs the entries removed named, once no entry left in any snapshot
+    of their repository names them; then the references to a snapshot that
+    went, and what empties: an entry's folders up to its snapshot, and the
+    Hub's folders of a repository whose snapshots and blobs are empty, with
+    the repository's own unless something else lies in it. A snapshot an
+    installation of another models root pins (a pin whose owner is not in
+    owners) keeps every entry, and with keep_shared, as an update asks, so
+    does one another tool has downloaded into (_holds_others), which may use
+    the rest, and nobody asked for them to go as a deletion does. Nothing
+    else is touched: no
+    entry or blob the assembly did not link, such as another tool's download
+    of the same commit or a download under way, and no partial .incomplete
+    file. It only frees space: a failure is a warning (models.freeing), and
+    the rest goes on."""
+    kept = list(kept)
+    kept_entries, kept_files = _identities(kept, os.lstat), _identities(kept, os.stat)
+    snapshots = {}
+    for entry in map(Path, entries):
+        if (snapshot := snapshot_of(entry)) is not None:
+            snapshots.setdefault(snapshot, set()).add(entry)
+    freed = 0
+    # Each repository folder an entry went from -> the blobs those named.
+    named = {}
+    for snapshot, paths in sorted(snapshots.items()):
+        folder = snapshot.parent.parent
+        if any(
+            ref.parent.name not in owners
+            for ref in (folder / "refs" / "splash").glob(f"*/{snapshot.name}")
+        ):
+            continue
+        if keep_shared and _holds_others(snapshot, paths, kept_entries):
+            continue
+        blobs = named.setdefault(folder, set())
+        with models.freeing():
+            for entry in sorted(paths):
+                try:
+                    if _file(entry) in kept_entries:
+                        continue
+                    if entry.is_symlink():
+                        blobs.add(entry.resolve())
+                except FileNotFoundError:
+                    continue
+                freed += _unlink(entry)
+                _remove_empty(entry.parent, snapshot)
+            if not snapshot.exists():
+                _remove_references(folder, snapshot.name)
+    for folder, blobs in named.items():
+        with models.freeing():
+            left = _identities((folder / "snapshots").rglob("*"), os.stat)
+            for blob in sorted(blobs):
+                try:
+                    identity = _file(blob, os.stat)
+                    ours = os.path.samefile(blob.parent, folder / "blobs")
+                except FileNotFoundError:
+                    continue
+                if ours and identity not in left and identity not in kept_files:
+                    freed += _unlink(blob)
+            if not any((folder / "snapshots").glob("*")) and not any(
+                (folder / "blobs").glob("*")
+            ):
+                _remove_repository(folder)
+    return freed
+
+
+def _holds_others(snapshot, entries, kept):
+    """Whether another tool has downloaded into snapshot: it holds a file that
+    is neither one of entries nor one of kept, the entries remaining
+    assemblies link. Splash downloads what it links and reads a repository's
+    JSON metadata besides, so those leave no sign, nor does the .DS_Store
+    Finder writes; a whole repository's download leaves its other weights,
+    README.md or .gitattributes."""
+    files = (
+        path
+        for path in snapshot.rglob("*")
+        if path.suffix != ".json"
+        and path.name != ".DS_Store"
+        and not (path.is_dir() and not path.is_symlink())
+    )
+    return bool(_identities(files, os.lstat) - _identities(entries, os.lstat) - kept)
+
+
+def _remove_references(folder, commit):
+    """Remove the references that name commit, whose snapshot went: the Hub's
+    cache scan refuses a repository with a reference to a missing commit,
+    which would hide the commits it still holds."""
+    for ref in (folder / "refs").rglob("*"):
+        if ref.is_file() and ref.read_bytes().strip() == commit.encode():
+            ref.unlink()
+
+
+def _remove_repository(folder):
+    """Remove the folders the Hub cache keeps of a repository, then its own,
+    unless something else, a user's file or another tool's, lies in it."""
+    for name in ("snapshots", "blobs", "refs", ".no_exist"):
+        if (folder / name).exists():
+            shutil.rmtree(folder / name)
+    with suppress(OSError):
+        folder.rmdir()
+
+
+def _identities(paths, status):
+    """The (device, inode) of each of paths by status, os.lstat for the path
+    itself or os.stat for the file a link names; a path that names nothing
+    is left out."""
+    identities = set()
+    for path in paths:
+        try:
+            identities.add(_file(path, status))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+    return identities
+
+
+def _unlink(path) -> int:
+    """Remove the file or link at path, and return the bytes this frees: a
+    file's size once its last link goes; nothing for a symbolic link or a
+    path already gone."""
+    try:
+        status = path.lstat()
+        path.unlink()
+    except FileNotFoundError:
+        return 0
+    if stat.S_ISREG(status.st_mode) and status.st_nlink == 1:
+        return status.st_size
+    return 0
+
+
+def _remove_empty(folder, top):
+    """Remove folder, then each of its parents up to top, while each is
+    empty."""
+    while folder.is_relative_to(top):
+        try:
+            folder.rmdir()
+        except OSError:
+            return
+        folder = folder.parent
+
+
 def retire_other_pins(pins, replaced=()):
     """Remove the installation's pins beside pins, and beside replaced, its
     pins before these, which may be in repositories pins do not name. Call
@@ -224,13 +369,14 @@ def retire_other_pins(pins, replaced=()):
         models.warn(f"could not retire old Hub cache references: {error}")
 
 
-def _file(path):
+def _file(path, status=os.lstat):
     """The entry at path, however the path spells it (through a symbolic link
     to a folder, or in another case on a case-insensitive volume): its device
-    and inode. A symbolic link at path is itself, not the file it names, so
-    one that names nothing is no pin rather than an error."""
-    status = path.lstat()
-    return status.st_dev, status.st_ino
+    and inode. By default a symbolic link at path is itself, not the file it
+    names, so one that names nothing is no pin rather than an error; os.stat
+    takes the file it names."""
+    result = status(path)
+    return result.st_dev, result.st_ino
 
 
 def repair_pins(installation: Path, snapshots):

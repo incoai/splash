@@ -2,9 +2,9 @@
 
 // Routed experts that stay in their source files and are read into slots when
 // a step routes them (--expert-memory), so a MoE target whose experts do not
-// fit in memory runs with part of them resident. The kernels read every
-// routed expert through its block's slot table (ops::BlockMoeWeights), so
-// resident and streamed experts run the same kernels.
+// fit in memory runs with part of them resident. The kernels find every
+// routed expert's slot in a table (ops::BlockMoeWeights), so resident and
+// streamed experts run the same kernels.
 //
 // Every block's experts share the slots of one size, the widest expert's: a
 // slot holds every plane of an expert's gate, up and down projections,
@@ -74,18 +74,17 @@
 // fails its command; every later load fails too.
 //
 // Threads: bind() runs while the model loads, before any command; addLoad()
-// and the split loads' adds on the thread that encodes a command, reading
-// only what construction and bind() set and which chunks are live, which
-// changes between commands; the loads on the backend's host-step thread, one
-// at a time (metal::EventStep); the reads of a read-ahead on the readers,
-// until the next load, a release or the store's end stops them, and those of
-// a split load's start until its finish waits for them; release(), restore(),
-// releaseAboveFloor(), releaseToFloor() and growTowardCap() on the engine
-// thread while no command is in flight (model::WeightMemory), so never beside
-// a load, under the store's mutex, which orders them against a read-ahead's
-// start; a read-ahead writes the staging alone, so they let it run on;
-// released() on the engine thread and stats() on any. Neither of those two
-// waits for a load: a status query never waits behind a command's reads.
+// on the thread that encodes a command, reading only what construction and
+// bind() set and which chunks are live, which changes between commands; the
+// loads on the backend's host-step thread, one at a time (metal::EventStep);
+// the reads of a read-ahead on the readers, until the next load, a release
+// or the store's end stops them; release(), restore(), releaseAboveFloor(),
+// releaseToFloor() and growTowardCap() on the engine thread while no command
+// is in flight (model::WeightMemory), so never beside a load, under the
+// store's mutex, which orders them against a read-ahead's start; a
+// read-ahead writes the staging alone, so they let it run on; released() on
+// the engine thread and stats() on any. Neither of those two waits for a
+// load: a status query never waits behind a command's reads.
 //
 // Shrinks and growth (releaseAboveFloor(), releaseToFloor(), growTowardCap())
 // run only between commands that succeeded. A failed command ends the engine
@@ -94,8 +93,8 @@
 // staged experts whose repack never ran, whose slots are claimed but hold
 // nothing. The store cannot tell that a command failed after a load's host
 // step ran, and need not: its guards refuse only where it knows of an
-// unfinished load, each once a load failed, and a shrink also while routed
-// experts wait to be staged.
+// unfinished load, each once a load failed, and a shrink and a load also
+// while routed experts wait to be staged.
 
 #include "metal/MetalBackend.hpp"
 #include "model/ExpertChunkLayout.hpp"
@@ -177,15 +176,8 @@ public:
   // store keeps the block's router, shared-expert gate and selection bias,
   // set before, which predict its routes.
   void bind(uint32_t block, ops::BlockMoeWeights &weights);
-  void addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block) const override;
-  // A decode step's load in one round (every expert it may route fits the
-  // staging) splits: its first host step routes the step, writes the passes'
-  // tiles and starts reading the experts that are not resident, which the
-  // readers read while the GPU runs the others; its second waits for them
-  // and plans the next block's read-ahead, before their repack.
-  [[nodiscard]] bool addSplitLoadStart(metal::CommandGraph &graph, const ops::MoeLoadPart &part, uint32_t block,
-                                       ops::MoeSplitTiles &tiles) const override;
-  void addSplitLoadFinish(metal::CommandGraph &graph, const ops::MoeLoadPart &part, uint32_t block) const override;
+  void addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block,
+               const std::function<void()> &beside = {}) const override;
   [[nodiscard]] ExpertStoreStats stats() const;
   // The bytes its loads read from the sources, of both phases, as the last
   // round published them (ExpertStoreStats::Use::readBytes): a command's

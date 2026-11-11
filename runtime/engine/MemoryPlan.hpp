@@ -76,9 +76,7 @@ struct StreamedSetting final {
 // MoE target's routed experts (model::ExpertStore) or the table its GGUF
 // holds (model::SparseRowStore). allBytes is what it takes loaded whole, zero
 // for a model without it, and minimumBytes the smallest store that streams
-// it. A part that only streams (DeepSeek-V4.1's Engram tables, which its
-// target reads through their store alone) streams whatever the budget holds,
-// and cannot be set off.
+// it; one that only streams (DeepSeek-V4.1's Engram tables) is never off.
 struct StreamedPart final {
   uint64_t allBytes = 0;
   uint64_t minimumBytes = 0;
@@ -124,9 +122,10 @@ struct ModelMemoryFootprint final {
 // block cache of decoding lanes' selected blocks (laneSlots a lane, floor
 // requiredSlots(1), target at least that) and a prefill's history staged a
 // layer at a time in stagingBuffers buffers; the pool keeps one empty Index
-// extent to spill through at the memory limit. Reader sizes are in whole
-// extents of the largest size a pool of the layout takes, so the pool's own
-// extents fit.
+// extent to spill through at the memory limit. Reader sizes and their tables
+// are the most any extent size a pool of the layout may take gives them
+// (kv::Layout::mostOverExtents), since the plan is made before the pool's
+// extent is: whichever the pool takes fits.
 struct KvSpillPlan final {
   bool enabled = false;
   uint32_t densePages = 0;
@@ -142,10 +141,19 @@ struct KvSpillPlan final {
   uint32_t stagingBuffers = 0;
   uint64_t stagingBytes = 0;
   uint64_t indexRunwayBytes = 0;
+  // The page tables the readers map their pages through: the hot cache's and
+  // one for each staging buffer, which they allocate at these sizes as the
+  // target starts (model::KvBlockCache::tableBytes,
+  // KvHistoryStream::tableBytes).
+  uint64_t tableBytes = 0;
   // The context the floors hold one Spill request of, and the floors: its
-  // pages, the readers' and the runway.
+  // pages, the readers', their tables and the runway.
   uint32_t floorTokens = 0;
   uint64_t floorBytes = 0;
+  // What the target holds from its start whatever its requests do: the
+  // Index runway, which no claim takes, and the readers' tables. Beside it no
+  // request's KV kept resident has it (ContextBounds::resident).
+  [[nodiscard]] uint64_t heldBytes() const noexcept { return indexRunwayBytes + tableBytes; }
   // What the plan sets aside for one Spill request's readers: the larger of
   // the hot cache's target and the history staging. Not the most they hold:
   // once their floors pass its target, each further lane decoding over Index
@@ -341,6 +349,11 @@ struct SpillGeometry final {
     const uint64_t all = pages(tokens);
     const uint64_t full = std::min<uint64_t>(all, uint64_t{densePages} + windowPages + 2ULL * groupPages);
     return full * fullPageBytes + (all - full) * indexPageBytes;
+  }
+  // What a page frees as it moves to the index form: 399,360 B on
+  // Qwen3.8-Flash-Next.
+  [[nodiscard]] uint64_t releasedPageBytes() const noexcept {
+    return fullPageBytes - std::min(fullPageBytes, indexPageBytes);
   }
 
 private:

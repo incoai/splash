@@ -135,7 +135,7 @@ private:
   const ops::ExecutionPlans &operators_;
   ops::ManifoldHyperShape mhc_{};
   ops::MoeShape moeShape_{};
-  ops::MoeFormats moeFormats_{};
+  uint32_t moeRouterFormat_ = ops::QuantizedSegment::kFloat32;
   std::unique_ptr<Scratch> scratch_;
   uint64_t allocated_ = 0;
 };

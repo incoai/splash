@@ -112,8 +112,9 @@ button {
 .glyph.check, .copied .glyph.copy { display: none; }
 .copied .glyph.check { display: inline-block; }
 
-/* The user's words: their images, then their text in a bubble, filled where the model's are not,
-   at the column's end; the images with a hairline, so that a white one keeps its edge. */
+/* The user's words: their images and PDFs, then their text in a bubble, filled where the model's
+   are not, at the column's end; the attachments with a hairline, so that a white one keeps its
+   edge. */
 .user {
   display: flex;
   flex-direction: column;
@@ -121,20 +122,54 @@ button {
   gap: 8px;
 }
 
-.user .images {
+.user .attachments {
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
 }
 
-.user .images img {
+.user .attachments img {
   width: 120px;
   height: 120px;
   object-fit: cover;
   border-radius: 12px;
   outline: 1px solid var(--separator);
   outline-offset: -1px;
+}
+
+/* A PDF: its glyph, then its name over its pages and size, as tall as an image. */
+.user .attachments .pdf {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  box-sizing: border-box;
+  height: 120px;
+  max-width: 240px;
+  padding: 0 16px;
+  border-radius: 12px;
+  background: var(--bubble);
+  outline: 1px solid var(--separator);
+  outline-offset: -1px;
+}
+
+.user .attachments .pdf .glyph { opacity: 0.6; }
+
+.pdf-about {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.pdf-name {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.pdf-details {
+  font-size: 12px;
+  opacity: 0.6;
 }
 
 .bubble {

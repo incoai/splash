@@ -108,8 +108,7 @@ void checkGoldenImages(MetalBackend &backend, const std::filesystem::path &path,
   });
   check(uint64_t(goldens) == loaded.size(), "every golden " + name + " image is prepared");
   images.release();
-  while (!images.restore(splash::test::admitAll)) {
-  }
+  splash::test::restoreWeights(images);
   check(bytesOf(images) == loaded, "restored " + name + " images are the bytes loaded");
 }
 

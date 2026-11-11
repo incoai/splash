@@ -67,7 +67,9 @@ inline bool moe_column_tile(Tiles tiles, uint32_t t) {
 // selector's, SelectorBatchParams): row r is row r % lane_rows of lane
 // r / lane_rows, and the routed routes of a row past its lane's verify rows
 // stay out of every tile with the route row ~0u, which the combine skips. The
-// other groupings route every row and ignore lane_rows.
+// other groupings route every row and ignore lane_rows. Only a streamed
+// grouping, of a step whose passes run around its load, reads the block's
+// slot table (MoeTileCount) and copies it for the passes beside the load.
 struct MoeGroupParams {
   uint32_t rows;
   uint32_t top_k;
@@ -76,23 +78,57 @@ struct MoeGroupParams {
   uint32_t gate_up_columns;
   uint32_t down_columns;
   uint32_t lane_rows;
+  uint32_t streamed;
 };
 
-static_assert(sizeof(MoeGroupParams) == 28,
-              "MoE grouping parameters are 28 bytes on both sides");
+static_assert(sizeof(MoeGroupParams) == 32,
+              "MoE grouping parameters are 32 bytes on both sides");
 
 // What the grouping writes besides the tiles: their count, which every pass
-// over them reads first, and the grids (column tiles, tiles, 1) of the
-// gate/up and down passes, which they read as an indirect dispatch
+// over them reads first, the tiles of experts resident before the step's
+// load, and the grids (column tiles, tiles, 1) of the gate/up and down
+// passes over all of them, over the resident ones and over the others
+// (MOE_TILES_*), which they read as an indirect dispatch
 // (MTLDispatchThreadgroupsIndirectArguments) to launch the live tiles alone.
+// Tiles [0, resident) are the resident experts' and then the shared slices',
+// and tiles [resident, tiles) those of the experts whose slot-table entry is
+// MOE_SLOT_ABSENT, which a load brings.
 struct MoeTileCount {
   uint32_t tiles;
+  uint32_t resident;
   uint32_t gate_up_grid[3];
   uint32_t down_grid[3];
+  uint32_t resident_gate_up_grid[3];
+  uint32_t resident_down_grid[3];
+  uint32_t loaded_gate_up_grid[3];
+  uint32_t loaded_down_grid[3];
 };
 
-static_assert(sizeof(MoeTileCount) == 28,
-              "the MoE tile count is 28 bytes on both sides");
+static_assert(sizeof(MoeTileCount) == 80,
+              "the MoE tile count is 80 bytes on both sides");
+
+// The tiles an expert pass runs (MoeTileCount): all of them, the resident
+// experts' and shared slices', or the others; tile moe_first_tile + y runs at
+// y of the pass's grid, below moe_end_tile.
+#define MOE_TILES_ALL 0u
+#define MOE_TILES_RESIDENT 1u
+#define MOE_TILES_LOADED 2u
+// A branch, not a select: the other ranges' tile loads do not wait for a
+// load of the count.
+template <typename Count>
+inline uint32_t moe_first_tile(Count count, uint32_t tiles) {
+  uint32_t first = 0;
+  if (tiles == MOE_TILES_LOADED) first = count[1];
+  return first;
+}
+template <typename Count>
+inline uint32_t moe_end_tile(Count count, uint32_t tiles) {
+  return count[tiles == MOE_TILES_RESIDENT ? 1 : 0];
+}
+
+// A slot-table entry (ops::BlockMoeWeights::slotTable) of an expert no slot
+// holds, which only the grouping reads.
+#define MOE_SLOT_ABSENT 0x80000000u
 
 struct MoeGatherParams {
   uint32_t tile_rows;
@@ -126,7 +162,8 @@ static_assert(sizeof(MoeGatherParams) == 12,
 #define MOE_EXPERT_CHUNK_ADDRESSES 9u
 #define MOE_EXPERT_MAX_CHUNKS 48u
 
-// A GGUF expert pass (ops/MoE.cpp) of projection z (0 gate, 1 up, 2 down):
+// A GGUF expert pass of one projection (the down pass,
+// moe_expert_gguf_m<rows>_down; kernels/common/moe_gguf_expert_tile.h):
 // routed expert e's planes start at row local * output_size of the
 // projection's regions in the chunk that holds slot slots[e] (local is the
 // slot's place in it), or local * routed_slot_bytes bytes into them; the
@@ -141,8 +178,9 @@ struct MoeGgufExpertParams {
   uint32_t shared_format;
   uint32_t floor_slots;
   uint32_t chunk_slots;
-  uint32_t projection;
-  // The up pass's SwiGLU clamp (ops::MoeShape::swigluLimit), 0 for none.
+  uint32_t tiles; // MOE_TILES_*
+  // An up pass's SwiGLU clamp (ops::MoeShape::swigluLimit), 0 for none:
+  // gguf-moe's reference runs the up pass apart; the down pass ignores it.
   float swiglu_limit;
   // The bytes from a routed expert's slot to the next one's, 0 for a
   // region's slots of the projection's rows in turn.
@@ -166,12 +204,14 @@ struct MoeGgufGateUpParams {
   uint32_t up_shared_format;
   uint32_t floor_slots;
   uint32_t chunk_slots;
+  uint32_t tiles; // MOE_TILES_*
+  // The up pass's SwiGLU clamp (ops::MoeShape::swigluLimit), 0 for none.
   float swiglu_limit;
   uint32_t routed_slot_bytes;
 };
 
-static_assert(sizeof(MoeGgufGateUpParams) == 44,
-              "MoE GGUF gate/up parameters are 44 bytes on both sides");
+static_assert(sizeof(MoeGgufGateUpParams) == 48,
+              "MoE GGUF gate/up parameters are 48 bytes on both sides");
 
 // One projection (gate, up or down) of the experts a load writes into their
 // slots (moe_expert_load, model/ExpertStore.cpp): rows x columns in `format`,

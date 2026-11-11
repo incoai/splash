@@ -167,6 +167,8 @@ int main() {
     rejects("truncated tensor", truncated, pastEnd);
     const gguf::Tensor block{"weight", {256, 1}, kQ4_K, gguf::Bytes(kQ4KBlockBytes)};
     rejects("duplicate name", gguf::file({}, {block, block}), "duplicate GGUF tensor: weight");
+    rejects("alignment under 8", gguf::file({gguf::uint32Key("general.alignment", 4)}, {block}),
+            "invalid GGUF alignment");
     // The first part of a split GGUF read alone, whose split.count names the
     // others.
     rejects("lone split part", gguf::file({gguf::uint32Key("split.count", 3)}, {block}),

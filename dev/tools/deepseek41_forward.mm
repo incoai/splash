@@ -196,7 +196,7 @@ class Forward {
 public:
   Forward(metal::MetalBackend &backend, const model::DeepSeek41Weights &weights, uint32_t capacity)
       : backend_(backend), weights_(weights), layout_(weights.layout), d_(layout_.deepseek),
-        operators_(backend.capabilities()), capacity_(capacity) {
+        operators_(backend.capabilities(), ops::Int8Activations::On), capacity_(capacity) {
     const uint32_t hidden = layout_.hiddenSize, latent = layout_.attentionHeadDimension;
     mhc_ = {hidden, d_.sinkhornIterations, d_.hcEpsilon, d_.normEpsilon};
     freqs_[0] = upload(ropeFrequencies(layout_, false));
@@ -238,7 +238,7 @@ public:
     moeShape_.swigluLimit = d_.swigluLimit;
     std::vector<const ops::BlockMoeWeights *> blocks;
     for (const model::DeepSeek41LayerWeights &layer : weights.layers) blocks.push_back(&layer.ffn);
-    moeFormats_ = ops::moeFormats(blocks);
+    moeRouterFormat_ = ops::moeRouterFormat(blocks);
     if (!moeShape_.valid()) throw std::runtime_error("invalid MoE shape");
   }
 
@@ -484,7 +484,7 @@ public:
     const uint32_t hidden = layout_.hiddenSize, R = rows_;
     MetalBuffer mixes = alloc(uint64_t{pad(R)} * MHC_MIXES * 4), x = alloc(uint64_t{pad(R)} * hidden * 2);
     MetalBuffer residual = zeroed(uint64_t{pad(R)} * hidden * 2), out = alloc(uint64_t{pad(R)} * hidden * 2);
-    const ops::MoePlan plan = decode_ ? operators_.moeDecode(moeShape_, moeFormats_, 1) : operators_.moePrefill(moeShape_, moeFormats_, R);
+    const ops::MoePlan plan = decode_ ? operators_.moeDecode(moeShape_, moeRouterFormat_, 1) : operators_.moePrefill(moeShape_, moeRouterFormat_, R);
     ops::MoeScratch scratch;
     for (const ops::MoeScratchField &field : ops::kMoeScratchFields)
       scratch.*field.buffer = zeroed(plan.workspace().*field.bytes);
@@ -634,7 +634,7 @@ private:
   bool decodeKernels_ = true, decode_ = false, rounds_ = true;
   MetalBuffer verifyRows_;
   ops::MoeShape moeShape_{};
-  ops::MoeFormats moeFormats_{};
+  uint32_t moeRouterFormat_ = ops::QuantizedSegment::kFloat32;
   MetalBuffer positions_, tokenBuffer_, freqs_[2], streams_, previousMixes_, attentionMixes_, chunks_;
   // The last compressor's pool and index keys, its groups, the last
   // indexer's selection and the candidate layer's kept blocks.
@@ -660,7 +660,7 @@ public:
 
   Drafter(metal::MetalBackend &backend, const model::DeepSeek41Weights &target, const model::DSparkWeights &weights)
       : backend_(backend), target_(target), weights_(weights), layout_(weights.layout.layers),
-        d_(layout_.deepseek), operators_(backend.capabilities()) {
+        d_(layout_.deepseek), operators_(backend.capabilities(), ops::Int8Activations::On) {
     const uint32_t hidden = layout_.hiddenSize, latent = layout_.attentionHeadDimension;
     mhc_ = {hidden, d_.sinkhornIterations, d_.hcEpsilon, d_.normEpsilon};
     freqs_ = upload(ropeFrequencies(layout_, false));
@@ -687,7 +687,7 @@ public:
     moeShape_ = layout_.moeBlockShape();
     std::vector<const ops::BlockMoeWeights *> blocks;
     for (const model::DeepSeek41LayerWeights &layer : weights.layers) blocks.push_back(&layer.ffn);
-    moeFormats_ = ops::moeFormats(blocks);
+    moeRouterFormat_ = ops::moeRouterFormat(blocks);
     if (!moeShape_.valid()) throw std::runtime_error("invalid DSpark MoE shape");
     for (MetalBuffer &buffer : buffers_) persistent_.push_back(std::move(buffer));
     buffers_.clear();
@@ -750,7 +750,7 @@ public:
     metal::CommandGraph graph;
     ops::Embedding::add(graph, tokenBuffer, target_.tokenEmbedding, embedding, B);
     ops::ManifoldHyperConnection::addInit(graph, embedding, streams, mhc_, B);
-    const ops::MoePlan plan = operators_.moeDecode(moeShape_, moeFormats_, 1);
+    const ops::MoePlan plan = operators_.moeDecode(moeShape_, moeRouterFormat_, 1);
     for (const model::DeepSeek41LayerWeights &layer : weights_.layers) {
       const size_t index = &layer - weights_.layers.data();
       MetalBuffer mixes = alloc(uint64_t{rows} * MHC_MIXES * 4), x = alloc(uint64_t{rows} * hidden * 2);
@@ -893,7 +893,7 @@ private:
   ops::ExecutionPlans operators_;
   ops::ManifoldHyperShape mhc_{};
   ops::MoeShape moeShape_{};
-  ops::MoeFormats moeFormats_{};
+  uint32_t moeRouterFormat_ = ops::QuantizedSegment::kFloat32;
   ops::LinearScratch decodeScratch_{}, prefillScratch_{};
   MetalBuffer freqs_;
   std::vector<MetalBuffer> rings_;

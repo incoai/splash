@@ -564,7 +564,7 @@ std::vector<metal::MetalBuffer> DeepSeek41Target::addPrefill(metal::CommandGraph
     const Scratch &s = prefill_[c];
     if (chunk.sequences.empty() || chunk.sequences.size() > kLanes || !chunk.rows || chunk.rows > s.rows)
       throw std::invalid_argument("invalid DeepSeek-V4.1 prefill chunk");
-    plans.push_back(operators_.moePrefill(moeShape_, geometry_.moeFormats, chunk.rows));
+    plans.push_back(operators_.moePrefill(moeShape_, geometry_.moeRouterFormat, chunk.rows));
     ffn[c] = {chunk.buffers.normalized, zeros_, s.ffnOut, chunk.buffers.moe, {}};
     for (uint32_t index = 0; index < chunk.sequences.size(); ++index) {
       const QwenTargetPrefillSequence &sequence = chunk.sequences[index];
@@ -764,7 +764,7 @@ void DeepSeek41Target::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuf
     }
     sequences.push_back(lanes);
   }
-  const ops::MoePlan plan = operators_.moeDecode(moeShape_, geometry_.moeFormats, lanes);
+  const ops::MoePlan plan = operators_.moeDecode(moeShape_, geometry_.moeRouterFormat, lanes);
   ops::ManifoldHyperConnection::addInit(graph, buffers.hidden[0], s.streams, mhc_, rows);
   for (uint32_t index = 0; index < layout.layers; ++index) {
     const DeepSeek41LayerWeights &layer = weights_.layers[index];

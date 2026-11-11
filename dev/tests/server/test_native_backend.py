@@ -1,6 +1,5 @@
 import array
 import dataclasses
-import io
 import itertools
 import math
 import queue
@@ -20,8 +19,10 @@ from dev.tests.server_fixtures import (
     READY,
     FakeFactory,
     FakeRuntime,
+    StalledConsole,
     byte_alphabet,
     byte_backend,
+    console_written,
     interface_drift,
     make_frontend,
     make_job,
@@ -464,18 +465,13 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(constraint.finish_calls, 1)
         self.assertFalse(transport.active)
 
-    def test_a_console_that_stops_draining_does_not_stall_the_reader(self):
-        # A request's Started line is printed when the engine starts it. On a
-        # console that stops draining (a paused terminal, an unread pipe) the
-        # write blocks; the finalizer makes it, as it does the Done line's,
-        # so the reader thread still delivers every request's tokens.
+    def test_a_console_that_stops_draining_holds_up_no_request(self):
+        # A request's Started line is printed when the engine starts it, its
+        # Done line when it completes. On a console that stops draining (a
+        # paused terminal, an unread pipe) a write blocks; the console thread
+        # makes it, so the reader thread still delivers every request's tokens
+        # and the finalizer every request's completion.
         drained = threading.Event()
-
-        class Console(io.StringIO):
-            def write(self, text):
-                drained.wait(5.0)
-                return super().write(text)
-
         factory = FakeFactory()
         native = runtime.MultiplexedRuntime(
             process_factory=factory, pending_limit=4, eager_start=True
@@ -486,7 +482,7 @@ class NativeBackendContractTests(unittest.TestCase):
         self.addCleanup(transport.close)
         # A failed assertion leaves the console drained for close.
         self.addCleanup(drained.set)
-        console = Console()
+        console = StalledConsole(drained)
         job = make_job()
         with mock.patch("sys.stdout", console):
             transport.submit(job)
@@ -501,12 +497,17 @@ class NativeBackendContractTests(unittest.TestCase):
                     frame.request_id, wire.FinishReason.STOP, 4, 1, 100, 200, 350, ()
                 )
             )
-            drained.set()
             self.assertEqual(self.terminal(job)[0], "done")
+            drained.set()
+            console_written()
         lines = [line.split(" ", 1)[1] for line in console.getvalue().splitlines()]
         self.assertEqual(len(lines), 2)
-        self.assertEqual(lines[0], "Started · input 4 · cached 0")
-        self.assertTrue(lines[1].startswith("Done · input 4 · cached 0 · output 1"))
+        # Both name the request as the engine knows it.
+        request = f"request {frame.request_id}"
+        self.assertEqual(lines[0], f"Started · {request} · input 4 · cached 0")
+        self.assertTrue(
+            lines[1].startswith(f"Done · {request} · input 4 · cached 0 · output 1")
+        )
 
     def test_inline_completion_cannot_leave_stale_active_job(self):
         transport, _runtime = self.make_transport(DrivenRuntime("complete_inline"))
@@ -724,6 +725,48 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(kind, "error")
         self.assertEqual((error.status, error.code), (503, "server_shutdown"))
         self.assertFalse(transport.active)
+
+    def test_a_request_the_engines_stop_ended_says_so_through_the_close(self):
+        # A server whose engine stopped for good exits, and its close claims
+        # the calls the failure is ending: their clients are owed why.
+        transport, driven = self.make_transport()
+        job = make_job()
+        transport.submit(job)
+        call = driven.calls[0]
+        transport.stop_reason = "Splash stopped restarting the engine"
+        original_close = driven.close
+
+        def close_after_failure():
+            call.complete(error=runtime.EngineUnhealthy("native protocol reached EOF"))
+            original_close()
+
+        driven.close = close_after_failure
+        transport.close()
+
+        kind, error = self.terminal(job)
+        self.assertEqual(
+            (kind, error.status, error.code, error.message),
+            ("error", 500, "engine_failed", "Splash stopped restarting the engine"),
+        )
+
+    def test_a_request_not_yet_admitted_hears_why_the_engine_stopped(self):
+        # The server closes as its engine's stop tells it to exit: a request
+        # that arrives then is owed the reason too, not a retry.
+        transport, _driven = self.make_transport()
+        transport.stop_reason = "Splash stopped restarting the engine"
+        transport.closing = True
+        self.addCleanup(setattr, transport, "closing", False)
+        refusal = transport.refusal()
+        self.assertEqual((refusal.status, refusal.code), (500, "engine_failed"))
+        job = make_job()
+        transport.submit(job)
+        kind, error = self.terminal(job)
+        self.assertEqual(
+            (kind, error.status, error.code), ("error", 500, "engine_failed")
+        )
+        with self.assertRaises(api_errors.APIError) as released:
+            transport.release_weights()
+        self.assertEqual(released.exception.code, "engine_failed")
 
     def test_close_does_not_wait_for_a_frame_being_written(self):
         # A writer stuck mid-frame holds the write lock for up to its write
@@ -1103,7 +1146,7 @@ class NativeBackendContractTests(unittest.TestCase):
             transport.close()
             # Keep this regression's fixture bounded even if close regresses.
             if transport.finalizer.is_alive():
-                transport.finalizer_queue.put(None)
+                transport.terminals.put(None)
                 transport.finalizer.join(1.0)
 
     def test_failed_status_thread_start_releases_refresh_ownership(self):

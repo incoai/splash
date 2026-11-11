@@ -4,9 +4,8 @@
 // selection bias): routed experts read from a file into slots of one block's
 // experts and three more, which two blocks share, run decode steps and
 // prefill chunks bitwise as the resident experts do, their slots holding the
-// reference repack's planes, in as many rounds as the staging needs (a
-// decode step's split around the passes of the experts that were resident),
-// and read ahead the next round's experts or the next block's a long chunk
+// reference repack's planes, in as many rounds as the staging needs, and
+// read ahead the next round's experts or the next block's a long chunk
 // routes or a decode step predicts; a decode step's experts outlive long
 // chunks of other blocks; the union of a block's steps loads at once; blocks
 // of other formats share the slots of the widest expert's size, through a
@@ -20,7 +19,7 @@
 // round fails its command with its own error alone, the load's later rounds
 // not run; memory one byte short of a block's slots is refused; the slots lie
 // in a floor chunk and smaller elastic chunks, the last of fewer slots,
-// bitwise on the staged and the register tile, through a release and a
+// bitwise, through a release and a
 // restore; the store gives its elastic chunks back one at a time down to its
 // floor and takes them back, bitwise at every step, its slot tables and
 // address tables never naming a chunk given back, also while a read-ahead
@@ -208,9 +207,7 @@ void growToCap(ExpertStore &store) {
 // The host steps of a load of `plan`'s rows, a round each: the staging
 // places the experts of a block a decode cycle's rows may route, and at least
 // two; a decode step's load that they hold stages them all in one round, any
-// other load half of them a round. A decode step's round on staged tiles
-// splits around its resident experts' passes into two host steps
-// (ExpertStore::addSplitLoadStart). A long chunk's load whose next block
+// other load half of them a round. A long chunk's load whose next block
 // streams (`nextStreams`) reads it ahead in one step more.
 uint32_t loadSteps(const MoeShape &shape, const MoePlan &plan, bool nextStreams) {
   using splash::model::ExecutionLimits;
@@ -219,9 +216,6 @@ uint32_t loadSteps(const MoeShape &shape, const MoePlan &plan, bool nextStreams)
                                                ExecutionLimits::targetVerifyRows * shape.expertsPerToken));
   const uint64_t routable = std::min<uint64_t>(shape.experts, uint64_t{plan.rows()} * shape.expertsPerToken);
   const uint64_t perRound = plan.phase() == MoePhase::Decode && routable <= places ? places : places / 2;
-  if (plan.phase() == MoePhase::Decode && routable <= places &&
-      plan.configuration().ggufTile == splash::ops::MoeGgufTile::Staged)
-    return 2;
   const bool longChunk = plan.phase() == MoePhase::Prefill &&
                          uint64_t{plan.rows()} * shape.expertsPerToken >= 3ULL * shape.experts;
   return static_cast<uint32_t>((routable + perRound - 1) / perRound) + (longChunk && nextStreams);
@@ -910,14 +904,13 @@ int streamedRefusal(MetalBackend &backend, const MoeShape &shape, const std::fil
 // block's experts, and three elastic chunks of fewer slots than the floor,
 // the last holding fewer, which together take the bytes of one chunk of them
 // all and which the blocks share. Decode steps of one to four lanes and
-// prefill chunks on the staged and the register tile, the blocks taking turns
-// so that their slots recycle across the chunks, give the resident experts'
-// bits, their slots holding their planes (gate and up in Q5_K, whose second
-// plane every chunk holds a region of), before and after a release, a restore
-// and regrows, the blocks' experts sitting in more than one chunk.
+// prefill chunks, the blocks taking turns so that their slots recycle across
+// the chunks, give the resident experts' bits, their slots holding their planes
+// (gate and up in Q5_K, whose second plane every chunk holds a region of),
+// before and after a release, a restore and regrows, the blocks' experts
+// sitting in more than one chunk.
 int streamedChunks(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
-  using splash::ops::MoeGgufTile;
-  const Model m = makeModel(backend, shape, Q5K, true, MoeGgufTile::Register);
+  const Model m = makeModel(backend, shape, Q5K, true);
   ExpertFile file(m, directory / "experts.bin");
   const uint64_t slots = 2 * shape.experts - 3, arena = arenaBytes(m, slots);
   ExpertStoreOptions options = storeOptions(arena + kSpareBytes, file.blocks, shape);
@@ -945,16 +938,9 @@ int streamedChunks(MetalBackend &backend, const MoeShape &shape, const std::file
            (unsigned long long)chunkBytes, (unsigned long long)slots, (unsigned long long)arena);
     ++failures;
   }
-  const MoeConfig registerTile{.expertTile = MoeExpertTile::M8, .ggufTile = MoeGgufTile::Register};
   std::vector<MoePlan> plans;
-  for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-    plans.push_back(MoE::decodePlan(shape, lanes, MoeConfig{}));
-    plans.push_back(MoE::decodePlan(shape, lanes, registerTile));
-  }
-  for (const uint32_t rows : {9u, 64u, kMaximumRows}) {
-    plans.push_back(prefillPlan(shape, rows));
-    plans.push_back(MoE::prefillPlan(shape, rows, registerTile));
-  }
+  for (uint32_t lanes = 1; lanes <= 4; ++lanes) plans.push_back(MoE::decodePlan(shape, lanes, MoeConfig{}));
+  for (const uint32_t rows : {9u, 64u, kMaximumRows}) plans.push_back(prefillPlan(shape, rows));
   Buffers b;
   for (const bool restored : {false, true}) {
     if (restored) {
@@ -970,10 +956,8 @@ int streamedChunks(MetalBackend &backend, const MoeShape &shape, const std::file
         const std::vector<uint16_t> want = runWeights(backend, m.weights, b, plan);
         if (runWeights(backend, streamed[block], b, plan) != want ||
             !slotsHoldTheirExperts(m, streamed[block], b, plan)) {
-          printf("  chunks%s, block %u, %u rows on the %s tile: output or slots differ from the resident experts' "
-                 "FAIL\n",
-                 restored ? " after a restore" : "", block, plan.rows(),
-                 plan.configuration().ggufTile == MoeGgufTile::Register ? "register" : "staged");
+          printf("  chunks%s, block %u, %u rows: output or slots differ from the resident experts' FAIL\n",
+                 restored ? " after a restore" : "", block, plan.rows());
           ++failures;
         }
       }
@@ -982,13 +966,15 @@ int streamedChunks(MetalBackend &backend, const MoeShape &shape, const std::file
   std::set<uint32_t> named;
   for (const BlockMoeWeights &weights : streamed)
     for (uint32_t expert = 0; expert < shape.experts; ++expert)
-      named.insert(chunkOf(chunks, static_cast<const uint32_t *>(weights.slotTable.contents())[expert]).first);
+      if (const uint32_t slot = static_cast<const uint32_t *>(weights.slotTable.contents())[expert];
+          slot != MOE_SLOT_ABSENT)
+        named.insert(chunkOf(chunks, slot).first);
   if (named.size() < 2) {
     printf("  chunks: the resident experts sit in one chunk FAIL\n");
     ++failures;
   }
   printf("streamed experts in a floor of %llu slots and %llu chunks in all of %llu, the last of fewer: bitwise the "
-         "resident experts' on the staged and register tiles, through a restore %s\n",
+         "resident experts', through a restore %s\n",
          (unsigned long long)floorSlots, (unsigned long long)count, (unsigned long long)chunkSlots,
          failures ? "FAIL" : "ok");
   return failures;
@@ -1059,12 +1045,13 @@ int streamedElastic(MetalBackend &backend, const MoeShape &shape, const std::fil
         streamed[1].chunks.planes() != chunks.planes() || lists[live] != list || !distinct)
       fail(when + ": the blocks' chunks do not name the " + std::to_string(live) + " live chunks in their one list");
   };
-  // No slot table names a slot past the live chunks'.
+  // No slot table names a slot past the live chunks' (an absent expert's
+  // entry is MOE_SLOT_ABSENT).
   const auto tablesBelow = [&](uint64_t live) {
     for (const BlockMoeWeights &weights : streamed) {
       const auto *table = static_cast<const uint32_t *>(weights.slotTable.contents());
       for (uint32_t expert = 0; expert < shape.experts; ++expert)
-        if (table[expert] >= live) return false;
+        if (table[expert] != MOE_SLOT_ABSENT && table[expert] >= live) return false;
     }
     return true;
   };
@@ -1505,8 +1492,8 @@ int streamedElasticLayouts(MetalBackend &backend, const MoeShape &shape, const s
       const uint64_t live = layout.first(chunks.liveChunks());
       const auto *table = static_cast<const uint32_t *>(streamed[block].slotTable.contents());
       for (uint32_t expert = 0; expert < shape.experts; ++expert)
-        if (table[expert] >= live) {
-          fail(when + ", block " + std::to_string(block) + ": its slot table names a slot past the live chunks");
+        if (table[expert] != MOE_SLOT_ABSENT && table[expert] >= live) {
+          fail(when + ", block " + std::to_string(block) + ": its slot table names a slot past its live chunks");
           break;
         }
       if (chunks.liveChunks() != liveOf(0) ||

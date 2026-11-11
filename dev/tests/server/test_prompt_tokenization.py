@@ -211,8 +211,30 @@ class PromptTokenizationTests(unittest.TestCase):
         self.assertEqual(cache.stats()["entries"], 4)
         self.assertEqual(cache.stats()["hits"], 4)
 
+    def test_interleaved_conversations_each_reuse_their_newest_prompt(self):
+        # Agents interleave more conversations than there are lanes, each
+        # waiting on its tool between turns: every next turn finds its own.
+        prompts = [
+            f"<|im_start|>user\n{i} " + "Hello world!" * 400 + "<|im_end|>\n"
+            for i in range(8)
+        ]
+        for prompt in prompts:
+            self.assert_encoding(prompt + "<|im_start|>assistant\n")
+        for i, prompt in enumerate(prompts):
+            self.assert_encoding(
+                prompt
+                + f"<|im_start|>assistant\n{i}<|im_end|>\n"
+                + "<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n"
+            )
+        stats = self.cache.stats()
+        self.assertEqual(
+            (stats["hits"], stats["misses"], stats["evictions"], stats["entries"]),
+            (8, 8, 0, 8),
+        )
+
     def test_concurrent_requests_eviction_and_oversized_prefix(self):
         self.enterContext(mock.patch.object(PromptTokenizer, "CAPACITY", 2))
+        self.enterContext(mock.patch.object(PromptTokenizer, "BUDGET_PROMPTS", 2))
         # Two prompts of 833 tokens: 39,984 bytes.
         cache = PromptTokenizer(self.tokenizer, QWEN.message_boundary, 833)
         budget = cache.stats()["budget_bytes"]
@@ -230,6 +252,10 @@ class PromptTokenizationTests(unittest.TestCase):
         stats = cache.stats()
         self.assertLessEqual(stats["entries"], 2)
         self.assertLessEqual(stats["bytes"], budget)
+        # Each encode looked up its prompt, and each of the 8 kept in turn
+        # but no longer kept was evicted.
+        self.assertEqual(stats["hits"] + stats["misses"], 24)
+        self.assertGreaterEqual(stats["evictions"], 8 - stats["entries"])
         before = stats["bytes"]
         self.assert_encoding("x" * 50000 + "<|im_end|>tail", cache)
         self.assertEqual(cache.stats()["bytes"], before)
