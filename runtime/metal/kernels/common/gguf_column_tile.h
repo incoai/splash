@@ -65,13 +65,14 @@ inline void column_dot(device const bfloat *x, uint rows, uint input_size, devic
   }
 }
 
-// column_dot in the run-time format `format` (uniform per threadgroup), after its pair table, which every thread of
-// the threadgroup fills.
-template <ushort Rows>
+// column_dot in the run-time format `format` (uniform per threadgroup), for each format `formats` switches to, after
+// its pair table, which every thread of the threadgroup fills.
+template <ushort Rows, class Formats>
 inline void column_dot_any(uint format, device const bfloat *x, uint rows, uint input_size, device uchar *w0,
                            device uchar *w1, device uchar *meta, uint column, uint g_begin, uint g_end,
-                           threadgroup half2 *tl, uint thread_index, uint threads, thread float (&sums)[Rows]) {
-  quant_format_switch(format, [&](auto f) {
+                           threadgroup half2 *tl, uint thread_index, uint threads, thread float (&sums)[Rows],
+                           Formats formats) {
+  formats(format, [&](auto f) {
     typedef decltype(f) F;
     quant_pair_table<F>(tl, thread_index, threads);
     column_dot<F, Rows>(x, rows, input_size, w0, w1, meta, column, g_begin, g_end, tl, sums);

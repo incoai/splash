@@ -667,6 +667,8 @@ std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const
       ComputeDispatch pass = dispatch;
       pass.pipelineName = "gguf_moe_test_m" + rows + (up ? "_up" : "_gate") +
                           std::string(kShape.compiledRouting()->slicesSuffix);
+      // The reference decodes every format, of no function constants.
+      pass.constants.clear();
       pass.buffers.resize(3);
       for (uint32_t plane = 0; plane < 3; ++plane)
         pass.buffers.push_back({3 + plane, dispatch.buffers[(up ? 6 : 3) + plane].buffer});
