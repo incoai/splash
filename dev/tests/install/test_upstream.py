@@ -20,6 +20,7 @@ from dev.tests.installer_fixtures import (
     CONFIGS,
     DENSE,
     DRAFT_COMMIT,
+    FLASH_NEXT,
     GGUF_ONLY,
     MODEL,
     MOE,
@@ -91,8 +92,8 @@ class UpstreamTest(unittest.TestCase):
                     family,
                 )
 
-        # Qwen3.8-Flash-Next and Flint load from a GGUF: the config the
-        # installer derives from it and its header name the family, with and
+        # The GGUF-only families: the config and
+        # metadata the installer derives from it name the family, with and
         # without its draft (Flint's flat config, its release's keys, and a
         # test draft naming one of its reserved tokens as its mask), and
         # another family's draft is refused.
@@ -889,6 +890,22 @@ class UpstreamTest(unittest.TestCase):
         (snapshot / "tokenizer.json").write_text("changed size")
         with self.assertRaises(models.ModelError):
             assembly.verify(chosen.link)
+
+    def test_flash_next_hub_pack_keeps_its_external_ple_table(self):
+        def target(root):
+            mlx_target(root, FLASH_NEXT)
+            (root / "ngram_table.bin").write_bytes(b"external PLE table")
+
+        fake = fake_hub(self, self.cache)
+        repo = "community/flash-next"
+        fake.publish(repo, "a" * 40, target)
+        chosen = selection(self.root, repo, language_only=True)
+        self.prepare(chosen)
+        record = assembly.verify(chosen.link, full=True)
+        self.assertIn("target/ngram_table.bin", record["files"])
+        self.assertEqual(
+            (chosen.link / "target/ngram_table.bin").read_bytes(), b"external PLE table"
+        )
 
     def test_mlx_vision_links_only_the_shards_holding_the_tower(self):
         shards = {
