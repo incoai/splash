@@ -233,9 +233,9 @@ private:
     // resumeFromResources, never through resourcesReady.
     bool suspended = false;
     DecodeStage decodeStage = DecodeStage::Regular;
+    uint8_t foregroundTokens = 0; // Saturates at the advance threshold.
     uint64_t order = 0;
     uint64_t lastDecodeDispatch = 0;
-    uint64_t committedTokens = 0;
     // The prefill commands of its priority in a row that served later
     // arrivals and not it, up to kMaximumOvertakes, at which it is overdue;
     // none once a command serves it or its prompt completes.

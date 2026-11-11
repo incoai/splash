@@ -351,7 +351,8 @@ std::optional<BatchPlan> Scheduler::next(const PlanInputs &in) const {
     // A small finishing turn gives its first token without waiting for an
     // earlier prefill's entire debt. Borrow once, retain every millisecond
     // owed, and let decode repay it before another advance.
-    if (!finishingPrefillAdvanced_ && decode->width() > 1 && finishesSmallPrefill(*prefill, *decode))
+    if (prefillPriority == RequestPriority::Foreground && !finishingPrefillAdvanced_ &&
+        decode->width() > 1 && finishesSmallPrefill(*prefill, *decode))
       return prefill;
     return decode;
   }
@@ -549,7 +550,7 @@ bool Scheduler::finishesSmallPrefill(const BatchPlan &plan, const BatchPlan &dec
   if (plan.kind != WorkKind::Prefill || plan.pass || plan.passes != 1 || plan.empty() ||
       get(plan.items.front().requestId).spec.priority != RequestPriority::Foreground)
     return false;
-  if (!std::ranges::all_of(decode.items, [&](const BatchItem &item) { return get(item.requestId).committedTokens >= 8; }))
+  if (!std::ranges::all_of(decode.items, [&](const BatchItem &item) { return get(item.requestId).foregroundTokens >= 8; }))
     return false;
   uint64_t rows = 0;
   for (const BatchItem &item : plan.items) {
@@ -687,7 +688,8 @@ void Scheduler::complete(const BatchPlan &plan, std::span<const StepResult> resu
       throw std::logic_error("completion request order changed");
     }
     Request &request = get(item.requestId);
-    request.committedTokens += result.committedTokens;
+    if (request.spec.priority == RequestPriority::Foreground && request.foregroundTokens < 8)
+      request.foregroundTokens += std::min<uint32_t>(8 - request.foregroundTokens, result.committedTokens);
     if (prefill && plan.pass + 1 < plan.passes) {
       // A pass before the last consumes nothing and ends no lane: one that
       // ends meanwhile stays in the command to its last pass.
@@ -777,11 +779,9 @@ void Scheduler::abandoned() {
 }
 
 void Scheduler::dropStaleDecodeDebt() noexcept {
-  const bool decoding = std::any_of(
-      requests_.begin(), requests_.end(), [](const auto &entry) {
-        return entry.second.phase == Phase::Decode ||
-               entry.second.phase == Phase::WaitingMask;
-      });
+  const bool decoding = std::ranges::any_of(requests_, [](const auto &entry) {
+    return entry.second.phase == Phase::Decode || entry.second.phase == Phase::WaitingMask;
+  });
   if (!decoding) {
     decodeDebtMilliseconds_ = 0.0;
     finishingPrefillAdvanced_ = false;
