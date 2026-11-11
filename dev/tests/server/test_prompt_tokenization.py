@@ -232,6 +232,83 @@ class PromptTokenizationTests(unittest.TestCase):
             (8, 8, 0, 8),
         )
 
+    def test_branches_reuse_shared_messages_and_earlier_turns(self):
+        shared = (
+            "<|im_start|>user\n" + "Repository 中文 e\u0301 🚀\n" * 400 + "<|im_end|>\n"
+        )
+        first = shared + "<|im_start|>user\nReview scheduling.<|im_end|>"
+        second = shared + "<|im_start|>user\nReview KV growth.<|im_end|>"
+        self.assert_encoding(first)
+        before = self.cache.stats()["reused_tokens"]
+        with mock.patch.object(
+            self.cache, "_encode", wraps=self.cache._encode
+        ) as encode:
+            self.assert_encoding(second)
+        self.assertEqual(self.cache.stats()["hits"], 1)
+        self.assertEqual(
+            self.cache.stats()["reused_tokens"] - before,
+            len(
+                self.tokenizer(shared.rstrip("\n"), add_special_tokens=False)[
+                    "input_ids"
+                ]
+            ),
+        )
+        self.assertTrue(
+            all(
+                len(call.args[0]) < self.cache.MIN_PREFIX_CHARS
+                for call in encode.call_args_list
+            )
+        )
+        extended = first + "<|im_start|>assistant\nAnswer.<|im_end|>"
+        self.assert_encoding(extended)
+        entries = self.cache.stats()["entries"]
+        self.assert_encoding(first)
+        self.assertEqual(self.cache.stats()["entries"], entries)
+        self.assertEqual(self.cache.stats()["hits"], 3)
+        self.assertEqual(self.cache.stats()["evictions"], 0)
+
+    def test_branch_reuse_is_exact_under_concurrent_unicode_edits(self):
+        shared = (
+            "<|im_start|>system\n"
+            + "Repository 👨‍👩‍👧‍👦 e\u0301 中文\n" * 300
+            + "<|im_end|>\n"
+        )
+        branches = [
+            shared + f"<|im_start|>user\nbranch {i}<|im_end|>" for i in range(8)
+        ]
+        self.assert_encoding(branches[0])
+        prompts = (
+            branches
+            + [p.replace("Repository", "Updated", 1) for p in branches]
+            + branches[::-1]
+        )
+        expected = [
+            self.tokenizer(p, add_special_tokens=False)["input_ids"] for p in prompts
+        ]
+        with ThreadPoolExecutor(4) as workers:
+            actual = list(workers.map(self.cache.encode, prompts))
+        self.assertEqual(actual, expected)
+        self.assertGreater(self.cache.stats()["hits"], 0)
+        self.assertLessEqual(
+            self.cache.stats()["bytes"], self.cache.stats()["budget_bytes"]
+        )
+
+    def test_branch_with_a_consumed_marker_falls_back_after_shared_messages(self):
+        t = tokenizer()
+        t.backend_tokenizer.add_special_tokens(
+            [AddedToken("hello<|im_end", normalized=False)]
+        )
+        cache = PromptTokenizer(t, QWEN.message_boundary, NATIVE_CONTEXT)
+        shared = "<|im_start|>user\n" + "Hello world!" * 400 + "<|im_end|>"
+        prefix = shared + "<|im_start|>user\nvalid<|im_end|>"
+        self.assertEqual(
+            cache.encode(prefix), t(prefix, add_special_tokens=False)["input_ids"]
+        )
+        branch = shared + "<|im_start|>user\nhello<|im_end|>suffix"
+        self.assertEqual(
+            cache.encode(branch), t(branch, add_special_tokens=False)["input_ids"]
+        )
+
     def test_concurrent_requests_eviction_and_oversized_prefix(self):
         self.enterContext(mock.patch.object(PromptTokenizer, "CAPACITY", 2))
         self.enterContext(mock.patch.object(PromptTokenizer, "BUDGET_PROMPTS", 2))
