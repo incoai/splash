@@ -66,20 +66,30 @@ struct ComposerTests {
 
     /// A new chat moves the composer from the conversation's foot to the middle in one animation:
     /// its text view travels with its controls, rather than being there at once; with Reduce
-    /// Motion it is there at once.
+    /// Motion it is there at once. The middle is where a new chat drawn without animation has it,
+    /// and the composer reaches it however long a slow Mac, as a virtual one is, takes to draw the
+    /// animation's frames: one there drew a single frame in the first second.
     @Test func aNewChatMovesTheWholeComposer() async throws {
         let (state, window, folder) = try chat()
         defer { window.orderOut(nil); try? FileManager.default.removeItem(at: folder) }
         let field = try #require(try await focusedComposer(in: window).enclosingScrollView)
         func height() -> CGFloat { field.convert(field.bounds, to: nil).minY }
+        let conversation = try #require(state.chats.selection)
+        var instant = Transaction()
+        instant.disablesAnimations = true
         Self.update(window)
         let foot = height()
+        withTransaction(instant) { state.chats.newChat() }
+        Self.update(window)
+        let middle = height()
+        #expect(middle > foot + 100)
+        withTransaction(instant) { state.chats.selection = conversation }
+        Self.update(window)
+        #expect(height() == foot)
         state.chats.newChat()
         Self.update(window)
         let start = height()
-        try await Task.sleep(for: .seconds(1))
-        let middle = height()
-        #expect(middle > foot + 100)
+        try await waitFor({ Self.update(window); return height() == middle }(), "the composer in the middle", seconds: 15)
         if Motion.reduced {
             #expect(start == middle)
         } else {
