@@ -291,6 +291,11 @@ def _check_port(host, port):
     or a dual-stack :: beside 127.0.0.1, or the reverse), and the two would
     then split the address's connections, so a listener that accepts one
     there owns the port too."""
+    if (path := serve_options.unix_path(host)) is not None:
+        with socket.socket(socket.AF_UNIX) as client:
+            if client.connect_ex(path) == 0:
+                raise OSError(errno.EADDRINUSE, os.strerror(errno.EADDRINUSE))
+        return
     with socket.socket() as probe:
         probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         probe.bind((host, port))

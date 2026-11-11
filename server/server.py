@@ -3,6 +3,7 @@ handler; each API's handlers, request conversion and answers live in its
 module in dialects/."""
 
 import argparse
+import contextlib
 import errno
 import json
 import math
@@ -14,6 +15,8 @@ import secrets
 import select
 import signal
 import socket
+import socketserver
+import stat
 import sys
 import threading
 import time
@@ -237,8 +240,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # The native job submitted last, which a failure cancels.
         self._submitted = None
         self._last_sse_write = time.monotonic()
+        keepalive = (
+            () if self.request.family == socket.AF_UNIX else TCP_KEEPALIVE_OPTIONS
+        )
         try:
-            for level, option, value in TCP_KEEPALIVE_OPTIONS:
+            for level, option, value in keepalive:
                 self.request.setsockopt(level, option, value)
         except OSError as error:
             # macOS refuses options on a connection its client reset before
@@ -1027,6 +1033,20 @@ def path_errors(path):
     return OPENAI_ERRORS
 
 
+def _remove_stale_socket(path):
+    """Unlink a socket at `path` that nothing listens on; a live one stays and
+    the bind then fails."""
+    try:
+        if not stat.S_ISSOCK(os.lstat(path).st_mode):
+            return
+    except FileNotFoundError:
+        return
+    with socket.socket(socket.AF_UNIX) as probe:
+        if probe.connect_ex(path) == 0:
+            return
+    os.unlink(path)
+
+
 class FrontendServer(HTTPServer):
     allow_reuse_address = True
     # Connections the kernel holds until the accept loop takes them. A burst
@@ -1069,11 +1089,16 @@ class FrontendServer(HTTPServer):
         )
         self.api_key = api_key
         self.webui = webui
+        path = serve_options.unix_path(address[0])
+        bound = () if path is not None else (address[0],)
         self.allowed_hosts = {
             host.lower().rstrip(".")
-            for host in (*allowed_hosts, address[0], "localhost", "127.0.0.1", "::1")
+            for host in (*allowed_hosts, *bound, "localhost", "127.0.0.1", "::1")
             if host not in ("0.0.0.0", "::")
         }
+        if path is not None:
+            self.address_family = socket.AF_UNIX
+            address = path
         # As serve_options.parse_allowed_origin returns them.
         self.allowed_origins = frozenset(allowed_origins)
         self.refused_origins = RefusedOriginLog()
@@ -1096,8 +1121,8 @@ class FrontendServer(HTTPServer):
             "id": self.instance_id,
             "pid": os.getpid(),
             "model": self.app.model,
-            "host": self.server_address[0],
-            "port": self.server_address[1],
+            "host": self.host,
+            "port": None if self.address_family == socket.AF_UNIX else self.server_port,
             "started_at": self.started_at,
         }
         status["http"] = {
@@ -1109,6 +1134,20 @@ class FrontendServer(HTTPServer):
         }
         status["console"] = console_stats()
         return status
+
+    @property
+    def host(self):
+        if self.address_family == socket.AF_UNIX:
+            return serve_options.UNIX_PREFIX + self.server_address
+        return self.server_address[0]
+
+    def server_bind(self):
+        if self.address_family != socket.AF_UNIX:
+            return super().server_bind()
+        _remove_stale_socket(self.server_address)
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = 0
 
     def server_activate(self):
         super().server_activate()
@@ -1161,6 +1200,9 @@ class FrontendServer(HTTPServer):
 
     def server_close(self):
         super().server_close()
+        if self.address_family == socket.AF_UNIX:
+            with contextlib.suppress(OSError):
+                os.unlink(self.server_address)
         self.connections.stop()
         self.connections.idle.wait(min(2.0, HTTP_IO_TIMEOUT))
 
@@ -1417,7 +1459,11 @@ def main():
         # The app takes the server for ready from its record alone: one that
         # cannot say so has not started (serve_record).
         serve_record.ready(args.serve_record)
-        address = f"http://{args.host}:{server.server_port}"
+        address = (
+            server.host
+            if server.address_family == socket.AF_UNIX
+            else f"http://{args.host}:{server.server_port}"
+        )
         tokens = served.max_context_tokens
         context = f"{tokens // 1024}K" if tokens % 1024 == 0 else f"{tokens:,}"
         mode = "" if served.vision else " · text only"
