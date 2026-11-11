@@ -330,6 +330,37 @@ id<MTLLibrary> loadLibrary(id<MTLDevice> device, const std::string &metallibPath
     return library;
 }
 
+// The pipeline of function `name` of `source` at these function constants.
+// It touches no backend state, and Metal's device and library are
+// thread-safe, so any thread may create one.
+id<MTLComputePipelineState> createPipeline(id<MTLDevice> device, id<MTLLibrary> source,
+                                           std::string_view name, std::span<const uint32_t> constants) {
+    NSString *key = checkedNSString(name, "pipeline name");
+    NSError *error = nil;
+    id<MTLFunction> function = nil;
+    if (constants.empty()) {
+        function = [source newFunctionWithName:key];
+    } else {
+        MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+        [values setConstantValues:constants.data() type:MTLDataTypeUInt
+                        withRange:NSMakeRange(0, constants.size())];
+        function = [source newFunctionWithName:key constantValues:values error:&error];
+    }
+    if (!function) {
+        throw MetalBackendError(
+            "missing Metal function: " + std::string(name) +
+            (error ? ": " + errorDescription(error) : ""));
+    }
+    id<MTLComputePipelineState> result =
+        [device newComputePipelineStateWithFunction:function error:&error];
+    if (!result) {
+        throw MetalBackendError(
+            "unable to create Metal pipeline " + std::string(name) +
+            ": " + errorDescription(error));
+    }
+    return result;
+}
+
 }  // namespace
 
 bool commandOutOfMemory(NSError *error) noexcept {
@@ -1279,66 +1310,113 @@ struct MetalBackend::Impl {
         return allocation;
     }
 
-    id<MTLComputePipelineState> pipeline(const ComputeDispatch &dispatch) {
-        const PipelineKeyView key{dispatch.pipelineName, dispatch.constants};
-        if (key.name.empty()) {
-            throw MetalBackendError("Metal pipeline name must not be empty");
+    // The most pipelines created at once (resolvePipelines). Metal compiles a
+    // pipeline its shader cache lacks, as it lacks an updated kernel's, and
+    // runs compilations side by side, each holding memory of its own until it
+    // ends: 4 at once took the 27B's cold start from 129 s to 49 s on the M5
+    // Max, its compiler at 1.4 GB against 0.7 GB one at a time; 16 took 38 s
+    // at 2.6 GB, more than the 2 GiB of free memory a start keeps.
+    static constexpr size_t kPipelinesCreatedAtOnce = 4;
+
+    // Resolves each of `dispatches` to its pipeline. The pipelines the backend
+    // has not created are created together (kPipelinesCreatedAtOnce) and
+    // cached. Creation fails as it does one at a time (createPipeline), with
+    // the first failure in dispatch order, once those created are cached. A
+    // hit allocates nothing.
+    void resolvePipelines(std::span<PreparedDispatch> dispatches) {
+        // What the cache lacks, each once, in the order dispatches name it.
+        std::vector<PipelineKeyView> missing;
+        for (PreparedDispatch &item : dispatches) {
+            const PipelineKeyView key{item.source->pipelineName, item.source->constants};
+            if (key.name.empty()) throw MetalBackendError("Metal pipeline name must not be empty");
+            if (const auto cached = pipelines.find(key); cached != pipelines.end())
+                item.pipeline = cached->second;
+            else if (std::ranges::none_of(missing, [&](PipelineKeyView known) { return PipelineKeyEqual{}(known, key); }))
+                missing.push_back(key);
         }
-        if (const auto cached = pipelines.find(key); cached != pipelines.end())
-            return cached->second;
-        id<MTLComputePipelineState> result = newPipeline(library, key.name, key.constants);
-        pipelines.emplace(PipelineKey{dispatch.pipelineName, dispatch.constants}, result);
+        if (!missing.empty()) {
+            createPipelines(missing);
+            for (PreparedDispatch &item : dispatches)
+                if (!item.pipeline)
+                    item.pipeline =
+                        pipelines.find(PipelineKeyView{item.source->pipelineName, item.source->constants})->second;
+        }
+        for (const PreparedDispatch &item : dispatches)
+            if (item.threadCount > item.pipeline.maxTotalThreadsPerThreadgroup)
+                throw MetalBackendError("threadsPerThreadgroup exceeds pipeline capability");
+    }
+
+    // Creates the pipelines of `keys`, none of them cached, together
+    // (kPipelinesCreatedAtOnce), and caches each one created; then throws the
+    // first failure.
+    void createPipelines(std::span<const PipelineKeyView> keys) {
+        struct Creation {
+            __strong id<MTLComputePipelineState> pipeline = nil;
+            double milliseconds = 0;
+            std::exception_ptr failure;
+        };
+        std::vector<Creation> creations(keys.size());
+        Creation *created = creations.data();
+        const PipelineKeyView *requested = keys.data();
+        std::atomic<size_t> claimed{0};
+        std::atomic<size_t> *next = &claimed;
+        // Each worker creates the next pipeline no other has taken.
+        dispatch_apply(std::min(keys.size(), kPipelinesCreatedAtOnce), DISPATCH_APPLY_AUTO, ^(size_t) {
+            for (size_t index = next->fetch_add(1); index < keys.size(); index = next->fetch_add(1)) {
+                @autoreleasepool {
+                    const auto started = AwakeClock::now();
+                    try {
+                        created[index].pipeline =
+                            createPipeline(device, library, requested[index].name, requested[index].constants);
+                    } catch (...) {
+                        created[index].failure = std::current_exception();
+                    }
+                    created[index].milliseconds = millisecondsSince(started);
+                }
+            }
+        });
+        for (size_t index = 0; index < keys.size(); ++index) {
+            if (!creations[index].pipeline) continue;
+            const PipelineKeyView key = keys[index];
+            pipelines.emplace(PipelineKey{std::string(key.name), {key.constants.begin(), key.constants.end()}},
+                              creations[index].pipeline);
+            noteCreated(key.name, key.constants, creations[index].milliseconds);
+        }
         sampleDeviceMemory();
-        return result;
+        for (const Creation &creation : creations)
+            if (creation.failure) std::rethrow_exception(creation.failure);
     }
 
     // The creation time from which a pipeline created while serving is logged
-    // as a warning (newPipeline): a wait its request notices, as the seconds
+    // as a warning (noteCreated): a wait its request notices, as the seconds
     // of a cold format were, past the 93 ms at most of the paths no warmup takes.
     static constexpr double kNoticedPipelineMs = 100;
 
-    id<MTLComputePipelineState> newPipeline(id<MTLLibrary> source, std::string_view name,
-                                            std::span<const uint32_t> constants = {}) {
+    // A pipeline created in `milliseconds`: once serving began, one a request
+    // waited for, counted and logged once with its function constants.
+    void noteCreated(std::string_view name, std::span<const uint32_t> constants, double milliseconds) {
+        if (!serving.load(std::memory_order_relaxed)) return;
+        pipelinesWhileServing.fetch_add(1, std::memory_order_relaxed);
+        std::string values;
+        for (const uint32_t value : constants)
+            values += (values.empty() ? "(" : ",") + std::to_string(value);
+        if (!values.empty()) values += ')';
+        // Its request waited for it: a warning where that is a wait to
+        // notice, as a cold pipeline of every format's seconds were; a
+        // notice otherwise, as an image's first kernels.
+        if (milliseconds >= kNoticedPipelineMs)
+            logWarning("Metal created pipeline ", name, values, " while serving, in ", milliseconds,
+                       " ms: no warmup of the start created it");
+        else
+            logLine("Metal created pipeline ", name, values, " while serving, in ", milliseconds, " ms");
+    }
+
+    // A pipeline the backend dispatches itself, of no function constants and
+    // outside the cache.
+    id<MTLComputePipelineState> newPipeline(id<MTLLibrary> source, std::string_view name) {
         const auto started = AwakeClock::now();
-        NSString *key = checkedNSString(name, "pipeline name");
-        NSError *error = nil;
-        id<MTLFunction> function = nil;
-        if (constants.empty()) {
-            function = [source newFunctionWithName:key];
-        } else {
-            MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
-            [values setConstantValues:constants.data() type:MTLDataTypeUInt
-                            withRange:NSMakeRange(0, constants.size())];
-            function = [source newFunctionWithName:key constantValues:values error:&error];
-        }
-        if (!function) {
-            throw MetalBackendError(
-                "missing Metal function: " + std::string(name) +
-                (error ? ": " + errorDescription(error) : ""));
-        }
-        id<MTLComputePipelineState> result =
-            [device newComputePipelineStateWithFunction:function error:&error];
-        if (!result) {
-            throw MetalBackendError(
-                "unable to create Metal pipeline " + std::string(name) +
-                ": " + errorDescription(error));
-        }
-        if (serving.load(std::memory_order_relaxed)) {
-            pipelinesWhileServing.fetch_add(1, std::memory_order_relaxed);
-            std::string values;
-            for (const uint32_t value : constants)
-                values += (values.empty() ? "(" : ",") + std::to_string(value);
-            if (!values.empty()) values += ')';
-            // Its request waited for it: a warning where that is a wait to
-            // notice, as a cold pipeline of every format's seconds were; a
-            // notice otherwise, as an image's first kernels.
-            const double ms = std::chrono::duration<double, std::milli>(AwakeClock::now() - started).count();
-            if (ms >= kNoticedPipelineMs)
-                logWarning("Metal created pipeline ", name, values, " while serving, in ", ms,
-                           " ms: no warmup of the start created it");
-            else
-                logLine("Metal created pipeline ", name, values, " while serving, in ", ms, " ms");
-        }
+        id<MTLComputePipelineState> result = createPipeline(device, source, name, {});
+        noteCreated(name, {}, millisecondsSince(started));
         return result;
     }
 
@@ -1513,14 +1591,7 @@ struct MetalBackend::Impl {
             command.dispatches.push_back(item);
         }
 
-        for (PreparedDispatch &item : command.dispatches) {
-            item.pipeline = pipeline(*item.source);
-            if (item.threadCount >
-                item.pipeline.maxTotalThreadsPerThreadgroup) {
-                throw MetalBackendError(
-                    "threadsPerThreadgroup exceeds pipeline capability");
-            }
-        }
+        resolvePipelines(command.dispatches);
 
         // Each allocation the command binds, once.
         std::vector<const std::shared_ptr<MetalAllocation> *> bound;

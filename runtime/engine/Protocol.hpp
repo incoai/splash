@@ -258,7 +258,7 @@ struct StopFrame {
 // Sent before Ready once the engine holds its weights, as its warm-up begins and
 // as each step ends (ServingRuntime::requireWarmup): on the first start after an
 // update the warm-up also prepares the GPU's programs, and the 27B's start then
-// took 118 s on a 48 GB M5 Pro.
+// took 56 s on a 48 GB M5 Pro.
 struct WarmingEvent {
   // The steps done, those memory kept from running among them, of all.
   uint32_t stepsDone = 0;

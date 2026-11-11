@@ -751,6 +751,78 @@ void functionConstantsSpecializePipelines(const std::string &metallibPath) {
     std::cout << "PASS function constants specialize pipelines\n";
 }
 
+// The pipelines a command names that the backend has not created are created
+// together: each once, as many as creating them a dispatch at a time makes,
+// running as those do; a failure throws as one alone does, the first in
+// dispatch order, with the pipelines created beside it cached. Serving has
+// begun, so the backend counts and logs each pipeline it creates.
+void pipelinesCreatedTogether(const std::string &metallibPath) {
+    const uint32_t count = 1, one = 1;
+    // Nine dispatches of five pipelines: test_add_constant_u32 at 3, 5 and 7,
+    // test_add_u32 and test_copy_u32. The word ends at 3 + 5 + 3 + 7 + 4.
+    const auto dispatches = [&](const MetalBuffer &word, const MetalBuffer &copy) {
+        std::vector<ComputeDispatch> result;
+        for (const uint32_t increment : {3u, 5u, 3u, 7u}) {
+            ComputeDispatch specialized{"test_add_constant_u32", {{0, word}}, {}, {1, 1, 1}, {1, 1, 1}};
+            specialized.constants = {increment};
+            result.push_back(specialized);
+            result.push_back(addition(word, count, one));
+        }
+        result.push_back({"test_copy_u32", {{0, word}, {1, copy}}, {{2, &count, sizeof(count)}}, {1, 1, 1}, {1, 1, 1}});
+        return result;
+    };
+    const auto run = [&](bool together, std::string &log) {
+        MetalBackend backend(metallibPath);
+        backend.beginServing();
+        const MetalBuffer word = sharedBuffer(backend, sizeof(uint32_t)), copy = sharedBuffer(backend, sizeof(uint32_t));
+        *static_cast<uint32_t *>(word.contents()) = 0;
+        const std::vector<ComputeDispatch> command = dispatches(word, copy);
+        log = capturedStderr([&] {
+            if (together)
+                (void)backend.submitCommandAsync(command).wait();
+            else
+                for (const ComputeDispatch &dispatch : command) (void)backend.submit(dispatch);
+        });
+        require(*static_cast<uint32_t *>(word.contents()) == 22 && *static_cast<uint32_t *>(copy.contents()) == 22,
+                std::string(together ? "pipelines created together" : "pipelines created one at a time") +
+                    " did not run as their dispatches ask");
+        return std::pair(backend.pipelinesCreatedWhileServing(), BackendInstrumentation::cachedPipelines(backend));
+    };
+    std::string together, alone;
+    require(run(true, together) == std::pair<uint64_t, size_t>(5, 5) && run(false, alone) == std::pair<uint64_t, size_t>(5, 5),
+            "a command's pipelines were not each created once, as a dispatch at a time creates them");
+    // Logged once each, in the order the command first names them.
+    size_t at = 0;
+    for (const char *name : {"test_add_constant_u32(3)", "test_add_u32", "test_add_constant_u32(5)",
+                             "test_add_constant_u32(7)", "test_copy_u32"}) {
+        const std::string line = std::string("Metal created pipeline ") + name + " while serving";
+        const size_t found = together.find(line, at);
+        require(found != std::string::npos && together.find(line, found + 1) == std::string::npos &&
+                    alone.find(line) != std::string::npos,
+                "a pipeline created together was not logged once, in dispatch order: " + together);
+        at = found + 1;
+    }
+
+    MetalBackend backend(metallibPath);
+    const MetalBuffer word = sharedBuffer(backend, sizeof(uint32_t));
+    *static_cast<uint32_t *>(word.contents()) = 0;
+    ComputeDispatch specialized{"test_add_constant_u32", {{0, word}}, {}, {1, 1, 1}, {1, 1, 1}};
+    specialized.constants = {9};
+    ComputeDispatch missingB = addition(word, count, one), missingA = missingB;
+    missingB.pipelineName = "does_not_exist_b";
+    missingA.pipelineName = "does_not_exist_a";
+    const ComputeDispatch failing[] = {addition(word, count, one), missingB, specialized, missingA};
+    rejects([&] { backend.preparePipelines(failing); }, "missing Metal function: does_not_exist_b",
+            "a command's first failing pipeline did not fail its preparation");
+    require(backend.healthy() && BackendInstrumentation::cachedPipelines(backend) == 2,
+            "the pipelines created beside a failing one were not cached");
+    const ComputeDispatch working[] = {addition(word, count, one), specialized};
+    (void)backend.submitCommandAsync(working).wait();
+    require(*static_cast<uint32_t *>(word.contents()) == 10 && BackendInstrumentation::cachedPipelines(backend) == 2,
+            "the pipelines created beside a failing one did not serve their dispatches");
+    std::cout << "PASS pipelines created together\n";
+}
+
 std::atomic<unsigned> blitEncoders{0};
 std::atomic<unsigned> computeEncoders{0};
 IMP originalBlitEncoder = nullptr;
@@ -3285,6 +3357,7 @@ std::span<const splash::test::TestCase> behaviourTests() {
         {"dispatchProfilingCoversEveryCommand", [] { dispatchProfilingCoversEveryCommand(metallib); }},
         {"preparedPipelinesCompileAhead", [] { preparedPipelinesCompileAhead(metallib); }},
         {"functionConstantsSpecializePipelines", [] { functionConstantsSpecializePipelines(metallib); }},
+        {"pipelinesCreatedTogether", [] { pipelinesCreatedTogether(metallib); }},
         {"buffersStayResident", [] { buffersStayResident(metallib); }},
         {"infiniteKeepAliveHoldsResidency", [] { infiniteKeepAliveHoldsResidency(metallib); }},
         {"releasedMemory", [] { releasedMemory(metallib); }},
