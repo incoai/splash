@@ -591,12 +591,10 @@ void testFlashNextOnTheThreeMacs() {
               requirePlan(kFlashNext.inputs(kStudio)).expertBytes,
           "a larger Mac did not stream more experts");
   // The floors hold the larger of the hot cache's floor and the staging,
-  // both buffers where there are two, and the readers' tables, a second
-  // buffer's 278,528 bytes more where there are two: beside them the M5
-  // Max's and the M5 Pro's floors of one context are the same.
+  // both buffers where there are two, and the readers' tables: beside them
+  // the M5 Max's and the M5 Pro's floors of one context are the same.
   const KvSpillPlan max = requirePlan(kFlashNext.inputs(kStudio)).spill, pro = requirePlan(kFlashNext.inputs(kM5Pro)).spill;
   require(max.floorTokens == pro.floorTokens && max.stagingBuffers == 1 && pro.stagingBuffers == 2 &&
-              pro.tableBytes - max.tableBytes == 278'528 &&
               max.floorBytes - max.tableBytes - std::max(max.stagingBytes, max.hotFloorBytes) ==
                   pro.floorBytes - pro.tableBytes - std::max(pro.stagingBytes, pro.hotFloorBytes),
           "the floors did not hold both staging buffers and their tables where there are two");
@@ -1092,21 +1090,20 @@ void testEnginePlanServesTheSpilledContext() {
 
 // The resident context is the one a lone start takes: one request's KV in
 // whole extents beside its lane's state and what a target that spills holds
-// from its start whatever its requests, the Index runway (6,291,456 bytes on
-// Flash-Next) and the readers' page tables as they allocate them, the hot
-// block cache's 32,768 bytes and 278,528 for each staging buffer. Across the
-// budgets that leave the room past eight extents beside the state anything
-// from nothing to an extent less a byte, Flash-Next keeps its eighth extent
-// exactly where that room holds what it holds: beside the state alone, the
-// plan advertised the extent there too, which no lone start could take.
+// from its start whatever its requests, the Index runway and the readers'
+// page tables (KvSpillPlan::heldBytes), which runtime-resources finds as the
+// start allocates them. Across the budgets that leave the room past eight
+// extents beside the state anything from nothing to an extent less a byte,
+// Flash-Next keeps its eighth extent exactly where that room holds what it
+// holds: beside the state alone, the plan advertised the extent there too,
+// which no lone start could take, wherever the room was short of the
+// 6,881,280 bytes it holds with two staging buffers.
 void testResidentContextIsWhatALoneStartTakes() {
   const kv::Layout layout = test::sparseKvLayout();
   for (const Mac &mac : {kStudio, kM5Pro}) {
     const StreamedMemoryPlan streamed = requirePlan(kFlashNext.inputs(mac));
     const KvSpillPlan &spill = streamed.spill;
-    const uint64_t held = 6'291'456 + 32'768 + spill.stagingBuffers * 278'528;
-    require(spill.enabled && spill.indexRunwayBytes + spill.tableBytes == held,
-            std::string("the spill plan on the ") + mac.name + " does not count what its start holds");
+    const uint64_t held = spill.heldBytes();
     const ModelMemoryProfile profile = kFlashNext.profile(streamed.expertBytes, streamed.tableBytes, spill);
     const uint64_t extent = 256 * layout.bytesPerModelPage();
     const uint64_t eight = profile.fixedRuntimeBytes() + kFlashNext.chunk.laneStatePlannedAllocatedBytes + 8 * extent;

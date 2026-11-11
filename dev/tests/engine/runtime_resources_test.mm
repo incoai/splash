@@ -1608,31 +1608,56 @@ std::unique_ptr<model::Runtime> runtimeOf(RuntimeResources &resources) {
 // lone start's claim finds them held (ContextBounds::resident). Left out,
 // Qwen3.8-Flash-Next's 589,824 bytes of them and its Index runway cost a lone
 // start the last KV extent the plan advertised wherever the room past it was
-// short of them.
+// short of them. The plan is made before the pool's extent is, so the readers
+// size their tables for whichever extent it takes (kv::Layout::
+// mostOverExtents). BF16 KV's extents range widest: under a hot target of
+// 4,196 pages the cache's table, an entry for each page of the target's whole
+// extents, takes a host page more in extents of some sizes than of others,
+// and starts at budgets whose pools take extents of several sizes hold the
+// tables the plan counts.
 void testThePlanCountsTheSpilledKvReadersTables(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-plan-spill-tables");
   RuntimeResourcesConfig config = flashNextConfig(metallibPath, root.path());
   config.cacheDisk = {.automatic = true};
   config.diskVolume = reading(localVolume(500 * kGiB));
+  // A start of `config` with a lane, whose state the audit counts as a
+  // warmup's; the extent its pool takes.
+  const auto holdsThePlannedTables = [&] {
+    const std::unique_ptr<RuntimeResources> resources = RuntimeResources::create(config, 0);
+    const std::unique_ptr<model::Runtime> runtime = runtimeOf(*resources);
+    const std::vector<uint32_t> prompt(64, 7);
+    ModelRequest request;
+    request.id = 1;
+    request.prompt = prompt;
+    request.maxNewTokens = 1;
+    runtime->beginColdRequest(request, 0);
+    const ActualMemoryReport report = resources->actualMemoryReport(runtime->actualRuntimeMemory());
+    const MemoryAuditResult audit = auditActualMemory(resources->memoryPlan(), report);
+    const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+    const KvSpillPlan &spill = budget.kvSpill;
+    require(spill.enabled && spill.tableBytes && report.spilledKvTableBytes == spill.tableBytes && audit.valid &&
+                !audit.backendUnclassifiedBytes,
+            "a start that spills " + std::string(kv::formatName(config.kvFormat)) + " KV in extents of " +
+                std::to_string(budget.kvExtentPages) + " pages holds " + std::to_string(report.spilledKvTableBytes) +
+                " bytes of its readers' tables where its plan counts " + std::to_string(spill.tableBytes) +
+                ", and " + std::to_string(audit.backendUnclassifiedBytes) + " bytes the plan does not count (" +
+                audit.message + ")");
+    return budget.kvExtentPages;
+  };
   config.maximumMemoryBytes = startStreamed(config).minimumRequired + 512 * kMiB;
-  const std::unique_ptr<RuntimeResources> resources = RuntimeResources::create(config, 0);
-  const std::unique_ptr<model::Runtime> runtime = runtimeOf(*resources);
-  // A lane, whose state the audit counts as a warmup's.
-  const std::vector<uint32_t> prompt(64, 7);
-  ModelRequest request;
-  request.id = 1;
-  request.prompt = prompt;
-  request.maxNewTokens = 1;
-  runtime->beginColdRequest(request, 0);
-  const ActualMemoryReport report = resources->actualMemoryReport(runtime->actualRuntimeMemory());
-  const MemoryAuditResult audit = auditActualMemory(resources->memoryPlan(), report);
-  const KvSpillPlan &spill = resources->memoryPlan().breakdown().kvSpill;
-  require(spill.enabled && spill.tableBytes && report.spilledKvTableBytes == spill.tableBytes && audit.valid &&
-              !audit.backendUnclassifiedBytes,
-          "a start that spills holds " + std::to_string(report.spilledKvTableBytes) +
-              " bytes of its readers' tables where its plan counts " + std::to_string(spill.tableBytes) +
-              ", and " + std::to_string(audit.backendUnclassifiedBytes) + " bytes the plan does not count (" +
-              audit.message + ")");
+  static_cast<void>(holdsThePlannedTables());
+  config.kvFormat = kv::Format::BFloat16;
+  config.maximumMemoryBytes = 0;
+  const uint64_t least = startStreamed(config).minimumRequired;
+  kv::Layout layout = config.model.targetKvLayout;
+  layout.format = config.kvFormat;
+  config.sparseKvMemory = 4'196 * layout.kvBytesPerModelPage();
+  std::set<uint32_t> extents;
+  for (uint64_t step = 0; step < 8; ++step) {
+    config.maximumMemoryBytes = least + 2 * kGiB + step * 7 * kMiB;
+    extents.insert(holdsThePlannedTables());
+  }
+  require(extents.size() > 1, "BF16 starts across budgets took KV extents of one size");
 }
 
 // The bound of one attention layer's pairs a command may compute: a full

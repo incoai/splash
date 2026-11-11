@@ -121,9 +121,10 @@ struct ModelMemoryFootprint final {
 // block cache of decoding lanes' selected blocks (laneSlots a lane, floor
 // requiredSlots(1), target at least that) and a prefill's history staged a
 // layer at a time in stagingBuffers buffers; the pool keeps one empty Index
-// extent to spill through at the memory limit. Reader sizes are in whole
-// extents of the largest size a pool of the layout takes, so the pool's own
-// extents fit.
+// extent to spill through at the memory limit. Reader sizes and their tables
+// are the most any extent size a pool of the layout may take gives them
+// (kv::Layout::mostOverExtents), since the plan is made before the pool's
+// extent is: whichever the pool takes fits.
 struct KvSpillPlan final {
   bool enabled = false;
   uint32_t densePages = 0;
@@ -139,9 +140,9 @@ struct KvSpillPlan final {
   uint32_t stagingBuffers = 0;
   uint64_t stagingBytes = 0;
   uint64_t indexRunwayBytes = 0;
-  // The page tables the readers map their pages through, in whole host
-  // pages: the hot cache's and one for each staging buffer, which they
-  // allocate as the target starts (model::KvBlockCache::tableBytes,
+  // The page tables the readers map their pages through: the hot cache's and
+  // one for each staging buffer, which they allocate at these sizes as the
+  // target starts (model::KvBlockCache::tableBytes,
   // KvHistoryStream::tableBytes).
   uint64_t tableBytes = 0;
   // The context the floors hold one Spill request of, and the floors: its

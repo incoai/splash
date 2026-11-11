@@ -27,9 +27,12 @@ uint64_t pagesOf(uint64_t tokens) noexcept { return (tokens + kv::kPageTokens - 
 // The KV of a context of `tokens` tokens holds its speculative rows too.
 uint64_t kvTokens(uint64_t tokens) noexcept { return tokens + model::ExecutionLimits::speculativeScratchTokens; }
 
-// `pages` pages of `pageBytes` bytes in whole extents of `extentPages`.
-uint64_t extentsBytes(uint64_t pages, uint64_t extentPages, uint64_t pageBytes) noexcept {
-  return (pages + extentPages - 1) / extentPages * extentPages * pageBytes;
+// `pages` pages of `pageBytes` bytes in whole extents of whichever size a
+// pool of `layout` takes (kv::Layout::mostOverExtents): the plan is made
+// before the pool's extent is.
+uint64_t extentsBytes(const kv::Layout &layout, uint64_t pages, uint64_t pageBytes) {
+  return layout.mostOverExtents(
+      [&](uint32_t extentPages) { return (pages + extentPages - 1) / extentPages * extentPages * pageBytes; });
 }
 
 // A streamed part as its setting leaves it to the planner: the bytes the
@@ -75,11 +78,10 @@ std::optional<Part> resolve(const StreamedPart &part, std::string_view option, s
 // The page tables of a spill-capable target's readers (KvSpillPlan::
 // tableBytes), as they allocate them: the hot block cache's at a target of
 // `hotTargetBytes` and one for each of `buffers` buffers of staged history.
-uint64_t readerTableBytes(const StreamedMemoryInputs &in, uint64_t hotTargetBytes, uint32_t buffers) noexcept {
-  const uint32_t extentPages = in.kvLayout.maximumExtentPages();
-  return model::KvBlockCache::tableBytes(in.kvLayout, extentPages, static_cast<uint32_t>(in.sparseKv->laneSlots()),
+uint64_t readerTableBytes(const StreamedMemoryInputs &in, uint64_t hotTargetBytes, uint32_t buffers) {
+  return model::KvBlockCache::tableBytes(in.kvLayout, static_cast<uint32_t>(in.sparseKv->laneSlots()),
                                          hotTargetBytes) +
-         buffers * model::KvHistoryStream::tableBytes(extentPages);
+         buffers * model::KvHistoryStream::tableBytes(in.kvLayout);
 }
 
 // What a spill-capable target's floors take, by the context they hold a
@@ -89,14 +91,13 @@ uint64_t readerTableBytes(const StreamedMemoryInputs &in, uint64_t hotTargetByte
 struct SpillFloors final {
   const StreamedMemoryInputs &in;
   SpillGeometry geometry;
-  uint64_t extentPages = 0;
   uint64_t hotFloorBytes = 0;
   uint64_t indexRunwayBytes = 0;
 
-  [[nodiscard]] uint64_t stagingBytes(uint64_t tokens, uint32_t buffers) const noexcept {
-    return buffers * extentsBytes(pagesOf(kvTokens(tokens)), extentPages, in.kvLayout.bytesPerLayerPage());
+  [[nodiscard]] uint64_t stagingBytes(uint64_t tokens, uint32_t buffers) const {
+    return buffers * extentsBytes(in.kvLayout, pagesOf(kvTokens(tokens)), in.kvLayout.bytesPerLayerPage());
   }
-  [[nodiscard]] uint64_t bytes(uint64_t tokens, uint32_t buffers) const noexcept {
+  [[nodiscard]] uint64_t bytes(uint64_t tokens, uint32_t buffers) const {
     return geometry.spillFloorBytes(kvTokens(tokens)) + indexRunwayBytes +
            readerTableBytes(in, hotFloorBytes, buffers) + std::max(stagingBytes(tokens, buffers), hotFloorBytes);
   }
@@ -110,7 +111,6 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
   const kv::Layout &layout = in.kvLayout;
   if (!in.sparseKv || !layout.spillable() || !in.tierWritable) return spill;
   const model::SparseKvShape &shape = *in.sparseKv;
-  const uint32_t extentPages = layout.maximumExtentPages();
   const SpillFloors spillFloors{
       .in = in,
       .geometry = {.fullPageBytes = layout.bytesPerModelPage(),
@@ -118,11 +118,10 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
                    .densePages = static_cast<uint32_t>(pagesOf(shape.denseHistoryTokens)),
                    .windowPages = kSpillWindowPages,
                    .groupPages = in.groupPages},
-      .extentPages = extentPages,
-      .hotFloorBytes =
-          extentsBytes(shape.requiredSlots(1) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS, extentPages,
-                       layout.kvBytesPerModelPage()),
-      .indexRunwayBytes = uint64_t{extentPages} * layout.indexBytesPerModelPage()};
+      .hotFloorBytes = extentsBytes(layout, shape.requiredSlots(1) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS,
+                                    layout.kvBytesPerModelPage()),
+      .indexRunwayBytes = layout.mostOverExtents(
+          [&](uint32_t extentPages) { return uint64_t{extentPages} * layout.indexBytesPerModelPage(); })};
   const uint64_t room = saturatingSubtract(in.hardBudgetBytes, floors);
   const auto fits = [&](uint32_t tokens) { return spillFloors.bytes(tokens, 1) <= room; };
   if (!fits(0)) return spill;
@@ -159,8 +158,8 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
   spill.laneSlots = shape.laneSlots();
   spill.hotFloorBytes = spill.hotTargetBytes = spillFloors.hotFloorBytes;
   spill.hotLimitBytes = extentsBytes(
-      shape.requiredSlots(model::ExecutionLimits::maximumBatchWidth) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS,
-      extentPages, layout.kvBytesPerModelPage());
+      layout, shape.requiredSlots(model::ExecutionLimits::maximumBatchWidth) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS,
+      layout.kvBytesPerModelPage());
   spill.indexRunwayBytes = spillFloors.indexRunwayBytes;
   spill.stagingBytes = spillFloors.stagingBytes(spill.floorTokens, spill.stagingBuffers);
   spill.tableBytes = readerTableBytes(in, spill.hotTargetBytes, spill.stagingBuffers);
