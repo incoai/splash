@@ -303,6 +303,20 @@ every row of a MoE target's cycles, as `backend-benchmark` does, so two
 builds' runs route the same experts; each width also reports its tokens per
 cycle and wall ms per token.
 
+For model acceptance analysis, `decode-profile --draft-dump FILE` captures
+ordinary greedy cycles, with all verify rows and without dispatch replay.
+It takes `--prompt-file TOKENS` (chat-formatted little-endian uint32 IDs),
+`--width 1..4`, `--cycles N` and an optional `--presence-penalty P`.
+Run `.venv/bin/python -m dev.benchmarks.draft_replay FILE` to check the captured
+selector, separate candidate recall misses from selection misses, and compare
+selection objectives against the recorded continuation. These are estimates
+at the original cycle starts, not alternative rollouts or throughput results.
+`--edge-scales 0,0.5,1,1.5,2` adds an exploratory score-calibration sweep on
+the same complete-reference cycles; choosing a scale still needs held-out
+data and native export/serving evaluation.
+See [DFlash model analysis](../dev/benchmarks/dflash-model-analysis.md) for the
+training proposals, measurements and limitations.
+
 To compare the model's numerics with another engine on the same weights,
 `make teacher-logits MODEL=... TEACHER_LOGITS_ARGS='TOKENS OUTPUT --window END:ROWS ...'`
 writes the installed model's teacher-forced next-token logits over windows of
