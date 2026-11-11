@@ -393,19 +393,20 @@ private struct ChatList<Actions: View>: View {
 
     /// The conversations in their groups, the latest first in each, the open one held highlighted.
     /// A chat that moves, pinned, unpinned or sent to, goes from its place at once and fades into
-    /// its new one once the rows have moved to make room, as a new one does; one deleted goes at
-    /// once and the rows under it close its gap (`Motion.comingAndGoing`). Sliding to its new place,
-    /// a chat drew over the rows it passed, and one coming or going faded over the rows moving.
+    /// its new one, as a new one does, and one deleted goes at once (`Motion.comingAndGoing`); the
+    /// rows around them take their places at once. Sliding to its new place, a chat drew over the
+    /// rows it passed, and one coming or going faded over the rows moving.
     private func list(_ shown: [Conversation]) -> some View {
         let chats = state.chats
         let sections = ChatSection.of(shown, now: today)
         let moves = places.moves(sections)
-        // A stack, not a sidebar list, whose source-list rows AppKit insets further; every row laid
-        // out, as a lazy stack, scrolled, moved rows it had put aside from their last places: one
-        // flew from the list's foot to its top, over every row, as a chat above the screen was
-        // pinned.
+        // A lazy stack, not a sidebar list, whose source-list rows AppKit insets further: with
+        // every row laid out, showing the Chat took 160 ms with 500 chats and 550 with 2,000,
+        // against 30 to 50 lazily. Its rows don't slide: scrolled, it moved a row it had put aside
+        // from where it last had it, which flew from the list's foot to its top over every row as
+        // a chat above the screen was pinned.
         return ScrollView {
-            VStack(alignment: .leading, spacing: 2) {
+            LazyVStack(alignment: .leading, spacing: 2) {
                 ForEach(sections) { section in
                     Text(section.group.title)
                         .font(.caption.weight(.medium))
@@ -415,8 +416,8 @@ private struct ChatList<Actions: View>: View {
                         .padding(.bottom, 2)
                         .accessibilityAddTraits(.isHeader)
                         .transition(Motion.comingAndGoing)
-                    ForEach(section.chats) { conversation in
-                        let id = conversation.id
+                    ForEach(section.chats.map { Place(chat: $0, group: section.group, moves: moves[$0.id] ?? 0) }) { place in
+                        let conversation = place.chat, id = conversation.id
                         ChatRow(conversation: conversation, open: chats.selection == id, picked: picked.map { $0.contains(id) },
                                 answering: chats.streaming == id) {
                             if picked == nil {
@@ -432,8 +433,6 @@ private struct ChatList<Actions: View>: View {
                                 Button("Select") { picked = [id] }
                             }
                         }
-                        // A row of its own in each group, and anew each time it moves up in one.
-                        .id(Place(group: section.group, moves: moves[id] ?? 0))
                         .transition(Motion.comingAndGoing)
                     }
                 }
@@ -441,14 +440,22 @@ private struct ChatList<Actions: View>: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 4)
         }
-        .animation(Motion.settle, value: sections.map { $0.chats.map(\.id) })
     }
 }
 
-/// Where a chat's row is: its group, and how many times it has moved up in it.
-private struct Place: Hashable {
+/// A chat's row where it is: a row of its own in each group, and anew each time the chat moves up in one.
+private struct Place: Identifiable {
+    struct ID: Hashable {
+        let chat: UUID
+        let group: ChatSection.Group
+        let moves: Int
+    }
+
+    let chat: Conversation
     let group: ChatSection.Group
+    /// How many times the chat has moved up in its group (`Places`).
     let moves: Int
+    var id: ID { ID(chat: chat.id, group: group, moves: moves) }
 }
 
 /// The order of the chats in each group of the list as it was last drawn, to tell the chats that
