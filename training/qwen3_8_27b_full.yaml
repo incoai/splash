@@ -1,0 +1,20 @@
+# Full-draft continuation starting point. Qualify memory with --preflight.
+# Choose max_steps on training/validation data; 100 is a smoke-sized budget.
+seed: 42
+max_steps: 100
+sequence_length: 2048
+batch_size: 1
+gradient_accumulation: 4
+learning_rate: 0.00001
+weight_decay: 0.01
+max_grad_norm: 1.0
+selector_loss_weight: 1.0
+selector_warmup_steps: 10
+checkpoint_interval: 10
+validation_interval: 10
+max_new_tokens: 128
+enable_thinking: true
+reasoning_effort: xhigh
+max_validation_blocks: 64
+vocabulary_chunk_rows: 1
+trainable: all
