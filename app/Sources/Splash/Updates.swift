@@ -6,7 +6,8 @@ import Sparkle
 /// taking an update whose disk image the release key (`SUPublicEDKey`) or, to replace a lost key,
 /// the app's Developer ID signed; `dev/tools/package_app.py` writes the keys. Sparkle asks on the
 /// second launch whether to check by itself, once a day, and installs an update by quitting the
-/// app as its Quit command does, which stops what runs first.
+/// app, which stops what runs first: its installer sends the quit, which asks nothing, being no
+/// quit of the user's (`AppDelegate.isUserQuit`).
 /// An app built without the key, as one `swift build` makes, checks nothing and says nothing.
 @MainActor @Observable
 final class Updates {

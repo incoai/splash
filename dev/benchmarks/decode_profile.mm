@@ -2,7 +2,7 @@
 //
 //   decode-profile METALLIB MODEL_ROOT [--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]
 //                  [--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE]
-//                  [--dispatch-list FILE]
+//                  [--dispatch-list FILE] [--verify-rows auto|all]
 //   decode-profile METALLIB MODEL_ROOT --images HxW[,HxW...] [--cycles K]
 //
 // Drives the real model runtime with Metal dispatch profiling enabled, so
@@ -277,6 +277,7 @@ struct CycleTiming final {
   double gpuSeconds = 0.0;
   double wallSeconds = 0.0;
   uint64_t commands = 0;
+  uint64_t tokens = 0;
 };
 
 CycleTiming decodeCycle(metal::MetalBackend &backend,
@@ -296,7 +297,9 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   auto results = executor.decode(plan, items);
   if (results.size() != lanes.size())
     throw std::runtime_error("decode width changed");
+  uint64_t tokens = 0;
   for (size_t index = 0; index < lanes.size(); ++index) {
+    tokens += results[index].outputTokens.size();
     if (!results[index].failure.empty())
       throw std::runtime_error(results[index].failure);
     if (results[index].finished)
@@ -307,7 +310,7 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   const auto finished = std::chrono::steady_clock::now();
   return {executor.telemetry().lastDecodeGpuSeconds,
           std::chrono::duration<double>(finished - started).count(),
-          BackendInstrumentation::submittedCommands(backend) - submissionsBefore};
+          BackendInstrumentation::submittedCommands(backend) - submissionsBefore, tokens};
 }
 
 } // namespace
@@ -319,7 +322,7 @@ int main(int argc, char **argv) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
                      "[--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE] "
-                     "[--dispatch-list FILE]\n"
+                     "[--dispatch-list FILE] [--verify-rows auto|all]\n"
                      "       decode-profile METALLIB MODEL_ROOT "
                      "--images HxW[,HxW...] [--cycles K]\n";
         return 2;
@@ -333,6 +336,7 @@ int main(int argc, char **argv) {
       model::ModelLoadOptions loadOptions;
       bool textOptions = false;
       std::string dispatchList;
+      model::VerifyRows verifyRows = model::VerifyRows::Auto;
       for (int index = 3; index < argc; index += 2) {
         const std::string_view option(argv[index]);
         if (index + 1 >= argc)
@@ -355,6 +359,12 @@ int main(int argc, char **argv) {
           stateFormat = value == "fp32" ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
           textOptions = true;
         } else if (tools::takeLoadOption(option, argv[index + 1], loadOptions)) {
+          textOptions = true;
+        } else if (option == "--verify-rows") {
+          const std::string_view value(argv[index + 1]);
+          if (value != "auto" && value != "all")
+            throw std::invalid_argument("--verify-rows takes auto or all");
+          verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
           textOptions = true;
         } else if (option == "--dispatch-list") {
           dispatchList = argv[index + 1];
@@ -379,7 +389,7 @@ int main(int argc, char **argv) {
       loadOptions.readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
       model::LoadedModel model =
           model::loadModel(backend, root, model::inspectModelRoot(root), loadOptions);
-      ops::ExecutionPlans operators(backend.capabilities());
+      ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
 
       // Enough Page32 pages for four lanes of prompt plus generated rows.
       const uint32_t pagesPerLane =
@@ -408,6 +418,7 @@ int main(int argc, char **argv) {
                                       governor.allocationAdmission(),
                                       model.stateLayout(stateFormat), nullptr);
       model::RuntimeContext context{backend, model, pages, states, operators};
+      context.verifyRows = verifyRows;
       model::Runtime executor(context);
 
       std::printf("device %s, %u prompt tokens, %u cycles per width, %s state\n",
@@ -451,10 +462,16 @@ int main(int argc, char **argv) {
                     return left.gpuSeconds < right.gpuSeconds;
                   });
         const CycleTiming median = fused[fused.size() / 2];
+        double tokens = 0.0, wall = 0.0;
+        for (const CycleTiming &cycle : fused) {
+          tokens += cycle.tokens;
+          wall += cycle.wallSeconds;
+        }
         std::printf("\n%s: median fused gpu %.2f ms, wall %.2f ms, %llu "
-                    "command(s) per cycle\n",
+                    "command(s) per cycle, %.2f tokens per cycle, %.2f wall ms per token\n",
                     title, median.gpuSeconds * 1e3, median.wallSeconds * 1e3,
-                    static_cast<unsigned long long>(median.commands));
+                    static_cast<unsigned long long>(median.commands), tokens / fused.size(),
+                    wall * 1e3 / tokens);
         BackendInstrumentation::setDispatchProfiling(backend, true);
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
           static_cast<void>(decodeCycle(backend, executor, active));

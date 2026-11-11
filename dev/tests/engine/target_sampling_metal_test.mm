@@ -2595,6 +2595,33 @@ void penaltyLifecycle() {
   }
 }
 
+// Tree nodes draw independently, even when all sixteen conditional
+// distributions are identical. Alternating uniforms must alternate tokens.
+void independentTreeDraws(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003, lanes = 2;
+  const Batch batch = makeBatch(backend, vocabulary, lanes);
+  Sampling sampling(vocabulary);
+  const std::array policies{SamplingPolicy{0, 1.0F, 1.0F, false},
+                            SamplingPolicy{0, 1.0F, 1.0F, false}};
+  for (uint32_t row = 0; row < batch.rows; ++row) {
+    std::fill_n(batch.row(row), vocabulary, -INFINITY);
+    batch.row(row)[10] = batch.row(row)[20] = 0;
+  }
+  for (uint32_t phase = 0; phase < 2; ++phase) {
+    batch.poison();
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      for (uint32_t row = 0; row < kRows; ++row)
+        batch.uniforms()[lane * kUniforms + SPLASH_UNIFORM_ACCEPTANCE + row] =
+            (row + phase) % 2 ? 0.75F : 0.25F;
+    CommandGraph graph;
+    sampling.addVerify(graph, policies, batch.buffers, kStopTokens, {}, true);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    for (uint32_t row = 0; row < batch.rows; ++row)
+      require(batch.outputTokens()[row] == ((row + phase) % 2 ? 20U : 10U),
+              "tree nodes did not draw from their own uniform");
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -2613,6 +2640,8 @@ int main(int argc, char **argv) {
     invalidPenalties(backend);
     stage = "buffer extents";
     bufferExtents(backend);
+    stage = "independent tree draws";
+    independentTreeDraws(backend);
     stage = "extreme penalties";
     extremes(backend);
     for (const uint32_t samplingMask : {0U, 1U, 2U, 3U}) {

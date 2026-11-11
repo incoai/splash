@@ -153,10 +153,14 @@ void testServerCommandLines(const char *path) {
        [](NativeArguments &read) { read.maxImagePatches = 16384; }},
       {"idle_sleep", [](NativeArguments &read) { read.preventIdleSleep = false; }},
       {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
+      {"activations_bf16", [](NativeArguments &read) { read.int8Activations = ops::Int8Activations::Off; }},
       {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
       // The defaults the server leaves out are the engine's: each meaning
       // names the value, so a change of the engine's default fails it.
       {"verify_rows_auto", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::Auto; }},
+      {"verify_tree_off", [](NativeArguments &read) { read.verifyTree = model::VerifyTree::Off; }},
+      {"verify_tree_on", [](NativeArguments &read) { read.verifyTree = model::VerifyTree::On; }},
+      {"activations_auto", [](NativeArguments &read) { read.int8Activations = ops::Int8Activations::On; }},
       {"kv_format_default", [](NativeArguments &read) { read.kvFormat = kv::Format::Int8; }},
       {"state_format_default",
        [](NativeArguments &read) { read.stateFormat = ops::GdnStateFormat::Float32; }},
@@ -209,7 +213,8 @@ void testServerCommandLines(const char *path) {
            read.neuralEngine == meant.neuralEngine && read.pleMemory == meant.pleMemory &&
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
            read.kvSpillAlways == meant.kvSpillAlways && read.kvWindowTrim == meant.kvWindowTrim &&
-           read.verifyRows == meant.verifyRows;
+           read.verifyRows == meant.verifyRows && read.verifyTree == meant.verifyTree &&
+           read.int8Activations == meant.int8Activations;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -233,6 +238,16 @@ void testNeuralEngine() {
               parse(model, {"auto", "auto", "--ane", "on"}).neuralEngine &&
               !parse(model, {"auto", "auto", "--ane", "off"}).neuralEngine,
           "--ane did not reach the arguments as given");
+}
+
+// Activations may round to int8 unless --activations bf16 keeps them bf16;
+// --activations auto, which the server never writes, keeps the rule.
+void testInt8Activations() {
+  const ModelDirectory model;
+  require(parse(model, {"auto", "auto"}).int8Activations == ops::Int8Activations::On &&
+              parse(model, {"auto", "auto", "--activations", "auto"}).int8Activations == ops::Int8Activations::On &&
+              parse(model, {"auto", "auto", "--activations", "bf16"}).int8Activations == ops::Int8Activations::Off,
+          "--activations did not reach the arguments as given");
 }
 
 // --verify-rows auto, which the server never writes, is the engine's rule.
@@ -294,6 +309,8 @@ void testRefusals() {
   refuses({"auto", "auto", "--idle-sleep", "never"},
           "--idle-sleep requires prevent or allow");
   refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
+  for (const char *value : {"on", "off", "BF16", ""})
+    refuses({"auto", "auto", "--activations", value}, "--activations requires auto or bf16");
   for (const char *rows : {"budget", "every", "ALL", ""})
     refuses({"auto", "auto", "--verify-rows", rows}, "--verify-rows requires auto or all");
   // The server passes bytes, auto or off.
@@ -401,6 +418,11 @@ void testVerifyTree() {
               parse(model, {"auto", "auto", "--verify-tree", "off"}).verifyTree == model::VerifyTree::Off &&
               parse(model, {"auto", "auto", "--verify-tree", "on"}).verifyTree == model::VerifyTree::On,
           "--verify-tree did not reach the arguments as given");
+  const NativeArguments combined = parse(model, {"auto", "auto", "--verify-tree", "on",
+                                                  "--verify-rows", "all", "--activations", "bf16"});
+  require(combined.verifyTree == model::VerifyTree::On && combined.verifyRows == model::VerifyRows::All &&
+              combined.int8Activations == ops::Int8Activations::Off,
+          "tree verification lost the row or activation policy");
   bool refused = false;
   try {
     static_cast<void>(parse(model, {"auto", "auto", "--verify-tree", "maybe"}));
@@ -420,6 +442,7 @@ int main(int argc, char **argv) {
     testServerCommandLines(argv[1]);
     testNeuralEngine();
     testVerifyTree();
+    testInt8Activations();
     testVerifyRows();
     testStreamedMemoryAndSpill();
     testWindowTrim();

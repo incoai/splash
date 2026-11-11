@@ -28,7 +28,7 @@ public:
 // What the serve-native command line asks for. server/server.py
 // `_native_command` writes it, and dev/tests/engine/native_command_golden.txt
 // pins the lines both sides agree on.
-struct NativeArguments final {
+struct NativeArguments final : model::DecodeOptions {
   std::filesystem::path modelRoot;
   // The model the directory holds, served for MAX_CONTEXT (model::servedFor):
   // with YaRN for a context past its native window.
@@ -84,12 +84,6 @@ struct NativeArguments final {
   // validation, keeps them Full, which changes no output
   // (RuntimeResourcesConfig::kvWindowTrim).
   bool kvWindowTrim = true;
-  // --verify-rows auto|all: the rows of the draft's block a decode
-  // cycle verifies (RuntimeResourcesConfig::verifyRows).
-  model::VerifyRows verifyRows = model::VerifyRows::Auto;
-  // --verify-tree on|off: a dense target verifies a tree of candidate rows
-  // (RuntimeResourcesConfig::verifyTree).
-  model::VerifyTree verifyTree = model::VerifyTree::Off;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

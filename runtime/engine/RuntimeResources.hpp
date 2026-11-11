@@ -100,7 +100,7 @@ struct CacheDiskQuota final {
   uint64_t bytes = 0;
 };
 
-struct RuntimeResourcesConfig {
+struct RuntimeResourcesConfig : model::DecodeOptions {
   kv::Format kvFormat = kv::Format::Int8;
   ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
   std::filesystem::path metallibPath;
@@ -122,7 +122,8 @@ struct RuntimeResourcesConfig {
   // process.
   bool persistentCache = false;
   // The volume a directory lives on (volumeOf), which the automatic quota
-  // reads for each place the tier may keep its files before it opens them.
+  // reads for each place the tier may keep its files before it opens them,
+  // and the tier at each measure for the place they opened in (DiskSpace).
   std::function<std::optional<DiskVolume>(const std::filesystem::path &directory)> diskVolume =
       volumeOf;
   // Patches per image, from --max-image-patches: the engine admits images up
@@ -159,13 +160,6 @@ struct RuntimeResourcesConfig {
   // --kv-window-trim off: a windowed target's pages keep every layer's K/V,
   // for validation that trimming changes no output (CacheWindowPolicy::trim).
   bool kvWindowTrim = true;
-  // --verify-rows: the rows of the draft's block a decode cycle verifies
-  // (model::budgetsVerifyRows); a benchmark round verifies every row so that
-  // rounds repeat one another.
-  model::VerifyRows verifyRows = model::VerifyRows::Auto;
-  // --verify-tree: a dense target verifies a tree of sixteen rows
-  // (model::VerifyTree).
-  model::VerifyTree verifyTree = model::VerifyTree::Off;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
@@ -368,7 +362,7 @@ private:
                    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
                    std::unique_ptr<model::KvBlockCache> blockCache,
                    std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
-                   model::VerifyRows verifyRows, model::VerifyTree verifyTree);
+                   model::DecodeOptions decodeOptions);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
   void adoptPersistentCache();
@@ -404,10 +398,7 @@ private:
   AneFfnOutcome aneFfnOutcome_;
   // --kv-spill always.
   bool spillAlways_ = false;
-  // --verify-rows, which modelContext() passes on.
-  model::VerifyRows verifyRows_ = model::VerifyRows::Auto;
-  // --verify-tree, which modelContext() passes on.
-  model::VerifyTree verifyTree_ = model::VerifyTree::Off;
+  model::DecodeOptions decodeOptions_;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
   std::mutex probationMutex_;
@@ -420,8 +411,9 @@ private:
 // run on a prefill arena of their own, its programs wait for the ANE's
 // service until `cancelled` returns true, and its calibrations are
 // remembered beside the programs (ane::recall) under its layers' shapes and
-// formats, the device, the macOS version, the engine's `buildId` and the
-// most units the plan holds.
+// formats and the Int8Activations its GPU part plans with
+// (ops::AneFfn::calibrationKey), the device, the macOS version, the engine's
+// `buildId` and the most units the plan holds.
 [[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                                       const ops::ExecutionPlans &operators, kv::Format format,
                                       std::string_view buildId, std::function<bool()> cancelled);

@@ -8,9 +8,12 @@ struct HoverStyle: ButtonStyle {
     var padding = EdgeInsets(top: 3, leading: 6, bottom: 3, trailing: 6)
     var shape = AnyShape(.rect(cornerRadius: 7))
     var held = false
+    /// Whether the pointer is over what the button is part of, for a row with a button of its own
+    /// laid over it, which takes the pointer from the label; nil for the label's own hover.
+    var hovered: Bool?
 
     func makeBody(configuration: Configuration) -> some View {
-        Highlight(configuration: configuration, padding: padding, shape: shape, held: held)
+        Highlight(configuration: configuration, padding: padding, shape: shape, held: held, hovered: hovered)
     }
 
     private struct Highlight: View {
@@ -18,6 +21,7 @@ struct HoverStyle: ButtonStyle {
         let padding: EdgeInsets
         let shape: AnyShape
         let held: Bool
+        let hovered: Bool?
         @State private var hovering = false
         @Environment(\.isEnabled) private var enabled
 
@@ -25,7 +29,7 @@ struct HoverStyle: ButtonStyle {
             configuration.label
                 .opacity(enabled ? 1 : 0.4)
                 .padding(padding)
-                .background(.quaternary.opacity(!enabled ? 0 : configuration.isPressed || held ? 1 : hovering ? 0.75 : 0), in: shape)
+                .background(.quaternary.opacity(!enabled ? 0 : configuration.isPressed || held ? 1 : (hovered ?? hovering) ? 0.75 : 0), in: shape)
                 .contentShape(shape)
                 // At once, as AppKit's own controls light up: a fade would redraw the window in
                 // each of its frames as the pointer crosses one row after another.
@@ -40,12 +44,34 @@ extension ButtonStyle where Self == HoverStyle {
     static var hoverFlush: HoverStyle { HoverStyle(padding: EdgeInsets()) }
     /// The highlight across a row of a form, which keeps its text where the row's other text is.
     static var hoverRow: HoverStyle { HoverStyle(padding: EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8)) }
+    /// `hoverRow` for a row with a button of its own laid over it (`HoverStyle.hovered`).
+    static func hoverRow(hovered: Bool) -> HoverStyle { HoverStyle(padding: Self.hoverRow.padding, hovered: hovered) }
 }
 
 extension View {
     /// Undoes `hoverRow`'s room, so that the row's text stays in line with the form's.
     func hoverRowAligned() -> some View {
         padding(.horizontal, -8).padding(.vertical, -4)
+    }
+}
+
+/// The button of a row's menu, laid over the row while the pointer is on it: a square, `trailing`
+/// from the row's end.
+struct RowMenuButton<Actions: View>: View {
+    let trailing: CGFloat
+    @ViewBuilder let actions: () -> Actions
+
+    var body: some View {
+        Menu(content: actions) {
+            Image(systemName: "ellipsis").foregroundStyle(.secondary).frame(width: 24, height: 24)
+        }
+        .menuStyle(.button)
+        .buttonStyle(HoverStyle(padding: EdgeInsets(), shape: AnyShape(.rect(cornerRadius: 6))))
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .padding(.trailing, trailing)
+        .help("More")
+        .accessibilityLabel("More")
     }
 }
 

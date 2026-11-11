@@ -33,6 +33,8 @@ public:
                                                            std::span<const QwenTargetPrefillChunk> chunks,
                                                            const kv::PageStorage &kv, SpilledKvReads &spilled,
                                                            QwenPrefillLayers layers, ops::AneFfn *aneFfn) override;
+  void addInsideCapture(metal::CommandGraph &graph, metal::MetalBuffer auxiliaryIn,
+                        metal::MetalBuffer captured) const override;
   void prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request) override;
   void addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers, const kv::PageStorage &kv,
                  SpilledKvReads &spilled, std::span<const kv::ChunkedPrefillParams> chunks,
@@ -71,6 +73,11 @@ private:
   void addPrefillBegin(PrefillStep &step) const;
   [[nodiscard]] bool attends(uint32_t index) const;
   void addPrefillLayer(PrefillStep &step, uint32_t index) const;
+  // The PLE history a state captured `capture.row` rows into a sequence
+  // holds: the history of `auxiliaryIn` advanced by those rows of the
+  // sequence's convolution inputs from `rowBegin` of the chunk's scratch.
+  void addCaptureHistory(metal::CommandGraph &graph, const Qwen4Scratch &scratch, uint32_t rowBegin,
+                         metal::MetalBuffer auxiliaryIn, const QwenTargetStateCapture &capture) const;
   [[nodiscard]] const ops::BlockMoeWeights *moe(uint32_t index) const;
   void addPrefillExperts(PrefillStep &step, uint32_t index) const;
   [[nodiscard]] metal::MetalBuffer addPrefillEnd(PrefillStep &step) const;

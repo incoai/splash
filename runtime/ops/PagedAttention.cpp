@@ -132,6 +132,28 @@ std::string projectionKernel(std::string_view phase, const CompiledAttention &co
 // A layout's KV format, as its kernels' names hold it.
 std::string kernelFormat(kv::Layout layout) { return layout.format == kv::Format::BFloat16 ? "bf16" : "q8"; }
 
+// The pages a tile that sees visibleTokens reads: with a window of
+// windowTokens keys before each row, no more than its window's.
+uint64_t readPages(uint64_t visibleTokens, uint32_t windowTokens) {
+  const uint64_t seen = (visibleTokens + kv::kPageTokens - 1) / kv::kPageTokens;
+  return windowTokens ? std::min<uint64_t>(seen, kv::windowAttentionPages(windowTokens)) : seen;
+}
+
+// A phase's split kernel: the sparse one where the layout selects blocks;
+// otherwise the page loop's, over INT8 pages with int8 activations on its
+// INT8-query entry (q8q) where splitReads, the pages each split of the longest
+// tile or lane reads, reaches int8QueriesFromPages.
+std::string splitKernel(std::string_view phase, kv::Layout layout, const CompiledAttention &compiled,
+                        AttentionVariant variant, uint32_t int8QueriesFromPages, Int8Activations int8Activations,
+                        uint64_t splitReads) {
+  if (selectsBlocks(layout))
+    return kernelName(phase, kernelFormat(layout) + "_sparse", splitSuffix(compiled, variant));
+  const bool int8Queries = int8Activations == Int8Activations::On && layout.format == kv::Format::Int8 &&
+                           splitReads >= int8QueriesFromPages;
+  return kernelName(phase, (int8Queries ? "q8q" : kernelFormat(layout)) + "_split",
+                    splitSuffix(compiled, variant));
+}
+
 // One dispatch normalizes both the queries and the keys, so their norms must
 // share a stored type.
 std::string qkNormKernel(std::string_view name, const NormWeights &queryNorm,
@@ -253,14 +275,10 @@ uint32_t mostSplits(uint32_t tiles) {
   constexpr uint32_t ceiling = kv::prefillAttentionTiles(kv::kChunkedPrefillMaximumRows);
   return std::clamp(ceiling / tiles, sharedSplits(tiles), uint32_t{SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS});
 }
-// Each query tile's history splits: one per `pagesPerSplit` pages a tile's
-// rows read (AttentionCalibration), those of the visibleTokens the chunk's rows
-// see or, with a window of windowTokens keys before each row, no more than its
-// window's, between the shared and the most splits; with a window no more than
-// the pages it reads (a split each).
-uint32_t prefillSplits(uint32_t tiles, uint64_t visibleTokens, uint32_t windowTokens, uint32_t pagesPerSplit) {
-  const uint64_t seen = (visibleTokens + kv::kPageTokens - 1) / kv::kPageTokens;
-  const uint64_t pages = windowTokens ? std::min<uint64_t>(seen, kv::windowAttentionPages(windowTokens)) : seen;
+// Each query tile's history splits: one per `pagesPerSplit` pages a tile
+// reads (readPages; AttentionCalibration), between the shared and the most
+// splits; with a window no more than the pages it reads (a split each).
+uint32_t prefillSplits(uint32_t tiles, uint64_t pages, uint32_t windowTokens, uint32_t pagesPerSplit) {
   const uint32_t splits =
       static_cast<uint32_t>(std::clamp<uint64_t>(pages / pagesPerSplit, sharedSplits(tiles), mostSplits(tiles)));
   return windowTokens ? std::min(splits, kv::windowAttentionPages(windowTokens)) : splits;
@@ -269,8 +287,8 @@ uint32_t prefillSplits(uint32_t tiles, uint64_t visibleTokens, uint32_t windowTo
 } // namespace
 
 PrefillAttentionPlan PagedAttention::prefillPlan(uint32_t rows, uint32_t historyTokens, uint32_t queryHeads,
-                                                 kv::Layout layout, uint32_t pagesPerSplit,
-                                                 AttentionVariant variant) {
+                                                 kv::Layout layout, const AttentionCalibration &calibration,
+                                                 Int8Activations int8Activations, AttentionVariant variant) {
   const CompiledAttention &kernel = compiledAttention(queryHeads, layout, variant);
   if (!rows || rows > kv::kChunkedPrefillMaximumRows)
     throw std::invalid_argument("invalid attention workspace rows");
@@ -278,25 +296,41 @@ PrefillAttentionPlan PagedAttention::prefillPlan(uint32_t rows, uint32_t history
   // A sparse tile reads its list's blocks, a few thousand tokens whatever
   // its history, and keeps the shared splits: by its history it ran up to
   // 47% slower (Qwen3.8-Flash-Next's 64-row chunk after 64K tokens).
-  const uint32_t splits =
-      prefillSplits(tiles, selectsBlocks(layout) ? 0 : uint64_t{historyTokens} + rows, variant.windowTokens,
-                    pagesPerSplit);
-  const uint32_t fusedRows =
-      kv::kPrefillAttentionTileRows * (queryHeads / layout.kvHeads);
+  const uint64_t pages = selectsBlocks(layout) ? 0 : readPages(uint64_t{historyTokens} + rows, variant.windowTokens);
+  const uint32_t splits = prefillSplits(tiles, pages, variant.windowTokens, calibration.prefillPagesPerSplit);
+  const uint64_t splitReads = (pages + splits - 1) / splits;
+  return prefillPlanOf(rows, splits,
+                       splitKernel("prefill", layout, kernel, variant, calibration.int8QueriesFromPages,
+                                   int8Activations, splitReads),
+                       reduceKernel("prefill", kernel, variant), selectsBlocks(layout), kernel.sinks, layout,
+                       queryHeads);
+}
+
+PrefillAttentionPlan PagedAttention::prefillPlanOf(uint32_t rows, uint32_t splits, std::string splitPipeline,
+                                                   std::string reducePipeline, bool sparse, bool sinks,
+                                                   kv::Layout layout, uint32_t queryHeads) {
+  const uint32_t tiles = kv::prefillAttentionTiles(rows);
+  const uint32_t fusedRows = kv::kPrefillAttentionTileRows * (queryHeads / layout.kvHeads);
   return {rows, splits,
-          attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows,
-                             layout.headDimension),
-          kernelName("prefill", kernelFormat(layout) + (selectsBlocks(layout) ? "_sparse" : "_split"),
-                     splitSuffix(kernel, variant)),
-          reduceKernel("prefill", kernel, variant),
+          attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows, layout.headDimension),
+          std::move(splitPipeline), std::move(reducePipeline),
           {layout.kvHeads * tileParts(queryHeads, layout), tiles, splits},
-          {layout.kvHeads, fusedRows, tiles}, selectsBlocks(layout), kernel.sinks,
-          layout, queryHeads};
+          {layout.kvHeads, fusedRows, tiles}, sparse, sinks, layout, queryHeads};
+}
+
+PrefillAttentionTail PagedAttention::prefillTail(const PrefillAttentionPlan &chunk, uint32_t row) {
+  if (row >= chunk.rows) throw std::invalid_argument("a prefill tail starts within its chunk");
+  const uint32_t first = row - row % kv::kPrefillAttentionTileRows;
+  return {first,
+          prefillPlanOf(chunk.rows - first, chunk.splits, chunk.splitPipeline, chunk.reducePipeline, chunk.sparse,
+                        chunk.sinks, chunk.layout, chunk.queryHeads),
+          uint64_t{chunk.queryHeads / chunk.layout.kvHeads} * chunk.layout.headDimension * sizeof(uint16_t)};
 }
 
 VerifyAttentionPlan PagedAttention::verifyPlan(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens, AttentionVariant variant) {
+    std::span<const uint32_t> historyTokens, const AttentionCalibration &calibration,
+    Int8Activations int8Activations, AttentionVariant variant) {
   const CompiledAttention &kernel = compiledAttention(queryHeads, layout, variant);
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid attention workspace batch width");
@@ -304,6 +338,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
     throw std::invalid_argument("invalid verify attention history vector");
   std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits{};
   uint32_t splits = 0;
+  uint64_t splitReads = 0;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (uint64_t{historyTokens[lane]} + kv::kVerifyRows >
         kv::kMaximumPhysicalTokens)
@@ -311,11 +346,13 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
           "verify attention history exceeds physical context");
     laneSplits[lane] = kv::verifyAttentionSplits(historyTokens[lane], variant.windowTokens);
     splits = std::max(splits, laneSplits[lane]);
+    const uint64_t pages = readPages(uint64_t{historyTokens[lane]} + kv::kVerifyRows, variant.windowTokens);
+    splitReads = std::max(splitReads, (pages + laneSplits[lane] - 1) / laneSplits[lane]);
   }
   return {lanes, laneSplits, splits,
           verifyWorkspaceBound(lanes, queryHeads, layout),
-          kernelName("verify", kernelFormat(layout) + (selectsBlocks(layout) ? "_sparse" : "_split"),
-                     splitSuffix(kernel, variant)),
+          splitKernel("verify", layout, kernel, variant, calibration.int8QueriesFromPages, int8Activations,
+                      splitReads),
           reduceKernel("verify", kernel, variant),
           // A sparse lane's list fills only the first of the plan's splits.
           // Its split grid is one-dimensional, x the KV head and then the

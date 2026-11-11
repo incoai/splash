@@ -124,6 +124,18 @@ enum class VerifyTree : uint8_t {
   On,
 };
 
+// Decode policy shared by command parsing and resource assembly. Model
+// execution keeps it for the engine's lifetime; benchmark rounds can request
+// every row so that a greedy or seeded run repeats its output.
+struct DecodeOptions {
+  // --verify-rows auto|all: budget MoE rows, or verify the full block.
+  VerifyRows verifyRows = VerifyRows::Auto;
+  // --verify-tree on|off: sixteen candidate rows where the target supports it.
+  VerifyTree verifyTree = VerifyTree::Off;
+  // --activations auto|bf16: allow int8 activation paths or retain BF16.
+  ops::Int8Activations int8Activations = ops::Int8Activations::On;
+};
+
 // Whether the decode cycles of `model` verify the rows the verify budget
 // chooses (model::VerifyBudget, ops::DraftSelector::addVerifyRows) under
 // `rows`. Each row a MoE target verifies routes its own experts, which a
