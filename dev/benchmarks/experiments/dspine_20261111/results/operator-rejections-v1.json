@@ -1,0 +1,1097 @@
+{
+  "scope": "Finite operator nomination screens, not controlled end-to-end throughput. No candidate is selected from a favorable subset.",
+  "prefill_candidates": [
+    {
+      "mode": 1,
+      "nomination_rule_met": false,
+      "geometric_throughput_change": -0.01742562703942996,
+      "worst_large_row_case": {
+        "rows": 2048,
+        "outputs": 5120,
+        "inputs": 17408,
+        "epilogue": "a",
+        "control_ms": 13.779050000000002,
+        "candidate_ms": 15.14495,
+        "latency_change": 0.09912874980495734,
+        "throughput_change": -0.09018847866780666
+      },
+      "cases": [
+        {
+          "rows": 128,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 0.9401085,
+          "candidate_ms": 0.8475235,
+          "latency_change": -0.09848331336223426,
+          "throughput_change": 0.10924180863421484
+        },
+        {
+          "rows": 128,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 0.8896275,
+          "candidate_ms": 0.851332,
+          "latency_change": -0.04304666840896898,
+          "throughput_change": 0.0449830383446177
+        },
+        {
+          "rows": 128,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 0.875151,
+          "candidate_ms": 0.8569735,
+          "latency_change": -0.020770701284692494,
+          "throughput_change": 0.021211274327619156
+        },
+        {
+          "rows": 128,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "a",
+          "control_ms": 0.869525,
+          "candidate_ms": 0.9334725,
+          "latency_change": 0.07354302636496945,
+          "throughput_change": -0.06850496399197625
+        },
+        {
+          "rows": 128,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "r",
+          "control_ms": 0.866698,
+          "candidate_ms": 0.9358945000000001,
+          "latency_change": 0.07983922888941719,
+          "throughput_change": -0.07393621823827379
+        },
+        {
+          "rows": 128,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "g",
+          "control_ms": 0.8643715,
+          "candidate_ms": 0.9402729999999999,
+          "latency_change": 0.08781120154933375,
+          "throughput_change": -0.08072283262414215
+        },
+        {
+          "rows": 128,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 0.5925959999999999,
+          "candidate_ms": 0.6067575000000001,
+          "latency_change": 0.023897393839985792,
+          "throughput_change": -0.02333963733452027
+        },
+        {
+          "rows": 128,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 0.617982,
+          "candidate_ms": 0.613413,
+          "latency_change": -0.007393419225802722,
+          "throughput_change": 0.007448489027783944
+        },
+        {
+          "rows": 128,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 0.60216,
+          "candidate_ms": 0.624776,
+          "latency_change": 0.0375581240866214,
+          "throughput_change": -0.03619857356876699
+        },
+        {
+          "rows": 512,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 3.12011,
+          "candidate_ms": 3.104655,
+          "latency_change": -0.0049533510036504635,
+          "throughput_change": 0.00497800882867816
+        },
+        {
+          "rows": 512,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 3.1608549999999997,
+          "candidate_ms": 3.155475,
+          "latency_change": -0.0017020711168338476,
+          "throughput_change": 0.0017049731023062176
+        },
+        {
+          "rows": 512,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 3.1989,
+          "candidate_ms": 3.17791,
+          "latency_change": -0.006561630560505294,
+          "throughput_change": 0.006604969933069249
+        },
+        {
+          "rows": 512,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "a",
+          "control_ms": 3.3222750000000003,
+          "candidate_ms": 3.4460499999999996,
+          "latency_change": 0.037256097102136065,
+          "throughput_change": -0.035917935027059755
+        },
+        {
+          "rows": 512,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "r",
+          "control_ms": 3.3552999999999997,
+          "candidate_ms": 3.480555,
+          "latency_change": 0.03733049205734207,
+          "throughput_change": -0.03598707677367552
+        },
+        {
+          "rows": 512,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "g",
+          "control_ms": 3.395735,
+          "candidate_ms": 3.539095,
+          "latency_change": 0.04221766421702511,
+          "throughput_change": -0.04050753088006964
+        },
+        {
+          "rows": 512,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 2.237025,
+          "candidate_ms": 2.20421,
+          "latency_change": -0.014669035884713022,
+          "throughput_change": 0.014887419982669625
+        },
+        {
+          "rows": 512,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 2.2987349999999998,
+          "candidate_ms": 2.2770099999999998,
+          "latency_change": -0.00945085014149083,
+          "throughput_change": 0.00954102090021558
+        },
+        {
+          "rows": 512,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 2.39574,
+          "candidate_ms": 2.3994299999999997,
+          "latency_change": 0.0015402339151993072,
+          "throughput_change": -0.0015378652429951511
+        },
+        {
+          "rows": 2048,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 12.90405,
+          "candidate_ms": 12.89345,
+          "latency_change": -0.0008214475300389878,
+          "throughput_change": 0.0008221228608324971
+        },
+        {
+          "rows": 2048,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 14.57685,
+          "candidate_ms": 14.7203,
+          "latency_change": 0.00984094643218536,
+          "throughput_change": -0.00974504595694381
+        },
+        {
+          "rows": 2048,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 15.2129,
+          "candidate_ms": 15.325849999999999,
+          "latency_change": 0.007424619894957463,
+          "throughput_change": -0.007369901180032445
+        },
+        {
+          "rows": 2048,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "a",
+          "control_ms": 13.779050000000002,
+          "candidate_ms": 15.14495,
+          "latency_change": 0.09912874980495734,
+          "throughput_change": -0.09018847866780666
+        },
+        {
+          "rows": 2048,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "r",
+          "control_ms": 15.73885,
+          "candidate_ms": 17.096400000000003,
+          "latency_change": 0.0862547136544285,
+          "throughput_change": -0.0794056058585435
+        },
+        {
+          "rows": 2048,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "g",
+          "control_ms": 16.020249999999997,
+          "candidate_ms": 17.20075,
+          "latency_change": 0.07368798863937842,
+          "throughput_change": -0.0686307283112656
+        },
+        {
+          "rows": 2048,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 9.883295,
+          "candidate_ms": 9.91338,
+          "latency_change": 0.0030440252972312454,
+          "throughput_change": -0.003034787327833688
+        },
+        {
+          "rows": 2048,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 10.869250000000001,
+          "candidate_ms": 10.9787,
+          "latency_change": 0.010069692021068555,
+          "throughput_change": -0.009969304198129025
+        },
+        {
+          "rows": 2048,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 11.0119,
+          "candidate_ms": 11.033100000000001,
+          "latency_change": 0.001925190021703882,
+          "throughput_change": -0.0019214907868142506
+        }
+      ],
+      "oracle": {
+        "cases": 40,
+        "bitwise_comparisons": 2346624,
+        "fp64_checks": 2160,
+        "stdout_sha256": "dd9d90444e948a2805ede41b4bd03aa02de1f5dd762ff026da7781e4b978045b"
+      },
+      "diagnostic_stdout_sha256": "4f6ab9906e01e3bf8401255e8bf1aac7863f2ecb5806e19840e87dd0c3df9cd0"
+    },
+    {
+      "mode": 2,
+      "nomination_rule_met": false,
+      "geometric_throughput_change": -0.027003491924389,
+      "worst_large_row_case": {
+        "rows": 2048,
+        "outputs": 5120,
+        "inputs": 17408,
+        "epilogue": "a",
+        "control_ms": 13.50965,
+        "candidate_ms": 17.553199999999997,
+        "latency_change": 0.29930827223503176,
+        "throughput_change": -0.23035970649226334
+      },
+      "cases": [
+        {
+          "rows": 128,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 0.8870415,
+          "candidate_ms": 0.8653789999999999,
+          "latency_change": -0.024421067109036243,
+          "throughput_change": 0.025032384654585016
+        },
+        {
+          "rows": 128,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 0.8841015000000001,
+          "candidate_ms": 0.9321875,
+          "latency_change": 0.05438968263259358,
+          "throughput_change": -0.051584042909822214
+        },
+        {
+          "rows": 128,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 0.8886799999999999,
+          "candidate_ms": 0.8931755,
+          "latency_change": 0.005058626277175238,
+          "throughput_change": -0.005033165374554116
+        },
+        {
+          "rows": 128,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "a",
+          "control_ms": 0.8649575,
+          "candidate_ms": 0.8650075,
+          "latency_change": 5.780630840246381e-05,
+          "throughput_change": -5.7802967026288066e-05
+        },
+        {
+          "rows": 128,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "r",
+          "control_ms": 0.868151,
+          "candidate_ms": 0.8665039999999999,
+          "latency_change": -0.0018971354061678714,
+          "throughput_change": 0.0019007413699188014
+        },
+        {
+          "rows": 128,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "g",
+          "control_ms": 0.871836,
+          "candidate_ms": 0.8753765,
+          "latency_change": 0.004060970182465429,
+          "throughput_change": -0.004044545404177424
+        },
+        {
+          "rows": 128,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 0.6022890000000001,
+          "candidate_ms": 0.5924675,
+          "latency_change": -0.01630695563093476,
+          "throughput_change": 0.016577280610328815
+        },
+        {
+          "rows": 128,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 0.600492,
+          "candidate_ms": 0.600801,
+          "latency_change": 0.0005145780460023008,
+          "throughput_change": -0.0005143133916222231
+        },
+        {
+          "rows": 128,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 0.624531,
+          "candidate_ms": 0.604449,
+          "latency_change": -0.032155329359151,
+          "throughput_change": 0.03322364666001576
+        },
+        {
+          "rows": 512,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 3.144405,
+          "candidate_ms": 3.09402,
+          "latency_change": -0.016023699237216582,
+          "throughput_change": 0.01628463940116731
+        },
+        {
+          "rows": 512,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 3.1540299999999997,
+          "candidate_ms": 3.134845,
+          "latency_change": -0.006082694203923156,
+          "throughput_change": 0.0061199198046473224
+        },
+        {
+          "rows": 512,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 3.1821349999999997,
+          "candidate_ms": 3.194835,
+          "latency_change": 0.003991031178752769,
+          "throughput_change": -0.003975166166640842
+        },
+        {
+          "rows": 512,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "a",
+          "control_ms": 3.33629,
+          "candidate_ms": 3.354985,
+          "latency_change": 0.005603529669183427,
+          "throughput_change": -0.005572305092273133
+        },
+        {
+          "rows": 512,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "r",
+          "control_ms": 3.363645,
+          "candidate_ms": 3.384785,
+          "latency_change": 0.006284848728091097,
+          "throughput_change": -0.006245596101377204
+        },
+        {
+          "rows": 512,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "g",
+          "control_ms": 3.3832649999999997,
+          "candidate_ms": 3.442685,
+          "latency_change": 0.017562916295353892,
+          "throughput_change": -0.017259784151033353
+        },
+        {
+          "rows": 512,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 2.22179,
+          "candidate_ms": 2.2015000000000002,
+          "latency_change": -0.009132276227726166,
+          "throughput_change": 0.009216443334090219
+        },
+        {
+          "rows": 512,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 2.256815,
+          "candidate_ms": 2.25757,
+          "latency_change": 0.00033454226420848165,
+          "throughput_change": -0.00033443038311098405
+        },
+        {
+          "rows": 512,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 2.2908999999999997,
+          "candidate_ms": 2.2697700000000003,
+          "latency_change": -0.009223449299401776,
+          "throughput_change": 0.009309313278437648
+        },
+        {
+          "rows": 2048,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 12.5039,
+          "candidate_ms": 12.7508,
+          "latency_change": 0.01974583929813889,
+          "throughput_change": -0.019363490918216875
+        },
+        {
+          "rows": 2048,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 13.599450000000001,
+          "candidate_ms": 13.96625,
+          "latency_change": 0.026971679001724258,
+          "throughput_change": -0.026263313344670136
+        },
+        {
+          "rows": 2048,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 14.57375,
+          "candidate_ms": 14.947700000000001,
+          "latency_change": 0.025659147439746066,
+          "throughput_change": -0.02501722673053386
+        },
+        {
+          "rows": 2048,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "a",
+          "control_ms": 13.50965,
+          "candidate_ms": 17.553199999999997,
+          "latency_change": 0.29930827223503176,
+          "throughput_change": -0.23035970649226334
+        },
+        {
+          "rows": 2048,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "r",
+          "control_ms": 15.687550000000002,
+          "candidate_ms": 19.0563,
+          "latency_change": 0.21474035142517467,
+          "throughput_change": -0.17677880805822743
+        },
+        {
+          "rows": 2048,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "g",
+          "control_ms": 16.477400000000003,
+          "candidate_ms": 19.50565,
+          "latency_change": 0.18378202871812266,
+          "throughput_change": -0.1552498891346864
+        },
+        {
+          "rows": 2048,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 10.25437,
+          "candidate_ms": 10.45755,
+          "latency_change": 0.019813991498258687,
+          "throughput_change": -0.019429024962825836
+        },
+        {
+          "rows": 2048,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 11.1525,
+          "candidate_ms": 11.470099999999999,
+          "latency_change": 0.0284779197489351,
+          "throughput_change": -0.027689383701972825
+        },
+        {
+          "rows": 2048,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 11.170850000000002,
+          "candidate_ms": 11.34045,
+          "latency_change": 0.015182371977065179,
+          "throughput_change": -0.014955314824367516
+        }
+      ],
+      "oracle": {
+        "cases": 40,
+        "bitwise_comparisons": 2346624,
+        "fp64_checks": 2160,
+        "stdout_sha256": "dd9d90444e948a2805ede41b4bd03aa02de1f5dd762ff026da7781e4b978045b"
+      },
+      "diagnostic_stdout_sha256": "fca520776c7eb7140539f88e46e36639d169fd46c0a766b0d9d516e7f8e0d150"
+    },
+    {
+      "mode": 3,
+      "nomination_rule_met": false,
+      "geometric_throughput_change": -0.12376438372556386,
+      "worst_large_row_case": {
+        "rows": 2048,
+        "outputs": 5120,
+        "inputs": 17408,
+        "epilogue": "a",
+        "control_ms": 13.49535,
+        "candidate_ms": 28.13375,
+        "latency_change": 1.0846995446579748,
+        "throughput_change": -0.5203145688008175
+      },
+      "cases": [
+        {
+          "rows": 128,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 0.8753515000000001,
+          "candidate_ms": 0.8929065,
+          "latency_change": 0.020054800842861376,
+          "throughput_change": -0.01966051316683215
+        },
+        {
+          "rows": 128,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 0.8752345,
+          "candidate_ms": 0.857987,
+          "latency_change": -0.01970614732394571,
+          "throughput_change": 0.020102285932071196
+        },
+        {
+          "rows": 128,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 0.893841,
+          "candidate_ms": 0.853272,
+          "latency_change": -0.0453872668628984,
+          "throughput_change": 0.04754521418726965
+        },
+        {
+          "rows": 128,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "a",
+          "control_ms": 0.8642814999999999,
+          "candidate_ms": 0.9292735,
+          "latency_change": 0.07519772203847941,
+          "throughput_change": -0.06993850572517135
+        },
+        {
+          "rows": 128,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "r",
+          "control_ms": 0.8622799999999999,
+          "candidate_ms": 0.93516,
+          "latency_change": 0.08452010947720012,
+          "throughput_change": -0.07793318790367432
+        },
+        {
+          "rows": 128,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "g",
+          "control_ms": 0.865556,
+          "candidate_ms": 0.9370975,
+          "latency_change": 0.08265380865016247,
+          "throughput_change": -0.07634371023292674
+        },
+        {
+          "rows": 128,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 0.6076905,
+          "candidate_ms": 0.603332,
+          "latency_change": -0.007172236525007425,
+          "throughput_change": 0.007224049113920827
+        },
+        {
+          "rows": 128,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 0.6017490000000001,
+          "candidate_ms": 0.616719,
+          "latency_change": 0.02487748213956298,
+          "throughput_change": -0.02427361569855957
+        },
+        {
+          "rows": 128,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 0.6155660000000001,
+          "candidate_ms": 0.6108595,
+          "latency_change": -0.007645808897827511,
+          "throughput_change": 0.007704717696950025
+        },
+        {
+          "rows": 512,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 3.12523,
+          "candidate_ms": 3.2292300000000003,
+          "latency_change": 0.03327755077226313,
+          "throughput_change": -0.032205819963272986
+        },
+        {
+          "rows": 512,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 3.19257,
+          "candidate_ms": 3.2990649999999997,
+          "latency_change": 0.033357138606201264,
+          "throughput_change": -0.03228035822270847
+        },
+        {
+          "rows": 512,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 3.25307,
+          "candidate_ms": 3.370885,
+          "latency_change": 0.03621655851242056,
+          "throughput_change": -0.03495076218856463
+        },
+        {
+          "rows": 512,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "a",
+          "control_ms": 3.32984,
+          "candidate_ms": 3.72923,
+          "latency_change": 0.1199426999495472,
+          "throughput_change": -0.10709717555634812
+        },
+        {
+          "rows": 512,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "r",
+          "control_ms": 3.40468,
+          "candidate_ms": 3.7679850000000004,
+          "latency_change": 0.10670753198538496,
+          "throughput_change": -0.0964189082493695
+        },
+        {
+          "rows": 512,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "g",
+          "control_ms": 3.457805,
+          "candidate_ms": 3.840925,
+          "latency_change": 0.11079861357132637,
+          "throughput_change": -0.0997468057824612
+        },
+        {
+          "rows": 512,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 2.216265,
+          "candidate_ms": 2.28632,
+          "latency_change": 0.0316094871326309,
+          "throughput_change": -0.030640942650197678
+        },
+        {
+          "rows": 512,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 2.2947949999999997,
+          "candidate_ms": 2.363295,
+          "latency_change": 0.029850160907619383,
+          "throughput_change": -0.028984955327202133
+        },
+        {
+          "rows": 512,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 2.3809750000000003,
+          "candidate_ms": 2.44402,
+          "latency_change": 0.026478648452839648,
+          "throughput_change": -0.025795615420495688
+        },
+        {
+          "rows": 2048,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 12.715250000000001,
+          "candidate_ms": 15.25175,
+          "latency_change": 0.19948487052948227,
+          "throughput_change": -0.1663087842378742
+        },
+        {
+          "rows": 2048,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 14.2967,
+          "candidate_ms": 16.8961,
+          "latency_change": 0.18181818181818188,
+          "throughput_change": -0.15384615384615385
+        },
+        {
+          "rows": 2048,
+          "outputs": 17408,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 15.70755,
+          "candidate_ms": 17.842799999999997,
+          "latency_change": 0.13593781334453792,
+          "throughput_change": -0.11967011903961244
+        },
+        {
+          "rows": 2048,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "a",
+          "control_ms": 13.49535,
+          "candidate_ms": 28.13375,
+          "latency_change": 1.0846995446579748,
+          "throughput_change": -0.5203145688008175
+        },
+        {
+          "rows": 2048,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "r",
+          "control_ms": 14.9915,
+          "candidate_ms": 28.744149999999998,
+          "latency_change": 0.9173631724643962,
+          "throughput_change": -0.47845039773310394
+        },
+        {
+          "rows": 2048,
+          "outputs": 5120,
+          "inputs": 17408,
+          "epilogue": "g",
+          "control_ms": 15.82715,
+          "candidate_ms": 29.429299999999998,
+          "latency_change": 0.8594187835459952,
+          "throughput_change": -0.4621975378279469
+        },
+        {
+          "rows": 2048,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "a",
+          "control_ms": 10.29558,
+          "candidate_ms": 11.95635,
+          "latency_change": 0.16130902775754263,
+          "throughput_change": -0.13890275878508085
+        },
+        {
+          "rows": 2048,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "r",
+          "control_ms": 11.68415,
+          "candidate_ms": 13.1613,
+          "latency_change": 0.1264234026437525,
+          "throughput_change": -0.11223435374924973
+        },
+        {
+          "rows": 2048,
+          "outputs": 12288,
+          "inputs": 5120,
+          "epilogue": "g",
+          "control_ms": 11.606449999999999,
+          "candidate_ms": 12.98985,
+          "latency_change": 0.11919234563540115,
+          "throughput_change": -0.10649853539494314
+        }
+      ],
+      "oracle": {
+        "cases": 40,
+        "bitwise_comparisons": 2346624,
+        "fp64_checks": 2160,
+        "stdout_sha256": "dd9d90444e948a2805ede41b4bd03aa02de1f5dd762ff026da7781e4b978045b"
+      },
+      "diagnostic_stdout_sha256": "e7bb448eda7f56920dfad59a008af3cd7d137096d7928a5ec5f1be9707f955ee"
+    }
+  ],
+  "prefill_production_nominations": 0,
+  "cooperative_input_candidate": {
+    "nominated": false,
+    "cases": [
+      {
+        "rows": 16,
+        "live_rows": 16,
+        "splits": 1,
+        "spread": false,
+        "original_one_pass_ms": 0.531431,
+        "original_two_pass_ms": 0.424558,
+        "cooperative_input_ms": 0.557208,
+        "latency_change_against_best_existing": 0.31244258734966723
+      },
+      {
+        "rows": 16,
+        "live_rows": 16,
+        "splits": 2,
+        "spread": false,
+        "original_one_pass_ms": 0.406832,
+        "original_two_pass_ms": 0.451178,
+        "cooperative_input_ms": 0.4978,
+        "latency_change_against_best_existing": 0.22360089668462657
+      },
+      {
+        "rows": 16,
+        "live_rows": 16,
+        "splits": 1,
+        "spread": true,
+        "original_one_pass_ms": 0.356374,
+        "original_two_pass_ms": 0.40386,
+        "cooperative_input_ms": 0.529023,
+        "latency_change_against_best_existing": 0.48446014580188224
+      },
+      {
+        "rows": 16,
+        "live_rows": 16,
+        "splits": 2,
+        "spread": true,
+        "original_one_pass_ms": 0.406098,
+        "original_two_pass_ms": 0.433905,
+        "cooperative_input_ms": 0.494288,
+        "latency_change_against_best_existing": 0.21716432979231604
+      },
+      {
+        "rows": 32,
+        "live_rows": 32,
+        "splits": 1,
+        "spread": false,
+        "original_one_pass_ms": 0.457688,
+        "original_two_pass_ms": 0.529075,
+        "cooperative_input_ms": 1.36183,
+        "latency_change_against_best_existing": 1.975454895037668
+      },
+      {
+        "rows": 32,
+        "live_rows": 32,
+        "splits": 2,
+        "spread": false,
+        "original_one_pass_ms": 0.49433,
+        "original_two_pass_ms": 0.551778,
+        "cooperative_input_ms": 1.13378,
+        "latency_change_against_best_existing": 1.2935690732911214
+      },
+      {
+        "rows": 32,
+        "live_rows": 32,
+        "splits": 1,
+        "spread": true,
+        "original_one_pass_ms": 0.402402,
+        "original_two_pass_ms": 0.449746,
+        "cooperative_input_ms": 1.36178,
+        "latency_change_against_best_existing": 2.384128309501444
+      },
+      {
+        "rows": 32,
+        "live_rows": 32,
+        "splits": 2,
+        "spread": true,
+        "original_one_pass_ms": 0.487012,
+        "original_two_pass_ms": 0.526155,
+        "cooperative_input_ms": 1.13791,
+        "latency_change_against_best_existing": 1.336513268666891
+      },
+      {
+        "rows": 64,
+        "live_rows": 64,
+        "splits": 1,
+        "spread": false,
+        "original_one_pass_ms": 2.53951,
+        "original_two_pass_ms": 0.831231,
+        "cooperative_input_ms": 1.7711,
+        "latency_change_against_best_existing": 1.130695318148625
+      },
+      {
+        "rows": 64,
+        "live_rows": 64,
+        "splits": 2,
+        "spread": false,
+        "original_one_pass_ms": 2.69643,
+        "original_two_pass_ms": 0.958467,
+        "cooperative_input_ms": 1.96332,
+        "latency_change_against_best_existing": 1.0483960324142614
+      },
+      {
+        "rows": 64,
+        "live_rows": 64,
+        "splits": 1,
+        "spread": true,
+        "original_one_pass_ms": 2.56106,
+        "original_two_pass_ms": 0.812931,
+        "cooperative_input_ms": 1.80675,
+        "latency_change_against_best_existing": 1.2225133498414995
+      },
+      {
+        "rows": 64,
+        "live_rows": 64,
+        "splits": 2,
+        "spread": true,
+        "original_one_pass_ms": 2.70244,
+        "original_two_pass_ms": 0.949928,
+        "cooperative_input_ms": 1.97193,
+        "latency_change_against_best_existing": 1.0758731188047936
+      }
+    ],
+    "oracle_cases": 12,
+    "bitwise_comparisons": 802816,
+    "fp64_checks": 2592,
+    "oracle_stdout_sha256": "2d3e08e52946a47132467536484b70f89f33f1fc033b8f00e0ab4d8f0d29c8d7",
+    "diagnostic_stdout_sha256": "bbaeecec7c6427bf30feb965964954698fffe8812497fdcd9d5ed9f202b56fc3",
+    "resources": [
+      {
+        "kernel": "gguf_decode_af4g64_m16_gate_up",
+        "static_threadgroup_bytes": 4112,
+        "maximum_threads": 1024,
+        "execution_width": 32,
+        "device_threadgroup_limit_bytes": 32768
+      },
+      {
+        "kernel": "gguf_decode_af4g64_m32_gate_up",
+        "static_threadgroup_bytes": 4112,
+        "maximum_threads": 1024,
+        "execution_width": 32,
+        "device_threadgroup_limit_bytes": 32768
+      },
+      {
+        "kernel": "gguf_decode_af4g64_m64_gate_up",
+        "static_threadgroup_bytes": 4112,
+        "maximum_threads": 1024,
+        "execution_width": 32,
+        "device_threadgroup_limit_bytes": 32768
+      },
+      {
+        "kernel": "gguf_decode_af4g64_coop_m16_gate_up",
+        "static_threadgroup_bytes": 16,
+        "maximum_threads": 1024,
+        "execution_width": 32,
+        "device_threadgroup_limit_bytes": 32768
+      },
+      {
+        "kernel": "gguf_decode_af4g64_coop_m32_gate_up",
+        "static_threadgroup_bytes": 16,
+        "maximum_threads": 1024,
+        "execution_width": 32,
+        "device_threadgroup_limit_bytes": 32768
+      },
+      {
+        "kernel": "gguf_decode_af4g64_coop_m64_gate_up",
+        "static_threadgroup_bytes": 16,
+        "maximum_threads": 1024,
+        "execution_width": 32,
+        "device_threadgroup_limit_bytes": 32768
+      }
+    ],
+    "resources_stdout_sha256": "87179d8cb77c61227425526332adfa428a4fa01daf4e800e625a24f48a37ae3a",
+    "interpretation": "Direct cooperative-register input reduces static threadgroup storage but loses to the best existing gate/up path in every tested production shape. Static storage is not an occupancy or spill measurement."
+  },
+  "invalid_fixture_attempts": [
+    {
+      "job": "prefill-tiles-v1-mode1-oracle",
+      "state": "complete",
+      "exit_code": 1
+    },
+    {
+      "job": "prefill-tiles-v1-mode2-oracle",
+      "state": "complete",
+      "exit_code": 1
+    },
+    {
+      "job": "prefill-tiles-v1-mode3-oracle",
+      "state": "complete",
+      "exit_code": 1
+    },
+    {
+      "job": "prefill-tiles-v2-mode1-oracle",
+      "state": "complete",
+      "exit_code": 1
+    },
+    {
+      "job": "prefill-tiles-v2-mode2-oracle",
+      "state": "complete",
+      "exit_code": 1
+    },
+    {
+      "job": "prefill-tiles-v2-mode3-oracle",
+      "state": "complete",
+      "exit_code": 1
+    }
+  ],
+  "fixture_correction": "Both v1 and v2 prefill fixtures actually executed and failed baseline validation: plain prefill requires the production segmented 36-byte/11-buffer ABI. V2 only corrected plane1 fallback, so it remained invalid. A v3 preparation note proposed canceling pending v2 jobs, but they had already executed and no receipts were overwritten. V3 corrected the fixture ABI; shader candidates were unchanged. Only v3 is numerical evidence."
+}

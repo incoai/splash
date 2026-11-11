@@ -1,0 +1,202 @@
+{
+  "kind": "logits",
+  "created_utc": "2026-11-11T01:25:31.006437+00:00",
+  "archive": "logits.tar.gz",
+  "archive_bytes": 208692684,
+  "archive_sha256": "1f3f585b00618c65e2b27e85d0cb985c075402b15fd4e3487aa89a0a058a87eb",
+  "files": {
+    "logit-probes/aligned-prefix-logit-probe-control8-v2/runtime_cache_cold-s0.f32": {
+      "bytes": 13905920,
+      "sha256": "348b67ac24f173e021a797016202fab583fc0d566478a71b617f5b1e2adca71e"
+    },
+    "logit-probes/aligned-prefix-logit-probe-control8-v2/runtime_cache_cold-s0.jsonl": {
+      "bytes": 19519,
+      "sha256": "7e7547de992d9cb05073fd32f5966ccacaf6f273a3ddb0d90eacd09aa88eb220"
+    },
+    "logit-probes/aligned-prefix-logit-probe-control8-v2/runtime_cache_hit-s0.f32": {
+      "bytes": 13905920,
+      "sha256": "ccc1f072dedad34fd9b6823a2f79a97c80d3145fac7efb571faa6ae4e7ad92ea"
+    },
+    "logit-probes/aligned-prefix-logit-probe-control8-v2/runtime_cache_hit-s0.jsonl": {
+      "bytes": 19522,
+      "sha256": "ad6f6d7277f667f1eff4ada9690c01a1ff6c88cba197366a591591e2f2fae82e"
+    },
+    "logit-probes/aligned-prefix-logit-probe-control8-v2/runtime_cache_seed-s0.f32": {
+      "bytes": 993280,
+      "sha256": "9fe5d346592fc320c86fc4eed8e990c1cd90daaa6bb8e5bcfed418aa7ce16576"
+    },
+    "logit-probes/aligned-prefix-logit-probe-control8-v2/runtime_cache_seed-s0.jsonl": {
+      "bytes": 293,
+      "sha256": "af8ef18dee8a20f6bd6795755fffeb596a5123cb2c3570a26582f8c5c25a7a43"
+    },
+    "logit-probes/aligned-prefix-logit-probe-core16-v2/runtime_cache_cold-s0.f32": {
+      "bytes": 13905920,
+      "sha256": "b701444705a433956de0504ea92a4f0e99aca41473f3f2a823420f6eacc04e1a"
+    },
+    "logit-probes/aligned-prefix-logit-probe-core16-v2/runtime_cache_cold-s0.jsonl": {
+      "bytes": 19527,
+      "sha256": "0303efbb9992bce9ca6ebd274751f53a06925b53c552a45e2c362670d3944cdb"
+    },
+    "logit-probes/aligned-prefix-logit-probe-core16-v2/runtime_cache_hit-s0.f32": {
+      "bytes": 13905920,
+      "sha256": "521e1b1696f2e6bae1c73b610166eef27a7ae0f6781255359a6bd1d364f062cc"
+    },
+    "logit-probes/aligned-prefix-logit-probe-core16-v2/runtime_cache_hit-s0.jsonl": {
+      "bytes": 19537,
+      "sha256": "8155791b8bf35260101bcd64e66717b0aa746ec0f8dc57f47f05dc5149541438"
+    },
+    "logit-probes/aligned-prefix-logit-probe-core16-v2/runtime_cache_seed-s0.f32": {
+      "bytes": 993280,
+      "sha256": "9fe5d346592fc320c86fc4eed8e990c1cd90daaa6bb8e5bcfed418aa7ce16576"
+    },
+    "logit-probes/aligned-prefix-logit-probe-core16-v2/runtime_cache_seed-s0.jsonl": {
+      "bytes": 293,
+      "sha256": "af8ef18dee8a20f6bd6795755fffeb596a5123cb2c3570a26582f8c5c25a7a43"
+    },
+    "logit-probes/full-seed-prefix-logit-probe-control8-v3/runtime_cache_cold-s0.f32": {
+      "bytes": 13905920,
+      "sha256": "348b67ac24f173e021a797016202fab583fc0d566478a71b617f5b1e2adca71e"
+    },
+    "logit-probes/full-seed-prefix-logit-probe-control8-v3/runtime_cache_cold-s0.jsonl": {
+      "bytes": 19519,
+      "sha256": "7e7547de992d9cb05073fd32f5966ccacaf6f273a3ddb0d90eacd09aa88eb220"
+    },
+    "logit-probes/full-seed-prefix-logit-probe-control8-v3/runtime_cache_hit-s0.f32": {
+      "bytes": 13905920,
+      "sha256": "348b67ac24f173e021a797016202fab583fc0d566478a71b617f5b1e2adca71e"
+    },
+    "logit-probes/full-seed-prefix-logit-probe-control8-v3/runtime_cache_hit-s0.jsonl": {
+      "bytes": 19519,
+      "sha256": "bb6c237ef1f9c41a2f83afd12e0d47007bbb1e9e4ab03a13784fd51deb831b68"
+    },
+    "logit-probes/full-seed-prefix-logit-probe-control8-v3/runtime_cache_seed-s0.f32": {
+      "bytes": 993280,
+      "sha256": "16366c5749850e9aa44f50d1c242aae89a6a8bf8258110ccbfaec9d871b069e9"
+    },
+    "logit-probes/full-seed-prefix-logit-probe-control8-v3/runtime_cache_seed-s0.jsonl": {
+      "bytes": 291,
+      "sha256": "937ed0309dcd7b59ee11538a021f91401b0c18aab777d93ac25f99e5c33007bc"
+    },
+    "logit-probes/full-seed-prefix-logit-probe-core16-v3/runtime_cache_cold-s0.f32": {
+      "bytes": 13905920,
+      "sha256": "b701444705a433956de0504ea92a4f0e99aca41473f3f2a823420f6eacc04e1a"
+    },
+    "logit-probes/full-seed-prefix-logit-probe-core16-v3/runtime_cache_cold-s0.jsonl": {
+      "bytes": 19527,
+      "sha256": "0303efbb9992bce9ca6ebd274751f53a06925b53c552a45e2c362670d3944cdb"
+    },
+    "logit-probes/full-seed-prefix-logit-probe-core16-v3/runtime_cache_hit-s0.f32": {
+      "bytes": 13905920,
+      "sha256": "b701444705a433956de0504ea92a4f0e99aca41473f3f2a823420f6eacc04e1a"
+    },
+    "logit-probes/full-seed-prefix-logit-probe-core16-v3/runtime_cache_hit-s0.jsonl": {
+      "bytes": 19527,
+      "sha256": "0303efbb9992bce9ca6ebd274751f53a06925b53c552a45e2c362670d3944cdb"
+    },
+    "logit-probes/full-seed-prefix-logit-probe-core16-v3/runtime_cache_seed-s0.f32": {
+      "bytes": 993280,
+      "sha256": "16366c5749850e9aa44f50d1c242aae89a6a8bf8258110ccbfaec9d871b069e9"
+    },
+    "logit-probes/full-seed-prefix-logit-probe-core16-v3/runtime_cache_seed-s0.jsonl": {
+      "bytes": 291,
+      "sha256": "937ed0309dcd7b59ee11538a021f91401b0c18aab777d93ac25f99e5c33007bc"
+    },
+    "logit-probes/prefix-logit-probe-control8-v2/runtime_cache_cold-s0.f32": {
+      "bytes": 13905920,
+      "sha256": "348b67ac24f173e021a797016202fab583fc0d566478a71b617f5b1e2adca71e"
+    },
+    "logit-probes/prefix-logit-probe-control8-v2/runtime_cache_cold-s0.jsonl": {
+      "bytes": 19519,
+      "sha256": "7e7547de992d9cb05073fd32f5966ccacaf6f273a3ddb0d90eacd09aa88eb220"
+    },
+    "logit-probes/prefix-logit-probe-control8-v2/runtime_cache_hit-s0.f32": {
+      "bytes": 13905920,
+      "sha256": "0b0439c06067fbe93f9777a53f1db6d58536e007937ac85ed497c5b5a7275520"
+    },
+    "logit-probes/prefix-logit-probe-control8-v2/runtime_cache_hit-s0.jsonl": {
+      "bytes": 19509,
+      "sha256": "30e51afe698c032d00860a291dd30b992d42c07d03d45c3bd8f2de8732501576"
+    },
+    "logit-probes/prefix-logit-probe-control8-v2/runtime_cache_seed-s0.f32": {
+      "bytes": 993280,
+      "sha256": "781829e822d0b20b2bd247b4a34fe7a3c7835a5577947e5c1284676f2f85d2ce"
+    },
+    "logit-probes/prefix-logit-probe-control8-v2/runtime_cache_seed-s0.jsonl": {
+      "bytes": 297,
+      "sha256": "84295d09a414de781e0cb5c3803730f83e2904979ef96de12e9753dca785fdf7"
+    },
+    "logit-probes/prefix-logit-probe-core16-v2/runtime_cache_cold-s0.f32": {
+      "bytes": 13905920,
+      "sha256": "b701444705a433956de0504ea92a4f0e99aca41473f3f2a823420f6eacc04e1a"
+    },
+    "logit-probes/prefix-logit-probe-core16-v2/runtime_cache_cold-s0.jsonl": {
+      "bytes": 19527,
+      "sha256": "0303efbb9992bce9ca6ebd274751f53a06925b53c552a45e2c362670d3944cdb"
+    },
+    "logit-probes/prefix-logit-probe-core16-v2/runtime_cache_hit-s0.f32": {
+      "bytes": 13905920,
+      "sha256": "eca008cb1a039ba3525c4d72a6e770418a890bd0d150ffeb1cdba436006034f9"
+    },
+    "logit-probes/prefix-logit-probe-core16-v2/runtime_cache_hit-s0.jsonl": {
+      "bytes": 19542,
+      "sha256": "47829f2d64da86295019f066a4ad0f2e3468b0e6b341669130d4eb6e837514a0"
+    },
+    "logit-probes/prefix-logit-probe-core16-v2/runtime_cache_seed-s0.f32": {
+      "bytes": 993280,
+      "sha256": "781829e822d0b20b2bd247b4a34fe7a3c7835a5577947e5c1284676f2f85d2ce"
+    },
+    "logit-probes/prefix-logit-probe-core16-v2/runtime_cache_seed-s0.jsonl": {
+      "bytes": 297,
+      "sha256": "84295d09a414de781e0cb5c3803730f83e2904979ef96de12e9753dca785fdf7"
+    },
+    "logit-probes/prefix-logit-probe-core8-v2/runtime_cache_cold-s0.f32": {
+      "bytes": 13905920,
+      "sha256": "348b67ac24f173e021a797016202fab583fc0d566478a71b617f5b1e2adca71e"
+    },
+    "logit-probes/prefix-logit-probe-core8-v2/runtime_cache_cold-s0.jsonl": {
+      "bytes": 19519,
+      "sha256": "7e7547de992d9cb05073fd32f5966ccacaf6f273a3ddb0d90eacd09aa88eb220"
+    },
+    "logit-probes/prefix-logit-probe-core8-v2/runtime_cache_hit-s0.f32": {
+      "bytes": 13905920,
+      "sha256": "0b0439c06067fbe93f9777a53f1db6d58536e007937ac85ed497c5b5a7275520"
+    },
+    "logit-probes/prefix-logit-probe-core8-v2/runtime_cache_hit-s0.jsonl": {
+      "bytes": 19509,
+      "sha256": "30e51afe698c032d00860a291dd30b992d42c07d03d45c3bd8f2de8732501576"
+    },
+    "logit-probes/prefix-logit-probe-core8-v2/runtime_cache_seed-s0.f32": {
+      "bytes": 993280,
+      "sha256": "781829e822d0b20b2bd247b4a34fe7a3c7835a5577947e5c1284676f2f85d2ce"
+    },
+    "logit-probes/prefix-logit-probe-core8-v2/runtime_cache_seed-s0.jsonl": {
+      "bytes": 297,
+      "sha256": "84295d09a414de781e0cb5c3803730f83e2904979ef96de12e9753dca785fdf7"
+    },
+    "logit-probes/prefix-logit-probe-dflash8-v2/runtime_cache_cold-s0.f32": {
+      "bytes": 13905920,
+      "sha256": "348b67ac24f173e021a797016202fab583fc0d566478a71b617f5b1e2adca71e"
+    },
+    "logit-probes/prefix-logit-probe-dflash8-v2/runtime_cache_cold-s0.jsonl": {
+      "bytes": 19517,
+      "sha256": "b45e8948b11809c59c2e0c6251880bc9fa379e2d30cbdc7d2cb2f52a681ef2fc"
+    },
+    "logit-probes/prefix-logit-probe-dflash8-v2/runtime_cache_hit-s0.f32": {
+      "bytes": 13905920,
+      "sha256": "0b0439c06067fbe93f9777a53f1db6d58536e007937ac85ed497c5b5a7275520"
+    },
+    "logit-probes/prefix-logit-probe-dflash8-v2/runtime_cache_hit-s0.jsonl": {
+      "bytes": 19507,
+      "sha256": "034b9075e523ef1ffb4d77a0be3c48c9a74db90642b75159df883ae84ac82fcb"
+    },
+    "logit-probes/prefix-logit-probe-dflash8-v2/runtime_cache_seed-s0.f32": {
+      "bytes": 993280,
+      "sha256": "781829e822d0b20b2bd247b4a34fe7a3c7835a5577947e5c1284676f2f85d2ce"
+    },
+    "logit-probes/prefix-logit-probe-dflash8-v2/runtime_cache_seed-s0.jsonl": {
+      "bytes": 297,
+      "sha256": "84295d09a414de781e0cb5c3803730f83e2904979ef96de12e9753dca785fdf7"
+    }
+  },
+  "scope": "Original bytes and relative layout. Absolute provenance keys inside receipts are unchanged. No compiled artifacts, model weights, physical HTTP cache payloads or Apple documents. The logit archive contains derived pre-policy outputs; the hardware archive contains raw telemetry."
+}

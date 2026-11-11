@@ -1,0 +1,27 @@
+{
+  "validated_utc": "2026-11-10T21:56:37.282863+00:00",
+  "integration_commit": "fb429642850299f81def93e730b84131fb075cde",
+  "receipts": {
+    "final-app-tests-v3": {
+      "sha256": "47dfd45f7097a8b1ae904617c1d9698a45c16a2c7542e77d7d45b0d212bda178",
+      "elapsed_seconds": 70.52911866700015
+    },
+    "final-cli-option-scope-v1": {
+      "sha256": "88be80aa72b151932d4e3bdc1bfa0e09db7f7b50ead9c19a8bd00e0c6f9705d6",
+      "elapsed_seconds": 1.3395868749939837
+    }
+  },
+  "source_witness_sha256": "94524fb6b0f91cd385021e8b1dd93f98a9ae7b001c3d922b4971dc711505b915",
+  "original_native_nomination_sha256": "0f7178ad70a11a90b4de8bb904b71cc24d2e7e8f4c02352250d0eba7c133c976",
+  "original_23_gate_validation_sha256": "a575e8212eb18d545b76694945c2a3eb59e8b8049ebd219d27378aa706aa91cb",
+  "frozen_runtime_source_and_artifacts_unchanged": true,
+  "allowed_peripheral_files": [
+    "app/Sources/Splash/Preferences.swift",
+    "app/Tests/SplashTests/SplashTests.swift",
+    "dev/tests/install/test_launcher.py",
+    "dev/tests/server_fixtures.py",
+    "docs/api.md",
+    "docs/server.md"
+  ],
+  "scope": "Final app offers no sixteen-row setting without a custom drafter selector; the per-model CLI/server flag remains. Revalidated full Swift suite and the affected Python option-table contract only, between complete comparisons. No inference/kernel/server implementation or timing artifact changed; original source choice/nomination and all benchmark records remain immutable."
+}

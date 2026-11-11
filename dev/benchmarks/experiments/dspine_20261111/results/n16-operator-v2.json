@@ -1,0 +1,164 @@
+{
+  "scope": "Balanced finite operator nomination screen on this M5 Pro, on battery. Not controlled whole-model throughput or a cross-device result.",
+  "candidate": "One SIMD group, sixteen output columns, paired gate/up staging; same AF4G64 half dequantization, K32 accumulation and partition count.",
+  "legacy_raw_field": "simdgroups is an arm selector: 0 means existing two-pass; 2 means the new one-SIMD-group N16 pair. It is not the number of SIMD groups.",
+  "numerical": {
+    "cases": 12,
+    "bitwise_comparisons": 802816,
+    "independent_fp64_checks": 2592,
+    "source": {
+      "job": "af4-n16-oracle-v2",
+      "stdout_sha256": "243df34622cf2dd0d75727bdaf1a4bb5ba6c507475bcbaf3ba4bc7cee7cfaccd",
+      "receipt_sha256": "512e7a1e4c3a7c121b5be61a965a986b08bcd617c77288122de83288f08ea118"
+    }
+  },
+  "cases": [
+    {
+      "rows": 64,
+      "live_rows": 48,
+      "splits": 1,
+      "spread": false,
+      "control_ms": 0.8327065,
+      "candidate_ms": 0.8866125,
+      "throughput_change": -0.06079995488446188,
+      "latency_change": 0.06473589433972227
+    },
+    {
+      "rows": 64,
+      "live_rows": 48,
+      "splits": 2,
+      "spread": false,
+      "control_ms": 0.9584185,
+      "candidate_ms": 0.9935400000000001,
+      "throughput_change": -0.035349860096221764,
+      "latency_change": 0.03664526509035482
+    },
+    {
+      "rows": 64,
+      "live_rows": 48,
+      "splits": 1,
+      "spread": true,
+      "control_ms": 0.813102,
+      "candidate_ms": 0.9394849999999999,
+      "throughput_change": -0.13452370181535622,
+      "latency_change": 0.15543314368922956
+    },
+    {
+      "rows": 64,
+      "live_rows": 48,
+      "splits": 2,
+      "spread": true,
+      "control_ms": 0.9520545,
+      "candidate_ms": 1.02855,
+      "throughput_change": -0.07437217442030042,
+      "latency_change": 0.08034781622270581
+    },
+    {
+      "rows": 64,
+      "live_rows": 64,
+      "splits": 1,
+      "spread": false,
+      "control_ms": 0.8330975,
+      "candidate_ms": 0.887899,
+      "throughput_change": -0.06172042090372887,
+      "latency_change": 0.06578041585768757
+    },
+    {
+      "rows": 64,
+      "live_rows": 64,
+      "splits": 2,
+      "spread": false,
+      "control_ms": 0.9600405000000001,
+      "candidate_ms": 0.9940335,
+      "throughput_change": -0.0341970366189871,
+      "latency_change": 0.035407881230010485
+    },
+    {
+      "rows": 64,
+      "live_rows": 64,
+      "splits": 1,
+      "spread": true,
+      "control_ms": 0.814183,
+      "candidate_ms": 0.9397869999999999,
+      "throughput_change": -0.1336515614708439,
+      "latency_change": 0.15426998598595154
+    },
+    {
+      "rows": 64,
+      "live_rows": 64,
+      "splits": 2,
+      "spread": true,
+      "control_ms": 0.952636,
+      "candidate_ms": 1.0236450000000001,
+      "throughput_change": -0.06936877530784602,
+      "latency_change": 0.07453948832502677
+    }
+  ],
+  "primary_cases": [
+    {
+      "rows": 64,
+      "live_rows": 48,
+      "splits": 1,
+      "spread": true,
+      "control_ms": 0.813102,
+      "candidate_ms": 0.9394849999999999,
+      "throughput_change": -0.13452370181535622,
+      "latency_change": 0.15543314368922956
+    },
+    {
+      "rows": 64,
+      "live_rows": 64,
+      "splits": 1,
+      "spread": true,
+      "control_ms": 0.814183,
+      "candidate_ms": 0.9397869999999999,
+      "throughput_change": -0.1336515614708439,
+      "latency_change": 0.15426998598595154
+    }
+  ],
+  "nomination_rule": "Both primary production shapes must gain at least 5% projection throughput, with all guarded bitwise/independent FP64 checks passing.",
+  "nomination_rule_met": false,
+  "production_nominated": false,
+  "resources": [
+    {
+      "kernel": "gguf_decode_af4g64_m64_gate_up",
+      "static_threadgroup_bytes": 4112,
+      "maximum_threads": 1024,
+      "execution_width": 32,
+      "device_threadgroup_limit_bytes": 32768
+    },
+    {
+      "kernel": "gguf_decode_af4g64_m64_a",
+      "static_threadgroup_bytes": 8208,
+      "maximum_threads": 1024,
+      "execution_width": 32,
+      "device_threadgroup_limit_bytes": 32768
+    },
+    {
+      "kernel": "gguf_decode_af4g64_m64_gate_up_n16",
+      "static_threadgroup_bytes": 2064,
+      "maximum_threads": 1024,
+      "execution_width": 32,
+      "device_threadgroup_limit_bytes": 32768
+    }
+  ],
+  "sources": [
+    {
+      "job": "af4-n16-diagnostic-v2",
+      "stdout_sha256": "7f863be33b1ea878a404371e6cb6056b99a57806c0c7ac31a2d8f2fd47f7ddd3",
+      "receipt_sha256": "7e92d88c1caf2e483452b7cf362da3d1eaf8a9db7ec74ec5f1b4fbe31a691147"
+    },
+    {
+      "job": "af4-n16-resources-v1",
+      "stdout_sha256": "efcc14277c0b0730f890f5f92f2c396c9cdd3c8fed8589c806bc283463f19d32",
+      "receipt_sha256": "07c6b0b9d31cc8af985b97deee81d8292ce66274f8187a8735f4675a8882f825"
+    }
+  ],
+  "fixture_failure_retained": {
+    "job": "af4-n16-diagnostic-v1",
+    "state": "complete",
+    "exit_code": 1,
+    "cause": "V1 balanced timing order began with the two-pass reference but reset stored outputs only on the one-pass arm. The next K split compared its baseline against stale outputs. V2 clears the reference at each split/spread pair; the shader library is unchanged. This was a fixture failure, not a demonstrated shader error."
+  },
+  "interpretation": "The N16 pair misses the prospective speed criterion. Lower static threadgroup storage does not establish better register occupancy or less spilling; neither was measured. Keep the existing two-pass production choice."
+}

@@ -1,0 +1,885 @@
+{
+  "protocol": {
+    "frozen_utc": "2026-11-10T14:52:00.674120+00:00",
+    "prefix": "wide-gateup-b3-v1",
+    "groups": 3,
+    "order_each_group": [
+      "control",
+      "candidate",
+      "candidate",
+      "control"
+    ],
+    "control": "runtime16-v10",
+    "candidate": "wide-gateup-v1",
+    "geometry": 16,
+    "clone_width": 3,
+    "cohort": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/kernel-smoke3-cap256-v1.txt",
+    "cohort_sha256": "4197b200cd24e583b19b973c032e33beda6026dc406ffe6331559329406a3246",
+    "cases": 3,
+    "output_cap": 256,
+    "samples_per_round": 3,
+    "criterion": "improvement",
+    "context_tokens": 32768,
+    "ane_ffn_share": 0,
+    "temperature": 0,
+    "verify_rows": "all",
+    "primary_metric": "serial (wall-TTFT)/(tokens-1) at B1; GPU-stream decode wall/decode outputs at clone B3/B4",
+    "aggregation": "Median across exactly three internal repetitions for each case, then token-weighted aggregate. All cases receive per-case ABBA and output checks.",
+    "gates": "Exactly three ABBA groups; all complete raw greedy arrays match; all per-case and aggregate spreads <=5%; aggregate MPT decrease > max(2%, 2*measured spread); all operating gates including sampled AC pass. No repeat-to-pass or subgroup deletion.",
+    "operating_script_sha256": "4bde430207a362eab510fe8ffd393fa2aa76c543eaa5821c7073e95e454d0f58",
+    "analyzer_sha256": "2999e35c224e6b3d57ca2b5dd94586ac8d25bac885ecc394b127883e39bb285e",
+    "abba_sha256": "7afc7b4fa24916acfc41745fc29cc659b5edada0bfa1ce55e19a685808475c0d",
+    "scope": "Kernel-only comparison within the same sixteen-row runtime. Historical three software prompts are calibration data, not the fresh heldout agent or sampling cohorts.",
+    "artifact_nomination": {
+      "runtime16-v10": {
+        "patch": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/patches/runtime16-v10.patch",
+        "patch_sha256": "57ba45d88b0f095ff0fff0743655aabbce9c7ffec1081c33b1b99fca86ed2161",
+        "build_manifest": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/runtime16-v10/build.json",
+        "driver": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-runtime16-v10-v2/study-driver",
+        "library": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-runtime16-v10-v2/splash.metallib",
+        "host_step": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-runtime16-v10-v2/host-step.metallib"
+      },
+      "wide-gateup-v1": {
+        "patch": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/patches/wide-gateup-v1.patch",
+        "patch_sha256": "d3394c6a36c73ed7b83f62cd51426943f15bfdb2af5b9b9ed1c3de8dea8eb1ab",
+        "build_manifest": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/wide-gateup-v1/build.json",
+        "driver": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-wide-gateup-v1-v2/study-driver",
+        "library": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-wide-gateup-v1-v2/splash.metallib",
+        "host_step": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-wide-gateup-v1-v2/host-step.metallib"
+      }
+    },
+    "preexecution_amendment": "Before any controlled output: clone metrics have no cold/warm field; absent means not applicable. Analyzer preflight corrected and rechecked against both serial and clone calibration documents."
+  },
+  "qualified": true,
+  "groups": [
+    {
+      "group": 1,
+      "rounds": [
+        "wide-gateup-b3-v1-g1-a1",
+        "wide-gateup-b3-v1-g1-b1",
+        "wide-gateup-b3-v1-g1-b2",
+        "wide-gateup-b3-v1-g1-a2"
+      ],
+      "sources": [
+        {
+          "job": "wide-gateup-b3-v1-g1-a1",
+          "sha256": "85c361a44e0e5397b73f3aa3b9832d602d495d8c21c7daa6c176c11a04fa8c0a",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-4dfd05ad635facd410a2de53c29cc88b4688f6ab04afe7a87333ebbf4b911e93"
+        },
+        {
+          "job": "wide-gateup-b3-v1-g1-b1",
+          "sha256": "2181a7c92b71157f77dd607a8a9c94f5dadbc3bc6e5fb3e82fdce1a32cbeddaa",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-75cf662eebf418b2b420594cac781591f907317b0bba25d6de194f1170fd16d1"
+        },
+        {
+          "job": "wide-gateup-b3-v1-g1-b2",
+          "sha256": "88e3ca0091c1becb7bb6e734fc8df782f2a72f054facfb3b33b13f4c508bdb20",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-75cf662eebf418b2b420594cac781591f907317b0bba25d6de194f1170fd16d1"
+        },
+        {
+          "job": "wide-gateup-b3-v1-g1-a2",
+          "sha256": "fa7e178a28efd44fb5ada346adb20b43c7c7297ac2d534ffa5836a9cbc347b2a",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-4dfd05ad635facd410a2de53c29cc88b4688f6ab04afe7a87333ebbf4b911e93"
+        }
+      ],
+      "problems": [],
+      "qualified": true,
+      "cases": [
+        {
+          "case": "python_lru",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              12.446562499999999,
+              7.152265624999999,
+              7.140885416666666,
+              12.840143229166666
+            ],
+            "baseline": 12.643352864583331,
+            "candidate": 7.146575520833332,
+            "noise": 0.031129458568633986,
+            "regression": -0.43475630259024245,
+            "bound": 0.06225891713726797,
+            "verdict": "pass",
+            "pass": true
+          },
+          "throughput_change": 0.7691484302832978,
+          "request_wall_abba": {
+            "rounds": [
+              9715.83,
+              5647.27,
+              5639.39,
+              10026.4
+            ],
+            "baseline": 9871.115,
+            "candidate": 5643.33,
+            "noise": 0.03146250448910784,
+            "regression": -0.42829862685218434,
+            "bound": 0.06292500897821568,
+            "verdict": "pass",
+            "pass": true
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              35,
+              35,
+              35
+            ],
+            [
+              35,
+              35,
+              35
+            ],
+            [
+              35,
+              35,
+              35
+            ],
+            [
+              35,
+              35,
+              35
+            ]
+          ]
+        },
+        {
+          "case": "sql_latest",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              19.35438596491228,
+              11.3371783625731,
+              11.246374269005848,
+              19.882894736842104
+            ],
+            "baseline": 19.618640350877193,
+            "candidate": 11.291776315789473,
+            "noise": 0.026939113133097145,
+            "regression": -0.42443634656442475,
+            "bound": 0.05387822626619429,
+            "verdict": "pass",
+            "pass": true
+          },
+          "throughput_change": 0.7374272924131637,
+          "request_wall_abba": {
+            "rounds": [
+              13492.6,
+              8009.36,
+              7947.15,
+              13860.8
+            ],
+            "baseline": 13676.7,
+            "candidate": 7978.254999999999,
+            "noise": 0.026921698947845525,
+            "regression": -0.41665350559711045,
+            "bound": 0.05384339789569105,
+            "verdict": "pass",
+            "pass": true
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              48,
+              48,
+              48
+            ],
+            [
+              48,
+              48,
+              48
+            ],
+            [
+              48,
+              48,
+              48
+            ],
+            [
+              48,
+              48,
+              48
+            ]
+          ]
+        },
+        {
+          "case": "typescript_heap",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              15.255078124999999,
+              9.02953125,
+              8.959114583333333,
+              15.635286458333333
+            ],
+            "baseline": 15.445182291666665,
+            "candidate": 8.994322916666667,
+            "noise": 0.024616629713620962,
+            "regression": -0.41766158878425874,
+            "bound": 0.049233259427241924,
+            "verdict": "pass",
+            "pass": true
+          },
+          "throughput_change": 0.7172145624265305,
+          "request_wall_abba": {
+            "rounds": [
+              11883.3,
+              7097.65,
+              7042.27,
+              12180
+            ],
+            "baseline": 12031.65,
+            "candidate": 7069.96,
+            "noise": 0.02465995935719546,
+            "regression": -0.41238649728009036,
+            "bound": 0.04931991871439092,
+            "verdict": "pass",
+            "pass": true
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              42,
+              42,
+              42
+            ],
+            [
+              42,
+              42,
+              42
+            ],
+            [
+              42,
+              42,
+              42
+            ],
+            [
+              42,
+              42,
+              42
+            ]
+          ]
+        }
+      ],
+      "primary_decode_abba": {
+        "rounds": [
+          15.546513513513512,
+          9.091103603603603,
+          9.034828828828829,
+          15.977040540540541
+        ],
+        "baseline": 15.761777027027026,
+        "candidate": 9.062966216216216,
+        "noise": 0.02731462488581053,
+        "regression": -0.4250035258920507,
+        "bound": 0.05462924977162106,
+        "verdict": "pass",
+        "pass": true
+      },
+      "primary_throughput_change": 0.7391410991717853,
+      "all_output_arrays_match": true,
+      "all_case_noise_within_five_percent": true,
+      "cold_warm_gate_passed": true,
+      "effect_gate_passed": true
+    },
+    {
+      "group": 2,
+      "rounds": [
+        "wide-gateup-b3-v1-g2-a1",
+        "wide-gateup-b3-v1-g2-b1",
+        "wide-gateup-b3-v1-g2-b2",
+        "wide-gateup-b3-v1-g2-a2"
+      ],
+      "sources": [
+        {
+          "job": "wide-gateup-b3-v1-g2-a1",
+          "sha256": "f69ecb91d33ac059642be5658dc3cd80f8b94cdcb09ca8b1d965143452a51d37",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-4dfd05ad635facd410a2de53c29cc88b4688f6ab04afe7a87333ebbf4b911e93"
+        },
+        {
+          "job": "wide-gateup-b3-v1-g2-b1",
+          "sha256": "25b51587f3ab4e79c483958eeae6400f75a6c0e850af1b472e70ac76839d4180",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-75cf662eebf418b2b420594cac781591f907317b0bba25d6de194f1170fd16d1"
+        },
+        {
+          "job": "wide-gateup-b3-v1-g2-b2",
+          "sha256": "2ad1d6086fe76dcc4109ae919e501f5a1ddf0c8dade51f6afa28d49c185d8170",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-75cf662eebf418b2b420594cac781591f907317b0bba25d6de194f1170fd16d1"
+        },
+        {
+          "job": "wide-gateup-b3-v1-g2-a2",
+          "sha256": "a3f4bae59a1e7a497036cd82df15bd94ebe626ef832dcb78e9e23418d079ecec",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-4dfd05ad635facd410a2de53c29cc88b4688f6ab04afe7a87333ebbf4b911e93"
+        }
+      ],
+      "problems": [],
+      "qualified": true,
+      "cases": [
+        {
+          "case": "python_lru",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              12.539505208333333,
+              7.118268229166667,
+              7.1348828125,
+              12.799335937499999
+            ],
+            "baseline": 12.669420572916666,
+            "candidate": 7.126575520833333,
+            "noise": 0.020508493476181864,
+            "regression": -0.43749791240905167,
+            "bound": 0.04101698695236373,
+            "verdict": "pass",
+            "pass": true
+          },
+          "throughput_change": 0.7777711799839582,
+          "request_wall_abba": {
+            "rounds": [
+              9789.9,
+              5621.08,
+              5633.83,
+              9992.16
+            ],
+            "baseline": 9891.029999999999,
+            "candidate": 5627.455,
+            "noise": 0.020448830910430992,
+            "regression": -0.4310547030996771,
+            "bound": 0.040897661820861984,
+            "verdict": "pass",
+            "pass": true
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              35,
+              35,
+              35
+            ],
+            [
+              35,
+              35,
+              35
+            ],
+            [
+              35,
+              35,
+              35
+            ],
+            [
+              35,
+              35,
+              35
+            ]
+          ]
+        },
+        {
+          "case": "sql_latest",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              19.67046783625731,
+              11.23624269005848,
+              11.278230994152047,
+              19.886549707602338
+            ],
+            "baseline": 19.778508771929822,
+            "candidate": 11.257236842105264,
+            "noise": 0.010925084081753324,
+            "regression": -0.4308349040913625,
+            "bound": 0.02185016816350665,
+            "verdict": "pass",
+            "pass": true
+          },
+          "throughput_change": 0.7569594607757189,
+          "request_wall_abba": {
+            "rounds": [
+              13717.8,
+              7940.59,
+              7968.06,
+              13864.8
+            ],
+            "baseline": 13791.3,
+            "candidate": 7954.325000000001,
+            "noise": 0.010658893650344782,
+            "regression": -0.42323602561034845,
+            "bound": 0.021317787300689565,
+            "verdict": "pass",
+            "pass": true
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              48,
+              48,
+              48
+            ],
+            [
+              48,
+              48,
+              48
+            ],
+            [
+              48,
+              48,
+              48
+            ],
+            [
+              48,
+              48,
+              48
+            ]
+          ]
+        },
+        {
+          "case": "typescript_heap",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              15.419661458333332,
+              8.947747395833334,
+              8.9434375,
+              15.623958333333334
+            ],
+            "baseline": 15.521809895833332,
+            "candidate": 8.945592447916667,
+            "noise": 0.013161923536690386,
+            "regression": -0.4236759432082713,
+            "bound": 0.02632384707338077,
+            "verdict": "pass",
+            "pass": true
+          },
+          "throughput_change": 0.7351349266362113,
+          "request_wall_abba": {
+            "rounds": [
+              12013.8,
+              7032.71,
+              7029.36,
+              12168
+            ],
+            "baseline": 12090.9,
+            "candidate": 7031.035,
+            "noise": 0.012753393047664006,
+            "regression": -0.4184853898386389,
+            "bound": 0.025506786095328013,
+            "verdict": "pass",
+            "pass": true
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              42,
+              42,
+              42
+            ],
+            [
+              42,
+              42,
+              42
+            ],
+            [
+              42,
+              42,
+              42
+            ],
+            [
+              42,
+              42,
+              42
+            ]
+          ]
+        }
+      ],
+      "primary_decode_abba": {
+        "rounds": [
+          15.73299099099099,
+          9.01995045045045,
+          9.037144144144143,
+          15.96013063063063
+        ],
+        "baseline": 15.84656081081081,
+        "candidate": 9.028547297297298,
+        "noise": 0.014333686807593062,
+        "regression": -0.43025193888519586,
+        "bound": 0.028667373615186124,
+        "verdict": "pass",
+        "pass": true
+      },
+      "primary_throughput_change": 0.755161742969934,
+      "all_output_arrays_match": true,
+      "all_case_noise_within_five_percent": true,
+      "cold_warm_gate_passed": true,
+      "effect_gate_passed": true
+    },
+    {
+      "group": 3,
+      "rounds": [
+        "wide-gateup-b3-v1-g3-a1",
+        "wide-gateup-b3-v1-g3-b1",
+        "wide-gateup-b3-v1-g3-b2",
+        "wide-gateup-b3-v1-g3-a2"
+      ],
+      "sources": [
+        {
+          "job": "wide-gateup-b3-v1-g3-a1",
+          "sha256": "4de449af01b630110d6d4bfea34b0f80d33c197c25b1669dc616841b75189959",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-4dfd05ad635facd410a2de53c29cc88b4688f6ab04afe7a87333ebbf4b911e93"
+        },
+        {
+          "job": "wide-gateup-b3-v1-g3-b1",
+          "sha256": "9149a4eedf0fb281bf2524d60fa8b98707d4ef83f254a15bf6e10d2dd414884b",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-75cf662eebf418b2b420594cac781591f907317b0bba25d6de194f1170fd16d1"
+        },
+        {
+          "job": "wide-gateup-b3-v1-g3-b2",
+          "sha256": "17349519c489d197d054ca06c1648d9502071c927adc7fdc7436b20738327eb1",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-75cf662eebf418b2b420594cac781591f907317b0bba25d6de194f1170fd16d1"
+        },
+        {
+          "job": "wide-gateup-b3-v1-g3-a2",
+          "sha256": "6c617ef7ff23d17b12d669bf6e06ee2ba98b2979e39884ad0e326dad320eda6b",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-4dfd05ad635facd410a2de53c29cc88b4688f6ab04afe7a87333ebbf4b911e93"
+        }
+      ],
+      "problems": [],
+      "qualified": true,
+      "cases": [
+        {
+          "case": "python_lru",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              12.5514453125,
+              7.0998046875,
+              7.1365755208333335,
+              12.890013020833335
+            ],
+            "baseline": 12.720729166666668,
+            "candidate": 7.118190104166667,
+            "noise": 0.02661543248798312,
+            "regression": -0.4404259369958812,
+            "bound": 0.05323086497596624,
+            "verdict": "pass",
+            "pass": true
+          },
+          "throughput_change": 0.7870735370246054,
+          "request_wall_abba": {
+            "rounds": [
+              9800.52,
+              5606.37,
+              5635.04,
+              10066.3
+            ],
+            "baseline": 9933.41,
+            "candidate": 5620.705,
+            "noise": 0.02675616933157887,
+            "regression": -0.43416158197436727,
+            "bound": 0.05351233866315774,
+            "verdict": "pass",
+            "pass": true
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              35,
+              35,
+              35
+            ],
+            [
+              35,
+              35,
+              35
+            ],
+            [
+              35,
+              35,
+              35
+            ],
+            [
+              35,
+              35,
+              35
+            ]
+          ]
+        },
+        {
+          "case": "sql_latest",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              19.69517543859649,
+              11.25843567251462,
+              11.273830409356725,
+              19.814912280701755
+            ],
+            "baseline": 19.75504385964912,
+            "candidate": 11.266133040935673,
+            "noise": 0.006061077006760533,
+            "regression": -0.42970852806115833,
+            "bound": 0.02,
+            "verdict": "pass",
+            "pass": true
+          },
+          "throughput_change": 0.7534893106506781,
+          "request_wall_abba": {
+            "rounds": [
+              13733.1,
+              7956.04,
+              7965.52,
+              13816.9
+            ],
+            "baseline": 13775.0,
+            "candidate": 7960.780000000001,
+            "noise": 0.006083484573502669,
+            "regression": -0.4220849364791288,
+            "bound": 0.02,
+            "verdict": "pass",
+            "pass": true
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              48,
+              48,
+              48
+            ],
+            [
+              48,
+              48,
+              48
+            ],
+            [
+              48,
+              48,
+              48
+            ],
+            [
+              48,
+              48,
+              48
+            ]
+          ]
+        },
+        {
+          "case": "typescript_heap",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              15.430338541666666,
+              8.968359375,
+              8.958190104166667,
+              15.388932291666668
+            ],
+            "baseline": 15.409635416666667,
+            "candidate": 8.963274739583333,
+            "noise": 0.0026870363172391432,
+            "regression": -0.4183331080053403,
+            "bound": 0.02,
+            "verdict": "pass",
+            "pass": true
+          },
+          "throughput_change": 0.7191970417480475,
+          "request_wall_abba": {
+            "rounds": [
+              12017.1,
+              7048.47,
+              7042.75,
+              11990.1
+            ],
+            "baseline": 12003.6,
+            "candidate": 7045.610000000001,
+            "noise": 0.002249325202439268,
+            "regression": -0.4130419207571062,
+            "bound": 0.02,
+            "verdict": "pass",
+            "pass": true
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              42,
+              42,
+              42
+            ],
+            [
+              42,
+              42,
+              42
+            ],
+            [
+              42,
+              42,
+              42
+            ],
+            [
+              42,
+              42,
+              42
+            ]
+          ]
+        }
+      ],
+      "primary_decode_abba": {
+        "rounds": [
+          15.74842792792793,
+          9.027531531531531,
+          9.041477477477478,
+          15.888121621621623
+        ],
+        "baseline": 15.818274774774777,
+        "candidate": 9.034504504504504,
+        "noise": 0.008831158623977238,
+        "regression": -0.42885651987081896,
+        "bound": 0.02,
+        "verdict": "pass",
+        "pass": true
+      },
+      "primary_throughput_change": 0.7508735279159979,
+      "all_output_arrays_match": true,
+      "all_case_noise_within_five_percent": true,
+      "cold_warm_gate_passed": true,
+      "effect_gate_passed": true
+    }
+  ],
+  "scope": "Exactly the registered groups and complete cohort; all failures retained. Medians of registered internal repetitions precede per-case ABBA. Aggregate rate weights cases by output tokens. AC and thermal state sampled every five seconds. A failure is not rerun into a pass."
+}

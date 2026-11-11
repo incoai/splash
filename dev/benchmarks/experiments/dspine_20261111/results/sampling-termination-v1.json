@@ -1,0 +1,209 @@
+{
+  "status": "incomplete",
+  "arms": [
+    {
+      "name": "DSpine8_control",
+      "status": "incomplete",
+      "errors": [
+        "sampling4-DSpine8_control-chunk1-v1: "
+      ],
+      "sources": [
+        {
+          "job": "sampling4-DSpine8_control-chunk0-v1",
+          "stdout_sha256": "8fee43306851ff1710304e2a0704ecfd8d7be4344df3a098edf64bcf63c7868c"
+        }
+      ],
+      "contexts": [
+        {
+          "context": "sample_code",
+          "requests_in_complete_chunks": 500,
+          "zero_output_requests": 0,
+          "requests_below_cap": 0,
+          "requests_at_cap": 500,
+          "output_length_histogram": {
+            "24": 500
+          }
+        },
+        {
+          "context": "sample_json",
+          "requests_in_complete_chunks": 500,
+          "zero_output_requests": 0,
+          "requests_below_cap": 372,
+          "requests_at_cap": 128,
+          "output_length_histogram": {
+            "17": 2,
+            "18": 35,
+            "19": 78,
+            "20": 68,
+            "21": 74,
+            "22": 63,
+            "23": 52,
+            "24": 128
+          }
+        },
+        {
+          "context": "sample_name",
+          "requests_in_complete_chunks": 500,
+          "zero_output_requests": 0,
+          "requests_below_cap": 500,
+          "requests_at_cap": 0,
+          "output_length_histogram": {
+            "3": 234,
+            "4": 193,
+            "5": 72,
+            "6": 1
+          }
+        },
+        {
+          "context": "sample_story",
+          "requests_in_complete_chunks": 500,
+          "zero_output_requests": 0,
+          "requests_below_cap": 0,
+          "requests_at_cap": 500,
+          "output_length_histogram": {
+            "24": 500
+          }
+        }
+      ]
+    },
+    {
+      "name": "DSpine16_candidate",
+      "status": "complete",
+      "errors": [],
+      "sources": [
+        {
+          "job": "sampling4-DSpine16_candidate-chunk0-v1",
+          "stdout_sha256": "952aedfafcc7698644fdd8e264ffaaad8d4b646edf27878d756f7283eed61ea9"
+        },
+        {
+          "job": "sampling4-DSpine16_candidate-chunk1-v1",
+          "stdout_sha256": "9cb894fa86d66384f0e5a0cca200f32bcec4ecd9621bf9f538d7d1d225824e3e"
+        }
+      ],
+      "contexts": [
+        {
+          "context": "sample_code",
+          "requests_in_complete_chunks": 1000,
+          "zero_output_requests": 0,
+          "requests_below_cap": 0,
+          "requests_at_cap": 1000,
+          "output_length_histogram": {
+            "24": 1000
+          }
+        },
+        {
+          "context": "sample_json",
+          "requests_in_complete_chunks": 1000,
+          "zero_output_requests": 0,
+          "requests_below_cap": 723,
+          "requests_at_cap": 277,
+          "output_length_histogram": {
+            "17": 11,
+            "18": 84,
+            "19": 141,
+            "20": 134,
+            "21": 118,
+            "22": 138,
+            "23": 97,
+            "24": 277
+          }
+        },
+        {
+          "context": "sample_name",
+          "requests_in_complete_chunks": 1000,
+          "zero_output_requests": 0,
+          "requests_below_cap": 1000,
+          "requests_at_cap": 0,
+          "output_length_histogram": {
+            "3": 466,
+            "4": 376,
+            "5": 145,
+            "6": 13
+          }
+        },
+        {
+          "context": "sample_story",
+          "requests_in_complete_chunks": 1000,
+          "zero_output_requests": 0,
+          "requests_below_cap": 0,
+          "requests_at_cap": 1000,
+          "output_length_histogram": {
+            "24": 1000
+          }
+        }
+      ]
+    },
+    {
+      "name": "DFlash8_candidate",
+      "status": "complete",
+      "errors": [],
+      "sources": [
+        {
+          "job": "sampling4-DFlash8_candidate-chunk0-v1",
+          "stdout_sha256": "000b4d86277af60b5b21e00f8157e75bb00224944769f359479e62e7695d13d1"
+        },
+        {
+          "job": "sampling4-DFlash8_candidate-chunk1-v1",
+          "stdout_sha256": "0e1cf08e918f09e7fc16088a3881950e19aa002908228629282f7ebac270c71d"
+        }
+      ],
+      "contexts": [
+        {
+          "context": "sample_code",
+          "requests_in_complete_chunks": 1000,
+          "zero_output_requests": 0,
+          "requests_below_cap": 0,
+          "requests_at_cap": 1000,
+          "output_length_histogram": {
+            "24": 1000
+          }
+        },
+        {
+          "context": "sample_json",
+          "requests_in_complete_chunks": 1000,
+          "zero_output_requests": 0,
+          "requests_below_cap": 715,
+          "requests_at_cap": 285,
+          "output_length_histogram": {
+            "16": 1,
+            "17": 11,
+            "18": 70,
+            "19": 155,
+            "20": 112,
+            "21": 136,
+            "22": 134,
+            "23": 96,
+            "24": 285
+          }
+        },
+        {
+          "context": "sample_name",
+          "requests_in_complete_chunks": 1000,
+          "zero_output_requests": 0,
+          "requests_below_cap": 1000,
+          "requests_at_cap": 0,
+          "output_length_histogram": {
+            "3": 492,
+            "4": 381,
+            "5": 118,
+            "6": 9
+          }
+        },
+        {
+          "context": "sample_story",
+          "requests_in_complete_chunks": 1000,
+          "zero_output_requests": 0,
+          "requests_below_cap": 0,
+          "requests_at_cap": 1000,
+          "output_length_histogram": {
+            "24": 1000
+          }
+        }
+      ]
+    }
+  ],
+  "cap": 24,
+  "additional_significance_tests": 0,
+  "specific_stop_reason_saved": false,
+  "scope": "Descriptive output lengths from complete retained chunks. Below-cap completion is reported without assigning a specific EOS/EOT reason, which the original driver does not save. Zero-output requests are counted explicitly. Incomplete arms retain their actual count; this audit does not turn them into a smaller complete statistical screen."
+}

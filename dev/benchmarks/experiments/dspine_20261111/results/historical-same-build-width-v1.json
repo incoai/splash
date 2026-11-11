@@ -1,0 +1,249 @@
+{
+  "shared_recorded_identity": {
+    "driver_sha256": "d83311f02bd9e0924f18032b7b8675f390569751c694809accaef1d32c3161d9",
+    "library_sha256": "f60d2e950c6a6c69ec7472b5ec7778de437edae81a57834b9cc2c08af0bac039",
+    "cohort_sha256": "0a4c38f6465e2cbec5f5415f168d818832cad659babd8257683c4217a571b3bf",
+    "build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba",
+    "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+    "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+    "temperature": 0,
+    "ane_ffn_share": 0,
+    "context_limit": 32768
+  },
+  "sources": [
+    {
+      "job": "final-historical31-production-final-v1-r8-v1",
+      "receipt_sha256": "c97fd8f0c4e3fa891d60b72de0e109366e26e664e08ee7750af2e9e1db3a7fa8",
+      "stdout_sha256": "328dffc559fd71ff1a71536673889eb4ecf44a93f50eea204ff7e749dbb6ca16"
+    },
+    {
+      "job": "dspine16-final-v1-g1-b1",
+      "receipt_sha256": "331a8e72e282c0c707892a4ba81289b4c61ae4fc63ee190dc1b49b8ee673aee6",
+      "stdout_sha256": "8e458bb0ff749f7fcfc3d629787bd35a724aeca9f0c6166bbe6f8be025c5a1e5"
+    }
+  ],
+  "historical_greedy_audit_sha256": "c36a008cfabb703c48e656cfbb4301d713d893594c5f1f4cefabbca4abd27023",
+  "cases": [
+    {
+      "case": "python_lru",
+      "final_eight_rows_sha256": "0fa00aa2f48e707468509984061abc7c018cab631633cfd3a8273e3dcda3c9dc",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": false
+    },
+    {
+      "case": "sql_latest",
+      "final_eight_rows_sha256": "43510781b2c6b13c19ca15009ebde550baabfcf3d7b48f6860ddc8126ab028a2",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": false
+    },
+    {
+      "case": "typescript_heap",
+      "final_eight_rows_sha256": "5f05f93eec442270315ac174d99a4a0b6b79d7f1f498e31ac7400681f6f5a234",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "chinese_explanation",
+      "final_eight_rows_sha256": "1c9412fcf602950f4d93c0f950f3d733775dfc2edca912b5e35230a17d085819",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": false
+    },
+    {
+      "case": "technical_memory",
+      "final_eight_rows_sha256": "d0d82d4ef522ffe55051bb88f18f48cf8a6214a52bb2f273d414b2e312719d4f",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": false
+    },
+    {
+      "case": "json_calculation",
+      "final_eight_rows_sha256": "9b5038b333df01a755b01f3d698611b4bf1546ab9bb664ba657347149982b5ff",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": false
+    },
+    {
+      "case": "count_secondary",
+      "final_eight_rows_sha256": "0b7d98388cd77e7a4f858d04734250dab4880dfae1d662718f562c9c5d30f251",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "plain_json_squares",
+      "final_eight_rows_sha256": "60c7bf9b26f6edd0115b0e201ab703a29b5590b4ff204dd6115b340c98341184",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "plain_json_fibonacci",
+      "final_eight_rows_sha256": "fb0079dac47751bb62f469b45e131f756448b41fdbdba918da10f2a235a202ae",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "plain_csv_inventory",
+      "final_eight_rows_sha256": "a52814ad3715225466a209d31717e06449df61c2952bb1fbbdbbcfe50e9e9a26",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "plain_yaml_services",
+      "final_eight_rows_sha256": "5298a559cd2b3b2b1d736fd0b65b444f9a2489ae8746733cc4b77f075d184183",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "plain_sql_schema",
+      "final_eight_rows_sha256": "be280137712685b71c6bed6402355318c19cf2255935669716eaabfaeaa4442c",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "plain_toml_package",
+      "final_eight_rows_sha256": "36a53a81610d1a21c6a34d13ab5f54813eebf72c21266e61e7fb1cb719e88eb2",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "plain_html_table",
+      "final_eight_rows_sha256": "19d8f5a9ca9b26c64d16551c421b36c929add2b69fc25a903ee913d7c003ee3e",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "plain_xml_catalog",
+      "final_eight_rows_sha256": "d582b6747e44237bdbc44d14a9d5d37678695fc115567b569b834a2bf6238c98",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "plain_json_nested",
+      "final_eight_rows_sha256": "bd0295de959b0d8182519b0694fb16a812979fe19d7fcde06239c945665f1006",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "plain_markdown_checklist",
+      "final_eight_rows_sha256": "5325af9355a0facc2b4ba1169d2b99226a4cd8e1a43ce4be19fe55a673f13eab",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": false
+    },
+    {
+      "case": "plain_diff_boundary",
+      "final_eight_rows_sha256": "ae353c6e83d3bd5a471ef2442e024bd7e8785d5ac73cb074353abbdfebc720c5",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "plain_json_coordinate_grid",
+      "final_eight_rows_sha256": "1aa2d725b64b7b769a94a603b3029dd18dba73f0f094d484970e29e40a541ffc",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "python_topological_sort",
+      "final_eight_rows_sha256": "6409aef10e46d70dc812f6b60ff52d32e60819547afd51fe2cf33cd4ba228146",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "rust_roman_numerals",
+      "final_eight_rows_sha256": "18fa0b17858c2c817d8ff4e3956c1b71e5dfc5811f61ddf93f746a328ddd59d0",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": false
+    },
+    {
+      "case": "go_round_robin",
+      "final_eight_rows_sha256": "cee3c4c1295bfbe47cb9557d6f8af00eb0727805c06cee5f71bdd7dc43a16ea1",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "cpp_fixed_queue",
+      "final_eight_rows_sha256": "564f734f9ffc688e5001f62db1df598c0f93e8a06b95dd35c36043b388310aab",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "typescript_log_parser",
+      "final_eight_rows_sha256": "7e5efa572ae23124fe5efbb9b621179641869c724c7747164ec0a855f50ce4da",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "shell_largest_files",
+      "final_eight_rows_sha256": "50aeee361766d09fe843c58b3594f437188afbe37ce070cabff58a3ad562675f",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "linear_equations",
+      "final_eight_rows_sha256": "c951c329dd88bcfa6c10b318bb7f0b40def7699233a490ab8ae0362c9389878c",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "urn_probability",
+      "final_eight_rows_sha256": "c35875cdc4bad416606ab95adcfaa4ae7d15edb5eb758c674f9bc7316cd7ca4a",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "french_cache_explanation",
+      "final_eight_rows_sha256": "942026ccc4ffa2563975ff4730e2a56c3e52eb9077ac0beeb5cf2e9be992892b",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": false
+    },
+    {
+      "case": "arabic_atomicity",
+      "final_eight_rows_sha256": "cb8bf502d6cf320a02d85115e03f40a70450affbb120aeb64cd83df14baaf237",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    },
+    {
+      "case": "japanese_lru_notes",
+      "final_eight_rows_sha256": "9dffbd1bba136a902722ee6e67c90241c2edd34584edcbea4c7422ebf2d016b6",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": false
+    },
+    {
+      "case": "chinese_batch_latency",
+      "final_eight_rows_sha256": "7f5af1d0a3822b812b8c9745c7a13873dbfb95053184f6e88f07cfc256e75c9b",
+      "matches_committed_eight_rows": true,
+      "matches_final_dflash2": true,
+      "matches_final_sixteen_rows": true
+    }
+  ],
+  "functional_eight_matches_committed_count": 31,
+  "functional_eight_matches_dflash2_count": 31,
+  "same_build_width_mismatches": 9,
+  "scope": "Descriptive cross-check using one retained eight-row functional pass and the repeatable sixteen-row timed outputs from the same recorded driver, library, model and cohort. This isolates the configured width path from source and drafter changes at the whole-request level. The exact responsible operator or state transition remains unresolved. No separate performance or repeatability claim for the single functional pass."
+}

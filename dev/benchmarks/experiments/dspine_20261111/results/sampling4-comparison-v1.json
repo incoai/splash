@@ -1,0 +1,250 @@
+{
+  "protocol": {
+    "frozen_utc": "2026-11-10T14:38:39.716105+00:00",
+    "cohort": "sampling4-v1.txt",
+    "cohort_sha256": "76d956e14f016bb067e310433bdaa9df95b266b691be4e1c499404445bbe61c3",
+    "contexts": 4,
+    "output_cap": 24,
+    "samples_per_arm_per_context": 1000,
+    "chunks_per_arm": 2,
+    "samples_per_chunk": 500,
+    "arms_reserved": {
+      "DS8_control": {
+        "seed_start": 4100000
+      },
+      "DS16_candidate": {
+        "seed_start": 4200000
+      },
+      "DF8_candidate": {
+        "seed_start": 4300000
+      }
+    },
+    "settings": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "ane_ffn_share": 0,
+      "context_limit": 32768
+    },
+    "positions": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+    ],
+    "adjacent_pair_starts": [
+      0,
+      1,
+      5,
+      6,
+      11,
+      12,
+      14,
+      15,
+      16,
+      22
+    ],
+    "additional_features": [
+      "complete_output_length"
+    ],
+    "family_size_reserved": 280,
+    "arithmetic": "4 contexts * (24 single positions + 10 adjacent pairs + 1 output length) * 2 candidate comparisons = 280 tests. Unrun comparisons remain p=1 in the reserved family.",
+    "statistics": "Pearson chi-square without Yates correction, SciPy survival probability; symmetric label-blind pooled categories with expected cells >=5, degenerate tests p=1/uninformative. Holm correction over all 280 reserved tests. Post-end positions use absorbing STOP (-1), never condition on surviving to that position.",
+    "nomination_rule": "Freeze all three source/runtime/binary/shader/cohort configurations before any positive-temperature output on these contexts. At most the two reserved candidates, including failed or nonbeneficial outcomes. Independent seed arms and complete 1000-seed ranges required. No repeat-to-pass, source substitution or dropping a context.",
+    "scope": "Finite regression screen for gross sampling mistakes, not equivalence, rare-event safety or upstream BF16 quality. Report empirical pooled total variation, Cramers V, informativeness and every rejection. Greedy and independent numerical operator checks are separate.",
+    "provenance": "Four original software/fantasy prompts; no generated outputs consulted. The short naming case intentionally checks early EOS as well as two-block coverage in the longer cases."
+  },
+  "nomination": {
+    "frozen_utc": "2026-11-10T20:29:48.395202+00:00",
+    "prefix": "sampling4-v1",
+    "cohort": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/sampling4-v1.txt",
+    "cohort_sha256": "76d956e14f016bb067e310433bdaa9df95b266b691be4e1c499404445bbe61c3",
+    "control": {
+      "variant": "control",
+      "rows": 8,
+      "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+      "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+      "name": "DSpine8_control",
+      "verify_rows": 8,
+      "seed_start": 4100000,
+      "jobs": [
+        "sampling4-DSpine8_control-chunk0-v1",
+        "sampling4-DSpine8_control-chunk1-v1"
+      ]
+    },
+    "candidates": [
+      {
+        "variant": "production-final-v1",
+        "rows": 16,
+        "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+        "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+        "name": "DSpine16_candidate",
+        "verify_rows": 16,
+        "seed_start": 4200000,
+        "jobs": [
+          "sampling4-DSpine16_candidate-chunk0-v1",
+          "sampling4-DSpine16_candidate-chunk1-v1"
+        ]
+      },
+      {
+        "variant": "production-final-v1",
+        "rows": 8,
+        "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+        "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf",
+        "name": "DFlash8_candidate",
+        "verify_rows": 8,
+        "seed_start": 4300000,
+        "jobs": [
+          "sampling4-DFlash8_candidate-chunk0-v1",
+          "sampling4-DFlash8_candidate-chunk1-v1"
+        ]
+      }
+    ],
+    "artifact_nomination": {
+      "production-final-v1": {
+        "source_root": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/production-final-v1",
+        "patch": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/patches/production-final-v1.patch",
+        "patch_sha256": "ec4254095b3f16ed843de824622d727164005cd70c6844c3f180c0278f752736",
+        "build_manifest": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/production-final-v1/build.json",
+        "driver": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/study-driver",
+        "library": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/splash.metallib",
+        "host_step": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/host-step.metallib"
+      },
+      "control": {
+        "source_root": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/control",
+        "patch": null,
+        "patch_sha256": null,
+        "build_manifest": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/control/build.json",
+        "driver": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-control-v2/study-driver",
+        "library": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-control-v2/splash.metallib",
+        "host_step": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-control-v2/host-step.metallib"
+      }
+    },
+    "operating_script_sha256": "4bde430207a362eab510fe8ffd393fa2aa76c543eaa5821c7073e95e454d0f58",
+    "analyzer_file": "analyze_sampling4_v1.py",
+    "analyzer_sha256": "66babc7961c3ef7d37b61777dd57b1906b6e6060edd05a264c1d073e2c7b5c35",
+    "abba_sha256": "7afc7b4fa24916acfc41745fc29cc659b5edada0bfa1ce55e19a685808475c0d",
+    "required_receipts": [
+      "build-production-final-v1",
+      "build-study-production-final-v1-v2",
+      "build-priority-production-final-v1-v1",
+      "full-metal-production-final-v1",
+      "python-contracts-production-final-v1",
+      "final-smoke-dspine8-v1",
+      "final-smoke-dspine16-v1",
+      "final-smoke-dflash8-v1",
+      "final-clone-b3-v1",
+      "final-clone-b4-v1",
+      "final-unaligned-tail16-v1",
+      "final-priority16-v1",
+      "final-http16-v1",
+      "final-cache-isolation-v2",
+      "final-historical31-control-r8-v1",
+      "final-historical31-production-final-v1-r8-v1",
+      "final-architecture-v1",
+      "final-python-full-v2",
+      "final-native-tools-build-v1",
+      "final-host-sanitizers-v1",
+      "final-app-tests-v2",
+      "final-python-static-v1",
+      "final-metal-tsan-v1"
+    ],
+    "settings": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "ane_ffn_share": 0,
+      "context_limit": 32768
+    },
+    "chunk_order": [
+      "DSpine8_0",
+      "DSpine16_0",
+      "DFlash8_0",
+      "DFlash8_1",
+      "DSpine16_1",
+      "DSpine8_1"
+    ],
+    "scope": "Independent-seed functional distribution screen, never throughput evidence. All three source/runtime arms frozen before first positive-temperature output; no source substitution or retry-to-pass."
+  },
+  "baseline_sources": [],
+  "candidate_sources": {
+    "DSpine16_candidate": [
+      {
+        "job": "sampling4-DSpine16_candidate-chunk0-v1",
+        "sha256": "952aedfafcc7698644fdd8e264ffaaad8d4b646edf27878d756f7283eed61ea9",
+        "build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba",
+        "geometry": {
+          "prefill_rows": 2048,
+          "verify_rows": 16,
+          "batch_width": 4,
+          "kv_block_tokens": 32
+        }
+      },
+      {
+        "job": "sampling4-DSpine16_candidate-chunk1-v1",
+        "sha256": "9cb894fa86d66384f0e5a0cca200f32bcec4ecd9621bf9f538d7d1d225824e3e",
+        "build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba",
+        "geometry": {
+          "prefill_rows": 2048,
+          "verify_rows": 16,
+          "batch_width": 4,
+          "kv_block_tokens": 32
+        }
+      }
+    ],
+    "DFlash8_candidate": [
+      {
+        "job": "sampling4-DFlash8_candidate-chunk0-v1",
+        "sha256": "000b4d86277af60b5b21e00f8157e75bb00224944769f359479e62e7695d13d1",
+        "build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba",
+        "geometry": {
+          "prefill_rows": 2048,
+          "verify_rows": 8,
+          "batch_width": 4,
+          "kv_block_tokens": 32
+        }
+      },
+      {
+        "job": "sampling4-DFlash8_candidate-chunk1-v1",
+        "sha256": "0e1cf08e918f09e7fc16088a3881950e19aa002908228629282f7ebac270c71d",
+        "build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba",
+        "geometry": {
+          "prefill_rows": 2048,
+          "verify_rows": 8,
+          "batch_width": 4,
+          "kv_block_tokens": 32
+        }
+      }
+    ]
+  },
+  "family_size_reserved": 280,
+  "tests_observed": 0,
+  "status": "incomplete",
+  "errors": {
+    "DSpine8_control": ""
+  },
+  "unobserved_reserved_tests": 280,
+  "rejections": 0,
+  "results": [],
+  "interpretation": "A finite regression screen. An incomplete arm is not replaced or analyzed as a smaller sample; its unobserved tests retain p=1 in the reserved family and no complete-screen verdict is inferred. No rejection is not proof of identical distributions, especially for rare outputs. Retain all comparisons and report uninformative tests."
+}

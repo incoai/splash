@@ -1,0 +1,495 @@
+{
+  "validation_complete_utc": "2026-11-10T20:29:48.353088+00:00",
+  "variant": "production-final-v1",
+  "source_manifest_sha256": "e085c8ecefbba3b5c84ff6212cb4de7f6f74e91328d6ae6f4d29737e15816ca1",
+  "patch_sha256": "ec4254095b3f16ed843de824622d727164005cd70c6844c3f180c0278f752736",
+  "receipts": [
+    {
+      "job": "build-production-final-v1",
+      "receipt_sha256": "3095492d70f6edce41b8c00277daa74ed76538afdfa9f1ec1e6debfe6e6ea214",
+      "elapsed_seconds": 192.015439625
+    },
+    {
+      "job": "build-study-production-final-v1-v2",
+      "receipt_sha256": "c7d9785df96a6b7bf2cd6f589feed8ee3a7940a0489ca929dd920bdbf489c3a9",
+      "elapsed_seconds": 2.060691582999425
+    },
+    {
+      "job": "build-priority-production-final-v1-v1",
+      "receipt_sha256": "532c9d486314775450dbd687e5b6686b9ac50bfe944c3b31754b9a40d7aeec57",
+      "elapsed_seconds": 2.119070707998617
+    },
+    {
+      "job": "full-metal-production-final-v1",
+      "receipt_sha256": "c2aa4502a01b76ea61bab038b95cfd71bfcda8df1f45dd28626855026e251c8f",
+      "elapsed_seconds": 3320.7547449580015
+    },
+    {
+      "job": "python-contracts-production-final-v1",
+      "receipt_sha256": "2ba62f86f4121bb8f040c7d0b5cf349a91ff4a35b76daa79c2b9de146a6e1749",
+      "elapsed_seconds": 55.14658783300183
+    },
+    {
+      "job": "final-smoke-dspine8-v1",
+      "receipt_sha256": "b5a33cccf936c2c02ae34f2bd43f27f3bb64dc5c661a5f5dd32362d1700e4127",
+      "elapsed_seconds": 16.671586249998654
+    },
+    {
+      "job": "final-smoke-dspine16-v1",
+      "receipt_sha256": "57fdd655d15b985b8387ba436c6af866ef026493e1905185c7f321cb8c60f150",
+      "elapsed_seconds": 16.339037417001236
+    },
+    {
+      "job": "final-smoke-dflash8-v1",
+      "receipt_sha256": "6c3fec9e132c320a3152181eabacad4b9f100f4927423e4d735c6cc970ee2d00",
+      "elapsed_seconds": 16.86278045799918
+    },
+    {
+      "job": "final-clone-b3-v1",
+      "receipt_sha256": "a752c097e3d5969198034d5a14e77e21a315c868e5b37ec9236a3a08a870ac93",
+      "elapsed_seconds": 20.876664791998337
+    },
+    {
+      "job": "final-clone-b4-v1",
+      "receipt_sha256": "48f9afb1bfd196b0aa3b1c9463518db13f476325ec771640d55e4b841b67ec34",
+      "elapsed_seconds": 20.819639666999137
+    },
+    {
+      "job": "final-unaligned-tail16-v1",
+      "receipt_sha256": "2301e2944ce08de6d09cae9e1a51835a5f248cda45bd1a886f64ab99b1a2ebe6",
+      "elapsed_seconds": 187.37046966699927
+    },
+    {
+      "job": "final-priority16-v1",
+      "receipt_sha256": "e92dcb454d75f10788e4543b98d08b73127078eda53e8ede221e06dc10b62530",
+      "elapsed_seconds": 312.2930283329988
+    },
+    {
+      "job": "final-http16-v1",
+      "receipt_sha256": "026ede954f1313b67fc8deeaeef992224fe434b675914ef66a9bd8188a98b26d",
+      "elapsed_seconds": 147.254110165999
+    },
+    {
+      "job": "final-cache-isolation-v2",
+      "receipt_sha256": "efd0c866fa03afe8186b56ff6d8112d08d05b4b2bd1d2aca3428b557c95bb416",
+      "elapsed_seconds": 330.8786975410003
+    },
+    {
+      "job": "final-historical31-control-r8-v1",
+      "receipt_sha256": "1b7c9e8380b59547442edb16f4d97762a2e0462e0faac76339926127f1b0c849",
+      "elapsed_seconds": 123.16046362499765
+    },
+    {
+      "job": "final-historical31-production-final-v1-r8-v1",
+      "receipt_sha256": "c97fd8f0c4e3fa891d60b72de0e109366e26e664e08ee7750af2e9e1db3a7fa8",
+      "elapsed_seconds": 153.48393666600168
+    },
+    {
+      "job": "final-architecture-v1",
+      "receipt_sha256": "5766a73cba2d8be4887d73d2cd7d0e2ba973e9a8f74273c3476c30ff4ee07135",
+      "elapsed_seconds": 2.1682865000002494
+    },
+    {
+      "job": "final-python-full-v2",
+      "receipt_sha256": "7d8f53ea793412bf2553a009d5d16108cbcfef801c249f162180a89f1e82d88d",
+      "elapsed_seconds": 535.9406519999975
+    },
+    {
+      "job": "final-native-tools-build-v1",
+      "receipt_sha256": "d933dfe9401f2091dad8662e71e784aa1490f61b25823e71d742d75ba91b0256",
+      "elapsed_seconds": 9.217426792001788
+    },
+    {
+      "job": "final-host-sanitizers-v1",
+      "receipt_sha256": "72ca96d24d6704f3e14cc0d71d9dde9c79bdea07cf9a92ca36d9c10eee3ba559",
+      "elapsed_seconds": 598.77181175
+    },
+    {
+      "job": "final-app-tests-v2",
+      "receipt_sha256": "c04b90672d759d461e57eded994d86d75512b037fab3e97d73d8a4067a6d606b",
+      "elapsed_seconds": 65.52083641699937
+    },
+    {
+      "job": "final-python-static-v1",
+      "receipt_sha256": "49e99eb057e943454b90924244401e12729ea5912dc32e15a31bf6e8c66a61be",
+      "elapsed_seconds": 0.9273827910001273
+    },
+    {
+      "job": "final-metal-tsan-v1",
+      "receipt_sha256": "56bfb0cb9dd17d81fea31532eb19bc235d16e2666c744ccb964d32d6baff9c86",
+      "elapsed_seconds": 1163.564096416998
+    }
+  ],
+  "same_geometry_output_checks": [
+    {
+      "jobs": [
+        "final-historical31-control-r8-v1",
+        "final-historical31-production-final-v1-r8-v1"
+      ],
+      "cases": 31,
+      "complete_arrays_match": true
+    },
+    {
+      "jobs": [
+        "calibration-baseline8-smoke3-v9",
+        "final-smoke-dspine8-v1"
+      ],
+      "cases": 3,
+      "complete_arrays_match": true
+    },
+    {
+      "jobs": [
+        "calibration-candidate16-smoke3-v9",
+        "final-smoke-dspine16-v1"
+      ],
+      "cases": 3,
+      "complete_arrays_match": true
+    },
+    {
+      "jobs": [
+        "calibration-dflash8-smoke3-v9",
+        "final-smoke-dflash8-v1"
+      ],
+      "cases": 3,
+      "complete_arrays_match": true
+    },
+    {
+      "jobs": [
+        "unaligned-tail-runtime16-v12-r16",
+        "final-unaligned-tail16-v1"
+      ],
+      "cases": 1,
+      "complete_arrays_match": true
+    }
+  ],
+  "clones": [
+    {
+      "physical_width": 3,
+      "cases": 3,
+      "all_complete_lane_arrays_match": true
+    },
+    {
+      "physical_width": 4,
+      "cases": 3,
+      "all_complete_lane_arrays_match": true
+    }
+  ],
+  "priority": [
+    {
+      "scenario": "python_lru",
+      "prompt_tokens": 45,
+      "priority_suspensions": 1,
+      "resumptions": 1,
+      "replay_tokens": 20,
+      "all_four_output_arrays_match": true,
+      "decode_widths": [
+        4,
+        3,
+        3,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        1,
+        1
+      ]
+    },
+    {
+      "scenario": "typescript_heap",
+      "prompt_tokens": 45,
+      "priority_suspensions": 1,
+      "resumptions": 1,
+      "replay_tokens": 16,
+      "all_four_output_arrays_match": true,
+      "decode_widths": [
+        4,
+        3,
+        3,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "scenario": "chinese_explanation",
+      "prompt_tokens": 39,
+      "priority_suspensions": 1,
+      "resumptions": 1,
+      "replay_tokens": 19,
+      "all_four_output_arrays_match": true,
+      "decode_widths": [
+        4,
+        3,
+        3,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        1
+      ]
+    },
+    {
+      "scenario": "technical_memory",
+      "prompt_tokens": 41,
+      "priority_suspensions": 1,
+      "resumptions": 1,
+      "replay_tokens": 19,
+      "all_four_output_arrays_match": true,
+      "decode_widths": [
+        4,
+        3,
+        3,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        1,
+        1
+      ]
+    },
+    {
+      "scenario": "suspend_long_lru",
+      "prompt_tokens": 15246,
+      "priority_suspensions": 1,
+      "resumptions": 1,
+      "replay_tokens": 21,
+      "all_four_output_arrays_match": true,
+      "decode_widths": [
+        4,
+        3,
+        3,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        1,
+        1,
+        1
+      ]
+    }
+  ],
+  "full_service": {
+    "passed": true,
+    "result_sha256": "5d490432dc6f1e00982f85512b6d4ef4920956402619b281a0b7654929352a4e"
+  },
+  "cache_compatibility_and_isolation": {
+    "passed": true,
+    "physical_namespaces": 4,
+    "result_sha256": "a90d290d3b0ad648328789112c12cc4b16715f625f7863765b46b396f17c6a28",
+    "retained_invalid_fixture": "final-cache-isolation-v1:645-token baseline wrote no disk points below the unchanged2048tokenminimum; source namespace itself matched",
+    "short_window_disk_restore_exercised": false
+  },
+  "dynamic_budget_bytes_32k": {
+    "dspine8": 20600982656,
+    "dspine16": 20379290752,
+    "dflash8": 20904021120
+  },
+  "integration_supplement": {
+    "source_witness_sha256": "2a552e10f180c1186154ca4ddff919eb0e63009f37c4be59a42dcc1544c72032",
+    "integration_commit": "9da56559a17ef55997f4424b38a7e938c129bc78",
+    "patch_sha256": "ca592cfe4e1e88eda4ca582ff1aaa709ee98d69049dd315f4b0d314528bc92a2",
+    "scope": "Desktop launch option, its forwarding test, parser-default test fixture, CLI/status documentation and locale-correct expected text in two existing Swift assertions. Frozen production source17a0 and all measured binaries/libraries unchanged.",
+    "original_full_suite_failed_receipt": "36c75288c8dc1ed8c07e5e7faa150ae4df04aed76d163d2c12474bda08fb30d3"
+  },
+  "scope": "Finite correctness/integration gates. Passing does not establish universal greedy parity across widths, sampling equivalence, cross-device support or throughput."
+}

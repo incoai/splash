@@ -1,0 +1,151 @@
+{
+  "report": "dev/benchmarks/experiments/dspine_20261111/README.md",
+  "mechanisms": "dev/benchmarks/experiments/dspine_20261111/MECHANISMS.md",
+  "pull_request": "https://github.com/incoai/splash/pull/731",
+  "baseline_commit": "425ad7400f3a00d2a1e6745bdacfa2881922d544",
+  "timed_source_commit": "17a0ae2454ef567a599ccd64373d25fc7df9313b",
+  "integration_commit": "fb429642850299f81def93e730b84131fb075cde",
+  "research_window": {
+    "start_utc": "2026-11-10T12:24:13+00:00",
+    "deadline_utc": "2026-11-11T01:24:13+00:00"
+  },
+  "overview": "dev/benchmarks/experiments/dspine_20261111/results/final-overview-v1.json",
+  "overview_sha256": "2bf23bf32008728f9779e1ceef0b2b885662c9e2ae05b15d81b1dfec6eafb2a0",
+  "comparison_status": [
+    {
+      "label": "default8-final-v1",
+      "status": "all_scheduled_rounds_complete",
+      "successful_rounds": 12,
+      "qualified": true
+    },
+    {
+      "label": "dspine16-final-v1",
+      "status": "all_scheduled_rounds_complete",
+      "successful_rounds": 12,
+      "qualified": false
+    },
+    {
+      "label": "dflash8-vs-dspine16-final-v1",
+      "status": "all_scheduled_rounds_complete",
+      "successful_rounds": 12,
+      "qualified": false
+    },
+    {
+      "label": "dflash8-vs-dspine16-b4-final-v1",
+      "status": "all_scheduled_rounds_complete",
+      "successful_rounds": 12,
+      "qualified": true
+    },
+    {
+      "label": "agent12-dflash8-vs-dspine16-final-v1",
+      "status": "interrupted_or_unrun",
+      "successful_rounds": 0,
+      "qualified": false
+    },
+    {
+      "label": "m48-b3-research-v1",
+      "status": "interrupted_or_unrun",
+      "successful_rounds": 0,
+      "qualified": false
+    }
+  ],
+  "sampling": {
+    "status": "incomplete",
+    "errors": {
+      "DSpine8_control": ""
+    },
+    "family_size_reserved": 280,
+    "tests_observed": 0,
+    "unobserved_reserved_tests": 280,
+    "rejections": 0,
+    "informative_tests": 0,
+    "rejections_by_candidate": {},
+    "analysis_sha256": "5ad9b41766750516a1eb5625e84f0573f2e7a0dba45465616a162d3c25c5bdfe",
+    "chunk_status": [
+      {
+        "arm": "DSpine8_control",
+        "job": "sampling4-DSpine8_control-chunk0-v1",
+        "state": "complete",
+        "exit_code": 0,
+        "registered_requests": 2000,
+        "request_completions_in_journal": 2000,
+        "malformed_progress_lines": 0
+      },
+      {
+        "arm": "DSpine8_control",
+        "job": "sampling4-DSpine8_control-chunk1-v1",
+        "state": "timeout",
+        "exit_code": -2,
+        "registered_requests": 2000,
+        "request_completions_in_journal": 1604,
+        "malformed_progress_lines": 0
+      },
+      {
+        "arm": "DSpine16_candidate",
+        "job": "sampling4-DSpine16_candidate-chunk0-v1",
+        "state": "complete",
+        "exit_code": 0,
+        "registered_requests": 2000,
+        "request_completions_in_journal": 2000,
+        "malformed_progress_lines": 0
+      },
+      {
+        "arm": "DSpine16_candidate",
+        "job": "sampling4-DSpine16_candidate-chunk1-v1",
+        "state": "complete",
+        "exit_code": 0,
+        "registered_requests": 2000,
+        "request_completions_in_journal": 2000,
+        "malformed_progress_lines": 0
+      },
+      {
+        "arm": "DFlash8_candidate",
+        "job": "sampling4-DFlash8_candidate-chunk0-v1",
+        "state": "complete",
+        "exit_code": 0,
+        "registered_requests": 2000,
+        "request_completions_in_journal": 2000,
+        "malformed_progress_lines": 0
+      },
+      {
+        "arm": "DFlash8_candidate",
+        "job": "sampling4-DFlash8_candidate-chunk1-v1",
+        "state": "complete",
+        "exit_code": 0,
+        "registered_requests": 2000,
+        "request_completions_in_journal": 2000,
+        "malformed_progress_lines": 0
+      }
+    ],
+    "request_completions_in_journals": 11604,
+    "termination_audit": {
+      "status": "incomplete",
+      "requests_from_complete_chunks": 10000,
+      "requests_below_cap": 4310,
+      "zero_output_requests": 0,
+      "specific_stop_reason_saved": false,
+      "sha256": "ef22cca3d7eef63b878de4d94a8309062bb70730a25e54d5317070fc2d7e6c01"
+    }
+  },
+  "archives_relative_to_report_directory": {
+    "evidence": {
+      "archive": "evidence/evidence.tar.gz",
+      "manifest": "evidence/evidence-manifest.json",
+      "bytes": 7743146,
+      "sha256": "e425964a8c080493f1c4ab9f54d38879bd45e82f3fea7844b92e9737e86b4286"
+    },
+    "hardware": {
+      "archive": "evidence/hardware.jsonl.gz",
+      "manifest": "evidence/hardware-manifest.json",
+      "bytes": 13036861,
+      "sha256": "59e449418652f127ad7c2e12ee06adc2e12c46a9a86c428995352ef72c072f90"
+    },
+    "logits": {
+      "archive": "logits.tar.gz",
+      "manifest": "evidence/logits-manifest.json",
+      "bytes": 208692684,
+      "sha256": "1f3f585b00618c65e2b27e85d0cb985c075402b15fd4e3487aa89a0a058a87eb",
+      "release_url": "https://github.com/linson007/splash/releases/download/dspine-13h-20261111-v1/logits.tar.gz"
+    }
+  }
+}

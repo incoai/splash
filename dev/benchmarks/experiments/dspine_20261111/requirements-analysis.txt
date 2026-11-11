@@ -1,0 +1,6 @@
+# Analysis environment: CPython 3.14.8
+numpy==2.5.4
+scipy==1.18.0
+matplotlib==3.11.2
+# Optional token text for the prefix diagnostic:
+tokenizers==0.22.2

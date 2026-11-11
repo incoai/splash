@@ -314,10 +314,10 @@ this finite screen does not prove identical distributions or cover long-range
 changes and EOS termination. The separate synthetic memory-pressure probe
 failed to trigger suspension and does not validate that mechanism.
 
-The serving backend on this PR remains **eight rows**. Production widening
-needs per-model geometry, preserving DFlash2's eight-row capacity, plus explicit
-support or rejection of Table16/register layouts. The full sixteen-row Table16
-test finds an out-of-bounds store; the prototype disables register paths and
+At the end of that study, the serving backend used **eight rows**. Production
+widening needed per-model geometry, preserving DFlash2's eight-row capacity,
+plus explicit support or rejection of Table16/register layouts. The full
+sixteen-row Table16 test finds an out-of-bounds store; the prototype disables register paths and
 passes a separately scoped plain16 oracle. A late packing-only follow-up
 passes the complete sixteen-row GDN suite under Metal validation, while
 register consumers and per-model dispatch remain future work. The measured
@@ -331,6 +331,41 @@ comparisons and target-feature diagnostics. The
 links the compressed original receipts, failures and hardware trace.
 [Source patches, frozen cohorts and the rebuild harness](../dev/benchmarks/experiments/dspine_20261110/reproduce.py)
 reproduce the experiments without changing serving defaults.
+
+### Thirteen-hour runtime and kernel follow-up
+
+The November 10–11 follow-up implements per-model geometry and the physical
+eight-row Table16 contract. DSpine can opt into sixteen rows with
+`--draft-block-size 16` alongside its `--draft-model`. The CLI defaults to
+eight rows. The combined Metal library includes both shader variants, and
+sixteen-row state has a separate persistent-cache namespace.
+
+The final paired comparisons on the same 20-core M5 Pro give these results.
+Each comparison schedules three ABBA groups.
+
+| Workload | DFlash2 tok/s | Sixteen-row DSpine tok/s | Qualification |
+| --- | ---: | ---: | --- |
+| 31 historical serial prompts | 63.4–63.5 | 79.5–79.7 | Unqualified, nine complete output arrays differ in every group |
+| Three prompts, four cloned lanes, 256-token caps | 240.1–240.6 | 149.6–150.6 | All three groups qualify in favor of DFlash2 with identical outputs |
+
+In the four-lane fixture, sixteen-row DSpine emits 16% more tokens per batch
+at 86–87% more GPU time. Projection cost dominates the extra work. A separate
+M64 gate/up dispatch correction improves three-lane sixteen-row throughput
+by 73.9–75.5% against the original sixteen-row policy. Explicit 32K context
+saves 95.24 MiB of attention scratch. A 2K-context allocation fixture frees
+564.38 MiB of pooled and cached state.
+
+The same final DSpine binary and checkpoint match both eight-row controls on
+all 31 historical prompts at eight rows and differ on the same nine at sixteen.
+The next numerical probe compares target logits at the first divergent token.
+The window closed with 10,000 sampling requests in complete chunks and 1,604
+additional journaled completions. Its statistical screen is incomplete.
+The fresh agent and separate M48 whole-model protocols remain unrun.
+
+The follow-up report includes source identities, all validation gates, raw
+arrays, failed experiments, operator results and reproduction commands.
+[Report and evidence](../dev/benchmarks/experiments/dspine_20261111/README.md)
+[Mechanisms and next experiments](../dev/benchmarks/experiments/dspine_20261111/MECHANISMS.md)
 
 ## Smaller GGUFs on 24 GB Macs
 

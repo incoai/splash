@@ -1,0 +1,113 @@
+{
+  "scope": "Finite balanced operator screen, not a controlled whole-model speed claim. Both arms receive64rows with48live rows; M48 only computes the48live rows. All split/spread settings retained.",
+  "numerical": {
+    "small_cases": 2,
+    "small_bitwise_comparisons": 196608,
+    "independent_fp64_checks": 432,
+    "production_shape_bitwise_comparisons": 10027008,
+    "guards": "NaNpadding, outputguard, same-split reference bits, independent FP64 bounds and released split counters.",
+    "source": {
+      "job": "af4-m48-oracle-v3",
+      "receipt_sha256": "4683ef3316c4d823b157c2bd3ef0e2cb64af29870bf7d478405f71d8e2daaa53",
+      "stdout_sha256": "539cc4e655191e506257c337e0fb58a711dbc1274ce6d8f0a18d599581c4959c"
+    }
+  },
+  "cases": [
+    {
+      "splits": 1,
+      "spread": false,
+      "control_ms": 0.830109,
+      "candidate_ms": 0.5988245000000001,
+      "latency_change": -0.2786194343152525,
+      "throughput_change": 0.38623085728790296
+    },
+    {
+      "splits": 2,
+      "spread": false,
+      "control_ms": 0.9649915,
+      "candidate_ms": 0.6980385,
+      "latency_change": -0.2766376698654859,
+      "throughput_change": 0.3824330606406381
+    },
+    {
+      "splits": 1,
+      "spread": true,
+      "control_ms": 0.8120229999999999,
+      "candidate_ms": 0.602471,
+      "latency_change": -0.2580616558890573,
+      "throughput_change": 0.34782089096404634
+    },
+    {
+      "splits": 2,
+      "spread": true,
+      "control_ms": 0.951962,
+      "candidate_ms": 0.6886155,
+      "latency_change": -0.2766355169639123,
+      "throughput_change": 0.38242894619711576
+    }
+  ],
+  "primary": {
+    "splits": 1,
+    "spread": true,
+    "control_ms": 0.8120229999999999,
+    "candidate_ms": 0.602471,
+    "latency_change": -0.2580616558890573,
+    "throughput_change": 0.34782089096404634
+  },
+  "operator_rule_met": true,
+  "production_source_adopted": false,
+  "resources": [
+    {
+      "kernel": "gguf_decode_af4g64_m64_gate_up",
+      "static_threadgroup_bytes": 4112,
+      "maximum_threads": 1024,
+      "execution_width": 32,
+      "device_threadgroup_limit_bytes": 32768
+    },
+    {
+      "kernel": "gguf_decode_af4g64_m64_a",
+      "static_threadgroup_bytes": 8208,
+      "maximum_threads": 1024,
+      "execution_width": 32,
+      "device_threadgroup_limit_bytes": 32768
+    },
+    {
+      "kernel": "gguf_decode_af4g64_m48_a",
+      "static_threadgroup_bytes": 8208,
+      "maximum_threads": 1024,
+      "execution_width": 32,
+      "device_threadgroup_limit_bytes": 32768
+    },
+    {
+      "kernel": "gguf_decode_af4g64_m48_g",
+      "static_threadgroup_bytes": 8208,
+      "maximum_threads": 1024,
+      "execution_width": 32,
+      "device_threadgroup_limit_bytes": 32768
+    }
+  ],
+  "sources": [
+    {
+      "job": "af4-m48-diagnostic-v3",
+      "receipt_sha256": "0179960389f56a4147f7f082faa5c4193e8d197033a6aba4ca83a1ed94e046c0",
+      "stdout_sha256": "ed0a91b4c58c59b199bec6b683a3ab27baffc85bcb8a06b0b588b53df9ca406c"
+    },
+    {
+      "job": "af4-m48-resources-v3",
+      "receipt_sha256": "df9e59ebc15b50c5490ca45f122afab4c914527a3738d512f92c8767bfd2a604",
+      "stdout_sha256": "805e9b8c881d257346dd78834ebc3be74e51e9926dc81b1df8165af43b582c72"
+    }
+  ],
+  "interpretation": "The primary rule is met and motivates a separate prospective B3 whole-model comparison. Actual M48allocation remainsM64 in that research variant, so no arena-memory saving is claimed. Static threadgroup bytes stay8208; smaller cooperative destination element capacity is not an allocated-register/spill measurement.",
+  "retained_setup_failures": [
+    {
+      "job": "build-af4-m48-operator-v1",
+      "cause": "Extracted entry wrapper omitted its source-local helper/store templates; no GPU output."
+    },
+    {
+      "job": "build-af4-m48-operator-v2",
+      "cause": "Copied unused prefill-only constant rejected by unchanged -Werror; no GPU output."
+    }
+  ],
+  "correction": "V3 includes the unchanged required helpers and removes the unused declaration. Compiler warnings, kernel math, operator order, numerical guards and5%rule are unchanged. Initial failures are not numerical shader failures."
+}

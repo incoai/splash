@@ -1,0 +1,1033 @@
+{
+  "protocol": {
+    "frozen_utc": "2026-11-10T20:29:48.376491+00:00",
+    "prefix": "dflash8-vs-dspine16-b4-final-v1",
+    "groups": 3,
+    "order_each_group": [
+      "control",
+      "candidate",
+      "candidate",
+      "control"
+    ],
+    "arms": {
+      "control": {
+        "variant": "production-final-v1",
+        "rows": 8,
+        "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+        "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf"
+      },
+      "candidate": {
+        "variant": "production-final-v1",
+        "rows": 16,
+        "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+        "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07"
+      }
+    },
+    "cohort": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/cohorts/kernel-smoke3-cap256-v1.txt",
+    "cohort_sha256": "4197b200cd24e583b19b973c032e33beda6026dc406ffe6331559329406a3246",
+    "cases": 3,
+    "samples_per_round": 1,
+    "criterion": "comparison",
+    "context_tokens": 32768,
+    "temperature": 0,
+    "ane_ffn_share": 0,
+    "verify_rows": "all",
+    "clone_width": 4,
+    "primary_endpoint": "decode",
+    "primary_metric": "Fixed physical clone width4; GPU-stream decode wall/decode output tokens, then token-weighted aggregate. Shared-prompt warm-model capacity, not heterogeneous HTTP latency.",
+    "gates": "Exactly3ABBA groups. All complete arrays match; all per-case and aggregate decode spreads<=5%. Improvement exceeds max(2%,twice spread); nonregression requires aggregate and every case to pass its allowance. Cold request wall and TTFT each retain independent gates. Sampled AC, no swap and no serious/critical thermal state throughout each saved round. No repeat-to-pass.",
+    "artifact_nomination": {
+      "production-final-v1": {
+        "source_root": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/production-final-v1",
+        "patch": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/patches/production-final-v1.patch",
+        "patch_sha256": "ec4254095b3f16ed843de824622d727164005cd70c6844c3f180c0278f752736",
+        "build_manifest": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/production-final-v1/build.json",
+        "driver": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/study-driver",
+        "library": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/splash.metallib",
+        "host_step": "/Users/linson/Documents/ai/splash-dspine-13h-20261110/artifacts/study-production-final-v1-v2/host-step.metallib"
+      }
+    },
+    "operating_script_sha256": "4bde430207a362eab510fe8ffd393fa2aa76c543eaa5821c7073e95e454d0f58",
+    "analyzer_file": "analyze_abba_v2.py",
+    "analyzer_sha256": "e2c3f42e4e5fce41d89251399beb7339bf9bdc4c4af51e15435cf984390da634",
+    "abba_sha256": "7afc7b4fa24916acfc41745fc29cc659b5edada0bfa1ce55e19a685808475c0d",
+    "required_receipts": [
+      "build-production-final-v1",
+      "build-study-production-final-v1-v2",
+      "build-priority-production-final-v1-v1",
+      "full-metal-production-final-v1",
+      "python-contracts-production-final-v1",
+      "final-smoke-dspine8-v1",
+      "final-smoke-dspine16-v1",
+      "final-smoke-dflash8-v1",
+      "final-clone-b3-v1",
+      "final-clone-b4-v1",
+      "final-unaligned-tail16-v1",
+      "final-priority16-v1",
+      "final-http16-v1",
+      "final-cache-isolation-v2",
+      "final-historical31-control-r8-v1",
+      "final-historical31-production-final-v1-r8-v1",
+      "final-architecture-v1",
+      "final-python-full-v2",
+      "final-native-tools-build-v1",
+      "final-host-sanitizers-v1",
+      "final-app-tests-v2",
+      "final-python-static-v1",
+      "final-metal-tsan-v1"
+    ],
+    "scope": "Historical calibration prompts; not independent heldout evidence."
+  },
+  "qualified": true,
+  "groups": [
+    {
+      "group": 1,
+      "rounds": [
+        "dflash8-vs-dspine16-b4-final-v1-g1-a1",
+        "dflash8-vs-dspine16-b4-final-v1-g1-b1",
+        "dflash8-vs-dspine16-b4-final-v1-g1-b2",
+        "dflash8-vs-dspine16-b4-final-v1-g1-a2"
+      ],
+      "sources": [
+        {
+          "job": "dflash8-vs-dspine16-b4-final-v1-g1-a1",
+          "sha256": "ce5bb57918acabc191ebb6342002a29c3049e29bd9306ca348f704e18324b4a1",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+            "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 8,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba"
+        },
+        {
+          "job": "dflash8-vs-dspine16-b4-final-v1-g1-b1",
+          "sha256": "5b8069f605d865d1df8bd570d32747fc80b8fed89be2e4fe4105f460dc793a1a",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba"
+        },
+        {
+          "job": "dflash8-vs-dspine16-b4-final-v1-g1-b2",
+          "sha256": "30ce55b1264e15f0ba44f0348be9d95d56b9a9da075062ad260128c229d53f39",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba"
+        },
+        {
+          "job": "dflash8-vs-dspine16-b4-final-v1-g1-a2",
+          "sha256": "9fee4d8c7813b4cdc4fd3581acdf2ec36f2bb02105521a8401bb1afdbde867f3",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+            "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 8,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba"
+        }
+      ],
+      "problems": [],
+      "qualified": true,
+      "cases": [
+        {
+          "case": "python_lru",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              3.566142578125,
+              5.269384765625,
+              5.268310546875,
+              3.56482421875
+            ],
+            "baseline": 3.5654833984375003,
+            "candidate": 5.26884765625,
+            "noise": 0.0003697561389789825,
+            "regression": 0.47773725676551027,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "throughput_change": -0.32328971512242133,
+          "request_wall_abba": {
+            "rounds": [
+              3822.26,
+              5570.59,
+              5570.12,
+              3819.67
+            ],
+            "baseline": 3820.965,
+            "candidate": 5570.355,
+            "noise": 0.0006778392369467257,
+            "regression": 0.4578398388888669,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              43
+            ],
+            [
+              35
+            ],
+            [
+              35
+            ],
+            [
+              43
+            ]
+          ]
+        },
+        {
+          "case": "sql_latest",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              4.637225877192982,
+              8.108629385964912,
+              8.188804824561403,
+              4.638377192982456
+            ],
+            "baseline": 4.6378015350877195,
+            "candidate": 8.148717105263158,
+            "noise": 0.009839025893377363,
+            "regression": 0.7570215205660009,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "throughput_change": -0.430855007582455,
+          "request_wall_abba": {
+            "rounds": [
+              4491.29,
+              7664.3,
+              7735.55,
+              4493.97
+            ],
+            "baseline": 4492.63,
+            "candidate": 7699.925,
+            "noise": 0.009253336883151459,
+            "regression": 0.7139014341265584,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              50
+            ],
+            [
+              48
+            ],
+            [
+              48
+            ],
+            [
+              50
+            ]
+          ]
+        },
+        {
+          "case": "typescript_heap",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              4.290283203125,
+              6.59693359375,
+              6.7476953125,
+              4.3418359375
+            ],
+            "baseline": 4.3160595703125,
+            "candidate": 6.672314453125001,
+            "noise": 0.022595115954013582,
+            "regression": 0.5459273312675565,
+            "bound": 0.045190231908027165,
+            "verdict": "fail",
+            "pass": false
+          },
+          "throughput_change": -0.3531390643180704,
+          "request_wall_abba": {
+            "rounds": [
+              4557.99,
+              6923.33,
+              7079.02,
+              4611.04
+            ],
+            "baseline": 4584.514999999999,
+            "candidate": 7001.175,
+            "noise": 0.022237695815345352,
+            "regression": 0.5271353676452146,
+            "bound": 0.044475391630690704,
+            "verdict": "fail",
+            "pass": false
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              52
+            ],
+            [
+              42
+            ],
+            [
+              42
+            ],
+            [
+              52
+            ]
+          ]
+        }
+      ],
+      "primary_decode_abba": {
+        "rounds": [
+          4.14666554054054,
+          6.6034391891891895,
+          6.679925675675675,
+          4.164398648648648
+        ],
+        "baseline": 4.155532094594594,
+        "candidate": 6.641682432432432,
+        "noise": 0.011516131230994976,
+        "regression": 0.5982748493440242,
+        "bound": 0.02303226246198995,
+        "verdict": "fail",
+        "pass": false
+      },
+      "primary_request_wall_abba": {
+        "rounds": [
+          12871.539999999999,
+          20158.22,
+          20384.690000000002,
+          12924.68
+        ],
+        "baseline": 12898.11,
+        "candidate": 20271.455,
+        "noise": 0.01117186704161103,
+        "regression": 0.5716608867500743,
+        "bound": 0.02234373408322206,
+        "verdict": "fail",
+        "pass": false
+      },
+      "endpoint_summaries": {
+        "decode": {
+          "abba": {
+            "rounds": [
+              4.14666554054054,
+              6.6034391891891895,
+              6.679925675675675,
+              4.164398648648648
+            ],
+            "baseline": 4.155532094594594,
+            "candidate": 6.641682432432432,
+            "noise": 0.011516131230994976,
+            "regression": 0.5982748493440242,
+            "bound": 0.02303226246198995,
+            "verdict": "fail",
+            "pass": false
+          },
+          "all_output_arrays_match": true,
+          "measurement_qualified": true,
+          "effect_gate_passed": true,
+          "qualified": true,
+          "direction": "candidate slower"
+        },
+        "request_wall": {
+          "abba": {
+            "rounds": [
+              12871.539999999999,
+              20158.22,
+              20384.690000000002,
+              12924.68
+            ],
+            "baseline": 12898.11,
+            "candidate": 20271.455,
+            "noise": 0.01117186704161103,
+            "regression": 0.5716608867500743,
+            "bound": 0.02234373408322206,
+            "verdict": "fail",
+            "pass": false
+          },
+          "all_output_arrays_match": true,
+          "measurement_qualified": true,
+          "effect_gate_passed": true,
+          "qualified": true,
+          "direction": "candidate slower"
+        }
+      },
+      "registered_categories": {},
+      "measurement_qualified": true,
+      "direction": "candidate slower",
+      "primary_throughput_change": -0.374325385642884,
+      "all_output_arrays_match": true,
+      "all_case_noise_within_five_percent": true,
+      "cold_warm_gate_passed": true,
+      "effect_gate_passed": true
+    },
+    {
+      "group": 2,
+      "rounds": [
+        "dflash8-vs-dspine16-b4-final-v1-g2-a1",
+        "dflash8-vs-dspine16-b4-final-v1-g2-b1",
+        "dflash8-vs-dspine16-b4-final-v1-g2-b2",
+        "dflash8-vs-dspine16-b4-final-v1-g2-a2"
+      ],
+      "sources": [
+        {
+          "job": "dflash8-vs-dspine16-b4-final-v1-g2-a1",
+          "sha256": "9654fb3229f01d484599d33788e34cdbb46cfa314e46e84fb2487533dc3e6478",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+            "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 8,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba"
+        },
+        {
+          "job": "dflash8-vs-dspine16-b4-final-v1-g2-b1",
+          "sha256": "4764006fa07c6e0264916ee649893282a681d9582682c9fa685e2065518ef061",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba"
+        },
+        {
+          "job": "dflash8-vs-dspine16-b4-final-v1-g2-b2",
+          "sha256": "a292b31c0c07e00f612b83bfb22286714e00595b1dd396abe540ea006aa61c48",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba"
+        },
+        {
+          "job": "dflash8-vs-dspine16-b4-final-v1-g2-a2",
+          "sha256": "55aaff20af0e2aab2b29c1b29da7f3d33a9429863959742358916187f6968709",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+            "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 8,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba"
+        }
+      ],
+      "problems": [],
+      "qualified": true,
+      "cases": [
+        {
+          "case": "python_lru",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              3.565,
+              5.270341796875,
+              5.26916015625,
+              3.562861328125
+            ],
+            "baseline": 3.5639306640625,
+            "candidate": 5.2697509765625,
+            "noise": 0.0006000879580979827,
+            "regression": 0.47863453958319924,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "throughput_change": -0.323700364606739,
+          "request_wall_abba": {
+            "rounds": [
+              3820.37,
+              5570.41,
+              5571.66,
+              3818.62
+            ],
+            "baseline": 3819.495,
+            "candidate": 5571.035,
+            "noise": 0.00045817575360093416,
+            "regression": 0.45857894826410295,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              43
+            ],
+            [
+              35
+            ],
+            [
+              35
+            ],
+            [
+              43
+            ]
+          ]
+        },
+        {
+          "case": "sql_latest",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              4.635526315789474,
+              8.17796052631579,
+              8.216929824561404,
+              4.631228070175439
+            ],
+            "baseline": 4.633377192982456,
+            "candidate": 8.197445175438597,
+            "noise": 0.0047538345681622275,
+            "regression": 0.7692160240815593,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "throughput_change": -0.43477789801326105,
+          "request_wall_abba": {
+            "rounds": [
+              4491.82,
+              7725.24,
+              7761.59,
+              4487.65
+            ],
+            "baseline": 4489.735,
+            "candidate": 7743.415,
+            "noise": 0.0046943112308975255,
+            "regression": 0.7246931054950907,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              50
+            ],
+            [
+              48
+            ],
+            [
+              48
+            ],
+            [
+              50
+            ]
+          ]
+        },
+        {
+          "case": "typescript_heap",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              4.316259765625,
+              6.718037109375,
+              6.78390625,
+              4.334541015625
+            ],
+            "baseline": 4.325400390625,
+            "candidate": 6.750971679687501,
+            "noise": 0.009756986660629699,
+            "regression": 0.5607738174527739,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "throughput_change": -0.3592921736526644,
+          "request_wall_abba": {
+            "rounds": [
+              4585.73,
+              7048.71,
+              7117,
+              4604.84
+            ],
+            "baseline": 4595.285,
+            "candidate": 7082.855,
+            "noise": 0.009641592267524885,
+            "regression": 0.5413309511814828,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              52
+            ],
+            [
+              42
+            ],
+            [
+              42
+            ],
+            [
+              52
+            ]
+          ]
+        }
+      ],
+      "primary_decode_abba": {
+        "rounds": [
+          4.1547331081081085,
+          6.667027027027028,
+          6.701412162162162,
+          4.158993243243243
+        ],
+        "baseline": 4.156863175675676,
+        "candidate": 6.684219594594595,
+        "noise": 0.005144225836467305,
+        "regression": 0.6079960566679248,
+        "bound": 0.02,
+        "verdict": "fail",
+        "pass": false
+      },
+      "primary_request_wall_abba": {
+        "rounds": [
+          12897.919999999998,
+          20344.36,
+          20450.25,
+          12911.11
+        ],
+        "baseline": 12904.515,
+        "candidate": 20397.305,
+        "noise": 0.005191372095480232,
+        "regression": 0.5806332124841578,
+        "bound": 0.02,
+        "verdict": "fail",
+        "pass": false
+      },
+      "endpoint_summaries": {
+        "decode": {
+          "abba": {
+            "rounds": [
+              4.1547331081081085,
+              6.667027027027028,
+              6.701412162162162,
+              4.158993243243243
+            ],
+            "baseline": 4.156863175675676,
+            "candidate": 6.684219594594595,
+            "noise": 0.005144225836467305,
+            "regression": 0.6079960566679248,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "all_output_arrays_match": true,
+          "measurement_qualified": true,
+          "effect_gate_passed": true,
+          "qualified": true,
+          "direction": "candidate slower"
+        },
+        "request_wall": {
+          "abba": {
+            "rounds": [
+              12897.919999999998,
+              20344.36,
+              20450.25,
+              12911.11
+            ],
+            "baseline": 12904.515,
+            "candidate": 20397.305,
+            "noise": 0.005191372095480232,
+            "regression": 0.5806332124841578,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "all_output_arrays_match": true,
+          "measurement_qualified": true,
+          "effect_gate_passed": true,
+          "qualified": true,
+          "direction": "candidate slower"
+        }
+      },
+      "registered_categories": {},
+      "measurement_qualified": true,
+      "direction": "candidate slower",
+      "primary_throughput_change": -0.37810792765736556,
+      "all_output_arrays_match": true,
+      "all_case_noise_within_five_percent": true,
+      "cold_warm_gate_passed": true,
+      "effect_gate_passed": true
+    },
+    {
+      "group": 3,
+      "rounds": [
+        "dflash8-vs-dspine16-b4-final-v1-g3-a1",
+        "dflash8-vs-dspine16-b4-final-v1-g3-b1",
+        "dflash8-vs-dspine16-b4-final-v1-g3-b2",
+        "dflash8-vs-dspine16-b4-final-v1-g3-a2"
+      ],
+      "sources": [
+        {
+          "job": "dflash8-vs-dspine16-b4-final-v1-g3-a1",
+          "sha256": "ba1b155c77cb5a9b4d847f426b0e806bdf2c134c09b209cb7fb73e35555c8533",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+            "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 8,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba"
+        },
+        {
+          "job": "dflash8-vs-dspine16-b4-final-v1-g3-b1",
+          "sha256": "8c05faef1cb7db6ba07e16716190c0bf1b4f5e6dba12e59174552679e128d72b",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba"
+        },
+        {
+          "job": "dflash8-vs-dspine16-b4-final-v1-g3-b2",
+          "sha256": "45bd1051d01d1190959ee62325a342832cb9a4c60248be175f6e58e160e66d09",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/6dbfbe7c7c327b08c37d96de63c96b112391c0f86da19499ce7630100121dc65",
+            "loaded_model_layout_sha256": "d54db3896d21781d482c1b5ee3f516faf27d501fcf154b751e54b508ea0d4e07",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 16,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba"
+        },
+        {
+          "job": "dflash8-vs-dspine16-b4-final-v1-g3-a2",
+          "sha256": "305b6696a79aa4ffe5637ae183d2148ccdb10804da8665bff3709b533ddbcdec",
+          "identity": {
+            "model_root": "/Users/linson/Documents/ai/splash/build/dspine/models/.resolved/e31456d643015663e71ff545239c1df6ccb003ce671f21eab041f9e6c45dc0f4",
+            "loaded_model_layout_sha256": "8684e288479283417919621bb56ec047d12fcf2d1c2b5194638604ed1fc91abf",
+            "device": "Apple M5 Pro"
+          },
+          "geometry": {
+            "prefill_rows": 2048,
+            "verify_rows": 8,
+            "batch_width": 4,
+            "kv_block_tokens": 32
+          },
+          "build_id": "src-06965b4f604f4515d274ff9892bae9a129ee51574115649367c22e7e587a11ba"
+        }
+      ],
+      "problems": [],
+      "qualified": true,
+      "cases": [
+        {
+          "case": "python_lru",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              3.57263671875,
+              5.26818359375,
+              5.26984375,
+              3.567421875
+            ],
+            "baseline": 3.570029296875,
+            "candidate": 5.269013671874999,
+            "noise": 0.001460728558884634,
+            "regression": 0.47590208194851313,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "throughput_change": -0.32244827605380055,
+          "request_wall_abba": {
+            "rounds": [
+              3828.75,
+              5569.5,
+              5571.6,
+              3822.61
+            ],
+            "baseline": 3825.6800000000003,
+            "candidate": 5570.55,
+            "noise": 0.001604943434892587,
+            "regression": 0.4560940800066915,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              43
+            ],
+            [
+              35
+            ],
+            [
+              35
+            ],
+            [
+              43
+            ]
+          ]
+        },
+        {
+          "case": "sql_latest",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              4.644331140350877,
+              8.167631578947368,
+              8.21655701754386,
+              4.639155701754386
+            ],
+            "baseline": 4.641743421052631,
+            "candidate": 8.192094298245614,
+            "noise": 0.005972274831720249,
+            "regression": 0.7648744351293446,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "throughput_change": -0.433387452333564,
+          "request_wall_abba": {
+            "rounds": [
+              4497.37,
+              7716.84,
+              7760.83,
+              4492.1
+            ],
+            "baseline": 4494.735000000001,
+            "candidate": 7738.835,
+            "noise": 0.005684318117649463,
+            "regression": 0.721755565122304,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              50
+            ],
+            [
+              48
+            ],
+            [
+              48
+            ],
+            [
+              50
+            ]
+          ]
+        },
+        {
+          "case": "typescript_heap",
+          "output_arrays_match": true,
+          "cold_output_match": true,
+          "decode_abba": {
+            "rounds": [
+              4.324541015625,
+              6.719755859375,
+              6.77828125,
+              4.342998046875
+            ],
+            "baseline": 4.33376953125,
+            "candidate": 6.7490185546875,
+            "noise": 0.008671689098313671,
+            "regression": 0.5573090599353732,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "throughput_change": -0.3578667037090897,
+          "request_wall_abba": {
+            "rounds": [
+              4592.5,
+              7050.71,
+              7109.29,
+              4613.13
+            ],
+            "baseline": 4602.8150000000005,
+            "candidate": 7080.0,
+            "noise": 0.008274011299435018,
+            "regression": 0.53818912991289,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "ttft_abba": null,
+          "cycles": [
+            [
+              52
+            ],
+            [
+              42
+            ],
+            [
+              42
+            ],
+            [
+              52
+            ]
+          ]
+        }
+      ],
+      "primary_decode_abba": {
+        "rounds": [
+          4.162952702702703,
+          6.663692567567567,
+          6.6995878378378375,
+          4.1659391891891895
+        ],
+        "baseline": 4.164445945945946,
+        "candidate": 6.681640202702702,
+        "noise": 0.005372224361280431,
+        "regression": 0.6044487764830335,
+        "bound": 0.02,
+        "verdict": "fail",
+        "pass": false
+      },
+      "primary_request_wall_abba": {
+        "rounds": [
+          12918.619999999999,
+          20337.05,
+          20441.72,
+          12927.84
+        ],
+        "baseline": 12923.23,
+        "candidate": 20389.385000000002,
+        "noise": 0.005133553562307146,
+        "regression": 0.5777313411585185,
+        "bound": 0.02,
+        "verdict": "fail",
+        "pass": false
+      },
+      "endpoint_summaries": {
+        "decode": {
+          "abba": {
+            "rounds": [
+              4.162952702702703,
+              6.663692567567567,
+              6.6995878378378375,
+              4.1659391891891895
+            ],
+            "baseline": 4.164445945945946,
+            "candidate": 6.681640202702702,
+            "noise": 0.005372224361280431,
+            "regression": 0.6044487764830335,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "all_output_arrays_match": true,
+          "measurement_qualified": true,
+          "effect_gate_passed": true,
+          "qualified": true,
+          "direction": "candidate slower"
+        },
+        "request_wall": {
+          "abba": {
+            "rounds": [
+              12918.619999999999,
+              20337.05,
+              20441.72,
+              12927.84
+            ],
+            "baseline": 12923.23,
+            "candidate": 20389.385000000002,
+            "noise": 0.005133553562307146,
+            "regression": 0.5777313411585185,
+            "bound": 0.02,
+            "verdict": "fail",
+            "pass": false
+          },
+          "all_output_arrays_match": true,
+          "measurement_qualified": true,
+          "effect_gate_passed": true,
+          "qualified": true,
+          "direction": "candidate slower"
+        }
+      },
+      "registered_categories": {},
+      "measurement_qualified": true,
+      "direction": "candidate slower",
+      "primary_throughput_change": -0.37673298477498973,
+      "all_output_arrays_match": true,
+      "all_case_noise_within_five_percent": true,
+      "cold_warm_gate_passed": true,
+      "effect_gate_passed": true
+    }
+  ],
+  "scope": "Exactly the registered groups and complete cohort; all failures retained. Top-level qualification concerns the primary decode endpoint. Cold request wall, TTFT and predeclared categories each retain their own output/noise/effect gates. Medians of registered internal repetitions precede per-case ABBA. Aggregate decode rate weights cases by output tokens. AC and thermal state sampled every five seconds. A failure is not rerun into a pass."
+}
