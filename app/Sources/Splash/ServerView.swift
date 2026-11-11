@@ -35,7 +35,7 @@ struct ServerView: View {
                         ProblemRow(title: "\(state.displayName(of: model)) ran into a problem", message: message,
                                    log: .server, dismiss: state.server.dismissFailure,
                                    // Files on this Mac that can't serve won't serve on a second try.
-                                   action: model.hasPrefix("/") && !state.server.running
+                                   action: model.hasPrefix("/")
                                        ? ("Remove from List", { state.server.dismissFailure(); state.removeLocal(model) }) : nil)
                     }
                     if let failure = state.installer.failure {
@@ -202,7 +202,7 @@ private struct ControlBar: View {
     /// Whether the server's failure is of another model than the one the bar names, which then
     /// shows as not running.
     private var othersFailure: Bool {
-        if case .failed = state.server.phase { !state.server.running && !failedPicked } else { false }
+        if case .failed = state.server.phase { !failedPicked } else { false }
     }
 
     private var look: MarkLook { othersFailure ? .off : state.serverStatus.look }
@@ -238,9 +238,7 @@ private struct ControlBar: View {
         let server = state.server
         switch server.phase {
         case .stopped, .failed:
-            // A server that runs but serves nothing gives way to the model picked.
-            let switching = server.running && state.selection != server.model
-            Button(failedPicked ? "Try Again" : switching ? "Switch to \(state.selection.map(state.displayName(of:)) ?? "")" : "Start") {
+            Button(failedPicked ? "Try Again" : "Start") {
                 if let model = state.selection { state.start(model) }
             }
             .buttonStyle(.borderedProminent)

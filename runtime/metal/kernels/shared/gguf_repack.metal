@@ -34,8 +34,37 @@ static inline void gguf_copy_native(device const uchar *blk, uint j, constant Qu
   for (uint i = 0; i < f.plane1_bytes; ++i) out1[i] = blk[at1 + f.plane1_bytes * j + i];
   if (j == 0) for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[atMeta + i];
 }
+// Nibbles 0..3 of x at bits 0, 8, 16, 24 to bits 0, 16, 4, 20: four consecutive 4-bit codes as a pair word holds
+// them (gguf_store_pairs).
+static inline uint gguf_nibble_pairs(uint x) {
+  return (x & 0xFu) | ((x >> 12) & 0xF0u) | ((x << 8) & 0xF0000u) | ((x >> 4) & 0xF00000u);
+}
+// Group j of a Q4_K (qs at byte 16) or Q5_K (qs at 48, with fifth bits) block from its words: a few shifts a word
+// instead of a byte load and a pack per element. Pair word c is qs words c and 4 + c; the fifth bits, bit j of
+// qh[4k..4k+3] gathered by the multiply, go to slots 8 (k % 4) + 4 (k / 4) on.
+static inline void gguf_repack_k_words(device const uchar *blk, uint qs_at, bool fifth, uint j, device uchar *out0,
+                                       device uchar *out1, device uchar *meta) {
+  device const uint *qs = (device const uint *)(blk + qs_at + (j / 2) * 32);
+  uint4 pairs;
+  for (uint c = 0; c < 4; ++c)
+    pairs[c] = gguf_nibble_pairs((qs[c] >> (4 * (j % 2))) & 0x0F0F0F0Fu) |
+               gguf_nibble_pairs((qs[4 + c] >> (4 * (j % 2))) & 0x0F0F0F0Fu) << 8;
+  *(device uint4 *)out0 = pairs;
+  if (fifth) {
+    device const uint *qh = (device const uint *)(blk + 16);
+    uint bits = 0;
+    for (uint k = 0; k < 8; ++k)
+      bits |= ((((qh[k] >> j) & 0x01010101u) * 0x204081u) >> 21 & 0xFu) << (8 * (k % 4) + 4 * (k / 4));
+    *(device uint *)out1 = bits;
+  }
+  device const uint *head = (device const uint *)blk;
+  if (j == 0) *(device uint4 *)meta = uint4(head[0], head[1], head[2], head[3]);
+}
 // Group g (32 wide) of row n of a tensor of G groups a row in format fmt: its native row from `row` on, written
-// into its plane0, plane1 and meta planes, each [rows / QUANT_TILE_ROWS][units][QUANT_TILE_ROWS].
+// into its plane0, plane1 and meta planes, each [rows / QUANT_TILE_ROWS][units][QUANT_TILE_ROWS]. Q4_K and Q5_K
+// blocks are read as words, Q2_0's, PQ2_0's and the 16-bit formats' as halfwords: their sizes are multiples of
+// those, and rows are whole blocks after a tensor start on 8 bytes, in the file (model/GgufFile.cpp) and in the
+// staging (pages of buffers bound at offset 0).
 static inline void gguf_repack_group(device const uchar *row, uint fmt, uint G, uint n, uint g, device uchar *plane0,
                                      device uchar *plane1, device uchar *meta_plane) {
   constant QuantFormat &f = kQuantFormats[fmt];
@@ -63,22 +92,12 @@ static inline void gguf_repack_group(device const uchar *row, uint fmt, uint G, 
     return;
   }
   switch (fmt) {
-    case GGUF_FMT_Q4K: {
-      for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = (blk[16 + (j / 2) * 32 + e] >> (4 * (j % 2))) & 15;
-      gguf_store_pairs(lo, out0);
-      if (j == 0) for (uint i = 0; i < 16; ++i) meta[i] = blk[i];
+    case GGUF_FMT_Q4K:
+      gguf_repack_k_words(blk, 16, false, j, out0, out1, meta);
       break;
-    }
-    case GGUF_FMT_Q5K: {
-      for (uint e = 0; e < 32; ++e) {
-        lo[quant_slot(e)] = (blk[48 + (j / 2) * 32 + e] >> (4 * (j % 2))) & 15;
-        hi[quant_slot(e)] = (blk[16 + e] >> j) & 1;
-      }
-      gguf_store_pairs(lo, out0);
-      gguf_store_bits(hi, 1, out1);
-      if (j == 0) for (uint i = 0; i < 16; ++i) meta[i] = blk[i];
+    case GGUF_FMT_Q5K:
+      gguf_repack_k_words(blk, 48, true, j, out0, out1, meta);
       break;
-    }
     case GGUF_FMT_IQ4XS: {
       for (uint l = 0; l < 16; ++l) { const uchar q = blk[8 + 16 * j + l]; lo[quant_slot(l)] = q & 15; lo[quant_slot(16 + l)] = q >> 4; }
       gguf_store_bits(lo, 4, out0);
@@ -120,10 +139,13 @@ static inline void gguf_repack_group(device const uchar *row, uint fmt, uint G, 
       break;
     }
     case GGUF_FMT_PQ20: case GGUF_FMT_Q20: {   // block_pq2_0 {d, qs[32]}, block_q2_0 {d, qs[16]}: element e of group
-                                               // j is bits 2 (e % 4) of qs[8 j + e / 4]
-      for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = (blk[2 + 8 * j + e / 4] >> (2 * (e % 4))) & 3;
-      gguf_store_bits(lo, 2, out0);
-      if (j == 0) { meta[0] = blk[0]; meta[1] = blk[1]; }
+                                               // j is bits 2 (e % 4) of qs[8 j + e / 4], so qs byte k goes whole to
+                                               // word k / 2 % 2 at bit 16 (k % 2) + 8 (k / 4)
+      device const ushort *qs = (device const ushort *)(blk + 2 + 8 * j);
+      const uint q0 = qs[0], q1 = qs[1], q2 = qs[2], q3 = qs[3];
+      *(device uint2 *)out0 = uint2((q0 & 0xFFu) | (q2 & 0xFFu) << 8 | (q0 >> 8) << 16 | (q2 >> 8) << 24,
+                                    (q1 & 0xFFu) | (q3 & 0xFFu) << 8 | (q1 >> 8) << 16 | (q3 >> 8) << 24);
+      if (j == 0) *(device ushort *)meta = *(device const ushort *)blk;
       break;
     }
     case GGUF_FMT_IQ4NL: case GGUF_FMT_Q40: case GGUF_FMT_Q41: case GGUF_FMT_MXFP4: {   // the meta unit, then qs[16]

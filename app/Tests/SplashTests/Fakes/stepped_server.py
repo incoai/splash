@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,10 +18,10 @@ def after(name):
         time.sleep(0.02)
 
 
-def record(phase):
+def record(phase, **fields):
     path = root / "build/runtime" / f"serve-{port}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"pid": os.getpid(), "phase": phase}))
+    path.write_text(json.dumps({"pid": os.getpid(), "phase": phase} | fields))
 
 
 record("loading")
@@ -48,8 +49,6 @@ class Handler(BaseHTTPRequestHandler):
                 "active_requests": running,
                 "metrics": {"decode_tokens_per_second": 41.6},
             }
-            if (root / "broken").exists():
-                body["transport"] = {"stopped": True, "error": "x"}
         data = json.dumps(body).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -58,6 +57,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def stop():
+    # As a server that stops restarting its engine: its record says why, then it exits.
+    after("broken")
+    record("failed", failure={"kind": "stopped", "message": "x"})
+    os._exit(69)
+
+
 server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
 record("ready")
+threading.Thread(target=stop, daemon=True).start()
 server.serve_forever()

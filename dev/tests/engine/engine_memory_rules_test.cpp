@@ -675,7 +675,7 @@ void testALaneBelowAWaitingClaimTakesWhatItLacksBeyondTheHeldPages() {
   ledger.addSource(landing);
   const ClaimId waiter = ledger.open({.cls = ClaimClass::InService, .rank = {.priority = 2}});
   const ClaimId below = ledger.open({.cls = ClaimClass::InService, .rank = {.priority = 1}});
-  require(ledger.free(waiter, {.bytes = 8 * harness.cache.bytesPerPage(kv::PageForm::Full)}, 0, false)
+  require(ledger.free(waiter, {.bytes = 8 * harness.cache.bytesPerPage(kv::PageForm::Full)}, 0, MemoryPressure::Normal)
                   .outcome == FreeOutcome::Pending &&
               ledger.claim(waiter).waiting && ledger.heldPages(below, 0)[0] == 8,
           "the Foreground claim did not wait for 8 pages' bytes");
@@ -1267,7 +1267,7 @@ void testCopiesAheadForRegrowthStayWithinAUnit() {
     // (MemoryLedger::copyDemand), the lanes asking for none.
     MemoryLedger &ledger = host.governor.ledger();
     const ClaimId reached = ledger.open({.cls = ClaimClass::Optional, .requestId = 1, .timing = NeedTiming::Immediate});
-    static_cast<void>(ledger.free(reached, {.pages = 1}, 0, false));
+    static_cast<void>(ledger.free(reached, {.pages = 1}, 0, MemoryPressure::Normal));
     ledger.close(reached);
     require(host.governor.copyDemand() && !tier.demotions, "no claim reached uncopied cache");
     for (uint32_t step = 0; step < 32; ++step) {

@@ -262,6 +262,17 @@ uint32_t Cache::stateTokens(std::span<const uint64_t> blocks) const {
   return 0;
 }
 
+std::span<const uint64_t> CacheProbe::restoredChain() const noexcept {
+  return matchableChain(std::span<const uint64_t>(blocks_).first(cachedTokens_ / KvCache::pageTokens));
+}
+
+std::span<const uint64_t> CacheProbe::matchableChain(std::span<const uint64_t> chain) const noexcept {
+  if (kvGeneration_ == owner_->kv_.generation())
+    return chain;
+  const auto end = std::ranges::find_if(chain, [&](uint64_t block) { return !owner_->kv_.matchable(block); });
+  return chain.first(static_cast<size_t>(end - chain.begin()));
+}
+
 CacheProbe Cache::probe(std::span<const uint32_t> prompt, PromptIdentity identity) {
   CacheProbe result;
   result.owner_ = this;
@@ -276,11 +287,8 @@ void Cache::refresh(CacheProbe &probe, std::span<const uint32_t> prompt,
   if (probe.owner_ != this)
     throw std::logic_error("a scheduling probe belongs to another cache");
   if (probe.kvGeneration_ != kv_.generation()) {
-    // See KvCache's generation: the chain holds up to its first block that
-    // no longer matches.
-    probe.blocks_.erase(std::find_if(probe.blocks_.begin(), probe.blocks_.end(),
-                                     [&](uint64_t block) { return !kv_.matchable(block); }),
-                        probe.blocks_.end());
+    // See KvCache's generation.
+    probe.blocks_.resize(probe.matchableChain(probe.blocks_).size());
     lookup_.probeHashedBlocks += extendMatch(probe.blocks_, prompt, identity);
     probe.kvGeneration_ = kv_.generation();
   }
@@ -603,7 +611,7 @@ Returning Cache::returningOf(std::optional<std::span<const uint64_t>> requestIds
   }
   constexpr auto full = static_cast<size_t>(kv::PageForm::Full);
   result.landingPages[full] += std::min(spilling, pool_.freePageCount(kv::PageForm::Index));
-  if (spill_ && writes(WriteClass::Spill)) {
+  if (spill_ && spill_->always && writes(WriteClass::Spill)) {
     // Requests on one prefix owe its blocks each; a block another request's
     // write drains already lands among the transfers.
     std::unordered_set<uint64_t> owed;
@@ -649,8 +657,6 @@ uint32_t Cache::convertiblePages(uint64_t requestId) const {
 uint32_t Cache::residentChainPages(std::span<const uint64_t> chain) const {
   uint32_t pages = 0;
   for (const uint64_t block : chain) {
-    if (!kv_.contains(block))
-      continue;
     const uint32_t page = kv_.page(block);
     pages += page != KvCache::noPage && pool_.form(page) != kv::PageForm::Index;
   }
@@ -665,6 +671,12 @@ Need Cache::growthNeed(uint32_t pages) const {
   Need need{.bytes = (beyond + extent - 1) / extent * extent * pool_.bytesPerPage(full), .kv = true};
   need.keptPages[static_cast<size_t>(full)] = std::min(pages, free);
   return need;
+}
+
+uint64_t Cache::growthPages(uint64_t bytes) const {
+  constexpr kv::PageForm full = kv::PageForm::Full;
+  const uint64_t extent = pool_.extentPages();
+  return pool_.freePageCount(full) + bytes / (extent * pool_.bytesPerPage(full)) * extent;
 }
 
 bool Cache::freesOnLanding(uint64_t block, const std::unordered_set<uint64_t> &freeing) const {
@@ -716,16 +728,15 @@ Cache::Walk Cache::walkFor(const VictimQuery &query) const {
   Walk walk;
   // The walk leaves out what the claim may not take (takeRights): a device
   // or a page need's reclaims take many victims, so nothing is marked. Every
-  // walk keeps the chain a start's placement reuses (VictimQuery::kept). The
-  // Index runway kept is where landed copies spill at the memory wall
-  // (moveLandedPages) and a conversion lands.
+  // walk keeps the chain a start's placement reuses (VictimQuery::kept), and
+  // the Index runway (Walk::keeps), where landed pages move without an
+  // allocation (moveLandedPages), a lane's release among them.
   walk.scope.upTo = rights.inUse ? ReclaimClass::InUse : ReclaimClass::Ordinary;
   walk.keepResumePoint = rights.certainReuse == Reuse::None;
   walk.restored = rights.certainReuse == Reuse::All ? nullptr : &wanted_;
   walk.reused = query.kept;
   walk.timing = rights.waitsForWrites ? ReclaimTiming::CanWait : ReclaimTiming::Immediate;
   walk.keepRunway = rights.reserves == Reserves::None;
-  walk.keepIndexRunway = rights.reserves != Reserves::All;
   walk.hostRefused = need.hostRefused;
   // A state that goes ends a unit for a need of its buffers, and of bytes,
   // which its buffers meet once they leave the model's pool.
@@ -738,13 +749,17 @@ Cache::Walk Cache::walkFor(const VictimQuery &query) const {
     walk.refused = Shortfall{pool_.extentPages(), kv::PageForm::Full};
     // A KV need takes the free pages of its form first, and those of the
     // other forms its attempt takes: releasing their extent would give it
-    // bytes for an extent it then allocates again.
+    // bytes for an extent it then allocates again. It keeps too those the
+    // other sources' units move pages into (VictimQuery::movedInto), which
+    // they count on.
     if (need.pages || std::ranges::any_of(need.keptPages, [](uint32_t each) { return each != 0; })) {
       walk.form = need.form;
       for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {
         const auto each = static_cast<size_t>(form);
-        const uint32_t takes = form == need.form && need.pages ? pool_.freePageCount(form) : need.keptPages[each];
-        walk.keptPages[each] = std::min(pool_.freePageCount(form), takes);
+        const uint64_t takes =
+            uint64_t{form == need.form && need.pages ? pool_.freePageCount(form) : need.keptPages[each]} +
+            query.movedInto[each];
+        walk.keptPages[each] = static_cast<uint32_t>(std::min<uint64_t>(pool_.freePageCount(form), takes));
       }
     }
   } else if (need.pages) {
@@ -1108,11 +1123,12 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
     throw std::logic_error("a walk restores chains the cache does not count");
   const std::span<const uint64_t> reused = walk.reused ? walk.reused->states() : std::span<const uint64_t>{};
   // A write in flight frees what it holds once it lands only where a take
-  // waits for it (returns): a demotion, a copy ahead whose block a reclaim
-  // of the class then frees through it (copyAheadReturns), a write through
-  // whose page spills as it lands. Above any other, no reclaim reaches a
-  // page until it has landed. The extents that hold a page a transfer reads
-  // or fills, which compaction does not move, empty only then too.
+  // waits for it (returns): a demotion, a copy whose block a reclaim of
+  // the class then frees through it (copyAheadReturns), under --kv-spill
+  // always a write through whose page spills as it lands. Above any other,
+  // no reclaim reaches a page until it has landed. The extents that hold a
+  // page a transfer reads or fills, which compaction does not move, empty
+  // only then too.
   std::vector<uint64_t> unwaited;
   std::array<uint32_t, 3> pinned{};
   {
@@ -1199,9 +1215,13 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
     written[index] = std::min(all[index], pool_.freePageCount(form) + pages.now[index] + pages.written[index]);
     // Compaction gathers the pages that stay into the fewest extents, and
     // the rest empty, but for the free pages a KV need takes and the
-    // runway the walk keeps.
+    // runway the walk keeps. A need in place empties none of its form: each
+    // take ends once it has a page more there (takeReclaim), which the next
+    // keeps with the other free pages.
     const uint64_t extentBytes = uint64_t{extent} * pool_.bytesPerPage(form);
     const auto extents = [&](uint32_t pages) {
+      if (walk.inPlace && form == walk.form)
+        return 0u;
       const uint32_t whole = (pages - std::min(pages, walk.keptPages[index])) / extent;
       return whole - std::min(whole, walk.keeps(form) ? 1u : 0u);
     };
@@ -1682,19 +1702,23 @@ Cache::ReclaimResult Cache::releaseExtent(const Walk &walk) {
 
 bool Cache::compactExtent(std::optional<kv::PageForm> form) {
   const auto start = AwakeClock::now();
-  std::vector<uint32_t> inTransfer;
-  inTransfer.reserve(writes_.size() + restores_.size());
-  for (const Write &write : writes_)
-    inTransfer.push_back(kv_.page(write.block));
-  for (const auto &[block, _] : restores_)
-    inTransfer.push_back(kv_.page(block));
-  const KvPageMoves moves = pool_.compactExtent(inTransfer, form);
+  const KvPageMoves moves = pool_.compactExtent(pagesInTransfer(), form);
   if (moves.empty())
     return false;
   followMoves(moves);
   extentCompactMaxMilliseconds_ =
       std::max(extentCompactMaxMilliseconds_, millisecondsSince(start));
   return true;
+}
+
+std::vector<uint32_t> Cache::pagesInTransfer() const {
+  std::vector<uint32_t> pages;
+  pages.reserve(writes_.size() + restores_.size());
+  for (const Write &write : writes_)
+    pages.push_back(kv_.page(write.block));
+  for (const auto &[block, _] : restores_)
+    pages.push_back(kv_.page(block));
+  return pages;
 }
 
 void Cache::followMoves(const KvPageMoves &moves) {
@@ -1723,10 +1747,13 @@ bool Cache::transfersInFlight() const noexcept {
   return transfersInFlight(Walk{.scope = {.upTo = ReclaimClass::InUse}});
 }
 
+bool Cache::writesInFlight() const noexcept { return !writes_.empty() || states_.writing(); }
+
 bool Cache::transfersInFlight(const Walk &walk) const noexcept {
   // A write counts by what its landing frees: a page written through or
-  // copied ahead returns something only where it spills once its copy lands
-  // or, copied ahead, where the walk then frees its block through the copy.
+  // copied ahead returns something only where, under --kv-spill always, it
+  // spills once its copy lands, or where the walk then frees its block
+  // through the copy.
   return !restores_.empty() || writes(WriteClass::Reclaim) || copyAheadReturns(walk) || states_.writing() ||
          spillingWrites();
 }
@@ -1764,7 +1791,7 @@ bool Cache::copyAheadReturns(const Write &write, const Walk &walk, ReclaimClass 
   // Its block, idle once the copy lands, is in the walk's reach as
   // KvCache::pageReach counts an idle page.
   const KvCache::Keeps stays = KvCache::keepBit(KvCache::Keep::Busy) | keptChains(walk, upTo);
-  return write.write == WriteClass::Persist && !(kv_.keeps(write.block) & stays) &&
+  return write.write != WriteClass::Reclaim && !(kv_.keeps(write.block) & stays) &&
          !(walk.reused && walk.reused->holds(write.block));
 }
 
@@ -1774,9 +1801,9 @@ bool Cache::copyAheadReturns(const Walk &walk) const noexcept {
 }
 
 uint32_t Cache::spillingWrites() const noexcept {
-  // A page a Spill request holds frees once its copy lands, written through
-  // or copied ahead, when it may spill then and an Index page is there to
-  // take its index.
+  // Under --kv-spill always a page a Spill request holds frees once its
+  // copy lands, written through or copied ahead, when it may spill then and
+  // an Index page is there to take its index.
   if (!spill_)
     return 0;
   const auto spillable = std::ranges::count_if(writes_, [&](const Write &write) { return spillsOnLanding(write); });
@@ -1785,11 +1812,13 @@ uint32_t Cache::spillingWrites() const noexcept {
 
 bool Cache::spillsOnLanding(const Write &write) const {
   // pendingPages counts every demotion already (writes(Reclaim)).
-  return write.write != WriteClass::Reclaim && spillEligibility(write.block) == Eligibility::Eligible;
+  return spill_->always && write.write != WriteClass::Reclaim &&
+         spillEligibility(write.block) == Eligibility::Eligible;
 }
 
 // Spilling: commitments of quota, write-through of Spill requests' pages,
-// and their moves to the index form once their copies landed.
+// and their moves to the index form as a claim releases them, or under
+// --kv-spill always once their copies landed.
 
 uint64_t Cache::spillRoom() const noexcept {
   if (!spill_)
@@ -1818,13 +1847,10 @@ bool Cache::convertToSpill(uint64_t requestId, uint32_t pages) {
   active.spillOrder = ++spillSequence_;
   oweCopies(active, active.cachedBlocks);
   // The blocks it shares with Spill requests may spill now, and its own
-  // writes start at once: what lands frees pages its retry waits for
-  // (pendingPages). Its blocks whose copies landed before, as a chain it
-  // restored has them, spill into free Index pages at once, whose Full
-  // pages the retry takes.
+  // writes start at once: its retry releases what lands, and its blocks
+  // whose copies landed before, as a chain it restored has them, at once.
   rescanSpills();
   static_cast<void>(writeThrough());
-  static_cast<void>(moveLandedPages(std::nullopt));
   return true;
 }
 
@@ -1838,12 +1864,9 @@ bool Cache::holdsCopy(const Request &active, uint32_t index) const {
 bool Cache::restoreTakesQuota(std::span<const uint64_t> chain) const {
   if (!spill_)
     return false;
-  for (const uint64_t block : chain) {
-    if (!kv_.matchable(block))
-      return false;
+  for (const uint64_t block : chain)
     if (takesQuota(block))
       return true;
-  }
   return false;
 }
 
@@ -1920,8 +1943,9 @@ uint32_t Cache::writeThrough() {
 bool Cache::writeThrough(Request &active, uint32_t &started) {
   while (!active.owedCopies.empty()) {
     const uint64_t block = active.owedCopies.front();
-    // Another request's write, or a restore, gave it a copy meanwhile.
-    if (kv_.kvCopied(block)) {
+    // Another request's write, or a restore, gave it a copy meanwhile, or
+    // its restore failed and its page holds nothing to write.
+    if (kv_.kvCopied(block) || !kv_.matchable(block)) {
       active.owedCopies.pop_front();
       returnCommitment(active, 1);
       continue;
@@ -1959,22 +1983,24 @@ bool Cache::writeThrough(Request &active, uint32_t &started) {
   return true;
 }
 
-Cache::Eligibility Cache::spillEligibility(uint64_t block) const {
+Cache::Eligibility Cache::spillEligibility(uint64_t block, const ReleaseRule &rule) const {
   const uint32_t index = kv_.chainLength(block) - 1;
   if (index < spill_->densePages)
     return Eligibility::KeptFull;
   bool held = false;
-  for (const auto &[_, holder] : requests_) {
+  for (const auto &[id, holder] : requests_) {
     if (holder.cachedBlocks.size() <= index || holder.cachedBlocks[index] != block)
       continue;
     if (holder.mode != KvMode::Spill)
       return Eligibility::KeptFull;
-    if (index + spill_->windowPages >= holder.cachedBlocks.size())
+    if (index + spill_->windowPages >= holder.cachedBlocks.size() || (rule.takesFrom && !rule.takesFrom(id)))
       return Eligibility::Later;
     held = true;
   }
   // Nothing frees a page no request holds: it stays a cached Full page.
-  return held ? Eligibility::Eligible : Eligibility::KeptFull;
+  if (!held)
+    return Eligibility::KeptFull;
+  return index < rule.kept.size() && rule.kept[index] == block ? Eligibility::Later : Eligibility::Eligible;
 }
 
 void Cache::rescanSpills() noexcept {
@@ -1982,89 +2008,268 @@ void Cache::rescanSpills() noexcept {
     active.spillScan = 0;
 }
 
-TokenAdmission Cache::spillWritten(SpilledExtents extents) { return moveLandedPages(extents); }
-
-TokenAdmission Cache::moveLandedPages(std::optional<SpilledExtents> extents) {
+TokenAdmission Cache::spillWritten(SpilledExtents extents, const std::function<void(uint64_t)> &funds) {
   if (!spill_)
     return {};
-  std::vector<uint32_t> pages;
-  for (auto &[_, active] : requests_) {
-    if (active.mode != KvMode::Spill)
+  // Under --kv-spill always the pages whose copies landed move now.
+  // Otherwise a lane's pages stay Full until a claim releases them
+  // (releasePages), and only the runway refills.
+  return moveLandedPages([this] { return spill_->always ? landedPages() : std::vector<uint32_t>{}; }, extents,
+                         funds);
+}
+
+void Cache::forReleasable(const Request &active, const ReleaseRule &rule, const ReleaseCount &count,
+                          const std::function<bool(uint32_t, uint64_t, bool)> &each) const {
+  if (!spill_ || active.mode != KvMode::Spill)
+    return;
+  const auto blocks = static_cast<uint32_t>(active.cachedBlocks.size());
+  const uint32_t end = blocks > spill_->windowPages ? blocks - spill_->windowPages : 0;
+  // A copy owed lands only while the SSD cache writes Spill requests'
+  // copies: with none in flight the tier's share, the quota or the volume
+  // holds it back.
+  const bool writing = writes(WriteClass::Spill) != 0;
+  for (uint32_t index = std::max(active.spillScan, spill_->densePages); index < end; ++index) {
+    const uint32_t page = active.pages[index];
+    const uint64_t block = active.cachedBlocks[index];
+    if (pool_.form(page) != kv::PageForm::Full || kv_.page(block) != page || count.blocks.contains(block) ||
+        spillEligibility(block, rule) != Eligibility::Eligible)
       continue;
-    const auto blocks = static_cast<uint32_t>(active.cachedBlocks.size());
-    const uint32_t end = blocks > spill_->windowPages ? blocks - spill_->windowPages : 0;
-    // The scan's mark passes what is spilled or kept Full, and stops at the
-    // first page that may spill later. A page waits for its own copy to
-    // land: one being written, or whose block has none of its own, as a
-    // block recomputed over another conversation's copy (KvCache::insert)
-    // until its rewrite lands. The pages past it whose copies landed, as a
-    // chain's persisted points have them, spill now.
-    bool settled = true;
-    for (uint32_t index = std::max(active.spillScan, spill_->densePages); index < end; ++index) {
-      const uint32_t page = active.pages[index];
-      const uint64_t block = active.cachedBlocks[index];
-      // A writer that kept a page of its own beside its block's restore
-      // keeps it Full.
-      Eligibility eligibility = Eligibility::KeptFull;
-      if (pool_.form(page) == kv::PageForm::Full && kv_.page(block) == page)
-        eligibility = kv_.kvCopied(block) && kv_.transfer(block) == KvCache::Transfer::None
-                          ? spillEligibility(block)
-                          : Eligibility::Later;
-      if (eligibility == Eligibility::Eligible)
-        pages.push_back(page);
-      settled = settled && eligibility == Eligibility::KeptFull;
-      if (settled)
-        active.spillScan = index + 1;
-    }
+    const KvCache::Transfer transfer = kv_.transfer(block);
+    const bool clean = kv_.kvCopied(block) && transfer == KvCache::Transfer::None;
+    if (!clean && transfer != KvCache::Transfer::Draining && !(writing && transfer == KvCache::Transfer::None))
+      continue;
+    if (!each(index, block, clean))
+      return;
   }
+}
+
+std::vector<uint64_t> Cache::holdersAt(uint32_t index, uint64_t block) const {
+  std::vector<uint64_t> holders;
+  for (const auto &[id, holder] : requests_)
+    if (holder.cachedBlocks.size() > index && holder.cachedBlocks[index] == block)
+      holders.push_back(id);
+  return holders;
+}
+
+Cache::ReleasablePages Cache::releasablePages(uint64_t requestId, const ReleaseRule &rule,
+                                              const ReleaseCount &count) const {
+  ReleasablePages result;
+  forReleasable(request(requestId), rule, count, [&](uint32_t index, uint64_t block, bool clean) {
+    if (!result.clean && !result.landing)
+      for (const uint64_t holder : holdersAt(index, block))
+        if (!count.holders.contains(holder))
+          result.holders.push_back(holder);
+    ++(clean ? result.clean : result.landing);
+    return true;
+  });
+  return result;
+}
+
+void Cache::countRelease(uint64_t requestId, const ReleaseMoves &moves, bool landing, const ReleaseRule &rule,
+                         ReleaseCount &count) const {
+  uint32_t counted = 0;
+  forReleasable(request(requestId), rule, count, [&](uint32_t index, uint64_t block, bool clean) {
+    if (counted == moves.pages)
+      return false;
+    if (!clean && !landing)
+      return true;
+    if (!counted++)
+      for (const uint64_t holder : holdersAt(index, block))
+        count.holders.insert(holder);
+    count.blocks.insert(block);
+    return true;
+  });
+  // The pages its moves free lie beside the next release's moves.
+  count.beside += moves.pages;
+  count.extents += moves.extents;
+}
+
+uint32_t Cache::releaseBeside(const VictimQuery &query) const {
+  constexpr kv::PageForm full = kv::PageForm::Full;
+  if (!spill_ || spill_->always)
+    return 0;
+  const uint32_t extent = pool_.extentPages();
+  const uint32_t empty = pool_.emptyExtents(full) * extent;
+  const uint32_t reusable = pool_.reusablePages(full);
+  if (reusable - std::min(reusable, empty) >= extent)
+    return 0;
+  const uint32_t free = pool_.freePageCount(full);
+  const uint32_t scattered = free - std::min(free, empty);
+  return scattered - std::min(scattered, walkFor(query).keptPages[static_cast<size_t>(full)]);
+}
+
+Cache::ReleaseMoves Cache::releaseMoves(uint32_t pages, bool landing, const ReleaseCount &count) const {
+  const uint32_t extent = pool_.extentPages();
+  // The extents they complete beside the free pages, as reclaims and landings
+  // count them; no Full runway stays (SpilledExtents::Released).
+  uint32_t extents = completedExtents(count.beside, pages, extent, false);
+  if (!landing) {
+    const uint32_t unpinned = pool_.unfixedExtents(pagesInTransfer(), kv::PageForm::Full);
+    extents = std::min(extents, unpinned - std::min(unpinned, count.extents));
+  }
+  const uint32_t moves = std::min(pages, extents * extent);
+  const uint32_t firstRunway = std::min(moves, pool_.freePageCount(kv::PageForm::Index));
+  if (!moves || firstRunway + pool_.freePageCount(kv::PageForm::Full) < extent)
+    return {};
+  return {.pages = moves, .extents = extents};
+}
+
+uint32_t Cache::inPlaceIndexPages(uint32_t pages) const noexcept {
+  const uint64_t besideRunway = uint64_t{pages} + pool_.extentPages();
+  return pages && pool_.freePageCount(kv::PageForm::Index) >= besideRunway ? static_cast<uint32_t>(besideRunway) : 0;
+}
+
+uint32_t Cache::inPlaceMoves(uint32_t pages, uint32_t clean) const {
+  const uint32_t extent = pool_.extentPages();
+  if (!pages || pages > clean)
+    return 0;
+  if (inPlaceIndexPages(pages))
+    return pages;
+  return clean - pages >= extent && releaseMoves(extent, false).pages ? pages + extent : 0;
+}
+
+uint32_t Cache::releasePages(uint64_t requestId, uint32_t pages, bool inPlace, const ReleaseRule &rule,
+                             const std::function<void(uint64_t)> &funds, uint32_t beside) {
+  Request &active = request(requestId);
+  if (!spill_ || active.mode != KvMode::Spill || !pages)
+    return 0;
+  // A need of bytes takes whole extents, which only the Full pages left
+  // gathered in the fewest extents leave (SpilledExtents::Released), and
+  // only those compaction can empty, whose bytes pay for the next runway:
+  // past them the moves would cost the lane the reads of its blocks and
+  // free nothing (releaseMoves). In place an extent more leaves so, past
+  // the claim's pages (inPlaceMoves); alone they move only into the free
+  // Index pages its reclaims kept (walkFor), gathering nothing it takes.
+  const auto found =
+      static_cast<uint32_t>(landedPages(active, pages + (inPlace ? pool_.extentPages() : 0), rule).size());
+  const uint32_t wanted =
+      inPlace ? inPlaceMoves(pages, found) : releaseMoves(found, false, {.beside = beside}).pages;
+  if (!wanted)
+    return 0;
+  const uint32_t claimed = inPlace ? pool_.freePageCount(kv::PageForm::Full) + pages : 0;
+  const uint64_t moves = spilled_.spillMoves;
+  const uint64_t before = pool_.allocatedBytes();
+  static_cast<void>(moveLandedPages(
+      [&] { return landedPages(active, wanted - static_cast<uint32_t>(spilled_.spillMoves - moves), rule); },
+      inPlace && wanted == pages ? std::nullopt : std::optional(SpilledExtents::Released), funds, claimed));
+  const auto moved = static_cast<uint32_t>(spilled_.spillMoves - moves);
+  // A release counts where it freed what it was for: Full pages in place,
+  // or bytes.
+  if (moved && (inPlace || pool_.allocatedBytes() < before)) {
+    ++spilled_.releases;
+    spilled_.releasedPages += moved;
+  }
+  return moved;
+}
+
+std::vector<uint32_t> Cache::landedPages() {
+  std::vector<uint32_t> pages;
+  for (auto &[_, active] : requests_)
+    if (active.mode == KvMode::Spill) {
+      const std::vector<uint32_t> landed = landedPages(active, std::numeric_limits<uint32_t>::max(), {});
+      pages.insert(pages.end(), landed.begin(), landed.end());
+    }
   // Requests on one prefix find its pages each.
   std::sort(pages.begin(), pages.end());
   pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
-  // Free Index pages first, the runway's among them: a spill never waits
-  // for an allocation. The rest, if it may allocate, asks for extents of
-  // the index form.
-  const auto now = std::min<size_t>(pages.size(), pool_.freePageCount(kv::PageForm::Index));
-  if (!extents)
-    pages.resize(now);
-  for (const std::span<const uint32_t> part :
-       {std::span<const uint32_t>(pages).first(now), std::span<const uint32_t>(pages).subspan(now)}) {
-    if (part.empty())
-      continue;
-    const KvPageMoveResult moved = pool_.movePages(part, kv::PageForm::Index);
-    if (!moved.granted())
-      return {TokenAdmissionFailure::Denied, static_cast<uint32_t>(part.size()),
-              pool_.freePageCount(kv::PageForm::Index), moved.failure, kv::PageForm::Index};
-    followMoves(moved.moves);
-    spilled_.spillMoves += part.size();
-  }
-  if (!extents)
-    return {};
-  // Then the runway, an extent's free Index pages, is refilled: the next
-  // spill frees Full pages without an allocation, at the memory wall too,
-  // where a converted request's pages spill through it (pendingPages).
-  const uint32_t free = pool_.freePageCount(kv::PageForm::Index);
-  if (free < pool_.extentPages()) {
-    if (const metal::AllocationResult runway = pool_.fillRunway(kv::PageForm::Index); !runway)
-      return {TokenAdmissionFailure::Denied, pool_.extentPages() - free, free, runway.failure,
-              kv::PageForm::Index};
-  }
-  // The memory the moves freed leaves with the Full extents they emptied,
-  // once the runway stands: at the wall, which refuses it, they stay, and
-  // the requests grow into their pages. Released, the Full pages left first
-  // gather in the fewest extents.
-  if (!pages.empty()) {
-    if (*extents == SpilledExtents::Released)
-      while (compactExtent(kv::PageForm::Full)) {
-      }
-    static_cast<void>(pool_.reclaimEmptyExtents(*extents == SpilledExtents::KeepRunway,
-                                                std::numeric_limits<uint32_t>::max(), kv::PageForm::Full));
-  }
-  return {};
+  return pages;
 }
+
+std::vector<uint32_t> Cache::landedPages(Request &active, uint32_t most, const ReleaseRule &rule) {
+  std::vector<uint32_t> pages;
+  const auto blocks = static_cast<uint32_t>(active.cachedBlocks.size());
+  const uint32_t end = blocks > spill_->windowPages ? blocks - spill_->windowPages : 0;
+  // The scan's mark passes what is spilled or kept Full, and stops at the
+  // first page that may spill later. A page waits for its own copy to
+  // land: one being written, or whose block has none of its own, as a
+  // block recomputed over another conversation's copy (KvCache::insert)
+  // until its rewrite lands. The pages past it whose copies landed, as a
+  // chain's persisted points have them, are those a release, or under
+  // --kv-spill always the landing, moves.
+  bool settled = true;
+  for (uint32_t index = std::max(active.spillScan, spill_->densePages); index < end && pages.size() < most;
+       ++index) {
+    const uint32_t page = active.pages[index];
+    const uint64_t block = active.cachedBlocks[index];
+    // A writer that kept a page of its own beside its block's restore
+    // keeps it Full.
+    Eligibility eligibility = Eligibility::KeptFull;
+    if (pool_.form(page) == kv::PageForm::Full && kv_.page(block) == page)
+      eligibility = kv_.kvCopied(block) && kv_.transfer(block) == KvCache::Transfer::None
+                        ? spillEligibility(block, rule)
+                        : Eligibility::Later;
+    if (eligibility == Eligibility::Eligible)
+      pages.push_back(page);
+    settled = settled && eligibility == Eligibility::KeptFull;
+    if (settled)
+      active.spillScan = index + 1;
+  }
+  return pages;
+}
+
+TokenAdmission Cache::moveLandedPages(const std::function<std::vector<uint32_t>()> &landed,
+                                      std::optional<SpilledExtents> extents,
+                                      const std::function<void(uint64_t)> &funds, uint32_t claimed) {
+  // Free Index pages take the landed pages first, the runway's among them,
+  // so a spill never waits for an allocation; without `extents` the rest
+  // stays Full. With them the pages move a runway at a time: the Full
+  // extents each runway's moves empty leave as `extents` says (released,
+  // the Full pages left first gather in the fewest extents), past the
+  // `claimed` Full pages a claim takes in place, and their bytes pay for the
+  // Index extent the runway refills with next (`funds`): where they cover
+  // it, it passes the engine's limit and the host, under critical pressure
+  // too, since on Qwen3.8-Flash-Next a Full extent returns 17 times an Index
+  // one's bytes. The pages that wait are
+  // found again for each runway, since gathering moves them. The runway then
+  // stands for the next spill, at the memory wall too, where a lane's
+  // release moves its pages through it.
+  for (std::vector<uint32_t> pages = landed();; pages = landed()) {
+    const size_t count = std::min<size_t>(pages.size(), pool_.freePageCount(kv::PageForm::Index));
+    if (count) {
+      followMoves(pool_.movePages(std::span<const uint32_t>(pages).first(count), kv::PageForm::Index).moves);
+      spilled_.spillMoves += count;
+    }
+    if (!extents)
+      return {};
+    if (!pages.empty()) {
+      if (*extents == SpilledExtents::Released)
+        while (compactExtent(kv::PageForm::Full)) {
+        }
+      // The pages that wait free theirs too.
+      const uint64_t freeing = uint64_t{pool_.freePageCount(kv::PageForm::Full)} + pages.size() - count;
+      const auto past = static_cast<uint32_t>(freeing > claimed ? (freeing - claimed) / pool_.extentPages() : 0);
+      const uint64_t released =
+          pool_.reclaimEmptyExtents(*extents == SpilledExtents::KeepRunway, past, kv::PageForm::Full);
+      if (released && funds)
+        funds(released);
+    }
+    const bool waiting = count < pages.size();
+    const uint32_t free = pool_.freePageCount(kv::PageForm::Index);
+    if (!waiting && free >= pool_.extentPages())
+      return {};
+    if (const metal::AllocationResult runway = pool_.fillRunway(kv::PageForm::Index); !runway)
+      return {TokenAdmissionFailure::Denied,
+              waiting ? static_cast<uint32_t>(pages.size() - count) : pool_.extentPages() - free, free,
+              runway.failure, kv::PageForm::Index};
+  }
+}
+
+bool Cache::owesCopies(uint64_t requestId) const { return !request(requestId).owedCopies.empty(); }
 
 uint32_t Cache::indexPages(uint64_t requestId) const { return request(requestId).indexPages; }
 
 bool Cache::holdsIndexPages(uint64_t requestId) const { return indexPages(requestId) != 0; }
+
+bool Cache::restoresIndexPages(std::span<const uint64_t> chain) const {
+  if (!spill_)
+    return false;
+  for (uint32_t position = 0; position < chain.size(); ++position) {
+    const uint32_t page = kv_.page(chain[position]);
+    if (page == KvCache::noPage ? position >= spill_->densePages : pool_.form(page) == kv::PageForm::Index)
+      return true;
+  }
+  return false;
+}
 
 // Trimming: the pages every window has passed give up their windowed
 // layers' K/V between commands.
@@ -2262,14 +2467,20 @@ void Cache::checkInvariants() const {
     }
     check(active.mode == KvMode::Spill || (!active.committedPages && active.owedCopies.empty()),
           "only a Spill request commits quota or owes copies");
-    // Each block on its own page without a copy of its own is owed: its
-    // page spills once that copy lands.
+    // Each block on its own page without a copy of its own is owed: a
+    // release takes its page once that copy lands.
     if (active.mode == KvMode::Spill) {
       const std::unordered_set<uint64_t> owed(active.owedCopies.begin(), active.owedCopies.end());
       for (uint32_t index = 0; index < active.cachedBlocks.size(); ++index) {
         const uint64_t block = active.cachedBlocks[index];
         check(kv_.page(block) != active.pages[index] || kv_.kvCopied(block) || owed.contains(block),
               "a Spill request owes the copy of each block on its pages without one");
+        // A release takes the oldest pages from the scan's mark on
+        // (landedPages): the mark passes only what is spilled or kept Full.
+        check(index >= active.spillScan || index < spill_->densePages ||
+                  pool_.form(active.pages[index]) != kv::PageForm::Full || kv_.page(block) != active.pages[index] ||
+                  spillEligibility(block) != Eligibility::Eligible,
+              "a Spill request's scan mark passed a page a release takes");
       }
     }
     committed += active.committedPages;
@@ -2723,9 +2934,9 @@ bool Cache::pollTierTransfers() {
     // drew the slot on its commitment. It commits a slot for it once more,
     // which the copy it writes draws or the copy another writes returns, as
     // when it published the block; one that still owes it keeps the slot it
-    // committed. Its page spills once that copy lands. A writer that kept a
-    // page of its own beside the block never spills that page, and owes
-    // nothing.
+    // committed. A release takes its page once that copy lands. A writer
+    // that kept a page of its own beside the block never spills that page,
+    // and owes nothing.
     if (!written) {
       kv_.setSlot(block, nullptr);
       const uint32_t index = kv_.chainLength(block) - 1;
@@ -2814,7 +3025,10 @@ PersistStatus Cache::persist(uint64_t block) {
         continue;
       }
       persisting_.landed = std::min(persisting_.landed, index);
-      // Only a resident block lacks a disk copy.
+      // Only a resident block lacks a disk copy. One whose restore failed
+      // holds nothing to write, and no lookup reaches the point past it.
+      if (!kv_.matchable(id))
+        return settled(PersistStatus::Unneeded);
       if (yields || !tier_->canDemote(WriteClass::Persist))
         return settled(inFlight ? PersistStatus::Started : PersistStatus::Busy);
       std::shared_ptr<KvDiskSlot> slot = persistent_

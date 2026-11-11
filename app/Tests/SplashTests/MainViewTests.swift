@@ -53,9 +53,9 @@ struct MainViewTests {
 
     /// The Server button names the model while it starts, runs and answers, and says Server
     /// while none runs: its title holds no step or speed, so its width, and the place of the
-    /// toolbar's buttons beside it, stay while the server starts and answers. An engine stopped
-    /// under a server that runs on marks it failed, and the app's status says it no longer
-    /// responds.
+    /// toolbar's buttons beside it, stay while the server starts and answers. A server that
+    /// stops restarting its engine exits, failed in the words of its record, and the app's
+    /// status says it ran into a problem.
     @Test func theServerButtonSaysWhatTheServerDoes() async throws {
         let server = try FakeServer()
         defer { server.remove() }
@@ -80,20 +80,19 @@ struct MainViewTests {
         #expect(state.serverTitle == name)
         server.signal("broken")
         try await waitFor(state.server.phase == .failed("x"))
-        #expect(state.server.running)
+        #expect(!state.server.running)
         #expect(state.serverStatus.look == .failed)
-        #expect(state.status == "\(state.displayName(of: model)) · Not responding")
+        #expect(state.status == "\(state.displayName(of: model)) · Ran into a problem")
         #expect(state.serverTitle == "Server")
-        state.server.stop()
-        #expect(state.serverTitle == name)
-        try await waitFor(state.server.phase == .stopped)
+        state.server.dismissFailure()
+        #expect(state.server.phase == .stopped)
         #expect(state.serverTitle == "Server")
     }
 }
 
 /// A runtime whose launcher starts as `splash serve` does, one step at a time as the test signals
-/// it, then answers as a ready server; its status reports a request running, then its engine
-/// stopped, once signalled so.
+/// it, then answers as a ready server; its status reports a request running, and once signalled
+/// so it stops restarting its engine as a server does: its record says why, and it exits.
 @MainActor
 private final class FakeServer {
     let root: URL
