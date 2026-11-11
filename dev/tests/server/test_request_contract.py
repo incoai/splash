@@ -352,6 +352,69 @@ class RequestContractTests(HarnessTestCase):
         handler.connection = accepted
         self.assertTrue(handler.client_disconnected())
 
+    def test_connections_probe_a_silent_client(self):
+        listener = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(listener.close)
+        client = socket.create_connection(listener.getsockname())
+        self.addCleanup(client.close)
+        accepted, _ = listener.accept()
+        self.addCleanup(accepted.close)
+        handler = object.__new__(api.FrontendHandler)
+        handler.request = accepted
+        handler.setup()
+        self.addCleanup(handler.rfile.close)
+        self.addCleanup(handler.wfile.close)
+        self.assertTrue(accepted.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE))
+        # A client that stops answering is dropped 60 s after its last data.
+        option = partial(accepted.getsockopt, socket.IPPROTO_TCP)
+        self.assertEqual(
+            option(socket.TCP_KEEPALIVE)
+            + option(socket.TCP_KEEPINTVL) * option(socket.TCP_KEEPCNT),
+            60,
+        )
+
+    def test_a_client_reset_before_it_is_served_ends_as_a_reset(self):
+        listener = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(listener.close)
+        client = socket.create_connection(listener.getsockname())
+        accepted, _ = listener.accept()
+        self.addCleanup(accepted.close)
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        client.close()
+        self.assertTrue(select.select([accepted], [], [], 2)[0])
+        handler = object.__new__(api.FrontendHandler)
+        handler.request = accepted
+        # The server ends a reset connection without logging it.
+        with self.assertRaises(ConnectionResetError):
+            handler.setup()
+
+    def test_a_socket_option_refused_for_another_reason_is_reported(self):
+        handler = object.__new__(api.FrontendHandler)
+        refused = OSError(errno.ENOPROTOOPT, "Protocol not available")
+        handler.request = mock.Mock(setsockopt=mock.Mock(side_effect=refused))
+        # Only a client's reset ends a connection quietly.
+        with self.assertRaises(OSError) as raised:
+            handler.setup()
+        self.assertNotIsInstance(raised.exception, ConnectionResetError)
+        self.assertEqual(raised.exception.errno, errno.ENOPROTOOPT)
+
+    def test_a_client_keepalive_found_gone_reads_as_disconnected(self):
+        local, peer = socket.socketpair()
+        self.addCleanup(local.close)
+        self.addCleanup(peer.close)
+        peer.sendall(b"x")
+
+        class TimedOut:
+            def fileno(self):
+                return local.fileno()
+
+            def recv(self, *_):
+                raise TimeoutError(errno.ETIMEDOUT, "Operation timed out")
+
+        handler = object.__new__(api.FrontendHandler)
+        handler.connection = TimedOut()
+        self.assertTrue(handler.client_disconnected())
+
     def test_unsupported_http_version_is_rejected_before_header_validation(self):
         handler = object.__new__(api.FrontendHandler)
         handler.server = mock.Mock()
@@ -482,7 +545,7 @@ class RequestContractTests(HarnessTestCase):
 
     def test_missing_native_executable_has_upgrade_guidance(self):
         with self.assertRaisesRegex(
-            runtime.EngineUnhealthy, "restart Splash from the current installation"
+            runtime.EngineUnhealthy, "Start Splash again from the current installation"
         ):
             runtime.MultiplexedRuntime(
                 process_factory=mock.Mock(side_effect=FileNotFoundError()),

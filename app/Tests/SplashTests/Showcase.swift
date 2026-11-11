@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import PDFKit
 import Testing
 
 @testable import Splash
@@ -23,7 +24,7 @@ enum Showcase {
         ChatMessage(role: .assistant, text: reply,
                     reasoning: "The user wants an overview.\nI should cover installing, picking a model and chatting.\nA table compares the sizes.",
                     model: "mlx-community/Qwen3-30B-A3B-4bit", tokensPerSecond: 38.4, thinkingTime: 3.2, reasoningTokens: 120),
-        ChatMessage(role: .user, text: "What’s in this picture?", images: [picture]),
+        ChatMessage(role: .user, text: "What’s in this picture?", attachments: [pictureAttachment]),
         ChatMessage(role: .assistant, text: "A gradient from teal to blue, square, with nothing else in it.",
                     model: "mlx-community/Qwen3-30B-A3B-4bit", tokensPerSecond: 41,
                     error: "The reply reached the end of the model’s context."),
@@ -75,6 +76,29 @@ enum Showcase {
         """
 
     /// A picture the user attached: a square gradient, as PNG.
+    /// The picture attached, its file in `attachments`.
+    static let pictureAttachment = Attachment.image(picture)
+
+    /// The showcase's attachments: a folder of the process's own, with the picture's file.
+    static let attachments: URL = {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-showcase-\(ProcessInfo.processInfo.processIdentifier)")
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? picture.write(to: folder.appending(path: pictureAttachment.file))
+        return folder
+    }()
+
+    /// A PDF of `pages` pages of the picture, written at `url`.
+    static func pdf(pages: Int, at url: URL) throws -> URL {
+        let document = PDFDocument()
+        for index in 0..<pages {
+            let image = try #require(NSImage(data: picture))
+            document.insert(try #require(PDFPage(image: image)), at: index)
+        }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try #require(document.write(to: url))
+        return url
+    }
+
     static let picture: Data = {
         let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 240, pixelsHigh: 240, bitsPerSample: 8,
                                       samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,

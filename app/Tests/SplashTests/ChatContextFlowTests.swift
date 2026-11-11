@@ -21,13 +21,13 @@ struct ChatContextFlowTests {
                 we should implement next.
                 """
             state.draft.attach([try #require(NSImage(data: Showcase.picture))])
-            try await waitFor(!state.draft.images.isEmpty)
-            let text = state.draft.text, images = state.draft.images
+            try await waitFor(!state.draft.attachments.isEmpty)
+            let text = state.draft.text, attachments = state.draft.attachments
             let usage = try await count(state)
             #expect(usage.level == .full && state.contextUsage == usage)
             #expect(!state.canSendDraft && state.overflow == usage)
             state.sendDraft()
-            #expect(state.draft.text == text && state.draft.images == images)
+            #expect(state.draft.text == text && state.draft.attachments == attachments)
             #expect(state.chats.current?.messages == fixture.history.messages)
             #expect(try fixture.sent().isEmpty)
             await picture("chat-context-full", state: state)
@@ -108,7 +108,7 @@ struct ChatContextFlowTests {
             // Return again once the image shows, if the first one waited for it.
             if !state.draft.isEmpty {
                 #expect(!state.canSendDraft)
-                try await waitFor(!state.draft.images.isEmpty)
+                try await waitFor(!state.draft.attachments.isEmpty)
                 state.sendDraft()
             }
             try await waitFor(state.chats.streaming == nil && !((try? fixture.sent()) ?? []).isEmpty)
@@ -116,6 +116,108 @@ struct ChatContextFlowTests {
             let parts = try #require(sent.last?.last?["content"] as? [[String: Any]])
             #expect(parts.map { $0["type"] as? String } == ["image_url", "text"])
             #expect(state.draft.isEmpty)
+        }
+    }
+
+    /// A PDF attaches as its file, with its name and pages, and goes to the model as a file part;
+    /// one over the model's pages stays in the draft, which says why.
+    @Test func aPDFGoesAsAFileWithinTheModelsLimits() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            state.chats.newChat()
+            #expect(state.server.limits?.pdf_pages == 3)
+            let folder = fixture.root.appending(path: "documents")
+            let long = try Showcase.pdf(pages: 4, at: folder.appending(path: "Long.pdf"))
+            let plan = try Showcase.pdf(pages: 2, at: folder.appending(path: "Plan.pdf"))
+            state.draft.attach(pdfs: [long])
+            try await waitFor(!state.draft.attachments.isEmpty)
+            #expect(state.draft.attachments.map(\.pages) == [4])
+            #expect(state.attachmentProblem == "Long.pdf has more than the model’s 3 pages" && !state.canSendDraft)
+            state.sendDraft()
+            #expect(state.draft.attachments.count == 1 && state.chats.streaming == nil)
+            state.draft.remove(at: 0)
+            state.draft.attach(pdfs: [plan])
+            try await waitFor(!state.draft.attachments.isEmpty)
+            let attachment = state.draft.attachments[0]
+            #expect(attachment.kind == .pdf && attachment.name == "Plan.pdf" && attachment.pages == 2)
+            #expect(try Data(contentsOf: state.chats.attachments.appending(path: attachment.file)) == Data(contentsOf: plan))
+            #expect(state.canSendDraft)
+            state.sendDraft()
+            try await waitFor(state.chats.streaming == nil && !((try? fixture.sent()) ?? []).isEmpty)
+            let parts = try #require(try fixture.sent().last?.last?["content"] as? [[String: Any]])
+            #expect(parts.map { $0["type"] as? String } == ["file", "text"])
+            #expect(parts[0]["file"] as? [String: String]
+                == ["filename": "Plan.pdf", "file_data": "data:application/pdf;base64,\(try Data(contentsOf: plan).base64EncodedString())"])
+            #expect(state.chats.current?.messages.first?.attachments == [attachment])
+        }
+    }
+
+    /// A message the server refuses goes back to the composer, its attachments with it, and says
+    /// why until it is sent; the chat stays as it was, and a new one stays new.
+    @Test func aRefusedMessageGoesBackToTheComposer() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            state.chats.newChat()
+            state.draft.text = "Hello"
+            state.sendDraft()
+            // Once the model has titled it, which it does after the first exchange.
+            try await waitFor(state.chats.streaming == nil && state.chats.current?.title == "A Title")
+            let chat = try #require(state.chats.current)
+            state.draft.text = "refuse this"
+            state.draft.attach([try #require(NSImage(data: Showcase.picture))])
+            try await waitFor(!state.draft.attachments.isEmpty)
+            let attachments = state.draft.attachments
+            state.sendDraft()
+            #expect(state.draft.isEmpty)
+            try await waitFor(state.chats.streaming == nil && state.draft.notice != nil)
+            #expect(state.draft.text == "refuse this" && state.draft.attachments == attachments)
+            #expect(state.draft.thumbnails[attachments[0].id] != nil)
+            // About that chat, where alone the composer says it.
+            #expect(state.draft.notice == Draft.Notice(text: "Request body too large", conversation: chat.id))
+            #expect(state.chats.current == chat)
+            #expect(attachments.allSatisfy { FileManager.default.fileExists(atPath: state.chats.attachments.appending(path: $0.file).path) })
+            // In a new chat, which stays new: nothing kept of it, in the list or on disk.
+            state.chats.newChat()
+            let count = state.chats.conversations.count
+            state.sendDraft()
+            try await waitFor(state.chats.streaming == nil && state.draft.notice != nil)
+            #expect(state.draft.notice?.conversation == nil)
+            #expect(state.chats.conversations.count == count && state.chats.selection == nil)
+            #expect(state.draft.attachments == attachments)
+            state.chats.flush()
+            let written = try FileManager.default.contentsOfDirectory(at: fixture.root.appending(path: "chats"), includingPropertiesForKeys: nil)
+            #expect(written.filter { $0.pathExtension == "json" }.count == count)
+            // Sent once it can go, the note goes with it.
+            state.draft.text = "Then this"
+            state.sendDraft()
+            #expect(state.draft.notice == nil)
+            try await waitFor(state.chats.streaming == nil && state.chats.current?.messages.count == 2)
+            #expect(state.chats.current?.messages.first?.attachments == attachments)
+        }
+    }
+
+    /// A chat opened shows its last count at once, while its prompt is counted again, and one not
+    /// counted yet an empty ring: the composer's ring never goes as chats open. With the last
+    /// count of all alone, it went as each chat opened and came back, fading in, once counted.
+    @Test func theRingStaysAsChatsOpen() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            let saved = try await count(state)
+            state.chats.newChat()
+            state.draft.text = "Hello"
+            state.sendDraft()
+            try await waitFor(state.chats.streaming == nil && state.chats.current?.messages.count == 2)
+            let answered = try #require(state.chats.selection)
+            let usage = try await count(state)
+            #expect(usage != saved)
+            state.chats.selection = fixture.history.id
+            #expect(state.showsContext && state.contextUsage == saved)
+            state.chats.selection = answered
+            #expect(state.showsContext && state.contextUsage == usage)
+            // A chat not counted yet: its draft, in a new chat.
+            state.chats.newChat()
+            state.draft.text = "Plan a trip"
+            #expect(state.showsContext && state.contextUsage == nil)
         }
     }
 

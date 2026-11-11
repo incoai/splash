@@ -32,11 +32,11 @@ double median(const std::function<double()> &run) {
 
 } // namespace
 
-Measurement::Measurement(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers,
+Measurement::Measurement(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
                          const PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden,
                          std::function<bool()> interrupted)
     : backend_(backend), layers_(layers), ffn_(ffn), hidden_(hidden), interrupted_(std::move(interrupted)),
-      linear_(backend.capabilities()) {
+      linear_(linear) {
   if (const char *reason = AneFfn::unsupported(layers)) throw std::invalid_argument(reason);
   if (layers.size() < 2) throw std::invalid_argument("ANE FFN split timed on fewer than two layers");
   // Timing does not depend on the values, but on their being finite.
@@ -120,7 +120,7 @@ Timings Measurement::time() {
   timings.gpuAlone = layer(sampled, kCount, kRows);
   const auto measure = [&](double share) {
     const uint32_t aneUnits = nearestUnits(share, units);
-    AneFfn split(backend_, sampled, aneUnits, interrupted_, std::array{kRows});
+    AneFfn split(backend_, linear_, sampled, aneUnits, interrupted_, std::array{kRows});
     return Timing{static_cast<double>(aneUnits) / units, gpuPart(sampled, split),
                   layer(sampled, kCount, kRows, &split, timings.gpuAlone)};
   };

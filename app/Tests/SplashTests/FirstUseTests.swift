@@ -9,15 +9,17 @@ import Testing
 struct FirstUseTests {
     @Test func examplesFillAnEmptyDraftAndRequestFocus() {
         for example in ChatExample.allCases {
-            let draft = Draft()
+            let draft = Draft(files: FileManager.default.temporaryDirectory.appending(path: "splash-first-use-\(UUID())"))
             draft.suggest(example.text)
             #expect(draft.text == example.text && draft.focusRequests == 1)
-            #expect(!draft.isEmpty && draft.images.isEmpty)
+            #expect(!draft.isEmpty && draft.attachments.isEmpty)
         }
     }
 
     @Test func examplesLeaveExistingTextAndAttachmentsAlone() async throws {
-        let draft = Draft()
+        let files = FileManager.default.temporaryDirectory.appending(path: "splash-first-use-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: files) }
+        let draft = Draft(files: files)
         draft.text = "My unfinished message"
         draft.suggest(ChatExample.explain.text)
         #expect(draft.text == "My unfinished message" && draft.focusRequests == 0)
@@ -26,10 +28,10 @@ struct FirstUseTests {
         draft.suggest(ChatExample.write.text)
         #expect(draft.text.isEmpty && draft.focusRequests == 0)
         try await waitFor { draft.attaching == 0 }
-        let images = draft.images
+        let images = draft.attachments
         #expect(!images.isEmpty)
         draft.suggest(ChatExample.write.text)
-        #expect(draft.text.isEmpty && draft.images == images && draft.focusRequests == 0)
+        #expect(draft.text.isEmpty && draft.attachments == images && draft.focusRequests == 0)
     }
 
     @Test func aFailedStartDoesNotAdvertiseAHealthySetupStep() throws {

@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// The first conversation needs three steps; preparing a download or a model stays on its step.
-enum FirstUseStage: Equatable {
+enum FirstUseStage: Equatable, CaseIterable {
     case download, downloading, start, starting, chat
 
     var step: Int {
@@ -34,10 +34,31 @@ enum FirstUseStage: Equatable {
 }
 
 struct GettingStartedGuide: View {
-    let stage: FirstUseStage
+    let stage: FirstUseStage?
     private let steps = ["Download a model", "Start Model", "Open Chat"]
 
     var body: some View {
+        // Each stage keeps the same space, so a start changes the guide's
+        // words without moving or animating the model rows below it.
+        ZStack(alignment: .topLeading) {
+            ForEach(FirstUseStage.allCases, id: \.self) { candidate in
+                content(for: candidate)
+                    .opacity(candidate == stage ? 1 : 0)
+                    .accessibilityHidden(candidate != stage)
+            }
+            if stage == nil {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Set up your first chat").font(.title2.weight(.semibold)).foregroundStyle(.primary)
+                    Text("Use the details below to get your model ready, then open Chat.")
+                        .font(.callout).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .transaction { $0.animation = nil }
+    }
+
+    private func content(for stage: FirstUseStage) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(stage.title).font(.title2.weight(.semibold)).foregroundStyle(.primary)
             Text(stage.message).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)

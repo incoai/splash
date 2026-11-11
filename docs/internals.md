@@ -81,8 +81,8 @@ metadata derived from a GGUF; `families.py` each family's draft repository;
 which inspects them and publishes them as `upstream.py` does a repository's;
 and `models.py` model IDs, selections, the
 installation lock, the command line (`install/models.py --model ID
-prepare|verify|link`, where `link` prints the selection link) and running the
-engine's checks. Since the installer checks a model with the engine, a source
+prepare|verify|link|remove`, where `link` prints the selection link) and
+running the engine's checks. Since the installer checks a model with the engine, a source
 checkout builds the engine before it installs, as `make install` and the first
 `./splash serve` do, and a packaged install ships it. The assembly's
 `model.json` records the resolved sources and selected formats. The native
@@ -100,8 +100,27 @@ that commit and records it in `model.json`, so a repository update cannot mix
 files from different revisions. It pins those snapshots in the Hub cache
 (`refs/splash/<installation>/<commit>`), so pruning the cache cannot remove files
 an installed model links. Publishing a new assembly retires the installation's
-other pins, in the repositories it links and in those its predecessor linked,
-so pruning can free what no installation links any more.
+other pins, in the repositories it links and in those its predecessor linked;
+the assembly it replaces goes, at this publish or, if a server holds it, at the
+next publish or `remove`, with the files of its Hub snapshots no remaining
+assembly links, as for `remove`; a publish leaves whole a snapshot another tool
+has downloaded into, one holding a file no assembly links beyond the JSON
+metadata the installer reads.
+
+`remove` takes an installation away under the installation lock, refusing one
+a server holds; the model named alone takes every selection of it, Text only's
+and a start's own draft's included. Its selection link and pins go, then its
+assembly, which garbage collection finds unlinked and unheld, then the entries
+its record names in Hub snapshots that no remaining assembly links, the blobs
+those named once no snapshot names them, the references to a snapshot that
+went, and a repository folder left empty of all but the Hub's own. A snapshot
+pinned by an installation of another models root, which this root's records
+don't describe, keeps all its files. It reports
+`{"event": "removed", "bytes": FREED}` on stdout; it fails as `prepare` does
+until a link is gone, and a failure to free files after that is a warning.
+`prepare --json-progress` reports what it did last as
+`{"event": "prepared", "outcome": OUTCOME}`, `updated`, `up_to_date`,
+`unreachable` or `kept`.
 
 `hub.Repository.download` first removes the partial files
 (`<blob>.<random>.incomplete`) killed downloads left in the repository's blobs
@@ -225,16 +244,17 @@ instead of mixing two versions. A start logs `Weights loaded in N s.`; loading
 reads the sources at about the speed of the disk that holds them
 ([upstream loading](../dev/benchmarks/upstream-loading.md#loading-time)).
 
-At load time the engine validates the GGUF metadata, including the rotary
-embedding and norm epsilon the kernels assume (`rope.freq_base`,
-`rope.dimension_count`, which a Flint GGUF, whose RoPE rotates whole heads,
-need not state, `attention.layer_norm_rms_epsilon`, and no
-`rope.scaling.type` but `none`), and plans the `MDGG0001` layout. A Flint
-GGUF's family keys hold its window, leading dense layers, shared expert's
-slices, sigmoid router and normalized, unscaled routing weights
-(`expert_weights_scale` 1) and its two layer patterns to the family's, and
-a router bias (`ffn_exp_probs_b`), which its blocks would not add, is
-refused.
+At load time the engine validates the GGUF metadata, including the data
+alignment (`general.alignment`, a power of two of 8 or more, as the GGUF spec
+requires: the repack reads blocks as words) and the rotary embedding and norm
+epsilon the kernels assume (`rope.freq_base`, `rope.dimension_count`, which a
+Flint GGUF, whose RoPE rotates whole heads, need not state,
+`attention.layer_norm_rms_epsilon`, and no `rope.scaling.type` but `none`),
+and plans the `MDGG0001` layout. A Flint GGUF's family keys hold its window,
+leading dense layers, shared expert's slices, sigmoid router and normalized,
+unscaled routing weights (`expert_weights_scale` 1) and its two layer
+patterns to the family's, and a router bias (`ffn_exp_probs_b`), which its
+blocks would not add, is refused.
 `GgufPreparation` stages rows in image order on the CPU within the
 staging bound, splitting rows wider than it into column chunks, and runs the
 `gguf_repack` kernel, which writes their planes into the image. Embeddings and
@@ -261,10 +281,16 @@ commands has the engine release the images' memory (`Engine::releaseIdleWeights`
 weights' views stay the same handles, and a command that binds released memory
 fails (`MetalBackend::releaseMemory`). The next request waits while the same
 writers write the images again (`WeightImages::restore`), the engine taking back
-an image per tick so that the loop keeps answering status and cancellations;
-meanwhile the tick still ends requests at their deadlines, collects the
-transfers that land and writes restore points behind (`Engine::tick`). The
-restore takes about as long as the load at startup and logs `Weights restored in
+an image per tick and writing it on a thread of its own, so that the loop keeps
+answering status and cancellations however long an image takes: Flash-Next's
+PLE table loaded whole (`--ple-memory off`) is one image of 28.8 GB, whose write
+from a disk slower than about 1 GB/s outlasts the 30 s within which the server
+stops an engine that leaves a status request unanswered
+(`supervision::kLoopStall`). While an image is written, which may allocate and
+run commands on the backend, the tick only ends requests at their deadlines and
+the control pass waits; between images the tick also collects the transfers
+that land and writes restore points behind (`Engine::tick`). The restore takes
+about as long as the load at startup and logs `Weights restored in
 N s`. The governor admits each image's memory
 (`MemoryGovernor::allocationAdmission`) as memory the waiting requests need:
 neither the host's margins nor macOS's warning refuse it, as for a request in
@@ -309,7 +335,9 @@ them or they already were. An engine serving a request or restoring its weights
 keeps them, and the server answers `409 engine_busy`. An engine that does not
 answer within 5 s, as while it runs a long command, gets `503 engine_busy`, and
 while the engine restarts or the server stops the release gets
-`503 engine_recovering` or `server_shutdown`, as other requests do. The request
+`503 engine_recovering` or `server_shutdown`, and once the engine has stopped
+for good, before the server exits, `500 engine_failed`, as other requests do.
+The request
 takes no body:
 
 ```sh
@@ -379,6 +407,22 @@ us at one to four lanes on the register tile, its native rows 5.2, 6.3, 7.4 and
 weights DRAM-cold). The GDN convolution and time-step bias become bf16 under
 the exact rule.
 
+A prefill command's last layer outputs only the rows something reads: one row
+per sequence, its last (the head's input and the finiteness check), unless the
+draft reads that layer. Every row still writes its KV. The tile that holds each
+read row attends as a chunk of its own on the chunk's split count
+(`PagedAttention::prefillTail`), and its gate, o-projection, norm and FFN run
+on the read rows compacted, on the chunk's projection tile kinds and K splits
+(`Linear::prefillPlan` of a chunk's rows), so a dense target's read rows keep
+their bits where the GPU runs the layer. A MoE block runs the plan of the read
+rows, whose routes then see
+fewer rows of their experts and sum in another order (abi/MoE.h), so a MoE
+target's read rows are not bitwise the whole chunk's: their next-token KL is
+about 1e-8, against about 1e-3 between the same prompts at other batch widths.
+The Neural Engine split, which takes whole chunks, leaves the read rows to the
+GPU, so in a chunk it takes their last FFN rounds as the GPU's alone. On a
+16-core M5 Pro this takes about 2% off the 35B's prefill of 8K tokens.
+
 ### Kernel selection
 
 Three pieces choose every kernel configuration, and nothing else in the
@@ -386,10 +430,12 @@ engine or the models branches on the GPU:
 
 - `DeviceCapabilities` (`runtime/metal/DeviceCapabilities.hpp`) describes the
   device: its class (`gpuClass()`: Apple9, family 9, whose matrix operations
-  share the FP32 pipe; Apple10, family 10 and later, a neural accelerator per
-  core) and the cores kernel policy plans for (`plannedGpuCores()`, the
-  reported count or 32 when IORegistry reports none, a fallback rather than a
-  calibrated optimum).
+  share the FP32 pipe; Apple10, family 10, a neural accelerator per core;
+  Apple11, family 11 and later, which takes Apple10's rows but for one lane's
+  16-row tile from four and a half bits, so what this page says of Apple10
+  holds for it unless it names Apple11) and the cores kernel policy plans for
+  (`plannedGpuCores()`, the reported count or 32 when IORegistry reports none,
+  a fallback rather than a calibrated optimum).
 - `KernelCalibration` (`runtime/ops/KernelCalibration.hpp`) holds every
   measured constant of selection as data, one row per class and, where a
   measurement says so, per core range (`KernelCalibration::of`, the one place
@@ -401,15 +447,32 @@ engine or the models branches on the GPU:
   blocks. `Linear` and `ExecutionPlans` hold the device's calibration and plan
   through them.
 
+One setting sits beside the measured row: `Int8Activations`
+(`runtime/ops/Linear.hpp`; `splash serve --activations`, on at `auto`, the default, off at `bf16`),
+whether a plan may round activations to int8 where an int8-activation path of
+rules 1, 2 and 5 takes them. The engine decides it once for `ExecutionPlans`,
+whose `Linear` holds it beside the calibration for `selectProjection` and
+whose attention plans read it too. Off, every plan is its plan with it on in
+bf16 activations and nothing else of it changes: no chunk runs the int8
+prefill tile, no decode plan the int8 decode tiles and no attention split INT8
+queries, so every activation stays bf16 (`kernel-selection` checks this for
+every plan on every device). The KV cache keeps `--kv-format` either way.
+
 The rules:
 
 1. *Projection, prefill.* A chunk of up to `stagedPrefillRows` rows (64 on
    Apple10 and on Apple9 GPUs of 10 cores or fewer, 32 on larger Apple9 GPUs)
    runs the staged tile at its rows' height (8, 16, 32 or 64) with
-   `stagedSplits`; a longer one runs the 128-row prefill tile, unsplit. A staged
-   chunk of a projection of several segments and no epilogue runs them in one
-   dispatch, in prefill as in decode: a tile choice never adds dispatches to a
-   fused projection.
+   `stagedSplits`; a longer one runs the 128-row prefill tile, unsplit, or,
+   with int8 activations on, on a row with `prefillInt8` (Apple10 and Apple11)
+   the [int8-activation tile](#int8-activation-prefill) where it takes every
+   quantized segment. A projection of several segments and no epilogue runs
+   them in one dispatch on the staged tile, in prefill as in decode, and those
+   of each format in one on the 128-row prefill tile; the int8 tile runs a
+   GEMM dispatch per segment beside the quantization of its input, which a
+   SwiGLU's gate and up share. (The segments of a format in one dispatch
+   took the 27B's fused inputs 6-11% less time at 65-128 rows but 1-3% more
+   at 512-2048, 12-core M6.)
 2. *Projection, decode.* The register tile runs where it takes every quantized
    segment and the unit's `FormatClass` (`GridLookup`: IQ3_XXS, the IQ2 formats
    and IQ1; `GridLookupOrQ2K`; `UnderFourBits`; `FourBitsOrMore`) is below its
@@ -418,38 +481,111 @@ The rules:
    splits by `registerSplits`. Otherwise the staged tile runs, split by
    `stagedSplits` (the Apple10 wave law also picks one or two passes for a
    pair of one format from `onePassFromCores`), its walks spread from
-   `spreadFromCores`, and one unsplit lane of fewer than `sixteenRowBelowBits16`
-   sixteenths of a bit per weight on the 16-row tile, a pair's only where both
-   its tensors' own plans take it. A unit stages only where every quantized
-   segment's class does: dense measurements were taken per projection.
+   `spreadFromCores`, and one unsplit lane on the 16-row tile below
+   `sixteenRowBelowBits16` sixteenths of a bit per weight, and from there
+   under the wave law where its grid runs in as many waves of that tile as of
+   the 8-row tile, `sixteenRowWaves` at most; a pair's only where both its
+   tensors' own plans take it. A unit stages only where every quantized
+   segment's class does: dense measurements were taken per projection. With
+   int8 activations on, a unit whose quantized segments are all rotated in a
+   format the int8 decode tiles take (`UnitFormats::decodeInt8Takes`: PQ2_0)
+   runs a staged plan of at least `decodeInt8FromRows` rows (16 on Apple10 and
+   Apple11, one lane's 16-row plan among them; never on Apple9) whose K splits
+   keep whole PQ2_0 blocks on those tiles, at the plan's splits and passes.
 3. *Float projection.* The accelerator tile runs where the device has one,
    from `minimumRows` rows and a grid of its tiles of at least half the class's
    half tiles per core for BF16 values, F32 values or a quantized format's rows.
-4. *MoE.* One plan per step serves every block, so a target's routed experts
-   are one unit (`ops::moeFormats`): the class of the format that holds most
-   routed weights, the register tile's take over every routed and shared
-   segment, the router of most blocks' format. The register tile runs where it
-   takes them and the class's `MoeCalibration::registerTile` entry holds, in
-   both phases; otherwise the staged tile, on 8-row tiles while a prefill
-   chunk's routes average at most one row per expert and 32-row tiles beyond.
-   The router follows rule 3.
+4. *MoE.* Every GPU runs the experts on the staged tile, on 8-row tiles
+   while a prefill chunk's routes average at most one row per expert and
+   32-row tiles beyond. One plan per step serves every block, so its router
+   follows rule 3 in the format of most blocks' routers (`ops::moeRouterFormat`).
 5. *Attention.* The kernels follow how a layout reads its pages
    (`kv::Layout::reads`, below). A dense prefill tile takes one history split
    per `AttentionCalibration::prefillPagesPerSplit` pages its rows read (32,
    and 64 on Apple9 GPUs of 10 cores or fewer, where 32 made one measured case
    slower than the shared splits), between the splits shared out over the
    chunk's tiles and the longest chunk's tiles' ceiling (`PagedAttention.cpp`);
-   a sparse tile reads its list's blocks and keeps the shared splits.
+   a sparse tile reads its list's blocks and keeps the shared splits. With
+   int8 activations on, over INT8 pages a dense split scores INT8 queries
+   (`q8q`) from `AttentionCalibration::int8QueriesFromPages` pages a split of
+   the longest tile or lane reads (8 on Apple10; never on Apple9, whose matrix
+   operations share the FP32 pipe); a verify's lanes share the choice.
 
 The register-against-staged boundaries are measured table entries, not a
 cost model: the wave law, which describes the Apple10 staged tiles, does not
 describe the register tile (`KernelCalibration.hpp`). `kernel-selection`
 (`dev/tests/engine/kernel_selection_test.cc`) pins every plan of every
-family's projections, float tiles, MoE blocks and attention on thirteen device
-classes and core counts as a golden of one FNV-1a-64 per device, section and
+family's projections (a rotated PQ2_0 unit's with its int8 activations), float
+tiles, MoE blocks and attention on fifteen device classes and core counts, with
+int8 activations on, as a golden of one FNV-1a-64 per device, section and
 group, and `--dump <dir>` writes the plan lines; a change of a rule or an entry
 shows as the groups it changes. Kernels and their instances do not depend on
 any of this.
+
+### Warmup and pipelines
+
+Metal creates a kernel's pipeline, one for each set of its function constants
+(a fused projection's formats), the first time a dispatch names it, while the
+thread that submits the command, which is the serving loop's, waits: a request
+whose command names a kernel no earlier command did waits while its pipeline
+is created, and so does every status request behind it. With a warm shader
+cache that is a load of milliseconds; cold, after an install or a macOS
+update, it is a compile, and the 27B's first 17-row chunk waited 19 s for its
+kernels, created one at a time, on an M5 Max planned as a 16-core Apple9 GPU.
+Metal compiles side by side, so the backend creates a command's new pipelines
+together, at most 4 at once, each compilation holding memory of its own
+(`MetalBackend::Impl::kPipelinesCreatedAtOnce`): the 27B's cold start took 49 s
+on an M5 Max, against 129 s one at a time.
+So before Ready the start runs a command of each kind serving runs, through
+every projection
+(`ServingRuntime::requireWarmup`):
+
+- a prefill of the most rows, 2048, and one of each class of chunk whose
+  projections run kernels of their own, of its fewest rows
+  (`ExecutionPlans::prefillRowClasses`): each staged tile height a chunk takes,
+  from 1, 9, 17 and, where `stagedPrefillRows` is 64, 33 rows, and the prefill
+  tile, from a row past `stagedPrefillRows`. These need no memory the first
+  did not, and are required as it is. Every other kernel choice a chunk's
+  rows make today has one threshold (the float tiles, the MoE expert and
+  router tiles, the staged norm, the hyper-connection norm's quarters, and the
+  Neural Engine split, which takes no class's first chunk), so the chunks of
+  one row and of the most take both sides. `kernel-selection` checks that
+  every projection, float and MoE tile a chunk of 1 to 2048 rows selects on
+  its fifteen devices, and its prefill attention after each history it plans,
+  is one of these chunks'. Each prefill also creates, without running it, the
+  draft rebuild a restored lane's first chunk begins with, which no other
+  command runs, so a memory-limited restore warmup leaves none of its kernels
+  to serving, and what a state captured inside a chunk runs, which no warmup
+  captures (Flash-Next's PLE history, `QwenTarget::addInsideCapture`);
+- a decode of each width the memory plan holds, and a state restore. Each
+  decode also creates, without running it, its verify after the longest
+  history the target serves: each choice a verify's history makes has one
+  threshold, whose other side the decodes' short history does not take,
+  INT8 queries past 7.2K tokens on Apple10 and Flash-Next's sparse attention
+  past 2,048 (its indexer's scoring and selection, and the attention's block
+  lists, which a prefill past 2,048 tokens runs too);
+
+and it prepares the sampling kernels' dispatches without running them
+(`MetalBackend::preparePipelines`). What memory keeps from running
+(`warmup.memory_limited_steps` in `/status`) stays cold, as do the paths no
+warmup takes: a decode width the host refused or the plan does not hold, an
+image and KV on the SSD.
+From Ready on the backend counts each pipeline it creates
+(`metal.pipelines_created_while_serving`) and logs it once, with its name, its
+function constants and how long it took: as a warning where that was 100 ms or
+more, a wait its request notices, as a cold pipeline of every GGUF format's
+seconds were.
+
+The start counts its warm-up in steps, a command each: the prefill of the most
+rows, each row class's, each decode width a batch may take (one the plan does
+not hold, or memory keeps from running, ends at once) and the state restore.
+Warming says how many of all have ended, as the warm-up begins and as each
+step ends ([Native protocol](#native-protocol)); the server prints each
+(`Warming up · 3 of 11 steps`) and writes it to its serve record, from which
+the app shows the start's progress and why it can take long. The steps count
+commands, not time; the first start after an update, which creates every
+pipeline, spent 56 s before Ready for the 27B and 145 s for Flint on a 48 GB
+M5 Pro, where later starts take about 14 s.
 
 ### GGUF tiles
 
@@ -523,24 +659,43 @@ the staged split law below takes it. Its output is bitwise the two passes' at th
 where its split differs from the two passes', its sums are reassociated. A step of three request
 lanes runs the 32-row tile over four lanes of storage. On Apple10 one lane runs the 16-row tile
 over two lanes of storage (`LinearConfig::sixteenRows`), its padding lane computed and
-discarded, where its staged plan is unsplit and the projection's quantized segments store fewer
-than four and a half bits per weight together (`sixteenRowBelowBits16`), an
-unsplit gate/up pair where both its tensors' own plans do: the lane's rows are bitwise the 8-row
-tile's, in less time (the 27B UD-IQ3_XXS decodes one lane 3.3-3.6% faster on a 12-core M6).
+discarded, where its staged plan is unsplit, and an unsplit gate/up pair, in one pass or two,
+where both its tensors' own plans do, since they size its storage: the lane's rows are bitwise
+the 8-row tile's, and a wave of most formats takes less time (MPP computes 16-row fragments).
+Below four and a half bits per weight (`sixteenRowBelowBits16`) a lane runs it whatever the
+grid: the formats measured there show no residency step and take 3-6% less a wave on 16 rows
+(16-core M5 Pro, 32-core M5 Max), and the 27B UD-IQ3_XXS decodes one lane 3.3-3.6% faster on a
+12-core M6. From four and a half bits the tile's lower residency shows: 5120-input Q4_K and MLX
+4-bit step past 9 threadgroups per core on 16 rows, past 10 on 8 (16-core M5 Pro, 32-core M5
+Max), so a lane runs it where its grid runs in as many waves of the 16-row tile
+(`WaveLaw::sixteenRowResident`) as of the 8-row tile, and in at most `sixteenRowWaves`: two on
+Apple10, the most waves measured end to end. Tied grids of three to nine waves keep 8 rows: of
+them kernel sweeps alone measured one, 24 threadgroups per core, where Q4_K and Q6_K took
+1.4-2.8% less time on 16 rows on macOS 27 (16-core M5 Pro, 32-core M5 Max) and Q4_K 1.0% more
+on a 20-core M5 Pro on macOS 26.5. The 27B's 4.5-bit gate/up passes (17 threadgroups per core
+on 16 cores, two waves of either tile; 8.5 on 32, one) take 7.1-8.2% and 0.7-1.2% less time on
+it, its Q5_K passes 2.6-4.4% more on 16 cores; on 20 cores its pair runs in one pass, which
+takes 4.1-4.5% less on 16 rows. A 10240 x 5120 Q4_K (10 per core on 16 cores: one wave of the
+8-row tile, two of the 16-row tile) keeps 8 rows, where 16 take 17.5-18.7% more, and so do the
+248320-column heads, which run more waves of it (27 against 25 on 16 cores, 14 against 13 on
+32) and took 1.1% less to 2.0% more time on it. Apple11's (the M6's) 16-row tile takes as long
+a wave as its 8-row tile from four and a half bits, so there its lanes keep 8 rows
+(`kApple11Projection`): 16 took 10% more on the 27B UD-IQ3_XXS's Q4_K out-projections.
 Split, the padding lane's partials double the split's traffic: on the narrow grids where the law
 splits K most (the 35B's, the 122B's and Flash-Next's output projections, 1 to 1.5 threadgroups
 per core unsplit, in four or eight partitions) the 16-row tile takes 4-36% more time than the
 8-row tile at the same split on a 32-core M5 Max (IQ3_XXS, IQ2_XS and Q2_K, and IQ4_XS where it
 stages), against 2-8% less at 4 to 20 threadgroups per core on the M6 and 7% less to 2% more on
-the 27B's 5120-column projections in four on the M5 Max. Q4_K's 4.5 bits take more time on it on
-the M6. Prefill runs the staged kernels on both families: the 128-row prefill tile
-(`LinearTile::GgufPrefill`), and the staged tile for chunks of up to 32 rows. On Apple10 and on
-Apple9 GPUs of 10 cores or fewer chunks of 33 to 64 rows run the staged tile's 64-row height too,
-which reads the weights once where the prefill tile costs about as much for 33 rows as for 64 (on
-the 10-core M4 12-22% less time than the prefill tile). A fused projection's staged chunk runs its
-segments in one dispatch, as decode does: a dispatch costs about 0.045 ms however narrow, and at 8
-to 32 rows one dispatch takes 16-56% less time than one per segment on the 32-core M5 Max and 3-11%
-less on the 10-core M4 for the 27B attention and 35B GDN inputs.
+the 27B's 5120-column projections in four on the M5 Max. Prefill runs the staged kernels on
+every class: the 128-row prefill tile (`LinearTile::GgufPrefill`; on Apple10 and Apple11 the
+[int8-activation tile](#int8-activation-prefill) where it takes the weights), and the staged
+tile for chunks of up to 32 rows. On Apple10 and on Apple9 GPUs of 10 cores or fewer chunks of
+33 to 64 rows run the staged tile's 64-row height too, which reads the weights once where the
+prefill tile costs about as much for 33 rows as for 64 (on the 10-core M4 12-22% less time than
+the prefill tile). A fused projection's staged chunk runs its segments in one dispatch, as
+decode does: a dispatch costs about 0.045 ms however narrow, and at 8 to 32 rows one dispatch
+takes 16-56% less time than one per segment on the 32-core M5 Max and 3-11% less on the 10-core
+M4 for the 27B attention and 35B GDN inputs.
 
 Apple10's staged tile splits K across threadgroups, and runs a gate/up pair in one pass or two,
 by one wave law (`WaveLaw`, `runtime/ops/KernelSelection.cpp`), for decode steps and short
@@ -558,24 +713,25 @@ partition reads back. The constants come from sweeps of 2 to 40 threadgroups per
 32-core M5 Max, the 20-core M5 Pro and the 12-core M6 (`gguf-projection-benchmark`, which times
 a gate/up pair in both pass modes; MLX 4-bit and six GGUF formats at 2048 and 5120 inputs,
 gate/up pairs in MLX 4-bit): time per byte steps up past 10 and 16 threadgroups per core at one
-and two lanes (past 8 or 9 of the two-simdgroup tile on the M5 Pro), and the 32-row tile of
-three and four lanes steps past 9 on the M5 Max, 8 on the M5 Pro and 11 on the M6, which the law
-leaves out. The floors are fitted, not measured: a grid search over every measured case's
-fastest split gave 6 and 10 for `saturating` (a lone chain measures 5.4 and 9 threadgroups'
-bytes) and 2 and 3 for `following` (one threadgroup per core past a full wave measures 2.7-3.5
-of the tile's and 6-8.5 of the pair's); they stand in for what the law leaves out. Floors at the
-measured trailing waves take as much time in total on the sweeps but leave more cases slower.
-The law's totals on the sweeps (1.1%, 1.6% and 0.05% less time than the earlier rules on the M5
-Max, the M5 Pro and the M6) are in-sample, the fit's own records; the ABBA decode runs and a
-16-core emulation are the only out-of-sample checks, and the down projections' 17408 inputs,
-pairs in other formats and low-bit pairs take the law unmeasured. On the 12-core M6 the 35B draft's
-fc projection (2048 columns over 16384 inputs) runs two partitions instead of four at three and
-four lanes, 1.0-1.2% (2 us a cycle) more, within the 1.2-1.4% the benchmark varies between
-repeats; the law keeps it. The benchmark times the 27B's IQ4_XS gate/up pair 6.5% slower in two
-passes than in one at three and four lanes on the M5 Max (318.0 against 298.5 us), yet in the 27B
-UD-Q4_K_M's decode cycles at a 1024-token prompt the law's two passes took 0.8-1.2% less time there
-than a build running IQ4_XS pairs in one pass (1.2-1.8% at one and two lanes, six runs each), so the
-law keeps them.
+lane (past 8 or 9 of the two-simdgroup tile on the M5 Pro; past 9 on 16 rows, above), and the
+32-row tile of three and four lanes steps past 9 on the M5 Max, 8 on the M5 Pro and 11 on the
+M6, which the law's splits leave out: they take the one-lane residency at every height, as a fit
+per height sped no Mac without slowing some model. The floors are fitted, not measured: a grid
+search over every measured case's fastest split gave 6 and 10 for `saturating` (a lone chain
+measures 5.4 and 9 threadgroups' bytes) and 2 and 3 for `following` (one threadgroup per core
+past a full wave measures 2.7-3.5 of the tile's and 6-8.5 of the pair's); they stand in for what
+the law leaves out. Floors at the measured trailing waves take as much time in total on the
+sweeps but leave more cases slower. The law's totals on the sweeps (1.1%, 1.6% and 0.05% less
+time than the earlier rules on the M5 Max, the M5 Pro and the M6) are in-sample, the fit's own
+records; the ABBA decode runs and a 16-core emulation are the only out-of-sample checks, and the
+down projections' 17408 inputs, pairs in other formats and low-bit pairs take the law unmeasured.
+On the 12-core M6 the 35B draft's fc projection (2048 columns over 16384 inputs) runs two
+partitions instead of four at three and four lanes, 1.0-1.2% (2 us a cycle) more, within the
+1.2-1.4% the benchmark varies between repeats; the law keeps it. The benchmark times the 27B's
+IQ4_XS gate/up pair 6.5% slower in two passes than in one at three and four lanes on the M5 Max
+(318.0 against 298.5 us), yet in the 27B UD-Q4_K_M's decode cycles at a 1024-token prompt the
+law's two passes took 0.8-1.2% less time there than a build running IQ4_XS pairs in one pass
+(1.2-1.8% at one and two lanes, six runs each), so the law keeps them.
 
 The law tells a gate/up pair's pass modes apart only where a last wave falls below its floor. On
 the M5 Max the 27B gate/up pair runs two passes (one pass would put 17 threadgroups on each
@@ -606,47 +762,40 @@ the register tile's of eight partitions) that do not depend on the batch width.
 Partitions stop at eight, but the register tile splits a grid that eight leave below three
 threadgroups per core into sixteen while partitions keep 512 inputs (Qwen3.8-Flash-Next's
 hyper-connection down projection, 320 columns over 10240 inputs; measured on Apple10, and on Apple9
-by width on the 10-core M4, where eight instead took up to 21% more). The MoE
-experts
-(`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows: the register
-form in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf.metal`, which
-Apple9 takes on GPUs of 10 cores or fewer (the base M3 and M4), and on larger ones for experts
-mostly in the formats it stages (`MoeFormats::experts`) and for experts with an F16 weight
-(`UnitFormats::registerTakes`). One plan serves all of a model's
-MoE layers, so one F16 routed or shared expert tensor in any layer stages every layer's experts
-there. A block routes as one of the routings the kernels compile (`ops::kCompiledMoeRoutings`):
-its router weights a row's top k experts by the softmax of their scores (`MoeRouter::Softmax`,
-the Qwen families) or by each one's sigmoid over the sum of theirs (`SigmoidNormalized`, Flint),
-and every row also visits the `MoeShape::sharedSlices` slices of the shared expert, ids `experts`
-on, of the routed experts' width, each weighted by the sigmoid of the block's scalar gate
-(`sharedGate`) or by 1. A shared expert wider than the routed ones runs as such slices in the
-grouped passes: the planner keeps its gate and up rows and lays its down projection out as column
-windows (`gguf::TensorRows::windows`), so slice s's rows of each projection follow slice s - 1's
-(`moe_gguf_segment`). The select kernel names the routing's select suffix
+by width on the 10-core M4, where eight instead took up to 21% more). The MoE experts
+(`runtime/ops/MoE.cpp`) run the staged tile's numerics over the grouped rows on every GPU
+(`kernels/shared/moe_gguf.metal`). A block routes as one of the routings the kernels compile
+(`ops::kCompiledMoeRoutings`): its router weights a row's top k experts by the softmax of their
+scores (`MoeRouter::Softmax`, the Qwen families) or by each one's sigmoid over the sum of theirs
+(`SigmoidNormalized`, Flint), and every row also visits the `MoeShape::sharedSlices` slices of the
+shared expert, ids `experts` on, of the routed experts' width, each weighted by the sigmoid of the
+block's scalar gate (`sharedGate`) or by 1. A shared expert wider than the routed ones runs as such
+slices in the grouped passes: the planner keeps its gate and up rows and lays its down projection
+out as column windows (`gguf::TensorRows::windows`), so slice s's rows of each projection follow
+slice s - 1's (`moe_gguf_segment`). The select kernel names the routing's select suffix
 (`moe_route_select_f32_sigmoid_s2`), the grouping and expert passes its slices suffix
-(`moe_group_routes_s2`, `moe_expert_gguf_m8_a_s2`); the softmax router's one gated slice is the
-unsuffixed instances. The expert passes launch the live tiles alone: the grouping kernel writes
-each pass's grid with the tile count, and the pass reads it as an indirect dispatch
-(`ComputeDispatch::indirectThreadgroups`). They find a routed expert through the block's slot
-table and the chunks that hold its slots (`ops::ExpertChunks`): slot s below floor_slots is at
-place s of the floor chunk, chunk 0, and slot s from floor_slots on at place
-e - (c - 1) * chunk_slots of elastic chunk c = 1 + e / chunk_slots, where e = s - floor_slots (a
-branch uniform per threadgroup). The passes reach the chunks' regions through a table of
-`MOE_EXPERT_CHUNK_ADDRESSES` GPU addresses per chunk (`MoE.h`, `moe_expert_chunk`,
-[Residency](#residency-and-kv-extents)); a resident block's experts are one chunk of its routed
-planes, floor_slots = chunk_slots = its slots, a streamed block's the expert store's floor and
-elastic chunks of its size (`model/ExpertChunkLayout.hpp`,
-[Streamed experts](server.md#streamed-experts)). The staged tile runs gate and up in one pass, a gate
-and an up simdgroup on the same columns, bitwise the two passes' intermediate; the simdgroups
+(`moe_group_routes_s2`, `moe_expert_gguf_m8_down_s2`); the softmax router's one gated slice is the
+unsuffixed instances. The expert passes launch the live tiles alone: the grouping kernel writes each
+pass's grid with the tile count, and the pass reads it as an indirect dispatch
+(`ComputeDispatch::indirectThreadgroups`). They find a routed expert through the block's slot table
+and the chunks that hold its slots (`ops::ExpertChunks`): slot s below floor_slots is at place s of
+the floor chunk, chunk 0, and slot s from floor_slots on at place e - (c - 1) * chunk_slots of
+elastic chunk c = 1 + e / chunk_slots, where e = s - floor_slots (a branch uniform per threadgroup).
+The passes reach the chunks' regions through a table of `MOE_EXPERT_CHUNK_ADDRESSES` GPU addresses
+per chunk (`MoE.h`, `moe_expert_chunk`, [Residency](#residency-and-kv-extents)); a resident block's
+experts are one chunk of its routed planes, floor_slots = chunk_slots = its slots, a streamed
+block's the expert store's floor and elastic chunks of its size (`model/ExpertChunkLayout.hpp`,
+[Streamed experts](server.md#streamed-experts)). The staged tile runs gate and up in one pass, a
+gate and an up simdgroup on the same columns, bitwise the two passes' intermediate; the simdgroups
 share one pair table where gate and up share their routed and their shared formats.
 An expert's only tile of at most `MOE_GGUF_COLUMN_ROWS` live rows runs on the column tile
 (`kernels/common/gguf_column_tile.h`) rather than the staged one, and the two sum a row's
 products in different orders: a route's output depends on how many rows the step routes to its
-expert, so decode results of GGUF MoE targets on the staged tile, the 35B's included, are not
-invariant to the batch (`kernels/common/moe_expert_slab.h`). Under the default `--verify-rows
-auto`, which rows a decode step routes also follows the verify budget ([Drafts](models.md#drafts)), which
-learns from timing and earlier requests, so a MoE target's decode results can differ between runs
-of one request.
+expert, so decode results of GGUF MoE targets, the 35B's included, are not invariant to the
+batch (`kernels/common/moe_expert_slab.h`). Under the default `--verify-rows auto`, which rows a
+decode step routes also follows the verify budget ([Drafts](models.md#drafts)), which learns
+from timing and earlier requests, so a MoE target's decode results can differ between runs of
+one request.
 The float router, QSA indexer and alpha/beta projections run in `kernels/shared/gguf_float.metal`,
 which runs two projections of one input in one dispatch where they take the same tile (the
 indexer's query and key, each on the tile of its own width), and the token rows are gathered by
@@ -687,21 +836,49 @@ the register tile prepares its table from the rotated rows, so the input's
 producer writes plain rows. The token table gathers each row through the inverse
 (`gguf_embed_rotated_pq20`).
 
+In int8 activations (`LinearConfig::decodeInt8`, rule 2) the rotation
+writes int8 rows instead (`gguf_rotate_int8`), one fp32 scale per row and
+rotation block, whose values the rotation spreads evenly, and the staged plan
+runs the int8 tiles, the staged tiles' dispatches on int8 stages
+(`gguf_decode_int8_pq20_m<rows>_<e>`, `_gate_up` and
+`gguf_decode_int8_pq20_fused_m<rows>`), at 16 or 32 rows: PQ2_0's two-bit
+codes q stand for q - 1, exact in int8, staged at a byte per weight, and the
+neural accelerator multiplies int8 at twice its bf16 rate. The 27B Bonsai's projections take 9-31% less time there than on
+the bf16 tiles at the policy's plans (20-core M5 Pro; 10-25% on a 12-core M6);
+the 8-row int8 matmul takes twice the 16-row one's time, so one lane's split
+plans, of 8 rows, keep bf16.
+
+Every int8-activation path (these rows, the [int8-activation prefill
+tile](#int8-activation-prefill)'s groups and the attention tiles' INT8
+queries) quantizes by one rule, `kernels/common/int8_activations.h`: a block
+whose largest magnitude is m codes x as clamp(rint(x * (127 / m)), -127, 127),
+ties to even, with scale m / 127, both quotients correctly rounded so that the
+tests' references compute the same codes; a block whose m is 2^-100 or less
+codes as zeros; and a block holding an infinity or a NaN, which its codes
+alone would round to finite values, takes a NaN scale, so that its row goes
+on in NaN as it would in bf16: a projection's outputs are not finite, and an
+attention row's softmax statistics are NaN, which the reduce writes as zeros.
+
 A GGUF kernel of one quantized tensor names its epilogue last: `a` none, `r` residual, `g` the
 up pass with the silu gate. The staged ones are `gguf_decode_<format>_m<rows>_<e>`, with gate and
 up in one pass `gguf_decode_<format>_m<rows>_gate_up`, and
 `gguf_prefill_<format>_<e>` (and `gguf_prefill_<format>_r_leading_inputs` over a view of the
 leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lanes>_<e>`, and the
-experts `moe_expert_gguf_m<rows>_<e>` and `moe_expert_gguf_sg_<e>`, with gate and up in one pass
-`moe_expert_gguf_m<rows>_gate_up`; the fused projections run
+experts' gate and up in one pass `moe_expert_gguf_m<rows>_gate_up` and their down pass
+`moe_expert_gguf_m<rows>_down`; the fused projections run
 `gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode and, on Apple10 and on
 Apple9 GPUs of 10 cores or fewer, in prefill chunks of 33 to 64 rows (`gguf_decode_fused_m64`),
-and in longer prefill chunks one `gguf_prefill_<format>_a` per format over that format's segments.
-The norm, GDN, attention-gate and attention-gather variants that also write the register kernels'
-input table carry `table16` in their names. The epilogue kinds of both GGUF families are in
-`kernels/common/gguf_tile.h`, the SiLU and sigmoid every kernel shares in
-`kernels/common/activation.h`, and the MMA helpers every register kernel uses, GGUF or fp32, in
-`kernels/common/sgmatrix.h`.
+and in longer prefill chunks one `gguf_prefill_<format>_a` per format over that format's
+segments (or, on the int8-activation tile, `gguf_prefill_int8_quantize` and one
+`gguf_prefill_int8_<format>_a` per segment). A `gguf_decode_fused_m<rows>` pipeline decodes
+its segments' formats alone, and a `moe_expert_gguf_m<rows>` pipeline its pass's routed and
+shared formats alone, which specialize it as Metal function constants
+(`ComputeDispatch::constants`, a pipeline per name and values), so its first use compiles a
+loop for each of those formats rather than for all 44. The norm, GDN, attention-gate and
+attention-gather variants that also write the register kernels' input table carry `table16` in
+their names. The epilogue kinds of both GGUF families are in `kernels/common/gguf_tile.h`, the
+SiLU and sigmoid every kernel shares in `kernels/common/activation.h`, and the MMA helpers every
+register kernel uses, GGUF or fp32, in `kernels/common/sgmatrix.h`.
 
 The ABIs are in `runtime/metal/abi/Gguf.h`, which also defines the tile geometry the kernels
 and `LinearGguf.cpp` share, and `MoE.h`; the image formats in
@@ -720,21 +897,25 @@ production executor and its `gguf_repack` kernel write them, bitwise against the
 also as column windows, the alpha/beta, norm, convolution and router bytes they write and the
 golden images; then `gguf-dequant`, the staged tile's dequantizer, built with the production Metal
 flags, against the half rounding of every reference weight; `gguf-rotation`, `gguf_rotate` and the
-rotated PQ2_0 token gather bitwise against the fp32 butterflies and within one bf16 step of fp64;
+rotated PQ2_0 token gather bitwise against the fp32 butterflies and within one bf16 step of fp64,
+and `gguf_rotate_int8`'s codes at their stage positions and per-block scales bit for bit against
+the int8-activation rule, NaN bits where a block holds a NaN or an infinity;
 `gguf-projection`, every GGUF projection through `ops::Linear` with each tile forced, so both
 decode tiles run on every GPU, each in every format it takes (the register tile all but F16), at
 one to four lanes, every K split and epilogue, fused segments, every format's gate with the next
 format's up and the prefill tiles, each output inside the fp64 bound of
 `GgufFormatReference.hpp`, the one-pass gate/up bitwise against the two passes at the same K
-split, and one lane on the staged 16-row tile bitwise against the 8-row tile; and
+split, one lane on the staged 16-row tile bitwise against the 8-row tile, and, where the device
+row takes int8 activations, rotated PQ2_0 on the int8 tiles within the fp32 rounding of the exact
+products of their codes, lanes and pass modes bitwise, and a non-finite input's row alone not
+finite; and
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
-plan, the staged 8- and 32-row tiles and the Apple9 register tile whatever GPU runs it, each in
-every format it takes as each routed and shared expert tensor, against fp64, bitwise against
-the full grids and two gate/up passes, and with the experts in permuted slots across a floor
-chunk and elastic chunks of other, few slots, the last of fewer, bitwise as in one chunk, and
-refuses floor and elastic chunks one unit short, a malformed chunk list or chunks made for
-another block; `gguf-moe-e512` runs all of it at Qwen3.8-Flash-Next's 512 experts and
-`gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated shared slices;
+plan, the staged 8- and 32-row tiles, in every format as each routed and shared expert tensor,
+against fp64, bitwise against the full grids and two gate/up passes, and with the experts in
+permuted slots across a floor chunk and elastic chunks of other, few slots, the last of fewer,
+bitwise as in one chunk, and refuses floor and elastic chunks one unit short, a malformed chunk list
+or chunks made for another block; `gguf-moe-e512` runs all of it at Qwen3.8-Flash-Next's 512 experts
+and `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated shared slices;
 and `expert-store`, streamed experts at four shapes bitwise against the resident ones, in loads
 of every kind, through a release and a restore, in a floor and three smaller elastic chunks,
 beside a size of one block, which the store reads whole into its floor
@@ -753,12 +934,16 @@ staged 16-row tile, `staged16`; a gate/up pair on the staged tile in two passes,
 the walks spread also in one, `pair` and `pair16`) and every K split, and marks the device policy's
 pick; widths emulate core counts, since the policy counts threadgroups per core. Or, with a trailing
 `prefill=R[,R...]` after the epilogue and the round count, one format's 128-row prefill tile at each
-chunk of `R` rows (more than 32), and for `R` up to 64 the staged 64-row tile at every K split; the formats `float-bf16` and `float-f32`, and `float-<format>` for
-a quantized format's native rows (such as `float-af8g64`), time the float projection
-(`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
-`selectFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape,
-or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
-device's plans and the other GGUF tile.
+chunk of `R` rows (more than 32), for `R` up to 64 the staged 64-row tile at every K split, and for
+`af4g64` and `af5g64` the int8-activation tile (`prefill int8`) and its GEMM alone on codes the
+scratch holds (`int8 codes`, as a SwiGLU's up runs on its gate's); the formats `float-bf16` and
+`float-f32`, and `float-<format>` for a quantized format's native rows (such as `float-af8g64`),
+time the float projection (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles
+instead, marking `selectFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B
+shape, or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
+device's plans; `GGUF_MOE_ARGS='repack'` times the repack of streamed experts into their slots
+(`moe_expert_load`, 1 to 32 jobs) and of tensors into an image (`gguf_repack`) in the streamed
+formats, each plane checked bytewise against the reference repack.
 
 Target attention runs the geometries of `kCompiledAttention` (`runtime/ops/PagedAttention.cpp`):
 query heads over KV heads of a head dimension (`_d128` in the names of 128-wide heads' kernels;
@@ -769,15 +954,72 @@ or a window of the keys before it (`…_w512`: a row at position p attends p −
 windowed split and reduce start at the page of their tile's first row's window start
 (`splash_attention_first_page`), each row masking the keys before its own, and a windowed verify
 lane's or prefill tile's splits stop at the 18 pages such a window reads
-(`kv::windowAttentionPages`). A geometry with learned sinks (`reduce…_sinks`) binds the layer's,
-an F32 per query head, to the reduce, which adds each to its row's softmax after the splits, in
-their order, as a key with no value; one without an output gate (`gather`) gives the
-out-projection its attention rows as they are. The RoPE tables are of the target geometry's pairs
-(`rope_build_tables`, or `rope_build_tables_p64` for 64). `make test-engine-metal` runs
-`attention-variants`, every variant through the production encoders against fp64, and
+(`kv::windowAttentionPages`). Over INT8 pages each dense split kernel (`…q8_split…`) also has a
+`…q8q_split…` entry, `q8q` for INT8 queries: it quantizes its tile's queries once (absmax / 127
+per row, by the int8-activation rule) and scores them against the INT8 keys (kernel selection,
+rule 5). A geometry
+with learned sinks (`reduce…_sinks`) binds the layer's, an F32 per query head, to the reduce,
+which adds each to its row's softmax after the splits, in their order, as a key with no value;
+one without an output gate (`gather`) gives the out-projection its attention rows as they are.
+The RoPE tables are of the target geometry's pairs (`rope_build_tables`, or
+`rope_build_tables_p64` for 64). `make test-engine-metal` runs `attention-variants`, every
+variant through the production encoders against fp64, and
 `make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--shapes flint-window,flint-full'` times
 Flint's two kinds of layers with their sinks: a window of 512 keys with RoPE, and the whole
 history without.
+
+### Int8-activation prefill
+
+On Apple10 and Apple11, which multiply int8 at twice their bf16 rate, a prefill chunk past the
+staged tile (more than 64 rows) of a projection whose quantized segments are all MLX affine 4- or
+5-bit in groups of 64 (`af4g64`, `af5g64`) runs `LinearTile::GgufPrefillInt8`
+(`kernels/prefill/gguf_prefill_int8.metal`) instead of the bf16 tile
+(`ProjectionCalibration::prefillInt8`; Apple9, whose int8 matmul runs at 0.9x its bf16 rate, never),
+with int8 activations on. With them off (`--activations bf16`) every chunk runs the bf16 tiles,
+bit for bit, and the prefill arena holds no codes. `gguf_prefill_int8_quantize` writes each 64-input
+group of each row as int8 codes with its own scale, by the int8-activation rule
+(`kernels/common/int8_activations.h`), which a SwiGLU's up takes from its gate's plan
+(`LinearInput::PrefillInt8`) rather than quantizing the same rows again; the GEMM
+(`gguf_prefill_int8_<format>_<e>`, one dispatch per segment) feeds the weights' 4- or 5-bit codes
+straight from the planes into int8 `matmul2d` fragments and folds each
+group's affine correction, `(sa s) sum(qa q) + z (sa sum(qa))`, once in fp32. The weights stay
+exact; only the activations round, per row and group, so an outlier channel costs only its own 64
+inputs. A group holding an infinity or a NaN, which its codes alone would round to finite values,
+takes NaN scales, so that its row's outputs are not finite, as the bf16 tile's are: a lane whose
+state went bad still fails alone. A row's prefill results therefore depend on whether its chunk,
+with the rows of the lanes prefilling beside it, has more than 64 rows, but not on its neighbours'
+values: a prefill's last layer runs its read rows alone on the chunk's tile and keeps their bits. A
+tile is two simdgroups of 32 rows by 32 columns for both formats, and threadgroups take 16 row tiles
+down each column tile before the next (`GGUF_PREFILL_INT8_WALK`), so a column tile's weights stream
+once per 16 row tiles: walking every column tile of a row tile first left the M6's 2048-row down
+projections at 0.95-1.12x the bf16 tile's speed. The GEMM's grid is 16 threadgroups wide and takes
+the walk's tiles in order, so each run of 16 along x is one column tile's row tiles of a block
+whatever the segment's column count; a grid of column tiles by row tiles kept that only where the
+column tiles were a multiple of 16 (M6, 2048 rows: 260 column tiles took 29% longer than 256, on the
+16-wide grid 1.7%, as their columns). Over the 27B's projection shapes in `af4g64` and
+`af5g64` at 65-2048 rows the tile takes 1.13-2.4x less time than the bf16 tile on a 32-core M5 Max,
+a 16-core M5 Pro and a 12-core M6. The quantizer stores each 32-input group's codes in the GEMM's
+fragment order (`prefill_int8_position`): the four inputs a lane takes in a fragment step, in the
+planes' slot order, are one word. The codes and scales are the prefill arena's
+`LinearTable` and `LinearSums`, sized for a full chunk of the target's widest projection whose
+formats the tile takes (`ProjectionShape::prefillInt8Formats`; 40 MB on Qwen3.8-27B MLX 4-bit, its
+down projection) wherever the family runs the tile; a GGUF target's arena holds none. The tile also
+takes the Neural Engine split's leading-input view. A DFlash2 draft, prepared `af4g64` whatever the
+target's format, prefills on the bf16 tiles (`ExecutionPlans::draftLinear`): its prefill gains
+nothing from the tile, while its context projection, the widest a prefill runs (25,600 inputs on
+the 27B), would set the tile's scratch, 38 MB on Qwen3.6-35B-A3B GGUF, enough at `--max-memory 24G`
+to stream the routed experts its plan otherwise holds whole. Over 24 real 1K-8K prefixes the
+next-token KL against bf16 prefill on the GPU alone is
+2.2e-3 on Qwen3.8-27B MLX 4-bit (median 3.6e-4) and 2.3e-3 on Qwen3.6-35B-A3B MLX 4-bit, the most
+likely token unchanged at every prefix. At default flags on a 20-core M5 Pro, where the 27B's Neural
+Engine split takes 10 of 34 units, it is 9.4e-4, against 1.1e-3 for the bf16 tiles with the split at
+its own 15 units; both change the most likely token at the same one prefix of 24. Time to the first
+token falls by a quarter at 2K and 10K tokens on the 27B (20-core M5 Pro) and by 12-13% on the 35B
+(16-core M5 Pro). `gguf-projection` checks that the tile computes the products of the inputs so
+rounded within the bf16 tile's error, also with an outlier input per row, and bounds the RMS error
+it adds over the bf16 tile on dense inputs at 1%, that a fused projection quantizes once and runs a
+GEMM per segment, and an up on its gate's codes bitwise its own run; `gguf-projection-benchmark`
+times it as `prefill int8`.
 
 ## Sparse attention
 
@@ -881,8 +1123,9 @@ channels on its prefill kernels, its down projection reading a view of the
 leading inputs of down's rows (`Projection::leadingInputs`) through instances
 of the residual kernels of their own (`<kernel>_leading_inputs`), which run
 the residual kernel's tile on the weight planes advanced past the inputs the
-view leaves unread. The Neural Engine runs the rest as one W8A8 program,
-Hadamard-rotated int8 activations and per-row int8 weights
+view leaves unread, or, on the int8-activation tile, through that tile's
+stride over the planes' rows. The Neural Engine runs the rest as one W8A8
+program, Hadamard-rotated int8 activations and per-row int8 weights
 (`runtime/ane/Program.mm`): a chunk takes the smallest of
 its functions that holds it, one every 128 rows from 512 to 2048, all reading
 and writing one set of surfaces sized for 2048 rows. The ANE service holds
@@ -958,19 +1201,22 @@ whose T, or T a unit either way, is least at its longest, since the timings can
 put T's least a unit off: a unit past where the ANE's part takes the longer
 costs the ANE's time per unit, a unit short of it the GPU's, and on an M5 Max
 and an M5 Pro the ANE's is the longer (1.7 ms a unit of the full-chunk layer
-against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms). On
-Qwen3.8-27B that takes 8 of the 34 units on an M5 Max, 14-15 on an M5 Pro and
-25-26 on an M6, the best each Mac's sweeps measured. The split runs if T there
-gains 5% on the GPU alone. A start calibrates the split once for a Mac, a
-model, a macOS version, an engine build and the most units its memory plan
-holds, and remembers what it found (`remembered-*` in the cache directory
-below): the units, the least chunk and the GPU alone's layer at 512 and 2048
-rows, or that no split gains enough. Later starts take it untimed: they build
-the split, check it as below and serve, in 0.6 s on an M5 Max, 0.9 s on an M5
-Pro and 1.4 s on an M6. Across many starts over hours of prefill on those three
-Macs the timings chose the same units within their noise, while timing every
-start cost 3-8 s, and a start whose timings strayed could change the share,
-each share compiling a program of its own (half a minute on an M6).
+against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms), all with
+`--activations bf16`. On Qwen3.8-27B that takes 8 of the 34 units on an M5
+Max, 14-15 on an M5 Pro and 25-26 on an M6 with `--activations bf16`, the best
+each Mac's sweeps measured. By default the int8-activation tile makes the
+GPU's part faster, so the split takes fewer: 10 on a 20-core M5 Pro (the M5
+Max and M6 unmeasured). The split runs if T there gains 5% on the GPU alone. A
+start calibrates the split once for a Mac, a model, a macOS version, an engine
+build, `--activations` and the most units its memory plan holds, and remembers
+what it found (`remembered-*` in the cache directory below): the units, the
+least chunk and the GPU alone's layer at 512 and 2048 rows, or that no split
+gains enough. Later starts take it untimed: they build the split, check it as
+below and serve, in 0.6 s on an M5 Max, 0.9 s on an M5 Pro and 1.4 s on an M6.
+Across many starts over hours of prefill on those three Macs the timings chose
+the same units within their noise, while timing every start cost 3-8 s, and a
+start whose timings strayed could change the share, each share compiling a
+program of its own (half a minute on an M6).
 
 The start then builds the split that serves and checks every function of its
 program against the GPU alone (`AneFfn::verify`): at the function's own rows
@@ -1068,43 +1314,65 @@ holds with the split it runs.
 ## Host steps
 
 A command can run CPU work between its GPU work. A host step
-(`metal::EventStep`, `CommandGraph::host`) runs once all the work before it
-has completed, on one thread of the backend's, and holds the work after it
-until it returns, through a shared event of its command's: it reads what the
-GPU wrote before it and writes Shared buffers the GPU reads after it, and it
-must not call the backend. A step after a failed command buffer is skipped,
-and one that throws fails its command with its message. A step's `then`, if
+(`metal::EventStep`, `CommandGraph::host`) runs on one thread of the
+backend's once the GPU has raised a shared event of its command's at the end
+of all the work before it, and the backend commits the command's buffers
+after it only once it returned: it reads what the GPU wrote before it and
+writes Shared buffers the GPU reads after it, and it must not call the
+backend. A step after a failed command buffer is skipped, and one that
+throws fails its command with its message. A step's `then`, if
 any, runs on the same thread once the step let the work after it go: CPU work
 the GPU need not wait for, such as starting reads that would hold the GPU's
 start back if they began as the step ends. It does not run after work that
 threw, and must not throw: the command may have completed by then, so a
-`then` that throws marks the backend unhealthy. A step's work may run after
+`then` that throws marks the backend unhealthy. A step's beside dispatches,
+those right after it (`EventStep::beside`), run while its work runs, in a
+buffer of their own after its signal, and the work after them waits for the
+step (a streamed MoE layer's passes over its resident experts beside its
+load). They write nothing the work reads and use no 128-byte line, the GPU's
+cache line, of the buffers the step names as its work's writes, which the
+backend checks as the command is submitted: a line the GPU read while the step
+ran is unproven fresh after it. So those MoE passes read the grouping's copy of
+the slot table, and the passes after the load a table of their own. Only
+Metal's tracking of the buffers they use orders the work after the step, and
+the command's end, after them, so that work reads what they write (the MoE
+combine reads those passes' outputs). A step's work may run after
 submitCommandAsync or wait() threw (its encoding failed after its first
 buffers were committed, or the watchdog or a shutdown gave the command up),
 so the work owns what it touches.
 
 Metal fails a command buffer whose event wait is still unmet 5 s after its
 queue reached the wait ("Caused GPU Timeout Error"), and with it the command
-and the engine. The backend commits a command's buffers as it encodes them, so
-the queue reaches a command's first host step, or Neural Engine wait, as the
-command is submitted, whatever GPU work runs ahead of it, and each later one
-once the one before it was met (macOS 27, M5 Max and M5 Pro; a wait committed
-behind 4.5 s of work and met 1 s after it fails at 5.0 s). The work between
-two steps, with the step, must therefore end within 5 s, which the
-scheduler's bounded prefill units keep with room to spare. Work outside them runs as
-a command of its own: a prefill command's image encodes, seconds of GPU work
-on a small GPU, run first, and the prefill command is submitted once they
-have completed ([Vision](models.md#vision)).
+and the engine. The queue reaches a wait as the buffer that holds it is
+committed, whatever GPU work runs ahead of it, and a later one once the one
+before it was met (macOS 27, M5 Max and M5 Pro; a wait committed behind
+4.5 s of work and met 1 s after it fails at 5.0 s). No wait spans a host
+step, so a step may work longer than 5 s, as an expert load or a spilled KV
+read from a slow disk does, and only the command watchdog bounds it: a
+command that makes no progress for 120 s fails the engine. A Neural Engine
+wait is such a wait, as is an awake step's spin (below), which waits for the
+end of the decode work before its step. The backend commits the buffers
+before a command's first host step as it encodes them, so the queue reaches
+the command's first Neural Engine wait, unless a host step comes before it,
+as the command is submitted. The work between two such waits, a layer's GPU
+part with the ANE's evaluation, must end within 5 s, which the scheduler's
+bounded prefill units and the split's 2 s bound on an evaluation keep with
+room to spare. A prefill command's image encodes, seconds of GPU work on a
+small GPU, run first as a command of their own, and the prefill command is
+submitted once they have completed, so that the scheduler counts their time
+apart from its rows' and Metal does not count it against its first Neural
+Engine wait ([Vision](models.md#vision)).
 
 A step about as short as the GPU's wake-up can keep the GPU awake: one GPU
-thread spins through it until the CPU ends it, so the work after it starts at
-once and at full clocks. The spin sees the CPU end it only through a memory
-scope Metal's public headers leave out (`runtime/metal/kernels/host_step.metal`),
-so it builds apart from the metallib, into `build/host-step.metallib`, and a
-Metal compiler that refuses it only warns. Before the first command with such
-a step, the backend checks that the spin sees the CPU end it; without the
-library, or if it does not, the steps run without the spin, with a warning.
-A completed command reports each step's round trip (`HostStepTiming`).
+thread spins through it, from the end of the work before it until the CPU
+ends it, so the work after it starts at once and at full clocks. The spin
+sees the CPU end it only through a memory scope Metal's public headers leave
+out (`runtime/metal/kernels/host_step.metal`), so it builds apart from the
+metallib, into `build/host-step.metallib`, and a Metal compiler that refuses
+it only warns. Before the first command with such a step, the backend checks
+that the spin sees the CPU end it; without the library, or if it does not,
+the steps run without the spin, with a warning. A completed command reports
+each step's round trip (`HostStepTiming`).
 
 ## Residency and KV extents
 
@@ -1194,8 +1462,30 @@ a pass that evicts everything copies only what is left afterwards. Every extent
 a pass empties is released, except that the host's pass short of critical
 pressure, a pool's growth, optional work and startup cleanup keep one empty
 extent as the runway the next request starts from, and a pool that spills
-keeps an extent's worth of free Index pages, which spilling draws on first, so
-that a page spills at the memory wall, and a lane's conversion lands in them.
+keeps, under critical pressure too, an extent's worth of free Index pages, which
+spilling draws on first, so that a page spills at the memory wall. A Spill
+lane's pages stay Full once their copies land, until a claim releases them
+(`Cache::releasePages`, [below](#memory-rules)); under `--kv-spill always`
+they move as their copies land (`Cache::spillWritten`). Either moves pages a
+runway at a time: the Full extents each runway's moves empty leave before the
+runway refills, and the refill passes the engine's limit and the host at every
+pressure level when the bytes those extents released cover it
+(`MemoryGovernor::fund`: a credit that lasts the allocation the moves run in,
+its retries included, and that only memory allocated takes back); a Full
+extent returns 17 times an Index one's bytes on Qwen3.8-Flash-Next. A release
+for a claim's bytes releases every one, the Full pages left first gathered in
+the fewest extents, so that each runway's moves pay for the next
+(`SpilledExtents::Released`). One for a claim's Full pages in place leaves the
+runway an extent of free Index pages, or moves an extent of pages more, as for
+bytes, whose emptied Full extent refills it (`Cache::inPlaceMoves`), or moves
+none: at a wall whose room holds no Index extent nothing else refills a runway
+left short, and short of an extent of free Index pages no release for bytes can
+start (`Cache::releaseMoves`). A claim that counts such a release keeps the free
+Index pages it moves into and the runway past them from its reclaims
+(`Engine::EngineVictims::movesInto`): released for the claim's bytes first, they
+left the release only the runway, and a lone lane at the wall ended at its
+length. Under `--kv-spill always` the moves as copies
+land release every one under critical pressure (`Engine::landedExtents`).
 `/status` reports under `kv` the pages of allocated extents (`pages_allocated`),
 those requests and the cache hold (`pages_active`, `pages_cache`) and those
 nothing holds (`pages_free`), the extents of the pages requests hold and their
@@ -1271,7 +1561,10 @@ place meets its refusal: the governor exempts that allocation's retries from
 the margin and the pressure test (`MemoryGovernor::free`), since waiting would
 stall work in service; so does the KV a prefill command takes past its first state
 boundary, which the lane's next command would take anyway. A `Floor` claim
-passes short of critical pressure, and critical pressure refuses every claim.
+passes short of critical pressure, and critical pressure refuses every claim,
+except an allocation covered by what the same allocation released, which
+passes the engine's limit too: its net change raises neither the charge nor
+what the host gives (`MemoryGovernor::fund`).
 The engine's start needs only what macOS can hand out at all beyond a reserve
 of a tenth of a small Mac's memory and 2 GiB of a larger one, counting what
 compressing the anonymous pages would free at the compressor's present ratio,
@@ -1298,8 +1591,11 @@ take is skipped, not a stop:
 4. Cached units that need a write: the state the idle staging buffer writes,
    whose RAM frees at once, for any claim; what frees only once its write
    lands, for a claim that can wait.
-5. The command between its passes, then the claimant's own conversion to
-   Spill.
+5. The command between its passes; then the Spill lanes' pages whose
+   copies landed, released to the index form, each costing its lane the
+   reads of the blocks it releases, the lowest-ranked lane first, and for a
+   claim that waits those whose copies land
+   ([releases](#memory-rules)); then the claimant's own conversion to Spill.
 6. Pool units above their floors: the expert store's chunks, top chunk first,
    and the hot block cache's extents while a lane reads above its floor.
 7. Units another request uses.
@@ -1311,8 +1607,12 @@ take is skipped, not a stop:
    them.
 9. The engine: it waits for copies in flight that cover the need. Else, when
    no lane's growth fits, the lane that yields first is suspended; while other
-   lanes fit, a refused lane waits for them, resident. A lane alone that
-   nothing meets fails with `capacity_exhausted` (`Engine::judge`).
+   lanes fit, a refused lane waits for them, resident. A lane alone, or a
+   start with no lane in service, waits while its claim takes something
+   ([below](#what-a-refused-claim-takes)) or any write is in flight, and fails
+   with `capacity_exhausted` only once nothing else holds memory it could get:
+   no other request's KV or state in memory, no cached unit it may take, no
+   write in flight, and the store at its floor (`Engine::judge`).
 
 Once a unit the claim reached waits for a transfer, it takes nothing past
 step 4.
@@ -1320,20 +1620,33 @@ step 4.
 **Who takes what**, derived in one function (`takeRights`) whose `TakeRights`
 every source of units reads (`MemoryLedger::Order`, `Cache::walkFor`):
 
-| Claimant | Cache that frees now | Cache that frees once its write lands | Rebuilt caches | Pass command, own conversion | Pools above their floors | Resume point | Queued chains | In use | Next lane's buffers |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `InService`, can wait | yes | yes | yes | yes | yes | yes | yes | where it reaches them | last, for KV |
-| `InService`, immediate | yes | no | yes | no | no | yes | yes | no | no |
-| `Start` | yes | yes | yes | no | no | yes | no | no | no |
-| `Optional` of a request | yes | no | yes | no | no | yes | no | no | no |
-| `Optional` of the engine's own, of no request | no | no | no | no | no | no | no | no | no |
-| `Growth` | yes | no | no | no | no | no | no | no | no |
-| `Host` with a deficit | yes | yes | yes | no | no | no | no | no | no |
-| `Host` under critical pressure | yes | no | yes | no | yes | yes | yes | yes | first |
-| A need the host refused | in place | no | yes | no | no | as its class | as its class | no | no |
+| Claimant | Cache that frees now | Cache that frees once its write lands | Rebuilt caches | Pass command, own conversion | Lanes' landed pages | Pools above their floors | Resume point | Queued chains | In use | Next lane's buffers |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `InService`, can wait | yes | yes | yes | yes | its own, and its priority's or lower | yes | yes | yes | where it reaches them | last, for KV |
+| `InService`, immediate | yes | no | yes | no | no | no | yes | yes | no | no |
+| `Start` | yes | yes | yes | no | its priority's or lower | no | yes | no | no | no |
+| `Optional` of a request | yes | no | yes | no | no | no | yes | no | no | no |
+| `Optional` KV its lane takes anyway (`laneNeeds`) | yes | no | yes | no | its own | no | yes | no | no | no |
+| `Optional` of the engine's own, of no request | no | no | no | no | no | no | no | no | no | no |
+| `Growth` | yes | no | no | no | no | no | no | no | no | no |
+| `Host` with a deficit | yes | yes | yes | no | every lane's under warning pressure; none at normal | no | no | no | no | no |
+| `Host` under critical pressure | yes | no | yes | no | every lane's | yes | yes | yes | yes | first |
+| A need the host refused | in place | no | yes | no | its own, in place | no | as its class | as its class | no | no |
 
 Under critical pressure every claim that takes units takes the next lane's buffers
-first, with the idle ones.
+first, with the idle ones, and the empty extent the next request starts from,
+never the Index runway. The host reaches the lanes' landed pages whenever
+macOS's pressure is above normal: under warning its pass for its deficit
+releases them, the lowest-ranked lane's first, as its pass under critical
+pressure does, which gives the host what a lane gave back as its copies landed
+before lanes kept their pages; at normal pressure its deficit leaves them Full.
+
+The KV past a prefill command's first boundary is the `Optional` claim its lane
+takes anyway (`ClaimSpec::laneNeeds`): refused, it cuts the command there, and
+the lane's next command takes that KV, releasing the lane's landed pages. So it
+releases its own lane's pages itself: a cut costs the command's fixed work
+again, on Qwen3.8-Flash-Next a pass of the routed experts, which stream, and 14
+cuts made a 237K-token prompt past the memory wall 8% slower to its first token.
 
 The resume point is the newest ordinary state in RAM (`StateCache::resumePoint`),
 the one a conversation's next turn most likely resumes from. A claim of no
@@ -1343,21 +1656,23 @@ from RAM is written to the SSD cache first while the tier takes the write, so
 a resume point that goes keeps its SSD copy: its next turn starts with a
 restore read rather than a prefill.
 
-The engine's own optional work (the Index runway's refill with no Spill lane
-in service, trims with no lane in service) takes no unit at all: its rights
-are the narrowest, `TakeRights{}`, which take only the idle state buffers
-and what lands, and its count walks no source. The pass
-command goes only to work that supersedes it, a conversion only to its own
-lane's KV growth. A claim below the priority of a lane in service
-takes no pool's units, rebuilt or above a floor. A `Floor` claim, the start's
-or a weights restore's, takes nothing: it is a class of the host's rule only
-(`MemoryGovernor::HostRule::admits`).
+The engine's own optional work (the Index runway's refill with no Spill lane in
+service, trims with no lane in service) takes no unit at all: its rights are the
+narrowest, `TakeRights{}`, which take only the idle state buffers and what
+lands, and its count walks no source. The pass command goes only to work that
+supersedes it, a conversion only to its own lane's KV growth, and a claim never
+releases a lane of a higher priority than its own. A claim below the priority of
+a lane in service takes no pool's units, rebuilt or above a floor. A `Floor`
+claim, the start's or a weights restore's, takes nothing: it is a class of the
+host's rule only (`MemoryGovernor::HostRule::admits`).
 
 **Whole or streamed** (`planParts` in
-`runtime/engine/StreamedMemoryPlan.cpp`). Under auto, a streamable part, the
-routed experts and then the PLE table, loads whole only where the budget
-leaves the floors, all of it and the KV allowance, and otherwise streams
-through what they leave; the experts leave the table's share too. The
+`runtime/engine/StreamedMemoryPlan.cpp`). Under auto, the routed experts load
+whole only where the budget leaves the floors, all of them, the KV allowance
+and the PLE table's share, and otherwise stream through what those leave. The
+PLE table streams through what the allowance leaves, up to its share, however
+much the budget holds, and loads whole only where it is no larger than its
+share and the budget holds it beside the allowance. The
 allowance is the KV of the first 64K tokens, or of the model's window where
 that is less, with their speculative rows, in the whole extents one request's
 capacity takes; `--max-context` replaces it where set, a spill-capable
@@ -1375,47 +1690,144 @@ smallest size is all its floor at either share (`holdsStores` in
 `runtime/engine/RuntimeResources.mm`). No claim takes the store below its
 floor.
 After the host's pass a pool grows one unit, an elastic store chunk of about
-1 GiB, once 30 s have passed since its last try and since a request's claim
-went unmet or took a pool unit above a floor, the pass command, a conversion
-or a unit in use (`MemoryLedger::free`). Nothing grows while a request's claim waits. The
-unit goes first into free room beyond the waiting claims' holds and the lanes'
-projected growth, then takes by the `Growth` row. A unit the cache pays for
-whole needs only no critical pressure and no host deficit; one that needs free
-room needs normal pressure, the margin and the host out of its band
-(`MemoryGovernor::growthHost`). Nothing is taken before the host admits it.
+1 GiB, once 30 s have passed since its last try and since a request's claim went
+unmet or took a pool unit above a floor, the pass command, a release, a
+conversion or a unit in use (`MemoryLedger::free`). Nothing grows while a
+request's claim waits. The unit goes first into free room beyond the waiting
+claims' holds and the lanes' projected growth, then takes by the `Growth` row. A
+unit the cache pays for whole needs only no critical pressure and no host
+deficit: it returns the host nothing, and a host short of memory takes those
+cache units itself. One that needs free room needs normal pressure, the margin
+and the host out of its band (`MemoryGovernor::growthHost`). Nothing is taken
+before the host admits it. The Index extent spilling refills needs neither when
+the Full extents its moves released cover it (`MemoryGovernor::fund`): they
+returned more than it takes back, and the refill is what lets the moves go on
+returning memory.
 
 **Placement** (`Engine::placement`, `runtime/engine/EngineMemory.cpp`). A
 start's projection is its tokens plus up to 4096 output tokens. It runs
 Resident when that fits its dense history or costs no more than Spill's peak
 (its floors and the larger of its history staging and its hot block floor);
-else Resident when what a `Start` claim may take covers its Resident KV, its
-state buffers and the lanes' projected growth; else Spill. The lanes'
-projected growth (`Engine::laneDemand`) is each lane's KV up to its
-projection and the hot block floors the lanes that read spilled KV still
-lack. One rule prices a hot block floor in both
+else Resident when what a `Start` claim may take covers its Resident KV, the
+buffers its lane takes that the pool lacks and the lanes' projected growth
+(`Engine::residentRoom`), as the memory plan counts one request
+(`ContextBounds::resident`), not the states its prefill captures, which take
+buffers only where memory has them; else Spill. A Spill start the SSD cache
+cannot take (closed, its write budget spent, or its room short of the
+projection) goes on in memory only where its projection fits one request's
+resident context (`Engine::inMemory`). There it starts Resident where the claim its admission makes covers its Resident
+KV now, as placement prices it. Beside another lane in service that claim
+is a `Start`'s, whose test placed it Spill unless every request spills;
+short of it the start waits for memory, and a lane of a lower priority yields
+to it only while every lane in service is of a lower priority, when each
+suspension brings it closer to alone (`Engine::waitForResources`). Alone it is
+`InService`, as its
+lane's growth is, which takes the pooled buffers the next lane starts from
+too, and short of the projection the KV it covers bounds the output, as the
+quota bounds a Spill start's, where it holds the prompt and a token past it
+with the 7 rows past that its decode step verifies (`Cache::growthPages`).
+Otherwise one the tier refuses is refused, and one whose room is short takes
+the SSD cache's bound on its output or waits for its quota as a Spill start
+does, and is otherwise refused at its start rather than fail partway through
+its prefill. The refusal names what the SSD cache has for it and, within the
+resident context, what memory has for its least start
+(`Engine::memoryShortfall`, as `capacity_exhausted` names memory). The lanes' projected growth (`Engine::laneDemand`) is each lane's
+KV up to its projection and what the lanes that hold Index pages still lack
+to read it: their hot block floors, and in prefill their history's staging
+through the next command. One rule prices a hot block floor in both
 (`KvBlockCache::lanesShortfallBytes`): the floors lacked count once for all
 lanes, in whole extents, and extents no lane reads above the floors are a
-rebuilt cache, not a lane's floor.
+rebuilt cache, not a lane's floor. A Spill lane's KV grows as its floor does,
+but the pages of its next prefill command, as many rows as one command holds
+within its prompt (`Engine::nextCommandPages`), count Full, as a Resident
+lane's growth does, and its floor grows from their end: the command writes
+its rows to Full pages, which no release returns until their copies land.
+Priced at the floor, a 225-page command right after a start placed Resident
+beside the lane took the room the start counted, and the start converted
+itself to Spill in its prefill. A decode step adds a page as its tail window
+lets go of one whose copy landed long since, which keeps the floor's count.
 
 **Self-conversion** (`Engine::EngineVictims::conversions`). On a target whose
-run can spill, a Resident lane in decode whose own KV growth the engine's
-limit refuses converts itself to Spill when its eligible pages
-(`Cache::convertiblePages`) times a Full page less an Index page, less the
-first lane's hot block floor (`Model::hotFloorBytes`), cover the missing
-bytes: about 46K tokens on Qwen3.8-Flash-Next. It needs the SSD cache's quota
-for its pages and a free page in the Index runway, an extent kept while
-spilling is possible (`Engine::spillLanded`). Its landed pages release the
-Full extents they empty (`Engine::landedExtents`), and it then follows the
-Spill rules ([KV on the SSD](server.md#kv-on-the-ssd)). No other claim
-converts a lane, and a prefill lane does not convert.
+run can spill, a Resident lane, decoding or between the commands of its
+prefill, whose own KV growth the engine's limit refuses converts itself to
+Spill when its eligible pages (`Cache::convertiblePages`) times a Full page
+less an Index page, less the first lane's hot block floor
+(`Model::hotFloorBytes`), cover the missing bytes: about 46K tokens on
+Qwen3.8-Flash-Next. It needs the SSD cache's quota for its pages and a free
+page in the Index runway, an extent kept while spilling is possible
+(`Engine::spillLanded`). Its claim then waits for its copies and releases its
+pages as they land (below), and it follows the Spill rules ([KV on the
+SSD](server.md#kv-on-the-ssd)): a prefill goes on as a Spill lane's, its
+later commands planned in that shape. No other claim converts a lane.
+
+**Releases** (`Engine::EngineVictims::releases`, `Cache::releasePages`). A Spill
+lane writes each committed page to the SSD cache and keeps it Full, so it
+decodes on its pages in memory while memory lasts. A claim the take order
+reaches with nothing cheaper left releases a lane's oldest pages whose copies
+landed, past its dense history and short of its tail window, to the index form,
+in prefill or in decode, with no write and no wait: between commands, never a
+lane restoring, ended or between its passes, and never one of a higher priority
+than the claimant's (the table's lanes' landed pages). Requests on one prefix
+share its pages, so a page moves only where the claim releases every lane that
+holds it, and never one of the chain a Resident start restores until it holds
+it: a Resident lane reads its history Full, and both the start's placement
+(`VictimQuery::kept`) and its own claims count that chain, its admission
+probe's, as its own, in place. A release gives Index pages to every lane that
+holds its oldest page, and so every later one. A need of bytes releases what the
+claim lacks still and the first reads of those lanes beside it, for each that
+holds no Index page yet its floor of the hot block cache in decode or its
+history's staging in prefill (`Engine::readsShortfall`), in whole extents of
+pages, whose Full extents then leave and whose bytes refill the Index runway: a
+page frees its Full bytes less its Index page's, so a growth's 108.5 MB extent
+and a prefill's 40 MB of staging release 512 pages, two extents, on
+Qwen3.8-Flash-Next. Its take gives the claim what it frees net of those reads,
+as its count does: taken gross, a claim of two lanes' releases kept a 390 MiB
+floor less for each than it counted. Where the lane's pages run short of a
+whole extent, the free Full pages compaction gathers with them complete it
+(`Cache::releaseBeside`): those of the extents that hold pages, less those the
+claim's attempt takes, and none where the pages only the cache holds would
+complete an extent with them, which its reclaims or its demotions as they land
+count then. Counted without them, a lane on a finished lane's prefix, its 511
+releasable pages beside 3 free ones, lacked the 390 MiB hot block floor it gets
+alone. It moves pages only where the runway's
+first moves empty a Full extent, and only as many extents of them as compaction
+can empty, since a page in transfer pins its extent (`Cache::releaseMoves`):
+past that they would cost the lanes their reads, and the runway's refill
+memory, and free nothing. A need of Full pages first moves the pages it lacks
+in place, where the reads of those lanes lack nothing more, as where they hold
+Index pages, since what it frees is not sized for a floor or staging: into free
+Index pages where those hold them and the runway beside them; else with an
+extent of pages more, released as for bytes past the claim's pages, whose
+emptied Full extent refills the runway (`Cache::inPlaceMoves`); else none: a
+lane whose release cannot empty an extent more moves none. It comes
+before the lane's release for bytes, which moves more pages and could take
+those it needs yet leave the claim short of its Full extent. A need the host
+refused lacks no bytes: it takes only its own lane's pages, in place. A claim
+that waits for writes waits for a lane's pages whose copies land, which it
+releases once they have. A count of the releases for bytes, placement's among
+them, adds up what their takes in turn free as the copies stand: each moves its
+lane's oldest pages, so a lane's release counts only the pages and first reads
+those before it leave, its extents completed beside the free pages they leave,
+and a page several lanes share, like each lane's first reads, counts once, for
+the first release that moves it (`ReleaseCount`).
+Counted for each lane alone, two lanes on one conversation, of 3,000 pages and
+of those and 1,000 more, gave a start 307 MB more than their takes free. Copies
+that land before the takes can lower the count, since a lane's landed pages
+then join, in its whole extents, shared pages a later lane's release counted:
+by an extent of pages, 102 MB, for two lanes on a 2,433-page prefix, of 769 and
+897 pages more, the shorter one's copies landing. A pass over the take order
+counts the releases once, not once a unit. Under `--kv-spill always` the pages
+leave as their copies land instead (`Engine::spillLanded`), and their landings
+count as memory on its way back. `/status` counts the releases that freed what
+they were for and their pages (`kv_spill.releases`, `released_pages`).
 
 **Hot block cache** (`HotBlocksPool`, `runtime/model/ModelPools.hpp`). The
-floor, 4,096 slots a layer for each decoding Spill lane that holds one and
-4,096 more, in whole extents, is taken all or none as a lane starts decoding
-(`KvBlockCache::reserveLane`). The cache grows toward `--sparse-kv-memory`
-only while a lane holds a floor, and is a rebuilt cache while no lane reads
-above the floor (`KvBlockCache::readsAboveFloor`). A lane's floor is no unit
-any claim takes: it goes only with its lane (`KvBlockCache::releaseLane`).
+floor, 4,096 slots a layer for each decoding lane that holds one and 4,096 more,
+in whole extents, is taken all or none as a lane holding Index pages decodes
+(`KvBlockCache::reserveLane`). The cache grows toward `--sparse-kv-memory` only
+while a lane holds a floor, and is a rebuilt cache while no lane reads above the
+floor (`KvBlockCache::readsAboveFloor`). A lane's floor is no unit any claim
+takes: it goes only with its lane (`KvBlockCache::releaseLane`).
 
 **Host passes** (`MemoryGovernor::controlPass`). A pass that took something
 waits a settle second (1 s) before the next. With a deficit, a headroom below
@@ -1494,21 +1906,59 @@ The ledger first counts the most the order gives, taking nothing
 (`MemoryLedger::bound`): each unit at what its source says it frees at most.
 Unless that covers what the claim lacks, nothing is taken. Otherwise it takes
 the units one at a time, each found again from the head of its source as it
-stands, until what they freed now and as their transfers land covers the
-need (`MemoryLedger::take`). A unit whose take frees nothing is passed over:
-a transfer in flight may hold it, or nothing of it is left. A claim met
-only by units that land later (a write it started, a conversion's copies)
-waits for them (`Pending`) and is retried as they land; one they do not meet
-waits while what it reached or started lands, and is `Short` otherwise. A
-refusal of KV counts the free pages of its form as its own: the ledger never
-releases their extent for it, which it would only allocate again.
+stands, until what they freed now and as their transfers land covers the need
+(`MemoryLedger::take`). A lone claim (`ClaimSpec::lone`), an `InService` claim
+whose refusal ends its lane (a lane's start, its KV growth or its reads, never
+a state it captures, which goes on without its buffers) that can wait and lacks
+bytes with no other lane in service, takes them whatever the count, and waits
+while it takes something: no lane yields for it, and the count adds up each unit
+in whole extents of its own, so their takes can free more together. Of two
+distinct prompts at the wall, the shorter, alone in decode once the other
+yielded, counted its hot block floor an extent short of what the pages the other
+left cached and its own release free together, 97.5 MiB, and it failed having
+taken nothing. A unit whose take frees nothing is passed over: a
+transfer in flight may hold it, or nothing of it is left. A claim met only by
+units that land later (a write it started, a conversion's copies, a lane's pages
+whose copies land) waits for them (`Pending`) and is retried as they land; one
+they do not meet waits while what it reached or started lands, and is `Short`
+otherwise. A refusal of KV counts the free pages of its form as its own: the
+ledger never releases their extent for it, which it would only allocate again.
+One that lacks pages takes them in place, and the pages its takes free there
+stay with the free ones: its count, as its takes, empties no extent of its form.
+A start's count credits the state buffers its units return to the model's pool,
+whether the pool releases them or the start takes them in place of buffers it
+would allocate, and so do its takes; a pooled buffer they release that the
+start would have taken frees it nothing, as the start then allocates it.
+`/status` counts the takes on a count that covered what the claim lacked, and
+those that freed less though no unit waited for a transfer and no allocation was
+refused meanwhile, by the host, the engine's limit or the driver
+(`memory_governor.count_checks`): a refused refill cuts a release short by the
+runways it would have moved, which is no overcount.
+
+The log has a line for each decision of a request's claim
+(`Memory: <class> claim of request N needs ...`) that waits, is short, is
+met past the host or takes what costs work later, a unit from step 5 of the
+[take order](#memory-rules) on (the next lane's buffers among them), with
+what it took, once for each kind of need until an allocation of the claim is
+granted; a claim of no request logs each take. A request's claim met by the
+room or by steps 1 to 4 alone logs nothing: a decode taking each next page
+from the cache logged such a met 1-2 times a second through a long reply.
+Nor does a wait, until it has lasted a second: the same pages, each waiting a
+tick for its copy to land, logged a pending and a granted a page.
+The grant that ends a logged wait logs `granted`, since a wait can end in an
+attempt that runs no `free()`, as the pages it waited for land; and a need
+`free()` met whose attempt is still refused logs `met, yet refused again`, the
+ledger having counted room the attempt did not find. `/status` shows the
+cache's pages (`kv.pages_cache`), its evicted states (`state.evictions`) and
+the pools' shrinks (`memory_governor.accounts`).
 
 A claim for memory nothing needs yet, such as the Index runway's refill with
-no Spill lane in service, takes only what costs nothing. Pages whose copies
-landed leave memory at every point between commands where memory is judged,
-before admission and at each command's start (`Engine::spillLanded`) and in
-the control pass (`Engine::collectLandings`), so the next attempt finds what
-they gave back.
+no Spill lane in service, takes only what costs nothing. The runway refills
+at every point between commands where memory is judged, before admission and
+at each command's start (`Engine::spillLanded`) and in the control pass
+(`Engine::collectLandings`); under `--kv-spill always` pages whose copies
+landed leave memory there first, so the next attempt finds what they gave
+back.
 
 A request in service keeps growing through host pressure and macOS's warning,
 short of critical pressure, within `--max-memory`, first into cached pages no
@@ -1722,8 +2172,11 @@ recovery alike.
 Admission starts a prompt only where the next command serves it and the
 prompt is overdue, or the command leaves it waiting for no other prompt: it
 ends the prompt, the prompt leads it, or every lane ahead of it ends its
-prompt there and none is a Spill lane, so two Spill lanes prefill together
-only as the later one leads or one is overdue.
+prompt there and none reads spilled history, so two such lanes prefill
+together only as the later one leads or one is overdue. A lane reads spilled
+history where it holds Index pages, a candidate where its restore brings
+them, and under `--kv-spill always` every Spill lane (`Engine::laneShapes`);
+a Spill lane whose pages no release took prefills as a Resident one does.
 The lanes of a command between its passes count past its rows, which commit
 before any other prefill.
 A start still restoring its prefix from the SSD cache runs in no command before
@@ -1788,9 +2241,15 @@ flight; the request's own deadline, its `timeout` or `--request-timeout`,
 applies throughout.
 Readiness does not guarantee that a request-sized allocation fits. A request
 that cannot fit even alone, after every cached prefix was evicted and the expert
-store shrank to its floor, fails with 400 `capacity_exhausted`, naming a smaller
-`--max-context`, or a larger `--max-memory` where one lowered the budget;
-retrying it fails the same way.
+store shrank to its floor, fails with 400 `capacity_exhausted`
+(`Engine::capacityExhausted`), naming what it could not allocate, then, as
+every end for want of memory does (`Engine::memoryShortfall`), its lane's
+mode, phase and tokens and the Metal memory outside the backend's buffers
+(`MemoryGovernor::untrackedBytes`), only for a Spill lane why its KV gave no
+more memory back (the SSD cache took no more of it where it owes copies no
+write started, `Cache::owesCopies`; otherwise even a release down to its floor
+does not cover what it lacks), and a smaller `--max-context`, or a larger
+`--max-memory` where one lowered the budget; retrying it fails the same way.
 
 ## Sliding windows
 
@@ -1899,8 +2358,12 @@ on the tier, and each request's commitment checks the room
 
 The volume sizes the tier only once its files are open, before a persistent
 tier takes anything back, and again at every control pass and whenever a write
-finds the volume full. `DiskSpace` reads the volume with `fstatfs` on the first
-file's descriptor, which names the right volume however the file was made, and
+finds the volume full. `DiskSpace` reads it through
+`RuntimeResourcesConfig::diskVolume`, the probe the automatic quota reads
+volumes with before the files open, for the folder they opened in, a
+persistent tier's root, else the temporary files' directory, its links
+resolved as they opened, so that a measure after the folder went still reads
+the volume that holds them. It
 sets the budget's limit to min(quota, max(0, available + held - floor) / 4) for
 the automatic quota and to min(quota, max(0, available + held - floor)) for a
 size, held being the blocks the tier's files take (`st_blocks`). The KV of
@@ -2179,9 +2642,12 @@ completion, where a Cancel frame would finish it cancelled. A Stop before the
 request's first token cancels it, and one for a request that has already
 ended is ignored.
 
-An engine sends Warming once it holds its weights, then its Ready event when
-its warm-up runs are done; the server writes the first engine's Warming to
-its serve record, where the app shows it as the start's Warming up step.
+An engine sends Warming once it holds its weights, with the steps of its
+warm-up done of all, and again as each step ends
+([Warmup and pipelines](#warmup-and-pipelines)), then its Ready event when the
+warm-up is done; the server prints the first engine's Warming and writes it to
+its serve record, where the app shows it as the start's Warming up step and
+its progress.
 Ready says what the start serves: its lanes, the context it resolved (a
 relaunch may serve less than the first engine did), whether it admits
 images, and the target's vocabulary, stop

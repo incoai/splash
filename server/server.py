@@ -3,6 +3,7 @@ handler; each API's handlers, request conversion and answers live in its
 module in dialects/."""
 
 import argparse
+import errno
 import json
 import math
 import os
@@ -44,7 +45,8 @@ from .constraints import (
     check_capabilities,
     validate_tokenizer,
 )
-from .diagnostics import log_unexpected, print_request, print_status
+from .diagnostics import console_stats, log_unexpected, print_request, print_status
+from .documents import MAX_PAGES, MAX_PDF_BYTES
 from .errors import (
     OPENAI_ERRORS,
     RETRY_STATUSES,
@@ -61,6 +63,7 @@ from .http_security import (
     authenticate,
     validate_headers,
 )
+from .images import MAX_IMAGE_BYTES
 from .latency import RequestLatency
 from .metrics import prometheus_metrics
 from .origins import ANY_ORIGIN
@@ -69,6 +72,7 @@ from .output import (
     StreamingToolCallProjector,
     validate_response_content,
 )
+from .protocol import MAX_IMAGE_SPANS
 from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
 
 # Request bodies held at once, from upload through preparation and, for what
@@ -87,7 +91,21 @@ ANSWERED_LINGER_SECONDS = 2.0
 # lingering after a burst and the engine's pipes and files can need. 10240 is
 # macOS's OPEN_MAX.
 DESCRIPTOR_LIMIT = 10240
+# The status of a server that stopped restarting its engine, apart from a
+# stop's 0 and a failed start's 1: what supervises the server, as launchd's
+# KeepAlive does, decides whether to start it again. 69 is sysexits'
+# EX_UNAVAILABLE.
+ENGINE_STOPPED_STATUS = os.EX_UNAVAILABLE
 SSE_KEEPALIVE_SECONDS = 2.0
+# A client gone without a FIN or RST (a Mac asleep, off its network) sends
+# nothing a non-streaming request reads; keepalive probes the idle connection
+# and drops it once its peer stops answering, 60 s after its last data.
+TCP_KEEPALIVE_OPTIONS = (
+    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 30),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3),
+)
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
 CHAT_ASSETS = {
@@ -216,7 +234,19 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # passed validate_headers.
         self._allow_origin = None
         self._unread_body = 0
+        # The native job submitted last, which a failure cancels.
+        self._submitted = None
         self._last_sse_write = time.monotonic()
+        try:
+            for level, option, value in TCP_KEEPALIVE_OPTIONS:
+                self.request.setsockopt(level, option, value)
+        except OSError as error:
+            # macOS refuses options on a connection its client reset before
+            # it was served (EINVAL): it ends as any reset does. Any other
+            # refusal is the server's to report.
+            if error.errno != errno.EINVAL:
+                raise
+            raise ConnectionResetError from error
         super().setup()
         self.connection.settimeout(HTTP_IO_TIMEOUT)
 
@@ -360,15 +390,23 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _log_api_error(self, code):
         path = "".join(char if char.isprintable() else "?" for char in self.route)
-        print_status(f"Error · {code} · {self.command} {path[:256]}", error=True)
+        # A request the engine took is named as the backend's lines name it,
+        # so that the app joins them.
+        job = self._submitted
+        engine_id = job.engine_request_id if job is not None else None
+        request = "" if engine_id is None else f"request {engine_id} · "
+        print_status(
+            f"Error · {request}{code} · {self.command} {path[:256]}", error=True
+        )
 
     def safe_error(self, error, *, log=True):
         """Answer with `error` as its path's API answers it, unless the
-        response has begun."""
+        response has begun. `log` prints its line unless the backend has:
+        one line ends a request."""
         if self.response_started:
             return
         status, code, payload = self.errors.answer(error)
-        if log:
+        if log and not error.logged:
             self._log_api_error(code)
         try:
             self.send_json(status, payload, error.retry_after)
@@ -527,6 +565,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "context_length": self.app.max_context,
                 "vision": self.app.vision,
                 "input_modalities": self.app.input_modalities,
+                "limits": self._limits(),
                 "reasoning": self.app.reasoning,
                 **(
                     {"root": self.app.response_model}
@@ -536,6 +575,19 @@ class FrontendHandler(BaseHTTPRequestHandler):
             }
             for name in self.app.model_names
         ]
+
+    def _limits(self):
+        """What a request may carry, which a client can check an attachment
+        against before it sends: its bytes (--max-request-size); its images,
+        a PDF's pages counted among them; an image's bytes; a PDF's bytes,
+        which the request's PDFs share, and its pages."""
+        return {
+            "request_bytes": self.server.max_request_bytes,
+            "images": MAX_IMAGE_SPANS,
+            "image_bytes": MAX_IMAGE_BYTES,
+            "pdf_bytes": MAX_PDF_BYTES,
+            "pdf_pages": MAX_PAGES,
+        }
 
     def _get_models(self):
         models = self._models()
@@ -581,8 +633,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
             return
         self._body_reservation = None
-        # The native job submitted last, which a failure cancels.
-        self._submitted = None
         try:
             generation = self._serve(route, started_at)
             if generation is not None:
@@ -595,8 +645,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.safe_error(error, log=self._submitted is None)
         except APIError as error:
             self._cancel_submitted()
-            # The native outcome was already logged; a server-side failure
-            # after submission must still reach the console.
+            # A failure the backend ended the request with is logged, under
+            # the engine's id; another server-side failure after submission
+            # must still reach the console.
             self.safe_error(error, log=self._submitted is None or error.status >= 500)
         except Exception as error:
             self._cancel_submitted()
@@ -724,7 +775,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
         except BlockingIOError:
             return False
-        except ConnectionError:
+        except (ConnectionError, TimeoutError):
+            # A connection keepalive dropped fails its read with ETIMEDOUT.
             return True
 
     def _finalize_content(self, content, job, result, projector, cut_in_call):
@@ -874,7 +926,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.app.backend.cancel(job)
             if not self.response_started:
                 raise
-            if error.status >= 500:
+            if error.status >= 500 and not error.logged:
                 self._log_api_error(error.code)
             try:
                 send_error(error)
@@ -1055,6 +1107,7 @@ class FrontendServer(HTTPServer):
             "token_counts": self.token_counts.stats(),
             "connections": self.connections.stats(),
         }
+        status["console"] = console_stats()
         return status
 
     def server_activate(self):
@@ -1112,10 +1165,12 @@ class FrontendServer(HTTPServer):
         self.connections.idle.wait(min(2.0, HTTP_IO_TIMEOUT))
 
     def handle_error(self, request, client_address):
+        # A client that left is no error. Any other is one console line, as a
+        # request's unexpected error is: socketserver's own writes a traceback
+        # straight to stderr, on the connection worker.
         error = sys.exc_info()[1]
-        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
-            return
-        super().handle_error(request, client_address)
+        if not isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            log_unexpected(error)
 
 
 def parse_args(argv=None):
@@ -1219,6 +1274,14 @@ def main():
     server = None
     runtime = None
     backend = None
+    # Why the backend stopped restarting the engine, once it has.
+    stopped = None
+
+    def stop_serving(reason):
+        nonlocal stopped
+        stopped = reason
+        os.kill(os.getpid(), signal.SIGTERM)
+
     # A server started in the background from a non-interactive shell inherits
     # SIGINT as ignored and Python then leaves it alone; install both stop
     # signals explicitly so scripts and supervisors can interrupt it.
@@ -1303,13 +1366,27 @@ def main():
             ),
             pending_limit=args.queue_size,
         )
-        runtime.on_warming = lambda: serve_record.entered(args.serve_record, "warming")
+
+        def warming(event):
+            # As the warm-up begins and as each of its steps ends: it can take
+            # minutes on the first start after an update, so the console and
+            # the record, which the app shows, say how far it is. It runs on
+            # the reader thread, which must not block (on_warming):
+            # print_status only queues the line for the console's one writer,
+            # which drops it once 1024 lines wait (diagnostics.CONSOLE_LINES).
+            print_status(f"Warming up · {event.steps_done} of {event.steps} steps")
+            serve_record.warming(args.serve_record, event.steps_done, event.steps)
+
+        runtime.on_warming = warming
         backend = NativeBackend(
             runtime,
             tokenizer,
             request_logger=print_request,
             thinking_end=thinking_end,
         )
+        # A server that serves nothing more stops as on SIGTERM and exits
+        # ENGINE_STOPPED_STATUS below.
+        backend.on_stopped = stop_serving
         if not runtime.wait_ready():
             raise engine_runtime.EngineUnhealthy("native runtime did not become ready")
         # The engine is authoritative for what it serves: it refuses a
@@ -1403,6 +1480,11 @@ def main():
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             if server is not None:
                 server.server_close()
+    if stopped is not None:
+        serve_record.failed(
+            args.serve_record, serve_record.failure(serve_record.STOPPED, stopped)
+        )
+        raise SystemExit(ENGINE_STOPPED_STATUS)
 
 
 if __name__ == "__main__":
