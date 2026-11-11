@@ -248,8 +248,10 @@ void GgufFile::parse(WeightSource &source, uint32_t file, GgufContents contents)
     default: skipValue(reader, type, 0); break;
     }
   }
+  // A power of two of 8 or more, as the GGUF spec requires: the GPU repack
+  // reads blocks as words (kernels/shared/gguf_repack.metal).
   const uint64_t alignment = metadata_.unsignedValue("general.alignment").value_or(32);
-  if (alignment == 0 || alignment > 65536 || (alignment & (alignment - 1)))
+  if (alignment < 8 || alignment > 65536 || (alignment & (alignment - 1)))
     throw GgufError("invalid GGUF alignment");
   const size_t firstTensor = tensors_.size();
   tensors_.reserve(firstTensor + tensorCount);

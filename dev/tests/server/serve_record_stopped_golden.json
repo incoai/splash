@@ -1,0 +1,8 @@
+{
+  "pid": 4242,
+  "phase": "failed",
+  "failure": {
+    "kind": "stopped",
+    "message": "Splash stopped restarting the engine: --kv-format bf16 is refused. Set SPLASH_CRASH_TRACE=1 to record a crash trace. Start the Splash server again after fixing the cause."
+  }
+}

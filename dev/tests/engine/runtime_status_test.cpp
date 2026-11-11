@@ -5,6 +5,7 @@
 #include "StderrLine.hpp"
 #include "engine/Status.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -190,6 +191,7 @@ StatusInputs representativeStatus() {
 
   WarmupReport warmup;
   warmup.maximumPrefill = WarmupStepStatus::Complete;
+  warmup.prefillRowClasses = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
   warmup.maximumPrefillDetail = "rows=2048";
@@ -263,6 +265,9 @@ StatusInputs representativeStatus() {
                         .shrinks = 2}};
   governor.owed = {.transfers = 2, .bytes = 64 * 4096ULL, .toClaimsBytes = 32 * 4096ULL, .oldestMilliseconds = 12.5};
   governor.claims = {.waiting = 2, .bytes = 32 * 4096ULL, .oldestMilliseconds = 1250.0};
+  // Of 40 takes on a count that covered what their claim lacked, one freed
+  // less; two releases taken first freed less than they counted.
+  governor.countChecks = {.coveredRuns = 40, .overcountedRuns = 1, .shortReleases = 2};
 
   // A streamed table, the experts' store and KV on the SSD cache with its
   // readers.
@@ -425,8 +430,9 @@ void testCleanRuntimeStatus(const char *goldenPath) {
 // steps memory-limited. A resident target with windows: the plan's kv_window,
 // no kv_spill or kv.window, no host telemetry, the idle release off, the
 // split off, the streamed stores absent, SSD writes open, Metal failed with a
-// reason that needs escaping, YaRN, BF16 token-major KV, no requests, no
-// ledger accounts and one warmup step memory-limited.
+// reason that needs escaping after it created two pipelines while serving,
+// YaRN, BF16 token-major KV, no requests, no ledger accounts and one warmup
+// step memory-limited.
 std::vector<std::pair<const char *, StatusInputs>> statusVariants() {
   const StatusInputs representative = representativeStatus();
 
@@ -478,6 +484,7 @@ std::vector<std::pair<const char *, StatusInputs>> statusVariants() {
   resident.sample.engine.resources.kvTier.writesGated = engine::DiskWritesGate::No;
   resident.sample.metalHealthy = false;
   resident.sample.metalFailureReason = "command buffer \"decode\" failed:\n\tGPU timeout";
+  resident.sample.pipelinesCreatedWhileServing = 2;
   resident.identity.ropeScaling = {3.814697265625, 262144};
   resident.identity.kvLayout = kv::Layout{16, 4, 256, kv::Format::BFloat16};
   resident.identity.kvLayout.valuesTokenMajor = true;
@@ -559,6 +566,7 @@ void testWarmupStepsReportMeasurementTruth() {
   const EngineMemoryPlan memoryPlan = plan();
   WarmupReport warmup;
   warmup.maximumPrefill = WarmupStepStatus::Complete;
+  warmup.prefillRowClasses = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
   MemoryGovernorSnapshot governor;
@@ -802,6 +810,8 @@ void testKvSpillStatus() {
                  .writeThroughBytes = 13'312'000'000,
                  .writeThroughInFlight = 3,
                  .spillMoves = 31'250,
+                 .releases = 3,
+                 .releasedPages = 1'536,
                  .indexRestores = 12,
                  .wholeRestores = 2,
                  .restore = {.count = 2, .totalMilliseconds = 1.5, .maximumMilliseconds = 1, .p50Milliseconds = 0.5,
@@ -851,9 +861,10 @@ void testKvSpillStatus() {
       "\"closed\":0},\"waiting_quota\":1},\"pages\":{\"index\":31250,"
       "\"index_bytes\":768000000,\"spilled\":31250,\"spilled_bytes\":13312000000},\"write_through\":{\"pages\":31250,"
       "\"bytes\":13312000000,\"in_flight\":3,\"failures\":0,\"paused\":false},\"spill_moves\":31250,\"unspills\":0,"
-      "\"rewrites\":0,\"restores\":{\"index_pages\":12,\"whole_pages\":2,\"ms\":{\"p50\":0.5,\"p95\":1,\"p99\":1,"
-      "\"max\":1,\"total\":1.5,\"samples\":2}},\"quota\":{\"active_limit_bytes\":34359738368,\"held_bytes\":"
-      "13312000000,\"committed_bytes\":55000000,\"revoked\":0},\"index_runway_bytes\":6291456,\"block_cache\":"
+      "\"releases\":3,\"released_pages\":1536,\"rewrites\":0,\"restores\":{\"index_pages\":12,\"whole_pages\":2,"
+      "\"ms\":{\"p50\":0.5,\"p95\":1,\"p99\":1,\"max\":1,\"total\":1.5,\"samples\":2}},\"quota\":"
+      "{\"active_limit_bytes\":34359738368,\"held_bytes\":13312000000,\"committed_bytes\":55000000,"
+      "\"revoked\":0},\"index_runway_bytes\":6291456,\"block_cache\":"
       "{\"bytes\":408944640,\"target_bytes\":408944640,\"floor_bytes\":408944640,\"slots_per_layer\":8192,\"lanes\":1,"
       "\"resolves\":24,\"entries\":98304,\"paged\":1024,\"hits\":60000,\"read\":37280,\"hit_rate\":0.6167763158,"
       "\"ghost_hits\":512,\"read_bytes\":310000000,\"read_failures\":0,\"resolve_ms\":" +
@@ -1006,25 +1017,49 @@ void testThermalStateTransitions() {
           "a warm start was not logged once");
 }
 
-// The server and the runtime share stderr, as `serve > log 2>&1` does: a
-// line written from any thread arrives whole.
+// The server reads the runtime's stderr from a pipe, which, once full, keeps a
+// write whole only up to PIPE_BUF (512 bytes on macOS): 8 threads write lines
+// of 2 KiB at once while the reader drains the pipe 256 bytes at a time, and
+// every line arrives whole.
 void testStderrLinesStayWhole() {
-  std::istringstream lines(capturedStderr([] {
-    std::vector<std::thread> writers;
-    for (int writer = 0; writer < 8; ++writer)
-      writers.emplace_back([writer] {
-        for (int line = 0; line < 300; ++line)
-          writeStderrLine("writer " + std::to_string(writer) + " line " +
-                          std::to_string(line));
-      });
-    for (std::thread &writer : writers)
-      writer.join();
-  }));
-  const std::regex whole("writer [0-7] line [0-9]+");
+  int ends[2];
+  require(::pipe(ends) == 0, "no pipe");
+  const int saved = ::dup(STDERR_FILENO);
+  ::dup2(ends[1], STDERR_FILENO);
+  ::close(ends[1]);
+  std::string received;
+  std::thread reader([&] {
+    char chunk[256];
+    for (ssize_t got; (got = ::read(ends[0], chunk, sizeof chunk)) > 0;) {
+      received.append(chunk, static_cast<size_t>(got));
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+  });
+  std::vector<std::thread> writers;
+  for (int writer = 0; writer < 8; ++writer)
+    writers.emplace_back([writer] {
+      for (int line = 0; line < 50; ++line)
+        writeStderrLine("writer " + std::to_string(writer) + " line " +
+                        std::to_string(line) + ' ' + std::string(2048, char('a' + writer)));
+    });
+  for (std::thread &writer : writers)
+    writer.join();
+  // The pipe's last write end closes: the reader reads to its end.
+  ::dup2(saved, STDERR_FILENO);
+  ::close(saved);
+  reader.join();
+  ::close(ends[0]);
+  std::istringstream lines(received);
+  const std::regex head("writer ([0-7]) line [0-9]+ ");
   int count = 0;
-  for (std::string line; std::getline(lines, line); ++count)
-    require(std::regex_match(line, whole), "a stderr line was broken");
-  require(count == 8 * 300, "stderr lines were lost or merged");
+  for (std::string line; std::getline(lines, line); ++count) {
+    std::smatch parts;
+    require(std::regex_search(line, parts, head, std::regex_constants::match_continuous) &&
+                line.substr(parts.length(0)) ==
+                    std::string(2048, char('a' + std::stoi(parts[1].str()))),
+            "a stderr line was broken");
+  }
+  require(count == 8 * 50, "stderr lines were lost or merged");
 }
 
 // A notice carries the time first, as the server's console lines do, and

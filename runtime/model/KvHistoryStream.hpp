@@ -26,6 +26,7 @@
 // reads, so that one its command gave up may still run, and does nothing
 // once its command's stream ended.
 
+#include "Checked.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/KvExtent.h"
@@ -67,6 +68,16 @@ public:
   ~KvHistoryStream();
   KvHistoryStream(const KvHistoryStream &) = delete;
   KvHistoryStream &operator=(const KvHistoryStream &) = delete;
+  // The page table of one buffer, which a stream of a pool's `layout`
+  // allocates for each as it is built and holds until it goes: an entry for
+  // each staging page, in whole host pages, as Metal allocates them, in
+  // whichever extent size the pool takes (kv::Layout::mostOverExtents), so
+  // that the memory plan, made before the pool's, counts it
+  // (KvSpillPlan::tableBytes); 278,528 bytes for 256-page extents.
+  [[nodiscard]] static constexpr uint64_t tableBytes(const kv::Layout &layout) {
+    return layout.mostOverExtents(
+        [](uint32_t extentPages) { return alignUp(stagedPages(extentPages) * sizeof(SplashKvPage)); });
+  }
 
   // Between commands: staging for a sequence of `pages` pages, its history
   // and the command's own, or a refusal with nothing changed. Staging stays
@@ -115,6 +126,13 @@ public:
   [[nodiscard]] KvHistoryStreamStats stats() const;
 
 private:
+  // A buffer's staging pages: one for each page of the longest sequence, in
+  // whole extents.
+  [[nodiscard]] static constexpr uint64_t stagedPages(uint32_t extentPages) noexcept {
+    constexpr uint64_t most = (uint64_t{kv::kMaximumPhysicalTokens} + kv::kPageTokens - 1) / kv::kPageTokens;
+    return (most + extentPages - 1) / extentPages * extentPages;
+  }
+
   struct Impl;
   std::shared_ptr<Impl> impl_;
 };

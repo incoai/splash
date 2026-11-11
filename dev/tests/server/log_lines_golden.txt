@@ -2,7 +2,8 @@
 # RequestEntry), one of each as the server writes them:
 # dev/tests/server/test_diagnostics.py checks the server writes them so, and
 # SplashTests reads each.
-12:00:09 Started · input 4,096 · cached 1,024 · effort none · thinking off
-12:01:09 Done · input 4,096 · cached 1,024 · output 574 · TTFT 0.4s · 36.8 tok/s · 1.9 tok/cycle
-12:02:00 Cancelled · input 69 · cached 0 · output 12
-12:03:00 Error · invalid_request_error
+12:00:09 Started · request 7 · input 4,096 · cached 1,024 · effort none · thinking off
+12:01:09 Done · request 7 · input 4,096 · cached 1,024 · output 574 · TTFT 0.4s · 36.8 tok/s · 1.9 tok/cycle
+12:02:00 Cancelled · request 8 · input 69 · cached 0 · output 12
+12:03:00 Error · request 9 · runtime_unavailable
+12:04:00 Error · invalid_request_error

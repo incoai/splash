@@ -118,47 +118,30 @@ struct Model {
   std::array<gguf_reference::Fmt, 6> formats{};
 };
 
-// The formats whose weights `tile` takes, in id order: the register tile takes
-// those of quant_register_format.
-inline std::vector<gguf_reference::Fmt> tileFormats(splash::ops::MoeGgufTile tile) {
-  std::vector<gguf_reference::Fmt> formats;
-  for (int f = 0; f < gguf_reference::FMT_COUNT; ++f)
-    if (tile == splash::ops::MoeGgufTile::Staged || quant_register_format(uint32_t(f)))
-      formats.push_back(gguf_reference::Fmt(f));
-  return formats;
-}
-
-// The first of `formats` from index i on, cyclically, that `tile` takes in
-// rows of K values: one whose column unit divides K (a GGUF stores no
-// 256-value blocks in rows of 640, Qwen3.8-Flash-Next's expert down
-// projections, which take 32- or 64-value blocks, and preparation takes
-// PQ2_0's 128-value blocks and the MLX affine formats' groups of 128 only in
-// rows of whole superblocks), and on the register tile one it takes in such
-// rows (quant_register_tensor: 64-value blocks in rows of whole 256 values).
-inline gguf_reference::Fmt fitting(const std::vector<gguf_reference::Fmt> &formats, size_t i, uint32_t K,
-                                   splash::ops::MoeGgufTile tile) {
-  for (size_t j = 0; j < formats.size(); ++j) {
-    const gguf_reference::Fmt g = formats[(i + j) % formats.size()];
-    if (K % quant_column_unit(kQuantFormats[g].block_elements) == 0 &&
-        (tile == splash::ops::MoeGgufTile::Staged || quant_register_tensor(g, K)))
-      return g;
+// The first format from id i on, cyclically, in rows of K values: one whose
+// column unit divides K (a GGUF stores no 256-value blocks in rows of 640,
+// Qwen3.8-Flash-Next's expert down projections, which take 32- or 64-value
+// blocks, and preparation takes PQ2_0's 128-value blocks and the MLX affine
+// formats' groups of 128 only in rows of whole superblocks).
+inline gguf_reference::Fmt fitting(size_t i, uint32_t K) {
+  for (size_t j = 0; j < gguf_reference::FMT_COUNT; ++j) {
+    const gguf_reference::Fmt g = gguf_reference::Fmt((i + j) % gguf_reference::FMT_COUNT);
+    if (K % quant_column_unit(kQuantFormats[g].block_elements) == 0) return g;
   }
   throw std::logic_error("no format fits the row");
 }
 
-// The model of `shape` and format f that `tile` runs: gate, up and down in f
-// and the next two formats the tile takes, cyclically, and the shared
-// expert's in the three after them, each the next that fits its rows; with
-// upInGateFormats, up in the gate's formats.
+// The model of `shape` and format f: gate, up and down in f and the next two
+// formats, cyclically, and the shared expert's in the three after them, each
+// the next that fits its rows; with upInGateFormats, up in the gate's
+// formats.
 inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::MoeShape &shape, int f,
-                       bool upInGateFormats, splash::ops::MoeGgufTile tile = splash::ops::MoeGgufTile::Staged) {
-  const std::vector<gguf_reference::Fmt> formats = tileFormats(tile);
-  const size_t first = std::find(formats.begin(), formats.end(), gguf_reference::Fmt(f)) - formats.begin();
+                       bool upInGateFormats) {
   const uint32_t hidden = shape.hiddenSize, intermediate = shape.expertIntermediateSize;
   const uint32_t n[3] = {intermediate, intermediate, hidden}, k[3] = {hidden, hidden, intermediate};
   Model m;
   m.shape = shape;
-  for (size_t i = 0; i < m.formats.size(); ++i) m.formats[i] = fitting(formats, first + i, k[i % 3], tile);
+  for (size_t i = 0; i < m.formats.size(); ++i) m.formats[i] = fitting(f + i, k[i % 3]);
   if (upInGateFormats) {
     m.formats[1] = m.formats[0];
     m.formats[4] = m.formats[3];

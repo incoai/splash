@@ -16,7 +16,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 12
+PROTOCOL_VERSION = 13
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -65,6 +65,8 @@ _ERROR = struct.Struct("<BBIQII")
 _STATUS_JSON = struct.Struct("<Q")
 # Kind, bound, required bytes, budget bytes, plan context, message bytes.
 _START_FAILED = struct.Struct("<BBQQII")
+# Steps done, steps.
+_WARMING = struct.Struct("<II")
 
 assert (
     array.array("I").itemsize == 4
@@ -80,6 +82,7 @@ assert _DONE.size == 62
 assert _ERROR.size == 22
 assert _STATUS_JSON.size == 8
 assert _START_FAILED.size == 26
+assert _WARMING.size == 8
 
 REQUEST_FIXED_BYTES = _REQUEST.size
 IMAGE_SPAN_BYTES = _IMAGE_SPAN.size
@@ -335,12 +338,15 @@ class ReleaseRequestFrame:
     correlation_id: int
 
 
-# Sent before Ready once the engine holds its weights: what remains of its
-# start is the warm-up runs, which can take a minute on the first start after
-# an update, when they also prepare the GPU's programs.
+# Sent before Ready once the engine holds its weights, as its warm-up begins
+# and as each step ends: on the first start after an update the warm-up also
+# prepares the GPU's programs, and the 27B's start then took 118 s on a 48 GB
+# M5 Pro.
 @dataclass(slots=True, frozen=True)
 class WarmingEvent:
-    pass
+    # The steps done, those memory kept from running among them, of all.
+    steps_done: int
+    steps: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -692,7 +698,7 @@ def _payload_bounds(frame_type: FrameType) -> tuple[int, int]:
         case FrameType.START_FAILED:
             bounds = (_START_FAILED.size, _START_FAILED.size + MAX_ERROR_STRING_BYTES)
         case FrameType.WARMING:
-            bounds = (0, 0)
+            bounds = (_WARMING.size, _WARMING.size)
     return bounds[0], min(bounds[1], MAX_FRAME_PAYLOAD_BYTES)
 
 
@@ -1156,7 +1162,10 @@ def _tail(
 def _decode_event(frame: Frame) -> EngineEvent:
     frame_type, payload = _checked_frame(frame)
     if frame_type is FrameType.WARMING:
-        return WarmingEvent()
+        steps_done, steps = _WARMING.unpack(payload)
+        if not steps or steps_done > steps:
+            _fatal(IssueCode.INVALID_COUNT, "warming steps are invalid")
+        return WarmingEvent(steps_done, steps)
     if frame_type is FrameType.READY:
         concurrent, context, vision, vocabulary, rows, stop_count = _READY.unpack_from(
             payload

@@ -6,6 +6,7 @@ test-python builds."""
 
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -228,8 +229,9 @@ def listing(directory):
 class FakeHub:
     """The Hub as huggingface_hub presents it to the installer: repositories
     whose branches name commits, and downloads that fill the test's Hub cache
-    with snapshots of only the files requested. It patches huggingface_hub for
-    the test's duration."""
+    as huggingface_hub does, with snapshots of only the files requested, each
+    a link to its blob (link_blob). It patches huggingface_hub for the test's
+    duration."""
 
     def __init__(self, test, cache):
         self.cache = cache
@@ -278,7 +280,7 @@ class FakeHub:
                 RepoSibling(
                     rfilename=name,
                     size=(root / name).stat().st_size,
-                    blob_id=hashlib.sha1((root / name).read_bytes()).hexdigest(),
+                    blob_id=blob_id(root / name),
                 )
                 for name in listing(root)
             ],
@@ -290,8 +292,13 @@ class FakeHub:
         path = self.snapshot(repo_id, revision) / name
         # As huggingface_hub does, a cached file is returned as it is.
         if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(self.remote / repo_id / revision / name, path)
+            source = self.remote / repo_id / revision / name
+            blobs = self.cache / hub.folder_name(repo_id) / "blobs"
+            blob = blobs / blob_id(source)
+            if not blob.exists():
+                blobs.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, blob)
+            link_blob(path, blob)
             self.downloads.append(f"{repo_id}/{name}")
         return path
 
@@ -325,10 +332,46 @@ def fake_hub(test, cache, *, target=DENSE, commit="a" * 40):
     return fake
 
 
+def blob_id(path):
+    """The name of the file at path in a Hub cache's blobs/, as FakeHub lists
+    it: its Git blob SHA-1, the Hub's blob ID of a file outside LFS. Files of
+    the same content share one blob."""
+    data = path.read_bytes()
+    return hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest()
+
+
+def link_blob(entry, blob):
+    """Make entry, a file of a snapshot, a relative symbolic link to blob, as
+    huggingface_hub links a snapshot's files to their blobs."""
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.unlink(missing_ok=True)
+    entry.symlink_to(os.path.relpath(blob, entry.parent))
+
+
 def cached_snapshot(cache, repo_id, commit, build):
     """repo_id at commit as a download leaves it in the Hub cache: a snapshot
-    of only the files downloaded."""
-    return build(cache / hub.folder_name(repo_id) / "snapshots" / commit)
+    of only the files downloaded, each a link to its blob."""
+    snapshot = cache / hub.folder_name(repo_id) / "snapshots" / commit
+    built = build(snapshot)
+    blobs = snapshot.parent.parent / "blobs"
+    blobs.mkdir(exist_ok=True)
+    for entry in [p for p in snapshot.rglob("*") if p.is_file() and not p.is_symlink()]:
+        blob = blobs / blob_id(entry)
+        if not blob.exists():
+            shutil.copyfile(entry, blob)
+        link_blob(entry, blob)
+    return built
+
+
+def blob_bytes(cache, repo_id=None):
+    """The bytes of the blobs in the Hub cache, of repo_id's or every
+    repository's."""
+    folders = [cache / hub.folder_name(repo_id)] if repo_id else cache.glob("models--*")
+    return sum(
+        blob.stat().st_size
+        for folder in folders
+        for blob in (folder / "blobs").glob("*")
+    )
 
 
 def pins(cache):

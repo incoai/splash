@@ -118,6 +118,7 @@ TEST_GGUF_PLANNER := $(ENGINE_TEST_BUILD)/gguf-planner
 TEST_GGUF_PREPARATION := $(ENGINE_TEST_BUILD)/gguf-preparation
 TEST_GGUF_DEQUANT_AIR := $(ENGINE_TEST_BUILD)/gguf-dequant.air
 TEST_GGUF_DEQUANT_LIB := $(ENGINE_TEST_BUILD)/gguf-dequant.metallib
+TEST_GGUF_MOE_AIR := $(ENGINE_TEST_BUILD)/gguf-moe.air
 # Every hash the weight tests compare against, and how to update them.
 WEIGHT_GOLDENS := dev/tests/fixtures/weight-goldens/goldens.json
 MLX_QUANTIZATION_FIXTURE := dev/tests/fixtures/mlx-quantization/fixture.json
@@ -305,7 +306,7 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB) $(HOST_STEP_LIB),$(sort $(TEST_CPU_TA
 	$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_HOST_STEP_AIR) $(TEST_METAL_BACKEND_AIR) \
-	$(TEST_GGUF_DEQUANT_AIR)
+	$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR)
 # Benchmarks and tools that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_BACKEND_BENCHMARK) $(WEIGHT_DIGESTS)
 SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
@@ -441,17 +442,17 @@ $(TEST_Q8_ATTENTION_TEST): dev/tests/engine/q8_flash_attention_metal_test.mm \
 $(TEST_Q8_PREFILL_TEST): dev/tests/engine/q8_chunked_prefill_metal_test.mm \
 		$(ENGINE_LIBRARY) $(TEST_Q8_ATTENTION_LIB)
 $(TEST_GGUF_MOE): dev/tests/engine/gguf_moe_test.mm \
-		$(ENGINE_LIBRARY) $(LIB)
+		$(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
 # The same test at Qwen3.8-Flash-Next's 512 experts, 10 per token and expert
 # width 640.
 $(TEST_GGUF_MOE_E512): dev/tests/engine/gguf_moe_test.mm \
-		$(ENGINE_LIBRARY) $(LIB)
+		$(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
 $(TEST_GGUF_MOE_E512): ENGINE_TEST_CXXFLAGS += -DGGUF_MOE_HIDDEN=256 -DGGUF_MOE_INTERMEDIATE=640 \
 		-DGGUF_MOE_EXPERTS=512 -DGGUF_MOE_TOP_K=10
 # The same test at Flint's routing: 256 experts, 6 per token by a sigmoid
 # router, expert width 512, and a shared expert of two ungated slices.
 $(TEST_GGUF_MOE_SIGMOID): dev/tests/engine/gguf_moe_test.mm \
-		$(ENGINE_LIBRARY) $(LIB)
+		$(ENGINE_LIBRARY) $(TEST_PRODUCTION_LIB)
 $(TEST_GGUF_MOE_SIGMOID): ENGINE_TEST_CXXFLAGS += -DGGUF_MOE_HIDDEN=256 -DGGUF_MOE_INTERMEDIATE=512 \
 		-DGGUF_MOE_EXPERTS=256 -DGGUF_MOE_TOP_K=6 -DGGUF_MOE_ROUTER=SigmoidNormalized \
 		-DGGUF_MOE_SHARED_SLICES=2 -DGGUF_MOE_SHARED_GATE=false
@@ -564,11 +565,14 @@ $(ENGINE_TEST_BUILD)/kernels/%.air: runtime/metal/kernels/%.metal \
 	$(RUN_CONFIGURED) $(METAL) $(TEST_METALFLAGS) -c $< -o $@
 
 # Production flags, not TEST_METALFLAGS: gguf-dequant checks the shipped
-# dequantizer bitwise, so it compiles as production does (its AIR does not
-# depend on -O3 with metal 32023, but that of some kernels does).
-$(TEST_GGUF_DEQUANT_AIR): dev/tests/engine/gguf_dequant_test.metal \
-		$(KERNEL_HEADERS) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $< -o $@
+# dequantizer bitwise, and gguf-moe the production gate/up pass against the
+# production down pass's expert tile, so they compile as production does
+# (gguf-dequant's AIR does not depend on -O3 with metal 32023, but that of
+# some kernels, moe_gguf's among them, does).
+$(TEST_GGUF_DEQUANT_AIR): dev/tests/engine/gguf_dequant_test.metal
+$(TEST_GGUF_MOE_AIR): dev/tests/engine/gguf_moe_test.metal
+$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR): $(KERNEL_HEADERS) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $(filter %.metal,$^) -o $@
 
 # Test libraries, each linked from the AIRs it lists.
 $(TEST_GGUF_DEQUANT_LIB): $(TEST_GGUF_DEQUANT_AIR) $(TEST_RESIDENCY_AIR)
@@ -576,10 +580,11 @@ $(TEST_Q8_LIB): $(TEST_Q8_AIR) $(TEST_RESIDENCY_AIR)
 $(TEST_Q8_ATTENTION_LIB): $(TEST_Q8_KERNEL_AIRS)
 $(TEST_METAL_BACKEND_LIB): $(TEST_METAL_BACKEND_AIR) $(TEST_RESIDENCY_AIR)
 $(TEST_HOST_STEP_LIB): $(TEST_HOST_STEP_AIR)
-# The production kernels and the test kernels of metal_backend_test.metal in
-# one library, for the kernel tests that order a test copy between production
-# dispatches. It relinks whenever the production library does.
-$(TEST_PRODUCTION_LIB): $(PRODUCTION_AIRS) $(TEST_METAL_BACKEND_AIR) $(LIB)
+# The production kernels and test kernels in one library, for the kernel
+# tests that run test kernels between production dispatches:
+# metal_backend_test.metal's copies, and gguf_moe_test.metal's gate and up
+# passes apart. It relinks whenever the production library does.
+$(TEST_PRODUCTION_LIB): $(PRODUCTION_AIRS) $(TEST_METAL_BACKEND_AIR) $(TEST_GGUF_MOE_AIR) $(LIB)
 
 $(TEST_GGUF_DEQUANT_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) $(TEST_METAL_BACKEND_LIB) \
 		$(TEST_PRODUCTION_LIB) $(TEST_HOST_STEP_LIB):
@@ -674,9 +679,9 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(TEST_ANE_FFN) $(LIB) faults
 	$(TEST_ANE_FFN) $(LIB) program
 	$(TEST_ANE_PROGRAM_FAULTS) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_GGUF_MOE) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_GGUF_MOE_E512) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_GGUF_MOE_SIGMOID) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_GGUF_MOE) $(TEST_PRODUCTION_LIB)
+	$(METAL_TEST_ENV) $(TEST_GGUF_MOE_E512) $(TEST_PRODUCTION_LIB)
+	$(METAL_TEST_ENV) $(TEST_GGUF_MOE_SIGMOID) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_EXPERT_STORE) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_KV_BLOCK_CACHE) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_KV_HISTORY_STREAM) $(LIB)
@@ -774,10 +779,10 @@ GGUF_PROJECTION_ARGS ?= q4k 5120 8192
 benchmark-gguf-projection: $(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB)
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB) $(GGUF_PROJECTION_ARGS)
 
-# One MoE layer in GGUF formats, on the device's plans and the other GGUF
-# tile (ops/MoE.cpp); GGUF_MOE_ARGS passes [35b|flash-next|flint] [rounds]
-# [gate/up format] [down format] [shared format] (35b, q4k q5k q80 by
-# default).
+# One MoE layer in GGUF formats, on the device's plans (ops/MoE.cpp);
+# GGUF_MOE_ARGS passes [35b|flash-next|flint] [rounds] [gate/up format]
+# [down format] [shared format] (35b, q4k q5k q80 by default), or repack
+# [rounds] for the expert repack.
 benchmark-gguf-moe: $(TEST_GGUF_MOE_BENCHMARK) $(LIB)
 	$(TEST_GGUF_MOE_BENCHMARK) $(LIB) $(GGUF_MOE_ARGS)
 
@@ -824,12 +829,12 @@ $(TEST_PROTOCOL_TEST) $(TEST_PROTOCOL_ASAN) $(TEST_PROTOCOL_TSAN): \
 $(TEST_ENGINE_TEST) $(TEST_ENGINE_ASAN) $(TEST_ENGINE_TSAN): \
 		$(BACKEND_CONTROL_SOURCES) \
 		runtime/engine/MemoryGovernor.cpp \
-		runtime/engine/MemoryLedger.cpp \
+		runtime/engine/MemoryLedger.cpp runtime/model/SlotFile.cpp \
 		dev/benchmarks/PrefillWork.hpp \
 		dev/tests/engine/engine_requests_test.cpp dev/tests/engine/engine_checkpoints_test.cpp \
 		dev/tests/engine/engine_commands_test.cpp dev/tests/engine/engine_memory_test.cpp \
 		dev/tests/engine/engine_spill_test.cpp dev/tests/engine/engine_disk_test.cpp \
-		dev/tests/engine/engine_memory_rules_test.cpp \
+		dev/tests/engine/engine_memory_rules_test.cpp dev/tests/engine/engine_release_property_test.cpp \
 		dev/tests/engine/TimingProfile.cpp dev/tests/engine/engine_test_main.cpp
 $(TEST_RAGGED_SCHEDULER_TEST) $(TEST_RAGGED_SCHEDULER_ASAN) $(TEST_RAGGED_SCHEDULER_TSAN): \
 		runtime/engine/Scheduler.cpp \
