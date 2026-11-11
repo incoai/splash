@@ -435,16 +435,24 @@ final class AppState {
         let text = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !history.isEmpty || !text.isEmpty || !draft.attachments.isEmpty else { return nil }
         return ChatContext.Request(history: history, text: text, attachments: draft.attachments, target: target,
-                                   started: server.since, files: chats.attachments)
+                                   started: server.since, files: chats.attachments, conversation: chats.selection)
+    }
+
+    /// Whether the composer shows its ring: a model with a context runs, and the open chat has a
+    /// prompt to count. Whether it is counted yet never decides it, so that the ring stays as
+    /// chats open and their prompts are counted, and only its figure changes.
+    var showsContext: Bool {
+        guard let limit = target?.context, limit > 0 else { return false }
+        return !(chats.current?.messages ?? []).isEmpty || !draft.isEmpty
     }
 
     /// The count the composer's ring shows: the next prompt's, or the last one of the open
-    /// conversation while the next is counted or a reply streams; none in an empty chat.
+    /// conversation while the next is counted or a reply streams; nil, an empty ring, for a chat
+    /// not counted yet.
     var contextUsage: ContextUsage? {
-        guard let target else { return nil }
-        let history = chats.current?.messages ?? []
-        guard !history.isEmpty || !draft.isEmpty else { return nil }
-        return chatContext.shown(history: history, target: target, started: server.since)
+        guard showsContext, let target else { return nil }
+        return chatContext.shown(in: chats.selection, history: chats.current?.messages ?? [], target: target,
+                                 started: server.since)
     }
 
     /// Whether the draft can go: its images are all attached, a model answers, no reply streams,

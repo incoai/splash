@@ -210,8 +210,8 @@ struct Composer: View {
                 }
                 EngineSlot()
                 Spacer(minLength: 12)
-                if let usage = state.contextUsage {
-                    ContextRing(usage: usage)
+                if state.showsContext {
+                    ContextRing(usage: state.contextUsage)
                         .transition(Motion.comingAndGoing)
                 }
                 EffortMenu()
@@ -232,7 +232,7 @@ struct Composer: View {
             .buttonStyle(.hover)
             // The first control's glyph on the text's edge.
             .padding(.leading, -6)
-            .animation(Motion.settle, value: state.contextUsage == nil)
+            .animation(Motion.settle, value: state.showsContext)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -283,24 +283,25 @@ struct Composer: View {
 
 /// How much of the model's context the next prompt takes, as a ring filling clockwise: in the
 /// secondary color while it leaves room for a reply, orange once it leaves less than the reply
-/// allowance, red once the context cannot hold it. Its help gives the exact figures.
+/// allowance, red once the context cannot hold it; empty, with no help, until the chat's prompt is
+/// first counted. Its help gives the exact figures.
 private struct ContextRing: View {
-    let usage: ContextUsage
+    let usage: ContextUsage?
 
     var body: some View {
-        Ring(fraction: usage.fraction, tint: tint, size: 14)
+        Ring(fraction: usage?.fraction ?? 0, tint: tint, size: 14)
             // Room around the ring for the pointer to find its help.
             .padding(5)
             .contentShape(.rect)
             .animation(Motion.settle, value: usage)
-            .help(usage.explanation)
+            .help(usage?.explanation ?? "")
             .accessibilityElement()
             .accessibilityLabel("Context")
-            .accessibilityValue(usage.explanation)
+            .accessibilityValue(usage?.explanation ?? "")
     }
 
     private var tint: AnyShapeStyle {
-        switch usage.level {
+        switch usage?.level ?? .normal {
         case .normal: AnyShapeStyle(.secondary)
         case .tight: AnyShapeStyle(.orange)
         case .full: AnyShapeStyle(.red)

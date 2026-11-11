@@ -196,6 +196,31 @@ struct ChatContextFlowTests {
         }
     }
 
+    /// A chat opened shows its last count at once, while its prompt is counted again, and one not
+    /// counted yet an empty ring: the composer's ring never goes as chats open. With the last
+    /// count of all alone, it went as each chat opened and came back, fading in, once counted.
+    @Test func theRingStaysAsChatsOpen() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            let saved = try await count(state)
+            state.chats.newChat()
+            state.draft.text = "Hello"
+            state.sendDraft()
+            try await waitFor(state.chats.streaming == nil && state.chats.current?.messages.count == 2)
+            let answered = try #require(state.chats.selection)
+            let usage = try await count(state)
+            #expect(usage != saved)
+            state.chats.selection = fixture.history.id
+            #expect(state.showsContext && state.contextUsage == saved)
+            state.chats.selection = answered
+            #expect(state.showsContext && state.contextUsage == usage)
+            // A chat not counted yet: its draft, in a new chat.
+            state.chats.newChat()
+            state.draft.text = "Plan a trip"
+            #expect(state.showsContext && state.contextUsage == nil)
+        }
+    }
+
     /// The draft's prompt, counted as the composer counts it.
     private func count(_ state: AppState) async throws -> ContextUsage {
         let request = try #require(state.contextRequest)

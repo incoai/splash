@@ -106,11 +106,11 @@ struct ChatContextTests {
         #expect(await probe.calls == 0)
         try await waitFor(context.usage(for: input) != nil)
         #expect(await probe.calls == 1)
-        #expect(context.shown(history: history, target: target, started: nil) != nil)
+        #expect(context.shown(in: nil, history: history, target: target, started: nil) != nil)
         context.refresh(request("Hey?", history: history))
-        try await waitFor(context.counted == nil)
+        try await waitFor(context.counted.isEmpty)
         #expect(await probe.calls == 2)
-        #expect(context.shown(history: history, target: target, started: nil) == nil)
+        #expect(context.shown(in: nil, history: history, target: target, started: nil) == nil)
         let next = request("Hey!", history: history)
         context.refresh(next)
         try await waitFor(context.usage(for: next) != nil)
@@ -124,37 +124,59 @@ struct ChatContextTests {
         let context = ChatContext(delay: .zero) { $0.text.utf8.count + $0.history.count }
         let history = [ChatMessage(role: .user, text: "Hi"), ChatMessage(role: .assistant, text: "Hello.")]
         context.refresh(request("Next", history: history))
-        try await waitFor(context.counted != nil)
-        let usage = context.counted?.usage
-        #expect(context.shown(history: history, target: target, started: nil) == usage)
+        try await waitFor(!context.counted.isEmpty)
+        let usage = context.counted[nil]?.usage
+        #expect(context.shown(in: nil, history: history, target: target, started: nil) == usage)
         // The question sent and its reply streaming.
         let sent = history + [ChatMessage(role: .user, text: "Next"), ChatMessage(role: .assistant, text: "Wo")]
-        #expect(context.shown(history: sent, target: target, started: nil) == usage)
-        #expect(context.shown(history: sent + [ChatMessage(role: .user, text: "More")], target: target, started: nil) == nil)
+        #expect(context.shown(in: nil, history: sent, target: target, started: nil) == usage)
+        #expect(context.shown(in: nil, history: sent + [ChatMessage(role: .user, text: "More")], target: target, started: nil) == nil)
         // The last answer asked again.
         let again = Array(history.dropLast()) + [ChatMessage(role: .assistant, text: "")]
-        #expect(context.shown(history: again, target: target, started: nil) == usage)
-        #expect(context.shown(history: [ChatMessage(role: .user, text: "Other")], target: target, started: nil) == nil)
-        #expect(context.shown(history: history, target: target, started: .now) == nil)
+        #expect(context.shown(in: nil, history: again, target: target, started: nil) == usage)
+        #expect(context.shown(in: nil, history: [ChatMessage(role: .user, text: "Other")], target: target, started: nil) == nil)
+        #expect(context.shown(in: nil, history: history, target: target, started: .now) == nil)
         let lighter = ChatTarget(url: target.url, model: target.model, acceptsImages: true, effort: "low",
                                  context: 32768, apiKey: "secret")
-        #expect(context.shown(history: history, target: lighter, started: nil) == usage)
+        #expect(context.shown(in: nil, history: history, target: lighter, started: nil) == usage)
         let model = ChatTarget(url: target.url, model: "a/other", acceptsImages: true, effort: "high",
                                context: 32768, apiKey: "secret")
-        #expect(context.shown(history: history, target: model, started: nil) == nil)
+        #expect(context.shown(in: nil, history: history, target: model, started: nil) == nil)
         var other = target
         other.context = 1024
-        #expect(context.shown(history: history, target: other, started: nil) == nil)
+        #expect(context.shown(in: nil, history: history, target: other, started: nil) == nil)
 
         // A new chat's count shows only on the chat its message started, not on another one of
         // one exchange.
         context.refresh(request("Summarize this"))
-        try await waitFor(context.counted?.request.history.isEmpty == true)
-        let fresh = context.counted?.usage
-        #expect(context.shown(history: history, target: target, started: nil) == nil)
+        try await waitFor(context.counted[nil]?.request.history.isEmpty == true)
+        let fresh = context.counted[nil]?.usage
+        #expect(context.shown(in: nil, history: history, target: target, started: nil) == nil)
         let started = [ChatMessage(role: .user, text: "Summarize this"), ChatMessage(role: .assistant, text: "Wo")]
-        #expect(context.shown(history: started, target: target, started: nil) == fresh)
-        #expect(context.shown(history: [], target: target, started: nil) == fresh)
+        #expect(context.shown(in: nil, history: started, target: target, started: nil) == fresh)
+        #expect(context.shown(in: nil, history: [], target: target, started: nil) == fresh)
+    }
+
+    /// Each conversation keeps its last count, which shows again at once as it opens, while its
+    /// next prompt is counted: with the last count of all alone, the ring went as each chat opened
+    /// and came back once counted.
+    @Test func eachConversationKeepsItsLastCount() async throws {
+        let context = ChatContext(delay: .zero) { $0.text.utf8.count + $0.history.count }
+        let first = UUID(), second = UUID()
+        let one = [ChatMessage(role: .user, text: "Hi"), ChatMessage(role: .assistant, text: "Hello.")]
+        let two = [ChatMessage(role: .user, text: "Why?"), ChatMessage(role: .assistant, text: "Because.")]
+        var request = request("Next", history: one)
+        request.conversation = first
+        context.refresh(request)
+        try await waitFor(context.usage(for: request) != nil)
+        let usage = context.usage(for: request)
+        var other = self.request("", history: two)
+        other.conversation = second
+        context.refresh(other)
+        try await waitFor(context.usage(for: other) != nil)
+        #expect(context.shown(in: first, history: one, target: target, started: nil) == usage)
+        #expect(context.shown(in: second, history: two, target: target, started: nil) == context.usage(for: other))
+        #expect(context.shown(in: UUID(), history: one, target: target, started: nil) == nil)
     }
 
     @Test func validatesCountResponsesAndSurfacesServerErrors() async throws {
