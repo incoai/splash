@@ -1,6 +1,5 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/activation.h"
-#include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/kernels/common/moe_expert_slab.h"
 
 // Routes group rows by expert so each tile streams its weights once. Each row
@@ -176,19 +175,32 @@ inline bool moe_unverified_route(device const uint *verify_rows,
 // that expert's last route that its last tile's matmul reads
 // (moe_matmul_rows) carry the route ~0u. One threadgroup covers all routes
 // and thread e owns expert e's count, offsets and tile descriptors. The
-// shared slices' tiles follow the routed tiles, slice after slice, and each
-// slice's hold every row in order. It writes the tile count with the expert
-// passes' grids (MoeTileCount). Slots threads, one per expert slot. A
-// Verified grouping routes each lane's verify rows alone (MoeGroupParams).
+// tiles of experts the slot table holds come first, then the shared slices',
+// slice after slice, each slice's holding every row in order, then those of
+// experts it marks MOE_SLOT_ABSENT. It writes the tile count with the expert
+// passes' grids (MoeTileCount) and a streamed block's slot table into
+// expert_slots (ops::MoeScratch::expertSlots). Slots threads, one per expert
+// slot. A Verified grouping routes each lane's verify rows alone
+// (MoeGroupParams).
 template <uint Slots, uint Shared, bool Verified>
 inline void moe_group_routes_phase(
     device const uint *selected, device MoeTileDescriptor *tiles, device MoeTileCount *tile_count,
-    device uint *grouped_routes, device uint *route_rows, device const uint *verify_rows,
+    device uint *grouped_routes, device uint *route_rows, device const uint *slots, device uint *expert_slots,
+    device const uint *verify_rows,
     constant MoeGroupParams &params, uint thread_index, uint simd_lane, uint simd_group,
     threadgroup atomic_uint *counts, threadgroup atomic_uint *cursors, threadgroup uint *tile_offsets,
-    threadgroup uint *simd_totals, threadgroup uint &routed_tiles) {
+    threadgroup uint *simd_totals, threadgroup uint *simd_absent) {
   const uint routes_per_row = params.top_k + Shared;
   const uint routes = params.rows * routes_per_row;
+  // A streamed grouping's slot, loaded before the counting: copied for the
+  // passes beside the load, its absent bit parked in tile_offsets until the
+  // counts are in.
+  uint slot = 0;
+  if (params.streamed && thread_index < params.experts) {
+    slot = slots[thread_index];
+    expert_slots[thread_index] = slot;
+  }
+  tile_offsets[thread_index] = slot & MOE_SLOT_ABSENT;
   atomic_store_explicit(&counts[thread_index], 0u, memory_order_relaxed);
   atomic_store_explicit(&cursors[thread_index], 0u, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -203,16 +215,28 @@ inline void moe_group_routes_phase(
 
   uint count = atomic_load_explicit(&counts[thread_index], memory_order_relaxed);
   uint expert_tiles = (count + params.tile_rows - 1) / params.tile_rows;
-  uint prefix = simd_prefix_exclusive_sum(expert_tiles);
-  if (simd_lane == 31)
-    simd_totals[simd_group] = prefix + expert_tiles;
+  const bool absent = tile_offsets[thread_index];
+  uint prefix = simd_prefix_exclusive_sum(absent ? 0u : expert_tiles);
+  uint absent_prefix = simd_prefix_exclusive_sum(absent ? expert_tiles : 0u);
+  if (simd_lane == 31) {
+    simd_totals[simd_group] = prefix + (absent ? 0u : expert_tiles);
+    simd_absent[simd_group] = absent_prefix + (absent ? expert_tiles : 0u);
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  uint tile_offset = prefix;
-  for (uint group = 0; group < simd_group; ++group)
-    tile_offset += simd_totals[group];
+  uint routed_tiles = 0, absent_tiles = 0;
+  for (uint group = 0; group < Slots / 32; ++group) {
+    if (group < simd_group) {
+      prefix += simd_totals[group];
+      absent_prefix += simd_absent[group];
+    }
+    routed_tiles += simd_totals[group];
+    absent_tiles += simd_absent[group];
+  }
+  const uint shared_tiles =
+      (params.rows + params.tile_rows - 1) / params.tile_rows;
+  const uint resident = routed_tiles + Shared * shared_tiles;
+  const uint tile_offset = absent ? resident + absent_prefix : prefix;
   tile_offsets[thread_index] = tile_offset;
-  if (thread_index == Slots - 1)
-    routed_tiles = tile_offset + expert_tiles;
   for (uint tile = 0; tile < expert_tiles; ++tile) {
     tiles[tile_offset + tile] = MoeTileDescriptor{
         thread_index, min(params.tile_rows, count - tile * params.tile_rows)};
@@ -241,8 +265,6 @@ inline void moe_group_routes_phase(
     route_rows[route] = row;
   }
 
-  const uint shared_tiles =
-      (params.rows + params.tile_rows - 1) / params.tile_rows;
   const uint shared_base = routed_tiles * params.tile_rows;
   const uint shared_rows =
       (shared_tiles - 1) * params.tile_rows +
@@ -269,9 +291,12 @@ inline void moe_group_routes_phase(
     }
   }
   if (thread_index == 0) {
-    const uint live = routed_tiles + Shared * shared_tiles;
-    *tile_count = MoeTileCount{live, {params.gate_up_columns, live, 1},
-                               {params.down_columns, live, 1}};
+    const uint live = resident + absent_tiles;
+    *tile_count = MoeTileCount{live, resident,
+                               {params.gate_up_columns, live, 1}, {params.down_columns, live, 1},
+                               {params.gate_up_columns, resident, 1}, {params.down_columns, resident, 1},
+                               {params.gate_up_columns, absent_tiles, 1},
+                               {params.down_columns, absent_tiles, 1}};
   }
 }
 
@@ -280,11 +305,11 @@ inline void moe_group_routes_phase(
     threadgroup atomic_uint cursors[Slots];                                    \
     threadgroup uint tile_offsets[Slots];                                      \
     threadgroup uint simd_totals[Slots / 32];                                  \
-    threadgroup uint routed_tiles;                                             \
+    threadgroup uint simd_absent[Slots / 32];                                  \
     moe_group_routes_phase<Slots, Shared, Verified>(                           \
-        selected, tiles, tile_count, grouped_routes, route_rows, verify_rows,  \
-        params, thread_index, simd_lane, simd_group, counts, cursors,          \
-        tile_offsets, simd_totals, routed_tiles);
+        selected, tiles, tile_count, grouped_routes, route_rows, slots,        \
+        expert_slots, verify_rows, params, thread_index, simd_lane,            \
+        simd_group, counts, cursors, tile_offsets, simd_totals, simd_absent);
 #define MOE_GROUP_ROUTES_ENTRY(Name, Slots, Shared)                            \
   kernel void Name(                                                            \
       device const uint *selected [[buffer(0)]],                               \
@@ -292,7 +317,9 @@ inline void moe_group_routes_phase(
       device MoeTileCount *tile_count [[buffer(2)]],                           \
       device uint *grouped_routes [[buffer(3)]],                               \
       device uint *route_rows [[buffer(4)]],                                   \
-      constant MoeGroupParams &params [[buffer(5)]],                           \
+      device const uint *slots [[buffer(5)]],                                  \
+      device uint *expert_slots [[buffer(6)]],                                 \
+      constant MoeGroupParams &params [[buffer(7)]],                           \
       uint thread_index [[thread_index_in_threadgroup]],                       \
       uint simd_lane [[thread_index_in_simdgroup]],                            \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
@@ -307,8 +334,10 @@ inline void moe_group_routes_phase(
       device MoeTileCount *tile_count [[buffer(2)]],                           \
       device uint *grouped_routes [[buffer(3)]],                               \
       device uint *route_rows [[buffer(4)]],                                   \
-      device const uint *verify_rows [[buffer(5)]],                            \
-      constant MoeGroupParams &params [[buffer(6)]],                           \
+      device const uint *slots [[buffer(5)]],                                  \
+      device uint *expert_slots [[buffer(6)]],                                 \
+      device const uint *verify_rows [[buffer(7)]],                            \
+      constant MoeGroupParams &params [[buffer(8)]],                           \
       uint thread_index [[thread_index_in_threadgroup]],                       \
       uint simd_lane [[thread_index_in_simdgroup]],                            \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
@@ -352,68 +381,6 @@ kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
                      : *reinterpret_cast<device const uint4 *>(
                            input + ulong(route / params.routes_per_row) * params.input_size + column);
   }
-}
-
-// The grouped rows as Table16 tiles (kernels/common/gguf_sgmatrix.h), the
-// input of the Apple9 GGUF register expert tile. Threadgroup (tile, part)
-// writes the four 64-input spans [4 part, 4 part + 4) of an 8-row tile, one
-// simdgroup per row, in under two thirds of the time of a threadgroup per
-// span pair or per tile. The gather reads each grouped row's route like
-// moe_gather_rows (padding rows are zero); the prepare reads grouped rows (the
-// down pass's intermediate). Grid (tiles, width / 256), 256 threads.
-template <class Source>
-inline void moe_table16_tile(Source source, device bfloat *table,
-                             device float *sums, uint width, uint2 group,
-                             uint simd_lane, uint simd_group) {
-  // The last part of a width that is not a multiple of 256 (an expert
-  // intermediate of 640) holds fewer spans.
-  for (uint span = group.y * 4; span < min(group.y * 4 + 4, width / 64); ++span) {
-    const bfloat2 values = source(simd_group, span * 64 + 2 * simd_lane);
-    gguf_sg::write_input(table + ulong(group.x) * width * 8,
-                       sums + ulong(group.x) * table16_sums_per_tile(width),
-                       width, span, simd_group, simd_lane, values.x, values.y);
-  }
-}
-
-kernel void moe_gather_table16(device const bfloat *input [[buffer(0)]],
-                               device const uint *grouped_routes [[buffer(1)]],
-                               device const uint *tile_count [[buffer(2)]],
-                               device bfloat *table [[buffer(3)]],
-                               device float *sums [[buffer(4)]],
-                               constant MoeGatherParams &params [[buffer(5)]],
-                               uint2 group [[threadgroup_position_in_grid]],
-                               uint simd_lane [[thread_index_in_simdgroup]],
-                               uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  if (group.x >= *tile_count)
-    return;
-  moe_table16_tile(
-      [&](uint row, uint k) {
-        const uint route = grouped_routes[group.x * 8 + row];
-        return route == ~0u
-                   ? bfloat2(bfloat(0.0f))
-                   : *reinterpret_cast<device const bfloat2 *>(
-                         input + ulong(route / params.routes_per_row) *
-                                     params.input_size + k);
-      },
-      table, sums, params.input_size, group, simd_lane, simd_group);
-}
-
-kernel void moe_prepare_table16(device const bfloat *rows [[buffer(0)]],
-                                device const uint *tile_count [[buffer(1)]],
-                                device bfloat *table [[buffer(2)]],
-                                device float *sums [[buffer(3)]],
-                                constant uint &width [[buffer(4)]],
-                                uint2 group [[threadgroup_position_in_grid]],
-                                uint simd_lane [[thread_index_in_simdgroup]],
-                                uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  if (group.x >= *tile_count)
-    return;
-  moe_table16_tile(
-      [&](uint row, uint k) {
-        return *reinterpret_cast<device const bfloat2 *>(
-            rows + (ulong(group.x) * 8 + row) * width + k);
-      },
-      table, sums, width, group, simd_lane, simd_group);
 }
 
 kernel void moe_combine(

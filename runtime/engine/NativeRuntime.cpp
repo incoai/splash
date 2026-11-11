@@ -143,9 +143,9 @@ void NativeRuntime::executionFailed(std::exception_ptr failure) {
   }
 }
 
-void NativeRuntime::announceWarming() {
+void NativeRuntime::announceWarming(const protocol::WarmingEvent &progress) {
   // A send that fails closes the connection, which announceReady reports.
-  static_cast<void>(send(protocol::WarmingEvent{}));
+  static_cast<void>(send(progress));
 }
 
 void NativeRuntime::announceReady(const protocol::ReadyEvent &ready) {

@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import SystemConfiguration
 
 /// The keys of what the app keeps in UserDefaults.
 enum Preference {
@@ -7,6 +8,8 @@ enum Preference {
     static let model = "model"
     /// The model files on this Mac the user added, by path, which `splash serve` prepares.
     static let localModels = "localModels"
+    /// What model files on this Mac start with besides, by their path (`AppState.ModelFiles`).
+    static let localModelFiles = "localModelFiles"
     static let agentFolder = "agentFolder"
     /// Whether the Chat shows its sidebar.
     static let sidebar = "sidebar"
@@ -33,6 +36,18 @@ struct ServeSettings: Equatable {
     /// `splash serve` takes otherwise.
     var values: [String: String] = [:]
     var apiKey: String?
+    /// The files of model files on this Mac that only their own start passes: a GGUF's vision
+    /// projector (`--mmproj`), which Text only leaves out (`textOnly`), and a draft in place of its
+    /// family's (`--draft-model`).
+    var projector: String?
+    var draft: String?
+
+    /// Whether the model starts without its vision, as Text only has it (`--language-only`), which
+    /// `splash serve` refuses beside a vision projector.
+    var textOnly: Bool { values["--language-only"] == "true" }
+
+    /// The vision projector a start passes: none under Text only.
+    var passedProjector: String? { textOnly ? nil : projector }
 
     subscript(flag: String) -> String? {
         get { values[flag] }
@@ -54,13 +69,36 @@ struct ServeSettings: Equatable {
 
     /// What `splash serve` takes to serve `model`, a Hugging Face ID or the path of model files on
     /// this Mac, with these options.
-    func serveArguments(model: String) -> [String] {
-        let source = model.hasPrefix("/") ? ["--model", Self.localID(model), "--model-dir", model] : ["--model", model]
+    func serveArguments(model: String, localName: String? = Self.localName) -> [String] {
+        let source = model.hasPrefix("/")
+            ? ["--model", Self.localID(model), "--model-dir", model] + (passedProjector.map { ["--mmproj", $0] } ?? [])
+                + (draft.map { ["--draft-model", $0] } ?? [])
+            : ["--model", model]
         var arguments = ["serve"] + source + ["--port", String(port), "--offline"]
         for option in LaunchOption.all where option.flag != "--port" && option.applies(self) {
             arguments += option.arguments(values[option.flag])
         }
+        // The name the API address gives other devices (`address`), which the server then accepts.
+        if sharesNetwork, let localName, !LaunchOption.items(values["--allowed-host"] ?? "").contains(localName) {
+            arguments += ["--allowed-host", localName]
+        }
         return arguments
+    }
+
+    /// Whether the server listens on every network this Mac is on, for other devices too.
+    var sharesNetwork: Bool { values["--host"] == "0.0.0.0" }
+
+    /// This Mac's name on its local networks, as Bonjour gives it (`name.local`); nil where it has
+    /// none.
+    static var localName: String? {
+        (SCDynamicStoreCopyLocalHostName(nil) as String?).map { "\($0.lowercased()).local" }
+    }
+
+    /// The address Copy API Address gives: this Mac's name on its networks while the server
+    /// listens on them, where other devices reach it; the loopback address otherwise (`url`).
+    func address(localName: String? = Self.localName) -> URL {
+        guard sharesNetwork, let localName else { return url }
+        return URL(string: "http://\(localName):\(port)")!
     }
 
     /// The ID the API reports for the model files at `path`: local/ and the file's or folder's name,
@@ -85,13 +123,14 @@ struct ServeSettings: Equatable {
     /// The options a model of `family` starts with: those set but the ones it does not take
     /// (`ModelFamily.takes`), whose values stay kept for a model that does.
     func usable(by family: ModelFamily) -> ServeSettings {
-        ServeSettings(values: values.filter { family.takes($0.key, $0.value) }, apiKey: apiKey)
+        ServeSettings(values: values.filter { family.takes($0.key, $0.value) }, apiKey: apiKey, projector: projector, draft: draft)
     }
 
     /// These options with the ones a model of `family` can use, those the card shows, back at their
-    /// defaults, the API key too; values kept for the others stay, for a model that can use them.
+    /// defaults; values kept for the others stay, for a model that can use them, and the API key,
+    /// which is no default's to replace.
     func defaults(for family: ModelFamily) -> ServeSettings {
-        ServeSettings(values: values.filter { !family.uses($0.key) })
+        ServeSettings(values: values.filter { !family.uses($0.key) }, apiKey: apiKey)
     }
 
     /// Whether a model of `family` started with these options would start otherwise with `other`.
@@ -215,6 +254,12 @@ struct LaunchOption: Identifiable, Sendable {
         }
     }
 
+    /// The choices its menu offers for a model of `family`: those its models take.
+    func choices(for family: ModelFamily) -> [(value: String, title: String)] {
+        guard case .choice(_, let choices, _) = kind else { return [] }
+        return choices.filter { family.takes(flag, $0.value) }
+    }
+
     /// Whether `value` is one this option takes: a choice, or a value typed in as its field shows it.
     func accepts(_ value: String) -> Bool {
         switch kind {
@@ -264,6 +309,14 @@ struct ModelFamily: Decodable, Equatable, Sendable {
     func refusal(_ flag: String, _ value: String) -> String? {
         guard flag == "--max-context", let tokens = Int(value), let most = maxContextTokens, tokens > most else { return nil }
         return "The model picked serves at most \(ContextLength.title(most)); it starts on Auto."
+    }
+
+    /// What to beware of with `value` for the option `flag`, which its models take: a context
+    /// length past their own window, which YaRN stretches; nil for any other.
+    func caution(_ flag: String, _ value: String) -> String? {
+        guard flag == "--max-context", let tokens = Int(value), let window = contextTokens, tokens > window,
+              refusal(flag, value) == nil else { return nil }
+        return ContextLength.yarn(window)
     }
 }
 
@@ -366,7 +419,7 @@ extension LaunchOption {
                 ? "Any device on these networks can use the model. Set an API key to require one." : nil }),
         LaunchOption(
             flag: "--allowed-host", title: "Host names",
-            help: "Other names clients reach this Mac by, such as mymac.local.",
+            help: "Names other than this Mac’s own .local name that clients reach it by, such as a DNS name.",
             section: .network,
             kind: .text(Value(prompt: "None", message: "", parse: { items($0).isEmpty ? nil : items($0).joined(separator: ", ") }),
                         list: true)),
@@ -442,7 +495,7 @@ extension LaunchOption {
             section: .requests,
             kind: .choice(standard: "4,194,304", choices: [], custom: Value(prompt: "1048576", message: "Pixels, 65,536 to 4,194,304.",
                                                                            parse: whole)),
-            requires: [Requirement("Needs the model’s vision (Text only off).") { $0["--language-only"] != "true" }]),
+            requires: [Requirement("Needs the model’s vision (Text only off).") { !$0.textOnly }]),
         LaunchOption(
             flag: "--decode-share", title: "Decode share",
             help: "Seconds of answering for each second spent reading a new prompt: more keeps answers flowing, less starts the new one sooner; 0 takes turns step by step.",
@@ -457,6 +510,10 @@ extension LaunchOption {
             flag: "--disable-ane", title: "Neural Engine for long prompts",
             help: "Reads long prompts faster on models that can use it.",
             section: .requests, kind: .toggle(on: false)),
+        LaunchOption(
+            flag: "--activations", title: "Activations",
+            help: "Auto does some of the GPU’s math in 8 bits where M5 and later Macs run it faster, at a small cost in precision. 16-bit does none.",
+            section: .requests, kind: .choice(standard: "Auto", choices: [("bf16", "16-bit")], custom: nil)),
         LaunchOption(
             flag: "--allow-idle-sleep", title: "Keep Mac awake while answering",
             help: "The Mac doesn’t sleep in the middle of an answer; the display still may.",
@@ -491,8 +548,9 @@ extension LaunchOption {
 /// How long a model's context may grow, in tokens, as `--max-context` takes it; the server fits
 /// it to memory on Auto.
 enum ContextLength {
-    /// The lengths the menu offers besides Auto and one typed in.
-    static let lengths = [16, 32, 64, 128, 256].map { $0 * 1024 }
+    /// The lengths the menu offers besides Auto and one typed in, those the model picked serves
+    /// (`LaunchOption.choices`): 1M tokens where YaRN stretches its window that far.
+    static let lengths = [16, 32, 64, 128, 256].map { $0 * 1024 } + [1_000_000]
 
     /// A length as the menu names it: 32K tokens, 1M tokens, 100,000 tokens.
     static func title(_ tokens: Int) -> String {
@@ -516,10 +574,16 @@ enum ContextLength {
     static let message: @Sendable (ModelFamily) -> String = { family in
         let units = "Tokens, with K for 1024 or M for a million"
         guard let window = family.contextTokens, let most = family.maxContextTokens else {
-            return "\(units), such as 100K or 1M. Past the model’s own window it stretches it with YaRN, which changes answers at every length."
+            return "\(units), such as 100K or 1M. \(yarn(nil))"
         }
         guard most > window else { return "\(units), such as 100K; at most \(figure(window)), the model’s own window." }
-        return "\(units), such as 100K or 1M; at most \(figure(most)). Past the model’s own window, \(figure(window)), it stretches it with YaRN, which changes answers at every length."
+        return "\(units), such as 100K or 1M; at most \(figure(most)). \(yarn(window))"
+    }
+
+    /// What a length past a model's own window `window`, which YaRN stretches, costs: one sentence,
+    /// the window named where it is known.
+    static func yarn(_ window: Int?) -> String {
+        "Past the model’s own window\(window.map { ", \(figure($0))," } ?? "") it stretches it with YaRN, which changes answers at every length."
     }
 
     /// The most context `splash serve` takes, its MAX_YARN_CONTEXT_TOKENS, which a test holds this

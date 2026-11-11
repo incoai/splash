@@ -1,5 +1,7 @@
 import signal
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 from server import protocol as wire
 from server import supervision
@@ -134,12 +136,54 @@ class QuarantineTests(unittest.TestCase):
         self.assertEqual(quarantine.after(frozenset({b"x", b"z"})), frozenset({b"x"}))
         self.assertTrue(quarantine.refuses(b"x"))
         self.assertFalse(quarantine.refuses(b"y") or quarantine.refuses(b"z"))
-        # Refused until the server restarts, whatever fails next.
+        # Refused for the hour, whatever fails next.
         self.assertEqual(quarantine.after(frozenset({b"y"})), frozenset())
         self.assertTrue(quarantine.refuses(b"x"))
         # Only the last two failures count: y was started at the first and
         # the third, not at two in a row.
         self.assertFalse(quarantine.refuses(b"y"))
+
+    def patch_clock(self):
+        """Patches the clock the quarantine reads; returns the one-element
+        list that holds its time."""
+        now = [0.0]
+        self.enterContext(
+            mock.patch.object(
+                supervision, "time", SimpleNamespace(monotonic=lambda: now[0])
+            )
+        )
+        return now
+
+    def test_a_refusal_ends_after_the_quarantine(self):
+        now = self.patch_clock()
+        quarantine = supervision.Quarantine()
+        quarantine.after(frozenset({b"x"}))
+        quarantine.after(frozenset({b"x"}))
+        now[0] = supervision.QUARANTINE_SECONDS - 1
+        self.assertTrue(quarantine.refuses(b"x"))
+        now[0] = supervision.QUARANTINE_SECONDS
+        self.assertFalse(quarantine.refuses(b"x"))
+        # Let back, it is still a suspect: the next failure it is started at
+        # refuses it again, for a new hour.
+        self.assertEqual(quarantine.after(frozenset({b"x"})), frozenset({b"x"}))
+        now[0] = 2 * supervision.QUARANTINE_SECONDS - 1
+        self.assertTrue(quarantine.refuses(b"x"))
+
+    def test_a_request_let_back_once_no_longer_a_suspect_costs_two_failures(self):
+        """A failure it was not started at replaces the suspects: let back,
+        a request is refused again only at the second failure in a row it is
+        started at, as at first."""
+        now = self.patch_clock()
+        quarantine = supervision.Quarantine()
+        quarantine.after(frozenset({b"x"}))
+        quarantine.after(frozenset({b"x"}))
+        now[0] = supervision.QUARANTINE_SECONDS
+        self.assertFalse(quarantine.refuses(b"x"))
+        self.assertEqual(quarantine.after(frozenset({b"y"})), frozenset())
+        self.assertEqual(quarantine.after(frozenset({b"x"})), frozenset())
+        self.assertFalse(quarantine.refuses(b"x"))
+        self.assertEqual(quarantine.after(frozenset({b"x"})), frozenset({b"x"}))
+        self.assertTrue(quarantine.refuses(b"x"))
 
     def test_only_a_failure_a_request_may_have_caused_counts(self):
         """How the engine exited decides first: a fault signal counts, a kill
