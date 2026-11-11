@@ -22,6 +22,7 @@ main {
 .line:not(.reasoned) .chevron { opacity: 0; }
 
 .glyph.again { mask-image: var(--again); width: var(--again-width); height: var(--again-height); }
+.glyph.document { mask-image: var(--document); width: var(--document-width); height: var(--document-height); }
 
 /* They show under the pointer and on the last reply, a little slower to come than to go, and
    never while it streams. */

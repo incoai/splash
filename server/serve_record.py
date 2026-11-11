@@ -1,17 +1,19 @@
 """The serve record, `<runtime>/serve-PORT.json` beside the launcher's lock,
 from which the desktop app follows a server it started through its start and
-words why one did not start. The launcher writes it, atomically, once it holds
-the lock; the server it executes, which keeps its pid, as each later phase of
-the start begins; either, when the start fails: a kind the app words and a
-message for the rest.
+words why one did not start, or stopped serving. The launcher writes it,
+atomically, once it holds the lock; the server it executes, which keeps its
+pid, as each later phase of the start begins and as each step of the engine's
+warm-up ends, and once it stops restarting its engine; either, when the start
+fails: a kind the app words and a message for the rest.
 
 The app learns a start's outcome from the record and the process's exit
-alone: it waits until the record says ready and takes an exit before that for
-the start's failure. So the starting and ready records that cannot be written
-fail the start (NotRecorded): the launcher ends before any model loads,
-rather than leave a record of an earlier process, a stale ready one of the
-same pid among them, to say how this start goes; the server ends before it
-serves instead of serving while the app waits on it. Every other record is
+alone: it waits until the record says ready and takes an exit it did not ask
+for, before that or after, for the failure the record names. So the starting
+and ready records that cannot be written fail the start (NotRecorded): the
+launcher ends before any model loads, rather than leave a record of an
+earlier process, a stale ready one of the same pid among them, to say how
+this start goes; the server ends before it serves instead of serving while
+the app waits on it. Every other record is
 best effort, one that cannot be written a line in the log: a refusal or a
 failure stays the one the process prints and exits with, and a later phase
 before ready, which only words the wait, leaves the record as it was. The
@@ -31,7 +33,7 @@ def _name(kind: StartFailureKind) -> str:
     return kind.name.lower()
 
 
-# The kinds of a failed start: the engine's StartFailureKind names, which the
+# The kinds of a failure: the engine's StartFailureKind names, which the
 # launcher and the server share where their failure is of the same class, and
 # the frontend's own.
 CONFIGURATION = _name(StartFailureKind.CONFIGURATION)
@@ -44,6 +46,8 @@ PORT = "port"
 UPGRADE = "upgrade"
 # The model's download or verification failed.
 INSTALL = "install"
+# The server stopped restarting its engine.
+STOPPED = "stopped"
 
 
 class NotRecorded(Exception):
@@ -58,9 +62,15 @@ def starting(path: Path | None):
 
 def entered(path: Path | None, phase: str):
     """Record, best effort, that this process's start entered a later
-    `phase`: "loading", the tokenizer, then the engine's weights; or
-    "warming", the engine runs the model once at full size (WarmingEvent)."""
+    `phase`: "loading", the tokenizer, then the engine's weights."""
     _write_best_effort(path, {"pid": os.getpid(), "phase": phase})
+
+
+def warming(path: Path | None, steps_done: int, steps: int):
+    """Record, best effort, that the engine warms up (WarmingEvent): as its
+    warm-up begins and as each of its steps ends, the steps done of all."""
+    warmup = {"steps_done": steps_done, "steps": steps}
+    _write_best_effort(path, {"pid": os.getpid(), "phase": "warming", "warmup": warmup})
 
 
 def ready(path: Path | None):
@@ -70,8 +80,8 @@ def ready(path: Path | None):
 
 
 def failed(path: Path | None, failure: dict):
-    """Record, best effort, that this process's start failed (failure,
-    engine_failure)."""
+    """Record, best effort, that this process's start, or its serving,
+    failed (failure, engine_failure)."""
     _write_best_effort(
         path, {"pid": os.getpid(), "phase": "failed", "failure": failure}
     )

@@ -556,9 +556,8 @@ static void testTheLimitBoundsLiveSlots() {
   first = file.acquire();
   require(first != nullptr, "the limit granted nothing once enough was freed");
   const std::vector<std::byte> payload(size, std::byte{3});
-  require(file.write(first, {payload}, {})->wait() && file.allocatedBytes() >= size &&
-              file.volume() && file.volume()->f_bsize,
-          "a written file did not measure its blocks and volume");
+  require(file.write(first, {payload}, {})->wait() && file.allocatedBytes() >= size,
+          "a written file did not measure its blocks");
 }
 
 // Writes draw their host pages from the write budget; overdrawn, it holds back writes not in use

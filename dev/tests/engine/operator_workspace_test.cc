@@ -1,4 +1,5 @@
 #include "TestChecks.hpp"
+#include "TestFamilies.hpp"
 #include "metal/abi/MoE.h"
 #include "model/WeightLayout.hpp"
 #include "ops/DraftSelector.hpp"
@@ -15,10 +16,7 @@
 
 namespace {
 
-// The pages per prefill attention split these plans take: the Apple10 row's
-// (KernelCalibration.hpp).
-constexpr uint32_t kPagesPerSplit = splash::ops::kAttention.prefillPagesPerSplit;
-
+using splash::test::attentionRow;
 using splash::test::rejects;
 using splash::test::require;
 
@@ -40,7 +38,8 @@ void attention() {
       require(workspace.statisticsBytes == uint64_t{maximumSlots} * 8 * queryHeads * 2 * 4,
               "prefill statistics workspace differs from the maximum over actual row counts");
       for (const uint32_t history : {0U, 65536U, 1'000'000U}) {
-        const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, kPagesPerSplit);
+        const auto plan = ops::PagedAttention::prefillPlan(rows, history, queryHeads, layout, ops::kApple10Attention,
+                                                           ops::Int8Activations::Off);
         require(workspace.partialsBytes >= plan.workspace.partialsBytes &&
                     workspace.statisticsBytes >= plan.workspace.statisticsBytes,
                 "prefill workspace omitted the plan of its own rows");
@@ -82,15 +81,16 @@ void attentionReads() {
   const kv::Layout selected{.attentionLayers = 1, .kvHeads = 2, .headDimension = 256,
                             .valuesTokenMajor = true, .reads = kv::Reads::SelectedBlocks};
   const std::array<uint32_t, 1> history{4096};
-  require(ops::PagedAttention::prefillPlan(64, 4096, 24, selected, kPagesPerSplit).sparse &&
-              ops::PagedAttention::verifyPlan(1, 24, selected, history).sparse,
+  constexpr ops::Int8Activations off = ops::Int8Activations::Off;
+  require(ops::PagedAttention::prefillPlan(64, 4096, 24, selected, ops::kApple10Attention, off).sparse &&
+              ops::PagedAttention::verifyPlan(1, 24, selected, history, ops::kApple10Attention, off).sparse,
           "a reader of selected blocks did not plan the sparse kernels");
   kv::Layout everyPage = selected;
   everyPage.reads = kv::Reads::EveryPage;
   require(everyPage.valid(), "a page loop over token-major values is not a layout");
-  rejects([&] { (void)ops::PagedAttention::prefillPlan(64, 4096, 24, everyPage, kPagesPerSplit); },
+  rejects([&] { (void)ops::PagedAttention::prefillPlan(64, 4096, 24, everyPage, ops::kApple10Attention, off); },
           "no paged-attention kernel for layout", "the page loop planned the sparse kernels of token-major values");
-  rejects([&] { (void)ops::PagedAttention::verifyPlan(1, 24, everyPage, history); },
+  rejects([&] { (void)ops::PagedAttention::verifyPlan(1, 24, everyPage, history, ops::kApple10Attention, off); },
           "no paged-attention kernel for layout", "the page loop planned the sparse kernels of token-major values");
   kv::Layout dimensionMajor = selected;
   dimensionMajor.valuesTokenMajor = false;
@@ -111,17 +111,14 @@ void blockIndexReader() {
   require(!everyPage.valid() && !everyPage.spillable(), "the page loop's layout holds a block index");
 }
 
-// Expert ids, route rows and grouped routes are uint32, routing weights fp32
-// and activations bf16; a row routes its top k and each shared slice, which
-// fills one tile per tileRows rows. The grouped input first holds the
-// router's fp32 scores, one row of 256 per token. Every plan parks its gate
-// in expertOutput, so that field spans the wider of the hidden and
-// intermediate widths. Plans of the staged tiles hold no sums.
+// Expert ids, route rows, grouped routes and the experts' slots are uint32,
+// routing weights fp32 and activations bf16; a row routes its top k and each
+// shared slice, which fills one tile per tileRows rows. The grouped input
+// first holds the router's fp32 scores, one row of 256 per token.
 void checkMoe(splash::ops::MoeWorkspace workspace,
               splash::ops::MoeShape shape, uint32_t rows, uint32_t tileRows) {
   using splash::model::kBFloat16Bytes;
   constexpr uint64_t kRouterScores = 256;
-  const uint64_t outputWidth = std::max(shape.hiddenSize, shape.expertIntermediateSize);
   const uint64_t routes = uint64_t{rows} * (shape.expertsPerToken + shape.sharedSlices);
   const uint64_t routed = uint64_t{rows} * shape.expertsPerToken;
   const uint64_t tiles = std::min(routed / tileRows + shape.experts, routed) +
@@ -134,12 +131,12 @@ void checkMoe(splash::ops::MoeWorkspace workspace,
               workspace.tileCountBytes == sizeof(MoeTileCount) &&
               workspace.groupedRoutesBytes == grouped * sizeof(uint32_t) &&
               workspace.routeRowsBytes == routes * sizeof(uint32_t) &&
+              workspace.expertSlotsBytes == uint64_t{shape.experts} * sizeof(uint32_t) &&
               workspace.groupedInputBytes == std::max(grouped * shape.hiddenSize * kBFloat16Bytes,
                                                       uint64_t{rows} * kRouterScores * sizeof(float)) &&
               workspace.expertIntermediateBytes ==
                   grouped * shape.expertIntermediateSize * kBFloat16Bytes &&
-              workspace.expertOutputBytes == grouped * outputWidth * kBFloat16Bytes &&
-              workspace.groupedSumsBytes == 0,
+              workspace.expertOutputBytes == grouped * shape.hiddenSize * kBFloat16Bytes,
           "MoE workspace changed from baseline");
 }
 

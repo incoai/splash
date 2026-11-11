@@ -26,6 +26,8 @@ enum class WarmupStepStatus { Pending, Complete, MemoryLimited };
 
 struct WarmupReport {
   WarmupStepStatus maximumPrefill = WarmupStepStatus::Pending;
+  // A prefill of each class of chunk (ops::ExecutionPlans::prefillRowClasses).
+  WarmupStepStatus prefillRowClasses = WarmupStepStatus::Pending;
   std::array<WarmupStepStatus, model::ExecutionLimits::maximumBatchWidth>
       decodeBatches{};
   WarmupStepStatus compositeStateRestore = WarmupStepStatus::Pending;
@@ -61,6 +63,8 @@ struct StatusSample final {
   bool metalHealthy = true;
   // Why Metal failed; empty while it is healthy.
   std::string metalFailureReason;
+  // metal::MetalBackend::pipelinesCreatedWhileServing.
+  uint64_t pipelinesCreatedWhileServing = 0;
   MemoryGovernorSnapshot memoryGovernor;
   AneFfnSnapshot aneFfn;
   ThermalState thermalState = ThermalState::Nominal;

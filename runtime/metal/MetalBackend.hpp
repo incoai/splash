@@ -163,6 +163,9 @@ struct ComputeDispatch {
   DispatchSize threadsPerThreadgroup;
   IndirectGrid indirectThreadgroups = {};
   AddressTable addresses = {};
+  // The values of the function's uint function constants at indices 0 up,
+  // which specialize its pipeline: a pipeline per name and values.
+  std::vector<uint32_t> constants = {};
 };
 
 // A host step's round trip on the host clock (AwakeClock, the time base of
@@ -189,45 +192,63 @@ enum class HostStepGpu : uint8_t {
 // signals, so a signal is never held back behind the dispatches that follow
 // it, and a signal is delivered even when the work before it fails.
 //
-// Metal fails a wait (a Wait, or the work after a host step) still unmet
-// supervision::kGpuWaitLimit after its queue reached it ("Caused GPU Timeout
-// Error"), and the command with it. The queue reaches a command's first wait
-// as the command is submitted, whatever work runs ahead of it, and each later
-// one once the wait before it was met: the work between two waits, with the
-// agent's or the step's part, must end within it. Longer work, such as the
+// Metal fails a Wait still unmet supervision::kGpuWaitLimit after its queue
+// reached it ("Caused GPU Timeout Error"), and the command with it. The queue
+// reaches a command's first wait as the command is submitted, or, after a
+// host step, once the step returned (below), whatever work runs ahead of it,
+// and each later one once the wait before it was met: the work between two
+// waits, with the agent's part, must end within it. Longer work, such as the
 // encodes of a prefill command's images, runs as a command of its own.
 //
 // A Host step runs `work` on the CPU once all earlier work has completed and
-// holds all later work until it returned, through two shared events the
-// backend creates for the command's host steps, one the GPU raises and one the
-// backend's runner raises, so that no write of one side puts back a value of
-// the other (the step's event and value are unused): the work reads what the
-// GPU wrote before it and writes Shared buffers the GPU reads after it. With
-// HostStepGpu::Awake, one GPU
-// thread spins through the step so the GPU stays awake and starts the work
-// after it at once and at full clocks: for steps about as short as the GPU's
-// wake-up (a streamed decode load), not for long ones, where the spin saves
-// little. The spin, host_step_wait of host-step.metallib beside the
-// backend's metallib, sees the CPU end it through a memory scope Metal's
-// public headers leave out, so the backend checks, before the first command
-// with an awake step, that it does; without that library, or if it does not,
-// awake steps run as plain ones, with a warning. The steps of the committed
-// commands run in order on one thread of the backend's while the submitting
-// thread goes on, so `work` must not call the backend: it touches buffer
-// contents and its own state only. It may also run after submitCommandAsync
-// or wait() threw (its encoding failed after its first buffers were committed,
-// or the watchdog or a shutdown gave the command up), so it owns what it
-// touches. A step is skipped when the command buffer before it failed, and
-// so is every later step of its command, as are those after a step whose
-// work threw: a later step may build on what an earlier one did (an expert
-// load's later rounds on its first), and a command that failed is given up.
+// holds all later work until it returned: the GPU raises a shared event the
+// backend creates for the command's host steps once the work before a step
+// has completed, and the backend's runner commits the buffers after the step
+// once it returned (the step's event and value are unused). So no GPU wait
+// spans the step, and its work may take longer than Metal's wait limit (an
+// expert load from a slow disk): only the watchdog bounds it
+// (CommandWatchdog). The runner also raises the GPU's event for an awake step
+// it gives up or that follows a failed buffer, as the step's spin waits for it
+// and the buffer may raise it late or never; every later step's GPU signal
+// follows the runner's. The work reads what the GPU wrote before it and
+// writes Shared buffers the GPU reads after it. With HostStepGpu::Awake, one
+// GPU thread spins from the end of the work before the step until the step
+// returned, so the GPU stays awake and starts the work after it at once and
+// at full clocks: for steps about as short as the GPU's wake-up (a streamed
+// decode load), not for long ones, where the spin saves little. The spin,
+// host_step_wait of host-step.metallib beside the backend's metallib, sees the
+// CPU end it through a memory scope Metal's public headers leave out, so the
+// backend checks, before the first command with an awake step, that it does;
+// without that library, or if it does not, awake steps run as plain ones, with
+// a warning. The steps of the committed commands run in order on one thread of
+// the backend's while the submitting thread goes on, so `work` must not call
+// the backend: it touches buffer contents and its own state only. It may also
+// run after submitCommandAsync or wait() threw (its encoding failed after its
+// first buffers were committed, or the watchdog or a shutdown gave the command
+// up), so it owns what it touches. A step is skipped when the command buffer
+// before it failed, and so is every later step of its command, as are those
+// after a step whose work threw: a later step may build on what an earlier one
+// did (an expert load's later rounds on its first), and a command that failed
+// is given up.
+// A host step's `beside` dispatches, those right after it, run while its
+// work runs, in a buffer of their own after the step's signal, which waits for
+// nothing; the work after them waits for the step. They write nothing the
+// work reads, and use no 128-byte line, the GPU's cache line, of `writes`,
+// the buffers the work writes, which submission checks: a line the GPU read
+// while the step ran is unproven fresh in the buffer after the step, where
+// only the buffer's start makes what the CPU wrote visible. Nothing but
+// Metal's tracking of the buffers they use orders the work after the step,
+// the command's completion and its failure report after them: the work after
+// the step uses what they write (a MoE step's combine reads the outputs of its
+// passes beside the load). A step after a buffer of them that failed by its
+// turn is skipped too. No other event step comes among them.
 // The GPU work after a skipped step still runs, on what its buffers held, as
 // all work after a failed buffer runs on what it left, and the command fails
 // with the first failure; a step whose work threw names it (its ticket's
 // wait() throws its message). The failure also names, of the steps that ran,
 // the longest work and the longest pickup (from the end of the GPU work
-// before a step to its start), so that a buffer Metal timed out tells which
-// step held its wait. Once a command completed without a failure, `timed`
+// before a step to its start), so that a failed command tells which step held
+// it up. Once a command completed without a failure, `timed`
 // gets the round trip of each of its host steps (HostStepTiming) on Metal's
 // completion thread; one that throws marks the backend unhealthy, as a
 // completion callback that throws does. A command run under dispatch
@@ -248,6 +269,10 @@ struct EventStep {
   std::function<void(const HostStepTiming &)> timed{};
   HostStepGpu gpu = HostStepGpu::Idle;
   std::function<void()> then{};
+  // A host step's dispatches from `before` on that run beside its work, and
+  // the buffers its work writes, of which they use no 128-byte line.
+  size_t beside = 0;
+  std::vector<MetalBuffer> writes{};
 };
 
 // What one submission encodes: its dispatches in order, and the event steps
@@ -441,13 +466,14 @@ public:
   [[nodiscard]] CommandTiming submit(const ComputeDispatch &dispatch);
 
   // Encodes a command into Metal command buffers, one plus one per buffer its
-  // event steps add (EventStep), and commits each as its encoding ends,
-  // without waiting: the GPU runs the work before an event step while the
-  // work after it is still encoded. The completion callback only notifies
-  // host control flow; command results and errors are consumed from the
-  // returned ticket, which reports the error of the first of its buffers that
-  // failed. A second command is rejected until wait() consumes the first
-  // ticket, preserving the one-in-flight runtime invariant.
+  // event steps add (EventStep), and commits each as its encoding ends, or
+  // once the host steps before it returned, without waiting: the GPU runs the
+  // work before an event step while the work after it is still encoded. The
+  // completion callback only notifies host control flow; command results and
+  // errors are consumed from the returned ticket, which reports the error of
+  // the first of its buffers that failed. A second command is rejected until
+  // wait() consumes the first ticket, preserving the one-in-flight runtime
+  // invariant.
   [[nodiscard]] CommandTicket
   submitCommandAsync(const Command &command, CommandCompletion completion = {});
   // A command of these dispatches without event steps: one command buffer.
@@ -459,6 +485,15 @@ public:
   // dispatches would compile. Validates them as submission does and throws
   // as it would, but encodes and commits nothing.
   void preparePipelines(std::span<const ComputeDispatch> dispatches);
+  // The engine is Ready. A pipeline is created the first time a dispatch
+  // names it, a command's new ones together, and the submitting thread waits
+  // while Metal compiles them if the shader cache is cold: 19 s for the 27B's
+  // first 17-row prefill chunk on a 16-core Apple9 plan, one at a time.
+  // Startup warmup creates the pipelines its commands name; each one created
+  // from here on is counted, and logged once with its name, function
+  // constants and time.
+  void beginServing() noexcept;
+  [[nodiscard]] uint64_t pipelinesCreatedWhileServing() const noexcept;
 
   [[nodiscard]] MetalMemoryStats memoryStats() const noexcept;
   // Explicit safe-point refresh for memory admission/reclamation code. A

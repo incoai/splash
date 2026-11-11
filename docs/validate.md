@@ -124,7 +124,7 @@ one that serves vision, so all three runs take
 `"--expert-memory 5632M --ple-memory 237M"` where the installation serves
 vision, whose default checks alone fit only up to about `7700M` of experts.
 Unlike `splash serve`, which
-streams the PLE table where memory cannot hold it, the oracle loads it whole
+streams the PLE table unless `--ple-memory off`, the oracle loads it whole
 unless `--ple-memory` streams it, and its weights then need 37555 MiB, which
 it refuses at once on the M6 (11-03); `237M` is the row cache `splash serve`
 gives the table there, with which the 32K check passed.
@@ -142,7 +142,8 @@ source tree and commits.
 ## Release check
 
 A release is checked once per source identity, and then on each Apple GPU
-family (an Apple9 M3 and an Apple10 M5) against a retained baseline build,
+family (an Apple9 M3, an Apple10 M5 and, by hand until a runner has one, an
+Apple11 M6) against a retained baseline build,
 `BASELINE`: a checkout whose `build/` holds `splash`, `splash.metallib`,
 `engine-tests/backend-benchmark` and `engine-tests/weight-digests`.
 `release-check` fails without it. The baseline must load the model: it is the previous release's
@@ -297,7 +298,10 @@ prefilled four at a time.
 A change of the weight images' layout (`EXPECT_IMAGE_CHANGE=1`) makes
 `backend_regression` report the images it changed instead of failing on them.
 `decode-profile --dispatch-list FILE` writes the profiled B1 cycles'
-dispatches in order with their GPU time.
+dispatches in order with their GPU time. Its `--verify-rows all` verifies
+every row of a MoE target's cycles, as `backend-benchmark` does, so two
+builds' runs route the same experts; each width also reports its tokens per
+cycle and wall ms per token.
 
 To compare the model's numerics with another engine on the same weights,
 `make teacher-logits MODEL=... TEACHER_LOGITS_ARGS='TOKENS OUTPUT --window END:ROWS ...'`
@@ -306,15 +310,15 @@ a file of uint32 token ids (`dev/benchmarks/teacher_logits.mm`): for each
 window, the fp32 logits of the prefill's final position and of ROWS decode
 positions after it, each computed by a verify row forced to the true next
 token, in `OUTPUT-END.f32`, and prints how well they predict the true ids. It
-also takes `--kv-format`, `--state-format`, `--expert-memory` and
-`--ple-memory`, and, with `--captures yes`, writes the output rows of the
-target layers the model's draft reads (its `target_layer_ids`) at the
-positions a window's prefill computed, in one command, to
-`OUTPUT-END.captures.f32` (fp32, a row per position of each layer's hidden
-values in the draft's layer order), which a reference's residuals after those
-layers compare with (`dev/tools/flint_reference.py` writes Flint's,
-`residuals.npy`): a draft of the layers to compare, such as a test draft whose
-`fc` reads them, makes them its captures.
+also takes `--kv-format`, `--state-format`, `--activations`,
+`--expert-memory` and `--ple-memory`, and, with `--captures yes`, writes the
+output rows of the target layers the model's draft reads (its
+`target_layer_ids`) at the positions a window's prefill computed, in one
+command, to `OUTPUT-END.captures.f32` (fp32, a row per position of each
+layer's hidden values in the draft's layer order), which a reference's
+residuals after those layers compare with (`dev/tools/flint_reference.py`
+writes Flint's, `residuals.npy`): a draft of the layers to compare, such as a
+test draft whose `fc` reads them, makes them its captures.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
 report. Its cache checks reuse each context's cached prefix, so they need that

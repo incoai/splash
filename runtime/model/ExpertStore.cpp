@@ -161,7 +161,7 @@ Places stagingOf(const Geometry &g, ops::MoeShape shape) {
 uint64_t fixedBytesOf(const Geometry &g, uint32_t blocks, ops::MoeShape shape) {
   const uint64_t prediction =
       uint64_t{kCycleRows} * (shape.routerWidth() + 2ULL * shape.routesPerToken()) * sizeof(float);
-  return stagingOf(g, shape).bytes() + uint64_t{blocks} * shape.experts * sizeof(uint32_t) +
+  return stagingOf(g, shape).bytes() + 2 * uint64_t{blocks} * shape.experts * sizeof(uint32_t) +
          uint64_t{shape.experts} * (sizeof(uint32_t) + 3 * sizeof(uint64_t)) + 4 * sizeof(uint32_t) + prediction;
 }
 
@@ -332,14 +332,15 @@ struct ExpertStore::Impl {
   void move(Size &size, uint32_t from, uint32_t to);
   // Before size `index`'s slots from `boundary` on are given back: no block
   // of it names them, every table entry of its blocks is the block's slot of
-  // the expert (0 for one not resident), no slot from it on has an owner, and
-  // its recycler holds the slots below it alone. Throws std::logic_error
-  // otherwise.
+  // the expert (MOE_SLOT_ABSENT for one not resident), no slot from it on
+  // has an owner, and its recycler holds the slots below it alone. Throws
+  // std::logic_error otherwise.
   void requireBelow(uint32_t index, uint32_t boundary) const;
   // No repack names a slot: a load's host step that does not run (one
   // before it threw, or the command before it failed) leaves the repack
   // after it no job, rather than the last round's, whose slots a shrink may
-  // have moved or given back; and no slot is staged, as no load is under way.
+  // have moved or given back; no slot is staged, as no load is under way;
+  // and every load table entry names slot 0, inside every size's floor.
   void forgetRepack();
   // The live chunks' count, bytes and slots in the counters, none while the
   // store is released.
@@ -358,10 +359,11 @@ struct ExpertStore::Impl {
   // The staging's places, and which of them the round being staged holds.
   Places places;
   std::vector<uint8_t> taken;
-  // Slot tables (blocks x experts), the staging, a round's jobs' slots and
-  // their projections' sources (MoE::addExpertLoad's), and its grid
-  // (MTLDispatchThreadgroupsIndirectArguments), all Shared.
-  metal::MetalBuffer tables, staging, jobs, sources, grid;
+  // Slot tables (blocks x experts), their copies for the passes after a
+  // load (ops::BlockMoeWeights::loadSlotTable), the staging, a round's jobs'
+  // slots and their projections' sources (MoE::addExpertLoad's), and its
+  // grid (MTLDispatchThreadgroupsIndirectArguments), all Shared.
+  metal::MetalBuffer tables, loadTables, staging, jobs, sources, grid;
   // A decode step's prediction of the next block's routes (addLoad): its
   // router's fp32 scores of this block's input, then each row's experts and
   // routing weights as the routing selects them (ops::MoE::addRoutes), for
@@ -432,10 +434,10 @@ void ExpertStore::Impl::evict(Size &size, uint32_t slot) {
   const uint32_t expert = size.ownerExpert[slot];
   blocks[owner].slot[expert] = kNoSlot;
   --blocks[owner].resident;
-  // A table entry of no resident expert names slot 0, which is inside chunk
-  // 0, which every size has: the kernels read only routed experts' entries,
-  // which a load set, so it is never used.
-  static_cast<uint32_t *>(tables.contents())[uint64_t{owner} * shape.experts + expert] = 0;
+  // A table entry of no resident expert is MOE_SLOT_ABSENT, which only the
+  // grouping reads: it puts the expert's tiles past the resident ones, whose
+  // passes run after the load that gives it a slot and read the load table.
+  static_cast<uint32_t *>(tables.contents())[uint64_t{owner} * shape.experts + expert] = MOE_SLOT_ABSENT;
   size.ownerBlock[slot] = size.ownerExpert[slot] = kNoSlot;
   --counters.resident;
 }
@@ -450,15 +452,18 @@ void ExpertStore::Impl::route(uint32_t index, std::span<const std::span<const Mo
   const bool chunk = longChunk(phase, rows);
   ++serial;
   pendingBlock = index;
+  // Every routed expert's slot, for the passes after the load.
+  uint32_t *loadTable = static_cast<uint32_t *>(loadTables.contents()) + uint64_t{index} * shape.experts;
   for (std::span<const MoeTileDescriptor> tiles : parts)
     for (const MoeTileDescriptor &tile : tiles) {
-      // Past the routed experts' tiles come the shared expert's (id experts).
+      // The shared expert's tiles (ids experts on) route nothing.
       const uint32_t expert = tile.expert;
       if (expert >= shape.experts || routedIn[expert] == serial) continue;
       routedIn[expert] = serial;
       ++use.routed;
       if (const uint32_t slot = block.slot[expert]; slot != kNoSlot) {
         size.recycling.touch(slot, serial, chunk);
+        loadTable[expert] = slot;
         continue;
       }
       pending.push_back({expert, kNoSlot});
@@ -472,7 +477,7 @@ void ExpertStore::Impl::route(uint32_t index, std::span<const std::span<const Mo
     size.ownerBlock[slot] = index;
     size.ownerExpert[slot] = expert;
     block.slot[expert] = slot;
-    table[expert] = slot;
+    table[expert] = loadTable[expert] = slot;
     waiting[expert] = 1;
     ++block.resident;
     ++counters.resident;
@@ -739,7 +744,7 @@ void ExpertStore::Impl::abandon() {
       waiting[expert] = 0;
       if (slot == kNoSlot || block.slot[expert] != slot) continue;
       block.slot[expert] = kNoSlot;
-      table[expert] = 0;
+      table[expert] = MOE_SLOT_ABSENT;
       size.ownerBlock[slot] = size.ownerExpert[slot] = kNoSlot;
       size.recycling.free(slot);
       --block.resident;
@@ -916,7 +921,7 @@ void ExpertStore::Impl::requireBelow(uint32_t index, uint32_t boundary) const {
     for (uint32_t expert = 0; expert < shape.experts; ++expert) {
       const uint32_t slot = blocks[block].slot[expert];
       if ((slot != kNoSlot && slot >= boundary) ||
-          table[uint64_t{block} * shape.experts + expert] != (slot == kNoSlot ? 0 : slot))
+          table[uint64_t{block} * shape.experts + expert] != (slot == kNoSlot ? MOE_SLOT_ABSENT : slot))
         throw std::logic_error("block " + std::to_string(block) + "'s expert " + std::to_string(expert) +
                                " is in slot " + std::to_string(slot) + " past the expert slots kept, " +
                                std::to_string(boundary) + ", or its slot table names another");
@@ -934,6 +939,7 @@ void ExpertStore::Impl::requireBelow(uint32_t index, uint32_t boundary) const {
 void ExpertStore::Impl::forgetRepack() {
   static_cast<uint32_t *>(grid.contents())[1] = 0;
   staged.clear();
+  std::memset(loadTables.contents(), 0, loadTables.sizeBytes());
 }
 
 void ExpertStore::Impl::countLive() {
@@ -982,10 +988,10 @@ void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows,
   ExpertStoreStats::Use &use = counters.uses[static_cast<size_t>(phase)];
   try {
     if (round == 0) {
-      // A load whose later rounds did not run (its command failed) frees the
-      // slots of the experts it had not staged; one that fails before it
-      // routes frees none of the last load's (abandon).
-      abandon();
+      // A load whose later rounds did not run (its command failed, which ends
+      // the engine) left routed experts in slots the slot table names but no
+      // repack wrote, which the grouping before this load took as resident.
+      if (!pending.empty()) throw std::logic_error("an expert load follows one whose later rounds did not run");
       partTiles.clear();
       for (const PartTiles &part : parts) {
         const auto *counted = static_cast<const MoeTileCount *>(part.count.contents());
@@ -1167,7 +1173,9 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
   impl.staging = backend.allocateBuffer(impl.places.bytes(), metal::BufferStorage::Shared, "experts/staging");
   const uint64_t tableBytes = uint64_t{shape.experts} * impl.blocks.size() * sizeof(uint32_t);
   impl.tables = backend.allocateBuffer(tableBytes, metal::BufferStorage::Shared, "experts/slot-tables");
-  std::memset(impl.tables.contents(), 0, tableBytes);
+  std::fill_n(static_cast<uint32_t *>(impl.tables.contents()), tableBytes / sizeof(uint32_t), MOE_SLOT_ABSENT);
+  impl.loadTables = backend.allocateBuffer(tableBytes, metal::BufferStorage::Shared, "experts/load-slot-tables");
+  std::memset(impl.loadTables.contents(), 0, tableBytes);
   const auto predictionBuffer = [&](uint64_t perRow, const char *label) {
     return backend.allocateBuffer(uint64_t{kCycleRows} * perRow * sizeof(float),
                                   metal::BufferStorage::Shared, label);
@@ -1215,6 +1223,9 @@ void ExpertStore::bind(uint32_t block, ops::BlockMoeWeights &weights) {
   weights.chunks = size.chunks;
   weights.slotTable = impl.backend.view(impl.tables, uint64_t{block} * impl.shape.experts * sizeof(uint32_t),
                                         uint64_t{impl.shape.experts} * sizeof(uint32_t));
+  weights.loadSlotTable = impl.backend.view(impl.loadTables,
+                                            uint64_t{block} * impl.shape.experts * sizeof(uint32_t),
+                                            uint64_t{impl.shape.experts} * sizeof(uint32_t));
   weights.slots = size.slots;
   // The experts of a size of one block stay in their slots: nothing loads
   // them.
@@ -1222,8 +1233,8 @@ void ExpertStore::bind(uint32_t block, ops::BlockMoeWeights &weights) {
   weights.streamBlock = block;
 }
 
-void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts,
-                          uint32_t block) const {
+void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block,
+                          const std::function<void()> &beside) const {
   const Impl &impl = *impl_;
   const Impl::Size &size = impl.sizes[impl.blocks.at(block).size];
   const ops::MoeShape shape = impl.shape;
@@ -1266,12 +1277,17 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
   // Each step's read-ahead starts once the GPU went on (startAhead).
   const auto startAhead = [impl = impl_] { impl->startAhead(); };
   const metal::MetalBuffer verifyRows = predicted ? parts.front().buffers->verifyRows : metal::MetalBuffer{};
+  // The first round's step runs beside the passes over the experts resident
+  // before it, whose slots route() leaves as they are (it touches every routed
+  // resident slot before it claims any): they read the grouping's copy of the
+  // slot table, no line of what a load's step writes.
   for (uint32_t round = 0; round < rounds; ++round) {
     graph.host(
         [impl = impl_, block, phase, rows, predicted, tiles, round, rounds, verifyRows] {
           impl->load(block, phase, rows, predicted, tiles, round, rounds, verifyRows);
         },
-        timed, gpu, startAhead);
+        timed, gpu, startAhead, round ? std::function<void()>{} : beside,
+        {impl.tables, impl.loadTables, impl.staging, impl.jobs, impl.sources, impl.grid});
     ops::MoE::addExpertLoad(graph, impl.staging, size.chunks, impl.jobs, impl.sources, size.load,
                             static_cast<uint32_t>(std::min<uint64_t>(routable, impl.places.count)),
                             metal::IndirectGrid{impl.grid, 0});
@@ -1320,7 +1336,8 @@ void ExpertStore::release() {
     std::ranges::fill(block.slot, kNoSlot);
     block.resident = 0;
   }
-  std::memset(impl.tables.contents(), 0, impl.tables.sizeBytes());
+  std::fill_n(static_cast<uint32_t *>(impl.tables.contents()), impl.tables.sizeBytes() / sizeof(uint32_t),
+              MOE_SLOT_ABSENT);
   // The chunks past the live ones were given back already.
   for (Impl::Size &size : impl.sizes) {
     for (uint32_t chunk = 0; chunk < size.chunks.liveChunks(); ++chunk) impl.backend.releaseMemory(size.buffers[chunk]);
