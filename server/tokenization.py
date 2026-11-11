@@ -28,11 +28,9 @@ class PromptTokenizer:
     `max_context` tokens, the served context."""
 
     MIN_PREFIX_CHARS = 4096
-    # A conversation keeps one prompt, its newest, so the count bounds the
-    # conversations whose next turn reuses it, and agents interleave more of
-    # them than there are lanes: with 4, eight coding agents on 4 lanes
-    # reused 6% of their 44K-token prompts, each miss encoding one in 27 ms;
-    # with 16 every turn found its prompt, 1.8 ms a request.
+    # Each branch keeps its newest prompt and earlier message ends. Agents
+    # interleave more branches than there are lanes: sixteen entries let
+    # their later turns reuse context within the unchanged byte budget.
     CAPACITY = 16
     # The storage, which bounds the memory however many prompts it holds.
     BUDGET_PROMPTS = 4
@@ -103,6 +101,20 @@ class PromptTokenizer:
     def _encode(self, text):
         return self.tokenizer(tokenizable(text), add_special_tokens=False)["input_ids"]
 
+    @staticmethod
+    def _shared_boundary(prefix, key, boundaries):
+        # Common message ends are ordered: a binary search compares their
+        # text in C, including when the next turn branches or gets shorter.
+        low, high = 0, len(boundaries) // 2
+        while low < high:
+            middle = (low + high) // 2
+            end = boundaries[2 * middle]
+            if end <= len(prefix) and prefix.startswith(key[:end]):
+                low = middle + 1
+            else:
+                high = middle
+        return low
+
     def encode(self, text):
         boundary = text.rfind(self.marker)
         if not self.enabled or boundary < 0:
@@ -112,32 +124,53 @@ class PromptTokenizer:
             return self._encode(text)
         prefix = text[:boundary]
         with self.lock:
-            key = max(
-                (key for key in self.entries if prefix.startswith(key)),
-                key=len,
-                default="",
-            )
-            cached = self.entries.get(key)
+            key, cached, shared = "", None, 0
+            reused_chars = 0
+            for candidate, entry in self.entries.items():
+                count = self._shared_boundary(prefix, candidate, entry[1])
+                if count and entry[1][2 * count - 2] > reused_chars:
+                    key, cached, shared = candidate, entry, count
+                    reused_chars = entry[1][2 * count - 2]
             if cached is not None:
+                self.entries.get(key)
                 self.hits += 1
-                self.reused_tokens += len(cached) // array("I").itemsize
+                self.reused_tokens += cached[1][2 * shared - 1]
             else:
                 self.misses += 1
-        tokens = array("I", cached).tolist() if cached is not None else []
-        if key != prefix:
-            tokens.extend(self._encode(prefix[len(key) :]))
+        boundaries = array("Q", cached[1][: 2 * shared]) if cached else array("Q")
+        token_count = boundaries[-1] if boundaries else 0
+        tokens = (
+            array("I", cached[0][: token_count * array("I").itemsize]).tolist()
+            if cached
+            else []
+        )
+        position = reused_chars
+        while position < boundary:
+            end = prefix.find(self.marker, position) + len(self.marker)
+            part = self._encode(prefix[position:end])
             # A different added token can consume part of the marker. In that
             # case this literal occurrence is not a tokenizer boundary.
-            if not tokens or tokens[-1] != self.marker_id:
+            if not part or part[-1] != self.marker_id:
                 return self._encode(text)
+            tokens.extend(part)
+            boundaries.extend((end, len(tokens)))
+            position = end
+        if reused_chars < boundary:
             token_bytes = array("I", tokens).tobytes()
-            size = sys.getsizeof(prefix) + sys.getsizeof(token_bytes)
+            entry = (token_bytes, boundaries)
+            size = (
+                sys.getsizeof(prefix)
+                + sys.getsizeof(token_bytes)
+                + sys.getsizeof(boundaries)
+                + sys.getsizeof(entry)
+            )
             if size <= self.entries.budget_bytes:
                 with self.lock:
-                    # An extension replaces its earlier prefix; unrelated
-                    # concurrent conversations retain their own LRU entries.
-                    self.entries.pop(key)
-                    self.entries.put(prefix, token_bytes, size)
+                    # A growing conversation retains every earlier message
+                    # boundary in its newest entry. Branches keep their own.
+                    if key and prefix.startswith(key):
+                        self.entries.pop(key)
+                    self.entries.put(prefix, entry, size)
         return tokens + self._encode(text[boundary:])
 
     def split(self, text):
