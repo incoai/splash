@@ -451,6 +451,25 @@ extension ServerScreenTests {
             + #""Flint": {"unusable": [\#(flint)], "context_tokens": 262144, "max_context_tokens": 262144}}"#
     }()
 
+    /// A model's phrase changes in place as the server starts it: every frame of the page shows the
+    /// row as it was or as it is once the phrase has changed. Animated with the page, the phrase
+    /// slid in over the check.
+    @Test func aModelsPhraseChangesInPlace() async throws {
+        let fake = try FakeRuntime("splash-phrase", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await Self.launchedWithModels(fake, families: Self.realisticFamilies)
+        defer { state.quit() }
+        let qwen = "mlx-community/Qwen3.8-27B-4bit"
+        state.options["--port"] = String(fake.port)
+        let window = await Self.serverWindow(state, picked: qwen)
+        defer { window.orderOut(nil) }
+        let start = try await Self.pictures(of: window) { state.start(qwen) }
+        let before = Self.page(start.before, of: window), after = Self.page(start.after, of: window)
+        #expect(state.server.phase == .starting && before != after)
+        let between = start.drawn.filter { Self.page($0.picture, of: window) != before && Self.page($0.picture, of: window) != after }.count
+        #expect(between == 0, "\(between) of \(start.drawn.count) frames drew the phrase between none and Starting…")
+    }
+
     /// A launch option's warning comes and goes as a row of the page does: a context past the
     /// model's window shows YaRN's caution only once the rows under it have moved down, and set
     /// back to Auto, the caution goes at once, the rows under it moving up into its place. It

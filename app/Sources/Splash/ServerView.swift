@@ -657,9 +657,7 @@ private struct ModelRow: View {
                         .truncationMode(.middle)
                 }
                 Spacer()
-                // In place, as the row moves: a phrase that came and went, or faded into the next,
-                // drew over the rows moving past it in a switch.
-                Text(phase ?? "").foregroundStyle(.secondary).contentTransition(.identity)
+                Text(phase ?? "").foregroundStyle(.secondary)
                 // Room for the menu's button, which shows under the pointer, so that nothing moves.
                 Color.clear.frame(width: 24, height: 24)
                 // One check at a time: it shows within `quick` and leaves at once.
@@ -670,6 +668,14 @@ private struct ModelRow: View {
                     .opacity(selected ? 1 : 0)
                     .animation(selected ? Motion.quick : nil, value: selected)
             }
+            // Its words change in place, and the room they take from the name and the ID with
+            // them: animated with the page, a phrase that came or grew (Starting…, Warming up ·
+            // 3 of 10) slid in over the check, the ID's line, cut anew, morphed off its row over
+            // the next one, and a phrase that faded drew over the rows moving past it. The row
+            // moves with the page as one (`geometryGroup`), its content laid out in it at once;
+            // without the group, its content would leave the row for where it ends up.
+            .transaction { $0.animation = nil }
+            .geometryGroup()
         }
         // The highlight kept while the pointer is on the menu's button.
         .buttonStyle(.hoverRow(hovered: hovering))
