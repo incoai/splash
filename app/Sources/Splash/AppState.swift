@@ -53,9 +53,21 @@ final class AppState {
     let drawer: Drawer
     var showsDrawer = false
     var drawerHeight: CGFloat = 280
-    private(set) var installed: [InstalledModel] = []
-    /// What each model family makes of the launch options, by its name, as the runtime reports it
-    /// at launch; none before, or where the report failed: every option then shows and passes.
+    /// The models on this Mac to pick from, as last listed (`refresh`): those of a family the runtime
+    /// serves (`families`). A model of another, which a newer or development build of Splash installs
+    /// into the models folder every Splash on the Mac shares, can only fail to start: it is left
+    /// out, as a model whose files are gone is. Model files on this Mac not prepared yet have no
+    /// family until a start prepares them, and stay; so does every model until the runtime says
+    /// which families it serves.
+    var installed: [InstalledModel] {
+        guard !families.isEmpty else { return listedModels }
+        return listedModels.filter { model in model.family.map { families[$0] != nil } ?? true }
+    }
+    /// The models on this Mac as last listed, of every family.
+    private var listedModels: [InstalledModel] = []
+    /// What each model family the runtime serves makes of the launch options, by its name, as the
+    /// runtime reports it at launch; none before, or where the report failed: every option then
+    /// shows and passes, and every model is offered.
     private(set) var families: [String: ModelFamily] = [:]
     private(set) var blocker: Blocker?
     /// Whether the checks of `launch` are done; nothing starts before.
@@ -230,9 +242,9 @@ final class AppState {
         return "\(name) (\(Catalog.variant(of: id)))"
     }
 
-    /// Checks this Mac and the app's location, waits for the list of the models on it, stops what
-    /// the app left running last time, and then, in the background, installs the models the Hugging
-    /// Face cache holds; meanwhile it reads what each model family makes of the launch options.
+    /// Checks this Mac and the app's location, waits for the list of the models on it and for the
+    /// families the runtime serves, which pick those it offers, stops what the app left running last
+    /// time, and then, in the background, installs the models the Hugging Face cache holds.
     func launch() async {
         defer { launched = true }
         // The shell's Hugging Face settings, read beside the checks, for all the app runs after them.
@@ -248,10 +260,13 @@ final class AppState {
         }
         chats.adoptFiles()
         runtime.shellSettings.set(await shellSettings.value)
+        // Which families the runtime serves, read beside the listing and the stops, and known before
+        // the window shows the models, so that it lists from the first only those it offers.
+        let served = Task { await runtime.families() }
         await listed()
-        Task { families = await runtime.families() }
         await installer.stopLeftover { self.launchWait = "Stopping the download Splash left running…" }
         await server.stopLeftover { self.launchWait = "Stopping the model Splash left running…" }
+        families = await served.value
         launchWait = nil
         installCached()
     }
@@ -597,13 +612,13 @@ final class AppState {
                 model.family = prepared[model.id]
                 return model
             }
-            let all = found + installed.filter { model in
+            let all = found + listedModels.filter { model in
                 server.running && server.model == model.id && !found.contains { $0.id == model.id }
             }
             let rank = { (id: String) in self.catalog.variants.firstIndex { $0.id == id } ?? Int.max }
             let listed = all.filter { !$0.local }.sorted { (rank($0.id), $0.id) < (rank($1.id), $1.id) }
                 + all.filter(\.local)
-            if listed != installed { installed = listed }
+            if listed != listedModels { listedModels = listed }
             if let arriving, listed.contains(where: { $0.id == arriving }) { self.arriving = nil }
             if let picked = picking {
                 picking = nil

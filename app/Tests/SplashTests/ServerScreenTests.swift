@@ -251,13 +251,15 @@ extension ServerScreenTests {
 
     /// An app launched on `fake` with the models of a Mac that has a few, named and sized as Splash
     /// suggests them, of the families the runtime serves, so that the Server screen is taller than
-    /// the window.
+    /// the window, and two speech models, of families the runtime doesn't serve, which a newer or
+    /// development build installs.
     static func launchedWithModels(_ fake: FakeRuntime) async throws -> AppState {
         try FileManager.default.copyItem(at: Showcase.runtime.suggestedModels, to: Runtime(root: fake.root).suggestedModels)
         try #"print('{"Qwen3.8-27B": {"unusable": []}, "Qwen3.6-35B-A3B": {"unusable": []}, "Flint": {"unusable": []}}')"#
             .write(to: fake.root.appending(path: "install/families.py"), atomically: true, encoding: .utf8)
         let models = [("mlx-community/Qwen3.8-27B-4bit", "Qwen3.8-27B", 20), ("unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M", "Qwen3.6-35B-A3B", 24),
-                      ("unsloth/flint-GGUF:UD-Q4_K_XL", "Flint", 26)]
+                      ("unsloth/flint-GGUF:UD-Q4_K_XL", "Flint", 26),
+                      ("mlx-community/Qwen3-ASR-1.7B-4bit", "Qwen3-ASR", 1), ("mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit", "Qwen3-TTS", 2)]
         for (model, family, gigabytes) in models {
             try fake.install(model, family: family, bytes: Format.gigabytes(gigabytes))
         }

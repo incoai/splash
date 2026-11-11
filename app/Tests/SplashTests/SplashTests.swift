@@ -1238,7 +1238,7 @@ struct ModelFamilyTests {
         let state = fake.state(keychain: Keychain(service: "Splash Tests"))
         defer { state.quit() }
         await state.launch()
-        try await waitFor(!state.families.isEmpty, "the families' report")
+        #expect(!state.families.isEmpty)
         let file = fake.root.appending(path: "Flint-Q4_0.gguf")
         try Data(count: 1000).write(to: file)
         state.addLocal(file)
@@ -1260,15 +1260,15 @@ struct ModelFamilyTests {
         #expect(!state.family(of: file.path).uses("--state-format"))
     }
 
-    /// The card offers a model the options its family can use, and a start passes only those; a
-    /// model whose family is not known gets them all. The models are listed once launched, a model
-    /// added is picked once listed, and the model that runs stays listed, with its pick and its
-    /// family, while it runs, its files gone.
+    /// The card offers a model the options its family can use, and a start passes only those; model
+    /// files on this Mac, whose family is not known until a start prepares them, get them all. The
+    /// models are listed once launched, a model added is picked once listed, and the model that runs
+    /// stays listed, with its pick and its family, while it runs, its files gone.
     @Test func aModelIsOfferedAndStartedWithTheOptionsItsFamilyCanUse() async throws {
         let fake = try FakeRuntime("splash-families", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
         let runtime = Runtime(root: fake.root)
-        try #"print('{"Flint": {"unusable": ["--state-format"], "context_tokens": 262144, "max_context_tokens": 262144}}')"#
+        try #"print('{"Flint": {"unusable": ["--state-format"], "context_tokens": 262144, "max_context_tokens": 262144}, "Other": {"unusable": []}}')"#
             .write(to: runtime.root.appending(path: "install/families.py"), atomically: true, encoding: .utf8)
         let flint = "a/Flint-GGUF:Q4", other = "a/Other-GGUF:Q4"
         try fake.install(flint, family: "Flint")
@@ -1278,8 +1278,6 @@ struct ModelFamilyTests {
         #expect(state.family(of: flint) == .unknown)
         await state.launch()
         #expect(state.isInstalled(flint) && state.isInstalled(other))
-        try await waitFor(!state.families.isEmpty, "the families' report")
-        #expect(state.family(of: other) == .unknown)
         // The options the card shows the model picked.
         func shown(_ model: String) -> [String] {
             state.selection = model
@@ -1294,6 +1292,7 @@ struct ModelFamilyTests {
         #expect(state.selection == other)
         await state.listed()
         #expect(state.selection == file.path)
+        #expect(state.family(of: file.path) == .unknown && shown(file.path).contains("--state-format"))
         state.removeLocal(file.path)
         state.options["--port"] = String(fake.port)
         state.options["--state-format"] = "bf16"
@@ -1315,6 +1314,38 @@ struct ModelFamilyTests {
         try await waitFor(state.server.phase == .stopped, "stopped")
         await state.listed()
         #expect(!state.isInstalled(flint) && state.selection == other)
+    }
+
+    /// Only the models of a family the runtime serves are offered, on the Server, in the menu bar's
+    /// panel and the composer, which list `installed`: a model of another, which a newer or
+    /// development build installs into the models folder every Splash on the Mac shares, is not, nor
+    /// picked where it was the model picked last. Model files on this Mac not prepared yet are
+    /// offered. Where the runtime doesn't say which families it serves, every model is.
+    @Test func onlyTheModelsOfAFamilyTheRuntimeServesAreOffered() async throws {
+        let fake = try FakeRuntime("splash-families", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let script = fake.root.appending(path: "install/families.py")
+        try #"print('{"Flint": {"unusable": []}}')"#.write(to: script, atomically: true, encoding: .utf8)
+        let flint = "a/Flint-GGUF:Q4", speech = "a/Speech-1.7B-4bit"
+        try fake.install(flint, family: "Flint")
+        try fake.install(speech, family: "Speech")
+        let file = fake.root.appending(path: "Added-Q4_0.gguf")
+        try Data(count: 10).write(to: file)
+        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { state.quit() }
+        state.addLocal(file)
+        await state.listed()
+        state.selection = speech
+        await state.launch()
+        #expect(state.installed.map(\.id) == [flint, file.path])
+        #expect(state.selection == flint)
+        // The next launch, whose report fails.
+        try "import sys; sys.exit(1)".write(to: script, atomically: true, encoding: .utf8)
+        let next = fake.state(keychain: Keychain(service: "Splash Tests"))
+        defer { next.quit() }
+        await next.launch()
+        #expect(next.installed.map(\.id) == [flint, speech, file.path])
+        #expect(next.selection == speech)
     }
 }
 

@@ -95,10 +95,13 @@ ones of one model (`--revision`, `--draft-model`, `--mmproj`) and the ones it
 sets itself, from one table (`LaunchOption.all`) the tests hold to `splash
 serve --help`. It offers a model only those its family can use, and passes
 no other: at launch it runs `install/families.py`, which reports for each
-family, from the engine's `families` command and the options' own needs
-(`ServeOption.needs`), the options none of its models can use and the context
-they serve; a model's family is its assembly record's, and a model whose
-family is not known yet gets every option. The API key reaches the server as
+family it serves, from the engine's `families` command and the options' own
+needs (`ServeOption.needs`), the options none of its models can use and the
+context they serve; a model's family is its assembly record's, and a model
+whose family is not known yet gets every option. It offers only the models of
+those families: one of another, which a newer or development build installs
+into the models folder every Splash on the Mac shares, could only fail to
+start. The API key reaches the server as
 `SPLASH_API_KEY`, from the Keychain, which takes it as its field is left or
 a start uses it, and nothing starts while the Keychain does not give it. Copy
 API Address gives the loopback address, or, while the server listens on all
