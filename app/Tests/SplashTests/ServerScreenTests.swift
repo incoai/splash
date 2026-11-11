@@ -269,6 +269,76 @@ extension ServerScreenTests {
     }
 }
 
+extension ServerScreenTests {
+    /// A switch of models changes the control bar at once: each frame drawn through a change shows
+    /// the bar of the state before it or of the state after it, never both over each other, as a
+    /// cross-fade drew them. The check leaves the row picked before at once, never fading there,
+    /// so that one shows at a time.
+    @Test func aSwitchChangesTheControlBarAtOnce() async throws {
+        let fake = try FakeRuntime("splash-switch", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = try await Self.launchedWithModels(fake)
+        defer { state.quit() }
+        let flint = "unsloth/flint-GGUF:UD-Q4_K_XL", qwen = "mlx-community/Qwen3.8-27B-4bit"
+        state.options["--port"] = String(fake.port)
+        for step in ["loaded", "warm"] { FileManager.default.createFile(atPath: fake.root.appending(path: step).path, contents: nil) }
+        state.start(flint)
+        try await waitFor(state.server.phase == .ready, "\(flint) ready")
+        let window = await Snapshot.window(MainView().environment(state), size: ServerPictures.size, appearance: .aqua)
+        defer { window.orderOut(nil) }
+        pump(0.5)
+        /// The window drawn now, a row of pixels at a time, from the top.
+        func rows() async throws -> [Data] {
+            let picture = try #require(await Snapshot.picture(of: window))
+            let data = try #require(picture.bitmapData)
+            return (0..<picture.pixelsHigh).map { Data(bytes: data + $0 * picture.bytesPerRow, count: picture.bytesPerRow) }
+        }
+        let scale = CGFloat(try #require(await Snapshot.picture(of: window)).pixelsHigh) / window.frame.height
+        // The bar's words and buttons: its bottom 48 points, under its divider, from 150 points
+        // in, past the mark, which takes its pose within `glide`.
+        let barRows = Int(48 * scale), skip = Int(150 * scale) * 4
+        func bar(_ rows: [Data]) -> [Data] { rows.suffix(barRows).map { $0.dropFirst(skip) } }
+        /// The frames drawn through `change`, as rows, with those before it and once it has changed
+        /// and stopped changing, which a slow Mac, as a virtual one is, reaches long after the
+        /// animations' length.
+        func frames(of change: () -> Void) async throws -> (before: [Data], drawn: [[Data]], after: [Data]) {
+            let before = try await rows()
+            change()
+            var drawn: [[Data]] = []
+            for _ in 0..<8 {
+                pump(0.03)
+                drawn.append(try await rows())
+            }
+            var after = try await rows()
+            for _ in 0..<40 {
+                pump(0.25)
+                let next = try await rows()
+                if next == after && next != before { break }
+                after = next
+            }
+            return (before, drawn, after)
+        }
+
+        let pick = try await frames { state.selection = qwen }
+        #expect(bar(pick.before) != bar(pick.after))
+        #expect(pick.drawn.allSatisfy { bar($0) == bar(pick.before) || bar($0) == bar(pick.after) }, "picking \(qwen)")
+        // The rows of the screen that the pick changes, above the bar: those of the check that
+        // goes, on Flint's row, under those of the one that comes, on Qwen3.8-27B's.
+        let changed = (0..<(pick.after.count - barRows)).filter { pick.before[$0] != pick.after[$0] }
+        let gap = try #require(zip(changed, changed.dropFirst()).max { $0.1 - $0.0 < $1.1 - $1.0 })
+        let gone = changed.filter { $0 >= gap.1 }
+        // A frame that the pick is yet to reach has the check there whole.
+        #expect(!gone.isEmpty && pick.drawn.allSatisfy { frame in
+            gone.allSatisfy { frame[$0] == pick.after[$0] } || gone.allSatisfy { frame[$0] == pick.before[$0] }
+        }, "the check leaves Flint's row at once")
+
+        let switching = try await frames { state.start(qwen) }
+        #expect(bar(switching.before) != bar(switching.after))
+        #expect(switching.drawn.allSatisfy { bar($0) == bar(switching.before) || bar($0) == bar(switching.after) },
+                "switching to \(qwen)")
+    }
+}
+
 /// The Server screen drawn to `server-*.png` in `SPLASH_APP_SNAPSHOTS`, light and dark, for people
 /// to review its look with the models of a Mac that has a few: at its top, and scrolled so that its
 /// first rows would be where the toolbar is.
@@ -288,6 +358,62 @@ struct ServerPictures {
         await Snapshot.save("server-scrolled", size: Self.size, MainView().environment(state)) { window in
             window.contentView?.pageScroll?.scroll(by: 90)
             try? await Task.sleep(for: .seconds(0.3))
+        }
+    }
+}
+
+/// A switch of models on the Server screen drawn to `switch-*.png` in `SPLASH_APP_SNAPSHOTS`,
+/// light and dark, for people to review its motion: each change of it, the pick, the stop, the
+/// start, the warm-up and ready, at 0, 25, 50, 75 and 100% of `settle`, and at twice that, once a
+/// section that comes has faded in.
+@MainActor
+@Suite(.serialized, .enabled(if: Snapshot.directory != nil))
+struct ServerSwitchPictures {
+    @Test func aSwitchFrameByFrame() async throws {
+        let directory = try #require(Snapshot.directory)
+        for (suffix, appearance) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
+            let fake = try FakeRuntime("splash-switch-pictures", launcher: "stepped_server")
+            defer { try? FileManager.default.removeItem(at: fake.root) }
+            let state = try await ServerScreenTests.launchedWithModels(fake)
+            defer { state.quit() }
+            let flint = "unsloth/flint-GGUF:UD-Q4_K_XL", qwen = "mlx-community/Qwen3.8-27B-4bit"
+            state.options["--port"] = String(fake.port)
+            func signal(_ step: String) { FileManager.default.createFile(atPath: fake.root.appending(path: step).path, contents: nil) }
+            signal("loaded")
+            signal("warm")
+            state.start(flint)
+            try await waitFor(state.server.phase == .ready, "\(flint) ready")
+            let window = await Snapshot.window(MainView().environment(state), size: ServerPictures.size, appearance: appearance)
+            defer { window.orderOut(nil) }
+            pump(0.5)
+            func frames(_ name: String) async {
+                let start = ContinuousClock.now
+                for percent in [0, 25, 50, 75, 100, 200] {
+                    while ContinuousClock.now < start + .milliseconds(percent * 24 / 10) { pump(0.005) }
+                    try? await Snapshot.picture(of: window)?.representation(using: .png, properties: [:])?
+                        .write(to: directory.appending(path: "switch-\(name)-\(percent)-\(suffix).png"))
+                }
+            }
+            /// Waits for `condition`, letting the app's own work on the main actor run meanwhile.
+            func until(_ condition: () -> Bool) async {
+                while !condition() {
+                    pump(0.002)
+                    await Task.yield()
+                }
+            }
+            state.selection = qwen
+            await frames("1-pick")
+            for step in ["loaded", "warm"] { try FileManager.default.removeItem(at: fake.root.appending(path: step)) }
+            state.start(qwen)
+            await frames("2-stop")
+            await until { state.server.phase == .starting && state.server.model == qwen }
+            await frames("3-start")
+            signal("loaded")
+            await until { state.server.step == .warming }
+            await frames("4-warm")
+            signal("warm")
+            await until { state.server.phase == .ready }
+            await frames("5-ready")
         }
     }
 }

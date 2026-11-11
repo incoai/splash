@@ -88,16 +88,19 @@ struct GroupedSection<Content: View, Header: View, Footer: View>: View {
     private func card(_ rows: SubviewsCollection) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             ForEach(rows) { row in
-                row
-                    .padding(.horizontal, Grouped.inset)
-                    .padding(.vertical, Grouped.rowPadding)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                if row.id != rows.last?.id {
-                    Rectangle()
-                        .fill(.quaternary.opacity(0.5))
-                        .frame(height: 1)
+                Group {
+                    row
                         .padding(.horizontal, Grouped.inset)
+                        .padding(.vertical, Grouped.rowPadding)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if row.id != rows.last?.id {
+                        Rectangle()
+                            .fill(.quaternary.opacity(0.5))
+                            .frame(height: 1)
+                            .padding(.horizontal, Grouped.inset)
+                    }
                 }
+                .transition(Motion.comingAndGoing)
             }
         }
         // A grouped form's card, a shade off the window in either appearance.

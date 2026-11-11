@@ -43,6 +43,13 @@ extension NSView {
     }
 }
 
+/// Runs the main run loop for `seconds`, as an app's event loop runs it: its observers commit
+/// SwiftUI's updates and its display link moves animations on, which a test's main actor alone
+/// never does.
+@MainActor func pump(_ seconds: Double) {
+    _ = CFRunLoopRunInMode(.defaultMode, seconds, false)
+}
+
 extension NSScrollView {
     /// Scrolls its content up by `distance` from where it is.
     func scroll(by distance: CGFloat) {

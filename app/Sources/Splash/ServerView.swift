@@ -121,6 +121,7 @@ private struct ServerSections: View {
                 if first { otherModels }
             }
         }
+        .transition(Motion.comingAndGoing)
         .animation(Motion.settle, value: Layout(installed: state.installed.map(\.id), downloading: state.installer.running,
                                                 warming: warming, failure: state.installer.failure?.message,
                                                 keyProblem: state.keyProblem, finding: state.findingCachedModels,
@@ -208,7 +209,6 @@ private struct ControlBar: View {
                 Text(model.map(state.displayName(of:)) ?? "")
                     .font(.headline)
                     .truncationMode(.middle)
-                    .contentTransition(.opacity)
                 detail
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -222,10 +222,9 @@ private struct ControlBar: View {
         .frame(maxWidth: column - 40)
         .padding(.vertical, 12)
         .frame(maxWidth: .infinity)
-        // The model picked and changed options change it with one cross-fade, as the server's
-        // stage does (`MainView`).
-        .animation(Motion.settle, value: state.selection)
-        .animation(Motion.settle, value: state.optionsChanged)
+        // Its words and buttons change at once, as a control's title does: cross-faded as the
+        // server's stage changed the window (`MainView`), the old ones drew over the new.
+        .transaction { $0.animation = nil }
     }
 
     /// Whether the model picked is the one that failed, so that Start tries it again.
@@ -658,15 +657,18 @@ private struct ModelRow: View {
                         .truncationMode(.middle)
                 }
                 Spacer()
-                if let phase { Text(phase).foregroundStyle(.secondary) }
+                // In place, as the row moves: a phrase that came and went, or faded into the next,
+                // drew over the rows moving past it in a switch.
+                Text(phase ?? "").foregroundStyle(.secondary).contentTransition(.identity)
                 // Room for the menu's button, which shows under the pointer, so that nothing moves.
                 Color.clear.frame(width: 24, height: 24)
+                // One check at a time: it shows within `quick` and leaves at once.
                 Image(systemName: "checkmark")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.tint)
                     .frame(width: 16)
                     .opacity(selected ? 1 : 0)
-                    .animation(Motion.quick, value: selected)
+                    .animation(selected ? Motion.quick : nil, value: selected)
             }
         }
         // The highlight kept while the pointer is on the menu's button.
