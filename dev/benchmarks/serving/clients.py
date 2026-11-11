@@ -146,6 +146,7 @@ class Stream:
         self.text: list[str] = []
         self.usage: dict = {}
         self.metrics: dict = {}
+        self.finish_reason: str | None = None
         self.error_body = ""
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
         try:
@@ -177,6 +178,9 @@ class Stream:
                 self.usage = event.get("usage") or self.usage
                 self.metrics = event.get("metrics") or self.metrics
                 for choice in event.get("choices", []):
+                    self.finish_reason = (
+                        choice.get("finish_reason") or self.finish_reason
+                    )
                     piece = (choice.get("delta") or {}).get("content")
                     if piece:
                         self.chunks.append(time.time())
