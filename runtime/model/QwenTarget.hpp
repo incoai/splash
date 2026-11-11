@@ -472,6 +472,13 @@ public:
                                                                    const kv::PageStorage &kv, SpilledKvReads &spilled,
                                                                    QwenPrefillLayers layers,
                                                                    ops::AneFfn *aneFfn = nullptr) = 0;
+  // Adds what only a state captured inside a prefill sequence's rows runs:
+  // for a sequence of the first chunk from auxiliary state `auxiliaryIn`,
+  // capturing after its first row into `captured`. That is Flash-Next's PLE
+  // history alone, as a capture's GDN scans and QSA pending keys run the
+  // kernels of every prefill (Runtime::warmupPrefill creates its pipelines).
+  virtual void addInsideCapture(metal::CommandGraph &graph, metal::MetalBuffer auxiliaryIn,
+                                metal::MetalBuffer captured) const;
   // Writes the inputs the target makes on the CPU of batch lane `lane`'s
   // verify rows, those from `position` on of `request`, before the cycle's
   // commands are encoded.

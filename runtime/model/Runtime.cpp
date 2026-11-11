@@ -1788,6 +1788,14 @@ struct Runtime::Impl {
     backend.preparePipelines(graph.dispatches());
   }
 
+  // Creates the pipelines only a state captured inside a prefill chunk runs,
+  // on `lane`, without running it (Runtime::warmupPrefill).
+  void prepareInsideCapture(uint32_t lane) const {
+    CommandGraph graph;
+    targetModel->addInsideCapture(graph, states.current(lane).auxiliary, states.next(lane).auxiliary);
+    if (!graph.dispatches().empty()) backend.preparePipelines(graph.dispatches());
+  }
+
   // Creates the pipelines of a verify of `entries`, each after the longest
   // history the target serves, without running it (Runtime::warmupDecodeBatch).
   // The lanes' inputs are prepared for that history; the next decode prepares
@@ -3535,6 +3543,12 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
     // pipelines on its lane. Without them the 35B's first cached prefix on
     // the 10-core M4 created two, 15 ms cold.
     impl_->prepareDraftRebuild(0, std::min(rows, ExecutionLimits::draftContextTokens));
+    // No warmup captures a state inside its chunk, as a prompt does at a
+    // cached boundary inside one: Flash-Next's first such request created
+    // ngram_embedding_history while serving (0.6 ms warm on the 48 GB
+    // M5 Pro). So each prefill warmup also creates, without running it, what
+    // such a capture runs on its lane.
+    impl_->prepareInsideCapture(0);
     end(id);
   } catch (...) {
     end(id);

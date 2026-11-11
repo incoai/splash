@@ -536,7 +536,8 @@ every projection
   is one of these chunks'. Each prefill also creates, without running it, the
   draft rebuild a restored lane's first chunk begins with, which no other
   command runs, so a memory-limited restore warmup leaves none of its kernels
-  to serving;
+  to serving, and what a state captured inside a chunk runs, which no warmup
+  captures (Flash-Next's PLE history, `QwenTarget::addInsideCapture`);
 - a decode of each width the memory plan holds, and a state restore. Each
   decode also creates, without running it, its verify after the longest
   history the target serves: each choice a verify's history makes has one
