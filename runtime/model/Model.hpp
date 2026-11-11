@@ -868,10 +868,10 @@ public:
   // whose buffers return to the pool: the pooled buffers, beyond those one
   // lane starts from with keepLane, at the sizes their layout declares,
   // which no allocation falls short of. With `afterStart`, of the pool a
-  // lane's start and the state it captures leave (startStateBytes): the
-  // evicted states refill the buffers they took from it before any of
-  // theirs frees memory. Zero where the model does not describe its pool,
-  // which counts on no more than it releases.
+  // lane's start leaves (startStateBytes): the evicted states refill the
+  // buffers it took from it before any of theirs frees memory. Zero where
+  // the model does not describe its pool, which counts on no more than it
+  // releases.
   [[nodiscard]] virtual uint64_t idleBufferBytes(uint32_t evictedStates, bool afterStart,
                                                  bool keepLane) const noexcept {
     static_cast<void>(evictedStates);
@@ -879,8 +879,8 @@ public:
     static_cast<void>(keepLane);
     return 0;
   }
-  // The state bytes a lane's start and the state it captures allocate: the
-  // buffers the idle pool lacks for them. Zero by default.
+  // The state bytes a lane's start allocates: the buffers the idle pool
+  // lacks for its lane. Zero by default.
   [[nodiscard]] virtual uint64_t startStateBytes() const noexcept { return 0; }
   // What one prefill command may hold (commandViolation): by default a
   // chunk's rows in one pass over one layer, one lane past a chunk and no

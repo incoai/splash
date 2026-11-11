@@ -6,6 +6,7 @@
 #include "model/QwenTargetLoader.hpp"
 #include "model/RuntimeArenas.hpp"
 
+#include "metal/abi/Gguf.h"
 #include "metal/abi/QuantFormat.h"
 
 #include <algorithm>
@@ -15,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -35,15 +37,16 @@ model::DFlashDraftLayout draftOf() {
 }
 
 // A target of Weights' architecture at the sizes of `family`, its first
-// family's by default, paired with `draft`.
+// family's by default, its projections in `format`, paired with `draft`.
 template <class Weights>
 model::LoadedModel loadedModel(const decltype(Weights::layout) &family = {},
-                               const model::DFlashDraftLayout &draft = draftOf<Weights>()) {
+                               const model::DFlashDraftLayout &draft = draftOf<Weights>(),
+                               uint32_t format = GGUF_FMT_Q4K) {
   model::LoadedModel result;
   Weights target;
   target.layout = family;
-  const auto projection = [](uint32_t n, uint32_t k) {
-    return ops::Projection(n, k, ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, n, k, {}, {}, {})}});
+  const auto projection = [format](uint32_t n, uint32_t k) {
+    return ops::Projection(n, k, ops::BlockWeights{{ops::QuantizedSegment::planes(format, n, k, {}, {}, {})}});
   };
   const auto &layout = target.layout;
   // Qwen3.8-Flash-Next's hyper-connection mixes, QSA indexers and PLE layer.
@@ -125,7 +128,7 @@ void checkGateUpLayers() {
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = 16;
-    ops::ExecutionPlans plans(device);
+    ops::ExecutionPlans plans(device, ops::Int8Activations::On);
     const auto geometry = model::RuntimeGeometry::from(dense, kv::Format::Int8, ops::GdnStateFormat::Float32);
     const auto head = target.logitsProjection.shape();
     const auto containsHead = [&](const auto &shapes) {
@@ -170,6 +173,39 @@ void checkGateUpLayers() {
   }
 }
 
+// The prefill arena holds the int8 prefill tile's codes and scales of a full
+// chunk of the target's widest projection the tile takes, wherever the family
+// runs it with int8 activations on, and none for the draft, which prefills on
+// the bf16 tiles: a GGUF target holds none, and Qwen3.8-27B MLX 4-bit its down
+// projection's (17408 inputs), not its draft's context projection's (25600).
+void checkPrefillInt8Scratch() {
+  for (uint32_t family : {9U, 10U, 11U})
+    for (const ops::Int8Activations setting : {ops::Int8Activations::On, ops::Int8Activations::Off}) {
+      DeviceCapabilities device;
+      device.appleGpuFamily = family;
+      device.gpuCoreCount = 20;
+      const ops::ExecutionPlans plans(device, setting);
+      // The arena's codes and scales for `loaded`.
+      const auto int8Scratch = [&](const model::LoadedModel &loaded) {
+        const auto sizes = model::prefillTensorBytes(
+            model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32), plans);
+        return std::pair{sizes[uint32_t(model::PrefillTensor::LinearTable)],
+                         sizes[uint32_t(model::PrefillTensor::LinearSums)]};
+      };
+      for (const model::LoadedModel &gguf :
+           {loadedModel<model::Qwen3_8Weights>(), loadedModel<model::Qwen3_6MoeWeights>()})
+        require(int8Scratch(gguf) == std::pair<uint64_t, uint64_t>{},
+                "the prefill arena of a GGUF target holds int8 prefill scratch");
+      const uint32_t down = model::Qwen3_8Layout{}.intermediateSize;
+      const auto [table, sums] =
+          int8Scratch(loadedModel<model::Qwen3_8Weights>({}, test::qwen3_8Draft(), GGUF_FMT_AF4G64));
+      const bool int8 = family >= 10 && setting == ops::Int8Activations::On;
+      require(table == (int8 ? gguf_prefill_int8_table_bytes(down, SPLASH_PREFILL_TOKEN_BUDGET) : 0) &&
+                  sums == (int8 ? gguf_prefill_int8_scale_bytes(down, SPLASH_PREFILL_TOKEN_BUDGET) : 0),
+              "the prefill arena of an MLX target holds other int8 prefill scratch than its down projection's");
+    }
+}
+
 // One decode arena serves every lane count, and a staged plan's partials
 // grow with its rows. The arena must hold every lane's plan of every target
 // and draft projection at the measured core counts.
@@ -187,7 +223,7 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
       DeviceCapabilities device;
       device.appleGpuFamily = family;
       device.gpuCoreCount = cores;
-      const ops::ExecutionPlans plans(device);
+      const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
       const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
       for (const auto matrix : matrices)
         for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes)
@@ -200,6 +236,28 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
                     "decode arena scratch below a lane's plan");
           }
     }
+}
+
+// The decode arena's plan counts each buffer it allocates in whole host
+// pages, as Metal allocates them and the memory ledger charges them: one
+// request's KV capacity rests on it, and a plan of the scratch fields' sum
+// left Qwen3.8-Flash-Next's context a KV extent more than a request could
+// use (RuntimeArenas.cpp, decodeArenaBytes).
+void checkDecodeArenaPages(const model::LoadedModel &loaded) {
+  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  for (uint32_t family : {9U, 10U, 11U}) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = family;
+    device.gpuCoreCount = 20;
+    const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+    const ops::LinearScratchSize linear = model::DecodeArena::linearScratchSize(geometry, plans);
+    uint64_t pages = model::decodeArenaBaseBytes(geometry, plans);
+    for (const uint64_t scratch : {model::DecodeArena::gateScratchBytes(geometry, plans), linear.input, linear.sums,
+                                   linear.partials, linear.counters, linear.rotated})
+      pages += alignUp(scratch);
+    require(model::decodeArenaBytes(geometry, plans) == pages,
+            "the decode arena's plan does not count each of its buffers in whole host pages");
+  }
 }
 
 // A model served with YaRN reaches the runtime's geometry with its scaling
@@ -224,7 +282,7 @@ uint64_t decodeBytes(const model::RuntimeGeometry &geometry, model::DecodeTensor
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
-  return model::decodeTensorBytes(geometry, ops::ExecutionPlans(device))[static_cast<uint32_t>(tensor)];
+  return model::decodeTensorBytes(geometry, ops::ExecutionPlans(device, ops::Int8Activations::On))[static_cast<uint32_t>(tensor)];
 }
 
 // A block-sparse target selects its blocks through index tables of their
@@ -285,7 +343,7 @@ void checkArenasWithoutGdnLayers() {
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
-  const ops::ExecutionPlans plans(device);
+  const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
   // Whether `bytes` are the hybrid's but for the GDN tensors, which only the
   // hybrid's arena holds.
   const auto withoutGdn = [](const auto &hybridBytes, const auto &bytes, const auto &gdnTensors) {
@@ -387,7 +445,7 @@ void checkPrefillAttentionHistory() {
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
-  const ops::ExecutionPlans plans(device);
+  const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
   model::QwenTargetPrefillSequence sequence;
   sequence.rows = 300;
   const auto splitsAfter = [&](uint32_t history) {
@@ -408,9 +466,12 @@ int main() {
     checkIndexTables();
     checkSpilledKvGeometry();
     checkArenasWithoutGdnLayers();
+    checkPrefillInt8Scratch();
     checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
+    checkDecodeArenaPages(loadedModel<model::Qwen3_8Weights>());
+    checkDecodeArenaPages(loadedModel<model::Qwen3_6MoeWeights>());
     std::cout << "model execution plans: PASS (three paired geometries)\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

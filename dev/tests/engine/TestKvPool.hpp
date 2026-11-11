@@ -26,7 +26,8 @@ namespace splash::test {
 // while growthBlocked, or when growthAllowed(extent) says no; a
 // budget-limited pool needs more page ids than its budget, as production's
 // has. With `memory`, growth is allocated through it under `admission`
-// instead (held as "kv"), and a release gives the bytes back. A release or
+// instead (held as "kv"), unless the driver denies it (driverDenies), and a
+// release gives the bytes back. A release or
 // a copy throws std::logic_error while commandInFlight()
 // says a command is in flight, as PageStorage's does. Every page holds one
 // value, which a test sets, a copy carries (between forms too, as what both
@@ -64,8 +65,12 @@ public:
         if (form == kv::PageForm::Slim && !slimBytesPerPage_)
             throw std::invalid_argument("test KV pages without a window keep every layer");
         if (memory) {
-            if (const metal::AllocationResult result =
-                    memory->allocate(admission, "kv", extentPages_ * bytesPerPage(form));
+            const uint64_t bytes = extentPages_ * bytesPerPage(form);
+            if (const metal::AllocationResult result = admission(bytes, [&] {
+                    if (driverDenies && driverDenies(form))
+                        throw metal::MetalAllocationError("the driver denied a test KV extent");
+                    memory->hold("kv", bytes);
+                });
                 !result)
                 return result;
         } else if (growthBlocked || (growthAllowed && !growthAllowed(extent)) ||
@@ -145,6 +150,9 @@ public:
     }
     FakeMemory *memory = nullptr;
     metal::AllocationAdmission admission;
+    // Through `memory`: whether the driver denies an extent of the form its
+    // admission granted, as Metal may past the governor's estimate.
+    std::function<bool(kv::PageForm form)> driverDenies;
     uint32_t budgetPages = std::numeric_limits<uint32_t>::max();
     bool growthBlocked = false;
     std::function<bool(uint32_t extent)> growthAllowed;

@@ -487,7 +487,7 @@ bool claimCache(engine::Cache &resources, const engine::Need &need) {
   ledger.addSource(resources);
   const engine::ClaimId claim =
       ledger.open({.cls = engine::ClaimClass::InService, .reach = engine::ReclaimClass::InUse});
-  const engine::FreeResult freed = ledger.free(claim, need, 0, false);
+  const engine::FreeResult freed = ledger.free(claim, need, 0, engine::MemoryPressure::Normal);
   ledger.close(claim);
   return freed.gave();
 }
@@ -740,6 +740,13 @@ uint32_t parseMaxContext(std::string_view value) {
   return tokens;
 }
 
+// --activations, as serve's: whether activations may round to int8
+// where an int8-activation path takes them.
+ops::Int8Activations parseInt8Activations(std::string_view value) {
+  if (value != "auto" && value != "bf16") throw std::invalid_argument("--activations requires auto or bf16");
+  return value == "auto" ? ops::Int8Activations::On : ops::Int8Activations::Off;
+}
+
 // --ane-ffn-minimum-rows: the least rows of a chunk the prefill FFN's Neural
 // Engine split takes, a positive count.
 uint32_t parseAneFfnMinimumRows(std::string_view value) {
@@ -895,6 +902,7 @@ int main(int argc, char **argv) {
                    "[--samples COUNT] [--progress PATH] "
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
                    "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
+                   "[--activations auto|bf16] "
                    "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
                    "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
                    "(default: decode,partial,context)\n"
@@ -905,6 +913,7 @@ int main(int argc, char **argv) {
                    "  TOKENS: the context the engine serves, as serve's "
                    "--max-context, with YaRN past the model's native window "
                    "(default: what memory holds)\n"
+                   "  --activations: as serve's (default: auto)\n"
                    "  DIR: the logits scenario's dump, and the earlier dump whose "
                    "prefixes it scores (default: its own greedy transcripts')\n"
                    "  LANES: the score requests the logits scenario runs at once "
@@ -917,6 +926,7 @@ int main(int argc, char **argv) {
     std::optional<double> aneFfnShare;
     std::optional<uint32_t> aneFfnMinimumRows;
     uint32_t maxContext = 0;
+    ops::Int8Activations int8Activations = ops::Int8Activations::On;
     std::optional<std::filesystem::path> logitsDirectory, logitsFrom;
     uint32_t logitsWidth = 1;
     bool logitsOptions = false;
@@ -936,6 +946,8 @@ int main(int argc, char **argv) {
         aneFfnMinimumRows = parseAneFfnMinimumRows(argv[index + 1]);
       } else if (option == "--max-context") {
         maxContext = parseMaxContext(argv[index + 1]);
+      } else if (option == "--activations") {
+        int8Activations = parseInt8Activations(argv[index + 1]);
       } else if (option == "--logits") {
         logitsDirectory = std::filesystem::path(argv[index + 1]);
       } else if (option == "--logits-from") {
@@ -964,6 +976,7 @@ int main(int argc, char **argv) {
     config.model = model::servedFor(model::inspectModelRoot(config.modelRoot), maxContext);
     config.buildId = SPLASH_BUILD_ID;
     config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
+    config.int8Activations = int8Activations;
     // The verify budget's rows follow the wall times and acceptance of the
     // cycles before them, so a MoE target's outputs would not repeat from
     // round to round: every cycle verifies every row (--verify-rows all), and

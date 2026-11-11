@@ -260,7 +260,7 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
        StartFailedEvent{StartFailureKind::CommandMemory,
                         {},
                         "a start command ran out of GPU memory"}},
-      {"warming", WarmingEvent{}},
+      {"warming", WarmingEvent{3, 9}},
       {"start", StartEvent{91, 2, 4096}},
       {"prompt_progress", PromptProgressEvent{91, 2048, 123456}},
       {"tokens", TokensEvent{91, 17, {10, 11, 12}}},
@@ -1068,6 +1068,9 @@ void testFailureTaxonomy() {
   invalid.sampling.topP = 0.0f;
   expectRequestIssue(test, invalid, IssueCode::InvalidSampling);
 
+  // A warm-up has steps, and no more of them done than it has.
+  expectEventIssue(test, WarmingEvent{0, 0}, IssueCode::InvalidCount);
+  expectEventIssue(test, WarmingEvent{10, 9}, IssueCode::InvalidCount);
   expectEventIssue(test, ReadyEvent{0, 4096, false, 64, {1}, 9},
                    IssueCode::InvalidCount);
   // Ready names the tokens that end generation, each inside the vocabulary.
