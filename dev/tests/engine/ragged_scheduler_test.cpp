@@ -347,6 +347,117 @@ void testPrefillAndDecodeAlternateWithoutStarvation() {
 
 // Lane 1 decodes beside lane 2's long prompt: one decode command, then one
 // prefill unit of 500 ms owes half of it at a share of 0.5.
+// A cached turn's final rows may borrow one prefill command against existing
+// decode debt, but the debt (including that command) must still be repaid.
+void testShortFinishingPrefillBorrowsOnceWithoutForgivingDebt() {
+  DenseSim sim(1.0);
+  sim.decoder(1, RequestPriority::Foreground);
+  sim.decoder(6, RequestPriority::Foreground);
+  for (uint32_t step = 0; step < 8; ++step)
+    completeDecode(sim);
+  sim.lane(2, 0, 20'000, RequestPriority::Foreground);
+  completePrefill(sim, sim.plan(), {.wallMilliseconds = 500.0});
+  sim.lane(3, 26'400, 32, RequestPriority::Foreground);
+  const BatchPlan turn = sim.plan();
+  require(turn.kind == WorkKind::Prefill && turn.items.front().requestId == 3,
+          "a short finishing turn waited for the whole decode debt");
+  completePrefill(sim, turn, {.wallMilliseconds = 100.0});
+  require(sim.scheduler.snapshot().finishingPrefillAdvances == 1, "the finishing advance was not counted");
+  sim.scheduler.finish(3);
+  sim.lane(4, 26'400, 32, RequestPriority::Foreground);
+  for (uint32_t step = 0; step < 12; ++step)
+    completeDecode(sim);
+  require(sim.plan().kind == WorkKind::Prefill,
+          "the short turn's debt was forgiven, or decode did not repay it");
+  completePrefill(sim, sim.plan(), {.wallMilliseconds = 500.0});
+  sim.scheduler.finish(4);
+  sim.lane(5, 26'400, 32, RequestPriority::Foreground);
+  require(sim.plan().kind == WorkKind::Prefill && sim.plan().items.front().requestId == 5,
+          "a fully repaid debt did not allow a later finishing turn to advance");
+}
+
+void testFinishingPrefillAdvanceKeepsPriorityAndSizeBounds() {
+  for (const auto [position, rows, priority] :
+       {std::tuple{0u, 32u, RequestPriority::Foreground},
+        std::tuple{26'400u, 257u, RequestPriority::Foreground},
+        std::tuple{26'400u, 32u, RequestPriority::Background}}) {
+    DenseSim sim(1.0);
+    sim.decoder(1, RequestPriority::Foreground);
+    sim.decoder(6, RequestPriority::Foreground);
+    for (uint32_t step = 0; step < 8; ++step)
+      completeDecode(sim);
+    sim.lane(2, 0, 20'000, RequestPriority::Foreground);
+    completePrefill(sim, sim.plan(), {.wallMilliseconds = 500.0});
+    sim.lane(3, position, rows, priority);
+    require(sim.plan().kind == WorkKind::Decode,
+            "an uncached, large or lower-priority prefill bypassed decode debt");
+  }
+}
+
+void testBackgroundFinishingPrefillDoesNotAdvance() {
+  DenseSim sim(1.0);
+  sim.decoder(1, RequestPriority::Background);
+  sim.decoder(6, RequestPriority::Background);
+  for (uint32_t step = 0; step < 8; ++step)
+    completeDecode(sim);
+  sim.lane(2, 0, 20'000, RequestPriority::Background);
+  completePrefill(sim, sim.plan(), {.wallMilliseconds = 500.0});
+  sim.lane(3, 26'400, 32, RequestPriority::Background);
+  require(sim.plan().kind == WorkKind::Decode, "background warming borrowed a foreground latency advance");
+}
+
+void testExcludedFinishingTurnDoesNotConsumeAdvance() {
+  DenseSim sim(1.0);
+  sim.decoder(1, RequestPriority::Foreground);
+  sim.decoder(6, RequestPriority::Foreground);
+  for (uint32_t step = 0; step < 8; ++step)
+    completeDecode(sim);
+  sim.lane(2, 0, 20'000, RequestPriority::Foreground);
+  completePrefill(sim, sim.plan(), {.wallMilliseconds = 500.0});
+  sim.lane(3, 26'400, 32, RequestPriority::Foreground);
+  sim.excluded = {3};
+  require(sim.plan().kind == WorkKind::Decode, "a blocked finishing lane ran");
+  completeDecode(sim);
+  sim.excluded.clear();
+  const BatchPlan turn = sim.plan();
+  require(turn.kind == WorkKind::Prefill && turn.items.front().requestId == 3,
+          "planning or excluding a finishing lane consumed its advance");
+}
+
+void testNormalFinishingPrefillKeepsItsExistingPolicy() {
+  DenseSim sim(1.0);
+  sim.decoder(1);
+  sim.decoder(6);
+  for (uint32_t step = 0; step < 8; ++step)
+    completeDecode(sim);
+  sim.lane(2, 0, 20'000);
+  completePrefill(sim, sim.plan(), {.wallMilliseconds = 500.0});
+  sim.lane(3, 26'400, 32);
+  require(sim.plan().kind == WorkKind::Decode, "ordinary coding traffic borrowed a foreground advance");
+}
+
+void testOneForegroundDecoderKeepsItsBatchingOpportunity() {
+  DenseSim sim(1.0);
+  sim.decoder(1, RequestPriority::Foreground);
+  for (uint32_t step = 0; step < 8; ++step)
+    completeDecode(sim);
+  sim.lane(2, 0, 20'000, RequestPriority::Foreground);
+  completePrefill(sim, sim.plan(), {.wallMilliseconds = 500.0});
+  sim.lane(3, 26'400, 32, RequestPriority::Foreground);
+  require(sim.plan().kind == WorkKind::Decode, "a finishing advance displaced a lone foreground decoder");
+}
+
+void testBriefForegroundDecodersKeepTheirBatchingOpportunity() {
+  DenseSim sim(1.0);
+  sim.decoder(1, RequestPriority::Foreground);
+  sim.decoder(6, RequestPriority::Foreground);
+  sim.lane(2, 0, 20'000, RequestPriority::Foreground);
+  completeDecode(sim);
+  completePrefill(sim, sim.plan(), {.wallMilliseconds = 500.0});
+  sim.lane(3, 26'400, 32, RequestPriority::Foreground);
+  require(sim.plan().kind == WorkKind::Decode, "brief decoders lost their batching opportunity");
+}
+
 void testDecodeRepaysItsShareOfContendedPrefill() {
   for (const double share : {0.0, 0.5}) {
     DenseSim sim(share);
@@ -390,6 +501,7 @@ void testExcludedLanesAreNotPlanned() {
 void testPriorityPrecedesWorkKindAlternation() {
   DenseSim sim;
   sim.decoder(1, RequestPriority::Background);
+  sim.decoder(6, RequestPriority::Background);
   sim.lane(2, 0, 100, RequestPriority::Foreground);
   const BatchPlan plan = sim.plan();
   require(plan.kind == WorkKind::Prefill && plan.items[0].requestId == 2,
@@ -1724,6 +1836,13 @@ constexpr test::TestCase kTests[] = {
     {"testDecodeLanesRotate", testDecodeLanesRotate},
     {"testMaskStagesNeverMix", testMaskStagesNeverMix},
     {"testPrefillAndDecodeAlternateWithoutStarvation", testPrefillAndDecodeAlternateWithoutStarvation},
+    {"testShortFinishingPrefillBorrowsOnceWithoutForgivingDebt", testShortFinishingPrefillBorrowsOnceWithoutForgivingDebt},
+    {"testFinishingPrefillAdvanceKeepsPriorityAndSizeBounds", testFinishingPrefillAdvanceKeepsPriorityAndSizeBounds},
+    {"testBackgroundFinishingPrefillDoesNotAdvance", testBackgroundFinishingPrefillDoesNotAdvance},
+    {"testExcludedFinishingTurnDoesNotConsumeAdvance", testExcludedFinishingTurnDoesNotConsumeAdvance},
+    {"testNormalFinishingPrefillKeepsItsExistingPolicy", testNormalFinishingPrefillKeepsItsExistingPolicy},
+    {"testOneForegroundDecoderKeepsItsBatchingOpportunity", testOneForegroundDecoderKeepsItsBatchingOpportunity},
+    {"testBriefForegroundDecodersKeepTheirBatchingOpportunity", testBriefForegroundDecodersKeepTheirBatchingOpportunity},
     {"testDecodeRepaysItsShareOfContendedPrefill", testDecodeRepaysItsShareOfContendedPrefill},
     {"testExcludedLanesAreNotPlanned", testExcludedLanesAreNotPlanned},
     {"testPriorityPrecedesWorkKindAlternation", testPriorityPrecedesWorkKindAlternation},
